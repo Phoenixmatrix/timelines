@@ -9,9 +9,6 @@
 
 import { Dialog } from "@base-ui/react/dialog";
 import {
-  FileMinusIcon,
-  FilePlusIcon,
-  FileTextIcon,
   FolderOpenIcon,
   GitCommitIcon,
   GlobeSimpleIcon,
@@ -22,11 +19,12 @@ import { useEffect, useRef, useState, type ReactNode, type RefObject } from "rea
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router";
 import type { CiRunList, CiRunSummary, CommitsResponse, RepoDetail } from "../../../shared/api.ts";
 import type { Deployment, DeploymentList } from "../../../shared/deployments.ts";
-import type { CommitDiff, DiffFile } from "../../../shared/diff.ts";
+import type { CommitDiff } from "../../../shared/diff.ts";
 import type { Published } from "../../../shared/packages.ts";
 import type { StepAuthor, StepPage } from "../../../shared/steps.ts";
 import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
 import { CiStatusIcon, runLabel } from "../../components/CiStatus.tsx";
+import { DiffView } from "../../components/DiffView.tsx";
 import { DEPLOYMENT_LABEL, DeploymentProvenance } from "../../components/Deployments.tsx";
 import { RecentAgents } from "../../components/RecentAgents.tsx";
 import { fadeMotion, link, Tip } from "../../components/ui.tsx";
@@ -857,16 +855,6 @@ function Deployments({
   );
 }
 
-const FILE_ICON: Record<DiffFile["status"], ReactNode> = {
-  added: <FilePlusIcon weight="bold" className="shrink-0 text-online" aria-label="Added" />,
-  deleted: (
-    <FileMinusIcon weight="bold" className="shrink-0 text-danger-text" aria-label="Deleted" />
-  ),
-  modified: (
-    <FileTextIcon weight="bold" className="shrink-0 text-ink-faint" aria-label="Modified" />
-  ),
-};
-
 function Files({
   repo,
   oid,
@@ -891,56 +879,24 @@ function Files({
             files.length === 0 ? (
               <Note>No files changed.</Note>
             ) : (
-              <>
-                <ul className="m-0 list-none divide-y divide-line-soft overflow-hidden rounded-plate bg-sunken p-0">
-                  {files.map((file) => {
-                    // A deleted file lives on at the parent.
-                    const at = file.status === "deleted" ? parent : oid;
-                    return (
-                      <li
-                        key={file.path}
-                        className="flex min-h-10 items-center gap-2 px-3 py-2 text-body-sm max-sm:min-h-11"
-                      >
-                        {FILE_ICON[file.status]}
-                        {at ? (
-                          <Link
-                            className="min-w-0 flex-1 truncate mk-mono text-mono text-ink no-underline hover:underline"
-                            to={blobUrl(owner, name, at, file.path, workSource(repo))}
-                            title={
-                              file.status === "deleted"
-                                ? `${file.path} before this commit`
-                                : `${file.path} at this commit`
-                            }
-                          >
-                            {file.path}
-                          </Link>
-                        ) : (
-                          <span className="min-w-0 flex-1 truncate mk-mono text-mono">
-                            {file.path}
-                          </span>
-                        )}
-                        <span className="shrink-0 mk-mono text-mono mk-tabular">
-                          {file.binary ? (
-                            <span className="text-ink-faint">binary</span>
-                          ) : file.omitted ? (
-                            <span className="text-ink-faint">not counted</span>
-                          ) : (
-                            <>
-                              <span className="text-online">+{file.additions}</span>{" "}
-                              <span className="text-danger-text">−{file.deletions}</span>
-                            </>
-                          )}
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-                {value.truncated && (
-                  <p className="m-0 mt-2 text-body-sm text-ink-faint">
-                    More files changed than are listed; browse the tree for the rest.
-                  </p>
-                )}
-              </>
+              <DiffView
+                files={files}
+                truncated={value.truncated}
+                idPrefix="commit-diff"
+                label="Changes"
+                // A deleted file lives on at the parent.
+                blobHref={(path) =>
+                  blobUrl(
+                    owner,
+                    name,
+                    files.find((f) => f.path === path)?.status === "deleted" && parent
+                      ? parent
+                      : oid,
+                    path,
+                    workSource(repo),
+                  )
+                }
+              />
             )
           }
         </Body>

@@ -79,7 +79,15 @@ async function world() {
         deletions: 0,
         binary: false,
         omitted: false,
-        hunks: [],
+        hunks: [
+          {
+            oldStart: 0,
+            oldLines: 0,
+            newStart: 1,
+            newLines: 3,
+            lines: ["+export function rank() {", "+  return byRecency();", "+}"],
+          },
+        ],
       },
       {
         path: "src/old.ts",
@@ -345,12 +353,16 @@ test("?commit= opens every section over the page; Escape closes back to it", asy
     .toHaveAttribute("href", "https://pr-12.example.dev");
   // Files, each at this commit (a deleted one before it), with stats.
   await expect
-    .element(dialog.getByRole("link", { name: "src/rank.ts" }))
+    .element(dialog.getByRole("link", { name: "View src/rank.ts" }))
     .toHaveAttribute("href", `/orbit/engine/blob/${head}/src/rank.ts`);
   await expect
-    .element(dialog.getByRole("link", { name: "src/old.ts" }))
+    .element(dialog.getByRole("link", { name: "View src/old.ts" }))
     .toHaveAttribute("href", `/orbit/engine/blob/${parent}/src/old.ts`);
-  await expect.element(dialog.getByText("+3")).toBeVisible();
+  await expect.element(dialog.getByText("+3").first()).toBeVisible();
+  // The hunks too, with line numbers (CORE-382).
+  const rankChanges = dialog.getByRole("table", { name: "Changes to src/rank.ts" });
+  await expect.element(rankChanges).toMatchTextContent(/@@ -0,0 \+1,3 @@/);
+  await expect.element(rankChanges).toMatchTextContent(/2\s*\+\s*return byRecency\(\);/);
   expect(server.unhandled).toEqual([]);
 
   // Escape closes it, leaving the page and dropping the parameter.
@@ -675,7 +687,7 @@ test("on a phone it fills the screen without sideways scrolling", async () => {
   try {
     renderApp(`/orbit/engine/ci?commit=${head}`);
     const dialog = panel(head);
-    await expect.element(dialog.getByRole("link", { name: "src/rank.ts" })).toBeVisible();
+    await expect.element(dialog.getByRole("link", { name: "View src/rank.ts" })).toBeVisible();
     const box = (dialog.element() as HTMLElement).getBoundingClientRect();
     expect(box.width).toBeGreaterThan(380);
     expect(box.right).toBeLessThanOrEqual(390);

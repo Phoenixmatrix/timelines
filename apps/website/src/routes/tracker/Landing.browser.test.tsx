@@ -34,7 +34,8 @@ import {
 const short = (oid: string) => oid.slice(0, 7);
 const inspector = () => page.getByRole("region", { name: "Selected timeline" });
 const panel = () => inspector().getByRole("region", { name: "Landing" });
-const landButton = () => panel().getByRole("button", { name: /^Land( again)?$/ });
+const landButton = () =>
+  panel().getByRole("button", { name: /^Land( checkpoint #\d+)?( again)?$/ });
 const repoRow = (name: string) =>
   panel()
     .getByRole("listitem")
@@ -46,12 +47,14 @@ function inspect(timeline: WorldTimeline) {
 
 /** Land, and the reason the route gave for not landing. */
 async function refused(reason: string) {
+  // Enabled once the timeline's checkpoints have loaded.
+  await expect.element(landButton()).toBeEnabled();
   await focusOn(landButton());
   await press("Enter");
   await expect.element(panel().getByRole("alert")).toHaveTextContent(reason);
   // The button stays, enabled and focused, to try again once it's fixed.
   await expect.element(landButton()).toBeEnabled();
-  expect(focused()).toMatchObject({ role: "button", name: "Land" });
+  expect(focused()).toMatchObject({ role: "button", name: "Land checkpoint #1" });
 }
 
 test("Land says why a timeline can't land yet", async () => {
@@ -64,10 +67,19 @@ test("Land says why a timeline can't land yet", async () => {
     .toMatchTextContent(
       "Lands once a person approves a checkpoint: its compact result is tested before main moves.",
     );
-  await expect.element(landButton()).toHaveTextContent("Land");
-  await refused("search has no checkpoint to land; make one with gm timeline checkpoint.");
+  // Nothing to land yet: the button is off, and the panel says what to do first.
+  await expect.element(landButton()).toBeDisabled();
+  await expect
+    .element(panel())
+    .toMatchTextContent("Needs a checkpoint first: push, then gm timeline checkpoint.");
+  await expect.element(landButton()).toHaveAccessibleDescription(/Needs a checkpoint first/);
 
   const view = await checkpoint(server, timeline, "Ranks results");
+  app.unmount();
+  const second = inspect(timeline);
+  // With a checkpoint it names what it lands.
+  await expect.element(landButton()).toHaveTextContent("Land checkpoint #1");
+  await expect.element(landButton()).toBeEnabled();
   await refused(
     `Checkpoint #1 of search needs a person's approval to land; ask for it with gm issue ask --kind approval --checkpoint ${view.checkpoint.id}.`,
   );
@@ -76,7 +88,7 @@ test("Land says why a timeline can't land yet", async () => {
     "Checkpoint #1 of search is waiting for a person's approval; it lands once approved.",
   );
   expect(await landing(server, timeline)).toBeNull();
-  app.unmount();
+  second.unmount();
 
   // An auto timeline lands once green; a failed run on its checkpoint isn't.
   const auto = { ...timeline, slug: "ranking", name: "Ranking" };
@@ -166,7 +178,7 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
     .toMatchTextContent(/Search\s*Active[\s\S]*Lands\s*after approval/);
 
   // Land again, by keyboard: the same approved checkpoint's landing, retried.
-  const again = panel().getByRole("button", { name: "Land again" });
+  const again = panel().getByRole("button", { name: "Land checkpoint #1 again" });
   await focusOn(again);
   const mark = server.requests.length;
   await press("Enter");
@@ -209,7 +221,9 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
     .toMatchTextContent(
       `The merge into orbit/engine's main failed (CI run #${second}). Land again to retry.`,
     );
-  await expect.element(panel().getByRole("button", { name: "Land again" })).toBeEnabled();
+  await expect
+    .element(panel().getByRole("button", { name: "Land checkpoint #1 again" }))
+    .toBeEnabled();
 });
 
 describe("the later states, with the runs that merged and tested them", () => {
@@ -352,7 +366,7 @@ describe("the later states, with the runs that merged and tested them", () => {
     await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webmain advanced");
     await expect
-      .element(repoRow("web").getByRole("link", { name: `compact commit ${short(merge.web)}` }))
+      .element(repoRow("web").getByRole("link", { name: `Landed commit ${short(merge.web)}` }))
       .toHaveAttribute("href", `/orbit/web?commit=${merge.web}&tl=search`);
     expect(landButton().elements()).toHaveLength(0);
   });
@@ -370,12 +384,14 @@ describe("the later states, with the runs that merged and tested them", () => {
         "Checkpoint #1 conflicts with orbit/engine's main (CI run #3 lists the files). Explicitly sync/rebase the owned work source, resolve conflicts, and renew the checkpoint and approval of timeline/search-with-a-long-name-that-does-not-break.",
       );
       await expect.element(panel()).toMatchTextContent("Stopped: conflicts with main");
-      const again = panel().getByRole("button", { name: "Land again" });
+      const again = panel().getByRole("button", { name: "Land checkpoint #1 again" });
+      await expect.element(again).toBeEnabled();
       again.element().scrollIntoView({ block: "center" });
       await expect.element(again).toBeVisible();
       const box = again.element().getBoundingClientRect();
       expect(box.left).toBeGreaterThanOrEqual(0);
       expect(box.right).toBeLessThanOrEqual(320);
+      expect(box.height, "Land is a 44px touch target").toBeGreaterThanOrEqual(44);
       expect(sidewaysOverflow(), "The timelines page scrolls sideways").toBeLessThanOrEqual(0);
       const section = panel().element();
       expect(section.scrollWidth, "The landing panel overflows").toBeLessThanOrEqual(
@@ -385,4 +401,32 @@ describe("the later states, with the runs that merged and tested them", () => {
       await page.viewport(1280, 900);
     }
   });
+});
+
+test("selecting another timeline never shows the last one's checkpoint on Land (CORE-382)", async () => {
+  const server = await TestServer.start({ world: true });
+  const timeline = await timelineWorld(server);
+  const view = await checkpoint(server, timeline, "Ranks results");
+  await server.call("POST", "/api/tracker/orbit/timelines", {
+    slug: "other",
+    name: "Other",
+    repos: ["orbit/engine"],
+  });
+  // The other timeline's checkpoints are slow to arrive; search's are known.
+  let arrive!: () => void;
+  const gate = new Promise<void>((resolve) => (arrive = resolve));
+  server.on("GET", "/api/tracker/:owner/timelines/:slug/checkpoints", async ({ params }) => {
+    if (params.slug === "other") await gate;
+    return { checkpoints: params.slug === "other" ? [] : [view] };
+  });
+  const app = inspect(timeline);
+  await expect.element(landButton()).toHaveTextContent("Land checkpoint #1");
+
+  await app.navigate("/tracker/orbit/timelines?tl=other");
+  await expect.element(inspector().getByRole("heading", { name: "Other" })).toBeVisible();
+  await expect
+    .element(inspector().getByRole("button", { name: "Land checkpoint #1" }))
+    .not.toBeInTheDocument();
+  arrive();
+  await expect.element(landButton()).toBeDisabled();
 });

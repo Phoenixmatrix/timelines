@@ -43,6 +43,8 @@ export function renderApp(path: string): RenderedApp {
   history.replaceState(null, "", path);
   const router = createBrowserRouter(routes);
   scopeLinks(router);
+  // As index.html does: text inherits the theme's ink, so captures (visual()) look like the app.
+  document.body.classList.add("mk-root");
   const container = document.createElement("div");
   container.id = "root";
   document.body.append(container);

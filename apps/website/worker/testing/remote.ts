@@ -226,6 +226,11 @@ export function fakeRemotes() {
                 treeHash: treeOf.get(hash) ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
                 parents: [...(remote?.parents.get(hash) ?? [])],
                 message: "Fixture commit",
+                // Whole metadata, as the binding returns it (CORE-382).
+                author: { name: "Fixture Author", email: "author@example.com" },
+                committer: { name: "Fixture Author", email: "author@example.com" },
+                authoredAt: 1_790_000_000,
+                committedAt: 1_790_000_000,
               }
             : null,
         readTree: async (hash?: string): Promise<ArtifactsTreeEntry[]> =>

@@ -29,9 +29,9 @@ import {
   type RepoRow,
 } from "../db.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
-import { structuredPatch } from "diff";
-import { DIFF_LIMITS, type CommitDiff, type DiffFile } from "../../shared/diff.ts";
-import { diffTrees, type FileChange } from "../knowledge/overlay.ts";
+import { COMPARE_COMMITS, type CommitDiff, type CompareDiff } from "../../shared/diff.ts";
+import { commitsSince, DiffBudget, diffFiles, readEither } from "../compare.ts";
+import { mergeBase } from "../knowledge/overlay.ts";
 import { isCommitId, RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
@@ -636,63 +636,12 @@ repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
     const commit = await objects.commit(oid);
     if (!commit) return fail(c, 404, `No commit ${oid}.`);
     const parent = commit.parents[0] ? await objects.commit(commit.parents[0]) : null;
-    let reads = 0;
-    const trees = {
-      tree: (tree: string) => {
-        if (++reads > DIFF_LIMITS.trees) throw new DiffBudget();
-        return objects.tree(tree);
-      },
-    };
-    let changes: FileChange[];
+    let diffed: Awaited<ReturnType<typeof diffFiles>>;
     try {
-      changes = await diffTrees(trees, parent?.treeHash ?? null, commit.treeHash);
+      diffed = await diffFiles(objects, parent?.treeHash ?? null, commit.treeHash);
     } catch (error) {
       if (!(error instanceof DiffBudget)) throw error;
       return fail(c, 413, "This commit changes too much to show here.");
-    }
-    const listed = changes.slice(0, DIFF_LIMITS.files);
-    const text = async (blob: string | null) => {
-      if (!blob) return { text: "", binary: false, omitted: false };
-      const data = await objects.blobLimited(blob, DIFF_LIMITS.blobBytes);
-      if (!data || data.bytes.length < data.size) return { text: "", binary: false, omitted: true };
-      if (data.bytes.subarray(0, 8000).includes(0))
-        return { text: "", binary: true, omitted: false };
-      return { text: new TextDecoder().decode(data.bytes), binary: false, omitted: false };
-    };
-    const files: DiffFile[] = [];
-    for (const [index, change] of listed.entries()) {
-      const status = !change.before ? "added" : !change.blob ? "deleted" : "modified";
-      const file: DiffFile = {
-        path: change.path,
-        status,
-        additions: 0,
-        deletions: 0,
-        binary: false,
-        omitted: index >= DIFF_LIMITS.patched,
-        hunks: [],
-      };
-      if (!file.omitted) {
-        const [before, after] = await Promise.all([text(change.before), text(change.blob)]);
-        file.binary = before.binary || after.binary;
-        file.omitted = before.omitted || after.omitted;
-        if (!file.binary && !file.omitted) {
-          const patch = structuredPatch(change.path, change.path, before.text, after.text, "", "", {
-            context: 3,
-          });
-          file.hunks = patch.hunks.map((h) => ({
-            oldStart: h.oldStart,
-            oldLines: h.oldLines,
-            newStart: h.newStart,
-            newLines: h.newLines,
-            lines: h.lines,
-          }));
-          for (const line of patch.hunks.flatMap((h) => h.lines)) {
-            if (line.startsWith("+")) file.additions++;
-            else if (line.startsWith("-")) file.deletions++;
-          }
-        }
-      }
-      files.push(file);
     }
     const body: CommitDiff = {
       oid,
@@ -700,8 +649,8 @@ repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
       message: commit.message,
       authorName: commit.author.name,
       authoredAt: commit.authoredAt,
-      files,
-      truncated: changes.length > listed.length,
+      files: diffed.files,
+      truncated: diffed.truncated,
     };
     cacheIfImmutable(c, oid);
     noteAgentPresence(c, {
@@ -716,7 +665,89 @@ repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
   }
 });
 
-class DiffBudget extends Error {}
+const REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
+
+// What a line of work changes (CORE-382): `head` (a commit id or branch/tag in
+// the loaded source, so a timeline's work source via `?source=`) against its
+// merge base with `base` (a commit id or branch/tag in the canonical repository,
+// default its default branch), so main merged into a timeline isn't the
+// timeline's change. Commits are listed newest first, as `git log base..head`.
+// Objects are read from the source, then the canonical repository: a work
+// source is a fork, and newer main commits exist only in canonical. Reads
+// check both repositories' caches before any remote read, starting with the
+// side that served a neighbour (base: canonical, head: source), so main's
+// commits never cost a certain miss on the work source (CORE-400).
+repos.get("/:owner/:name/compare", async (c) => {
+  const loaded = await loadSourceRepo(c);
+  if (loaded instanceof Response) return loaded;
+  const headRef = c.req.query("head") ?? "";
+  const baseRef = c.req.query("base") || loaded.canonical.default_branch;
+  for (const ref of [headRef, baseRef])
+    if (!isCommitId(ref) && (!REF_NAME.test(ref) || ref.includes("..") || ref.endsWith("/")))
+      return fail(c, 400, "Give head and base as a branch, tag or full 40-character commit hash.");
+  const sourceObjects = reader(c, loaded.row);
+  // The canonical source is one repository; a work source adds the canonical one.
+  const canonicalObjects =
+    loaded.source.sourceId === "canonical" ? sourceObjects : reader(c, loaded.canonical);
+  try {
+    const either =
+      canonicalObjects === sourceObjects ? null : readEither(sourceObjects, canonicalObjects);
+    const objects = either ?? sourceObjects;
+    const head = await sourceObjects.resolve(headRef);
+    // A base named by branch is where work lands (canonical); a commit id may also be
+    // the timeline's own, such as an earlier checkpoint (CORE-382).
+    const base =
+      isCommitId(baseRef) && baseRef.length === 40
+        ? baseRef
+        : await canonicalObjects.resolve(baseRef);
+    if (head) either?.prefer(head, sourceObjects);
+    // A base given as a commit id may be the timeline's own, so it isn't assumed canonical.
+    if (base && !isCommitId(baseRef)) either?.prefer(base, canonicalObjects);
+    if (!head || !(await objects.commit(head))) return fail(c, 404, `No commit named ${headRef}.`);
+    const baseCommit = base && (await objects.commit(base));
+    if (!base || !baseCommit) return fail(c, 404, `No commit named ${baseRef}.`);
+    const found = await mergeBase(objects, head, base);
+    const from = found.base ?? base;
+    const fromCommit = from === base ? baseCommit : await objects.commit(from);
+    const headCommit = (await objects.commit(head))!;
+    if (!fromCommit) return fail(c, 404, `No commit ${from}.`);
+    const history = await commitsSince(objects, head, from, COMPARE_COMMITS);
+    let diffed: Awaited<ReturnType<typeof diffFiles>>;
+    try {
+      diffed = await diffFiles(objects, fromCommit.treeHash, headCommit.treeHash);
+    } catch (error) {
+      if (error instanceof DiffBudget)
+        return fail(c, 413, "These changes are too large to show here.");
+      // A tree neither repository has (CORE-382): the history was pruned.
+      if (error instanceof Error && /^Tree \S+ not found$/.test(error.message))
+        return fail(c, 404, "Part of this history isn't available.");
+      throw error;
+    }
+    const body: CompareDiff = {
+      base,
+      head,
+      from,
+      mergeBase: found.base,
+      historyTruncated: found.truncated,
+      commits: history.commits,
+      commitsTruncated: history.truncated,
+      files: diffed.files,
+      truncated: diffed.truncated,
+    };
+    // Branch names move; only two commit ids name an unchanging comparison.
+    if (isCommitId(headRef) && isCommitId(baseRef)) cacheIfImmutable(c, head);
+    noteAgentPresence(c, {
+      kind: "commit",
+      scopeId: loaded.canonical.id,
+      resourceId: head,
+      sourceId: loaded.source.sourceId,
+    });
+    return c.json(body);
+  } finally {
+    await sourceObjects.close();
+    if (canonicalObjects !== sourceObjects) await canonicalObjects.close();
+  }
+});
 
 repos.get("/:owner/:name/commits", async (c) => {
   const loaded = await loadSourceRepo(c);

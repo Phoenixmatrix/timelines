@@ -42,6 +42,12 @@ function recall<T>(key: string): T | undefined {
   return entry.value as T;
 }
 
+/** Drop this isolate's object memory, as a fresh isolate starts; the Cache API keeps its copies. */
+export function forgetObjectMemory() {
+  memory.clear();
+  memoryUsed = 0;
+}
+
 // Only completed data may cross request boundaries. Pending I/O belongs to a reader.
 const refsCache = new Map<string, { at: number; refs: RepoRefs }>();
 /** Heads already warmed in this isolate. */
@@ -65,6 +71,12 @@ const HEX40 = /^[0-9a-f]{40}$/;
 export function isCommitId(ref: string): boolean {
   return HEX40.test(ref);
 }
+
+const jsonEncode = (value: unknown) => {
+  const body = JSON.stringify(value);
+  return { body, size: body.length * 2 };
+};
+const jsonDecode = <T>(response: Response) => response.json() as Promise<T>;
 
 export class RepoReader {
   #stub: Promise<ArtifactsRepo> | undefined;
@@ -105,12 +117,35 @@ export class RepoReader {
     stub?.[Symbol.dispose]();
   }
 
+  /** Memory, then the Cache API; never the remote. Fills memory on a Cache API hit. */
+  async #fromCache<T>(
+    kind: string,
+    id: string,
+    encode: (value: T) => { body: BodyInit; size: number },
+    decode: (response: Response) => Promise<T>,
+  ): Promise<T | undefined> {
+    const key = `${this.artifactsName}/${kind}/${id}`;
+    const hit = recall<T>(key);
+    if (hit !== undefined && hit !== null) {
+      this.timing.count(`${kind}-memory`);
+      return hit;
+    }
+    const stored = await caches.default.match(`${CACHE_ORIGIN}/${key}`);
+    if (stored?.headers.get("x-gitmatrix-object") !== "present") return undefined;
+    this.timing.count(`${kind}-cache`);
+    const value = await decode(stored);
+    remember(key, value, encode(value).size);
+    return value;
+  }
+
   async #cached<T>(
     kind: string,
     id: string,
     load: () => Promise<T>,
     encode: (value: T) => { body: BodyInit; size: number },
     decode: (response: Response) => Promise<T>,
+    /** The caller already found neither cache holds it (CORE-400): go straight to the remote. */
+    checked = false,
   ): Promise<T> {
     const key = `${this.artifactsName}/${kind}/${id}`;
     const hit = recall<T>(key);
@@ -124,22 +159,15 @@ export class RepoReader {
       return pending;
     }
     const work = (async () => {
-      const url = `${CACHE_ORIGIN}/${key}`;
-      const cache = caches.default;
-      const stored = await cache.match(url);
-      if (stored?.headers.get("x-gitmatrix-object") === "present") {
-        this.timing.count(`${kind}-cache`);
-        const value = await decode(stored);
-        remember(key, value, encode(value).size);
-        return value;
-      }
+      const stored = checked ? undefined : await this.#fromCache(kind, id, encode, decode);
+      if (stored !== undefined) return stored;
       const value = await this.timing.measure(kind, load());
       // Absence is mutable: an object may arrive in a later push or fork.
       if (value === null) return value;
       const { body, size } = encode(value);
       remember(key, value, size);
-      await cache.put(
-        url,
+      await caches.default.put(
+        `${CACHE_ORIGIN}/${key}`,
         new Response(body, {
           headers: {
             "cache-control": "public, max-age=31536000, immutable",
@@ -163,17 +191,8 @@ export class RepoReader {
     if (recall(key) === undefined) remember(key, value, JSON.stringify(value).length * 2);
   }
 
-  #json<T>(kind: string, id: string, load: () => Promise<T>): Promise<T> {
-    return this.#cached(
-      kind,
-      id,
-      load,
-      (value) => {
-        const body = JSON.stringify(value);
-        return { body, size: body.length * 2 };
-      },
-      (response) => response.json() as Promise<T>,
-    );
+  #json<T>(kind: string, id: string, load: () => Promise<T>, checked = false): Promise<T> {
+    return this.#cached<T>(kind, id, load, jsonEncode, jsonDecode<T>, checked);
   }
 
   commit(oid: string): Promise<ArtifactsCommitMetadata | null> {
@@ -182,6 +201,41 @@ export class RepoReader {
 
   tree(oid: string): Promise<ArtifactsTreeEntry[] | null> {
     return this.#json("tree", oid, async () => (await this.#repo()).readTree(oid));
+  }
+
+  /** Cache-only reads (CORE-400): memory, then the Cache API; undefined when neither has it. */
+  peekCommit(oid: string): Promise<ArtifactsCommitMetadata | undefined> {
+    return this.#fromCache<ArtifactsCommitMetadata>("commit", oid, jsonEncode, jsonDecode);
+  }
+
+  peekTree(oid: string): Promise<ArtifactsTreeEntry[] | undefined> {
+    return this.#fromCache<ArtifactsTreeEntry[]>("tree", oid, jsonEncode, jsonDecode);
+  }
+
+  /** This isolate's memory only (CORE-400): free, so callers may ask every reader. */
+  recallCommit(oid: string): ArtifactsCommitMetadata | undefined {
+    return recall<ArtifactsCommitMetadata>(`${this.artifactsName}/commit/${oid}`) ?? undefined;
+  }
+
+  recallTree(oid: string): ArtifactsTreeEntry[] | undefined {
+    return recall<ArtifactsTreeEntry[]>(`${this.artifactsName}/tree/${oid}`) ?? undefined;
+  }
+
+  /** blobLimited from memory only (CORE-400), with the same oversize answer. */
+  peekBlobLimited(oid: string, maxBytes: number): BlobData | undefined {
+    const cached = recall<BlobData | null>(`${this.artifactsName}/blob/${oid}`);
+    if (!cached) return undefined;
+    return cached.size > maxBytes ? { size: cached.size, bytes: new Uint8Array(0) } : cached;
+  }
+
+  /** commit() after peekCommit() missed: the remote, then both caches (CORE-400). */
+  fetchCommit(oid: string): Promise<ArtifactsCommitMetadata | null> {
+    return this.#json("commit", oid, async () => (await this.#repo()).readCommit(oid), true);
+  }
+
+  /** tree() after peekTree() missed: the remote, then both caches (CORE-400). */
+  fetchTree(oid: string): Promise<ArtifactsTreeEntry[] | null> {
+    return this.#json("tree", oid, async () => (await this.#repo()).readTree(oid), true);
   }
 
   /** A page of first-parent history counted from a commit: immutable too. */
@@ -213,12 +267,8 @@ export class RepoReader {
   /** Inspect size before materializing source bytes for bounded semantic analysis.
    * Oversized blobs return their size with no bytes, never a truncated cache entry. */
   async blobLimited(oid: string, maxBytes: number): Promise<BlobData | null> {
-    const cached = recall<BlobData | null>(`${this.artifactsName}/blob/${oid}`);
-    if (cached !== undefined) {
-      return cached && cached.size > maxBytes
-        ? { size: cached.size, bytes: new Uint8Array(0) }
-        : cached;
-    }
+    const cached = this.peekBlobLimited(oid, maxBytes);
+    if (cached) return cached;
     const blob = await this.timing.measure("blob-limited", (await this.#repo()).readBlob(oid));
     if (!blob) return null;
     if (blob.size > maxBytes) return { size: blob.size, bytes: new Uint8Array(0) };

@@ -144,6 +144,9 @@ function routeTitle(matches: UIMatch[], search: string): string {
     case ":owner/-/packages/:format/*": {
       return join(data?.detail?.package.name, "Packages", owner, match.params.format);
     }
+    case "tracker/:owner/timelines/:slug/changes": {
+      return join(data?.timeline?.name ?? slug, "Changes", owner);
+    }
     case "tracker/:owner/timelines/:slug/story": {
       return join(data?.timeline?.name ?? slug, "Story", owner);
     }

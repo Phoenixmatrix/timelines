@@ -10,12 +10,13 @@
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
+import type { CompareDiff } from "../../../shared/diff.ts";
 import type { OpenRequests } from "../../../shared/tracker.ts";
 import type { CheckpointView, PreviewRevival } from "../../../shared/timelines.ts";
 import { sidewaysOverflow } from "../../testing/atlas.ts";
 import { focused, focusOn, press } from "../../testing/focus.ts";
 import { renderApp } from "../../testing/render.tsx";
-import { TestServer } from "../../testing/server.ts";
+import { reply, TestServer } from "../../testing/server.ts";
 import { visual } from "../../testing/visual.ts";
 import {
   askApproval,
@@ -124,6 +125,10 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
   const server = await TestServer.start({ world: true });
   const { timeline, view, engine, web, docs, site } = await approvalWorld(server);
 
+  // Every repository compares to the same canned diffstat.
+  server.on("GET", "/api/repos/:owner/:name/compare", ({ url }) =>
+    compared(url.searchParams.get("base") ?? "", url.searchParams.get("head") ?? "", [[3, 1]]),
+  );
   renderApp("/needs-you");
   const request = page.getByRole("article", { name: "Approval for you" });
   await expect.element(request).toBeVisible();
@@ -133,6 +138,12 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
   // The header and the hint: approving this one lands it.
   await expect
     .element(card().getByRole("link", { name: "Search", exact: true }))
+    .toHaveAttribute("href", "/tracker/orbit/timelines/search/changes");
+  await expect
+    .element(card().getByRole("link", { name: "#1", exact: true }))
+    .toHaveAttribute("href", "/tracker/orbit/timelines/search/changes?checkpoint=1");
+  await expect
+    .element(card().getByRole("link", { name: "Timeline overview" }))
     .toHaveAttribute("href", "/tracker/orbit/timelines?tl=search");
   await expect.element(card().getByText("Superseded")).not.toBeInTheDocument();
   await expect
@@ -152,6 +163,19 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
     await expect
       .element(row.getByRole("link", { name: short(repo.tip), exact: true }))
       .toHaveAttribute("href", `/orbit/${repo.name}/tree/${repo.tip}?source=${repo.sourceId}`);
+    await expect
+      .element(row.getByRole("link", { name: short(repo.tip), exact: true }))
+      .toHaveAttribute("title", `Browse files at ${short(repo.tip)}`);
+    await expect
+      .element(row.getByRole("link", { name: "Review changes" }))
+      .toHaveAttribute(
+        "href",
+        `/tracker/orbit/timelines/search/changes?checkpoint=1&repo=orbit%2F${repo.name}`,
+      );
+    // Base, work source and the rest sit under Details, still reachable.
+    await expect.element(row.getByText("Details", { exact: true })).toBeVisible();
+    await expect.element(row.getByText("Knowledge diff")).not.toBeVisible();
+    await row.getByText("Details", { exact: true }).click();
     await expect.element(row).toMatchTextContent(`onto main ${short(repo.main)}`);
     await expect.element(row).toMatchTextContent("Work source");
     // Main's commit is canonical: it opens in the commit panel.
@@ -162,6 +186,8 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
       .element(row.getByRole("link", { name: "Knowledge diff" }))
       .toHaveAttribute("href", `/orbit/${repo.name}/knowledge?timeline=search`);
   }
+  // The diffstat is shown beside the commits link, which stays under Details.
+  await expect.element(repoRow("engine")).toMatchTextContent("+3 \u22121 \u00b7 1 file");
   const engineChanges = repoRow("engine").getByRole("link", { name: "3 changes" });
   await expect
     .element(engineChanges)
@@ -249,6 +275,114 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
     `/api/tracker/orbit/timelines/${timeline.slug}/checkpoints/1`,
   );
   expect(approval.approval).toMatchObject({ state: "approved", note: "Ranking reviewed" });
+});
+
+/** A canned compare of `files` (additions, deletions) between two commits. */
+function compared(
+  base: string,
+  head: string,
+  files: [number, number][],
+  merged = false,
+): CompareDiff {
+  return {
+    base,
+    head,
+    from: base,
+    mergeBase: base,
+    historyTruncated: false,
+    commits: merged
+      ? [{ oid: head, summary: "Merge main", authorName: "Marco", authoredAt: 1, merge: true }]
+      : [],
+    commitsTruncated: false,
+    truncated: false,
+    files: files.map(([additions, deletions], i) => ({
+      path: `src/file${i}.ts`,
+      status: "modified" as const,
+      additions,
+      deletions,
+      binary: false,
+      omitted: false,
+      hunks: [],
+    })),
+  };
+}
+
+test("a repository's diffstat is what the checkpoint added, from main for #1; too large falls back to the commits (CORE-382)", async () => {
+  const server = await TestServer.start({ world: true });
+  const timeline = await timelineWorld(server, { names: ["engine", "web"] });
+  const [engine, web] = timeline.repos as [
+    WorldTimeline["repos"][number],
+    WorldTimeline["repos"][number],
+  ];
+  await changes(server, timeline, engine, ["kxqrstuv", "lmnopqrs"]);
+  await changes(server, timeline, web, ["ponmlkji"]);
+  const view = await checkpoint(server, timeline, "Ranks results");
+  await askApproval(server, timeline, view.checkpoint.id);
+  const asked: URL[] = [];
+  server.on("GET", "/api/repos/:owner/:name/compare", ({ url, params }) => {
+    asked.push(url);
+    return params.name === "engine"
+      ? compared(engine.main, engine.tip, [
+          [10, 1],
+          [2, 2],
+        ])
+      : reply({ error: "These changes are too large to show here." }, 413);
+  });
+
+  renderApp("/needs-you");
+  await expect.element(card()).toBeVisible();
+  await expect.element(repoRow("engine")).toMatchTextContent("+12 \u22123 \u00b7 2 files");
+  // The first checkpoint is measured from main, in the repository's own source.
+  const engineAsk = asked.find((url) => url.pathname === "/api/repos/orbit/engine/compare")!;
+  expect(engineAsk.searchParams.get("base")).toBe(engine.main);
+  expect(engineAsk.searchParams.get("head")).toBe(engine.tip);
+  expect(engineAsk.searchParams.get("source")).toBe(engine.sourceId);
+  // The commits stay one click away under Details.
+  await repoRow("engine").getByText("Details", { exact: true }).click();
+  await expect.element(repoRow("engine").getByRole("link", { name: "2 changes" })).toBeVisible();
+  // Too large: no diffstat, the commit list in its place.
+  await expect.element(repoRow("web").getByRole("link", { name: "1 change" })).toBeVisible();
+  await expect.element(repoRow("web")).not.toMatchTextContent("files");
+});
+
+test("a repository the checkpoint left alone is one quiet line; the rest is measured from the previous checkpoint (CORE-382)", async () => {
+  const server = await TestServer.start({ world: true });
+  const timeline = await timelineWorld(server, { names: ["engine", "web"] });
+  const [engine] = timeline.repos as [WorldTimeline["repos"][number]];
+  await checkpoint(server, timeline, "First pass");
+  const before = engine.tip;
+  await work(server, timeline, engine);
+  const second = await checkpoint(server, timeline, "Second pass");
+  await askApproval(server, timeline, second.checkpoint.id);
+  const asked: URL[] = [];
+  server.on("GET", "/api/repos/:owner/:name/compare", ({ url }) => {
+    asked.push(url);
+    return compared(before, engine.tip, [[4, 0]], true);
+  });
+
+  renderApp("/needs-you");
+  const card2 = page.getByRole("region", { name: "Checkpoint #2 of search" });
+  await expect.element(card2).toBeVisible();
+  await expect.element(card2).toMatchTextContent("Unchanged: orbit/web");
+  await visual("Checkpoint - diffstat and unchanged repositories");
+  await expect.element(card2).toMatchTextContent("+4 \u22120 \u00b7 1 file");
+  // Measured from checkpoint #1, main merged in between is part of it.
+  await expect
+    .element(card2.getByTitle("Includes what merging main brought in between."))
+    .toBeVisible();
+  expect(card2.getByRole("link", { name: "Review changes" }).elements()).toHaveLength(1);
+  await expect
+    .element(card2.getByRole("link", { name: "Review changes" }))
+    .toHaveAttribute(
+      "href",
+      "/tracker/orbit/timelines/search/changes?checkpoint=2&repo=orbit%2Fengine",
+    );
+  await expect
+    .element(card2.getByRole("link", { name: "#2", exact: true }))
+    .toHaveAttribute("href", "/tracker/orbit/timelines/search/changes?checkpoint=2");
+  // Measured against the previous checkpoint's commit, never main; the unchanged one isn't asked.
+  expect(asked.map((url) => url.searchParams.get("base"))).toEqual([before]);
+  expect(asked.some((url) => url.pathname.includes("/web/"))).toBe(false);
 });
 
 test("a superseded checkpoint can't be approved, and the withdrawn request says why", async () => {
@@ -537,6 +671,7 @@ test("a 320px phone: the approval card fits and its actions are in reach", async
       const box = button.element().getBoundingClientRect();
       expect(box.left, `${name} starts on screen`).toBeGreaterThanOrEqual(0);
       expect(box.right, `${name} ends on screen`).toBeLessThanOrEqual(320);
+      expect(box.height, `${name} is a 44px touch target`).toBeGreaterThanOrEqual(44);
     }
     const panel = card().element();
     expect(panel.scrollWidth, "The card's content overflows it").toBeLessThanOrEqual(

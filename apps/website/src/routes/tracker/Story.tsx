@@ -13,17 +13,25 @@ import {
 } from "react-router";
 import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type { CommitSummary, HistoryPage } from "../../../shared/api.ts";
-import type { CommitDiff, DiffFile } from "../../../shared/diff.ts";
+import type { CommitDiff } from "../../../shared/diff.ts";
 import type { Step, StepPage, StepVersions } from "../../../shared/steps.ts";
-import type { TimelineDetail, TimelineRepo } from "../../../shared/timelines.ts";
+import type {
+  CheckpointList,
+  CheckpointView,
+  TimelineDetail,
+  TimelineRepo,
+} from "../../../shared/timelines.ts";
+import { DiffView } from "../../components/DiffView.tsx";
 import { SelectField, link } from "../../components/ui.tsx";
 import { Actor } from "./Actor.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { commitPanelUrl } from "../../lib/commitPanel.ts";
+import { useMediaQuery } from "../../lib/useMediaQuery.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
-import { sourceUrl } from "../../lib/refs.ts";
+import { blobUrl, sourceUrl } from "../../lib/refs.ts";
 import { readTrackerShortcuts } from "./preferences.ts";
 import { StepVisuals } from "./StepVisuals.tsx";
+import { TimelineNav, timelinePageUrl } from "./TimelineNav.tsx";
 import { givenAt } from "./timelineSpans.ts";
 
 /** The filters' "no filter" value. */
@@ -31,6 +39,9 @@ const ALL = "*";
 
 /** How far back a story reads: first-parent commits per repository. */
 const MAX_COMMITS = 300;
+
+/** The width at which the list and the step sit side by side (Tailwind's `lg`). */
+const WIDE = "(min-width: 64rem)";
 
 export async function storyLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -75,28 +86,38 @@ function headOf(detail: TimelineDetail, repo: TimelineRepo): string {
 }
 
 function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
+  const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<{
+    /** What the rows were read for; other renders wait for theirs. */
+    key: string;
     rows: StoryRow[];
     error: string | null;
     loading: boolean;
     more: boolean;
-  }>({ rows: [], error: null, loading: true, more: false });
+  }>({ key: "", rows: [], error: null, loading: true, more: false });
+  // Primitives, not the loader's objects: the route reloads the timeline on
+  // every ?step= change, and the whole history must not be read again for it.
+  const owner = repo?.owner;
+  const name = repo?.name;
+  const sourceId = repo?.source?.sourceId;
+  const head = repo ? headOf(detail, repo) : null;
+  const fork = repo ? detail.timeline.forkPoint.commits[repo.id] : undefined;
+  const key = `${owner}/${name}@${head}`;
   useEffect(() => {
-    if (!repo) return;
+    if (!owner || !name) return;
     const abort = new AbortController();
-    const base = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
-    const fork = detail.timeline.forkPoint.commits[repo.id];
+    const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
     setState((s) => ({ ...s, loading: true, error: null }));
     (async () => {
       const commits: CommitSummary[] = [];
-      let at: string | null = headOf(detail, repo);
+      let at: string | null = head;
       let cursor: string | null = null;
       let more = false;
       while (at) {
         const query = new URLSearchParams({ at });
         if (cursor) query.set("cursor", cursor);
         const page: HistoryPage = await api<HistoryPage>(
-          sourceUrl(`${base}/history?${query}`, repo.source?.sourceId),
+          sourceUrl(`${base}/history?${query}`, sourceId),
           { signal: abort.signal },
         );
         let reachedFork = false;
@@ -125,6 +146,7 @@ function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
           if (!steps.has(step.commitOid)) steps.set(step.commitOid, step);
       }
       setState({
+        key,
         rows: commits.map((commit) => ({
           commit,
           step: steps.get(commit.oid) ?? null,
@@ -137,6 +159,7 @@ function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
     })().catch((error: unknown) => {
       if (abort.signal.aborted) return;
       setState({
+        key,
         rows: [],
         error: error instanceof Error ? error.message : "Couldn't read this timeline's steps.",
         loading: false,
@@ -144,8 +167,67 @@ function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
       });
     });
     return () => abort.abort();
-  }, [detail, repo]);
-  return state;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, sourceId, fork, attempt]);
+  const current = state.key === key;
+  return {
+    rows: current ? state.rows : [],
+    error: current ? state.error : null,
+    loading: state.loading || !current,
+    more: current && state.more,
+    retry: () => setAttempt((n) => n + 1),
+  };
+}
+
+/**
+ * The timeline's checkpoints (CORE-382), for the dividers in the list. They
+ * are context, not content: a failed read leaves the list without dividers.
+ */
+function useCheckpoints(owner: string, slug: string): CheckpointView[] {
+  const [views, setViews] = useState<CheckpointView[]>([]);
+  useEffect(() => {
+    const abort = new AbortController();
+    api<CheckpointList>(
+      `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(slug)}/checkpoints`,
+      { signal: abort.signal },
+    )
+      .then((list) => setViews(list.checkpoints))
+      .catch(() => {});
+    return () => abort.abort();
+  }, [owner, slug]);
+  return views;
+}
+
+/** Whether an element, or an ancestor inside the page, scrolls sideways (a code block). */
+function inSidewaysScroller(element: Element): boolean {
+  for (
+    let node: Element | null = element;
+    node && node !== document.body;
+    node = node.parentElement
+  ) {
+    const { overflowX } = getComputedStyle(node);
+    if ((overflowX === "auto" || overflowX === "scroll") && node.scrollWidth > node.clientWidth)
+      return true;
+  }
+  return false;
+}
+
+/** Where a checkpoint stands, in a few words. */
+function approvalLabel(view: CheckpointView): string | null {
+  if (view.approved)
+    return view.approval?.via === "auto-approve" ? "Approved automatically" : "Approved";
+  switch (view.approval?.state) {
+    case "pending":
+      return "Awaiting approval";
+    case "rejected":
+      return "Rejected";
+    case "approved":
+      return "Approved earlier";
+    case "superseded":
+      return "Superseded";
+    default:
+      return null;
+  }
 }
 
 const agentOf = (row: StoryRow) =>
@@ -156,9 +238,14 @@ export function Story() {
   const { timeline } = detail;
   const [params, setParams] = useLiveSearchParams();
   const shortcuts = readTrackerShortcuts();
+  const wide = useMediaQuery(WIDE);
+  // The timeline belongs to the tracker in the address, not to its repositories' owner.
+  const owner = useParams().owner ?? "";
   const repo =
     timeline.repos.find((r) => `${r.owner}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
-  const { rows, error, loading, more } = useStory(detail, repo);
+  const repoKey = repo ? `${repo.owner}/${repo.name}` : "";
+  const { rows, error, loading, more, retry } = useStory(detail, repo);
+  const checkpoints = useCheckpoints(owner, timeline.slug);
   const agent = params.get("agent") ?? "";
   const issue = params.get("issue") ?? "";
   const shown = useMemo(
@@ -173,6 +260,31 @@ export function Story() {
     () => [...new Set(rows.flatMap((r) => (r.step?.issue ? [r.step.issue] : [])))].sort(),
     [rows],
   );
+  // How many steps each repository has, as far as it has been read.
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  useEffect(() => {
+    if (!loading && !error && repoKey) setCounts((c) => ({ ...c, [repoKey]: rows.length }));
+  }, [loading, error, repoKey, rows.length]);
+  // Checkpoint dividers sit before the step whose commit the checkpoint holds
+  // in this repository; a checkpoint beyond the steps read has none.
+  const dividers = useMemo(() => {
+    const byCommit = new Map<string, CheckpointView[]>();
+    for (const view of checkpoints) {
+      const commit = view.checkpoint.repos.find((r) => `${r.owner}/${r.name}` === repoKey)?.commit;
+      if (commit) byCommit.set(commit, [...(byCommit.get(commit) ?? []), view]);
+    }
+    return byCommit;
+  }, [checkpoints, repoKey]);
+  // The steps in runs, each headed by the checkpoints made at its first step.
+  const groups = useMemo(() => {
+    const out: { views: CheckpointView[]; rows: StoryRow[] }[] = [];
+    for (const row of shown) {
+      const views = dividers.get(row.commit.oid) ?? [];
+      if (views.length || out.length === 0) out.push({ views, rows: [] });
+      out[out.length - 1]!.rows.push(row);
+    }
+    return out;
+  }, [shown, dividers]);
   const selected = params.get("step");
   const index = shown.findIndex((row) => row.commit.oid === selected);
   const current = index >= 0 ? shown[index]! : null;
@@ -192,7 +304,33 @@ export function Story() {
       { replace: true },
     );
   };
+  // A chosen file goes along to a step that changes it too; the step's diff
+  // drops it once it knows it isn't there (CORE-382).
   const open = (row: StoryRow | undefined) => row && set({ step: row.commit.oid });
+  // Back to the list, with focus on the row the step was opened from.
+  const restore = useRef<string | null>(null);
+  const close = () => {
+    restore.current = new URLSearchParams(window.location.search).get("step");
+    set({ step: null, file: null });
+  };
+  useEffect(() => {
+    if (selected || !restore.current) return;
+    const row = [...document.querySelectorAll<HTMLElement>("[data-step]")].find(
+      (el) => el.dataset.step === restore.current,
+    );
+    restore.current = null;
+    row?.focus();
+  });
+
+  // On a screen wide enough for the split, the newest step opens at once so
+  // the code is in view; once per repository, so Escape can still close it.
+  // A step already chosen (a link's ?step=) counts as that once (CORE-382).
+  const autoSelected = useRef<string | null>(null);
+  useEffect(() => {
+    if (!wide || loading || error || autoSelected.current === repoKey) return;
+    autoSelected.current = repoKey;
+    if (!selected && shown[0]) set({ step: shown[0].commit.oid });
+  });
 
   // Keep the requested step across intermediate renders until the URL shows
   // it. Undefined means settled; null is an explicitly requested close.
@@ -200,12 +338,14 @@ export function Story() {
     shown,
     open,
     set,
+    close,
     heading: undefined as string | null | undefined,
   });
   position.current = {
     shown,
     open,
     set,
+    close,
     heading:
       position.current.heading !== undefined &&
       position.current.heading === new URLSearchParams(window.location.search).get("step")
@@ -233,17 +373,27 @@ export function Story() {
         )
       )
         return;
-      if ((event.key === "j" || event.key === "k") && !readTrackerShortcuts()) return;
-      const { shown, open, set, heading } = position.current;
+      const characters = readTrackerShortcuts();
+      // Up and Down scroll the page unless character navigation is on, and
+      // Left and Right scroll a code block that scrolls sideways.
+      if ((event.key === "j" || event.key === "k") && !characters) return;
+      if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !characters) return;
+      if (
+        (event.key === "ArrowLeft" || event.key === "ArrowRight") &&
+        target &&
+        inSidewaysScroller(target)
+      )
+        return;
+      const { shown, open, close, heading } = position.current;
       const at =
         heading === undefined ? new URLSearchParams(window.location.search).get("step") : heading;
       const index = shown.findIndex((row) => row.commit.oid === at);
-      // Next/Previous follow the visible newest-first list, down/up respectively.
+      // Newer and Older follow the visible newest-first list, up/down respectively.
       if (event.key === "k" || event.key === "ArrowLeft" || event.key === "ArrowUp")
         open(shown[index < 0 ? 0 : index - 1]);
       else if (event.key === "j" || event.key === "ArrowRight" || event.key === "ArrowDown")
         open(shown[index < 0 ? 0 : index + 1]);
-      else if (event.key === "Escape" && at) set({ step: null });
+      else if (event.key === "Escape" && at) close();
       else return;
       event.preventDefault();
     };
@@ -251,34 +401,37 @@ export function Story() {
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
-  // The timeline belongs to the tracker in the address, not to its repositories' owner.
-  const owner = useParams().owner ?? "";
+  const changesUrl = (query?: Record<string, string>) =>
+    timelinePageUrl(owner, timeline.slug, "changes", { repo: repoKey, ...query });
+  const forked = !more && !agent && !issue && shown.length > 0;
   return (
     <main className="mx-auto max-w-[110rem] px-4 py-4">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <h1 className="m-0 text-title-lg [overflow-wrap:anywhere]">{timeline.name}: story</h1>
-        <Link
-          className={link}
-          to={`/tracker/${encodeURIComponent(owner)}/timelines?tl=${encodeURIComponent(timeline.slug)}`}
-        >
-          Timeline
-        </Link>
-      </div>
+      <h1 className="m-0 text-title-lg [overflow-wrap:anywhere]">{timeline.name}</h1>
+      <TimelineNav
+        owner={owner}
+        slug={timeline.slug}
+        current="story"
+        query={{ repo: params.get("repo") }}
+      />
       <p className="mt-1 mb-3 text-body-sm text-ink-muted">
-        Every commit on <span className="mk-mono">timeline/{timeline.slug}</span>, newest first,
-        with the context its agent recorded: why, instructions, steering, challenges and tests.
+        Every step on <span className="mk-mono">timeline/{timeline.slug}</span>, with the context
+        its agent recorded.
       </p>
       <div className="mb-3 flex flex-wrap items-end gap-3" role="group" aria-label="Filters">
         {timeline.repos.length > 1 && (
           <SelectField
             ariaLabel="Repository"
-            className="w-56"
-            value={`${repo?.owner}/${repo?.name}`}
-            options={timeline.repos.map((r) => ({
-              value: `${r.owner}/${r.name}`,
-              label: `${r.owner}/${r.name}`,
-            }))}
-            onChange={(value) => set({ repo: value, step: null })}
+            className="w-64"
+            value={repoKey}
+            options={timeline.repos.map((r) => {
+              const key = `${r.owner}/${r.name}`;
+              const n = counts[key];
+              return {
+                value: key,
+                label: n === undefined ? key : `${key} (${n} ${n === 1 ? "step" : "steps"})`,
+              };
+            })}
+            onChange={(value) => set({ repo: value, step: null, file: null })}
           />
         )}
         <SelectField
@@ -302,8 +455,19 @@ export function Story() {
           onChange={(value) => set({ issue: value === ALL ? null : value })}
         />
       </div>
+      {timeline.repos.length > 1 && (
+        <p className="mt-0 mb-3 text-body-sm text-ink-muted">
+          Showing <span className="mk-mono">{repoKey}</span> · {timeline.repos.length - 1} more{" "}
+          {timeline.repos.length === 2 ? "repository" : "repositories"}
+        </p>
+      )}
       {error ? (
-        <p className="mk-error">{error}</p>
+        <div role="alert" className="flex flex-wrap items-center gap-3">
+          <p className="mk-error m-0">{error}</p>
+          <button type="button" className="mk-btn mk-btn--ghost mk-btn--sm" onClick={retry}>
+            Retry
+          </button>
+        </div>
       ) : (
         <div className="grid gap-4 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
           <section
@@ -317,20 +481,36 @@ export function Story() {
                 {rows.length ? "No steps match these filters." : "No commits on this timeline yet."}
               </p>
             ) : (
-              <ol className="m-0 list-none p-0">
-                {shown.map((row) => (
-                  <StepRow
-                    key={row.commit.oid}
-                    row={row}
-                    active={row.commit.oid === selected}
-                    onOpen={() => open(row)}
-                  />
-                ))}
-              </ol>
+              groups.map((group, at) => (
+                <div key={group.views[0]?.checkpoint.id ?? `top-${at}`} className="mt-2 first:mt-0">
+                  {group.views.map((view) => (
+                    <CheckpointHeading
+                      key={view.checkpoint.id}
+                      view={view}
+                      href={changesUrl({ checkpoint: String(view.checkpoint.number) })}
+                    />
+                  ))}
+                  <ol className="m-0 list-none p-0">
+                    {group.rows.map((row) => (
+                      <StepRow
+                        key={row.commit.oid}
+                        row={row}
+                        active={row.commit.oid === selected}
+                        onOpen={() => open(row)}
+                      />
+                    ))}
+                  </ol>
+                </div>
+              ))
             )}
             {more && (
               <p className="m-2 text-micro text-ink-faint">
-                Showing the newest {MAX_COMMITS} commits.
+                Earlier steps not loaded: showing the newest {MAX_COMMITS} commits.
+              </p>
+            )}
+            {forked && (
+              <p className="m-2 text-micro text-ink-faint">
+                This is where the timeline forked from main.
               </p>
             )}
           </section>
@@ -343,18 +523,24 @@ export function Story() {
                 .slice(rows.findIndex((r) => r.commit.oid === current.commit.oid) + 1)
                 .flatMap((r) => (r.step ? [r.step] : []))}
               shortcuts={shortcuts}
-              onPrevious={index > 0 ? () => open(shown[index - 1]) : null}
-              onNext={index + 1 < shown.length ? () => open(shown[index + 1]) : null}
-              onClose={() => set({ step: null })}
+              wide={wide}
+              file={params.get("file")}
+              onFile={(path) => set({ file: path })}
+              changesUrl={changesUrl()}
+              oldest={index + 1 >= shown.length && !agent && !issue}
+              truncated={more}
+              onNewer={index > 0 ? () => open(shown[index - 1]) : null}
+              onOlder={index + 1 < shown.length ? () => open(shown[index + 1]) : null}
+              onClose={close}
             />
           ) : (
             <p className="m-0 self-start rounded-pane bg-pane p-4 text-body-sm text-ink-faint max-lg:hidden">
-              Open a step to see its context and diff. Right / Down goes to the next visible step;
-              Left / Up goes to the previous visible step.
+              Open a step to see its context and diff. Left goes to the next newer visible step;
+              Right goes to the next older one.
               {shortcuts && (
                 <>
                   {" "}
-                  <kbd>j</kbd> is Next; <kbd>k</kbd> is Previous.
+                  <kbd>k</kbd> is newer (also Up); <kbd>j</kbd> is older (also Down).
                 </>
               )}
             </p>
@@ -362,6 +548,23 @@ export function Story() {
         </div>
       )}
     </main>
+  );
+}
+
+/**
+ * Where a checkpoint was made, among the steps (CORE-382). It heads the steps
+ * the checkpoint holds, down to the previous checkpoint. A heading above its
+ * own list, not a step: keys skip it and it is not an option in the list.
+ */
+function CheckpointHeading({ view, href }: { view: CheckpointView; href: string }) {
+  const approval = approvalLabel(view);
+  return (
+    <h2 className="m-0 flex flex-wrap items-baseline gap-x-2 border-b border-line-soft px-2 pb-1 text-micro font-semibold text-ink-muted">
+      <Link className={link} to={href} title={`What checkpoint #${view.checkpoint.number} added`}>
+        Checkpoint #{view.checkpoint.number}
+      </Link>
+      {approval && <span className="mk-chip mk-chip--tag">{approval}</span>}
+    </h2>
   );
 }
 
@@ -377,29 +580,40 @@ function testSummary(step: Step | null): { label: string; ok: boolean } | null {
     : { label: `${tests.length} passed`, ok: true };
 }
 
-function coverageLabel(step: Step | null): string {
-  if (!step) return "No context";
-  if (step.deleted) return "Context removed";
+function coverageLabel(step: Step | null): { label: string; title?: string } {
+  if (!step) return { label: "No context" };
+  if (step.deleted) return { label: "Context removed" };
   const { instructions, steering } = step.context.coverage;
-  return byHook(instructions) && byHook(steering) ? "Full context" : "Partial context";
+  return byHook(instructions) && byHook(steering)
+    ? { label: "Full context" }
+    : {
+        label: "Some context missing",
+        title:
+          "A harness hook didn't capture this step's instructions or steering, so only what the agent recorded is here.",
+      };
 }
 
 function StepRow({ row, active, onOpen }: { row: StoryRow; active: boolean; onOpen: () => void }) {
   const tests = testSummary(row.step);
   const at = new Date(row.commit.authoredAt * 1000).toISOString();
+  const coverage = coverageLabel(row.step);
   return (
     <li>
       <button
         type="button"
         onClick={onOpen}
+        data-step={row.commit.oid}
         aria-current={active ? "true" : undefined}
         className={`block w-full rounded-md px-2 py-1.5 text-left text-body-sm ${active ? "bg-signal-wash" : "hover:bg-sunken"}`}
       >
         <span className="flex items-baseline gap-1.5">
+          {/* A merge from main is plumbing; real work stands out beside it. */}
           {row.merge && (
-            <GitMergeIcon className="shrink-0 self-center text-ink-faint" aria-label="Merge" />
+            <span className="flex shrink-0 items-center gap-1 self-center text-micro text-ink-faint">
+              <GitMergeIcon aria-hidden /> Merge
+            </span>
           )}
-          <span className="min-w-0 flex-1 truncate text-ink">
+          <span className={`min-w-0 flex-1 truncate ${row.merge ? "text-ink-muted" : "text-ink"}`}>
             {row.step?.summary || firstLine(row.commit.message) || "(no description)"}
           </span>
         </span>
@@ -421,7 +635,7 @@ function StepRow({ row, active, onOpen }: { row: StoryRow; active: boolean; onOp
           {tests && (
             <span className={tests.ok ? "text-online" : "text-danger-text"}>{tests.label}</span>
           )}
-          <span>{coverageLabel(row.step)}</span>
+          <span title={coverage.title}>{coverage.label}</span>
         </span>
       </button>
     </li>
@@ -433,8 +647,14 @@ function StepDetail({
   row,
   earlier,
   shortcuts,
-  onPrevious,
-  onNext,
+  wide,
+  file,
+  onFile,
+  changesUrl,
+  oldest,
+  truncated,
+  onNewer,
+  onOlder,
   onClose,
 }: {
   repo: TimelineRepo;
@@ -442,8 +662,19 @@ function StepDetail({
   /** Steps before this one on the line, nearest first, to compare visuals with (CORE-383). */
   earlier: Step[];
   shortcuts: boolean;
-  onPrevious: (() => void) | null;
-  onNext: (() => void) | null;
+  /** The list sits beside the step; otherwise the step has the screen and a bar of its own. */
+  wide: boolean;
+  /** The file chosen in the diff (`?file=`, CORE-382). */
+  file: string | null;
+  onFile: (path: string | null) => void;
+  /** This repository's changes across the whole timeline. */
+  changesUrl: string;
+  /** The last step in the list, with nothing filtered out. */
+  oldest: boolean;
+  /** Earlier history was cut off. */
+  truncated: boolean;
+  onNewer: (() => void) | null;
+  onOlder: (() => void) | null;
   onClose: () => void;
 }) {
   const base = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
@@ -459,39 +690,69 @@ function StepDetail({
   }, [base, row.step]);
   const step = versions.find((v) => v.commitOid === version) ?? row.step;
   const at = new Date(row.commit.authoredAt * 1000).toISOString();
+  const diff = useDiff(repo, version);
+  // A file kept from the step before that this diff doesn't change is dropped.
+  useEffect(() => {
+    if (file && diff.diff && !diff.diff.files.some((f) => f.path === file)) onFile(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diff.diff]);
+  // On a phone the step replaces the list: start at its heading.
+  const heading = useRef<HTMLHeadingElement>(null);
+  // The bar below sticks to the screen's bottom: focus must not scroll under it.
+  useEffect(() => {
+    if (wide) return;
+    const root = document.documentElement;
+    const was = root.style.scrollPaddingBottom;
+    root.style.scrollPaddingBottom = "4.5rem";
+    return () => {
+      root.style.scrollPaddingBottom = was;
+    };
+  }, [wide]);
+  useEffect(() => {
+    if (!wide) heading.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const files = diff.diff?.files ?? [];
+  const additions = files.reduce((sum, f) => sum + f.additions, 0);
+  const deletions = files.reduce((sum, f) => sum + f.deletions, 0);
+  const newerKeys = shortcuts ? "k ArrowLeft ArrowUp" : "ArrowLeft";
+  const olderKeys = shortcuts ? "j ArrowRight ArrowDown" : "ArrowRight";
+  const newerTitle = shortcuts ? "Newer step (k, Left or Up)" : "Newer step (Left)";
+  const olderTitle = shortcuts ? "Older step (j, Right or Down)" : "Older step (Right)";
   return (
     <section aria-label="Step" className="min-w-0 rounded-pane bg-pane p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          className="mk-btn mk-btn--ghost mk-btn--sm lg:hidden"
-          onClick={onClose}
+        <h2
+          ref={heading}
+          tabIndex={-1}
+          className="m-0 min-w-0 flex-1 text-body font-semibold [overflow-wrap:anywhere] outline-none max-sm:order-first max-sm:basis-full"
         >
-          All steps
-        </button>
-        <h2 className="m-0 min-w-0 flex-1 text-body font-semibold [overflow-wrap:anywhere] max-sm:order-first max-sm:basis-full">
           {step?.summary || firstLine(row.commit.message) || "(no description)"}
         </h2>
-        <button
-          type="button"
-          className="mk-btn mk-btn--ghost mk-btn--sm"
-          disabled={!onPrevious}
-          onClick={() => onPrevious?.()}
-          aria-keyshortcuts={shortcuts ? "k ArrowLeft ArrowUp" : "ArrowLeft ArrowUp"}
-          title={shortcuts ? "Previous step (k, Left or Up)" : "Previous step (Left or Up)"}
-        >
-          <CaretLeftIcon aria-hidden /> Previous
-        </button>
-        <button
-          type="button"
-          className="mk-btn mk-btn--ghost mk-btn--sm"
-          disabled={!onNext}
-          onClick={() => onNext?.()}
-          aria-keyshortcuts={shortcuts ? "j ArrowRight ArrowDown" : "ArrowRight ArrowDown"}
-          title={shortcuts ? "Next step (j, Right or Down)" : "Next step (Right or Down)"}
-        >
-          Next <CaretRightIcon aria-hidden />
-        </button>
+        <span className="flex gap-2 max-lg:hidden">
+          <button
+            type="button"
+            className="mk-btn mk-btn--ghost mk-btn--sm"
+            disabled={!onNewer}
+            onClick={() => onNewer?.()}
+            aria-label="Newer step"
+            aria-keyshortcuts={newerKeys}
+            title={newerTitle}
+          >
+            <CaretLeftIcon aria-hidden /> Newer
+          </button>
+          <button
+            type="button"
+            className="mk-btn mk-btn--ghost mk-btn--sm"
+            disabled={!onOlder}
+            onClick={() => onOlder?.()}
+            aria-label="Older step"
+            aria-keyshortcuts={olderKeys}
+            title={olderTitle}
+          >
+            Older <CaretRightIcon aria-hidden />
+          </button>
+        </span>
       </div>
       <p className="mt-1 mb-3 flex flex-wrap gap-x-3 text-body-sm text-ink-muted">
         <span>
@@ -520,8 +781,31 @@ function StepDetail({
         </Link>
         {step?.issue && <span className="mk-chip mk-chip--tag">{step.issue}</span>}
         {step && !step.verified && (
-          <span className="mk-chip mk-chip--tag">Not verified by a push</span>
+          <span
+            className="mk-chip mk-chip--tag"
+            title="Timelines hasn't seen this commit in a push yet."
+          >
+            Unpushed
+          </span>
         )}
+        {diff.diff && (
+          <span
+            className="mk-tabular"
+            title={diff.diff.truncated ? "More files not shown" : undefined}
+          >
+            {files.length} {files.length === 1 ? "file" : "files"}
+            {" · "}
+            <span className="text-online">+{additions}</span>{" "}
+            <span className="text-danger-text">−{deletions}</span>
+          </span>
+        )}
+        <Link
+          className={link}
+          to={changesUrl}
+          title={`Everything ${repo.owner}/${repo.name} changed on this timeline`}
+        >
+          Timeline changes
+        </Link>
       </p>
       {versions.length > 1 && (
         <div className="mb-3">
@@ -542,9 +826,41 @@ function StepDetail({
           narrow strip at every width the page reaches. */}
       <div className="flex flex-col gap-4">
         <Context step={step} />
-        <Diff base={base} oid={version} sourceId={repo.source?.sourceId} />
+        <Diff repo={repo} oid={version} state={diff} file={file} onFile={onFile} />
       </div>
       <StepVisuals step={step} earlier={earlier} />
+      {oldest && (
+        <p className="mt-4 mb-0 text-body-sm text-ink-muted">
+          {truncated ? "Earlier steps not loaded." : "That was the first step after the fork."}{" "}
+          <Link className={link} to={changesUrl}>
+            Review all changes
+          </Link>
+        </p>
+      )}
+      {/* On a phone the step has the screen: keep the way on within thumb reach. */}
+      <div className="sticky bottom-0 z-10 -mx-4 -mb-4 mt-4 flex gap-2 border-t border-line-soft bg-pane p-2 lg:hidden">
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost min-h-11 flex-1"
+          disabled={!onNewer}
+          onClick={() => onNewer?.()}
+          aria-label="Newer step"
+        >
+          <CaretLeftIcon aria-hidden /> Newer
+        </button>
+        <button type="button" className="mk-btn mk-btn--ghost min-h-11 flex-1" onClick={onClose}>
+          All steps
+        </button>
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost min-h-11 flex-1"
+          disabled={!onOlder}
+          onClick={() => onOlder?.()}
+          aria-label="Older step"
+        >
+          Older <CaretRightIcon aria-hidden />
+        </button>
+      </div>
     </section>
   );
 }
@@ -632,15 +948,26 @@ function Context({ step }: { step: Step | null }) {
   );
 }
 
-function Diff({ base, oid, sourceId }: { base: string; oid: string; sourceId?: string }) {
-  const [state, setState] = useState<{ diff: CommitDiff | null; error: string | null }>({
-    diff: null,
-    error: null,
-  });
+interface DiffState {
+  diff: CommitDiff | null;
+  error: string | null;
+}
+
+/** A commit's diff, read for the step header's totals as well as the diff below it. */
+function useDiff(repo: TimelineRepo, oid: string): DiffState {
+  const { owner, name } = repo;
+  const sourceId = repo.source?.sourceId;
+  const [state, setState] = useState<DiffState>({ diff: null, error: null });
   useEffect(() => {
     const abort = new AbortController();
     setState({ diff: null, error: null });
-    api<CommitDiff>(sourceUrl(`${base}/commits/${oid}/diff`, sourceId), { signal: abort.signal })
+    api<CommitDiff>(
+      sourceUrl(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/commits/${oid}/diff`,
+        sourceId,
+      ),
+      { signal: abort.signal },
+    )
       .then((diff) => setState({ diff, error: null }))
       .catch((error: unknown) => {
         if (!abort.signal.aborted)
@@ -650,58 +977,55 @@ function Diff({ base, oid, sourceId }: { base: string; oid: string; sourceId?: s
           });
       });
     return () => abort.abort();
-  }, [base, oid, sourceId]);
-  if (state.error) return <p className="mk-error m-0">{state.error}</p>;
-  if (!state.diff) return <p className="m-0 text-body-sm text-ink-faint">Reading the diff…</p>;
-  const { files, truncated } = state.diff;
-  return (
-    <section aria-label="Diff" className="min-w-0">
-      <p className="mt-0 mb-2 text-body-sm text-ink-muted">
-        {files.length} {files.length === 1 ? "file" : "files"} changed
-        {truncated ? " (more not shown)" : ""}
-      </p>
-      {files.map((file) => (
-        <DiffFileView key={file.path} file={file} />
-      ))}
-    </section>
-  );
+  }, [owner, name, oid, sourceId]);
+  return state;
 }
 
-function DiffFileView({ file }: { file: DiffFile }) {
+function Diff({
+  repo,
+  oid,
+  state,
+  file,
+  onFile,
+}: {
+  repo: TimelineRepo;
+  oid: string;
+  state: DiffState;
+  file: string | null;
+  onFile: (path: string) => void;
+}) {
+  const { owner, name } = repo;
+  const sourceId = repo.source?.sourceId;
+  if (state.error) return <p className="mk-error m-0">{state.error}</p>;
+  if (!state.diff) return <p className="m-0 text-body-sm text-ink-faint">Reading the diff…</p>;
+  const { files, truncated, parents } = state.diff;
   return (
-    <details open className="mb-2 rounded-md border border-line-soft">
-      <summary className="flex cursor-pointer flex-wrap items-baseline gap-2 px-2 py-1 text-body-sm">
-        <span className="mk-mono min-w-0 flex-1 [overflow-wrap:anywhere]">{file.path}</span>
-        <span className="text-micro text-ink-faint">{file.status}</span>
-        <span className="text-micro text-online">+{file.additions}</span>
-        <span className="text-micro text-danger-text">−{file.deletions}</span>
-      </summary>
-      {file.binary ? (
-        <p className="m-0 px-2 pb-2 text-micro text-ink-faint">Binary file.</p>
-      ) : file.omitted ? (
-        <p className="m-0 px-2 pb-2 text-micro text-ink-faint">Too large to show here.</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <pre className="m-0 text-micro leading-5">
-            {file.hunks.map((hunk, h) => (
-              <code key={h} className="block">
-                <span className="block bg-sunken px-2 text-ink-faint">
-                  @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@
-                </span>
-                {hunk.lines.map((line, n) => (
-                  <span
-                    key={n}
-                    className={`block px-2 ${line.startsWith("+") ? "bg-data-teal-wash" : line.startsWith("-") ? "bg-danger-wash" : ""}`}
-                  >
-                    {line || " "}
-                  </span>
-                ))}
-              </code>
-            ))}
-          </pre>
-        </div>
+    <div className="min-w-0">
+      {parents.length > 1 && (
+        <p className="mt-0 mb-2 rounded-md bg-sunken p-2 text-body-sm text-ink-muted" role="note">
+          Merge commit: changes shown against its first parent, including what the merge brought in.
+        </p>
       )}
-    </details>
+      <DiffView
+        files={files}
+        truncated={truncated}
+        selectedPath={file}
+        onSelectPath={onFile}
+        idPrefix="story-diff"
+        // A deleted file lives on at the first parent.
+        blobHref={(path) =>
+          blobUrl(
+            owner,
+            name,
+            files.find((f) => f.path === path)?.status === "deleted" && parents[0]
+              ? parents[0]
+              : oid,
+            path,
+            sourceId,
+          )
+        }
+      />
+    </div>
   );
 }
 

@@ -34,6 +34,44 @@ export interface CommitDiff {
   truncated: boolean;
 }
 
+/**
+ * Everything one line of work changes, as GET
+ * /api/repos/:owner/:name/compare?base=&head=[&source=] returns it (CORE-382):
+ * `head` against where it meets `base` (their merge base), so main merged
+ * into a timeline doesn't count as the timeline's own change.
+ */
+export interface CompareDiff {
+  /** The requested base and head, resolved to commits. */
+  base: string;
+  head: string;
+  /** What the diff starts from: the merge base, or `base` when none was found. */
+  from: string;
+  /** Null when the histories share nothing within the search budget. */
+  mergeBase: string | null;
+  /** The merge-base search stopped at its budget; `from` is `base`. */
+  historyTruncated: boolean;
+  /**
+   * Commits on head's first-parent chain since `from`, newest first, at most
+   * COMPARE_COMMITS: a merge of main shows as its merge commit.
+   */
+  commits: {
+    oid: string;
+    summary: string;
+    authorName: string;
+    authoredAt: number;
+    /** More than one parent. */
+    merge: boolean;
+  }[];
+  /** More commits than were listed. */
+  commitsTruncated: boolean;
+  files: DiffFile[];
+  /** More files changed than were listed. */
+  truncated: boolean;
+}
+
+/** Commits listed by a compare. */
+export const COMPARE_COMMITS = 100;
+
 /** Bounds on what one diff reads and returns. */
 export const DIFF_LIMITS = {
   /** Files listed. */

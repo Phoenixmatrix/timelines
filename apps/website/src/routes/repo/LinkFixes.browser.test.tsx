@@ -183,7 +183,7 @@ test("the workspace Atlas names its owner in a breadcrumb", async () => {
   await expect.element(crumbs).toMatchTextContent(/orbit\s*\/\s*Atlas/);
 });
 
-test("a story's Timeline link opens the tracker in its address, not its repositories' owner", async () => {
+test("a story's Overview link opens the tracker in its address, not its repositories' owner", async () => {
   const server = await TestServer.start({ world: true });
   await server.repo("orbit", "engine");
   const main = commitId();
@@ -210,7 +210,12 @@ test("a story's Timeline link opens the tracker in its address, not its reposito
   }));
   renderApp("/tracker/marco/timelines/search/story");
   await expect
-    .element(page.getByRole("link", { name: "Timeline", exact: true }))
+    .element(
+      // The timeline's nav replaced Story's "Timeline" link (CORE-382).
+      page
+        .getByRole("navigation", { name: "Timeline" })
+        .getByRole("link", { name: "Overview", exact: true }),
+    )
     .toHaveAttribute("href", "/tracker/marco/timelines?tl=search");
 });
 

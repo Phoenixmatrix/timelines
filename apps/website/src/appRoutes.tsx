@@ -1,7 +1,7 @@
 // The app's routes, apart from the browser router (router.tsx) so the
 // browser-mode tests can mount them in a memory router.
 
-import { redirect, type RouteObject } from "react-router";
+import { redirect, type RouteObject, type ShouldRevalidateFunction } from "react-router";
 import { AppShell } from "./components/AppShell.tsx";
 import { PageTitle, PageTitleError, withPageTitles } from "./components/PageTitle.tsx";
 import { keepPageUnderPanel } from "./lib/commitPanel.ts";
@@ -33,6 +33,7 @@ import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageC
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { Releases, releasesLoader } from "./routes/repo/Releases.tsx";
 import { TrackerReleases, trackerReleasesLoader } from "./routes/tracker/Releases.tsx";
+import { Changes, changesLoader } from "./routes/tracker/Changes.tsx";
 import { Story, storyLoader } from "./routes/tracker/Story.tsx";
 import { TrackerTimelines, trackerTimelinesLoader } from "./routes/tracker/Timelines.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
@@ -100,6 +101,26 @@ function InitialPageTitle() {
   return <PageTitle loading>{null}</PageTitle>;
 }
 
+/**
+ * A timeline's Story and Changes load the timeline by its address alone:
+ * choosing a step, file, repository or comparison (search params) reuses it
+ * rather than reading the whole timeline again (CORE-382).
+ */
+const timelinePageShouldRevalidate: ShouldRevalidateFunction = ({
+  currentParams,
+  nextParams,
+  formMethod,
+  currentUrl,
+  nextUrl,
+  defaultShouldRevalidate,
+}) =>
+  currentParams.owner !== nextParams.owner ||
+  currentParams.slug !== nextParams.slug ||
+  formMethod ||
+  currentUrl.href === nextUrl.href
+    ? defaultShouldRevalidate
+    : false;
+
 /** The app's routes. */
 export const routes: RouteObject[] = withPageTitles([
   {
@@ -152,8 +173,15 @@ export const routes: RouteObject[] = withPageTitles([
             Component: TrackerTimelines,
           },
           {
+            path: "tracker/:owner/timelines/:slug/changes",
+            loader: changesLoader,
+            shouldRevalidate: timelinePageShouldRevalidate,
+            Component: Changes,
+          },
+          {
             path: "tracker/:owner/timelines/:slug/story",
             loader: storyLoader,
+            shouldRevalidate: timelinePageShouldRevalidate,
             Component: Story,
           },
           {
