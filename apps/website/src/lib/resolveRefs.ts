@@ -71,15 +71,15 @@ export interface JumpContext {
   /** The page it was typed on, so a commit opens over it in its repository. */
   here: { pathname: string; search: string; state: unknown };
   /** The repository being viewed: SHAs and run numbers are its own. */
-  repo: Pick<RepoDetail, "owner" | "name"> | null;
-  /** The tracker in view (or the repository owner's), whose matches come first. */
+  repo: Pick<RepoDetail, "space" | "name"> | null;
+  /** The tracker in view (or the repository space's), whose matches come first. */
   tracker: string | null;
   /** The account the page belongs to, whose packages `pkg@version` names. */
-  owner: string | null;
+  space: string | null;
   /** Repositories visited recently: where a SHA typed outside a repository may be. */
-  recentRepos: { owner: string; name: string }[];
+  recentRepos: { space: string; name: string }[];
   /** Timelines the viewer can see in the tracker in view, when loaded. */
-  timelines: { slug: string; name: string; owner: string }[];
+  timelines: { slug: string; name: string; space: string }[];
 }
 
 const short = (sha: string) => sha.slice(0, 7);
@@ -112,11 +112,11 @@ function commitJump(context: JumpContext, target: RefTarget): Jump[] {
   if (target.kind !== "commit") return [];
   return [
     {
-      id: `jump:commit:${target.owner}/${target.repo}@${target.sha}`,
+      id: `jump:commit:${target.space}/${target.repo}@${target.sha}`,
       kind: "commit",
       title: `Commit ${short(target.sha)}`,
-      detail: `in ${target.owner}/${target.repo}`,
-      ...commitHref(context.here, target.owner, target.repo, target.sha),
+      detail: `in ${target.space}/${target.repo}`,
+      ...commitHref(context.here, target.space, target.repo, target.sha),
     },
   ];
 }
@@ -127,7 +127,7 @@ export async function resolveJump(
   context: JumpContext,
   signal: AbortSignal,
 ): Promise<Jump[]> {
-  const repo = context.repo ? { owner: context.repo.owner.slug, repo: context.repo.name } : null;
+  const repo = context.repo ? { space: context.repo.space.slug, repo: context.repo.name } : null;
   switch (ref.kind) {
     case "issue": {
       const resolution = await resolveFor(
@@ -154,7 +154,7 @@ export async function resolveJump(
       // ones visited recently, each asked whether it has the commit.
       const repos = repo
         ? [repo]
-        : context.recentRepos.slice(0, 3).map((r) => ({ owner: r.owner, repo: r.name }));
+        : context.recentRepos.slice(0, 3).map((r) => ({ space: r.space, repo: r.name }));
       const answers = await Promise.all(repos.map((r) => resolveFor(ref.sha, r, signal)));
       return answers.flatMap((answer) => targetsOf(answer).flatMap((t) => commitJump(context, t)));
     }
@@ -162,16 +162,16 @@ export async function resolveJump(
       if (!repo) return [];
       try {
         const run = await api<CiRunDetail>(
-          `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/ci/runs/${ref.number}`,
+          `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.repo)}/ci/runs/${ref.number}`,
           { signal },
         );
         return [
           {
-            id: `jump:run:${repo.owner}/${repo.repo}#${run.number}`,
+            id: `jump:run:${repo.space}/${repo.repo}#${run.number}`,
             kind: "run",
             title: `#${run.number} ${run.title}`,
-            detail: `CI run in ${repo.owner}/${repo.repo}`,
-            to: repoPath(repo.owner, repo.repo, "ci", String(run.number)),
+            detail: `CI run in ${repo.space}/${repo.repo}`,
+            to: repoPath(repo.space, repo.repo, "ci", String(run.number)),
           },
         ];
       } catch (error) {
@@ -180,23 +180,23 @@ export async function resolveJump(
       }
     }
     case "package": {
-      // Packages are an owner's: the page's, else those of repositories visited recently.
-      const owners = [
+      // Packages are an space's: the page's, else those of repositories visited recently.
+      const spaces = [
         ...new Set(
-          context.owner ? [context.owner] : context.recentRepos.slice(0, 3).map((r) => r.owner),
+          context.space ? [context.space] : context.recentRepos.slice(0, 3).map((r) => r.space),
         ),
       ];
       const raw = `${ref.name}@${ref.version}`;
-      const answers = await Promise.all(owners.map((owner) => resolveFor(raw, { owner }, signal)));
+      const answers = await Promise.all(spaces.map((space) => resolveFor(raw, { space }, signal)));
       return answers.flatMap((answer) =>
         targetsOf(answer).flatMap((target) =>
           target.kind === "package"
             ? [
                 {
-                  id: `jump:package:${target.owner}/${target.format}/${target.name}@${target.version}`,
+                  id: `jump:package:${target.space}/${target.format}/${target.name}@${target.version}`,
                   kind: "package" as const,
                   title: `${target.name}@${target.version}`,
-                  detail: `${target.format} · ${target.owner}`,
+                  detail: `${target.format} · ${target.space}`,
                   to: target.path,
                 },
               ]
@@ -211,13 +211,13 @@ export async function resolveJump(
   }
 }
 
-export function timelineJump(timeline: { slug: string; name: string; owner: string }): Jump {
+export function timelineJump(timeline: { slug: string; name: string; space: string }): Jump {
   return {
-    id: `jump:timeline:${timeline.owner}/${timeline.slug}`,
+    id: `jump:timeline:${timeline.space}/${timeline.slug}`,
     kind: "timeline",
     title: timeline.name,
-    detail: `timeline/${timeline.slug} · ${timeline.owner}`,
-    to: `/tracker/${encodeURIComponent(timeline.owner)}/timelines?tl=${encodeURIComponent(timeline.slug)}`,
+    detail: `timeline/${timeline.slug} · ${timeline.space}`,
+    to: `/tracker/${encodeURIComponent(timeline.space)}/timelines?tl=${encodeURIComponent(timeline.slug)}`,
   };
 }
 
@@ -229,16 +229,16 @@ export interface ConfirmedIssue {
 }
 
 /**
- * Which of `keys` are Gitmatrix issues the viewer can open from `owner/repo`,
+ * Which of `keys` are Gitmatrix issues the viewer can open from `space/repo`,
  * and where. Keys that aren't (or are ambiguous) come back absent, so callers
  * show them as plain text, never a guessed link.
  */
 export async function confirmIssueKeys(
   keys: string[],
-  repo: { owner: string; name: string },
+  repo: { space: string; name: string },
   signal: AbortSignal,
 ): Promise<Map<string, ConfirmedIssue>> {
-  const context: RefContext = { owner: repo.owner, repo: repo.name, tracker: repo.owner };
+  const context: RefContext = { space: repo.space, repo: repo.name, tracker: repo.space };
   const answers = await Promise.all(keys.map((key) => resolveFor(key, context, signal)));
   const found = new Map<string, ConfirmedIssue>();
   keys.forEach((key, i) => {
@@ -250,11 +250,11 @@ export async function confirmIssueKeys(
 }
 
 /**
- * The full id of `sha` in `owner/name`, or null when the repository has no
+ * The full id of `sha` in `space/name`, or null when the repository has no
  * such commit (a short hash must match exactly one recent commit).
  */
 export async function resolveCommit(
-  owner: string,
+  space: string,
   name: string,
   sha: string,
   signal: AbortSignal,
@@ -262,7 +262,7 @@ export async function resolveCommit(
   const wanted = sha.toLowerCase();
   if (/^[0-9a-f]{40}$/.test(wanted)) return wanted;
   if (!SHA_PATTERN.test(wanted)) return null;
-  const answer = await resolveFor(wanted, { owner, repo: name }, signal);
+  const answer = await resolveFor(wanted, { space, repo: name }, signal);
   const target = targetsOf(answer).find((t) => t.kind === "commit");
   return target?.kind === "commit" ? target.sha : null;
 }

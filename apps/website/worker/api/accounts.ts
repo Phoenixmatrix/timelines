@@ -2,14 +2,10 @@ import { Hono } from "hono";
 import { sql } from "kysely";
 import type { AccountPage, Persona, SessionResponse } from "../../shared/api.ts";
 import { endAllSessions, startPersonaSession, type AppEnv } from "../auth.ts";
-import { accountSummary, findAccountBySlug, findUserById, viewerFor, visibleRepos } from "../db.ts";
+import { accountSummary, findAccountBySlug, findUserById, viewerFor } from "../db.ts";
 import { db } from "../schema.ts";
-import { createDb } from "../../registry/core/db.ts";
 import { slugProblem } from "../names.ts";
-import { canManageOrg } from "../avatars/api.ts";
 import { fail, readJson, requireActor } from "./http.ts";
-import { accessible } from "../tracker/api.ts";
-import { trackerObject } from "../tracker/stub.ts";
 
 export const accounts = new Hono<AppEnv>();
 
@@ -25,7 +21,7 @@ accounts.post("/session", async (c) => {
   const { accountId } = await readJson<{ accountId: string }>(c);
   const actor = accountId ? await findUserById(c.env.DB, accountId) : null;
   if (!actor) return fail(c, 404, "No such persona.");
-  startPersonaSession(c, actor.id);
+  await startPersonaSession(c, actor.id);
   const body: SessionResponse = { viewer: await viewerFor(c.env.DB, actor) };
   return c.json(body);
 });
@@ -51,11 +47,7 @@ accounts.get("/personas", async (c) => {
   return c.json({ personas });
 });
 
-/**
- * Your own display name and username. The display name can always change.
- * The username is the root of your URLs; it can change while you own no
- * package feeds, whose keys and client URLs are built from it.
- */
+/** Person profile changes never rename immutable Organization or Space handles. */
 accounts.patch("/account", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
@@ -78,17 +70,6 @@ accounts.patch("/account", async (c) => {
       .where("id", "!=", actor.id)
       .executeTakeFirst();
     if (taken) return fail(c, 409, `"${slug}" is taken.`);
-    const feed = await createDb(c.env.REGISTRY_DB)
-      .selectFrom("repositories")
-      .select("key")
-      .where("owner_id", "=", actor.id)
-      .executeTakeFirst();
-    if (feed)
-      return fail(
-        c,
-        409,
-        "You own package feeds, and their addresses are built from your username, so it can't change yet.",
-      );
     changes.slug = slug;
   }
   if (changes.display_name || changes.slug) {
@@ -117,43 +98,19 @@ accounts.get("/users", async (c) => {
 
 accounts.get("/accounts/:slug", async (c) => {
   const account = await findAccountBySlug(c.env.DB, c.req.param("slug"));
-  if (!account) return fail(c, 404, "No such user or organization.");
-  const members =
-    account.kind === "org"
-      ? (
-          await db(c.env.DB)
-            .selectFrom("accounts as a")
-            .innerJoin("org_members as m", "m.user_id", "a.id")
-            .selectAll("a")
-            .select("m.role")
-            .where("m.org_id", "=", account.id)
-            .orderBy("m.role", "desc")
-            .orderBy("a.slug")
-            .execute()
-        ).map((row) => ({ ...accountSummary(row), role: row.role }))
-      : [];
-  const actor = c.get("actor");
-  // Repository visibility, subscriptions and site administration do not grant tracker membership.
-  const trackerOwner = actor
-    ? (await accessible(c.env.DB, actor)).find((owner) => owner.id === account.id)
-    : undefined;
-  let teams: AccountPage["teams"] = null;
-  if (trackerOwner) {
-    const result = await trackerObject(c.env, account.id).teamDirectory();
-    if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
-    teams = result.value;
-  }
+  if (!account || account.kind !== "user") return fail(c, 404, "No such person.");
+  const personal = await c.env.DB.prepare(
+    "SELECT id, default_space_id FROM organizations WHERE kind = 'personal' AND personal_account_id = ?",
+  )
+    .bind(account.id)
+    .first<{ id: string; default_space_id: string }>();
+  // Personal tenant locators are private profile shortcuts, not public content discovery.
+  const self = c.get("actor")?.id === account.id;
   const page: AccountPage = {
     ...accountSummary(account),
     bio: account.bio,
-    repos: await visibleRepos(c.env.DB, actor, account.id),
-    members,
-    teams,
-    // People manage organizations; agents acting for them don't.
-    viewerCanManage:
-      account.kind === "org" && !!actor && !actor.agent
-        ? await canManageOrg(c.env.DB, actor, account.id)
-        : false,
+    personalOrganizationId: self ? (personal?.id ?? null) : null,
+    defaultSpaceId: self ? (personal?.default_space_id ?? null) : null,
   };
   return c.json(page);
 });

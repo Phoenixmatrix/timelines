@@ -1,5 +1,6 @@
 // Shapes the Worker's JSON API returns, shared with the React app.
 import type { CodeSource, SourceSnapshot } from "./code-source.ts";
+import type { OrganizationSummary, SpaceSummary } from "./spaces.ts";
 
 export type RepoRole = "none" | "read" | "write" | "admin";
 export type Visibility = "public" | "private";
@@ -8,10 +9,10 @@ export type CollaboratorRole = "read" | "write" | "admin";
 
 export interface AccountSummary {
   id: string;
-  kind: "user" | "org";
+  kind: "user";
   slug: string;
   displayName: string;
-  /** A person's profile picture or an organization's icon; null shows initials. */
+  /** A person's profile picture; null shows initials. */
   avatarUrl: string | null;
 }
 
@@ -28,8 +29,12 @@ export interface Viewer extends AccountSummary {
   isSiteAdmin: boolean;
   /** The address they sign in with; null for development personas. */
   email: string | null;
-  /** Owners the viewer may create repositories under: themselves, then their orgs. */
-  canCreateIn: AccountSummary[];
+  organizations: OrganizationSummary[];
+  /** Only live explicit grants contribute to content navigation. */
+  spaces: SpaceSummary[];
+  personalOrganizationId: string | null;
+  /** Persisted personal default; null when the person cannot access it. */
+  defaultSpaceId: string | null;
   /** Set when signed in with an agent's token: the agent acting for this viewer. */
   agent: AgentRef | null;
 }
@@ -86,7 +91,7 @@ export interface SessionResponse {
 
 export interface RepoSummary {
   id: string;
-  owner: AccountSummary;
+  space: SpaceSummary;
   name: string;
   description: string;
   visibility: Visibility;
@@ -179,18 +184,14 @@ export interface HistoryPage {
 
 export interface AccountPage extends AccountSummary {
   bio: string;
-  repos: RepoSummary[];
-  members: (AccountSummary & { role: "owner" | "member" })[];
-  /** null means no tracker access; [] means an accessible tracker with no active teams. */
-  teams: { id: string; key: string; name: string }[] | null;
-  /** An organization the signed-in person can manage (its owners, site admins). */
-  viewerCanManage: boolean;
+  personalOrganizationId: string | null;
+  defaultSpaceId: string | null;
 }
 
 /** Only membership-visible subscriptions contribute; null never means zero ready work. */
 export interface RepoIssueSummary {
   ready: number | null;
-  workspaces: number;
+  projects: number;
 }
 
 export interface Collaborator extends AccountSummary {
@@ -261,7 +262,7 @@ export interface CreatedAccessToken extends AccessToken {
 }
 
 export interface CreateRepoRequest {
-  owner: string;
+  spaceId: string;
   name: string;
   description?: string;
   visibility: Visibility;

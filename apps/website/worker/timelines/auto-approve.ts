@@ -6,19 +6,30 @@
 // Nor does it approve a checkpoint whose changes touch the CI definition: an
 // agent could weaken CI to make "green" trivial and get the person's name on
 // the approval. That, or not being able to tell, leaves it to the person.
+//
+// It acts with the work authority the person turned it on with (their own
+// credential, never an agent's), re-resolved before every use: a revoked or
+// expired credential, a lost Space grant or a migration since turns the
+// setting off, logged, and they turn it on again. There is no
+// credential-less automation path.
 
 import type { CheckpointState } from "../../shared/timelines.ts";
 import { autoApprovable, type HumanRequest } from "../../shared/tracker.ts";
 import { lsRefs } from "../artifacts.ts";
 import { CONFIG_PATH } from "../ci/config.ts";
-import { actorFromRow } from "../db.ts";
+import {
+  resolveWorkAuthority,
+  WorkAuthorizationError,
+  type WorkAuthority,
+} from "../ci/admission.ts";
+import type { Actor } from "../db.ts";
 import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
 import { db } from "../schema.ts";
+import { findSpaceById } from "../spaces/access.ts";
 import { accessFor } from "../tracker/access.ts";
 import type { TrackerReply } from "../tracker/object.ts";
-import { TrackerError } from "../tracker/store.ts";
+import { TrackerError, type Access } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
-import { writableRepoIds } from "./checkpoints.ts";
 import { greenness, maybeLand, type LandingDeps } from "./landing.ts";
 import { getWorkSource } from "./sources.ts";
 
@@ -42,7 +53,7 @@ export const CI_DEFINITION_PATHS: readonly string[] = [CONFIG_PATH];
  */
 export async function ciDefinitionChange(env: Env, state: CheckpointState): Promise<string | null> {
   for (const repo of state.checkpoint.repos) {
-    const where = `${repo.owner}/${repo.name}`;
+    const where = `${repo.space}/${repo.name}`;
     try {
       const row = await db(env.DB)
         .selectFrom("repos")
@@ -123,74 +134,119 @@ export interface AutoApproveScope {
 export async function maybeAutoApprove(
   env: Env,
   deps: LandingDeps,
-  ownerId: string,
+  spaceId: string,
   scope: AutoApproveScope,
 ): Promise<number> {
   try {
-    const tracker = trackerObject(env, ownerId);
-    const on = new Set(unwrap(await tracker.approvingWhenGreen()));
-    if (!on.size) return 0;
-    const open = unwrap(await tracker.openRequests())
-      .map(({ request }) => request)
-      .filter(
-        (request) =>
-          request.kind === "approval" &&
-          request.checkpoint &&
-          on.has(request.routeTo) &&
-          (!scope.slug || request.checkpoint.timeline === scope.slug) &&
-          (!scope.requestId || request.id === scope.requestId) &&
-          (!scope.personId || request.routeTo === scope.personId),
-      );
+    const tracker = trackerObject(env, spaceId);
+    const people = unwrap(await tracker.approvingWhenGreen()).filter(
+      (id) => !scope.personId || id === scope.personId,
+    );
     let approved = 0;
-    for (const request of open) if (await approveOne(env, deps, ownerId, request)) approved++;
+    for (const personId of people) {
+      const consent = await consentOf(env, spaceId, personId);
+      if (!consent) continue;
+      const open = consent.open
+        .map(({ request }) => request)
+        .filter(
+          (request) =>
+            request.kind === "approval" &&
+            request.checkpoint &&
+            request.routeTo === personId &&
+            (!scope.slug || request.checkpoint.timeline === scope.slug) &&
+            (!scope.requestId || request.id === scope.requestId),
+        );
+      for (const request of open)
+        if (await approveOne(env, deps, spaceId, consent, request)) approved++;
+    }
     return approved;
   } catch (error) {
-    console.error("Auto-approve: looking for approvals failed", { ownerId, scope, error });
+    console.error("Auto-approve: looking for approvals failed", { spaceId, scope, error });
     return 0;
+  }
+}
+
+interface Consent {
+  authority: WorkAuthority;
+  access: Access;
+  open: { request: HumanRequest }[];
+}
+
+/**
+ * The person's tracker access, built from the authority they turned
+ * approve-when-green on with and checked live; null (and the setting turned
+ * off, when that's why) if it can't act for them any more.
+ */
+async function consentOf(env: Env, spaceId: string, personId: string): Promise<Consent | null> {
+  const tracker = trackerObject(env, spaceId);
+  const authority = unwrap(await tracker.workAuthority(`automation:${personId}`));
+  const space = await findSpaceById(env.DB, spaceId);
+  if (!authority || !space) return null;
+  try {
+    const access = await accessFor(env, space, personId, null, true, authority.credential);
+    access.source = "automation";
+    if (access.migrationEpoch !== authority.migrationEpoch)
+      throw new TrackerError(409, "migration_epoch_mismatch", "Consent predates this epoch.");
+    // The Durable Object checks the credential is live here, and as it answers.
+    const open = unwrap(await tracker.openRequests(access));
+    return { authority, access, open };
+  } catch (error) {
+    if (!(error instanceof TrackerError)) throw error;
+    // The Durable Object re-checks why before it takes the setting away.
+    const retired = await tracker.retireApprovalAutomation({ spaceId, personId });
+    console.warn("Auto-approve: the consent it acts with can't act any more", {
+      spaceId,
+      personId,
+      code: error.code,
+      retired: retired.ok && retired.value,
+    });
+    return null;
   }
 }
 
 async function approveOne(
   env: Env,
   deps: LandingDeps,
-  ownerId: string,
+  spaceId: string,
+  { authority, access }: Consent,
   request: HumanRequest,
 ): Promise<boolean> {
   const requestId = request.id;
   const checkpointId = request.checkpoint!.id;
-  const personId = request.routeTo;
   try {
-    const tracker = trackerObject(env, ownerId);
-    const [found] = unwrap(await tracker.checkpointStates([checkpointId]));
+    const tracker = trackerObject(env, spaceId);
+    const [found] = unwrap(await tracker.checkpointStates(access, [checkpointId]));
     if (!found || found.timeline.policy !== "approval" || !found.state.current) return false;
-    const [owner, person] = await Promise.all(
-      [ownerId, personId].map((id) =>
-        db(env.DB).selectFrom("accounts").selectAll().where("id", "=", id).executeTakeFirst(),
-      ),
-    );
-    if (!owner || !person || person.kind !== "user") return false;
-    // The routed person's own access, never the asker's: their write access approves.
-    const access = await accessFor(env.DB, owner, person.id, null);
-    access.source = "automation";
-    // Someone who left: the tracker drops their setting (and approves nothing).
-    if (!access.members.some((member) => member.id === person.id)) {
-      await tracker.autoApprove(access, requestId, checkpointId);
-      return false;
-    }
     // Only what they or their own agents asked; the tracker checks it again as it answers.
     if (!autoApprovable(request, access.agents)) return false;
+    const note = async (reason: string) => {
+      console.warn("Auto-approve: left to its person", { spaceId, requestId, reason });
+      const noted = await tracker.noteAutoApproveSkipped(access, requestId, checkpointId, reason);
+      if (!noted.ok) console.error("Auto-approve: noting why failed", noted);
+    };
+    // Their own authority, live, in every repository it would land in.
+    let actor: Actor | null = null;
+    for (const repo of found.state.checkpoint.repos) {
+      try {
+        actor = (await resolveWorkAuthority(env, authority, repo.id)).actor;
+      } catch (error) {
+        if (!(error instanceof WorkAuthorizationError)) throw error;
+        await note(
+          `Approve when green can't act for you in ${repo.space}/${repo.name}: approve it yourself.`,
+        );
+        return false;
+      }
+    }
+    if (!actor) return false;
     // Never for changes to CI itself, or when that can't be told: noted on the request.
     const skipped = await ciDefinitionChange(env, found.state);
     if (skipped) {
-      console.warn("Auto-approve: left to its person", { ownerId, requestId, reason: skipped });
-      const noted = await tracker.noteAutoApproveSkipped(access, requestId, checkpointId, skipped);
-      if (!noted.ok) console.error("Auto-approve: noting why failed", noted);
+      await note(skipped);
       return false;
     }
     // Green just before answering; the tracker checks the rest as it answers.
     const green = await greenness(env.DB, found.timeline, found.state, { requireRun: true });
     if (!green.ok) return false;
-    access.writableRepoIds = await writableRepoIds(env.DB, actorFromRow(person), owner.id);
     const reply = await tracker.autoApprove(access, requestId, checkpointId);
     if (!reply.ok) {
       // Someone answered first, or it moved on: nothing to do.
@@ -198,14 +254,11 @@ async function approveOne(
       return false;
     }
     if (!reply.value) return false;
-    await refreshAfterTrackerMutation(env, owner.id, reply.value, []);
-    await maybeLand(env, deps, owner.id, found.timeline.slug, "approval", {
-      principalId: person.id,
-      agentId: null,
-    });
+    await refreshAfterTrackerMutation(env, spaceId, reply.value, [], actor);
+    await maybeLand(env, deps, spaceId, found.timeline.slug, "approval", authority);
     return true;
   } catch (error) {
-    console.error("Auto-approve: approving failed", { ownerId, requestId, error });
+    console.error("Auto-approve: approving failed", { spaceId, requestId, error });
     return false;
   }
 }

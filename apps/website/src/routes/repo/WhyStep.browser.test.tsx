@@ -17,7 +17,7 @@ test("a line's why shows the step behind its commit, into the story", async () =
   const head = commitId();
   await server.push("orbit/engine", "main", head);
   const [landed, before] = [commitId(), commitId()];
-  server.on("GET", "/api/repos/:owner/:name/blob", (): BlobResponse => ({
+  server.on("GET", "/api/repos/:space/:name/blob", (): BlobResponse => ({
     ref: "main",
     commitOid: head,
     path: "src/rank.ts",
@@ -83,9 +83,9 @@ test("a line's why shows the step behind its commit, into the story", async () =
       step: null,
       ...over,
     }) as WhyChain;
-  server.on("GET", "/api/repos/:owner/:name/why", (): WhyResponse => ({
-    repo: { owner: "orbit", name: "engine", defaultBranch: "main" },
-    tracker: { owner: "orbit", readable: true },
+  server.on("GET", "/api/repos/:space/:name/why", (): WhyResponse => ({
+    repo: { space: "orbit", name: "engine", defaultBranch: "main" },
+    tracker: { space: "orbit", readable: true },
     blame: null,
     chains: [chain(landed, { step })],
     people: {},

@@ -9,11 +9,12 @@
 // recomputed, and wiki pages reachable from the capabilities they're about.
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AtlasError, AtlasTimeline } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Timing } from "../timing.ts";
 import { atlasApi, atlasErrorOf } from "../../src/lib/atlas.ts";
@@ -33,7 +34,14 @@ import {
 } from "./fixture.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -73,16 +81,30 @@ function forbidden(name: string, touched: string[]) {
 
 let names = 0;
 
-function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
-  const sqlite = migratedDatabase();
+async function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   // A fresh Artifacts name each time: RepoReader caches refs by name.
   const artifacts = `atlas-timeline-${++names}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'private', '${artifacts}', 'https://shop');
-    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, space_id,
       artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
       fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
       initial_token_revoked, created_at, updated_at)
@@ -101,6 +123,7 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
   );
   const touched: string[] = [];
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
@@ -117,7 +140,7 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
     c.set("timing", new Timing());
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
   const executionCtx = { waitUntil() {}, passThroughOnException() {}, props: {} };
   const request = (path: string, init?: RequestInit) =>
     app.request(path, init ?? {}, env, executionCtx as unknown as ExecutionContext);
@@ -136,10 +159,10 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
   };
 }
 
-const repo = { owner: "ann", name: "shop" };
+const repo = { space: "ann", name: "shop" };
 
 /** Main's Atlas at C1, and the plan timeline's overlay at TIP measured against it. */
-async function planned(s: ReturnType<typeof setup>) {
+async function planned(s: { env: Env }) {
   await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
   const main = await publishAtlasFixture(s.env, "r1", C1);
   const overlay = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
@@ -163,7 +186,7 @@ async function all(request: Parameters<typeof atlasApi.timeline>[2] = {}) {
 
 describe("Timelines in the Atlas", () => {
   test("source selection cannot read another timeline or fall back to a canonical bookmark", async () => {
-    const s = setup();
+    const s = await setup();
     await planned(s);
     await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", C2, C1, "canonical");
     const selected = await atlasApi.timeline(repo, "timeline/plan");
@@ -181,7 +204,7 @@ describe("Timelines in the Atlas", () => {
   });
 
   test("a timeline's files are placed in capabilities, with what's inferred said so", async () => {
-    const s = setup();
+    const s = await setup();
     const { main } = await planned(s);
     // An overlay whose regrouping isn't computed yet (as one kept before
     // CORE-186): new files are placed by inference, and that's said.
@@ -196,7 +219,7 @@ describe("Timelines in the Atlas", () => {
       expect.objectContaining({
         repoId: "r1",
         sourceId: SOURCE,
-        owner: "ann",
+        space: "ann",
         name: "shop",
         ref: "timeline/plan",
         state: "up-to-date",
@@ -316,7 +339,7 @@ describe("Timelines in the Atlas", () => {
   });
 
   test("against a newer main, the overlay says it was measured against an older one", async () => {
-    const s = setup();
+    const s = await setup();
     const { main } = await planned(s);
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C2, "merged");
     const later = await publishAtlasFixture(s.env, "r1", C2);
@@ -350,7 +373,7 @@ describe("Timelines in the Atlas", () => {
 
   test("an ended timeline is read as kept, and reading it changes nothing", async () => {
     // The bookmark is gone: the timeline landed.
-    const s = setup({});
+    const s = await setup({});
     await planned(s);
     await endAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", "landed");
     const kept = () =>
@@ -381,7 +404,7 @@ describe("Timelines in the Atlas", () => {
   });
 
   test("wiki pages are reachable from the capabilities they're about, labelled by their main", async () => {
-    const s = setup();
+    const s = await setup();
     await planned(s);
     // Publish pages while the owned set is writing; completed sets are immutable.
     s.sqlite.exec(`
@@ -429,7 +452,7 @@ describe("Timelines in the Atlas", () => {
   });
 
   test("a cursor is bound to the overlay it started on, and requests are checked", async () => {
-    const s = setup();
+    const s = await setup();
     await planned(s);
     const first = await atlasApi.timeline(repo, "timeline/plan", { limit: 1 });
     // A push recomputes the overlay: the traversal stops, it doesn't mix two.

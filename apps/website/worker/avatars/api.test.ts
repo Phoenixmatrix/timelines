@@ -3,9 +3,14 @@ import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus
 import type { AvatarOptions, SessionResponse } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { accounts } from "../api/accounts.ts";
+import { organizations } from "../api/organizations.ts";
+import { issueToken } from "../api/tokens.ts";
+import { seedSpaceFixture } from "../testing/spaces.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { durableStorage } from "../testing/durable.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { Tracker } from "../tracker/object.ts";
 import {
   avatarPrompts,
@@ -16,7 +21,16 @@ import {
   MAX_GENERATION_CALLS,
 } from "./api.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
 const annsAgent: Actor = { ...ann, agent: { id: "agt", name: "bot" } };
@@ -58,17 +72,17 @@ function bucket() {
   };
 }
 
-function setup({
+async function setup({
   ai = "ok" as "ok" | "none" | "fail" | ((n: number, prompt: string) => boolean),
 } = {}) {
   const sqlite = migratedDatabase();
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
-      ('cid', 'user', 'cid', 'Cid'), ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'owner'), ('orbit', 'ben', 'member');
-  `);
+  const registry = migratedRegistryDatabase();
+  const waits: Promise<unknown>[] = [];
+  onTestFinished(async () => {
+    await Promise.all(waits);
+    sqlite.close();
+    registry.close();
+  });
   const store = bucket();
   let calls = 0;
   const run = vi.fn(async (_model: string, input: { prompt: string }) => {
@@ -80,6 +94,7 @@ function setup({
   const trackers = new Map<string, Tracker>();
   const env = {
     DB: d1(sqlite),
+    REGISTRY_DB: d1(registry),
     AVATARS: store,
     AI: ai === "none" ? undefined : { run },
     TRACKER: {
@@ -94,15 +109,36 @@ function setup({
       },
     },
   } as unknown as Env;
+  onTestFinished(installCutoverTestControl(env).close);
+  await initializeFreshSpaceInstallation(env);
+  sqlite.exec(`
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'), ('cid', 'user', 'cid', 'Cid');
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "orbit", slug: "orbit", displayName: "Orbit", kind: "company" },
+    space: { id: "space-orbit", slug: "orbit-work", displayName: "Work" },
+    actorId: "ann",
+    members: [
+      { accountId: "ann", role: "owner" },
+      { accountId: "ben", role: "member" },
+    ],
+  });
+  const credentials: Record<string, string> = {};
+  for (const id of ["ann", "ben", "cid"])
+    credentials[id] = (await issueToken(env.DB, id, "avatar-test", "write")).id;
   let actor: Actor | null = ann;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
-    c.set("actor", actor);
+    c.set(
+      "actor",
+      actor ? { ...actor, credential: { kind: "token", id: credentials[actor.id]! } } : null,
+    );
     await next();
   });
   app.route("/api", avatars);
   app.route("/api", accounts);
-  const waits: Promise<unknown>[] = [];
+  app.route("/api/organizations", organizations);
   const ctx = { waitUntil: (p: Promise<unknown>) => waits.push(p), passThroughOnException() {} };
   const call = (path: string, init: RequestInit = {}) =>
     app.request(`/api${path}`, init, env, ctx as unknown as ExecutionContext);
@@ -113,6 +149,10 @@ function setup({
     waits,
     as: (next: Actor | null) => {
       actor = next;
+      if (next)
+        sqlite
+          .prepare("UPDATE accounts SET is_site_admin = ? WHERE id = ?")
+          .run(Number(next.isSiteAdmin), next.id);
     },
     call,
     upload: (bytes: Uint8Array) => call("/account/avatar", { method: "PUT", body: bytes }),
@@ -126,7 +166,7 @@ describe("avatar pictures", () => {
       "image/jpeg",
       "image/webp",
     ]);
-    const s = setup();
+    const s = await setup();
     const first = await s.upload(PNG);
     expect(first.status).toBe(200);
     const url = ((await first.json()) as SessionResponse).viewer!.avatarUrl!;
@@ -146,7 +186,7 @@ describe("avatar pictures", () => {
   });
 
   test("rejects anything else, oversized pictures, agents and signed-out requests", async () => {
-    const s = setup();
+    const s = await setup();
     expect((await s.upload(new TextEncoder().encode("<svg onload=alert(1)>"))).status).toBe(415);
     const huge = new Uint8Array(MAX_AVATAR_BYTES + 1);
     huge.set(PNG);
@@ -159,7 +199,7 @@ describe("avatar pictures", () => {
   });
 
   test("removing goes back to initials and deletes the picture", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(PNG);
     const removed = await s.call("/account/avatar", { method: "DELETE" });
     expect(((await removed.json()) as SessionResponse).viewer!.avatarUrl).toBeNull();
@@ -168,7 +208,7 @@ describe("avatar pictures", () => {
   });
 
   test("serves only well-formed picture keys", async () => {
-    const s = setup();
+    const s = await setup();
     for (const path of [
       "/avatars/ann/../secret",
       "/avatars/ann/abc.svg",
@@ -182,7 +222,7 @@ describe("generated options", () => {
   const options = async (response: Response) => (await response.json()) as AvatarOptions;
 
   test("are made once, four of them, from fixed prompts", async () => {
-    const s = setup();
+    const s = await setup();
     expect(await options(await s.call("/account/avatar/options"))).toEqual({
       status: "none",
       options: [],
@@ -206,7 +246,7 @@ describe("generated options", () => {
   });
 
   test("gateway logs keep the pictures' prompts only where the person's account says so (CORE-290)", async () => {
-    const s = setup();
+    const s = await setup();
     s.sqlite.exec(
       "INSERT INTO account_ai_log_bodies (account_id, component, keep) VALUES ('ann', 'avatars', 1)",
     );
@@ -216,18 +256,18 @@ describe("generated options", () => {
     const options = s.run.mock.calls.map((call) => (call as unknown[])[2] as AiOptions);
     expect(options.map((o) => [o.gateway?.metadata, o.extraHeaders ?? null])).toEqual([
       ...[0, 1, 2, 3].map(() => [
-        { component: "avatars", account: "ann", feature: "avatars" },
+        { component: "avatars", scopeKind: "person", scopeId: "ann", feature: "avatars" },
         null,
       ]),
       ...[0, 1, 2, 3].map(() => [
-        { component: "avatars", account: "ben", feature: "avatars" },
+        { component: "avatars", scopeKind: "person", scopeId: "ben", feature: "avatars" },
         { "cf-aig-collect-log-payload": "false" },
       ]),
     ]);
   });
 
   test("a double click pays once", async () => {
-    const s = setup();
+    const s = await setup();
     const [a, b] = await Promise.all([
       s.call("/account/avatar/options", { method: "POST" }),
       s.call("/account/avatar/options", { method: "POST" }),
@@ -238,7 +278,7 @@ describe("generated options", () => {
 
   test("refusals are retried within a hard budget; nothing made can be tried again", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const failed = setup({ ai: "fail" });
+    const failed = await setup({ ai: "fail" });
     expect((await failed.call("/account/avatar/options", { method: "POST" })).status).toBe(502);
     expect(failed.run).toHaveBeenCalledTimes(MAX_GENERATION_CALLS);
     expect(await options(await failed.call("/account/avatar/options"))).toEqual({
@@ -248,7 +288,7 @@ describe("generated options", () => {
     expect((await failed.call("/account/avatar/options", { method: "POST" })).status).toBe(502);
 
     // The provider's filter refuses harmless prompts at random: a retry fills the slot.
-    const flaky = setup({ ai: (n) => n % 2 === 0 });
+    const flaky = await setup({ ai: (n) => n % 2 === 0 });
     expect(
       (await options(await flaky.call("/account/avatar/options", { method: "POST" }))).options,
     ).toHaveLength(4);
@@ -258,7 +298,7 @@ describe("generated options", () => {
   test("a preset the provider always refuses falls back to the fixed fallback", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const refused = avatarPrompts("ann")[1]!;
-    const s = setup({ ai: (_, prompt) => prompt !== refused });
+    const s = await setup({ ai: (_, prompt) => prompt !== refused });
     const made = await options(await s.call("/account/avatar/options", { method: "POST" }));
     expect(made.options).toHaveLength(4);
     const prompts = s.run.mock.calls.map((call) => call[1].prompt);
@@ -274,7 +314,7 @@ describe("generated options", () => {
 
   test("anything made is final, even a short set", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const s = setup({ ai: (n) => n < 2 });
+    const s = await setup({ ai: (n) => n < 2 });
     const made = await s.call("/account/avatar/options", { method: "POST" });
     expect(made.status).toBe(201);
     expect((await options(made)).options).toHaveLength(2);
@@ -284,14 +324,15 @@ describe("generated options", () => {
   });
 
   test("are their owner's alone, and off without AI", async () => {
-    const s = setup();
+    const s = await setup();
     await s.call("/account/avatar/options", { method: "POST" });
     s.as(ben);
     expect((await s.call("/account/avatar/options/0")).status).toBe(404);
     s.as(annsAgent);
     expect((await s.call("/account/avatar/options", { method: "POST" })).status).toBe(403);
     expect(
-      (await setup({ ai: "none" }).call("/account/avatar/options", { method: "POST" })).status,
+      (await (await setup({ ai: "none" })).call("/account/avatar/options", { method: "POST" }))
+        .status,
     ).toBe(503);
   });
 });
@@ -299,29 +340,31 @@ describe("generated options", () => {
 describe("organization icons", () => {
   const cid: Actor = { id: "cid", slug: "cid", displayName: "Cid", isSiteAdmin: false };
   const admin: Actor = { id: "cid", slug: "cid", displayName: "Cid", isSiteAdmin: true };
-  const put = (s: ReturnType<typeof setup>, slug = "orbit") =>
-    s.call(`/accounts/${slug}/avatar`, { method: "PUT", body: PNG });
+  const put = (
+    s: { call(path: string, init?: RequestInit): Response | Promise<Response> },
+    slug = "orbit",
+  ) => s.call(`/organizations/${slug}/avatar`, { method: "PUT", body: PNG });
 
   test("owners and site admins set and remove it; it shows on the organization", async () => {
-    const s = setup();
+    const s = await setup();
     const saved = await put(s);
     expect(saved.status).toBe(200);
     const { avatarUrl } = (await saved.json()) as { avatarUrl: string };
     expect(avatarUrl).toMatch(/^\/api\/avatars\/orbit\/[0-9a-f]{32}\.png$/);
-    const page = (await (await s.call("/accounts/orbit")).json()) as {
-      avatarUrl: string;
-      viewerCanManage: boolean;
+    const page = (await (await s.call("/organizations/orbit")).json()) as {
+      organization: { avatarUrl: string };
+      viewerRole: string;
     };
-    expect(page).toMatchObject({ avatarUrl, viewerCanManage: true });
+    expect(page).toMatchObject({ organization: { avatarUrl }, viewerRole: "owner" });
     s.as(admin);
-    expect((await s.call("/accounts/orbit/avatar", { method: "DELETE" })).status).toBe(200);
+    expect((await s.call("/organizations/orbit/avatar", { method: "DELETE" })).status).toBe(200);
     expect(
-      ((await (await s.call("/accounts/orbit")).json()) as { avatarUrl: null }).avatarUrl,
-    ).toBeNull();
+      s.sqlite.prepare("SELECT avatar_key FROM organizations WHERE id = 'orbit'").get(),
+    ).toEqual({ avatar_key: null });
   });
 
-  test("members, outsiders, agents and signed-out people can't, and see no manage control", async () => {
-    const s = setup();
+  test("members, outsiders, agents and signed-out people cannot change directory icons", async () => {
+    const s = await setup();
     for (const [actor, status] of [
       [ben, 403],
       [cid, 403],
@@ -330,36 +373,72 @@ describe("organization icons", () => {
     ] as const) {
       s.as(actor);
       expect((await put(s)).status).toBe(status);
-      expect(
-        ((await (await s.call("/accounts/orbit")).json()) as { viewerCanManage: boolean })
-          .viewerCanManage,
-      ).toBe(false);
     }
     expect(s.store.objects.size).toBe(0);
   });
 
   test("the organization route is for organizations only", async () => {
-    const s = setup();
+    const s = await setup();
     expect((await put(s, "ben")).status).toBe(404);
     expect((await put(s, "missing")).status).toBe(404);
   });
 
   test("organizations get their own once-only set, from logo-style prompts", async () => {
-    const s = setup();
-    const made = await s.call("/accounts/orbit/avatar/options", { method: "POST" });
+    const s = await setup();
+    const made = await s.call("/organizations/orbit/avatar/options", { method: "POST" });
     expect(made.status).toBe(201);
     expect(((await made.json()) as AvatarOptions).options).toEqual(
-      [0, 1, 2, 3].map((n) => `/api/accounts/orbit/avatar/options/${n}`),
+      [0, 1, 2, 3].map((n) => `/api/organizations/orbit/avatar/options/${n}`),
     );
+    const image = await s.call("/organizations/orbit/avatar/options/0");
+    expect(image.status).toBe(200);
+    expect(new Uint8Array(await image.arrayBuffer())).toEqual(JPEG);
+    await Promise.all(s.waits);
+    expect(
+      s.sqlite
+        .prepare(
+          "SELECT scope_kind, scope_id, SUM(calls) AS calls FROM ai_usage GROUP BY scope_kind, scope_id",
+        )
+        .all(),
+    ).toEqual([{ scope_kind: "person", scope_id: "ann", calls: 4 }]);
     expect(s.run.mock.calls.map((call) => call[1].prompt)).toEqual(avatarPrompts("orbit", "org"));
     expect(avatarPrompts("orbit", "org")).not.toEqual(avatarPrompts("orbit", "user"));
-    expect((await s.call("/accounts/orbit/avatar/options", { method: "POST" })).status).toBe(409);
+    expect((await s.call("/organizations/orbit/avatar/options", { method: "POST" })).status).toBe(
+      409,
+    );
     // Ann's own set is separate, and a plain member can't load the org's.
     expect((await (await s.call("/account/avatar/options")).json()) as AvatarOptions).toEqual({
       status: "none",
       options: [],
     });
     s.as(ben);
-    expect((await s.call("/accounts/orbit/avatar/options/0")).status).toBe(403);
+    expect((await s.call("/organizations/orbit/avatar/options/0")).status).toBe(403);
   });
+  test.each(["credential", "membership"] as const)(
+    "revoked %s prevents generated publication and further paid calls",
+    async (revocation) => {
+      const s = await setup();
+      s.run.mockImplementationOnce(async () => {
+        if (revocation === "credential")
+          s.sqlite.exec("DELETE FROM access_tokens WHERE user_id = 'ann'");
+        else
+          s.sqlite.exec(
+            "DELETE FROM organization_members WHERE organization_id = 'orbit' AND account_id = 'ann'",
+          );
+        return { image: btoa(String.fromCharCode(...JPEG)) };
+      });
+      expect((await s.call("/organizations/orbit/avatar/options", { method: "POST" })).status).toBe(
+        403,
+      );
+      expect(s.run).toHaveBeenCalledTimes(1);
+      expect(s.store.objects.size).toBe(0);
+      expect(
+        s.sqlite
+          .prepare(
+            "SELECT status, options FROM organization_avatar_generations WHERE organization_id = 'orbit'",
+          )
+          .get(),
+      ).toEqual({ status: "failed", options: "[]" });
+    },
+  );
 });

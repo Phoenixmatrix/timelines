@@ -1,4 +1,4 @@
-// CI run history (category "ci-runs", CORE-200): an account's CI runs older
+// CI run history (category "ci-runs", CORE-200): an Space's CI runs older
 // than `days` before the run's moment, with their jobs, steps and logs (the
 // schema cascades them), keeping the latest `keepLatest` runs of each ref.
 //
@@ -27,7 +27,7 @@ interface Item {
 const MAX_RUNS = 50;
 
 /** Parameters: account id, cutoff, keepLatest - 1. `r` is the run. */
-const MATCHES = `r.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+const MATCHES = `r.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND r.status NOT IN ('queued', 'running')
   AND coalesce(r.finished_at, r.created_at) < ?
   AND (SELECT n.number FROM ci_runs n
@@ -56,11 +56,11 @@ const SIZE = `
   AS bytes`;
 
 function scope(ctx: CleanupContext): [string, string, number] {
-  if (ctx.target.scope !== "account") throw new Error("ci-runs is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("ci-runs is a Space category.");
   const { days, keepLatest } = ctx.thresholds;
   if (days === undefined || keepLatest === undefined)
     throw new Error("ci-runs needs its days and keepLatest thresholds.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days), keepLatest - 1];
+  return [ctx.target.id, daysBefore(ctx.now, days), keepLatest - 1];
 }
 
 /** Those of `ids` a registry publish names as the run it came from. */

@@ -8,6 +8,7 @@ import type { Context } from "hono";
 import type { AppEnv } from "../auth.ts";
 import { hashToken } from "../auth.ts";
 import { db, nowIso } from "../schema.ts";
+import { resolveJobAuthority, type WorkAuthority } from "../ci/admission.ts";
 
 export const JOB_TOKEN_PREFIX = "gmj_";
 
@@ -20,6 +21,7 @@ const JOB_PATHS =
   /^\/api\/repos\/[^/]+\/[^/]+\/(?:(?:deployments|environments)(?:\/|$)|steps\/artifacts\/)/;
 
 export interface JobCaller {
+  authority: WorkAuthority;
   jobId: string;
   jobName: string;
   runId: string;
@@ -54,8 +56,8 @@ export function jobRoute(c: Context<AppEnv>): boolean {
 }
 
 /** The job behind a credential, while the job runs; null for anything else. */
-export async function jobCaller(d1: D1Database, secret: string): Promise<JobCaller | null> {
-  const row = await db(d1)
+export async function jobCaller(env: Env, secret: string): Promise<JobCaller | null> {
+  const row = await db(env.DB)
     .selectFrom("ci_job_tokens as t")
     .innerJoin("ci_jobs as j", "j.id", "t.job_id")
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
@@ -83,5 +85,11 @@ export async function jobCaller(d1: D1Database, secret: string): Promise<JobCall
     .where("r.status", "in", ["queued", "running"])
     .whereRef("j.source_id", "=", "r.source_id")
     .executeTakeFirst();
-  return row ?? null;
+  if (!row) return null;
+  try {
+    const { authority } = await resolveJobAuthority(env, row.jobId);
+    return { ...row, authority };
+  } catch {
+    return null;
+  }
 }

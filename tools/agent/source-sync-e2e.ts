@@ -99,7 +99,7 @@ export async function runSourceSyncE2E(
     const author = join(ctx.work, `${slug}-author`);
     clones.push(author);
     await gm(["clone", f.repo, author], "marco");
-    await gm(["timeline", "start", slug, "--owner", "orbit", "--policy", "auto"], "marco", author);
+    await gm(["timeline", "start", slug, "--space", "orbit", "--policy", "auto"], "marco", author);
     await writeFile(join(author, "approved.txt"), "approved snapshot\n");
     await gm(["commit", "-m", "Approved source snapshot"], "marco", author);
     await gm(["push"], "marco", author);
@@ -115,7 +115,7 @@ export async function runSourceSyncE2E(
       await gm(["clone", f.repo, cwd], "marco");
       await f.git(["config", "user.name", "Source Sync Fixture"], cwd);
       await f.git(["config", "user.email", "source-sync@example.invalid"], cwd);
-      await gm(["timeline", "use", slug, "--owner", "orbit"], "marco", cwd);
+      await gm(["timeline", "use", slug, "--space", "orbit"], "marco", cwd);
       return cwd;
     };
     const late = await clone("late");
@@ -225,9 +225,9 @@ export async function runSourceSyncE2E(
       bookmarks,
     );
     await denied(late, ["push"], "timeline_ended");
-    await gm(["timeline", "use", "main", "--owner", "orbit"], "marco", late);
+    await gm(["timeline", "use", "main", "--space", "orbit"], "marco", late);
     const mainChoice = JSON.parse(
-      await gm(["timeline", "list", "--owner", "orbit"], "marco", late),
+      await gm(["timeline", "list", "--space", "orbit"], "marco", late),
     );
     assert.equal(mainChoice.current, null);
     await gm(["push"], "marco", late);
@@ -248,7 +248,7 @@ export async function runSourceSyncE2E(
     await denied(revised, ["push"], "timeline_ended");
     const continuation = `${slug}-continuation`;
     await gm(
-      ["timeline", "start", continuation, "--owner", "orbit", "--policy", "approval"],
+      ["timeline", "start", continuation, "--space", "orbit", "--policy", "approval"],
       "marco",
       revised,
     );
@@ -333,7 +333,7 @@ export async function runSourceSyncE2E(
     // An abandoned divergent source has no exact integration receipt: refusing must be atomic.
     const unknownSlug = `${slug}-unknown`;
     await gm(
-      ["timeline", "start", unknownSlug, "--owner", "orbit", "--policy", "approval"],
+      ["timeline", "start", unknownSlug, "--space", "orbit", "--policy", "approval"],
       "marco",
       late,
     );

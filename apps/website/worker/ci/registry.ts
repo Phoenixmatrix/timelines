@@ -11,19 +11,21 @@
 
 import { generateTokenSecret, hashToken } from "../auth.ts";
 import { db } from "../schema.ts";
+import { resolveJobAuthority } from "./admission.ts";
 
 export const CONFIG_PLACEHOLDER = "${GITMATRIX_CONFIG}";
 const GRACE_MINUTES = 30;
 
 export async function mintJobToken(
-  d1: D1Database,
+  env: Env,
   jobId: string,
   timeoutMinutes: number,
 ): Promise<string> {
+  await resolveJobAuthority(env, jobId);
   // Same alphabet as access tokens, its own prefix so the registry can tell.
   const secret = `gmj_${generateTokenSecret().slice(4)}`;
   const expires = new Date(Date.now() + (timeoutMinutes + GRACE_MINUTES) * 60_000).toISOString();
-  await db(d1)
+  await db(env.DB)
     .insertInto("ci_job_tokens")
     .values({ token_hash: await hashToken(secret), job_id: jobId, expires_at: expires })
     .execute();
@@ -52,7 +54,7 @@ export function registrySetup(origin: string, owner: string, token: string): Reg
     env: {
       GITMATRIX_URL: base,
       GITMATRIX_TOKEN: token,
-      GITMATRIX_OWNER: owner,
+      GITMATRIX_SPACE: owner,
       // Image names are `${GITMATRIX_IMAGE_PREFIX}/<image>:<tag>`.
       GITMATRIX_IMAGE_PREFIX: `${host}/${owner}`,
       // npm, pnpm, yarn (npmrc), bun.

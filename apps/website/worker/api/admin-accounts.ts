@@ -20,6 +20,7 @@ import type { AppEnv } from "../auth.ts";
 import { MAX_PASSWORD, MIN_PASSWORD } from "../better-auth.ts";
 import { slugProblem } from "../names.ts";
 import { db } from "../schema.ts";
+import { personStatements } from "../spaces/store.ts";
 import { fail, readJson, requirePerson } from "./http.ts";
 
 export const adminAccounts = new Hono<AppEnv>();
@@ -101,11 +102,14 @@ adminAccounts.post("/", async (c) => {
     passwordProblem(input.password);
   if (problem) return fail(c, 400, problem);
 
+  // The personal Organization and its default Space take the same handle.
   const [slugTaken, emailTaken] = await Promise.all([
     db(c.env.DB)
       .selectFrom("accounts")
       .select("id")
       .where("slug", "=", username)
+      .unionAll(db(c.env.DB).selectFrom("organizations").select("id").where("slug", "=", username))
+      .unionAll(db(c.env.DB).selectFrom("spaces").select("id").where("slug", "=", username))
       .executeTakeFirst(),
     db(c.env.DB)
       .selectFrom("auth_users")
@@ -129,15 +133,19 @@ adminAccounts.post("/", async (c) => {
         `INSERT INTO auth_users (id, name, email, emailVerified, createdAt, updatedAt)
          VALUES (?1, ?2, ?3, 0, ?4, ?4)`,
       ).bind(id, displayName, email, now),
-      DB.prepare(
-        `INSERT INTO accounts (id, kind, slug, display_name, email, is_site_admin)
-         VALUES (?1, 'user', ?2, ?3, ?4, 0)`,
-      ).bind(id, username, displayName, email),
+      // A person, never a bare Account: their private personal Organization
+      // and default Space come with them, as with an invited sign-up.
+      ...personStatements(DB, {
+        id,
+        slug: username,
+        displayName,
+        email,
+        isSiteAdmin: false,
+      }),
       DB.prepare(
         `INSERT INTO auth_accounts (id, accountId, providerId, userId, password, createdAt, updatedAt)
          VALUES (?1, ?2, 'credential', ?2, ?3, ?4, ?4)`,
       ).bind(crypto.randomUUID(), id, hash, now),
-      DB.prepare(`DELETE FROM auth_invites WHERE email = ?`).bind(email),
     ]);
   } catch (error) {
     // Lost a race for the username or address since the checks above.

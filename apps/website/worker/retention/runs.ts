@@ -2,7 +2,7 @@
 // and reading them back. The cleanup contract is in engine.ts; cleanups are
 // registered in cleanups/index.ts.
 //
-// - A run covers one target (an account, or the site) and some categories,
+// - A run covers one explicit Space, person, or Instance target and categories,
 //   each with the thresholds it uses. It is a dry run (select only) or a real
 //   run (select, then remove), and records counts, bytes, batches and errors
 //   per category in cleanup_run_categories, totals in cleanup_runs.
@@ -26,12 +26,20 @@ import type {
 } from "../../shared/retention.ts";
 import { productionOnly } from "../preview.ts";
 import { batch, db } from "../schema.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
+import { isActorCredentialLive } from "../auth.ts";
+import type { Actor } from "../db.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
 import { priceTimeline } from "../usage/prices.ts";
 import { category, overlappingPairs } from "./categories.ts";
 import { cleanupFor } from "./cleanups/index.ts";
 import { categoryCost } from "./costs.ts";
 import type { CleanupContext } from "./engine.ts";
 import { enabledTargets, type RetentionTarget } from "./policies.ts";
+
+export interface RetentionAuthority extends Actor {
+  migrationEpoch: number;
+}
 
 export interface RetentionJob {
   type: "retention";
@@ -51,6 +59,8 @@ export interface NewRun {
   target: RetentionTarget;
   trigger: "schedule" | "manual";
   actorId: string | null;
+  /** Original nonsecret credential identity for manual delayed work. */
+  authority?: RetentionAuthority;
   dryRun: boolean;
   /** In order; each with its full thresholds. */
   categories: { id: string; thresholds: Record<string, number> }[];
@@ -62,9 +72,11 @@ export async function createRun(d1: D1Database, run: NewRun): Promise<number> {
   const row = await db(d1)
     .insertInto("cleanup_runs")
     .values({
-      account_id: run.target.scope === "account" ? run.target.accountId : null,
+      scope_kind: run.target.kind,
+      scope_id: run.target.id,
       trigger: run.trigger,
       actor_id: run.actorId,
+      authority: run.trigger === "manual" && run.authority ? JSON.stringify(run.authority) : null,
       dry_run: run.dryRun ? 1 : 0,
       status: "queued",
       as_of: at,
@@ -141,8 +153,7 @@ export async function advanceRun(
     if (!exists) return "missing";
     return exists.status === "succeeded" || exists.status === "failed" ? "done" : "busy";
   }
-  const target: RetentionTarget =
-    run.account_id === null ? { scope: "site" } : { scope: "account", accountId: run.account_id };
+  const target: RetentionTarget = { kind: run.scope_kind, id: run.scope_id };
   const categories = await kdb
     .selectFrom("cleanup_run_categories")
     .selectAll()
@@ -209,7 +220,7 @@ export async function advanceRun(
   for (const row of categories) {
     if (row.status === "succeeded" || row.status === "failed") continue;
     const cleanup = cleanupFor(row.category);
-    if (!cleanup || !category(row.category)) {
+    if (!cleanup || category(row.category)?.scope !== target.kind) {
       if (!(await save(row.category, { status: "failed", error: "No cleanup for this category." })))
         return "busy";
       continue;
@@ -236,6 +247,50 @@ export async function advanceRun(
       }
       let progress: { next: string | null; count: number; bytes: number };
       try {
+        if (run.trigger === "manual") {
+          const authority: RetentionAuthority | null = run.authority
+            ? (JSON.parse(run.authority) as RetentionAuthority)
+            : null;
+          const admission = await cutoverControl(env).admission(4);
+          if (!admission.allowed) throw new Error("space_cutover_fenced");
+          if (!authority || admission.epoch !== authority.migrationEpoch)
+            throw new Error("migration_epoch_mismatch");
+          if (
+            !authority ||
+            authority.id !== run.actor_id ||
+            authority.agent ||
+            !(await isActorCredentialLive(env.DB, authority, "write"))
+          )
+            throw new Error("Retention initiator credential is missing, expired, or revoked.");
+          const person =
+            run.actor_id === null
+              ? undefined
+              : await kdb
+                  .selectFrom("accounts")
+                  .select(["id", "slug", "display_name", "is_site_admin"])
+                  .where("id", "=", run.actor_id)
+                  .where("kind", "=", "user")
+                  .executeTakeFirst();
+          if (!person) throw new Error("Retention initiator is no longer available.");
+          if (target.kind === "person" && target.id !== person.id)
+            throw new Error("Personal retention belongs only to its initiating person.");
+          if (target.kind === "instance" && person.is_site_admin !== 1)
+            throw new Error("Retention initiator is no longer an Instance administrator.");
+          if (target.kind === "space") {
+            const access = await resolveSpaceAccess(
+              env.DB,
+              {
+                id: person.id,
+                slug: person.slug,
+                displayName: person.display_name,
+                isSiteAdmin: person.is_site_admin === 1,
+              },
+              target.id,
+            );
+            if (access?.grant.role !== "admin")
+              throw new Error("Retention initiator no longer has a live Space admin grant.");
+          }
+        }
         const selection = await cleanup.select(ctx, cursor);
         let count = selection.count ?? selection.items.length;
         let bytes = selection.bytes;
@@ -320,7 +375,7 @@ export async function runRetentionJob(env: Env, message: Message<RetentionJob>):
 
 /**
  * Hourly: start scheduled runs that are due, and restart stalled ones. With
- * nothing enabled, the only scheduled run is the site's fixed categories.
+ * nothing enabled, the only scheduled run is the Instance's fixed categories.
  */
 export async function retentionCron(
   env: Env,
@@ -337,10 +392,7 @@ export async function retentionCron(
       .select("id")
       .where("trigger", "=", "schedule")
       .where("created_at", ">", new Date(now.getTime() - SCHEDULE_EVERY_MS).toISOString());
-    recent =
-      target.scope === "site"
-        ? recent.where("account_id", "is", null)
-        : recent.where("account_id", "=", target.accountId);
+    recent = recent.where("scope_kind", "=", target.kind).where("scope_id", "=", target.id);
     if (await recent.executeTakeFirst()) continue;
     scheduled.push(
       await createRun(env.DB, {
@@ -373,11 +425,10 @@ function runQuery(d1: D1Database, target: RetentionTarget) {
   const query = db(d1)
     .selectFrom("cleanup_runs as r")
     .leftJoin("accounts as a", "a.id", "r.actor_id")
-    .leftJoin("accounts as o", "o.id", "r.account_id")
     .select([
       "r.id",
-      "r.account_id",
-      "o.slug as account",
+      "r.scope_kind",
+      "r.scope_id",
       "r.trigger",
       "a.slug as actor",
       "r.dry_run",
@@ -390,9 +441,7 @@ function runQuery(d1: D1Database, target: RetentionTarget) {
       "r.bytes",
       "r.error",
     ]);
-  return target.scope === "site"
-    ? query.where("r.account_id", "is", null)
-    : query.where("r.account_id", "=", target.accountId);
+  return query.where("r.scope_kind", "=", target.kind).where("r.scope_id", "=", target.id);
 }
 
 type RunRow = Awaited<ReturnType<ReturnType<typeof runQuery>["execute"]>>[number];
@@ -450,8 +499,7 @@ async function toRuns(d1: D1Database, rows: RunRow[]): Promise<RetentionRun[]> {
     const own = categories.filter((c) => c.run_id === r.id);
     return {
       id: r.id,
-      level: r.account_id === null ? "site" : "account",
-      account: r.account,
+      target: { kind: r.scope_kind, id: r.scope_id },
       trigger: r.trigger,
       actor: r.actor,
       dryRun: r.dry_run === 1,

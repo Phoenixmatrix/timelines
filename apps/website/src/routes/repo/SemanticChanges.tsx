@@ -105,7 +105,7 @@ type FeedState = { query: string; feed: SemanticFeedResponse | null; error: stri
 export function SemanticChanges() {
   const repo = useRepo();
   const [searchParams] = useSearchParams();
-  const base = repoPath(repo.owner.slug, repo.name);
+  const base = repoPath(repo.space.slug, repo.name);
   const queryParams = new URLSearchParams();
   for (const key of ["ref", "cursor", "path", "kind", "language"]) {
     const value = searchParams.get(key);

@@ -1,6 +1,7 @@
 import { selectRepos } from "../db.ts";
 import { db } from "../schema.ts";
 import { getWorkSource, resolveSource } from "../timelines/sources.ts";
+import { parseWorkAuthority, resolveWorkAuthority } from "./admission.ts";
 
 type TeardownClaim = { runId: string } | { deploymentId: number; commit: string };
 
@@ -19,7 +20,7 @@ export async function ciSource(
   if (!claim) throw new Error("Repository is unavailable.");
   let parent = db(env.DB)
     .selectFrom("deployments as d")
-    .select("d.id")
+    .select(["d.id", "d.authority"])
     .where("d.repo_id", "=", repoId)
     .where("d.source_id", "=", sourceId)
     .where("d.status", "=", "expired")
@@ -51,8 +52,10 @@ export async function ciSource(
       .where("d.commit_oid", "=", claim.commit)
       .where("d.teardown_run_id", "is", null);
   }
-  const admitted = await parent.executeTakeFirst();
-  if (!admitted) throw new Error("No exact admitted teardown source claim.");
+  const admitted = await parent.execute();
+  if (admitted.length === 0) throw new Error("No exact admitted teardown source claim.");
+  for (const deployment of admitted)
+    await resolveWorkAuthority(env, parseWorkAuthority(deployment.authority), repoId);
   if (sourceId === "canonical") return { ...repo, source_id: sourceId };
   const source = await getWorkSource(env, repoId, sourceId);
   const root = await db(env.DB)
@@ -61,10 +64,14 @@ export async function ciSource(
     .where("repo_id", "=", repoId)
     .where("source_id", "=", sourceId)
     .where("consumer_kind", "=", "deployment")
-    .where("consumer_id", "=", String(admitted.id))
-    .executeTakeFirst();
+    .where(
+      "consumer_id",
+      "in",
+      admitted.map((deployment) => String(deployment.id)),
+    )
+    .execute();
   if (
-    !root ||
+    root.length !== admitted.length ||
     !source?.artifacts_remote ||
     !source.initial_token_revoked ||
     !["ready", "archived"].includes(source.state)

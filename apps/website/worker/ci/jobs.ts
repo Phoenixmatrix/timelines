@@ -9,6 +9,7 @@ import { batch, db, nowIso } from "../schema.ts";
 import type { JobSpec } from "./config.ts";
 import { registrySetup, revokeJobTokens } from "./registry.ts";
 import { previousVerification } from "./verification.ts";
+import { resolveJobAuthority, WorkAuthorizationError } from "./admission.ts";
 
 /** What ci_jobs.spec holds: the parsed job with pipeline env merged in. */
 export type StoredJob = Omit<JobSpec, "name">;
@@ -26,7 +27,7 @@ export async function loadJob(d1: D1Database, jobId: string) {
     .selectFrom("ci_jobs as j")
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .innerJoin("repos as p", "p.id", "j.repo_id")
-    .innerJoin("accounts as o", "o.id", "p.owner_id")
+    .innerJoin("spaces as s", "s.id", "p.space_id")
     .selectAll("j")
     .select([
       "r.number",
@@ -39,7 +40,7 @@ export async function loadJob(d1: D1Database, jobId: string) {
       "r.landing_id",
       "r.queue_id",
       "r.step",
-      sql<string>`o.slug || '/' || p.name`.as("full_name"),
+      sql<string>`s.slug || '/' || p.name`.as("full_name"),
       "p.artifacts_name",
       "p.artifacts_remote",
     ])
@@ -65,10 +66,12 @@ async function secretsFor(d1: D1Database, repoId: string, names: string[]) {
  * package tools' configuration for publishing with the job's credential.
  */
 export async function jobPayload(
-  d1: D1Database,
+  env: Env,
   job: JobContext,
   registry: { origin: string; token: string },
 ): Promise<CiClaimedJob> {
+  await resolveJobAuthority(env, job.id);
+  const d1 = env.DB;
   const spec = JSON.parse(job.spec) as StoredJob;
   const secrets = await secretsFor(d1, job.repo_id, spec.secrets);
   const setup = registrySetup(registry.origin, job.full_name.split("/")[0] ?? "", registry.token);
@@ -89,6 +92,8 @@ export async function jobPayload(
   // source (whose ref is just `work`, CORE-296), names the timeline.
   const timeline = job.timeline_slug ?? timelineSlug ?? timelineSlugOf(`refs/heads/${job.ref}`);
   const gitUrl = `${registry.origin}/${job.full_name}${timelineSlug ? `@${encodeURIComponent(timelineSlug)}` : ""}.git`;
+  const verifiedBase = JSON.stringify(await previousVerification(d1, job.id));
+  await resolveJobAuthority(env, job.id);
   return {
     id: job.id,
     runId: job.run_id,
@@ -126,7 +131,7 @@ export async function jobPayload(
       ...spec.env,
       ...secrets,
       // Reserved: repository env and secrets cannot manufacture verification provenance.
-      GITMATRIX_VERIFIED_BASE: JSON.stringify(await previousVerification(d1, job.id)),
+      GITMATRIX_VERIFIED_BASE: verifiedBase,
     },
     files: setup.files,
     steps: spec.steps.map((s, i) => ({ position: i, name: s.name, run: s.run })),
@@ -152,6 +157,20 @@ export async function report(
   const kdb = db(d1);
   const job = await loadJob(d1, jobId);
   if (!job) throw new Error(`No CI job ${jobId}`);
+  const authorize = async () => {
+    try {
+      await resolveJobAuthority(env, jobId);
+      return true;
+    } catch (error) {
+      await revokeJobTokens(d1, jobId);
+      if (!(error instanceof WorkAuthorizationError)) throw error;
+      // Ask the runner to stop without accepting logs, steps or success.
+      // Only its later terminal acknowledgment releases the source claim.
+      if (update.done) await settleStoppedJob(env, jobId, "Job authority is no longer current.");
+      return false;
+    }
+  };
+  if (!(await authorize())) return { cancelled: true };
   const spec = JSON.parse(job.spec) as StoredJob;
   const secrets = Object.values(await secretsFor(d1, job.repo_id, spec.secrets));
   const statements: Parameters<typeof batch>[1] = [];
@@ -229,15 +248,17 @@ export async function report(
         .where("status", "in", ["pending", "running"]),
     );
   }
+  if (!(await authorize())) return { cancelled: true };
   await batch(d1, statements);
 
   // The job's registry credential ends with the job.
   if (update.done) await revokeJobTokens(d1, jobId);
   if (update.done && job.runner === "local") {
-    const instance = await env.CI_RUN.get(job.run_id).catch(() => null);
-    await instance
-      ?.sendEvent({ type: doneEvent(job.name), payload: { status: update.done.status } })
-      .catch((error) => console.error("CI: could not wake the run", error));
+    const instance = await env.CI_RUN.get(job.run_id);
+    await instance.sendEvent({
+      type: doneEvent(job.name),
+      payload: { status: update.done.status },
+    });
   }
   // Parent cancellation asks a runner to stop, but its source claim remains
   // until the runner reports done. Never mistake the request for completion.
@@ -280,10 +301,16 @@ export async function failDispatch(d1: D1Database, jobId: string, error: string)
 }
 
 /** Claim a queued job for a local runner; false if someone else got it first. */
-export async function claim(d1: D1Database, jobId: string, runnerName: string): Promise<boolean> {
-  const result = await db(d1)
+export async function claim(env: Env, jobId: string, runnerName: string): Promise<boolean> {
+  await resolveJobAuthority(env, jobId);
+  const result = await db(env.DB)
     .updateTable("ci_jobs")
-    .set({ status: "running", claimed_by: runnerName, started_at: nowIso() })
+    .set({
+      status: "running",
+      claimed_by: runnerName,
+      started_at: nowIso(),
+      source_completion_pending: 1,
+    })
     .where("id", "=", jobId)
     .where("status", "=", "queued")
     .where("run_id", "in", (eb) =>
@@ -291,4 +318,33 @@ export async function claim(d1: D1Database, jobId: string, runnerName: string): 
     )
     .executeTakeFirst();
   return result.numUpdatedRows > 0n;
+}
+
+/** Internal shutdown acknowledgment, never a capability to publish job results. */
+export async function settleStoppedJob(env: Env, jobId: string, error: string): Promise<void> {
+  const job = await loadJob(env.DB, jobId);
+  if (!job) throw new Error(`No CI job ${jobId}`);
+  const kdb = db(env.DB);
+  await batch(env.DB, [
+    kdb
+      .updateTable("ci_jobs")
+      .set({ status: "cancelled", error, finished_at: nowIso(), source_completion_pending: 0 })
+      .where("id", "=", jobId)
+      .where((eb) =>
+        eb.or([
+          eb("status", "in", ["pending", "queued", "running"]),
+          eb("source_completion_pending", "=", 1),
+        ]),
+      ),
+    kdb
+      .updateTable("ci_steps")
+      .set({ status: "cancelled", finished_at: nowIso() })
+      .where("job_id", "=", jobId)
+      .where("status", "in", ["pending", "running"]),
+  ]);
+  await revokeJobTokens(env.DB, jobId);
+  if (job.runner === "local") {
+    const instance = await env.CI_RUN.get(job.run_id);
+    await instance.sendEvent({ type: doneEvent(job.name), payload: { status: "cancelled" } });
+  }
 }

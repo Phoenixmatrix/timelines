@@ -542,7 +542,7 @@ await test("installGm installs main's newest gm and checks its checksum", async 
     }) as typeof fetch;
     const env = {
       GITMATRIX_URL: "https://gm.example/",
-      GITMATRIX_OWNER: "matrixorg",
+      GITMATRIX_SPACE: "matrixorg",
       GITMATRIX_TOKEN: "gmj_job",
     };
     const path = await installGm(env, directory, { request, arch: "x64" });

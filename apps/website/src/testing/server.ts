@@ -12,6 +12,8 @@
 
 import { commands } from "vite-plus/test/browser";
 import { onTestFinished, vi } from "vite-plus/test";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
+import type { Snapshot } from "../../shared/tracker.ts";
 
 export type Persona = "priya" | "marco" | "jun" | "sam" | "fward" | null;
 
@@ -99,7 +101,7 @@ export class TestServer {
     return server;
   }
 
-  /** Answer `method` requests to `pathname` (a URLPattern, e.g. /api/tracker/:owner) with `handler`. */
+  /** Answer `method` requests to `pathname` (a URLPattern, e.g. /api/tracker/:space) with `handler`. */
   on(method: string, pathname: string, handler: Canned): this;
   /** …or always with `value`. */
   on(method: string, pathname: string, value: object): this;
@@ -122,13 +124,33 @@ export class TestServer {
     const served = await this.#serve(
       method,
       path,
-      body === undefined ? [] : [["content-type", "application/json"]],
+      [
+        [CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION)],
+        ...(body === undefined
+          ? []
+          : ([["content-type", "application/json"]] as [string, string][])),
+      ],
       body === undefined ? null : JSON.stringify(body),
       as,
     );
     if (served.status >= 400)
       throw new Error(`${method} ${path}: ${served.status} ${served.body.slice(0, 500)}`);
     return (served.body ? JSON.parse(served.body) : undefined) as T;
+  }
+
+  /** Negotiate the actual Space and epoch before constructing a fixture mutation. */
+  async trackerContract(space: string, as?: Persona) {
+    const snapshot = await this.call<Snapshot>(
+      "GET",
+      `/api/tracker/${encodeURIComponent(space)}/snapshot`,
+      undefined,
+      as,
+    );
+    return {
+      contractVersion: snapshot.contractVersion,
+      spaceId: snapshot.spaceId,
+      migrationEpoch: snapshot.migrationEpoch,
+    };
   }
 
   /** Call the world's server as one of its agents (by id), as its token would. */
@@ -138,6 +160,7 @@ export class TestServer {
       path,
       [
         ["x-browser-test-agent", agentId],
+        [CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION)],
         ...(body === undefined
           ? []
           : ([["content-type", "application/json"]] as [string, string][])),
@@ -155,16 +178,16 @@ export class TestServer {
   }
 
   /** A repository in the world, as `gm repo create` leaves it. */
-  async repo(owner: string, name: string, visibility: "public" | "private" = "public") {
+  async repo(space: string, name: string, visibility: "public" | "private" = "public") {
     return (await browserCommands.gmWorld("repo", {
       world: this.#world(),
-      owner,
+      space,
       name,
       visibility,
-    })) as { id: string; owner: string; name: string };
+    })) as { id: string; space: string; name: string };
   }
 
-  /** Move `branch` of `repo` (owner/name) to `commit`, as a push would; null deletes it. */
+  /** Move `branch` of `repo` (space/name) to `commit`, as a push would; null deletes it. */
   async push(
     repo: string,
     branch: string,

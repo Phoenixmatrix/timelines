@@ -42,11 +42,11 @@ export function Profile() {
     <SettingsPage>
       <h1 className="m-0 text-headline">Profile</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
-        Manage your picture, display name and username. These identify you across Timelines. See{" "}
-        <Link to={`/${viewer.slug}`} className={link}>
-          your repositories
-        </Link>{" "}
-        for the projects you own.
+        Manage your picture, display name and username. These identify you across Spaces. See{" "}
+        <Link to={`/accounts/${encodeURIComponent(viewer.slug)}`} className={link}>
+          your public profile
+        </Link>
+        .
       </p>
 
       <div className="mt-8 flex flex-col gap-6">

@@ -6,14 +6,14 @@
 //
 // "policy" categories are disabled until an administrator enables them unless
 // defaultEnabled is set; thresholds default to the values here, within bounds,
-// per account (account scope) or for the whole site (site scope; site
-// administrators also set site-wide defaults for account categories).
+// per Space, private person, or Instance. Instance administrators set default
+// policies without gaining access to Space or personal records.
 //
 // Two categories describe cleanup that already ran before policies existed and
 // keeps running exactly as before: preview teardown ("active"; its two numbers
-// are the account_settings preview columns, also served by
+// are the space_settings preview columns, also served by
 // /settings/previews) and Atlas snapshot retention ("active"; ATLAS_RETENTION,
-// which an account can tighten within ATLAS_RETENTION_BOUNDS; CORE-201).
+// which a Space can tighten within ATLAS_RETENTION_BOUNDS; CORE-201).
 //
 // "fixed" categories always run with their defaults and can't be changed:
 // auth hygiene (CORE-249).
@@ -48,10 +48,10 @@ const keepLatest = (label: string, value: number): RetentionThreshold => ({
 });
 
 export const CATEGORIES = [
-  // Account scope.
+  // Space content, with personal chats explicitly separated below.
   {
     id: "ci-logs",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "CI logs",
     description: "Log text of CI jobs that finished more than the given days ago.",
@@ -61,7 +61,7 @@ export const CATEGORIES = [
   },
   {
     id: "ci-runs",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "CI run history",
     description: "CI runs older than the given days, with their jobs, steps and logs.",
@@ -75,7 +75,7 @@ export const CATEGORIES = [
   },
   {
     id: "preview-records",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Expired preview deployment records",
     description: "Records of preview deployments that expired more than the given days ago.",
@@ -84,7 +84,7 @@ export const CATEGORIES = [
   },
   {
     id: "knowledge-builds",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Knowledge build history",
     description: "Knowledge graph build records and their change lists older than the given days.",
@@ -96,7 +96,7 @@ export const CATEGORIES = [
   },
   {
     id: "ended-timeline-data",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Ended timeline overlays and page sets",
     description:
@@ -109,7 +109,7 @@ export const CATEGORIES = [
   // people's own words, the step-run artifacts and the live feed are not.
   {
     id: "step-steering",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Step instructions and steering",
     description:
@@ -119,7 +119,7 @@ export const CATEGORIES = [
   },
   {
     id: "step-artifacts",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Step run artifacts",
     description: "What step runs produced (test summaries), the given days after the run.",
@@ -129,11 +129,11 @@ export const CATEGORIES = [
   },
   {
     id: "step-feed",
-    scope: "account",
+    scope: "space",
     control: "active",
     label: "Live step feed",
     description:
-      "Each timeline's live feed keeps a step's small record for the given days, enough for readers to catch up; the step itself stays. An account can keep less, never more.",
+      "Each timeline's live feed keeps a step's small record for the given days, enough for readers to catch up; the step itself stays. A Space can keep less, never more.",
     never: ["Steps and their context"],
     thresholds: [
       {
@@ -148,7 +148,7 @@ export const CATEGORIES = [
   },
   {
     id: "timeline-work-sources",
-    scope: "account",
+    scope: "space",
     control: "policy",
     defaultEnabled: true,
     label: "Timeline work Git repositories",
@@ -166,7 +166,7 @@ export const CATEGORIES = [
   },
   {
     id: "push-log",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Push log",
     description:
@@ -180,7 +180,7 @@ export const CATEGORIES = [
   },
   {
     id: "unreachable-git",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Unreachable git data",
     description:
@@ -193,22 +193,30 @@ export const CATEGORIES = [
   },
   {
     id: "closed-issues",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Closed and canceled issues",
     description:
       "Issues closed or canceled more than the given days ago, with their comments, links and events.",
-    never: ["Open issues", "Issue keys (never reused)"],
+    never: [
+      "Open issues",
+      "Issue keys (never reused)",
+      "Migration operation deduplication evidence",
+    ],
     overlaps: ["tracker-activity"],
     thresholds: [days("days", "Days after closing", 365)],
   },
   {
     id: "tracker-activity",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Tracker activity logs and ended timelines",
     description: "Tracker activity log entries older than the given days, and ended timelines.",
-    never: ["Activity that open issues and timelines still show", "Open timelines"],
+    never: [
+      "Activity that open issues and timelines still show",
+      "Open timelines",
+      "Migration operation deduplication evidence",
+    ],
     overlaps: ["closed-issues"],
     thresholds: [
       days("eventDays", "Days to keep activity", 365),
@@ -217,7 +225,7 @@ export const CATEGORIES = [
   },
   {
     id: "assistant-chats",
-    scope: "account",
+    scope: "person",
     control: "policy",
     label: "Assistant chats",
     description: "Assistant chats nobody has used for the given days.",
@@ -240,7 +248,7 @@ export const CATEGORIES = [
   },
   {
     id: "release-notes",
-    scope: "account",
+    scope: "space",
     control: "policy",
     label: "Release notes",
     description: "Release notes older than the given days, with their entries and mentions.",
@@ -249,7 +257,7 @@ export const CATEGORIES = [
   },
   {
     id: "previews",
-    scope: "account",
+    scope: "space",
     control: "active",
     label: "Timeline previews",
     description:
@@ -276,11 +284,11 @@ export const CATEGORIES = [
   },
   {
     id: "atlas-snapshots",
-    scope: "account",
+    scope: "space",
     control: "active",
     label: "Atlas snapshots",
     description:
-      "Each repository keeps its current Atlas snapshot and recent prior ones; older priors expire and their rows are reclaimed. An account can keep fewer, never more.",
+      "Each repository keeps its current Atlas snapshot and recent prior ones; older priors expire and their rows are reclaimed. A Space can keep fewer, never more.",
     never: ["The current snapshot"],
     thresholds: [
       {
@@ -307,10 +315,10 @@ export const CATEGORIES = [
     ],
   },
 
-  // Site scope.
+  // Instance infrastructure.
   {
     id: "analysis-caches",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "Analysis caches",
     description:
@@ -320,7 +328,7 @@ export const CATEGORIES = [
   },
   {
     id: "registry-proxy-cache",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "Registry proxy cache and derived objects",
     description:
@@ -334,7 +342,7 @@ export const CATEGORIES = [
   },
   {
     id: "registry-audit",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "Registry audit log and publish records",
     description: "Registry audit entries and publish records older than the given days.",
@@ -347,7 +355,7 @@ export const CATEGORIES = [
   },
   {
     id: "auth-hygiene",
-    scope: "site",
+    scope: "instance",
     // Expired sign-in state is worth nothing to keep, so it isn't left to an
     // administrator to find and enable (CORE-249).
     control: "fixed",
@@ -359,7 +367,7 @@ export const CATEGORIES = [
   },
   {
     id: "ai-spend",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "AI spend records",
     description: "Per-call AI spend records older than the given days, rolled up to daily totals.",
@@ -370,13 +378,13 @@ export const CATEGORIES = [
   // CORE-225: what metering (CORE-207) and the Durable Object registry (CORE-197) keep.
   {
     id: "usage-history",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "Usage history",
     description:
       "Daily usage figures older than the given days, rolled up to monthly figures; monthly figures older than the given months.",
     never: [
-      "The latest figures of each account and construct (the report's current usage)",
+      "The latest figures of each explicit scope and construct (the report's current usage)",
       "Totals: a month's roll-up keeps the sum of its days",
     ],
     thresholds: [
@@ -394,17 +402,17 @@ export const CATEGORIES = [
   },
   {
     id: "ai-usage",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "AI usage records",
     description:
-      "Daily AI call and token records older than the given days, rolled up to monthly totals per account, feature and model.",
+      "Daily AI call and token records older than the given days, rolled up to monthly totals per explicit scope, feature and model.",
     never: ["Totals: a month's roll-up keeps the sum of its days", "Records of the current period"],
     thresholds: [days("days", "Days of daily records", 90, 7)],
   },
   {
     id: "durable-registry",
-    scope: "site",
+    scope: "instance",
     control: "policy",
     label: "Durable Object registry rows",
     description: "Rows of Durable Object instances purged more than the given days ago.",

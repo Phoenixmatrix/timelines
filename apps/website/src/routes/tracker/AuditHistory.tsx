@@ -67,7 +67,7 @@ const labels: Record<string, string> = {
   type: "Type",
   assigneeId: "Assignee",
   parentId: "Parent issue",
-  workspaceIds: "Workspaces",
+  projectIds: "Projects",
   labels: "Tags",
   requires: "Agent requirements",
   body: "Body",
@@ -103,9 +103,9 @@ function changes(event: IssueAuditEvent) {
       if (bookkeeping[key]) return false;
       const oldValue = before[key];
       const newValue = after[key];
-      // Tags and workspace associations are sets, not ordered text.
+      // Tags and project associations are sets, not ordered text.
       if (
-        (key === "labels" || key === "workspaceIds") &&
+        (key === "labels" || key === "projectIds") &&
         Array.isArray(oldValue) &&
         Array.isArray(newValue)
       )
@@ -133,8 +133,8 @@ function previewValue(value: unknown, key: string, snapshot: Snapshot): string {
   if (key === "status") return statusLabel({ status: value as Issue["status"] });
   if (key === "type") return typeLabel(value);
   if (key === "assigneeId") return actorName(snapshot, value);
-  if (key === "workspaceIds")
-    return snapshot.workspaces.find((workspace) => workspace.id === value)?.name ?? value;
+  if (key === "projectIds")
+    return snapshot.projects.find((project) => project.id === value)?.name ?? value;
   if (key === "teamId") return snapshot.teams.find((team) => team.id === value)?.key ?? value;
   if (["parentId", "fromId", "toId", "issueId"].includes(key))
     return snapshot.issues.find((issue) => issue.id === value)?.key ?? value;
@@ -148,7 +148,7 @@ function excerpt(text: string): string {
 function FieldPreview({ field, snapshot }: { field: FieldChange; snapshot: Snapshot }) {
   const delta = useMemo(() => {
     if (
-      (field.key === "labels" || field.key === "workspaceIds") &&
+      (field.key === "labels" || field.key === "projectIds") &&
       Array.isArray(field.before) &&
       Array.isArray(field.after)
     ) {
@@ -363,14 +363,14 @@ function AuditPages({ issueId, snapshot }: { issueId: string; snapshot: Snapshot
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
-  const owner = snapshot.owner.slug;
+  const space = snapshot.space.slug;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
     setError("");
     const query = before === null ? "limit=50" : `limit=50&before=${before}`;
     void api<IssueHistory>(
-      `/tracker/${encodeURIComponent(owner)}/issues/${encodeURIComponent(issueId)}/history?${query}`,
+      `/tracker/${encodeURIComponent(space)}/issues/${encodeURIComponent(issueId)}/history?${query}`,
       { signal: controller.signal },
     )
       .then((page) => {
@@ -387,7 +387,7 @@ function AuditPages({ issueId, snapshot }: { issueId: string; snapshot: Snapshot
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [owner, issueId, before, retry]);
+  }, [space, issueId, before, retry]);
   return (
     <div>
       <p className="mk-hint mt-0 mb-1">
@@ -436,7 +436,7 @@ function AuditPages({ issueId, snapshot }: { issueId: string; snapshot: Snapshot
   );
 }
 
-/** The parent keys by owner/issue; cursor resets pages without closing the disclosure. */
+/** The parent keys by space/issue; cursor resets pages without closing the disclosure. */
 export function AuditHistory({ issueId, snapshot }: { issueId: string; snapshot: Snapshot }) {
   const [open, setOpen] = useState(false);
   return (

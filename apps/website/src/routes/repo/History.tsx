@@ -64,7 +64,7 @@ export function useHistory(
     setError(false);
     repoData
       .history(
-        repo.owner.slug,
+        repo.space.slug,
         repo.name,
         `${head}${path ? `/${path}` : ""}`,
         withEntries,
@@ -89,7 +89,7 @@ export function useHistory(
       current = false;
     };
   }, [
-    repo.owner.slug,
+    repo.space.slug,
     repo.name,
     repo.source?.sourceId,
     head,
@@ -145,14 +145,14 @@ export function CommitInfo({ commit, repo }: { commit: CommitSummary; repo: Repo
             repo.source && repo.source.sourceId !== "canonical" ? (
               <Link
                 className="text-ink no-underline hover:underline"
-                to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source.sourceId)}
+                to={treeUrl(repo.space.slug, repo.name, commit.oid, "", repo.source.sourceId)}
               >
                 {text}
               </Link>
             ) : (
               <CommitLink
                 className="text-ink no-underline hover:underline"
-                owner={repo.owner.slug}
+                space={repo.space.slug}
                 name={repo.name}
                 sha={commit.oid}
               >
@@ -225,7 +225,7 @@ export function FileHistory({
         )}
         <Link
           className="mk-btn mk-btn--sm no-underline"
-          to={commitsUrl(repo.owner.slug, repo.name, head, path, repo.source?.sourceId)}
+          to={commitsUrl(repo.space.slug, repo.name, head, path, repo.source?.sourceId)}
         >
           {history ? countLabel(history.commits.length, !!history.next) : "File history"}
         </Link>
@@ -240,7 +240,7 @@ export function SourceHistory({ repo, head }: { repo: RepoDetail; head: string |
   const source = repo.source;
   const path =
     source?.kind === "timeline-work" && head
-      ? `/repos/${encodeURIComponent(repo.owner.slug)}/${encodeURIComponent(repo.name)}/sources/${encodeURIComponent(source.sourceId)}/lineage?commit=${encodeURIComponent(head)}`
+      ? `/repos/${encodeURIComponent(repo.space.slug)}/${encodeURIComponent(repo.name)}/sources/${encodeURIComponent(source.sourceId)}/lineage?commit=${encodeURIComponent(head)}`
       : null;
   const [state, setState] = useState<{
     path: string;
@@ -279,7 +279,7 @@ export function SourceHistory({ repo, head }: { repo: RepoDetail; head: string |
             Integrated result{" "}
             <Link
               to={treeUrl(
-                repo.owner.slug,
+                repo.space.slug,
                 repo.name,
                 receipt.integration.canonical.commit,
                 "",

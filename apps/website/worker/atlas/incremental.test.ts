@@ -2,9 +2,12 @@
 // feed must publish exactly what a full pass over the same graph and history
 // publishes, and never ask the model again for inputs it has seen.
 
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 import {
   atlasPass,
   changeFiles,
@@ -20,11 +23,24 @@ import { ENTITY_BATCH, repoScope } from "./projection.ts";
 
 const scope = repoScope("r1");
 
-function database() {
-  const sqlite = migratedDatabase();
+async function database() {
+  const { sqlite, close } = await createFreshSpaceTestEnvironment();
+  onTestFinished(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('r1', 'ann', 'big', 'private', 'art-r1', '');
   `);
   return { sqlite, db: d1(sqlite) };
@@ -80,14 +96,14 @@ function inputsHashes(sqlite: DatabaseSync): string[] {
 }
 
 /** Two copies of one repository history: `inc` projects from the feed, `full` reads everything. */
-function twins(files: number) {
+async function twins(files: number) {
   const inc = {
-    ...database(),
+    ...(await database()),
     repo: syntheticRepo(files, 7),
     calls: { n: 0, hashes: [] as string[] },
   };
   const full = {
-    ...database(),
+    ...(await database()),
     repo: syntheticRepo(files, 7),
     calls: { n: 0, hashes: [] as string[] },
   };
@@ -122,7 +138,7 @@ function twins(files: number) {
 // Each test runs two whole projection histories: allow slow CI sandboxes time.
 describe("incremental projection", { timeout: 60_000 }, () => {
   test("publishes exactly what a full pass publishes, push after push", async () => {
-    const t = twins(320);
+    const t = await twins(320);
     await t.push("b1", () => {});
     const first = await t.project("b1");
     // Nothing published yet: the first projection reads everything.
@@ -170,7 +186,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("an unchanged rebuild writes nothing and asks the model nothing", async () => {
-    const t = twins(200);
+    const t = await twins(200);
     await t.push("b1", () => {});
     await t.project("b1");
     const before = published(t.inc.sqlite);
@@ -191,7 +207,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("a failed projection's changes carry into the next increment", async () => {
-    const t = twins(240);
+    const t = await twins(240);
     await t.push("b1", () => {});
     await t.project("b1");
     await t.push("b2", (repo) => changeFiles(repo, 10));
@@ -207,7 +223,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("an incremental batch stays within the step bound and resumes by cursor", async () => {
-    const t = twins(200);
+    const t = await twins(200);
     await t.push("b1", () => {});
     await t.project("b1");
     await t.push("b2", (repo) => changeFiles(repo, 10));
@@ -219,7 +235,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("too much change, or a projection version without the feed, reads the whole graph", async () => {
-    const t = twins(120);
+    const t = await twins(120);
     await t.push("b1", () => {});
     await t.project("b1");
     // A push too big to list collapses the feed into one `full` row.
@@ -241,7 +257,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("the feed holds at most FEED_LIMIT listed changes, then one full row", async () => {
-    const { sqlite, db } = database();
+    const { sqlite, db } = await database();
     const repo = syntheticRepo(150, 3);
     await storeGraph(sqlite, db, repo, "r1", "b1");
     const listed = (sqlite.prepare("SELECT count(*) AS n FROM atlas_feed").get() as { n: number })

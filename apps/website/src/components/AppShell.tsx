@@ -2,16 +2,13 @@ import { popMotion } from "./ui.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
   ChatCenteredDotsIcon,
-  EnvelopeSimpleIcon,
   FingerprintIcon,
   GearSixIcon,
   HandWavingIcon,
-  GitBranchIcon,
   KeyIcon,
   ListChecksIcon,
   MoonIcon,
   PackageIcon,
-  PlusIcon,
   RobotIcon,
   ScrollIcon,
   NewspaperIcon,
@@ -31,18 +28,19 @@ import {
   useLocation,
   useMatch,
   useNavigation,
+  useMatches,
 } from "react-router";
 import { AssistantDock, preloadAssistant } from "../assistant/Dock.tsx";
 import { AssistantProvider, useAssistant } from "../assistant/state.tsx";
 import { PaletteProvider, SearchButton } from "../palette/Palette.tsx";
 import { useViewer } from "../lib/session.ts";
-import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
-import { scopeOf, scopeOwner } from "../lib/timelineScope.ts";
+import { scopeOf, scopeSpace } from "../lib/timelineScope.ts";
 import { needsYouBadge, needsYouLabel, useNeedsYou } from "../lib/needs-you.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo, TimelinesMark } from "./GitmatrixLogo.tsx";
 import { TimelineBanner } from "./TimelineScope.tsx";
+import { ScopeSelectors } from "./ScopeSelectors.tsx";
 import { KeyboardShortcuts } from "./KeyboardShortcuts.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
@@ -115,7 +113,7 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
               </div>
               <div className="text-body-sm text-ink-faint">
                 @{viewer.slug}
-                {viewer.isSiteAdmin && " · Site admin"}
+                {viewer.isSiteAdmin && " · Instance operator"}
               </div>
             </div>
             <div className="mk-menu-sep" />
@@ -138,18 +136,10 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
             <Menu.LinkItem
               closeOnClick
               className="mk-menu-item"
-              render={<Link to={`/${viewer.slug}`} />}
+              render={<Link to={`/accounts/${encodeURIComponent(viewer.slug)}`} />}
             >
-              <GitBranchIcon className="size-4" aria-hidden />
-              Your repositories
-            </Menu.LinkItem>
-            <Menu.LinkItem
-              closeOnClick
-              className="mk-menu-item"
-              render={<Link to={packagesPath(viewer.slug)} />}
-            >
-              <PackageIcon className="size-4" aria-hidden />
-              Your packages
+              <UserCircleIcon className="size-4" aria-hidden />
+              Your public profile
             </Menu.LinkItem>
             <div className="mk-menu-sep" />
             <Menu.LinkItem
@@ -177,13 +167,9 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
               SSH keys
             </Menu.LinkItem>
             {viewer.isSiteAdmin && (
-              <Menu.LinkItem
-                closeOnClick
-                className="mk-menu-item"
-                render={<Link to="/settings/invites" />}
-              >
-                <EnvelopeSimpleIcon className="size-4" aria-hidden />
-                Invitations
+              <Menu.LinkItem closeOnClick className="mk-menu-item" render={<Link to="/instance" />}>
+                <GearSixIcon className="size-4" aria-hidden />
+                Instance
               </Menu.LinkItem>
             )}
             <Menu.LinkItem closeOnClick className="mk-menu-item" render={<Link to="/signin" />}>
@@ -226,32 +212,37 @@ export function AppShell() {
   const needsYou = useNeedsYou(!!viewer);
   const navigation = useNavigation();
   const location = useLocation();
-  const tracker = useMatch("/tracker/:owner/*");
+  const tracker = useMatch("/tracker/:space/*");
+  const matches = useMatches();
+  const routeSpace = matches.at(-1)?.params.space;
   const params = new URLSearchParams(location.search);
   const managingTracker = Boolean(tracker) && params.get("manage") === "true";
   // Timelines and release notes are their own places, though they live under a tracker.
   const trackerPage = tracker?.params["*"]?.split("/")[0];
+  const trackerWorkbench =
+    Boolean(tracker) && !managingTracker && (!trackerPage || trackerPage === "issues");
   const onTimelines = trackerPage === "timelines" || location.pathname === "/timelines";
   const scoped = scopeOf(location.search);
-  // The graph of the account this page belongs to (a tracker, a repository,
+  // The graph of the Space this page belongs to (a tracker, a repository,
   // a settings page's); else the default one.
-  const graphOwner = scopeOwner(location.pathname, location.search);
+  const graphSpace = scopeSpace(location.pathname, location.search);
   const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
   const onHighlights = trackerPage === "highlights" || location.pathname === "/highlights";
-  const owner =
-    tracker?.params.owner ??
+  const requestedSpace =
+    tracker?.params.space ??
+    routeSpace ??
     (location.pathname === "/settings/preferences"
       ? params.get("tracker")
       : location.pathname.startsWith("/settings/")
-        ? params.get("owner")
+        ? params.get("space")
         : null);
-  const settingsParams = tracker ? new URLSearchParams(location.search) : new URLSearchParams();
-  settingsParams.set("manage", "true");
-  const settingsPath = `${owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}?${settingsParams}`;
+  const owner = viewer?.spaces.some((space) => space.slug === requestedSpace)
+    ? requestedSpace
+    : null;
   const preferencesPath = owner
     ? `/settings/preferences?tracker=${encodeURIComponent(owner)}`
     : "/settings/preferences";
-  const places = viewer?.canCreateIn.slice(1) ?? [];
+  const settingsPath = preferencesPath;
 
   // Sign-in and device approval are their own focused pages, outside the shell.
   if (location.pathname === "/signin" || location.pathname === "/device")
@@ -311,7 +302,7 @@ export function AppShell() {
               // The graph is the place (CORE-402); switching is on its rows, the
               // banner's Switch and the command palette.
               <Place
-                to={`${graphOwner ? `/tracker/${encodeURIComponent(graphOwner)}/timelines` : "/timelines"}${scoped ? `?tl=${encodeURIComponent(scoped)}` : ""}`}
+                to={`${graphSpace ? `/tracker/${encodeURIComponent(graphSpace)}/timelines` : "/timelines"}${scoped ? `?tl=${encodeURIComponent(scoped)}` : ""}`}
                 label={scoped ? `Timelines (in ${scoped})` : "Timelines"}
                 active={onTimelines}
               >
@@ -376,29 +367,6 @@ export function AppShell() {
                 )}
               </Place>
             )}
-            {places.length > 0 && <span className="mk-rail-rule max-sm:hidden" />}
-            {places.map((org) => (
-              <Tip key={org.id} label={org.displayName} side="right">
-                <NavLink
-                  to={`/${org.slug}`}
-                  className="grid size-12 place-items-center rounded-[16px]"
-                  aria-label={org.displayName}
-                >
-                  <Monogram name={org.displayName} shape="place" size="lg" src={org.avatarUrl} />
-                </NavLink>
-              </Tip>
-            ))}
-            {viewer && (
-              <Tip label="New repository" side="right">
-                <NavLink
-                  to="/new"
-                  className="mk-place mk-place--add max-sm:before:hidden"
-                  aria-label="New repository"
-                >
-                  <PlusIcon size={20} weight="bold" aria-hidden />
-                </NavLink>
-              </Tip>
-            )}
             <div className="flex-1" />
             {viewer && <AskButton />}
             {viewer && (
@@ -421,10 +389,20 @@ export function AppShell() {
             )}
           </nav>
           <main
-            className="min-w-0 flex-1 transition-opacity"
+            className={`min-w-0 flex-1 transition-opacity${trackerWorkbench ? " lg:flex lg:h-dvh lg:flex-col lg:overflow-hidden" : ""}`}
             style={{ opacity: navigation.state === "loading" ? 0.7 : 1 }}
           >
-            <TimelineBanner />
+            {trackerWorkbench ? (
+              <div className="contents lg:block lg:shrink-0">
+                <ScopeSelectors />
+                <TimelineBanner />
+              </div>
+            ) : (
+              <>
+                <ScopeSelectors />
+                <TimelineBanner />
+              </>
+            )}
             <Outlet />
           </main>
           {viewer && <AssistantDock />}

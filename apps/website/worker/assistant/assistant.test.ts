@@ -1,7 +1,7 @@
 import type { Tool } from "ai";
 import { describe, expect, test } from "vite-plus/test";
 import { describeWrite, toolLabel } from "../../shared/assistant.ts";
-import { allowedPath } from "./internal.ts";
+import { allowedPath, apiClient } from "./internal.ts";
 import { planFrom, questions } from "./plan.ts";
 import { cleanStatus, progressPrompt, stepFromMessage } from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
@@ -52,12 +52,12 @@ describe("completion evidence consumers", () => {
       navigate: false,
     });
     const showIssue = tools.reads.show_issue as Tool<
-      { owner: string; key: string },
+      { space: string; key: string },
       unknown,
       unknown
     >;
     const result = await showIssue.execute!(
-      { owner: "orbit", key: "ENG-1" },
+      { space: "orbit", key: "ENG-1" },
       { toolCallId: "show", messages: [], context: undefined },
     );
     expect(result).toMatchObject({
@@ -154,7 +154,7 @@ describe("approvals say what the request does", () => {
   test("from the call's own fields, not the model's summary", () => {
     expect(
       describeWrite("create_issue", {
-        owner: "orbit",
+        space: "orbit",
         team: "CORE",
         title: "Ship search",
         priority: 1,
@@ -305,7 +305,13 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
         return {
           status: 200,
           ok: true,
-          body: { teams: [{ id: "t", key: "CORE" }], issues: [issue] },
+          body: {
+            contractVersion: 4,
+            spaceId: "space-1",
+            migrationEpoch: 7,
+            teams: [{ id: "t", key: "CORE" }],
+            issues: [issue],
+          },
         };
       sent.push(body);
       return {
@@ -335,13 +341,27 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
         messages: [],
       });
     await run("create_issue", {
-      owner: "o",
+      space: "o",
       team: "CORE",
       title: "Design",
       requires: "tag:UX memory>=16GiB",
     });
-    await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "" } });
-    await run("update_issue", { owner: "o", key: "CORE-1", changes: { title: "y" } });
+    await run("update_issue", { space: "o", key: "CORE-1", changes: { requires: "" } });
+    await run("update_issue", { space: "o", key: "CORE-1", changes: { title: "y" } });
+    expect(
+      sent.every((body) => {
+        const envelope = body as {
+          contractVersion: number;
+          spaceId: string;
+          migrationEpoch: number;
+        };
+        return (
+          envelope.contractVersion === 4 &&
+          envelope.spaceId === "space-1" &&
+          envelope.migrationEpoch === 7
+        );
+      }),
+    ).toBe(true);
     expect(
       sent.map((b) => (b as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data),
     ).toEqual([
@@ -350,7 +370,7 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
       { title: "y" },
     ]);
     expect(
-      await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "gpu" } }),
+      await run("update_issue", { space: "o", key: "CORE-1", changes: { requires: "gpu" } }),
     ).toEqual({ error: expect.stringContaining('Unknown requirement "gpu"') });
   });
 
@@ -363,7 +383,14 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
         return {
           status: 200,
           ok: true,
-          body: { teams: [{ id: "t", key: "CORE" }], issues: [issue, other], links: [] },
+          body: {
+            contractVersion: 4,
+            spaceId: "space-1",
+            migrationEpoch: 7,
+            teams: [{ id: "t", key: "CORE" }],
+            issues: [issue, other],
+            links: [],
+          },
         };
       sent.push((body as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data);
       return { status: 200, ok: true, body: { events: [] } };
@@ -374,16 +401,16 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
         toolCallId: "t",
         messages: [],
       });
-    await run(tools.writes, "create_issue", { owner: "o", team: "CORE", title: "A", tags: ["ux"] });
+    await run(tools.writes, "create_issue", { space: "o", team: "CORE", title: "A", tags: ["ux"] });
     await run(tools.writes, "create_issue", {
-      owner: "o",
+      space: "o",
       team: "CORE",
       title: "B",
       labels: ["ux"],
     });
-    await run(tools.writes, "update_issue", { owner: "o", key: "CORE-1", changes: { tags: [] } });
+    await run(tools.writes, "update_issue", { space: "o", key: "CORE-1", changes: { tags: [] } });
     await run(tools.writes, "update_issue", {
-      owner: "o",
+      space: "o",
       key: "CORE-1",
       changes: { labels: ["data"] },
     });
@@ -391,7 +418,7 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
     expect(sent.every((d) => !("tags" in d))).toBe(true);
     type Found = { issues: { key: string; tags: string[] }[] };
     for (const filter of [{ tag: "ux" }, { label: "UX" }]) {
-      const found = (await run(tools.reads, "find_issues", { owner: "o", ...filter })) as Found;
+      const found = (await run(tools.reads, "find_issues", { space: "o", ...filter })) as Found;
       expect(found.issues.map((i) => [i.key, i.tags])).toEqual([["CORE-1", ["UX"]]]);
     }
   });
@@ -408,7 +435,18 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
     };
     const api = async (method: string, _path: string, body?: unknown) => {
       if (method === "GET")
-        return { status: 200, ok: true, body: { teams: [], issues: [issue], links: [] } };
+        return {
+          status: 200,
+          ok: true,
+          body: {
+            contractVersion: 4,
+            spaceId: "space-1",
+            migrationEpoch: 7,
+            teams: [],
+            issues: [issue],
+            links: [],
+          },
+        };
       sent.push((body as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data);
       return {
         status: 200,
@@ -425,7 +463,7 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
     const result = await (
       writes.update_issue!.execute as (i: unknown, o: unknown) => Promise<unknown>
     )(
-      { owner: "o", key: "CORE-1", changes: { requires: "tag:gpu", releaseClaim: true } },
+      { space: "o", key: "CORE-1", changes: { requires: "tag:gpu", releaseClaim: true } },
       { toolCallId: "t", messages: [] },
     );
     expect(sent[0]).toEqual({ requires: { tags: ["gpu"] }, releaseClaim: true });
@@ -435,4 +473,95 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
       note: "Released the claim held by builder: it needs tag gpu.",
     });
   });
+});
+
+describe("Space-bound tracker tools", () => {
+  test("a second tool rechecks access instead of reusing its first snapshot", async () => {
+    let reads = 0;
+    const tools = buildTools({
+      api: async () =>
+        ++reads === 1
+          ? { status: 200, ok: true, body: { issues: [], teams: [] } }
+          : { status: 404, ok: false, body: { error: "No such tracker." } },
+      writes: true,
+      approve: true,
+      navigate: false,
+    });
+    const execute = tools.reads.show_issue!.execute as (
+      input: unknown,
+      options: unknown,
+    ) => Promise<unknown>;
+    await execute({ space: "private", key: "ENG-1" }, { toolCallId: "one", messages: [] });
+    expect(
+      await execute({ space: "private", key: "ENG-1" }, { toolCallId: "two", messages: [] }),
+    ).toEqual({ error: "No such tracker." });
+    expect(reads).toBe(2);
+  });
+
+  test("unknown and cross-Space Projects never widen queries or submit mutations", async () => {
+    let writes = 0;
+    const tools = buildTools({
+      api: async (method) => {
+        if (method !== "GET") writes++;
+        return {
+          status: 200,
+          ok: true,
+          body: {
+            contractVersion: 4,
+            spaceId: "space-1",
+            migrationEpoch: 7,
+            projects: [{ id: "project-local", slug: "local" }],
+            issues: [],
+            teams: [],
+            links: [],
+          },
+        };
+      },
+      writes: true,
+      approve: false,
+      navigate: false,
+    });
+    const find = tools.reads.find_issues!.execute as (
+      input: unknown,
+      options: unknown,
+    ) => Promise<unknown>;
+    expect(
+      await find({ space: "private", project: "sibling" }, { toolCallId: "find", messages: [] }),
+    ).toEqual({ error: "No Project sibling in this Space." });
+    const create = tools.writes.create_issue!.execute as (
+      input: unknown,
+      options: unknown,
+    ) => Promise<unknown>;
+    expect(
+      await create(
+        { space: "private", team: "ENG", title: "Keep IDs", projectIds: ["project-sibling"] },
+        { toolCallId: "create", messages: [] },
+      ),
+    ).toEqual({ error: "Every Project must belong to the selected Space." });
+    expect(writes).toBe(0);
+  });
+});
+
+test("internal Assistant calls negotiate version4 and obtain current credentials on every request", async () => {
+  const requests: Request[] = [];
+  let issued = 0;
+  const api = apiClient(
+    async (request) => {
+      requests.push(request);
+      return Response.json({});
+    },
+    {} as Env,
+    () => {},
+    async () => `token-${++issued}`,
+  );
+  await api("GET", "/tracker/private/snapshot");
+  await api("GET", "/repos/private/code");
+  expect(requests.map((request) => request.headers.get("X-Gitmatrix-Content-Version"))).toEqual([
+    "4",
+    "4",
+  ]);
+  expect(requests.map((request) => request.headers.get("authorization"))).toEqual([
+    "Bearer token-1",
+    "Bearer token-2",
+  ]);
 });

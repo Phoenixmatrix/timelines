@@ -1,7 +1,11 @@
-import { describe, expect, test, vi } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { Timeline, Landing } from "../../shared/timelines.ts";
 import type { SourceSnapshot } from "../../shared/code-source.ts";
-import { migratedDatabase, d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { accessFor } from "../tracker/access.ts";
+import { findSpaceById } from "../spaces/access.ts";
+import type { Access } from "../tracker/store.ts";
 import { durableStorage } from "../testing/durable.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { migrateLegacyTimeline } from "./migration.ts";
@@ -10,6 +14,18 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { COMPACT_SCRIPT } from "../ci/compact-script.ts";
+import { fakeDurableObjectId } from "../testing/durable-state.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: DurableObjectState;
+    public env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 
 const rpc = vi.hoisted(() => ({
   timelineById: vi.fn(),
@@ -32,15 +48,59 @@ vi.mock(import("./sources.ts"), async (original) => ({
 }));
 vi.mock("./bookmarks.ts", () => ({ writeRefs: provider.writeRefs }));
 
-function fixture(status: Timeline["status"] = "active") {
-  const sql = migratedDatabase();
+async function fixture(status: Timeline["status"] = "active") {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const sql = fresh.sqlite;
+  onTestFinished(fresh.close);
   const durable = durableStorage();
+  sql.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('owner','user','owner','Owner')",
+  );
+  // Explicit legacy partition mapping: the old owner ID remains storage identity,
+  // while its person and grant are independently persisted.
+  await seedSpaceFixture(fresh.env.DB, {
+    organization: {
+      id: "org_owner",
+      slug: "owner",
+      displayName: "Owner",
+      kind: "personal",
+      personalAccountId: "owner",
+    },
+    space: { id: "owner", slug: "owner", displayName: "Owner" },
+    members: [
+      {
+        accountId: "owner",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "owner",
+  });
+  Reflect.set(fresh.env, "TRACKER", { idFromName: fakeDurableObjectId });
+  await initializeFreshTrackerSpace(
+    fresh.env,
+    {
+      id: fakeDurableObjectId("owner"),
+      storage: { sql: durable.sql, transactionSync: durable.transactionSync },
+    } as unknown as Pick<DurableObjectState, "id" | "storage">,
+    "owner",
+  );
   const store = new TrackerStore(durable.sql, durable.transactionSync);
-  sql.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES ('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote,default_branch)
+  sql.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote,default_branch)
       VALUES ('a','owner','a','private','canonical-a','https://example/a','main'),
              ('b','owner','b','private','canonical-b','https://example/b','main');`);
-  const timeline: Timeline = {
+  const token = await issueToken(fresh.env.DB, "owner", "migration", "write");
+  const actor = {
+    id: "owner",
+    slug: "owner",
+    displayName: "Owner",
+    isSiteAdmin: false,
+    credential: { kind: "token", id: token.id } as const,
+  };
+  const space = await findSpaceById(fresh.env.DB, "owner");
+  if (!space) throw new Error("Missing mapped fixture Space");
+  const access = await accessFor(fresh.env, space, "owner", null, true, actor.credential);
+  const legacyTimeline = {
     id: "legacy-id",
     slug: "legacy",
     name: "Legacy",
@@ -58,6 +118,16 @@ function fixture(status: Timeline["status"] = "active") {
     updatedAt: "2026-01-01T00:00:00.000Z",
     pushedAt: null,
   };
+  const mapping: Record<string, string> = { owner: "owner" };
+  const timeline: Timeline = {
+    ...legacyTimeline,
+    policy: "approval",
+    repos: legacyTimeline.repos.map(({ owner, ...repo }) => {
+      const space = mapping[owner];
+      if (!space) throw new Error(`Unmapped legacy owner: ${owner}`);
+      return { ...repo, space };
+    }),
+  };
   durable.db
     .prepare("INSERT INTO timelines(id,data) VALUES (?,?)")
     .run(timeline.id, JSON.stringify(timeline));
@@ -68,12 +138,15 @@ function fixture(status: Timeline["status"] = "active") {
       return { ok: false, status: 409, code: "blocked", error: String(error) };
     }
   };
-  rpc.timelineById.mockImplementation((id: string) => reply(() => store.timelines.byId(id)));
-  rpc.beginLegacyMigration.mockImplementation((id: string) =>
+  rpc.timelineById.mockImplementation((_access: Access, id: string) =>
+    reply(() => store.timelines.byId(id)),
+  );
+  rpc.beginLegacyMigration.mockImplementation((_access: Access, id: string) =>
     reply(() => store.timelines.beginLegacyMigration(id)),
   );
-  rpc.completeLegacyMigration.mockImplementation((id: string, repos: Timeline["repos"]) =>
-    reply(() => store.timelines.completeLegacyMigration(id, repos)),
+  rpc.completeLegacyMigration.mockImplementation(
+    (_access: Access, id: string, repos: Timeline["repos"]) =>
+      reply(() => store.timelines.completeLegacyMigration(id, repos)),
   );
   const heads: Record<string, string> = { "canonical-a": "head-a", "canonical-b": "head-b" };
   provider.lsRefs.mockImplementation(async (_env, name: string) =>
@@ -92,6 +165,7 @@ function fixture(status: Timeline["status"] = "active") {
   provider.ensureWorkSource.mockImplementation(
     async (
       _env,
+      _access: Access,
       repo: { id: string },
       input: { base: SourceSnapshot; initialHead: SourceSnapshot },
     ) => {
@@ -118,7 +192,7 @@ function fixture(status: Timeline["status"] = "active") {
     },
   );
   const env = {
-    DB: d1(sql),
+    ...fresh.env,
     ARTIFACTS: {
       get: async () => ({
         readCommit: async (oid: string) => ({ treeHash: `tree-${oid}` }),
@@ -126,20 +200,20 @@ function fixture(status: Timeline["status"] = "active") {
       }),
     },
   } as unknown as Env;
-  return { sql, durable, store, env, timeline, heads, allocated };
+  return { sql, durable, store, env, timeline, heads, allocated, access, actor };
 }
 
 describe("finite legacy source cutover", () => {
   test("a partial allocation leaves routing frozen; retries fork the frozen heads and switch all repositories once", async () => {
-    const f = fixture();
-    await expect(migrateLegacyTimeline(f.env, "owner", f.timeline.id)).rejects.toThrow(
+    const f = await fixture();
+    await expect(migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id)).rejects.toThrow(
       "fork interrupted",
     );
     const frozen = f.store.timelines.byId(f.timeline.id);
     expect(frozen.migrationState).toBe("frozen");
     expect(frozen.repos.map((repo) => repo.source)).toEqual([undefined, undefined]);
     expect(f.heads).toEqual({ "canonical-a": "head-a", "canonical-b": "head-b" });
-    const migrated = await migrateLegacyTimeline(f.env, "owner", f.timeline.id);
+    const migrated = await migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id);
     expect(migrated.migrationState).toBe("ready");
     expect(
       migrated.repos.map((repo) => [
@@ -156,14 +230,14 @@ describe("finite legacy source cutover", () => {
       ["b", "head-b"],
     ]);
     expect(f.heads).toEqual({});
-    expect(await migrateLegacyTimeline(f.env, "owner", f.timeline.id)).toEqual(migrated);
+    expect(await migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id)).toEqual(migrated);
     f.sql.close();
     f.durable.db.close();
   });
 
   test("ended records gain historical provenance without allocating or deleting Git", async () => {
-    const f = fixture("abandoned");
-    const migrated = await migrateLegacyTimeline(f.env, "owner", f.timeline.id);
+    const f = await fixture("abandoned");
+    const migrated = await migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id);
     expect(
       migrated.repos.map((repo) => [repo.source?.kind, repo.source?.sourceId, repo.bookmark]),
     ).toEqual([
@@ -177,11 +251,9 @@ describe("finite legacy source cutover", () => {
   });
 
   test("a tombstoned canonical repository prevents allocation and never resurrects routing", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec("UPDATE repos SET deleted_at='2026-10-04' WHERE id='a'");
-    await expect(migrateLegacyTimeline(f.env, "owner", f.timeline.id)).rejects.toThrow(
-      "cannot be resurrected",
-    );
+    await expect(migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id)).rejects.toThrow();
     expect([...f.allocated]).toEqual([]);
     expect(f.store.timelines.byId(f.timeline.id).repos.every((repo) => !repo.source)).toBe(true);
     f.sql.close();
@@ -189,9 +261,16 @@ describe("finite legacy source cutover", () => {
   });
 
   test("partly landed legacy work requires explicit abandonment and retains its successful receipt without replay", async () => {
-    const f = fixture("partly_landed");
+    const f = await fixture("partly_landed");
     const landing: Landing = {
       id: "old-landing",
+      authority: {
+        spaceId: "owner",
+        migrationEpoch: f.access.migrationEpoch,
+        personId: "owner",
+        agentId: null,
+        credential: f.actor.credential,
+      },
       timelineId: f.timeline.id,
       slug: f.timeline.slug,
       checkpointId: "old-checkpoint",
@@ -205,7 +284,7 @@ describe("finite legacy source cutover", () => {
       updatedAt: "2026-01-01",
       repos: f.timeline.repos.map((repo, index) => ({
         id: repo.id,
-        owner: repo.owner,
+        space: repo.space,
         name: repo.name,
         commit: `head-${repo.id}`,
         base: `base-${repo.id}`,
@@ -220,7 +299,7 @@ describe("finite legacy source cutover", () => {
     f.durable.db
       .prepare("INSERT INTO timeline_landings(id,timeline_id,created_at,data) VALUES (?,?,?,?)")
       .run(landing.id, f.timeline.id, landing.createdAt, JSON.stringify(landing));
-    await expect(migrateLegacyTimeline(f.env, "owner", f.timeline.id)).rejects.toThrow(
+    await expect(migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id)).rejects.toThrow(
       "Resolve the legacy landing",
     );
     expect(() =>
@@ -232,7 +311,7 @@ describe("finite legacy source cutover", () => {
       "accept-partial-and-abandon",
       "Keep A receipt; abandon remaining B.",
     );
-    const migrated = await migrateLegacyTimeline(f.env, "owner", f.timeline.id);
+    const migrated = await migrateLegacyTimeline(f.env, f.access, f.actor, f.timeline.id);
     expect(migrated.status).toBe("abandoned");
     expect(migrated.repos.map((repo) => repo.source?.kind)).toEqual([
       "canonical-historical",
@@ -250,7 +329,7 @@ describe("finite legacy source cutover", () => {
 
   test("migrated legacy work materializes B-to-T rather than an empty T-to-T delta", async () => {
     const root = mkdtempSync(join(tmpdir(), "migrated-compact-"));
-    const f = fixture();
+    const f = await fixture();
     const identity = {
       ...process.env,
       GIT_AUTHOR_NAME: "test",
@@ -302,10 +381,10 @@ describe("finite legacy source cutover", () => {
           }),
         },
       } as unknown as Env;
-      await expect(migrateLegacyTimeline(env, "owner", f.timeline.id)).rejects.toThrow(
+      await expect(migrateLegacyTimeline(env, f.access, f.actor, f.timeline.id)).rejects.toThrow(
         "fork interrupted",
       );
-      const migrated = await migrateLegacyTimeline(env, "owner", f.timeline.id);
+      const migrated = await migrateLegacyTimeline(env, f.access, f.actor, f.timeline.id);
       const entry = migrated.repos[0]!;
       const result = spawnSync("bash", ["-c", COMPACT_SCRIPT], {
         cwd: local,

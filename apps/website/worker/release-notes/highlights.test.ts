@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
 import { chatText } from "../knowledge/models.ts";
 import type * as Models from "../knowledge/models.ts";
 import { attribution } from "../usage/ai.ts";
@@ -15,10 +14,13 @@ import {
 import { releaseNotesFor, viewerTrackers } from "./read.ts";
 import { releaseNotes, trackerReleaseNotes } from "./api.ts";
 import { CHILD_ROWS } from "../retention/repo-deletion.ts";
+import {
+  releaseActor,
+  releaseEnvironment,
+  seedReleasePerson,
+  seedReleaseSpace,
+} from "./test-support.ts";
 
-// The real routes reach the knowledge coordinator through loadRepo; only shim
-// its Workers platform base class, leaving route and authorization logic intact.
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 vi.mock("../knowledge/models.ts", async (importOriginal) => ({
   ...(await importOriginal<typeof Models>()),
   chatText: vi.fn(),
@@ -29,50 +31,58 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.resetAllMocks();
 });
-const actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
-const outsider = { id: "bob", slug: "bob", displayName: "Bob", isSiteAdmin: false };
+const actor = releaseActor("ann");
+const outsider = releaseActor("bob");
+const authorization = (personId: string, policySpaceId: string) => ({
+  policySpaceId,
+  migrationEpoch: 0,
+  personId,
+  agentId: null,
+  credential: { kind: "token" as const, id: `token-${personId}` },
+});
 const day = "@day:2026-10-08";
 // The fixture clock is 2026-10-11, so this daily note is outside the 7-day window.
 const oldDay = "@day:2026-10-03";
-function fixture() {
+async function fixture() {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-10-11T00:00:00Z"));
-  const sqlite = migratedDatabase();
+  const { sqlite, env } = await releaseEnvironment();
+  for (const id of ["ann", "bob"]) {
+    seedReleasePerson(sqlite, id);
+    await seedReleaseSpace(sqlite, `personal-${id}`, id, true);
+  }
+  await seedReleaseSpace(sqlite, "orbit", "ann");
+  await seedReleaseSpace(sqlite, "secret", "ann");
   sqlite.exec(`
-    INSERT INTO accounts (id,kind,slug,display_name) VALUES ('ann','user','ann','Ann'),('bob','user','bob','Bob'),('orbit','org','orbit','Orbit'),('secret','org','secret','Secret');
-    UPDATE accounts SET member_repo_role='read' WHERE id IN ('orbit','secret');
-    INSERT INTO org_members(org_id,user_id,role) VALUES ('orbit','ann','member'),('secret','ann','member');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES ('public','orbit','public','public','a','https://a'),('private','orbit','private','private','b','https://b');
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote) VALUES ('public','orbit','public','public','a','https://a'),('private','orbit','private','private','b','https://b');
     INSERT INTO release_note_state(repo_id,status,format_version,dirty) VALUES ('public','ready',1,0),('private','ready',1,0);
     INSERT INTO release_notes(repo_id,release,to_oid,released_at,updated_at,format_version,intro) VALUES ('public','${day}','c1','2026-10-08','2026-10-08',1,'Detailed introduction'),('private','${day}','c2','2026-10-08','2026-10-08',1,'Private introduction');
     INSERT INTO release_note_entries(id,repo_id,release,subject,kind,category,title,summary,inputs_hash,shipped_at,updated_at) VALUES
     ('open','public','${day}','commit:c1','commit','feature','Parcel verification','Batch parcels can be verified','h','2026-10-08','2026-10-08'),
     ('private-entry','private','${day}','commit:c2','commit','feature','Private outcome','Private repository text','h','2026-10-08','2026-10-08');
-    INSERT INTO release_note_entries(id,repo_id,release,subject,kind,category,title,summary,inputs_hash,shipped_at,updated_at,tracker_owner_id,issue_id,issue_key,team_id,team_key) VALUES
+    INSERT INTO release_note_entries(id,repo_id,release,subject,kind,category,title,summary,inputs_hash,shipped_at,updated_at,tracker_space_id,issue_id,issue_key,team_id,team_key) VALUES
     ('secret-entry','public','${day}','issue:secret:SEC-1','issue','fix','Secret tracker outcome','Confidential details','h','2026-10-08','2026-10-08','secret','i1','SEC-1','t1','SEC');
   `);
   const sent: ReleaseHighlightsJob[] = [];
-  const env = {
-    DB: d1(sqlite),
-    AI: {},
-    JOBS: {
-      send: async (job: ReleaseHighlightsJob) => {
-        if (job.type === "release-highlights") sent.push(job);
-      },
+  env.AI = {} as NonNullable<Env["AI"]>;
+  env.JOBS = {
+    send: async (job: ReleaseHighlightsJob) => {
+      if (job.type === "release-highlights") sent.push(job);
     },
-    TRACKER: {
-      getByName: () => ({
-        workspaceSlugs: async () => ({ ok: true, value: [] }),
-        teamNames: async () => ({ ok: true, value: [] }),
-      }),
-    },
-  } as unknown as Env;
+  } as unknown as Env["JOBS"];
+  env.TRACKER = {
+    getByName: () => ({
+      projectSlugs: async () => ({ ok: true, value: [] }),
+      teamNames: async () => ({ ok: true, value: [] }),
+    }),
+  } as unknown as Env["TRACKER"];
   const job: ReleaseHighlightsJob = {
     type: "release-highlights",
     scope: "tracker",
     scopeId: "orbit",
     viewerId: "ann",
-    ownerAccountId: "orbit",
+    spaceId: "orbit",
+    authorization: authorization("ann", "orbit"),
   };
   vi.mocked(chatText).mockResolvedValue({
     text: "- Batch parcel verification is available in the code updates.",
@@ -95,18 +105,49 @@ function barrier() {
 }
 
 describe("viewer-owned release highlights", () => {
-  test("an organization projects only authorized daily sources and exact backlinks", async () => {
-    const t = fixture();
+  test.each(["credential", "epoch", "person"])(
+    "rejects delayed %s changes before invoking a provider",
+    async (change) => {
+      const t = await fixture();
+      await readReleaseHighlights(t.env, actor, t.job);
+      const job = structuredClone(t.sent[0]!);
+      if (change === "credential") t.sqlite.exec("DELETE FROM access_tokens WHERE id='token-ann'");
+      if (change === "epoch") job.authorization.migrationEpoch--;
+      if (change === "person") job.authorization.personId = "bob";
+      await t.deliver(job);
+      expect(chatText).not.toHaveBeenCalled();
+      expect(t.sqlite.prepare("SELECT body FROM release_highlights").get()).toEqual({ body: "" });
+    },
+  );
+
+  test("credential revocation during generation prevents publication without altering detailed history", async () => {
+    const t = await fixture();
+    const before = t.sqlite.prepare("SELECT * FROM release_note_entries ORDER BY id").all();
+    await readReleaseHighlights(t.env, actor, t.job);
+    vi.mocked(chatText).mockImplementationOnce(async () => {
+      t.sqlite.exec("DELETE FROM access_tokens WHERE id='token-ann'");
+      return { text: "- Must never publish.", usage: { model: "test-model", tokens: 20 } };
+    });
+    await t.deliver();
+    expect(t.sqlite.prepare("SELECT body,status FROM release_highlights").get()).toEqual({
+      body: "",
+      status: "failed",
+    });
+    expect(t.sqlite.prepare("SELECT * FROM release_note_entries ORDER BY id").all()).toEqual(
+      before,
+    );
+  });
+  test("a Space projects only authorized daily sources and exact backlinks", async () => {
+    const t = await fixture();
     const sources = await projectReleaseHighlights(t.env, t.job);
     expect(sources.sources.map((s) => s.id)).toEqual(["open", "private-entry", "secret-entry"]);
-    await expect(
-      projectReleaseHighlights(t.env, { ...t.job, viewerId: "bob" }),
-    ).rejects.toMatchObject({ status: 403 });
-    await expect(
-      readReleaseHighlights(t.env, outsider, { ...t.job, viewerId: "bob" }),
-    ).rejects.toMatchObject({ status: 403 });
-    // Losing the other organization's membership removes its entry from the projection.
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id='secret'");
+    const bob = { ...t.job, viewerId: "bob", authorization: authorization("bob", "orbit") };
+    await expect(projectReleaseHighlights(t.env, bob)).rejects.toMatchObject({ status: 403 });
+    await expect(readReleaseHighlights(t.env, outsider, bob)).rejects.toMatchObject({
+      status: 403,
+    });
+    // Losing the other Space's grant removes its entry from the projection.
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id='secret'");
     expect((await projectReleaseHighlights(t.env, t.job)).sources.map((s) => s.id)).toEqual([
       "open",
       "private-entry",
@@ -115,16 +156,16 @@ describe("viewer-owned release highlights", () => {
     await t.deliver();
     const result = await readReleaseHighlights(t.env, actor, t.job);
     expect(result.status.state).toBe("ready");
-    expect(result.owner).toEqual({ slug: "orbit", displayName: "Orbit" });
+    expect(result.space).toMatchObject({ id: "orbit", slug: "orbit" });
     expect(result.notes).toEqual([
-      { repo: { owner: "orbit", name: "public" }, release: day },
-      { repo: { owner: "orbit", name: "private" }, release: day },
+      { repo: { space: "orbit", name: "public" }, release: day },
+      { repo: { space: "orbit", name: "private" }, release: day },
     ]);
     expect(vi.mocked(chatText).mock.calls[0]![3]).not.toMatch(/Secret|Confidential|SEC-1/);
   });
 
   test("only daily entries from the last seven days feed a summary", async () => {
-    const t = fixture();
+    const t = await fixture();
     t.sqlite.exec(`
       INSERT INTO release_notes(repo_id,release,to_oid,released_at,updated_at,format_version,intro) VALUES ('public','${oldDay}','c0','2026-10-03','2026-10-03',1,'Old'),('public','@day:2026-10-04','c0','2026-10-04','2026-10-04',1,'Edge');
       INSERT INTO release_note_entries(id,repo_id,release,subject,kind,category,title,summary,inputs_hash,shipped_at,updated_at) VALUES
@@ -149,9 +190,9 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("ageing out of the window waits for the next scheduled refresh", async () => {
-    const t = fixture();
+    const t = await fixture();
     t.sqlite.exec(
-      "INSERT INTO account_settings(account_id,release_highlights_interval_hours) VALUES ('orbit',168)",
+      "INSERT INTO space_settings(space_id,release_highlights_interval_hours) VALUES ('orbit',168)",
     );
     await readReleaseHighlights(t.env, actor, t.job);
     await t.deliver();
@@ -181,28 +222,29 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("losing access to an aged-out source still blanks the prose", async () => {
-    const t = fixture();
+    const t = await fixture();
     await readReleaseHighlights(t.env, actor, t.job);
     await t.deliver();
     vi.setSystemTime(new Date("2026-10-17T00:00:00Z"));
     expect((await readReleaseHighlights(t.env, actor, t.job)).body).not.toBeNull();
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id='secret'");
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id='secret'");
     expect((await readReleaseHighlights(t.env, actor, t.job)).body).toBeNull();
   });
 
   test("stale non-tracker jobs and rows are skipped without generating", async () => {
-    const t = fixture();
+    const t = await fixture();
     const stale = { ...t.job, scope: "repo", scopeId: "public" } as unknown as ReleaseHighlightsJob;
     await t.deliver(stale);
     await expect(readReleaseHighlights(t.env, actor, stale)).rejects.toMatchObject({
       status: 404,
     });
     await expect(projectReleaseHighlights(t.env, stale)).rejects.toMatchObject({ status: 404 });
+    // A pre-cutover personal (site) projection has no Space and is removed, not generated.
     t.sqlite
       .prepare(`INSERT INTO release_highlights
-        (scope,scope_id,viewer_id,owner_account_id,source_hash,body,updated_at,due_at,lease_until)
-        VALUES ('site','ann','ann','ann','','',?,0,0)`)
-      .run(new Date().toISOString());
+        (scope,scope_id,viewer_id,space_id,authorization_binding,source_hash,body,updated_at,due_at,lease_until)
+        VALUES ('site','ann','ann',NULL,?,'','',?,0,0)`)
+      .run(JSON.stringify(authorization("ann", "personal-ann")), new Date().toISOString());
     await sweepReleaseHighlights(t.env);
     expect(t.sent).toHaveLength(0);
     expect(chatText).not.toHaveBeenCalled();
@@ -212,9 +254,9 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("source changes during paid work discard the result without retrying", async () => {
-    const t = fixture();
+    const t = await fixture();
     vi.mocked(chatText).mockImplementation(async () => {
-      t.sqlite.exec("DELETE FROM org_members WHERE org_id='secret'");
+      t.sqlite.exec("DELETE FROM space_grants WHERE space_id='secret'");
       return { text: "- Confidential details.", usage: { model: "test-model", tokens: 20 } };
     });
     await readReleaseHighlights(t.env, actor, t.job);
@@ -228,9 +270,12 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("concurrent admission and delivery use one paid call, correctly attributed", async () => {
-    const t = fixture();
+    const t = await fixture();
     vi.mocked(chatText).mockImplementation(async () => {
-      expect(await attribution(t.env)).toEqual({ account: "orbit", feature: "release_highlights" });
+      expect(await attribution(t.env)).toMatchObject({
+        scope: { kind: "space", id: "orbit" },
+        feature: "release_highlights",
+      });
       return { text: "- Batch parcel verification.", usage: { model: "test-model", tokens: 20 } };
     });
     await Promise.all([
@@ -260,28 +305,36 @@ describe("viewer-owned release highlights", () => {
     expect(chatText).toHaveBeenCalledTimes(2);
   });
 
-  test("an exact sweep isolates organization and viewer while cron still admits unrelated due rows", async () => {
-    const t = fixture();
-    t.sqlite.exec(`
-      INSERT INTO accounts (id,kind,slug,display_name) VALUES ('public','org','public','Public');
-      INSERT INTO org_members(org_id,user_id,role) VALUES ('public','ann','member');
-      INSERT INTO org_members(org_id,user_id,role) VALUES ('orbit','bob','member');
-    `);
+  test("an exact sweep isolates Space and viewer while cron still admits unrelated due rows", async () => {
+    const t = await fixture();
+    await seedReleaseSpace(t.sqlite, "public", "ann");
+    t.sqlite.exec(
+      "INSERT INTO organization_members(organization_id,account_id,role,origin,granted_by) VALUES ('organization-orbit','bob','member','fixture','ann')",
+    );
+    t.sqlite.exec(
+      "INSERT INTO space_grants(space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by) VALUES ('orbit','organization-orbit','bob','member','none','none','fixture','ann')",
+    );
     const unrelated: ReleaseHighlightsJob[] = [
-      { ...t.job, scopeId: "public", ownerAccountId: "public" },
-      { ...t.job, viewerId: "bob" },
+      {
+        ...t.job,
+        scopeId: "public",
+        spaceId: "public",
+        authorization: authorization("ann", "public"),
+      },
+      { ...t.job, viewerId: "bob", authorization: authorization("bob", "orbit") },
     ];
     const jobs = [t.job, ...unrelated];
     for (const job of jobs) {
       t.sqlite
         .prepare(`INSERT INTO release_highlights
-        (scope,scope_id,viewer_id,owner_account_id,source_hash,body,updated_at,due_at,lease_until)
-        VALUES (?,?,?,?,?,?,?,0,0)`)
+        (scope,scope_id,viewer_id,space_id,authorization_binding,source_hash,body,updated_at,due_at,lease_until)
+        VALUES (?,?,?,?,?,?,?,?,0,0)`)
         .run(
           job.scope,
           job.scopeId,
           job.viewerId,
-          job.ownerAccountId,
+          job.spaceId,
+          JSON.stringify(job.authorization),
           "",
           "",
           new Date().toISOString(),
@@ -307,7 +360,7 @@ describe("viewer-owned release highlights", () => {
   test.each(["complete", "delete"])(
     "stale invalidation preserves an active generation before %s",
     async (outcome) => {
-      const t = fixture();
+      const t = await fixture();
       await readReleaseHighlights(t.env, actor, t.job);
       await t.deliver();
       vi.setSystemTime(new Date("2026-10-12T00:00:01Z"));
@@ -365,7 +418,7 @@ describe("viewer-owned release highlights", () => {
   );
 
   test("deletion of the previous manifest cancels admission before paying for replacement sources", async () => {
-    const t = fixture();
+    const t = await fixture();
     await readReleaseHighlights(t.env, actor, t.job);
     await t.deliver();
     const insert = t.sqlite.prepare(
@@ -407,7 +460,7 @@ describe("viewer-owned release highlights", () => {
   test.each(["edit", "delete", "revoke"])(
     "%s suppresses previously summarized text before cadence",
     async (change) => {
-      const t = fixture();
+      const t = await fixture();
       await readReleaseHighlights(t.env, actor, t.job);
       await t.deliver();
       if (change === "edit")
@@ -416,7 +469,7 @@ describe("viewer-owned release highlights", () => {
         );
       if (change === "delete")
         t.sqlite.exec("DELETE FROM release_note_entries WHERE id='secret-entry'");
-      if (change === "revoke") t.sqlite.exec("DELETE FROM org_members WHERE org_id='secret'");
+      if (change === "revoke") t.sqlite.exec("DELETE FROM space_grants WHERE space_id='secret'");
       const result = await readReleaseHighlights(t.env, actor, t.job);
       expect(result.body).toBeNull();
       expect(result.notes).toEqual([]);
@@ -426,9 +479,9 @@ describe("viewer-owned release highlights", () => {
   );
 
   test("revocation after admission prevents a model call", async () => {
-    const t = fixture();
+    const t = await fixture();
     await readReleaseHighlights(t.env, actor, t.job);
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id='orbit'");
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id='orbit'");
     await t.deliver();
     expect(chatText).not.toHaveBeenCalled();
     await expect(readReleaseHighlights(t.env, actor, t.job)).rejects.toMatchObject({
@@ -437,7 +490,7 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("provider failure is observable, waits for cadence, and preserves detailed notes", async () => {
-    const t = fixture();
+    const t = await fixture();
     const before = await releaseNotesFor(
       t.env.DB,
       "public",
@@ -460,11 +513,11 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("disabled, AI-off and empty projections never invoke a model", async () => {
-    const t = fixture();
-    t.sqlite.exec("INSERT INTO account_settings(account_id,ai_release_notes) VALUES ('orbit',0)");
+    const t = await fixture();
+    t.sqlite.exec("INSERT INTO space_settings(space_id,ai_release_notes) VALUES ('orbit',0)");
     expect((await readReleaseHighlights(t.env, actor, t.job)).status.state).toBe("disabled");
     expect(t.sent).toHaveLength(0);
-    t.sqlite.exec("UPDATE account_settings SET ai_release_notes=1");
+    t.sqlite.exec("UPDATE space_settings SET ai_release_notes=1");
     expect(
       (await readReleaseHighlights({ ...t.env, AI: undefined } as unknown as Env, actor, t.job))
         .status.state,
@@ -477,7 +530,7 @@ describe("viewer-owned release highlights", () => {
   });
 
   test("purge predicate and deletion triggers remove referencing cross-scope projections", async () => {
-    const t = fixture();
+    const t = await fixture();
     await readReleaseHighlights(t.env, actor, t.job);
     await t.deliver();
     const predicate = CHILD_ROWS.find(([name]) => name === "release_highlights")![1];
@@ -487,7 +540,13 @@ describe("viewer-owned release highlights", () => {
     });
     await readReleaseHighlights(t.env, actor, t.job);
     await t.deliver();
-    t.sqlite.exec("DELETE FROM accounts WHERE id='secret'");
+    t.sqlite.exec(`
+      BEGIN;
+      DELETE FROM organization_members WHERE organization_id='organization-secret';
+      DELETE FROM spaces WHERE id='secret';
+      DELETE FROM organizations WHERE id='organization-secret';
+      COMMIT;
+    `);
     expect(t.sqlite.prepare("SELECT count(*) AS n FROM release_highlights").get()).toEqual({
       n: 0,
     });
@@ -499,15 +558,15 @@ describe("viewer-owned release highlights", () => {
     });
   });
 
-  test("routes require person access, never cache, and exist only for organizations", async () => {
-    const t = fixture();
+  test("routes require person access, never cache, and exist only for Spaces", async () => {
+    const t = await fixture();
     const app = new Hono<AppEnv>();
     app.use("*", async (c, next) => {
       c.set("actor", null);
       await next();
     });
-    app.route("/api/repos/:owner/:name/release-notes", releaseNotes);
-    app.route("/api/tracker/:owner/release-notes", trackerReleaseNotes);
+    app.route("/api/repos/:space/:name/release-notes", releaseNotes);
+    app.route("/api/tracker/:space/release-notes", trackerReleaseNotes);
     const tracker = await app.request("/api/tracker/orbit/release-notes/highlights", {}, t.env);
     expect(tracker.status).toBe(401);
     expect(tracker.headers.get("cache-control")).toBe("private, no-store");

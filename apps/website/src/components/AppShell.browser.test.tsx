@@ -9,6 +9,7 @@ const controls = () => Array.from(rail().element().querySelectorAll<HTMLElement>
 
 async function seedIssue(server: TestServer) {
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Engineering", memberIds: [] } },

@@ -1,22 +1,52 @@
-// AI call metering (CORE-207): model calls record into ai_usage for the
-// account whose work declared them, and recording never fails a call.
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
+// AI call metering keeps Space, person and Instance ownership distinct.
+// Recording errors never fail the model call.
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { seedSpaceFixture } from "../testing/spaces.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { chatJson, embed } from "../knowledge/models.ts";
-import { aiWork, recordAiCall, tokensOf } from "./ai.ts";
+import { aiWork, attribution, recordAiCall, tokensOf } from "./ai.ts";
 
 let sqlite: DatabaseSync;
 let env: Env;
+let registry: DatabaseSync;
+let closeControl: () => void;
 
-beforeEach(() => {
+afterEach(() => {
+  closeControl();
+  sqlite.close();
+  registry.close();
+});
+
+beforeEach(async () => {
   sqlite = migratedDatabase();
+  registry = migratedRegistryDatabase();
+  env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
+  closeControl = installCutoverTestControl(env).close;
+  await initializeFreshSpaceInstallation(env);
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_o', 'org', 'orbit', 'Orbit');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_o', 'user', 'ann', 'Ann');
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: { id: "org", slug: "company", displayName: "Company", kind: "company" },
+    space: { id: "acc_o", slug: "orbit", displayName: "Orbit" },
+    actorId: "acc_o",
+    members: [
+      {
+        accountId: "acc_o",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo_1', 'acc_o', 'engine', 'private', 'n', 'https://x');
   `);
   env = {
+    ...env,
     DB: d1(sqlite),
     AI: {
       run: vi.fn(async (model: string) =>
@@ -34,24 +64,27 @@ beforeEach(() => {
 function usage() {
   return sqlite
     .prepare(
-      "SELECT account_id, feature, model, calls, input_tokens, output_tokens, total_tokens FROM ai_usage ORDER BY account_id, feature, model",
+      "SELECT scope_kind, scope_id, feature, model, calls, input_tokens, output_tokens, total_tokens FROM ai_usage ORDER BY scope_id, scope_kind, feature, model",
     )
     .all();
 }
 
 describe("AI metering", () => {
-  test("model calls record for the repository owner's declared work", async () => {
+  test("model calls record for the repository Space, person or Instance", async () => {
     await aiWork({ feature: "knowledge", repo: "repo_1" }, async () => {
       await chatJson(env, "fast", "system", "user");
       await chatJson(env, "fast", "system", "user");
       await embed(env, ["a"]);
     });
-    await aiWork({ feature: "assistant", account: "acc_p" }, () => chatJson(env, "fast", "s", "u"));
+    await aiWork({ feature: "assistant", personId: "acc_p" }, () =>
+      chatJson(env, "fast", "s", "u"),
+    );
     // Outside any declared work: the site's.
     await chatJson(env, "fast", "s", "u");
     expect(usage()).toEqual([
       {
-        account_id: "",
+        scope_kind: "instance",
+        scope_id: "",
         feature: "unattributed",
         model: expect.any(String),
         calls: 1,
@@ -60,7 +93,8 @@ describe("AI metering", () => {
         total_tokens: 128,
       },
       {
-        account_id: "acc_o",
+        scope_kind: "space",
+        scope_id: "acc_o",
         feature: "knowledge",
         model: "@cf/qwen/qwen3-embedding-0.6b",
         calls: 1,
@@ -69,7 +103,8 @@ describe("AI metering", () => {
         total_tokens: 0,
       },
       {
-        account_id: "acc_o",
+        scope_kind: "space",
+        scope_id: "acc_o",
         feature: "knowledge",
         model: expect.any(String),
         calls: 2,
@@ -78,7 +113,8 @@ describe("AI metering", () => {
         total_tokens: 256,
       },
       {
-        account_id: "acc_p",
+        scope_kind: "person",
+        scope_id: "acc_p",
         feature: "assistant",
         model: expect.any(String),
         calls: 1,
@@ -112,10 +148,10 @@ describe("AI metering", () => {
       env,
       "@cf/flux",
       {},
-      { calls: 4, work: { feature: "avatars", account: "acc_o" } },
+      { calls: 4, work: { feature: "avatars", personId: "acc_o" } },
     );
     expect(usage()).toMatchObject([
-      { account_id: "acc_o", feature: "avatars", calls: 4, total_tokens: 0 },
+      { scope_kind: "person", scope_id: "acc_o", feature: "avatars", calls: 4, total_tokens: 0 },
     ]);
     expect(tokensOf({ usage: { inputTokens: 3, outputTokens: 2 } })).toEqual({
       input: 3,
@@ -125,8 +161,29 @@ describe("AI metering", () => {
     expect(tokensOf(null)).toEqual({});
   });
 
-  test("who asked is recorded beside the account, each on its own row (CORE-222)", async () => {
-    const work = { feature: "search", account: "acc_o" };
+  test("equal preserved person and Space IDs never merge their usage", async () => {
+    await recordAiCall(env, "m", { input: 2 }, { work: { feature: "test", personId: "acc_o" } });
+    await recordAiCall(env, "m", { input: 3 }, { work: { feature: "test", spaceId: "acc_o" } });
+    expect(usage()).toMatchObject([
+      { scope_kind: "person", scope_id: "acc_o", input_tokens: 2 },
+      { scope_kind: "space", scope_id: "acc_o", input_tokens: 3 },
+    ]);
+  });
+
+  test("missing or mismatched repositories cannot fall back to personal or Instance attribution", async () => {
+    await expect(
+      aiWork({ feature: "test", repo: "missing" }, () => attribution(env)),
+    ).rejects.toThrow("AI work repository has no active Space.");
+    await expect(
+      aiWork({ feature: "test", repo: "repo_1", spaceId: "other" }, () => attribution(env)),
+    ).rejects.toThrow("AI work repository does not belong to the declared Space.");
+    await expect(
+      aiWork({ feature: "test", repo: "repo_1", personId: "acc_o" }, () => attribution(env)),
+    ).rejects.toThrow("AI work cannot mix personal and content attribution.");
+  });
+
+  test("who asked is recorded beside the Space, each on its own row (CORE-222)", async () => {
+    const work = { feature: "search", spaceId: "acc_o" };
     await recordAiCall(env, "@cf/e", { total: 10 }, { work: { ...work, actor: "acc_ann" } });
     await recordAiCall(env, "@cf/e", { total: 20 }, { work: { ...work, actor: "acc_ann" } });
     await recordAiCall(

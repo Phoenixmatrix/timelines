@@ -23,6 +23,8 @@ import { DELIM, FLUSH, pkt } from "../git/pktline.ts";
 import { indexPushedMentions } from "../mentions/index.ts";
 import { readPktLines } from "../mirror/protocol.ts";
 import { batch, db, nowIso } from "../schema.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import { resumeMentionBackfill } from "../mentions/backfill.ts";
 
 /** Generations of history read per update: a new branch's history stops here. */
 const MAX_DEPTH = 500;
@@ -69,23 +71,116 @@ function isLogged(name: string): boolean {
 export async function recordPush(
   env: Env,
   repo: PushRepo,
-  actor: Pick<Actor, "id" | "agent"> | null,
+  actor: Pick<Actor, "id" | "agent" | "credential"> | null,
 ): Promise<LoggedUpdate[]> {
-  const tips = new Map<string, string>();
-  for (const ref of await lsRefs(env, repo.artifacts_name, repo.artifacts_remote)) {
-    if (ref.oid && isLogged(ref.name)) tips.set(ref.name, ref.oid);
-  }
+  const authority = actor?.credential ? await captureWorkAuthority(env, repo.id, actor) : null;
+  if (actor?.credential && (!repo.source_id || repo.source_id === "canonical"))
+    await resumeMentionBackfill(env, repo.id, actor).catch((error) =>
+      console.error("Mentions: backfill admission failed", { repo: repo.id, error }),
+    );
   const logged = await recordRefs(
     env.DB,
     repo.id,
-    tips,
+    await loggedTips(env, repo),
     actor,
     (want, haves) => fetchNewCommits(env, repo, want, haves),
     repo.source_id ?? "canonical",
   );
   // The issues their messages mention (CORE-22), as this source's (CORE-296).
-  await indexPushedMentions(env, repo.id, logged, { sourceId: repo.source_id ?? "canonical" });
+  if (authority) {
+    await indexPushedMentions(env, repo.id, authority, logged, {
+      sourceId: repo.source_id ?? "canonical",
+    });
+  }
   return logged;
+}
+
+/** The branches and tags Artifacts holds for `repo` now: what the push log compares. */
+export async function loggedTips(env: Env, repo: PushRepo): Promise<Map<string, string>> {
+  const tips = new Map<string, string>();
+  for (const ref of await lsRefs(env, repo.artifacts_name, repo.artifacts_remote)) {
+    if (ref.oid && isLogged(ref.name)) tips.set(ref.name, ref.oid);
+  }
+  return tips;
+}
+
+/**
+ * Log ref moves no push recorded, with no known pusher: the Space cutover's
+ * reconciliation of writes Artifacts accepted while the database was fenced
+ * (space-cutover/ref-barrier.ts). `d1` may be the fenced migration database.
+ */
+export function recordObservedRefs(
+  env: Env,
+  d1: D1Database,
+  repo: PushRepo,
+  tips: Map<string, string>,
+): Promise<LoggedUpdate[]> {
+  return recordRefs(
+    d1,
+    repo.id,
+    tips,
+    null,
+    (want, haves) => fetchNewCommits(env, repo, want, haves),
+    repo.source_id ?? "canonical",
+  );
+}
+
+/**
+ * The push-log entries a reconciliation logged for `changes` with no known
+ * pusher, with the commits each made newly reachable: what replaying their
+ * effects needs (space-cutover/ref-barrier.ts), since repo_refs has already
+ * moved past them. A change some push logged with its pusher is left out: that
+ * push delivered its own effects.
+ */
+export async function journaledUpdates(
+  env: Env,
+  repo: PushRepo,
+  changes: { ref: string; old: string | null; new: string | null }[],
+): Promise<LoggedUpdate[]> {
+  const kdb = db(env.DB);
+  const sourceId = repo.source_id ?? "canonical";
+  const logged: LoggedUpdate[] = [];
+  for (const change of changes) {
+    const row = await kdb
+      .selectFrom("ref_updates")
+      .select("id")
+      .where("repo_id", "=", repo.id)
+      .where("source_id", "=", sourceId)
+      .where("ref", "=", change.ref)
+      .where((eb) =>
+        change.old === null ? eb("old_oid", "is", null) : eb("old_oid", "=", change.old),
+      )
+      .where((eb) =>
+        change.new === null ? eb("new_oid", "is", null) : eb("new_oid", "=", change.new),
+      )
+      .where("actor_id", "is", null)
+      .orderBy("id", "desc")
+      .limit(1)
+      .executeTakeFirst();
+    if (row && !logged.some((update) => update.id === row.id))
+      logged.push({ ...change, id: row.id });
+  }
+  const others = await kdb
+    .selectFrom("repo_refs")
+    .select(["ref", "oid"])
+    .where("repo_id", "=", repo.id)
+    .where("source_id", "=", sourceId)
+    .execute();
+  for (const update of logged.filter((u) => u.new !== null).slice(0, MAX_READS)) {
+    const haves = update.old
+      ? [update.old]
+      : [...new Set(others.filter((r) => r.ref !== update.ref).map((r) => r.oid))];
+    try {
+      update.commits = (await fetchNewCommits(env, repo, update.new!, haves)).commits;
+    } catch (error) {
+      console.error("Push log: couldn't read a replayed update's commits", {
+        repo: repo.id,
+        ref: update.ref,
+        error,
+      });
+    }
+  }
+  return logged.sort((a, b) => a.id - b.id);
 }
 
 /**

@@ -37,7 +37,7 @@ async function world(markdown = MARKDOWN) {
   );
   await server.sql(
     `INSERT INTO release_note_entries
-      (id, repo_id, release, subject, kind, category, title, summary, tracker_owner_id,
+      (id, repo_id, release, subject, kind, category, title, summary, tracker_space_id,
        issue_id, issue_key, team_id, team_key, inputs_hash, shipped_at, updated_at)
      VALUES ('n1', ?, '@day:2026-09-20', 'issue:acc_orbit:ENG-1', 'issue', 'feature', 'Parcel verification', '', 'acc_orbit',
        'ENG-1', 'ENG-1', 'eng', 'ENG', 'h', '2026-09-20T00:00:00.000Z', '2026-09-20T00:00:00.000Z')`,
@@ -50,11 +50,11 @@ async function world(markdown = MARKDOWN) {
     entries: 1,
     truncated: false,
   });
-  server.on("POST", "/api/tracker/:owner/release-notes/compose", ({ body }) => {
+  server.on("POST", "/api/tracker/:space/release-notes/compose", ({ body }) => {
     asked.push(body);
     return compose();
   });
-  server.on("POST", "/api/repos/:owner/:name/release-notes/compose", ({ body }) => {
+  server.on("POST", "/api/repos/:space/:name/release-notes/compose", ({ body }) => {
     asked.push(body);
     return compose();
   });
@@ -64,7 +64,7 @@ async function world(markdown = MARKDOWN) {
 /** The repository's notes pages: the browser world's API has no such routes, so they are canned. */
 function repoNotes(server: TestServer, state: "ready" | "disabled") {
   const at = "2026-09-20T00:00:00.000Z";
-  server.on("GET", "/api/repos/:owner/:name/release-notes", {
+  server.on("GET", "/api/repos/:space/:name/release-notes", {
     status: { state, generatedAt: null },
     releases: [
       {
@@ -78,7 +78,7 @@ function repoNotes(server: TestServer, state: "ready" | "disabled") {
       },
     ],
   });
-  server.on("GET", "/api/repos/:owner/:name/release-notes/release", {
+  server.on("GET", "/api/repos/:space/:name/release-notes/release", {
     release: {
       name: "@day:2026-09-20",
       kind: "daily",
@@ -103,7 +103,7 @@ function repoNotes(server: TestServer, state: "ready" | "disabled") {
         summary: "",
         issue: null,
         labels: [],
-        workspaceIds: [],
+        projectIds: [],
         commits: ["c1"],
         provenance: [],
         timeline: null,
@@ -363,15 +363,15 @@ test("an environment without AI explains itself instead of offering a dead butto
 
 test("the server's refusal is shown beside the request, with where to fix it", async () => {
   const { server } = await world();
-  server.on("POST", "/api/tracker/:owner/release-notes/compose", () =>
-    reply({ error: "AI release-note writing is off for Orbit." }, 409),
+  server.on("POST", "/api/tracker/:space/release-notes/compose", () =>
+    reply({ error: "AI release-note writing is off for orbit." }, 409),
   );
   renderApp("/tracker/orbit/releases");
   await expect.element(page.getByText("Parcel verification", { exact: true })).toBeVisible();
   await toggle().click();
   await prompt().fill("Announcement");
   await write().click();
-  await expect.element(page.getByText(/AI release-note writing is off for Orbit\./)).toBeVisible();
+  await expect.element(page.getByText(/AI release-note writing is off for orbit\./)).toBeVisible();
   await expect.element(page.getByRole("alert")).toBeVisible();
 });
 

@@ -14,7 +14,7 @@ import { FORMAT_IDS, type FormatId } from "@gitmatrix/formats/info";
 import type {
   FeedSummary,
   FeedVisibility,
-  OwnerPackages as OwnerPackagesData,
+  SpacePackages as SpacePackagesData,
 } from "../../../shared/packages.ts";
 import { Page } from "../../components/AppShell.tsx";
 import {
@@ -28,20 +28,20 @@ import { api, attempt, field, load } from "../../lib/api.ts";
 import { FORMATS, formatLabel, packagesPath, plural } from "../../lib/packages.ts";
 
 export async function feedsLoader({ request, params }: LoaderFunctionArgs) {
-  return load<OwnerPackagesData>(`/packages/${params.owner}`, request);
+  return load<SpacePackagesData>(`/packages/${params.space}`, request);
 }
 
 const optionalNumber = (value: string) => (value.trim() ? Number(value) : undefined);
 
 export async function feedsAction({ request, params }: ActionFunctionArgs) {
   const form = await request.formData();
-  const owner = params.owner ?? "";
+  const space = params.space ?? "";
   const intent = field(form, "intent");
-  const feed = `/packages/${owner}/feeds/${field(form, "format")}/${field(form, "key")}`;
+  const feed = `/packages/${space}/feeds/${field(form, "format")}/${field(form, "key")}`;
   return attempt(async () => {
     if (intent === "create") {
       const kind = field(form, "kind") as "remote" | "virtual";
-      await api(`/packages/${owner}/feeds`, {
+      await api(`/packages/${space}/feeds`, {
         method: "POST",
         json: {
           format: field(form, "format"),
@@ -61,7 +61,7 @@ export async function feedsAction({ request, params }: ActionFunctionArgs) {
               }),
         },
       });
-      return { ok: `Created ${owner}.${field(form, "name")}` };
+      return { ok: `Created ${space}.${field(form, "name")}` };
     }
     if (intent === "delete") {
       await api(feed, { method: "DELETE" });
@@ -93,18 +93,18 @@ export async function feedsAction({ request, params }: ActionFunctionArgs) {
 }
 
 const VISIBILITY = [
-  { value: "private", label: "Private: the owner's people and CI" },
+  { value: "private", label: "Private: the space's people and CI" },
   { value: "internal", label: "Internal: anyone signed in" },
   { value: "public", label: "Public: anyone" },
 ];
 
-function FeedRow({ feed, owner }: { feed: FeedSummary; owner: string }) {
+function FeedRow({ feed, space }: { feed: FeedSummary; space: string }) {
   const navigation = useNavigation();
   const submit = useSubmit();
   const busy = navigation.state !== "idle";
   const describe =
     feed.kind === "local"
-      ? `${owner}'s own ${formatLabel(feed.format)} registry · ${plural(feed.packages, "package")}`
+      ? `${space}'s own ${formatLabel(feed.format)} registry · ${plural(feed.packages, "package")}`
       : feed.kind === "remote"
         ? `Proxy and cache of ${feed.upstream}`
         : `Resolves from ${feed.members.join(", ") || "nothing yet"}, in that order`;
@@ -222,7 +222,7 @@ function FeedRow({ feed, owner }: { feed: FeedSummary; owner: string }) {
   );
 }
 
-function NewFeed({ owner }: { owner: string }) {
+function NewFeed({ space }: { space: string }) {
   const [kind, setKind] = useState<"remote" | "virtual">("remote");
   const [format, setFormat] = useState<FormatId>("npm");
   const navigation = useNavigation();
@@ -268,7 +268,7 @@ function NewFeed({ owner }: { owner: string }) {
             required
             pattern="[a-z0-9][a-z0-9_\-]{0,40}"
             placeholder={kind === "remote" ? "npmjs" : "all"}
-            hint={`Clients use ${owner}.<name>.`}
+            hint={`Clients use ${space}.<name>.`}
           />
           {kind === "remote" ? (
             <>
@@ -294,7 +294,7 @@ function NewFeed({ owner }: { owner: string }) {
               className="md:col-span-2"
               label="Members, in order"
               name="members"
-              placeholder={`${owner}, ${owner}.npmjs`}
+              placeholder={`${space}, ${space}.npmjs`}
               hint="Feed keys of the same format. The first that has a package wins."
             />
           )}
@@ -316,7 +316,7 @@ function NewFeed({ owner }: { owner: string }) {
 export function Feeds() {
   const data = useLoaderData<typeof feedsLoader>();
   const result = useActionData<typeof feedsAction>();
-  const owner = data.owner.slug;
+  const space = data.space.slug;
   const toast = useToast();
   useEffect(() => {
     if (result && "ok" in result) toast.add({ title: result.ok });
@@ -324,17 +324,17 @@ export function Feeds() {
   return (
     <Page>
       <nav aria-label="Breadcrumb" className="text-body-sm text-ink-muted">
-        <Link to={`/${owner}`} className="text-ink-muted no-underline hover:text-ink">
-          {owner}
+        <Link to={`/${space}`} className="text-ink-muted no-underline hover:text-ink">
+          {space}
         </Link>
         <span className="px-1.5 text-ink-faint">/</span>
-        <Link to={packagesPath(owner)} className="text-ink-muted no-underline hover:text-ink">
+        <Link to={packagesPath(space)} className="text-ink-muted no-underline hover:text-ink">
           Packages
         </Link>
       </nav>
       <h1 className="m-0 mt-2 text-headline">Feeds and proxies</h1>
       <p className="m-0 mt-1 max-w-[48ch] text-ink-muted">
-        Every format gets a registry for {owner} the first time something is published to it. Set
+        Every format gets a registry for {space} the first time something is published to it. Set
         who can install from each, how long versions stay, and add proxies of public registries.
       </p>
       {result && "error" in result && (
@@ -343,7 +343,7 @@ export function Feeds() {
         </div>
       )}
       {data.access !== "admin" ? (
-        <div className="mk-empty mt-6">Only {owner}'s admins manage its feeds.</div>
+        <div className="mk-empty mt-6">Only {space}'s admins manage its feeds.</div>
       ) : (
         <>
           <h2 className="mt-8 mb-3 text-title">Feeds</h2>
@@ -352,12 +352,12 @@ export function Feeds() {
           ) : (
             <ul className="m-0 flex list-none flex-col gap-6 p-0">
               {data.feeds.map((feed) => (
-                <FeedRow key={feed.id} feed={feed} owner={owner} />
+                <FeedRow key={feed.id} feed={feed} space={space} />
               ))}
             </ul>
           )}
           <div className="mt-8">
-            <NewFeed owner={owner} />
+            <NewFeed space={space} />
           </div>
         </>
       )}

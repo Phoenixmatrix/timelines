@@ -199,7 +199,7 @@ export function RangeSummary({
 }
 
 export function Inspector({
-  owner,
+  space,
   issue,
   span,
   data,
@@ -211,7 +211,7 @@ export function Inspector({
   checkpointHref,
   window: view,
 }: {
-  owner: string;
+  space: string;
   issue: ChronicleIssue;
   span: WorkSpan | null;
   data: Loaded;
@@ -408,7 +408,7 @@ export function Inspector({
         </div>
       )}
       <LinkedWorkPanel
-        owner={owner}
+        space={space}
         issueId={issue.id}
         issueKey={issue.key}
         span={span}

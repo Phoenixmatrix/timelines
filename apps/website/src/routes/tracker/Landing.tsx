@@ -40,13 +40,13 @@ const REPO_STATE: Record<LandingRepo["state"], string> = {
 };
 
 export function LandingPanel({
-  owner,
+  space,
   timeline,
   checkpoints,
   failed,
   onChange,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   /** The timeline's checkpoints: `null` while loading or when they failed. */
   checkpoints: CheckpointView[] | null;
@@ -54,7 +54,7 @@ export function LandingPanel({
   /** After a landing was queued: the timeline's status changed. */
   onChange: () => void;
 }) {
-  const path = `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}`;
+  const path = `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}`;
   const [landing, setLanding] = useState<Landing | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -155,11 +155,11 @@ export function LandingPanel({
                 className="flex flex-wrap items-baseline gap-x-3 py-0.5 text-body-sm text-ink-muted"
               >
                 <span className="min-w-0 truncate text-ink">
-                  {repo.owner}/{repo.name}
+                  {repo.space}/{repo.name}
                 </span>
                 <span>{REPO_STATE[repo.state]}</span>
                 {repo.merge && (
-                  <Link className={link} to={commitPanelUrl(repo.owner, repo.name, repo.merge)}>
+                  <Link className={link} to={commitPanelUrl(repo.space, repo.name, repo.merge)}>
                     {repo.source?.kind === "timeline-work"
                       ? repo.state === "advanced"
                         ? repo.noop
@@ -173,16 +173,16 @@ export function LandingPanel({
                 {repo.source && (
                   <Link
                     className={link}
-                    to={treeUrl(repo.owner, repo.name, repo.commit, "", repo.source.sourceId)}
+                    to={treeUrl(repo.space, repo.name, repo.commit, "", repo.source.sourceId)}
                   >
                     approved source <span className="mk-mono">{shortOid(repo.commit)}</span>
                   </Link>
                 )}
                 <Link
                   className={link}
-                  to={timelinePageUrl(owner, timeline.slug, "changes", {
+                  to={timelinePageUrl(space, timeline.slug, "changes", {
                     checkpoint: String(landing.checkpointNumber),
-                    repo: `${repo.owner}/${repo.name}`,
+                    repo: `${repo.space}/${repo.name}`,
                   })}
                 >
                   Changes in #{landing.checkpointNumber}
@@ -193,7 +193,7 @@ export function LandingPanel({
                     key={`${dependency.source.sourceId}:${dependency.source.commit}`}
                     className={link}
                     to={treeUrl(
-                      repo.owner,
+                      repo.space,
                       repo.name,
                       dependency.source.commit,
                       "",
@@ -210,7 +210,7 @@ export function LandingPanel({
                       <Link
                         key={i}
                         className={link}
-                        to={repoPath(repo.owner, repo.name, "ci", String(run.number))}
+                        to={repoPath(repo.space, repo.name, "ci", String(run.number))}
                       >
                         {i === 0 ? "Preparation" : "Gates"} #{run.number}
                       </Link>

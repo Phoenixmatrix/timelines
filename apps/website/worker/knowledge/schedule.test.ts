@@ -4,21 +4,15 @@
 // admin's "update now", an explicit rebuild and a repository's first build
 // don't wait. The status says what is pending and when it will be built.
 
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { KnowledgeCoordinator } from "./coordinator.ts";
 
-vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {
-    ctx: unknown;
-    env: unknown;
-    constructor(ctx: unknown, env: unknown) {
-      this.ctx = ctx;
-      this.env = env;
-    }
-  },
-}));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 const MIN = 60_000;
@@ -49,21 +43,43 @@ function objectState() {
 
 let names = 0;
 
-function setup(options: { indexed?: boolean; settings?: [number, number] } = {}) {
+async function setup(options: { indexed?: boolean; settings?: [number, number] } = {}) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(T0);
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite, env } = fresh;
+  onTestFinished(fresh.close);
   const artifacts = `kg-schedule-${++names}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('repo', 'ann', 'app', 'private', '${artifacts}', 'https://app');
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: {
+      id: "ann-org",
+      slug: "ann-org",
+      displayName: "Ann organization",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "ann-space", slug: "ann", displayName: "Ann Space" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('repo', 'ann-space', 'app', 'private', '${artifacts}', 'https://app');
   `);
   if (options.indexed !== false)
     sqlite.exec(`INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('repo', '${oid(1)}')`);
   if (options.settings)
-    sqlite.exec(`INSERT INTO account_settings (account_id, knowledge_quiet_minutes, knowledge_max_wait_minutes)
-      VALUES ('ann', ${options.settings[0]}, ${options.settings[1]})`);
+    sqlite.exec(`INSERT INTO space_settings (space_id, knowledge_quiet_minutes, knowledge_max_wait_minutes)
+      VALUES ('ann-space', ${options.settings[0]}, ${options.settings[1]})`);
   const git = fakeRemotes();
   const remote = git.add(
     "https://app",
@@ -74,7 +90,7 @@ function setup(options: { indexed?: boolean; settings?: [number, number] } = {})
   vi.stubGlobal("fetch", git.fetch);
   const builds: { id: string; params: Record<string, unknown> }[] = [];
   const running = new Set<string>();
-  const env = {
+  Object.assign(env, {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
     TIMELINE_QUIET_SECONDS: "0",
@@ -89,7 +105,12 @@ function setup(options: { indexed?: boolean; settings?: [number, number] } = {})
         terminate: async () => {},
       }),
     },
-  } as unknown as Env;
+  } as unknown as Env);
+  const token = await issueToken(env.DB, "ann", "Knowledge test", "write");
+  const authorization = await captureWorkAuthority(env, "repo", {
+    id: "ann",
+    credential: { kind: "token", id: token.id },
+  });
   const object = objectState();
   const coordinator = new KnowledgeCoordinator(object.state, env);
   /** The alarm fires: like a Durable Object's, it is unset while its handler runs. */
@@ -101,6 +122,7 @@ function setup(options: { indexed?: boolean; settings?: [number, number] } = {})
   return {
     sqlite,
     coordinator,
+    authorization,
     builds,
     /** Advance the clock to `minutes` after T0 and run the alarm if it is due. */
     async at(minutes: number) {
@@ -113,7 +135,7 @@ function setup(options: { indexed?: boolean; settings?: [number, number] } = {})
       vi.setSystemTime(T0 + minutes * MIN);
       if (options.main !== false) remote.refs.set("refs/heads/main", oid(++head));
       else remote.refs.set("refs/heads/timeline/side", oid(100 + minutes));
-      await coordinator.notify("repo");
+      await coordinator.notify("repo", { authorization });
       vi.setSystemTime(T0 + minutes * MIN + 2_000);
       await fire();
       return oid(head);
@@ -137,7 +159,7 @@ function setup(options: { indexed?: boolean; settings?: [number, number] } = {})
 
 describe("batched Knowledge updates", () => {
   test("pushes wait for the quiet period, then one update builds the latest head", async () => {
-    const t = setup();
+    const t = await setup();
     await t.push(0);
     await t.push(4);
     const last = await t.push(7);
@@ -157,7 +179,7 @@ describe("batched Knowledge updates", () => {
   });
 
   test("steady pushes never wait longer than the longest wait after the first", async () => {
-    const t = setup();
+    const t = await setup();
     for (let minute = 0; minute <= 32; minute += 4) {
       await t.at(minute);
       if (t.builds.length) break;
@@ -170,7 +192,7 @@ describe("batched Knowledge updates", () => {
   });
 
   test("pushes during an update wait for their own window, not for the build to end", async () => {
-    const t = setup();
+    const t = await setup();
     await t.push(0);
     await t.at(10.1);
     expect(t.builds).toHaveLength(1);
@@ -185,38 +207,38 @@ describe("batched Knowledge updates", () => {
   });
 
   test("an admin's update now, an explicit rebuild and a first build don't wait", async () => {
-    const t = setup();
+    const t = await setup();
     const head = await t.push(0);
-    await t.coordinator.notify("repo", { now: true });
+    await t.coordinator.notify("repo", { now: true, authorization: t.authorization });
     await t.at(0.1);
     expect(t.builds).toHaveLength(1);
     expect(t.builds[0]!.params).toMatchObject({ commit: head, force: false });
     await t.finish(1);
 
-    await t.coordinator.notify("repo", { force: true });
+    await t.coordinator.notify("repo", { force: true, authorization: t.authorization });
     await t.at(1.2);
     expect(t.builds).toHaveLength(2);
     expect(t.builds[1]!.params).toMatchObject({ force: true });
 
-    const first = setup({ indexed: false });
+    const first = await setup({ indexed: false });
     await first.push(0);
     expect(first.builds).toHaveLength(1);
   });
 
   test("a push that moves only a timeline leaves nothing pending", async () => {
-    const t = setup();
+    const t = await setup();
     await t.push(0, { main: false });
     const status = await t.coordinator.status();
     expect(status.pending).toBe(false);
     expect(status.update).toBeNull();
     // Update now with nothing pending has nothing to build.
-    await t.coordinator.notify("repo", { now: true });
+    await t.coordinator.notify("repo", { now: true, authorization: t.authorization });
     await t.at(0.2);
     expect(t.builds).toEqual([]);
   });
 
-  test("an account's own windows", async () => {
-    const t = setup({ settings: [2, 5] });
+  test("a Space's own windows", async () => {
+    const t = await setup({ settings: [2, 5] });
     await t.push(0);
     await t.push(1.5);
     await t.push(3);
@@ -226,4 +248,27 @@ describe("batched Knowledge updates", () => {
     await t.at(5.1);
     expect(t.builds).toHaveLength(1);
   });
+
+  test.each(["grant", "membership", "credential"])(
+    "a queued build cannot start after its initiating %s is revoked",
+    async (kind) => {
+      const t = await setup();
+      await t.push(0);
+      expect(t.builds).toEqual([]);
+      if (kind === "grant") t.sqlite.exec("DELETE FROM space_grants WHERE account_id='ann'");
+      else if (kind === "membership")
+        t.sqlite.exec("DELETE FROM organization_members WHERE account_id='ann'");
+      else
+        t.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(t.authorization.credential.id);
+      await expect(t.at(10.1)).rejects.toThrow(
+        kind === "credential"
+          ? "Work initiating credential is revoked or expired."
+          : "Work source authorization is unavailable.",
+      );
+      expect(t.builds).toEqual([]);
+      await expect(
+        t.coordinator.notify("repo", { now: true, authorization: t.authorization }),
+      ).rejects.toThrow();
+    },
+  );
 });

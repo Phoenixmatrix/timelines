@@ -2,13 +2,13 @@
 // meaningful step, stored per (change, commit) and read by anyone who can read
 // the repository.
 //
-//   POST   /api/repos/:owner/:name/steps                       gm uploads one step (write access)
-//   GET    /api/repos/:owner/:name/steps?timeline=&issue=&commits=&cursor=&limit=   newest first
-//   GET    /api/repos/:owner/:name/steps/:changeId             every version of a change
-//   DELETE /api/repos/:owner/:name/steps/:changeId/:commitOid  delete or redact (admins)
-//   PUT    /api/repos/:owner/:name/steps/artifacts/screenshots/<name>  a CI job's image (CORE-383)
-//   PUT    /api/repos/:owner/:name/steps/artifacts/documents/<name>    a CI job's diagram
-//   GET    /api/repos/:owner/:name/steps/artifacts/:id        a stored screenshot (readers)
+//   POST   /api/repos/:space/:name/steps                       gm uploads one step (write access)
+//   GET    /api/repos/:space/:name/steps?timeline=&issue=&commits=&cursor=&limit=   newest first
+//   GET    /api/repos/:space/:name/steps/:changeId             every version of a change
+//   DELETE /api/repos/:space/:name/steps/:changeId/:commitOid  delete or redact (admins)
+//   PUT    /api/repos/:space/:name/steps/artifacts/screenshots/<name>  a CI job's image (CORE-383)
+//   PUT    /api/repos/:space/:name/steps/artifacts/documents/<name>    a CI job's diagram
+//   GET    /api/repos/:space/:name/steps/artifacts/:id        a stored screenshot (readers)
 //
 // A step is verified once a push has shown Gitmatrix its commit (here, at
 // upload, or later in worker/ref-log/record.ts); until then it's reported as
@@ -49,6 +49,8 @@ import { avatarUrl, EXTENSION, imageType } from "../avatars/api.ts";
 import { jobCaller, jobSecret, type JobCaller } from "../deployments/job.ts";
 import { findRepo, sqlNow, type RepoRow } from "../db.ts";
 import { db, nowIso, type Database } from "../schema.ts";
+import { captureWorkAuthority, resolveWorkAuthority, type WorkAuthority } from "../ci/admission.ts";
+import { captureFeedAccess } from "./feed.ts";
 import { deleteUnreferenced } from "./objects.ts";
 import { resolveSource } from "../timelines/sources.ts";
 
@@ -195,8 +197,8 @@ async function present(c: Context<AppEnv>, rows: Row[]) {
 async function stepsPath(d1: D1Database, repoId: string): Promise<string | null> {
   const row = await db(d1)
     .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
-    .select(["o.slug", "r.name"])
+    .innerJoin("spaces as s", "s.id", "r.space_id")
+    .select(["s.slug", "r.name"])
     .where("r.id", "=", repoId)
     .executeTakeFirst();
   return row ? `/api/repos/${row.slug}/${row.name}/steps` : null;
@@ -364,6 +366,7 @@ steps.post("/", async (c) => {
   const loaded = await loadRepo(c, "write");
   if (loaded instanceof Response) return loaded;
   const repoId = loaded.row.id;
+  const authority = await captureWorkAuthority(c.env, repoId, actor);
   const raw = await c.req.text();
   if (raw.length > STEP_LIMITS.contextBytes * 2)
     return fail(c, 413, "Keep a step's context under 256 KiB.");
@@ -453,7 +456,7 @@ steps.post("/", async (c) => {
   const [step] = await present(c, [row]);
   // A new step in a timeline goes out on its live feed (CORE-239), after the answer.
   if (!existing && step!.timeline && Reflect.has(c.env, "STEP_FEED")) {
-    const work = publishStep(c.env, loaded.row, step!).catch((error) =>
+    const work = publishStep(c.env, loaded.row, step!, authority).catch((error) =>
       console.error("Steps: publishing to the live feed failed", error),
     );
     try {
@@ -466,13 +469,13 @@ steps.post("/", async (c) => {
 });
 
 /**
- * How long the repository's account keeps live feed records (retention
+ * How long the repository's Space keeps live feed records (retention
  * category "step-feed", CORE-244): its stored days within 1–7, else 7.
  */
 async function feedKeepMs(env: Env, repoId: string): Promise<number> {
   const row = await env.DB.prepare(
-    `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.owner_id = p.account_id
-     WHERE r.id = ? AND p.category = 'step-feed'`,
+    `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.space_id = p.scope_id
+     WHERE r.id = ? AND p.scope_kind = 'space' AND p.category = 'step-feed'`,
   )
     .bind(repoId)
     .first<{ thresholds: string }>();
@@ -496,12 +499,13 @@ function feed(env: Env, repoId: string, timeline: string) {
 
 async function publishStep(
   env: Env,
-  repo: { id: string; owner_slug: string; name: string },
+  repo: { id: string; space_slug: string; name: string },
   step: Step,
+  authority: WorkAuthority,
 ) {
   const tests = step.context.tests;
   const record: Omit<StepFeedRecord, "seq" | "at"> = {
-    repo: `${repo.owner_slug}/${repo.name}`,
+    repo: `${repo.space_slug}/${repo.name}`,
     timeline: step.timeline!,
     changeId: step.changeId,
     commitOid: step.commitOid,
@@ -517,7 +521,9 @@ async function publishStep(
     why: (step.context.why.split("\n").find((l) => l.trim()) ?? "").trim().slice(0, 200),
     committedAt: step.committedAt,
   };
-  await feed(env, repo.id, step.timeline!).publish(record, await feedKeepMs(env, repo.id));
+  const keepMs = await feedKeepMs(env, repo.id);
+  await resolveWorkAuthority(env, authority, repo.id);
+  await feed(env, repo.id, step.timeline!).publish(repo.id, authority, record, keepMs);
 }
 
 /**
@@ -527,14 +533,14 @@ async function publishStep(
  */
 async function forgetOnFeed(
   env: Env,
-  repo: { id: string; owner_slug: string; name: string },
+  repo: { id: string; space_slug: string; name: string },
   timeline: string,
   deleted: { change_id: string; commit_oid: string }[],
 ) {
   try {
     await feed(env, repo.id, timeline).forget(
       deleted.map((d) => ({
-        repo: `${repo.owner_slug}/${repo.name}`,
+        repo: `${repo.space_slug}/${repo.name}`,
         changeId: d.change_id,
         commitOid: d.commit_oid,
       })),
@@ -558,6 +564,10 @@ steps.get("/live", async (c) => {
     return fail(c, 400, "timeline is a timeline's slug.");
   const headers = new Headers();
   const last = c.req.header("last-event-id") ?? c.req.query("after");
+  headers.set(
+    "x-step-feed-access",
+    JSON.stringify(await captureFeedAccess(c.env, loaded.row.id, timeline, c.get("actor"))),
+  );
   if (last && /^\d+$/.test(last)) headers.set("last-event-id", last);
   // Steps deleted while their record could still be kept: the feed forgets
   // them first, in case telling it at deletion failed (CORE-399). Usually none.
@@ -587,12 +597,13 @@ async function artifactJob(
   const secret = jobSecret(c.req.header("authorization"));
   if (!secret)
     return fail(c, 401, "Only a CI job uploads step artifacts, with its own credential.");
-  const job = await jobCaller(c.env.DB, secret);
+  // Resolves the job's current work authority: a revoked initiator ends its uploads.
+  const job = await jobCaller(c.env, secret);
   if (!job) return fail(c, 401, "The CI job's credential is invalid, or the job has ended.");
   const repo = await findRepo(
     c.env.DB,
     null,
-    c.req.param("owner") ?? "",
+    c.req.param("space") ?? "",
     c.req.param("name") ?? "",
   );
   if (!repo || repo.id !== job.repoId)
@@ -677,7 +688,7 @@ async function putArtifact(
     { id, runId: job.runId, runNumber: job.runNumber, createdAt: values.created_at },
     kind,
     data,
-    `/api/repos/${repo.owner_slug}/${repo.name}/steps`,
+    `/api/repos/${repo.space_slug}/${repo.name}/steps`,
   );
   return c.json(artifact, existing ? 200 : 201);
 }

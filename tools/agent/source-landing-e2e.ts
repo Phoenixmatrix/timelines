@@ -188,7 +188,7 @@ export async function runSourceLandingE2E(
         for (const f of owned) {
           const list = await capture(`${f.repo}:ci`, () => f.json<CiRunList>(`${f.api}/ci`));
           const repo = snapshot?.landing?.repos.find(
-            (value) => `${value.owner}/${value.name}` === f.repo,
+            (value) => `${value.space}/${value.name}` === f.repo,
           );
           const numbers = new Set(
             [repo?.mergeRun?.number, repo?.gateRun?.number].filter(
@@ -254,11 +254,11 @@ export async function runSourceLandingE2E(
       // Use the actual admission order, not assumptions about database repository ordering.
       const first = detail.timeline.repos[0]!;
       const second = detail.timeline.repos[1]!;
-      const fa = owned.find((f) => f.repo === `${first.owner}/${first.name}`)!;
-      const fb = owned.find((f) => f.repo === `${second.owner}/${second.name}`)!;
+      const fa = owned.find((f) => f.repo === `${first.space}/${first.name}`)!;
+      const fb = owned.find((f) => f.repo === `${second.space}/${second.name}`)!;
       const sources = new Map<string, string>();
       for (const entry of detail.timeline.repos) {
-        const f = owned.find((value) => value.repo === `${entry.owner}/${entry.name}`)!;
+        const f = owned.find((value) => value.repo === `${entry.space}/${entry.name}`)!;
         assert(entry.source?.kind === "timeline-work");
         const url = `${ctx.origin}/${f.repo}@${slug}.git`;
         await f.git(["fetch", url, "refs/heads/work"]);
@@ -325,7 +325,7 @@ export async function runSourceLandingE2E(
       const receipts = (await control(s.slug, "inspect")).receipts;
       assert.equal(receipts.length, 2);
       for (const repo of landed.repos) {
-        const f = owned.find((value) => value.repo === `${repo.owner}/${repo.name}`)!;
+        const f = owned.find((value) => value.repo === `${repo.space}/${repo.name}`)!;
         const receipt = receipts.find((value) => value.repo_id === repo.id)!;
         assert.equal(receipt.status, "complete");
         assert.equal(receipt.canonical_commit, repo.merge);
@@ -350,7 +350,7 @@ export async function runSourceLandingE2E(
         }
       }
       await gm(
-        ["timeline", "land", s.slug, "--owner", "orbit"],
+        ["timeline", "land", s.slug, "--space", "orbit"],
         "marco",
         a.root,
         /landed|timeline_ended/i,
@@ -380,7 +380,7 @@ export async function runSourceLandingE2E(
     assert.deepEqual(await Promise.all(owned.map((f) => f.tip())), moving.before);
     const movedB = await move(moving.fb, moving.slug);
     await control(moving.slug, "arm", { point: "before-cas", repoId: moving.first.id });
-    await gm(["timeline", "land", moving.slug, "--owner", "orbit"], "marco", a.root);
+    await gm(["timeline", "land", moving.slug, "--space", "orbit"], "marco", a.root);
     const validBeforeCas = await waitBarrier(moving.slug);
     assert(validBeforeCas.repos.every((repo) => repo.state === "tested"));
     assert.equal(
@@ -475,7 +475,7 @@ export async function runSourceLandingE2E(
       const repaired = await s.fb.git(["rev-parse", "HEAD"]);
       await s.fb.git(["push", "origin", "HEAD:main"]);
       if (!cancel) {
-        await gm(["timeline", "land", s.slug, "--owner", "orbit"], "marco", a.root);
+        await gm(["timeline", "land", s.slug, "--space", "orbit"], "marco", a.root);
         const landed = await assertComplete(s);
         const finalA = landed.repos.find((r) => r.id === s.first.id)!;
         assert.equal(finalA.merge, fixedA.merge);
@@ -537,7 +537,7 @@ export async function runSourceLandingE2E(
       });
       // Explicit operator repair restores known history, permitting honest recovery/cleanup.
       await unknown.fa.git(["push", "--force", "origin", `${uncertain.merge}:main`]);
-      await gm(["timeline", "land", unknown.slug, "--owner", "orbit"], "marco", a.root);
+      await gm(["timeline", "land", unknown.slug, "--space", "orbit"], "marco", a.root);
       const repairedUnknown = await assertComplete(unknown);
       assert.equal(
         repairedUnknown.repos.find((repo) => repo.id === unknown.first.id)?.merge,

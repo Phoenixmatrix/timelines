@@ -5,12 +5,12 @@ export type TimelinePage = "overview" | "changes" | "story";
 
 /** Where each of a timeline's pages lives; `query` carries filters such as `?repo=`. */
 export function timelinePageUrl(
-  owner: string,
+  space: string,
   slug: string,
   page: TimelinePage,
   query?: Record<string, string | null | undefined>,
 ): string {
-  const base = `/tracker/${encodeURIComponent(owner)}/timelines`;
+  const base = `/tracker/${encodeURIComponent(space)}/timelines`;
   const params = new URLSearchParams();
   if (page === "overview") params.set("tl", slug);
   for (const [key, value] of Object.entries(query ?? {})) if (value) params.set(key, value);
@@ -31,12 +31,12 @@ const LABELS: Record<TimelinePage, string> = {
  * three places from each, so Story and Changes are never dead ends.
  */
 export function TimelineNav({
-  owner,
+  space,
   slug,
   current,
   query,
 }: {
-  owner: string;
+  space: string;
   slug: string;
   current: TimelinePage;
   /** Carried to Changes and Story, e.g. the selected repository. */
@@ -50,7 +50,7 @@ export function TimelineNav({
       {(["overview", "changes", "story"] as const).map((page) => (
         <Link
           key={page}
-          to={timelinePageUrl(owner, slug, page, page === "overview" ? undefined : query)}
+          to={timelinePageUrl(space, slug, page, page === "overview" ? undefined : query)}
           aria-current={page === current ? "page" : undefined}
           className="-mb-px flex min-h-11 shrink-0 items-center border-b-2 border-transparent px-1 font-semibold text-ink-muted no-underline transition-colors hover:text-ink aria-[current=page]:border-signal-line aria-[current=page]:text-ink lg:min-h-9"
         >

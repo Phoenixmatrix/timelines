@@ -6,8 +6,8 @@
 //   GET    /api/account/avatar/options     your generated options, if any
 //   POST   /api/account/avatar/options     generate them: once per account, ever
 //   GET    /api/account/avatar/options/:n  one generated option (its account only)
-//   …/api/accounts/:slug/avatar[/options[/:n]]  the same for an organization,
-//                                          by its owners (and site admins)
+//   …/api/organizations/:organization/avatar[/options[/:n]] organization icons,
+//                                          managed by their owners and Instance operators
 //   GET    /api/avatars/:account/:file     a chosen picture (public, immutable)
 //
 // The browser crops and scales every picture (uploads and chosen options
@@ -18,10 +18,10 @@
 import { Hono, type Context } from "hono";
 import type { AvatarOptions } from "../../shared/api.ts";
 import { aiGatewayOptions } from "../ai-gateway.ts";
-import type { AppEnv } from "../auth.ts";
+import { isActorCredentialLive, type AppEnv } from "../auth.ts";
 import { readBounded, sha256 } from "../api/bytes.ts";
 import { fail, requirePerson } from "../api/http.ts";
-import { findAccountBySlug, findUserById, sqlNow, viewerFor, type Actor } from "../db.ts";
+import { findUserById, sqlNow, viewerFor, type Actor } from "../db.ts";
 import { db } from "../schema.ts";
 import { recordAiCall } from "../usage/ai.ts";
 
@@ -129,6 +129,8 @@ async function boundedBody(c: Context<AppEnv>): Promise<Uint8Array | Response> {
 interface Target {
   id: string;
   kind: "user" | "org";
+  /** The accountable person requesting non-content image generation. */
+  personId: string;
   /** Where its generated options are served. */
   optionsPath: string;
   respond: (c: Context<AppEnv>) => Promise<Response>;
@@ -141,6 +143,7 @@ function self(c: Context<AppEnv>): Target | Response {
   return {
     id: person.id,
     kind: "user",
+    personId: person.id,
     optionsPath: "/api/account/avatar/options",
     respond: async (ctx) => {
       const user = await findUserById(ctx.env.DB, person.id);
@@ -153,17 +156,26 @@ function self(c: Context<AppEnv>): Target | Response {
 async function organization(c: Context<AppEnv>): Promise<Target | Response> {
   const person = requirePerson(c);
   if (person instanceof Response) return person;
-  const slug = c.req.param("slug") ?? "";
-  const org = await findAccountBySlug(c.env.DB, slug);
-  if (!org || org.kind !== "org") return fail(c, 404, "No such organization.");
+  const slug = c.req.param("organization") ?? "";
+  const org = await db(c.env.DB)
+    .selectFrom("organizations")
+    .selectAll()
+    .where("slug", "=", slug)
+    .executeTakeFirst();
+  if (!org) return fail(c, 404, "No such organization.");
   if (!(await canManageOrg(c.env.DB, person, org.id)))
     return fail(c, 403, "Only the organization's owners can change its icon.");
   return {
     id: org.id,
     kind: "org",
-    optionsPath: `/api/accounts/${encodeURIComponent(org.slug)}/avatar/options`,
+    personId: person.id,
+    optionsPath: `/api/organizations/${encodeURIComponent(org.slug)}/avatar/options`,
     respond: async (ctx) => {
-      const row = await findAccountBySlug(ctx.env.DB, org.slug);
+      const row = await db(ctx.env.DB)
+        .selectFrom("organizations")
+        .select("avatar_key")
+        .where("id", "=", org.id)
+        .executeTakeFirst();
       return ctx.json({ avatarUrl: avatarUrl(row?.avatar_key ?? null) });
     },
   };
@@ -171,21 +183,21 @@ async function organization(c: Context<AppEnv>): Promise<Target | Response> {
 
 /** Owners of the organization, and site admins, manage its icon. */
 export async function canManageOrg(d1: D1Database, person: Actor, orgId: string) {
-  if (person.isSiteAdmin) return true;
+  if (person.isSiteAdmin && (await findUserById(d1, person.id))?.isSiteAdmin) return true;
   const membership = await db(d1)
-    .selectFrom("org_members")
+    .selectFrom("organization_members")
     .select("role")
-    .where("org_id", "=", orgId)
-    .where("user_id", "=", person.id)
+    .where("organization_id", "=", orgId)
+    .where("account_id", "=", person.id)
     .executeTakeFirst();
   return membership?.role === "owner";
 }
 
-async function currentKey(c: Context<AppEnv>, accountId: string) {
+async function currentKey(c: Context<AppEnv>, target: Target) {
   const row = await db(c.env.DB)
-    .selectFrom("accounts")
+    .selectFrom(target.kind === "org" ? "organizations" : "accounts")
     .select("avatar_key")
-    .where("id", "=", accountId)
+    .where("id", "=", target.id)
     .executeTakeFirst();
   return row?.avatar_key ?? null;
 }
@@ -197,9 +209,9 @@ async function setPicture(c: Context<AppEnv>, target: Target) {
   if (!type) return fail(c, 415, "Send a PNG, JPEG or WebP picture.");
   const key = `avatars/${target.id}/${(await sha256(bytes)).slice(0, 32)}.${EXTENSION[type]}`;
   await c.env.AVATARS.put(key, bytes, { httpMetadata: { contentType: type } });
-  const previous = await currentKey(c, target.id);
+  const previous = await currentKey(c, target);
   await db(c.env.DB)
-    .updateTable("accounts")
+    .updateTable(target.kind === "org" ? "organizations" : "accounts")
     .set({ avatar_key: key })
     .where("id", "=", target.id)
     .execute();
@@ -208,9 +220,9 @@ async function setPicture(c: Context<AppEnv>, target: Target) {
 }
 
 async function removePicture(c: Context<AppEnv>, target: Target) {
-  const previous = await currentKey(c, target.id);
+  const previous = await currentKey(c, target);
   await db(c.env.DB)
-    .updateTable("accounts")
+    .updateTable(target.kind === "org" ? "organizations" : "accounts")
     .set({ avatar_key: null })
     .where("id", "=", target.id)
     .execute();
@@ -220,9 +232,9 @@ async function removePicture(c: Context<AppEnv>, target: Target) {
 
 async function optionsFor(c: Context<AppEnv>, target: Target): Promise<AvatarOptions> {
   const row = await db(c.env.DB)
-    .selectFrom("avatar_generations")
+    .selectFrom(target.kind === "org" ? "organization_avatar_generations" : "avatar_generations")
     .selectAll()
-    .where("user_id", "=", target.id)
+    .where(target.kind === "org" ? "organization_id" : "user_id", "=", target.id)
     .executeTakeFirst();
   if (!row) return { status: "none", options: [] };
   const keys = JSON.parse(row.options) as string[];
@@ -234,9 +246,9 @@ async function optionsFor(c: Context<AppEnv>, target: Target): Promise<AvatarOpt
 
 async function serveOption(c: Context<AppEnv>, target: Target) {
   const row = await db(c.env.DB)
-    .selectFrom("avatar_generations")
+    .selectFrom(target.kind === "org" ? "organization_avatar_generations" : "avatar_generations")
     .select("options")
-    .where("user_id", "=", target.id)
+    .where(target.kind === "org" ? "organization_id" : "user_id", "=", target.id)
     .executeTakeFirst();
   const key = row ? (JSON.parse(row.options) as string[])[Number(c.req.param("n"))] : undefined;
   const object = key ? await c.env.AVATARS.get(key) : null;
@@ -258,26 +270,39 @@ async function serveOption(c: Context<AppEnv>, target: Target) {
  */
 async function generateOptions(c: Context<AppEnv>, target: Target) {
   if (!c.env.AI) return fail(c, 503, "Generated pictures are off on this server.");
-  const claimed = await db(c.env.DB)
-    .insertInto("avatar_generations")
-    .values({ user_id: target.id, status: "generating" })
-    .onConflict((oc) =>
-      oc
-        .column("user_id")
-        .doUpdateSet({ status: "generating", created_at: sqlNow, finished_at: null })
-        .where("avatar_generations.status", "=", "failed"),
-    )
-    .executeTakeFirst();
-  if (!Number(claimed.numInsertedOrUpdatedRows ?? 0n))
-    return c.json(await optionsFor(c, target), 409);
+  const person = requirePerson(c);
+  if (person instanceof Response) return person;
+  const authorized = async () =>
+    person.id === target.personId &&
+    (await isActorCredentialLive(c.env.DB, person, "write")) &&
+    (target.kind !== "org" || (await canManageOrg(c.env.DB, person, target.id)));
+  if (!(await authorized()))
+    return fail(c, 403, "Picture generation authorization is no longer valid.");
+  const table = target.kind === "org" ? "organization_avatar_generations" : "avatar_generations";
+  const column = target.kind === "org" ? "organization_id" : "user_id";
+  const claimed = await c.env.DB.prepare(
+    `INSERT INTO ${table} (${column}, status) VALUES (?, 'generating')
+     ON CONFLICT (${column}) DO UPDATE SET status = 'generating',
+       created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), finished_at = NULL
+     WHERE ${table}.status = 'failed'`,
+  )
+    .bind(target.id)
+    .run();
+  if (!claimed.meta.changes) return c.json(await optionsFor(c, target), 409);
 
   const keys: string[] = [];
   const generate = async (prompt: string) => {
-    const result = (await c.env.AI!.run(
-      AVATAR_MODEL,
-      { prompt, steps: 4 },
-      await aiGatewayOptions(c.env, "avatars", { account: target.id, feature: "avatars" }),
-    )) as { image?: string };
+    const gateway = await aiGatewayOptions(c.env, "avatars", {
+      personId: target.personId,
+      feature: "avatars",
+    });
+    if (!(await authorized())) {
+      revoked = true;
+      throw new Error("Picture generation authorization changed before model dispatch.");
+    }
+    const result = (await c.env.AI!.run(AVATAR_MODEL, { prompt, steps: 4 }, gateway)) as {
+      image?: string;
+    };
     // Metering (CORE-207): an image call, no tokens.
     c.executionCtx.waitUntil(
       recordAiCall(
@@ -287,7 +312,7 @@ async function generateOptions(c: Context<AppEnv>, target: Target) {
         {
           work: {
             feature: "avatars",
-            account: target.id,
+            personId: target.personId,
             // Who asked (CORE-222): an administrator may generate for someone else.
             actor: c.get("actor")?.id ?? null,
             agent: c.get("actor")?.agent?.id ?? null,
@@ -301,10 +326,15 @@ async function generateOptions(c: Context<AppEnv>, target: Target) {
   // Refusals are retried, within a hard budget: per slot its preset twice,
   // then the fallback; never more than MAX_GENERATION_CALLS in all.
   let budget = MAX_GENERATION_CALLS;
+  let revoked = false;
   for (const [index, prompt] of avatarPrompts(target.id, target.kind).entries()) {
     let bytes: Uint8Array | null = null;
     for (const attempt of [prompt, prompt, fallbackPrompt(target.id, index)]) {
       if (budget <= 0) break;
+      if (!(await authorized())) {
+        revoked = true;
+        break;
+      }
       budget--;
       try {
         bytes = await generate(attempt);
@@ -313,21 +343,32 @@ async function generateOptions(c: Context<AppEnv>, target: Target) {
         console.error(`avatar option ${index} failed`, error);
       }
     }
+    if (revoked) break;
     if (!bytes) continue;
+    if (!(await authorized())) {
+      revoked = true;
+      break;
+    }
     const type = imageType(bytes) ?? "image/jpeg";
     const key = `avatar-options/${target.id}/${index}.${EXTENSION[type]}`;
     await c.env.AVATARS.put(key, bytes, { httpMetadata: { contentType: type } });
     keys.push(key);
   }
   await db(c.env.DB)
-    .updateTable("avatar_generations")
+    .updateTable(target.kind === "org" ? "organization_avatar_generations" : "avatar_generations")
     .set({
       status: keys.length ? "ready" : "failed",
       options: JSON.stringify(keys),
       finished_at: sqlNow,
     })
-    .where("user_id", "=", target.id)
+    .where(target.kind === "org" ? "organization_id" : "user_id", "=", target.id)
     .execute();
+  if (revoked || !(await authorized()))
+    return fail(
+      c,
+      403,
+      "Picture generation authorization changed; generated options were not disclosed.",
+    );
   return c.json(await optionsFor(c, target), keys.length ? 201 : 502);
 }
 
@@ -351,7 +392,7 @@ function routes(base: string, resolve: Resolve) {
   avatars.get(`${base}/options/:n`, run(serveOption));
 }
 routes("/account/avatar", self);
-routes("/accounts/:slug/avatar", organization);
+routes("/organizations/:organization/avatar", organization);
 
 // Pictures are as public as profiles; a key changes with its content, so
 // they cache forever.

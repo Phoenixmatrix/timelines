@@ -128,7 +128,7 @@ test("Land says why a timeline can't land yet", async () => {
 
   // Commits since a checkpoint: the world has no push log to say so, so the
   // route's answer is canned.
-  server.on("POST", "/api/tracker/:owner/timelines/:slug/land", () =>
+  server.on("POST", "/api/tracker/:space/timelines/:slug/land", () =>
     reply(
       {
         error: "ranking has commits since checkpoint #1; make a new checkpoint to land them.",
@@ -242,6 +242,10 @@ describe("the later states, with the runs that merged and tested them", () => {
     const server = await TestServer.start({ world: true });
     const timeline = await timelineWorld(server, { names: ["engine", "web"] });
     const view = await checkpoint(server, timeline, "Ranks results");
+    const request = await askApproval(server, timeline, view.checkpoint.id);
+    await mutate(server, [{ kind: "request.answer", id: request, data: { approved: true } }]);
+    const queued = await landing(server, timeline);
+    if (!queued) throw new Error("Approving the checkpoint did not create its landing");
     const canned: Landing = {
       id: "ld_canned",
       timelineId: view.timeline.id,
@@ -252,6 +256,7 @@ describe("the later states, with the runs that merged and tested them", () => {
       reason,
       trigger: "request",
       requestedBy: { actorId: "acc_marco", accountableId: "acc_marco", agentId: null },
+      authority: queued.authority,
       version: 4,
       createdAt: "2026-10-04T10:00:00.000Z",
       updatedAt: "2026-10-04T10:05:00.000Z",
@@ -259,7 +264,7 @@ describe("the later states, with the runs that merged and tested them", () => {
         // Each repository's approved work source, as the checkpoint measured it.
         source: view.checkpoint.repos.find((pinned) => pinned.id === repo.id)!.source,
         id: repo.id,
-        owner: repo.owner,
+        space: repo.space,
         name: repo.name,
         commit: repo.tip,
         base: repo.main,
@@ -272,8 +277,8 @@ describe("the later states, with the runs that merged and tested them", () => {
         ...repos[repo.name as "engine" | "web"],
       })),
     };
-    server.on("GET", "/api/tracker/:owner/timelines/:slug/landing", { landing: canned });
-    server.on("GET", "/api/tracker/:owner/timeline-graph", async () => {
+    server.on("GET", "/api/tracker/:space/timelines/:slug/landing", { landing: canned });
+    server.on("GET", "/api/tracker/:space/timeline-graph", async () => {
       const data = await server.call<TimelineGraphData>("GET", "/api/tracker/orbit/timeline-graph");
       for (const t of data.timelines) if (t.slug === timeline.slug) t.status = status;
       return data;

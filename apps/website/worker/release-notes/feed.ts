@@ -1,4 +1,4 @@
-// A tracker account's code-update feed, filtered by facets.
+// A Space's code-update feed, filtered by facets.
 
 import {
   landedTimelineSlug,
@@ -11,14 +11,16 @@ import {
   type ReleaseFeedEntry,
   type ReleaseFeedFacet,
 } from "../../shared/release-notes.ts";
-import { findAccountBySlug, visibleRepos, type Actor } from "../db.ts";
+import { visibleRepos, type Actor } from "../db.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
+import { accessFor } from "../tracker/access.ts";
 import { db } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { toEntry, viewerTrackers, type EntryRow, type ViewerTrackers } from "./read.ts";
 import { ensureReleaseNotes } from "./queue.ts";
 
 export interface FeedRow extends EntryRow {
-  repo_owner: string;
+  repo_space: string;
   repo_name: string;
 }
 
@@ -26,9 +28,9 @@ export interface FeedContext {
   trackers: ViewerTrackers;
   /** Repositories the viewer can read. */
   visibleRepoIds: Set<string>;
-  /** Workspace id → slug, for the account's tracker. */
-  workspaces: Map<string, string>;
-  /** Team key → name, for the account's tracker: a facet reads "Core", not "CORE" (CORE-395). */
+  /** Project id → slug, for the Space's tracker. */
+  projects: Map<string, string>;
+  /** Team key → name, for the Space's tracker: a facet reads "Core", not "CORE" (CORE-395). */
   teams: Map<string, string>;
   query: ParsedReleaseQuery;
   /** Independent landed-timeline scope, ANDed with the explicit query. */
@@ -40,8 +42,8 @@ export interface FeedContext {
 const FEED_LIMIT = 200;
 const SCAN_LIMIT = 5000;
 
-/** Filter, merge and count rows already scoped to one tracker account. */
-export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFeed, "owner"> {
+/** Filter, merge and count rows already scoped to one tracker Space. */
+export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFeed, "space"> {
   const scope = context.timeline && context.timeline !== "main" ? context.timeline : null;
   const query: ParsedReleaseQuery = {
     ...context.query,
@@ -68,8 +70,8 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     if (!entry) continue;
     if (scope && landedTimelineSlug(entry.timeline) !== scope) continue;
     if (!includeTags && entry.releaseKind !== "daily") continue;
-    const repo = `${row.repo_owner}/${row.repo_name}`.toLowerCase();
-    const slugs = entry.workspaceIds.flatMap((id) => context.workspaces.get(id) ?? []);
+    const repo = `${row.repo_space}/${row.repo_name}`.toLowerCase();
+    const slugs = entry.projectIds.flatMap((id) => context.projects.get(id) ?? []);
     const text =
       `${entry.title}\n${entry.summary}\n${entry.issue?.key ?? ""}\n${entry.timeline?.branch ?? ""}`.toLowerCase();
     const matches = (key: string, value: string): boolean => {
@@ -78,7 +80,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
           return entry.issue?.team.key.toLowerCase() === value;
         case "repo":
           return repo === value || row.repo_name.toLowerCase() === value;
-        case "ws":
+        case "project":
           return slugs.some((slug) => slug.toLowerCase() === value);
         case "type":
           return entry.category === value;
@@ -108,8 +110,8 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     // Explicit named snapshots remain distinct; the default feed contains only days.
     shipped.push({
       ...entry,
-      repo: { owner: row.repo_owner, name: row.repo_name },
-      repos: [{ owner: row.repo_owner, name: row.repo_name, releases: [entry.release] }],
+      repo: { space: row.repo_space, name: row.repo_name },
+      repos: [{ space: row.repo_space, name: row.repo_name, releases: [entry.release] }],
     });
   }
 
@@ -143,11 +145,11 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
           : [],
       ),
       repos: facet((e) =>
-        e.repos.map((r) => [`${r.owner}/${r.name}`.toLowerCase(), `${r.owner}/${r.name}`]),
+        e.repos.map((r) => [`${r.space}/${r.name}`.toLowerCase(), `${r.space}/${r.name}`]),
       ),
-      workspaces: facet((e) =>
-        e.workspaceIds.flatMap((id) => {
-          const slug = context.workspaces.get(id);
+      projects: facet((e) =>
+        e.projectIds.flatMap((id) => {
+          const slug = context.projects.get(id);
           return slug ? [[slug.toLowerCase(), slug] as [string, string]] : [];
         }),
       ),
@@ -186,29 +188,41 @@ function oldTagSpelling(rows: FeedRow[], filters: ParsedReleaseQuery["filters"])
 }
 
 export class FeedError extends Error {
-  readonly status: 401 | 403 | 404;
-  constructor(status: 401 | 403 | 404, message: string) {
+  readonly status: 400 | 401 | 403 | 404;
+  constructor(status: 400 | 401 | 403 | 404, message: string) {
     super(message);
     this.status = status;
   }
 }
 
-/** The feed for a tracker account, as an actor who can read that tracker sees it. */
+/** The feed for a tracker Space, as an actor who can read that tracker sees it. */
 export async function releaseFeed(
   env: Env,
   actor: Actor | null,
-  ownerSlug: string,
+  spaceSlug: string,
   q: string,
   timeline?: string,
 ): Promise<ReleaseFeed> {
   if (!actor) throw new FeedError(401, "Sign in to read release notes.");
-  const owner = await findAccountBySlug(env.DB, ownerSlug);
-  if (!owner) throw new FeedError(404, "Tracker account not found.");
+  const space = await findSpaceBySlug(env.DB, spaceSlug);
+  if (!space) throw new FeedError(404, "Tracker Space not found.");
   const trackers = await viewerTrackers(env.DB, actor);
-  if (!trackers.has(owner.id))
-    throw new FeedError(403, "Release notes for a tracker require account membership.");
-
-  const query = parseReleaseQuery(q);
+  if (!trackers.has(space.id))
+    throw new FeedError(403, "Release notes for a tracker require an explicit Space grant.");
+  const access = await accessFor(
+    env,
+    space,
+    actor.id,
+    actor.agent?.id ?? null,
+    false,
+    actor.credential,
+  );
+  let query: ParsedReleaseQuery;
+  try {
+    query = parseReleaseQuery(q);
+  } catch (error) {
+    throw new FeedError(400, error instanceof Error ? error.message : "Invalid release query.");
+  }
   const scope = timeline && timeline !== "main" ? timeline : null;
   const d = db(env.DB);
   const repos = await visibleRepos(env.DB, actor);
@@ -216,27 +230,15 @@ export async function releaseFeed(
   const candidates = await d
     .selectFrom("repos")
     .select("id")
-    .where((eb) =>
-      eb.or([
-        eb("owner_id", "=", owner.id),
-        eb(
-          "id",
-          "in",
-          eb
-            .selectFrom("tracker_repo_subscriptions")
-            .select("repo_id")
-            .where("tracker_owner_id", "=", owner.id),
-        ),
-      ]),
-    )
+    .where("space_id", "=", space.id)
     .execute();
   for (const repo of candidates)
-    if (visibleRepoIds.has(repo.id)) await ensureReleaseNotes(env, repo.id);
+    if (visibleRepoIds.has(repo.id)) await ensureReleaseNotes(env, repo.id, actor);
   // Narrow in SQL by the cheap facets; the rest are applied with access rules.
   let select = d
     .selectFrom("release_note_entries as e")
     .innerJoin("repos as r", "r.id", "e.repo_id")
-    .innerJoin("accounts as a", "a.id", "r.owner_id")
+    .innerJoin("spaces as a", "a.id", "r.space_id")
     .innerJoin("release_note_state as s", "s.repo_id", "e.repo_id")
     .where("s.format_version", "=", 1)
     .where("r.deleted_at", "is", null)
@@ -245,10 +247,8 @@ export async function releaseFeed(
     )
     .where("n.format_version", "=", 1)
     .selectAll("e")
-    .select(["a.slug as repo_owner", "r.name as repo_name"])
-    .where((eb) =>
-      eb.or([eb("e.tracker_owner_id", "=", owner.id), eb("r.owner_id", "=", owner.id)]),
-    );
+    .select(["a.slug as repo_space", "r.name as repo_name"])
+    .where("r.space_id", "=", space.id);
   // Scope before the scan cap so unrelated landings cannot crowd out this timeline.
   if (scope)
     select = select
@@ -272,15 +272,15 @@ export async function releaseFeed(
       select = select.where("e.category", "=", filter.value as EntryRow["category"]);
     if (filter.key === "team") select = select.where("e.team_key", "=", filter.value.toUpperCase());
   }
-  const [rows, workspaces, teams] = await Promise.all([
+  const [rows, projects, teams] = await Promise.all([
     select.orderBy("e.shipped_at", "desc").limit(SCAN_LIMIT).execute(),
-    trackerObject(env, owner.id).workspaceSlugs(),
-    trackerObject(env, owner.id).teamNames(),
+    trackerObject(env, space.id).projectSlugs(access),
+    trackerObject(env, space.id).teamNames(access),
   ]);
   const feed = buildFeed(rows, {
     trackers,
     visibleRepoIds,
-    workspaces: new Map(workspaces.ok ? workspaces.value.map((w) => [w.id, w.slug]) : []),
+    projects: new Map(projects.ok ? projects.value.map((p) => [p.id, p.slug]) : []),
     teams: new Map(teams.ok ? teams.value.map((t) => [t.key, t.name]) : []),
     query,
     timeline,
@@ -288,7 +288,7 @@ export async function releaseFeed(
     limit: FEED_LIMIT,
   });
   return {
-    owner: { slug: owner.slug, displayName: owner.display_name },
+    space,
     ...feed,
     truncated: feed.truncated || rows.length === SCAN_LIMIT,
   };

@@ -34,6 +34,12 @@ import {
 } from "./verification.ts";
 import { durableStub } from "../durable/registry.ts";
 import { cancelRun } from "./cancel.ts";
+import {
+  captureWorkAuthority,
+  resolveRunAuthority,
+  resolveWorkAuthority,
+  type WorkAuthority,
+} from "./admission.ts";
 
 export interface CiRepo {
   id: string;
@@ -95,6 +101,7 @@ export async function startWorkflow(env: Env, runId: string) {
     .where((eb) => eb.or([eb("p.deleted_at", "is", null), eb("r.preview_action", "=", "teardown")]))
     .executeTakeFirst();
   if (!run) return;
+  await resolveRunAuthority(env, runId);
   await ciSource(env, run.repo_id, run.source_id, { runId });
   await env.CI_RUN.create({ id: runId, params: { runId } satisfies RunParams });
 }
@@ -122,7 +129,9 @@ export async function startRun(
     /** Only queue recovery supplies this; direct pushes and reruns execute normally. */
     verification?: CandidateVerification;
     /** Who pushed or started it: a person, or an agent acting for one. */
-    actor: Pick<Actor, "id" | "agent"> | null;
+    actor: Pick<Actor, "id" | "agent" | "credential"> | null;
+    /** Original initiating authority for delayed/retried work. */
+    authority?: WorkAuthority;
     waitUntil: Waiter;
     /** The run's id, when the caller recorded it before starting it (a landing does). */
     runId?: string;
@@ -149,6 +158,8 @@ export async function startRun(
   const preview = options.trigger === "preview" ? (options.preview ?? null) : null;
   if (options.trigger === "preview" && !preview)
     throw new Error("A preview run needs its action and timeline.");
+  const authority = options.authority ?? (await captureWorkAuthority(env, repo.id, options.actor));
+  await resolveWorkAuthority(env, authority, repo.id);
   repo = await ciSource(
     env,
     repo.id,
@@ -323,6 +334,9 @@ export async function startRun(
           "id",
           "repo_id",
           "source_id",
+          "space_id",
+          "migration_epoch",
+          "authority",
           "number",
           "commit_oid",
           "ref",
@@ -352,13 +366,16 @@ export async function startRun(
               eb.val(runId).as("id"),
               eb.val(repo.id).as("repo_id"),
               eb.val(repo.source_id ?? "canonical").as("source_id"),
+              eb.val(authority.spaceId).as("space_id"),
+              eb.val(authority.migrationEpoch).as("migration_epoch"),
+              eb.val(JSON.stringify(authority)).as("authority"),
               eb(eb.fn.coalesce(eb.fn.max("number"), eb.lit(0)), "+", eb.lit(1)).as("number"),
               eb.val(options.commit).as("commit_oid"),
               eb.val(options.branch).as("ref"),
               // ci_runs.trigger's CHECK predates previews and landings: see the migrations.
               eb.val(stored).as("trigger"),
-              eb.val(options.actor?.id ?? null).as("actor_id"),
-              eb.val(options.actor?.agent?.id ?? null).as("agent_id"),
+              eb.val(authority.personId).as("actor_id"),
+              eb.val(authority.agentId).as("agent_id"),
               eb.val(title).as("title"),
               eb.val(error ? "failed" : "queued").as("status"),
               eb.val(error).as("config_error"),
@@ -501,6 +518,7 @@ export async function startRun(
         ),
       );
     }
+    await resolveWorkAuthority(env, authority, repo.id);
     await batch(env.DB, statements);
     // Under load, a push waits in a held run: when a run on its branch finishes,
     // the newest held run starts and covers the older ones.
@@ -539,9 +557,12 @@ export async function startRun(
     if (!error && options.sourceRecovery) {
       await startRecoveredWorkflow(env, runId);
     } else if (!error) {
+      await resolveRunAuthority(env, runId);
       try {
         await startWorkflow(env, runId);
       } catch (cause) {
+        // An existing Workflow never restores revoked initiating authority.
+        await resolveRunAuthority(env, runId);
         // Landing replay, like queue/source recovery, can race an earlier start.
         // A handle alone is not evidence that the exact instance exists.
         const recovered = await env.CI_RUN.get(runId)
@@ -579,6 +600,7 @@ export async function startRun(
 
 /** Preserve the queued run on transient startup failure; replay uses this same ID. */
 async function startRecoveredWorkflow(env: Env, runId: string) {
+  await resolveRunAuthority(env, runId);
   try {
     await startWorkflow(env, runId);
   } catch (error) {
@@ -662,6 +684,7 @@ export async function releaseQuiet(
     .execute();
   for (const run of waiting) {
     try {
+      await resolveRunAuthority(env, run.id);
       await (await env.CI_RUN.get(run.id)).sendEvent({ type: QUIET_RELEASE, payload: {} });
     } catch (error) {
       console.error("CI: could not release a quiet run", { runId: run.id, error });
@@ -676,9 +699,10 @@ const START_RETRY_MS = [1_000, 4_000] as const;
 export async function onPush(
   env: Env,
   repo: CiRepo,
-  actor: Pick<Actor, "id" | "agent"> | null,
+  actor: Pick<Actor, "id" | "agent" | "credential"> | null,
   waitUntil: Waiter,
 ) {
+  const authority = await captureWorkAuthority(env, repo.id, actor);
   const refs = await listRefs(env, repo.artifacts_name, repo.artifacts_remote);
   const kdb = db(env.DB);
   const known = new Set(
@@ -779,6 +803,7 @@ export async function onPush(
             commit: row.oid,
             trigger,
             actor,
+            authority,
             waitUntil,
           });
           break;

@@ -1,15 +1,14 @@
 // Usage metering (CORE-207): measured figures match seeded stores of known
 // sizes, estimates say so, collection is bounded and resumable, and every
-// D1 table is in a group.
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+// D1 table is metered or explicitly classified as independent control state.
 import { DatabaseSync } from "node:sqlite";
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import { FakeR2Bucket } from "@gitmatrix/testing";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { collectUsage, SITE, USAGE_LIMITS } from "./collect.ts";
-import { TABLE_GROUPS } from "./tables.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { collectUsage, USAGE_LIMITS } from "./collect.ts";
+import { TABLE_GROUPS, UNMETERED_CONTROL_TABLES } from "./tables.ts";
+import type { UsageScope } from "../../shared/usage.ts";
+const INSTANCE = { kind: "instance", id: "" } as const;
 
 // Unreachable git data takes a fetch from Artifacts (worker/git/unreachable.test.ts).
 vi.mock(import("../git/unreachable.ts"), async (original) => ({
@@ -21,16 +20,6 @@ vi.mock(import("../git/unreachable.ts"), async (original) => ({
     truncated: false,
   }),
 }));
-
-function migrated(dir: string): DatabaseSync {
-  const db = new DatabaseSync(":memory:");
-  const path = fileURLToPath(new URL(dir, import.meta.url).href);
-  for (const file of readdirSync(path)
-    .filter((f) => f.endsWith(".sql"))
-    .sort())
-    db.exec(readFileSync(join(path, file), "utf8"));
-  return db;
-}
 
 const NOW = new Date("2026-10-05T03:17:00Z");
 const TODAY = "2026-10-05";
@@ -44,22 +33,34 @@ let env: Env;
 let avatars: FakeR2Bucket;
 
 beforeEach(async () => {
-  main = migratedDatabase();
-  registry = migrated("../../registry/migrations/");
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  main = fresh.sqlite;
+  registry = fresh.registry;
   avatars = new FakeR2Bucket();
   env = {
-    DB: d1(main),
-    REGISTRY_DB: d1(registry),
+    ...fresh.env,
     AVATARS: avatars,
   } as unknown as Env;
-  main.exec(`
+  main.exec(`BEGIN;
     INSERT INTO accounts (id, kind, slug, display_name, avatar_key) VALUES
-      ('acc_o', 'org', 'orbit', 'Orbit', 'avatars/acc_o/a.png'),
+      ('acc_o', 'user', 'orbit', 'Orbit', 'avatars/acc_o/a.png'),
       ('acc_p', 'user', 'pat', 'Pat', NULL);
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote, pushed_bytes) VALUES
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id) VALUES
+      ('org_o', 'orbit-company', 'Orbit', 'company', NULL, 'acc_o'),
+      ('org_p', 'pat-personal', 'Pat', 'personal', 'acc_p', 'acc_p');
+    INSERT INTO spaces (id, organization_id, slug, display_name) VALUES
+      ('acc_o', 'org_o', 'orbit', 'Orbit'),
+      ('acc_p', 'org_p', 'pat', 'Pat');
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote, pushed_bytes) VALUES
       ('repo_1', 'acc_o', 'engine', 'private', 'n1', 'https://x', 5000),
       ('repo_2', 'acc_o', 'site', 'public', 'n2', 'https://x', 7000),
       ('repo_p', 'acc_p', 'notes', 'private', 'n3', 'https://x', 0);
+    INSERT INTO mention_backfill_jobs (repo_id, authority, state) VALUES
+      ('repo_1', NULL, 'blocked'), ('repo_2', NULL, 'blocked'),
+      ('repo_p', NULL, 'blocked');
+    INSERT INTO tracker_repo_subscriptions (tracker_space_id, repo_id) VALUES
+      ('acc_o', 'repo_p'), ('acc_p', 'repo_1'), ('acc_p', 'repo_2');
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
       ('run_1', 'repo_1', 1, 'c', 'refs/heads/main', 'push', 'succeeded');
     -- Branches deleted in Orbit's two repositories, none in Pat's.
@@ -81,21 +82,27 @@ beforeEach(async () => {
     INSERT INTO kg_search_items (repo_id, key, item_id, version, bytes) VALUES
       ('repo_1', 'file:a', 'i1', 'v', 3000), ('repo_1', 'file:b', 'i2', 'v', 1000),
       ('repo_2', 'page:x', 'i3', 'v', NULL);
-    INSERT INTO do_instances (class, name, account_id, repo_id, storage_bytes, sized_at, purged_at) VALUES
-      ('Tracker', 'acc_o', 'acc_o', NULL, 40960, '${TODAY}T00:00:00Z', NULL),
-      ('KnowledgeCoordinator', 'repo_1', 'acc_o', 'repo_1', 8192, '${TODAY}T00:00:00Z', NULL),
-      ('KnowledgeCoordinator', 'repo_2', 'acc_o', 'repo_2', NULL, NULL, NULL),
-      ('KnowledgeCoordinator', 'repo_gone', 'acc_o', 'repo_gone', 0, '${TODAY}T00:00:00Z', '${TODAY}T00:00:00Z'),
-      ('RegistryUpload', 'u1', NULL, NULL, NULL, NULL, NULL);
-    INSERT INTO ai_usage (day, account_id, feature, model, calls, input_tokens, output_tokens, total_tokens) VALUES
-      ('${YESTERDAY}', 'acc_o', 'knowledge', '@cf/m', 3, 300, 30, 330),
-      ('${YESTERDAY}', 'acc_o', 'release_notes', '@cf/m', 1, 100, 10, 110),
-      ('${YESTERDAY}', '', 'unattributed', '@cf/e', 2, 0, 0, 0),
-      ('${YESTERDAY}', 'acc_o', 'knowledge', 'openrouter:google/gemini-3-flash', 5, 500, 50, 550),
-      ('${TODAY}', 'acc_o', 'knowledge', '@cf/m', 9, 900, 90, 990);
-  `);
+    INSERT INTO do_instances (class, name, space_id, account_id, repo_id, storage_bytes, sized_at, purged_at) VALUES
+      ('Tracker', 'acc_o', 'acc_o', NULL, NULL, 40960, '${TODAY}T00:00:00Z', NULL),
+      ('KnowledgeCoordinator', 'repo_1', 'acc_o', NULL, 'repo_1', 8192, '${TODAY}T00:00:00Z', NULL),
+      ('KnowledgeCoordinator', 'repo_2', 'acc_o', NULL, 'repo_2', NULL, NULL, NULL),
+      ('KnowledgeCoordinator', 'repo_gone', 'acc_o', NULL, 'repo_gone', 0, '${TODAY}T00:00:00Z', '${TODAY}T00:00:00Z'),
+      ('Assistant', 'acc_o:chat', NULL, 'acc_o', NULL, 1024, '${TODAY}T00:00:00Z', NULL),
+      ('StepFeed', 'repo_1:main', 'acc_o', NULL, 'repo_1', 2048, '${TODAY}T00:00:00Z', NULL),
+      ('RegistryRepo', 'feed_1', 'acc_o', NULL, NULL, 4096, '${TODAY}T00:00:00Z', NULL),
+      ('CiSandbox', 'job_1', 'acc_o', NULL, 'repo_1', 0, '${TODAY}T00:00:00Z', NULL),
+      ('RegistryLogin', 'login_1', NULL, NULL, NULL, NULL, NULL, NULL),
+      ('RegistryUpload', 'u1', NULL, NULL, NULL, NULL, NULL, NULL);
+    INSERT INTO ai_usage (day, scope_kind, scope_id, feature, model, calls, input_tokens, output_tokens, total_tokens) VALUES
+      ('${YESTERDAY}', 'space', 'acc_o', 'knowledge', '@cf/m', 3, 300, 30, 330),
+      ('${YESTERDAY}', 'space', 'acc_o', 'release_notes', '@cf/m', 1, 100, 10, 110),
+      ('${YESTERDAY}', 'person', 'acc_o', 'assistant', '@cf/m', 7, 700, 70, 770),
+      ('${YESTERDAY}', 'instance', '', 'unattributed', '@cf/e', 2, 0, 0, 0),
+      ('${YESTERDAY}', 'space', 'acc_o', 'knowledge', 'openrouter:google/gemini-3-flash', 5, 500, 50, 550),
+      ('${TODAY}', 'space', 'acc_o', 'knowledge', '@cf/m', 9, 900, 90, 990);
+  COMMIT;`);
   registry.exec(`
-    INSERT INTO repositories (id, key, format, owner_id, kind, visibility, created_at, updated_at) VALUES
+    INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at) VALUES
       ('feed_1', 'npm-o', 'npm', 'acc_o', 'local', 'private', 't', 't'),
       ('feed_2', 'gen-o', 'generic', 'acc_o', 'local', 'private', 't', 't'),
       ('feed_p', 'gen-p', 'generic', 'acc_p', 'local', 'private', 't', 't');
@@ -115,15 +122,15 @@ beforeEach(async () => {
   await avatars.put("avatars/acc_o/a.png", new Uint8Array(1234));
 });
 
-function figures(account: string) {
+function figures(scope: UsageScope) {
   return Object.fromEntries(
     (
       main
         .prepare(
           `SELECT day, construct, item, metric, kind, quantity, estimated, method FROM usage_snapshots
-           WHERE account_id = ? ORDER BY construct, item, metric`,
+           WHERE scope_kind = ? AND scope_id = ? ORDER BY construct, item, metric`,
         )
-        .all(account) as {
+        .all(scope.kind, scope.id) as {
         day: string;
         construct: string;
         item: string;
@@ -142,6 +149,7 @@ async function collectAll(limits = USAGE_LIMITS) {
   for (;;) {
     runs++;
     const result = await collectUsage(env, NOW, limits);
+    expect(result.failed).toBe(0);
     if (result.done) return runs;
     if (runs > 500) throw new Error("collection never finished");
   }
@@ -150,7 +158,7 @@ async function collectAll(limits = USAGE_LIMITS) {
 describe("collectUsage", () => {
   test("measured figures match the seeded stores; estimates are labelled", async () => {
     expect(await collectAll()).toBe(1);
-    const o = figures("acc_o");
+    const o = figures({ kind: "space", id: "acc_o" });
     const q = (key: string) => o[`${key}`]?.quantity;
 
     // D1: CI logs measured exactly (job_3's local log belongs to the same account).
@@ -163,6 +171,15 @@ describe("collectUsage", () => {
     expect(o[`${TODAY} d1/repositories/bytes`]).toMatchObject({ estimated: 1 });
     expect(o[`${TODAY} d1/repositories/bytes`]!.method).toMatch(/sampled rows/);
     expect(q(`${TODAY} d1/repositories/bytes`)).toBeGreaterThan(0);
+    expect(q(`${TODAY} d1/issue-mentions/rows`)).toBe(2);
+    expect(
+      figures({ kind: "space", id: "acc_p" })[`${TODAY} d1/issue-mentions/rows`]?.quantity,
+    ).toBe(1);
+    // Subscriptions belong to the subscribing Tracker's Space, not the repo's.
+    expect(q(`${TODAY} d1/content-settings/rows`)).toBe(1);
+    expect(
+      figures({ kind: "space", id: "acc_p" })[`${TODAY} d1/content-settings/rows`]?.quantity,
+    ).toBe(2);
     // Registry D1 groups too: 2 feeds, 1 package, 1 version, 3 files, 1 derived file.
     expect(q(`${TODAY} d1/packages/rows`)).toBe(8);
 
@@ -180,7 +197,17 @@ describe("collectUsage", () => {
     expect(q(`${TODAY} r2/registry_blobs/objects`)).toBe(2);
     expect(q(`${TODAY} r2/registry_blobs/bytes`)).toBe(300);
     expect(q(`${TODAY} r2/registry_derived/bytes`)).toBe(50);
-    expect(q(`${TODAY} r2/avatars/bytes`)).toBe(1234);
+    expect(q(`${TODAY} r2/avatars/bytes`)).toBeUndefined();
+    const person = figures({ kind: "person", id: "acc_o" });
+    expect(person[`${TODAY} r2/avatars/bytes`]?.quantity).toBe(1234);
+    expect(person[`${TODAY} durable_objects/Assistant/bytes`]?.quantity).toBe(1024);
+    expect(person[`${YESTERDAY} workers_ai/@cf/m/calls`]?.quantity).toBe(7);
+    expect(person[`${TODAY} durable_objects/Tracker/bytes`]).toBeUndefined();
+    expect(person[`${TODAY} artifacts/repositories/bytes`]).toBeUndefined();
+    expect(q(`${TODAY} durable_objects/Assistant/bytes`)).toBeUndefined();
+    expect(q(`${TODAY} durable_objects/StepFeed/bytes`)).toBe(2048);
+    expect(q(`${TODAY} durable_objects/RegistryRepo/bytes`)).toBe(4096);
+    expect(person[`${TODAY} durable_objects/RegistryRepo/bytes`]).toBeUndefined();
 
     // Artifacts: estimated from pushed pack bytes.
     expect(q(`${TODAY} artifacts/repositories/repositories`)).toBe(2);
@@ -226,15 +253,18 @@ describe("collectUsage", () => {
     expect(o[`${YESTERDAY} ci/sandbox/minutes`]!.estimated).toBe(0);
 
     // The other account sees only its own.
-    const p = figures("acc_p");
+    const p = figures({ kind: "space", id: "acc_p" });
     expect(p[`${TODAY} r2/registry_blobs/bytes`]?.quantity).toBe(400);
     expect(p[`${TODAY} d1/ci-logs/rows`]).toBeUndefined();
     expect(p[`${TODAY} durable_objects/Tracker/bytes`]).toBeUndefined();
 
     // The site: global caches, unowned instances, the whole blob catalog, unattributed AI.
-    const site = figures(SITE);
+    const site = figures(INSTANCE);
     expect(site[`${TODAY} r2/registry_blobs_all/bytes`]?.quantity).toBe(700);
     expect(site[`${TODAY} durable_objects/RegistryUpload/instances`]?.quantity).toBe(1);
+    expect(site[`${TODAY} durable_objects/CiSandbox/instances`]).toBeUndefined();
+    expect(q(`${TODAY} durable_objects/CiSandbox/instances`)).toBe(1);
+    expect(site[`${TODAY} durable_objects/RegistryLogin/instances`]?.quantity).toBe(1);
     expect(site[`${YESTERDAY} workers_ai/@cf/e/calls`]?.quantity).toBe(2);
     expect(site[`${TODAY} d1/system/rows`]?.quantity).toBeGreaterThanOrEqual(1);
 
@@ -242,80 +272,132 @@ describe("collectUsage", () => {
     expect(await collectUsage(env, NOW)).toMatchObject({ steps: 0, done: true });
   });
 
-  test("highlight storage belongs to the scope owner, or the viewer for global projections", async () => {
-    const projections = [
-      { scope: "repo", scopeId: "repo_1", owner: "acc_o", body: "Repository highlights: é" },
-      { scope: "tracker", scopeId: "acc_o", owner: "acc_o", body: "Organization highlights" },
-      { scope: "site", scopeId: "acc_p", owner: "acc_p", body: "Global highlights" },
-    ];
-    const updatedAt = NOW.toISOString();
-    const insert = main.prepare(`
+  test("highlights charge content to Space and global projections to their person", async () => {
+    main.exec(`
       INSERT INTO release_highlights
-        (scope, scope_id, viewer_id, owner_account_id, source_hash, body, status, updated_at)
-      VALUES (?, ?, 'acc_p', ?, 'hash', ?, 'ready', ?)
+        (scope, scope_id, viewer_id, space_id, source_hash, body, status, updated_at)
+      VALUES ('repo', 'repo_1', 'acc_p', 'acc_o', 'h', 'repo', 'ready', '${TODAY}'),
+             ('tracker', 'acc_o', 'acc_p', 'acc_o', 'h', 'tracker', 'ready', '${TODAY}'),
+             ('site', 'acc_p', 'acc_p', NULL, 'h', 'global', 'ready', '${TODAY}');
     `);
-    for (const projection of projections) {
-      insert.run(
-        projection.scope,
-        projection.scopeId,
-        projection.owner,
-        projection.body,
-        updatedAt,
-      );
-    }
-    // All rows fit in the sample. Count the fixture's UTF-8 payload independently
-    // of the collector's SQL, including the manifest and two integer defaults.
-    const payloadBytes = (projection: (typeof projections)[number]) =>
-      new TextEncoder().encode(
-        projection.scope +
-          projection.scopeId +
-          "acc_p" +
-          projection.owner +
-          "hash[]" +
-          projection.body +
-          "ready" +
-          updatedAt +
-          "00",
-      ).byteLength;
-
     await collectAll();
-    const owner = figures("acc_o");
-    const viewer = figures("acc_p");
-    expect(owner[`${TODAY} d1/release-notes/rows`]).toMatchObject({
-      quantity: 2,
-      estimated: 0,
-      kind: "storage",
-    });
-    expect(owner[`${TODAY} d1/release-notes/bytes`]).toMatchObject({
-      quantity: payloadBytes(projections[0]!) + payloadBytes(projections[1]!),
-      estimated: 1,
-    });
-    expect(viewer[`${TODAY} d1/release-notes/rows`]).toMatchObject({
-      quantity: 1,
-      estimated: 0,
-      kind: "storage",
-    });
-    expect(viewer[`${TODAY} d1/release-notes/bytes`]).toMatchObject({
-      quantity: payloadBytes(projections[2]!),
-      estimated: 1,
-    });
-    expect(figures(SITE)[`${TODAY} d1/release-notes/rows`]).toBeUndefined();
-    expect(figures(SITE)[`${TODAY} d1/release-notes/bytes`]).toBeUndefined();
+    expect(
+      figures({ kind: "space", id: "acc_o" })[`${TODAY} d1/release-notes/rows`]?.quantity,
+    ).toBe(2);
+    expect(
+      figures({ kind: "space", id: "acc_p" })[`${TODAY} d1/release-notes/rows`],
+    ).toBeUndefined();
+    const personal = TABLE_GROUPS.find((g) => g.id === "account" && g.scope === "person")!;
+    expect(
+      main
+        .prepare(
+          `SELECT COUNT(*) AS n FROM release_highlights WHERE ${personal.tables.release_highlights}`,
+        )
+        .get("acc_p"),
+    ).toEqual({ n: 1 });
+  });
+
+  test("unresolved content instances are not infrastructure; genuine personal metadata remains personal", async () => {
+    main.exec(`
+      INSERT INTO do_instances (class, name, account_id, space_id, storage_bytes) VALUES
+        ('Tracker', 'unresolved-tracker', NULL, NULL, 100),
+        ('KnowledgeCoordinator', 'unresolved-repo', NULL, NULL, 100),
+        ('StepFeed', 'unresolved-repo:main', NULL, NULL, 100),
+        ('RegistryRepo', 'unresolved-feed', NULL, NULL, 100),
+        ('CiSandbox', 'unresolved-job', NULL, NULL, 100),
+        ('Assistant', 'unresolved-person:chat', NULL, NULL, 100),
+        ('CiSandbox', 'personal-job', 'acc_o', NULL, 20),
+        ('RegistryLogin', 'personal-login', 'acc_o', NULL, 30);
+    `);
+    await collectAll();
+    const instance = figures(INSTANCE);
+    const person = figures({ kind: "person", id: "acc_o" });
+    for (const cls of [
+      "Tracker",
+      "KnowledgeCoordinator",
+      "StepFeed",
+      "RegistryRepo",
+      "CiSandbox",
+      "Assistant",
+    ]) {
+      expect(instance[`${TODAY} durable_objects/${cls}/instances`]).toBeUndefined();
+    }
+    expect(instance[`${TODAY} durable_objects/RegistryLogin/instances`]?.quantity).toBe(1);
+    expect(person[`${TODAY} durable_objects/CiSandbox/bytes`]?.quantity).toBe(20);
+    expect(person[`${TODAY} durable_objects/RegistryLogin/bytes`]?.quantity).toBe(30);
+    const predicate = TABLE_GROUPS.find(
+      (g) => g.id === "durable-registry" && g.scope === "instance",
+    )!.tables.do_instances;
+    expect(
+      main.prepare(`SELECT COUNT(*) AS n FROM do_instances WHERE ${predicate}`).get(""),
+    ).toEqual({ n: 2 });
+  });
+
+  test("Organization pictures and options charge Instance despite matching person and Space IDs", async () => {
+    const selected = "avatar-options/legacy-org/0.jpg";
+    const option = "avatar-options/legacy-org/1.jpg";
+    const personalOption = "avatar-options/acc_o/0.jpg";
+    main.exec(`BEGIN;
+      INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id, avatar_key)
+        VALUES ('acc_o', 'directory-org', 'Directory', 'company', NULL, 'icon-space', '${selected}');
+      INSERT INTO spaces (id, organization_id, slug, display_name)
+        VALUES ('icon-space', 'acc_o', 'icon-space', 'Icon');
+      INSERT INTO organization_avatar_generations (organization_id, status, options)
+        VALUES ('acc_o', 'ready', '${JSON.stringify([selected, option, selected])}');
+      INSERT INTO avatar_generations (user_id, status, options)
+        VALUES ('acc_o', 'ready', '${JSON.stringify(["avatars/acc_o/a.png", personalOption])}');
+    COMMIT;`);
+    await avatars.put(selected, new Uint8Array(100));
+    await avatars.put(option, new Uint8Array(200));
+    await avatars.put(personalOption, new Uint8Array(50));
+    await collectAll({ ...USAGE_LIMITS, steps: 2 });
+    const instance = figures(INSTANCE);
+    const person = figures({ kind: "person", id: "acc_o" });
+    const space = figures({ kind: "space", id: "acc_o" });
+    expect(instance[`${TODAY} r2/organization_avatars/bytes`]?.quantity).toBe(300);
+    expect(instance[`${TODAY} r2/organization_avatars/objects`]?.quantity).toBe(2);
+    expect(person[`${TODAY} r2/avatars/bytes`]?.quantity).toBe(1284);
+    expect(person[`${TODAY} r2/avatars/objects`]?.quantity).toBe(2);
+    expect(person[`${TODAY} r2/organization_avatars/bytes`]).toBeUndefined();
+    expect(space[`${TODAY} r2/organization_avatars/bytes`]).toBeUndefined();
+  });
+
+  test("legacy collection cursors cannot skip scope-aware collection", async () => {
+    main
+      .prepare("INSERT INTO job_cursors (name, cursor, updated_at) VALUES (?, ?, ?)")
+      .run(
+        "usage:collect",
+        JSON.stringify({ day: TODAY, account: "acc_o", step: 100, page: "old", done: true }),
+        TODAY,
+      );
+    await collectAll();
+    expect(figures({ kind: "space", id: "acc_o" })[`${TODAY} d1/repositories/rows`]?.quantity).toBe(
+      2,
+    );
+    expect(figures({ kind: "person", id: "acc_o" })[`${TODAY} r2/avatars/bytes`]?.quantity).toBe(
+      1234,
+    );
   });
 
   test("bounded and resumable: tiny budgets reach the same figures", async () => {
     await collectAll();
-    const whole = { o: figures("acc_o"), p: figures("acc_p"), site: figures(SITE) };
-    main.exec("DELETE FROM usage_snapshots; DELETE FROM job_cursors WHERE name = 'usage:collect'");
+    const whole = {
+      o: figures({ kind: "space", id: "acc_o" }),
+      p: figures({ kind: "space", id: "acc_p" }),
+      site: figures(INSTANCE),
+    };
+    main.exec(
+      "DELETE FROM usage_snapshots; DELETE FROM job_cursors WHERE name = 'usage:collect:v4'",
+    );
     const runs = await collectAll({ ...USAGE_LIMITS, steps: 2, logJobs: 1 });
     expect(runs).toBeGreaterThan(10);
     const strip = (rows: Record<string, { quantity: number; estimated: number }>) =>
       Object.fromEntries(
         Object.entries(rows).map(([k, v]) => [k, [v.quantity, v.estimated]] as const),
       );
-    expect(strip(figures("acc_o"))).toEqual(strip(whole.o));
-    expect(strip(figures("acc_p"))).toEqual(strip(whole.p));
-    expect(strip(figures(SITE))).toEqual(strip(whole.site));
+    expect(strip(figures({ kind: "space", id: "acc_o" }))).toEqual(strip(whole.o));
+    expect(strip(figures({ kind: "space", id: "acc_p" }))).toEqual(strip(whole.p));
+    expect(strip(figures(INSTANCE))).toEqual(strip(whole.site));
   });
 
   test("a failing step is skipped, not retried forever", async () => {
@@ -330,7 +412,9 @@ describe("collectUsage", () => {
     } finally {
       console.error = errors;
     }
-    expect(figures("acc_o")[`${TODAY} d1/ci-logs/bytes`]?.quantity).toBe(3004);
+    expect(figures({ kind: "space", id: "acc_o" })[`${TODAY} d1/ci-logs/bytes`]?.quantity).toBe(
+      3004,
+    );
   });
 
   test("a new day starts over", async () => {
@@ -340,14 +424,18 @@ describe("collectUsage", () => {
     expect(
       main.prepare("SELECT COUNT(*) AS n FROM usage_snapshots WHERE day = '2026-10-06'").get(),
     ).toMatchObject({ n: expect.any(Number) });
-    expect(figures("acc_o")["2026-10-06 d1/ci-logs/bytes"]?.quantity).toBe(3004);
+    expect(figures({ kind: "space", id: "acc_o" })["2026-10-06 d1/ci-logs/bytes"]?.quantity).toBe(
+      3004,
+    );
     // Activity for the 5th: today's AI rows.
-    expect(figures("acc_o")[`${TODAY} workers_ai/@cf/m/calls`]?.quantity).toBe(9);
+    expect(
+      figures({ kind: "space", id: "acc_o" })[`${TODAY} workers_ai/@cf/m/calls`]?.quantity,
+    ).toBe(9);
   });
 });
 
 describe("table groups", () => {
-  test("every table in both databases is in exactly one group", () => {
+  test("every table is classified, and each row is metered exactly once", () => {
     const tables = (db: DatabaseSync) =>
       (
         db
@@ -360,25 +448,37 @@ describe("table groups", () => {
       ["db", main],
       ["registry", registry],
     ] as const) {
-      const grouped = TABLE_GROUPS.filter((g) => g.database === database).flatMap((g) =>
-        Object.keys(g.tables),
-      );
-      expect(new Set(grouped).size, `${database}: a table is in two groups`).toBe(grouped.length);
-      expect([...grouped].sort(), `${database}: add new tables to worker/usage/tables.ts`).toEqual(
-        tables(db),
-      );
-    }
-  });
-
-  test("every account-scope owner clause runs", () => {
-    for (const group of TABLE_GROUPS) {
-      const db = group.database === "db" ? main : registry;
-      for (const [table, owner] of Object.entries(group.tables))
-        expect(() =>
-          db
-            .prepare(`SELECT COUNT(*) FROM "${table}" ${owner ? `WHERE ${owner}` : ""}`)
-            .get(...(owner ? ["acc_o"] : [])),
-        ).not.toThrow();
+      const groups = TABLE_GROUPS.filter((g) => g.database === database);
+      const grouped = groups.flatMap((g) => Object.keys(g.tables));
+      const classified = [...new Set(grouped), ...UNMETERED_CONTROL_TABLES[database]];
+      expect(classified.sort(), `${database}: classify new tables`).toEqual(tables(db));
+      const scopes: UsageScope[] = [
+        INSTANCE,
+        { kind: "person", id: "acc_o" },
+        { kind: "person", id: "acc_p" },
+        { kind: "space", id: "acc_o" },
+        { kind: "space", id: "acc_p" },
+      ];
+      for (const table of new Set(grouped)) {
+        let attributed = 0;
+        for (const scope of scopes) {
+          for (const group of groups.filter((g) => g.scope === scope.kind && table in g.tables)) {
+            const predicate = group.tables[table];
+            attributed += Number(
+              (
+                db
+                  .prepare(
+                    `SELECT COUNT(*) AS n FROM "${table}" ${predicate ? `WHERE ${predicate}` : ""}`,
+                  )
+                  .get(...(predicate ? [scope.id] : [])) as { n: number }
+              ).n,
+            );
+          }
+        }
+        expect(attributed, `${database}:${table}: no lost or double-charged rows`).toBe(
+          (db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n,
+        );
+      }
     }
   });
 });

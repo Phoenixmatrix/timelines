@@ -9,8 +9,8 @@ export interface DurableClassInfo {
   binding: string;
   /** The class's source, relative to apps/website (the conformance test reads it). */
   source: string;
-  /** The account and repository an instance belongs to, from its name alone. */
-  owner(name: string): { account: string | null; repo: string | null };
+  /** Explicit person/Space ownership and stable repository identity from the name. */
+  owner(name: string): { space: string | null; account: string | null; repo: string | null };
   /**
    * Cleans itself up with an alarm when its short-lived work ends (registry
    * uploads and logins). Registered like the others, but never sized, and
@@ -21,32 +21,32 @@ export interface DurableClassInfo {
   stateless?: boolean;
 }
 
-const none = { account: null, repo: null };
+const none = { space: null, account: null, repo: null };
 
 export const DURABLE_CLASSES = {
-  /** One per account: its issues, timelines and events. Named by account id. */
+  /** One per Space: its issues, timelines and events. Named by immutable Space id. */
   Tracker: {
     binding: "TRACKER",
     source: "worker/tracker/object.ts",
-    owner: (name: string) => ({ account: name, repo: null }),
+    owner: (name: string) => ({ ...none, space: name }),
   },
   /** One per conversation, "<userId>:<chatId>". */
   Assistant: {
     binding: "ASSISTANT",
     source: "worker/assistant/agent.ts",
-    owner: (name: string) => ({ account: name.split(":")[0] || null, repo: null }),
+    owner: (name: string) => ({ ...none, account: name.split(":")[0] || null }),
   },
   /** One per repository, named by repository id. */
   KnowledgeCoordinator: {
     binding: "KNOWLEDGE_COORDINATOR",
     source: "worker/knowledge/coordinator.ts",
-    owner: (name: string) => ({ account: null, repo: name }),
+    owner: (name: string) => ({ ...none, repo: name }),
   },
   /** One per repository and timeline, "<repoId>:<slug>": its live feed of steps (CORE-239). */
   StepFeed: {
     binding: "STEP_FEED",
     source: "worker/steps/feed.ts",
-    owner: (name: string) => ({ account: null, repo: name.split(":")[0] || null }),
+    owner: (name: string) => ({ ...none, repo: name.split(":")[0] || null }),
   },
   /** One per CI job, named by job id; owns the job's container while it runs. */
   CiSandbox: {

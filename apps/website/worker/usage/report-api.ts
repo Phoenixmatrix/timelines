@@ -1,20 +1,12 @@
-// The usage and cost report's API (CORE-209):
-//
-//   GET /api/accounts/:slug/usage   the account's report (its administrators:
-//                                   org owners, the user themselves, site
-//                                   administrators); `?format=csv` for CSV
-//   GET /api/admin/usage            the site's report with every account's
-//                                   total (site administrators); `?format=csv`
-//
-// Members who aren't administrators get 403, everyone else 404 (an account's
-// existence isn't confirmed to outsiders).
-
+// Usage and cost reports: explicit Space admin, personal self, or Instance operator.
+// Every route supports ?format=csv with identical authorization.
 import { Hono, type Context } from "hono";
 import type { UsageReport } from "../../shared/usage.ts";
 import { fail, requireActor } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
-import { load } from "../deployments/settings.ts";
-import { accountUsageReport, reportCsv, siteUsageReport } from "./report.ts";
+import { db } from "../schema.ts";
+import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
+import { spaceUsageReport, personUsageReport, reportCsv, instanceUsageReport } from "./report.ts";
 
 function respond(c: Context<AppEnv>, report: UsageReport, name: string) {
   if (c.req.query("format") !== "csv") return c.json<UsageReport>(report);
@@ -24,24 +16,45 @@ function respond(c: Context<AppEnv>, report: UsageReport, name: string) {
   });
 }
 
-export const accountUsageApi = new Hono<AppEnv>();
-
-accountUsageApi.get("/", async (c) => {
+export const spaceUsageApi = new Hono<AppEnv>();
+spaceUsageApi.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
-  const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  if (found.role !== "admin")
-    return fail(c, 403, "Only the account's administrators see its usage and costs.");
-  const report = await accountUsageReport(c.env.DB, found.account);
-  return respond(c, report, found.account.slug);
+  const space = await findSpaceBySlug(c.env.DB, c.req.param("space") ?? "");
+  const access = space && (await resolveSpaceAccess(c.env.DB, actor, space.id));
+  if (!access) return fail(c, 404, "Space not found.");
+  if (access.grant.role !== "admin")
+    return fail(c, 403, "Only Space administrators see its usage and costs.");
+  return respond(c, await spaceUsageReport(c.env.DB, access.space), access.space.slug);
 });
 
-export const siteUsageApi = new Hono<AppEnv>();
-
-siteUsageApi.get("/", async (c) => {
+export const personUsageApi = new Hono<AppEnv>();
+personUsageApi.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
-  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators see the site's usage.");
-  return respond(c, await siteUsageReport(c.env.DB), "site");
+  const person = await db(c.env.DB)
+    .selectFrom("accounts")
+    .select(["id", "slug", "display_name"])
+    .where("id", "=", actor.id)
+    .where("kind", "=", "user")
+    .where("slug", "=", c.req.param("slug") ?? "")
+    .executeTakeFirst();
+  if (!person) return fail(c, 404, "Person not found.");
+  return respond(
+    c,
+    await personUsageReport(c.env.DB, {
+      id: person.id,
+      slug: person.slug,
+      displayName: person.display_name,
+    }),
+    person.slug,
+  );
+});
+
+export const instanceUsageApi = new Hono<AppEnv>();
+instanceUsageApi.get("/", async (c) => {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  if (!actor.isSiteAdmin) return fail(c, 403, "Only Instance operators see Instance usage.");
+  return respond(c, await instanceUsageReport(c.env.DB), "instance");
 });

@@ -6,7 +6,7 @@
 // timelines keep theirs read-only. The models are fakes.
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { WorkflowStep } from "cloudflare:workers";
 import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type {
@@ -21,8 +21,8 @@ import type { OpenRequests } from "../../shared/tracker.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import type { RepoReader } from "../objects.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { d1 } from "../testing/d1.ts";
+import { fakeDurableState, fakeDurableObjectId } from "../testing/durable-state.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { timelines } from "../timelines/api.ts";
 import { Timing } from "../timing.ts";
@@ -42,6 +42,8 @@ import {
 } from "./pages.ts";
 import { overlayGraphs, diffGraphs, type FileChange } from "./overlay.ts";
 import { updatePages, type WikiSource } from "./wiki.ts";
+import { seedSpaceFixture, createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -156,16 +158,40 @@ interface AiCall {
 }
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  onTestFinished(fresh.close);
   const artifactsName = `r-pages-${crypto.randomUUID()}`;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
-      ('ann', 'user', 'ann', 'Ann', NULL), ('ben', 'user', 'ben', 'Ben', NULL),
-      ('cat', 'user', 'cat', 'Cat', NULL), ('orbit', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'owner'), ('orbit', 'ben', 'member'), ('orbit', 'cat', 'member');
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
+      ('cat', 'user', 'cat', 'Cat');
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: { id: "org-orbit", slug: "orbit", displayName: "Orbit", kind: "company" },
+    space: { id: "orbit", slug: "orbit", displayName: "General" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+      {
+        accountId: "ben",
+        role: "member",
+        grant: { role: "member", repositoryRole: "read", packageRole: "read" },
+      },
+      {
+        accountId: "cat",
+        role: "member",
+        grant: { role: "member", repositoryRole: "read", packageRole: "read" },
+      },
+    ],
+  });
+  sqlite.exec(`
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('app', 'orbit', 'app', 'private', '${artifactsName}', 'https://app');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('app', 'ben', 'write');
     INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('app', '${MAIN}');
@@ -200,7 +226,7 @@ async function setup() {
   const builds = new Map<string, { params: unknown; status: string }>();
   const trackers = new Map<string, Tracker>();
   const env: Env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: git.artifacts,
     // Overlays start at once here; the quiet period has its own tests (CORE-238).
     TIMELINE_QUIET_SECONDS: "0",
@@ -215,11 +241,12 @@ async function setup() {
     },
     KNOWLEDGE_COORDINATOR: { getByName: () => coordinator },
     TRACKER: {
+      idFromName: fakeDurableObjectId,
       getByName: (id: string) => {
         if (!trackers.has(id)) {
-          const { sql, transactionSync } = durableStorage();
-          const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
-          trackers.set(id, new Tracker(ctx, env));
+          const state = fakeDurableState({ name: id });
+          onTestFinished(() => state.db.close());
+          trackers.set(id, new Tracker(state.ctx, env));
         }
         return trackers.get(id);
       },
@@ -275,8 +302,8 @@ async function setup() {
     c.set("timing", new Timing());
     return next();
   });
-  server.route("/api/tracker/:owner/timelines", timelines);
-  server.route("/api/repos/:owner/:name/knowledge", knowledge);
+  server.route("/api/tracker/:space/timelines", timelines);
+  server.route("/api/repos/:space/:name/knowledge", knowledge);
   server.route("/api", trackerRoutes);
   const tokens = {
     ann: (await issueToken(env.DB, "ann", "t", "write")).secret,
@@ -284,6 +311,11 @@ async function setup() {
     cat: (await issueToken(env.DB, "cat", "t", "write")).secret,
     bot: (await issueToken(env.DB, "ben", "t", "write", undefined, "agt_bot")).secret,
   };
+  const initiatingToken = await issueToken(env.DB, "ann", "workflow", "write");
+  const authorization = await captureWorkAuthority(env, "app", {
+    id: "ann",
+    credential: { kind: "token", id: initiatingToken.id },
+  });
   const pending: Promise<unknown>[] = [];
   const executionCtx = {
     waitUntil: (work: Promise<unknown>) => pending.push(work),
@@ -297,6 +329,7 @@ async function setup() {
         method,
         headers: {
           authorization: `Bearer ${tokens[who]}`,
+          "X-Gitmatrix-Content-Version": "4",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -379,6 +412,7 @@ async function setup() {
 
   return {
     sqlite,
+    authorization,
     sourceId: owned.source_id,
     env,
     app,
@@ -415,13 +449,43 @@ async function makeCheckpoint(t: Setup, summary = "Refunds") {
 }
 
 describe("timeline wiki pages", () => {
+  for (const revoked of ["credential", "agent", "grant", "legacy-intent"] as const) {
+    test(`queued page work stops after ${revoked} authorization loss`, async () => {
+      const t = await setup();
+      const made = await makeCheckpoint(t);
+      const before = pageAndMainBuilds(t).length;
+      const row = t.sqlite
+        .prepare("SELECT ai_snapshot FROM kg_page_sets WHERE set_key = ?")
+        .get(made.checkpoint.id) as { ai_snapshot: string };
+      const saved = JSON.parse(row.ai_snapshot) as {
+        authorization: { credential: { id: string } };
+      };
+      if (revoked === "credential")
+        t.sqlite
+          .prepare("DELETE FROM access_tokens WHERE id = ?")
+          .run(saved.authorization.credential.id);
+      else if (revoked === "agent")
+        t.sqlite.exec("UPDATE agents SET revoked_at = '2026-10-11T00:00:00Z' WHERE id = 'agt_bot'");
+      else if (revoked === "grant") {
+        t.sqlite.exec("DELETE FROM repo_collaborators WHERE repo_id = 'app' AND user_id = 'ben'");
+        t.sqlite.exec("DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'ben'");
+      } else
+        t.sqlite
+          .prepare("UPDATE kg_page_sets SET ai_snapshot = NULL WHERE set_key = ?")
+          .run(made.checkpoint.id);
+      await expect(t.coordinator.alarm()).rejects.toThrow();
+      expect(pageAndMainBuilds(t)).toHaveLength(before);
+      expect(t.ai.calls).toEqual([]);
+      expect(t.pages(made.checkpoint.id)).toEqual([]);
+    });
+  }
   test("knowledge disabled before admission blocks main, overlays and queued pages", async () => {
     const t = await setup();
     const made = await makeCheckpoint(t);
     t.sqlite
-      .prepare("INSERT INTO account_settings (account_id, ai_knowledge) VALUES (?, ?)")
+      .prepare("INSERT INTO space_settings (space_id, ai_knowledge) VALUES (?, ?)")
       .run("orbit", 0);
-    await t.coordinator.notify("app", { force: true });
+    await t.coordinator.notify("app", { force: true, authorization: t.authorization });
     await t.coordinator.alarm();
     expect(pageAndMainBuilds(t)).toEqual([]);
     expect(t.ai.calls).toEqual([]);
@@ -439,7 +503,7 @@ describe("timeline wiki pages", () => {
       const made = await makeCheckpoint(t);
       const path = `/overlay/pages?ref=timeline/search&checkpoint=${made.checkpoint.id}`;
       t.sqlite
-        .prepare(`INSERT INTO account_settings (account_id, ai_${feature}) VALUES (?, 0)`)
+        .prepare(`INSERT INTO space_settings (space_id, ai_${feature}) VALUES (?, 0)`)
         .run("orbit");
       await t.coordinator.alarm();
       const wake = vi.spyOn(t.coordinator, "pagesRequested");
@@ -447,7 +511,7 @@ describe("timeline wiki pages", () => {
       expect(wake).not.toHaveBeenCalled();
 
       t.sqlite
-        .prepare(`UPDATE account_settings SET ai_${feature} = 1 WHERE account_id = ?`)
+        .prepare(`UPDATE space_settings SET ai_${feature} = 1 WHERE space_id = ?`)
         .run("orbit");
       await t.coordinator.alarm();
       expect(pageAndMainBuilds(t)).toEqual([]);
@@ -467,7 +531,7 @@ describe("timeline wiki pages", () => {
     const t = await setup();
     const made = await makeCheckpoint(t);
     t.sqlite
-      .prepare("INSERT INTO account_settings (account_id, ai_wiki) VALUES (?, ?)")
+      .prepare("INSERT INTO space_settings (space_id, ai_wiki) VALUES (?, ?)")
       .run("orbit", 0);
     await t.coordinator.alarm();
     expect(pageAndMainBuilds(t)).toEqual([]);
@@ -475,7 +539,7 @@ describe("timeline wiki pages", () => {
     expect((await t.kn("ben", "POST", "/overlay/pages?ref=timeline/search")).status).toBe(409);
 
     t.sqlite
-      .prepare("UPDATE account_settings SET ai_wiki = 1, ai_task_model = ? WHERE account_id = ?")
+      .prepare("UPDATE space_settings SET ai_wiki = 1, ai_task_model = ? WHERE space_id = ?")
       .run("gemma-4-26b-a4b-it", "orbit");
     // Saving policy does not wake a stopped queue. Re-requesting the same
     // checkpoint must wake it even though its set already exists.
@@ -493,15 +557,11 @@ describe("timeline wiki pages", () => {
     await t.coordinator.alarm();
     const build = pageAndMainBuilds(t)[0]!;
     const params = build.params as Parameters<typeof runPageSet>[1];
-    const snapshot = t.sqlite
-      .prepare("SELECT ai_snapshot FROM kg_page_sets WHERE set_key = ?")
-      .get(made.checkpoint.id) as { ai_snapshot: string };
-    expect(JSON.parse(snapshot.ai_snapshot)).toEqual(params.policy);
     expect(params.policy!.ai.models.task).toBe("@cf/google/gemma-4-26b-a4b-it");
 
     t.sqlite
       .prepare(
-        "UPDATE account_settings SET ai_knowledge = 0, ai_wiki = 0, ai_task_model = ? WHERE account_id = ?",
+        "UPDATE space_settings SET ai_knowledge = 0, ai_wiki = 0, ai_task_model = ? WHERE space_id = ?",
       )
       .run("glm-5.3-flash", "orbit");
     const { results } = await t.drain();
@@ -520,15 +580,15 @@ describe("timeline wiki pages", () => {
     const t = await setup();
     // Keep this scenario on main rather than starting an independent overlay.
     t.app.refs.delete("refs/heads/work");
-    await t.coordinator.notify("app", { force: true });
+    await t.coordinator.notify("app", { force: true, authorization: t.authorization });
     await t.coordinator.alarm();
     const [firstId, first] = [...t.builds.entries()][0]!;
     const firstParams = first.params as Parameters<typeof runPageSet>[1];
     t.sqlite
-      .prepare("INSERT INTO account_settings (account_id, ai_task_model, ai_wiki) VALUES (?, ?, ?)")
+      .prepare("INSERT INTO space_settings (space_id, ai_task_model, ai_wiki) VALUES (?, ?, ?)")
       .run("orbit", "gemma-4-26b-a4b-it", 0);
     first.status = "errored";
-    await t.coordinator.notify("app", { force: true });
+    await t.coordinator.notify("app", { force: true, authorization: t.authorization });
     await t.coordinator.alarm();
     const [retryId, retry] = [...t.builds.entries()].find(([id]) => id !== firstId)!;
     expect((retry.params as Parameters<typeof runPageSet>[1]).policy).toEqual(firstParams.policy);
@@ -625,6 +685,9 @@ describe("timeline wiki pages", () => {
     const mutate = (who: "ann" | "bot", mutation: unknown) =>
       t.raw(who, "POST", "/tracker/orbit/mutate", {
         operationId: crypto.randomUUID(),
+        contractVersion: 4,
+        spaceId: t.authorization.spaceId,
+        migrationEpoch: t.authorization.migrationEpoch,
         mutations: [mutation],
       });
     await mutate("ann", { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } });
@@ -653,7 +716,7 @@ describe("timeline wiki pages", () => {
     const first = t.sqlite.prepare("SELECT * FROM kg_page_set_pages ORDER BY slug").all();
 
     // Asking again for the same checkpoint is the same set: nothing starts.
-    await requestCheckpointPages(t.env, made.checkpoint, "search", "agt_bot");
+    await requestCheckpointPages(t.env, made.checkpoint, "search", "agt_bot", t.authorization);
     expect(
       await queueSet(t.env.DB, {
         repoId: "app",
@@ -663,6 +726,7 @@ describe("timeline wiki pages", () => {
         commit: TIP,
         checkpoint: { id: made.checkpoint.id, number: 1 },
         requestedBy: null,
+        authorization: t.authorization,
       }),
     ).toEqual({ status: "succeeded", queued: false });
     expect((await t.drain()).started).toEqual([]);
@@ -820,6 +884,7 @@ describe("timeline wiki pages", () => {
         commit: TIP,
         checkpoint: { id: "cp-later", number: 3 },
         requestedBy: null,
+        authorization: t.authorization,
       }),
     ).toEqual({ status: "ended", queued: false });
     expect((await t.kn("ben", "POST", "/overlay/pages?ref=timeline/search")).status).toBe(409);
@@ -831,7 +896,7 @@ describe("timeline wiki pages", () => {
 
   test("published pages outlive work Git while retained source ownership remains enforced", async () => {
     const t = await setup();
-    try {
+    {
       const made = await makeCheckpoint(t);
       await t.drain();
       const query = `ref=timeline/search&source=${t.sourceId}`;
@@ -854,19 +919,19 @@ describe("timeline wiki pages", () => {
         (await t.kn("cat", "GET", pagePath.replace("timeline/search", "timeline/other"))).status,
       ).toBe(404);
       t.sqlite.exec(`
-        INSERT INTO repos (id,owner_id,name,visibility,artifacts_name,artifacts_remote)
-          VALUES ('other','orbit','other','private','other','https://other');
-      `);
+      INSERT INTO repos (id,space_id,name,visibility,artifacts_name,artifacts_remote)
+        VALUES ('other','orbit','other','private','other','https://other');
+    `);
       expect((await t.raw("cat", "GET", `/repos/orbit/other/knowledge${pagePath}`)).status).toBe(
         404,
       );
-      t.sqlite.exec("DELETE FROM org_members WHERE org_id='orbit' AND user_id='cat'");
+      t.sqlite.exec(
+        "DELETE FROM organization_members WHERE organization_id='org-orbit' AND account_id='cat'",
+      );
       expect((await t.kn("cat", "GET", pagePath)).status).toBe(404);
       expect((await t.kn("ann", "GET", pagePath)).status).toBe(200);
       t.sqlite.exec("UPDATE repos SET deleted_at='2026-10-04' WHERE id='app'");
       expect((await t.kn("ann", "GET", pagePath)).status).toBe(404);
-    } finally {
-      t.sqlite.close();
     }
   });
 });
@@ -879,6 +944,7 @@ async function requestSecond(t: Setup, first: CheckpointView) {
     { ...first.checkpoint, id: key, number: 2 },
     "search",
     "agt_bot",
+    t.authorization,
   );
   return key;
 }

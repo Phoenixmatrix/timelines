@@ -20,6 +20,7 @@ const KINDS = [
   "unknown",
 ] as const;
 const identifier = /^[a-zA-Z0-9_-]{1,128}$/;
+const SCOPE_KINDS = ["space", "person", "instance"] as const;
 const modelIdentifier = /^@?[a-zA-Z0-9][a-zA-Z0-9/_.:-]{0,255}$/;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -29,7 +30,9 @@ export interface ModelFailureDiagnostic {
   attempt: string;
   provider: "workers-ai" | "typesafe" | "openrouter";
   model: string;
-  account: string;
+  /** The metered scope (usage/ai.ts): a Space, a person or the Instance (''). */
+  scopeKind: (typeof SCOPE_KINDS)[number];
+  scopeId: string;
   feature: string;
   dispatched: boolean;
   kind: (typeof KINDS)[number];
@@ -63,8 +66,9 @@ export function parseModelFailureDiagnostic(value: unknown): ModelFailureDiagnos
       !uuid.test(v.attempt) ||
       (v.provider !== "workers-ai" && v.provider !== "typesafe" && v.provider !== "openrouter") ||
       !safeModel(v.model) ||
-      typeof v.account !== "string" ||
-      (v.account !== "" && !identifier.test(v.account)) ||
+      !SCOPE_KINDS.includes(v.scopeKind as ModelFailureDiagnostic["scopeKind"]) ||
+      typeof v.scopeId !== "string" ||
+      (v.scopeKind === "instance" ? v.scopeId !== "" : !identifier.test(v.scopeId)) ||
       typeof v.feature !== "string" ||
       !identifier.test(v.feature) ||
       typeof v.dispatched !== "boolean" ||
@@ -80,7 +84,8 @@ export function parseModelFailureDiagnostic(value: unknown): ModelFailureDiagnos
       attempt: v.attempt,
       provider: v.provider,
       model: v.model,
-      account: v.account,
+      scopeKind: v.scopeKind as ModelFailureDiagnostic["scopeKind"],
+      scopeId: v.scopeId,
       feature: v.feature,
       dispatched: v.dispatched,
       kind: v.kind as ModelFailureDiagnostic["kind"],
@@ -97,7 +102,7 @@ export function parseModelFailureDiagnostic(value: unknown): ModelFailureDiagnos
 export function modelFailureDiagnostic(
   context: Pick<
     ModelFailureDiagnostic,
-    "attempt" | "provider" | "model" | "account" | "feature" | "dispatched"
+    "attempt" | "provider" | "model" | "scopeKind" | "scopeId" | "feature" | "dispatched"
   >,
   error: unknown,
   localKind?: "deadline" | "work_expired" | "work_stopped",
@@ -150,7 +155,10 @@ export function modelFailureDiagnostic(
     attempt: context.attempt,
     provider: context.provider,
     model: safeModel(context.model) ? context.model : "unknown",
-    account: identifier.test(context.account) ? context.account : "",
+    // An unsafe scope id is withheld as the Instance's, never retained.
+    ...(context.scopeKind !== "instance" && identifier.test(context.scopeId)
+      ? { scopeKind: context.scopeKind, scopeId: context.scopeId }
+      : { scopeKind: "instance" as const, scopeId: "" }),
     feature: identifier.test(context.feature) ? context.feature : "unknown",
     dispatched: context.dispatched,
     kind: localKind ?? kind,

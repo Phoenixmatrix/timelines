@@ -5,20 +5,24 @@ section: Concepts
 order: 4
 ---
 
-The Timelines issue tracker is a dependency graph that agents work through on their own. Each account or organization owns a tracker. It is independent of git history, and tracker commands work anywhere, without a repository.
+The Timelines issue tracker is a dependency graph that agents work through on their own. Each **Space**, within an Organization, owns a Tracker. Accounts identify people, not content owners. Organization membership or ownership alone does not grant access to a private Tracker; an explicit Space grant is required. Repository collaborator access does not grant Tracker access. The Tracker is independent of git history, and tracker commands work anywhere, without a repository.
 
-People use the workbench at `/tracker` in the web app. Agents use `gm issue`.
+People use the workbench at `/tracker` in the web app, then select a Space. Its canonical Tracker route is `/tracker/<space>`, where `<space>` is the globally unique Space handle. Agents use `gm issue`.
 
 ## Teams, issues and tags
 
-Each issue belongs to one **team**, whose prefix forms the issue key (`ENG-1`), and to any number of cross-team **workspaces**.
+Each issue belongs to exactly one **Team**, whose prefix forms the issue key (`ENG-1`), and to zero or more cross-team **Projects**. The Team and all Projects must belong to the same Space as the issue. A Project is not a local checkout or worktree.
 
 ```sh
-gm tracker use orbit                     # select the account's tracker
+gm tracker list
+gm tracker use orbit                     # select the Space's Tracker
 gm team create ENG --name Engineering
-gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --tag ux --tag frontend
+gm project create launch --name Launch
+gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --project launch --tag ux --tag frontend
 gm issue show ENG-1
 ```
+
+The saved selector is `tracker.space`, bound to the immutable Space ID. Use `--space orbit` to override it for one command. Use `gm project` to manage cross-team Projects, `--project launch` to select one, `projectIds` in JSON patches and `project:` in content queries. Project repository subscriptions require a repository in the same Space and grant no additional permissions.
 
 Issue types are `task` (the default), `bug`, `prd`, `chore`, `research` and `remediation`. A PRD carries a full Markdown description (`--description-file`) and acceptance criteria (`--acceptance-file`).
 
@@ -26,7 +30,7 @@ Tag issues by the expertise their scope needs, reusing the tracker's tag catalog
 
 ## Structure: sub-issues and blockers
 
-Give an issue a parent with `--parent` to make it a sub-issue. Parents act as containers such as projects: a parent with open sub-issues is never offered as work itself. Parent hierarchy does not block anything by itself.
+Give an issue a parent with `--parent` to make it a sub-issue. Parent issues organize work into a hierarchy, independently of Project membership: a parent with open sub-issues is never offered as work itself. Parent hierarchy does not block anything by itself.
 
 Dependencies are explicit links. `FROM` blocks `TO`:
 
@@ -60,7 +64,7 @@ Each issue also has a **pickup** policy: `anyone` (the default), `not_ready` (no
 
 ```sh
 gm issue next
-gm issue next --under ENG-4       # only inside a project or other parent
+gm issue next --under ENG-4       # only inside this parent issue's subtree
 ```
 
 If nothing is ready, stop; do not retry in a loop. If no fencing token comes back, you do not own the issue. The result includes the issue's working context, its `timelineRule` (see [Timelines](/docs/concepts/timelines/#when-to-use-one)) and the effective `intervention` mode.
@@ -128,5 +132,16 @@ The queue is refused in a timeline; timelines land through checkpoints.
 ## Offline
 
 Mutations can be queued offline with `--offline` and replayed in order with `gm tracker sync`. Conflicts stop replay and are resolved explicitly with `gm tracker conflicts` and `gm tracker resolve`. Claims, renewals, releases and completions always need the server.
+
+The v4 content contract binds replicas and queued mutations to the server, accountable person/agent, immutable Space ID and migration epoch. Upgrade through the [coordinated CLI procedure](/docs/getting-started/#upgrading-across-the-v4-content-cutover) before using these commands. The old `tracker.owner`, content `--owner`, `gm workspace`, `--workspace` and `workspace:` filter syntax are removed, not aliases. Confirm the approved Space mapping, run `gm tracker use SPACE`, and migrate agent YAML `tracker.owner`/`scope.owner` to `space` and `workspace` to `project`.
+
+Keep the original legacy replica and export a lossless copy before recovery:
+
+```sh
+gm tracker export /private/old/orbit.sqlite --destination /private/recovery.sqlite
+gm tracker recover /private/old/orbit.sqlite --space orbit
+```
+
+Export works without selecting a Tracker and preserves unknown tables and original queued bodies. Recovery runs online, verifies identity and Space mapping, and requires server proof of committed legacy receipts. Missing or expired proof returns `export_required`: preserve the exported intent for explicit reconciliation, never delete the outbox or guess whether a write committed. Normal v4 use is fenced when legacy data exists; recovery keeps the original read-only and preserves operation IDs and ordered atomic batches.
 
 See [`gm issue next`](/docs/gm/#gm-issue-next), [`gm issue ask`](/docs/gm/#gm-issue-ask) and [`gm queue wait`](/docs/gm/#gm-queue-wait) in the reference.

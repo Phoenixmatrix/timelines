@@ -6,6 +6,43 @@ import type {
   Snapshot,
   TrackerEvent,
 } from "../../../shared/tracker.ts";
+import { CONTENT_CONTRACT_VERSION } from "../../../shared/spaces.ts";
+
+const entityTypes: readonly EntityType[] = [
+  "team",
+  "project",
+  "issue",
+  "link",
+  "comment",
+  "request",
+  "subscription",
+  // Approve-when-green settings (CORE-378): applied to `approveWhenGreen` below.
+  "automation",
+];
+
+type TrackerScope = Pick<Snapshot, "contractVersion" | "spaceId" | "migrationEpoch">;
+
+/** Never apply another Space's data or a response from a different cutover epoch. */
+export function assertTrackerScope(value: TrackerScope, expected?: TrackerScope): void {
+  if (value.contractVersion !== CONTENT_CONTRACT_VERSION)
+    throw new Error("client_upgrade_required: Reload Gitmatrix to use content contract 4.");
+  // Native-v4 installations use epoch zero; only migrated installations have positive epochs.
+  if (!value.spaceId || !Number.isSafeInteger(value.migrationEpoch) || value.migrationEpoch < 0)
+    throw new Error("migration_epoch_mismatch: Reload this Space before continuing.");
+  if (
+    expected &&
+    (value.spaceId !== expected.spaceId || value.migrationEpoch !== expected.migrationEpoch)
+  )
+    throw new Error(
+      "migration_epoch_mismatch: The Space or migration epoch changed. Reload before continuing.",
+    );
+}
+
+export function assertTrackerSnapshot(snapshot: Snapshot, expected?: TrackerScope): void {
+  assertTrackerScope(snapshot, expected);
+  if (snapshot.space.id !== snapshot.spaceId)
+    throw new Error("migration_epoch_mismatch: The snapshot does not belong to this Space.");
+}
 
 function updated<T extends NonNullable<TrackerEvent["entity"]>>(
   current: T[],
@@ -43,6 +80,12 @@ function updated<T extends NonNullable<TrackerEvent["entity"]>>(
  * overwrite it. Conversely, a newer snapshot already includes this result.
  */
 export function acknowledge(snapshot: Snapshot, result: MutationResult): Snapshot {
+  assertTrackerSnapshot(snapshot);
+  assertTrackerScope(result, snapshot);
+  if (result.events.some((event) => !entityTypes.includes(event.entityType)))
+    throw new Error(
+      "client_upgrade_required: The acknowledgement contains an unsupported tracker entity.",
+    );
   if (result.cursor <= snapshot.cursor) return snapshot;
   const apply = <T extends NonNullable<TrackerEvent["entity"]>>(current: T[], type: EntityType) =>
     updated(current, type, result.events, snapshot.cursor, !!snapshot.timeline);
@@ -65,7 +108,7 @@ export function acknowledge(snapshot: Snapshot, result: MutationResult): Snapsho
     ...(green === undefined ? {} : { approveWhenGreen: green }),
     labels: [...labels].sort(),
     teams: apply(snapshot.teams, "team"),
-    workspaces: apply(snapshot.workspaces, "workspace"),
+    projects: apply(snapshot.projects, "project"),
     issues: apply(snapshot.issues, "issue"),
     links: apply(snapshot.links, "link"),
     comments: apply(snapshot.comments, "comment"),

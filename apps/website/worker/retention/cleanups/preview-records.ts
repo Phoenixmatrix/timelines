@@ -1,7 +1,7 @@
 // Expired preview deployment records (category "preview-records"): the
 // engine's reference cleanup (CORE-198); copy its shape for new categories.
 //
-// Selects, in an account's repositories, deployment records the preview sweep
+// Selects, in an Space's repositories, deployment records the preview sweep
 // expired more than `days` before the run's moment (by when it was torn down,
 // else its expiry, else its last change). Never: live, sleeping or failed
 // records (production's included; only previews expire), a record a live
@@ -27,7 +27,7 @@ const bytes = (d: string) => `(160 + length(${d}environment) + length(${d}commit
 
 /** Parameters: account id, cutoff. */
 const MATCHES = `d.status = 'expired'
-  AND d.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+  AND d.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND coalesce(d.torn_down_at, d.expires_at, d.updated_at) < ?
   AND NOT EXISTS (SELECT 1 FROM deployments l
                   WHERE l.rebuilt_from = d.id AND l.status IN ('active', 'sleeping'))
@@ -35,10 +35,10 @@ const MATCHES = `d.status = 'expired'
                   WHERE r.preview_rebuilt_from = d.id AND r.status IN ('queued', 'running'))`;
 
 function scope(ctx: Parameters<CategoryCleanup["select"]>[0]): [string, string] {
-  if (ctx.target.scope !== "account") throw new Error("preview-records is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("preview-records is a Space category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("preview-records needs its days threshold.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days)];
+  return [ctx.target.id, daysBefore(ctx.now, days)];
 }
 
 export const previewRecords: CategoryCleanup<Item> = {

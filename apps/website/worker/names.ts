@@ -1,17 +1,20 @@
-// Account usernames (slugs): users and organizations share one namespace,
-// and it sits at the root of every URL, so a slug must look like a path
-// segment and must not take a route the app or the registry already serves.
+// Space handles occupy the root URL namespace. Person and Organization names
+// have their own explicit routes; all share the same conservative path rules.
 
-/** Top-level paths an account must never shadow: app routes and registry prefixes. */
+/** Top-level paths a Space must never shadow: app routes and registry prefixes. */
 export const RESERVED_SLUGS = new Set([
   // App routes (src/appRoutes.tsx) and the Worker's own prefixes.
   "agent-work",
+  "accounts",
+  "organizations",
+  "spaces",
   "api",
   "assets",
   "ci",
   "cli-auth",
   "device",
   "highlights",
+  "instance",
   "knowledge",
   "needs-you",
   "new",

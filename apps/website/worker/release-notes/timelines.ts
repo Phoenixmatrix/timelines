@@ -3,20 +3,34 @@
 // merge's other parent was. The branch comes from the push log (CORE-68),
 // which saw branches pointing at the merged commit, or the merge message; a
 // `timeline/<slug>` branch then names the timeline record (CORE-69) in the
-// tracker of the repository's owner.
+// tracker of the repository's immutable Space.
 
 import { mergedBranch } from "../../shared/landings.ts";
 import type { LandedTimeline } from "../../shared/release-notes.ts";
 import { db } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
+import type { Actor } from "../db.ts";
+import { findSpaceById, resolveSpaceAccess } from "../spaces/access.ts";
+import { accessFor } from "../tracker/access.ts";
 
 /** Looks up timeline ids by slug; slugs without a record are left out. */
 export type TimelineIds = (slugs: string[]) => Promise<Map<string, string>>;
 
-/** Timeline ids by slug, from the tracker of the account owning the repository. */
-export function ownerTimelines(env: Env, ownerId: string): TimelineIds {
+/** Timeline ids from the repository's Space, authorized independently of repository access. */
+export function spaceTimelines(env: Env, spaceId: string, actor: Actor | null): TimelineIds {
   return async (slugs) => {
-    const result = await trackerObject(env, ownerId).listTimelines();
+    if (!actor || !(await resolveSpaceAccess(env.DB, actor, spaceId))) return new Map();
+    const space = await findSpaceById(env.DB, spaceId);
+    if (!space) return new Map();
+    const access = await accessFor(
+      env,
+      space,
+      actor.id,
+      actor.agent?.id ?? null,
+      false,
+      actor.credential,
+    );
+    const result = await trackerObject(env, spaceId).listTimelines(access);
     if (!result.ok) return new Map();
     return new Map(
       result.value

@@ -1,6 +1,6 @@
-// AI spend records (site category "ai-spend", CORE-201): per-call Atlas spend
+// AI spend records (Instance category "ai-spend", CORE-201): per-call Atlas spend
 // rows (atlas_spend) of UTC days that ended more than `days` before the run's
-// moment, rolled up into one atlas_spend_daily row per account and day.
+// moment, rolled up into one atlas_spend_daily row per Space and day.
 //
 // Budget checks add a day's atlas_spend_daily row to that day's atlas_spend
 // rows (worker/knowledge/budget.ts), so a rolled-up day answers exactly as it
@@ -9,17 +9,17 @@
 // flight (`reserved`), and the daily totals themselves. A build's own spend
 // (atlasRunSpend) reads per-call rows, so a rolled-up run shows no detail.
 //
-// An item is one account's day; its count is the per-call rows it folds into
+// An item is one Space's day; its count is the per-call rows it folds into
 // one. Removing re-checks the predicate, adds the rows to the day's total
 // (creating it, or adding to it if part of the day was rolled up earlier) and
 // deletes them, in one transaction: run twice, the second finds nothing.
-// Cursor: "<account id> <day>".
+// Cursor: "<Space id> <day>".
 
 import type { CategoryCleanup, CleanupContext } from "../engine.ts";
 import { daysBefore } from "../engine.ts";
 
 interface Item {
-  account: string;
+  spaceId: string;
   day: string;
   rows: number;
   bytes: number;
@@ -29,11 +29,11 @@ interface Item {
 const MATCHES = `s.day < ? AND s.status <> 'reserved'`;
 
 /** A spend row's estimated stored size (`p`: the row's qualifier, if any). */
-const rowBytes = (p = "") => `(160 + length(${p}id) + length(${p}account_id) + length(${p}run_id)
+const rowBytes = (p = "") => `(160 + length(${p}id) + length(${p}space_id) + length(${p}run_id)
   + coalesce(length(${p}repo_id), 0) + length(${p}purpose) + length(${p}model))`;
 
 function firstKept(ctx: CleanupContext): string {
-  if (ctx.target.scope !== "site") throw new Error("ai-spend is a site category.");
+  if (ctx.target.kind !== "instance") throw new Error("ai-spend is an Instance category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("ai-spend needs its days threshold.");
   // Whole days only: the day the cutoff falls in keeps its per-call rows.
@@ -41,27 +41,27 @@ function firstKept(ctx: CleanupContext): string {
 }
 
 /** The items as a subquery's (account, day) pairs. */
-const CHOSEN = `(s.account_id, s.day) IN
+const CHOSEN = `(s.space_id, s.day) IN
   (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))`;
 
 export const aiSpend: CategoryCleanup<Item> = {
   async select(ctx, cursor) {
     const day = firstKept(ctx);
     const space = cursor?.indexOf(" ") ?? -1;
-    const [account, after] =
+    const [spaceId, after] =
       cursor && space > 0 ? [cursor.slice(0, space), cursor.slice(space + 1)] : ["", ""];
     const { results } = await ctx.env.DB.prepare(
-      `SELECT s.account_id AS account, s.day, count(*) AS rows, sum(${rowBytes("s.")}) AS bytes
+      `SELECT s.space_id AS spaceId, s.day, count(*) AS rows, sum(${rowBytes("s.")}) AS bytes
        FROM atlas_spend s
-       WHERE ${MATCHES} AND (s.account_id, s.day) > (?, ?)
-       GROUP BY s.account_id, s.day ORDER BY s.account_id, s.day LIMIT ?`,
+       WHERE ${MATCHES} AND (s.space_id, s.day) > (?, ?)
+       GROUP BY s.space_id, s.day ORDER BY s.space_id, s.day LIMIT ?`,
     )
-      .bind(day, account, after, ctx.limit)
+      .bind(day, spaceId, after, ctx.limit)
       .all<Item>();
     const last = results.at(-1);
     return {
       items: results,
-      next: results.length < ctx.limit || !last ? null : `${last.account} ${last.day}`,
+      next: results.length < ctx.limit || !last ? null : `${last.spaceId} ${last.day}`,
       count: results.reduce((sum, r) => sum + r.rows, 0),
       bytes: results.reduce((sum, r) => sum + r.bytes, 0),
     };
@@ -69,16 +69,16 @@ export const aiSpend: CategoryCleanup<Item> = {
   async remove(ctx, items) {
     if (!items.length) return { count: 0, bytes: 0 };
     const day = firstKept(ctx);
-    const keys = JSON.stringify(items.map((i) => [i.account, i.day]));
+    const keys = JSON.stringify(items.map((i) => [i.spaceId, i.day]));
     const [, deleted] = await ctx.env.DB.batch<{ bytes: number }>([
       ctx.env.DB.prepare(
         `INSERT INTO atlas_spend_daily
-           (account_id, day, calls, input_tokens, output_tokens, cost_micro_usd, rolled_up_at)
-         SELECT s.account_id, s.day, sum(s.status <> 'released'), sum(s.input_tokens),
+           (space_id, day, calls, input_tokens, output_tokens, cost_micro_usd, rolled_up_at)
+         SELECT s.space_id, s.day, sum(s.status <> 'released'), sum(s.input_tokens),
                 sum(s.output_tokens), sum(s.cost_micro_usd), ?
          FROM atlas_spend s WHERE ${CHOSEN} AND ${MATCHES}
-         GROUP BY s.account_id, s.day
-         ON CONFLICT (account_id, day) DO UPDATE SET
+         GROUP BY s.space_id, s.day
+         ON CONFLICT (space_id, day) DO UPDATE SET
            calls = calls + excluded.calls,
            input_tokens = input_tokens + excluded.input_tokens,
            output_tokens = output_tokens + excluded.output_tokens,

@@ -1,9 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, describe, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlas } from "./api.ts";
 import { workspaceAtlas } from "./workspace.ts";
 import {
@@ -18,21 +19,43 @@ import {
 } from "./projection.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const scope = repoScope("r1");
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('r1', 'ann', 'shop', 'private', 'art-r1', '');
   `);
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
   } as unknown as Env;
@@ -41,8 +64,8 @@ function setup() {
     c.set("actor", ann);
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
-  app.route("/api/accounts/:owner/atlas", workspaceAtlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
+  app.route("/api/spaces/:space/atlas", workspaceAtlas);
   return {
     sqlite,
     db: env.DB,
@@ -50,7 +73,7 @@ function setup() {
     /** The same, across a workspace of this one repository (ids namespaced `r1/`). */
     across: (path: string) =>
       app.request(
-        `/api/accounts/ann/atlas/${path}${path.includes("?") ? "&" : "?"}repos=shop`,
+        `/api/spaces/ann/atlas/${path}${path.includes("?") ? "&" : "?"}repos=shop`,
         {},
         env,
       ),
@@ -106,7 +129,7 @@ async function build(db: D1Database, commit: string) {
 
 describe("the relationship lens", () => {
   test("capabilities relate through the imports that cross them, with the links behind each", async () => {
-    const { sqlite, call, across } = setup();
+    const { sqlite, call, across } = await setup();
     // A published snapshot with two capabilities and one import crossing them.
     const data = (capability: string) => JSON.stringify({ membership: { capability } });
     sqlite.exec(`
@@ -224,7 +247,7 @@ describe("the relationship lens", () => {
   });
 
   test("capability edges are versioned like graph edges", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     sqlite.exec(
       `INSERT INTO atlas_scopes (scope, kind, repo_id) VALUES ('repo:r1', 'repo', 'r1');`,
     );
@@ -257,7 +280,7 @@ describe("the relationship lens", () => {
   });
 
   test("high fan-out pages honestly: loaded, known total and more", async () => {
-    const { sqlite, db, call } = setup();
+    const { sqlite, db, call } = await setup();
     seed(sqlite);
     for (let i = 0; i < 150; i++) {
       node(sqlite, `file:users/u${String(i).padStart(3, "0")}.ts`, "file");

@@ -8,6 +8,7 @@ test("completion evidence is distinct, attributable and optional when finishing 
   const server = await TestServer.start({ world: true });
   const repo = await server.repo("orbit", "engine");
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       {
@@ -15,12 +16,12 @@ test("completion evidence is distinct, attributable and optional when finishing 
         id: "team",
         data: { key: "ENG", name: "Engineering", memberIds: ["acc_marco"] },
       },
-      { kind: "workspace.create", id: "workspace", data: { slug: "parcels", name: "Parcels" } },
-      { kind: "subscription.add", id: "sub", data: { workspaceId: "workspace", repoId: repo.id } },
+      { kind: "project.create", id: "project", data: { slug: "parcels", name: "Parcels" } },
+      { kind: "subscription.add", id: "sub", data: { projectId: "project", repoId: repo.id } },
       {
         kind: "issue.create",
         id: "work",
-        data: { teamId: "team", title: "Verify parcels", workspaceIds: ["workspace"] },
+        data: { teamId: "team", title: "Verify parcels", projectIds: ["project"] },
       },
       {
         kind: "comment.add",
@@ -59,7 +60,7 @@ test("completion evidence is distinct, attributable and optional when finishing 
         .map((c) =>
           expect.objectContaining({
             ...c,
-            trackerOwner: "orbit",
+            trackerSpace: "orbit",
             url: `/tracker/orbit/issues/ENG-1#evidence-${c.id}`,
           }),
         ),
@@ -94,6 +95,7 @@ test("completion evidence is distinct, attributable and optional when finishing 
 test("router evidence citations scroll after issue navigation and hash-only navigation, not refresh", async () => {
   const server = await TestServer.start({ world: true });
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       {

@@ -122,7 +122,7 @@ and canonical repository (`work_<id>`, physical `refs/heads/work`). Landing
 applies the approved tree change onto current main as a gated single-parent
 commit, or records a no-op; WIP commits are not uploaded to canonical.
 Source-qualified provenance keeps steps, previews and historical reads linked
-to that work. Git uses `/<owner>/<repo>@<slug>.git`. Ended work is read-only
+to that work. Git uses `/<space>/<repo>@<slug>.git`. Ended work is read-only
 and expires by default after 30 days landed or 90 days abandoned, configurable
 in Data retention independently of Tracker details, published wiki and previews.
 See the [current timeline contract](apps/website/README.md#timelines) and
@@ -134,11 +134,15 @@ Authenticate `gm` with your Timelines server before accessing private packages.
 Download any generic artifact to a local file, or install a direct Unix executable:
 
 ```sh
-gm pkg download tools/1.2.3/linux-x86_64/tools --owner orbit --dest ./tools
-gm pkg install tools --owner orbit
-gm pkg install tools --owner orbit --force
-gm pkg install tools --owner orbit --version 1.2.3 --bin-dir ./disposable-bin
+gm pkg download tools/1.2.3/linux-x86_64/tools --space orbit --dest ./tools
+gm pkg install tools --space orbit
+gm pkg install tools --space orbit --force
+gm pkg install tools --space orbit --version 1.2.3 --bin-dir ./disposable-bin
 ```
+
+Package selection uses `--space`, then `GITMATRIX_SPACE`, then the current
+repository's Space, then the signed-in person's authorized default Space.
+It does not infer a Space from the person's Account handle or use `tracker.space`.
 
 `download` defaults to the artifact's basename in the current directory; `install`
 defaults to `$HOME/.local/bin/<name>`. Both refuse existing files unless `--force`
@@ -162,11 +166,14 @@ without creating local files or directories. For feature-worktree validation,
 always choose an external disposable `--bin-dir`, never a shared/global install.
 
 Timelines publishes Linux x86-64 and ARM64 release binaries from `main`:
-`gm pkg install gm --owner matrixorg`, then use `--force` for updates. Versions
+`gm pkg install gm --space matrixorg`, then use `--force` for updates. Versions
 use the `apps/cli` source tree id; unrelated pushes reuse existing artifacts.
 On 64-bit Raspberry Pi OS (Bookworm or newer), the installer selects
 `linux-aarch64/gm` automatically. A 32-bit OS cannot run this ARM64 binary.
-See [CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-and-installing-unix-clis).
+These commands require a compatible CLI; an old installed client cannot bootstrap
+itself through the v4 content API. See
+[CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-and-installing-unix-clis)
+for the checksum-verified temporary released-client path.
 
 ## Knowledge Atlas
 
@@ -174,7 +181,7 @@ The Knowledge tab shows the repository as capability territory: groups of files
 that work together, found from imports and shared concepts rather than folders.
 Open a region to see its areas and files, select anything to read why it is
 grouped, what it uses and what uses it, and jump to its source. Labels appear
-as you zoom in; a name is drawn whole or not at all. The account page's
+as you zoom in; a name is drawn whole or not at all. The Space page's
 Knowledge link opens the same view across the repositories you pick.
 
 ### AI usage in Cloudflare AI Gateway
@@ -191,11 +198,13 @@ through the configured Gateway. Filter logs by `metadata.component`: `knowledge`
 `merge-queue` (and `metadata.account`/`metadata.feature`, as in `ai_usage`).
 Logs always keep model, status, tokens, cost and latency. Whether they also keep
 request and response bodies is a setting per component, "Keep AI request and
-response bodies in gateway logs" (CORE-290): a site default (site admins,
-**Settings → Site AI settings** or `gm settings ai set --site --log-bodies on`),
-which an account's administrators can override for their own account's calls
-(**AI settings** or `gm settings ai set --log-bodies assistant=off`). Without a
-site choice deployed servers keep no bodies (`AI_LOG_BODIES=off`) and the dev
+response bodies in gateway logs" (CORE-290): an Instance default (human Instance
+operators, `gm settings ai set --site --log-bodies on`). Space administrators
+override Space components with `--space SPACE --log-bodies knowledge=off`;
+people control their own personal components with
+`--person PERSON --log-bodies assistant=off`. These selectors are mutually
+exclusive; Organization administration alone grants no Space content access.
+Without an Instance choice deployed servers keep no bodies (`AI_LOG_BODIES=off`) and the dev
 server and agent environments keep them (`on`). Where the effective setting is
 off, a call sends `cf-aig-collect-log-payload: false`. Kept bodies, including
 repository code and assistant conversations, are readable by the Cloudflare
@@ -228,7 +237,7 @@ cf ai-search update knowledge --name gitmatrix-prod --ai-gateway-id gitmatrix
 
 ## Release note evidence
 
-On repository and account release-note pages, select an item's **last commit**
+On repository and Space release-note pages, select an item's **last commit**
 time to open its details sidebar. The sidebar lists every linked commit, the
 linked tracker issue when available, and any landing timeline; commit links open
 the exact source revision. These links stay out of the reading view until opened.
@@ -262,19 +271,26 @@ Details: `apps/cli/README.md` ("Steps: context for every commit") and
 
 Most retention categories are opt-in. **Timeline work Git repositories** is
 enabled by default: 30 days after landing, 90 after abandonment. Expired
-sign-in state (auth hygiene) is always cleaned up. Account administrators can
+sign-in state (auth hygiene) is always cleaned up. Space administrators can
 change both durations or disable that policy in **Settings → Data retention**.
-Site administrators set site categories (shared caches, the registry, sign-in
-state, usage records) and defaults for every account in
-**Settings → Site data retention**. Each category says what it never
+Instance operators set Instance categories (shared caches, the registry, sign-in
+state, usage records) and defaults. Each category says what it never
 deletes. **Clean up now** previews any categories (a dry run with counts,
 bytes and estimated storage cost) before deleting, and every run, scheduled
 or manual, is kept in the run history with who started it. The same from a
-terminal: `gm retention show`, `gm retention set <category> --enable`,
-`gm --dry-run retention run <category>…`, `gm retention run <category> --yes`,
-`gm retention runs` (`--owner <slug>` or `--site`).
+terminal: `gm retention show --space SPACE`,
+`gm retention set <category> --space SPACE --enable`,
+`gm retention run <category> --space SPACE --dry-run`,
+`gm retention run <category> --space SPACE --yes`,
+`gm retention runs --space SPACE`.
 
-**Settings → Usage & costs** shows what each account stores and runs, priced
+Choose exactly one scope: `--space <handle>` for Space content, `--person <person>`
+for your own personal retention (including chats), or `--site` for Instance
+categories and defaults. With none, retention selects the signed-in person's
+authorized default Space, not `tracker.space` or their Account handle.
+Space grants do not authorize another person's history.
+
+**Settings → Usage & costs** shows scoped storage and activity, priced
 from Cloudflare's published list prices, with links to the categories that
 clean each line up. Deleting a repository removes everything it owned.
 
@@ -1019,16 +1035,24 @@ changed, unless `--force`: inspect the evidence and fix the cause instead of loo
 `completion.json` and `ai-e2e.json` (`selection`, `stages`, `cost`) record which
 stages ran, why, their outcomes and the Gateway-logged spend.
 
+Cloudflare execution synchronizes authoritative local source before selecting AI
+stages. Its snapshot has no Git baseline, so selection runs all stages and records
+`sourceSnapshot`, the committed source-manifest revision. The planner checks every
+manifest file against disk before provisioning. Resume evidence is reusable only
+for that identical whole snapshot; any source change invalidates every stage's
+fingerprint. This conservative fallback never narrows coverage or bypasses the
+failure cooldown, and does not apply to ordinary local Git errors.
+
 | Stage                                                | Verifies                                                                                            |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `classification`                                     | Selected Clef Flash/Omni decisions, uncached attribution and one metered call per model             |
 | `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview                                 |
-| `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search                        |
-| `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps                      |
+| `search`                                             | Exact Vectorize/AI Search results and four-Space isolation across two Organizations; palette search |
+| `assistant`                                          | A real indexed turn, approved writes, retry/status and warm/cold retained-content revocation        |
 | `avatars`                                            | Real avatar generation within its ten-call budget                                                   |
 | `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings                             |
 | `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed                                |
-| `release-highlights`                                 | Grounded organization prose over seven days, authorized-source isolation, cadence, invalidation, UI |
+| `release-highlights`                                 | Grounded Space prose over seven days, authorized-source isolation, cadence, invalidation, UI        |
 | `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                                             |
 | `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                                           |
 | `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep                         |
@@ -1050,6 +1074,27 @@ usage metadata, and that bodies are kept for knowledge and assistant streams (th
 environment's default) but not for titles and status lines, which the persona turns off. `ai-e2e.json` retains sanitized Gateway evidence. Assertions check source
 facts, not exact generated wording. Missing providers or an expired visibility
 deadline fail honestly. Interactive `agent setup` is AI-off unless `--ai`.
+
+The search stage builds private sources in two Organizations with two Spaces each.
+It checks committed graph identities, exact entity/passage provenance, populated
+same-Organization and cross-Organization isolation, and private/absent denials.
+An Organization administrator's directory powers do not supply a content grant.
+Cleanup removes owned fixtures and restores effective grants and AI settings.
+
+The assistant stage first consumes real repository and composite Atlas cursors and
+snapshot pins while authorized. After removing the source Space grant, it replays
+those exact handles, the Knowledge query, and the stored transcript/export/SDK
+reads. It repeats the denials after stopping and starting the same owned native app
+without reseeding or resetting storage, recording both server process identities
+in `assistantSourceRevocation.coldRuntime`. Grant restoration must return the
+unchanged exported transcript. This app-restart proof does not establish completion
+or cancellation of legacy provider-side Git operations.
+
+The ended-timeline check resumes the actual paused Knowledge workflow and requires
+the same workflow to terminate with `TimelineEnded`, without a successful output
+or a late publication. Other authorization failures remain distinct. Atlas budget
+checks inspect spend and build counts through the running fixture app's D1 binding,
+not a second local D1 runtime competing with active builds for the SQLite database.
 
 Build completion acknowledges uploads, not search visibility. The AI gate observes
 the fixture item’s own AI Search indexing status before making at most six

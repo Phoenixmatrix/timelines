@@ -20,7 +20,7 @@ import { isArtifactsError, newArtifactsName } from "../artifacts.ts";
 import { launchPurge, requestDeletion } from "../retention/repo-deletion.ts";
 import {
   accountSummary,
-  canCreateIn,
+  canCreateRepository,
   findAccountBySlug,
   findRepo,
   repoSummary,
@@ -28,7 +28,9 @@ import {
   visibleRepos,
   type RepoRow,
 } from "../db.ts";
+import { findSpaceById, findSpaceBySlug } from "../spaces/access.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
+import { captureWorkAuthority, WorkAuthorizationError } from "../ci/admission.ts";
 import { COMPARE_COMMITS, type CommitDiff, type CompareDiff } from "../../shared/diff.ts";
 import { commitsSince, DiffBudget, diffFiles, readEither } from "../compare.ts";
 import { mergeBase } from "../knowledge/overlay.ts";
@@ -63,7 +65,7 @@ export async function loadRepo(
   const row = await findRepo(
     c.env.DB,
     actor,
-    c.req.param("owner") ?? "",
+    c.req.param("space") ?? "",
     c.req.param("name") ?? "",
   );
   const role = row ? roleFor(row, actor) : "none";
@@ -93,7 +95,7 @@ export async function loadSourceRepo(
   } catch (error) {
     if (metadataOnly && error instanceof TrackerError && error.code === "source_expired") {
       const owned = await getWorkSource(c.env, loaded.row.id, c.req.query("source")!);
-      if (owned && owned.owner_id === loaded.row.owner_id) {
+      if (owned && owned.space_id === loaded.row.space_id) {
         const source: CodeSource = {
           sourceId: owned.source_id,
           repoId: loaded.row.id,
@@ -122,7 +124,7 @@ export async function loadSourceRepo(
   }
 }
 
-repos.get("/:owner/:name/sources/:sourceId/lineage", async (c) => {
+repos.get("/:space/:name/sources/:sourceId/lineage", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   const commit = c.req.query("commit") ?? "";
@@ -145,14 +147,14 @@ async function sourcePushRoute(c: Context<AppEnv>, action: "list" | "inspect" | 
   c.header("cache-control", "private, no-store");
   try {
     const access = await authorize(c, false);
-    if (access.owner.id !== loaded.row.owner_id) return fail(c, 404, "No matching source.");
+    if (access.space.id !== loaded.row.space_id) return fail(c, 404, "No matching source.");
     const sourceId = c.req.param("sourceId")!;
     const source = await getWorkSource(c.env, loaded.row.id, sourceId);
-    if (!source || source.owner_id !== loaded.row.owner_id || sourceId === "canonical")
+    if (!source || source.space_id !== loaded.row.space_id || sourceId === "canonical")
       return fail(c, 404, "No matching owned source.");
-    const tracker = trackerObject(c.env, loaded.row.owner_id);
+    const tracker = trackerObject(c.env, loaded.row.space_id);
     if (action === "list") {
-      const result = await tracker.sourcePushes(loaded.row.id);
+      const result = await tracker.sourcePushes(access, loaded.row.id);
       if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
       return c.json({
         sourceId,
@@ -161,7 +163,7 @@ async function sourcePushRoute(c: Context<AppEnv>, action: "list" | "inspect" | 
     }
     const operationId = c.req.param("operationId")!;
     if (action === "inspect") {
-      const result = await tracker.sourcePush(operationId, loaded.row.id, sourceId);
+      const result = await tracker.sourcePush(access, operationId, loaded.row.id, sourceId);
       if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
       return c.json(result.value);
     }
@@ -173,14 +175,7 @@ async function sourcePushRoute(c: Context<AppEnv>, action: "list" | "inspect" | 
     }
     if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length)
       return fail(c, 400, "Expected an empty JSON object.");
-    const result = await recoverSourcePush(
-      c.env,
-      loaded.row,
-      sourceId,
-      operationId,
-      access.actorId,
-      access.principalId,
-    );
+    const result = await recoverSourcePush(c.env, loaded.row, sourceId, operationId, actor);
     if (
       source.state === "ready" &&
       source.artifacts_remote &&
@@ -203,17 +198,21 @@ async function sourcePushRoute(c: Context<AppEnv>, action: "list" | "inspect" | 
     }
     return c.json(result);
   } catch (error) {
-    if (error instanceof TrackerError)
+    if (error instanceof TrackerError || error instanceof WorkAuthorizationError)
       return c.json({ error: error.message, code: error.code }, error.status);
+    if (error instanceof Error && error.message === "migration_epoch_mismatch")
+      return c.json({ error: error.message, code: error.message }, 409);
+    if (error instanceof Error && error.message === "space_cutover_fenced")
+      return c.json({ error: error.message, code: error.message }, 503);
     throw error;
   }
 }
 
-repos.get("/:owner/:name/sources/:sourceId/pushes", (c) => sourcePushRoute(c, "list"));
-repos.get("/:owner/:name/sources/:sourceId/pushes/:operationId", (c) =>
+repos.get("/:space/:name/sources/:sourceId/pushes", (c) => sourcePushRoute(c, "list"));
+repos.get("/:space/:name/sources/:sourceId/pushes/:operationId", (c) =>
   sourcePushRoute(c, "inspect"),
 );
-repos.post("/:owner/:name/sources/:sourceId/pushes/:operationId/recover", (c) =>
+repos.post("/:space/:name/sources/:sourceId/pushes/:operationId/recover", (c) =>
   sourcePushRoute(c, "recover"),
 );
 
@@ -239,7 +238,10 @@ function looksBinary(bytes: Uint8Array): boolean {
 }
 
 repos.get("/", async (c) => {
-  return c.json({ repos: await visibleRepos(c.env.DB, c.get("actor")) });
+  const slug = c.req.query("space");
+  const space = slug === undefined ? null : await findSpaceBySlug(c.env.DB, slug);
+  if (slug !== undefined && !space) return fail(c, 404, "No such Space.");
+  return c.json({ repos: await visibleRepos(c.env.DB, c.get("actor"), space?.id) });
 });
 
 repos.post("/", async (c) => {
@@ -257,20 +259,22 @@ repos.post("/", async (c) => {
       "Use letters, numbers, dots, dashes and underscores, without a .git ending.",
     );
   }
-  const owner = body.owner ? await findAccountBySlug(c.env.DB, body.owner) : null;
-  if (!owner) return fail(c, 404, "No such owner.");
-  if (!(await canCreateIn(c.env.DB, actor, owner))) {
-    return fail(c, 403, `You can't create repositories in ${owner.slug}.`);
+  if (typeof body.spaceId !== "string" || !body.spaceId.trim())
+    return fail(c, 400, "An immutable spaceId is required.");
+  const space = await findSpaceById(c.env.DB, body.spaceId);
+  if (!space) return fail(c, 404, "No such Space.");
+  if (!(await canCreateRepository(c.env.DB, actor, space.id))) {
+    return fail(c, 403, `You can't create repositories in ${space.slug}.`);
   }
-  const existing = await findRepo(c.env.DB, null, owner.slug, name, { deleting: true });
+  const existing = await findRepo(c.env.DB, null, space.slug, name, { deleting: true });
   if (existing) {
     // A deleted repository keeps its name until its purge ends (CORE-199).
     return fail(
       c,
       409,
       existing.deleted_at
-        ? `${owner.slug}/${name} is being deleted. Its name is free again once that finishes.`
-        : `${owner.slug}/${name} already exists.`,
+        ? `${space.slug}/${name} is being deleted. Its name is free again once that finishes.`
+        : `${space.slug}/${name} already exists.`,
     );
   }
 
@@ -316,7 +320,7 @@ repos.post("/", async (c) => {
       .insertInto("repos")
       .values({
         id: `repo_${crypto.randomUUID()}`,
-        owner_id: owner.id,
+        space_id: space.id,
         name,
         description,
         visibility,
@@ -332,8 +336,14 @@ repos.post("/", async (c) => {
     throw error;
   }
 
-  const row = await findRepo(c.env.DB, actor, owner.slug, name);
-  if (row) c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
+  const row = await findRepo(c.env.DB, actor, space.slug, name);
+  if (row && atLeast(roleFor(row, actor), "write")) {
+    c.executionCtx.waitUntil(
+      captureWorkAuthority(c.env, row.id, actor).then((authorization) =>
+        notifyKnowledge(c.env, row.id, { authorization }),
+      ),
+    );
+  }
   return c.json(row && repoSummary(row, actor), 201);
 });
 
@@ -382,13 +392,13 @@ async function resolveTarget(
   return { ref: refs.headBranch ?? row.default_branch, path };
 }
 
-repos.get("/:owner/:name/semantic", async (c) => {
+repos.get("/:space/:name/semantic", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   return semanticResponse(c, loaded.row);
 });
 
-repos.get("/:owner/:name", async (c) => {
+repos.get("/:space/:name", async (c) => {
   const loaded = await loadSourceRepo(c, "read", c.req.query("metadata") === "1");
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
@@ -398,13 +408,21 @@ repos.get("/:owner/:name", async (c) => {
       : await getWorkSource(c.env, row.id, loaded.source.sourceId);
   if (loaded.source.sourceId !== "canonical" && !owned)
     return fail(c, 404, "Code source not found.");
+  if (c.req.query("authorization") === "1") {
+    c.header("cache-control", "private, no-store");
+    return c.json({
+      id: loaded.canonical.id,
+      space: repoSummary(loaded.canonical, c.get("actor")).space,
+      source: loaded.source,
+    });
+  }
 
   const detail: RepoDetail = {
     ...repoSummary(loaded.canonical, c.get("actor")),
     source: loaded.source,
     sourceState: loaded.expired ? "expired" : owned?.state === "archived" ? "archived" : "ready",
     state: "ready",
-    cloneUrl: `${new URL(c.req.url).origin}${owned ? workGitPath(loaded.canonical, owned.timeline_slug) : `/${row.owner_slug}/${row.name}.git`}`,
+    cloneUrl: `${new URL(c.req.url).origin}${owned ? workGitPath(loaded.canonical, owned.timeline_slug) : `/${row.space_slug}/${row.name}.git`}`,
     head: null,
     branches: [],
     tags: [],
@@ -460,7 +478,7 @@ repos.get("/:owner/:name", async (c) => {
   return c.json(detail);
 });
 
-repos.get("/:owner/:name/tree", async (c) => {
+repos.get("/:space/:name/tree", async (c) => {
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
@@ -516,7 +534,7 @@ repos.get("/:owner/:name/tree", async (c) => {
   }
 });
 
-repos.get("/:owner/:name/blob", async (c) => {
+repos.get("/:space/:name/blob", async (c) => {
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
@@ -553,7 +571,7 @@ repos.get("/:owner/:name/blob", async (c) => {
   }
 });
 
-repos.get("/:owner/:name/history", async (c) => {
+repos.get("/:space/:name/history", async (c) => {
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const cursor = c.req.query("cursor");
@@ -598,7 +616,7 @@ repos.get("/:owner/:name/history", async (c) => {
   }
 });
 
-repos.get("/:owner/:name/commits/:oid/presence", async (c) => {
+repos.get("/:space/:name/commits/:oid/presence", async (c) => {
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const oid = c.req.param("oid");
@@ -624,7 +642,7 @@ repos.get("/:owner/:name/commits/:oid/presence", async (c) => {
 
 // One commit's diff against its first parent (CORE-234: a step's work).
 // Bounded: DIFF_LIMITS caps files listed, files patched, blob size and tree reads.
-repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
+repos.get("/:space/:name/commits/:oid/diff", async (c) => {
   // A timeline's commit may live only in its work source (`?source=`, CORE-296).
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
@@ -677,7 +695,7 @@ const REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 // check both repositories' caches before any remote read, starting with the
 // side that served a neighbour (base: canonical, head: source), so main's
 // commits never cost a certain miss on the work source (CORE-400).
-repos.get("/:owner/:name/compare", async (c) => {
+repos.get("/:space/:name/compare", async (c) => {
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const headRef = c.req.query("head") ?? "";
@@ -749,7 +767,7 @@ repos.get("/:owner/:name/compare", async (c) => {
   }
 });
 
-repos.get("/:owner/:name/commits", async (c) => {
+repos.get("/:space/:name/commits", async (c) => {
   const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
@@ -782,7 +800,7 @@ repos.get("/:owner/:name/commits", async (c) => {
   }
 });
 
-repos.patch("/:owner/:name", async (c) => {
+repos.patch("/:space/:name", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
@@ -811,7 +829,7 @@ repos.patch("/:owner/:name", async (c) => {
     .where("deleted_at", "is", null)
     .where(sql<boolean>`NOT EXISTS (
       SELECT 1 FROM repos AS occupied
-      WHERE occupied.owner_id = ${row.owner_id}
+      WHERE occupied.space_id = ${row.space_id}
         AND occupied.name = ${name} AND occupied.id != ${row.id}
     )`)
     .executeTakeFirst();
@@ -822,22 +840,22 @@ repos.patch("/:owner/:name", async (c) => {
       .where("id", "=", row.id)
       .executeTakeFirst();
     if (!current || current.deleted_at) return fail(c, 404, "Repository not found.");
-    const existing = await findRepo(c.env.DB, null, row.owner_slug, name, { deleting: true });
+    const existing = await findRepo(c.env.DB, null, row.space_slug, name, { deleting: true });
     return fail(
       c,
       409,
       existing && existing.id !== row.id
         ? existing.deleted_at
-          ? `${row.owner_slug}/${name} is being deleted. Its name is free again once that finishes.`
-          : `${row.owner_slug}/${name} already exists.`
+          ? `${row.space_slug}/${name} is being deleted. Its name is free again once that finishes.`
+          : `${row.space_slug}/${name} already exists.`
         : "The repository changed during this request. Reload it and try again.",
     );
   }
-  const updated = await findRepo(c.env.DB, c.get("actor"), row.owner_slug, name);
+  const updated = await findRepo(c.env.DB, c.get("actor"), row.space_slug, name);
   return c.json(updated && repoSummary(updated, c.get("actor")));
 });
 
-repos.delete("/:owner/:name", async (c) => {
+repos.delete("/:space/:name", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
@@ -853,7 +871,7 @@ repos.delete("/:owner/:name", async (c) => {
   return c.body(null, 204);
 });
 
-repos.get("/:owner/:name/collaborators", async (c) => {
+repos.get("/:space/:name/collaborators", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const results = await db(c.env.DB)
@@ -871,7 +889,7 @@ repos.get("/:owner/:name/collaborators", async (c) => {
   return c.json({ collaborators });
 });
 
-repos.put("/:owner/:name/collaborators/:username", async (c) => {
+repos.put("/:space/:name/collaborators/:username", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const { role } = await readJson<{ role: CollaboratorRole }>(c);
@@ -891,7 +909,7 @@ repos.put("/:owner/:name/collaborators/:username", async (c) => {
   return c.json(collaborator);
 });
 
-repos.delete("/:owner/:name/collaborators/:username", async (c) => {
+repos.delete("/:space/:name/collaborators/:username", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const user = await findAccountBySlug(c.env.DB, c.req.param("username"));

@@ -1,13 +1,13 @@
 // Paid inference that is attributed, metered and stoppable (CORE-285):
-// a Workflow step's model calls record for the repository owner even though
+// a Workflow step's model calls record for the repository's Space even though
 // the runtime calls step callbacks outside the context `run` set up; every
 // attempt, failed or not, is metered the way the AI Gateway logs it; a build
 // the watchdog stopped, a failed step and a timed-out attempt stop spending.
 
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
 import type { WorkflowStep } from "cloudflare:workers";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { aiWork } from "../usage/ai.ts";
 import { buildStopped } from "./build.ts";
@@ -17,21 +17,17 @@ import { chatJson, chatText, decide, MODELS } from "./models.ts";
 import { paidSteps, timeoutMs } from "./paid-steps.ts";
 import { paidWork, PaidWorkStopped } from "./paid-work.ts";
 import { pool } from "./util.ts";
+import { seedSpaceFixture, createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 
-vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {
-    ctx: unknown;
-    env: unknown;
-    constructor(ctx: unknown, env: unknown) {
-      this.ctx = ctx;
-      this.env = env;
-    }
-  },
-  WorkflowEntrypoint: class {},
-}));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 vi.mock("cloudflare:workflows", () => ({
   NonRetryableError: class NonRetryableError extends Error {
-    override name = "NonRetryableError";
+    constructor(message: string, name = "NonRetryableError") {
+      super(message);
+      this.name = name;
+    }
   },
 }));
 
@@ -50,17 +46,33 @@ interface Call {
 }
 
 /** A database with one repository, and a Workers AI fake that logs each call like the gateway. */
-function setup(answer: (call: Call) => Promise<unknown> = async () => ANSWER) {
-  const sqlite = migratedDatabase();
+async function setup(answer: (call: Call) => Promise<unknown> = async () => ANSWER) {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  onTestFinished(fresh.close);
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_o', 'org', 'orbit', 'Orbit');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('person', 'user', 'person', 'Person');
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: { id: "org", slug: "orbit", displayName: "Orbit", kind: "company" },
+    space: { id: "acc_o", slug: "orbit", displayName: "General" },
+    actorId: "person",
+    members: [
+      {
+        accountId: "person",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc_o', 'app', 'private', 'n', 'https://app');
     INSERT INTO kg_builds (id, repo_id, to_commit, status) VALUES ('b1', 'repo', 'c', 'running');
   `);
   const calls: Call[] = [];
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     AI_GATEWAY: "gw",
     AI: {
       run: async (model: string, _inputs: unknown, options: AiOptions) => {
@@ -76,7 +88,7 @@ function setup(answer: (call: Call) => Promise<unknown> = async () => ANSWER) {
 const usage = (sqlite: DatabaseSync) =>
   sqlite
     .prepare(
-      "SELECT account_id, feature, model, calls, failed_calls, input_tokens FROM ai_usage ORDER BY account_id, feature, model",
+      "SELECT scope_kind, scope_id, feature, model, calls, failed_calls, input_tokens FROM ai_usage ORDER BY scope_kind, scope_id, feature, model",
     )
     .all();
 
@@ -121,8 +133,8 @@ const hangs = (call: Call) =>
   });
 
 describe("attribution across Workflow steps", () => {
-  test("a step's model calls record for the repository owner, not as unattributed", async () => {
-    const { sqlite, env, calls } = setup();
+  test("a step's model calls record for the repository Space, not as unattributed", async () => {
+    const { sqlite, env, calls } = await setup();
     const work = { feature: "knowledge", repo: "repo" };
     // Without re-entering the context in each step: the production bug.
     const bare = detachedSteps();
@@ -143,7 +155,8 @@ describe("attribution across Workflow steps", () => {
     await kept;
     expect(usage(sqlite)).toEqual([
       {
-        account_id: "",
+        scope_kind: "instance",
+        scope_id: "",
         feature: "unattributed",
         model: MODELS.classify,
         calls: 1,
@@ -151,7 +164,8 @@ describe("attribution across Workflow steps", () => {
         input_tokens: 40,
       },
       {
-        account_id: "acc_o",
+        scope_kind: "space",
+        scope_id: "acc_o",
         feature: "knowledge",
         model: MODELS.classify,
         calls: 2,
@@ -159,19 +173,27 @@ describe("attribution across Workflow steps", () => {
         input_tokens: 80,
       },
     ]);
-    // The gateway log of each call names the same account and feature, so the
+    // The gateway log of each call names the same scope and feature, so the
     // two records reconcile; a deadline-bearing signal goes with every call.
     expect(calls.map((c) => c.options.gateway?.metadata)).toEqual([
-      { component: "knowledge", account: "", feature: "unattributed", attempt: expect.any(String) },
       {
         component: "knowledge",
-        account: "acc_o",
+        scopeKind: "instance",
+        scopeId: "",
+        feature: "unattributed",
+        attempt: expect.any(String),
+      },
+      {
+        component: "knowledge",
+        scopeKind: "space",
+        scopeId: "acc_o",
         feature: "knowledge",
         attempt: expect.any(String),
       },
       {
         component: "knowledge",
-        account: "acc_o",
+        scopeKind: "space",
+        scopeId: "acc_o",
         feature: "knowledge",
         attempt: expect.any(String),
       },
@@ -181,13 +203,15 @@ describe("attribution across Workflow steps", () => {
   });
 
   test("the step callback overload without a config is wrapped too", async () => {
-    const { sqlite, env } = setup();
-    const work = { feature: "wiki", account: "acc_o" };
+    const { sqlite, env } = await setup();
+    const work = { feature: "wiki", spaceId: "acc_o" };
     const { step, drain } = detachedSteps();
     const done = paidSteps(step, work).do("pages", () => decide(env, {}, QUESTION));
     await drain();
     await done;
-    expect(usage(sqlite)).toEqual([expect.objectContaining({ account_id: "acc_o", calls: 1 })]);
+    expect(usage(sqlite)).toEqual([
+      expect.objectContaining({ scope_kind: "space", scope_id: "acc_o", calls: 1 }),
+    ]);
   });
 });
 
@@ -195,26 +219,31 @@ describe("metered attempts", () => {
   test("rate-limited attempts are bounded and each is metered as failed", async () => {
     vi.useFakeTimers();
     let n = 0;
-    const { sqlite, env, calls } = setup(async () => {
+    const { sqlite, env, calls } = await setup(async () => {
       if (++n <= 2) throw new Error("3021: Rate limit reached");
       return {
         choices: [{ message: { content: '{"ok":true}' } }],
         usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
       };
     });
-    const result = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+    const result = aiWork({ feature: "knowledge", spaceId: "acc_o" }, () =>
       chatJson(env, "fast", "s", "u"),
     );
     await vi.runAllTimersAsync();
     await expect(result).resolves.toMatchObject({ value: { ok: true } });
     expect(calls).toHaveLength(3);
     expect(usage(sqlite)).toEqual([
-      expect.objectContaining({ account_id: "acc_o", calls: 1, failed_calls: 2 }),
+      expect.objectContaining({
+        scope_kind: "space",
+        scope_id: "acc_o",
+        calls: 1,
+        failed_calls: 2,
+      }),
     ]);
 
     // Past the retry bound the error surfaces; every attempt was metered.
     n = -100;
-    const exhausted = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+    const exhausted = aiWork({ feature: "knowledge", spaceId: "acc_o" }, () =>
       chatJson(env, "fast", "s", "u", { attempts: 1, rateLimitRetries: 1 }),
     );
     const settled = expect(exhausted).rejects.toThrow(/Rate limit/);
@@ -222,7 +251,12 @@ describe("metered attempts", () => {
     await settled;
     expect(calls).toHaveLength(5);
     expect(usage(sqlite)).toEqual([
-      expect.objectContaining({ account_id: "acc_o", calls: 1, failed_calls: 4 }),
+      expect.objectContaining({
+        scope_kind: "space",
+        scope_id: "acc_o",
+        calls: 1,
+        failed_calls: 4,
+      }),
     ]);
   });
 });
@@ -235,12 +269,12 @@ describe("safe failed-attempt evidence", () => {
     const error = new Error(`3021: Rate limit reached ${secret}`, { cause: { secret } });
     error.stack = secret;
     let attempts = 0;
-    const { sqlite, env, calls } = setup(async () => {
+    const { sqlite, env, calls } = await setup(async () => {
       if (++attempts === 1) throw error;
       return ANSWER;
     });
     try {
-      const result = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+      const result = aiWork({ feature: "knowledge", spaceId: "acc_o" }, () =>
         decide(env, {}, QUESTION),
       );
       await vi.runAllTimersAsync();
@@ -255,7 +289,8 @@ describe("safe failed-attempt evidence", () => {
       expect(diagnostic).toMatchObject({
         provider: "workers-ai",
         model: MODELS.classify,
-        account: "acc_o",
+        scopeKind: "space",
+        scopeId: "acc_o",
         feature: "knowledge",
         dispatched: true,
         kind: "rate_limit",
@@ -281,12 +316,12 @@ describe("safe failed-attempt evidence", () => {
       const dispatched = new Promise<void>((resolve) => {
         sent = resolve;
       });
-      const { sqlite, env } = setup((call) => {
+      const { sqlite, env } = await setup((call) => {
         sent();
         return hangs(call);
       });
       try {
-        const outcome = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+        const outcome = aiWork({ feature: "knowledge", spaceId: "acc_o" }, () =>
           paidWork({}, async (guard) => {
             const call = chatText(env, "reason", "s", "u");
             const caught = call.catch((error: unknown) => error);
@@ -319,12 +354,12 @@ describe("safe failed-attempt evidence", () => {
       throw new Error("logger unavailable");
     });
     const original = new Error("provider rejected secret content");
-    const { sqlite, env } = setup(async () => {
+    const { sqlite, env } = await setup(async () => {
       throw original;
     });
     try {
       await expect(
-        aiWork({ feature: "knowledge", account: "acc_o" }, () => chatText(env, "fast", "s", "u")),
+        aiWork({ feature: "knowledge", spaceId: "acc_o" }, () => chatText(env, "fast", "s", "u")),
       ).rejects.toBe(original);
       expect(usage(sqlite)).toEqual([expect.objectContaining({ calls: 0, failed_calls: 1 })]);
     } finally {
@@ -336,8 +371,8 @@ describe("safe failed-attempt evidence", () => {
 describe("call deadlines", () => {
   test("a writing call on the fast model gets the writing deadline, then is aborted and metered", async () => {
     vi.useFakeTimers();
-    const { sqlite, env, calls } = setup(hangs);
-    const page = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+    const { sqlite, env, calls } = await setup(hangs);
+    const page = aiWork({ feature: "knowledge", spaceId: "acc_o" }, () =>
       chatText(env, "reason", "s", "u", { model: MODELS.fast }),
     );
     const settled = page.catch((error: unknown) => error);
@@ -356,7 +391,7 @@ describe("a stopped build stops paying", () => {
     "stopping during %s preparation neither dispatches nor meters a model attempt",
     async (table) => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const { sqlite, env, calls } = setup(async (call) => {
+      const { sqlite, env, calls } = await setup(async (call) => {
         call.options.signal?.throwIfAborted();
         return ANSWER;
       });
@@ -386,7 +421,8 @@ describe("a stopped build stops paying", () => {
           ).toMatchObject({
             dispatched: false,
             kind: "work_stopped",
-            account: "acc_o",
+            scopeKind: "space",
+            scopeId: "acc_o",
             feature: "knowledge",
           });
         } else {
@@ -403,7 +439,7 @@ describe("a stopped build stops paying", () => {
     let hang = true;
     let sent!: () => void;
     const firstSent = new Promise<void>((resolve) => (sent = resolve));
-    const { sqlite, env, calls } = setup((call) => {
+    const { sqlite, env, calls } = await setup((call) => {
       sent();
       return hang ? hangs(call) : Promise.resolve(ANSWER);
     });
@@ -434,12 +470,17 @@ describe("a stopped build stops paying", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.options.signal!.aborted).toBe(true);
     expect(usage(sqlite)).toEqual([
-      expect.objectContaining({ account_id: "acc_o", calls: 0, failed_calls: 1 }),
+      expect.objectContaining({
+        scope_kind: "space",
+        scope_id: "acc_o",
+        calls: 0,
+        failed_calls: 1,
+      }),
     ]);
   });
 
   test("a step that skips refused calls still fails once its build was stopped", async () => {
-    const { sqlite, env, calls } = setup();
+    const { sqlite, env, calls } = await setup();
     sqlite.exec("UPDATE kg_builds SET status = 'failed' WHERE id = 'b1'");
     const { step, drain } = detachedSteps();
     const steps = paidSteps(step, { feature: "knowledge", repo: "repo" }, () =>
@@ -459,20 +500,80 @@ describe("a stopped build stops paying", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("steps with no model calls (recording the failure) still run for a stopped build", async () => {
-    const { sqlite, env } = setup();
-    sqlite.exec("UPDATE kg_builds SET status = 'failed' WHERE id = 'b1'");
+  test("a delayed publication is refused even without a model call after authorization loss", async () => {
     const { step, drain } = detachedSteps();
-    const steps = paidSteps(step, { feature: "knowledge", repo: "repo" }, () =>
-      buildStopped(env.DB, "repo", "b1"),
+    const publish = vi.fn(async () => "published");
+    const steps = paidSteps(
+      step,
+      { feature: "knowledge", spaceId: "space" },
+      async () => "Grant revoked",
+      0,
     );
-    const outcome = steps.do("fail", async () => "recorded");
+    const outcome = steps.do("publish", publish).catch((error: unknown) => error);
     await drain();
-    await expect(outcome).resolves.toBe("recorded");
+    expect(((await outcome) as Error).name).toBe("NonRetryableError");
+    expect(publish).not.toHaveBeenCalled();
+    // Failure bookkeeping deliberately uses the original, non-business step.
+    const recorded = step.do("fail", async () => "recorded");
+    await drain();
+    await expect(recorded).resolves.toBe("recorded");
+  });
+
+  test("an ended-source refusal retains its durable identity without publishing", async () => {
+    const { step, drain } = detachedSteps();
+    const publish = vi.fn(async () => "published");
+    const steps = paidSteps(
+      step,
+      { feature: "knowledge", spaceId: "space" },
+      async () => ({ code: "TimelineEnded", message: "Source archived" }),
+      0,
+    );
+    const outcome = steps.do("publish", publish).catch((error: unknown) => error);
+    await drain();
+    expect(await outcome).toBeInstanceOf(Error);
+    expect(((await outcome) as Error).name).toBe("TimelineEnded");
+    expect(publish).not.toHaveBeenCalled();
+    const cleanup = step.do("cleanup", async () => "released");
+    await drain();
+    await expect(cleanup).resolves.toBe("released");
+  });
+
+  test("an unavailable authorization lookup fails closed", async () => {
+    const { step, drain } = detachedSteps();
+    const publish = vi.fn(async () => "published");
+    const steps = paidSteps(
+      step,
+      { feature: "knowledge", spaceId: "space" },
+      async () => {
+        throw new Error("D1 unavailable");
+      },
+      0,
+    );
+    const outcome = steps.do("publish", publish).catch((error: unknown) => error);
+    await drain();
+    expect(((await outcome) as Error).name).toBe("NonRetryableError");
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  test("a provider result cannot publish after the initiating credential is revoked", async () => {
+    let revoked = false;
+    const publish = vi.fn();
+    await expect(
+      paidWork(
+        { every: 0, live: async () => (revoked ? "Credential revoked" : null) },
+        async (guard) => {
+          await guard.check();
+          revoked = true;
+          await guard.check();
+          publish();
+        },
+      ),
+    ).rejects.toThrow("Credential revoked");
+    expect(publish).not.toHaveBeenCalled();
   });
 
   test("a running build, or one not yet recorded, may spend; a deleted repository's may not", async () => {
-    const { sqlite, env } = setup();
+    const { sqlite, env } = await setup();
     expect(await buildStopped(env.DB, "repo", "b1")).toBeNull();
     expect(await buildStopped(env.DB, "repo", "not-started")).toBeNull();
     sqlite.exec("UPDATE kg_builds SET status = 'succeeded' WHERE id = 'b1'");
@@ -485,11 +586,11 @@ describe("a stopped build stops paying", () => {
     vi.useFakeTimers();
     let sent!: () => void;
     const firstSent = new Promise<void>((resolve) => (sent = resolve));
-    const { sqlite, env, calls } = setup((call) => {
+    const { sqlite, env, calls } = await setup((call) => {
       sent();
       return hangs(call);
     });
-    const outcome = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+    const outcome = aiWork({ feature: "knowledge", spaceId: "acc_o" }, () =>
       paidWork({ deadline: Date.now() + 30_000 }, async () => {
         const first = await decide(env, {}, QUESTION).catch((error: unknown) => error);
         const second = await decide(env, {}, QUESTION).catch((error: unknown) => error);
@@ -508,7 +609,7 @@ describe("a stopped build stops paying", () => {
 
     // Through paidSteps an expired attempt's error is an ordinary (retryable) one.
     const { step, drain } = detachedSteps();
-    const expired = paidSteps(step, { feature: "knowledge", account: "acc_o" }).do(
+    const expired = paidSteps(step, { feature: "knowledge", spaceId: "acc_o" }).do(
       "slow",
       { timeout: "20 seconds" },
       () => decide(env, {}, QUESTION),
@@ -576,11 +677,33 @@ let artifactsNames = 0;
 
 /** A coordinator whose first build of main is running; `status` is what Workflows says of it. */
 async function runningBuild(status: () => Promise<{ status: string }>) {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  onTestFinished(fresh.close);
   const artifacts = `kg-paid-${++artifactsNames}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: {
+      id: "org-ann",
+      slug: "ann",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "ann", slug: "ann", displayName: "General" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'ann', 'app', 'private', '${artifacts}', 'https://app');
     INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('repo', '${oid(1)}');
   `);
@@ -590,7 +713,7 @@ async function runningBuild(status: () => Promise<{ status: string }>) {
   const created: string[] = [];
   const terminated: string[] = [];
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: git.artifacts,
     AI: {},
     TIMELINE_QUIET_SECONDS: "0",
@@ -613,7 +736,12 @@ async function runningBuild(status: () => Promise<{ status: string }>) {
     },
   } as unknown as Env;
   const coordinator = new KnowledgeCoordinator(objectState(), env);
-  await coordinator.notify("repo");
+  const token = await issueToken(env.DB, "ann", "push", "write");
+  const authorization = await captureWorkAuthority(env, "repo", {
+    id: "ann",
+    credential: { kind: "token", id: token.id },
+  });
+  await coordinator.notify("repo", { authorization });
   await coordinator.alarm();
   expect(created).toHaveLength(1);
   const builds = () => sqlite.prepare("SELECT id, status FROM kg_builds ORDER BY rowid").all();

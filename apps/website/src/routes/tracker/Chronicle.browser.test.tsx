@@ -1,4 +1,8 @@
-import { expect, test, vi } from "vite-plus/test";
+import { Tooltip } from "@base-ui/react/tooltip";
+import { act, type ComponentProps } from "react";
+import { createRoot } from "react-dom/client";
+import { createMemoryRouter, RouterProvider, useSearchParams } from "react-router";
+import { expect, onTestFinished, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { Snapshot } from "../../../shared/tracker.ts";
 import { renderApp } from "../../testing/render.tsx";
@@ -6,6 +10,7 @@ import { TestServer } from "../../testing/server.ts";
 import { visual } from "../../testing/visual.ts";
 import { mutate } from "../../testing/timelines.ts";
 import { focusOn, press } from "../../testing/focus.ts";
+import { Chronicle } from "./Chronicle.tsx";
 
 const LONG =
   "Rank search results by freshness and click-through so the newest useful answer comes first for everyone";
@@ -80,6 +85,82 @@ test("list playhead preserves successive keyboard increments and browser history
   await expect.element(scrubber).toHaveValue(String(at + 2 * step));
 });
 
+test("older navigation acknowledgements cannot erase a newer playhead gesture", async () => {
+  await TestServer.start({ world: true });
+  const from = Date.parse("2026-01-01T00:00:00.000Z");
+  const at = from + 9 * 3_600_000;
+  const to = from + 24 * 3_600_000;
+  const initial = new URLSearchParams({
+    view: "chronicle",
+    layout: "list",
+    from: new Date(from).toISOString(),
+    to: new Date(to).toISOString(),
+    at: new Date(at).toISOString(),
+  });
+  const writes: Parameters<ComponentProps<typeof Chronicle>["setParams"]>[] = [];
+  function DelayedNavigation() {
+    const [params] = useSearchParams();
+    return (
+      <Chronicle
+        space="orbit"
+        base="/tracker/orbit"
+        query=""
+        params={params}
+        setParams={(...write) => writes.push(write)}
+        selectedIssue={null}
+        serverNow={to}
+      />
+    );
+  }
+  const router = createMemoryRouter([{ path: "*", element: <DelayedNavigation /> }], {
+    initialEntries: [`/tracker/orbit?${initial}`],
+  });
+  const container = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(container);
+  let held = false;
+  onTestFinished(async () => {
+    if (held) await userEvent.keyboard("{/ArrowLeft}");
+    await act(async () => root.unmount());
+    router.dispose();
+    container.remove();
+  });
+  await act(async () =>
+    root.render(
+      <Tooltip.Provider>
+        <RouterProvider router={router} />
+      </Tooltip.Provider>,
+    ),
+  );
+  const acknowledge = async () => {
+    const next = writes.shift();
+    if (!next) throw new Error("Expected a pending playhead navigation");
+    await act(async () => router.navigate(`/tracker/orbit?${next[0]}`, next[1]));
+  };
+  const scrubber = page.getByRole("slider", { name: "Playhead" });
+  await focusOn(scrubber);
+  const step = Number((scrubber.element() as HTMLInputElement).step);
+  await press("ArrowRight");
+  await expect.element(scrubber).toHaveValue(String(at + step));
+  held = true;
+  await userEvent.keyboard("{ArrowLeft>}");
+  await expect.element(scrubber).toHaveValue(String(at));
+  await acknowledge();
+  await expect.element(scrubber).toHaveValue(String(at));
+  await userEvent.keyboard("{/ArrowLeft}");
+  held = false;
+  await press("ArrowRight");
+  await expect.element(scrubber).toHaveValue(String(at + step));
+  await acknowledge();
+  await expect.element(scrubber).toHaveValue(String(at + step));
+  await acknowledge();
+  await expect.element(scrubber).toHaveValue(String(at + step));
+  await act(async () => router.navigate(-1));
+  await expect.element(scrubber).toHaveValue(String(at));
+  await act(async () => router.navigate(1));
+  await expect.element(scrubber).toHaveValue(String(at + step));
+  await expect.element(scrubber).toHaveFocus();
+});
+
 test.each([
   { committed: false, direction: "ArrowRight", offset: 2 },
   { committed: true, direction: "ArrowRight", offset: 2 },
@@ -87,79 +168,92 @@ test.each([
 ])(
   "an older URL acknowledgement preserves $direction (committed: $committed)",
   async ({ committed, direction, offset }) => {
-    const server = await TestServer.start({ world: true });
-    await mutate(server, [
-      {
-        kind: "team.create",
-        id: "chronicle-ack-team",
-        data: { key: "ACK", name: "Acknowledgements", memberIds: ["acc_marco"] },
-      },
-    ]);
+    await TestServer.start({ world: true });
     const from = Date.parse("2026-01-01T00:00:00.000Z");
     const at = from + 9 * 3_600_000;
-    const params = new URLSearchParams({
+    const to = from + 24 * 3_600_000;
+    const initial = new URLSearchParams({
       view: "chronicle",
       layout: "list",
       from: new Date(from).toISOString(),
-      to: new Date(from + 24 * 3_600_000).toISOString(),
+      to: new Date(to).toISOString(),
       at: new Date(at).toISOString(),
     });
-    const app = renderApp(`/tracker/orbit?${params}`);
+    // Each playhead write waits here until the test acknowledges it, inside
+    // act(), so React has committed the older address before the assertions.
+    const writes: Parameters<ComponentProps<typeof Chronicle>["setParams"]>[] = [];
+    function DelayedNavigation() {
+      const [params] = useSearchParams();
+      return (
+        <Chronicle
+          space="orbit"
+          base="/tracker/orbit"
+          query=""
+          params={params}
+          setParams={(...write) => writes.push(write)}
+          selectedIssue={null}
+          serverNow={to}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "*", element: <DelayedNavigation /> }], {
+      initialEntries: [`/tracker/orbit?${initial}`],
+    });
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container);
+    let held = false;
+    onTestFinished(async () => {
+      if (held) await userEvent.keyboard(`{/${direction}}`);
+      await act(async () => root.unmount());
+      router.dispose();
+      container.remove();
+    });
+    await act(async () =>
+      root.render(
+        <Tooltip.Provider>
+          <RouterProvider router={router} />
+        </Tooltip.Provider>,
+      ),
+    );
+    const acknowledge = async () => {
+      const next = writes.shift();
+      if (!next) throw new Error("Expected a pending playhead navigation");
+      await act(async () => router.navigate(`/tracker/orbit?${next[0]}`, next[1]));
+    };
     const scrubber = page.getByRole("slider", { name: "Playhead" });
-    await expect.element(scrubber).toBeVisible();
+    await focusOn(scrubber);
     const input = scrubber.element() as HTMLInputElement;
     const step = Number(input.step);
     const nextAt = at + offset * step;
-    await focusOn(scrubber);
-    const navigate = app.router.navigate.bind(app.router);
-    const pending: Array<() => Promise<void>> = [];
-    const navigation = vi.spyOn(app.router, "navigate").mockImplementation((to, options) => {
-      if (typeof to === "number") return navigate(to);
-      return new Promise<void>((resolve, reject) => {
-        pending.push(() => navigate(to, options).then(resolve, reject));
-      });
-    });
-    let held = false;
-    try {
-      await press("ArrowRight");
-      await expect.poll(() => pending.length).toBe(1);
-      if (committed) await press(direction);
-      else {
-        await userEvent.keyboard(`{${direction}>}`);
-        held = true;
-      }
-      await expect.element(scrubber).toHaveValue(String(nextAt));
-      await pending.shift()!();
-      await app.waitForUrl(
-        (url) => url.searchParams.get("at") === new Date(at + step).toISOString(),
-      );
-      // Router state leads React's commit; wait for the rendered URL before
-      // checking that its acknowledgement did not erase the newer gesture.
-      await expect
-        .element(page.getByRole("link", { name: "Settings", exact: true }))
-        .toHaveAttribute(
-          "href",
-          expect.stringContaining(`at=${encodeURIComponent(new Date(at + step).toISOString())}`),
-        );
-      await expect.element(scrubber).toHaveValue(String(nextAt));
-      if (held) {
-        await userEvent.keyboard(`{/${direction}}`);
-        held = false;
-      }
-      await expect.poll(() => pending.length).toBe(1);
-      await pending.shift()!();
-      await app.waitForUrl((url) => url.searchParams.get("at") === new Date(nextAt).toISOString());
-      navigation.mockRestore();
-      expect(document.activeElement).toBe(input);
-      await app.back();
-      await expect.element(scrubber).toHaveValue(String(at + step));
-      await app.forward();
-      await expect.element(scrubber).toHaveValue(String(nextAt));
-    } finally {
-      navigation.mockRestore();
-      if (held) await userEvent.keyboard(`{/${direction}}`);
-      for (const acknowledge of pending) await acknowledge();
+    await press("ArrowRight");
+    await expect.poll(() => writes.length).toBe(1);
+    if (committed) await press(direction);
+    else {
+      await userEvent.keyboard(`{${direction}>}`);
+      held = true;
     }
+    await expect.element(scrubber).toHaveValue(String(nextAt));
+    // The first gesture's address arrives after the newer one began.
+    await acknowledge();
+    expect(router.state.location.search).toContain(
+      `at=${encodeURIComponent(new Date(at + step).toISOString())}`,
+    );
+    await expect.element(scrubber).toHaveValue(String(nextAt));
+    if (held) {
+      await userEvent.keyboard(`{/${direction}}`);
+      held = false;
+    }
+    await expect.poll(() => writes.length).toBe(1);
+    await acknowledge();
+    expect(router.state.location.search).toContain(
+      `at=${encodeURIComponent(new Date(nextAt).toISOString())}`,
+    );
+    await expect.element(scrubber).toHaveValue(String(nextAt));
+    expect(document.activeElement).toBe(input);
+    await act(async () => router.navigate(-1));
+    await expect.element(scrubber).toHaveValue(String(at + step));
+    await act(async () => router.navigate(1));
+    await expect.element(scrubber).toHaveValue(String(nextAt));
   },
 );
 

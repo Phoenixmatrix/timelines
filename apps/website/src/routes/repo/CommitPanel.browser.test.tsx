@@ -39,6 +39,7 @@ async function world() {
   cannedFiles(server, head);
   // A real issue in orbit's tracker: its key resolves; NOPE-9 doesn't.
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: "panel-fixtures",
     mutations: [
       {
@@ -113,7 +114,7 @@ async function world() {
   diffs.set(parent, diff(parent, "Add the search index", []));
   server.on(
     "GET",
-    "/api/repos/:owner/:name/commits/:oid/diff",
+    "/api/repos/:space/:name/commits/:oid/diff",
     ({ params }) => diffs.get(params.oid!) ?? reply({ error: `No commit ${params.oid}.` }, 404),
   );
 
@@ -135,7 +136,7 @@ async function world() {
     heldAt: null,
     coveredBy: null,
   };
-  server.on("GET", "/api/repos/:owner/:name/ci", ({ url }): CiRunList => ({
+  server.on("GET", "/api/repos/:space/:name/ci", ({ url }): CiRunList => ({
     runs: url.searchParams.get("commit") === head ? [run] : [],
     runner: "local",
   }));
@@ -164,7 +165,7 @@ async function world() {
           ]
         : [],
   }));
-  server.on("GET", "/api/repos/:owner/:name/deployments", ({ url }): DeploymentList => ({
+  server.on("GET", "/api/repos/:space/:name/deployments", ({ url }): DeploymentList => ({
     deployments:
       url.searchParams.get("commit") === head
         ? [
@@ -200,7 +201,7 @@ async function world() {
     agent: "claude-code",
     createdAt: new Date(Date.now() - 600_000).toISOString(),
   };
-  server.on("GET", "/api/repos/:owner/:name/why", ({ url }): WhyResponse => {
+  server.on("GET", "/api/repos/:space/:name/why", ({ url }): WhyResponse => {
     const oid = url.searchParams.get("commit")!;
     const chain: WhyChain = {
       commit: null,
@@ -258,8 +259,8 @@ async function world() {
       step: null,
     };
     return {
-      repo: { owner: "orbit", name: "engine", defaultBranch: "main" },
-      tracker: { owner: "orbit", readable: true },
+      repo: { space: "orbit", name: "engine", defaultBranch: "main" },
+      tracker: { space: "orbit", readable: true },
       blame: null,
       chains: [chain],
       people: {},
@@ -267,7 +268,7 @@ async function world() {
   });
   server.on(
     "GET",
-    "/api/repos/:owner/:name/steps",
+    "/api/repos/:space/:name/steps",
     ({ url }) =>
       ({
         steps:
@@ -314,11 +315,11 @@ test("?commit= opens every section over the page; Escape closes back to it", asy
   await expect.element(dialog.getByText("Marco Rossi")).toBeVisible();
   await expect
     .element(dialog.getByRole("link", { name: "Marco", exact: true }))
-    .toHaveAttribute("href", "/marco");
+    .toHaveAttribute("href", "/accounts/marco");
   await expect.element(dialog.getByText(/claude-code for/).first()).toBeVisible();
   await expect
     .element(dialog.getByRole("link", { name: "marco", exact: true }).first())
-    .toHaveAttribute("href", "/marco");
+    .toHaveAttribute("href", "/accounts/marco");
   await expect
     .element(dialog.getByRole("link", { name: `Open parent commit ${short(parent)}` }))
     .toBeVisible();
@@ -378,7 +379,7 @@ test("on a work source's page it reads the commit from that source (CORE-296)", 
   const { server, head } = await world();
   // The page is the repository's timeline work source: the layout reads it from `?source=`.
   const detail = await server.call<RepoDetail>("GET", "/api/repos/orbit/engine");
-  server.on("GET", "/api/repos/:owner/:name", ({ url }) =>
+  server.on("GET", "/api/repos/:space/:name", ({ url }) =>
     url.searchParams.get("source") === "work_1"
       ? {
           ...detail,
@@ -520,7 +521,7 @@ test("non-CI deployment observers are lazy, source-scoped and poll only the expa
     createdAt: now,
     updatedAt: now,
   }));
-  server.on("GET", "/api/repos/:owner/:name/deployments", () => ({ deployments, next: null }));
+  server.on("GET", "/api/repos/:space/:name/deployments", () => ({ deployments, next: null }));
   const presence = (name: string): AgentPresence => ({
     agents: [
       {
@@ -535,10 +536,10 @@ test("non-CI deployment observers are lazy, source-scoped and poll only the expa
     windowSeconds: 600,
     truncated: false,
   });
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/presence", () =>
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/presence", () =>
     presence("commit observer"),
   );
-  server.on("GET", "/api/repos/:owner/:name/deployments/:id/presence", ({ params }) =>
+  server.on("GET", "/api/repos/:space/:name/deployments/:id/presence", ({ params }) =>
     presence(`deployment observer ${params.id}`),
   );
   const mark = server.requests.length;
@@ -644,7 +645,7 @@ test("loading, a short hash, and hashes that aren't commits", async () => {
   let release = () => {};
   const held = new Promise<void>((resolve) => (release = resolve));
   const diffs = new Map<string, unknown>();
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", async ({ params }) => {
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", async ({ params }) => {
     await held;
     return diffs.get(params.oid!) ?? reply({ error: "No commit." }, 404);
   });

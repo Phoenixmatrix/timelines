@@ -17,12 +17,12 @@ import { accessible } from "../tracker/api.ts";
 import type { Selectable } from "kysely";
 import { repoAiSnapshot } from "../settings/ai.ts";
 
-/** Tracker accounts the viewer can read, by id, with their slugs. */
+/** Tracker Spaces the viewer can read, by immutable id, with their slugs. */
 export type ViewerTrackers = Map<string, string>;
 
 export async function viewerTrackers(d1: D1Database, actor: Actor | null): Promise<ViewerTrackers> {
   if (!actor) return new Map();
-  return new Map((await accessible(d1, actor)).map((owner) => [owner.id, owner.slug]));
+  return new Map((await accessible(d1, actor)).map((space) => [space.id, space.slug]));
 }
 
 export type EntryRow = Selectable<Database["release_note_entries"]>;
@@ -31,10 +31,10 @@ export type EntryRow = Selectable<Database["release_note_entries"]>;
 export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEntry | null {
   let issue: ReleaseNoteEntry["issue"] = null;
   if (row.kind === "issue") {
-    const trackerOwner = row.tracker_owner_id ? trackers.get(row.tracker_owner_id) : undefined;
-    if (!trackerOwner) return null;
+    const trackerSpace = row.tracker_space_id ? trackers.get(row.tracker_space_id) : undefined;
+    if (!trackerSpace) return null;
     issue = {
-      trackerOwner,
+      trackerSpace,
       id: row.issue_id!,
       key: row.issue_key!,
       type: row.issue_type ?? "task",
@@ -54,7 +54,7 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
     summary: row.summary,
     issue,
     labels: JSON.parse(row.labels) as string[],
-    workspaceIds: JSON.parse(row.workspace_ids) as string[],
+    projectIds: JSON.parse(row.project_ids) as string[],
     commits: JSON.parse(row.commits) as string[],
     provenance,
     timeline: row.landing_oid
@@ -106,14 +106,14 @@ export async function releaseIndex(
       .execute(),
     d
       .selectFrom("release_note_entries")
-      .select(["release", "kind", "tracker_owner_id", "landing_oid", "timeline_branch"])
+      .select(["release", "kind", "tracker_space_id", "landing_oid", "timeline_branch"])
       .where("repo_id", "=", repoId)
       .execute(),
   ]);
   const counts = new Map<string, number>();
   for (const entry of entries)
     if (
-      (entry.kind !== "issue" || trackers.has(entry.tracker_owner_id ?? "")) &&
+      (entry.kind !== "issue" || trackers.has(entry.tracker_space_id ?? "")) &&
       (!scope || (entry.landing_oid && entry.timeline_branch === `timeline/${scope}`))
     )
       counts.set(entry.release, (counts.get(entry.release) ?? 0) + 1);

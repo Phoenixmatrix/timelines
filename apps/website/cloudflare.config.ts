@@ -130,6 +130,10 @@ export default defineConfig(({ mode, isPreview }) => {
           id: preview?.db ?? (dev ? "00000000000000000000000000000000" : instance.db.id),
         }),
         TRACKER: bindings.durableObject({ worker, exportName: "Tracker" }),
+        SPACE_CUTOVER: bindings.durableObject({ worker, exportName: "SpaceCutover" }),
+        CUTOVER_DEPLOYMENT_CHECKPOINT: bindings.text(
+          env.GITMATRIX_CUTOVER_CHECKPOINT ?? "unversioned",
+        ),
         // The assistant (CORE-25): one Durable Object per conversation, and the
         // Worker Loader its Code Mode scripts run in (isolated, no network).
         ASSISTANT: bindings.durableObject({ worker, exportName: "Assistant" }),
@@ -352,6 +356,7 @@ export default defineConfig(({ mode, isPreview }) => {
           ],
       exports: {
         Tracker: exports.durableObject({ storage: "sqlite" }),
+        SpaceCutover: exports.durableObject({ storage: "sqlite" }),
         Assistant: exports.durableObject({ storage: "sqlite" }),
         KnowledgeCoordinator: exports.durableObject({ storage: "sqlite" }),
         StepFeed: exports.durableObject({ storage: "sqlite" }),

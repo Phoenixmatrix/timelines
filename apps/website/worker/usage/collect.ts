@@ -1,12 +1,6 @@
-// Daily usage snapshots per account and construct (CORE-207), collected by
-// the hourly cron, never on a request path. A collection walks the site
-// ('' — data no account owns) and then every account, one small step at a
-// time: a D1 table group, a page of CI logs, Durable Objects, R2, Artifacts,
-// Vectorize, AI Search, then yesterday's AI and CI activity. It stops after a
-// step or time budget and the next run carries on from its cursor
-// (job_cursors 'usage:collect'), so a large account never times out the cron;
-// each step's rows and the cursor are written in one batch, so a step counts
-// once. Figures that aren't measured carry estimated = 1 and their method.
+// Daily usage snapshots collected in bounded, resumable steps. Content belongs
+// to Spaces, personal data to people, and shared infrastructure to the Instance.
+// Scope kind is part of every identity: migrated Space and person IDs may match.
 
 import { db, nowIso, type UsageConstruct } from "../schema.ts";
 import { DURABLE_CLASS_NAMES } from "../durable/classes.ts";
@@ -14,6 +8,7 @@ import { EMBEDDING_DIMENSIONS } from "../knowledge/models.ts";
 import { measureUnreachable, type Unreachable, type UnreachableRepo } from "../git/unreachable.ts";
 import { instanceSize } from "./containers.ts";
 import { MEASURED_TEXT, TABLE_GROUPS, type Database, type TableGroup } from "./tables.ts";
+import type { UsageScope } from "../../shared/usage.ts";
 
 export const USAGE_LIMITS = {
   /** Steps per cron run, and wall time, whichever ends first. */
@@ -25,9 +20,8 @@ export const USAGE_LIMITS = {
   sample: 100,
 };
 
-const CURSOR = "usage:collect";
-/** The account id site-wide figures are filed under. */
-export const SITE = "";
+/** The day's collection cursor in job_cursors; the scope-aware name leaves pre-Space cursors behind. */
+export const USAGE_CURSOR = "usage:collect:v4";
 /** Knowledge graph node kinds that get a vector (worker/knowledge/indexes.ts). */
 const EMBEDDED_KINDS = ["repository", "file", "symbol", "component", "concept"];
 /** What an AI Search item is assumed to weigh when none of the account's are measured. */
@@ -47,7 +41,7 @@ export interface UsageRow {
 
 interface StepContext {
   env: Env;
-  account: string;
+  scope: UsageScope;
   /** The collection's UTC day (storage) and the day before (activity). */
   day: string;
   yesterday: string;
@@ -67,7 +61,7 @@ interface Step {
 
 interface Cursor {
   day: string;
-  account: string;
+  scope: UsageScope;
   step: number;
   page: string | null;
   done: boolean;
@@ -108,7 +102,7 @@ function groupStep(group: TableGroup): Step {
       const tables = Object.entries(group.tables);
       for (const [table, owner] of tables) {
         const where = owner ? `WHERE ${owner}` : "";
-        const params = owner ? [ctx.account] : [];
+        const params = owner ? [ctx.scope.id] : [];
         const payload = (await columns(ctx.env, group.database, table))
           .map((c) => `COALESCE(length(CAST("${c}" AS BLOB)), 0)`)
           .join(" + ");
@@ -158,7 +152,7 @@ const ciLogs: Step = {
       .selectFrom("ci_jobs as j")
       .innerJoin("repos as r", "r.id", "j.repo_id")
       .select("j.id")
-      .where("r.owner_id", "=", ctx.account)
+      .where("r.space_id", "=", ctx.scope.id)
       .where("j.id", ">", page ?? "")
       .orderBy("j.id")
       .limit(ctx.limits.logJobs)
@@ -200,10 +194,10 @@ const durableObjects: Step = {
       `SELECT class, COUNT(*) AS n, COALESCE(SUM(storage_bytes), 0) AS bytes,
               SUM(storage_bytes IS NULL) AS unsized
        FROM do_instances
-       WHERE ${ctx.account === SITE ? "account_id IS NULL" : "account_id = ?1"} AND purged_at IS NULL
+       WHERE ${ctx.scope.kind === "space" ? "space_id = ?1" : ctx.scope.kind === "person" ? "space_id IS NULL AND account_id = ?1" : "space_id IS NULL AND account_id IS NULL AND class IN ('RegistryUpload', 'RegistryLogin')"} AND purged_at IS NULL
        GROUP BY class`,
     )
-      .bind(...(ctx.account === SITE ? [] : [ctx.account]))
+      .bind(...(ctx.scope.kind === "instance" ? [] : [ctx.scope.id]))
       .all<{ class: string; n: number; bytes: number; unsized: number }>();
     return {
       rows: results
@@ -236,7 +230,7 @@ const durableObjects: Step = {
 };
 
 const FEED_DIGESTS = `
-  WITH feeds AS (SELECT id FROM repositories WHERE owner_id = ?1),
+  WITH feeds AS (SELECT id FROM repositories WHERE space_id = ?1),
   digests AS (
     SELECT digest FROM files WHERE repo_id IN (SELECT id FROM feeds)
     UNION SELECT digest FROM oci_blob_links WHERE repo_id IN (SELECT id FROM feeds)
@@ -259,7 +253,7 @@ const r2: Step = {
         { construct: "r2", item, metric: "bytes", kind: "storage", quantity: bytes, method },
       );
     };
-    if (ctx.account === SITE) {
+    if (ctx.scope.kind === "instance") {
       const all = await ctx.env.REGISTRY_DB.prepare(
         "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM blobs",
       ).first<{ n: number; bytes: number }>();
@@ -267,41 +261,85 @@ const r2: Step = {
         "registry_blobs_all",
         Number(all?.n ?? 0),
         Number(all?.bytes ?? 0),
-        "every blob in the registry catalog, once (the bucket's logical total; accounts' figures overlap where they share blobs)",
+        "every blob in the registry catalog once; Instance reports substitute this total for Space blob references",
       );
       return { rows, next: null };
     }
-    const [blobs, derived] = await ctx.env.REGISTRY_DB.batch<{ n: number; bytes: number }>([
-      ctx.env.REGISTRY_DB.prepare(
-        `${FEED_DIGESTS} SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM blobs WHERE digest IN (SELECT digest FROM digests)`,
-      ).bind(ctx.account),
-      ctx.env.REGISTRY_DB.prepare(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM derived_files WHERE repo_id IN (SELECT id FROM repositories WHERE owner_id = ?1)",
-      ).bind(ctx.account),
-    ]);
-    push(
-      "registry_blobs",
-      Number(blobs?.results[0]?.n ?? 0),
-      Number(blobs?.results[0]?.bytes ?? 0),
-      "catalog sizes of the distinct blobs the account's feeds reference (a blob shared with another account counts for both)",
-    );
-    push(
-      "registry_derived",
-      Number(derived?.results[0]?.n ?? 0),
-      Number(derived?.results[0]?.bytes ?? 0),
-      "catalog sizes of the feeds' generated index files",
-    );
-    const account = await db(ctx.env.DB)
-      .selectFrom("accounts")
-      .select("avatar_key")
-      .where("id", "=", ctx.account)
-      .executeTakeFirst();
-    const avatars = Reflect.get(ctx.env, "AVATARS") as R2Bucket | undefined;
-    if (account?.avatar_key && avatars) {
-      const head = await avatars.head(account.avatar_key).catch(() => null);
-      if (head) push("avatars", 1, head.size, "the profile picture's object size (HEAD)");
+    if (ctx.scope.kind === "space") {
+      const [blobs, derived] = await ctx.env.REGISTRY_DB.batch<{ n: number; bytes: number }>([
+        ctx.env.REGISTRY_DB.prepare(
+          `${FEED_DIGESTS} SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM blobs WHERE digest IN (SELECT digest FROM digests)`,
+        ).bind(ctx.scope.id),
+        ctx.env.REGISTRY_DB.prepare(
+          "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM derived_files WHERE repo_id IN (SELECT id FROM repositories WHERE space_id = ?1)",
+        ).bind(ctx.scope.id),
+      ]);
+      push(
+        "registry_blobs",
+        Number(blobs?.results[0]?.n ?? 0),
+        Number(blobs?.results[0]?.bytes ?? 0),
+        "catalog sizes of distinct blobs referenced by this Space (shared references overlap between Spaces)",
+      );
+      push(
+        "registry_derived",
+        Number(derived?.results[0]?.n ?? 0),
+        Number(derived?.results[0]?.bytes ?? 0),
+        "catalog sizes of the feeds' generated index files",
+      );
+      return { rows, next: null };
     }
     return { rows, next: null };
+  },
+};
+
+/** Directory images: stored keys are authoritative, including legacy prefixes.
+ * One Organization per page bounds Instance work; personal images stay personal.
+ * UNION counts a selected option only once.
+ */
+const avatarObjects: Step = {
+  id: "r2:avatars",
+  async run(ctx, page) {
+    const organization = ctx.scope.kind === "instance";
+    const table = organization ? "organizations" : "accounts";
+    const generations = organization ? "organization_avatar_generations" : "avatar_generations";
+    const owner = organization ? "organization_id" : "user_id";
+    const row = await ctx.env.DB.prepare(
+      organization
+        ? "SELECT id FROM organizations WHERE id > ?1 ORDER BY id LIMIT 1"
+        : "SELECT id FROM accounts WHERE id = ?1",
+    )
+      .bind(organization ? (page ?? "") : ctx.scope.id)
+      .first<{ id: string }>();
+    if (!row && page !== null) return { rows: [], next: null };
+    let objects = 0;
+    let bytes = 0;
+    if (row) {
+      const { results } = await ctx.env.DB.prepare(
+        `SELECT avatar_key AS key FROM ${table} WHERE id = ?1 AND avatar_key IS NOT NULL
+         UNION SELECT value AS key FROM ${generations}, json_each(${generations}.options)
+         WHERE ${owner} = ?1`,
+      )
+        .bind(row.id)
+        .all<{ key: string }>();
+      const avatars = Reflect.get(ctx.env, "AVATARS") as R2Bucket | undefined;
+      if (avatars)
+        for (const { key } of results) {
+          const head = await avatars.head(key);
+          if (head) {
+            objects++;
+            bytes += head.size;
+          }
+        }
+    }
+    const item = organization ? "organization_avatars" : "avatars";
+    const method = "distinct selected and generated picture object sizes (HEAD of persisted keys)";
+    return {
+      rows: [
+        { construct: "r2", item, metric: "objects", kind: "storage", quantity: objects, method },
+        { construct: "r2", item, metric: "bytes", kind: "storage", quantity: bytes, method },
+      ],
+      next: organization && row ? row.id : null,
+    };
   },
 };
 
@@ -310,9 +348,9 @@ const artifacts: Step = {
   id: "artifacts",
   async run(ctx) {
     const row = await ctx.env.DB.prepare(
-      "SELECT COUNT(*) AS n, COALESCE(SUM(pushed_bytes), 0) AS bytes FROM repos WHERE owner_id = ?1",
+      "SELECT COUNT(*) AS n, COALESCE(SUM(pushed_bytes), 0) AS bytes FROM repos WHERE space_id = ?1",
     )
-      .bind(ctx.account)
+      .bind(ctx.scope.id)
       .first<{ n: number; bytes: number }>();
     const n = Number(row?.n ?? 0);
     if (n === 0) return { rows: [], next: null };
@@ -352,19 +390,19 @@ const artifactsUnreachable: Step = {
   async run(ctx, page) {
     const repo = await ctx.env.DB.prepare(
       `SELECT r.id, r.artifacts_name, r.artifacts_remote FROM repos r
-        WHERE r.owner_id = ?1 AND r.id > ?2 AND r.deleted_at IS NULL
+        WHERE r.space_id = ?1 AND r.id > ?2 AND r.deleted_at IS NULL
           AND EXISTS (SELECT 1 FROM ref_updates u WHERE u.repo_id = r.id AND u.old_oid IS NOT NULL
                         AND (u.new_oid IS NULL OR u.forced = 1))
         ORDER BY r.id LIMIT 1`,
     )
-      .bind(ctx.account, page ?? "")
+      .bind(ctx.scope.id, page ?? "")
       .first<UnreachableRepo>();
     if (!repo && page !== null) return { rows: [], next: null };
     // The first page writes the day's figure, zero when nothing left a ref
     // (and nothing when the account has no repositories).
     if (!repo) {
-      const any = await ctx.env.DB.prepare("SELECT 1 AS n FROM repos WHERE owner_id = ?1 LIMIT 1")
-        .bind(ctx.account)
+      const any = await ctx.env.DB.prepare("SELECT 1 AS n FROM repos WHERE space_id = ?1 LIMIT 1")
+        .bind(ctx.scope.id)
         .first();
       if (!any) return { rows: [], next: null };
     }
@@ -403,7 +441,7 @@ const artifactsUnreachable: Step = {
   },
 };
 
-const OWNED_REPOS = "repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)";
+const OWNED_REPOS = "repo_id IN (SELECT id FROM repos WHERE space_id = ?1)";
 
 /** Vectorize: one vector per embedded graph node. */
 const vectorize: Step = {
@@ -413,7 +451,7 @@ const vectorize: Step = {
       `SELECT COUNT(*) AS n FROM kg_nodes WHERE ${OWNED_REPOS}
          AND kind IN (${EMBEDDED_KINDS.map(() => "?").join(",")}) AND summary != ''`,
     )
-      .bind(ctx.account, ...EMBEDDED_KINDS)
+      .bind(ctx.scope.id, ...EMBEDDED_KINDS)
       .first<{ n: number }>();
     const vectors = Number(row?.n ?? 0);
     if (vectors === 0) return { rows: [], next: null };
@@ -452,7 +490,7 @@ const aiSearch: Step = {
       `SELECT COUNT(*) AS n, COUNT(bytes) AS known, COALESCE(SUM(bytes), 0) AS bytes
        FROM kg_search_items WHERE ${OWNED_REPOS}`,
     )
-      .bind(ctx.account)
+      .bind(ctx.scope.id)
       .first<{ n: number; known: number; bytes: number }>();
     const n = Number(row?.n ?? 0);
     if (n === 0) return { rows: [], next: null };
@@ -498,11 +536,11 @@ const workersAi: Step = {
     const { results } = await ctx.env.DB.prepare(
       `SELECT model, SUM(calls) AS calls, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
               SUM(total_tokens) AS total, SUM(failed_calls) AS failed
-       FROM ai_usage WHERE day = ?1 AND account_id = ?2
+       FROM ai_usage WHERE day = ?1 AND scope_kind = ?2 AND scope_id = ?3
          AND model NOT LIKE 'openrouter:%' AND model NOT LIKE 'typesafe:%'
        GROUP BY model`,
     )
-      .bind(ctx.yesterday, ctx.account)
+      .bind(ctx.yesterday, ctx.scope.kind, ctx.scope.id)
       .all<{
         model: string;
         calls: number;
@@ -550,11 +588,11 @@ const ci: Step = {
       `SELECT json_extract(j.spec, '$.instance') AS instance, COUNT(*) AS jobs,
               COALESCE(SUM((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0) AS seconds
        FROM ci_jobs j JOIN repos r ON r.id = j.repo_id
-       WHERE r.owner_id = ?1 AND j.runner = 'sandbox' AND j.started_at IS NOT NULL
+       WHERE r.space_id = ?1 AND j.runner = 'sandbox' AND j.started_at IS NOT NULL
          AND j.finished_at >= ?2 AND j.finished_at < ?3
        GROUP BY 1`,
     )
-      .bind(ctx.account, ctx.yesterday, ctx.day)
+      .bind(ctx.scope.id, ctx.yesterday, ctx.day)
       .all<{ instance: string | null; jobs: number; seconds: number }>();
     const jobs = results.reduce((sum, r) => sum + Number(r.jobs), 0);
     if (jobs === 0) return { rows: [], next: null };
@@ -602,32 +640,22 @@ const ci: Step = {
   },
 };
 
-/** The steps for the site, or for an account. */
-export function stepsFor(account: string): Step[] {
-  const scope = account === SITE ? "site" : "account";
-  const groups = TABLE_GROUPS.filter((g) => g.scope === scope).map((g) =>
+/** Only content steps run for a Space; person and Instance never infer content. */
+export function stepsFor(scope: UsageScope): Step[] {
+  const groups = TABLE_GROUPS.filter((g) => g.scope === scope.kind).map((g) =>
     g.id === "ci-logs" ? ciLogs : groupStep(g),
   );
-  return account === SITE
-    ? [...groups, durableObjects, r2, workersAi]
-    : [
-        ...groups,
-        durableObjects,
-        r2,
-        artifacts,
-        artifactsUnreachable,
-        vectorize,
-        aiSearch,
-        workersAi,
-        ci,
-      ];
+  const common = [...groups, durableObjects, r2, workersAi];
+  return scope.kind === "space"
+    ? [...common, artifacts, artifactsUnreachable, vectorize, aiSearch, ci]
+    : [...common, avatarObjects];
 }
 
 async function loadCursor(env: Env): Promise<Cursor | null> {
   const row = await db(env.DB)
     .selectFrom("job_cursors")
     .select("cursor")
-    .where("name", "=", CURSOR)
+    .where("name", "=", USAGE_CURSOR)
     .executeTakeFirst();
   return row ? (JSON.parse(row.cursor) as Cursor) : null;
 }
@@ -636,7 +664,7 @@ function saveCursor(env: Env, cursor: Cursor): D1PreparedStatement {
   return env.DB.prepare(
     `INSERT INTO job_cursors (name, cursor, updated_at) VALUES (?1, ?2, ?3)
      ON CONFLICT (name) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
-  ).bind(CURSOR, JSON.stringify(cursor), nowIso());
+  ).bind(USAGE_CURSOR, JSON.stringify(cursor), nowIso());
 }
 
 /** A step's rows: the first page replaces the day's figure, later pages add to it. */
@@ -648,15 +676,16 @@ function writeRow(
   at: string,
 ): D1PreparedStatement {
   return env.DB.prepare(
-    `INSERT INTO usage_snapshots (day, account_id, construct, item, metric, kind, quantity, estimated, method, collected_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-     ON CONFLICT (day, account_id, construct, item, metric) DO UPDATE SET
+    `INSERT INTO usage_snapshots (day, scope_kind, scope_id, construct, item, metric, kind, quantity, estimated, method, collected_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT (day, scope_kind, scope_id, construct, item, metric) DO UPDATE SET
        quantity = ${add ? "usage_snapshots.quantity + excluded.quantity" : "excluded.quantity"},
        estimated = ${add ? "MAX(usage_snapshots.estimated, excluded.estimated)" : "excluded.estimated"},
        kind = excluded.kind, method = excluded.method, collected_at = excluded.collected_at`,
   ).bind(
     row.day ?? cursor.day,
-    cursor.account,
+    cursor.scope.kind,
+    cursor.scope.id,
     row.construct,
     row.item,
     row.metric,
@@ -668,15 +697,26 @@ function writeRow(
   );
 }
 
-async function nextAccount(env: Env, after: string): Promise<string | null> {
-  const row = await db(env.DB)
-    .selectFrom("accounts")
+async function nextScope(env: Env, scope: UsageScope): Promise<UsageScope | null> {
+  if (scope.kind !== "space") {
+    const person = await db(env.DB)
+      .selectFrom("accounts")
+      .select("id")
+      .where("kind", "=", "user")
+      .where("id", ">", scope.kind === "person" ? scope.id : "")
+      .orderBy("id")
+      .limit(1)
+      .executeTakeFirst();
+    if (person) return { kind: "person", id: person.id };
+  }
+  const space = await db(env.DB)
+    .selectFrom("spaces")
     .select("id")
-    .where("id", ">", after)
+    .where("id", ">", scope.kind === "space" ? scope.id : "")
     .orderBy("id")
     .limit(1)
     .executeTakeFirst();
-  return row?.id ?? null;
+  return space ? { kind: "space", id: space.id } : null;
 }
 
 export interface UsageCollection {
@@ -702,25 +742,25 @@ export async function collectUsage(
     .slice(0, 10);
   const saved = await loadCursor(env);
   let cursor: Cursor =
-    saved && saved.day === day ? saved : { day, account: SITE, step: 0, page: null, done: false };
+    saved && saved.day === day
+      ? saved
+      : { day, scope: { kind: "instance", id: "" }, step: 0, page: null, done: false };
   let steps = 0;
   let failed = 0;
   while (!cursor.done && steps < limits.steps && Date.now() - started < limits.ms) {
-    const plan = stepsFor(cursor.account);
+    const plan = stepsFor(cursor.scope);
     const step = plan[cursor.step];
     let next: Cursor;
     let statements: D1PreparedStatement[] = [];
     if (!step) {
-      const account = await nextAccount(env, cursor.account);
-      next = account
-        ? { day, account, step: 0, page: null, done: false }
-        : { ...cursor, done: true };
+      const scope = await nextScope(env, cursor.scope);
+      next = scope ? { day, scope, step: 0, page: null, done: false } : { ...cursor, done: true };
     } else {
       steps++;
       const at = nowIso();
       try {
         const result = await step.run(
-          { env, account: cursor.account, day, yesterday, limits },
+          { env, scope: cursor.scope, day, yesterday, limits },
           cursor.page,
         );
         statements = result.rows.map((row) => writeRow(env, cursor, row, cursor.page !== null, at));
@@ -730,7 +770,7 @@ export async function collectUsage(
       } catch (error) {
         // One failing step mustn't stall the day: note it and move on.
         failed++;
-        console.error("Usage: a collection step failed", step.id, cursor.account, error);
+        console.error("Usage: a collection step failed", step.id, cursor.scope.id, error);
         next = { ...cursor, step: cursor.step + 1, page: null };
       }
     }

@@ -159,27 +159,27 @@ export async function expireAtlasPriors(d1: D1Database, repoId: string) {
 
 /**
  * Say in the registry that `repoId` publishes the npm package `name`, as its
- * first CI publish would: a package in the owner's npm feed (created public
- * if the owner has none) with the repository as a source. Idempotent.
+ * first CI publish would: a package in the Space's npm feed (created public
+ * if the Space has none) with the repository as a source. Idempotent.
  */
 export async function registerFixturePackage(
   registry: D1Database,
-  owner: { id: string; slug: string },
+  space: { id: string; slug: string },
   repoId: string,
   name: string,
 ): Promise<void> {
   const now = new Date().toISOString();
-  const feedId = `atlas-fixture-npm-${owner.id}`;
+  const feedId = `atlas-fixture-npm-${space.id}`;
   await registry
     .prepare(
-      `INSERT INTO repositories (id, key, format, owner_id, kind, visibility, created_at, updated_at)
+      `INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at)
        VALUES (?, ?, 'npm', ?, 'local', 'public', ?, ?) ON CONFLICT DO NOTHING`,
     )
-    .bind(feedId, owner.slug, owner.id, now, now)
+    .bind(feedId, space.slug, space.id, now, now)
     .run();
   const feed = await registry
     .prepare(`SELECT id FROM repositories WHERE format = 'npm' AND key = ?`)
-    .bind(owner.slug)
+    .bind(space.slug)
     .first<{ id: string }>();
   if (!feed) throw new Error("The fixture feed couldn't be created.");
   const normalized = name.toLowerCase();

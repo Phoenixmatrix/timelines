@@ -1,10 +1,13 @@
-// Preview expiry (CORE-79): the account's retention, the sweep that tears
+// Preview expiry (CORE-79): the Space's retention, the sweep that tears
 // timeline previews down, and records that stay.
 
 import { describe, expect, test, vi } from "vite-plus/test";
 import { previewExpiry } from "../../shared/deployments.ts";
 import type { Timeline } from "../../shared/timelines.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
 import { sweepPreviews } from "./sweep.ts";
 
 // Teardown runs go through CI's startRun: recorded here, never run.
@@ -65,42 +68,62 @@ describe("previewExpiry", () => {
   });
 });
 
-function setup(timelines: Record<string, Timeline[]>) {
-  const sqlite = migratedDatabase();
+async function setup(timelines: Record<string, Timeline[]>) {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('person','user','person','Person')",
+  );
+  for (const id of ["orbit", "nova", "broken"]) {
+    await seedSpaceFixture(env.DB, {
+      organization: { id: `${id}-org`, slug: `${id}-company`, displayName: id, kind: "company" },
+      space: { id, slug: id, displayName: id },
+      actorId: "person",
+      members: [
+        {
+          accountId: "person",
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+        },
+      ],
+    });
+  }
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('orbit', 'org', 'orbit', 'Orbit'), ('nova', 'org', 'nova', 'Nova');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('app', 'orbit', 'app', 'private', 'a', 'https://a'),
       ('lib', 'orbit', 'lib', 'private', 'l', 'https://l'),
-      ('site', 'nova', 'site', 'private', 's', 'https://s');
+      ('site', 'nova', 'site', 'private', 's', 'https://s'),
+      ('gone', 'broken', 'gone', 'private', 'g', 'https://g');
     -- Orbit keeps previews 1 day after landing and 3 idle days; Nova the defaults.
-    INSERT INTO account_settings (account_id, preview_ended_days, preview_idle_days)
+    INSERT INTO space_settings (space_id, preview_ended_days, preview_idle_days)
       VALUES ('orbit', 1, 3);
   `);
+  const token = await issueToken(env.DB, "person", "previews", "write");
+  const authorities: Record<string, WorkAuthority> = {};
+  for (const repo of ["app", "lib", "site", "gone"])
+    authorities[repo] = await captureWorkAuthority(env, repo, {
+      id: "person",
+      credential: { kind: "token", id: token.id },
+    });
   let runs = 0;
   startRun.mockReset();
   startRun.mockImplementation(async (_env, repo: { id: string }, options) => {
     if (repo.id === "lib") return { skipped: "doesn't opt in", teardownUnmanaged: true };
     runs++;
     sqlite.exec(`
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, preview_action)
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, preview_action, actor_id, space_id, migration_epoch, authority)
         VALUES ('teardown-${runs}', '${repo.id}', ${100 + runs}, '${options.commit}', '${options.branch}',
-                'manual', 'queued', 'teardown');
+                'manual', 'queued', 'teardown', '${options.authority.personId}', '${options.authority.spaceId}', ${options.authority.migrationEpoch}, '${JSON.stringify(options.authority)}');
     `);
     return { runId: `teardown-${runs}`, number: 100 + runs };
   });
-  const env = {
-    DB: d1(sqlite),
-    TRACKER: {
-      getByName: (owner: string) => ({
-        listTimelines: async () =>
-          owner === "broken"
-            ? { ok: false, status: 500, code: "x", error: "down" }
-            : { ok: true, value: timelines[owner] ?? [] },
-      }),
-    },
-  } as unknown as Env;
+  env.TRACKER = {
+    getByName: (space: string) => ({
+      listTimelines: async () =>
+        space === "broken"
+          ? { ok: false, status: 500, code: "x", error: "down" }
+          : { ok: true, value: timelines[space] ?? [] },
+    }),
+  } as unknown as Env["TRACKER"];
   let next = 1;
   const record = (
     repo: string,
@@ -111,17 +134,20 @@ function setup(timelines: Record<string, Timeline[]>) {
       revived?: boolean;
       pinned?: string | null;
       status?: string;
+      /** Recorded before Spaces: no initiating authority. */
+      legacy?: boolean;
     } = {},
   ) => {
     const id = next++;
     sqlite.exec(`
       INSERT INTO deployments (id, repo_id, environment, timeline_slug, timeline_id, checkpoint_id,
-                               commit_oid, url, status, revived, expiry_pinned, expires_at, created_at)
+                               commit_oid, url, status, revived, expiry_pinned, expires_at, created_at, authority)
         VALUES (${id}, '${repo}', 'timeline/${slug}', '${slug}', '${slug}',
                 ${options.checkpoint ? `'${options.checkpoint}'` : "NULL"}, '${oid(id)}',
                 'https://${slug}-${id}.example', '${options.status ?? "active"}',
                 ${options.revived ? 1 : 0}, ${options.pinned !== undefined ? 1 : 0},
-                ${options.pinned ? `'${options.pinned}'` : "NULL"}, '${ago(options.created ?? 5)}');
+                ${options.pinned ? `'${options.pinned}'` : "NULL"}, '${ago(options.created ?? 5)}',
+                ${options.legacy ? "NULL" : `'${JSON.stringify(authorities[repo])}'`});
     `);
     return id;
   };
@@ -137,12 +163,12 @@ function setup(timelines: Record<string, Timeline[]>) {
       teardown_run_id: string | null;
     };
   const sweep = () => sweepPreviews(env, { now: NOW, waitUntil: () => {} });
-  return { sqlite, record, row, sweep };
+  return { sqlite, record, row, sweep, close, authorities, token };
 }
 
 describe("the preview sweep", () => {
-  test("tears down by the org's retention: after landing and after idle days", async () => {
-    const t = setup({
+  test("tears down by the Space's retention: after landing and after idle days", async () => {
+    const t = await setup({
       orbit: [
         timeline("landed", "landed", 5, 1.5),
         timeline("idle", "active", 4),
@@ -175,7 +201,7 @@ describe("the preview sweep", () => {
   });
 
   test("a timeline's previews in a repository go together, once every one is due", async () => {
-    const t = setup({ orbit: [timeline("landed", "landed", 10, 5)] });
+    const t = await setup({ orbit: [timeline("landed", "landed", 10, 5)] });
     const original = t.record("app", "landed", { checkpoint: "cp_1", created: 6 });
     // Revived half a day ago: it counts from then, and keeps its sibling up.
     const revived = t.record("app", "landed", { checkpoint: "cp_1", created: 0.5, revived: true });
@@ -185,7 +211,9 @@ describe("the preview sweep", () => {
   });
 
   test("a pinned expiry wins; a repository that doesn't opt in is still marked expired", async () => {
-    const t = setup({ orbit: [timeline("pinned", "active", 0), timeline("kept", "active", 10)] });
+    const t = await setup({
+      orbit: [timeline("pinned", "active", 0), timeline("kept", "active", 10)],
+    });
     const pinned = t.record("app", "pinned", { pinned: ago(0.1) });
     const never = t.record("app", "kept", { pinned: null });
     const lib = t.record("lib", "pinned", { pinned: ago(1) });
@@ -202,7 +230,7 @@ describe("the preview sweep", () => {
   });
 
   test("failed scheduling remains retryable without claiming teardown completed", async () => {
-    const t = setup({ orbit: [timeline("idle", "active", 30)] });
+    const t = await setup({ orbit: [timeline("idle", "active", 30)] });
     const id = t.record("app", "idle");
     startRun.mockRejectedValueOnce(new Error("temporarily unavailable"));
     await t.sweep();
@@ -214,20 +242,113 @@ describe("the preview sweep", () => {
     ).toEqual({ teardown_completed_at: null, teardown_unmanaged_at: null });
     await t.sweep();
     expect(t.row(id).teardown_run_id).toMatch(/^teardown-/);
-    t.sqlite.close();
+    t.close();
   });
 
-  test("leaves records alone when the account's tracker can't answer, and failed ones always", async () => {
-    const t = setup({ orbit: [timeline("idle", "active", 30)] });
-    t.sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('broken', 'org', 'broken', 'B');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-        VALUES ('gone', 'broken', 'gone', 'private', 'g', 'https://g');
-    `);
+  test("leaves records alone when the Space's tracker can't answer, and failed ones always", async () => {
+    const t = await setup({ orbit: [timeline("idle", "active", 30)] });
     const unknown = t.record("gone", "idle");
     const failed = t.record("app", "idle", { status: "failed" });
     expect((await t.sweep()).expired).toEqual([]);
     expect(t.row(unknown).status).toBe("active");
     expect(t.row(failed).status).toBe("failed");
+  });
+
+  test("revoked initiating credentials leave preview history and teardown untouched", async () => {
+    const t = await setup({ orbit: [timeline("idle", "active", 30)] });
+    try {
+      const id = t.record("app", "idle");
+      t.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(t.token.id);
+      expect((await t.sweep()).expired).toEqual([]);
+      expect(startRun).not.toHaveBeenCalled();
+      expect(t.row(id)).toMatchObject({
+        status: "active",
+        torn_down_at: null,
+        teardown_run_id: null,
+      });
+    } finally {
+      t.close();
+    }
+  });
+
+  test("a pre-Spaces record first in its Space never hides the Space's other previews", async () => {
+    const t = await setup({
+      orbit: [timeline("busy", "active", 1), timeline("idle", "active", 30)],
+    });
+    try {
+      const legacy = t.record("app", "busy", { legacy: true });
+      const idle = t.record("app", "idle");
+      const result = await t.sweep();
+      expect(result.expired).toEqual([idle]);
+      expect(t.row(idle).teardown_run_id).toMatch(/^teardown-/);
+      // The Space's rules still apply to the old record; nothing tears it down early.
+      expect(t.row(legacy)).toMatchObject({ status: "active", expires_at: ago(-2) });
+    } finally {
+      t.close();
+    }
+  });
+
+  test("a due pre-Spaces preview is expired by the service policy, with no run in anyone's name", async () => {
+    const t = await setup({
+      orbit: [timeline("idle", "active", 30), timeline("busy", "active", 1)],
+    });
+    try {
+      // A current record lets the sweep read Orbit's timelines.
+      const busy = t.record("app", "busy");
+      const legacy = t.record("app", "idle", { legacy: true });
+      // Nova has no record with live authority to read its timelines: the
+      // recorded expiry stands, and a passed one still expires the preview.
+      const alone = t.record("site", "landed", { legacy: true, pinned: ago(1) });
+      const result = await t.sweep();
+      expect(result.expired.toSorted((a, b) => a - b)).toEqual([legacy, alone]);
+      expect(startRun).not.toHaveBeenCalled();
+      for (const id of [legacy, alone])
+        expect(t.row(id)).toMatchObject({
+          status: "expired",
+          torn_down_at: expect.any(String),
+          teardown_run_id: null,
+        });
+      expect(t.row(busy).status).toBe("active");
+      // Expired without authority, it isn't looked at again.
+      expect((await t.sweep()).expired).toEqual([]);
+      expect(startRun).not.toHaveBeenCalled();
+    } finally {
+      t.close();
+    }
+  });
+
+  test("a group with any pre-Spaces record expires together but starts no run", async () => {
+    const t = await setup({ orbit: [timeline("idle", "active", 30)] });
+    try {
+      const legacy = t.record("app", "idle", { legacy: true, checkpoint: "cp_1" });
+      const current = t.record("app", "idle", { checkpoint: "cp_2" });
+      const result = await t.sweep();
+      expect(result.expired.toSorted((a, b) => a - b)).toEqual([legacy, current]);
+      // A newer record never lends its authority to an older one's teardown.
+      expect(startRun).not.toHaveBeenCalled();
+      expect(t.row(current)).toMatchObject({ status: "expired", teardown_run_id: null });
+    } finally {
+      t.close();
+    }
+  });
+
+  test("stale original deployment authority cannot schedule a teardown", async () => {
+    const t = await setup({ orbit: [timeline("idle", "active", 30)] });
+    try {
+      t.authorities.app = {
+        ...t.authorities.app!,
+        migrationEpoch: t.authorities.app!.migrationEpoch + 1,
+      };
+      const id = t.record("app", "idle");
+      expect((await t.sweep()).expired).toEqual([]);
+      expect(startRun).not.toHaveBeenCalled();
+      expect(t.row(id)).toMatchObject({
+        status: "active",
+        torn_down_at: null,
+        teardown_run_id: null,
+      });
+    } finally {
+      t.close();
+    }
   });
 });

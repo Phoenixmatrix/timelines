@@ -8,7 +8,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { CiClaimedJob, CiJobReport } from "../../shared/api.ts";
 import { upstreamToken } from "../artifacts.ts";
 import { batch, db, nowIso } from "../schema.ts";
-import { jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
+import { jobPayload, loadJob, report, settleStoppedJob, type StoredJob } from "./jobs.ts";
 import { mintJobToken, revokeJobTokens, withConfigDir } from "./registry.ts";
 import {
   clearStorage,
@@ -23,6 +23,14 @@ import {
 import { durableStub } from "../durable/registry.ts";
 import { ciSource } from "./source.ts";
 import { executionIdentity } from "./verification.ts";
+import {
+  cutoverControl,
+  withCutoverAdmission,
+  withCutoverAlarmAdmission,
+} from "../durable/cutover-admission.ts";
+import { reportCutoverRuntime } from "../durable/cutover-runtime.ts";
+import { resolveJobAuthority, WorkAuthorizationError } from "./admission.ts";
+import { CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 
 const WORKDIR = "/workspace/repo";
 /** Package tools' configuration (npmrc, docker/config.json…), outside the checkout. */
@@ -48,8 +56,22 @@ class Cancelled extends Error {}
 
 const FINISHED = new Set(["succeeded", "failed", "cancelled", "skipped"]);
 
+const CUTOVER_EXECUTION = "space-cutover-execution";
+interface SandboxAdmission {
+  ticket: string;
+  epoch: number;
+  jobId: string;
+  sealed?: boolean;
+}
+
 export class CiSandbox extends DurableObject<Env> implements Purgeable {
   #running: Promise<void> | null = null;
+  #shutdownConfirmed = false;
+
+  /** Maintenance-only attestation; neither starts a container nor touches job state. */
+  cutoverRuntime(runId: string) {
+    return reportCutoverRuntime(this.env, runId, "ci-sandbox");
+  }
 
   /** Read platform version/image metadata without starting a container. */
   verificationIdentity(): string | null {
@@ -65,16 +87,85 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
    * a job that already finished returns at once instead of starting it over.
    */
   run(jobId: string): Promise<void> {
-    this.#running ??= this.#run(jobId).finally(() => {
+    this.#running ??= this.#admittedRun(jobId).finally(() => {
       this.#running = null;
     });
     return this.#running;
   }
 
-  // The purge contract (worker/durable/contract.ts, CORE-197): the container
-  // is the external resource; the object keeps no storage of its own.
+  async #admittedRun(jobId: string): Promise<void> {
+    const control = cutoverControl(this.env);
+    let lease = await this.ctx.storage.get<SandboxAdmission>(CUTOVER_EXECUTION);
+    if (lease && lease.jobId !== jobId) throw new Error("Sandbox has an unresolved prior job");
+    if (lease?.sealed) throw new Error("Sandbox execution was sealed by cutover");
+    if (lease && !this.ctx.container)
+      throw new Error("Sandbox container binding unavailable for execution reconciliation");
+    if (!lease) {
+      // A process predating preparation has no trustworthy execution identity.
+      // Do not destroy it or let a new run hide it from the drain inventory.
+      if (this.ctx.container?.running)
+        throw new Error("Untracked sandbox execution blocks cutover");
+      lease = {
+        ...(await control.acquire("ci-sandbox", CONTENT_CONTRACT_VERSION, {
+          kind: "ci-sandbox",
+          instanceId: this.ctx.id.toString(),
+        })),
+        jobId,
+      };
+      await this.ctx.storage.put(CUTOVER_EXECUTION, lease);
+    }
+    await control.assertTicket(lease.ticket, lease.epoch, CONTENT_CONTRACT_VERSION);
+    this.#shutdownConfirmed = !this.ctx.container?.running;
+    try {
+      await this.#run(jobId);
+    } finally {
+      // Destruction can fail or return before shutdown. Keep the independent
+      // lease in that case: a terminated CiRun is not container-stop evidence.
+      if (this.#shutdownConfirmed && !this.ctx.container?.running) {
+        await control.release(lease.ticket);
+        await this.ctx.storage.delete(CUTOVER_EXECUTION);
+      }
+    }
+  }
+
+  /** Read-only provider state; never stops an execution to manufacture a drain. */
+  async cutoverDrainStatus() {
+    const lease = await this.ctx.storage.get<SandboxAdmission>(CUTOVER_EXECUTION);
+    const containerRunning = this.ctx.container?.running ?? null;
+    return {
+      ticket: lease?.ticket ?? null,
+      epoch: lease?.epoch ?? null,
+      jobId: lease?.jobId ?? null,
+      running: this.#running !== null,
+      containerRunning,
+      drained: this.#running === null && containerRunning === false,
+    };
+  }
+
+  /** Seal a stopped orphan before control releases it; status alone races replay. */
+  async cutoverReconcile(runId: string, ticket: string, epoch: number): Promise<boolean> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const control = cutoverControl(this.env);
+      const run = await control.status();
+      if (!run || run.runId !== runId || run.phase !== "fenced")
+        throw new Error("Sandbox reconciliation requires the exact fenced cutover");
+      const lease = await this.ctx.storage.get<SandboxAdmission>(CUTOVER_EXECUTION);
+      if (!lease || lease.ticket !== ticket || lease.epoch !== epoch)
+        throw new Error("Sandbox reconciliation ticket mismatch");
+      if (this.#running || !this.ctx.container || this.ctx.container.running) return false;
+      await this.ctx.storage.put(CUTOVER_EXECUTION, { ...lease, sealed: true });
+      return true;
+    });
+  }
+
+  // The purge contract also preserves unresolved execution tickets: independent
+  // control, not a business-store purge, decides when an orphan is drained.
   async purge(reason: string): Promise<PurgeReport> {
-    const report = await this.#clear(reason);
+    const report = await withCutoverAdmission(this.env, "ci-sandbox", async () => {
+      if (this.#running || (await this.ctx.storage.get(CUTOVER_EXECUTION)))
+        throw new Error("Cannot purge an unresolved sandbox execution");
+      return this.#clear(reason);
+    });
     resetSoon(this.ctx);
     return report;
   }
@@ -87,7 +178,9 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
 
   /** Purge once the job in progress (if any) has ended. */
   retire(reason: string, name: string, delayMs?: number): Promise<void> {
-    return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
+    return withCutoverAdmission(this.env, "ci-sandbox", () =>
+      scheduleRetirement(this.ctx.storage, reason, name, delayMs),
+    );
   }
 
   storageReport() {
@@ -95,6 +188,12 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
   }
 
   override async alarm(): Promise<void> {
+    return withCutoverAlarmAdmission(this.env, "ci-sandbox", this.ctx.storage, () =>
+      this.#retirementAlarm(),
+    );
+  }
+
+  async #retirementAlarm(): Promise<void> {
     const retirement = await pendingRetirement(this.ctx.storage);
     if (!retirement) return;
     await settleRetirement({
@@ -102,7 +201,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       env: this.env,
       className: "CiSandbox",
       retirement,
-      busy: this.#running !== null,
+      busy: this.#running !== null || !!(await this.ctx.storage.get(CUTOVER_EXECUTION)),
       purge: (reason) => this.#clear(reason),
     });
   }
@@ -126,29 +225,32 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     // Claim before preparing checkout. Cancellation may have won since loadJob;
     // in that case no runner may start using a source whose claim was released.
     const kdb = db(d1);
-    const claimed = await kdb
-      .updateTable("ci_jobs")
-      .set({
-        status: "running",
-        claimed_by: "sandbox",
-        started_at: nowIso(),
-        execution_identity: spec.image === "default" ? this.verificationIdentity() : null,
-      })
-      .where("id", "=", jobId)
-      .where("status", "in", ["queued", "running"])
-      .where(
-        "run_id",
-        "in",
-        kdb.selectFrom("ci_runs").select("id").where("status", "in", ["queued", "running"]),
-      )
-      .executeTakeFirst();
-    if (claimed.numUpdatedRows === 0n) return;
     let done: CiJobReport["done"];
+    const failures: unknown[] = [];
     try {
+      await resolveJobAuthority(this.env, jobId);
+      const claimed = await kdb
+        .updateTable("ci_jobs")
+        .set({
+          status: "running",
+          claimed_by: "sandbox",
+          started_at: nowIso(),
+          source_completion_pending: 1,
+          execution_identity: spec.image === "default" ? this.verificationIdentity() : null,
+        })
+        .where("id", "=", jobId)
+        .where("status", "in", ["queued", "running"])
+        .where(
+          "run_id",
+          "in",
+          kdb.selectFrom("ci_runs").select("id").where("status", "in", ["queued", "running"]),
+        )
+        .executeTakeFirst();
+      if (claimed.numUpdatedRows === 0n) return;
       // Packages publish to the public URL the registry answers on.
       const origin = String(Reflect.get(this.env, "PUBLIC_URL") || "http://localhost:5180");
-      const credential = await mintJobToken(d1, jobId, spec.timeoutMinutes);
-      const payload = await jobPayload(d1, job, { origin, token: credential });
+      const credential = await mintJobToken(this.env, jobId, spec.timeoutMinutes);
+      const payload = await jobPayload(this.env, job, { origin, token: credential });
 
       // A retried step starts over and clears the earlier attempt.
       await batch(d1, [
@@ -183,6 +285,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
 
       await say(`Checking out ${payload.ref} at ${payload.commit.slice(0, 12)}…\n`);
       const source = await ciSource(this.env, job.repo_id, job.source_id, { runId: job.run_id });
+      await resolveJobAuthority(this.env, jobId);
       const token = await upstreamToken(this.env, source.artifacts_name, "read");
       const gitEnv = {
         ...BASE_ENV,
@@ -214,46 +317,56 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       });
       if (code !== 0) {
         done = { status: "failed", exitCode: code, error: "Checkout failed." };
-        return;
-      }
-
-      // Package tools come preconfigured with the job's credential.
-      const files = Object.entries(payload.files);
-      if (files.length) {
-        const write = files
-          .map((_, i) => `mkdir -p "$(dirname "$P${i}")" && printf '%s' "$C${i}" > "$P${i}"`)
-          .join(" && ");
-        const fileEnv = Object.fromEntries(
-          files.flatMap(([path, content], i) => [
-            [`P${i}`, `${CONFIG_DIR}/${path}`],
-            [`C${i}`, content],
-          ]),
-        );
-        await this.#exec(container, jobId, SETUP_STEP, write, {
-          cwd: "/",
-          env: { ...BASE_ENV, ...fileEnv },
+      } else {
+        // Package tools come preconfigured with the job's credential.
+        const files = Object.entries(payload.files);
+        if (files.length) {
+          const write = files
+            .map((_, i) => `mkdir -p "$(dirname "$P${i}")" && printf '%s' "$C${i}" > "$P${i}"`)
+            .join(" && ");
+          const fileEnv = Object.fromEntries(
+            files.flatMap(([path, content], i) => [
+              [`P${i}`, `${CONFIG_DIR}/${path}`],
+              [`C${i}`, content],
+            ]),
+          );
+          await this.#exec(container, jobId, SETUP_STEP, write, {
+            cwd: "/",
+            env: { ...BASE_ENV, ...fileEnv },
+            deadline,
+          });
+        }
+        done = await this.#steps(
+          container,
+          jobId,
+          { ...payload, env: withConfigDir(payload.env, CONFIG_DIR) },
           deadline,
-        });
+        );
       }
-      done = await this.#steps(
-        container,
-        jobId,
-        { ...payload, env: withConfigDir(payload.env, CONFIG_DIR) },
-        deadline,
-      );
     } catch (error) {
-      if (!(error instanceof Cancelled)) {
-        // Left unfinished so the step's retry runs the job again; once retries
-        // run out, the workflow marks it failed with this message.
-        throw error;
+      if (error instanceof Cancelled) done = { status: "cancelled" };
+      else {
+        // Preserve the execution error even if shutdown or final reporting fails.
+        // An infrastructure failure remains unfinished for the Workflow retry.
+        failures.push(error);
       }
-      done = { status: "cancelled" };
-    } finally {
+    }
+    try {
       // A terminal report releases source claims. Confirm every process stopped
       // first, including background children and cancelled or failed attempts.
+      this.#shutdownConfirmed = false;
       await container.destroy();
+      if (container.running) throw new Error("Sandbox shutdown has not been confirmed");
+      this.#shutdownConfirmed = true;
       if (done) await report(this.env, jobId, { done });
       else {
+        try {
+          await resolveJobAuthority(this.env, jobId);
+        } catch (error) {
+          if (error instanceof WorkAuthorizationError)
+            await settleStoppedJob(this.env, jobId, "Job authority is no longer current.");
+          throw error;
+        }
         // Preserve Workflow retries, but clear active-attempt evidence only after
         // confirmed shutdown. This makes a stopped queued retry cancellable while
         // retaining its logs and step history until another attempt starts.
@@ -270,7 +383,12 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
           .bind(nowIso(), jobId)
           .run();
       }
+    } catch (error) {
+      failures.push(error);
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1)
+      throw new AggregateError(failures, "Sandbox execution and cleanup failed");
   }
 
   async #steps(
@@ -343,6 +461,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     script: string,
     options: { cwd: string; env: Record<string, string>; deadline: number },
   ): Promise<number> {
+    await resolveJobAuthority(this.env, jobId);
     const process = await container.exec(["/bin/bash", "-eo", "pipefail", "-c", script], {
       cwd: options.cwd,
       env: options.env,
@@ -354,11 +473,18 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     let timedOut = false;
     let flushing: Promise<void> = Promise.resolve();
     const flush = () => {
-      if (!buffer) return flushing;
+      // Even a silent process must observe revocation on the next poll.
       const text = buffer;
       buffer = "";
       flushing = flushing.then(async () => {
-        const result = await report(this.env, jobId, { logs: [{ step, text }] });
+        let result: { cancelled: boolean };
+        try {
+          await resolveJobAuthority(this.env, jobId);
+          result = await report(this.env, jobId, { logs: [{ step, text }] });
+        } catch (error) {
+          process.kill();
+          throw error;
+        }
         if (result.cancelled && !cancelled) {
           cancelled = true;
           process.kill();
@@ -366,7 +492,9 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       });
       return flushing;
     };
-    const timer = setInterval(() => void flush(), FLUSH_MS);
+    const timer = setInterval(() => {
+      void flush().catch(() => {});
+    }, FLUSH_MS);
     const timeout = setTimeout(
       () => {
         timedOut = true;
@@ -375,21 +503,35 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       },
       Math.max(0, options.deadline - Date.now()),
     );
+    let outcome: { code: number } | { error: unknown };
     try {
       const decoder = new TextDecoder();
       for await (const chunk of process.stdout ?? []) {
         buffer += decoder.decode(chunk as Uint8Array, { stream: true });
-        if (buffer.length >= FLUSH_BYTES) void flush();
+        if (buffer.length >= FLUSH_BYTES) void flush().catch(() => {});
       }
       buffer += decoder.decode();
       const code = await process.exitCode;
       await flush();
       if (cancelled) throw new Cancelled();
-      return timedOut ? 124 : code;
+      outcome = { code: timedOut ? 124 : code };
+    } catch (error) {
+      outcome = { error };
     } finally {
       clearInterval(timer);
       clearTimeout(timeout);
     }
+    // Drain writes after stopping timers. A flush failure takes precedence over
+    // the stream result, but cannot bypass timer cleanup or process shutdown.
+    try {
+      await flush();
+    } catch (error) {
+      process.kill();
+      await process.exitCode;
+      throw error;
+    }
+    if ("error" in outcome) throw outcome.error;
+    return outcome.code;
   }
 }
 

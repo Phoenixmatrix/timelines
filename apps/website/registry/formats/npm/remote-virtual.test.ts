@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { makeHarness, type Harness } from "../../testing/harness.ts";
 import { digests, makeTarball, publishBody } from "./testing.ts";
 
@@ -41,7 +40,6 @@ describe("npm remote and virtual repositories", () => {
   let corrupt: boolean;
 
   beforeEach(async () => {
-    invalidateMembers();
     hits = [];
     corrupt = false;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -212,7 +210,7 @@ describe("npm remote and virtual repositories", () => {
         members: [{ key: "npmjs" }, { key: "js-local" }],
       }),
     });
-    invalidateMembers();
+
     expect((await publish("/npm/js/left-pad", "left-pad", "9.0.0")).status).toBe(201);
     const doc = await get("/npm/js/left-pad");
     expect(Object.keys(doc.versions).sort()).toEqual(["1.3.0", "9.0.0"]);

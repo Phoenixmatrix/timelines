@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { Link, useLoaderData, type LoaderFunctionArgs } from "react-router";
 import type { FormatId } from "@gitmatrix/formats/info";
 import type {
-  OwnerPackages as OwnerPackagesData,
+  SpacePackages as SpacePackagesData,
   PackageSummary,
 } from "../../../shared/packages.ts";
 import { Page } from "../../components/AppShell.tsx";
@@ -13,8 +13,8 @@ import { load } from "../../lib/api.ts";
 import { fullDate, timeAgo } from "../../lib/format.ts";
 import { count, feedsPath, formatLabel, packagePath, plural } from "../../lib/packages.ts";
 
-export async function ownerPackagesLoader({ request, params }: LoaderFunctionArgs) {
-  return load<OwnerPackagesData>(`/packages/${params.owner}`, request);
+export async function spacePackagesLoader({ request, params }: LoaderFunctionArgs) {
+  return load<SpacePackagesData>(`/packages/${params.space}`, request);
 }
 
 /** The last day of publishes, an hour per cell: what's busy right now. */
@@ -34,7 +34,7 @@ export function Activity({ spark, label }: { spark: number[]; label: string }) {
   );
 }
 
-export function PackageRow({ pkg, owner }: { pkg: PackageSummary; owner: string }) {
+export function PackageRow({ pkg, space }: { pkg: PackageSummary; space: string }) {
   // The name's link covers the row; source repositories are their own links on top.
   return (
     <li className="mk-enter-up">
@@ -42,7 +42,7 @@ export function PackageRow({ pkg, owner }: { pkg: PackageSummary; owner: string 
         <span className="min-w-0">
           <span className="flex flex-wrap items-center gap-2">
             <PrefetchLink
-              to={packagePath(owner, pkg.format, pkg.name)}
+              to={packagePath(space, pkg.format, pkg.name)}
               className="truncate font-semibold text-ink no-underline after:absolute after:inset-0"
             >
               <bdi>{pkg.name}</bdi>
@@ -90,8 +90,8 @@ export function PackageRow({ pkg, owner }: { pkg: PackageSummary; owner: string 
   );
 }
 
-export function OwnerPackages() {
-  const data = useLoaderData<typeof ownerPackagesLoader>();
+export function SpacePackages() {
+  const data = useLoaderData<typeof spacePackagesLoader>();
   const [filter, setFilter] = useState("");
   const [format, setFormat] = useState<FormatId | "all">("all");
   const formats = useMemo(
@@ -103,27 +103,21 @@ export function OwnerPackages() {
       (format === "all" || p.format === format) &&
       (!filter || p.name.toLowerCase().includes(filter.toLowerCase())),
   );
-  const isOrg = data.owner.kind === "org";
   const busiest = data.packages.reduce((sum, p) => sum + p.publishes24h, 0);
 
   return (
     <Page wide>
       <header className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-4">
-          <Monogram
-            name={data.owner.displayName}
-            shape={isOrg ? "place" : "person"}
-            size="lg"
-            src={data.owner.avatarUrl}
-          />
+          <Monogram name={data.space.displayName} shape="place" size="lg" />
           <div className="min-w-0">
             <h1 className="m-0 text-headline">Packages</h1>
             <p className="m-0 text-ink-muted">
               <Link
-                to={`/${data.owner.slug}`}
+                to={`/${data.space.slug}`}
                 className="text-ink-muted no-underline hover:text-ink"
               >
-                @{data.owner.slug}
+                @{data.space.slug}
               </Link>
               {data.packages.length > 0 &&
                 ` · ${plural(data.packages.length, "package")}, ${count(busiest)} publishes in the last day`}
@@ -131,7 +125,7 @@ export function OwnerPackages() {
           </div>
         </div>
         {data.access === "admin" && (
-          <Link to={feedsPath(data.owner.slug)} className="mk-btn mk-btn--sm no-underline">
+          <Link to={feedsPath(data.space.slug)} className="mk-btn mk-btn--sm no-underline">
             <GearSixIcon weight="bold" aria-hidden />
             Feeds and proxies
           </Link>
@@ -142,7 +136,7 @@ export function OwnerPackages() {
         <section className="mk-card mt-8">
           <h2 className="mk-card-title">Nothing published yet</h2>
           <p className="mk-card-desc max-w-[48ch]">
-            CI jobs in {data.owner.slug}'s repositories publish here with nothing to configure: npm,
+            CI jobs in {data.space.slug}'s repositories publish here with nothing to configure: npm,
             docker, twine, cargo, mvn and helm come set up with the job's credential. From your
             machine, sign in with <code className="mk-mono">gm auth login</code> and run{" "}
             <code className="mk-mono">gm pkg setup</code>.
@@ -201,7 +195,7 @@ jobs:
           ) : (
             <ul className="m-0 mt-4 list-none divide-y divide-line-soft overflow-hidden rounded-pane bg-pane p-0">
               {shown.map((pkg) => (
-                <PackageRow key={pkg.id} pkg={pkg} owner={data.owner.slug} />
+                <PackageRow key={pkg.id} pkg={pkg} space={data.space.slug} />
               ))}
             </ul>
           )}

@@ -1,4 +1,4 @@
-// Deployment records, per repository under /api/repos/:owner/:name:
+// Deployment records, per repository under /api/repos/:space/:name:
 //   GET    /deployments           newest first; filters: environment, timeline,
 //                                 commit (one or a comma list), run (number),
 //                                 status, version (provider version id);
@@ -63,6 +63,15 @@ import { jobCaller, jobSecret, type JobCaller } from "./job.ts";
 import { previewSettings } from "./settings.ts";
 import { resolveSource } from "../timelines/sources.ts";
 import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
+import {
+  captureWorkAuthority,
+  parseWorkAuthority,
+  resolveWorkAuthority,
+  WorkAuthorizationError,
+  type WorkAuthority,
+} from "../ci/admission.ts";
+import { findSpaceById } from "../spaces/access.ts";
+import { accessFor } from "../tracker/access.ts";
 import {
   normalizeDigest,
   OBSERVABILITY_PROVIDERS,
@@ -191,7 +200,13 @@ async function findDeployment(kdb: DB, repoId: string, id: number) {
 
 type Writer =
   | { kind: "job"; repo: RepoRow; job: JobCaller }
-  | { kind: "person"; repo: RepoRow; actorId: string; agentId: string | null };
+  | {
+      kind: "person";
+      repo: RepoRow;
+      actorId: string;
+      agentId: string | null;
+      authority: WorkAuthority;
+    };
 
 /**
  * Who may write this repository's deployments: a CI job of the repository
@@ -200,13 +215,13 @@ type Writer =
 async function writer(c: Context<AppEnv>): Promise<Writer | Response> {
   const secret = jobSecret(c.req.header("authorization"));
   if (secret) {
-    const job = await jobCaller(c.env.DB, secret);
+    const job = await jobCaller(c.env, secret);
     if (!job) return fail(c, 401, "The CI job's credential is invalid, or the job has ended.");
     // A deletion's preview teardown job still reports (CORE-199).
     const repo = await findRepo(
       c.env.DB,
       null,
-      c.req.param("owner") ?? "",
+      c.req.param("space") ?? "",
       c.req.param("name") ?? "",
       { deleting: true },
     );
@@ -219,16 +234,27 @@ async function writer(c: Context<AppEnv>): Promise<Writer | Response> {
   const repo = await loadRepo(c, "write");
   if (repo instanceof Response) return repo;
   const actor = c.get("actor")!;
-  return { kind: "person", repo: repo.row, actorId: actor.id, agentId: actor.agent?.id ?? null };
+  return {
+    kind: "person",
+    repo: repo.row,
+    actorId: actor.id,
+    agentId: actor.agent?.id ?? null,
+    authority: await captureWorkAuthority(c.env, repo.row.id, actor),
+  };
 }
 
-/** A job reads its own repository and, for lists, source; stable ids use recordSource. */
-async function reader(c: Context<AppEnv>, sourceId?: string): Promise<RepoRow | Response> {
+/**
+ * The repository to read: a job reads its own, anyone else needs read access.
+ * A job reads only its exact source: `sourceId` for a list, or null where the
+ * caller checks each record (recordSource) or answers repository-wide slugs
+ * only (live-timelines). Every caller says which.
+ */
+async function reader(c: Context<AppEnv>, sourceId: string | null): Promise<RepoRow | Response> {
   if (jobSecret(c.req.header("authorization"))) {
     const found = await writer(c);
     if (found instanceof Response) return found;
-    if (found.kind === "job" && sourceId !== undefined && found.job.sourceId !== sourceId)
-      return fail(c, 403, "A job may read only its own source's deployments.");
+    if (found.kind === "job" && sourceId !== null && found.job.sourceId !== sourceId)
+      return fail(c, 403, "A job must name its exact source when reading deployments.");
     return found.repo;
   }
   const repo = await loadRepo(c);
@@ -241,7 +267,7 @@ async function recordSource(c: Context<AppEnv>, row: DeploymentRow): Promise<Res
     return fail(c, 404, "No such deployment.");
   const secret = jobSecret(c.req.header("authorization"));
   if (secret) {
-    const job = await jobCaller(c.env.DB, secret);
+    const job = await jobCaller(c.env, secret);
     if (!job || job.repoId !== row.repo_id || job.sourceId !== row.source_id)
       return fail(c, 403, "A job may read only its own source's deployments.");
   }
@@ -475,21 +501,41 @@ export function placement(
   );
 }
 
-/** The timeline in its account's tracker, when it exists there. */
-async function timelineRecord(env: Env, ownerId: string, slug: string): Promise<Timeline | null> {
-  try {
-    const reply = await trackerObject(env, ownerId).timeline(slug, 0, 1);
-    return reply.ok ? reply.value.timeline : null;
-  } catch (error) {
-    console.warn("Deployments: looking up a timeline failed", { slug, error });
-    return null;
-  }
+/**
+ * The timeline in its Space's tracker, when it exists there; a record for an
+ * unknown slug stays unlinked. Timeline association never supplies Tracker
+ * rights: anything but "not found" still refuses the record.
+ */
+async function timelineRecord(
+  env: Env,
+  authority: WorkAuthority,
+  repoId: string,
+  slug: string,
+): Promise<Timeline | null> {
+  await resolveWorkAuthority(env, authority, repoId);
+  const space = await findSpaceById(env.DB, authority.spaceId);
+  if (!space) throw new Invalid("Timeline Space is unavailable.", 403);
+  const access = await accessFor(
+    env,
+    space,
+    authority.personId,
+    authority.agentId,
+    false,
+    authority.credential,
+  );
+  const reply = await trackerObject(env, space.id).timeline(access, slug, 0, 1);
+  if (!reply.ok && reply.status === 404 && reply.code === "not_found") return null;
+  if (!reply.ok) throw new Invalid(reply.error, reply.status === 404 ? 404 : 403);
+  return reply.value.timeline;
 }
 
 export const deployments = new Hono<AppEnv>();
 
 deployments.onError((error, c) => {
   if (error instanceof Invalid) return fail(c, error.status, error.message);
+  if (error instanceof WorkAuthorizationError) return fail(c, 403, error.message);
+  if (error.message === "migration_epoch_mismatch" || error.message === "space_cutover_fenced")
+    return fail(c, 409, error.message);
   throw error;
 });
 
@@ -544,8 +590,8 @@ deployments.get("/deployments", async (c) => {
  * Which timelines still have a live preview, in ANY source of the repository,
  * in one answer. Since CORE-255 a timeline's preview runs, and the records
  * they make, live in that timeline's own work source. GET /deployments reads
- * one source per request (`?source=`, which a job's credential may also set
- * to another source's id), and nothing here lists the sources, so a preview
+ * one source per request (`?source=`; a job's credential only its own), and
+ * nothing here lists the sources, so a preview
  * janitor (tools/preview/preview.ts reconcile, CORE-372) couldn't otherwise
  * know every live timeline before it deletes what no live preview owns. This
  * answers slugs only, never URLs, commits, sources or any other field, to the
@@ -554,7 +600,9 @@ deployments.get("/deployments", async (c) => {
  * anything but a 200 here, and reconcile deletes nothing.
  */
 deployments.get("/deployments/live-timelines", async (c) => {
-  const repo = await reader(c);
+  // The one deliberate cross-source read: slugs only, for a preview teardown's
+  // reconcile, which runs in the torn-down timeline's own work source.
+  const repo = await reader(c, null);
   if (repo instanceof Response) return repo;
   const rows = await db(c.env.DB)
     .selectFrom("deployments")
@@ -591,6 +639,7 @@ deployments.post("/deployments", async (c) => {
     "replaces",
   ]);
   const job = who.kind === "job" ? who.job : null;
+  const authority = who.kind === "job" ? who.job.authority : who.authority;
   const sourceId = job?.sourceId ?? optionalString(data.source, "source") ?? "canonical";
   if (job && data.source !== undefined && data.source !== job.sourceId)
     throw new Invalid("A job records only its exact source.");
@@ -690,14 +739,14 @@ deployments.post("/deployments", async (c) => {
   const revived = Boolean(job?.revived) && checkpoint === job?.checkpointId;
   const now = nowIso();
   const timeline = where.timeline
-    ? await timelineRecord(c.env, who.repo.owner_id, where.timeline)
+    ? await timelineRecord(c.env, authority, who.repo.id, where.timeline)
     : null;
   let expiresAt = givenExpiry;
   const pinned = expiresAt !== undefined;
   // A timeline's preview follows the account's retention unless told
   // otherwise; the preview sweep (sweep.ts) moves it as work goes on.
   if (expiresAt === undefined && where.timeline && state !== "failed") {
-    const settings = await previewSettings(c.env.DB, who.repo.owner_id);
+    const settings = await previewSettings(c.env.DB, who.repo.space_id);
     expiresAt = previewExpiry({ timeline, createdAt: now, revived }, settings);
   }
   // The replaced version's record, only in this source and environment.
@@ -716,12 +765,14 @@ deployments.post("/deployments", async (c) => {
           .limit(1)
           .executeTakeFirst()
       : undefined;
+  await resolveWorkAuthority(c.env, authority, who.repo.id);
   let inserted: { id: number };
   try {
     inserted = await kdb
       .insertInto("deployments")
       .values({
         repo_id: who.repo.id,
+        authority: JSON.stringify(authority),
         source_id: sourceId,
         environment: where.environment,
         timeline_slug: where.timeline,
@@ -777,7 +828,7 @@ deployments.post("/deployments", async (c) => {
 });
 
 deployments.get("/deployments/:id{[0-9]+}", async (c) => {
-  const repo = await reader(c);
+  const repo = await reader(c, null);
   if (repo instanceof Response) return repo;
   const row = await findDeployment(db(c.env.DB), repo.id, Number(c.req.param("id")));
   if (!row) return fail(c, 404, "No such deployment.");
@@ -793,7 +844,7 @@ deployments.get("/deployments/:id{[0-9]+}", async (c) => {
 });
 
 deployments.get("/deployments/:id{[0-9]+}/presence", async (c) => {
-  const repo = await reader(c);
+  const repo = await reader(c, null);
   if (repo instanceof Response) return repo;
   const row = await findDeployment(db(c.env.DB), repo.id, Number(c.req.param("id")));
   if (!row) return fail(c, 404, "No such deployment.");
@@ -899,12 +950,33 @@ deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
   const nextUrl = "url" in changes ? changes.url : existing.url;
   if (!nextUrl && (changes.status ?? existing.status) !== "failed")
     throw new Invalid("Only a failed deployment may have no url.");
-  await kdb
+  await resolveWorkAuthority(
+    c.env,
+    who.kind === "job" ? who.job.authority : who.authority,
+    who.repo.id,
+  );
+  // A record from before Spaces has no initiating authority, and none is
+  // inferred from its history. A person with write access may take it over
+  // with their own live authority, which the record keeps from then on.
+  const adopted = existing.authority === null;
+  if (adopted && (who.kind === "job" || who.agentId !== null))
+    return fail(c, 403, "A deployment from before Spaces can be changed only by a person.");
+  if (!adopted)
+    await resolveWorkAuthority(c.env, parseWorkAuthority(existing.authority), who.repo.id);
+  const [updated] = await kdb
     .updateTable("deployments")
-    .set({ ...changes, updated_at: nowIso() })
+    .set({
+      ...changes,
+      ...(adopted && who.kind === "person" ? { authority: JSON.stringify(who.authority) } : {}),
+      updated_at: nowIso(),
+    })
     .where("id", "=", id)
     .where("repo_id", "=", who.repo.id)
+    .where((eb) =>
+      adopted ? eb("authority", "is", null) : eb("authority", "=", existing.authority),
+    )
     .execute();
+  if (!updated?.numUpdatedRows) return fail(c, 409, "The deployment changed; try again.");
   const row = await findDeployment(kdb, who.repo.id, id);
   noteAgentPresence(c, {
     kind: "deployment",

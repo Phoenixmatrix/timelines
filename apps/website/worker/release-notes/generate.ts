@@ -31,6 +31,8 @@ export const MAX_MODEL_CALLS = 40;
 const CATEGORIES: ReleaseCategory[] = ["feature", "fix", "improvement", "internal"];
 
 export interface GeneratorSource extends HistoryReader {
+  /** Re-resolve epoch, initiating credential and current Space/resource grants. */
+  authorize(): Promise<void>;
   refs(): Promise<RepoRefs>;
   /** Issues cited by key, from the trackers subscribed to the repository. */
   issues(keys: string[]): Promise<LinkedIssue[]>;
@@ -147,6 +149,7 @@ async function write(
     if (changes.length >= 30) break;
     changes.push(...(await source.changes(oid)).slice(0, 30 - changes.length));
   }
+  await source.authorize();
   const { value, usage } = await chatJson<{ category?: string; title?: string; summary?: string }>(
     env,
     "fast",
@@ -242,6 +245,7 @@ export async function generateReleaseNotes(
   { maxModelCalls = MAX_MODEL_CALLS, now = () => new Date().toISOString() } = {},
 ): Promise<GenerateResult> {
   const d = db(env.DB);
+  await source.authorize();
   const refs = await source.refs();
   const [stored, state] = await Promise.all([
     d
@@ -296,6 +300,7 @@ export async function generateReleaseNotes(
   const byKey = new Map<string, LinkedIssue[]>();
   for (const issue of issues) byKey.set(issue.key, [...(byKey.get(issue.key) ?? []), issue]);
 
+  await source.authorize();
   await batch(env.DB, [
     d.deleteFrom("release_note_mentions").where("repo_id", "=", repoId),
     ...keys.map((key) =>
@@ -347,7 +352,7 @@ export async function generateReleaseNotes(
         continue;
       }
       for (const issue of cited) {
-        const subject = `issue:${issue.trackerOwnerId}:${issue.key}`;
+        const subject = `issue:${issue.trackerSpaceId}:${issue.key}`;
         const draft = bySubject.get(subject) ?? {
           release: release.release,
           subject,
@@ -431,6 +436,7 @@ export async function generateReleaseNotes(
     const shippedAt = (commit: ArtifactsCommitMetadata) =>
       provenance.get(commit)?.at ??
       (byHash.get(release.landings.get(commit.hash) ?? "") ?? commit).committedAt;
+    await source.authorize();
     await d
       .insertInto("release_notes")
       .values({
@@ -479,14 +485,14 @@ export async function generateReleaseNotes(
         category: written.category,
         title: written.title,
         summary: written.summary,
-        tracker_owner_id: issue?.trackerOwnerId ?? null,
+        tracker_space_id: issue?.trackerSpaceId ?? null,
         issue_id: issue?.id ?? null,
         issue_key: issue?.key ?? null,
         team_id: issue?.team.id ?? null,
         team_key: issue?.team.key ?? null,
         issue_type: issue?.type ?? null,
         labels: JSON.stringify(issue?.labels ?? []),
-        workspace_ids: JSON.stringify(issue?.workspaceIds ?? []),
+        project_ids: JSON.stringify(issue?.projectIds ?? []),
         commits: JSON.stringify([
           ...new Set(draft.commits.map((c) => provenance.get(c)?.landing ?? c.hash)),
         ]),
@@ -501,6 +507,7 @@ export async function generateReleaseNotes(
         inputs_hash: draft.inputsHash,
         updated_at: stamp,
       };
+      await source.authorize();
       await d
         .insertInto("release_note_entries")
         .values({
@@ -525,6 +532,7 @@ export async function generateReleaseNotes(
     const stale = persisted.filter((entry) => !keep.has(entry.subject)).map((entry) => entry.id);
     // D1 allows 100 bindings per statement; never split a NOT IN keep-list.
     for (let start = 0; start < stale.length; start += 90) {
+      await source.authorize();
       await d
         .deleteFrom("release_note_entries")
         .where("repo_id", "=", repoId)
@@ -536,7 +544,7 @@ export async function generateReleaseNotes(
     if (pending.length) continue;
     const shown = await d
       .selectFrom("release_note_entries")
-      .select(["title", "summary", "category", "tracker_owner_id"])
+      .select(["title", "summary", "category", "tracker_space_id"])
       .where("repo_id", "=", repoId)
       .where("release", "=", release.release)
       .where("category", "!=", "internal")
@@ -553,6 +561,7 @@ export async function generateReleaseNotes(
       .where("release", "=", release.release)
       .executeTakeFirstOrThrow();
     if (current.intro_inputs_hash === introHash) {
+      await source.authorize();
       await d
         .updateTable("release_notes")
         .set({ format_version: 1 })
@@ -570,6 +579,7 @@ export async function generateReleaseNotes(
       }
       modelCalls++;
       const prompt = shown.map((e) => `- [${e.category}] ${e.title}: ${e.summary}`).join("\n");
+      await source.authorize();
       const { text, usage } = await chatText(env, "reason", INTRO_SYSTEM, prompt, {
         maxTokens: 1200,
         model: models.task,
@@ -577,6 +587,7 @@ export async function generateReleaseNotes(
       intro = text.trim().slice(0, 2000);
       introModel = usage.model;
     }
+    await source.authorize();
     await d
       .updateTable("release_notes")
       .set({
@@ -586,7 +597,7 @@ export async function generateReleaseNotes(
         intro_inputs_hash: introHash,
         intro_trackers: JSON.stringify(
           [
-            ...new Set(shown.flatMap((e) => (e.tracker_owner_id ? [e.tracker_owner_id] : []))),
+            ...new Set(shown.flatMap((e) => (e.tracker_space_id ? [e.tracker_space_id] : []))),
           ].sort(),
         ),
       })
@@ -602,6 +613,7 @@ export async function generateReleaseNotes(
     .select("release")
     .where("repo_id", "=", repoId)
     .execute();
+  await source.authorize();
   for (const row of existing)
     if (!live.has(row.release))
       await batch(env.DB, [

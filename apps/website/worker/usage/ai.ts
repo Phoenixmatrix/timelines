@@ -1,10 +1,8 @@
-// Workers AI calls and tokens per account (CORE-207). Work that runs models
-// for an account declares it once, at its entry point, with `aiWork`; every
-// model call underneath (worker/knowledge/models.ts, the assistant, avatars)
-// then records itself into ai_usage, per UTC day, account, feature and model,
-// and, when the work knows them, the person, agent and timeline it was for
-// (CORE-222). A call outside any declared work is recorded under account ''
-// (site).
+// AI calls are attributed independently to a Space, person or the Instance.
+// A repository always resolves its immutable Space; person identity is never
+// interpreted as content ownership, even when migration preserves equal IDs.
+// When the work knows them, each call also records the person, agent and
+// timeline it was for (CORE-222): attribution within that scope, not ownership.
 // Recording never throws and never fails the call it describes.
 //
 // AsyncLocalStorage doesn't follow a Workflow's `step.do` callbacks: the
@@ -13,14 +11,19 @@
 // the site as `unattributed` (CORE-285).
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { UsageScope } from "../../shared/usage.ts";
+import type { Actor } from "../db.ts";
 import { db } from "../schema.ts";
 
 export interface AiWork {
   /** What the calls are for: knowledge, wiki, release_notes, assistant, search, avatars… */
   feature: string;
-  account?: string | null;
-  /** The repository, when the account isn't known up front (its owner is looked up once). */
+  spaceId?: string | null;
+  personId?: string | null;
+  /** Resolve repository work to its current immutable Space. */
   repo?: string | null;
+  /** Explicit, separately authorized policy Space for personal aggregate work. */
+  providerAuthority?: { spaceId: string; actor: Actor };
   /**
    * Who asked, when one person or agent did (CORE-222): the person (an agent's
    * accountable person), the agent acting for them, and the timeline the work
@@ -40,9 +43,7 @@ export interface AiWork {
   ) => unknown;
 }
 
-interface Context extends AiWork {
-  owner?: Promise<string>;
-}
+type Context = AiWork;
 
 const current = new AsyncLocalStorage<Context>();
 
@@ -51,18 +52,17 @@ export function aiWork<T>(context: AiWork, work: () => T): T {
   return current.run({ ...context }, work);
 }
 
-/**
- * Who the current work is for, resolved: the account id ('' for the site) and
- * feature. Model calls label their AI Gateway logs with it, so the gateway and
- * ai_usage can be reconciled per account and feature.
- */
-export async function attribution(env: Env): Promise<{ account: string; feature: string }> {
+/** Current attribution is metadata, not authorization to use a provider. */
+export async function attribution(env: Env): Promise<{
+  scope: UsageScope;
+  feature: string;
+  providerAuthority?: { spaceId: string; actor: Actor };
+}> {
   const context = current.getStore();
-  // Without a database there's nothing to look the owner up in (nor record to).
-  const recorded = Boolean(Reflect.get(env, "DB"));
   return {
-    account: recorded ? await accountOf(env, context).catch(() => "") : (context?.account ?? ""),
+    scope: await scopeOf(env, context),
     feature: context?.feature ?? "unattributed",
+    ...(context?.providerAuthority ? { providerAuthority: context.providerAuthority } : {}),
   };
 }
 
@@ -85,18 +85,24 @@ export function tokensOf(result: unknown): AiTokens {
   };
 }
 
-async function accountOf(env: Env, context: Context | undefined): Promise<string> {
-  if (!context) return "";
-  if (context.account) return context.account;
-  if (!context.repo) return "";
-  context.owner ??= db(env.DB)
-    .selectFrom("repos")
-    .select("owner_id")
-    .where("id", "=", context.repo)
-    .executeTakeFirst()
-    .then((row) => row?.owner_id ?? "")
-    .catch(() => "");
-  return context.owner;
+async function scopeOf(env: Env, context: Context | undefined): Promise<UsageScope> {
+  if (!context) return { kind: "instance", id: "" };
+  if (context.personId && (context.spaceId || context.repo))
+    throw new Error("AI work cannot mix personal and content attribution.");
+  if (context.repo) {
+    const row = await db(env.DB)
+      .selectFrom("repos")
+      .select("space_id")
+      .where("id", "=", context.repo)
+      .executeTakeFirst();
+    if (!row?.space_id) throw new Error("AI work repository has no active Space.");
+    if (context.spaceId && context.spaceId !== row.space_id)
+      throw new Error("AI work repository does not belong to the declared Space.");
+    return { kind: "space", id: row.space_id };
+  }
+  if (context.spaceId) return { kind: "space", id: context.spaceId };
+  if (context.personId) return { kind: "person", id: context.personId };
+  return { kind: "instance", id: "" };
 }
 
 /**
@@ -113,16 +119,16 @@ export async function recordAiCall(
     const d1 = Reflect.get(env, "DB") as D1Database | undefined;
     if (!d1) return;
     const context = options.work ? { ...options.work } : current.getStore();
-    const account = await accountOf(env, context);
+    const scope = await scopeOf(env, context);
     const input = Math.round(tokens.input ?? 0);
     const output = Math.round(tokens.output ?? 0);
     const total = Math.round(tokens.total ?? input + output);
     await d1
       .prepare(
-        `INSERT INTO ai_usage (day, account_id, feature, model, calls, input_tokens, output_tokens, total_tokens, failed_calls,
+        `INSERT INTO ai_usage (day, scope_kind, scope_id, feature, model, calls, input_tokens, output_tokens, total_tokens, failed_calls,
            actor_id, agent_id, timeline)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT (day, account_id, feature, model, actor_id, agent_id, timeline) DO UPDATE SET
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT (day, scope_kind, scope_id, feature, model, actor_id, agent_id, timeline) DO UPDATE SET
            calls = calls + excluded.calls,
            input_tokens = input_tokens + excluded.input_tokens,
            output_tokens = output_tokens + excluded.output_tokens,
@@ -131,7 +137,8 @@ export async function recordAiCall(
       )
       .bind(
         (options.at ?? new Date()).toISOString().slice(0, 10),
-        account,
+        scope.kind,
+        scope.id,
         context?.feature ?? "unattributed",
         model,
         options.failed ? 0 : (options.calls ?? 1),

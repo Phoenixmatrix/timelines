@@ -1,18 +1,22 @@
 // Work context retention (CORE-244): what trimming leaves of a step.
 
-import { expect, test } from "vite-plus/test";
+import { expect, onTestFinished, test } from "vite-plus/test";
 import { TRIMMED_TEXT } from "../../../shared/steps.ts";
-import { d1, migratedDatabase } from "../../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../../testing/spaces.ts";
 import type { CleanupContext } from "../engine.ts";
 import { stepSteering } from "./steps.ts";
 
 test("trimming keeps a step's why, tests, coverage and each entry's source", async () => {
-  const sqlite = migratedDatabase();
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'orbit', 'Orbit');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite, env } = fresh;
+  sqlite.exec(`BEGIN; 
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id)
+      VALUES ('org','orbit-company','Orbit','company','acc');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('acc','org','orbit','Orbit');
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('r', 'acc', 'app', 'private', 'a', 'https://a');
-  `);
+   COMMIT;`);
   const context = {
     why: "Recency matters.",
     instructions: [{ text: "Rank by recency", source: "hook", at: "2025-01-01T00:00:00.000Z" }],
@@ -30,8 +34,8 @@ test("trimming keeps a step's why, tests, coverage and each entry's source", asy
     )
     .run("a".repeat(40), JSON.stringify(context), "2025-01-01T00:00:00.000Z");
   const ctx: CleanupContext = {
-    env: { DB: d1(sqlite) } as unknown as Env,
-    target: { scope: "account", accountId: "acc" },
+    env,
+    target: { kind: "space", id: "acc" },
     thresholds: { days: 365 },
     now: new Date("2026-10-04T00:00:00.000Z"),
     limit: 10,

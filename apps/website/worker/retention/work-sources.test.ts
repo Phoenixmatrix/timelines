@@ -1,12 +1,17 @@
 import { describe, expect, test, vi } from "vite-plus/test";
-import { migratedDatabase, d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import { accessFor } from "../tracker/access.ts";
+import { findSpaceById } from "../spaces/access.ts";
 import {
   drainDeletedRepoSources,
   expireArchivedSources,
   pinSourceRoot,
   releaseSourceRoots,
 } from "./work-sources.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { initializeWorkSource, resolveSource } from "../timelines/sources.ts";
 import { selectRepos } from "../db.ts";
@@ -23,10 +28,26 @@ const tracker = vi.hoisted(() => ({
 }));
 vi.mock("../tracker/stub.ts", () => ({ trackerObject: () => tracker }));
 
-function fixture() {
-  const sql = migratedDatabase();
-  const durable = durableStorage();
-  const store = new TrackerStore(durable.sql, durable.transactionSync);
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: unknown;
+    env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
+
+async function fixture() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const sql = fresh.sqlite;
+  const stateStorage = fakeDurableState({ name: "owner" });
+  const durable = {
+    db: stateStorage.db,
+    sql: stateStorage.ctx.storage.sql,
+    transactionSync: <T>(fn: () => T) => stateStorage.ctx.storage.transactionSync(fn),
+  };
   tracker.reconcileDeletedSource.mockResolvedValue({
     ok: false,
     error: "provider outcome unknown",
@@ -56,14 +77,21 @@ function fixture() {
     ok: true,
     value: store.timelines.getWorkSource(sourceId),
   }));
-  sql.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES ('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote,default_branch)
+  sql.exec(`BEGIN; INSERT INTO accounts(id,kind,slug,display_name) VALUES ('owner','user','owner','Owner');
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id)
+      VALUES ('org_owner','owner-company','Owner','company','owner');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('owner','org_owner','owner','Owner');
+    INSERT INTO organization_members (organization_id,account_id,role,origin,granted_by)
+      VALUES ('org_owner','owner','owner','test','owner');
+    INSERT INTO space_grants (space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by)
+      VALUES ('owner','org_owner','owner','admin','write','write','test','owner');
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote,default_branch)
       VALUES ('repo','owner','repo','private','canonical','https://example/canonical','main'),
-             ('foreign','owner','foreign','private','foreign','https://example/foreign','main');`);
+             ('foreign','owner','foreign','private','foreign','https://example/foreign','main'); COMMIT;`);
   const names = new Set(["canonical", "owned", "foreign-owned"]);
   let crash = false;
   const env = {
-    DB: d1(sql),
+    ...fresh.env,
     ARTIFACTS: {
       delete: async (name: string) => {
         const deleted = names.delete(name);
@@ -76,10 +104,19 @@ function fixture() {
       },
     },
   } as Env;
+  Object.assign(env, { TRACKER: { idFromName: fakeDurableObjectId } });
+  await initializeFreshTrackerSpace(env, stateStorage.ctx, "owner");
+  const store = new TrackerStore(durable.sql, durable.transactionSync);
+  const token = await issueToken(env.DB, "owner", "source-retention-fixture", "write");
+  const credential = { kind: "token", id: token.id } as const;
+  const authority = await captureWorkAuthority(env, "repo", { id: "owner", credential });
+  const space = await findSpaceById(env.DB, "owner");
+  if (!space) throw new Error("Missing fixture Space");
+  const access = await accessFor(env, space, "owner", null, true, credential);
   const add = (source = "work_owned", repo = "repo", state = "archived", name = "owned") => {
     sql
       .prepare(`INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,state,allocation_operation_id,
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,state,allocation_operation_id,
        fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,archived_at,archive_disposition)
       VALUES (?,?,?,'timeline','owner',?,?,?,'canonical','head','tree','refs/heads/main','canonical','head','tree','refs/heads/main',?,?,?,'abandoned')`)
       .run(
@@ -93,6 +130,9 @@ function fixture() {
         "2026-01-01T00:00:00.000Z",
         "2026-01-01T00:00:00.000Z",
       );
+    sql
+      .prepare("UPDATE timeline_work_sources SET authority=? WHERE source_id=?")
+      .run(JSON.stringify(authority), source);
     const row = sql.prepare("SELECT * FROM timeline_work_sources WHERE source_id=?").get(source);
     durable.db
       .prepare(
@@ -109,6 +149,9 @@ function fixture() {
     sql,
     durable,
     env,
+    authority,
+    access,
+    close: fresh.close,
     names,
     add,
     state,
@@ -119,14 +162,33 @@ function fixture() {
 }
 
 describe("owned source retention", () => {
+  test("Tracker allocation Space drift cannot delete source bytes", async () => {
+    const f = await fixture();
+    f.durable.db.exec(`UPDATE timeline_source_allocations
+      SET data=json_set(data,'$.space_id','another-space') WHERE source_id='work_owned'`);
+    await expect(
+      expireArchivedSources(
+        f.env,
+        "owner",
+        {
+          landed: "2026-07-01T00:00:00.000Z",
+          abandoned: "2026-07-01T00:00:00.000Z",
+        },
+        ["timeline-work_owned"],
+      ),
+    ).rejects.toThrow("ownership mismatch");
+    expect(f.names.has("owned")).toBe(true);
+    f.close();
+    f.durable.db.close();
+  });
   test("landed and abandoned byte deadlines are strict and independent of Tracker detail", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec(
       "UPDATE timeline_work_sources SET archive_disposition='landed' WHERE source_id='work_owned'",
     );
     const ctx = {
       env: f.env,
-      target: { scope: "account" as const, accountId: "owner" },
+      target: { kind: "space" as const, id: "owner" },
       thresholds: { landedDays: 30, abandonedDays: 90 },
       now: new Date("2026-01-31T00:00:00.000Z"),
       limit: 100,
@@ -146,12 +208,12 @@ describe("owned source retention", () => {
     await timelineWorkSources.remove(ctx, abandoned.items);
     expect(f.names.has("foreign-owned")).toBe(false);
     expect(f.names.has("canonical")).toBe(true);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("missing end evidence never permits source deletion", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec("UPDATE timeline_work_sources SET archive_disposition=NULL");
     f.durable.db.exec(
       "UPDATE timeline_source_allocations SET data=json_remove(data,'$.archive_disposition')",
@@ -167,12 +229,12 @@ describe("owned source retention", () => {
     );
     expect(f.state()).toBe("archived");
     expect(f.names.has("owned")).toBe(true);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("legacy end evidence survives detail removal before independent Git expiry", async () => {
-    const f = fixture();
+    const f = await fixture();
     // Its commits' mentions go with the source; main's stay (CORE-296).
     f.sql
       .exec(`INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, resolution, source_id)
@@ -228,12 +290,12 @@ describe("owned source retention", () => {
     expect(f.sql.prepare("SELECT commit_oid, source_id FROM commit_issue_mentions").all()).toEqual([
       { commit_oid: "c1", source_id: "canonical" },
     ]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("expiry fences new claims while an admitted job keeps reading and retrying", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec(`UPDATE timeline_work_sources SET artifacts_remote='https://example/owned',
       initial_token_revoked=1 WHERE source_id='work_owned'`);
     const root = {
@@ -287,7 +349,8 @@ describe("owned source retention", () => {
       ok: true,
       value: { ...row, expiry_requested_at: null },
     });
-    await initializeWorkSource(f.env, repo, {
+    await initializeWorkSource(f.env, f.access, repo, {
+      authority: f.authority,
       timelineId: "timeline-work_owned",
       timelineSlug: "timeline",
       base: {
@@ -320,14 +383,14 @@ describe("owned source retention", () => {
     );
     expect(f.state()).toBe("purged");
     expect(f.names.has("owned")).toBe(false);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("an unresolved operation is fenced before reconciliation fails", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec(`INSERT INTO source_operations
-      (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+      (id,space_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
       VALUES ('push','owner','timeline-work_owned','repo','work_owned','push','ambiguous','{}','now','now')`);
     await expect(
       expireArchivedSources(
@@ -348,13 +411,13 @@ describe("owned source retention", () => {
         commit: "head",
       }),
     ).rejects.toThrow("expired");
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
   test.each(["ready", "archived"])(
     "policy expiry leaves %s nonexpired sources open",
     async (state) => {
-      const f = fixture();
+      const f = await fixture();
       f.sql
         .prepare(
           "UPDATE timeline_work_sources SET state=?,archived_at=? WHERE source_id='work_owned'",
@@ -382,13 +445,13 @@ describe("owned source retention", () => {
       });
       expect(f.state()).toBe(state);
       expect(f.names.has("owned")).toBe(true);
-      f.sql.close();
+      f.close();
       f.durable.db.close();
     },
   );
 
   test("archive cutoff and consumer roots protect Git, then expiry retries an ambiguous delete", async () => {
-    const f = fixture();
+    const f = await fixture();
     const root = {
       repoId: "repo",
       sourceId: "work_owned",
@@ -431,12 +494,12 @@ describe("owned source retention", () => {
     );
     expect(f.state()).toBe("purged");
     expect([...f.names].sort()).toEqual(["canonical", "foreign-owned"]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("canonical tombstone waits for CI source claims before physical deletion", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec(`INSERT INTO ci_runs
       (id,repo_id,number,commit_oid,ref,trigger,status,source_id)
       VALUES ('run','repo',1,'head','work','push','running','work_owned');
@@ -449,15 +512,15 @@ describe("owned source retention", () => {
     await drainDeletedRepoSources(f.env, "repo");
     expect(f.state()).toBe("purged");
     expect([...f.names].sort()).toEqual(["canonical", "foreign-owned"]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("canonical tombstone drains ambiguous operations and fork creation before deleting only owned forks", async () => {
-    const f = fixture();
+    const f = await fixture();
     await expect(drainDeletedRepoSources(f.env, "repo")).rejects.toThrow("live repository");
     f.sql.exec(`UPDATE repos SET deleted_at='2026-10-04' WHERE id='repo';
-      INSERT INTO source_operations(id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+      INSERT INTO source_operations(id,space_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
       VALUES ('push','owner','timeline-work_owned','repo','work_owned','push','ambiguous','{}','now','now');`);
     await expect(drainDeletedRepoSources(f.env, "repo")).rejects.toThrow();
     expect(f.names.has("owned")).toBe(true);
@@ -475,12 +538,12 @@ describe("owned source retention", () => {
     await drainDeletedRepoSources(f.env, "repo");
     expect(f.state()).toBe("purged");
     expect([...f.names].sort()).toEqual(["canonical", "foreign-owned"]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("a crash after the authoritative purge converges without another provider deletion", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec(`CREATE TRIGGER fail_projection BEFORE UPDATE ON timeline_work_sources
       WHEN NEW.state='purged' BEGIN SELECT RAISE(ABORT,'projection interrupted'); END;`);
     await expect(
@@ -503,12 +566,12 @@ describe("owned source retention", () => {
     );
     expect(f.state()).toBe("purged");
     expect([...f.names].sort()).toEqual(["canonical", "foreign-owned"]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test("inventory drift cannot delete a foreign provider repository", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.sql.exec(
       "UPDATE timeline_work_sources SET artifacts_name='unowned-name' WHERE source_id='work_owned'",
     );
@@ -522,14 +585,14 @@ describe("owned source retention", () => {
       ),
     ).rejects.toThrow("ownership mismatch");
     expect([...f.names].sort()).toEqual(["canonical", "foreign-owned", "owned", "unowned-name"]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 
   test.each(["dependency", "knowledge-build"])(
     "expired dependency cycles remain protected by an external %s root, then drain together",
     async (consumerKind) => {
-      const f = fixture();
+      const f = await fixture();
       const owned = { repoId: "repo", sourceId: "work_owned", commit: "head" };
       const foreign = { repoId: "foreign", sourceId: "work_foreign", commit: "head" };
       await pinSourceRoot(f.env, {
@@ -578,13 +641,13 @@ describe("owned source retention", () => {
         { source_id: "work_owned", state: "purged" },
       ]);
       expect(f.sql.prepare("SELECT * FROM timeline_source_roots").all()).toEqual([]);
-      f.sql.close();
+      f.close();
       f.durable.db.close();
     },
   );
 
   test("an unexpired member protects the whole dependency cycle", async () => {
-    const f = fixture();
+    const f = await fixture();
     await pinSourceRoot(f.env, {
       repoId: "repo",
       sourceId: "work_owned",
@@ -620,7 +683,7 @@ describe("owned source retention", () => {
       timelines,
     );
     expect([...f.names]).toEqual(["canonical"]);
-    f.sql.close();
+    f.close();
     f.durable.db.close();
   });
 });

@@ -40,7 +40,7 @@ const HEALTH: Record<Health, { color: string; word: string }> = {
   none: { color: "var(--ink-faint)", word: "no checks recorded" },
 };
 
-/** A repository's steps API, by its owner/name. */
+/** A repository's steps API, by its Space/name. */
 const stepsPath = (repo: string, query: URLSearchParams) => {
   const [o, n] = repo.split("/");
   return `/repos/${encodeURIComponent(o!)}/${encodeURIComponent(n!)}/steps?${query}`;
@@ -67,14 +67,14 @@ interface Loaded {
  * commit the live feed brings that isn't among them, that commit's step, once.
  */
 function useSpans(
-  owner: string,
+  space: string,
   timeline: Timeline,
   feed: StepFeedRecord[],
   removed: ReadonlySet<string>,
 ) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointView[]>([]);
-  const repos = timeline.repos.map((r) => `${r.owner}/${r.name}`).join(",");
+  const repos = timeline.repos.map((r) => `${r.space}/${r.name}`).join(",");
   useEffect(() => {
     const abort = new AbortController();
     const signal = abort.signal;
@@ -161,7 +161,7 @@ function useSpans(
     const timer = setTimeout(
       () => {
         api<CheckpointList>(
-          `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}/checkpoints`,
+          `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}/checkpoints`,
           { signal: abort.signal },
         )
           .then((list) => setCheckpoints(list.checkpoints))
@@ -173,7 +173,7 @@ function useSpans(
       clearTimeout(timer);
       abort.abort();
     };
-  }, [timeline.slug, owner, steps]);
+  }, [timeline.slug, space, steps]);
   return { loaded, checkpoints };
 }
 
@@ -191,19 +191,19 @@ function take(into: Loaded, repo: string, page: StepPage) {
 }
 
 export function TimelineObservability({
-  owner,
+  space,
   timeline,
   feed,
   removed = NONE,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   /** The timeline's live feed records, newest first (useStepFeed). */
   feed: StepFeedRecord[];
   /** Steps the feed said were deleted since the page opened (CORE-399): hidden, even if loaded. */
   removed?: ReadonlySet<string>;
 }) {
-  const { loaded, checkpoints } = useSpans(owner, timeline, feed, removed);
+  const { loaded, checkpoints } = useSpans(space, timeline, feed, removed);
   const spans = useMemo(
     () =>
       loaded
@@ -252,7 +252,7 @@ export function TimelineObservability({
   const selected = spans.find((span) => span.key === selectedKey) ?? newest;
   const latestArrival = [...arrived.entries()].sort((a, b) => b[1] - a[1])[0];
   const announce = latestArrival && spans.find((span) => span.key === latestArrival[0]);
-  const story = `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}/story`;
+  const story = `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}/story`;
   const pos = (at: number) => ((at - domain[0]) / (domain[1] - domain[0])) * 100;
   const x = (at: number) => `${pos(at).toFixed(3)}%`;
 

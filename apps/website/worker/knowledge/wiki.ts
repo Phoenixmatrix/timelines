@@ -12,6 +12,7 @@ import { db, nowIso } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import type { BuiltGraph, ComponentPlan, SnapshotFile, Syntheses } from "./graph.ts";
 import { chatText, decide, yes } from "./models.ts";
+import { paidWorkGuard } from "./paid-work.ts";
 import { pool, runBatched, sha256, slug, type Statement } from "./util.ts";
 
 export const WRITER = "w1";
@@ -477,6 +478,7 @@ export async function planWiki(env: Env, source: WikiSource): Promise<WikiPlan> 
         .where("slug", "=", slugName),
     );
   }
+  await paidWorkGuard()?.check();
   await runBatched(env.DB, statements);
   const order = new Map(pages.map((p, i) => [p.slug, i]));
   pending.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
@@ -512,11 +514,13 @@ export async function updatePages(
     if (before && page.kind !== "glossary") {
       if (!(await isStale(env, models, page, before, changedNodes, graph, inputs))) {
         stats.kept++;
+        await paidWorkGuard()?.check();
         await keep(env.DB, source, page, hash, before.body).execute();
         return;
       }
     }
     const written = await writePage(env, models, page, inputs);
+    await paidWorkGuard()?.check();
     await db(env.DB)
       .insertInto("wiki_pages")
       .values({

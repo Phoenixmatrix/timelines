@@ -2,33 +2,69 @@
 // history; validation and authorization.
 
 import { Hono } from "hono";
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { RetentionRun, RetentionRunPage, RetentionSettings } from "../../shared/retention.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { seedPrice } from "../usage/seed.ts";
-import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./api.ts";
+import { spaceRetentionApi, spaceRunsApi, personRunsApi, instanceRetentionApi } from "./api.ts";
 import { CATEGORIES } from "./categories.ts";
 import { runNotes } from "./runs.ts";
 
 const DAY = 86_400_000;
 const ago = (days: number) => new Date(Date.now() - days * DAY).toISOString();
 
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const close of cleanups.splice(0)) close();
+});
+
 async function setup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('acc_ann', 'user', 'ann', 'Ann'), ('acc_bob', 'user', 'bob', 'Bob'),
       ('acc_cat', 'user', 'cat', 'Cat');
     INSERT INTO accounts (id, kind, slug, display_name, is_site_admin)
       VALUES ('acc_sue', 'user', 'sue', 'Sue', 1);
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role)
-      VALUES ('acc_org', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('acc_org', 'acc_ann', 'owner'), ('acc_org', 'acc_cat', 'member');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'acc_ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+  `);
+  for (const [id, slug, person] of [
+    ["acc_org", "orbit", "acc_ann"],
+    ["acc_bob", "bob", "acc_bob"],
+  ] as const) {
+    await seedSpaceFixture(d1(sqlite), {
+      organization: { id: `org_${id}`, slug: `org-${slug}`, displayName: slug, kind: "company" },
+      space: { id, slug, displayName: slug },
+      actorId: person,
+      members: [
+        {
+          accountId: person,
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "read", packageRole: "read" },
+        },
+        ...(id === "acc_org"
+          ? [
+              {
+                accountId: "acc_cat",
+                role: "member" as const,
+                grant: {
+                  role: "member" as const,
+                  repositoryRole: "read" as const,
+                  packageRole: "read" as const,
+                },
+              },
+              { accountId: "acc_sue", role: "owner" as const },
+            ]
+          : []),
+      ],
+    });
+  }
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('repo', 'acc_org', 'app', 'private', 'a', 'https://a'),
       ('bobs', 'acc_bob', 'b', 'private', 'b', 'https://b');
   `);
@@ -39,16 +75,16 @@ async function setup() {
   insert.run("repo", "expired", ago(10), ago(10));
   insert.run("repo", "active", ago(-3), null);
   insert.run("bobs", "expired", ago(90), ago(90));
-  const env = { DB: d1(sqlite) } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/settings/retention", accountRetentionApi);
-  app.route("/api/accounts/:slug/retention/runs", accountRunsApi);
-  app.route("/api/admin/retention", siteRetentionApi);
+  app.route("/api/spaces/:space/retention", spaceRetentionApi);
+  app.route("/api/spaces/:space/retention/runs", spaceRunsApi);
+  app.route("/api/admin/retention", instanceRetentionApi);
+  app.route("/api/accounts/:person/retention/runs", personRunsApi);
   const token = async (user: string, agent?: string) =>
     (await issueToken(env.DB, user, `t-${Math.random()}`, "write", undefined, agent)).secret;
   const tokens = {
@@ -84,7 +120,7 @@ async function setup() {
   return { call, tokens, sqlite, deployments };
 }
 
-const RUNS = "/api/accounts/orbit/retention/runs";
+const RUNS = "/api/spaces/orbit/retention/runs";
 
 describe("manual cleanup runs", () => {
   test("dry run, run, and history, for a disabled category at its shown thresholds", async () => {
@@ -95,7 +131,11 @@ describe("manual cleanup runs", () => {
     });
     expect(started.status).toBe(202);
     const dry = started.json as RetentionRun;
-    expect(dry).toMatchObject({ level: "account", account: "orbit", actor: "ann", dryRun: true });
+    expect(dry).toMatchObject({
+      target: { kind: "space", id: "acc_org" },
+      actor: "ann",
+      dryRun: true,
+    });
     const finished = (await t.call(t.tokens.ann, "GET", `${RUNS}/${dry.id}`)).json as RetentionRun;
     expect(finished).toMatchObject({
       status: "succeeded",
@@ -156,7 +196,7 @@ describe("manual cleanup runs", () => {
     expect(rest).toMatchObject({ runs: [{ id: dry.id }], next: null });
 
     // Settings show the category as runnable, still disabled, with its last run.
-    const settings = (await t.call(t.tokens.ann, "GET", "/api/accounts/orbit/settings/retention"))
+    const settings = (await t.call(t.tokens.ann, "GET", "/api/spaces/orbit/retention"))
       .json as RetentionSettings;
     expect(settings.categories.find((c) => c.id === "preview-records")).toMatchObject({
       enabled: false,
@@ -203,8 +243,9 @@ describe("manual cleanup runs", () => {
     expect((await t.call(t.tokens.agent, "POST", RUNS, body)).status).toBe(403);
     expect((await t.call(t.tokens.bob, "POST", RUNS, body)).status).toBe(404);
     expect((await t.call(t.tokens.bob, "GET", RUNS)).status).toBe(404);
-    const run = (await t.call(t.tokens.sue, "POST", RUNS, body)).json as RetentionRun;
-    expect(run.actor).toBe("sue");
+    expect((await t.call(t.tokens.sue, "POST", RUNS, body)).status).toBe(404);
+    const run = (await t.call(t.tokens.ann, "POST", RUNS, body)).json as RetentionRun;
+    expect(run.actor).toBe("ann");
     expect((await t.call(t.tokens.ann, "GET", `${RUNS}/${run.id}`)).status).toBe(200);
     expect((await t.call(t.tokens.agent, "GET", `${RUNS}/${run.id}`)).status).toBe(200);
     // Members see neither the history nor a run.
@@ -212,7 +253,7 @@ describe("manual cleanup runs", () => {
     expect((await t.call(t.tokens.cat, "GET", `${RUNS}/${run.id}`)).status).toBe(403);
     // Another account's run isn't found through this one.
     expect(
-      (await t.call(t.tokens.bob, "GET", `/api/accounts/bob/retention/runs/${run.id}`)).status,
+      (await t.call(t.tokens.bob, "GET", `/api/spaces/bob/retention/runs/${run.id}`)).status,
     ).toBe(404);
     expect((await t.call(t.tokens.ann, "GET", `${RUNS}/nope`)).status).toBe(404);
 
@@ -253,4 +294,28 @@ describe("preview figures", () => {
           (CATEGORIES.find((x) => x.id === other) as { overlaps?: readonly string[] }).overlaps,
         ).toContain(c.id);
   });
+});
+
+test("personal run metadata cannot be requested by company or Instance administrators", async () => {
+  const t = await setup();
+  const path = "/api/accounts/ann/retention/runs";
+  expect((await t.call(t.tokens.ann, "GET", path)).status).toBe(200);
+  expect((await t.call(t.tokens.sue, "GET", path)).status).toBe(404);
+  expect((await t.call(t.tokens.bob, "GET", path)).status).toBe(404);
+  expect(
+    (
+      await t.call(t.tokens.ann, "POST", path, {
+        dryRun: true,
+        categories: ["preview-records"],
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await t.call(t.tokens.ann, "POST", RUNS, {
+        dryRun: true,
+        categories: ["assistant-chats"],
+      })
+    ).status,
+  ).toBe(400);
 });

@@ -20,18 +20,24 @@
 // `vp run agent test-ai` (README "Retention safety").
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { DURABLE_CLASSES } from "../durable/classes.ts";
 import { purgeInstance } from "../durable/registry.ts";
 import { isEmpty, storageReport } from "../durable/contract.ts";
 import { sweepDurableInstances } from "../durable/sweep.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { pricesApi } from "../usage/prices-api.ts";
-import { accountUsageApi, siteUsageApi } from "../usage/report-api.ts";
+import { spaceUsageApi, personUsageApi, instanceUsageApi } from "../usage/report-api.ts";
 import { collectUsage } from "../usage/collect.ts";
-import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./api.ts";
+import {
+  spaceRetentionApi,
+  spaceRunsApi,
+  personRetentionApi,
+  personRunsApi,
+  instanceRetentionApi,
+} from "./api.ts";
 import { CATEGORIES, category, defaultValues } from "./categories.ts";
 import { AUTH_TABLES } from "./cleanups/auth-hygiene.ts";
 import { cleanupFor } from "./cleanups/index.ts";
@@ -50,27 +56,6 @@ vi.mock("cloudflare:workers", () => ({
     }
   },
 }));
-
-// The Assistant is an Agents SDK agent (workerd only): a stand-in with its
-// purge contract, over the seeded chat objects.
-vi.mock("agents", async () => {
-  const { chatObjects } = await import("./testing/rich.ts");
-  return {
-    getAgentByName: async (_namespace: unknown, name: string) => ({
-      async purgeIfIdle(reason: string) {
-        const chat = chatObjects.get(name) ?? { messages: 0, busy: false };
-        if (chat.busy) return null;
-        chatObjects.set(name, { messages: 0, busy: false });
-        const at = new Date().toISOString();
-        return { reason, purgedAt: at, bytes: 0, tables: [], keys: 0, alarm: null };
-      },
-      async storageReport() {
-        const chat = chatObjects.get(name);
-        return { bytes: (chat?.messages ?? 0) * 100, tables: [], keys: 0, alarm: null };
-      },
-    }),
-  };
-});
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -159,8 +144,8 @@ async function runOne(t: Rich, id: string, target: RetentionTarget, dryRun: bool
   const thresholds = defaultValues(category(id)!);
   const runId = await createRun(t.env.DB, {
     target,
-    trigger: "manual",
-    actorId: "acc_marco",
+    trigger: "schedule",
+    actorId: null,
     dryRun,
     categories: [{ id, thresholds }],
     now: NOW,
@@ -196,21 +181,21 @@ describe("retention safety: coverage", () => {
       RUNNABLE.filter((id) => id !== "timeline-work-sources").sort(),
     );
     for (const [id, fixture] of Object.entries(FIXTURES))
-      expect(fixture.target.scope, id).toBe(category(id)!.scope);
+      expect(fixture.target.kind, id).toBe(category(id)!.scope);
   });
 });
 
 describe("gate 1: nothing enabled, a full cron cycle deletes nothing but expired sign-in state", () => {
   test("every hourly retention job over 26 hours, on the rich deployment", async () => {
-    const t = richSeed();
+    const t = await richSeed();
     await t.ready;
     // Stored policies that enable nothing: thresholds changed, categories
     // turned off explicitly, site-wide defaults without enabling.
     t.sqlite.exec(`
-      INSERT INTO retention_policies (account_id, category, enabled, thresholds) VALUES
-        ('acc_orbit', 'ci-logs', 0, '{"days": 1}'),
-        ('acc_orbit', 'push-log', NULL, '{"days": 1}'),
-        ('acc_marco', 'assistant-chats', 0, '{"days": 1, "maxPerUser": 1}');
+      INSERT INTO retention_policies (scope_kind, scope_id, category, enabled, thresholds) VALUES
+        ('space', 'acc_orbit', 'ci-logs', 0, '{"days": 1}'),
+        ('space', 'acc_orbit', 'push-log', NULL, '{"days": 1}'),
+        ('person', 'acc_marco', 'assistant-chats', 0, '{"days": 1, "maxPerUser": 1}');
       INSERT INTO retention_site_policies (category, enabled, thresholds) VALUES
         ('timeline-work-sources', 0, '{}'),
         ('auth-hygiene', 0, '{"days": 1}'),
@@ -251,7 +236,7 @@ describe("gate 1: nothing enabled, a full cron cycle deletes nothing but expired
     for (const store of ["tracker", "r2", "chats"])
       expect(after[store], store).toEqual(before[store]);
     for (const id of scheduled)
-      expect(await getRun(t.env.DB, { scope: "site" }, id)).toMatchObject({
+      expect(await getRun(t.env.DB, { kind: "instance", id: "" }, id)).toMatchObject({
         trigger: "schedule",
         status: "succeeded",
         categories: [{ category: "auth-hygiene" }],
@@ -264,7 +249,7 @@ describe("gate 1: nothing enabled, a full cron cycle deletes nothing but expired
 describe("gate 2: each category's dry run is its run, bounded, idempotent, audited", () => {
   test.each(Object.keys(FIXTURES))("%s", async (id) => {
     const fixture = FIXTURES[id]!;
-    const t = richSeed();
+    const t = await richSeed();
     await t.ready;
     const before = await snapshot(t);
     const kept = await fixture.kept(t);
@@ -314,8 +299,8 @@ describe("gate 2: each category's dry run is its run, bounded, idempotent, audit
       .all(real.runId);
     expect(audit).toEqual([
       {
-        trigger: "manual",
-        actor_id: "acc_marco",
+        trigger: "schedule",
+        actor_id: null,
         dry_run: 0,
         status: "succeeded",
         as_of: NOW.toISOString(),
@@ -341,7 +326,8 @@ describe("gate 2: each category's dry run is its run, bounded, idempotent, audit
 
 describe("gate 3: Durable Objects", () => {
   test("the account's Tracker, holding issues and activity, purges to nothing, and is recorded", async () => {
-    const t = richSeed();
+    const t = await richSeed();
+    await t.ready;
     expect(isEmpty(await storageReport(t.tracker.ctx.storage))).toBe(false);
     const report = await purgeInstance(t.env, "Tracker", "acc_orbit", "safety suite");
     expect(report).toMatchObject({ reason: "safety suite", tables: [], keys: 0, alarm: null });
@@ -354,8 +340,8 @@ describe("gate 3: Durable Objects", () => {
         )
         .get(),
     ).toEqual({ purge_reason: "safety suite" });
-    // Every class has the contract (conformance.test.ts) and a purge test
-    // (purge.test.ts; the Assistant in workerd: E2E durable-objects-register-and-purge).
+    // Business classes have purge coverage in purge.test.ts; the Assistant runs
+    // in workerd: E2E durable-objects-register-and-purge.
     expect(Object.keys(DURABLE_CLASSES)).toContain("Tracker");
   });
 });
@@ -363,28 +349,33 @@ describe("gate 3: Durable Objects", () => {
 // ---- authorization ------------------------------------------------------------------
 
 async function authorizationSetup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  onTestFinished(close);
   const { readFileSync } = await import("node:fs");
   const { fileURLToPath } = await import("node:url");
+  sqlite.exec("BEGIN");
   sqlite.exec(
     readFileSync(fileURLToPath(new URL("../../seed/0001_dev.sql", import.meta.url).href), "utf8"),
   );
+  sqlite.exec("COMMIT");
   sqlite.exec(
     "INSERT INTO agents (id, name, accountable_id) VALUES ('agt_marco', 'builder', 'acc_marco')",
   );
-  const env = { DB: d1(sqlite) } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/settings/retention", accountRetentionApi);
-  app.route("/api/accounts/:slug/retention/runs", accountRunsApi);
-  app.route("/api/admin/retention", siteRetentionApi);
+  app.route("/api/spaces/:space/retention", spaceRetentionApi);
+  app.route("/api/spaces/:space/retention/runs", spaceRunsApi);
+  app.route("/api/admin/retention", instanceRetentionApi);
   app.route("/api/admin/prices", pricesApi);
-  app.route("/api/accounts/:slug/usage", accountUsageApi);
-  app.route("/api/admin/usage", siteUsageApi);
+  app.route("/api/spaces/:space/usage", spaceUsageApi);
+  app.route("/api/admin/usage", instanceUsageApi);
+  app.route("/api/accounts/:person/retention", personRetentionApi);
+  app.route("/api/accounts/:person/retention/runs", personRunsApi);
+  app.route("/api/accounts/:slug/usage", personUsageApi);
   const token = async (user: string, agent?: string) =>
     (await issueToken(env.DB, user, `t-${Math.random()}`, "write", undefined, agent)).secret;
   const tokens = {
@@ -439,7 +430,7 @@ async function authorizationSetup() {
 
 const PERSONAS = ["outsider", "member", "agent", "owner", "siteAdmin"] as const;
 type Persona = (typeof PERSONAS)[number];
-const ORG = "/api/accounts/orbit";
+const ORG = "/api/spaces/orbit";
 
 /** Each route: the status per persona; a write's success may store, a refusal never. */
 const ROUTES: {
@@ -452,32 +443,32 @@ const ROUTES: {
   // CORE-210: an account's retention is its administrators' (members 403).
   {
     method: "GET",
-    path: `${ORG}/settings/retention`,
-    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 200 },
+    path: `${ORG}/retention`,
+    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 404 },
   },
   {
     method: "PATCH",
-    path: `${ORG}/settings/retention`,
+    path: `${ORG}/retention`,
     body: { categories: { "ci-logs": { enabled: true } } },
-    expect: { outsider: 404, member: 403, agent: 403, owner: 200, siteAdmin: 200 },
+    expect: { outsider: 404, member: 403, agent: 403, owner: 200, siteAdmin: 404 },
     write: true,
   },
   {
     method: "POST",
     path: `${ORG}/retention/runs`,
     body: { dryRun: true, categories: ["preview-records"] },
-    expect: { outsider: 404, member: 403, agent: 403, owner: 202, siteAdmin: 202 },
+    expect: { outsider: 404, member: 403, agent: 403, owner: 202, siteAdmin: 404 },
     write: true,
   },
   {
     method: "GET",
     path: `${ORG}/retention/runs`,
-    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 200 },
+    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 404 },
   },
   {
     method: "GET",
     path: (runs) => `${ORG}/retention/runs/${runs.account}`,
-    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 200 },
+    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 404 },
   },
   {
     method: "GET",
@@ -511,7 +502,7 @@ const ROUTES: {
   {
     method: "GET",
     path: `${ORG}/usage`,
-    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 200 },
+    expect: { outsider: 404, member: 403, agent: 200, owner: 200, siteAdmin: 404 },
   },
   {
     method: "GET",
@@ -545,6 +536,15 @@ const ROUTES: {
 ];
 
 describe("authorization", () => {
+  test("Organization ownership does not grant private Space retention or personal usage", async () => {
+    const t = await authorizationSetup();
+    expect(await t.call("owner", "GET", "/api/spaces/orbit-research/retention")).toBe(404);
+    expect(await t.call("owner", "GET", "/api/spaces/orbit-research/usage")).toBe(404);
+    expect(await t.call("owner", "GET", "/api/accounts/marco/retention")).toBe(200);
+    expect(await t.call("owner", "GET", "/api/accounts/jun/retention")).toBe(404);
+    expect(await t.call("siteAdmin", "GET", "/api/accounts/marco/retention")).toBe(404);
+    expect(await t.call("owner", "GET", "/api/accounts/jun/usage")).toBe(404);
+  });
   test("every retention, usage and price route, for every kind of caller", async () => {
     const t = await authorizationSetup();
     // A run of each level to read back.

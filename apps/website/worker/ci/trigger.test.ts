@@ -1,11 +1,16 @@
 // Preview runs (CORE-79) through startRun, over a fake repository reader that
 // serves one ci.yml at every commit, and the variables their jobs get.
 
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { seedSpaceFixture } from "../testing/spaces.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
+import type { DatabaseSync } from "node:sqlite";
 import { jobPayload, loadJob } from "./jobs.ts";
 import { recordStepRun } from "../steps/runs.ts";
 import { timelineQuietMs } from "../timelines/quiet.ts";
+import { captureWorkAuthority } from "./admission.ts";
 import { onPush, releaseQuiet, startRun, startWorkflow } from "./trigger.ts";
 
 const files = vi.hoisted(() => ({ ciYml: "", failReads: 0 }));
@@ -49,20 +54,44 @@ jobs:
     steps: [./teardown.sh]
 `;
 
-function setup() {
+const closeControls: Array<() => void> = [];
+afterEach(() => {
+  for (const close of closeControls.splice(0)) close();
+});
+const initiatingActor = { id: "ann", credential: { kind: "token" as const, id: "ann-token" } };
+
+async function setup() {
   const sqlite = migratedDatabase();
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('org', 'org', 'orbit', 'Orbit'),
-      ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('repo', 'org', 'app', 'private', 'a', 'https://a');
-  `);
+  const registry = migratedRegistryDatabase();
+  closeControls.push(() => registry.close());
   const created: string[] = [];
   const env = {
     DB: d1(sqlite),
+    REGISTRY_DB: d1(registry),
     CI_RUNNER: "sandbox",
     CI_RUN: { create: async ({ id }: { id: string }) => void created.push(id) },
   } as unknown as Env;
+  closeControls.push(installCutoverTestControl(env).close);
+  await initializeFreshSpaceInstallation(env);
+  sqlite.exec(`INSERT INTO accounts (id,kind,slug,display_name) VALUES ('ann','user','ann','Ann')`);
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "company", slug: "company", displayName: "Orbit", kind: "company" },
+    space: { id: "org", slug: "orbit", displayName: "Orbit" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id,space_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES ('repo','org','app','private','a','https://a');
+    INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four)
+      VALUES ('ann-token','ann','CI initiator','write','ci-ann-hash','hash');
+  `);
   const repo = { id: "repo", artifacts_name: "a", artifacts_remote: "https://a" };
   const start = (options: Partial<Parameters<typeof startRun>[2]> = {}) =>
     startRun(env, repo, {
@@ -70,7 +99,7 @@ function setup() {
       commit: oid(9),
       trigger: "preview",
       preview: { action: "create", timeline: "search", checkpoint: "cp_1" },
-      actor: { id: "ann" },
+      actor: initiatingActor,
       waitUntil: () => {},
       ...options,
     });
@@ -85,9 +114,28 @@ beforeEach(() => {
   files.ciYml = OPTED_IN;
 });
 
+describe("CI initiating authority", () => {
+  test("a captured run cannot start after its credential is revoked", async () => {
+    const t = await setup();
+    const authority = await captureWorkAuthority(t.env, "repo", initiatingActor);
+    t.sqlite.prepare("DELETE FROM access_tokens WHERE id = ?").run(initiatingActor.credential.id);
+    await expect(t.start({ authority })).rejects.toThrow("credential");
+    expect(t.created).toEqual([]);
+    t.sqlite.close();
+  });
+
+  test("an organization owner without a live Space grant cannot enqueue work", async () => {
+    const t = await setup();
+    t.sqlite.exec("DELETE FROM space_grants");
+    await expect(t.start()).rejects.toThrow("authorization");
+    expect(t.created).toEqual([]);
+    t.sqlite.close();
+  });
+});
+
 describe("Workflow startup terminalization", () => {
   test("a duplicate landing start joins the existing Workflow without failing its queued gate", async () => {
-    const t = setup();
+    const t = await setup();
     files.ciYml = "jobs:\n  gate:\n    steps: [echo gate]\n";
     const failure = new Error("WorkflowError(instance.already_exists)");
     t.env.CI_RUN = {
@@ -117,7 +165,7 @@ describe("Workflow startup terminalization", () => {
   });
 
   test("a failed start preserves its error and settles only unstarted jobs", async () => {
-    const t = setup();
+    const t = await setup();
     files.ciYml = "jobs:\n  gate:\n    steps: [echo gate]\n";
     const failure = new Error("Workflow unavailable");
     t.env.CI_RUN = {
@@ -148,10 +196,11 @@ describe("Workflow startup terminalization", () => {
 
 describe("preview runs", () => {
   test("deletion fences new CI and workflow recovery but permits purge teardown", async () => {
-    const t = setup();
+    const t = await setup();
     try {
       const original = await t.start();
       if (!("runId" in original)) throw new Error(original.skipped);
+      const authority = await captureWorkAuthority(t.env, "repo", initiatingActor);
       t.created.length = 0;
       t.sqlite.exec("UPDATE repos SET deleted_at = CURRENT_TIMESTAMP WHERE id = 'repo'");
       await startWorkflow(t.env, original.runId);
@@ -169,9 +218,9 @@ describe("preview runs", () => {
       ).rejects.toThrow();
       t.sqlite
         .prepare(`INSERT INTO deployments
-        (id,repo_id,environment,timeline_slug,checkpoint_id,commit_oid,url,status)
-        VALUES(1,'repo','timeline/search','search','cp_1',?,'https://preview','expired')`)
-        .run(oid(9));
+        (id,repo_id,environment,timeline_slug,checkpoint_id,commit_oid,url,status,authority)
+        VALUES(1,'repo','timeline/search','search','cp_1',?,'https://preview','expired',?)`)
+        .run(oid(9), JSON.stringify(authority));
       const teardown = await t.start({
         preview: { action: "teardown", timeline: "search", checkpoint: "cp_1", teardownOf: 1 },
       });
@@ -185,7 +234,7 @@ describe("preview runs", () => {
     }
   });
   test("a create run records its action, timeline and checkpoint, and runs only its job", async () => {
-    const t = setup();
+    const t = await setup();
     const started = await t.start();
     if (!("runId" in started)) throw new Error(started.skipped);
     expect(t.created).toEqual([started.runId]);
@@ -214,7 +263,7 @@ describe("preview runs", () => {
   });
 
   test("a teardown runs the teardown job; a push of the same commit is a run of its own", async () => {
-    const t = setup();
+    const t = await setup();
     const teardown = await t.start({
       preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
     });
@@ -233,7 +282,7 @@ describe("preview runs", () => {
   });
 
   test("a project that doesn't opt in, or has no job for the action, gets no run", async () => {
-    const t = setup();
+    const t = await setup();
     files.ciYml = "jobs:\n  test:\n    steps: [vp test]\n";
     await t.start();
     files.ciYml = "on: preview\njobs:\n  p:\n    if: action == 'create'\n    steps: [x]\n";
@@ -247,7 +296,7 @@ describe("preview runs", () => {
   });
 
   test("jobs get the timeline, checkpoint, commit and action", async () => {
-    const t = setup();
+    const t = await setup();
     const started = await t.start({
       preview: {
         action: "create",
@@ -262,7 +311,7 @@ describe("preview runs", () => {
       t.env.DB,
       t.jobs(started.runId).find((j) => j.name === "preview")!.id,
     );
-    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "gmj_x" });
+    const payload = await jobPayload(t.env, job!, { origin: "https://gm.test", token: "gmj_x" });
     expect(payload.env).toMatchObject({
       GITMATRIX_TRIGGER: "preview",
       GITMATRIX_TIMELINE: "search",
@@ -279,8 +328,7 @@ describe("preview runs", () => {
     const push = await t.start({ trigger: "push", preview: undefined });
     if (!("runId" in push)) throw new Error(push.skipped);
     const pushed = await loadJob(t.env.DB, t.jobs(push.runId).find((j) => j.name === "test")!.id);
-    const env = (await jobPayload(t.env.DB, pushed!, { origin: "https://gm.test", token: "x" }))
-      .env;
+    const env = (await jobPayload(t.env, pushed!, { origin: "https://gm.test", token: "x" })).env;
     expect(env).toMatchObject({ GITMATRIX_TRIGGER: "push", GITMATRIX_TIMELINE: "search" });
     expect(env.GITMATRIX_CHECKPOINT).toBeUndefined();
     expect(env.GITMATRIX_PREVIEW_ACTION).toBeUndefined();
@@ -289,7 +337,7 @@ describe("preview runs", () => {
 
 describe("landing runs", () => {
   test("the gates on a landing's merge are stored as manual with their landing, and say landing", async () => {
-    const t = setup();
+    const t = await setup();
     files.ciYml = `
 jobs:
   test:
@@ -319,14 +367,14 @@ jobs:
       ["test", "pending"],
     ]);
     const job = await loadJob(t.env.DB, t.jobs(started.runId).find((j) => j.name === "gate")!.id);
-    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    const payload = await jobPayload(t.env, job!, { origin: "https://gm.test", token: "x" });
     expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
   });
 });
 
 describe("queue gates", () => {
   test("a source staging ref never starts a pipeline, including a manual request", async () => {
-    const t = setup();
+    const t = await setup();
     for (const trigger of ["push", "manual"] as const) {
       expect(
         await t.start({
@@ -341,7 +389,7 @@ describe("queue gates", () => {
   });
 
   test("a queue with no runnable landing gate is not an all-skipped success", async () => {
-    const t = setup();
+    const t = await setup();
     files.ciYml = "jobs:\n  deploy:\n    if: trigger == 'push'\n    steps: [deploy]\n";
     expect(
       await t.start({
@@ -356,7 +404,7 @@ describe("queue gates", () => {
   });
 
   test("the current queue gate cannot adopt an unrelated manual run of the same object", async () => {
-    const t = setup();
+    const t = await setup();
     files.ciYml = "jobs:\n  gate:\n    steps: [check]\n";
     const branch = `gitmatrix/landing/queue-${oid(9)}-1`;
     const manual = await t.start({ branch, trigger: "manual", preview: undefined });
@@ -373,7 +421,7 @@ describe("queue gates", () => {
       { id: expect.any(String), name: "gate", status: "pending" },
     ]);
     const job = await loadJob(t.env.DB, t.jobs("queue-gates")[0]!.id);
-    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    const payload = await jobPayload(t.env, job!, { origin: "https://gm.test", token: "x" });
     expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
     expect(payload.env.GITMATRIX_QUEUE_ID).toBe(oid(9));
     expect(payload.env.GITMATRIX_TIMELINE).toBeUndefined();
@@ -397,14 +445,14 @@ jobs:
   build:
     steps: [vp build]
 `;
-  const runs = (t: ReturnType<typeof setup>) =>
+  const runs = (t: { sqlite: DatabaseSync }) =>
     t.sqlite
       .prepare("SELECT id, ref, trigger, step, commit_oid FROM ci_runs ORDER BY number")
       .all() as { id: string; ref: string; trigger: string; step: number; commit_oid: string }[];
 
   test("a timeline push starts its push run and a step run of only the step jobs", async () => {
     files.ciYml = STEPS;
-    const t = setup();
+    const t = await setup();
     // CI has seen the repository before; main and a timeline move.
     t.sqlite.exec(`INSERT INTO ci_refs (repo_id, ref, oid) VALUES ('repo', 'main', '${oid(1)}')`);
     refs.branches = [
@@ -414,7 +462,7 @@ jobs:
     await onPush(
       t.env,
       { id: "repo", artifacts_name: "a", artifacts_remote: "https://a" },
-      { id: "ann" },
+      initiatingActor,
       () => {},
     );
     const all = runs(t);
@@ -436,23 +484,29 @@ jobs:
       ["unit", "pending"],
     ]);
     const job = await loadJob(t.env.DB, t.jobs(step.id).find((j) => j.name === "lint")!.id);
-    const env = (await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" })).env;
+    const env = (await jobPayload(t.env, job!, { origin: "https://gm.test", token: "x" })).env;
     expect(env).toMatchObject({ GITMATRIX_TRIGGER: "step", GITMATRIX_TIMELINE: "search" });
     refs.branches = [];
   });
 
   test("a work source's first push to work starts its runs; the fork's copies of canonical don't", async () => {
     files.ciYml = STEPS;
-    const t = setup();
+    const t = await setup();
     t.sqlite.exec(`
       INSERT INTO timeline_work_sources
-        (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,
+        (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,
          initial_token_revoked,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,
          fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
       VALUES ('work_search','repo','tl_search','search','org','w','https://w',1,'ready',
         'allocation','canonical','${oid(1)}','${oid(1)}','refs/heads/main',
         'canonical','${oid(1)}','${oid(1)}','refs/heads/main','2026-10-05','2026-10-05');
     `);
+    t.sqlite
+      .prepare("UPDATE timeline_work_sources SET authority = ? WHERE source_id = ?")
+      .run(
+        JSON.stringify(await captureWorkAuthority(t.env, "repo", initiatingActor)),
+        "work_search",
+      );
     // A canonical queue's same branch/OID must not suppress a physical work source.
     t.sqlite
       .prepare(
@@ -468,7 +522,7 @@ jobs:
     await onPush(
       t.env,
       { id: "repo", source_id: "work_search", artifacts_name: "w", artifacts_remote: "https://w" },
-      { id: "ann" },
+      initiatingActor,
       () => {},
     );
     expect(runs(t).map((r) => [r.ref, r.trigger, r.step, r.commit_oid])).toEqual([
@@ -478,7 +532,7 @@ jobs:
     // Its jobs name the source's timeline, though the ref is just `work` (CORE-296).
     const run = runs(t).find((r) => r.trigger === "push")!;
     const job = await loadJob(t.env.DB, t.jobs(run.id)[0]!.id);
-    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    const payload = await jobPayload(t.env, job!, { origin: "https://gm.test", token: "x" });
     expect(payload.env.GITMATRIX_TIMELINE).toBe("search");
     refs.branches = [];
   });
@@ -486,10 +540,10 @@ jobs:
   test("a push whose run start hits a transient provider error is retried, once (CORE-305)", async () => {
     files.ciYml = STEPS;
     files.failReads = 1;
-    const t = setup();
+    const t = await setup();
     refs.branches = [{ shortName: "main", oid: oid(2) }];
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    await onPush(t.env, t.repo, { id: "ann" }, () => {});
+    await onPush(t.env, t.repo, initiatingActor, () => {});
     expect(runs(t).map((r) => [r.ref, r.trigger, r.step, r.commit_oid])).toEqual([
       ["main", "push", 0, oid(2)],
     ]);
@@ -500,7 +554,7 @@ jobs:
 
   test("a step run neither answers for nor is answered by the push run of its commit", async () => {
     files.ciYml = STEPS;
-    const t = setup();
+    const t = await setup();
     const push = await t.start({ trigger: "push", preview: undefined });
     const step = await t.start({ trigger: "step", preview: undefined });
     if (!("runId" in push) || !("runId" in step)) throw new Error("both should start");
@@ -511,7 +565,7 @@ jobs:
   });
 
   test("repositories that don't opt in get no step run", async () => {
-    const t = setup();
+    const t = await setup();
     expect(await t.start({ trigger: "step", preview: undefined })).toEqual({
       skipped: `.gitmatrix/ci.yml at ${oid(9).slice(0, 12)} doesn't opt in to step runs (on: step).`,
     });
@@ -523,7 +577,7 @@ jobs:
 
   test("a finished step run leaves a test summary on its step, once", async () => {
     files.ciYml = STEPS;
-    const t = setup();
+    const t = await setup();
     const push = await t.start({ trigger: "push", preview: undefined });
     const step = await t.start({ trigger: "step", preview: undefined });
     if (!("runId" in push) || !("runId" in step)) throw new Error("both should start");
@@ -537,9 +591,9 @@ jobs:
       UPDATE ci_runs SET status = 'failed' WHERE id = '${step.runId}';
       UPDATE ci_runs SET status = 'succeeded' WHERE id = '${push.runId}';
     `);
-    expect(await recordStepRun(t.env.DB, push.runId)).toBe(false);
-    expect(await recordStepRun(t.env.DB, step.runId)).toBe(true);
-    expect(await recordStepRun(t.env.DB, step.runId)).toBe(true);
+    expect(await recordStepRun(t.env, push.runId)).toBe(false);
+    expect(await recordStepRun(t.env, step.runId)).toBe(true);
+    expect(await recordStepRun(t.env, step.runId)).toBe(true);
     const rows = t.sqlite.prepare("SELECT commit_oid, kind, data FROM step_artifacts").all() as {
       commit_oid: string;
       kind: string;
@@ -562,7 +616,7 @@ jobs:
 describe("a timeline's quiet period (CORE-238)", () => {
   const PIPE =
     "on:\n  push: {}\n  step: {}\njobs:\n  lint:\n    on: step\n    steps: [x]\n  test:\n    steps: [y]\n";
-  const runs = (t: ReturnType<typeof setup>) =>
+  const runs = (t: { sqlite: DatabaseSync }) =>
     t.sqlite
       .prepare(
         "SELECT id, number, ref, step, status, quiet_until, covered_by FROM ci_runs ORDER BY number",
@@ -579,7 +633,7 @@ describe("a timeline's quiet period (CORE-238)", () => {
 
   test("a timeline's push run waits; its step run and main's runs don't", async () => {
     files.ciYml = PIPE;
-    const t = setup();
+    const t = await setup();
     const before = Date.now();
     await t.start({ trigger: "push", preview: undefined });
     await t.start({ trigger: "step", preview: undefined });
@@ -596,7 +650,7 @@ describe("a timeline's quiet period (CORE-238)", () => {
 
   test("a newer push covers the run still waiting; a checkpoint releases the newest", async () => {
     files.ciYml = PIPE;
-    const t = setup();
+    const t = await setup();
     const events: { id: string; type: string }[] = [];
     Object.assign(t.env, {
       CI_RUN: {
@@ -620,7 +674,7 @@ describe("a timeline's quiet period (CORE-238)", () => {
 
   test("a checkpoint that beats its push's run still releases it", async () => {
     files.ciYml = PIPE;
-    const t = setup();
+    const t = await setup();
     // The bookmark CI already follows; the checkpoint of oid(3) comes first.
     t.sqlite.exec(
       `INSERT INTO ci_refs (repo_id, ref, oid) VALUES ('repo', 'timeline/search', '${oid(2)}')`,

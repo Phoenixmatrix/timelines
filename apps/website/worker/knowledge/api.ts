@@ -55,6 +55,8 @@ import { aiWork } from "../usage/ai.ts";
 import { liveTimelineSources, timelineKnowledgeSource, knowledgeRepo } from "./sources.ts";
 import { getWorkSource, resolveSource } from "../timelines/sources.ts";
 import { accessible } from "../tracker/api.ts";
+import { accessFor } from "../tracker/access.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { parseQuery } from "../search/query.ts";
 
@@ -141,9 +143,12 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
     !failedHere &&
     !current &&
     !coordination.running &&
-    !coordination.pending
+    !coordination.pending &&
+    c.get("actor") &&
+    atLeast(roleFor(row, c.get("actor") ?? null), "admin")
   ) {
-    c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
+    const authorization = await captureWorkAuthority(c.env, row.id, c.get("actor") ?? null);
+    c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id, { authorization }));
   }
   const update = coordination.update;
   // What waits for the next update (CORE-286): main's pushes since the
@@ -196,7 +201,7 @@ async function repoOrFail(c: Context<AppEnv>, needed: "read" | "write" | "admin"
         "Work-source knowledge is available through its timeline overlay and pages.",
       );
     const owned = await getWorkSource(c.env, loaded.row.id, sourceId);
-    if (!owned || owned.owner_id !== loaded.row.owner_id)
+    if (!owned || owned.space_id !== loaded.row.space_id)
       return fail(c, 404, "No such code source.");
     // Published knowledge has its own retention. Reading it needs source identity,
     // not the Git repository that its now-completed producer used.
@@ -224,9 +229,10 @@ knowledge.post("/update", async (c) => {
   if (!c.env.AI)
     return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
   if (!(await repoAiSnapshot(c.env.DB, row.id)).features.knowledge)
-    return fail(c, 409, "Knowledge generation is disabled in this account's AI settings.");
-  if (!(await notifyKnowledge(c.env, row.id, { now: true })))
-    return fail(c, 409, "Knowledge generation is disabled for this account or environment.");
+    return fail(c, 409, "Knowledge generation is disabled in this Space's AI settings.");
+  const authorization = await captureWorkAuthority(c.env, row.id, c.get("actor") ?? null);
+  if (!(await notifyKnowledge(c.env, row.id, { now: true, authorization })))
+    return fail(c, 409, "Knowledge generation is disabled for this Space or environment.");
   return c.json(await status(c, row), 202);
 });
 
@@ -237,9 +243,10 @@ knowledge.post("/rebuild", async (c) => {
   if (!c.env.AI)
     return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
   if (!(await repoAiSnapshot(c.env.DB, row.id)).features.knowledge)
-    return fail(c, 409, "Knowledge generation is disabled in this account's AI settings.");
-  if (!(await notifyKnowledge(c.env, row.id, { force: true })))
-    return fail(c, 409, "Knowledge generation is disabled for this account or environment.");
+    return fail(c, 409, "Knowledge generation is disabled in this Space's AI settings.");
+  const authorization = await captureWorkAuthority(c.env, row.id, c.get("actor") ?? null);
+  if (!(await notifyKnowledge(c.env, row.id, { force: true, authorization })))
+    return fail(c, 409, "Knowledge generation is disabled for this Space or environment.");
   return c.json(await status(c, row), 202);
 });
 
@@ -393,18 +400,31 @@ knowledge.get("/completion-evidence", async (c) => {
   if (!actor) return fail(c, 401, "Sign in to read completion evidence.");
   const query = parseQuery(c.req.query("q"));
   if (typeof query === "string") return fail(c, 400, query);
-  // Repository visibility never grants tracker access. Check membership first;
-  // the live tracker then restricts results to subscribed, unarchived workspaces.
-  const owners = await accessible(c.env.DB, actor);
+  // Repository visibility never grants tracker access. Only this repository's
+  // Space may contribute subscribed, unarchived Project evidence.
+  const spaces = (await accessible(c.env.DB, actor)).filter((space) => space.id === row.space_id);
   const results = await Promise.all(
-    owners.map(async (owner) => {
-      const result = await trackerObject(c.env, owner.id).completionEvidence(row.id, query, 31);
+    spaces.map(async (space) => {
+      const access = await accessFor(
+        c.env,
+        space,
+        actor.id,
+        actor.agent?.id ?? null,
+        false,
+        actor.credential,
+      );
+      const result = await trackerObject(c.env, space.id).completionEvidence(
+        access,
+        row.id,
+        query,
+        31,
+      );
       if (!result.ok) throw new Error(`Completion evidence unavailable: ${result.error}`);
       return result.value.map((note) => ({
         ...note,
-        trackerOwner: owner.slug,
-        trackerOwnerId: owner.id,
-        url: `/tracker/${encodeURIComponent(owner.slug)}/issues/${encodeURIComponent(note.issue.key)}#evidence-${encodeURIComponent(note.id)}`,
+        trackerSpace: space.slug,
+        trackerSpaceId: space.id,
+        url: `/tracker/${encodeURIComponent(space.slug)}/issues/${encodeURIComponent(note.issue.key)}#evidence-${encodeURIComponent(note.id)}`,
       }));
     }),
   );
@@ -413,7 +433,7 @@ knowledge.get("/completion-evidence", async (c) => {
     .sort(
       (a, b) =>
         b.createdAt.localeCompare(a.createdAt) ||
-        a.trackerOwner.localeCompare(b.trackerOwner) ||
+        a.trackerSpace.localeCompare(b.trackerSpace) ||
         a.id.localeCompare(b.id),
     );
   return c.json({
@@ -443,6 +463,9 @@ knowledge.get("/search", async (c) => {
       },
       () => embed(c.env, [query]),
     );
+    const current = await repoOrFail(c);
+    if (current instanceof Response || current.id !== row.id || current.space_id !== row.space_id)
+      throw new Error("Knowledge source access changed before the vector query.");
     const matches = await c.env.VECTORS.query(vector as number[], {
       topK: 12,
       filter: { repo: row.id, ...(kinds?.length ? { kind: { $in: kinds } } : {}) },
@@ -512,6 +535,10 @@ knowledge.get("/search", async (c) => {
   })();
 
   const [e, p, i] = await Promise.allSettled([entities, passages, index]);
+  const current = await repoOrFail(c);
+  if (current instanceof Response) return current;
+  if (current.id !== row.id || current.space_id !== row.space_id)
+    return fail(c, 404, "Repository not found.");
   for (const [name, result] of [
     ["entities", e],
     ["passages", p],
@@ -600,7 +627,7 @@ async function recheckEnded(c: Context<AppEnv>, row: RepoRow, rows: OverlayRow[]
     .slice(0, RECHECK_ENDED);
   await Promise.all(
     unsure.map(async (r) => {
-      const reason = await timelineEnd(c.env, row.owner_id, r.ref);
+      const reason = await timelineEnd(c.env, row.space_id, row.id, r.ref);
       if (!reason) return;
       r.ended_reason = reason;
       await setEndReason(c.env.DB, row.id, r.ref, reason);
@@ -684,8 +711,16 @@ async function overlaySummaries(
     };
   });
   // A bookmark pushed before overlays existed, or a missed ping: compare it now.
-  if (stale && coordination && !coordination.overlayScanPending)
-    c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
+  if (
+    stale &&
+    coordination &&
+    !coordination.overlayScanPending &&
+    c.get("actor") &&
+    atLeast(roleFor(row, c.get("actor") ?? null), "admin")
+  ) {
+    const authorization = await captureWorkAuthority(c.env, row.id, c.get("actor") ?? null);
+    c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id, { authorization }));
+  }
   return out;
 }
 
@@ -781,7 +816,7 @@ knowledge.post("/overlay/pages", async (c) => {
     return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
   const ai = await repoAiSnapshot(c.env.DB, row.id);
   if (!ai.features.knowledge || !ai.features.wiki)
-    return fail(c, 409, "Wiki generation is disabled in this account's AI settings.");
+    return fail(c, 409, "Wiki generation is disabled in this Space's AI settings.");
   const ref = overlayRef(c.req.query("ref") ?? "");
   if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
   const checkpoint = c.req.query("checkpoint");
@@ -793,6 +828,7 @@ knowledge.post("/overlay/pages", async (c) => {
   if (source.state !== "ready") return fail(c, 409, "Timeline source is read-only or unavailable.");
   if (await overlayEnded(c.env.DB, row.id, ref, source.source_id))
     return fail(c, 409, "This timeline has ended: its pages are kept read-only.");
+  const authorization = await captureWorkAuthority(c.env, row.id, c.get("actor") ?? null);
   if (checkpoint) {
     // A checkpoint's set is queued when the checkpoint is made; asking again retries a failed one.
     const [set] = await listSets(c.env.DB, row.id, ref, {
@@ -803,6 +839,7 @@ knowledge.post("/overlay/pages", async (c) => {
     if (!set) return fail(c, 404, "No pages were asked for at that checkpoint.");
     request = {
       repoId: row.id,
+      authorization,
       sourceId: source.source_id,
       ref,
       key: set.key,
@@ -826,6 +863,7 @@ knowledge.post("/overlay/pages", async (c) => {
     if (!tip) return fail(c, 404, "No such timeline bookmark.");
     request = {
       repoId: row.id,
+      authorization,
       sourceId: source.source_id,
       ref,
       key: commitKey(tip),
@@ -835,8 +873,7 @@ knowledge.post("/overlay/pages", async (c) => {
     };
   }
   const admitted = await requestPages(c.env, request);
-  if (!admitted)
-    return fail(c, 409, "Wiki generation is disabled for this account or environment.");
+  if (!admitted) return fail(c, 409, "Wiki generation is disabled for this Space or environment.");
   const [set] = await listSets(c.env.DB, row.id, ref, { key: request.key, limit: 1 });
   return c.json(set, 202);
 });

@@ -28,7 +28,7 @@ function state(c: RetentionCategory): string {
 /** One category as a Markdown list item, wrapped at 80 columns. */
 function item(c: RetentionCategory): string {
   const text = [
-    `**${c.label}** (\`${c.id}\`, ${c.scope === "site" ? "site" : "account"} scope; ${state(c)}).`,
+    `**${c.label}** (\`${c.id}\`, ${c.scope} scope; ${state(c)}).`,
     c.description,
     `${c.control === "policy" && !c.defaultEnabled ? "Defaults when enabled" : "Defaults"}: ${c.thresholds.map(threshold).join("; ")}.`,
     `Never deletes: ${c.never.map((n) => n[0]!.toLowerCase() + n.slice(1)).join("; ")}.`,
@@ -56,7 +56,7 @@ function wrap(text: string, indent: string): string {
 
 /** The generated section, markers included. */
 export function categoriesMarkdown(): string {
-  const scope = (s: "account" | "site", title: string) => [
+  const scope = (s: RetentionCategory["scope"], title: string) => [
     `**${title}**`,
     "",
     ...CATEGORIES.filter((c) => c.scope === s).map((c) => item(c)),
@@ -65,8 +65,9 @@ export function categoriesMarkdown(): string {
   return [
     START,
     "",
-    ...scope("account", "Account scope"),
-    ...scope("site", "Site scope"),
+    ...scope("space", "Space scope"),
+    ...scope("person", "Person scope"),
+    ...scope("instance", "Instance scope"),
     END,
   ].join("\n");
 }

@@ -7,17 +7,19 @@ import {
   trackerIndexLoader,
   trackerLoader,
 } from "./loaders.ts";
+import { readLegacyDefaults } from "./preferences.ts";
 
-const owners = [
+const scope = { contractVersion: 4, spaceId: "org", migrationEpoch: 1 };
+const spaces = [
   { id: "ann", slug: "ann", displayName: "Ann", canAdmin: true },
   { id: "org", slug: "orbit", displayName: "Orbit", canAdmin: false },
 ];
-function args(path: string, owner = "orbit") {
+function args(path: string, space = "orbit") {
   return {
     request: new Request(`https://example.com${path}`),
     url: new URL(`https://example.com${path}`),
-    pattern: "/tracker/:owner",
-    params: { owner },
+    pattern: "/tracker/:space",
+    params: { space },
     context: new RouterContextProvider(),
   } satisfies LoaderFunctionArgs;
 }
@@ -29,8 +31,30 @@ function reply(body: unknown, status = 200) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("tracker navigation", () => {
+  test("migrates stored legacy Project filters without broadening or rewriting ordinary words", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () =>
+        JSON.stringify({
+          ownerId: "org",
+          teamId: "team-1",
+          view: "board",
+          query:
+            'ws:shipping -workspace:archived ws:"release train" tag:workspace "workspace planning" "ws:literal"',
+        }),
+    });
+    expect(readLegacyDefaults("ann")).toEqual({
+      spaceId: "org",
+      teamId: "team-1",
+      view: "board",
+      query:
+        'project:shipping -project:archived project:"release train" tag:workspace "workspace planning" "ws:literal"',
+    });
+  });
   test("loads a direct tracker with one cancellable request and no session or repository preflight", async () => {
-    const view = { snapshot: { owner: owners[1], issues: [] }, trackers: owners };
+    const view = {
+      snapshot: { ...scope, space: spaces[1], issues: [], projects: [], teams: [] },
+      trackers: spaces,
+    };
     const fetch = reply(view);
     const input = args("/tracker/orbit");
     expect(await trackerLoader(input)).toEqual(view);
@@ -39,17 +63,12 @@ describe("tracker navigation", () => {
       "/api/tracker/orbit/view",
       expect.objectContaining({ signal: input.request.signal }),
     );
+    expect(new Headers(fetch.mock.calls[0]![1].headers).get("X-Gitmatrix-Content-Version")).toBe(
+      "4",
+    );
   });
-  test("?tl= loads a timeline's view", async () => {
-    const view = { snapshot: { owner: owners[1], issues: [] }, trackers: owners };
-    const fetch = reply(view);
-    await trackerLoader(args("/tracker/orbit?q=is%3Aopen&tl=search"));
-    expect(fetch.mock.calls[0]![0]).toBe("/api/tracker/orbit/view?timeline=search");
-    await trackerLoader(args("/tracker/orbit?tl=main"));
-    expect(fetch.mock.calls[1]![0]).toBe("/api/tracker/orbit/view");
-  });
-  test("uses the authenticated viewer's saved owner and preserves explicit URL state", async () => {
-    const fetch = reply({ viewerId: "ann", trackers: owners });
+  test("uses the authenticated viewer's saved space and preserves explicit URL state", async () => {
+    const fetch = reply({ viewerId: "ann", trackers: spaces });
     const getItem = vi
       .fn()
       .mockReturnValue(
@@ -64,21 +83,21 @@ describe("tracker navigation", () => {
     expect(fetch.mock.calls[0]![0]).toBe("/api/tracker");
   });
   test("opens the tracker whose defaults were saved on the server, over this browser's", async () => {
-    reply({ viewerId: "ann", trackers: owners, defaultOwnerId: "ann" });
+    reply({ viewerId: "ann", trackers: spaces, defaultSpaceId: "ann" });
     vi.stubGlobal("localStorage", {
-      getItem: () => JSON.stringify({ ownerId: "org", view: "list", query: "is:open", teamId: "" }),
+      getItem: () => JSON.stringify({ spaceId: "org", view: "list", query: "is:open", teamId: "" }),
     });
     const result = await trackerIndexLoader(args("/tracker")).catch((e) => e);
     expect(result.headers.get("location")).toBe("/tracker/ann");
   });
-  test("falls back to an accessible owner when a saved membership has been removed", async () => {
-    reply({ viewerId: "ann", trackers: owners });
+  test("does not select another Space when the saved Space grant has been removed", async () => {
+    reply({ viewerId: "ann", trackers: spaces });
     vi.stubGlobal("localStorage", {
       getItem: () =>
-        JSON.stringify({ ownerId: "removed", view: "list", query: "is:open", teamId: "" }),
+        JSON.stringify({ spaceId: "removed", view: "list", query: "is:open", teamId: "" }),
     });
     const result = await trackerIndexLoader(args("/tracker")).catch((e) => e);
-    expect(result.headers.get("location")).toBe("/tracker/ann");
+    expect(result).toEqual({ trackers: spaces });
   });
   test("the rail's Timelines, Release notes and Highlights open your default tracker's pages", async () => {
     for (const [loader, path, location] of [
@@ -86,15 +105,53 @@ describe("tracker navigation", () => {
       [releaseNotesIndexLoader, "/release-notes?q=fix", "/tracker/ann/releases?q=fix"],
       [highlightsIndexLoader, "/highlights", "/tracker/ann/highlights"],
     ] as const) {
-      reply({ viewerId: "ann", trackers: owners, defaultOwnerId: "ann" });
+      reply({ viewerId: "ann", trackers: spaces, defaultSpaceId: "ann" });
       vi.stubGlobal("localStorage", { getItem: () => null });
       const result = await loader(args(path)).catch((e) => e);
       expect(result.headers.get("location")).toBe(location);
     }
   });
-  test("handles an empty owner list", async () => {
+  test("handles an empty space list", async () => {
     reply({ viewerId: "ann", trackers: [] });
     expect(await trackerIndexLoader(args("/tracker"))).toEqual({ trackers: [] });
+  });
+  test("preserves timeline, source, query and evidence fragment through the default redirect", async () => {
+    reply({ viewerId: "ann", trackers: spaces, defaultSpaceId: "org" });
+    const result = await trackerIndexLoader(
+      args("/tracker?tl=release&source=source-1&q=project%3Ashipping#evidence-1"),
+    ).catch((error) => error);
+    expect(result.headers.get("location")).toBe(
+      "/tracker/orbit?tl=release&source=source-1&q=project%3Ashipping#evidence-1",
+    );
+  });
+  test("obsolete Project filter spellings fail before loading a broader tracker", async () => {
+    for (const query of ["workspace=old", "ws=old", "q=workspace%3Aold", "q=-ws%3Aold"]) {
+      const fetch = reply({});
+      await expect(trackerLoader(args(`/tracker/orbit?${query}`))).rejects.toMatchObject({
+        data: { message: expect.stringContaining("client_upgrade_required") },
+        init: { status: 400 },
+      });
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+  test("unavailable Project and Team IDs never disappear into an unfiltered query", async () => {
+    for (const filter of ["project", "team"]) {
+      reply({ snapshot: { ...scope, space: spaces[1], projects: [], teams: [] } });
+      await expect(trackerLoader(args(`/tracker/orbit?${filter}=missing`))).rejects.toMatchObject({
+        data: { message: expect.stringContaining("no broader query") },
+        init: { status: 400 },
+      });
+    }
+  });
+  test("rejects snapshots with obsolete contracts or a mismatched Space", async () => {
+    for (const patch of [
+      { contractVersion: 3 },
+      { spaceId: "other" },
+      { migrationEpoch: undefined },
+    ]) {
+      reply({ snapshot: { ...scope, ...patch, space: spaces[1] } });
+      await expect(trackerLoader(args("/tracker/orbit"))).rejects.toThrow();
+    }
   });
   for (const loader of [trackerIndexLoader, trackerLoader]) {
     test(`${loader.name} redirects an expired session with a return URL`, async () => {

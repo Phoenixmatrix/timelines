@@ -45,6 +45,7 @@ import type { Timeline, TimelineEvent } from "../../shared/timelines.ts";
 import { buildIndex, compile } from "../../shared/tracker-query.ts";
 import { all, json, tracker, type SqlDatabase } from "./sql.ts";
 import { feedFloor } from "./retention.ts";
+import { fail } from "./store.ts";
 
 const ms = (iso: string) => Date.parse(iso);
 
@@ -508,7 +509,7 @@ export interface ChronicleOptions {
   to: string;
   /** A tracker query (shared/tracker-query.ts), matched against the issues as they are now. */
   query: string;
-  /** The key of the last issue of the previous page. */
+  /** Opaque cursor bound to Space, epoch, authorization version and query. */
   cursor: string | null;
   limit: number;
   /** Include issues closed before the range and untouched in it. */
@@ -522,6 +523,7 @@ export function buildChronicle(
   sql: SqlDatabase,
   world: {
     viewerId: string;
+    authorizationVersion: number;
     snapshot: Snapshot;
     known: (id: string) => AuditActor;
   },
@@ -531,14 +533,55 @@ export function buildChronicle(
   const from = ms(options.from);
   const to = ms(options.to);
   const { snapshot } = world;
+  const scope = JSON.stringify([
+    snapshot.spaceId,
+    snapshot.migrationEpoch,
+    world.authorizationVersion,
+    world.viewerId,
+    options.from,
+    options.to,
+    options.query,
+    options.quiet,
+  ]);
+  let after: string | null = null;
+  if (options.cursor) {
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(decodeURIComponent(options.cursor));
+    } catch {
+      fail(
+        "client_upgrade_required",
+        "Refresh the Chronicle; this cursor uses an obsolete contract.",
+        409,
+      );
+    }
+    if (
+      !Array.isArray(decoded) ||
+      decoded.length !== 2 ||
+      typeof decoded[0] !== "string" ||
+      typeof decoded[1] !== "string"
+    )
+      fail(
+        "client_upgrade_required",
+        "Refresh the Chronicle; this cursor uses an obsolete contract.",
+        409,
+      );
+    if (decoded[0] !== scope)
+      fail(
+        "migration_epoch_mismatch",
+        "Chronicle scope or authorization changed; restart from the first page.",
+        409,
+      );
+    after = decoded[1];
+  }
   const serverTime = new Date(now).toISOString();
   const index = buildIndex(snapshot, serverTime);
   const query = compile(options.query, index, world.viewerId, now);
   const matching = snapshot.issues
     .filter((issue) => ms(issue.createdAt) <= to && query.matches(issue))
     .sort((a, b) => KEY_ORDER.compare(a.key, b.key));
-  const startAt = options.cursor
-    ? matching.findIndex((issue) => KEY_ORDER.compare(issue.key, options.cursor!) > 0)
+  const startAt = after
+    ? matching.findIndex((issue) => KEY_ORDER.compare(issue.key, after!) > 0)
     : 0;
   const keyOf = (id: string) => index.byId.get(id)?.key ?? null;
   const blockers = new Map<string, string[]>();
@@ -562,7 +605,7 @@ export function buildChronicle(
     }
     const more = position < page.length - 1;
     if (more && (rows.length >= options.limit || read >= CHRONICLE_EVENT_BUDGET)) {
-      next = issue.key;
+      next = encodeURIComponent(JSON.stringify([scope, issue.key]));
       break;
     }
   }

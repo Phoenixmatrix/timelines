@@ -2,6 +2,7 @@ import { cloudflare } from "@cloudflare/vite-plugin";
 import { readFileSync, watchFile, unwatchFile } from "node:fs";
 import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import type { Plugin } from "vite-plus";
 import react from "@vitejs/plugin-react";
@@ -165,6 +166,23 @@ export default defineConfig({
           maxWorkers: process.env.VITEST
             ? unitWorkers(availableParallelism(), availableMemory(), memoryReserve(process.env))
             : 1,
+          // Most tests take well under a second; on a loaded CI container a
+          // few that build migrated databases ran past Vitest's 5s default.
+          testTimeout: 20_000,
+          hookTimeout: 30_000,
+          // Transform the real Worker SDKs so platform imports use the unit
+          // aliases/mocks instead of escaping into Node's native ESM loader.
+          server: {
+            deps: {
+              inline: ["agents", "@cloudflare/ai-chat", "@cloudflare/codemode"],
+            },
+          },
+          alias: [
+            {
+              find: /^cloudflare:workers$/,
+              replacement: fileURLToPath(new URL("./worker/testing/runtime.ts", import.meta.url)),
+            },
+          ],
           include: [
             "worker/**/*.test.ts",
             "registry/**/*.test.ts",
@@ -187,7 +205,8 @@ export default defineConfig({
           include: ["src/**/*.browser.test.tsx"],
           // Pages settle in well under a second; a missing element fails in 5s.
           expect: { poll: { timeout: 5_000 } },
-          testTimeout: 30_000,
+          // Long walks through a page ran past 30s on a loaded CI container.
+          testTimeout: 90_000,
           browser: {
             enabled: true,
             // Chromium's headless shell, which `vp run agent setup` and CI install.

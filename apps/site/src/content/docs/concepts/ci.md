@@ -72,7 +72,7 @@ gm runs rerun 12
 gm runs cancel 12
 ```
 
-`gm runs wait` exits non-zero and names the failing job when a run fails. It gives up after `--timeout` seconds (default 1800). All `gm runs` commands take `-R owner/name` to act on another repository.
+`gm runs wait` exits non-zero and names the failing job when a run fails. It gives up after `--timeout` seconds (default 1800). All `gm runs` commands take `-R space/name` to act on another repository. The locator uses the repository's globally unique Space handle, not an Account handle or Organization slug.
 
 The repository's CI tab in the web app shows the same runs with live logs.
 

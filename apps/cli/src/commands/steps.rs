@@ -640,7 +640,7 @@ pub fn upload_pending(ctx: &Ctx, config: &Config, repo: &str, ws: &Workspace) ->
     result
 }
 
-/// The repository's owner/name on the server, from origin.
+/// The repository's space/name on the server, from origin.
 pub fn repo_slug(ctx: &Ctx) -> Result<String> {
     super::server::current_repo(ctx)
 }

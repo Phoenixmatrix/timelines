@@ -6,7 +6,7 @@
 //   is:ready is:waiting is:not_ready is:human_only is:blocked is:container is:claimed is:leased
 //   is:open is:closed   (is:container: To do with open sub-issues, CORE-108)
 //   status:backlog|todo|in_progress|done|done_in_timeline|canceled
-//   team:CORE  ws:packages  assignee:jun|me|none  tag:perf  type:bug  p:1
+//   team:CORE  project:packages  assignee:jun|me|none  tag:perf  type:bug  p:1
 //   (tag: is the issue's tags from the tracker's tag catalog; label: still works)
 //   since:7d until:2026-09-01   (last activity: updatedAt)
 //   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
@@ -109,7 +109,7 @@ export interface IssueIndex {
   /** For leased issues: the ancestor whose active lease covers them. */
   leasedBy: Map<string, Issue>;
   teamKey: Map<string, string>;
-  workspaceSlug: Map<string, string>;
+  projectSlug: Map<string, string>;
   memberSlug: Map<string, string>;
   memberName: Map<string, string>;
   agentIds: Set<string>;
@@ -242,7 +242,7 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     state,
     leasedBy,
     teamKey: new Map(snapshot.teams.map((t) => [t.id, t.key])),
-    workspaceSlug: new Map(snapshot.workspaces.map((w) => [w.id, w.slug])),
+    projectSlug: new Map(snapshot.projects.map((w) => [w.id, w.slug])),
     memberSlug: new Map(snapshot.members.map((m) => [m.id, m.slug])),
     memberName: new Map([
       ...snapshot.members.map((m): [string, string] => [m.id, m.displayName]),
@@ -260,7 +260,7 @@ export const QUERY_KEYS = [
   "is",
   "status",
   "team",
-  "ws",
+  "project",
   "assignee",
   "tag",
   "type",
@@ -276,7 +276,6 @@ export const QUERY_KEYS = [
 export type QueryKey = (typeof QUERY_KEYS)[number];
 /** Other spellings of a key; `label:` is the old name of `tag:` (CORE-271). */
 export const QUERY_ALIASES: Record<string, QueryKey> = {
-  workspace: "ws",
   priority: "p",
   state: "is",
   owner: "assignee",
@@ -285,9 +284,16 @@ export const QUERY_ALIASES: Record<string, QueryKey> = {
   tags: "tag",
   doneby: "done-by",
 };
+export class TrackerQueryUpgradeError extends Error {
+  readonly code = "client_upgrade_required";
+  constructor() {
+    super("Replace legacy workspace filters with project: and refresh the saved query.");
+  }
+}
 /** The key a written key means, aliases included; undefined when it isn't one. */
 export function queryKey(name: string): QueryKey | undefined {
   const lower = name.toLowerCase();
+  if (lower === "workspace" || lower === "ws") throw new TrackerQueryUpgradeError();
   return (QUERY_KEYS as readonly string[]).includes(lower)
     ? (lower as QueryKey)
     : QUERY_ALIASES[lower];
@@ -400,8 +406,8 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
       return (i) => i.status === v;
     case "team":
       return (i) => index.teamKey.get(i.teamId)?.toLowerCase() === v;
-    case "ws":
-      return (i) => i.workspaceIds.some((w) => index.workspaceSlug.get(w)?.toLowerCase() === v);
+    case "project":
+      return (i) => i.projectIds.some((w) => index.projectSlug.get(w)?.toLowerCase() === v);
     case "assignee":
       if (v === "none") return (i) => i.assigneeId === null;
       if (v === "me") return (i) => i.assigneeId === viewerId;
@@ -728,7 +734,7 @@ export interface FacetValue {
 export interface Facets {
   state: FacetValue[];
   team: FacetValue[];
-  ws: FacetValue[];
+  project: FacetValue[];
   assignee: FacetValue[];
   type: FacetValue[];
   tag: FacetValue[];
@@ -767,7 +773,7 @@ export function facetsOf(
   };
   const states = count<IssueState>(["is", "status"], (i) => [index.state.get(i.id)!]);
   const teams = count<string>(["team"], (i) => [i.teamId]);
-  const wss = count<string>(["ws"], (i) => i.workspaceIds);
+  const projects = count<string>(["project"], (i) => i.projectIds);
   const people = count<string>(["assignee"], (i) => [i.assigneeId ?? ""]);
   const kinds = count<string>(["type"], (i) => [i.type]);
   const tags = count<string>(["tag"], (i) => i.labels);
@@ -784,10 +790,10 @@ export function facetsOf(
         count: n,
       })),
     ),
-    ws: sorted(
-      [...wss].map(([id, n]) => ({
-        token: { key: "ws" as const, value: (index.workspaceSlug.get(id) ?? id).toLowerCase() },
-        label: snapshot.workspaces.find((w) => w.id === id)?.name ?? id,
+    project: sorted(
+      [...projects].map(([id, n]) => ({
+        token: { key: "project" as const, value: (index.projectSlug.get(id) ?? id).toLowerCase() },
+        label: snapshot.projects.find((w) => w.id === id)?.name ?? id,
         count: n,
       })),
     ),

@@ -14,7 +14,7 @@ const timeline = (slug: string, fields: Partial<Timeline> = {}): Timeline => ({
   experimental: false,
   parentId: null,
   forkPoint: { commits: {}, trackerCursor: 0 },
-  repos: [{ id: "app", owner: "orbit", name: "app", bookmark: `timeline/${slug}` }],
+  repos: [{ id: "app", space: "orbit", name: "app", bookmark: `timeline/${slug}` }],
   status: "active",
   accountableId: "ann",
   startedBy: "ann",
@@ -56,7 +56,7 @@ function data() {
       refUpdateId: null,
     },
   ];
-  return { timelines, events, actors: {}, workspaces: {} };
+  return { timelines, events, actors: {}, projects: {} };
 }
 
 const draw = (selected: string | null) => {

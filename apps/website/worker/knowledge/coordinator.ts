@@ -3,7 +3,7 @@
 // Every push pings it. A push that moves main marks Knowledge pending (CORE-286):
 // it records main's new head, how many pushes are waiting and when the first
 // and last arrived. One update then runs, asynchronously, at the latest head
-// once pushes have paused for the account's quiet period (10 minutes by
+// once pushes have paused for the Space's quiet period (10 minutes by
 // default), and never later than its longest wait after the first pending
 // push (30 minutes by default). An admin can ask for it now. The first build
 // of a repository, an explicit full rebuild and a watchdog retry start right
@@ -67,6 +67,10 @@ import {
   type Retirement,
 } from "../durable/contract.ts";
 import { durableStub } from "../durable/registry.ts";
+import { withCutoverAdmission, withCutoverAlarmAdmission } from "../durable/cutover-admission.ts";
+import { reportCutoverRuntime } from "../durable/cutover-runtime.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
+import { resolveWorkAuthority } from "../ci/admission.ts";
 
 /** Quiet period after the last push before looking at the refs (overlays, pending main). */
 const DEBOUNCE_MS = 1_500;
@@ -101,6 +105,7 @@ function instanceEnded(status: { status: string } | null): boolean {
 
 interface Running {
   buildId: string;
+  authorization: WorkAuthority;
   /** The push sequence number the build covers (builds started before CORE-286). */
   seq?: number;
   startedAt: number;
@@ -126,7 +131,7 @@ export interface PendingUpdate {
 }
 
 export interface CoordinatorStatus {
-  running: (Running & { phase?: string }) | null;
+  running: (Omit<Running, "authorization"> & { phase?: string }) | null;
   /** Pushes not yet covered by a finished or running build. */
   pending: boolean;
   /** What is pending, and when it will be built (CORE-286). */
@@ -143,6 +148,8 @@ export interface CoordinatorStatus {
 
 interface State {
   repoId: string | null;
+  authorization?: WorkAuthority;
+  overlayAuthorization?: WorkAuthority;
   /** Pings received, and those the refs have been looked at for. */
   seq: number;
   builtSeq: number;
@@ -166,7 +173,14 @@ interface State {
     string,
     OverlayState & {
       policy?: KnowledgePolicy;
-      retry?: { commit: string; base: string | null; sourceId?: string; policy: KnowledgePolicy };
+      authorization?: WorkAuthority;
+      retry?: {
+        commit: string;
+        base: string | null;
+        sourceId?: string;
+        policy: KnowledgePolicy;
+        authorization?: WorkAuthority;
+      };
     }
   >;
   /** Timeline wiki page sets being written, by build id. */
@@ -192,6 +206,10 @@ const INITIAL: State = {
 };
 
 export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeable {
+  cutoverRuntime(runId: string) {
+    return reportCutoverRuntime(this.env, runId, "knowledge-coordinator");
+  }
+
   async #state(): Promise<State> {
     return { ...INITIAL, ...(await this.ctx.storage.get<State>("state")) };
   }
@@ -205,50 +223,66 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
    * rebuild). `force` asks for a full rebuild now; `now` for the pending
    * update now (CORE-286), without waiting for its settle window.
    */
-  async notify(repoId: string, options: { force?: boolean; now?: boolean } = {}): Promise<void> {
-    const state = await this.#state();
-    const now = Date.now();
-    state.repoId = repoId;
-    state.seq += 1;
-    state.force ||= Boolean(options.force);
-    state.now ||= Boolean(options.now);
-    state.scan = true;
-    state.pagesDue = true;
-    state.burstStartedAt ??= now;
-    await this.#save(state);
-    // Even while a build runs: timeline overlays don't wait for main's build.
-    const due = Math.min(now + DEBOUNCE_MS, state.burstStartedAt + MAX_WAIT_MS);
-    const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+  async notify(
+    repoId: string,
+    options: { force?: boolean; now?: boolean; authorization: WorkAuthority },
+  ): Promise<void> {
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      await resolveWorkAuthority(this.env, options.authorization, repoId);
+      const state = await this.#state();
+      const now = Date.now();
+      state.repoId = repoId;
+      state.authorization = options.authorization;
+      state.overlayAuthorization = options.authorization;
+      state.seq += 1;
+      state.force ||= Boolean(options.force);
+      state.now ||= Boolean(options.now);
+      state.scan = true;
+      state.pagesDue = true;
+      state.burstStartedAt ??= now;
+      await this.#save(state);
+      // Even while a build runs: timeline overlays don't wait for main's build.
+      const due = Math.min(now + DEBOUNCE_MS, state.burstStartedAt + MAX_WAIT_MS);
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+    });
   }
 
   /** A checkpoint wants these bookmarks' overlays now, quiet period or not (CORE-238). */
-  async overlayNow(repoId: string, refs: string[]): Promise<void> {
-    const state = await this.#state();
-    state.repoId = repoId;
-    state.scan = true;
-    state.overlaysNow = [...new Set([...(state.overlaysNow ?? []), ...refs])];
-    await this.#save(state);
-    const due = Date.now() + 250;
-    const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+  async overlayNow(repoId: string, refs: string[], authorization: WorkAuthority): Promise<void> {
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      await resolveWorkAuthority(this.env, authorization, repoId);
+      const state = await this.#state();
+      state.repoId = repoId;
+      state.overlayAuthorization = authorization;
+      state.scan = true;
+      state.overlaysNow = [...new Set([...(state.overlaysNow ?? []), ...refs])];
+      await this.#save(state);
+      const due = Date.now() + 250;
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+    });
   }
 
   /** A timeline page set was queued in D1 (a checkpoint, or someone asked). */
   async pagesRequested(repoId: string): Promise<void> {
-    const state = await this.#state();
-    state.repoId = repoId;
-    state.pagesDue = true;
-    await this.#save(state);
-    const due = Date.now() + 250;
-    const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      const state = await this.#state();
+      state.repoId = repoId;
+      state.pagesDue = true;
+      await this.#save(state);
+      const due = Date.now() + 250;
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+    });
   }
 
   async alarm(): Promise<void> {
     // The alarm reads state, then waits on D1, the ref listing and Workflows
     // before saving it: a push arriving meanwhile must not be overwritten.
-    await this.ctx.blockConcurrencyWhile(() => this.#alarm());
+    await withCutoverAlarmAdmission(this.env, "knowledge-coordinator", this.ctx.storage, () =>
+      this.ctx.blockConcurrencyWhile(() => this.#alarm()),
+    );
   }
 
   async #alarm(): Promise<void> {
@@ -268,12 +302,12 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       state.scan;
     let refs: RepoRefs | null = null;
     let indexed: string | null = null;
-    let ownerId: string | null = null;
+    let spaceId: string | null = null;
     if (look) {
       const [repo, kgState] = await Promise.all([
         db(this.env.DB)
           .selectFrom("repos")
-          .select(["artifacts_name", "artifacts_remote", "owner_id"])
+          .select(["artifacts_name", "artifacts_remote", "space_id"])
           .where("id", "=", state.repoId)
           .where("deleted_at", "is", null)
           .executeTakeFirst(),
@@ -284,7 +318,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
           .executeTakeFirst(),
       ]);
       indexed = kgState?.indexed_commit ?? null;
-      ownerId = repo?.owner_id ?? null;
+      spaceId = repo?.space_id ?? null;
       refs = repo
         ? await listRefs(this.env, repo.artifacts_name, repo.artifacts_remote).catch((error) => {
             console.error("Knowledge: listing refs failed", { repo: state.repoId, error });
@@ -310,8 +344,8 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     state.burstStartedAt = null;
     // Without a ref listing the scan waits for the next ping.
     let quietWake: number | null = null;
-    if (state.scan && refs && ownerId)
-      quietWake = await this.#scanOverlays(state, indexed, ownerId);
+    if (state.scan && refs && spaceId)
+      quietWake = await this.#scanOverlays(state, indexed, spaceId);
     await this.#watchPages(state);
     if (state.pagesDue) await this.#startPages(state);
     await this.#save(state);
@@ -370,6 +404,9 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       if (!pending) state.now = false;
       return;
     }
+    const authorization = retry ? retry.authorization : state.authorization;
+    if (!authorization) throw new Error("Queued Knowledge work requires migration reconciliation");
+    await resolveWorkAuthority(this.env, authorization, state.repoId!);
     const policy =
       retry?.policy ??
       (retry ? LEGACY_KNOWLEDGE_POLICY : await knowledgePolicy(this.env, state.repoId!));
@@ -384,6 +421,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     const commit = retry?.commit ?? pending?.head ?? refs?.head ?? undefined;
     state.running = {
       buildId,
+      authorization,
       force,
       policy,
       commit,
@@ -404,6 +442,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       params: {
         repoId: state.repoId!,
         buildId,
+        authorization,
         force,
         policy,
         commit,
@@ -439,17 +478,23 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
   // page sets run in Workflows that report back by id; purge forgets them
   // (their reports find no state and start nothing), retire waits for them.
   async purge(reason: string): Promise<PurgeReport> {
-    const report = await clearStorage(this.ctx.storage, reason);
+    const report = await withCutoverAdmission(this.env, "knowledge-coordinator", () =>
+      clearStorage(this.ctx.storage, reason),
+    );
     resetSoon(this.ctx);
     return report;
   }
 
   retire(reason: string, name: string, delayMs?: number): Promise<void> {
-    return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
+    return withCutoverAdmission(this.env, "knowledge-coordinator", () =>
+      scheduleRetirement(this.ctx.storage, reason, name, delayMs),
+    );
   }
 
   storageReport() {
-    return storageReport(this.ctx.storage);
+    return withCutoverAdmission(this.env, "knowledge-coordinator", () =>
+      storageReport(this.ctx.storage),
+    );
   }
 
   #busy(state: State) {
@@ -495,6 +540,10 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     const queued = await queuedSets(this.env.DB, repoId);
     const plan = schedulePages(Object.values(state.pages), queued);
     for (const set of plan.start) {
+      await resolveWorkAuthority(this.env, set.authorization, repoId);
+      const source = await timelineKnowledgeSource(this.env, repoId, set.ref);
+      if (!source || source.source_id !== set.sourceId || source.state !== "ready")
+        throw new Error("Queued page source is no longer authorized");
       const policy = await knowledgePolicy(this.env, repoId);
       if (!policy.ai.features.knowledge || !policy.ai.features.wiki) {
         state.pagesDue = false;
@@ -502,14 +551,26 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       }
       const buildId = crypto.randomUUID();
       if (!(await claimSet(this.env.DB, { repoId, ...set }, buildId, policy))) continue;
-      state.pages[buildId] = { buildId, ...set, startedAt: Date.now() };
+      state.pages[buildId] = {
+        buildId,
+        ref: set.ref,
+        key: set.key,
+        sourceId: set.sourceId,
+        startedAt: Date.now(),
+      };
       await this.#save(state);
       await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
       // Persist admission before create: an ambiguous provider response cannot
       // turn a possibly-running producer back into unclaimed queued work.
       await this.env.KNOWLEDGE_BUILD.create({
         id: buildId,
-        params: { repoId, buildId, pages: set, policy },
+        params: {
+          repoId,
+          buildId,
+          pages: { ref: set.ref, key: set.key, sourceId: set.sourceId },
+          policy,
+          authorization: set.authorization,
+        },
       });
     }
     // The rest start as these finish (pagesFinished), or at the next wake-up.
@@ -612,6 +673,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
           sourceId: run.sourceId,
           base: run.base,
           policy: overlay.policy ?? LEGACY_KNOWLEDGE_POLICY,
+          authorization: overlay.authorization,
         };
     } else {
       overlay.retries = 0;
@@ -629,7 +691,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
   async #scanOverlays(
     state: State,
     indexed: string | null,
-    ownerId: string,
+    spaceId: string,
   ): Promise<number | null> {
     const repoId = state.repoId!;
     const sources = await liveTimelineSources(this.env, repoId);
@@ -647,7 +709,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
         if (!tips.has(ref) || state.overlays[ref]) continue;
         if (reason === "ended") {
           // The tracker never said it ended: it may have since, or it goes on.
-          const ended = await timelineEnd(this.env, ownerId, ref);
+          const ended = await timelineEnd(this.env, spaceId, repoId, ref);
           if (!ended) {
             await reopenOverlay(this.env.DB, repoId, ref, sources.get(ref)!.sourceId);
             continue;
@@ -672,7 +734,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     const reasons = new Map<string, KnowledgeOverlayEndReason>();
     for (const ref of scan.gone) {
       delete state.overlays[ref];
-      reasons.set(ref, (await timelineEnd(this.env, ownerId, ref)) ?? "ended");
+      reasons.set(ref, (await timelineEnd(this.env, spaceId, repoId, ref)) ?? "ended");
     }
     await endOverlays(this.env.DB, repoId, reasons);
     // Over the limit: picked up when one of those in flight ends. In the quiet
@@ -682,9 +744,16 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       const previous = state.overlays[ref];
       const retry = previous?.retry;
       const policy = retry?.policy ?? (await knowledgePolicy(this.env, repoId));
+      const authorization = retry ? retry.authorization : state.overlayAuthorization;
+      if (!authorization)
+        throw new Error("Queued Knowledge overlay requires migration reconciliation");
+      await resolveWorkAuthority(this.env, authorization, repoId);
       if (!policy.ai.features.knowledge) continue;
       const buildId = crypto.randomUUID();
-      const sourceId = sources.get(ref)!.sourceId;
+      const currentSourceId = sources.get(ref)!.sourceId;
+      const sourceId = retry ? retry.sourceId : currentSourceId;
+      if (!sourceId || sourceId !== currentSourceId)
+        throw new Error("Queued Knowledge overlay source identity changed");
       await pinSourceRoot(this.env, {
         repoId,
         sourceId,
@@ -702,6 +771,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
           startedAt: Date.now(),
         },
         policy,
+        authorization,
         retry: undefined,
       };
       await this.#save(state);
@@ -711,6 +781,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
         params: {
           repoId,
           buildId,
+          authorization,
           overlay: {
             ref,
             sourceId,
@@ -726,37 +797,41 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
 
   /** Called by the Workflow when a build ends. */
   async finished(buildId: string, ok: boolean, error: string | null): Promise<void> {
-    const state = await this.#state();
-    if (state.running?.buildId !== buildId) return;
-    state.running = null;
-    state.retries = 0;
-    state.lastError = ok ? null : error;
-    state.lastFinishedAt = Date.now();
-    // Main's indexed commit moved: overlays are measured against it, and
-    // page sets that waited for main's first graph can start.
-    if (ok) {
-      state.scan = true;
-      state.pagesDue = true;
-    }
-    await this.#save(state);
-    // Pushes that arrived during the build: schedule their update (the alarm
-    // applies the settle windows), and compare timelines with the new graph.
-    if (state.seq > state.builtSeq || state.scan || state.update || state.now)
-      await this.ctx.storage.setAlarm(Date.now() + 250);
-    // A retiring coordinator's alarm purges it once this was the last work.
-    else if (await pendingRetirement(this.ctx.storage))
-      await this.ctx.storage.setAlarm(Date.now() + 250);
-    else if (!this.#busy(state)) await this.ctx.storage.deleteAlarm();
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      const state = await this.#state();
+      if (state.running?.buildId !== buildId) return;
+      state.running = null;
+      state.retries = 0;
+      state.lastError = ok ? null : error;
+      state.lastFinishedAt = Date.now();
+      // Main's indexed commit moved: overlays are measured against it, and
+      // page sets that waited for main's first graph can start.
+      if (ok) {
+        state.scan = true;
+        state.pagesDue = true;
+      }
+      await this.#save(state);
+      // Pushes that arrived during the build: schedule their update (the alarm
+      // applies the settle windows), and compare timelines with the new graph.
+      if (state.seq > state.builtSeq || state.scan || state.update || state.now)
+        await this.ctx.storage.setAlarm(Date.now() + 250);
+      // A retiring coordinator's alarm purges it once this was the last work.
+      else if (await pendingRetirement(this.ctx.storage))
+        await this.ctx.storage.setAlarm(Date.now() + 250);
+      else if (!this.#busy(state)) await this.ctx.storage.deleteAlarm();
+    });
   }
 
   /** Called by the Workflow when a page set ends, however it ended. */
   async pagesFinished(buildId: string): Promise<void> {
-    const state = await this.#state();
-    if (!state.pages[buildId]) return;
-    delete state.pages[buildId];
-    state.pagesDue = true;
-    await this.#save(state);
-    await this.ctx.storage.setAlarm(Date.now() + 250);
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      const state = await this.#state();
+      if (!state.pages[buildId]) return;
+      delete state.pages[buildId];
+      state.pagesDue = true;
+      await this.#save(state);
+      await this.ctx.storage.setAlarm(Date.now() + 250);
+    });
   }
 
   /** Called by the Workflow when an overlay ends; `base` is main's commit it measured against. */
@@ -767,34 +842,44 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     error: string | null,
     base: string | null,
   ): Promise<void> {
-    const state = await this.#state();
-    const overlay = state.overlays[ref];
-    if (overlay?.running?.buildId !== buildId) return;
-    const covered = { commit: overlay.running.commit, base: ok ? base : overlay.running.base };
-    this.#overlayEnded(state, overlay, covered, ok ? null : (error ?? "Overlay failed"));
-    await this.#save(state);
-    await this.ctx.storage.setAlarm(Date.now() + 250);
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      const state = await this.#state();
+      const overlay = state.overlays[ref];
+      if (overlay?.running?.buildId !== buildId) return;
+      const covered = { commit: overlay.running.commit, base: ok ? base : overlay.running.base };
+      this.#overlayEnded(state, overlay, covered, ok ? null : (error ?? "Overlay failed"));
+      await this.#save(state);
+      await this.ctx.storage.setAlarm(Date.now() + 250);
+    });
   }
 
   async status(): Promise<CoordinatorStatus> {
-    const state = await this.#state();
-    return {
-      running: state.running
-        ? { ...state.running, ai: state.running.policy?.ai ?? LEGACY_KNOWLEDGE_POLICY.ai }
-        : null,
-      pending: (Boolean(state.update) || state.seq > state.builtSeq) && !state.running,
-      update: state.update ? { ...state.update, now: Boolean(state.now) } : null,
-      lastError: state.lastError,
-      lastFinishedAt: state.lastFinishedAt,
-      overlays: Object.fromEntries(
-        Object.entries(state.overlays).map(([ref, o]) => [
-          ref,
-          { running: o.running, lastError: o.lastError },
-        ]),
-      ),
-      overlayScanPending: state.scan,
-      pages: Object.values(state.pages),
-    };
+    return withCutoverAdmission(this.env, "knowledge-coordinator", async () => {
+      const state = await this.#state();
+      const running = state.running
+        ? (({ authorization, ...run }) => {
+            void authorization;
+            return run;
+          })(state.running)
+        : null;
+      return {
+        running: running
+          ? { ...running, ai: running.policy?.ai ?? LEGACY_KNOWLEDGE_POLICY.ai }
+          : null,
+        pending: (Boolean(state.update) || state.seq > state.builtSeq) && !state.running,
+        update: state.update ? { ...state.update, now: Boolean(state.now) } : null,
+        lastError: state.lastError,
+        lastFinishedAt: state.lastFinishedAt,
+        overlays: Object.fromEntries(
+          Object.entries(state.overlays).map(([ref, o]) => [
+            ref,
+            { running: o.running, lastError: o.lastError },
+          ]),
+        ),
+        overlayScanPending: state.scan,
+        pages: Object.values(state.pages),
+      };
+    });
   }
 }
 
@@ -807,25 +892,34 @@ export function coordinator(env: Env, repoId: string): DurableObjectStub<Knowled
 export async function notifyKnowledge(
   env: Env,
   repoId: string,
-  options: { force?: boolean; now?: boolean } = {},
+  options: { force?: boolean; now?: boolean; authorization: WorkAuthority },
 ) {
   // Automatic non-AI agent environments omit provider bindings altogether,
   // and a preview never starts the (production) KnowledgeBuild Workflow.
   if (!env.AI || !productionOnly(env, "workflow", "a knowledge build")) return false;
-  if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
-  await coordinator(env, repoId).notify(repoId, options);
-  return true;
+  return withCutoverAdmission(env, "knowledge-coordinator", async () => {
+    if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
+    await coordinator(env, repoId).notify(repoId, options);
+    return true;
+  });
 }
 
 /**
  * A checkpoint: compute these timeline bookmarks' overlays now, without
  * waiting for the quiet period (CORE-238). Respects the automatic-AI settings.
  */
-export async function overlayNow(env: Env, repoId: string, refs: string[]) {
+export async function overlayNow(
+  env: Env,
+  repoId: string,
+  refs: string[],
+  authorization: WorkAuthority,
+) {
   if (!env.AI || !productionOnly(env, "workflow", "a knowledge overlay")) return false;
-  if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
-  await coordinator(env, repoId).overlayNow(repoId, refs);
-  return true;
+  return withCutoverAdmission(env, "knowledge-coordinator", async () => {
+    if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
+    await coordinator(env, repoId).overlayNow(repoId, refs, authorization);
+    return true;
+  });
 }
 
 /**
@@ -835,17 +929,20 @@ export async function overlayNow(env: Env, repoId: string, refs: string[]) {
  */
 export async function requestPages(env: Env, request: PageRequest) {
   if (!env.AI || !productionOnly(env, "workflow", "wiki pages")) return null;
-  const ai = await repoAiSnapshot(env.DB, request.repoId);
-  if (!ai.features.knowledge || !ai.features.wiki) return null;
-  const source = await timelineKnowledgeSource(env, request.repoId, request.ref);
-  if (!source || source.source_id !== request.sourceId)
-    throw new Error("Timeline source migration required or source mismatch");
-  if (source.state !== "ready") return { status: "ended" as const, queued: false };
-  if (!(await knowledgeRepo(env, request.repoId, source.source_id))) return null;
-  const result = await queueSet(env.DB, request);
-  if (result.status === "queued")
-    await coordinator(env, request.repoId).pagesRequested(request.repoId);
-  return result;
+  return withCutoverAdmission(env, "knowledge-coordinator", async () => {
+    await resolveWorkAuthority(env, request.authorization, request.repoId);
+    const ai = await repoAiSnapshot(env.DB, request.repoId);
+    if (!ai.features.knowledge || !ai.features.wiki) return null;
+    const source = await timelineKnowledgeSource(env, request.repoId, request.ref);
+    if (!source || source.source_id !== request.sourceId)
+      throw new Error("Timeline source migration required or source mismatch");
+    if (source.state !== "ready") return { status: "ended" as const, queued: false };
+    if (!(await knowledgeRepo(env, request.repoId, source.source_id))) return null;
+    const result = await queueSet(env.DB, request);
+    if (result.status === "queued")
+      await coordinator(env, request.repoId).pagesRequested(request.repoId);
+    return result;
+  });
 }
 
 /**
@@ -858,6 +955,7 @@ export async function requestCheckpointPages(
   checkpoint: Checkpoint,
   slug: string,
   requestedBy: string | null,
+  authorization: WorkAuthority,
 ) {
   const ref = `refs/heads/timeline/${slug}`;
   await Promise.all(
@@ -870,6 +968,7 @@ export async function requestCheckpointPages(
         commit: repo.commit,
         checkpoint: { id: checkpoint.id, number: checkpoint.number },
         requestedBy,
+        authorization,
       }).catch((error) =>
         console.error("Knowledge: queueing a checkpoint's pages failed", {
           checkpoint: checkpoint.id,

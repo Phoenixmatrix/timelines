@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { makeHarness, type Harness } from "../../testing/harness.ts";
 
 describe("generic remote and virtual repositories", () => {
@@ -9,7 +8,6 @@ describe("generic remote and virtual repositories", () => {
   const upstreamHits: string[] = [];
 
   beforeEach(async () => {
-    invalidateMembers();
     upstreamHits.length = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -77,7 +75,7 @@ describe("generic remote and virtual repositories", () => {
         config: { defaultDeployRepo: "local", pinnedNamespaces: ["dist/**"] },
       }),
     });
-    invalidateMembers();
+
     expect((await h.request("/generic/all/dist/tool.tgz")).status).toBe(404);
     expect(upstreamHits).toEqual([]);
   });

@@ -69,21 +69,21 @@ function outsideLink(href: string, children: ReactNode) {
  */
 export function Markdown({
   text,
-  owner,
+  space,
   name,
   refName,
   sourceId,
   sourceLocations,
 }: {
   text: string;
-  owner: string;
+  space: string;
   name: string;
   refName: string;
   sourceId?: string;
   sourceLocations?: { path: string; sourceId: string; commit: string }[];
 }) {
   // Refs in the page link when they resolve, in this repository (CORE-22).
-  const refs = useRefMarkdown(outsideLink, { owner, repo: name });
+  const refs = useRefMarkdown(outsideLink, { space, repo: name });
   return (
     <div className="gm-prose" dir="auto">
       <ReactMarkdown
@@ -101,7 +101,7 @@ export function Markdown({
               return (
                 <Link
                   className={link}
-                  to={sourceUrl(repoPath(owner, name, "wiki", href.slice(5)), sourceId)}
+                  to={sourceUrl(repoPath(space, name, "wiki", href.slice(5)), sourceId)}
                 >
                   {children}
                 </Link>
@@ -119,7 +119,7 @@ export function Markdown({
                 </a>
               );
             }
-            // App-absolute links (/tracker/…, /owner/repo/…) open in place, as written.
+            // App-absolute links (/tracker/…, /space/repo/…) open in place, as written.
             if (href.startsWith("/") && !href.startsWith("//")) {
               return (
                 <Link className={link} to={href}>
@@ -132,7 +132,7 @@ export function Markdown({
             return (
               <Link
                 className={link}
-                to={`${blobUrl(owner, name, location?.commit ?? refName, path, location?.sourceId ?? sourceId)}${href.includes("#") ? href.slice(href.indexOf("#")) : ""}`}
+                to={`${blobUrl(space, name, location?.commit ?? refName, path, location?.sourceId ?? sourceId)}${href.includes("#") ? href.slice(href.indexOf("#")) : ""}`}
               >
                 {children}
               </Link>

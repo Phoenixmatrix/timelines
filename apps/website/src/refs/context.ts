@@ -1,25 +1,30 @@
-// Where a ref is being read, from the address: the page's repository, owner
+// Where a ref is being read, from the address: the page's repository, space
 // or tracker (shared/refs.ts RefContext), and where a resolved target opens.
 
 import { useMemo } from "react";
 import { useLocation } from "react-router";
 import type { RefContext, RefTarget } from "../../shared/refs.ts";
 
-/** First path segments that are app places, not account slugs (src/appRoutes.tsx). */
-const PLACES = new Set([
-  "-",
-  "agent-work",
-  "cli-auth",
-  "device",
-  "needs-you",
-  "new",
-  "packages",
-  "release-notes",
-  "settings",
-  "signin",
-  "timelines",
-  "tracker",
-]);
+/** First path segments that are app places, not Space slugs (src/appRoutes.tsx). */
+const PLACES: Record<string, true> = {
+  "-": true,
+  "agent-work": true,
+  accounts: true,
+  organizations: true,
+  instance: true,
+  api: true,
+  highlights: true,
+  "cli-auth": true,
+  device: true,
+  "needs-you": true,
+  new: true,
+  packages: true,
+  "release-notes": true,
+  settings: true,
+  signin: true,
+  timelines: true,
+  tracker: true,
+};
 
 function segments(pathname: string): string[] {
   return pathname
@@ -39,22 +44,22 @@ export function refContextFromPath(pathname: string): RefContext {
   const [first, second] = segments(pathname);
   if (!first) return {};
   if (first === "tracker") return second ? { tracker: second } : {};
-  if (PLACES.has(first)) return {};
-  if (!second || second === "-") return { owner: first };
-  return { owner: first, repo: second };
+  if (PLACES[first]) return {};
+  if (!second || second === "-") return { space: first };
+  return { space: first, repo: second };
 }
 
 /** The current page's ref context, or `override` where a component knows better. */
 export function useRefContext(override?: RefContext): RefContext {
   const { pathname } = useLocation();
-  const owner = override?.owner;
+  const space = override?.space;
   const repo = override?.repo;
   const tracker = override?.tracker;
   return useMemo(
-    () => (override ? { owner, repo, tracker } : refContextFromPath(pathname)),
+    () => (override ? { space, repo, tracker } : refContextFromPath(pathname)),
     // `override` is fully described by its fields.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pathname, owner, repo, tracker, !!override],
+    [pathname, space, repo, tracker, !!override],
   );
 }
 
@@ -65,8 +70,8 @@ export function useRefContext(override?: RefContext): RefContext {
  */
 export function refHref(target: RefTarget, location: { pathname: string; search: string }): string {
   if (target.kind !== "commit") return target.path;
-  const [owner, repo] = segments(location.pathname);
-  if (owner !== target.owner || repo !== target.repo) return target.path;
+  const [space, repo] = segments(location.pathname);
+  if (space !== target.space || repo !== target.repo) return target.path;
   const params = new URLSearchParams(location.search);
   params.set("commit", target.sha);
   return `${location.pathname}?${params.toString()}`;

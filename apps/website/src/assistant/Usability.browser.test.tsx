@@ -1,6 +1,6 @@
 // Real Chat/Dock and app layout; only the agent transport is replaced. No AI,
 // WebSocket, or write-tool execution is involved in these browser regressions.
-import { useState } from "react";
+import { act, useState } from "react";
 import { expect, onTestFinished, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { PageContext } from "../../shared/assistant.ts";
@@ -61,7 +61,14 @@ const catalog: AssistantSkillSummary[] = [
   { id: "quiet", name: "quiet", description: "", source: "repository" },
 ];
 
-async function setup(width: number, height: number, approval = false, receipt = false) {
+async function setup(
+  width: number,
+  height: number,
+  approval = false,
+  receipt = false,
+  recovery = false,
+  options: { fresh?: boolean; chatsReady?: Promise<void> } = {},
+) {
   const previous = ["gm.assistant.open", "gm.assistant.chat"].map(
     (key) => [key, localStorage.getItem(key)] as const,
   );
@@ -74,7 +81,8 @@ async function setup(width: number, height: number, approval = false, receipt = 
     await page.viewport(viewport.width, viewport.height);
   });
   localStorage.setItem("gm.assistant.open", "1");
-  localStorage.setItem("gm.assistant.chat", "usability-fixture");
+  if (options.fresh) localStorage.removeItem("gm.assistant.chat");
+  else localStorage.setItem("gm.assistant.chat", "usability-fixture");
   transport.sent.length = 0;
   transport.decisions.length = 0;
   transport.messages = approval
@@ -89,7 +97,7 @@ async function setup(width: number, height: number, approval = false, receipt = 
               state: "approval-requested",
               approval: { id: "review-fixture" },
               input: {
-                owner: "orbit",
+                space: "orbit",
                 team: "ENG",
                 title: "Review the complete proposal",
                 description: [
@@ -119,10 +127,29 @@ async function setup(width: number, height: number, approval = false, receipt = 
       : [];
   await page.viewport(width, height);
   const server = await TestServer.start({ world: true });
-  server.on("GET", "/api/assistant/chats", { chats: [] });
+  server.on("GET", "/api/assistant/chats", {
+    chats: recovery
+      ? [
+          {
+            id: "usability-fixture",
+            title: "Content unavailable",
+            source: "web",
+            createdAt: "2026-10-11T00:00:00Z",
+            updatedAt: "2026-10-11T00:00:00Z",
+            expiresAt: null,
+            contentUnavailable: true,
+          },
+        ]
+      : [],
+  });
+  if (options.chatsReady)
+    server.on("GET", "/api/assistant/chats", async () => {
+      await options.chatsReady;
+      return { chats: [] };
+    });
   server.on("GET", "/api/assistant/skills", { skills: catalog });
   const app = renderApp("/tracker/orbit");
-  await expect.element(composer()).toBeEnabled();
+  if (!recovery) await expect.element(composer()).toBeEnabled();
   return { ...app, server };
 }
 
@@ -149,6 +176,55 @@ function reachable(element: Element) {
     element.contains(hit)
   );
 }
+
+test("a new conversation keeps slash completion when its delayed history arrives", async () => {
+  let releaseHistory!: () => void;
+  const history = new Promise<void>((resolve) => {
+    releaseHistory = resolve;
+  });
+  try {
+    await setup(1440, 900, false, false, false, {
+      fresh: true,
+      chatsReady: history,
+    });
+    await userEvent.fill(composer(), "/pl");
+    const option = dock().getByRole("option", { name: /^\/plan/ });
+    await expect.element(option).toBeVisible();
+    await act(async () => releaseHistory());
+    await expect.element(option).toBeVisible();
+    await press("Tab");
+    await expect.element(composer()).toHaveValue("/plan ");
+    await expect.element(composer()).toHaveFocus();
+  } finally {
+    releaseHistory();
+  }
+});
+
+test("a fresh conversation retains its first sent message while chat access history loads", async () => {
+  let releaseHistory!: () => void;
+  const history = new Promise<void>((resolve) => {
+    releaseHistory = resolve;
+  });
+  try {
+    await setup(1440, 900, false, false, false, {
+      fresh: true,
+      chatsReady: history,
+    });
+    const prompt = "Keep this first message while history finishes loading.";
+    await userEvent.fill(composer(), prompt);
+    await userEvent.click(dock().getByRole("button", { name: "Send", exact: true }));
+    await expect
+      .element(dock().getByRole("list", { name: "Conversation" }))
+      .toHaveTextContent(prompt);
+    await act(async () => releaseHistory());
+    await expect
+      .element(dock().getByRole("list", { name: "Conversation" }))
+      .toHaveTextContent(prompt);
+    await expect.element(composer()).toBeEnabled();
+  } finally {
+    releaseHistory();
+  }
+});
 
 for (const [width, height] of [
   [1440, 540],
@@ -428,4 +504,14 @@ test("slashes in prose and command arguments do not open completion", async () =
       .not.toBeInTheDocument();
     await expect.element(composer()).toHaveValue(text);
   }
+});
+
+test("unverifiable retained conversations expose neither a composer nor a download", async () => {
+  await setup(1440, 900, false, false, true);
+  await expect
+    .element(dock().getByRole("region", { name: "Unavailable conversation" }))
+    .toBeVisible();
+  await expect.element(dock().getByRole("link")).not.toBeInTheDocument();
+  await expect.element(composer()).not.toBeInTheDocument();
+  expect(transport.sent).toHaveLength(0);
 });

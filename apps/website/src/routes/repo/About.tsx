@@ -54,7 +54,7 @@ export function About({
   issues: RepoIssueSummary | null;
 }) {
   const [more, setMore] = useState(false);
-  const owner = repo.owner.slug;
+  const space = repo.space.slug;
   const node = knowledge?.node;
   const summary = node?.summary ?? "";
   const long = summary.length > 320;
@@ -106,13 +106,13 @@ export function About({
         )}
         <ul className="m-0 mt-3 list-none p-0">
           <ExploreLink
-            to={repoPath(owner, repo.name, "wiki")}
+            to={repoPath(space, repo.name, "wiki")}
             icon={<BookOpenTextIcon weight="bold" aria-hidden />}
           >
             Read the wiki
           </ExploreLink>
           <ExploreLink
-            to={repoPath(owner, repo.name, "knowledge")}
+            to={repoPath(space, repo.name, "knowledge")}
             icon={<MapTrifoldIcon weight="bold" aria-hidden />}
           >
             {files !== null ? (
@@ -131,14 +131,14 @@ export function About({
             )}
           </ExploreLink>
           <ExploreLink
-            to={repoPath(owner, repo.name, "packages")}
+            to={repoPath(space, repo.name, "packages")}
             icon={<PackageIcon weight="bold" aria-hidden />}
           >
             Packages published from here
           </ExploreLink>
           {issues && issues.ready !== null && (
             <ExploreLink
-              to={repoPath(owner, repo.name, "tracker")}
+              to={repoPath(space, repo.name, "tracker")}
               icon={<ListChecksIcon weight="bold" aria-hidden />}
             >
               Issues · <span className="font-mono text-mono tabular-nums">{issues.ready}</span>{" "}
@@ -146,7 +146,7 @@ export function About({
             </ExploreLink>
           )}
           <ExploreLink
-            to={repoPath(owner, repo.name, "releases")}
+            to={repoPath(space, repo.name, "releases")}
             icon={<TagIcon weight="bold" aria-hidden />}
           >
             Releases
@@ -159,7 +159,7 @@ export function About({
           title={`CI on ${repo.defaultBranch}`}
           action={
             <PrefetchLink
-              to={repoPath(owner, repo.name, "ci")}
+              to={repoPath(space, repo.name, "ci")}
               className="text-body-sm text-ink-muted no-underline hover:text-ink"
             >
               All runs
@@ -169,7 +169,7 @@ export function About({
           {latest ? (
             <>
               <PrefetchLink
-                to={repoPath(owner, repo.name, "ci", String(latest.number))}
+                to={repoPath(space, repo.name, "ci", String(latest.number))}
                 className="-mx-2 flex items-start gap-2.5 rounded-plate px-2 py-1.5 text-ink no-underline transition-colors hover:bg-raised"
               >
                 <CiStatusIcon status={latest.status} className="mt-0.5 size-4" />
@@ -194,7 +194,7 @@ export function About({
                     <li key={run.id} className="flex">
                       <Tip label={`#${run.number} · ${ciLabel(run.status)}`}>
                         <PrefetchLink
-                          to={repoPath(owner, repo.name, "ci", String(run.number))}
+                          to={repoPath(space, repo.name, "ci", String(run.number))}
                           aria-label={`Run ${run.number}: ${ciLabel(run.status)}`}
                           className="flex size-4 items-center justify-center rounded-[3px] hover:bg-raised"
                         >

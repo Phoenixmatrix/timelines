@@ -1,13 +1,13 @@
 // An in-process registry with gitmatrix around it: the registry's catalog in
-// one fake D1 and gitmatrix's own tables (accounts, orgs, repositories, tokens,
+// one fake D1 and gitmatrix's own tables (people, Organizations, Spaces, tokens,
 // CI) in another, both built from their real migrations.
 //
-// Feeds created by tests belong to the org `test` (OWNER_ID), whose members get
-// write. Tokens are real gitmatrix tokens for real accounts. Calls to the old
-// artifatrix admin API that the protocol tests still make are translated:
+// Feeds created by tests belong to the Space `test` (SPACE_ID), with explicit
+// independent repository/package grants. Tokens remain person-owned. Calls to
+// the old artifatrix admin API that the protocol tests still make are translated:
 //
 //   PUT /api/v1/repositories/:key/permissions {principal, role}
-//        admin → org owner, write → org member, read → outside collaborator
+//        admin → Space admin, write/read → explicit package grant
 //   POST/PATCH /api/v1/repositories[/:key]   → core createRepo / updateRepo
 //   GET  /api/v1/audit?repo=:key             → the feed's audit log
 //   /api/v1/<format>/…                       → /api/registry/<format>/…
@@ -15,6 +15,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { afterEach } from "vite-plus/test";
 
 import { FakeD1, FakeQueue, FakeR2Bucket } from "@gitmatrix/testing";
 import { isFormatId } from "@gitmatrix/formats/info";
@@ -29,7 +30,6 @@ import { asRegistryError } from "../core/errors.ts";
 import {
   createRepo as createFeed,
   getRepoById,
-  invalidateRepoCache,
   sealConfig,
   updateRepo,
   type Repository,
@@ -37,14 +37,23 @@ import {
 import { resetDerivedKeys } from "../core/secrets.ts";
 import { RepoLogic } from "../do/repo-logic.ts";
 import { cacheNpmArchive } from "../manage/archive.ts";
+import { installCutoverTestControl } from "../../worker/testing/space-cutover.ts";
+import { captureWorkAuthority } from "../../worker/ci/admission.ts";
+import { initializeFreshSpaceInstallation } from "../../worker/space-cutover/installation.ts";
 
 const REGISTRY_MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url).href);
 const GITMATRIX_MIGRATIONS = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
-/** Development accounts (personas, Orbit Labs): local-only, applied after the migrations. */
+/** Canonical development people/Organizations/Spaces, seeded after native v4 initialization. */
 const GITMATRIX_SEED = fileURLToPath(new URL("../../seed/", import.meta.url).href);
 export const REGISTRY_URL = "https://pkg.test";
-/** The org that owns every feed tests create. */
-export const OWNER_ID = "acc_test";
+/** The immutable Space ID used by feeds and source repositories. */
+export const SPACE_ID = "acc_test";
+
+// Each harness owns an independent journal; release every instance at the test boundary.
+const cutoverClosers: Array<() => void> = [];
+afterEach(() => {
+  for (const close of cutoverClosers.splice(0)) close();
+});
 
 /** In-process Durable Object namespace: one plain object per name. */
 class FakeNamespace<T> {
@@ -199,10 +208,17 @@ export interface Harness {
   token(user?: string, scopes?: string[]): string;
   /** A site admin's token. */
   adminToken(): Promise<string>;
-  /** A running CI job's credential, in a repository of the `test` org (or `owner`). */
-  jobToken(options?: { repo?: string; owner?: string; ref?: string }): JobCredential;
-  /** Give `user` a role over everything the test org publishes. */
-  grant(user: string, role: "read" | "write" | "admin"): void;
+  /** A running CI job's credential, in the `test` Space (or another explicit Space). */
+  jobToken(options?: {
+    repo?: string;
+    space?: string;
+    ref?: string;
+    packageRole?: "none" | "read" | "write";
+  }): Promise<JobCredential>;
+  /** Persist an explicit Space grant, with independent resource baselines. */
+  grant(user: string, role: "read" | "write" | "admin" | "none"): void;
+  /** A repository-only collaborator; never grants package or Space access. */
+  collaborate(user: string, repo?: string, role?: "read" | "write"): string;
   createRepo(input: Record<string, unknown>): Promise<Response>;
 }
 
@@ -227,17 +243,22 @@ export async function makeHarness(
   resetRegistryTokenKeys();
   resetDerivedKeys();
   purgedRepoObjects.length = 0;
-  invalidateRepoCache();
 
   const db = new FakeD1();
   migrate(db, REGISTRY_MIGRATIONS);
   const gitmatrix = new FakeD1();
   migrate(gitmatrix, GITMATRIX_MIGRATIONS);
-  migrate(gitmatrix, GITMATRIX_SEED);
-  gitmatrix.applySql(
-    `INSERT INTO accounts (id, kind, slug, display_name, member_repo_role)
-     VALUES (${quote(OWNER_ID)}, 'org', 'test', 'Test Org', 'write')`,
-  );
+  const ensureSpace = (id: string, slug: string) => {
+    gitmatrix.applySql(
+      `BEGIN;
+       INSERT OR IGNORE INTO organizations (id, slug, display_name, kind, default_space_id)
+       VALUES (${quote(`org_${slug}`)}, ${quote(slug)}, ${quote(slug)}, 'company', ${quote(id)});
+       INSERT OR IGNORE INTO spaces (id, organization_id, slug, display_name)
+       VALUES (${quote(id)}, ${quote(`org_${slug}`)}, ${quote(slug)}, ${quote(slug)});
+       COMMIT;`,
+    );
+    return id;
+  };
 
   const bucket = new FakeR2Bucket();
   const queue = new FakeQueue();
@@ -251,6 +272,18 @@ export async function makeHarness(
     REGISTRY_KEK: btoa("k".repeat(32)),
     ...overrides,
   } as unknown as Env;
+  const cutover = installCutoverTestControl(env);
+  cutoverClosers.push(cutover.close);
+  await initializeFreshSpaceInstallation(env);
+  gitmatrix.applySql("BEGIN");
+  try {
+    migrate(gitmatrix, GITMATRIX_SEED);
+    gitmatrix.applySql("COMMIT");
+  } catch (error) {
+    gitmatrix.applySql("ROLLBACK");
+    throw error;
+  }
+  ensureSpace(SPACE_ID, "test");
   const repoNamespace = new FakeNamespace(() => new FakeRepoObject(new RepoLogic(env), env));
   Object.assign(env, {
     REGISTRY_REPO: repoNamespace,
@@ -287,45 +320,100 @@ export async function makeHarness(
   const adminToken = async () => mint(ensureUser("admin", true), "write");
 
   let repoCount = 0;
-  const gitRepo = (owner: string, name: string) => {
-    const id = `repo_${owner}_${name}`;
+  const gitRepo = (space: string, name: string) => {
+    const id = `repo_${space}_${name}`;
     gitmatrix.applySql(
-      `INSERT OR IGNORE INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-       VALUES (${quote(id)}, ${quote(owner)}, ${quote(name)}, 'private',
+      `INSERT OR IGNORE INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+       VALUES (${quote(id)}, ${quote(space)}, ${quote(name)}, 'private',
          ${quote(`art_${++repoCount}_${name}`)}, 'https://artifacts.test')`,
     );
     return id;
   };
 
-  const grant = (user: string, role: "read" | "write" | "admin") => {
+  const grant = (user: string, role: "read" | "write" | "admin" | "none") => {
     const userId = ensureUser(user);
-    if (role === "read") {
-      const repoId = gitRepo(OWNER_ID, "shared");
-      gitmatrix.applySql(
-        `INSERT OR REPLACE INTO repo_collaborators (repo_id, user_id, role)
-         VALUES (${quote(repoId)}, ${quote(userId)}, 'read')`,
-      );
-      return;
-    }
     gitmatrix.applySql(
-      `INSERT OR REPLACE INTO org_members (org_id, user_id, role)
-       VALUES (${quote(OWNER_ID)}, ${quote(userId)}, ${quote(role === "admin" ? "owner" : "member")})`,
+      `BEGIN;
+       INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+       VALUES ('org_test', ${quote(userId)}, ${quote(role === "admin" ? "owner" : "member")}, 'test-fixture', ${quote(userId)})
+       ON CONFLICT (organization_id, account_id) DO UPDATE SET role = excluded.role;
+       INSERT INTO space_grants
+         (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+       VALUES (${quote(SPACE_ID)}, 'org_test', ${quote(userId)}, ${quote(role === "admin" ? "admin" : "member")},
+         ${quote(role === "admin" || role === "write" ? "write" : "none")},
+         ${quote(role === "admin" ? "write" : role)}, 'test-fixture', ${quote(userId)})
+       ON CONFLICT (space_id, account_id) DO UPDATE SET
+         role = excluded.role, repository_role = excluded.repository_role, package_role = excluded.package_role;
+       INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+       VALUES (${quote(`audit_${randomBytes(8).toString("hex")}`)}, 'org_test', ${quote(SPACE_ID)},
+         ${quote(userId)}, 'space.grant', ${quote(userId)}, ${quote(JSON.stringify({ role, origin: "test-fixture" }))});
+       COMMIT;`,
     );
   };
 
+  const collaborate = (user: string, repo = "shared", role: "read" | "write" = "read") => {
+    const userId = ensureUser(user);
+    const repoId = gitRepo(SPACE_ID, repo);
+    gitmatrix.applySql(
+      `INSERT INTO repo_collaborators (repo_id, user_id, role)
+       VALUES (${quote(repoId)}, ${quote(userId)}, ${quote(role)})
+       ON CONFLICT (repo_id, user_id) DO UPDATE SET role = excluded.role`,
+    );
+    return repoId;
+  };
+
   let jobCount = 0;
-  const jobToken = (options: { repo?: string; owner?: string; ref?: string } = {}) => {
-    const owner = options.owner ?? OWNER_ID;
-    const repoId = gitRepo(owner, options.repo ?? "app");
+  const jobToken = async (
+    options: {
+      repo?: string;
+      space?: string;
+      ref?: string;
+      packageRole?: "none" | "read" | "write";
+    } = {},
+  ) => {
+    const space = options.space ?? SPACE_ID;
+    const repoId = gitRepo(space, options.repo ?? "app");
     const n = ++jobCount;
     const runId = `run_${n}`;
     const jobId = `job_${n}`;
     const commit = sha256(`commit-${n}`).slice(0, 40);
     const secret = `${JOB_TOKEN_PREFIX}${randomBytes(16).toString("hex")}`;
+    const personId = ensureUser(`ci_${n}`);
+    const initiatingSecret = mint(personId, "write");
+    const credential = await gitmatrix
+      .prepare("SELECT id FROM access_tokens WHERE token_hash = ?")
+      .bind(sha256(initiatingSecret))
+      .first<{ id: string }>();
+    if (!credential) throw new Error("Missing initiating fixture credential");
     gitmatrix.applySql(
-      `INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, title, status)
+      `BEGIN;
+       INSERT INTO repo_collaborators (repo_id, user_id, role)
+       VALUES (${quote(repoId)}, ${quote(personId)}, 'write');
+       INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+       SELECT organization_id, ${quote(personId)}, 'member', 'test-fixture', ${quote(personId)}
+       FROM spaces WHERE id = ${quote(space)};
+       INSERT INTO space_grants
+         (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+       SELECT id, organization_id, ${quote(personId)}, 'member', 'none',
+         ${quote(options.packageRole ?? "write")}, 'test-fixture', ${quote(personId)}
+       FROM spaces WHERE id = ${quote(space)};
+       INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+       SELECT ${quote(`audit_${randomBytes(8).toString("hex")}`)}, organization_id, id,
+         ${quote(personId)}, 'space.grant', ${quote(personId)},
+         ${quote(JSON.stringify({ repositoryRole: "none", packageRole: options.packageRole ?? "write", origin: "test-fixture" }))}
+       FROM spaces WHERE id = ${quote(space)};
+       COMMIT;`,
+    );
+    const authority = await captureWorkAuthority(env, repoId, {
+      id: personId,
+      credential: { kind: "token", id: credential.id },
+    });
+    gitmatrix.applySql(
+      `INSERT INTO ci_runs
+         (id, repo_id, number, commit_oid, ref, trigger, title, status, space_id, migration_epoch, authority, actor_id, agent_id)
        VALUES (${quote(runId)}, ${quote(repoId)}, ${n}, ${quote(commit)},
-         ${quote(options.ref ?? "main")}, 'push', 'test', 'running');
+         ${quote(options.ref ?? "main")}, 'push', 'test', 'running', ${quote(space)},
+         ${authority.migrationEpoch}, ${quote(JSON.stringify(authority))}, ${quote(personId)}, NULL);
        INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
        VALUES (${quote(jobId)}, ${quote(runId)}, ${quote(repoId)}, 'build', '{}', 'running', 'local');
        INSERT INTO ci_job_tokens (token_hash, job_id, expires_at)
@@ -345,19 +433,12 @@ export async function makeHarness(
     return row ? getRepoById(kysely, row.id) : null;
   };
 
-  /** `owner` puts the feed under another org (created on demand): access follows owners. */
-  const createRepo = async ({ owner, ...input }: Record<string, unknown>) => {
-    let ownerId = OWNER_ID;
-    if (typeof owner === "string") {
-      ownerId = `acc_${owner}`;
-      gitmatrix.applySql(
-        `INSERT OR IGNORE INTO accounts (id, kind, slug, display_name, member_repo_role)
-         VALUES (${quote(ownerId)}, 'org', ${quote(owner)}, ${quote(owner)}, 'write')`,
-      );
-    }
+  /** `space` selects another explicit Space (created on demand), never a person. */
+  const createRepo = async ({ space, ...input }: Record<string, unknown>) => {
+    const spaceId = typeof space === "string" ? ensureSpace(`acc_${space}`, space) : SPACE_ID;
     try {
       const sealed = await sealConfig(env, input);
-      const repo = await createFeed(kysely, { ...sealed, ownerId } as never, "system");
+      const repo = await createFeed(kysely, { ...sealed, spaceId } as never, "system");
       return json(repo, 201);
     } catch (error) {
       const e = asRegistryError(error);
@@ -419,6 +500,7 @@ export async function makeHarness(
     adminToken,
     jobToken,
     grant,
+    collaborate,
     createRepo,
   };
 }

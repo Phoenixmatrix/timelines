@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vite-plus/test";
+import { parseQuery, TrackerQueryUpgradeError } from "./tracker-query.ts";
 import {
   attribution,
   attributionText,
@@ -8,6 +9,18 @@ import {
   type IssueClaim,
   type Snapshot,
 } from "./tracker.ts";
+
+describe("Project query contract", () => {
+  test("preserves the Project filter instead of widening legacy queries", () => {
+    expect(parseQuery("project:release")).toEqual({
+      filters: [{ key: "project", value: "release", negated: false }],
+      words: [],
+      unknown: [],
+    });
+    for (const query of ["workspace:release", "-ws:release", "WORKSPACE:release"])
+      expect(() => parseQuery(query)).toThrow(TrackerQueryUpgradeError);
+  });
+});
 
 const ann = { id: "ann", slug: "ann", displayName: "Ann Lee" };
 const people = {

@@ -324,7 +324,7 @@ function Comparison({
     if (toCommit) query.set("ref", toCommit);
     query.set("source", toSourceId);
     if (path) query.set("path", path);
-    return `${repoPath(repo.owner, repo.name, "changes")}?${query}`;
+    return `${repoPath(repo.space, repo.name, "changes")}?${query}`;
   };
   // A region the newer snapshot doesn't have opens in the older one, without the comparison.
   const inOlder = (id: string) => {
@@ -502,7 +502,7 @@ function Comparison({
           <p className="m-0 flex flex-wrap gap-x-3 gap-y-1 text-body-sm">
             {toCommit && (
               <Link
-                to={commitsUrl(repo.owner, repo.name, toCommit, "", toSourceId)}
+                to={commitsUrl(repo.space, repo.name, toCommit, "", toSourceId)}
                 className="text-ink underline"
               >
                 Commits up to {short(toCommit)}
@@ -680,7 +680,7 @@ function ChangeItem({
         )}
         {path && change.to && toCommit && (
           <Link
-            to={blobUrl(repo.owner, repo.name, toCommit, path, toSourceId)}
+            to={blobUrl(repo.space, repo.name, toCommit, path, toSourceId)}
             className="text-ink underline"
           >
             Source at {short(toCommit)}
@@ -688,7 +688,7 @@ function ChangeItem({
         )}
         {path && change.from && fromCommit && change.fields.includes("source") && (
           <Link
-            to={blobUrl(repo.owner, repo.name, fromCommit, path, fromSourceId)}
+            to={blobUrl(repo.space, repo.name, fromCommit, path, fromSourceId)}
             className="text-ink underline"
           >
             Before, at {short(fromCommit)}
@@ -696,7 +696,7 @@ function ChangeItem({
         )}
         {path && !change.to && fromCommit && (
           <Link
-            to={blobUrl(repo.owner, repo.name, fromCommit, path, fromSourceId)}
+            to={blobUrl(repo.space, repo.name, fromCommit, path, fromSourceId)}
             className="text-ink underline"
           >
             Last source, at {short(fromCommit)}
@@ -705,7 +705,7 @@ function ChangeItem({
         {path && change.classes.includes("source") && (change.to ? toCommit : fromCommit) && (
           <Link
             to={commitsUrl(
-              repo.owner,
+              repo.space,
               repo.name,
               (change.to ? toCommit : fromCommit)!,
               path,

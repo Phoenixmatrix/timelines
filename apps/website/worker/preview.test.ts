@@ -14,6 +14,14 @@ import { MirrorError, syncMirror } from "./mirror/sync.ts";
 import { isPreview, PreviewModeError, productionOnly } from "./preview.ts";
 import { ensureReleaseNotes, notifyReleaseNotes } from "./release-notes/queue.ts";
 
+const actor = { id: "person", slug: "person", displayName: "Person", isSiteAdmin: false };
+const authority = {
+  spaceId: "space",
+  migrationEpoch: 0,
+  personId: actor.id,
+  agentId: null,
+  credential: { kind: "token" as const, id: "unconsumed-preview-credential" },
+};
 /** A preview's env with every production binding still attached, each a spy. */
 function previewEnv() {
   const send = vi.fn(async () => {});
@@ -66,15 +74,15 @@ describe("in a preview", () => {
 
   test("pushes never queue a mirror sync, and syncing by hand refuses", async () => {
     const { env, send } = previewEnv();
-    await queueMirror(env, "repo_1");
+    await queueMirror(env, "repo_1", actor);
     expect(send).not.toHaveBeenCalled();
-    await expect(syncMirror(env, "repo_1")).rejects.toBeInstanceOf(MirrorError);
+    await expect(syncMirror(env, "repo_1", authority)).rejects.toBeInstanceOf(MirrorError);
   });
 
   test("release notes enqueue nothing", async () => {
     const { env, send } = previewEnv();
-    await notifyReleaseNotes(env, "repo_1");
-    await ensureReleaseNotes(env, "repo_1");
+    await notifyReleaseNotes(env, "repo_1", actor);
+    await ensureReleaseNotes(env, "repo_1", actor);
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -104,6 +112,7 @@ describe("in a preview", () => {
           title: "Land x",
           author: { name: "A", email: "a@example.com" },
           actor: null,
+          authority,
           source: {
             sourceId: "work_x",
             repoId: "repo_1",

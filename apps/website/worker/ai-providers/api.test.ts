@@ -1,23 +1,25 @@
 // An account's own AI providers (CORE-294): connecting a key, choosing
 // models, using them in AI settings and in the snapshots jobs run with.
 
-import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AiProviderCatalogView, AiProvidersView, AiSettingsView } from "../../shared/ai.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
+import { captureWorkAuthority, resolveWorkAuthority } from "../ci/admission.ts";
 import { chatJson, decide } from "../knowledge/models.ts";
 import { knowledgePolicy } from "../knowledge/policy.ts";
 import { aiSettingsApi, repoAiSnapshot } from "../settings/ai.ts";
 import { fakeProviders, isProviderUrl } from "../testing/ai-providers.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { aiWork } from "../usage/ai.ts";
 import { aiProvidersApi } from "./api.ts";
 import { forgetProviderCatalogs, openRouterEntry } from "./providers.ts";
-import { parseProviderModelRef } from "./store.ts";
+import { parseProviderModelRef, providerKey } from "./store.ts";
 
-const databases: DatabaseSync[] = [];
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+
+const fixtures: Array<() => void> = [];
 let provider = fakeProviders();
 beforeEach(() => {
   provider = fakeProviders();
@@ -31,24 +33,36 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.restoreAllMocks();
-  for (const sqlite of databases.splice(0)) sqlite.close();
+  for (const close of fixtures.splice(0)) close();
 });
 
 async function setup() {
-  const sqlite = migratedDatabase();
-  databases.push(sqlite);
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  fixtures.push(fresh.close);
   sqlite.exec(`
+    BEGIN;
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('owner', 'user', 'ann', 'Ann'), ('member', 'user', 'cat', 'Cat'),
-      ('outsider', 'user', 'bob', 'Bob'), ('org', 'org', 'orbit', 'Orbit');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('org', 'owner', 'owner'), ('org', 'member', 'member');
+      ('outsider', 'user', 'bob', 'Bob');
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('company', 'company', 'Company', 'company', NULL, 'org');
+    INSERT INTO spaces (id, organization_id, slug, display_name) VALUES
+      ('org', 'company', 'orbit', 'Orbit'), ('other-space', 'company', 'other', 'Other');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by) VALUES
+      ('company', 'owner', 'owner', 'fixture', 'owner'),
+      ('company', 'member', 'member', 'fixture', 'owner'),
+      ('company', 'outsider', 'owner', 'fixture', 'owner');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by) VALUES
+      ('org', 'company', 'owner', 'admin', 'write', 'write', 'fixture', 'owner'),
+      ('org', 'company', 'member', 'member', 'none', 'none', 'fixture', 'owner');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agent', 'builder', 'owner');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('repo', 'org', 'app', 'private', 'a', 'https://a');
+    COMMIT;
   `);
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     REGISTRY_KEK: btoa("k".repeat(32)),
     PUBLIC_URL: "https://gitmatrix.test",
   } as unknown as Env;
@@ -58,17 +72,18 @@ async function setup() {
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);
-  app.route("/api/accounts/:slug/ai-providers", aiProvidersApi);
+  app.route("/api/spaces/:space/settings/ai", aiSettingsApi);
+  app.route("/api/spaces/:space/ai-providers", aiProvidersApi);
+  const ownerToken = await issueToken(env.DB, "owner", "owner", "write");
   const tokens = {
-    owner: (await issueToken(env.DB, "owner", "owner", "write")).secret,
+    owner: ownerToken.secret,
     member: (await issueToken(env.DB, "member", "member", "write")).secret,
     outsider: (await issueToken(env.DB, "outsider", "outsider", "write")).secret,
     agent: (await issueToken(env.DB, "owner", "agent", "write", undefined, "agent")).secret,
   };
   const call = (token: string, method: string, path: string, body?: unknown) =>
     app.request(
-      `/api/accounts/orbit/${path}`,
+      `/api/spaces/orbit/${path}`,
       {
         method,
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -76,7 +91,18 @@ async function setup() {
       },
       env,
     );
-  return { sqlite, env, tokens, call };
+  const authorization = await captureWorkAuthority(env, "repo", {
+    id: "owner",
+    credential: { kind: "token", id: ownerToken.id },
+  });
+  const work = async <T>(run: () => Promise<T>) => {
+    const { actor } = await resolveWorkAuthority(env, authorization, "repo");
+    return aiWork(
+      { feature: "knowledge", repo: "repo", providerAuthority: { spaceId: "org", actor } },
+      run,
+    );
+  };
+  return { sqlite, env, tokens, call, work };
 }
 
 const providerOf = (view: AiProvidersView, kind: string) =>
@@ -199,6 +225,14 @@ describe("connecting a provider", () => {
     expect((await call(tokens.outsider, "PUT", "ai-providers/openrouter", body)).status).toBe(404);
     expect((await call(tokens.owner, "PUT", "ai-providers/anthropic", body)).status).toBe(404);
   });
+
+  test("a warm provider catalog does not survive Space-grant revocation", async () => {
+    const { sqlite, tokens, call } = await setup();
+    expect((await call(tokens.member, "GET", "ai-providers/openrouter/catalog")).status).toBe(200);
+    sqlite.exec("DELETE FROM space_grants WHERE space_id = 'org' AND account_id = 'member'");
+    expect((await call(tokens.member, "GET", "ai-providers/openrouter/catalog")).status).toBe(404);
+    expect((await call(tokens.outsider, "GET", "ai-providers")).status).toBe(404);
+  });
 });
 
 describe("provider models in AI settings and jobs", () => {
@@ -259,7 +293,7 @@ describe("provider models in AI settings and jobs", () => {
   });
 
   test("jobs snapshot the provider row and price, and call the provider with the account's key", async () => {
-    const { env, tokens, call } = await connected();
+    const { env, tokens, call, work } = await connected();
     await call(tokens.owner, "POST", "ai-providers/openrouter/models", {
       model: "anthropic/claude-sonnet-5",
     });
@@ -290,7 +324,7 @@ describe("provider models in AI settings and jobs", () => {
 
     // A replaced key keeps the provider row, so captured work uses the new key.
     await call(tokens.owner, "PUT", "ai-providers/openrouter", { apiKey: "sk-or-v1-second-3333" });
-    const { value, usage } = await aiWork({ feature: "knowledge", account: "org" }, () =>
+    const { value, usage } = await work(() =>
       chatJson<{ ok: boolean }>(env, "reason", "system", "user", {
         model: snapshot.models.task,
         think: true,
@@ -314,7 +348,7 @@ describe("provider models in AI settings and jobs", () => {
       },
     });
 
-    const answers = await aiWork({ feature: "knowledge", account: "org" }, () =>
+    const answers = await work(() =>
       decide(
         env,
         { file: "README.md" },
@@ -335,7 +369,7 @@ describe("provider models in AI settings and jobs", () => {
 
     // Usage is metered under the account-facing ids, never the provider row.
     const usageRows = env.DB.prepare(
-      "SELECT model, calls, input_tokens, output_tokens FROM ai_usage WHERE account_id = 'org' ORDER BY model",
+      "SELECT model, calls, input_tokens, output_tokens FROM ai_usage WHERE scope_kind = 'space' AND scope_id = 'org' ORDER BY model",
     );
     expect((await usageRows.all()).results).toEqual([
       {
@@ -348,8 +382,29 @@ describe("provider models in AI settings and jobs", () => {
     ]);
   });
 
+  test("sealed provider references cannot cross Spaces or survive model removal", async () => {
+    const { sqlite, env, tokens, call } = await connected();
+    await call(tokens.owner, "POST", "ai-providers/openrouter/models", {
+      model: "anthropic/claude-sonnet-5",
+    });
+    await call(tokens.owner, "PATCH", "settings/ai", {
+      models: { task: "openrouter:anthropic/claude-sonnet-5" },
+    });
+    const ref = parseProviderModelRef((await repoAiSnapshot(env.DB, "repo")).models.task)!;
+    const before = sqlite
+      .prepare("SELECT id, key_sealed, updated_by FROM ai_providers ORDER BY id")
+      .all();
+    await expect(providerKey(env, ref, "other-space")).rejects.toThrow(/no longer available/);
+    expect(
+      sqlite.prepare("SELECT id, key_sealed, updated_by FROM ai_providers ORDER BY id").all(),
+    ).toEqual(before);
+    expect(await providerKey(env, ref, "org")).toBe("sk-or-v1-first-1111");
+    sqlite.prepare("DELETE FROM ai_provider_models WHERE provider_id = ?").run(ref.providerId);
+    await expect(providerKey(env, ref, "org")).rejects.toThrow(/no longer available/);
+  });
+
   test("a provider's refusal fails the call without retrying, and is metered as failed", async () => {
-    const { env, tokens, call } = await connected();
+    const { env, tokens, call, work } = await connected();
     await call(tokens.owner, "POST", "ai-providers/openrouter/models", {
       model: "google/gemini-3-flash",
     });
@@ -360,9 +415,7 @@ describe("provider models in AI settings and jobs", () => {
     provider.next.chat = () =>
       new Response(JSON.stringify({ error: { message: "Insufficient credits" } }), { status: 402 });
     await expect(
-      aiWork({ feature: "knowledge", account: "org" }, () =>
-        chatJson(env, "fast", "s", "u", { model: models.fast, attempts: 1 }),
-      ),
+      work(() => chatJson(env, "fast", "s", "u", { model: models.fast, attempts: 1 })),
     ).rejects.toThrow("OpenRouter failed (402): Insufficient credits");
     expect(provider.requests.filter((r) => r.url.endsWith("/chat/completions"))).toHaveLength(1);
     const row = await env.DB.prepare(
@@ -414,7 +467,7 @@ describe("provider models in AI settings and jobs", () => {
     expect((await repoAiSnapshot(env.DB, "repo")).models.fast).toBe("@cf/zai-org/glm-5.3-flash");
   });
 
-  test("a model that went missing anyway falls back to the default rather than failing reads", async () => {
+  test("a removed selected provider model fails closed instead of changing paid policy", async () => {
     const { env, sqlite, tokens, call } = await connected();
     await call(tokens.owner, "POST", "ai-providers/openrouter/models", {
       model: "google/gemini-3-flash",
@@ -423,13 +476,13 @@ describe("provider models in AI settings and jobs", () => {
       models: { task: "openrouter:google/gemini-3-flash" },
     });
     sqlite.exec("DELETE FROM ai_provider_models");
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect((await repoAiSnapshot(env.DB, "repo")).models.task).toBe("@cf/zai-org/glm-5.3-flash");
-    expect(warn).toHaveBeenCalled();
+    await expect(repoAiSnapshot(env.DB, "repo")).rejects.toThrow(
+      /no longer available in this Space/,
+    );
   });
 
   test("refreshing re-reads names and prices; a removed provider's captured work fails clearly", async () => {
-    const { env, sqlite, tokens, call } = await connected();
+    const { env, sqlite, tokens, call, work } = await connected();
     await call(tokens.owner, "POST", "ai-providers/openrouter/models", {
       model: "google/gemini-3-flash",
     });
@@ -452,8 +505,8 @@ describe("provider models in AI settings and jobs", () => {
     });
     const { models } = await repoAiSnapshot(env.DB, "repo");
     sqlite.exec("DELETE FROM ai_providers WHERE kind = 'openrouter'");
-    await expect(chatJson(env, "fast", "s", "u", { model: models.fast })).rejects.toThrow(
-      /provider this work started with was removed/,
-    );
+    await expect(
+      work(() => chatJson(env, "fast", "s", "u", { model: models.fast })),
+    ).rejects.toThrow(/no longer available in this Space/);
   });
 });

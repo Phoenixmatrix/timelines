@@ -7,11 +7,11 @@
 //   falls outside the 20 or under storage pressure.
 // - Storage: 2 GiB per repository scope, measured as the sum of its snapshots'
 //   `bytes` (the estimated size of the rows each opened that still exist; see
-//   ENTITY_BYTES_SQL in projection.ts). Composition scopes (workspace/account,
-//   not built yet) must share ONE 2 GiB pool per account, lineage and
-//   provenance included, so changing scope can't multiply the allowance: pass
-//   all of an account's composition scopes to `enforceRetention` together with
-//   ACCOUNT_COMPOSITION_RETENTION. The pool is the hook; nothing calls it yet:
+//   `ENTITY_BYTES_SQL` in projection.ts). Composition scopes (selected Space repositories,
+//   not materialized) share ONE 2 GiB pool per Space, lineage and
+//   provenance included, so changing scope cannot multiply the allowance: pass
+//   all of a Space's composition scopes to `enforceRetention` together with
+//   SPACE_COMPOSITION_RETENTION. The pool is the hook; nothing calls it yet:
 //   cross-repository composition (CORE-167, compose.ts) is computed at read
 //   from repository snapshots and stores nothing.
 // - Under pressure the oldest prior (by publication) is evicted first, one at a
@@ -19,10 +19,10 @@
 //   never evicted: a snapshot that doesn't fit even with every prior gone fails
 //   with `failure = 'capacity'` (`admitProjection`) and the previous snapshot
 //   stays current, stale; `capacityFailure` reports it for the UI.
-// - An account may tighten these for its repositories, never loosen them
+// - A Space may tighten these for its repositories, never loosen them
 //   (retention category "atlas-snapshots", CORE-201: fewer priors, fewer
 //   days, a smaller cap, within ATLAS_RETENTION_BOUNDS). Every pass reads the
-//   owner's choice (`scopePolicy`); a shorter period also brings forward the
+//   Space's choice (`scopePolicy`); a shorter period also brings forward the
 //   expiry of priors stamped before it changed.
 // - Reclaiming: a row is kept while any retained snapshot (published or
 //   building) sees it (from_seq <= seq < to_seq, or open). Expiry is always
@@ -70,14 +70,14 @@ export const ATLAS_RETENTION = {
   priorTtlMs: 7 * DAY,
   /** Projection storage per repository scope. */
   repoCapBytes: 2 * GIB,
-  /** Projection storage for all of one account's composition scopes together. */
-  accountCompositionCapBytes: 2 * GIB,
+  /** Projection storage for all of one Space's composition scopes together. */
+  spaceCompositionCapBytes: 2 * GIB,
   /** How long an expired or failed snapshot's record outlives its rows. */
   recordTtlMs: 30 * DAY,
 } as const;
 
 /**
- * What an account may choose for its repositories (retention category
+ * What a Space may choose for its repositories (retention category
  * "atlas-snapshots", CORE-201): anything up to ATLAS_RETENTION, never more.
  * Stored in retention_policies; `scopePolicy` reads it for every pass.
  */
@@ -91,9 +91,9 @@ export const ATLAS_RETENTION_BOUNDS = {
 export const ATLAS_CATEGORY = "atlas-snapshots";
 
 /**
- * A repository scope's policy as its owning account chose it (category
+ * A repository scope's policy as its owning Space chose it (category
  * "atlas-snapshots"), over REPO_RETENTION; nothing for other pools or when
- * the account chose nothing. A stored value outside ATLAS_RETENTION_BOUNDS is
+ * the Space chose nothing. A stored value outside ATLAS_RETENTION_BOUNDS is
  * ignored, like any retention threshold.
  */
 export async function scopePolicy(
@@ -104,7 +104,7 @@ export async function scopePolicy(
   if (scopes.length !== 1 || !scope?.startsWith("repo:")) return {};
   const row = await d1
     .prepare(
-      `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.owner_id = p.account_id
+      `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.space_id = p.scope_id AND p.scope_kind = 'space'
        WHERE r.id = ? AND p.category = ?`,
     )
     .bind(scope.slice("repo:".length), ATLAS_CATEGORY)
@@ -158,10 +158,10 @@ export const REPO_RETENTION: RetentionPolicy = {
   maxRounds: 10,
 };
 
-/** For an account's composition scopes, enforced as one pool (see the header). */
-export const ACCOUNT_COMPOSITION_RETENTION: RetentionPolicy = {
+/** For a Space's composition scopes, enforced as one pool (see the header). */
+export const SPACE_COMPOSITION_RETENTION: RetentionPolicy = {
   ...REPO_RETENTION,
-  capBytes: ATLAS_RETENTION.accountCompositionCapBytes,
+  capBytes: ATLAS_RETENTION.spaceCompositionCapBytes,
 };
 
 export type ExpiredReason = "age" | "count" | "storage";
@@ -315,7 +315,7 @@ export async function enforceRetention(
   const expired: RetentionResult["expired"] = [];
   let rows = await retainedSnapshots(d1, scopes);
 
-  // A prior's 7 days start when the next snapshot was published. An account
+  // A prior's 7 days start when the next snapshot was published. A Space
   // that shortened the period since a prior was stamped brings it forward.
   const stamps: Statement[] = [];
   for (const row of rows) {

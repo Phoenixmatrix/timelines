@@ -1,3 +1,5 @@
+import { contentHeaders, fixtureMutationBody, fixtureSpace } from "./content-fixtures.ts";
+import { spaceBoundaryScenario } from "./space-e2e.ts";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -56,6 +58,11 @@ export async function runE2E(
   fixtures: SeedManifest,
   selected?: readonly string[],
 ): Promise<void> {
+  assert.equal(
+    fixtures.version,
+    4,
+    "Reseed this environment with Organization/Space content contract 4 fixtures.",
+  );
   const selection =
     selected === undefined ? undefined : new Set<string>(expandE2EScenarios(selected));
   assert.equal(fixtures.origin, ctx.origin, "Fixture/server identity mismatch");
@@ -110,9 +117,11 @@ export async function runE2E(
     body?: unknown,
     statuses = [200],
   ) {
+    body = await fixtureMutationBody(ctx.origin, path, token, body);
     const response = await fetch(`${ctx.origin}${path}`, {
       method,
       headers: {
+        ...contentHeaders,
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(body === undefined ? {} : { "content-type": "application/json" }),
       },
@@ -217,14 +226,14 @@ export async function runE2E(
       await delay(750);
     }
   }
-  const repo = fixtures.repos.find((r) => r.owner === "orbit" && r.visibility === "private");
-  const outsiderRepo = fixtures.repos.find((r) => r.owner === "sam" && r.visibility === "private");
+  const repo = fixtures.repos.find((r) => r.space === "orbit" && r.visibility === "private");
+  const outsiderRepo = fixtures.repos.find((r) => r.space === "sam" && r.visibility === "private");
   const publicRepo = fixtures.repos.find((r) => r.visibility === "public");
   assert(
     repo && outsiderRepo && publicRepo,
     "Seed must contain private orbit/sam and public repositories",
   );
-  const fullName = `${repo.owner}/${repo.name}`;
+  const fullName = `${repo.space}/${repo.name}`;
   const api = `/api/repos/${fullName}`;
   const ownerToken = fixtures.tokens.marco;
   const checkout = join(work, "checkout");
@@ -233,11 +242,11 @@ export async function runE2E(
 
   async function timelineSource(slug: string) {
     const detail = await json<TimelineDetail>(
-      `/api/tracker/${fixtures.tracker.owner}/timelines/${slug}`,
+      `/api/tracker/${fixtures.tracker.space}/timelines/${slug}`,
       ownerToken,
     );
     const entry = detail.timeline.repos.find(
-      (entry) => `${entry.owner}/${entry.name}` === fullName,
+      (entry) => `${entry.space}/${entry.name}` === fullName,
     );
     assert(entry?.source, "An owned timeline exposes its source identity");
     assert.match(entry.source.sourceId, /^work_[0-9a-f-]+$/);
@@ -276,14 +285,14 @@ export async function runE2E(
   }
 
   await scenario("authorization-and-token-revocation", async () => {
-    await request(`/api/repos/${publicRepo.owner}/${publicRepo.name}`, null);
+    await request(`/api/repos/${publicRepo.space}/${publicRepo.name}`, null);
     await request(api, null, "GET", undefined, [401, 404]);
     await request(api, "gmx_invalid", "GET", undefined, [401, 404]);
     for (const persona of ["priya", "marco", "jun", "sam"] as const)
       await request(api, fixtures.tokens[persona]);
     await request(api, fixtures.readToken);
     await request(
-      `/api/repos/${outsiderRepo.owner}/${outsiderRepo.name}`,
+      `/api/repos/${outsiderRepo.space}/${outsiderRepo.name}`,
       ownerToken,
       "GET",
       undefined,
@@ -312,6 +321,7 @@ export async function runE2E(
     await request(api, issued.secret);
     await request(`/api/tokens/${issued.id}`, ownerToken, "DELETE", undefined, [204]);
     await request(api, issued.secret, "GET", undefined, [401, 404]);
+    await spaceBoundaryScenario(ctx, fixtures, json, record);
   });
 
   await scenario("gm-clone-commit-push-and-denied-push", async () => {
@@ -379,7 +389,7 @@ export async function runE2E(
     assert.notEqual(readme.commits[0]?.oid, history.head);
     await request(`${api}/history`, null, "GET", undefined, [401, 404]);
     await request(
-      `/api/repos/${outsiderRepo.owner}/${outsiderRepo.name}/history`,
+      `/api/repos/${outsiderRepo.space}/${outsiderRepo.name}/history`,
       ownerToken,
       "GET",
       undefined,
@@ -395,23 +405,23 @@ export async function runE2E(
   });
 
   await scenario("tracker-claim-sync-complete-and-blocked-transitions", async () => {
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     await gm(["tracker", "use", owner]);
-    await gm(["tracker", "sync", "--owner", owner]);
+    await gm(["tracker", "sync", "--space", owner]);
     await gm(
-      ["issue", "claim", fixtures.tracker.blocked, "--owner", owner, "--agent", "e2e"],
+      ["issue", "claim", fixtures.tracker.blocked, "--space", owner, "--agent", "e2e"],
       "marco",
       work,
       /blocked|blocker|not.ready/i,
     );
     const claimed = JSON.parse(
-      await gm(["issue", "claim", fixtures.tracker.ready, "--owner", owner, "--agent", "e2e"]),
+      await gm(["issue", "claim", fixtures.tracker.ready, "--space", owner, "--agent", "e2e"]),
     ) as { results: { leaseToken: string }[] };
     const lease = claimed.results[0]?.leaseToken;
     assert(lease, "Claim must return a fencing token");
     secrets.add(lease);
     await gm(
-      ["issue", "claim", fixtures.tracker.ready, "--owner", owner, "--agent", "contender"],
+      ["issue", "claim", fixtures.tracker.ready, "--space", owner, "--agent", "contender"],
       "jun",
       work,
       /claim|lease|conflict|owned/i,
@@ -421,7 +431,7 @@ export async function runE2E(
         "issue",
         "complete",
         fixtures.tracker.ready,
-        "--owner",
+        "--space",
         owner,
         "--evidence",
         "invalid lease must not complete",
@@ -436,7 +446,7 @@ export async function runE2E(
         "issue",
         "complete",
         fixtures.tracker.ready,
-        "--owner",
+        "--space",
         owner,
         "--evidence",
         "Real gm claim and fenced completion verified",
@@ -446,9 +456,9 @@ export async function runE2E(
       undefined,
       { GM_LEASE_TOKEN: lease },
     );
-    await gm(["tracker", "sync", "--owner", owner]);
+    await gm(["tracker", "sync", "--space", owner]);
     const completed = JSON.parse(
-      await gm(["issue", "show", fixtures.tracker.ready, "--owner", owner, "--offline"]),
+      await gm(["issue", "show", fixtures.tracker.ready, "--space", owner, "--offline"]),
     ) as { issue: { status: string }; notes: { body: string }[] };
     assert.equal(completed.issue.status, "done");
     assert(completed.notes.some((n) => n.body === "Real gm claim and fenced completion verified"));
@@ -464,7 +474,7 @@ export async function runE2E(
   await scenario("chronicle-history-and-linked-work-over-api", async () => {
     // CORE-250: real gm work on a fresh issue, read back by time from the
     // Tracker Durable Object in workerd: its states, its work span and markers.
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const from = new Date(Date.now() - 5_000).toISOString();
     const id = randomUUID();
     const created = await json<{ events: { entity: { key?: string } | null }[] }>(
@@ -484,18 +494,18 @@ export async function runE2E(
     );
     const key = created.events.find((event) => event.entity?.key)?.entity?.key;
     assert(key, "The new issue has a key");
-    await gm(["tracker", "sync", "--owner", owner]);
+    await gm(["tracker", "sync", "--space", owner]);
     const claimed = JSON.parse(
-      await gm(["issue", "claim", key, "--owner", owner, "--agent", "chronicle-e2e"]),
+      await gm(["issue", "claim", key, "--space", owner, "--agent", "chronicle-e2e"]),
     ) as { results: { leaseToken: string }[] };
     const lease = claimed.results[0]?.leaseToken;
     assert(lease, "Claim must return a fencing token");
     secrets.add(lease);
-    await gm(["issue", "renew", key, "--owner", owner], "marco", work, undefined, {
+    await gm(["issue", "renew", key, "--space", owner], "marco", work, undefined, {
       GM_LEASE_TOKEN: lease,
     });
     await gm(
-      ["issue", "complete", key, "--owner", owner, "--evidence", "Chronicle verified"],
+      ["issue", "complete", key, "--space", owner, "--evidence", "Chronicle verified"],
       "marco",
       work,
       undefined,
@@ -551,7 +561,7 @@ export async function runE2E(
 
   await scenario("timeline-fork-owned-source-and-abandon-permissions", async () => {
     // Forks allocate a separate source; abandonment archives it without changing main.
-    const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
+    const timelines = `/api/tracker/${fixtures.tracker.space}/timelines`;
     const slug = `e2e-${randomUUID().slice(0, 8)}`;
     const jun = fixtures.tokens.jun;
     await request(timelines, fixtures.tokens.sam, "POST", { slug, repos: [fullName] }, [403]);
@@ -615,7 +625,7 @@ export async function runE2E(
 
   await scenario("gm-timeline-start-push-and-abandon", async () => {
     // A bound checkout pushes to its owned source, never a canonical timeline branch.
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const slug = `gm-e2e-${randomUUID().slice(0, 8)}`;
     const bookmark = "work";
     const clone = join(work, "timeline-checkout");
@@ -629,14 +639,14 @@ export async function runE2E(
     const main = await mainTip();
 
     const dry = JSON.parse(
-      await gm(["timeline", "start", slug, "--owner", owner, "--dry-run"], "jun", clone),
+      await gm(["timeline", "start", slug, "--space", owner, "--dry-run"], "jun", clone),
     ) as { dry_run: boolean; request: { slug: string; repos: string[] } };
     assert.equal(dry.dry_run, true);
     assert.deepEqual(dry.request.repos, [fullName], "The checkout's repository is the default");
     assert.equal(await binding(), "", "A dry run binds nothing");
 
     const started = JSON.parse(
-      await gm(["timeline", "start", slug, "--owner", owner, "--policy", "approval"], "jun", clone),
+      await gm(["timeline", "start", slug, "--space", owner, "--policy", "approval"], "jun", clone),
     ) as { timeline: { slug: string; policy: string }; use: { timeline: string } };
     assert.equal(started.timeline.slug, slug);
     assert.equal(started.timeline.policy, "approval");
@@ -647,8 +657,8 @@ export async function runE2E(
       `/api/tracker/${owner}/timelines/${slug}`,
       ownerToken,
     );
-    await gm(["timeline", "migrate", slug, "--owner", owner], "jun", clone);
-    await gm(["timeline", "migrate", slug, "--owner", owner], "jun", clone);
+    await gm(["timeline", "migrate", slug, "--space", owner], "jun", clone);
+    await gm(["timeline", "migrate", slug, "--space", owner], "jun", clone);
     const afterMigration = await json<TimelineDetail>(
       `/api/tracker/${owner}/timelines/${slug}`,
       ownerToken,
@@ -672,13 +682,13 @@ export async function runE2E(
     assert.equal(await mainTip(), main, "Main never moves from a bound checkout");
     await gm(["timeline", "merge", "main", "--dry-run"], "jun", clone);
 
-    const list = JSON.parse(await gm(["timeline", "list", "--owner", owner], "jun", clone)) as {
+    const list = JSON.parse(await gm(["timeline", "list", "--space", owner], "jun", clone)) as {
       timelines: { slug: string }[];
       current: string;
     };
     assert(list.timelines.some((t) => t.slug === slug));
     assert.equal(list.current, slug);
-    const shown = JSON.parse(await gm(["timeline", "show", "--owner", owner], "jun", clone)) as {
+    const shown = JSON.parse(await gm(["timeline", "show", "--space", owner], "jun", clone)) as {
       events: { kind: string }[];
     };
     assert.equal(shown.events[0]?.kind, "fork");
@@ -686,28 +696,28 @@ export async function runE2E(
     // CORE-86: any writer flags it experimental and clears the flag; stalled
     // lists leave experimental timelines out (and a fresh one hasn't stalled).
     const flagged = JSON.parse(
-      await gm(["timeline", "flag", "--experimental", "--owner", owner], "marco", clone),
+      await gm(["timeline", "flag", "--experimental", "--space", owner], "marco", clone),
     ) as { timeline: { experimental: boolean } };
     assert.equal(flagged.timeline.experimental, true);
     const stalled = JSON.parse(
-      await gm(["timeline", "list", "--stalled", "--owner", owner], "jun", clone),
+      await gm(["timeline", "list", "--stalled", "--space", owner], "jun", clone),
     ) as { timelines: { slug: string }[]; idleDays: number };
     assert(!stalled.timelines.some((t) => t.slug === slug), "Experimental never stalls");
     assert(stalled.idleDays > 0);
     const cleared = JSON.parse(
-      await gm(["timeline", "update", "--no-experimental", "--owner", owner], "jun", clone),
+      await gm(["timeline", "update", "--no-experimental", "--space", owner], "jun", clone),
     ) as { timeline: { experimental: boolean } };
     assert.equal(cleared.timeline.experimental, false);
 
     // Only its accountable person (or the agent that started it) abandons it.
-    await gm(["timeline", "abandon", "--owner", owner], "marco", clone, /"forbidden"/);
+    await gm(["timeline", "abandon", "--space", owner], "marco", clone, /"forbidden"/);
     const abandoned = JSON.parse(
-      await gm(["timeline", "abandon", "--owner", owner], "jun", clone),
+      await gm(["timeline", "abandon", "--space", owner], "jun", clone),
     ) as { timeline: { status: string } };
     assert.equal(abandoned.timeline.status, "abandoned");
     assert.match(await binding(), new RegExp(`timeline: ${slug}`));
     await gm(["push"], "jun", clone, /timeline_ended/);
-    await gm(["timeline", "use", "main", "--owner", owner], "jun", clone);
+    await gm(["timeline", "use", "main", "--space", owner], "jun", clone);
     assert.doesNotMatch(await binding(), /timeline:/);
     assert.equal(
       await sourceTip(slug),
@@ -811,7 +821,7 @@ export async function runE2E(
     };
     assert.deepEqual(shown.agent.capabilities, refreshed.agent.capabilities);
     const visible = JSON.parse(
-      await gm(["agent", "list", "--owner", fixtures.tracker.owner], "jun"),
+      await gm(["agent", "list", "--space", fixtures.tracker.space], "jun"),
     ) as { agents: Pick<Agent, "id" | "capabilities">[] };
     assert.deepEqual(
       visible.agents.find((candidate) => candidate.id === agent.id)?.capabilities,
@@ -856,8 +866,8 @@ export async function runE2E(
           "issue",
           "claim",
           fixtures.tracker.blocker,
-          "--owner",
-          fixtures.tracker.owner,
+          "--space",
+          fixtures.tracker.space,
           "--agent",
           name,
         ],
@@ -872,7 +882,7 @@ export async function runE2E(
     secrets.add(lease);
     const claimed = JSON.parse(
       await gm(
-        ["issue", "show", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+        ["issue", "show", fixtures.tracker.blocker, "--space", fixtures.tracker.space],
         "marco",
         work,
         undefined,
@@ -882,7 +892,7 @@ export async function runE2E(
     assert.equal(claimed.issue.claim.actorId, agent.id);
     assert.equal(claimed.issue.claim.accountableId, agent.accountable.id);
     await gm(
-      ["issue", "release", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+      ["issue", "release", fixtures.tracker.blocker, "--space", fixtures.tracker.space],
       "marco",
       work,
       undefined,
@@ -891,7 +901,7 @@ export async function runE2E(
 
     // Requirements (CORE-32): next passes over what the agent doesn't meet and
     // says so, a claim names what's missing, and people can lift them.
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const key = `R${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
     await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
       operationId: randomUUID(),
@@ -910,7 +920,7 @@ export async function runE2E(
             priority,
             "--requires",
             requires,
-            "--owner",
+            "--space",
             owner,
           ]),
         ) as { entities: { id: string; key: string | null; requires?: unknown }[] }
@@ -919,7 +929,7 @@ export async function runE2E(
     const native = await create("Native work", "1", "tag:NATIVE-E2E model:fixture-*");
     assert.deepEqual(native.requires, { tags: ["native-e2e"], models: ["fixture-*"] });
     const asAgent = (args: string[], failure?: RegExp) =>
-      gm([...args, "--owner", owner], "marco", work, failure, agentEnv);
+      gm([...args, "--space", owner], "marco", work, failure, agentEnv);
     const picked = JSON.parse(await asAgent(["issue", "next", "--team", key, "--agent", name])) as {
       claimed: { issueId: string; leaseToken: string } | null;
       skipped: { requirements: number; keys: string[]; message: string };
@@ -944,7 +954,7 @@ export async function runE2E(
       eligibility.eligibility.unmet.map((u) => u.wanted),
       ["tag:gpu", "memory>=1TiB"],
     );
-    await gm(["issue", "update", gpu.id, "--clear-requires", "--owner", owner]);
+    await gm(["issue", "update", gpu.id, "--clear-requires", "--space", owner]);
     const lifted = JSON.parse(await asAgent(["issue", "claim", gpu.id, "--agent", name])) as {
       results: { leaseToken: string }[];
     };
@@ -969,7 +979,7 @@ export async function runE2E(
     // CORE-271: issue tags from the tracker's tag catalog through the real gm and
     // API, with every old spelling kept: --label, `labels` in --data and the API,
     // and label: in search.
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const key = `T${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
     const suffix = randomUUID().slice(0, 6);
     const [ux, data] = [`ux-${suffix}`, `data-${suffix}`];
@@ -979,7 +989,7 @@ export async function runE2E(
     });
     const create = async (title: string, flag: string, tag: string) =>
       JSON.parse(
-        await gm(["issue", "create", title, "--team", key, flag, tag, "--owner", owner]),
+        await gm(["issue", "create", title, "--team", key, flag, tag, "--space", owner]),
       ) as { entities: { id: string; labels: string[] }[]; tagCatalog?: { added: string[] } };
     const tagged = await create("Tagged with --tag", "--tag", ux);
     assert.deepEqual(tagged.entities[0]!.labels, [ux]);
@@ -987,17 +997,17 @@ export async function runE2E(
     const old = await create("Tagged with --label", "--label", data);
     assert.deepEqual(old.entities[0]!.labels, [data]);
     const id = old.entities[0]!.id;
-    await gm(["issue", "update", id, "--tag", ux, "--owner", owner]);
+    await gm(["issue", "update", id, "--tag", ux, "--space", owner]);
     await gm([
       "issue",
       "update",
       id,
       "--data",
       JSON.stringify({ tags: [data, ux] }),
-      "--owner",
+      "--space",
       owner,
     ]);
-    const shown = await gm(["issue", "show", id, "--owner", owner, "--output", "text"]);
+    const shown = await gm(["issue", "show", id, "--space", owner, "--output", "text"]);
     assert.match(shown, new RegExp(`Tags: ${data}, ${ux}\n`));
     // The API takes `tags` and still `labels`; the catalog lists both with counts.
     const snapshot = await json<{ issues: { id: string; version: number; labels: string[] }[] }>(
@@ -1022,13 +1032,13 @@ export async function runE2E(
         { name: ux, issues: 1, open: 1 },
       ],
     );
-    const listed = JSON.parse(await gm(["issue", "tags", "--owner", owner])) as {
+    const listed = JSON.parse(await gm(["issue", "tags", "--space", owner])) as {
       tags: { name: string }[];
     };
     assert(listed.tags.some((t) => t.name === ux) && listed.tags.some((t) => t.name === data));
     // An unknown tag: requirement warns and is still saved.
     const required = JSON.parse(
-      await gm(["issue", "update", id, "--requires", `tag:${ux}x`, "--owner", owner]),
+      await gm(["issue", "update", id, "--requires", `tag:${ux}x`, "--space", owner]),
     ) as { tagCatalog: { unknownRequired: { tag: string; suggestion: string | null }[] } };
     assert.deepEqual(required.tagCatalog.unknownRequired, [{ tag: `${ux}x`, suggestion: ux }]);
     record({ tags: [ux, data], aliases: ["--label", "labels", "tags"] });
@@ -1038,7 +1048,7 @@ export async function runE2E(
     // CORE-272: a real agent claims; a person tightens the requirements. gm says
     // who's affected and keeps the claim (recorded), --release-claim releases it,
     // --require-issue-tags turns tags into requirements, and next names what blocked it.
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const key = `Q${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
     const suffix = randomUUID().slice(0, 6);
     const [ux, gpu] = [`ux-${suffix}`, `gpu-${suffix}`];
@@ -1089,14 +1099,14 @@ export async function runE2E(
         gpu,
         "--requires",
         `tag:${ux}`,
-        "--owner",
+        "--space",
         owner,
       ]),
     ) as { entities: { id: string }[] };
     const id = created.entities[0]!.id;
     const claim = JSON.parse(
       await gm(
-        ["issue", "claim", id, "--agent", "e2e-session", "--owner", owner],
+        ["issue", "claim", id, "--agent", "e2e-session", "--space", owner],
         "marco",
         work,
         undefined,
@@ -1115,7 +1125,7 @@ export async function runE2E(
     };
     // --require-issue-tags asks for tag:gpu-… too: the holder misses it, so the claim is kept and said.
     const kept = JSON.parse(
-      await gm(["issue", "update", id, "--require-issue-tags", "--owner", owner]),
+      await gm(["issue", "update", id, "--require-issue-tags", "--space", owner]),
     ) as Effect;
     assert.equal(kept.claimEffect?.agent, agent.name);
     assert.equal(kept.claimEffect?.session, "e2e-session");
@@ -1130,7 +1140,7 @@ export async function runE2E(
       id,
       "--requires",
       `tag:${gpu} cpus>=64`,
-      "--owner",
+      "--space",
       owner,
       "--output",
       "text",
@@ -1148,7 +1158,7 @@ export async function runE2E(
         "--requires",
         `tag:${gpu} memory>=1TiB`,
         "--release-claim",
-        "--owner",
+        "--space",
         owner,
       ]),
     ) as Effect;
@@ -1166,7 +1176,7 @@ export async function runE2E(
     // next passes it over and says what kept it.
     const next = JSON.parse(
       await gm(
-        ["issue", "next", "--team", key, "--agent", "e2e-session", "--owner", owner],
+        ["issue", "next", "--team", key, "--agent", "e2e-session", "--space", owner],
         "marco",
         work,
         undefined,
@@ -1185,7 +1195,7 @@ export async function runE2E(
   });
 
   await scenario("agent-durable-interventions-and-resume", async () => {
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const directory = join(work, "autonomous-agent");
     await mkdir(join(directory, ".gitmatrix"), { recursive: true, mode: 0o700 });
     const { agent } = await json<{ agent: Agent }>(
@@ -1211,7 +1221,7 @@ export async function runE2E(
       "--no-identity",
       "--harness",
       "codex",
-      "--owner",
+      "--space",
       owner,
       "--team",
       "AUTO",
@@ -1369,7 +1379,7 @@ export async function runE2E(
       "Completed independent fixture while owner input was pending.",
     ]);
     assert.equal((JSON.parse(await run(["issue", "next"])) as Pick).claimed, null);
-    await gm(["request", "answer", decision.id, "--choice", "EU", "--owner", owner]);
+    await gm(["request", "answer", decision.id, "--choice", "EU", "--space", owner]);
     const partial = JSON.parse(
       await run(["request", "list", "--issue", waiting, "--status", "answered"]),
     ) as Requests;
@@ -1380,7 +1390,7 @@ export async function runE2E(
     await gm(["issue", "resume", waiting], "marco", directory, /request|waiting|answer/i, {
       GM_TOKEN: token.secret,
     });
-    await gm(["request", "answer", question.id, "--answer", "DNS enabled", "--owner", owner]);
+    await gm(["request", "answer", question.id, "--answer", "DNS enabled", "--space", owner]);
     const resolved = JSON.parse(
       await run(["request", "list", "--issue", waiting, "--status", "all"]),
     ) as Requests;
@@ -1446,9 +1456,9 @@ export async function runE2E(
 
   await scenario("tracker-handoff-to-an-agent-created-after-sync", async () => {
     // marco's replica predates this agent: the handoff must still find it by name.
-    const owner = fixtures.tracker.owner;
+    const owner = fixtures.tracker.space;
     const issue = fixtures.tracker.blocker;
-    await gm(["tracker", "sync", "--owner", owner], "marco");
+    await gm(["tracker", "sync", "--space", owner], "marco");
     const name = `late-${randomUUID().slice(0, 8)}`;
     const { agent } = await json<{ agent: Agent }>(
       "/api/agents",
@@ -1466,14 +1476,14 @@ export async function runE2E(
     );
     secrets.add(token.secret);
     const claimed = JSON.parse(
-      await gm(["issue", "claim", issue, "--owner", owner, "--agent", "e2e-handoff"], "marco"),
+      await gm(["issue", "claim", issue, "--space", owner, "--agent", "e2e-handoff"], "marco"),
     ) as { results: { leaseToken: string }[] };
     const lease = claimed.results[0]?.leaseToken;
     assert(lease, "Claim must return a fencing token");
     secrets.add(lease);
     const offered = JSON.parse(
       await gm(
-        ["issue", "handoff", issue, "--owner", owner, "--to", name],
+        ["issue", "handoff", issue, "--space", owner, "--to", name],
         "marco",
         work,
         undefined,
@@ -1486,7 +1496,7 @@ export async function runE2E(
     assert(code, "Handoff must return a single-use code");
     secrets.add(code);
     const accepted = JSON.parse(
-      await gm(["issue", "accept", code, "--owner", owner], "marco", work, undefined, {
+      await gm(["issue", "accept", code, "--space", owner], "marco", work, undefined, {
         GM_TOKEN: token.secret,
       }),
     ) as { results: { leaseToken: string }[] };
@@ -1494,12 +1504,12 @@ export async function runE2E(
     assert(handed, "Accepting must return the agent's fencing token");
     secrets.add(handed);
     const shown = JSON.parse(
-      await gm(["issue", "show", issue, "--owner", owner], "marco", work, undefined, {
+      await gm(["issue", "show", issue, "--space", owner], "marco", work, undefined, {
         GM_TOKEN: token.secret,
       }),
     ) as { issue: { claim: { actorId: string } } };
     assert.equal(shown.issue.claim.actorId, agent.id, "The agent now holds the lease");
-    await gm(["issue", "release", issue, "--owner", owner], "marco", work, undefined, {
+    await gm(["issue", "release", issue, "--space", owner], "marco", work, undefined, {
       GM_TOKEN: token.secret,
       GM_LEASE_TOKEN: handed,
     });
@@ -1510,9 +1520,9 @@ export async function runE2E(
   await scenario("package-upload-download-and-write-boundary", async () => {
     const file = join(work, "artifact.txt");
     await writeFile(file, bytes);
-    await gm(["pkg", "upload", file, `${packageName}/1.0.0/artifact.txt`, "--owner", repo.owner]);
+    await gm(["pkg", "upload", file, `${packageName}/1.0.0/artifact.txt`, "--space", repo.space]);
     assert.equal(
-      await request(`/generic/${repo.owner}/${packageName}/1.0.0/artifact.txt`, ownerToken),
+      await request(`/generic/${repo.space}/${packageName}/1.0.0/artifact.txt`, ownerToken),
       bytes,
     );
     const downloaded = join(work, "downloaded-artifact.txt");
@@ -1520,8 +1530,8 @@ export async function runE2E(
       "pkg",
       "download",
       `${packageName}/latest/artifact.txt`,
-      "--owner",
-      repo.owner,
+      "--space",
+      repo.space,
       "--dest",
       downloaded,
     ]);
@@ -1546,8 +1556,8 @@ export async function runE2E(
       "pkg",
       "install",
       executableName,
-      "--owner",
-      repo.owner,
+      "--space",
+      repo.space,
       "--bin-dir",
       binDir,
     ];
@@ -1579,8 +1589,8 @@ export async function runE2E(
       "upload",
       executableFile,
       `${executableName}/1.0.0/${platform}/${executableName}`,
-      "--owner",
-      repo.owner,
+      "--space",
+      repo.space,
     ]);
     await gm([...installArgs, "--dry-run"]);
     await assert.rejects(stat(binDir), { code: "ENOENT" });
@@ -1594,8 +1604,8 @@ export async function runE2E(
       "upload",
       executableFile,
       `${executableName}/2.0.0/${platform}/${executableName}`,
-      "--owner",
-      repo.owner,
+      "--space",
+      repo.space,
     ]);
     await gm(installArgs, "marco", work, /exist|overwrite|force/i);
     await checkInstalled("1.0.0");
@@ -1610,12 +1620,12 @@ export async function runE2E(
     await checkInstalled("2.0.0");
     record({ rejectedOverwritePreserved: "1.0.0", missingVersionPreserved: "2.0.0" });
     await gm(
-      ["pkg", "upload", file, `${packageName}/forbidden/artifact.txt`, "--owner", repo.owner],
+      ["pkg", "upload", file, `${packageName}/forbidden/artifact.txt`, "--space", repo.space],
       "read",
       work,
       /403|denied|forbidden|read.only|permission/i,
     );
-    await gm(["pkg", "grant", `generic/${packageName}`, fullName, "--owner", repo.owner]);
+    await gm(["pkg", "grant", `generic/${packageName}`, fullName, "--space", repo.space]);
   });
 
   async function pushPipeline(jobs: Record<string, unknown>, branch: string, automatic = false) {
@@ -1709,7 +1719,7 @@ export async function runE2E(
     assert.equal(row.commit, successRun.commit);
     assert.equal(row.ref, "agent-ci-success");
     assert.equal(
-      await request(`/generic/${repo.owner}/${packageName}/2.0.0/artifact.txt`, ownerToken),
+      await request(`/generic/${repo.space}/${packageName}/2.0.0/artifact.txt`, ownerToken),
       bytes,
     );
     record({ publish: row });
@@ -1782,8 +1792,11 @@ export async function runE2E(
     );
     record({ deployment });
 
-    // Outside CI: a person records for an explicit commit, and marks the
-    // preview expired; the record stays.
+    // Outside CI, a real same-Space timeline supplies the preview association.
+    // A Git branch with a similar name is not a Tracker timeline.
+    const timelineSlug = `deploy-preview-${randomUUID().slice(0, 8)}`;
+    const timelineApi = `/api/tracker/${fixtures.tracker.space}/timelines`;
+    await json(timelineApi, ownerToken, "POST", { slug: timelineSlug, repos: [fullName] }, [201]);
     const recorded = JSON.parse(
       await gm([
         "deploy",
@@ -1791,14 +1804,14 @@ export async function runE2E(
         "--url",
         "https://agent-e2e.example.com/preview",
         "--timeline",
-        "agent-e2e",
+        timelineSlug,
         "--commit",
         run.commit,
         "-R",
         fullName,
       ]),
     ) as Deployment;
-    assert.equal(recorded.environment, "timeline/agent-e2e");
+    assert.equal(recorded.environment, `timeline/${timelineSlug}`);
     assert.equal(recorded.run, null);
     assert.equal(recorded.repoId, deployment.repoId);
     assert.equal(recorded.provider, null, "A record that names no version stays uninstrumented");
@@ -1822,6 +1835,7 @@ export async function runE2E(
       /403|read.only|write access/i,
     );
     record({ recorded: kept });
+    await request(`${timelineApi}/${timelineSlug}/abandon`, ownerToken, "POST");
   });
 
   await scenario("ci-cancellation-and-job-token-lifetime", async () => {
@@ -1879,7 +1893,7 @@ export async function runE2E(
         );
         assert(gate);
         // Registry authentication, not the normal user-token API, accepts job credentials.
-        await request(`/api/packages/${repo.owner}/generic/${packageName}`, token);
+        await request(`/api/packages/${repo.space}/generic/${packageName}`, token);
         assert.equal(gate.destroyed, false, "held step exited before cancellation/release");
         if (expected === "cancelled") {
           await gm(["runs", "cancel", String(number), "--repo", fullName]);
@@ -1901,7 +1915,7 @@ export async function runE2E(
         assert.equal(run.status, expected);
         assert(run.jobs.every((job) => job.status === expected));
         await request(
-          `/api/packages/${repo.owner}/generic/${packageName}`,
+          `/api/packages/${repo.space}/generic/${packageName}`,
           token,
           "GET",
           undefined,
@@ -1933,12 +1947,12 @@ export async function runE2E(
     const latest = await poll(() => runDetail(newer), terminal, "newer retention run");
     assert.equal(latest.status, "succeeded");
     await json("/api/dev/ci-age", ctx.env.GITMATRIX_AGENT_SECRET ?? "", "POST", {
-      owner: repo.owner,
+      space: repo.space,
       name: repo.name,
       numbers: [older, newer],
       days: 40,
     });
-    const runs = `/api/accounts/${repo.owner}/retention/runs`;
+    const runs = `/api/spaces/${repo.space}/retention/runs`;
     interface Run {
       id: number;
       status: string;
@@ -2023,17 +2037,17 @@ export async function runE2E(
   });
 
   // Real runner gates evaluate a one-parent compact candidate before canonical CAS.
-  const timelinesApi = `/api/tracker/${fixtures.tracker.owner}/timelines`;
+  const timelinesApi = `/api/tracker/${fixtures.tracker.space}/timelines`;
   const mutateTracker = (token: string, mutations: unknown[], timeline?: string) =>
     json<{ results: { leaseToken?: string }[] }>(
-      `/api/tracker/${fixtures.tracker.owner}/mutate`,
+      `/api/tracker/${fixtures.tracker.space}/mutate`,
       token,
       "POST",
       { operationId: randomUUID(), mutations, ...(timeline ? { timeline } : {}) },
     );
   const trackerIssue = async (id: string) =>
     (
-      await json<Snapshot>(`/api/tracker/${fixtures.tracker.owner}/snapshot`, fixtures.tokens.jun)
+      await json<Snapshot>(`/api/tracker/${fixtures.tracker.space}/snapshot`, fixtures.tokens.jun)
     ).issues.find((issue) => issue.id === id);
   const branchTip = async (name: string) =>
     (await json<RepoDetail>(api, ownerToken)).branches.find((b) => b.shortName === name)?.oid;
@@ -2067,7 +2081,7 @@ export async function runE2E(
     const clone = join(work, `landing-${slug}`);
     await gm(["clone", fullName, clone], "jun");
     await gm(
-      ["timeline", "start", slug, "--owner", fixtures.tracker.owner, "--policy", "auto"],
+      ["timeline", "start", slug, "--space", fixtures.tracker.space, "--policy", "auto"],
       "jun",
       clone,
     );
@@ -2085,7 +2099,7 @@ export async function runE2E(
     );
     const checkpoint = JSON.parse(
       await gm(
-        ["timeline", "checkpoint", "-m", message, "--owner", fixtures.tracker.owner],
+        ["timeline", "checkpoint", "-m", message, "--space", fixtures.tracker.space],
         "jun",
         clone,
       ),
@@ -2292,7 +2306,10 @@ export async function runE2E(
     const retention = await json<{
       run: { status: string; categories: { error: string | null }[] };
     }>("/api/dev/retention", ctx.env.GITMATRIX_AGENT_SECRET ?? "", "POST", {
-      account: fixtures.tracker.owner,
+      target: {
+        kind: "space",
+        id: (await fixtureSpace(ctx.origin, fixtures.tracker.space, ownerToken)).space.id,
+      },
       categories: { "tracker-activity": { eventDays: 365, endedTimelineDays: 180 } },
       daysAhead: 179,
       dryRun: false,
@@ -2309,7 +2326,7 @@ export async function runE2E(
       `${checkpointCommit}\trefs/heads/work`,
     );
     record({ archiveRetentionBeforeDeadline: retention.run });
-    await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
+    await gm(["timeline", "land", slug, "--space", fixtures.tracker.space], "jun", clone, /landed/);
     // The work commit never reaches canonical refs: its main provenance is the
     // source's integration receipt. Wait for that, then assert it exactly below.
     const why = await poll(
@@ -2360,7 +2377,7 @@ export async function runE2E(
       "Preserve unpushed local work after landing.\n",
     );
     await gm(["push"], "jun", clone, /timeline_ended/);
-    await gm(["timeline", "use", "main", "--owner", fixtures.tracker.owner], "jun", clone);
+    await gm(["timeline", "use", "main", "--space", fixtures.tracker.space], "jun", clone);
     record({
       timeline: slug,
       mainBefore,
@@ -2598,7 +2615,7 @@ export async function runE2E(
       assert.equal(timeline.timeline.status, "active");
       assert.equal(timeline.events.at(-1)?.outcome, "conflict");
       const shown = JSON.parse(
-        await gm(["timeline", "show", slug, "--owner", fixtures.tracker.owner], "jun", clone),
+        await gm(["timeline", "show", slug, "--space", fixtures.tracker.space], "jun", clone),
       ) as { landing?: { state: string; reason: string } };
       assert.equal(shown.landing?.state, "conflict", "gm timeline show reports the landing");
       record({ timeline: slug, main: mainTip, conflict: landing.reason });
@@ -2636,8 +2653,8 @@ export async function runE2E(
             "--sync-main",
             "-m",
             `Resolved main sync ${slug}`,
-            "--owner",
-            fixtures.tracker.owner,
+            "--space",
+            fixtures.tracker.space,
           ],
           "jun",
           clone,
@@ -2728,7 +2745,7 @@ export async function runE2E(
     assert.equal(await sourceTip(child), p0);
     const childClone = join(work, child);
     await gm(["clone", fullName, childClone], "jun");
-    await gm(["timeline", "use", child, "--owner", fixtures.tracker.owner], "jun", childClone);
+    await gm(["timeline", "use", child, "--space", fixtures.tracker.space], "jun", childClone);
     await writeFile(join(childClone, childFile), "Child delta\n");
     const checkpoint = await pushAndCheckpoint(childClone, child, "Child before parent lands");
     assert.equal(checkpoint.repos[0]?.logicalBase?.commit, p0);
@@ -2748,7 +2765,7 @@ export async function runE2E(
     const importedFile = `${importedChild}.txt`;
     await gm(["clone", fullName, importedClone], "jun");
     await gm(
-      ["timeline", "use", importedChild, "--owner", fixtures.tracker.owner],
+      ["timeline", "use", importedChild, "--space", fixtures.tracker.space],
       "jun",
       importedClone,
     );
@@ -2819,7 +2836,7 @@ export async function runE2E(
     );
     await nativeGit(["push", "origin", "HEAD:main"], reverted);
     const revertTip = await nativeGit(["rev-parse", "HEAD"], reverted);
-    await gm(["timeline", "land", child, "--owner", fixtures.tracker.owner], "jun", childClone);
+    await gm(["timeline", "land", child, "--space", fixtures.tracker.space], "jun", childClone);
     const childLanding = await settledLanding(child);
     assert.equal(childLanding.state, "landed", childLanding.reason ?? "");
     const childCompact = childLanding.repos[0]?.merge;
@@ -2859,7 +2876,7 @@ export async function runE2E(
     await gm(["auth", "login", "--token", ownerToken], "marco", first, undefined, machine);
     const list = async () => (await json<{ agents: Agent[] }>("/api/agents", ownerToken)).agents;
     const before = await list();
-    const args = ["agent", "setup", "--harness", "codex", "--owner", fixtures.tracker.owner];
+    const args = ["agent", "setup", "--harness", "codex", "--space", fixtures.tracker.space];
     await gm([...args, "--check"], "marco", first, /"stale"/, machine);
     assert.deepEqual(await readdir(first), [".gitmatrix"]);
     assert.deepEqual(await readdir(join(first, ".gitmatrix")), []);
@@ -2944,7 +2961,7 @@ export async function runE2E(
     assert.match(status.actingAs ?? "", new RegExp(`^${name} \\(for `));
     const claim = JSON.parse(
       await gm(
-        ["issue", "claim", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+        ["issue", "claim", fixtures.tracker.blocker, "--space", fixtures.tracker.space],
         "marco",
         dir,
         undefined,
@@ -2956,7 +2973,7 @@ export async function runE2E(
     secrets.add(lease);
     const shown = JSON.parse(
       await gm(
-        ["issue", "show", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+        ["issue", "show", fixtures.tracker.blocker, "--space", fixtures.tracker.space],
         "marco",
         dir,
         undefined,
@@ -2970,7 +2987,7 @@ export async function runE2E(
     assert(agent, "gm must have created the checkout's agent");
     assert.equal(agent.tokens.length, 1, "Later commands reuse the kept token");
     await gm(
-      ["issue", "release", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+      ["issue", "release", fixtures.tracker.blocker, "--space", fixtures.tracker.space],
       "marco",
       dir,
       undefined,
@@ -3004,7 +3021,7 @@ export async function runE2E(
     const put = (bytes: Uint8Array, type: string) =>
       fetch(`${ctx.origin}/api/account/avatar`, {
         method: "PUT",
-        headers: { authorization: `Bearer ${token}`, "content-type": type },
+        headers: { ...contentHeaders, authorization: `Bearer ${token}`, "content-type": type },
         body: new Uint8Array(bytes),
         signal: AbortSignal.timeout(30_000),
       });
@@ -3037,10 +3054,12 @@ export async function runE2E(
     assert.equal(removed.viewer.avatarUrl, null);
 
     // CORE-128: an organization's icon, by its owners only.
+    const organization = (await fixtureSpace(ctx.origin, repo.space, fixtures.tokens.marco)).space
+      .organization;
     const orgPut = (who: string) =>
-      fetch(`${ctx.origin}/api/accounts/${repo.owner}/avatar`, {
+      fetch(`${ctx.origin}/api/organizations/${organization.slug}/avatar`, {
         method: "PUT",
-        headers: { authorization: `Bearer ${who}`, "content-type": "image/png" },
+        headers: { ...contentHeaders, authorization: `Bearer ${who}`, "content-type": "image/png" },
         body: new Uint8Array(png),
         signal: AbortSignal.timeout(30_000),
       });
@@ -3048,13 +3067,17 @@ export async function runE2E(
     const iconSaved = await orgPut(fixtures.tokens.marco);
     assert.equal(iconSaved.status, 200, `org icon: HTTP ${iconSaved.status}`);
     const icon = ((await iconSaved.json()) as { avatarUrl: string | null }).avatarUrl;
-    const org = await json<{ avatarUrl: string | null; viewerCanManage: boolean }>(
-      `/api/accounts/${repo.owner}`,
+    const org = await json<{
+      organization: { avatarUrl: string | null };
+      viewerRole: "owner" | "member";
+    }>(`/api/organizations/${organization.slug}`, fixtures.tokens.marco);
+    assert.equal(org.organization.avatarUrl, icon, "The Organization shows its icon");
+    assert.equal(org.viewerRole, "owner");
+    await request(
+      `/api/organizations/${organization.slug}/avatar`,
       fixtures.tokens.marco,
+      "DELETE",
     );
-    assert.equal(org.avatarUrl, icon, "The organization shows its icon");
-    assert.equal(org.viewerCanManage, true);
-    await request(`/api/accounts/${repo.owner}/avatar`, fixtures.tokens.marco, "DELETE");
     record({ avatar: url, removed: true, orgIcon: icon });
   });
 
@@ -3112,7 +3135,7 @@ export async function runE2E(
   await scenario("usage-metering-collects-per-account", async () => {
     // CORE-207, in the real runtime: the cron's collection, run to the end,
     // meters what the earlier scenarios stored for the fixture repository's
-    // owner: pushed pack bytes (Artifacts), D1 groups, Durable Objects.
+    // Space: pushed pack bytes (Artifacts), D1 groups, Durable Objects.
     interface Figure {
       day: string;
       construct: string;
@@ -3127,7 +3150,12 @@ export async function runE2E(
       "/api/dev/usage",
       ctx.env.GITMATRIX_AGENT_SECRET ?? "",
       "POST",
-      { account: repo.owner },
+      {
+        target: {
+          kind: "space",
+          id: (await fixtureSpace(ctx.origin, repo.space, ownerToken)).space.id,
+        },
+      },
     );
     const find = (construct: string, item: string, metric: string) =>
       figures.find((f) => f.construct === construct && f.item === item && f.metric === metric);
@@ -3140,7 +3168,7 @@ export async function runE2E(
     assert.equal(find("d1", "repositories", "bytes")?.estimated, 1);
     assert(
       (find("durable_objects", "Tracker", "instances")?.quantity ?? 0) >= 1,
-      "The account's tracker is metered from the instance registry",
+      "The Space's tracker is metered from the instance registry",
     );
     for (const figure of figures)
       assert(figure.method.length > 0, `${figure.construct}/${figure.item} says how it was made`);
@@ -3150,14 +3178,14 @@ export async function runE2E(
   await scenario("ai-gateway-log-bodies-site-default-and-account-override", async () => {
     // CORE-290: "Keep AI request and response bodies in gateway logs", per
     // component. Agent environments keep them by default; site administrators
-    // set the site default and an account's administrators override it for
-    // the account, through the API and `gm settings ai`; both show the
+    // set the Instance default and a Space's administrators override it for
+    // that Space, through the API and `gm settings ai`; both show the
     // retention note; members, non-admins and agents are refused.
     type Entry = {
       component: string;
       site: boolean;
       siteFrom: string;
-      account?: boolean | null;
+      space?: boolean | null;
       effective: boolean;
     };
     type View = { logBodies: { environmentDefault: boolean; note: string; components: Entry[] } };
@@ -3183,7 +3211,7 @@ export async function runE2E(
     );
 
     try {
-      // The site turns Knowledge bodies off; marco keeps them for his own account.
+      // The Instance turns Knowledge bodies off; marco keeps them for his personal Space.
       const shown = JSON.parse(await gm(["settings", "ai", "show", "--site"], "priya")) as View;
       assert.equal(find(shown, "knowledge").effective, true);
       const off = JSON.parse(
@@ -3194,18 +3222,18 @@ export async function runE2E(
       assert.equal(knowledge.siteFrom, "site");
       assert.equal(knowledge.effective, false);
       const own = JSON.parse(
-        await gm(["settings", "ai", "set", "--owner", "marco", "--log-bodies", "knowledge=on"]),
+        await gm(["settings", "ai", "set", "--space", "marco", "--log-bodies", "knowledge=on"]),
       ) as View;
-      assert.equal(find(own, "knowledge").account, true);
+      assert.equal(find(own, "knowledge").space, true);
       assert.equal(find(own, "knowledge").effective, true);
       // Orbit follows the site; jun (a member) reads but can't change it.
-      const orbit = await json<View>("/api/accounts/orbit/settings/ai", fixtures.tokens.jun);
+      const orbit = await json<View>("/api/spaces/orbit/settings/ai", fixtures.tokens.jun);
       assert.equal(find(orbit, "knowledge").effective, false);
       await gm(
-        ["settings", "ai", "set", "--owner", "orbit", "--log-bodies", "knowledge=on"],
+        ["settings", "ai", "set", "--space", "orbit", "--log-bodies", "knowledge=on"],
         "jun",
         work,
-        /owner|site admin|403/i,
+        /space admin|403/i,
       );
       // --dry-run sends nothing.
       const dry = JSON.parse(
@@ -3219,7 +3247,7 @@ export async function runE2E(
       );
       record({ site: "knowledge=off", marco: "knowledge=on", orbit: "follows site" });
     } finally {
-      await gm(["settings", "ai", "set", "--owner", "marco", "--log-bodies", "default"]);
+      await gm(["settings", "ai", "set", "--space", "marco", "--log-bodies", "default"]);
       await gm(["settings", "ai", "set", "--site", "--log-bodies", "default"], "priya");
     }
     const reset = await json<View>("/api/admin/ai", fixtures.tokens.priya);
@@ -3227,11 +3255,11 @@ export async function runE2E(
   });
 
   await scenario("browser-usage-and-costs-account-and-site", async () => {
-    // CORE-209: the account's Usage & costs page (its administrators) and the
-    // site's (site administrators), from the collection the scenario above ran,
-    // at desktop and phone widths; members and non-admins are refused.
-    const owner = repo.owner;
-    const report = await json<UsageReport>(`/api/accounts/${owner}/usage`, fixtures.tokens.marco);
+    // CORE-209: Space usage requires its explicit admin grant; Instance totals
+    // never grant drilldown access. Exercise both widths from the collection
+    // above; members and non-admins remain refused.
+    const owner = repo.space;
+    const report = await json<UsageReport>(`/api/spaces/${owner}/usage`, fixtures.tokens.marco);
     assert(report.asOf, "The collection above produced a report day");
     const lines = report.constructs.flatMap((c) => c.lines);
     assert(lines.length > 0, "The report has priced lines");
@@ -3246,13 +3274,13 @@ export async function runE2E(
             1e-12,
           `${line.construct}/${line.item}: cost = quantity × price`,
         );
-    await request(`/api/accounts/${owner}/usage`, fixtures.tokens.jun, "GET", undefined, [403]);
-    await request(`/api/accounts/${owner}/usage`, fixtures.tokens.sam, "GET", undefined, [404]);
+    await request(`/api/spaces/${owner}/usage`, fixtures.tokens.jun, "GET", undefined, [403]);
+    await request(`/api/spaces/${owner}/usage`, fixtures.tokens.sam, "GET", undefined, [404]);
     await request("/api/admin/usage", fixtures.tokens.marco, "GET", undefined, [403]);
     const site = await json<UsageReport>("/api/admin/usage", fixtures.tokens.priya);
     assert(
-      site.accounts?.some((a) => a.slug === owner),
-      "The site report totals the fixture's owner",
+      site.subjects?.some((subject) => subject.scope === "space" && subject.slug === owner),
+      "The Instance report totals the fixture's Space",
     );
 
     const browserTimeout = 15_000;
@@ -3283,13 +3311,18 @@ export async function runE2E(
         const { context, page } = await signIn("marco", { width, height });
         contexts.push(context);
         current = page;
-        // Reached from the settings navigation's account group.
-        await page.goto(`/settings/ai?owner=${owner}`);
+        // Reached from the settings navigation's Space group.
+        await page.goto(`/settings/ai?space=${owner}`);
         if (width < 768) await page.getByText("Settings /").click();
-        await page.getByRole("link", { name: "Usage & costs", exact: true }).click();
-        await page.waitForURL((url) => url.pathname === "/settings/usage");
-        await expect(page.getByRole("heading", { name: "Usage & costs", level: 1 })).toBeVisible();
-        await expect(page.getByText(`Usage for @${owner}`, { exact: true })).toBeVisible();
+        await page
+          .getByRole("link")
+          .and(page.locator(`[href="/settings/usage?space=${owner}"]`))
+          .click();
+        await page.waitForURL(
+          (url) => url.pathname === "/settings/usage" && url.searchParams.get("space") === owner,
+        );
+        await expect(page.getByRole("status").filter({ hasText: `@${owner}` })).toBeVisible();
+        await expect(page.locator('[data-usage-report="space"]')).toBeVisible();
         await expect(page.locator("[data-usage-total]")).toBeVisible();
         await expect(page.getByText("Daily cost, last 30 days")).toBeVisible();
         for (const construct of report.constructs)
@@ -3319,9 +3352,8 @@ export async function runE2E(
         // CSV export: one row per figure.
         const [download] = await Promise.all([
           page.waitForEvent("download"),
-          page.getByRole("link", { name: "Download CSV" }).click(),
+          page.getByRole("button", { name: "Download CSV" }).click(),
         ]);
-        assert.equal(download.suggestedFilename(), `${owner}-usage-${report.asOf}.csv`);
         const csv = await readFile((await download.path())!, "utf8");
         const rows = csv.trim().split("\n");
         assert.match(rows[0]!, /^construct,item,label,kind,metric,quantity,estimated,/);
@@ -3339,9 +3371,9 @@ export async function runE2E(
         const { context, page } = await signIn("jun", { width: 390, height: 844 });
         contexts.push(context);
         current = page;
-        await page.goto(`/settings/usage?owner=${owner}`);
+        await page.goto(`/settings/usage?space=${owner}`);
         await expect(
-          page.getByText("Only the account's administrators see its usage and costs."),
+          page.getByText("Only Space administrators see its usage and costs."),
         ).toBeVisible();
         await expect(page.locator("[data-usage-report]")).toHaveCount(0);
         await page.goto("/settings/site-usage");
@@ -3350,7 +3382,7 @@ export async function runE2E(
         await context.close();
       }
 
-      // The site administrator: every account and the site total, at both widths.
+      // The Instance operator: distinct subjects and total, not private Space access.
       for (const [width, height] of [
         [1280, 900],
         [390, 844],
@@ -3360,21 +3392,25 @@ export async function runE2E(
         current = page;
         await page.goto("/settings/site-usage");
         await expect(
-          page.getByRole("heading", { name: "Site usage & costs", level: 1 }),
+          page.getByRole("heading", { name: "Instance usage & costs", level: 1 }),
         ).toBeVisible();
-        await expect(page.locator('[data-usage-report="site"]')).toBeVisible();
-        const accounts = page.getByRole("region", { name: "By account" });
-        await expect(accounts.getByRole("listitem")).toHaveCount(site.accounts!.length);
+        await expect(page.locator('[data-usage-report="instance"]')).toBeVisible();
+        const subjects = page.getByRole("region", { name: "By Space and person" });
+        await expect(subjects.getByRole("listitem")).toHaveCount(site.subjects!.length);
         await noSideways(page, `site ${width}px`);
-        await accounts.getByRole("link", { name: new RegExp(`@${owner}\\b`) }).click();
+        await subjects
+          .getByRole("link")
+          .and(page.locator(`[href="/settings/usage?space=${owner}"]`))
+          .click();
         await page.waitForURL(
-          (url) => url.pathname === "/settings/usage" && url.searchParams.get("owner") === owner,
+          (url) => url.pathname === "/settings/usage" && url.searchParams.get("space") === owner,
         );
-        await expect(page.locator('[data-usage-report="account"]')).toBeVisible();
+        await expect(page.getByText("Space not found.")).toBeVisible();
+        await expect(page.locator('[data-usage-report="space"]')).toHaveCount(0);
         await context.tracing.stop();
         await context.close();
       }
-      record({ lines: lines.length, accounts: site.accounts!.length, widths: [1280, 390] });
+      record({ lines: lines.length, subjects: site.subjects!.length, widths: [1280, 390] });
     } catch (error) {
       await current
         ?.screenshot({ path: join(ctx.artifacts, "browser-usage-failure.png"), fullPage: true })
@@ -3391,9 +3427,9 @@ export async function runE2E(
   });
 
   await scenario("browser-data-retention-account-and-site", async () => {
-    // CORE-210: the account's Data retention page (its administrators) and
-    // the site's (site administrators), at desktop and phone widths, driven
-    // from the keyboard. marco turns assistant chat expiration on, previews it
+    // CORE-210: independent personal, Space-admin and Instance retention,
+    // at desktop and phone widths, driven from the keyboard.
+    // Marco turns personal assistant chat expiration on, previews it
     // (exactly the stale chats seeded here), deletes them, and the history
     // records both runs; the cron never schedules a category that's off;
     // the usage report links each category to its row and "Clean up now";
@@ -3401,8 +3437,10 @@ export async function runE2E(
     const owner = "marco";
     const token = fixtures.tokens.marco;
     const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
-    const settings = `/api/accounts/${owner}/settings/retention`;
+    const settings = `/api/accounts/${owner}/retention`;
     const runs = `/api/accounts/${owner}/retention/runs`;
+    const personalSpace = (await fixtureSpace(ctx.origin, owner, token)).space;
+    const personId = (await json<{ id: string }>(`/api/accounts/${owner}`, token)).id;
     type Run = {
       id: number;
       dryRun: boolean;
@@ -3415,8 +3453,8 @@ export async function runE2E(
 
     // Authorization, API: a member of orbit and an outsider see nothing; only
     // site administrators reach the site level.
-    const orbit = `/api/accounts/${repo.owner}`;
-    await request(`${orbit}/settings/retention`, fixtures.tokens.jun, "GET", undefined, [403]);
+    const orbit = `/api/spaces/${repo.space}`;
+    await request(`${orbit}/retention`, fixtures.tokens.jun, "GET", undefined, [403]);
     await request(`${orbit}/retention/runs`, fixtures.tokens.jun, "GET", undefined, [403]);
     await request(
       `${orbit}/retention/runs`,
@@ -3429,7 +3467,7 @@ export async function runE2E(
       [403],
     );
     await request(
-      `${orbit}/settings/retention`,
+      `${orbit}/retention`,
       fixtures.tokens.jun,
       "PATCH",
       {
@@ -3437,7 +3475,7 @@ export async function runE2E(
       },
       [403],
     );
-    await request(`${orbit}/settings/retention`, fixtures.tokens.sam, "GET", undefined, [404]);
+    await request(`${orbit}/retention`, fixtures.tokens.sam, "GET", undefined, [404]);
     await request("/api/admin/retention", token, "GET", undefined, [403]);
     await request(
       "/api/admin/retention/runs",
@@ -3449,7 +3487,12 @@ export async function runE2E(
       },
       [403],
     );
-    await gm(["retention", "show", "--owner", repo.owner], "jun", work, /owners|forbidden|403/i);
+    await gm(
+      ["retention", "show", "--space", repo.space],
+      "jun",
+      work,
+      /administrators|forbidden|403/i,
+    );
 
     // Seed: stale chats (last used 120 days ago) and one used today.
     const tag = randomUUID().replaceAll("-", "").slice(0, 10);
@@ -3480,17 +3523,17 @@ export async function runE2E(
       );
 
     // gm parity: show, set, and a dry run that deletes nothing.
-    const shown = JSON.parse(await gm(["retention", "show", "--owner", owner])) as {
+    const shown = JSON.parse(await gm(["retention", "show", "--person", owner])) as {
       categories: { id: string; enabled: boolean }[];
     };
     assert.equal(shown.categories.find((c) => c.id === "assistant-chats")?.enabled, false);
     const gmDry = JSON.parse(
-      await gm(["retention", "run", "assistant-chats", "--owner", owner, "--dry-run"]),
+      await gm(["retention", "run", "assistant-chats", "--person", owner, "--dry-run"]),
     ) as Run;
     assert.equal(gmDry.dryRun, true);
     assert.equal(gmDry.items, idle.length, "gm's dry run lists exactly the idle chats");
     await gm(
-      ["retention", "run", "assistant-chats", "--owner", owner],
+      ["retention", "run", "assistant-chats", "--person", owner],
       "marco",
       work,
       /--yes|confirm/i,
@@ -3521,10 +3564,15 @@ export async function runE2E(
         const { context, page } = await signIn("marco", { width: 1280, height: 900 });
         contexts.push(context);
         current = page;
-        await page.goto(`/settings/usage?owner=${owner}`);
-        await page.getByRole("link", { name: "Data retention", exact: true }).click();
-        await page.waitForURL((url) => url.pathname === "/settings/retention");
-        await expect(page.getByRole("heading", { name: "Data retention", level: 1 })).toBeVisible();
+        await page.goto(`/settings/usage?person=${owner}`);
+        await page
+          .getByRole("link")
+          .and(page.locator(`[href="/settings/retention?person=${owner}"]`))
+          .click();
+        await page.waitForURL(
+          (url) =>
+            url.pathname === "/settings/retention" && url.searchParams.get("person") === owner,
+        );
         const all = (await json<{ categories: { id: string; scope: string }[] }>(settings, token))
           .categories;
         await expect(page.locator("[data-retention-row]")).toHaveCount(all.length);
@@ -3591,18 +3639,20 @@ export async function runE2E(
         await expect(page.locator(`[data-run="${dry.id}"]`)).toContainText(`Preview #${dry.id}`);
         await expect(row.locator("[data-last-run]")).toContainText(`#${real.id}`);
 
-        // Previews: the existing preview settings, as a category.
+        // Space previews are independent of the person's assistant chats.
+        await page.goto(`/settings/retention?space=${personalSpace.slug}`);
         const previews = page.locator('[data-retention-row="previews"]');
         await previews.getByLabel("Days without pushes").fill("9");
         await previews.getByRole("button", { name: "Save Timeline previews" }).click();
         await expect(previews.getByText("Timeline previews: saved.")).toBeVisible();
         const previewSettings = await json<{ idleDays: number }>(
-          `/api/accounts/${owner}/settings/previews`,
+          `/api/spaces/${personalSpace.slug}/settings/previews`,
           token,
         );
         assert.equal(previewSettings.idleDays, 9, "The preview sweep reads what the page saved");
 
         // Turn it off again, with a harmless category on so the cron has a run to make.
+        await page.goto(`/settings/retention?person=${owner}`);
         await toggle.focus();
         await page.keyboard.press("Space");
         await row.getByRole("button", { name: "Save Assistant chats" }).click();
@@ -3619,27 +3669,35 @@ export async function runE2E(
         title: `Stale ${stale}`,
         updatedAt: new Date(Date.now() - 120 * 86_400_000).toISOString(),
       });
-      await gm(["retention", "set", "release-notes", "--enable", "--owner", owner]);
+      await gm(["retention", "set", "release-notes", "--enable", "--space", personalSpace.slug]);
       const cron = await json<{
-        scheduled: { id: number; account: string | null; categories: string[] }[];
+        scheduled: { id: number; target: { kind: string; id: string }; categories: string[] }[];
       }>("/api/dev/retention-cron", secret, "POST", {});
       assert(
         cron.scheduled.some(
-          (run) => run.account === owner && run.categories.includes("release-notes"),
+          (run) =>
+            run.target.kind === "space" &&
+            run.target.id === personalSpace.id &&
+            run.categories.includes("release-notes"),
         ),
         "The explicitly enabled category is scheduled",
       );
       for (const run of cron.scheduled)
-        if (run.account === null)
+        if (run.target.kind === "instance")
           assert.deepEqual(run.categories, ["auth-hygiene"], "The site's only always-on category");
       assert(
         !cron.scheduled.some(
-          (r) => r.categories.includes("assistant-chats") && r.account === owner,
+          (r) =>
+            r.categories.includes("assistant-chats") &&
+            r.target.kind === "person" &&
+            r.target.id === personId,
         ),
         "A disabled category is never scheduled",
       );
-      await gm(["retention", "set", "release-notes", "--inherit", "--owner", owner]);
-      await json(`/api/accounts/${owner}/settings/previews`, token, "PATCH", { idleDays: 7 });
+      await gm(["retention", "set", "release-notes", "--inherit", "--space", personalSpace.slug]);
+      await json(`/api/spaces/${personalSpace.slug}/settings/previews`, token, "PATCH", {
+        idleDays: 7,
+      });
       assert(
         (await chats()).some((c) => c.id === stale),
         "The schedule left the stale chat",
@@ -3650,7 +3708,7 @@ export async function runE2E(
         const { context, page } = await signIn("marco", { width: 390, height: 844 });
         contexts.push(context);
         current = page;
-        await page.goto(`/settings/usage?owner=${repo.owner}`);
+        await page.goto(`/settings/usage?space=${repo.space}`);
         const linked = page.locator("[data-retention-category] a").first();
         const category = await linked.locator("xpath=..").getAttribute("data-retention-category");
         await linked.locator("xpath=ancestor::details/summary").click();
@@ -3658,7 +3716,7 @@ export async function runE2E(
         await page.waitForURL(
           (url) =>
             url.pathname === "/settings/retention" &&
-            url.searchParams.get("owner") === repo.owner &&
+            url.searchParams.get("space") === repo.space &&
             url.searchParams.get("cleanup") === category,
         );
         await expect(page.locator(`[data-retention-row="${category}"]`)).toBeVisible();
@@ -3673,10 +3731,8 @@ export async function runE2E(
         const { context, page } = await signIn("jun", { width: 390, height: 844 });
         contexts.push(context);
         current = page;
-        await page.goto(`/settings/retention?owner=${repo.owner}`);
-        await expect(
-          page.getByText("Only the organization's owners can see its data retention."),
-        ).toBeVisible();
+        await page.goto(`/settings/retention?space=${repo.space}`);
+        await expect(page.getByText("Only Space administrators manage retention.")).toBeVisible();
         await expect(page.locator("[data-retention-row]")).toHaveCount(0);
         await page.goto("/settings/site-retention");
         await page.waitForURL((url) => url.pathname === "/");
@@ -3694,10 +3750,10 @@ export async function runE2E(
         current = page;
         await page.goto("/settings/site-retention?cleanup=auth-hygiene");
         await expect(
-          page.getByRole("heading", { name: "Site data retention", level: 1 }),
+          page.getByRole("heading", { name: "Instance data retention", level: 1 }),
         ).toBeVisible();
         await expect(
-          page.getByRole("heading", { name: "Defaults for every account" }),
+          page.getByRole("heading", { name: "Defaults for Spaces and people" }),
         ).toBeVisible();
         await expect(page.locator('[data-retention-row="usage-history"]')).toContainText("months");
         // Auth hygiene always runs: no switch, its days shown but not editable.
@@ -3740,6 +3796,7 @@ export async function runE2E(
     // the API, `gm issue show` and the browser.
     const owner = "sam";
     const token = fixtures.tokens.sam;
+    const space = (await fixtureSpace(ctx.origin, owner, token)).space;
     const key = `R${randomUUID().replaceAll("-", "").slice(0, 5).toUpperCase()}`;
     const team = randomUUID(),
       closed = randomUUID(),
@@ -3762,8 +3819,8 @@ export async function runE2E(
     const closedKey = keys.issues.find((issue) => issue.id === closed)?.key;
     const openKey = keys.issues.find((issue) => issue.id === open)?.key;
     assert(closedKey && openKey, "Both issues have keys");
-    await gm(["tracker", "sync", "--owner", owner], "sam");
-    await gm(["issue", "show", closedKey, "--owner", owner, "--offline"], "sam");
+    await gm(["tracker", "sync", "--space", owner], "sam");
+    await gm(["issue", "show", closedKey, "--space", owner, "--offline"], "sam");
     // Two renames after the replica's cursor: retention prunes the first
     // (the team's newest event stays), which raises the feed's floor past it.
     for (const [version, name] of [
@@ -3788,7 +3845,7 @@ export async function runE2E(
         runs.push(
           (
             await json<Run>("/api/dev/retention", secret, "POST", {
-              account: owner,
+              target: { kind: "space", id: space.id },
               categories: { [category]: thresholds },
               daysAhead: 400,
               dryRun,
@@ -3823,26 +3880,32 @@ export async function runE2E(
     assert.match(gone.error, /removed by retention/);
 
     // The replica's cursor is below the feed's new floor: it starts over.
+    const cursorQuery = new URLSearchParams({
+      after: "0",
+      limit: "1",
+      spaceId: after.spaceId,
+      migrationEpoch: String(after.migrationEpoch),
+    });
     const stale = await request(
-      `/api/tracker/${owner}/changes?after=0&limit=1`,
+      `/api/tracker/${owner}/changes?${cursorQuery}`,
       token,
       "GET",
       undefined,
       [410],
     );
     assert.match(stale, /cursor_expired/);
-    await gm(["tracker", "sync", "--owner", owner], "sam");
+    await gm(["tracker", "sync", "--space", owner], "sam");
     const kept = JSON.parse(
-      await gm(["issue", "show", openKey, "--owner", owner, "--offline"], "sam"),
+      await gm(["issue", "show", openKey, "--space", owner, "--offline"], "sam"),
     ) as { issue: { id: string } };
     assert.equal(kept.issue.id, open);
     await gm(
-      ["issue", "show", closedKey, "--owner", owner, "--offline"],
+      ["issue", "show", closedKey, "--space", owner, "--offline"],
       "sam",
       work,
       /tracker_not_found/,
     );
-    await gm(["issue", "show", closedKey, "--owner", owner], "sam", work, /removed by retention/);
+    await gm(["issue", "show", closedKey, "--space", owner], "sam", work, /removed by retention/);
     // A new issue never takes the removed key, and the replica gets it.
     const fresh = randomUUID();
     await json(`/api/tracker/${owner}/mutate`, token, "POST", {
@@ -3853,8 +3916,8 @@ export async function runE2E(
       (issue) => issue.id === fresh,
     )?.key;
     assert(freshKey && freshKey !== closedKey, "The removed key is not reused");
-    await gm(["tracker", "sync", "--owner", owner], "sam");
-    await gm(["issue", "show", freshKey, "--owner", owner, "--offline"], "sam");
+    await gm(["tracker", "sync", "--space", owner], "sam");
+    await gm(["issue", "show", freshKey, "--space", owner, "--offline"], "sam");
 
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ baseURL: ctx.origin });
@@ -3897,6 +3960,7 @@ export async function runE2E(
         runs.push(
           (
             await json<Run>("/api/dev/retention", secret, "POST", {
+              target: { kind: "instance", id: "" },
               categories: { [category]: { days } },
               daysAhead: 400,
               dryRun,
@@ -3912,7 +3976,7 @@ export async function runE2E(
     }
     assert(counts["registry-audit"]! > 0, "Old audit entries are removed");
     assert.equal(
-      await request(`/generic/${repo.owner}/${packageName}/1.0.0/artifact.txt`, ownerToken),
+      await request(`/generic/${repo.space}/${packageName}/1.0.0/artifact.txt`, ownerToken),
       bytes,
       "A published file still downloads",
     );
@@ -3923,8 +3987,8 @@ export async function runE2E(
         "pkg",
         "install",
         executableName,
-        "--owner",
-        repo.owner,
+        "--space",
+        repo.space,
         "--bin-dir",
         binDir,
         "--version",
@@ -3975,7 +4039,7 @@ export async function runE2E(
     }
     const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
     const name = `agent-delete-${randomUUID().slice(0, 8)}`;
-    const doomed = `${repo.owner}/${name}`;
+    const doomed = `${repo.space}/${name}`;
     const timeline = `delete-${randomUUID().slice(0, 8)}`;
     // The local runtime's D1 sometimes fails a query under load: retry a read.
     const inventory = async (): Promise<Inventory> => {
@@ -4021,7 +4085,7 @@ export async function runE2E(
     try {
       const address = collector.address();
       assert(address && typeof address !== "string");
-      await gm(["repo", "create", name, "--owner", repo.owner]);
+      await gm(["repo", "create", name, "--space", repo.space]);
       const clone = join(work, name);
       await gm(["clone", doomed, clone]);
       await writeFile(join(clone, "marker.txt"), "checked out by the teardown\n");
@@ -4065,8 +4129,8 @@ export async function runE2E(
       const granted = `${name}-pkg`;
       const artifact = join(work, `${name}.txt`);
       await writeFile(artifact, "published before the repository was deleted\n");
-      await gm(["pkg", "upload", artifact, `${granted}/1.0.0/artifact.txt`, "--owner", repo.owner]);
-      await gm(["pkg", "grant", `generic/${granted}`, doomed, "--owner", repo.owner]);
+      await gm(["pkg", "upload", artifact, `${granted}/1.0.0/artifact.txt`, "--space", repo.space]);
+      await gm(["pkg", "grant", `generic/${granted}`, doomed, "--space", repo.space]);
 
       // The push log is written after the push answers (waitUntil), so wait for
       // its row rather than racing it under load (CORE-258).
@@ -4091,7 +4155,11 @@ export async function runE2E(
         "/api/repos",
         ownerToken,
         "POST",
-        { owner: repo.owner, name, visibility: "private" },
+        {
+          spaceId: (await fixtureSpace(ctx.origin, repo.space, ownerToken)).space.id,
+          name,
+          visibility: "private",
+        },
         [409],
       );
       assert.match(taken, /being deleted/);
@@ -4150,7 +4218,7 @@ export async function runE2E(
       record({ after });
 
       // Purged, the name is free again.
-      await gm(["repo", "create", name, "--owner", repo.owner]);
+      await gm(["repo", "create", name, "--space", repo.space]);
       await request(`/api/repos/${doomed}`, ownerToken, "DELETE", undefined, [204]);
       await poll(
         inventory,
@@ -4175,7 +4243,8 @@ export async function runE2E(
     const tag = randomUUID().replaceAll("-", "").slice(0, 10);
     const stale = { id: `e2e-stale-${tag}`, title: `Stale chat ${tag}` };
     const used = { id: `e2e-used-${tag}`, title: `Used chat ${tag}` };
-    const settings = `/api/accounts/${owner}/settings/retention`;
+    const settings = `/api/accounts/${owner}/retention`;
+    const personId = (await json<{ id: string }>(`/api/accounts/${owner}`, token)).id;
     type Chat = { id: string; title: string; expiresAt: string | null };
     const list = async () =>
       (await json<{ chats: Chat[] }>("/api/assistant/chats", token)).chats.filter((chat) =>
@@ -4229,7 +4298,7 @@ export async function runE2E(
         runs.push(
           (
             await json<Run>("/api/dev/retention", secret, "POST", {
-              account: owner,
+              target: { kind: "person", id: personId },
               categories: { "assistant-chats": { days: 90, maxPerUser: 0 } },
               daysAhead: 100,
               dryRun,
@@ -4419,8 +4488,8 @@ export async function runE2E(
   });
 
   await scenario("push-log-retention-and-unreachable-git", async () => {
-    // CORE-202 with real Artifacts, in jun's own account (the cleanup is
-    // per account): a deleted branch leaves a commit no ref reaches.
+    // CORE-202 with real Artifacts, in jun's explicitly granted personal Space
+    // (cleanup is per Space): a deleted branch leaves a commit no ref reaches.
     // Artifacts keeps it (it still serves it by id) and can't prune it, so
     // it's measured, not deleted: the usage figure counts its incompressible
     // blob. Push log retention, a year on, removes exactly the entries its dry
@@ -4428,6 +4497,7 @@ export async function runE2E(
     // object is identical before and after.
     const owner = "jun";
     const token = fixtures.tokens.jun;
+    const space = (await fixtureSpace(ctx.origin, owner, token)).space;
     const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
     const name = `agent-unreachable-${randomUUID().slice(0, 8)}`;
     const remote = `${ctx.origin}/${owner}/${name}.git`;
@@ -4448,7 +4518,13 @@ export async function runE2E(
       (
         await run("git", args, { cwd, env: gitEnv, timeout: 90_000, maxBuffer: 16 << 20 })
       ).stdout.trim();
-    await json(`/api/repos`, token, "POST", { owner, name, visibility: "private" }, [201]);
+    await json(
+      `/api/repos`,
+      token,
+      "POST",
+      { spaceId: space.id, name, visibility: "private" },
+      [201],
+    );
     await mkdir(dir);
     await git(["init", "--initial-branch=main"]);
     await git(["config", "user.name", "Agent Fixture"]);
@@ -4528,7 +4604,7 @@ export async function runE2E(
     }
     const unreachable = async () => {
       const { figures } = await json<{ figures: Figure[] }>("/api/dev/usage", secret, "POST", {
-        account: owner,
+        target: { kind: "space", id: space.id },
       });
       const figure = (metric: string) =>
         figures.find(
@@ -4553,7 +4629,12 @@ export async function runE2E(
           "/api/dev/retention",
           secret,
           "POST",
-          { account: owner, categories: { "push-log": { days: 365 } }, daysAhead: 400, dryRun },
+          {
+            target: { kind: "space", id: space.id },
+            categories: { "push-log": { days: 365 } },
+            daysAhead: 400,
+            dryRun,
+          },
         )
       ).run;
     const dry = await cleanup(true);
@@ -4595,6 +4676,44 @@ export async function runE2E(
             .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
             .click();
           await page.waitForURL((url) => url.pathname !== "/signin");
+          const activeSpace = persona === "marco" ? "orbit" : "nova";
+          for (const width of [1280, 390]) {
+            await page.setViewportSize({ width, height: 850 });
+            await page.goto(`/${activeSpace}`);
+            const scope = page.getByRole("navigation", {
+              name: "Organization and Space",
+              exact: true,
+            });
+            await expect(
+              scope.getByRole("combobox", { name: "Switch Organization", exact: true }),
+            ).toBeVisible();
+            await expect(
+              scope.getByRole("combobox", { name: "Switch Space", exact: true }),
+            ).toBeVisible();
+            await expect(
+              page.getByRole("region", { name: "Repositories", exact: true }),
+            ).toBeVisible();
+            const create = page.getByRole("link", { name: "New repository", exact: true });
+            await expect(create).toHaveAttribute("href", `/${activeSpace}/-/repositories/new`);
+            await create.focus();
+            await expect(create).toBeFocused();
+            await page.keyboard.press("Enter");
+            await page.waitForURL((url) => url.pathname === `/${activeSpace}/-/repositories/new`);
+            await expect(page.getByText("Destination Space", { exact: true })).toBeVisible();
+            await page.goBack();
+            await page.waitForURL((url) => url.pathname === `/${activeSpace}`);
+            await page.goForward();
+            await page.waitForURL((url) => url.pathname === `/${activeSpace}/-/repositories/new`);
+            await page.goto(`/${activeSpace}`);
+            await page
+              .getByRole("navigation", { name: "Space work", exact: true })
+              .getByRole("link", { name: "Projects", exact: true })
+              .click();
+            await page.waitForURL((url) => url.pathname === `/tracker/${activeSpace}/projects`);
+            await page.reload();
+            assert.equal(new URL(page.url()).pathname, `/tracker/${activeSpace}/projects`);
+          }
+          await page.setViewportSize({ width: 1280, height: 850 });
           const persistent = async (path: string, check: () => Promise<void>) => {
             await page.goto(path);
             await check();
@@ -4616,7 +4735,7 @@ export async function runE2E(
           });
           if (persona === "marco") {
             await persistent(
-              `/tracker/${fixtures.tracker.owner}/issues/${fixtures.tracker.ready}`,
+              `/tracker/${fixtures.tracker.space}/issues/${fixtures.tracker.ready}`,
               async () => {
                 await expect(
                   page.getByText("Agent ready fixture", { exact: true }).first(),
@@ -4664,8 +4783,8 @@ export async function runE2E(
               releaseSnapshot = resolve;
             });
             let snapshotHeld = false;
-            const snapshotPath = `/api/tracker/${fixtures.tracker.owner}/snapshot`;
-            const mutationPath = `/api/tracker/${fixtures.tracker.owner}/mutate`;
+            const snapshotPath = `/api/tracker/${fixtures.tracker.space}/snapshot`;
+            const mutationPath = `/api/tracker/${fixtures.tracker.space}/mutate`;
             const descriptionEditor = page.getByRole("form", { name: "Edit Description / PRD" });
             const descriptionInput = descriptionEditor.getByRole("textbox", {
               name: "Description / PRD",
@@ -4926,14 +5045,14 @@ export async function runE2E(
               competingWritePreserved: true,
               recoverableDraftAfterReload: true,
             });
-            await persistent(`/${repo.owner}/-/packages/generic/${packageName}`, async () => {
+            await persistent(`/${repo.space}/-/packages/generic/${packageName}`, async () => {
               await expect(
                 page.getByRole("heading", { name: packageName, exact: true }),
               ).toBeVisible();
               await expect(page.getByText("2.0.0", { exact: true }).first()).toBeVisible();
             });
           } else {
-            await persistent(`/tracker/${fixtures.tracker.owner}`, async () => {
+            await persistent(`/tracker/${fixtures.tracker.space}`, async () => {
               await expect(
                 page.getByText(/not found|not available|access|permission|forbidden/i).first(),
               ).toBeVisible();
@@ -4997,7 +5116,7 @@ export async function runE2E(
 
   await scenario("browser-timeline-scope-round-trip", async () => {
     // A real session carries the owned source through code links, then explicitly returns to main.
-    const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
+    const timelines = `/api/tracker/${fixtures.tracker.space}/timelines`;
     const slug = `e2e-switch-${randomUUID().slice(0, 8)}`;
     const name = `Switcher ${slug.slice(-8)}`;
     const bookmark = "work";
@@ -5042,7 +5161,7 @@ export async function runE2E(
       await page.waitForURL((url) => url.pathname.includes("/blob/"));
       assert.equal(new URL(page.url()).searchParams.get("source"), source.sourceId);
 
-      await page.goto(`/tracker/${fixtures.tracker.owner}/timelines?tl=${slug}`);
+      await page.goto(`/tracker/${fixtures.tracker.space}/timelines?tl=${slug}`);
       // The switch is in the panel's Settings section, closed until opened.
       await page
         .getByRole("region", { name: "Selected timeline" })
@@ -5084,15 +5203,17 @@ export async function runE2E(
   });
   await scenario("retention-concurrent-with-pushes-builds-and-chats", async () => {
     // CORE-211, in the real runtime: real cleanups (dated a year ahead, so
-    // nearly everything is old enough) run again and again in jun's account
+    // nearly everything is old enough) run again and again in jun's Space and personal scope
     // while jun pushes to two branches, a CI build runs, and new chats are
     // made. Afterwards every push landed (refs, objects, fsck), the build
     // finished and is kept as its ref's latest, every new chat is there and
     // only the long-idle ones are gone, each ref keeps its latest push log
     // entry, every run succeeded, and a final run then dry run find nothing
-    // left. Last in the suite: it ages jun's account a year.
+    // left. Last in the suite: it ages jun's Space and personal scope a year.
     const owner = "jun";
     const token = fixtures.tokens.jun;
+    const space = (await fixtureSpace(ctx.origin, owner, token)).space;
+    const personId = (await json<{ id: string }>(`/api/accounts/${owner}`, token)).id;
     const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
     const name = `agent-concurrency-${randomUUID().slice(0, 8)}`;
     const remote = `${ctx.origin}/${owner}/${name}.git`;
@@ -5114,7 +5235,13 @@ export async function runE2E(
       (
         await run("git", args, { cwd, env: gitEnv, timeout: 90_000, maxBuffer: 16 << 20 })
       ).stdout.trim();
-    await json(`/api/repos`, token, "POST", { owner, name, visibility: "private" }, [201]);
+    await json(
+      `/api/repos`,
+      token,
+      "POST",
+      { spaceId: space.id, name, visibility: "private" },
+      [201],
+    );
     await mkdir(join(dir, ".gitmatrix"), { recursive: true });
     await git(["init", "--initial-branch=main"]);
     await git(["config", "user.name", "Agent Fixture"]);
@@ -5149,7 +5276,6 @@ export async function runE2E(
       "ci-logs": { days: 30 },
       "ci-runs": { days: 180, keepLatest: 1 },
       "preview-records": { days: 30 },
-      "assistant-chats": { days: 3650, maxPerUser: 0 },
     };
     type DevRun = {
       run: {
@@ -5159,12 +5285,20 @@ export async function runE2E(
       };
     };
     const cleanup = (dryRun: boolean) =>
-      json<DevRun>("/api/dev/retention", secret, "POST", {
-        account: owner,
-        categories,
-        daysAhead: 400,
-        dryRun,
-      });
+      Promise.all([
+        json<DevRun>("/api/dev/retention", secret, "POST", {
+          target: { kind: "space", id: space.id },
+          categories,
+          daysAhead: 400,
+          dryRun,
+        }),
+        json<DevRun>("/api/dev/retention", secret, "POST", {
+          target: { kind: "person", id: personId },
+          categories: { "assistant-chats": { days: 3650, maxPerUser: 0 } },
+          daysAhead: 400,
+          dryRun,
+        }),
+      ]);
 
     const fresh: string[] = [];
     const pushed: Record<"main" | "work", string> = { main: "", work: "" };
@@ -5218,7 +5352,8 @@ export async function runE2E(
       // Cleanups, back to back, for as long as the rest is going (at least 4).
       (async () => {
         const done: DevRun["run"][] = [];
-        while (!settled || done.length < 4) done.push((await cleanup(false)).run);
+        while (!settled || done.length < 8)
+          done.push(...(await cleanup(false)).map(({ run }) => run));
         return done;
       })(),
       concurrent,
@@ -5269,10 +5404,12 @@ export async function runE2E(
     record({ refUpdates: latest.length });
 
     // Then nothing is left for the same cleanup: a run, and a dry run after it, at that moment.
-    const last = (await cleanup(false)).run;
-    const after = (await cleanup(true)).run;
-    assert.equal(after.status, "succeeded");
-    assert.equal(after.items, 0, `Nothing left: ${JSON.stringify(after.categories)}`);
+    const last = (await cleanup(false)).map(({ run }) => run);
+    const after = (await cleanup(true)).map(({ run }) => run);
+    for (const run of after) {
+      assert.equal(run.status, "succeeded");
+      assert.equal(run.items, 0, `Nothing left: ${JSON.stringify(run.categories)}`);
+    }
     const remaining = (await json<RefUpdateList>(`${repoApi}/ref-updates`, token)).updates;
     for (const branch of ["main", "work"] as const)
       assert(
@@ -5280,11 +5417,11 @@ export async function runE2E(
         `${branch} keeps its latest push log entry after the cleanups`,
       );
     assert(
-      runs.reduce((sum, r) => sum + r.items, 0) + last.items > idle.length,
+      [...runs, ...last].reduce((sum, r) => sum + r.items, 0) > idle.length,
       "The cleanups removed push log entries and run records, not only the idle chats",
     );
     record({
-      cleanups: [...runs.map((r) => r.items), last.items],
+      cleanups: [...runs, ...last].map((r) => r.items),
       refUpdatesAfter: remaining.length,
       build: build.number,
       pushes: 8,

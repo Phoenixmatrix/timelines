@@ -52,6 +52,9 @@ import {
 import { getWorkSource } from "../timelines/sources.ts";
 import { releaseKnowledgeBase } from "./source-reader.ts";
 import { releaseSourceRoots } from "../retention/work-sources.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
+import { paidWorkGuard } from "./paid-work.ts";
+import { parseWorkAuthority } from "../ci/admission.ts";
 
 /** Component pages per set; the rest are counted as skipped. */
 export const MAX_COMPONENT_PAGES = 12;
@@ -275,13 +278,14 @@ export async function writeSetPages(
   // Spent by this set so far, a retried step's pages included.
   let spent = own.reduce((n, p) => n + p.tokens, 0);
 
-  const save = (
+  const save = async (
     page: PlannedPage,
     change: ChosenPage["change"],
     hash: string,
     row: { outcome: "written" | "kept"; body: string; model: string | null; tokens: number },
-  ) =>
-    k
+  ) => {
+    await paidWorkGuard()?.check();
+    return k
       .insertInto("kg_page_set_pages")
       .values({
         repo_id: set.repoId,
@@ -336,6 +340,7 @@ export async function writeSetPages(
         })),
       )
       .execute();
+  };
 
   const settle = async ({ slug, change }: ChosenPage) => {
     const page = bySlug.get(slug);
@@ -414,6 +419,7 @@ export interface PageRequest extends PageSetRef {
   commit: string;
   checkpoint: { id: string; number: number } | null;
   requestedBy: string | null;
+  authorization: WorkAuthority;
 }
 
 /** Whether a timeline's overlay has ended: its pages are read-only. */
@@ -457,7 +463,13 @@ export async function queueSet(
   if (existing) {
     await k
       .updateTable("kg_page_sets")
-      .set({ status: "queued", build_id: null, error: null, finished_at: null })
+      .set({
+        status: "queued",
+        build_id: null,
+        error: null,
+        finished_at: null,
+        ai_snapshot: JSON.stringify({ authorization: request.authorization }),
+      })
       .where("repo_id", "=", request.repoId)
       .where("source_id", "=", request.sourceId ?? "canonical")
       .where("ref", "=", request.ref)
@@ -479,6 +491,7 @@ export async function queueSet(
       status: "queued",
       requested_by: request.requestedBy,
       requested_at: nowIso(),
+      ai_snapshot: JSON.stringify({ authorization: request.authorization }),
     })
     .onConflict((oc) => oc.columns(["repo_id", "source_id", "ref", "set_key"]).doNothing())
     .returning("status")
@@ -508,14 +521,14 @@ export interface PageRun {
  * Which queued sets start now: oldest first, one per timeline bookmark, and
  * at most `max` per repository in flight. `more` when some had to wait.
  */
-export function schedulePages(
+export function schedulePages<T extends { ref: string; key: string; sourceId?: string }>(
   running: PageRun[],
-  queued: { ref: string; key: string; sourceId?: string }[],
+  queued: T[],
   max = MAX_PAGE_JOBS,
-): { start: { ref: string; key: string; sourceId?: string }[]; more: boolean } {
+): { start: T[]; more: boolean } {
   const busy = new Set(running.map((r) => r.ref));
   let room = max - running.length;
-  const start: { ref: string; key: string; sourceId?: string }[] = [];
+  const start: T[] = [];
   let more = false;
   for (const set of queued) {
     if (busy.has(set.ref) || room <= 0) {
@@ -531,14 +544,23 @@ export function schedulePages(
 
 /** Queued sets of a repository, oldest first. */
 export async function queuedSets(d1: D1Database, repoId: string, limit = 20) {
-  return db(d1)
+  const sets = await db(d1)
     .selectFrom("kg_page_sets")
-    .select(["ref", "set_key as key", "source_id as sourceId"])
+    .select(["ref", "set_key as key", "source_id as sourceId", "ai_snapshot"])
     .where("repo_id", "=", repoId)
     .where("status", "=", "queued")
     .orderBy("requested_at")
     .limit(limit)
     .execute();
+  return sets.map(({ ai_snapshot, ...set }) => {
+    const snapshot = ai_snapshot ? (JSON.parse(ai_snapshot) as { authorization?: unknown }) : null;
+    return {
+      ...set,
+      authorization: parseWorkAuthority(
+        snapshot?.authorization ? JSON.stringify(snapshot.authorization) : null,
+      ),
+    };
+  });
 }
 
 /** Mark a queued set as being written by `buildId`; false if someone else took it. */
@@ -550,7 +572,11 @@ export async function claimSet(
 ) {
   const row = await db(d1)
     .updateTable("kg_page_sets")
-    .set({ status: "writing", build_id: buildId, ai_snapshot: JSON.stringify(policy) })
+    .set({
+      status: "writing",
+      build_id: buildId,
+      ai_snapshot: sql<string>`json_patch(coalesce(ai_snapshot, '{}'), ${JSON.stringify(policy)})`,
+    })
     .where("repo_id", "=", set.repoId)
     .where("source_id", "=", set.sourceId ?? "canonical")
     .where("ref", "=", set.ref)
@@ -644,6 +670,7 @@ const ANALYZE_BATCH = 32;
 
 /** What the knowledge Workflow lends a page set. */
 export interface PageSetDeps<R extends { id: string; full_name: string }> {
+  cleanupStep?: WorkflowStep;
   repo(repoId: string, ref: string, sourceId?: string): Promise<R | null>;
   withReader<T>(row: R, work: (reader: RepoReader) => Promise<T>, snapshot?: string): Promise<T>;
   pinBase(repoId: string, commit: string, snapshot: string): Promise<SnapshotFile[]>;
@@ -663,6 +690,7 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
   params: {
     repoId: string;
     buildId: string;
+    authorization: WorkAuthority;
     pages: { ref: string; key: string; sourceId?: string };
     policy?: KnowledgePolicy;
   },
@@ -675,13 +703,17 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
   const set: PageSetRef = { repoId, ...params.pages };
   const snapshot = `knowledge:${buildId}`;
   const done = (status: "succeeded" | "failed" | "ended", values = {}) =>
-    step.do(`pages-${status}`, STEP, async () => {
-      await closeSet(env.DB, set, buildId, status, values);
-      await releaseSourceRoots(env, "knowledge-pages-build", buildId);
-      await releaseKnowledgeBase(env, repoId, snapshot);
-      await deps.finished(buildId);
-      return null;
-    });
+    (status === "failed" ? (deps.cleanupStep ?? step) : step).do(
+      `pages-${status}`,
+      STEP,
+      async () => {
+        await closeSet(env.DB, set, buildId, status, values);
+        await releaseSourceRoots(env, "knowledge-pages-build", buildId);
+        await releaseKnowledgeBase(env, repoId, snapshot);
+        await deps.finished(buildId);
+        return null;
+      },
+    );
   try {
     const stored = await setFor(env.DB, set, buildId);
     if (!stored) {
@@ -690,6 +722,21 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
       await deps.finished(buildId);
       return { status: "gone" };
     }
+    const saved = stored.ai_snapshot
+      ? (JSON.parse(stored.ai_snapshot) as { authorization?: unknown })
+      : null;
+    const authorization = parseWorkAuthority(
+      saved?.authorization ? JSON.stringify(saved.authorization) : null,
+    );
+    if (
+      authorization.spaceId !== params.authorization.spaceId ||
+      authorization.migrationEpoch !== params.authorization.migrationEpoch ||
+      authorization.personId !== params.authorization.personId ||
+      authorization.agentId !== params.authorization.agentId ||
+      authorization.credential.kind !== params.authorization.credential.kind ||
+      authorization.credential.id !== params.authorization.credential.id
+    )
+      throw new Error("Page workflow authority differs from its queued intent");
     const repo = await deps.repo(repoId, set.ref, stored.source_id);
     if (!repo) throw new Error("Repository not found");
     const plan = await step.do("pages-plan", STEP, async () => {

@@ -7,10 +7,11 @@
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import { stateAt, summarize, type Chronicle, type ChronicleIssue } from "../../shared/chronicle.ts";
 import type { Mutation } from "../../shared/tracker.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { removeActivity, selectActivity } from "./retention.ts";
 import { TrackerStore, type Access } from "./store.ts";
 import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.ts";
+import { issueToken } from "../api/tokens.ts";
 
 const databases: { close(): void }[] = [];
 afterEach(() => {
@@ -23,14 +24,32 @@ const at = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString();
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
 /** The history every test reads; minutes from T0 in the comments. */
-function history() {
-  const { db, sql, transactionSync } = durableStorage();
-  databases.push(db);
+async function history() {
+  const { db, sql, transactionSync, close, scope, space, env } = await freshTrackerStorage(
+    "org",
+    ["alice", "bob"].map((accountId) => ({
+      accountId,
+      role: "member" as const,
+      grant: {
+        role: "admin" as const,
+        repositoryRole: "write" as const,
+        packageRole: "none" as const,
+      },
+    })),
+  );
+  databases.push({ close });
+  await env.DB.prepare(
+    "INSERT INTO agents (id, name, accountable_id) VALUES ('agt-bot', 'builder', 'alice')",
+  ).run();
+  const aliceToken = await issueToken(env.DB, "alice", "alice", "write");
+  const bobToken = await issueToken(env.DB, "bob", "bob", "write");
+  const botToken = await issueToken(env.DB, "alice", "builder", "write", undefined, "agt-bot");
   let now = T0;
   const store = new TrackerStore(sql, transactionSync, () => now);
   const alice: Access = {
     actorId: "alice",
     principalId: "alice",
+    credential: { kind: "token", id: aliceToken.id },
     agents: [
       {
         id: "agt-bot",
@@ -41,7 +60,10 @@ function history() {
         revokedAt: null,
       },
     ],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
     members: [
       { id: "alice", slug: "alice", displayName: "Alice" },
@@ -49,12 +71,26 @@ function history() {
     ],
     repos: [],
   };
-  const bot: Access = { ...alice, actorId: "agt-bot" };
-  const bob: Access = { ...alice, actorId: "bob", principalId: "bob", canAdmin: false };
+  const bot: Access = {
+    ...alice,
+    actorId: "agt-bot",
+    agentId: "agt-bot",
+    credential: { kind: "token", id: botToken.id },
+  };
+  const bob: Access = {
+    ...alice,
+    actorId: "bob",
+    principalId: "bob",
+    canAdmin: false,
+    credential: { kind: "token", id: bobToken.id },
+  };
   let n = 0;
   const as = (who: Access, minute: number, timeline: string | null, ...mutations: Mutation[]) => {
     now = T0 + minute * 60_000;
     return store.mutate(who, {
+      contractVersion: 4,
+      spaceId: who.spaceId,
+      migrationEpoch: who.migrationEpoch,
       operationId: `op-${++n}`,
       mutations,
       ...(timeline ? { timeline } : {}),
@@ -149,7 +185,7 @@ function history() {
   ownedTimeline(store.timelines, alice, {
     slug: "search",
     parent: null,
-    repos: [{ id: "app", owner: "org", name: "app" }],
+    repos: [{ id: "app", space: "org", name: "app" }],
     commits: { app: oid(1) },
   });
   const e = token(as(bot, 150, "search", { kind: "issue.claim", id: "e", data: { agent: "s3" } }));
@@ -164,7 +200,7 @@ function history() {
     repos: [
       ownedCheckpointRepo(store.timelines, "search", {
         id: "app",
-        owner: "org",
+        space: "org",
         name: "app",
         commit: oid(2),
         base: oid(1),
@@ -209,8 +245,8 @@ const status = (issue: ChronicleIssue, minute: number) =>
   stateAt(issue, Date.parse(at(minute))).status;
 
 describe("the Chronicle's history by time", () => {
-  test("status as of any time matches the history exactly", () => {
-    const h = history();
+  test("status as of any time matches the history exactly", async () => {
+    const h = await history();
     const all = h.read(30, 500, { quiet: true });
     const a = row(all, "ENG-1");
     const b = row(all, "ENG-2");
@@ -264,8 +300,8 @@ describe("the Chronicle's history by time", () => {
     expect(row(early, "ENG-1").segments).toMatchObject([{ at: at(0), status: "todo" }]);
   });
 
-  test("work spans: renewals, completion, expiry, takeover, release, revoke, parking, retained leases", () => {
-    const h = history();
+  test("work spans: renewals, completion, expiry, takeover, release, revoke, parking, retained leases", async () => {
+    const h = await history();
     const all = h.read(30, 500);
     expect(row(all, "ENG-1").spans).toEqual([
       {
@@ -338,8 +374,8 @@ describe("the Chronicle's history by time", () => {
     expect(all.actors.bob).toMatchObject({ kind: "person", name: "Bob" });
   });
 
-  test("a span still held at the range's end stays open; one cut by the range keeps its true bounds", () => {
-    const h = history();
+  test("a span still held at the range's end stays open; one cut by the range keeps its true bounds", async () => {
+    const h = await history();
     const mid = h.read(140, 155);
     // e was claimed at 150 and held past 155: open as of the range's end.
     const e = row(mid, "ENG-6").spans[0]!;
@@ -352,8 +388,8 @@ describe("the Chronicle's history by time", () => {
     expect(mid.issues.map((i) => i.key)).not.toContain("ENG-1");
   });
 
-  test("markers: comments, checkpoints, evidence, requests, links, landings and timeline checkpoints", () => {
-    const h = history();
+  test("markers: comments, checkpoints, evidence, requests, links, landings and timeline checkpoints", async () => {
+    const h = await history();
     const all = h.read(-1, 500, { quiet: true });
     const kinds = (key: string) => row(all, key).markers.map((m) => [m.kind, m.at, m.text]);
     expect(kinds("ENG-1")).toEqual([
@@ -377,9 +413,12 @@ describe("the Chronicle's history by time", () => {
     expect(kinds("ENG-2").map(([kind, time]) => [kind, time])).toContainEqual(["comment", at(190)]);
   });
 
-  test("links are markers on both issues, and current blockers ride along", () => {
-    const h = history();
+  test("links are markers on both issues, and current blockers ride along", async () => {
+    const h = await history();
     h.store.mutate(h.alice, {
+      contractVersion: 4,
+      spaceId: h.alice.spaceId,
+      migrationEpoch: h.alice.migrationEpoch,
       operationId: "link",
       mutations: [{ kind: "link.add", id: "l1", data: { fromId: "b", toId: "d", kind: "blocks" } }],
     });
@@ -398,8 +437,8 @@ describe("the Chronicle's history by time", () => {
     ]);
   });
 
-  test("closed and untouched issues stay out unless asked for; queries narrow the rows", () => {
-    const h = history();
+  test("closed and untouched issues stay out unless asked for; queries narrow the rows", async () => {
+    const h = await history();
     const range = h.read(30, 500);
     expect(range.issues.map((i) => i.key)).toEqual([
       "ENG-1",
@@ -421,6 +460,9 @@ describe("the Chronicle's history by time", () => {
     ]);
     // Issues created after the range's end aren't rows.
     h.store.mutate(h.alice, {
+      contractVersion: 4,
+      spaceId: h.alice.spaceId,
+      migrationEpoch: h.alice.migrationEpoch,
       operationId: "late",
       mutations: [{ kind: "issue.create", id: "z", data: { teamId: "team", title: "Later" } }],
     });
@@ -428,8 +470,8 @@ describe("the Chronicle's history by time", () => {
     expect(h.read(30, 501).issues.map((i) => i.key)).toContain("ENG-8");
   });
 
-  test("the range summary counts start and end states, completions and who worked how long", () => {
-    const h = history();
+  test("the range summary counts start and end states, completions and who worked how long", async () => {
+    const h = await history();
     const all = h.read(30, 500, { quiet: true });
     const summary = summarize(all.issues, Date.parse(at(30)), Date.parse(at(500)), h.nowIs());
     // q, closed before the range and untouched in it, isn't part of it.
@@ -447,8 +489,8 @@ describe("the Chronicle's history by time", () => {
     expect(minutes).toEqual({ "agt-bot": 84, alice: 100, bob: 10 });
   });
 
-  test("pages are bounded and cover every row once", () => {
-    const h = history();
+  test("pages are bounded and cover every row once", async () => {
+    const h = await history();
     const seen: string[] = [];
     let cursor: string | null = null;
     let pages = 0;
@@ -466,16 +508,31 @@ describe("the Chronicle's history by time", () => {
     expect(() => h.read(30, 500, { limit: 0 })).toThrow(/limit/);
     expect(() => h.read(30, 30)).toThrow(/after from/);
   });
+  test("paging rejects obsolete keys and changed authorization or query scope", async () => {
+    const h = await history();
+    const page = h.read(30, 500, { limit: 1, quiet: true });
+    expect(page.next).not.toBeNull();
+    expect(() => h.read(30, 500, { cursor: "ENG-1", quiet: true })).toThrow(
+      expect.objectContaining({ code: "client_upgrade_required" }),
+    );
+    expect(() => h.read(30, 500, { cursor: page.next, quiet: false })).toThrow(
+      expect.objectContaining({ code: "migration_epoch_mismatch" }),
+    );
+    h.alice.authorizationVersion++;
+    expect(() => h.read(30, 500, { cursor: page.next, quiet: true })).toThrow(
+      expect.objectContaining({ code: "migration_epoch_mismatch" }),
+    );
+  });
 
-  test("density counts every issue event over the whole history; history states its beginning", () => {
-    const h = history();
+  test("density counts every issue event over the whole history; history states its beginning", async () => {
+    const h = await history();
     const page = h.read(30, 500, { quiet: true });
     const density = page.density!;
     const events = (
       h.db
         .prepare(
           `SELECT count(*) AS n FROM events
-           WHERE json_extract(data, '$.entityType') IN ('issue', 'comment', 'request', 'link')`,
+         WHERE json_extract(data, '$.entityType') IN ('issue', 'comment', 'request', 'link')`,
         )
         .get() as { n: number }
     ).n;
@@ -487,8 +544,8 @@ describe("the Chronicle's history by time", () => {
     expect(narrow.counts.reduce((sum, n) => sum + n, 0)).toBeLessThan(events);
   });
 
-  test("retention-pruned history is stated, not silently missing", () => {
-    const h = history();
+  test("retention-pruned history is stated, not silently missing", async () => {
+    const h = await history();
     // 100 days on, prune activity older than 30 days, as tracker-activity does.
     h.advance(100 * 86_400_000);
     const now = new Date(h.nowIs()).toISOString();

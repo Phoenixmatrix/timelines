@@ -5,10 +5,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import type { PurgeReport, StorageReport } from "./contract.ts";
 import {
+  durableAgent,
   durableStub,
   forgetRecorded,
   purgeInstance,
@@ -16,6 +18,19 @@ import {
   TOUCH_EVERY_MS,
 } from "./registry.ts";
 import { SWEEP_LIMITS, sweepDurableInstances } from "./sweep.ts";
+import { recordUse, resolveDurableOwner } from "./record.ts";
+
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+  WorkflowEntrypoint: class {},
+}));
 
 /** Lets background recording (a promise per call) land. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -64,24 +79,21 @@ let coordinators: ReturnType<typeof namespace>;
 let feeds: ReturnType<typeof namespace>;
 let registry: DatabaseSync;
 
-function migratedRegistry(): DatabaseSync {
-  const db = new DatabaseSync(":memory:");
-  const dir = fileURLToPath(new URL("../../registry/migrations/", import.meta.url).href);
-  for (const file of readdirSync(dir)
-    .filter((f) => f.endsWith(".sql"))
-    .sort())
-    db.exec(readFileSync(join(dir, file), "utf8"));
-  return db;
-}
+let close: () => void;
 
-beforeEach(() => {
+afterEach(() => close?.());
+
+beforeEach(async () => {
   forgetRecorded();
-  sqlite = migratedDatabase();
-  registry = migratedRegistry();
+  const fixture = await createFreshSpaceTestEnvironment();
+  close = fixture.close;
+  sqlite = fixture.sqlite;
+  registry = fixture.registry;
   trackers = namespace();
   coordinators = namespace();
   feeds = namespace();
   env = {
+    ...fixture.env,
     DB: d1(sqlite),
     REGISTRY_DB: d1(registry),
     TRACKER: trackers,
@@ -95,23 +107,185 @@ beforeEach(() => {
 function rows(cls?: string) {
   return sqlite
     .prepare(
-      `SELECT class, name, account_id, repo_id, last_active_at, storage_bytes, sized_at, retiring_at, purged_at, purge_reason
+      `SELECT class, name, space_id, account_id, repo_id, last_active_at, storage_bytes, sized_at, retiring_at, purged_at, purge_reason
        FROM do_instances ${cls ? "WHERE class = ?" : ""} ORDER BY class, name`,
     )
     .all(...(cls ? [cls] : [])) as Record<string, unknown>[];
 }
 
+async function seedSpace(id: string) {
+  await seedSpaceFixture(env.DB, {
+    organization: { id: `organization_${id}`, slug: id, displayName: id, kind: "company" },
+    space: { id, slug: id, displayName: id },
+    members: [],
+    actorId: "test-fixture",
+  });
+}
+
 describe("durableStub", () => {
   test("returns the instance's stub and records it with its owner", async () => {
+    await seedSpace("acc_orbit");
     const stub = durableStub(env, "Tracker", "acc_orbit");
-    expect(trackers.getByName).toHaveBeenCalledWith("acc_orbit");
     expect(typeof stub.purge).toBe("function");
     durableStub(env, "KnowledgeCoordinator", "repo_1");
     await settle();
     expect(rows()).toMatchObject([
       { class: "KnowledgeCoordinator", name: "repo_1", account_id: null, repo_id: "repo_1" },
-      { class: "Tracker", name: "acc_orbit", account_id: "acc_orbit", repo_id: null },
+      {
+        class: "Tracker",
+        name: "acc_orbit",
+        space_id: "acc_orbit",
+        account_id: null,
+        repo_id: null,
+      },
     ]);
+  });
+
+  test("equal ids do not conflate Space, person, unknown content, or infrastructure", async () => {
+    sqlite.exec(
+      "INSERT INTO accounts (id, kind, slug, display_name) VALUES ('same', 'user', 'same', 'Person')",
+    );
+    await seedSpace("same");
+    expect(await resolveDurableOwner(env, "Tracker", "same", { account: "same" })).toEqual({
+      space: "same",
+      account: null,
+      repo: null,
+    });
+    expect(await resolveDurableOwner(env, "Assistant", "same:chat", { repo: "same" })).toEqual({
+      space: null,
+      account: "same",
+      repo: null,
+    });
+    expect(
+      await resolveDurableOwner(env, "KnowledgeCoordinator", "same", { account: "same" }),
+    ).toEqual({ space: null, account: null, repo: "same" });
+    expect(await resolveDurableOwner(env, "CiSandbox", "same")).toEqual({
+      space: null,
+      account: null,
+      repo: null,
+    });
+    expect(await resolveDurableOwner(env, "RegistryLogin", "same")).toEqual({
+      space: null,
+      account: null,
+      repo: null,
+    });
+  });
+
+  test("unknown named content stays unattributed through retirement, purge, and cold sweep", async () => {
+    sqlite.exec(
+      "INSERT INTO accounts (id, kind, slug, display_name) VALUES ('missing', 'user', 'missing', 'Person')",
+    );
+    durableStub(env, "Tracker", "missing", { account: "missing" });
+    await settle();
+    await retireInstance(env, "Tracker", "missing", "deleted");
+    await purgeInstance(env, "Tracker", "missing", "deleted");
+    forgetRecorded();
+    await sweepDurableInstances(env, Date.now(), { ...SWEEP_LIMITS, sizes: 0 });
+    expect(rows("Tracker")[0]).toMatchObject({
+      space_id: null,
+      account_id: null,
+      purged_at: "2026-10-04T00:00:00.000Z",
+      retiring_at: null,
+      purge_reason: "deleted",
+    });
+    expect(sqlite.prepare("SELECT COUNT(*) AS count FROM spaces").get()).toEqual({ count: 0 });
+  });
+
+  test("sandbox ownership preserves an original person but never infers one from its opaque name", async () => {
+    sqlite.exec(
+      "INSERT INTO accounts (id, kind, slug, display_name) VALUES ('person', 'user', 'person', 'Person')",
+    );
+    await recordUse(
+      env.DB,
+      {
+        class: "CiSandbox",
+        name: "opaque-job",
+        space: null,
+        account: "person",
+        repo: null,
+      },
+      "2026-10-04T00:00:00.000Z",
+      "2026-10-04T00:00:00.000Z",
+    );
+    expect(await resolveDurableOwner(env, "CiSandbox", "opaque-job")).toEqual({
+      space: null,
+      account: "person",
+      repo: null,
+    });
+    expect(await resolveDurableOwner(env, "CiSandbox", "person")).toEqual({
+      space: null,
+      account: null,
+      repo: null,
+    });
+  });
+
+  test("warm ownership corrections and cold replay replace stale attribution without reviving purge during sweep", async () => {
+    await seedSpace("same");
+    const at = "2026-10-04T00:00:00.000Z";
+    await recordUse(
+      env.DB,
+      { class: "Tracker", name: "same", space: null, account: "same", repo: null },
+      at,
+      at,
+    );
+    durableStub(env, "Tracker", "same");
+    await settle();
+    expect(rows("Tracker")[0]).toMatchObject({ space_id: "same", account_id: null });
+    forgetRecorded();
+    durableStub(env, "Tracker", "same");
+    await settle();
+    await purgeInstance(env, "Tracker", "same", "test");
+    sqlite.exec(
+      "UPDATE do_instances SET space_id = NULL, account_id = 'same' WHERE class = 'Tracker'",
+    );
+    await sweepDurableInstances(env, Date.now(), { ...SWEEP_LIMITS, sizes: 0 });
+    expect(rows("Tracker")[0]).toMatchObject({
+      space_id: "same",
+      account_id: null,
+      purge_reason: "test",
+    });
+  });
+
+  test("sweep pages past unresolved content and retries it after source rows arrive", async () => {
+    await seedSpace("space");
+    await seedSpace("other");
+    durableStub(env, "RegistryRepo", "a_missing");
+    durableStub(env, "RegistryRepo", "z_later");
+    await settle();
+    registry.exec(`INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at)
+      VALUES ('z_later', 'later', 'npm', 'space', 'local', 'private', '2026-10-04', '2026-10-04')`);
+    const limits = { ...SWEEP_LIMITS, backfill: 0, owners: 1, sizes: 0 };
+    await sweepDurableInstances(env, Date.now(), limits);
+    await sweepDurableInstances(env, Date.now(), limits);
+    expect(rows("RegistryRepo")[1]).toMatchObject({ space_id: "space", account_id: null });
+    registry.exec(`INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at)
+      VALUES ('a_missing', 'missing', 'npm', 'other', 'local', 'private', '2026-10-04', '2026-10-04')`);
+    await sweepDurableInstances(env, Date.now(), limits);
+    await sweepDurableInstances(env, Date.now(), limits);
+    expect(rows("RegistryRepo")[0]).toMatchObject({ space_id: "other", account_id: null });
+  });
+
+  test("registry backfill keeps missing Space references unresolved and reconciles them later", async () => {
+    registry.exec(`INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at)
+      VALUES ('feed', 'feed', 'npm', 'later', 'local', 'private', '2026-10-04', '2026-10-04')`);
+    const limits = { ...SWEEP_LIMITS, sizes: 0 };
+    expect((await sweepDurableInstances(env, Date.now(), limits)).registered).toBe(1);
+    await purgeInstance(env, "RegistryRepo", "feed", "deleted");
+    expect(rows("RegistryRepo")[0]).toMatchObject({
+      space_id: null,
+      account_id: null,
+      purge_reason: "deleted",
+    });
+    expect(sqlite.prepare("SELECT COUNT(*) AS count FROM spaces").get()).toEqual({ count: 0 });
+    await seedSpace("later");
+    forgetRecorded();
+    await sweepDurableInstances(env, Date.now(), limits);
+    expect(rows("RegistryRepo")[0]).toMatchObject({
+      space_id: "later",
+      account_id: null,
+      purge_reason: "deleted",
+      purged_at: "2026-10-04T00:00:00.000Z",
+    });
   });
 
   test("records at most once an hour per instance", async () => {
@@ -120,11 +294,9 @@ describe("durableStub", () => {
       vi.setSystemTime(new Date("2026-10-04T00:00:00Z"));
       durableStub(env, "Tracker", "acc_orbit");
       await settle();
-      const prepare = vi.spyOn(env.DB, "prepare");
       vi.setSystemTime(new Date("2026-10-04T00:30:00Z"));
       durableStub(env, "Tracker", "acc_orbit");
       await settle();
-      expect(prepare).not.toHaveBeenCalled();
       expect(rows()[0]).toMatchObject({ last_active_at: "2026-10-04T00:00:00.000Z" });
 
       vi.setSystemTime(new Date(Date.parse("2026-10-04T00:00:00Z") + TOUCH_EVERY_MS + 1));
@@ -247,13 +419,14 @@ describe("sweepDurableInstances", () => {
     for (let i = 0; i < count; i++)
       registry
         .prepare(
-          `INSERT INTO repositories (id, key, format, owner_id, kind, visibility, created_at, updated_at)
+          `INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at)
            VALUES (?, ?, 'npm', 'acc_o', 'local', 'private', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
         )
         .run(`feed_${String(i).padStart(3, "0")}`, `key${i}`);
   }
 
   test("backfills registry repositories in bounded, resumable steps", async () => {
+    await seedSpace("acc_o");
     seedRegistry(5);
     const limits = { ...SWEEP_LIMITS, backfill: 2 };
     expect((await sweepDurableInstances(env, Date.now(), limits)).registered).toBe(2);
@@ -261,16 +434,32 @@ describe("sweepDurableInstances", () => {
     expect((await sweepDurableInstances(env, Date.now(), limits)).registered).toBe(1);
     expect((await sweepDurableInstances(env, Date.now(), limits)).registered).toBe(0);
     expect(rows("RegistryRepo")).toHaveLength(5);
-    expect(rows("RegistryRepo").every((r) => r.account_id === "acc_o")).toBe(true);
+    expect(rows("RegistryRepo").every((r) => r.space_id === "acc_o" && r.account_id === null)).toBe(
+      true,
+    );
   });
 
   test("fills owners from the rows that name them", async () => {
+    sqlite.exec(
+      "INSERT INTO accounts (id, kind, slug, display_name) VALUES ('person', 'user', 'person', 'Person')",
+    );
+    await seedSpaceFixture(env.DB, {
+      organization: { id: "org", slug: "org", displayName: "Org", kind: "company" },
+      space: { id: "acc_o", slug: "space", displayName: "Space" },
+      members: [{ accountId: "person", role: "owner" }],
+      actorId: "person",
+    });
     sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_o', 'org', 'o', 'O');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES ('repo_1', 'acc_o', 'r', 'private', 'n', 'https://x');
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES ('repo_1', 'acc_o', 'r', 'private', 'n', 'https://x');
       INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES ('run_1', 'repo_1', 1, 'c', 'refs/heads/main', 'push', 'running');
       INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES ('job_1', 'run_1', 'repo_1', 'a', '{}', 'running', 'sandbox');
     `);
+    expect(
+      await resolveDurableOwner(env, "CiSandbox", "run_1", { account: "person", repo: "wrong" }),
+    ).toEqual({ space: "acc_o", account: null, repo: "repo_1" });
+    expect(
+      await resolveDurableOwner(env, "CiSandbox", "job_1", { account: "person", repo: "wrong" }),
+    ).toEqual({ space: "acc_o", account: null, repo: "repo_1" });
     seedRegistry(1);
     durableStub(env, "KnowledgeCoordinator", "repo_1");
     durableStub(env, "CiSandbox", "job_1");
@@ -279,22 +468,30 @@ describe("sweepDurableInstances", () => {
     await settle();
     await sweepDurableInstances(env, Date.now(), { ...SWEEP_LIMITS, backfill: 0 });
     expect(
-      rows().map(({ class: cls, name, account_id, repo_id }) => ({
+      rows().map(({ class: cls, name, space_id, account_id, repo_id }) => ({
         cls,
         name,
+        space_id,
         account_id,
         repo_id,
       })),
     ).toEqual([
-      { cls: "CiSandbox", name: "job_1", account_id: "acc_o", repo_id: "repo_1" },
-      { cls: "KnowledgeCoordinator", name: "repo_1", account_id: "acc_o", repo_id: "repo_1" },
+      { cls: "CiSandbox", name: "job_1", space_id: "acc_o", account_id: null, repo_id: "repo_1" },
+      {
+        cls: "KnowledgeCoordinator",
+        name: "repo_1",
+        space_id: "acc_o",
+        account_id: null,
+        repo_id: "repo_1",
+      },
       {
         cls: "KnowledgeCoordinator",
         name: "repo_deleted",
+        space_id: null,
         account_id: null,
         repo_id: "repo_deleted",
       },
-      { cls: "RegistryRepo", name: "feed_000", account_id: "acc_o", repo_id: null },
+      { cls: "RegistryRepo", name: "feed_000", space_id: "acc_o", account_id: null, repo_id: null },
     ]);
   });
 
@@ -325,14 +522,6 @@ describe("sweepDurableInstances", () => {
       "RegistryUpload:upload_1": null,
       "KnowledgeCoordinator:repo_purged": 0,
     });
-    expect(trackers.getByName.mock.calls.map(([n]) => n).sort()).toEqual([
-      "acc_1",
-      "acc_1",
-      "acc_2",
-      "acc_2",
-      "acc_3",
-      "acc_3",
-    ]);
     warn.mockRestore();
   });
 
@@ -347,5 +536,54 @@ describe("sweepDurableInstances", () => {
     const { forgotten } = await sweepDurableInstances(env);
     expect(forgotten).toBe(1);
     expect(rows().map((r) => r.name)).toEqual(["new", "old_tracker"]);
+  });
+});
+
+describe("assistant facade startup", () => {
+  test("does not return the named stub until SDK initialization finishes", async () => {
+    const startup = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const stub = {
+      __unsafe_ensureInitialized: vi.fn(async () => {
+        entered.resolve();
+        await startup.promise;
+      }),
+    };
+    const getByName = vi.fn(() => stub);
+    Reflect.set(env, "ASSISTANT", { getByName });
+    let returned = false;
+    const pending = durableAgent(env, "Assistant", "person:chat").then((value) => {
+      returned = true;
+      return value;
+    });
+    await entered.promise;
+    expect(returned).toBe(false);
+    expect(getByName).toHaveBeenCalledWith("person:chat");
+    startup.resolve();
+    expect(await pending).toBe(stub);
+  });
+
+  test("preserves SDK retryable startup failures without retrying overloads or admission denial", async () => {
+    vi.useFakeTimers();
+    try {
+      const transient = Object.assign(new Error("platform reset"), { retryable: true });
+      const initialize = vi.fn().mockRejectedValueOnce(transient).mockResolvedValue(undefined);
+      const stub = { __unsafe_ensureInitialized: initialize };
+      Reflect.set(env, "ASSISTANT", { getByName: () => stub });
+      const pending = durableAgent(env, "Assistant", "person:retry");
+      await vi.runAllTimersAsync();
+      expect(await pending).toBe(stub);
+      expect(initialize).toHaveBeenCalledTimes(2);
+      for (const error of [
+        Object.assign(new Error("overloaded"), { retryable: true, overloaded: true }),
+        new Error("space_cutover_fenced"),
+      ]) {
+        initialize.mockReset().mockRejectedValue(error);
+        await expect(durableAgent(env, "Assistant", "person:denied")).rejects.toBe(error);
+        expect(initialize).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

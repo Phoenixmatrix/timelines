@@ -105,6 +105,9 @@ export function runChronicleFixture(
   const failed = new Set<number>();
   const send = (who: Access, at: number, ...mutations: Mutation[]) => {
     const result = apply(who, at, {
+      contractVersion: 4,
+      spaceId: who.spaceId,
+      migrationEpoch: who.migrationEpoch,
       operationId: `chronicle-${options.team}-${options.seed}-${++operation}`,
       mutations,
     });

@@ -35,7 +35,7 @@ import { issueKeys } from "../release-notes/keys.ts";
 /** Commits of a change (on other refs) whose messages are read for issue keys. */
 const MESSAGE_COMMITS = 8;
 
-/** Where the chain's facts come from: D1, Artifacts and the owner's tracker, or fakes. */
+/** Where the chain's facts come from: D1, Artifacts and the Space's tracker, or fakes. */
 export interface WhySources {
   repoId: string;
   defaultBranch: string;
@@ -48,18 +48,18 @@ export interface WhySources {
   changeFromHeader(oid: string): Promise<string | null>;
   /** The refs a change reached, oldest first. */
   changeRefs(changeId: string): Promise<ChangeRef[]>;
-  /** Null when the caller can't read the owner's tracker: no tracker records then. */
+  /** Null when the caller can't read the Space's tracker: no tracker records then. */
   tracker: WhyTracker | null;
   /** Issues by key, from the trackers the caller can read that the repository is subscribed to. */
   issues(
     keys: string[],
   ): Promise<
-    { id: string; key: string; title: string; status: IssueStatus; trackerOwner: string }[]
+    { id: string; key: string; title: string; status: IssueStatus; trackerSpace: string }[]
   >;
 }
 
 export interface WhyTracker {
-  owner: string;
+  space: string;
   timelines(): Promise<Timeline[]>;
   /** A timeline's events, oldest first, and its issues. */
   timeline(slug: string): Promise<{ events: TimelineEvent[]; issues: TimelineIssue[] } | null>;
@@ -92,7 +92,7 @@ export function shared(sources: WhySources): WhySources {
     changeFromHeader: once((oid) => sources.changeFromHeader(oid)),
     changeRefs: once((id) => sources.changeRefs(id)),
     tracker: tracker && {
-      owner: tracker.owner,
+      space: tracker.space,
       timelines: () => timelines!(undefined),
       timeline: once((slug) => tracker.timeline(slug)),
       checkpoints: once((slug) => tracker.checkpoints(slug)),
@@ -243,7 +243,7 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
             key: issue.key,
             title: issue.title,
             status: issue.status,
-            trackerOwner: tracker.owner,
+            trackerSpace: tracker.space,
             source: "timeline",
           });
       for (const state of await tracker.checkpoints(timeline.slug)) {
@@ -336,7 +336,7 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
     key: issue.key,
     title: issue.title,
     status: issue.status,
-    trackerOwner: issue.trackerOwner,
+    trackerSpace: issue.trackerSpace,
     source: "commit",
   }));
 

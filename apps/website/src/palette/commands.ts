@@ -9,7 +9,7 @@ import {
   type SearchCategory,
   type SearchMatch,
 } from "../../shared/search.ts";
-import type { TrackerOwner } from "../../shared/tracker.ts";
+import type { SpaceSummary } from "../../shared/spaces.ts";
 import { createIntent } from "./intents.ts";
 import type { ScopedRepo } from "./knowledge.ts";
 import { packagesPath } from "../lib/packages.ts";
@@ -36,7 +36,7 @@ export interface PaletteContext {
   /** The repository being viewed, when on one of its pages. */
   repo: RepoDetail | null;
   /** Trackers the viewer can use (GET /api/tracker); null until loaded or signed out. */
-  trackers: TrackerOwner[] | null;
+  trackers: SpaceSummary[] | null;
   /** The tracker /tracker opens for the viewer: where they last saved defaults. */
   defaultTrackerId?: string | null;
   /** What's typed, for actions that take it as input (a proposed title). */
@@ -105,7 +105,7 @@ const navigate: CommandSource = ({ viewer, repo }) =>
           id: "go",
           group: "pages",
           title: "Go to…",
-          hint: repo ? `Pages, settings and ${repo.owner.slug}/${repo.name}` : "Pages and settings",
+          hint: repo ? `Pages, settings and ${repo.space.slug}/${repo.name}` : "Pages and settings",
           keywords: ["navigate", "pages", "open", "jump"],
           home: true,
           run: { kind: "scope", scope: { kind: "go" } },
@@ -144,7 +144,7 @@ const pages: CommandSource = ({ viewer, pathname }) => {
       "keyboard",
       "shortcuts",
     ]),
-    page("settings", "Settings", "/tracker?manage=true", ["teams", "workspaces", "administration"]),
+    page("settings", "Settings", "/tracker?manage=true", ["teams", "projects", "administration"]),
     page("tokens", "Access tokens", "/settings/tokens", ["pat", "api"]),
     page("agents", "Agents", "/settings/agents", ["bots"]),
     page("ssh-keys", "SSH keys", "/settings/ssh-keys"),
@@ -187,7 +187,7 @@ const repository: CommandSource = ({ viewer, repo }) =>
         id: `repo:${section.id}`,
         group: "repository" as const,
         title: section.label,
-        hint: `${repo.owner.slug}/${repo.name}`,
+        hint: `${repo.space.slug}/${repo.name}`,
         keywords: section.keywords,
         home: !viewer,
         run: { kind: "navigate" as const, to: section.to },
@@ -235,8 +235,8 @@ const FINDS: { category: SearchCategory; title: string; keywords: string[] }[] =
   { category: "issues", title: "Find an issue…", keywords: ["tickets", "tasks", "tracker"] },
   {
     category: "accounts",
-    title: "Find a person or organization…",
-    keywords: ["people", "users", "orgs", "teams", "members"],
+    title: "Find a person…",
+    keywords: ["people", "users", "members"],
   },
   { category: "packages", title: "Find a package…", keywords: ["registry"] },
   { category: "conversations", title: "Find a conversation…", keywords: ["chats", "assistant"] },
@@ -255,10 +255,10 @@ const find: CommandSource = ({ viewer }) =>
       }))
     : [];
 
-/** The tracker the viewer is in: the one being viewed, or the repository owner's. */
+/** The tracker the viewer is in: the one being viewed, or the repository space's. */
 export function contextTracker({ pathname, repo, trackers }: PaletteContext) {
   const viewing = /^\/tracker\/([^/?#]+)/.exec(pathname)?.[1];
-  const slug = viewing ? decodeURIComponent(viewing) : repo?.owner.slug;
+  const slug = viewing ? decodeURIComponent(viewing) : repo?.space.slug;
   return trackers?.find((tracker) => tracker.slug === slug) ?? null;
 }
 
@@ -277,7 +277,7 @@ const createIssue: CommandSource = (context) => {
     ...(here ? [here] : []),
     ...trackers.filter((tracker) => tracker.id !== here?.id),
   ];
-  const open = (tracker: TrackerOwner, title: string) => ({
+  const open = (tracker: SpaceSummary, title: string) => ({
     kind: "navigate" as const,
     to: `/tracker/${encodeURIComponent(tracker.slug)}`,
     state: createIntent(title),
@@ -337,14 +337,14 @@ const knowledge: CommandSource = ({ viewer, repo }) => {
           id: "knowledge:here",
           group: "repository",
           title: "Search code and wiki",
-          hint: `${repo.owner.slug}/${repo.name}`,
+          hint: `${repo.space.slug}/${repo.name}`,
           keywords,
           home: true,
           run: {
             kind: "scope",
             scope: {
               kind: "repo",
-              owner: repo.owner.slug,
+              space: repo.space.slug,
               name: repo.name,
               defaultBranch: repo.defaultBranch,
             },

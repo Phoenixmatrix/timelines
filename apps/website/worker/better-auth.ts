@@ -2,9 +2,9 @@
 // password for accounts a site admin created (worker/api/admin-accounts.ts),
 // and the device authorization flow (RFC 8628) for `gm auth login`.
 //
-// A Better Auth user's id is the Gitmatrix account id ("acc_…"), created
-// together with the accounts row on first sign-in, so a session resolves
-// straight to the account that permissions, tokens and org membership use.
+// A Better Auth user's id is the Gitmatrix person id ("acc_…"). Credentials
+// and attribution retain that identity; content belongs to separately persisted
+// Organizations and Spaces with explicit grants.
 //
 // Sign-up is by invitation: a code is only sent to an existing user, the
 // instance owner (OWNER_EMAIL) or an address an admin invited, and anyone else
@@ -23,6 +23,7 @@ import { readSecret } from "../registry/core/secrets.ts";
 import { RESERVED_SLUGS } from "./names.ts";
 import { isPreview, productionOnly } from "./preview.ts";
 import { db } from "./schema.ts";
+import { createPerson } from "./spaces/store.ts";
 
 /** The only device client: the gm CLI. */
 export const GM_CLIENT_ID = "gm";
@@ -91,7 +92,7 @@ export async function mayJoin(env: Env, email: string): Promise<boolean> {
   return Boolean(invite);
 }
 
-/** A slug from the email's local part, made unique against accounts and reserved names. */
+/** A person/personal-tenant handle free in each independent namespace. */
 async function freeSlug(env: Env, email: string): Promise<string> {
   const base =
     normalize(email)
@@ -103,69 +104,43 @@ async function freeSlug(env: Env, email: string): Promise<string> {
       .replace(/-+$/, "") || "user";
   for (let n = 0; ; n++) {
     const slug = n || RESERVED_SLUGS.has(base) ? `${base}-${n + 1}` : base;
-    const taken = await db(env.DB)
-      .selectFrom("accounts")
-      .select("id")
-      .where("slug", "=", slug)
-      .executeTakeFirst();
-    if (!taken) return slug;
+    if (slug === Reflect.get(env, "OWNER_ORG")) continue;
+    const taken = await Promise.all([
+      db(env.DB).selectFrom("accounts").select("id").where("slug", "=", slug).executeTakeFirst(),
+      db(env.DB)
+        .selectFrom("organizations")
+        .select("id")
+        .where("slug", "=", slug)
+        .executeTakeFirst(),
+      db(env.DB).selectFrom("spaces").select("id").where("slug", "=", slug).executeTakeFirst(),
+    ]);
+    if (taken.every((row) => !row)) return slug;
   }
 }
 
-/**
- * Create the Gitmatrix account for a new Better Auth user. The owner becomes a
- * site admin and, where OWNER_ORG is set (deployed), the owner of that org.
- */
+/** Create person, personal tenant, explicit grants and optional installation company atomically. */
 export async function linkAccount(env: Env, user: { id: string; email: string; name: string }) {
-  const email = normalize(user.email);
   const existing = await db(env.DB)
     .selectFrom("accounts")
     .select("id")
     .where("id", "=", user.id)
     .executeTakeFirst();
+  // Sign-in never repairs migration mappings or restores a revoked content grant.
+  if (existing) return;
+  const email = normalize(user.email);
+  const slug = await freeSlug(env, email);
   const owner = email === normalize(env.OWNER_EMAIL);
-  if (!existing) {
-    const slug = await freeSlug(env, email);
-    await db(env.DB)
-      .insertInto("accounts")
-      .values({
-        id: user.id,
-        kind: "user",
-        slug,
-        display_name: user.name || slug,
-        email,
-        is_site_admin: owner ? 1 : 0,
-      })
-      .execute();
-  }
-  await db(env.DB).deleteFrom("auth_invites").where("email", "=", email).execute();
-  const org = Reflect.get(env, "OWNER_ORG") as string | undefined;
-  if (owner && org) {
-    let orgRow = await db(env.DB)
-      .selectFrom("accounts")
-      .select("id")
-      .where("slug", "=", org)
-      .where("kind", "=", "org")
-      .executeTakeFirst();
-    if (!orgRow) {
-      orgRow = { id: `acc_${crypto.randomUUID()}` };
-      await db(env.DB)
-        .insertInto("accounts")
-        .values({
-          id: orgRow.id,
-          kind: "org",
-          slug: org,
-          display_name: org,
-          member_repo_role: "read",
-        })
-        .execute();
-    }
-    await db(env.DB)
-      .insertInto("org_members")
-      .values({ org_id: orgRow.id, user_id: user.id, role: "owner" })
-      .onConflict((oc) => oc.doNothing())
-      .execute();
-  }
+  const ownerOrganizationSlug = owner
+    ? (Reflect.get(env, "OWNER_ORG") as string | undefined)
+    : undefined;
+  await createPerson(env.DB, {
+    id: user.id,
+    slug,
+    displayName: user.name || slug,
+    email,
+    isSiteAdmin: owner,
+    ownerOrganizationSlug,
+  });
 }
 
 /** Keys a failure counts against: who it names (when known) and the client IP. */
@@ -328,6 +303,22 @@ export function authOptions(env: Env, secret: string, origin?: string) {
           },
           async after(user) {
             await linkAccount(env, user);
+          },
+        },
+      },
+      session: {
+        create: {
+          async before(session) {
+            // A failed user.create.after can leave only the authentication row.
+            // Retry its atomic person bootstrap before issuing any session.
+            const user = await db(env.DB)
+              .selectFrom("auth_users")
+              .select(["id", "email", "name"])
+              .where("id", "=", session.userId)
+              .executeTakeFirst();
+            if (!user) return false;
+            await linkAccount(env, user);
+            return { data: session };
           },
         },
       },

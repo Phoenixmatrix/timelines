@@ -2,8 +2,8 @@
 //
 // The runtime calls a `step.do` callback from outside the AsyncLocalStorage
 // context `run` set up, so each callback re-enters it here:
-//   - aiWork: its calls record in ai_usage for the account and feature whose
-//     work it is, not under the site as `unattributed`;
+//   - aiWork: its calls record in ai_usage for the Space and feature whose
+//     work it is, not under the Instance as `unattributed`;
 //   - paidWork: no call starts after the step attempt's timeout (the runtime
 //     has retried or failed it by then), and none once `live` says the work
 //     is no longer wanted. The latter fails the step without retries.
@@ -11,7 +11,7 @@
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { aiWork, type AiWork } from "../usage/ai.ts";
-import { paidWork } from "./paid-work.ts";
+import { paidWork, type PaidWorkLimits } from "./paid-work.ts";
 
 /** Workflows' step timeout when a step sets none. */
 const DEFAULT_STEP_TIMEOUT_MS = 10 * 60_000;
@@ -42,7 +42,7 @@ type Callback = (ctx: unknown) => Promise<unknown>;
 export function paidSteps(
   step: WorkflowStep,
   work: AiWork,
-  live?: () => Promise<string | null>,
+  live?: PaidWorkLimits["live"],
   every?: number,
 ): WorkflowStep {
   const wrap =
@@ -54,15 +54,18 @@ export function paidSteps(
           async (guard) => {
             let result: unknown;
             try {
+              await guard.check();
               result = await callback(ctx);
             } catch (error) {
               // Stopped work fails now; an expired attempt's error goes nowhere.
-              if (guard.stopped) throw new NonRetryableError(guard.stopped.message);
+              if (guard.stopped)
+                throw new NonRetryableError(guard.stopped.message, guard.stopped.code);
               throw error;
             }
             // Even if the step carried on past refused calls (a page or file
             // that failed is usually skipped), stopped work goes no further.
-            if (guard.stopped) throw new NonRetryableError(guard.stopped.message);
+            if (guard.stopped)
+              throw new NonRetryableError(guard.stopped.message, guard.stopped.code);
             return result;
           },
         ),

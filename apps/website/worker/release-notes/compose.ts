@@ -9,10 +9,11 @@ import { sql } from "kysely";
 import { releaseName } from "../../shared/release-notes.ts";
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
-import { canCreateIn, findAccountBySlug, type Actor } from "../db.ts";
+import type { Actor } from "../db.ts";
 import { chatText } from "../knowledge/models.ts";
 import { db } from "../schema.ts";
-import { accountAiSnapshot } from "../settings/ai.ts";
+import { spaceAiSnapshot } from "../settings/ai.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
 import { aiWork } from "../usage/ai.ts";
 import { FeedError, releaseFeed } from "./feed.ts";
 import { ensureReleaseNotes } from "./queue.ts";
@@ -23,7 +24,7 @@ export const COMPOSE_PROMPT_LIMIT = 2000;
 export const COMPOSE_ENTRY_LIMIT = 200;
 export const COMPOSE_CHAR_LIMIT = 60_000;
 export const COMPOSE_QUERY_LIMIT = 500;
-/** Custom release notes one person may write per account per UTC day. */
+/** Custom release notes one person may write per Space per UTC day. */
 export const COMPOSE_DAILY_LIMIT = 50;
 const MAX_TOKENS = 2000;
 
@@ -37,7 +38,7 @@ interface ComposeEntry {
   lastCommitAt: string;
   issue: { key: string } | null;
   labels: string[];
-  repo?: { owner: string; name: string };
+  repo?: { space: string; name: string };
 }
 
 /** One JSON object per line, as many as fit the entry and size caps. */
@@ -53,7 +54,7 @@ export function serializeEntries(entries: ComposeEntry[]): {
     JSON.stringify({
       release: entry.release,
       date: entry.lastCommitAt.slice(0, 10),
-      ...(entry.repo ? { repository: `${entry.repo.owner}/${entry.repo.name}` } : {}),
+      ...(entry.repo ? { repository: `${entry.repo.space}/${entry.repo.name}` } : {}),
       category: entry.category,
       kind: entry.kind,
       title: entry.title,
@@ -102,22 +103,45 @@ function checkPrompt(body: unknown): string {
   return prompt.trim();
 }
 
-/** Refuse unless the billed account allows AI release notes here. */
-async function requireAi(env: Env, accountId: string, accountName: string) {
+/** Billed Space: its explicit grant, never Organization role or public read access. */
+interface BilledSpace {
+  id: string;
+  name: string;
+}
+
+/** Writing is paid for by the Space, so only people with a live grant there may ask. */
+/**
+ * Composing spends the Space's AI budget, so it needs the right to work in that
+ * Space: an explicit member or admin grant (the grant that permits tracker work
+ * and repository creation). Repository collaborators, public readers,
+ * Organization roles and Instance operator power are not Space grants.
+ */
+async function requireGrant(env: Env, actor: Actor, space: BilledSpace) {
+  const access = await resolveSpaceAccess(env.DB, actor, space.id);
+  if (access?.grant.role !== "member" && access?.grant.role !== "admin")
+    throw new ComposeError(
+      403,
+      `Only people with access to ${space.name} can write custom release notes.`,
+    );
+}
+
+/** Refuse unless the billed Space allows AI release notes here. */
+async function requireAi(env: Env, space: BilledSpace) {
   if (!env.AI) throw new ComposeError(503, "AI is not available in this environment.");
-  const snapshot = await accountAiSnapshot(env.DB, accountId);
+  const snapshot = await spaceAiSnapshot(env.DB, space.id);
   if (!snapshot.features.releaseNotes)
-    throw new ComposeError(409, `AI release-note writing is off for ${accountName}.`);
+    throw new ComposeError(409, `AI release-note writing is off for ${space.name}.`);
   return snapshot;
 }
 
-/** Calls (and failed attempts) this person has made today for the account. */
-async function composedToday(env: Env, accountId: string, actorId: string): Promise<number> {
+/** Calls (and failed attempts) this person has made today for the Space. */
+async function composedToday(env: Env, spaceId: string, actorId: string): Promise<number> {
   const row = await db(env.DB)
     .selectFrom("ai_usage")
     .select(sql<number>`COALESCE(SUM(calls + failed_calls), 0)`.as("n"))
     .where("day", "=", new Date().toISOString().slice(0, 10))
-    .where("account_id", "=", accountId)
+    .where("scope_kind", "=", "space")
+    .where("scope_id", "=", spaceId)
     .where("feature", "=", "release_notes_compose")
     .where("actor_id", "=", actorId)
     .executeTakeFirst();
@@ -127,7 +151,7 @@ async function composedToday(env: Env, accountId: string, actorId: string): Prom
 async function write(
   env: Env,
   actor: Actor,
-  account: { id: string; name: string },
+  space: BilledSpace,
   snapshot: Awaited<ReturnType<typeof requireAi>>,
   prompt: string,
   entries: ComposeEntry[],
@@ -136,17 +160,17 @@ async function write(
 ) {
   const data = serializeEntries(entries);
   if (!data.count) throw new ComposeError(422, "No release notes to write from.");
-  if ((await composedToday(env, account.id, actor.id)) >= COMPOSE_DAILY_LIMIT)
+  if ((await composedToday(env, space.id, actor.id)) >= COMPOSE_DAILY_LIMIT)
     throw new ComposeError(
       429,
-      `You've written ${COMPOSE_DAILY_LIMIT} custom release notes today for ${account.name}; try again tomorrow.`,
+      `You've written ${COMPOSE_DAILY_LIMIT} custom release notes today for ${space.name}; try again tomorrow.`,
     );
   let result: Awaited<ReturnType<typeof chatText>>;
   try {
     result = await aiWork(
       {
         feature: "release_notes_compose",
-        account: account.id,
+        spaceId: space.id,
         actor: actor.id,
         agent: actor.agent?.id ?? null,
         timeline: timeline && timeline !== "main" ? timeline : null,
@@ -205,16 +229,11 @@ composeRepoNotes.post("/compose", async (c) => {
     const loaded = await loadRepo(c);
     if (loaded instanceof Response) return loaded;
     const { row } = loaded;
-    const owner = await findAccountBySlug(c.env.DB, c.req.param("owner") ?? "");
-    if (!owner) throw new ComposeError(404, "Repository not found.");
-    // Reading a public repository doesn't mean paying for its owner's model calls.
-    if (!(await canCreateIn(c.env.DB, actor, owner)))
-      throw new ComposeError(
-        403,
-        `Only members of ${owner.display_name} can write custom release notes.`,
-      );
-    const snapshot = await requireAi(c.env, row.owner_id, owner.display_name);
-    await ensureReleaseNotes(c.env, row.id);
+    const space = { id: row.space_id, name: row.space_display_name };
+    // Reading a public repository doesn't mean paying for its Space's model calls.
+    await requireGrant(c.env, actor, space);
+    const snapshot = await requireAi(c.env, space);
+    await ensureReleaseNotes(c.env, row.id, actor);
     const trackers = await viewerTrackers(c.env.DB, actor);
     let name = typeof release === "string" ? releaseName(release.trim()) : "";
     if (!name) {
@@ -233,7 +252,7 @@ composeRepoNotes.post("/compose", async (c) => {
       await write(
         c.env,
         actor,
-        { id: row.owner_id, name: owner.display_name },
+        space,
         snapshot,
         prompt,
         notes?.entries ?? [],
@@ -247,7 +266,7 @@ composeRepoNotes.post("/compose", async (c) => {
   }
 });
 
-/** POST /tracker/:owner/release-notes/compose: the feed a `q` filter selects. */
+/** POST /tracker/:space/release-notes/compose: the feed a `q` filter selects. */
 export const composeTrackerNotes = new Hono<AppEnv>();
 composeTrackerNotes.post("/compose", async (c) => {
   c.header("cache-control", "private, no-store");
@@ -264,23 +283,13 @@ composeTrackerNotes.post("/compose", async (c) => {
       );
     if (timeline !== undefined && typeof timeline !== "string")
       throw new ComposeError(400, "Timeline must be a timeline name.");
-    // Membership is checked here, before anything about the account's AI is said.
-    const slug = c.req.param("owner") ?? "";
-    const feed = await releaseFeed(c.env, actor, slug, q ?? "", timeline);
-    const owner = await findAccountBySlug(c.env.DB, slug);
-    if (!owner) throw new ComposeError(404, "Tracker account not found.");
-    const snapshot = await requireAi(c.env, owner.id, feed.owner.displayName);
+    // The feed checks the explicit Space grant before anything about the Space's AI is said.
+    const feed = await releaseFeed(c.env, actor, c.req.param("space") ?? "", q ?? "", timeline);
+    const space = { id: feed.space.id, name: feed.space.displayName };
+    await requireGrant(c.env, actor, space);
+    const snapshot = await requireAi(c.env, space);
     return c.json(
-      await write(
-        c.env,
-        actor,
-        { id: owner.id, name: feed.owner.displayName },
-        snapshot,
-        prompt,
-        feed.entries,
-        feed.truncated,
-        timeline,
-      ),
+      await write(c.env, actor, space, snapshot, prompt, feed.entries, feed.truncated, timeline),
     );
   } catch (error) {
     const { status, message } = failure(error);

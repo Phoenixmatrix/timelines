@@ -1,9 +1,11 @@
-//! Data retention (CORE-195): an account's or the site's retention policies and
+//! Data retention (CORE-195): Space, person or Instance retention policies and
 //! cleanup runs, the same API the Data retention settings pages use.
 //!
-//! Account level: `/accounts/<owner>/settings/retention` and
-//! `/accounts/<owner>/retention/runs`; site level (`--site`, site
+//! Space level: `/spaces/<space>/retention` and
+//! `/spaces/<space>/retention/runs`; site level (`--site`, site
 //! administrators): `/admin/retention` and `/admin/retention/runs`.
+//! Personal categories (such as chats): `--person <person>` selects
+//! `/accounts/<person>/retention` and `/accounts/<person>/retention/runs`.
 
 use super::Ctx;
 use crate::output::{GmError, Render, Result, exit};
@@ -23,7 +25,7 @@ pub enum RetentionCommand {
         #[command(flatten)]
         level: Level,
     },
-    /// Enable, disable or reset a category, or change its thresholds (account owners or site administrators)
+    /// Enable, disable or reset a category, or change its thresholds (Space admins or site administrators)
     Set(SetArgs),
     /// Clean up now: run categories (add --dry-run to preview what would be deleted), then wait for the result
     Run(RunArgs),
@@ -42,12 +44,15 @@ pub enum RetentionCommand {
     },
 }
 
-/// Whose retention: an account's (default: the signed-in person) or the site's.
+/// Retention scope: an authorized Space, the signed-in person, or the Instance.
 #[derive(Args, Clone, Default)]
 pub struct Level {
-    /// Account slug; defaults to the signed-in person, never the repository owner.
-    #[arg(long, value_parser = account_slug, conflicts_with = "site")]
-    owner: Option<String>,
+    /// Space handle; defaults to your authorized personal default Space.
+    #[arg(long, value_parser = space_slug, conflicts_with_all = ["site", "person"])]
+    space: Option<String>,
+    /// Personal categories for this person (self-only), separate from Space content.
+    #[arg(long, value_parser = space_slug, conflicts_with = "site")]
+    person: Option<String>,
     /// The site level: site categories and site-wide defaults (site administrators).
     #[arg(long)]
     site: bool,
@@ -100,13 +105,13 @@ pub struct RunArgs {
     level: Level,
 }
 
-fn account_slug(value: &str) -> std::result::Result<String, String> {
+fn space_slug(value: &str) -> std::result::Result<String, String> {
     if value.is_empty()
         || !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err("Use an account slug, not a repository or URL.".into());
+        return Err("Use a Space handle, not a repository or URL.".into());
     }
     Ok(value.to_string())
 }
@@ -196,7 +201,8 @@ impl RunArgs {
 /// Where a level's settings and runs live in the API.
 struct Paths {
     level: &'static str,
-    owner: Option<String>,
+    space: Option<String>,
+    person: Option<String>,
     settings: String,
     runs: String,
 }
@@ -205,31 +211,32 @@ fn paths(config: &Config, level: &Level) -> Result<Paths> {
     if level.site {
         return Ok(Paths {
             level: "site",
-            owner: None,
+            space: None,
+            person: None,
             settings: "/admin/retention".into(),
             runs: "/admin/retention/runs".into(),
         });
     }
-    let owner = match &level.owner {
-        Some(owner) => owner.clone(),
-        None => {
-            let session = remote::api(config, "GET", "/session", None)?;
-            session["viewer"]["slug"]
-                .as_str()
-                .ok_or_else(|| {
-                    GmError::new("unauthenticated", "Sign in to manage data retention.")
-                        .hint("Run `gm auth login`, or pass --owner <account> (or --site).")
-                        .exit(exit::AUTH)
-                })?
-                .to_string()
-        }
+    if let Some(person) = &level.person {
+        return Ok(Paths {
+            level: "person",
+            space: None,
+            person: Some(person.clone()),
+            settings: format!("/accounts/{person}/retention"),
+            runs: format!("/accounts/{person}/retention/runs"),
+        });
+    }
+    let space = match &level.space {
+        Some(space) => space.clone(),
+        None => remote::default_space(config)?,
     };
-    account_slug(&owner).map_err(GmError::usage)?;
+    space_slug(&space).map_err(GmError::usage)?;
     Ok(Paths {
-        level: "account",
-        settings: format!("/accounts/{owner}/settings/retention"),
-        runs: format!("/accounts/{owner}/retention/runs"),
-        owner: Some(owner),
+        level: "space",
+        settings: format!("/spaces/{space}/retention"),
+        runs: format!("/spaces/{space}/retention/runs"),
+        space: Some(space),
+        person: None,
     })
 }
 
@@ -351,7 +358,7 @@ fn run_text(run: &Value) -> String {
 }
 
 pub fn run(ctx: &Ctx, command: &RetentionCommand) -> Result<Shown> {
-    // Like account settings, retention is administered with the person's sign-in.
+    // Like Space settings, retention is administered with the person's sign-in.
     // Explicit environment tokens still win; only the backend grants authority.
     let mut config = Config::load();
     config.acting = Acting::Person;
@@ -388,7 +395,7 @@ pub fn run(ctx: &Ctx, command: &RetentionCommand) -> Result<Shown> {
                 return Ok(Shown {
                     text: format!("Would PATCH {} with {patch}.", paths.settings),
                     value: json!({
-                        "dry_run": true, "level": paths.level, "owner": paths.owner,
+                        "dry_run": true, "scope": paths.level, "space": paths.space, "person": paths.person,
                         "method": "PATCH", "path": paths.settings, "request": patch
                     }),
                 });
@@ -404,7 +411,7 @@ pub fn run(ctx: &Ctx, command: &RetentionCommand) -> Result<Shown> {
             Ok(Shown {
                 text: category_text(&category),
                 value: json!({
-                    "level": settings["level"], "account": settings["account"],
+                    "target": settings["target"],
                     "category": category
                 }),
             })
@@ -490,8 +497,10 @@ fn unknown_category(id: &str, paths: &Paths) -> GmError {
     )
     .hint(if paths.level == "site" {
         "`gm retention show --site` lists the site's categories."
+    } else if paths.level == "person" {
+        "`gm retention show --person <person>` lists personal categories."
     } else {
-        "`gm retention show` lists the account's categories; site categories need --site."
+        "`gm retention show` lists the Space's categories; site categories need --site."
     })
 }
 
@@ -571,8 +580,11 @@ fn wait(ctx: &Ctx, config: &Config, paths: &Paths, mut run: Value, timeout: u64)
 }
 
 fn level_flag(paths: &Paths) -> String {
-    match &paths.owner {
-        Some(owner) => format!(" --owner {owner}"),
+    if let Some(person) = &paths.person {
+        return format!(" --person {person}");
+    }
+    match &paths.space {
+        Some(space) => format!(" --space {space}"),
         None => " --site".into(),
     }
 }
@@ -594,6 +606,24 @@ mod tests {
             Ok(_) => Err("not a retention command".into()),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    #[test]
+    fn personal_scope_is_distinct_from_space_content() {
+        let Ok(RetentionCommand::Show { level, .. }) =
+            parse(&["show", "chats", "--person", "francois"])
+        else {
+            panic!("expected personal retention");
+        };
+        assert_eq!(level.person.as_deref(), Some("francois"));
+        assert!(level.space.is_none());
+        assert!(!level.site);
+        let Ok(RetentionCommand::Show { level, .. }) = parse(&["show", "--space", "engineering"])
+        else {
+            panic!("expected Space retention");
+        };
+        assert_eq!(level.space.as_deref(), Some("engineering"));
+        assert!(level.person.is_none());
     }
 
     #[test]
@@ -642,12 +672,14 @@ mod tests {
             vec!["set", "ci-logs", "--threshold", "days"],
             vec!["set", "ci-logs", "--threshold", "days=soon"],
             vec!["set", "ci-logs", "--threshold", "days=1.5"],
-            vec!["set", "ci-logs", "--enable", "--owner", "orbit/engine"],
-            vec!["set", "ci-logs", "--enable", "--owner", "orbit", "--site"],
+            vec!["set", "ci-logs", "--enable", "--space", "orbit/engine"],
+            vec!["set", "ci-logs", "--enable", "--space", "orbit", "--site"],
+            vec!["show", "--person", "francois", "--space", "orbit"],
+            vec!["show", "--person", "francois", "--site"],
             vec!["run"],
             vec!["run", "ci-logs", "--threshold", "days=3"],
             vec!["run", "ci-logs", "--threshold", ".days=3"],
-            vec!["show", "--owner", ""],
+            vec!["show", "--space", ""],
             vec!["runs", "3", "--before", "2"],
         ] {
             assert!(parse(&flags).is_err(), "accepted {flags:?}");
@@ -691,13 +723,13 @@ mod tests {
     #[test]
     fn text_shows_switches_values_and_runs() {
         let line = category_text(&json!({
-            "id": "ci-logs", "scope": "account", "control": "policy", "label": "CI logs",
-            "enabled": true, "runnable": true, "values": {"days": 30}, "valuesFrom": {"days": "site"},
+            "id": "ci-logs", "scope": "space", "control": "policy", "label": "CI logs",
+            "enabled": true, "runnable": true, "values": {"days": 30}, "valuesFrom": {"days": "instance"},
             "lastRun": {"runId": 4, "status": "succeeded", "dryRun": true, "items": 12}
         }));
         assert_eq!(
             line,
-            "on     ci-logs [account] CI logs  days=30 (site)  last run #4 succeeded (dry run): 12 items"
+            "on     ci-logs [space] CI logs  days=30 (instance)  last run #4 succeeded (dry run): 12 items"
         );
         let text = run_text(&json!({
             "id": 4, "trigger": "manual", "dryRun": false, "status": "succeeded", "items": 3,

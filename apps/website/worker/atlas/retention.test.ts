@@ -1,6 +1,9 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 import {
   beginRepoProjection,
   currentSnapshot,
@@ -30,11 +33,24 @@ const scope = repoScope("r1");
 const DAY = 86_400_000;
 const later = (ms: number) => new Date(Date.now() + ms);
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const { sqlite, close } = await createFreshSpaceTestEnvironment();
+  onTestFinished(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('r1', 'ann', 'engine', 'private', 'art-r1', ''),
              ('r2', 'ann', 'tools', 'private', 'art-r2', '');
   `);
@@ -138,7 +154,7 @@ function expectAccounted(sqlite: DatabaseSync) {
 
 describe("Atlas retention", () => {
   test("keep current plus 20 priors; older ones expire and their rows are reclaimed", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     const published = await pushes(sqlite, db, 24, { retain: {} });
 
     const states = snapshots(sqlite);
@@ -181,7 +197,7 @@ describe("Atlas retention", () => {
   });
 
   test("priors expire 7 days after they were superseded", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     const [first, second, third] = await pushes(sqlite, db, 3);
     await enforceRetention(db, [scope]);
 
@@ -220,22 +236,34 @@ describe("Atlas retention", () => {
     expect((await pinnedSnapshot(db, scope, first!.snapshotId)).state).toBe("expired");
   });
 
-  test("an account's tighter policy (CORE-201): fewer priors, a shorter period", async () => {
-    const { sqlite, db } = setup();
+  test("a Space's tighter policy (CORE-201): fewer priors, a shorter period", async () => {
+    const { sqlite, db } = await setup();
     await pushes(sqlite, db, 6, { retain: {} });
     expect(snapshots(sqlite).filter((s) => s.status === "published")).toHaveLength(6);
-    // Another account's choice changes nothing here.
+    // Another Space's choice changes nothing here.
     sqlite.exec(`
       INSERT INTO accounts (id, kind, slug, display_name) VALUES ('bob', 'user', 'bob', 'Bob');
-      INSERT INTO retention_policies (account_id, category, thresholds)
-        VALUES ('bob', 'atlas-snapshots', '{"maxPrior": 0}');
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-bob', 'personal-bob', 'bob', 'personal', 'bob', 'bob');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('bob', 'org-bob', 'bob', 'bob');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-bob', 'bob', 'owner', 'test-fixture', 'bob');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('bob', 'org-bob', 'bob', 'admin', 'write', 'write', 'test-fixture', 'bob');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-bob', 'org-bob', 'bob', 'bob', 'space.grant', 'bob', '{"origin":"test-fixture"}');
+    COMMIT;
+      INSERT INTO retention_policies (scope_kind, scope_id, category, thresholds)
+        VALUES ('space', 'bob', 'atlas-snapshots', '{"maxPrior": 0}');
     `);
     expect((await enforceRetention(db, [scope])).expired).toEqual([]);
 
     // Ann keeps 3 priors for 2 days, and a value over the bounds is ignored.
     sqlite.exec(`
-      INSERT INTO retention_policies (account_id, category, thresholds)
-        VALUES ('ann', 'atlas-snapshots', '{"maxPrior": 3, "priorDays": 2, "capGib": 9}');
+      INSERT INTO retention_policies (scope_kind, scope_id, category, thresholds)
+        VALUES ('space', 'ann', 'atlas-snapshots', '{"maxPrior": 3, "priorDays": 2, "capGib": 9}');
     `);
     const result = await enforceRetention(db, [scope]);
     expect(result.expired.map((e) => e.seq).sort((a, b) => a - b)).toEqual([1, 2]);
@@ -262,7 +290,7 @@ describe("Atlas retention", () => {
   });
 
   test("storage pressure evicts the oldest priors first and never current", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     await pushes(sqlite, db, 6, { size: 10_000 });
     await enforceRetention(db, [scope]);
     const before = await storedBytes(db, [scope]);
@@ -295,7 +323,7 @@ describe("Atlas retention", () => {
   });
 
   test("a replacement that doesn't fit fails for capacity and current stays, stale", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     const old = await pushes(sqlite, db, 3);
     const current = old[2]!;
     const capBytes = (await storedBytes(db, [scope])) + 5_000;
@@ -343,7 +371,7 @@ describe("Atlas retention", () => {
   });
 
   test("reclaim deletes only rows no retained snapshot sees", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     // 1: a v1, b v1, a→c. 2: a v2. 3: a v3, b v2, a→c gone, b→c.
     summarize(sqlite, "r1", "file:a.ts", "a1 — naïve 😀");
     summarize(sqlite, "r1", "file:b.ts", "b1");
@@ -389,7 +417,7 @@ describe("Atlas retention", () => {
   });
 
   test("reclaiming is bounded per call and the sweep resumes it", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     await pushes(sqlite, db, 6);
     const policy = { maxPrior: 0, reclaimBatch: 1, maxRounds: 2 };
     const first = await enforceRetention(db, [scope], { policy });
@@ -416,8 +444,8 @@ describe("Atlas retention", () => {
     expect(await sweepAtlasRetention(db, { policy })).toMatchObject({ scopes: 0, more: false });
   });
 
-  test("an account pool shares one cap and evicts its oldest prior across scopes", async () => {
-    const { sqlite, db } = setup();
+  test("a Space pool shares one cap and evicts its oldest prior across scopes", async () => {
+    const { sqlite, db } = await setup();
     const pool = [repoScope("r1"), repoScope("r2")];
     await pushes(sqlite, db, 2, { repo: "r1", size: 10_000 }); // r1's prior is oldest
     await pushes(sqlite, db, 2, { repo: "r2", size: 10_000 });
@@ -431,7 +459,7 @@ describe("Atlas retention", () => {
   });
 
   test("unknown snapshots, and cursor expiry", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     const [one] = await pushes(sqlite, db, 1);
     expect(await pinnedSnapshot(db, scope, "nope")).toEqual({ state: "unknown" });
     expect(await pinnedSnapshot(db, repoScope("r2"), one!.snapshotId)).toEqual({
@@ -451,7 +479,7 @@ describe("Atlas retention", () => {
       maxPrior: 20,
       priorTtlMs: 7 * DAY,
       repoCapBytes: 2 * 1024 ** 3,
-      accountCompositionCapBytes: 2 * 1024 ** 3,
+      spaceCompositionCapBytes: 2 * 1024 ** 3,
     });
   });
 });

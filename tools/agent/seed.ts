@@ -8,13 +8,13 @@ import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 const exec = promisify(execFile);
 const personas: Persona[] = ["priya", "marco", "jun", "sam"];
 const repos: SeedManifest["repos"] = [
-  { owner: "orbit", name: "engine", visibility: "private" },
-  { owner: "orbit", name: "website", visibility: "public" },
-  { owner: "marco", name: "hello-world", visibility: "public" },
-  { owner: "sam", name: "notes", visibility: "private" },
+  { space: "orbit", name: "engine", visibility: "private" },
+  { space: "orbit", name: "website", visibility: "public" },
+  { space: "marco", name: "hello-world", visibility: "public" },
+  { space: "sam", name: "notes", visibility: "private" },
 ];
 const tracker: SeedManifest["tracker"] = {
-  owner: "orbit",
+  space: "orbit",
   team: "agent-team",
   ready: "agent-ready",
   blocked: "agent-blocked",
@@ -75,7 +75,7 @@ export async function seed(ctx: HarnessContext): Promise<SeedManifest> {
     env: ctx.env,
   });
   const manifest: SeedManifest = {
-    version: 1,
+    version: 4,
     origin: ctx.origin,
     tokens,
     readToken,
@@ -127,6 +127,7 @@ export async function seedFixtures(
       method: body === undefined ? "GET" : "POST",
       headers: {
         ...ctx.headers,
+        "X-Gitmatrix-Content-Version": "4",
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
@@ -205,7 +206,7 @@ export async function seedFixtures(
   // examining the remote contents, not by trusting a local completion marker.
   for (const repo of repos) {
     const directory = await mkdtemp(join(ctx.work, "seed-clone-"));
-    const token = repo.owner === "sam" ? tokens.sam : tokens.marco;
+    const token = repo.space === "sam" ? tokens.sam : tokens.marco;
     const env = { ...ctx.env };
     for (const key of Object.keys(env)) {
       if (
@@ -237,14 +238,14 @@ export async function seedFixtures(
         await exec(ctx.gm, args, { cwd, env, timeout: 120_000, maxBuffer: 1024 * 1024 });
       } catch {
         throw new Error(
-          `Seed gm ${args[0]} failed for ${repo.owner}/${repo.name}; credentials and child output withheld.`,
+          `Seed gm ${args[0]} failed for ${repo.space}/${repo.name}; credentials and child output withheld.`,
         );
       }
     }
     try {
       const checkout = join(directory, "repo");
-      await gm(["clone", `${repo.owner}/${repo.name}`, checkout], directory);
-      const contents = `# ${repo.owner}/${repo.name}\n\nDeterministic Gitmatrix agent fixture, version 1.\n`;
+      await gm(["clone", `${repo.space}/${repo.name}`, checkout], directory);
+      const contents = `# ${repo.space}/${repo.name}\n\nDeterministic Gitmatrix agent fixture, version 1.\n`;
       let existing: string | undefined;
       try {
         existing = await readFile(join(checkout, "README.md"), "utf8");
@@ -254,7 +255,7 @@ export async function seedFixtures(
       if (existing !== contents) {
         if (existing !== undefined)
           throw new Error(
-            `Fixture ${repo.owner}/${repo.name} has unexpected contents; refusing to overwrite.`,
+            `Fixture ${repo.space}/${repo.name} has unexpected contents; refusing to overwrite.`,
           );
         await writeFile(join(checkout, "README.md"), contents);
         await gm(["commit", "-m", "Seed deterministic agent fixture"], checkout);
@@ -264,7 +265,14 @@ export async function seedFixtures(
       await rm(directory, { recursive: true, force: true });
     }
   }
+  const scope = await request<{ contractVersion: 4; spaceId: string; migrationEpoch: number }>(
+    "/tracker/orbit/snapshot",
+    tokens.marco,
+  );
   const mutation: MutationRequest = {
+    contractVersion: scope.contractVersion,
+    spaceId: scope.spaceId,
+    migrationEpoch: scope.migrationEpoch,
     operationId: "agent-fixtures-v1",
     mutations: [
       {

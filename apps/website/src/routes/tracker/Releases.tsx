@@ -17,7 +17,7 @@ import {
   type ReleaseFeedEntry,
   type ReleaseFeedFacet,
 } from "../../../shared/release-notes.ts";
-import type { TrackerOwner } from "../../../shared/tracker.ts";
+import type { TrackerSpace } from "../../../shared/tracker.ts";
 import {
   RELEASE_NOTE_DETAILS_ID,
   ReleaseNoteDetails,
@@ -32,19 +32,22 @@ import { repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 import { useRefContext } from "../../refs/context.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
+import { assertCurrentTrackerFilters } from "./loaders.ts";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
-  const search = new URL(request.url).searchParams;
+  const url = new URL(request.url);
+  assertCurrentTrackerFilters(url);
+  const search = url.searchParams;
   const q = search.get("q") ?? "";
   const query = new URLSearchParams({ q });
   const scope = scopeOf(search);
   if (scope) query.set("timeline", scope);
   const [feed, trackers] = await Promise.all([
     load<ReleaseFeed>(
-      `/tracker/${encodeURIComponent(params.owner!)}/release-notes?${query}`,
+      `/tracker/${encodeURIComponent(params.space!)}/release-notes?${query}`,
       request,
     ),
-    api<{ trackers: TrackerOwner[] }>("/tracker", { signal: request.signal }),
+    api<{ trackers: TrackerSpace[] }>("/tracker", { signal: request.signal }),
   ]);
   return { feed, q, trackers: trackers.trackers };
 }
@@ -137,7 +140,7 @@ function Entry({
 }) {
   // Refs resolve in this tracker first, then in the entry's repository (CORE-22).
   const { tracker } = useRefContext();
-  const context = { tracker, owner: entry.repo.owner, repo: entry.repo.name };
+  const context = { tracker, space: entry.repo.space, repo: entry.repo.name };
   return (
     <li className="flex min-w-0 flex-col gap-2 border-t border-line-soft py-4 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -153,17 +156,17 @@ function Entry({
       )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         {entry.repos.map((repo) => (
-          <span key={`${repo.owner}/${repo.name}`} className="min-w-0 [overflow-wrap:anywhere]">
+          <span key={`${repo.space}/${repo.name}`} className="min-w-0 [overflow-wrap:anywhere]">
             <Link
               className="text-ink-muted"
               to={repoPath(
-                repo.owner,
+                repo.space,
                 repo.name,
                 "releases",
                 encodeURIComponent(repo.releases[0]!),
               )}
             >
-              {repo.owner}/{repo.name}
+              {repo.space}/{repo.name}
             </Link>{" "}
             {repo.releases
               .map(
@@ -195,7 +198,7 @@ export function TrackerReleases() {
   const revalidator = useRevalidator();
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
-  const owner = feed.owner.slug;
+  const space = feed.space.slug;
   const location = useLocation();
   const scope = scopeOf(location.search);
   const [selected, setSelected] = useState<{
@@ -203,14 +206,14 @@ export function TrackerReleases() {
     trigger: HTMLButtonElement;
     pathname: string;
     search: string;
-    owner: string;
+    space: string;
     q: string;
   } | null>(null);
   const selectedEntry =
     selected &&
     selected.pathname === location.pathname &&
     selected.search === location.search &&
-    selected.owner === owner &&
+    selected.space === space &&
     selected.q === q
       ? feed.entries.find((entry) => entry.id === selected.id)
       : undefined;
@@ -290,10 +293,10 @@ export function TrackerReleases() {
       />
       <Facets title="Repos" facets={feed.facets.repos} q={q} queryKey="repo" onQuery={onQuery} />
       <Facets
-        title="Workspaces"
-        facets={feed.facets.workspaces}
+        title="Projects"
+        facets={feed.facets.projects}
         q={q}
-        queryKey="ws"
+        queryKey="project"
         onQuery={onQuery}
       />
       <Facets
@@ -311,15 +314,15 @@ export function TrackerReleases() {
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <h1 className="m-0 text-title-lg">Release notes</h1>
         <SelectField
-          ariaLabel="Tracker owner"
-          value={owner}
+          ariaLabel="Tracker space"
+          value={space}
           className="w-44 max-w-full"
           options={trackers.map((tracker) => ({ value: tracker.slug, label: tracker.displayName }))}
           onChange={(value) => navigate(`/tracker/${encodeURIComponent(value)}/releases`)}
         />
         <TimelineSwitcher variant="filter" />
         <Link
-          to={`/tracker/${encodeURIComponent(owner)}/highlights`}
+          to={`/tracker/${encodeURIComponent(space)}/highlights`}
           className="mk-btn mk-btn--sm min-h-11 sm:min-h-8"
         >
           View highlights
@@ -367,15 +370,15 @@ export function TrackerReleases() {
           >
             {feed.query.unknown.length ? `Not understood: ${feed.query.unknown.join(" ")}. ` : ""}
             Daily updates are shown by default. Use kind:tag for tagged releases or
-            release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, tag (issue tags),
-            release, kind, timeline, since and until; prefix with - to exclude. These are code
-            updates, not deployments.
+            release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, project, type, tag (issue
+            tags), release, kind, timeline, since and until; prefix with - to exclude. These are
+            code updates, not deployments.
           </p>
           {feed.entries.length > 0 && (
             <div className="max-w-[52rem]">
               <ReleaseNotesComposer
-                target={{ kind: "tracker", owner, q, timeline: scope }}
-                label={feed.owner.displayName}
+                target={{ kind: "tracker", space, q, timeline: scope }}
+                label={feed.space.displayName}
               />
             </div>
           )}
@@ -384,7 +387,7 @@ export function TrackerReleases() {
               <FunnelSimpleIcon weight="bold" aria-hidden />
               Narrow it down
               <span className="text-body-sm font-normal text-ink-faint">
-                history, teams, type, repos, workspaces, tags
+                history, teams, type, repos, projects, tags
               </span>
             </summary>
             <div className="pt-4">{narrow}</div>
@@ -397,7 +400,7 @@ export function TrackerReleases() {
                   ? "No landed notes you can see match this timeline and these filters. Choose another timeline or main, or adjust your search."
                   : q
                     ? "No code updates match this filter."
-                    : `No daily notes are available for ${feed.owner.displayName}'s repositories or teams yet.`}
+                    : `No daily notes are available for ${feed.space.displayName}'s repositories or teams yet.`}
               </div>
               <p className="m-0 text-body-sm text-ink-faint">
                 Refresh to check for newly processed notes.
@@ -432,7 +435,7 @@ export function TrackerReleases() {
                                   trigger,
                                   pathname: location.pathname,
                                   search: location.search,
-                                  owner,
+                                  space,
                                   q,
                                 },
                           )

@@ -2,45 +2,36 @@
 // what their policies say, never the "never" list, remove exactly what a dry
 // run at the same moment listed, and remove nothing the second time.
 
-import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
-import { describe, expect, test } from "vite-plus/test";
-import { d1, migratedDatabase } from "../../testing/d1.ts";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
+import { createFreshSpaceTestEnvironment } from "../../testing/spaces.ts";
 import { advanceRun, createRun, getRun } from "../runs.ts";
 
 const NOW = new Date("2026-10-01T12:00:00.000Z");
 const DAY = 86_400_000;
 const ago = (days: number) => new Date(NOW.getTime() - days * DAY).toISOString();
 const oid = (n: number) => n.toString(16).padStart(40, "0");
-const ORBIT = { scope: "account", accountId: "acc_orbit" } as const;
+const ORBIT = { kind: "space", id: "acc_orbit" } as const;
 
-function migratedRegistry(): DatabaseSync {
-  const db = new DatabaseSync(":memory:");
-  const dir = fileURLToPath(new URL("../../../registry/migrations/", import.meta.url).href);
-  for (const file of readdirSync(dir)
-    .filter((f) => f.endsWith(".sql"))
-    .sort())
-    db.exec(readFileSync(join(dir, file), "utf8"));
-  return db;
-}
-
-function seeded() {
-  const sqlite = migratedDatabase();
+async function seeded() {
+  const fixture = await createFreshSpaceTestEnvironment();
+  onTestFinished(fixture.close);
+  const { sqlite, registry, env } = fixture;
+  sqlite.exec("BEGIN");
   sqlite.exec(
     readFileSync(
       fileURLToPath(new URL("../../../seed/0001_dev.sql", import.meta.url).href),
       "utf8",
     ),
   );
+  sqlite.exec("COMMIT");
   sqlite.exec(`
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_app', 'acc_orbit', 'app', 'private', 'a', 'https://a'),
       ('r_lib', 'acc_orbit', 'lib', 'private', 'b', 'https://b'),
       ('r_sam', 'acc_sam', 'mine', 'private', 'c', 'https://c');
   `);
-  const registry = migratedRegistry();
   const runs = sqlite.prepare(`
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, title,
                          created_at, finished_at, landing_id)
@@ -83,7 +74,6 @@ function seeded() {
     steps.run(id);
     text.forEach((t, seq) => logs.run(id, seq + 1, t));
   };
-  const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as unknown as Env;
   return { sqlite, registry, env, addRun, addJob };
 }
 
@@ -96,8 +86,8 @@ async function run(
 ) {
   const id = await createRun(env.DB, {
     target: ORBIT,
-    trigger: "manual",
-    actorId: "acc_marco",
+    trigger: "schedule",
+    actorId: null,
     dryRun,
     categories: [{ id: category, thresholds }],
     now: NOW,
@@ -117,8 +107,8 @@ async function run(
 }
 
 describe("ci-logs", () => {
-  function logsSeed() {
-    const t = seeded();
+  async function logsSeed() {
+    const t = await seeded();
     t.addRun("run_a", "r_app", 1, "main", 200);
     t.addRun("run_b", "r_app", 2, "main", 1, { status: "running", created: 100 });
     t.addRun("run_l", "r_lib", 1, "main", 60);
@@ -153,7 +143,7 @@ describe("ci-logs", () => {
   const TEXT = Buffer.byteLength("hello wörld\nboom\nstop\nlib\n");
 
   test("removes exactly the dry run's logs, marks their jobs, and is idempotent", async () => {
-    const t = logsSeed();
+    const t = await logsSeed();
     const before = t.chunks();
     const dry = await run(t.env, "ci-logs", { days: 30 }, true);
     expect(dry.seen).toEqual(SELECTED);
@@ -176,7 +166,7 @@ describe("ci-logs", () => {
   });
 
   test("the days threshold decides the cutoff", async () => {
-    const t = logsSeed();
+    const t = await logsSeed();
     expect((await run(t.env, "ci-logs", { days: 50 }, true)).seen).toEqual(["j_failed", "j_lib"]);
     expect((await run(t.env, "ci-logs", { days: 1 }, true)).seen).toEqual([
       ...SELECTED.slice(0, 3),
@@ -186,7 +176,7 @@ describe("ci-logs", () => {
   });
 
   test("a job that started running again since select keeps its log", async () => {
-    const t = logsSeed();
+    const t = await logsSeed();
     const { ciLogs } = await import("./ci-logs.ts");
     const ctx = { env: t.env, target: ORBIT, thresholds: { days: 30 }, now: NOW, limit: 10 };
     const selection = await ciLogs.select(ctx, null);
@@ -203,8 +193,8 @@ describe("ci-logs", () => {
 });
 
 describe("ci-runs", () => {
-  function runsSeed() {
-    const t = seeded();
+  async function runsSeed() {
+    const t = await seeded();
     const add = (
       id: string,
       repo: string,
@@ -261,7 +251,7 @@ describe("ci-runs", () => {
   const POLICY = { days: 180, keepLatest: 2 };
 
   test("removes exactly the dry run's runs with their jobs, steps and logs, once", async () => {
-    const t = runsSeed();
+    const t = await runsSeed();
     const before = t.remaining();
     const dry = await run(t.env, "ci-runs", POLICY, true);
     expect(dry.seen).toEqual(SELECTED);
@@ -292,7 +282,7 @@ describe("ci-runs", () => {
   });
 
   test("keeps the latest runs per ref at the default count, and follows the days threshold", async () => {
-    const t = runsSeed();
+    const t = await runsSeed();
     expect((await run(t.env, "ci-runs", { days: 180, keepLatest: 20 }, true)).seen).toEqual([]);
     expect((await run(t.env, "ci-runs", { days: 190, keepLatest: 2 }, true)).seen).toEqual([
       "app_01",
@@ -308,7 +298,7 @@ describe("ci-runs", () => {
   });
 
   test("a run something started referring to since select stays", async () => {
-    const t = runsSeed();
+    const t = await runsSeed();
     const { ciRuns } = await import("./ci-runs.ts");
     const ctx = { env: t.env, target: ORBIT, thresholds: POLICY, now: NOW, limit: 10 };
     const selection = await ciRuns.select(ctx, null);

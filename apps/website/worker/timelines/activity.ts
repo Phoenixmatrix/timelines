@@ -18,8 +18,8 @@ const OIDS_PER_QUERY = 80;
 type PushedRepo = Pick<
   RepoRow,
   | "id"
-  | "owner_id"
-  | "owner_slug"
+  | "space_id"
+  | "space_slug"
   | "name"
   | "default_branch"
   | "artifacts_name"
@@ -117,7 +117,7 @@ export async function timelineActivity(
   }
   if (!pushed.size && !merges.length && !heads.length) return null;
   return {
-    repo: { id: repo.id, owner: repo.owner_slug, name: repo.name },
+    repo: { id: repo.id, spaceId: repo.space_id, space: repo.space_slug, name: repo.name },
     actorId: actor ? (actor.agent?.id ?? actor.id) : null,
     accountableId: actor?.id ?? null,
     pushed: [...pushed],
@@ -127,13 +127,30 @@ export async function timelineActivity(
 }
 
 /**
+ * Note what logged updates did to the repository Space's timelines. The Space
+ * cutover's ref barrier hands it the updates it logged itself, so a replay
+ * delivers them even though repo_refs has already moved on.
+ */
+export async function recordTimelineActivity(
+  env: Env,
+  repo: PushedRepo,
+  actor: Pick<Actor, "id" | "agent"> | null,
+  logged: LoggedUpdate[],
+): Promise<void> {
+  const activity = await timelineActivity(env.DB, repo, actor, logged);
+  if (!activity) return;
+  const result = await trackerObject(env, repo.space_id).recordTimelinePush(activity);
+  if (!result.ok) throw new Error(result.error);
+}
+
+/**
  * Log a push (or a ref the server wrote itself) and note what it did to the
- * repository owner's timelines. Never throws: it runs after the response.
+ * repository Space's timelines. Never throws: it runs after the response.
  */
 export async function logPush(
   env: Env,
   repo: PushedRepo,
-  actor: Pick<Actor, "id" | "agent"> | null,
+  actor: Pick<Actor, "id" | "agent" | "credential"> | null,
 ): Promise<void> {
   let logged: LoggedUpdate[];
   try {
@@ -143,10 +160,7 @@ export async function logPush(
     return;
   }
   try {
-    const activity = await timelineActivity(env.DB, repo, actor, logged);
-    if (!activity) return;
-    const result = await trackerObject(env, repo.owner_id).recordTimelinePush(activity);
-    if (!result.ok) throw new Error(result.error);
+    await recordTimelineActivity(env, repo, actor, logged);
   } catch (error) {
     console.error("Timelines: recording a push failed", { repo: repo.id, error });
   }

@@ -6,8 +6,18 @@ import { AppShell } from "./components/AppShell.tsx";
 import { PageTitle, PageTitleError, withPageTitles } from "./components/PageTitle.tsx";
 import { keepPageUnderPanel } from "./lib/commitPanel.ts";
 import { rootLoader } from "./lib/session.ts";
-import { scopeOf, timelineScopeMiddleware } from "./lib/timelineScope.ts";
+import { timelineScopeMiddleware } from "./lib/timelineScope.ts";
 import { Account, accountLoader } from "./routes/Account.tsx";
+import {
+  Organization,
+  organizationLoader,
+  organizationAction,
+  Organizations,
+  organizationsLoader,
+  organizationsAction,
+} from "./routes/Organization.tsx";
+import { Space, spaceLoader, spaceAction } from "./routes/Space.tsx";
+import { Instance, instanceLoader } from "./routes/Instance.tsx";
 import { ErrorPage } from "./routes/ErrorPage.tsx";
 import { Home, homeLoader } from "./routes/Home.tsx";
 import { Highlights, highlightsLoader } from "./routes/Highlights.tsx";
@@ -28,7 +38,7 @@ import { NpmLogin, npmLoginAction, npmLoginLoader } from "./routes/packages/NpmL
 import { AllPackages, allPackagesLoader } from "./routes/packages/AllPackages.tsx";
 import { NeedsYou, needsYouLoader } from "./routes/NeedsYou.tsx";
 import { AgentWork, agentWorkLoader, agentWorkShouldRevalidate } from "./routes/AgentWork.tsx";
-import { OwnerPackages, ownerPackagesLoader } from "./routes/packages/OwnerPackages.tsx";
+import { SpacePackages, spacePackagesLoader } from "./routes/packages/SpacePackages.tsx";
 import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageConsole.tsx";
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { Releases, releasesLoader } from "./routes/repo/Releases.tsx";
@@ -115,7 +125,7 @@ const timelinePageShouldRevalidate: ShouldRevalidateFunction = ({
   nextUrl,
   defaultShouldRevalidate,
 }) =>
-  currentParams.owner !== nextParams.owner ||
+  currentParams.space !== nextParams.space ||
   currentParams.slug !== nextParams.slug ||
   formMethod ||
   currentUrl.href === nextUrl.href
@@ -129,9 +139,8 @@ export const routes: RouteObject[] = withPageTitles([
     // The timeline scope (?tl=) follows every navigation that doesn't name one.
     middleware: [timelineScopeMiddleware],
     loader: rootLoader,
-    // The session only changes through forms (sign in, sign out).
-    shouldRevalidate: ({ formMethod, currentUrl, nextUrl, defaultShouldRevalidate }) =>
-      formMethod || currentUrl.href === nextUrl.href ? defaultShouldRevalidate : false,
+    // Re-resolve grants on navigation; a cached selector is never access authority.
+    shouldRevalidate: () => true,
     Component: TitledShell,
     ErrorBoundary: RootError,
     HydrateFallback: InitialPageTitle,
@@ -143,7 +152,26 @@ export const routes: RouteObject[] = withPageTitles([
           { index: true, loader: homeLoader, Component: Home },
           { path: "signin", loader: signInLoader, action: signInAction, Component: SignIn },
           { path: "device", loader: deviceLoader, action: deviceAction, Component: Device },
-          { path: "new", loader: newRepoLoader, action: newRepoAction, Component: NewRepo },
+          {
+            path: ":space/-/repositories/new",
+            loader: newRepoLoader,
+            action: newRepoAction,
+            Component: NewRepo,
+          },
+          { path: "accounts/:person", loader: accountLoader, Component: Account },
+          {
+            path: "organizations",
+            loader: organizationsLoader,
+            action: organizationsAction,
+            Component: Organizations,
+          },
+          {
+            path: "organizations/:organization",
+            loader: organizationLoader,
+            action: organizationAction,
+            Component: Organization,
+          },
+          { path: "instance", loader: instanceLoader, Component: Instance },
           { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
           { path: "timelines", loader: timelinesIndexLoader, Component: TrackerIndex },
           { path: "release-notes", loader: releaseNotesIndexLoader, Component: TrackerIndex },
@@ -159,52 +187,40 @@ export const routes: RouteObject[] = withPageTitles([
           // Whatever a ref names (CORE-22): redirects, or a chooser when it's ambiguous.
           { path: "-/go/*", loader: goLoader, Component: GoPage },
           {
-            path: "tracker/:owner/releases",
+            path: "tracker/:space/releases",
             loader: trackerReleasesLoader,
             Component: TrackerReleases,
           },
           {
-            path: "tracker/:owner/highlights",
+            path: "tracker/:space/highlights",
             loader: highlightsLoader,
             Component: Highlights,
           },
           {
-            path: "tracker/:owner/timelines",
+            path: "tracker/:space/timelines",
             loader: trackerTimelinesLoader,
             Component: TrackerTimelines,
           },
           {
-            path: "tracker/:owner/timelines/:slug/changes",
+            path: "tracker/:space/timelines/:slug/changes",
             loader: changesLoader,
             shouldRevalidate: timelinePageShouldRevalidate,
             Component: Changes,
           },
           {
-            path: "tracker/:owner/timelines/:slug/story",
+            path: "tracker/:space/timelines/:slug/story",
             loader: storyLoader,
             shouldRevalidate: timelinePageShouldRevalidate,
             Component: Story,
           },
           {
-            path: "tracker/:owner",
+            path: "tracker/:space",
             loader: trackerLoader,
-            shouldRevalidate: ({
-              currentParams,
-              nextParams,
-              formMethod,
-              currentUrl,
-              nextUrl,
-              defaultShouldRevalidate,
-            }) =>
-              currentParams.owner !== nextParams.owner ||
-              // A timeline's view is its own snapshot (?tl=, CORE-74's "Reopen it there").
-              scopeOf(currentUrl.search) !== scopeOf(nextUrl.search) ||
-              formMethod ||
-              currentUrl.href === nextUrl.href
-                ? defaultShouldRevalidate
-                : false,
+            // Navigation revalidates current grant/epoch rather than retaining
+            // a private snapshot after revocation or a context change.
+            shouldRevalidate: () => true,
             Component: Tracker,
-            children: [{ path: "issues/:issue" }],
+            children: [{ path: "issues/:issue" }, { path: "projects" }, { path: "teams" }],
           },
           {
             path: "settings/agents",
@@ -272,21 +288,21 @@ export const routes: RouteObject[] = withPageTitles([
             action: sshKeysAction,
             Component: SshKeys,
           },
-          { path: ":owner", loader: accountLoader, Component: Account },
+          { path: ":space", loader: spaceLoader, action: spaceAction, Component: Space },
           {
-            path: ":owner/-/packages",
-            loader: ownerPackagesLoader,
-            Component: OwnerPackages,
+            path: ":space/-/packages",
+            loader: spacePackagesLoader,
+            Component: SpacePackages,
           },
           {
-            path: ":owner/-/packages/:format/*",
+            path: ":space/-/packages/:format/*",
             loader: packageConsoleLoader,
             Component: PackageConsole,
           },
-          { path: ":owner/-/feeds", loader: feedsLoader, action: feedsAction, Component: Feeds },
+          { path: ":space/-/feeds", loader: feedsLoader, action: feedsAction, Component: Feeds },
           // The Atlas across selected repositories (CORE-172).
           {
-            path: ":owner/-/atlas",
+            path: ":space/-/atlas",
             loader: workspaceAtlasLoader,
             shouldRevalidate: workspaceAtlasShouldRevalidate,
             Component: WorkspaceAtlas,
@@ -299,7 +315,7 @@ export const routes: RouteObject[] = withPageTitles([
           },
           {
             id: "repo",
-            path: ":owner/:repo",
+            path: ":space/:repo",
             loader: repoLoader,
             shouldRevalidate: repoShouldRevalidate,
             Component: RepoLayout,

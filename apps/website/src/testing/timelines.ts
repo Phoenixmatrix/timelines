@@ -16,7 +16,7 @@ import type { TestServer } from "./server.ts";
 
 export interface WorldRepo {
   id: string;
-  owner: string;
+  space: string;
   name: string;
   /** Main's tip. */
   main: string;
@@ -36,8 +36,9 @@ export interface WorldTimeline {
   repos: WorldRepo[];
 }
 
-export function mutate(server: TestServer, mutations: unknown[]) {
+export async function mutate(server: TestServer, mutations: unknown[]) {
   return server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations,
   });
@@ -63,7 +64,7 @@ export async function timelineWorld(
     await server.push(`orbit/${repoName}`, "main", main);
     repos.push({
       id,
-      owner: "orbit",
+      space: "orbit",
       name: repoName,
       main,
       tip: main,

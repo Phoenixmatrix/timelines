@@ -92,13 +92,13 @@ function useApi<T>(path: string | null): Loaded<T> {
 /** The full id `sha` names in the repository, or why it doesn't. */
 function useResolved(repo: RepoDetail, sha: string | null): Loaded<string | null> {
   const [result, setResult] = useState<{ sha: string; loaded: Loaded<string | null> } | null>(null);
-  const owner = repo.owner.slug;
+  const space = repo.space.slug;
   const { name } = repo;
   useEffect(() => {
     if (!sha) return;
     const controller = new AbortController();
     setResult({ sha, loaded: { state: "loading" } });
-    resolveCommit(owner, name, sha, controller.signal).then(
+    resolveCommit(space, name, sha, controller.signal).then(
       (value) => setResult({ sha, loaded: { state: "done", value } }),
       (error: unknown) => {
         if (controller.signal.aborted) return;
@@ -113,7 +113,7 @@ function useResolved(repo: RepoDetail, sha: string | null): Loaded<string | null
       },
     );
     return () => controller.abort();
-  }, [owner, name, sha]);
+  }, [space, name, sha]);
   return result && result.sha === sha ? result.loaded : { state: "loading" };
 }
 
@@ -182,9 +182,9 @@ function CommitBody({
   const valid = SHA_PATTERN.test(sha);
   const resolved = useResolved(repo, valid && active ? sha : null);
   const oid = resolved.state === "done" ? resolved.value : null;
-  const owner = repo.owner.slug;
+  const space = repo.space.slug;
   const { name } = repo;
-  const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+  const base = `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}`;
   const ready = oid && active ? oid : null;
   const inSource = (path: string) => sourceUrl(path, workSource(repo));
 
@@ -196,7 +196,7 @@ function CommitBody({
   );
   const runs = useApi<CiRunList>(ready && inSource(`${base}/ci?commit=${ready}`));
   const published = useApi<Published>(
-    ready && `/packages/-/published?repo=${encodeURIComponent(`${owner}/${name}`)}&commit=${ready}`,
+    ready && `/packages/-/published?repo=${encodeURIComponent(`${space}/${name}`)}&commit=${ready}`,
   );
   const deployments = useApi<DeploymentList>(
     ready && inSource(`${base}/deployments?commit=${ready}&limit=20`),
@@ -222,8 +222,8 @@ function CommitBody({
       ? {
           kind: "commit",
           title: shortOid(ready),
-          detail: `${firstLine(summary.message)} · ${owner}/${name}`,
-          to: commitPanelUrl(owner, name, ready),
+          detail: `${firstLine(summary.message)} · ${space}/${name}`,
+          to: commitPanelUrl(space, name, ready),
         }
       : null,
   );
@@ -233,10 +233,10 @@ function CommitBody({
     : resolved.state === "failed"
       ? `Couldn't look for ${shortOid(sha)}: ${resolved.error}`
       : resolved.state === "done" && !resolved.value
-        ? `No commit starting ${sha} in ${owner}/${name}'s branches, tags or recent history. Try the full hash.`
+        ? `No commit starting ${sha} in ${space}/${name}'s branches, tags or recent history. Try the full hash.`
         : diff.state === "failed" && !tooLarge
           ? diff.status === 404
-            ? `No commit ${shortOid(sha)} in ${owner}/${name}.`
+            ? `No commit ${shortOid(sha)} in ${space}/${name}.`
             : `Couldn't load commit ${shortOid(sha)}: ${diff.error}`
           : tooLarge && logged.state === "failed"
             ? `Couldn't load commit ${shortOid(sha)}: ${logged.error}`
@@ -251,7 +251,7 @@ function CommitBody({
             Commit <span className="mk-mono font-normal">{shortOid(oid ?? sha)}</span>
           </Dialog.Title>
           <Dialog.Description className="m-0 mt-0.5 truncate text-body-sm text-ink-muted">
-            {summary ? firstLine(summary.message) : `in ${owner}/${name}`}
+            {summary ? firstLine(summary.message) : `in ${space}/${name}`}
           </Dialog.Description>
         </div>
         <Tip label="Close (Escape)" side="bottom">
@@ -282,9 +282,9 @@ function CommitBody({
             <Landing
               repo={repo}
               why={why}
-              trackerOwner={why.state === "done" ? why.value.tracker.owner : owner}
+              trackerSpace={why.state === "done" ? why.value.tracker.space : space}
             />
-            <Issues message={summary.message} owner={owner} repoName={name} />
+            <Issues message={summary.message} space={space} repoName={name} />
             <Runs repo={repo} runs={runs} oid={ready} />
             <PublishedPackages published={published} />
             <Deployments repo={repo} deployments={deployments} />
@@ -352,7 +352,7 @@ function Body<T>({
 /** A person links to their profile; an agent is named as text. */
 function Who({ slug, agent }: { slug: string | null; agent?: string | null }) {
   const person = slug ? (
-    <Link className={link} to={`/${encodeURIComponent(slug)}`}>
+    <Link className={link} to={`/accounts/${encodeURIComponent(slug)}`}>
       {slug}
     </Link>
   ) : null;
@@ -369,7 +369,7 @@ function Who({ slug, agent }: { slug: string | null; agent?: string | null }) {
 
 function MadeBy({ author }: { author: StepAuthor }) {
   const person = (
-    <Link className={link} to={`/${encodeURIComponent(author.accountable.slug)}`}>
+    <Link className={link} to={`/accounts/${encodeURIComponent(author.accountable.slug)}`}>
       {author.accountable.displayName}
     </Link>
   );
@@ -396,7 +396,7 @@ function Message({
   chain: WhyChain | null;
 }) {
   const commitHref = useCommitHref();
-  const owner = repo.owner.slug;
+  const space = repo.space.slug;
   const { name } = repo;
   const [title = "", ...rest] = summary.message.trimEnd().split("\n");
   const body = rest.join("\n").trim();
@@ -407,11 +407,11 @@ function Message({
     <section aria-label="Message">
       {/* References in the message link to what they name, once resolved (CORE-22). */}
       <p className="m-0 text-title-lg">
-        <LinkedText text={title} context={{ owner, repo: name }} />
+        <LinkedText text={title} context={{ space, repo: name }} />
       </p>
       {body && (
         <p className="m-0 mt-2 max-w-[72ch] text-body-sm whitespace-pre-wrap text-ink-muted">
-          <LinkedText text={body} context={{ owner, repo: name }} />
+          <LinkedText text={body} context={{ space, repo: name }} />
         </p>
       )}
       <dl className="m-0 mt-4 flex flex-col gap-2 text-body-sm">
@@ -454,7 +454,7 @@ function Message({
               <span className="text-ink-faint">None: the first commit</span>
             ) : (
               summary.parents.map((parent) => {
-                const href = commitHref(owner, name, parent);
+                const href = commitHref(space, name, parent);
                 return (
                   <Link
                     key={parent}
@@ -477,13 +477,13 @@ function Message({
         </div>
       </dl>
       <p className="m-0 mt-4 flex flex-wrap gap-2">
-        <Link className="mk-btn mk-btn--sm" to={treeUrl(owner, name, oid, "", workSource(repo))}>
+        <Link className="mk-btn mk-btn--sm" to={treeUrl(space, name, oid, "", workSource(repo))}>
           <FolderOpenIcon weight="bold" aria-hidden />
           Browse files at this commit
         </Link>
         <Link
           className="mk-btn mk-btn--ghost mk-btn--sm"
-          to={commitsUrl(owner, name, oid, "", workSource(repo))}
+          to={commitsUrl(space, name, oid, "", workSource(repo))}
         >
           History from here
         </Link>
@@ -495,14 +495,14 @@ function Message({
 function Landing({
   repo,
   why,
-  trackerOwner,
+  trackerSpace,
 }: {
   repo: RepoDetail;
   why: Loaded<WhyResponse>;
-  trackerOwner: string;
+  trackerSpace: string;
 }) {
   const timelineUrl = (slug: string) =>
-    `/tracker/${encodeURIComponent(trackerOwner)}/timelines?tl=${encodeURIComponent(slug)}`;
+    `/tracker/${encodeURIComponent(trackerSpace)}/timelines?tl=${encodeURIComponent(slug)}`;
   const refName = (ref: string) => ref.replace(/^refs\/(heads|tags)\//, "");
   return (
     <Section id="commit-landing" title="How it landed">
@@ -540,7 +540,7 @@ function Landing({
                               <Link
                                 className={link}
                                 to={repoPath(
-                                  repo.owner.slug,
+                                  repo.space.slug,
                                   repo.name,
                                   "ci",
                                   String(chain.landing.queue.mergeRun.number),
@@ -623,7 +623,7 @@ function Landing({
               )}
               {!result.tracker.readable && (
                 <Note>
-                  You can't read {result.tracker.owner}'s tracker, so its timelines and approvals
+                  You can't read {result.tracker.space}'s tracker, so its timelines and approvals
                   aren't shown.
                 </Note>
               )}
@@ -638,11 +638,11 @@ function Landing({
 /** Issue keys the message cites: links only where they resolve to an issue the viewer can open. */
 function Issues({
   message,
-  owner,
+  space,
   repoName,
 }: {
   message: string;
-  owner: string;
+  space: string;
   repoName: string;
 }) {
   const keys = issueKeysIn(message);
@@ -652,12 +652,12 @@ function Issues({
     if (!keyList) return;
     const controller = new AbortController();
     setConfirmed(null);
-    confirmIssueKeys(keyList.split(","), { owner, name: repoName }, controller.signal).then(
+    confirmIssueKeys(keyList.split(","), { space, name: repoName }, controller.signal).then(
       (found) => !controller.signal.aborted && setConfirmed(found),
       () => !controller.signal.aborted && setConfirmed(new Map()),
     );
     return () => controller.abort();
-  }, [keyList, owner, repoName]);
+  }, [keyList, space, repoName]);
 
   return (
     <Section id="commit-issues" title="Issues it mentions" count={keys.length}>
@@ -707,7 +707,7 @@ function Runs({ repo, runs, oid }: { repo: RepoDetail; runs: Loaded<CiRunList>; 
               {listed.map((run) => (
                 <li key={run.id}>
                   <Link
-                    to={repoPath(repo.owner.slug, repo.name, "ci", String(run.number))}
+                    to={repoPath(repo.space.slug, repo.name, "ci", String(run.number))}
                     className="flex min-h-10 items-center gap-2 px-3 py-2 text-body-sm text-ink no-underline hover:bg-raised max-sm:min-h-11"
                   >
                     <CiStatusIcon status={run.status} />
@@ -811,7 +811,7 @@ function Deployments({
                     {deployment.run !== null && (
                       <Link
                         className={`${link} text-micro`}
-                        to={repoPath(repo.owner.slug, repo.name, "ci", String(deployment.run))}
+                        to={repoPath(repo.space.slug, repo.name, "ci", String(deployment.run))}
                       >
                         run #{deployment.run}
                       </Link>
@@ -838,7 +838,7 @@ function Deployments({
                       {expanded === deployment.id && (
                         <RecentAgents
                           endpoint={sourceUrl(
-                            `/repos/${repo.owner.slug}/${repo.name}/deployments/${deployment.id}/presence`,
+                            `/repos/${repo.space.slug}/${repo.name}/deployments/${deployment.id}/presence`,
                             deployment.sourceId,
                           )}
                         />
@@ -867,7 +867,7 @@ function Files({
   parent: string | null;
 }) {
   const files = diff.state === "done" ? diff.value.files : [];
-  const owner = repo.owner.slug;
+  const space = repo.space.slug;
   const { name } = repo;
   return (
     <Section id="commit-files" title="Files changed" count={files.length}>
@@ -887,7 +887,7 @@ function Files({
                 // A deleted file lives on at the parent.
                 blobHref={(path) =>
                   blobUrl(
-                    owner,
+                    space,
                     name,
                     files.find((f) => f.path === path)?.status === "deleted" && parent
                       ? parent

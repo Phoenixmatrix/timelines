@@ -3,17 +3,19 @@
 // and the overlay API shows it.
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { KnowledgeOverlay, KnowledgeOverlaySummary } from "../../shared/api.ts";
 import type { TimelineStatus } from "../../shared/timelines.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { endedTimelineData } from "../retention/cleanups/ended-timeline-data.ts";
 import { Timing } from "../timing.ts";
 import { knowledge } from "./api.ts";
 import { KnowledgeCoordinator } from "./coordinator.ts";
+import { seedSpaceFixture, createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -53,12 +55,34 @@ function objectState() {
 let artifactsNames = 0;
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  onTestFinished(fresh.close);
   // A fresh Artifacts name each time: RepoReader caches refs by name.
   const artifacts = `kg-ended-${++artifactsNames}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: {
+      id: "org-ann",
+      slug: "ann",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "ann", slug: "ann", displayName: "General" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'ann', 'app', 'private', '${artifacts}', 'https://app');
     INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('repo', '${oid(1)}');
   `);
@@ -80,7 +104,7 @@ async function setup() {
     sqlite
       .prepare(`
     INSERT INTO timeline_work_sources
-      (source_id, repo_id, timeline_id, timeline_slug, owner_id, artifacts_name, artifacts_remote,
+      (source_id, repo_id, timeline_id, timeline_slug, space_id, artifacts_name, artifacts_remote,
        state, allocation_operation_id, fork_source_id, fork_commit, fork_tree, fork_ref,
        initial_token_revoked, created_at, updated_at, initial_source_id, initial_commit, initial_tree, initial_ref)
     VALUES (?, 'repo', ?, ?, 'ann', ?, ?, 'ready', ?, 'canonical', ?, 'tree', 'refs/heads/main', 1, 'now', 'now',
@@ -100,7 +124,7 @@ async function setup() {
   const timelines: Record<string, TimelineStatus> = { fast: "active" };
   const builds = vi.fn(async (_options: { id: string; params: unknown }) => undefined);
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: git.artifacts,
     // Overlays start at once here; the quiet period has its own tests (CORE-238).
     TIMELINE_QUIET_SECONDS: "0",
@@ -110,18 +134,23 @@ async function setup() {
     },
     TRACKER: {
       getByName: () => ({
-        timeline: async (slug: string) =>
-          timelines[slug]
-            ? { ok: true, value: { timeline: { slug, status: timelines[slug] }, events: [] } }
-            : { ok: false, error: { code: "not_found", message: "No timeline.", status: 404 } },
+        timelineLifecycle: async ({ timelineSlug: slug }: { timelineSlug: string }) => ({
+          ok: true,
+          value: timelines[slug] ? { status: timelines[slug] } : null,
+        }),
       }),
     },
   } as unknown as Env;
   const coordinator = new KnowledgeCoordinator(objectState(), env);
+  const initiatingToken = await issueToken(env.DB, "ann", "push", "write");
+  const authorization = await captureWorkAuthority(env, "repo", {
+    id: "ann",
+    credential: { kind: "token", id: initiatingToken.id },
+  });
 
   /** A push: the coordinator wakes after its quiet period and scans the bookmarks. */
   const push = async () => {
-    await coordinator.notify("repo");
+    await coordinator.notify("repo", { authorization });
     await coordinator.alarm();
   };
   /** The overlays the coordinator started since the last call, by bookmark. */
@@ -162,7 +191,7 @@ async function setup() {
     c.set("timing", new Timing());
     return next();
   });
-  server.route("/api/repos/:owner/:name/knowledge", knowledge);
+  server.route("/api/repos/:space/:name/knowledge", knowledge);
   const token = (await issueToken(env.DB, "ann", "t", "read")).secret;
   const executionCtx = {
     waitUntil() {},
@@ -172,7 +201,7 @@ async function setup() {
   const get = async <T>(path: string) => {
     const response = await server.request(
       `/api/repos/ann/app/knowledge${path}`,
-      { headers: { authorization: `Bearer ${token}` } },
+      { headers: { authorization: `Bearer ${token}`, "X-Gitmatrix-Content-Version": "4" } },
       env,
       executionCtx,
     );
@@ -272,7 +301,7 @@ describe("ended overlays", () => {
     const now = new Date(Date.parse(before.ended!.at) + 100 * 86_400_000);
     const ctx = {
       env: { DB: d1(t.sqlite) } as unknown as Env,
-      target: { scope: "account", accountId: "ann" } as const,
+      target: { kind: "space", id: "ann" } as const,
       thresholds: { days: 90 },
       now,
       limit: 10,

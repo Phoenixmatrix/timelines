@@ -85,7 +85,7 @@ pub fn clone(ctx: &Ctx, args: &cli::CloneArgs) -> Result<Cloned> {
     let repository = args.repository.trim_end_matches(".git").trim_matches('/');
     let Some((_, name)) = repository.split_once('/') else {
         return Err(GmError::usage(
-            "Name the repository as owner/name, e.g. `gm clone orbit/engine`.",
+            "Name the repository as space/name, e.g. `gm clone orbit/engine`.",
         ));
     };
     let url = format!("{}/{}.git", config.server(), repository);
@@ -552,7 +552,7 @@ pub fn sync(ctx: &Ctx) -> Result<OpResult> {
 
 // ---- push ------------------------------------------------------------------------
 
-/// Queue authority is the configured API server, not just an owner/name slug.
+/// Queue authority is the configured API server, not just a space/name slug.
 /// Canonical host/default-port spelling prevents aliases of that authority
 /// from escaping a receipt; the path retains any configured API mount prefix.
 fn queue_repository(config: &Config, repo: &str) -> Result<String> {

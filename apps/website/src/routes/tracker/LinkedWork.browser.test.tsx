@@ -17,16 +17,17 @@ test("the issue page lists a mentioning commit with its CI run and package", asy
   const tip = commitId();
   await server.push("orbit/engine", "main", tip);
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng", memberIds: [] } },
       { kind: "issue.create", id: "rank", data: { teamId: "team", title: "Rank search results" } },
     ],
   });
-  const [orbit] = await server.sql<{ id: string }>("SELECT id FROM accounts WHERE slug = 'orbit'");
+  const [orbit] = await server.sql<{ id: string }>("SELECT id FROM spaces WHERE slug = 'orbit'");
   // What the push log indexed, the run CI started and the package it published.
   await server.sql(
-    `INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, resolution, tracker_owner_id, issue_id, title, committed_at, first_ref)
+    `INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, resolution, tracker_space_id, issue_id, title, committed_at, first_ref)
      VALUES (?, ?, 'ENG-1', 'linked', ?, 'rank', 'ENG-1: Rank by freshness and click-through', '2026-10-03T09:00:00.000Z', 'refs/heads/main')`,
     repo.id,
     tip,
@@ -39,7 +40,7 @@ test("the issue page lists a mentioning commit with its CI run and package", asy
     tip,
   );
   await server.registrySql(
-    `INSERT INTO repositories (id, owner_id, key, format, kind, visibility, config, created_at, updated_at)
+    `INSERT INTO repositories (id, space_id, key, format, kind, visibility, config, created_at, updated_at)
      VALUES ('feed', ?, 'orbit', 'npm', 'local', 'private', '{}', '2026-10-03T00:00:00Z', '2026-10-03T00:00:00Z')`,
     orbit!.id,
   );
@@ -95,6 +96,7 @@ test("linked deployments show the provider version recorded, or that none was", 
   const tip = commitId();
   await server.push("orbit/engine", "main", tip);
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng", memberIds: [] } },

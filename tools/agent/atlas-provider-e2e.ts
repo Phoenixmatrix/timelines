@@ -1,3 +1,4 @@
+import { contentHeaders, fixtureSpace } from "./content-fixtures.ts";
 // The Semantic Code Atlas against the real providers (CORE-179, the CORE-155
 // PRD's gate 19, with gates 4, 11 and 15 for the degraded providers).
 //
@@ -47,10 +48,10 @@ import type {
   AtlasProvenance,
   AtlasWorkspaceComposition,
 } from "../../apps/website/shared/atlas.ts";
-import { command } from "./environment.ts";
 import type { StageDefinition } from "./ai-stages.ts";
 import type { AiRun } from "./provider-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
+import { command } from "./environment.ts";
 
 const WORKER = "apps/website/worker";
 const SRC = "apps/website/src";
@@ -118,11 +119,11 @@ type AtlasStage = (typeof ATLAS_STAGES)[number]["id"];
 export const ATLAS_REFUSED_MODEL = "@cf/gitmatrix/atlas-unserved-model";
 
 /**
- * The environment's Atlas settings per owning account (GITMATRIX_ATLAS_CONFIG,
+ * The environment's Atlas settings per Space (GITMATRIX_ATLAS_CONFIG,
  * the ATLAS_CONFIG binding). priya keeps the built-in defaults.
  */
 export const ATLAS_PROVIDER_CONFIG = {
-  accounts: {
+  spaces: {
     // No price for any model: the budget disables paid synthesis.
     marco: { prices: {} },
     // Priced, so reservations succeed, and refused by the real provider.
@@ -397,7 +398,7 @@ type Mode = "enabled" | "disabled" | "refused" | "exhausted";
 
 interface FixtureRepo {
   mode: Mode | "consumer";
-  owner: Persona;
+  space: Persona;
   name: string;
   id: string;
   head: string;
@@ -502,7 +503,11 @@ export async function runAtlasProviderE2E(
   ) => {
     const response = await fetch(`${ctx.origin}${path}`, {
       method: init.method ?? "GET",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      headers: {
+        ...contentHeaders,
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
       ...(init.body === undefined ? {} : { body: init.body }),
       signal: AbortSignal.timeout(120_000),
     });
@@ -515,40 +520,6 @@ export async function runAtlasProviderE2E(
   };
   const api = <T>(path: string, token: string = fixtures.tokens.priya) =>
     request(`/api${path}`, token) as Promise<T>;
-  /** One read-only query of the environment's local D1 (as `agent inspect` does). */
-  const sql = async (query: string): Promise<Record<string, unknown>[]> => {
-    // The server writes the same SQLite file: a read can find it locked for a moment.
-    let out = "";
-    for (let attempt = 0; ; attempt++) {
-      try {
-        out = await read(query);
-        break;
-      } catch (error) {
-        if (attempt >= 20 || !/SQLITE_BUSY|database is locked/.test(String(error))) throw error;
-        await delay(1_000 + Math.random() * 2_000);
-      }
-    }
-    const [first] = JSON.parse(out) as { results: { columns: string[]; rows: unknown[][] } }[];
-    assert(first, "D1 returned no result");
-    return first.results.rows.map((row) =>
-      Object.fromEntries(first.results.columns.map((c, i) => [c, row[i]])),
-    );
-  };
-  const read = (query: string) =>
-    command(
-      "cf",
-      [
-        "d1",
-        "raw",
-        "00000000000000000000000000000000",
-        "--local",
-        "--persist-to",
-        join(ctx.dir, "state"),
-        "--sql",
-        query,
-      ],
-      { cwd: join(ctx.root, "apps", "website") },
-    );
 
   const repos = new Map<Mode | "consumer", FixtureRepo>();
   const createRepo = async (mode: Mode | "consumer", owner: Persona, prefix: string) => {
@@ -556,13 +527,18 @@ export async function runAtlasProviderE2E(
     const token = fixtures.tokens[owner];
     await request("/api/repos", token, {
       method: "POST",
-      body: JSON.stringify({ owner, name, visibility: "private", description: "Atlas fixture" }),
+      body: JSON.stringify({
+        spaceId: (await fixtureSpace(ctx.origin, owner, token)).space.id,
+        name,
+        visibility: "private",
+        description: "Atlas fixture",
+      }),
       expected: [201],
     });
     const { id } = (await api<{ id: string }>(`/repos/${owner}/${name}`, token)) as { id: string };
     const dir = join(root, `${owner}-${name}`);
     await mkdir(dir);
-    const repo: FixtureRepo = { mode, owner, name, id, head: "", dir };
+    const repo: FixtureRepo = { mode, space: owner, name, id, head: "", dir };
     repos.set(mode, repo);
     return repo;
   };
@@ -575,7 +551,7 @@ export async function runAtlasProviderE2E(
         "remote",
         "add",
         "origin",
-        `${ctx.origin}/${repo.owner}/${repo.name}.git`,
+        `${ctx.origin}/${repo.space}/${repo.name}.git`,
       ]);
     }
     for (const [path, text] of Object.entries(files)) {
@@ -584,23 +560,25 @@ export async function runAtlasProviderE2E(
     }
     await git(repo.dir, ["add", "-A"]);
     await git(repo.dir, ["-c", "core.hooksPath=/dev/null", "commit", "-m", message]);
-    await git(repo.dir, ["push", "origin", "main"], fixtures.tokens[repo.owner]);
+    await git(repo.dir, ["push", "origin", "main"], fixtures.tokens[repo.space]);
     repo.head = await git(repo.dir, ["rev-parse", "HEAD"]);
   };
   /** The build of exactly `repo.head`, once the repository is up to date with it. */
   const built = async (repo: FixtureRepo): Promise<KnowledgeBuild> => {
-    const token = fixtures.tokens[repo.owner];
+    const token = fixtures.tokens[repo.space];
     const deadline = Date.now() + 15 * 60_000;
     let observed: KnowledgeStatus | undefined;
     while (Date.now() < deadline) {
       observed = await api<KnowledgeStatus>(
-        `/repos/${repo.owner}/${repo.name}/knowledge/status`,
+        `/repos/${repo.space}/${repo.name}/knowledge/status`,
         token,
       );
-      if (observed.state === "failed")
+      if (observed.state === "failed") {
+        evidence.failedBuild = { repo: `${repo.space}/${repo.name}`, head: repo.head, observed };
         throw new Error(
-          `${repo.owner}/${repo.name}: Knowledge build failed (${observed.current?.error ?? observed.recent[0]?.error ?? "no error recorded"})`,
+          `${repo.space}/${repo.name}: Knowledge build failed (${observed.current?.error ?? observed.recent[0]?.error ?? "no error recorded"})`,
         );
+      }
       const build = observed.recent.find(
         (b) => b.toCommit === repo.head && b.status === "succeeded",
       );
@@ -608,12 +586,13 @@ export async function runAtlasProviderE2E(
         return build;
       await delay(5_000);
     }
+    evidence.failedBuild = { repo: `${repo.space}/${repo.name}`, head: repo.head, observed };
     throw new Error(
-      `${repo.owner}/${repo.name}: no successful build of ${short(repo.head)} (state ${observed?.state}, phase ${observed?.current?.phase})`,
+      `${repo.space}/${repo.name}: no successful build of ${short(repo.head)} (state ${observed?.state}, phase ${observed?.current?.phase})`,
     );
   };
-  const atlasOf = (repo: FixtureRepo) => `/repos/${repo.owner}/${repo.name}/atlas`;
-  const tokenOf = (repo: FixtureRepo) => fixtures.tokens[repo.owner];
+  const atlasOf = (repo: FixtureRepo) => `/repos/${repo.space}/${repo.name}/atlas`;
+  const tokenOf = (repo: FixtureRepo) => fixtures.tokens[repo.space];
   /** Each fixture file's primary capability in the repository's current snapshot. */
   const capabilityOfFiles = async (repo: FixtureRepo, paths: string[]) => {
     const out = new Map<string, string | null>();
@@ -655,10 +634,16 @@ export async function runAtlasProviderE2E(
       `${atlasOf(repo)}/evidence?id=${encodeURIComponent(id)}&limit=20`,
       tokenOf(repo),
     );
-  const spendRows = (repoIds: string[]) =>
-    sql(
-      `SELECT repo_id, run_id, purpose, model, status, input_tokens, output_tokens, cost_micro_usd FROM atlas_spend WHERE repo_id IN (${repoIds.map((id) => `'${id.replace(/'/g, "")}'`).join(",")}) ORDER BY created_at`,
-    );
+  const inspectDatabase = async (repoId: string) => {
+    const repo = [...repos.values()].find((entry) => entry.id === repoId);
+    assert(repo, "Inspect only this run's owned fixture repositories");
+    return request("/api/dev/atlas", ctx.env.GITMATRIX_AGENT_SECRET ?? "", {
+      method: "POST",
+      body: JSON.stringify({ repo: `${repo.space}/${repo.name}`, action: "inspect" }),
+    }) as Promise<{ spend: Record<string, unknown>[]; builds: number }>;
+  };
+  const spendRows = async (repoIds: string[]) =>
+    (await Promise.all(repoIds.map(inspectDatabase))).flatMap((result) => result.spend);
 
   let browser: Browser | undefined;
   const browse = async <T>(persona: Persona, label: string, work: (page: Page) => Promise<T>) => {
@@ -741,7 +726,7 @@ export async function runAtlasProviderE2E(
     const file = path.at(-1)!;
     assert(selectedFile, `Drilling ${capability} reached no file: ${path.join(" › ")}`);
     const link = scope
-      .locator(`a[href^="/${repo.owner}/${repo.name}/blob/${repo.head}/"]`)
+      .locator(`a[href^="/${repo.space}/${repo.name}/blob/${repo.head}/"]`)
       .filter({ hasText: new RegExp(`(?:^|/)${escape(file)}(?::\\d+)?$`) })
       .first();
     await expect(link).toBeVisible();
@@ -831,7 +816,6 @@ export async function runAtlasProviderE2E(
           cached: number;
           unavailable: number;
           model?: string;
-          settings?: string;
           capabilities: number;
         };
         atlasSpend?: {
@@ -856,13 +840,12 @@ export async function runAtlasProviderE2E(
       };
       // Retain the structural inputs before teardown, even if membership fails.
       evidence.enabledGraph = await api(
-        `/repos/${ledger.owner}/${ledger.name}/knowledge/graph/export`,
+        `/repos/${ledger.space}/${ledger.name}/knowledge/graph/export`,
         tokenOf(ledger),
       );
       assert.equal(stats.atlasError, undefined, `Atlas projection failed: ${stats.atlasError}`);
       assert(stats.atlasSnapshot && stats.atlasDescribed && stats.atlasSpend && stats.atlasTimings);
       const described = stats.atlasDescribed;
-      assert.equal(described.settings, "default", "priya runs with the built-in Atlas settings");
       assert.match(
         described.model ?? "",
         /^@cf\//,
@@ -1004,7 +987,7 @@ export async function runAtlasProviderE2E(
         evidence.repos = Object.fromEntries(
           [...repos].map(([mode, r]) => [
             mode,
-            { repo: `${r.owner}/${r.name}`, id: r.id, head: r.head },
+            { repo: `${r.space}/${r.name}`, id: r.id, head: r.head },
           ]),
         );
       },
@@ -1013,10 +996,7 @@ export async function runAtlasProviderE2E(
     // The Knowledge tab: capability → area/file → source at the snapshot's commit,
     // and browsing it makes no model call and starts no build.
     await step("atlas-enabled-ui", ["atlas-describe"], async () => {
-      const before = await spendRows([ledger.id]);
-      const buildsBefore = await sql(
-        `SELECT COUNT(*) AS n FROM kg_builds WHERE repo_id = '${ledger.id}'`,
-      );
+      const before = await inspectDatabase(ledger.id);
       const drilled = await browse("priya", "enabled", async (page) => {
         await page.goto(`/priya/${ledger.name}/knowledge?view=outline`);
         const tree = page.getByRole("tree", { name: `Outline of priya/${ledger.name}` });
@@ -1036,13 +1016,13 @@ export async function runAtlasProviderE2E(
         await page.screenshot({ path: join(ctx.artifacts, "atlas-enabled-source.png") });
         return result;
       });
-      const after = await spendRows([ledger.id]);
-      const buildsAfter = await sql(
-        `SELECT COUNT(*) AS n FROM kg_builds WHERE repo_id = '${ledger.id}'`,
-      );
-      assert.deepEqual(after, before, "Browsing the Atlas made a model call");
-      assert.deepEqual(buildsAfter, buildsBefore, "Browsing the Atlas started a build");
-      evidence.enabledUi = { ...drilled, atlasCallsWhileBrowsing: after.length - before.length };
+      const after = await inspectDatabase(ledger.id);
+      assert.deepEqual(after.spend, before.spend, "Browsing the Atlas made a model call");
+      assert.equal(after.builds, before.builds, "Browsing the Atlas started a build");
+      evidence.enabledUi = {
+        ...drilled,
+        atlasCallsWhileBrowsing: after.spend.length - before.spend.length,
+      };
     });
     run.outcomes["atlas-describe"] = "passed";
 
@@ -1054,7 +1034,7 @@ export async function runAtlasProviderE2E(
         const shopCap = await sharedCapability(shop, SHOP_CAPABILITY);
         assert.deepEqual(shopCap.entity.summaryState, { status: "current" });
         const names = `${ledger.name},${shop.name}`;
-        const ws = `/accounts/priya/atlas`;
+        const ws = `/spaces/priya/atlas`;
         const scoped = (id: string) => `${shop.id}/${id}`;
         const links = await api<AtlasPage<AtlasCrossLink>>(
           `${ws}/links?repos=${names}&id=${encodeURIComponent(scoped(shopCap.entity.id))}&state=resolved`,
@@ -1088,7 +1068,7 @@ export async function runAtlasProviderE2E(
           (c) => c.repos.includes(ledger.id) && c.repos.includes(shop.id),
         );
         const repoVectors = composition.snapshot.repos.map((r) => ({
-          repo: `${r.owner}/${r.name}`,
+          repo: `${r.space}/${r.name}`,
           state: r.state,
           vector: r.snapshot?.vector ?? null,
         }));
@@ -1196,7 +1176,7 @@ export async function runAtlasProviderE2E(
           "-m",
           "Advance ledger provenance without changing description inputs",
         ]);
-        await git(ledger.dir, ["push", "origin", "main"], fixtures.tokens[ledger.owner]);
+        await git(ledger.dir, ["push", "origin", "main"], fixtures.tokens[ledger.space]);
         ledger.head = await git(ledger.dir, ["rev-parse", "HEAD"]);
         assert.notEqual(ledger.head, previousCommit);
         assert.equal(await git(ledger.dir, ["rev-parse", "HEAD^"]), previousCommit);
@@ -1204,7 +1184,7 @@ export async function runAtlasProviderE2E(
         const build = await built(ledger);
         // Retained beside enabledGraph: what any changed part's prose became.
         evidence.reuseGraph = await api(
-          `/repos/${ledger.owner}/${ledger.name}/knowledge/graph/export`,
+          `/repos/${ledger.space}/${ledger.name}/knowledge/graph/export`,
           tokenOf(ledger),
         );
         const stats = build.stats as {
@@ -1382,7 +1362,6 @@ export async function runAtlasProviderE2E(
             stale: number;
             reasons: Record<string, number>;
             model?: string;
-            settings?: string;
           };
           atlasSpend?: {
             calls: number;
@@ -1393,7 +1372,7 @@ export async function runAtlasProviderE2E(
           };
         };
         const record: Record<string, unknown> = {
-          repo: `${repo.owner}/${repo.name}`,
+          repo: `${repo.space}/${repo.name}`,
           build: build.id,
           commit: repo.head,
           atlasSnapshot: stats.atlasSnapshot,
@@ -1406,7 +1385,6 @@ export async function runAtlasProviderE2E(
         assert.equal(stats.atlasError, undefined, `Projection failed: ${stats.atlasError}`);
         assert(stats.atlasSnapshot && stats.atlasDescribed && stats.atlasSpend);
         const described = stats.atlasDescribed;
-        assert.equal(described.settings, "account", "The owning account's configuration applies");
         assert(described.capabilities >= 2);
         const overview = await api<AtlasOverview>(`${atlasOf(repo)}/overview`, tokenOf(repo));
         assert.equal(overview.snapshot.id, stats.atlasSnapshot);
@@ -1491,11 +1469,11 @@ export async function runAtlasProviderE2E(
           for (const e of sources.items) assert.equal(e.commit, repo.head);
         }
         const target = missing[0]!;
-        record.ui = await browse(repo.owner, expected.mode, async (page) => {
-          await page.goto(`/${repo.owner}/${repo.name}/knowledge?view=outline`);
+        record.ui = await browse(repo.space, expected.mode, async (page) => {
+          await page.goto(`/${repo.space}/${repo.name}/knowledge?view=outline`);
           const notices = page.getByRole("list", { name: "Map state" });
           await expect(notices.getByText(expected.notice)).toBeVisible();
-          const tree = page.getByRole("tree", { name: `Outline of ${repo.owner}/${repo.name}` });
+          const tree = page.getByRole("tree", { name: `Outline of ${repo.space}/${repo.name}` });
           await tree
             .getByRole("treeitem", { name: new RegExp(`^${escape(target.name)}\\s*Capability`) })
             .first()
@@ -1519,7 +1497,7 @@ export async function runAtlasProviderE2E(
 
     await step("atlas-usage", ["atlas-describe"], async () => {
       const rows = await spendRows([...repos.values()].map((r) => r.id));
-      const byRepo = new Map([...repos.values()].map((r) => [r.id, `${r.owner}/${r.name}`]));
+      const byRepo = new Map([...repos.values()].map((r) => [r.id, `${r.space}/${r.name}`]));
       evidence.providerUsage = {
         calls: rows.map((r) => ({ ...r, repo: byRepo.get(String(r.repo_id)) })),
         totals: {

@@ -1,7 +1,7 @@
 import { importPKCS8, jwtVerify, SignJWT, type CryptoKey as JoseKey } from "jose";
 
 import { registryTokenSeed } from "../secrets.ts";
-import type { AccessGrant, Actor } from "./actor.ts";
+import type { AccessGrant, Actor, CredentialReference } from "./actor.ts";
 import { scopeSet } from "./actor.ts";
 
 /**
@@ -66,9 +66,9 @@ export async function issueRegistryToken(
     email: actor.email ?? undefined,
     tid: actor.tokenId ?? undefined,
     scope: [...actor.scopes].join(" "),
-    // A job's identity rides along so `docker push` from CI records provenance.
-    job: actor.job,
-    adm: actor.isSiteAdmin || undefined,
+    person: actor.personId,
+    agent: actor.agentId,
+    credential: actor.credential,
   })
     .setProtectedHeader({ alg: "EdDSA", typ: "JWT" })
     .setIssuer(REGISTRY_TOKEN_ISSUER)
@@ -94,19 +94,54 @@ export async function verifyRegistryToken(env: object, token: string): Promise<A
       algorithms: ["EdDSA"],
       clockTolerance: 30,
     });
-    const kind =
-      payload.kind === "job" ? "job" : payload.sub === "anonymous" ? "anonymous" : "user";
+    const kind = payload.kind;
+    if (kind !== "anonymous" && kind !== "user" && kind !== "job") return null;
+    const reference = payload.credential;
+    let credential: CredentialReference | undefined;
+    if (reference && typeof reference === "object" && !Array.isArray(reference)) {
+      const ref = reference as Record<string, unknown>;
+      if (
+        (ref.kind === "token" || ref.kind === "session") &&
+        typeof ref.id === "string" &&
+        ref.id
+      ) {
+        credential = { kind: ref.kind, id: ref.id };
+      } else if (
+        ref.kind === "job" &&
+        typeof ref.hash === "string" &&
+        /^[a-f0-9]{64}$/.test(ref.hash)
+      ) {
+        credential = { kind: "job", hash: ref.hash };
+      }
+    }
+    if (kind !== "anonymous" && (!payload.sub || !credential || typeof payload.person !== "string"))
+      return null;
+    if (
+      !Array.isArray(payload.access) ||
+      !payload.access.every((grant: unknown) => {
+        if (!grant || typeof grant !== "object") return false;
+        const value = grant as Record<string, unknown>;
+        return (
+          typeof value.type === "string" &&
+          typeof value.name === "string" &&
+          Array.isArray(value.actions) &&
+          value.actions.every((action: unknown) => typeof action === "string")
+        );
+      })
+    )
+      return null;
     return {
       kind,
       subject: kind === "anonymous" ? null : (payload.sub ?? null),
       email: typeof payload.email === "string" ? payload.email : null,
       name: typeof payload.name === "string" ? payload.name : null,
-      job: kind === "job" ? (payload.job as Actor["job"]) : undefined,
-      isSiteAdmin: payload.adm === true,
+      personId: typeof payload.person === "string" ? payload.person : undefined,
+      agentId: typeof payload.agent === "string" ? payload.agent : null,
+      credential,
       scopes: scopeSet(typeof payload.scope === "string" ? payload.scope.split(" ") : []),
       tokenId: typeof payload.tid === "string" ? payload.tid : null,
       via: "registry",
-      access: Array.isArray(payload.access) ? (payload.access as AccessGrant[]) : [],
+      access: payload.access as AccessGrant[],
     };
   } catch {
     return null;

@@ -11,13 +11,85 @@ import type { QueueStatus } from "../shared/merge-queue.ts";
 import type { ReleaseHighlightsScope, ReleaseHighlightsState } from "../shared/release-notes.ts";
 
 /**
- * Gitmatrix's database (the DB binding) for Kysely. The SQL migrations in
- * `migrations/` are the source of truth; every migration updates this
- * interface in the same change. `Generated` marks columns with a default.
+ * Gitmatrix's canonical v4 database (the DB binding) for Kysely. Ordinary
+ * migrations prepare the legacy schema; space-cutover/canonical-schema.ts
+ * defines its independently fenced reconstruction. `Generated` marks defaults.
  * Timestamps are ISO strings; JSON columns are TEXT, parsed at the edges.
  * (The package registry keeps its own database: registry/core/db.ts.)
  */
 export interface Database {
+  /** Independent SQL fence; excluded from business restoration and metering. */
+  _space_cutover_fence: {
+    id: number;
+    run_id: string | null;
+    migration_epoch: number | null;
+    manifest_digest: string | null;
+    fenced: Generated<number>;
+    bypass: Generated<number>;
+    authority_token: Generated<string>;
+  };
+  timeline_source_migrations: {
+    space_id: string;
+    timeline_id: string;
+    state: "frozen" | "ready" | "cleaned";
+    input: string;
+    output: string | null;
+    created_at: string;
+    updated_at: string;
+  };
+  organizations: {
+    id: string;
+    slug: string;
+    display_name: string;
+    kind: "company" | "personal";
+    personal_account_id: string | null;
+    default_space_id: string;
+    avatar_key: Generated<string | null>;
+    created_at: Generated<string>;
+  };
+  spaces: {
+    id: string;
+    organization_id: string;
+    slug: string;
+    display_name: string;
+    archived_at: Generated<string | null>;
+    authorization_version: Generated<number>;
+    created_at: Generated<string>;
+  };
+  organization_members: {
+    organization_id: string;
+    account_id: string;
+    role: "owner" | "member";
+    origin: string;
+    granted_at: Generated<string>;
+    granted_by: string;
+    granted_by_agent_id: string | null;
+  };
+  space_grants: {
+    space_id: string;
+    organization_id: string;
+    account_id: string;
+    role: "admin" | "member";
+    repository_role: "none" | "read" | "write";
+    package_role: "none" | "read" | "write";
+    origin: string;
+    granted_at: Generated<string>;
+    granted_by: string;
+    granted_by_agent_id: string | null;
+  };
+  space_audit: {
+    id: string;
+    organization_id: string;
+    space_id: string | null;
+    actor_id: string;
+    agent_id: string | null;
+    action: string;
+    subject_id: string | null;
+    detail: string;
+    migration_run_id: string | null;
+    manifest_digest: string | null;
+    created_at: Generated<string>;
+  };
   source_integration_inputs: { receipt_id: string; repo_id: string; commits_json: string };
   timeline_source_roots: {
     repo_id: string;
@@ -28,11 +100,12 @@ export interface Database {
     created_at: string;
   };
   timeline_work_sources: {
+    space_id: string;
+    authority: Generated<string | null>;
     source_id: string;
     repo_id: string;
     timeline_id: string;
     timeline_slug: string;
-    owner_id: string;
     artifacts_name: string;
     artifacts_remote: string | null;
     state: "reserved" | "creating" | "ready" | "archived" | "purging" | "purged" | "failed";
@@ -56,8 +129,8 @@ export interface Database {
     error: string | null;
   };
   source_operations: {
+    space_id: string;
     id: string;
-    owner_id: string;
     timeline_id: string;
     repo_id: string;
     source_id: string;
@@ -122,14 +195,12 @@ export interface Database {
   };
   accounts: {
     id: string;
-    kind: "user" | "org";
+    kind: "user";
     slug: string;
     display_name: string;
     bio: Generated<string>;
     is_site_admin: Generated<number>;
-    /** Orgs only: the role every member gets on every repo the org owns. */
-    member_repo_role: "none" | "read" | "write" | null;
-    /** Users who sign in by email; null for orgs and seed personas. */
+    /** People who sign in by email; null for seed personas. */
     email: string | null;
     created_at: Generated<string>;
     /** People's profile picture in the AVATARS bucket; null shows initials. */
@@ -169,14 +240,9 @@ export interface Database {
     key: string;
     until: string;
   };
-  org_members: {
-    org_id: string;
-    user_id: string;
-    role: "owner" | "member";
-  };
   repos: {
+    space_id: string;
     id: string;
-    owner_id: string;
     name: string;
     description: Generated<string>;
     visibility: "public" | "private";
@@ -193,8 +259,8 @@ export interface Database {
   };
   /** Repository deletions and what their purge did (CORE-199, worker/retention/repo-purge.ts). */
   repo_deletions: {
+    space_id: string | null;
     repo_id: string;
-    owner_id: string;
     full_name: string;
     artifacts_name: string | null;
     source: Generated<"delete" | "orphan-sweep">;
@@ -248,8 +314,8 @@ export interface Database {
     last_seen_at: string;
   };
   tracker_preferences: {
+    space_id: string;
     user_id: string;
-    owner_id: string;
     team_id: string | null;
     view: Generated<string>;
     query: Generated<string>;
@@ -275,6 +341,7 @@ export interface Database {
   };
   /** The Durable Object instance registry (CORE-197, worker/durable/). */
   do_instances: {
+    space_id: Generated<string | null>;
     class: string;
     name: string;
     account_id: string | null;
@@ -287,10 +354,11 @@ export interface Database {
     purged_at: string | null;
     purge_reason: string | null;
   };
-  /** Daily usage per account and construct (CORE-207, worker/usage/collect.ts). */
+  /** Daily usage per explicit scope and construct (worker/usage/collect.ts). */
   usage_snapshots: {
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
     day: string;
-    account_id: string;
     construct: UsageConstruct;
     item: string;
     metric: string;
@@ -300,10 +368,11 @@ export interface Database {
     method: string;
     collected_at: string;
   };
-  /** Workers AI calls and tokens per day, account, feature and model (worker/usage/ai.ts). */
+  /** Workers AI calls and tokens per day, scope, feature and model. */
   ai_usage: {
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
     day: string;
-    account_id: string;
     feature: string;
     model: string;
     /** Who it was for, when the work knew (CORE-222): the person, their agent, the timeline; '' otherwise. */
@@ -319,8 +388,9 @@ export interface Database {
   };
   /** usage_snapshots past their policy, rolled up by month (CORE-225, worker/usage/history.ts). */
   usage_monthly: {
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
     month: string;
-    account_id: string;
     construct: UsageConstruct;
     item: string;
     metric: string;
@@ -334,8 +404,9 @@ export interface Database {
   };
   /** ai_usage past its policy, rolled up by month (CORE-225). */
   ai_usage_monthly: {
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
     month: string;
-    account_id: string;
     feature: string;
     model: string;
     calls: Generated<number>;
@@ -502,9 +573,9 @@ export interface Database {
     /** Set when retention removed an ended overlay's changes and pages (CORE-201). */
     removed_at: Generated<string | null>;
   };
-  /** Atlas spend rolled up per account and day (CORE-201, "ai-spend"). */
+  /** Atlas spend rolled up per Space and day. */
   atlas_spend_daily: {
-    account_id: string;
+    space_id: string;
     day: string;
     calls: number;
     input_tokens: number;
@@ -514,8 +585,8 @@ export interface Database {
   };
   /** Atlas paid-synthesis calls, reserved then reconciled (worker/knowledge/budget.ts). */
   atlas_spend: {
+    space_id: string;
     id: string;
-    account_id: string;
     day: string;
     scope: "build" | "grouping";
     run_id: string;
@@ -533,8 +604,8 @@ export interface Database {
     settled_at: string | null;
   };
   atlas_budget_exhaustions: {
+    space_id: string;
     key: string;
-    account_id: string;
     scope: "day" | "build" | "grouping";
     run_id: string | null;
     day: string | null;
@@ -751,14 +822,14 @@ export interface Database {
     diagram: Generated<string>;
   };
   tracker_repo_subscriptions: {
-    tracker_owner_id: string;
+    tracker_space_id: string;
     repo_id: string;
   };
   release_highlights: {
+    space_id: Generated<string | null>;
     scope: ReleaseHighlightsScope;
     scope_id: string;
     viewer_id: string;
-    owner_account_id: string;
     source_hash: string;
     /** Bounded source identifiers/digests; revalidate these even before due_at. */
     source_manifest: Generated<string>;
@@ -772,6 +843,7 @@ export interface Database {
     lease_id: string | null;
     lease_until: Generated<number>;
     ai_snapshot: string | null;
+    authorization_binding: Generated<string | null>;
   };
   release_notes: {
     repo_id: string;
@@ -799,14 +871,14 @@ export interface Database {
     category: "feature" | "fix" | "improvement" | "internal";
     title: string;
     summary: string;
-    tracker_owner_id: string | null;
+    tracker_space_id: string | null;
     issue_id: string | null;
     issue_key: string | null;
     team_id: string | null;
     team_key: string | null;
     issue_type: string | null;
     labels: Generated<string>;
-    workspace_ids: Generated<string>;
+    project_ids: Generated<string>;
     commits: Generated<string>;
     changes: Generated<string>;
     shipped_at: string;
@@ -832,6 +904,8 @@ export interface Database {
     ai_snapshot: Generated<string | null>;
     lease_id: Generated<string | null>;
     generation_refs: Generated<string | null>;
+    generation_binding: Generated<string | null>;
+    dirty_binding: Generated<string | null>;
     /** Releases before it were removed by retention: never regenerated (CORE-206). */
     retained_from: Generated<string | null>;
   };
@@ -874,6 +948,9 @@ export interface Database {
     last_seen_at: Generated<string>;
   };
   ci_runs: {
+    space_id: Generated<string | null>;
+    migration_epoch: Generated<number | null>;
+    authority: Generated<string | null>;
     source_id: Generated<string>;
     id: string;
     repo_id: string;
@@ -987,6 +1064,7 @@ export interface Database {
   };
   /** Where a repository's code is deployed (CORE-78); rows outlive their previews. */
   deployments: {
+    authority: Generated<string | null>;
     source_id: Generated<string>;
     id: Generated<number>;
     repo_id: string;
@@ -1039,7 +1117,6 @@ export interface Database {
     artifact_version: Generated<string | null>;
     artifact_digest: Generated<string | null>;
   };
-  /** Per-account settings; a missing row means the defaults. */
   /** Issue keys commit messages name, resolved to tracker issues on push (CORE-22). */
   commit_issue_mentions: {
     repo_id: string;
@@ -1047,7 +1124,7 @@ export interface Database {
     issue_key: string;
     change_id: string | null;
     resolution: "linked" | "ambiguous";
-    tracker_owner_id: string | null;
+    tracker_space_id: string | null;
     issue_id: string | null;
     title: Generated<string>;
     committed_at: string | null;
@@ -1062,6 +1139,13 @@ export interface Database {
     commits: Generated<number>;
     note: string | null;
     done_at: Generated<string>;
+  };
+  /** Resumable mention work keeps its originating authority, never an inferred owner. */
+  mention_backfill_jobs: {
+    repo_id: string;
+    authority: string | null;
+    state: "pending" | "blocked";
+    error: string | null;
   };
   /** The context attached to a step: a commit an agent made in a timeline (CORE-231). */
   step_contexts: {
@@ -1102,8 +1186,15 @@ export interface Database {
     created_at: Generated<string>;
     finished_at: string | null;
   };
-  account_settings: {
-    account_id: string;
+  organization_avatar_generations: {
+    organization_id: string;
+    status: "generating" | "ready" | "failed";
+    options: Generated<string>;
+    created_at: Generated<string>;
+    finished_at: string | null;
+  };
+  space_settings: {
+    space_id: string;
     preview_ended_days: Generated<number>;
     preview_idle_days: Generated<number>;
     updated_by: string | null;
@@ -1121,17 +1212,17 @@ export interface Database {
     knowledge_max_wait_minutes: Generated<number>;
     release_highlights_interval_hours: Generated<number>;
   };
-  /** An account's own AI provider and its sealed API key (CORE-294); one per kind. */
+  /** A Space's AI provider and sealed API key; one per kind. */
   ai_providers: {
+    space_id: string;
     id: string;
-    account_id: string;
     kind: AiProviderKind;
     key_sealed: string;
     key_last_four: string;
     updated_by: string | null;
     updated_at: Generated<string>;
   };
-  /** A provider model an account made available, as the provider described it when added. */
+  /** A provider model a Space made available. */
   ai_provider_models: {
     provider_id: string;
     model: string;
@@ -1159,9 +1250,17 @@ export interface Database {
     updated_by: string | null;
     updated_at: Generated<string>;
   };
-  /** Retention policies (CORE-196): what an account changed; absent inherits. */
+  space_ai_log_bodies: {
+    space_id: string;
+    component: string;
+    keep: number;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
+  /** Retention overrides classified by explicit scope; absent inherits. */
   retention_policies: {
-    account_id: string;
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
     category: string;
     enabled: number | null;
     /** JSON {key: number} of threshold overrides. */
@@ -1177,20 +1276,23 @@ export interface Database {
     updated_by: string | null;
     updated_at: Generated<string>;
   };
-  /** Who changed which retention policy; account_id null at site level. */
+  /** Who changed which explicitly scoped retention policy. */
   retention_policy_changes: {
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
     id: Generated<number>;
-    account_id: string | null;
     category: string;
     actor_id: string | null;
     before: string;
     after: string;
     created_at: Generated<string>;
   };
-  /** Cleanup runs (CORE-198): one per retention run; account_id null for the site. */
+  /** Cleanup runs, preserving explicit scope and initiating authority. */
   cleanup_runs: {
+    scope_kind: "space" | "person" | "instance";
+    scope_id: string;
+    authority: Generated<string | null>;
     id: Generated<number>;
-    account_id: string | null;
     trigger: "schedule" | "manual";
     actor_id: string | null;
     dry_run: number;

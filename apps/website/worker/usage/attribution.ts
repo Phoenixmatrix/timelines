@@ -5,14 +5,16 @@
 // with the report's own catalog prices over its window. What no one person,
 // agent or timeline caused is listed with the reason instead: storage, builds
 // that batch several people's pushes, background work, and calls from before
-// attribution was recorded. In an account's report, people and agents from
-// outside the account are counted together rather than named.
+// attribution was recorded. In a Space's report, people and agents without a
+// live grant to it are counted together rather than named; a person's report
+// names only them.
 
 import type {
   AttributedSpend,
   UnattributedSpend,
   UsageAttribution,
   UsageLine,
+  UsageScope,
 } from "../../shared/usage.ts";
 import { instanceSize } from "./containers.ts";
 import type { SnapshotRow } from "./report.ts";
@@ -20,7 +22,7 @@ import type { SnapshotRow } from "./report.ts";
 /** At most this many people, agents and timelines each, costliest first. */
 export const ATTRIBUTION_LIMIT = 100;
 
-/** The id of everyone from outside an account, in its report. */
+/** The id of everyone from outside a Space or person, in its report. */
 export const OUTSIDE = "outside";
 
 /** AI work for everyone in a repository at once, never one person's. */
@@ -52,13 +54,13 @@ const UNATTRIBUTED: Record<
 };
 
 export interface AttributionInput {
-  /** The account, or null for the whole site. */
-  account: string | null;
+  /** The Space or person, or null for the whole Instance. */
+  scope: UsageScope | null;
   /** The report's activity window (days, inclusive) and the day after it. */
   from: string;
   to: string;
   asOf: string;
-  /** Storage's monthly cost in the report: the account's, whoever wrote it. */
+  /** Storage's monthly cost in the report: the scope's, whoever wrote it. */
   storageUsd: number;
   /** The report's pricing: activity rows over the whole window, priced as lines. */
   price: (rows: SnapshotRow[]) => UsageLine[];
@@ -94,31 +96,32 @@ export async function attributionReport(
     if (!found) buckets.set(key, (found = tally()));
     return found;
   };
-  // Who an account's members are: the user, or an organization's members.
-  const members = input.account ? await membersOf(d1, input.account) : null;
+  const scope = input.scope?.kind === "instance" ? null : input.scope;
+  // Who a scope's people are: the person, or a Space's live explicit grants.
+  const members = scope ? await membersOf(d1, scope) : null;
   const who = (actor: string | null, agent: string | null) => {
     if (!actor && !agent) return null;
     const outside = members !== null && !(actor && members.has(actor));
     if (agent) return `agent:${outside ? OUTSIDE : agent}`;
     return `person:${outside ? OUTSIDE : actor}`;
   };
-  // A timeline is its owner's: slugs repeat across accounts.
-  const timeline = (owner: string, slug: string | null) =>
-    slug ? [`timeline:${owner}/${slug}`] : [];
+  // A timeline is its Space's: slugs repeat across Spaces.
+  const timeline = (space: string, slug: string | null) =>
+    slug ? [`timeline:${space}/${slug}`] : [];
 
   const ai = await d1
     .prepare(
-      `SELECT account_id, actor_id, agent_id, timeline, feature, model, SUM(calls) AS calls,
+      `SELECT scope_id, actor_id, agent_id, timeline, feature, model, SUM(calls) AS calls,
               SUM(input_tokens) AS input, SUM(output_tokens) AS output, SUM(total_tokens) AS total
          FROM ai_usage
-        WHERE day >= ?1 AND day <= ?2 AND (?3 IS NULL OR account_id = ?3)
-          -- An account's own provider (CORE-294) bills its key, not Workers AI.
+        WHERE day >= ?1 AND day <= ?2 AND (?3 IS NULL OR (scope_kind = ?3 AND scope_id = ?4))
+          -- A Space's own provider (CORE-294) bills its key, not Workers AI.
           AND model NOT LIKE 'openrouter:%' AND model NOT LIKE 'typesafe:%'
-        GROUP BY account_id, actor_id, agent_id, timeline, feature, model`,
+        GROUP BY scope_kind, scope_id, actor_id, agent_id, timeline, feature, model`,
     )
-    .bind(input.from, input.to, input.account)
+    .bind(input.from, input.to, scope?.kind ?? null, scope?.id ?? null)
     .all<{
-      account_id: string;
+      scope_id: string;
       actor_id: string;
       agent_id: string;
       timeline: string;
@@ -137,7 +140,7 @@ export async function attributionReport(
           : BACKGROUND_FEATURES.has(r.feature)
             ? "ai-background"
             : "ai-unknown"),
-      ...timeline(r.account_id, r.timeline || null),
+      ...timeline(r.scope_id, r.timeline || null),
     ];
     for (const key of keys) {
       const models = bucket(key).ai;
@@ -156,7 +159,7 @@ export async function attributionReport(
     .prepare(
       `SELECT r.actor_id AS actor_id, r.agent_id AS agent_id,
               COALESCE(r.timeline_slug, s.timeline_slug, w.timeline_slug) AS timeline,
-              COALESCE(s.owner_id, w.owner_id, o.owner_id) AS owner,
+              COALESCE(s.space_id, w.space_id, o.space_id) AS space,
               json_extract(j.spec, '$.instance') AS instance, COUNT(*) AS jobs,
               COALESCE(SUM((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0) AS seconds
          FROM ci_jobs j
@@ -166,16 +169,18 @@ export async function attributionReport(
          LEFT JOIN source_integration_receipts i
            ON i.landing_id = r.landing_id AND i.repo_id = r.repo_id
          LEFT JOIN timeline_work_sources w ON w.source_id = i.source_id
-        WHERE (?3 IS NULL OR o.owner_id = ?3) AND j.runner = 'sandbox' AND j.started_at IS NOT NULL
+        -- Repositories are Space content: a person's report has no CI of its own.
+        WHERE (?3 IS NULL OR (?3 = 'space' AND o.space_id = ?4))
+          AND j.runner = 'sandbox' AND j.started_at IS NOT NULL
           AND j.finished_at >= ?1 AND j.finished_at < ?2
         GROUP BY 1, 2, 3, 4, 5`,
     )
-    .bind(input.from, input.asOf, input.account)
+    .bind(input.from, input.asOf, scope?.kind ?? null, scope?.id ?? null)
     .all<{
       actor_id: string | null;
       agent_id: string | null;
       timeline: string | null;
-      owner: string;
+      space: string;
       instance: string | null;
       jobs: number;
       seconds: number;
@@ -183,7 +188,7 @@ export async function attributionReport(
   for (const r of ci.results) {
     const seconds = Math.max(0, Number(r.seconds));
     const size = instanceSize(r.instance);
-    const keys = [who(r.actor_id, r.agent_id) ?? "ci-system", ...timeline(r.owner, r.timeline)];
+    const keys = [who(r.actor_id, r.agent_id) ?? "ci-system", ...timeline(r.space, r.timeline)];
     for (const key of keys) {
       const t = bucket(key);
       t.ciJobs += Number(r.jobs);
@@ -238,7 +243,7 @@ export async function attributionReport(
       label: "Storage",
       costUsd: input.storageUsd,
       reason:
-        "Repositories, databases, search indexes and files belong to the account, whoever wrote them.",
+        "Repositories, databases, search indexes and files belong to the Space, whoever wrote them.",
     },
   ];
   for (const [key, t] of buckets) {
@@ -275,7 +280,7 @@ export async function attributionReport(
     agents: ranked(spends.agent),
     timelines: ranked(spends.timeline),
   };
-  await name(d1, shown, input.account === null);
+  await name(d1, shown, scope);
   const order: UnattributedSpend["id"][] = [
     "storage",
     "ci-system",
@@ -293,26 +298,33 @@ export async function attributionReport(
   };
 }
 
-/** An account's people: the user, or an organization's members. */
-async function membersOf(d1: D1Database, account: string): Promise<Set<string>> {
+/**
+ * A scope's people: the person, or a Space's live explicit grants (joined to
+ * current Organization membership). Organization roles alone name no one.
+ */
+async function membersOf(d1: D1Database, scope: UsageScope): Promise<Set<string>> {
+  if (scope.kind !== "space") return new Set([scope.id]);
   const { results } = await d1
     .prepare(
-      `SELECT id FROM accounts WHERE id = ?1 AND kind = 'user'
-       UNION SELECT user_id FROM org_members WHERE org_id = ?1`,
+      `SELECT g.account_id AS id FROM space_grants g
+         JOIN spaces s ON s.id = g.space_id
+         JOIN organization_members m
+           ON m.organization_id = s.organization_id AND m.account_id = g.account_id
+        WHERE g.space_id = ?1`,
     )
-    .bind(account)
+    .bind(scope.id)
     .all<{ id: string }>();
   return new Set(results.map((r) => r.id));
 }
 
 /**
  * Names in place: people's, agents' with their accountable person, and
- * timelines' (with their owner on the site's report).
+ * timelines' (with their Space on the Instance's report).
  */
 async function name(
   d1: D1Database,
   shown: { people: AttributedSpend[]; agents: AttributedSpend[]; timelines: AttributedSpend[] },
-  site: boolean,
+  scope: UsageScope | null,
 ): Promise<void> {
   const agentIds = shown.agents.map((a) => a.id).filter((id) => id !== OUTSIDE);
   const agents = agentIds.length
@@ -328,7 +340,6 @@ async function name(
   const accountIds = new Set([
     ...shown.people.map((p) => p.id),
     ...agents.map((a) => a.accountable_id),
-    ...shown.timelines.map((t) => t.id.slice(0, t.id.indexOf("/"))),
   ]);
   accountIds.delete(OUTSIDE);
   const accounts = accountIds.size
@@ -342,16 +353,29 @@ async function name(
       ).results
     : [];
   const account = new Map(accounts.map((a) => [a.id, a]));
+  const spaceIds = [...new Set(shown.timelines.map((t) => t.id.slice(0, t.id.indexOf("/"))))];
+  const spaces = new Map(
+    (spaceIds.length && !scope
+      ? (
+          await d1
+            .prepare(`SELECT id, slug FROM spaces WHERE id IN (SELECT value FROM json_each(?1))`)
+            .bind(JSON.stringify(spaceIds))
+            .all<{ id: string; slug: string }>()
+        ).results
+      : []
+    ).map((s) => [s.id, s.slug]),
+  );
+  const outside = scope?.kind === "space" ? "this Space" : "this person";
   const personName = (id: string) => {
     const a = account.get(id);
     return a ? a.display_name || a.slug : "Deleted account";
   };
   for (const p of shown.people)
-    p.name = p.id === OUTSIDE ? "People outside this account" : personName(p.id);
+    p.name = p.id === OUTSIDE ? `People outside ${outside}` : personName(p.id);
   const agentRow = new Map(agents.map((a) => [a.id, a]));
   for (const a of shown.agents) {
     if (a.id === OUTSIDE) {
-      a.name = "Agents outside this account";
+      a.name = `Agents outside ${outside}`;
       continue;
     }
     const row = agentRow.get(a.id);
@@ -361,7 +385,7 @@ async function name(
   for (const t of shown.timelines) {
     const slash = t.id.indexOf("/");
     const slug = t.id.slice(slash + 1);
-    const owner = account.get(t.id.slice(0, slash));
-    t.name = site && owner ? `${slug} (@${owner.slug})` : slug;
+    const space = spaces.get(t.id.slice(0, slash));
+    t.name = space ? `${slug} (@${space})` : slug;
   }
 }

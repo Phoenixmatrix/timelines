@@ -8,8 +8,8 @@
 // CORE-166's incremental Atlas tests.
 
 import type { DatabaseSync } from "node:sqlite";
-import { describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { d1 } from "../testing/d1.ts";
 import {
   editCode,
   fakeAi,
@@ -25,6 +25,15 @@ import {
 } from "../testing/knowledge-repo.ts";
 import { resolveAtlasSettings } from "./budget.ts";
 import type { KnowledgePolicy } from "./policy.ts";
+import { seedSpaceFixture, createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
+
+const dispose: (() => void)[] = [];
+afterEach(() => {
+  for (const close of dispose.splice(0)) close();
+});
 
 const reading = vi.hoisted(() => ({ reader: null as unknown }));
 
@@ -75,18 +84,40 @@ const POLICY: KnowledgePolicy = {
 interface Side {
   sqlite: DatabaseSync;
   env: Env;
+  authorization: WorkAuthority;
   calls: CallCounts;
   vectors: ReturnType<typeof fakeVectors>;
   search: ReturnType<typeof fakeSearch>;
 }
 
-function side(): Side {
-  const sqlite = migratedDatabase();
+async function side(): Promise<Side> {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  dispose.push(fresh.close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('r1', 'ann', 'ledger', 'private', 'art-r1', '');
   `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: {
+      id: "org-ann",
+      slug: "ann",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "ann", slug: "ann", displayName: "General" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(
+    "INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES ('r1', 'ann', 'ledger', 'private', 'art-r1', '')",
+  );
   const calls: CallCounts = {};
   const vectors = fakeVectors();
   const search = fakeSearch();
@@ -96,13 +127,18 @@ function side(): Side {
     overlayFinished: async () => {},
   };
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     AI: fakeAi(calls),
     VECTORS: vectors,
     SEARCH: search,
     KNOWLEDGE_COORDINATOR: { getByName: () => coordinator },
   } as unknown as Env;
-  return { sqlite, env, calls, vectors, search };
+  const token = await issueToken(env.DB, "ann", "build", "write");
+  const authorization = await captureWorkAuthority(env, "r1", {
+    id: "ann",
+    credential: { kind: "token", id: token.id },
+  });
+  return { sqlite, env, calls, vectors, search, authorization };
 }
 
 /** Run one build of `commit` to the end; its stats and the model calls it made. */
@@ -115,7 +151,15 @@ async function build(s: Side, commit: string, force = false) {
   };
   await new KnowledgeBuild({ waitUntil: () => {} } as never, s.env).run(
     {
-      payload: { repoId: "r1", buildId, policy: POLICY, commit, force },
+      payload: {
+        repoId: "r1",
+        buildId,
+        policy: POLICY,
+        commit,
+        force,
+        authorization: s.authorization,
+      },
+      instanceId: buildId,
     } as never,
     step as never,
   );
@@ -133,12 +177,12 @@ async function build(s: Side, commit: string, force = false) {
 const state = (s: Side) => knowledgeState(s.sqlite, "r1", s);
 
 /** Two copies of one history: `inc` updates after each push, `full` rebuilds in full. */
-function twins() {
+async function twins() {
   const repo = knowledgeFixture();
   const git = new FakeGit();
   reading.reader = git.reader();
-  const inc = side();
-  const full = side();
+  const inc = await side();
+  const full = await side();
   return {
     repo,
     git,
@@ -159,7 +203,7 @@ function twins() {
 // Each test runs whole build histories twice: allow slow CI sandboxes time.
 describe("Knowledge updates", { timeout: 120_000 }, () => {
   test("an update leaves exactly what a full rebuild at the same commit leaves, push after push", async () => {
-    const t = twins();
+    const t = await twins();
     const first = await t.push(() => {});
     // The first build is a full one on both sides.
     expect(first.inc.stats).toMatchObject({ mode: "full", fullBecause: "first" });
@@ -205,7 +249,7 @@ describe("Knowledge updates", { timeout: 120_000 }, () => {
   });
 
   test("a small push asks the model only about what it changed", async () => {
-    const t = twins();
+    const t = await twins();
     const first = await t.push(() => {});
     const cold = first.inc.calls.total!;
 
@@ -240,7 +284,7 @@ describe("Knowledge updates", { timeout: 120_000 }, () => {
   });
 
   test("an update reads only the trees that changed", async () => {
-    const t = twins();
+    const t = await twins();
     const first = await t.push(() => {});
     const edit = await t.push((r) => editCode(r, "src/billing/f0.ts"));
     // The root, src and src/billing (twice: before and after), not every directory.
@@ -250,11 +294,37 @@ describe("Knowledge updates", { timeout: 120_000 }, () => {
   });
 
   test("a new pipeline version rebuilds in full", async () => {
-    const t = twins();
+    const t = await twins();
     await t.push(() => {});
     t.inc.sqlite.exec("UPDATE kg_state SET pipeline = 'older'");
     const next = await t.push((r) => editCode(r, "lib/f0.ts"));
     expect(next.inc.stats).toMatchObject({ mode: "full", fullBecause: "version" });
     expect(state(t.inc)).toEqual(state(t.full));
   });
+  for (const revoked of ["credential", "grant", "membership", "epoch", "space"] as const) {
+    test(`queued builds refuse ${revoked} changes before provider or publication effects`, async () => {
+      const t = await twins();
+      const commit = t.git.commit(t.repo);
+      const before = state(t.inc);
+      if (revoked === "credential")
+        t.inc.sqlite
+          .prepare("DELETE FROM access_tokens WHERE id = ?")
+          .run(t.inc.authorization.credential.id);
+      else if (revoked === "grant")
+        t.inc.sqlite.exec("DELETE FROM space_grants WHERE space_id = 'ann' AND account_id = 'ann'");
+      else if (revoked === "membership")
+        t.inc.sqlite.exec(
+          "DELETE FROM organization_members WHERE organization_id = 'org-ann' AND account_id = 'ann'",
+        );
+      else if (revoked === "epoch")
+        t.inc.authorization = {
+          ...t.inc.authorization,
+          migrationEpoch: t.inc.authorization.migrationEpoch + 1,
+        };
+      else t.inc.authorization = { ...t.inc.authorization, spaceId: "another-space" };
+      await expect(build(t.inc, commit)).rejects.toThrow();
+      expect(t.inc.calls).toEqual({});
+      expect(state(t.inc)).toEqual(before);
+    });
+  }
 });

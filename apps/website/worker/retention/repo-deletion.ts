@@ -26,6 +26,7 @@
 
 import { previewBranch, startPreviewRuns } from "../deployments/previews.ts";
 import { cancelRun } from "../ci/cancel.ts";
+import { parseWorkAuthority, resolveWorkAuthority } from "../ci/admission.ts";
 import { forgetUpstreamTokens } from "../artifacts.ts";
 import { peekStub, purgeInstance } from "../durable/registry.ts";
 import { DURABLE_CLASSES, type DurableClass } from "../durable/classes.ts";
@@ -146,7 +147,7 @@ export interface Progress {
 
 export interface DeletionRow {
   repo_id: string;
-  owner_id: string;
+  space_id: string | null;
   full_name: string;
   artifacts_name: string | null;
   source: "delete" | "orphan-sweep";
@@ -169,8 +170,8 @@ export async function requestDeletion(
   env: Env,
   repo: {
     id: string;
-    owner_id: string;
-    owner_slug: string;
+    space_id: string;
+    space_slug: string;
     name: string;
     artifacts_name: string;
   },
@@ -183,14 +184,14 @@ export async function requestDeletion(
     ).bind(repo.id, at),
     env.DB.prepare(
       `INSERT INTO repo_deletions
-         (repo_id, owner_id, full_name, artifacts_name, source, requested_by, requested_at, phase, updated_at)
+         (repo_id, space_id, full_name, artifacts_name, source, requested_by, requested_at, phase, updated_at)
        SELECT ?1, ?2, ?3, ?4, 'delete', ?5, ?6, 'stop', ?6
        WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?1 AND deleted_at = ?6)
        ON CONFLICT (repo_id) DO NOTHING`,
     ).bind(
       repo.id,
-      repo.owner_id,
-      `${repo.owner_slug}/${repo.name}`,
+      repo.space_id,
+      `${repo.space_slug}/${repo.name}`,
       repo.artifacts_name,
       requestedBy,
       at,
@@ -312,7 +313,7 @@ async function loadDeletion(env: Env, repoId: string): Promise<DeletionRow | nul
     .selectFrom("repo_deletions")
     .select([
       "repo_id",
-      "owner_id",
+      "space_id",
       "full_name",
       "artifacts_name",
       "source",
@@ -656,7 +657,7 @@ async function claimPreviews(
     const records = group.deployments.length
       ? await kdb
           .selectFrom("deployments")
-          .select(["id", "source_id", "timeline_slug", "commit_oid", "checkpoint_id"])
+          .select(["id", "source_id", "timeline_slug", "commit_oid", "checkpoint_id", "authority"])
           .where("repo_id", "=", repoId)
           .where("id", "in", group.deployments)
           .orderBy("id")
@@ -680,6 +681,8 @@ async function claimPreviews(
       normalized.push(group);
       continue;
     }
+    for (const record of records)
+      await resolveWorkAuthority(env, parseWorkAuthority(record.authority), repoId);
     const sources = new Map<string, PreviewGroup>();
     for (const record of records) {
       if (!record.timeline_slug)
@@ -700,7 +703,7 @@ async function claimPreviews(
   previews.groups = normalized;
   const live = await kdb
     .selectFrom("deployments")
-    .select(["id", "source_id", "timeline_slug", "commit_oid", "checkpoint_id"])
+    .select(["id", "source_id", "timeline_slug", "commit_oid", "checkpoint_id", "authority"])
     .where("repo_id", "=", repoId)
     .where("status", "in", ["active", "sleeping"])
     .where("timeline_slug", "is not", null)
@@ -711,6 +714,7 @@ async function claimPreviews(
   const fresh = new Map<string, PreviewGroup>();
   for (const deployment of live) {
     if (known.has(deployment.id)) continue;
+    await resolveWorkAuthority(env, parseWorkAuthority(deployment.authority), repoId);
     const timeline = deployment.timeline_slug!;
     const key = `${deployment.source_id}\0${timeline}`;
     const group = fresh.get(key) ?? {
@@ -754,19 +758,25 @@ async function claimPreviews(
       group.skipped = "The repository is gone.";
       continue;
     }
-    const parent = await kdb
+    const deployments = await kdb
       .selectFrom("deployments")
-      .select(["id", "source_id"])
+      .select(["id", "source_id", "authority"])
       .where("repo_id", "=", repoId)
       .where("id", "in", group.deployments)
       .orderBy("id", "desc")
-      .executeTakeFirstOrThrow();
+      .execute();
+    if (deployments.length !== group.deployments.length || !deployments[0])
+      throw new Error("Preview cleanup deployment identities changed.");
+    for (const deployment of deployments)
+      await resolveWorkAuthority(env, parseWorkAuthority(deployment.authority), repoId);
+    const parent = deployments[0];
     const sourceRepo = { ...repo, source_id: parent.source_id };
     const [started] = await startPreviewRuns(
       env,
       [
         {
           repo: sourceRepo,
+          authority: parseWorkAuthority(parent.authority),
           commit: group.commit,
           branch: await previewBranch(env, sourceRepo, group.timeline),
           preview: {
@@ -789,6 +799,8 @@ async function claimPreviews(
         .where("id", "in", group.deployments)
         .execute();
     } else {
+      if (!started?.teardownUnmanaged)
+        throw new Error(started?.skipped ?? "Preview teardown was not admitted.");
       group.skipped = started?.skipped ?? "No run was started.";
       if (started?.teardownUnmanaged)
         await kdb
@@ -1210,6 +1222,7 @@ export const CHILD_ROWS: [table: string, where: string][] = [
   ["atlas_entities", "scope IN (SELECT scope FROM atlas_scopes WHERE repo_id = ?1)"],
   ["change_refs", "repo_id = ?1"],
   ["commit_issue_mentions", "repo_id = ?1"],
+  ["mention_backfill_jobs", "repo_id = ?1"],
   ["ref_updates", "repo_id = ?1"],
   [
     "release_highlights",

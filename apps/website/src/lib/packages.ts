@@ -3,13 +3,13 @@ import { packagePath, packagesPath, type PackageSummary } from "../../shared/pac
 
 export { FORMATS, packagePath, packagesPath };
 
-export function feedsPath(owner: string): string {
-  return `/${owner}/-/feeds`;
+export function feedsPath(space: string): string {
+  return `/${space}/-/feeds`;
 }
 
 /** …and travel as one encoded segment in the API's. */
-export function packageApi(owner: string, format: FormatId, name: string): string {
-  return `/packages/${owner}/${format}/${encodeURIComponent(name)}`;
+export function packageApi(space: string, format: FormatId, name: string): string {
+  return `/packages/${space}/${format}/${encodeURIComponent(name)}`;
 }
 
 export function formatLabel(format: FormatId): string {

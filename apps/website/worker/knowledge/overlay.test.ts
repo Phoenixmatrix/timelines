@@ -1,5 +1,6 @@
-import { describe, expect, test } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import { ANALYZER } from "./analyze.ts";
 import { applyGraph, buildGraph, saveSnapshot, type SnapshotFile } from "./graph.ts";
@@ -18,6 +19,12 @@ import {
   toAnalyze,
   type OverlayState,
 } from "./overlay.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+const fixtures: { close(): void }[] = [];
+afterEach(() => {
+  for (const fixture of fixtures.splice(0)) fixture.close();
+});
 
 const analysis = (over: Partial<FileAnalysis>): FileAnalysis => ({
   language: "typescript",
@@ -344,11 +351,27 @@ describe("diffGraphs", () => {
 });
 
 describe("stored overlays", () => {
-  function setup() {
-    const sqlite = migratedDatabase();
+  async function setup() {
+    const fixture = await createFreshSpaceTestEnvironment();
+    fixtures.push(fixture);
+    const { sqlite } = fixture;
     sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('person', 'user', 'person', 'Person');
+    `);
+    await seedSpaceFixture(d1(sqlite), {
+      organization: { id: "org", slug: "org", displayName: "Org", kind: "company" },
+      space: { id: "acc", slug: "org", displayName: "General" },
+      actorId: "person",
+      members: [
+        {
+          accountId: "person",
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+        },
+      ],
+    });
+    sqlite.exec(`
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
       INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('repo', 'm1');
     `);
@@ -365,10 +388,10 @@ describe("stored overlays", () => {
   }
 
   test("archiving a work source fences late overlay publication and page completion", async () => {
-    const sqlite = setup();
+    const sqlite = await setup();
     sqlite.exec(`
       INSERT INTO timeline_work_sources
-        (source_id, repo_id, timeline_id, timeline_slug, owner_id, artifacts_name,
+        (source_id, repo_id, timeline_id, timeline_slug, space_id, artifacts_name,
          state, allocation_operation_id, fork_source_id, fork_commit, fork_tree,
          fork_ref, created_at, updated_at, initial_source_id, initial_commit, initial_tree, initial_ref)
       VALUES ('work_one', 'repo', 'timeline-one', 'fast', 'acc', 'owned',
@@ -470,7 +493,7 @@ describe("stored overlays", () => {
   });
 
   test("computeOverlay stores the diff and leaves main's graph alone", async () => {
-    const sqlite = setup();
+    const sqlite = await setup();
     const db = d1(sqlite);
     const main = [{ path: "a.ts", blob: "a1", mode: "100644" }];
     await saveSnapshot(db, "repo", "current", main);
@@ -582,7 +605,7 @@ describe("stored overlays", () => {
   });
 
   test("a bookmark that never had an overlay leaves nothing behind", async () => {
-    const sqlite = setup();
+    const sqlite = await setup();
     const db = d1(sqlite);
     await overlayFailed(db, "repo", "refs/heads/timeline/broken", "t1", "boom");
     await endOverlays(db, "repo", new Map([["refs/heads/timeline/broken", "landed"]]));

@@ -46,6 +46,7 @@ import {
   refusal,
   reusableStages,
   selectStages,
+  snapshotInputs,
   type Reason,
   type Selection,
   type TestAiOptions,
@@ -172,6 +173,15 @@ async function migrate(env: Environment): Promise<void> {
       ],
       { cwd: website },
     );
+}
+
+async function seedDatabase(env: Environment): Promise<void> {
+  // The authenticated readiness request completes real canonical-v4 bootstrap.
+  // Never apply persona SQL to a legacy or not-yet-initialized installation.
+  if (!(await identity(env)))
+    throw new Error(
+      "Database seed requires the owned server with canonical-v4 readiness. Start it after ordinary migrations; legacy data requires a reviewed migration or an explicit reset.",
+    );
   // Development data (personas, Orbit Labs) lives in seed/, applied like
   // migrations but only here and in local dev, so a deployed database starts empty.
   await command(
@@ -277,7 +287,9 @@ async function start(
     }
     await delay(250);
   }
-  throw new Error(`Server identity/readiness timed out. See ${ctx.artifacts}/server.log`);
+  throw new Error(
+    `Server identity/canonical-v4 readiness timed out. Existing legacy data requires a reviewed migration or an explicit reset. See ${ctx.artifacts}/server.log`,
+  );
 }
 
 interface EnvironmentSupervisor {
@@ -330,6 +342,8 @@ async function setup(options: { ai: boolean }): Promise<void> {
     await migrate(env);
     owned = (await start(env, ctx)).owned;
     supervisor.assertRunning();
+    await seedDatabase(env);
+    supervisor.assertRunning();
     await seed(ctx);
     supervisor.assertRunning();
     console.log(
@@ -365,22 +379,36 @@ function describeReasons(reasons: Reason[]): string {
 
 /** The test-ai stages to run, or null when there is nothing to run (or a dry run). */
 async function selectAiStages(options: TestAiOptions): Promise<Selection | null> {
-  const { base, changed } = await changedPaths(root, options.base);
-  const prints = await fingerprints(root, base, changed);
+  const { base, changed, prints, sourceSnapshot } = await changedPaths(root, options.base)
+    .then(async ({ base, changed }) => ({
+      base,
+      changed,
+      prints: await fingerprints(root, base, changed),
+      sourceSnapshot: undefined as string | undefined,
+    }))
+    .catch(async (error: unknown) => {
+      const credentials = process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE;
+      if (process.env.GITMATRIX_REMOTE_HOSTED !== "1" || !credentials) throw error;
+      // The runtime keeps the committed manifest beside credentials, outside
+      // synchronized source. Read the manifest only, never the credentials.
+      return snapshotInputs(root, join(dirname(credentials), "manifest.json"));
+    });
   const history = await readHistory(root);
   const selection = selectStages({
     changed,
     requested: options.stages,
-    all: options.all,
+    all: options.all || sourceSnapshot !== undefined,
     reusable: options.resume ? reusableStages(history, base, prints) : undefined,
     base,
     fingerprints: prints,
   });
+  if (sourceSnapshot) selection.sourceSnapshot = sourceSnapshot;
   console.log(
     JSON.stringify(
       {
         event: "test-ai.selection",
         base,
+        sourceSnapshot,
         changed: changed.length,
         stages: Object.fromEntries(
           selection.stages.map((id) => [id, describeReasons(selection.reasons[id]!)]),
@@ -455,15 +483,30 @@ async function liveTest(
     await timed("start", () => start(env!, ctx));
     supervisor.assertRunning();
     const fixtures = await timed("seed", async () => {
+      await seedDatabase(env!);
+      supervisor!.assertRunning();
       const fixtures = await seed(ctx);
       if (!ai) await seed(ctx); // Bootstrap remains repeatable against real data.
       return fixtures;
     });
+    const runtime = env;
+    const restartRuntime = async () => {
+      supervisor!.assertRunning();
+      const before = runtime.server;
+      if (!before) throw new Error("Cold verification requires the owned running server.");
+      await stopEnvironment(runtime);
+      const restarted = await start(runtime, ctx);
+      supervisor!.assertRunning();
+      const after = runtime.server;
+      if (!restarted.owned || !after || (before.pid === after.pid && before.start === after.start))
+        throw new Error("Cold verification did not observe a new owned server process.");
+      return { environmentId: runtime.id, origin: runtime.origin, before, after };
+    };
     await timed("scenarios", async () => {
       // Independent repositories and reports; neither failure tears down the other's server.
       const results = await Promise.allSettled(
         ai
-          ? [runProviderE2E(ctx, fixtures, "ai", run)]
+          ? [runProviderE2E(ctx, fixtures, "ai", run, restartRuntime)]
           : [
               runE2E(ctx, fixtures, readyE2E?.scenarios ?? undefined),
               ...(readyE2E?.mirror === false ? [] : [runProviderE2E(ctx, fixtures, "mirror")]),
@@ -639,7 +682,9 @@ async function gates(options: ReadyOptions): Promise<void> {
             ...(name === "tests" || name.endsWith("-tests")
               ? { env: unitTestEnvironment(process.env) }
               : {}),
-            timeout: 1_800_000,
+            // The full test gate runs every workspace serially; individual test
+            // deadlines still apply inside each workspace.
+            timeout: name === "tests" ? 3_600_000 : 1_800_000,
             log: join(directory, `${name}.log`),
           });
         } finally {

@@ -11,13 +11,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { SYSTEM_ACTOR } from "../../../registry/core/auth/system.ts";
 import { Services } from "../../../registry/core/context.ts";
 import { createDb } from "../../../registry/core/db.ts";
-import { invalidateMembers } from "../../../registry/core/virtual.ts";
 import { makeTarball, publishBody } from "../../../registry/formats/npm/testing.ts";
 import { collectGarbage, GC_GRACE_MS } from "../../../registry/jobs/gc.ts";
 import { makeHarness, type Harness } from "../../../registry/testing/harness.ts";
 import { advanceRun, createRun, getRun } from "../runs.ts";
 
-const SITE = { scope: "site" } as const;
+const SITE = { kind: "instance", id: "" } as const;
 const DAY = 86_400_000;
 const UPSTREAM = "https://registry.npmjs.org";
 const leftPad = makeTarball("left-pad", "1.3.0");
@@ -27,7 +26,6 @@ let admin: string;
 let hits: string[];
 
 beforeEach(async () => {
-  invalidateMembers();
   hits = [];
   vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -71,7 +69,7 @@ async function install(path: string) {
 async function run(category: string, dryRun: boolean, now: Date, days: number) {
   const id = await createRun(h.env.DB, {
     target: SITE,
-    trigger: "manual",
+    trigger: "schedule",
     actorId: null,
     dryRun,
     categories: [{ id: category, thresholds: { days } }],
@@ -208,8 +206,8 @@ describe("registry audit log and publish records", () => {
     const older = "2023-06-01T00:00:00.000Z";
     const recent = new Date().toISOString();
     h.db.applySql(`
-      INSERT INTO repositories (id, owner_id, key, format, kind, visibility, config, created_at, updated_at)
-        SELECT 'feed', owner_id, 'audit-feed', 'generic', 'local', 'private', '{}', '${old}', '${old}'
+      INSERT INTO repositories (id, space_id, key, format, kind, visibility, config, created_at, updated_at)
+        SELECT 'feed', space_id, 'audit-feed', 'generic', 'local', 'private', '{}', '${old}', '${old}'
         FROM repositories LIMIT 1;
       INSERT INTO packages (id, repo_id, name, normalized_name, created_at, updated_at)
         VALUES ('pkg', 'feed', 'app', 'app', '${old}', '${old}');

@@ -7,15 +7,16 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import { Hono } from "hono";
 import type { AssistantChat } from "../../../shared/assistant.ts";
 import { assistant } from "../../api/assistant.ts";
 import { issueToken } from "../../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../../auth.ts";
-import { d1, migratedDatabase } from "../../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../../testing/spaces.ts";
 import { forgetRecorded } from "../../durable/registry.ts";
 import { advanceRun, createRun, getRun } from "../runs.ts";
+import { assistantChats } from "./assistant-chats.ts";
 
 interface Chat {
   messages: number;
@@ -25,9 +26,19 @@ interface Chat {
   reset?: boolean;
 }
 const objects = new Map<string, Chat>();
+const background = vi.hoisted(() => [] as Promise<unknown>[]);
+// The hoisted Workers mock must load its Node runtime before static consumers.
+vi.mock("cloudflare:workers", async () => ({
+  ...(await import("../../testing/runtime.ts")),
+  waitUntil: (work: Promise<unknown>) => void background.push(work),
+}));
 
-vi.mock("agents", () => ({
-  getAgentByName: async (_namespace: unknown, name: string) => ({
+const assistantNamespace = {
+  getByName: (name: string) => ({
+    async __unsafe_ensureInitialized() {},
+    async canReadTranscript(actor: { id: string }) {
+      return name.startsWith(`${actor.id}:`);
+    },
     async purgeIfIdle(reason: string) {
       const chat = objects.get(name) ?? { messages: 0, busy: false };
       if (chat.fail) throw new Error("object unavailable");
@@ -44,25 +55,36 @@ vi.mock("agents", () => ({
       };
     },
   }),
-}));
+};
 
-const MARCO = { scope: "account", accountId: "acc_marco" } as const;
+const MARCO = { kind: "person", id: "acc_marco" } as const;
 const DAY = 86_400_000;
 const NOW = new Date("2026-10-04T12:00:00Z");
 const ago = (days: number) => new Date(NOW.getTime() - days * DAY).toISOString();
 
 let env: Env;
-beforeEach(() => {
+beforeEach(async () => {
   objects.clear();
   forgetRecorded();
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(async () => {
+    try {
+      for (let cursor = 0; cursor < background.length; cursor++) await background[cursor];
+      background.length = 0;
+    } finally {
+      fresh.close();
+    }
+  });
+  const { sqlite } = fresh;
+  sqlite.exec("BEGIN");
   sqlite.exec(
     readFileSync(
       fileURLToPath(new URL("../../../seed/0001_dev.sql", import.meta.url).href),
       "utf8",
     ),
   );
-  env = { DB: d1(sqlite) } as unknown as Env;
+  sqlite.exec("COMMIT");
+  env = { ...fresh.env, ASSISTANT: assistantNamespace } as unknown as Env;
 });
 
 async function chat(user: string, id: string, daysAgo: number, busy = false) {
@@ -91,8 +113,8 @@ async function chats(user = "acc_marco") {
 async function run(dryRun: boolean, thresholds = { days: 90, maxPerUser: 0 }) {
   const id = await createRun(env.DB, {
     target: MARCO,
-    trigger: "manual",
-    actorId: "acc_marco",
+    trigger: "schedule",
+    actorId: null,
     dryRun,
     categories: [{ id: "assistant-chats", thresholds }],
     now: NOW,
@@ -111,6 +133,22 @@ async function run(dryRun: boolean, thresholds = { days: 90, maxPerUser: 0 }) {
 }
 
 describe("assistant chat expiration", () => {
+  test("a mapped Space identifier cannot authorize personal chat cleanup", async () => {
+    await chat("acc_marco", "chat-personal", 200);
+    const ctx = {
+      env,
+      target: { kind: "space", id: "acc_marco" } as const,
+      thresholds: { days: 90, maxPerUser: 0 },
+      now: NOW,
+      limit: 20,
+    };
+    await expect(assistantChats.select(ctx, null)).rejects.toThrow("person category");
+    await expect(assistantChats.remove(ctx, [{ id: "chat-personal", bytes: 0 }])).rejects.toThrow(
+      "person category",
+    );
+    expect((await chats()).map((entry) => entry.id)).toEqual(["chat-personal"]);
+    expect(objects.get("acc_marco:chat-personal")?.messages).toBe(12);
+  });
   test("purges inactive chats through the registry, dry run = run, then nothing", async () => {
     await chat("acc_marco", "chat-old-1", 200);
     await chat("acc_marco", "chat-old-2", 91);
@@ -236,8 +274,8 @@ describe("assistant chat expiration", () => {
         .run();
     expect((await list()).map((c) => c.expiresAt)).toEqual([null, null]);
     await env.DB.prepare(
-      `INSERT INTO retention_policies (account_id, category, enabled, thresholds)
-       VALUES ('acc_marco', 'assistant-chats', 1, '{"days": 30, "maxPerUser": 1}')`,
+      `INSERT INTO retention_policies (scope_kind, scope_id, category, enabled, thresholds)
+       VALUES ('person', 'acc_marco', 'assistant-chats', 1, '{"days": 30, "maxPerUser": 1}')`,
     ).run();
     const [fresh, older] = await list();
     expect(fresh!.expiresAt).toBe(new Date(Date.parse(fresh!.updatedAt) + 30 * DAY).toISOString());

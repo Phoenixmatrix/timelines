@@ -3,15 +3,19 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "./admission.ts";
 import { landingJob } from "./landing.ts";
 import { COMPACT_SCRIPT } from "./compact-script.ts";
 import { mintJobToken } from "./registry.ts";
+import { issueToken } from "../api/tokens.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 const dirs: string[] = [];
+const cleanups: Array<() => void> = [];
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const close of cleanups.splice(0)) close();
 });
 const identity = {
   ...process.env,
@@ -161,38 +165,63 @@ test("a source merge never introduces either WIP parent into canonical objects",
 });
 
 test("only the running trusted job owns its source and canonical landing authority", async () => {
-  const sqlite = migratedDatabase();
-  sqlite.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES('r','owner','repo','private','r','https://r');
-    INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('person','user','person','Person')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "organization",
+      slug: "organization",
+      displayName: "Organization",
+      kind: "company",
+    },
+    space: { id: "space", slug: "owner", displayName: "Space" },
+    members: [
+      {
+        accountId: "person",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "person",
+  });
+  sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+    VALUES('r','space','repo','private','r','https://r');`);
+  const credential = await issueToken(env.DB, "person", "Fixture", "write");
+  const authority = await captureWorkAuthority(env, "r", {
+    id: "person",
+    credential: { kind: "token", id: credential.id },
+  });
+  sqlite.exec(`INSERT INTO timeline_work_sources
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,authority,artifacts_name,artifacts_remote,state,
        allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
        initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
-      VALUES ('work_test','r','timeline','test','owner','work-r','https://work-r','ready',
+      VALUES ('work_test','r','timeline','test','space','${JSON.stringify(authority)}','work-r','https://work-r','ready',
        'allocation','canonical','${"a".repeat(40)}','${"b".repeat(40)}','refs/heads/main',
        'canonical','${"a".repeat(40)}','${"b".repeat(40)}','refs/heads/main',datetime('now'),datetime('now'));
-    INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,source_id) VALUES('run','r',1,'${"a".repeat(40)}','gitmatrix/landing/test','manual','running','work_test');
+    INSERT INTO ci_runs(id,repo_id,space_id,migration_epoch,authority,actor_id,agent_id,number,commit_oid,ref,trigger,status,source_id) VALUES('run','r','space',${authority.migrationEpoch},'${JSON.stringify(authority)}','person',NULL,1,'${"a".repeat(40)}','gitmatrix/landing/test','manual','running','work_test');
     INSERT INTO ci_jobs(id,run_id,repo_id,name,spec,status,runner,source_id) VALUES('job','run','r','land','{"landing":{"slug":"test","sourceId":"work_test"},"steps":[]}','running','local','work_test');`);
-  const db = d1(sqlite),
-    token = await mintJobToken(db, "job", 30);
-  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({
+  const token = await mintJobToken(env, "job", 30);
+  expect(await landingJob(env, token, "owner", "repo")).toMatchObject({
     ok: true,
     sourceId: "work_test",
     slug: "test",
   });
-  expect(await landingJob(db, token, "owner", "other")).toMatchObject({ ok: false });
+  expect(await landingJob(env, token, "owner", "other")).toMatchObject({ ok: false });
   sqlite.exec(
     'UPDATE ci_jobs SET spec=\'{"landing":{"slug":"test","sourceId":"work_other"}}\' WHERE id=\'job\'',
   );
-  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  expect(await landingJob(env, token, "owner", "repo")).toMatchObject({ ok: false });
   sqlite.exec(
     'UPDATE ci_jobs SET spec=\'{"landing":{"slug":"test","sourceId":"work_test"}}\' WHERE id=\'job\'',
   );
   sqlite.exec("UPDATE ci_runs SET ref='gitmatrix/landing/other' WHERE id='run'");
-  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  expect(await landingJob(env, token, "owner", "repo")).toMatchObject({ ok: false });
   sqlite.exec("UPDATE ci_runs SET ref='gitmatrix/landing/test',status='succeeded' WHERE id='run'");
-  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  expect(await landingJob(env, token, "owner", "repo")).toMatchObject({ ok: false });
   sqlite.exec("UPDATE ci_runs SET status='running' WHERE id='run'");
   sqlite.exec("UPDATE ci_jobs SET status='succeeded' WHERE id='job'");
-  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  expect(await landingJob(env, token, "owner", "repo")).toMatchObject({ ok: false });
 });

@@ -112,9 +112,9 @@ Timelines are a first-class place, so they get a mark of their own in the rail i
 
 `public/brand/timelines.svg` holds the paths in a `mark` group, with the generation prompt, selection and conversion in its metadata; `TimelinesMark` in `src/components/GitmatrixLogo.tsx` references it at 28px in the 48px rail tile. Its fills read the `--timelines-mint/amber/violet/sky` tokens: the generated pastels on dark, and deeper shades on light (each at least 3:1 against the rail) the way the Pounce cat switches to forest. Like `--brand`, these colors belong to the mark alone and never style interface state. Bump `?v=` on the reference when the artwork changes.
 
-The rail has one Timelines control (CORE-218): its branded mark opens quick scope switching and the timeline graph, instead of separate switcher and graph buttons. The tile marks the graph as the current place; the amber dot still marks a selected timeline on other pages. Search, ended timelines and the scope banner remain available. The graph action stays reachable while the list loads or fails, using the current account or the default-tracker route when no account is resolved.
+The rail has one Timelines control (CORE-218): its branded mark opens quick scope switching and the timeline graph, instead of separate switcher and graph buttons. The tile marks the graph as the current place; the amber dot still marks a selected timeline on other pages. Search, ended timelines and the scope banner remain available. The graph action stays reachable while the list loads or fails, using the current Space or the default-tracker route when no Space is resolved.
 
-Settings retain the account named by `?owner=` when opening timelines, even when another tracker is the user's default. Preferences also retains its `?tracker=` context when no `owner` is supplied.
+Settings and timeline navigation retain an explicitly selected, readable Space: `?space=` on Space settings and `?tracker=` on Preferences. Neither person identity nor Organization ownership substitutes for a Space grant.
 
 ## Colors
 
@@ -160,7 +160,7 @@ Controls have gently rounded corners, panes slightly broader corners, and tags a
 
 Primary buttons use amber with dark signal ink; secondary buttons use a raised neutral surface. Ghost actions are visually subordinate. Disabled controls retain readable labels and explain invalid actions nearby. Fields are recessed, with a clear focus treatment and action-local errors. Use the existing Base UI select/combobox components and native controls rather than simulating interactions with generic elements.
 
-Tracker capture is a split action: **Create** remains the default submission, with a compact issue-type selector; the adjacent arrow reveals **Add details**, carrying the parsed title, tags, type, team and workspace scope into the dialog. Leading `(tag)` prefixes resolve against the shared catalog; unknown names require explicit inline definition before creation. Tags use a searchable Base UI combobox with keyboard selection, inline creation, and removable selections in both creation and editing. Keep the expanded path subordinate rather than presenting two competing primary buttons.
+Tracker capture is a split action: **Create** remains the default submission, with a compact issue-type selector; the adjacent arrow reveals **Add details**, carrying the parsed title, tags, type, Team and Project scope into the dialog. Leading `(tag)` prefixes resolve against the shared catalog; unknown names require explicit inline definition before creation. Tags use a searchable Base UI combobox with keyboard selection, inline creation, and removable selections in both creation and editing. Keep the expanded path subordinate rather than presenting two competing primary buttons.
 
 Pickup is separate from issue status: **Anyone**, **Not ready**, or **Human only**.
 Use the shared select in creation details and the autosaving editor, with a
@@ -172,7 +172,7 @@ The assistant composer starts at one row for short prompts, grows to a capped he
 
 ### Navigation and metadata
 
-Navigation uses links; view toggles use pressed buttons. Workspace names are underlined links in labelled metadata, while issue tags stay inert chips. Repeated actions name their issue, repository or workspace in accessible labels.
+Navigation uses links; view toggles use pressed buttons. Project names are underlined links in labelled metadata, while issue tags stay inert chips. Repeated actions name their issue, repository or Project in accessible labels.
 
 Same-origin absolute links in tracker Markdown use client-side navigation; external links, modified clicks, relative links and fragments retain browser behavior. Tracker search treats bare numbers and full issue keys as exact ticket lookups, even when quoted; other words and quoted phrases search keys, titles and tags. Keep filter and exclusion semantics intact.
 
@@ -183,7 +183,8 @@ Navigation follow-ups (CORE-262–265) retain the existing visual system:
 - Browser-tab titles identify the current route and available resource context: account/repository, issue key and live title, timeline/release, package, CI run or file path. Navigation and error states must replace stale resource titles rather than leave private context behind.
 - The rail's keyboard-help control follows Search; `?` opens the same accessible shortcut dialog, including on focused sign-in/device pages without a rail button. `g i` (issues), `g p` (packages), `g h` (home) and Story `j`/`k` (next/down and previous/up) honor the character-navigation opt-in. Typing, composition, modified keys and active dialogs must not trigger character navigation.
 - The single-row phone rail preserves every destination, timeline scope, assistant and account control. Horizontal touch scrolling and keyboard focus reveal overflowed controls; desktop navigation remains vertical.
-- Account pages expose tracker/issues and only accessible team destinations. Repository About links to Issues with the actual ready count and to Releases with repository/timeline context. Repository subscriptions are discovery associations, not tracker access grants; unavailable trackers and empty associations must not invent links or counts.
+- On phones, Organization and Space selectors share the available width; the Organization directory link takes its own row so selected scope names remain readable.
+- Space pages expose tracker/issues and only accessible Team destinations. Person profiles remain identity pages, and Organization directories do not imply Space content access. Repository About links to Issues with the actual ready count and to Releases with repository/timeline context. Repository subscriptions are discovery associations, not tracker access grants; unavailable trackers and empty associations must not invent links or counts.
 
 These are implementation contracts, not new runtime-verification claims; the browser regressions cover navigation behavior and phone geometry, with execution recorded separately.
 
@@ -193,7 +194,7 @@ A selected issue row uses a subtle amber wash. Readiness combines a text label a
 
 ### Conflict comparison
 
-Attention styling distinguishes conflicts from selection. Compare only differing fields, with readable names and Markdown, explicit per-field choices and an explicit rebase action. Group untouched remote differences under “Changed by others” without misleading choice buttons. Tags and workspace membership compare as normalized sets. The visual affordance must match data preservation: untouched remote fields remain remote, and failed saves keep the draft.
+Attention styling distinguishes conflicts from selection. Compare only differing fields, with readable names and Markdown, explicit per-field choices and an explicit rebase action. Group untouched remote differences under “Changed by others” without misleading choice buttons. Tags and Project membership compare as normalized sets. The visual affordance must match data preservation: untouched remote fields remain remote, and failed saves keep the draft.
 
 ## Do's and Don'ts
 

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1, migratedRegistryDatabase } from "../testing/d1.ts";
 import { cancelRun } from "./cancel.ts";
 import { claim, failDispatch, report } from "./jobs.ts";
 import { ciRuns } from "../retention/cleanups/ci-runs.ts";
@@ -11,6 +11,10 @@ import { mintJobToken } from "./registry.ts";
 import { jobCaller } from "../deployments/job.ts";
 import { authenticate } from "../../registry/core/auth/authenticate.ts";
 import { CiSandbox } from "./sandbox.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "./admission.ts";
+import { fakeDurableState } from "../testing/durable-state.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -31,7 +35,7 @@ const migration = "20261005212506_ci_source_claims.sql";
 const directory = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
 const oid = "a".repeat(40);
 
-function fixture(sqlite = migratedDatabase()) {
+function legacyFixture(sqlite: DatabaseSync) {
   sqlite.exec(`
     INSERT INTO accounts (id,kind,slug,display_name) VALUES ('org','org','orbit','Orbit');
     INSERT INTO repos (id,owner_id,name,visibility,artifacts_name,artifacts_remote)
@@ -77,10 +81,75 @@ function fixture(sqlite = migratedDatabase()) {
   return { sqlite, run, job, runStatus, jobStatus, roots, fence };
 }
 
+async function fixture() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite, env } = fresh;
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('person','user','person','Person')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "org", slug: "orbit", displayName: "Orbit", kind: "company" },
+    space: { id: "space", slug: "orbit", displayName: "Orbit" },
+    members: [
+      {
+        accountId: "person",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "person",
+  });
+  sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+    VALUES('repo','space','app','private','app','https://app');
+    INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four)
+    VALUES('credential','person','Fixture','write','fixture-hash','test');`);
+  const authority = await captureWorkAuthority(env, "repo", {
+    id: "person",
+    credential: { kind: "token", id: "credential" },
+  });
+  sqlite
+    .prepare(`INSERT INTO timeline_work_sources
+    (source_id,repo_id,timeline_id,timeline_slug,space_id,authority,artifacts_name,state,
+     allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+     initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,archived_at)
+    VALUES ('work','repo','timeline','timeline','space',?,'work','archived',
+      'allocation','canonical','${oid}','${oid}','refs/heads/main',
+      'canonical','${oid}','${oid}','refs/heads/main','2025-01-01','2025-01-01','2025-01-01')`)
+    .run(JSON.stringify(authority));
+  let number = 0;
+  const run = (id: string, status = "queued", landing: string | null = null) =>
+    sqlite
+      .prepare(`INSERT INTO ci_runs
+      (id,repo_id,space_id,migration_epoch,authority,actor_id,agent_id,source_id,number,commit_oid,ref,trigger,status,title,landing_id)
+      VALUES (?,'repo','space',?,?,'person',NULL,'work',?,'${oid}','work','manual',?,'Source claims',?)`)
+      .run(id, authority.migrationEpoch, JSON.stringify(authority), ++number, status, landing);
+  const job = (id: string, runId: string, status = "pending") =>
+    sqlite
+      .prepare(`INSERT INTO ci_jobs (id,run_id,repo_id,source_id,name,spec,status,runner)
+      VALUES (?,?,'repo','work',?,'{"secrets":[]}',?,'sandbox')`)
+      .run(id, runId, id, status);
+  const runStatus = (id: string, status: string) =>
+    sqlite.prepare("UPDATE ci_runs SET status=? WHERE id=?").run(status, id);
+  const jobStatus = (id: string, status: string) =>
+    sqlite.prepare("UPDATE ci_jobs SET status=? WHERE id=?").run(status, id);
+  const roots = () =>
+    sqlite
+      .prepare(
+        "SELECT consumer_id FROM timeline_source_roots WHERE consumer_kind='ci' ORDER BY consumer_id",
+      )
+      .all()
+      .map((row) => row.consumer_id);
+  const fence = () =>
+    sqlite.exec(
+      "UPDATE timeline_work_sources SET expiry_requested_at='2026-10-04' WHERE source_id='work'",
+    );
+  return { ...fresh, run, job, runStatus, jobStatus, roots, fence };
+}
+
 describe("CI source claim lifetime", () => {
   test("cancellation settles only unstarted or confirmed-stopped children and leaves live evidence intact", async () => {
-    const t = fixture();
-    const env = { DB: d1(t.sqlite) } as unknown as Env;
+    const t = await fixture();
+    const env = t.env;
     try {
       t.run("cancel", "running");
       for (const id of ["unstarted", "stopped", "claimed", "started", "ack", "running"]) {
@@ -120,14 +189,14 @@ describe("CI source claim lifetime", () => {
         await report(env, id, { done: { status: "cancelled" } });
       expect(t.roots()).toEqual([]);
     } finally {
-      t.sqlite.close();
+      t.close();
     }
   });
 
   test.each(["stopped", "stop-failed"])(
     "Sandbox source claim waits for confirmed container shutdown: %s",
     async (shutdown) => {
-      const t = fixture();
+      const t = await fixture();
       const stopping = Promise.withResolvers<void>();
       const stopped = Promise.withResolvers<void>();
       let running = false;
@@ -171,10 +240,11 @@ describe("CI source claim lifetime", () => {
           image: "default",
         }),
       );
-      const sandbox = new CiSandbox(
-        { container } as unknown as DurableObjectState,
-        { DB: d1(t.sqlite), PUBLIC_URL: "https://gitmatrix.example" } as unknown as Env,
-      );
+      const env = t.env;
+      env.PUBLIC_URL = "https://gitmatrix.example";
+      const state = fakeDurableState({ name: "sandbox-job" });
+      Reflect.set(state.ctx, "container", container);
+      const sandbox = new CiSandbox(state.ctx, env);
       const execution = sandbox.run("sandbox-job");
       const outcome = execution.then(
         () => null,
@@ -207,19 +277,19 @@ describe("CI source claim lifetime", () => {
       } finally {
         stopped.resolve();
         await outcome;
-        t.sqlite.close();
+        t.close();
+        state.db.close();
       }
     },
   );
 
   test("a source-aware job is delivered to exactly one runner despite retention trigger writes", async () => {
-    const t = fixture();
-    const database = d1(t.sqlite);
+    const t = await fixture();
     try {
       t.run("run", "running");
       t.job("job", "run", "queued");
-      expect(await claim(database, "job", "first")).toBe(true);
-      expect(await claim(database, "job", "second")).toBe(false);
+      expect(await claim(t.env, "job", "first")).toBe(true);
+      expect(await claim(t.env, "job", "second")).toBe(false);
       expect(
         t.sqlite.prepare("SELECT status,claimed_by FROM ci_jobs WHERE id='job'").get(),
       ).toEqual({
@@ -228,31 +298,31 @@ describe("CI source claim lifetime", () => {
       });
       expect(t.roots()).toEqual(["run"]);
     } finally {
-      t.sqlite.close();
+      t.close();
     }
   });
 
   test.each(["cancelled", "failed"])(
     "terminal parent %s revokes execution and publication grants before child acknowledgment",
     async (status) => {
-      const t = fixture();
-      const env = { DB: d1(t.sqlite) } as unknown as Env;
+      const t = await fixture();
+      const env = t.env;
       try {
         t.run("run", "running");
         t.job("job", "run", "running");
         t.job("queued", "run", "queued");
-        const secret = await mintJobToken(env.DB, "job", 20);
+        const secret = await mintJobToken(env, "job", 20);
         const headers = new Headers({ authorization: `Bearer ${secret}` });
-        expect(await jobCaller(env.DB, secret)).toMatchObject({ jobId: "job" });
+        expect(await jobCaller(env, secret)).toMatchObject({ jobId: "job" });
         expect(await authenticate(env, headers)).toMatchObject({ kind: "job" });
         t.runStatus("run", status);
-        expect(await claim(env.DB, "queued", "runner")).toBe(false);
+        expect(await claim(env, "queued", "runner")).toBe(false);
         await cancelRun(env, "run");
         expect(t.roots()).toEqual(["run"]);
         expect(t.sqlite.prepare("SELECT status FROM ci_jobs WHERE id='job'").get()).toEqual({
           status: "running",
         });
-        expect(await jobCaller(env.DB, secret)).toBeNull();
+        expect(await jobCaller(env, secret)).toBeNull();
         await expect(authenticate(env, headers)).rejects.toThrow();
         expect(await report(env, "job", { logs: [{ step: -1, text: "stopping" }] })).toEqual({
           cancelled: true,
@@ -260,14 +330,14 @@ describe("CI source claim lifetime", () => {
         await report(env, "job", { done: { status: "cancelled" } });
         expect(t.roots()).toEqual([]);
       } finally {
-        t.sqlite.close();
+        t.close();
       }
     },
   );
 
   test("cancellation and dispatch timeout retain running consumers until their acknowledgment", async () => {
-    const t = fixture();
-    const env = { DB: d1(t.sqlite) } as unknown as Env;
+    const t = await fixture();
+    const env = t.env;
     try {
       t.run("cancel", "running");
       t.job("cancel-running", "cancel", "running");
@@ -293,13 +363,13 @@ describe("CI source claim lifetime", () => {
       await report(env, "timeout-running", { done: { status: "failed", exitCode: 124 } });
       expect(t.roots()).toEqual([]);
     } finally {
-      t.sqlite.close();
+      t.close();
     }
   });
 
   for (const terminal of ["succeeded", "failed", "cancelled"]) {
-    test(`${terminal} parent holds every unfinished child and preserves history on release`, () => {
-      const t = fixture();
+    test(`${terminal} parent holds every unfinished child and preserves history on release`, async () => {
+      const t = await fixture();
       try {
         t.run("run", "running", "compact-landing");
         t.job("pending", "run");
@@ -326,13 +396,13 @@ describe("CI source claim lifetime", () => {
           { id: "running" },
         ]);
       } finally {
-        t.sqlite.close();
+        t.close();
       }
     });
   }
 
-  test("finished children do not release an outstanding parent; config failures release jobless runs", () => {
-    const t = fixture();
+  test("finished children do not release an outstanding parent; config failures release jobless runs", async () => {
+    const t = await fixture();
     try {
       t.run("run");
       t.job("job", "run");
@@ -346,12 +416,12 @@ describe("CI source claim lifetime", () => {
       t.runStatus("config-error", "failed");
       expect(t.roots()).toEqual([]);
     } finally {
-      t.sqlite.close();
+      t.close();
     }
   });
 
-  test("unexpired retries reacquire claims but released expired runs and children cannot resurrect", () => {
-    const t = fixture();
+  test("unexpired retries reacquire claims but released expired runs and children cannot resurrect", async () => {
+    const t = await fixture();
     try {
       t.run("run");
       t.job("job", "run");
@@ -381,7 +451,7 @@ describe("CI source claim lifetime", () => {
       });
       expect(t.roots()).toEqual([]);
     } finally {
-      t.sqlite.close();
+      t.close();
     }
   });
 
@@ -393,7 +463,7 @@ describe("CI source claim lifetime", () => {
         .filter((name) => name.endsWith(".sql") && name < migration)
         .sort())
         sqlite.exec(readFileSync(join(directory, file), "utf8"));
-      const t = fixture(sqlite);
+      const t = legacyFixture(sqlite);
       t.run("completed", "succeeded", "historical-landing");
       t.job("completed-job", "completed", "succeeded");
       t.run("cancelled-active", "cancelled");
@@ -437,11 +507,44 @@ describe("CI source claim lifetime", () => {
       ]);
       t.jobStatus("active-job", "cancelled");
       expect(t.roots()).toEqual(["old-cancel", "old-timeout", "queued"]);
-      const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as unknown as Env;
+      const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
+      const admission = installCutoverTestControl(env);
+      try {
+        await expect(
+          captureWorkAuthority(env, "repo", {
+            id: "org",
+            credential: { kind: "token", id: "legacy-credential" },
+          }),
+        ).rejects.toThrow("space_cutover_fenced");
+      } finally {
+        admission.close();
+      }
+    } finally {
+      sqlite.close();
+      registry.close();
+    }
+  });
+
+  test("retention excludes ambiguous terminal consumers until their exact acknowledgment", async () => {
+    const t = await fixture();
+    const { sqlite, env } = t;
+    try {
+      t.run("old-cancel", "running");
+      t.job("old-cancel-job", "old-cancel", "running");
+      t.run("old-timeout", "running");
+      t.job("old-timeout-job", "old-timeout", "running");
+      sqlite.exec(`UPDATE ci_jobs SET started_at='2025-01-01',source_completion_pending=1;
+        UPDATE ci_jobs SET status='cancelled' WHERE id='old-cancel-job';
+        UPDATE ci_jobs SET status='failed' WHERE id='old-timeout-job';`);
+      t.runStatus("old-cancel", "cancelled");
+      t.runStatus("old-timeout", "failed");
+      t.run("queued");
+      t.fence();
+      expect(t.roots()).toEqual(["old-cancel", "old-timeout", "queued"]);
       sqlite.exec("UPDATE ci_runs SET created_at='2025-01-01'");
       const context = {
         env,
-        target: { scope: "account", accountId: "org" } as const,
+        target: { kind: "space", id: "space" } as const,
         thresholds: { days: 1, keepLatest: 1 },
         now: new Date("2026-10-04"),
         limit: 50,
@@ -456,8 +559,7 @@ describe("CI source claim lifetime", () => {
       expect(after.items.map((item) => item.id)).toContain("old-cancel");
       expect(after.items.map((item) => item.id)).toContain("old-timeout");
     } finally {
-      sqlite.close();
-      registry.close();
+      t.close();
     }
   });
 });

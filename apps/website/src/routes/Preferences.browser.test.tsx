@@ -63,6 +63,7 @@ test("a person turns it on for one tracker; it answers their green approvals, ma
     name: "lander",
   });
   const off = {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [{ kind: "automation.approveWhenGreen", id: "acc_marco", data: { enabled: false } }],
   };

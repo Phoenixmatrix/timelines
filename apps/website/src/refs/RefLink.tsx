@@ -34,7 +34,7 @@ function hrefOf(
   location: ReturnType<typeof useLocation>,
 ): { to: string; state?: unknown } {
   return target.kind === "commit"
-    ? commitHref(location, target.owner, target.repo, target.sha)
+    ? commitHref(location, target.space, target.repo, target.sha)
     : { to: refHref(target, location) };
 }
 
@@ -97,7 +97,7 @@ export function RefChooser({
                     <span className="text-micro text-ink-faint">
                       {KIND_LABEL[target.kind]}
                       {target.kind === "issue" ? ` in ${target.tracker}` : ""}
-                      {target.kind === "package" ? ` in ${target.owner}` : ""}
+                      {target.kind === "package" ? ` in ${target.space}` : ""}
                     </span>
                   </Link>
                 </li>

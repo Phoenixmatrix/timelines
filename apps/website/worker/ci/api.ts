@@ -1,6 +1,6 @@
 // The CI API.
 //
-// Per repository, under /api/repos/:owner/:name/ci:
+// Per repository, under /api/repos/:space/:name/ci:
 //   GET    /                       recent runs (?before=<number> pages back, ?ref=<branch>
 //                                   only that branch's: a timeline's bookmark, say;
 //                                   ?commit=<oid> only that commit's)
@@ -18,7 +18,7 @@
 //   POST   /claim                  {name, repo?} → a queued local job, or 204
 //   POST   /jobs/:job              a CiJobReport → {cancelled}
 
-import { Hono } from "hono";
+import { Hono, type ErrorHandler } from "hono";
 import { sql, type InferResult } from "kysely";
 import type {
   CiClaimedJob,
@@ -39,13 +39,14 @@ import { RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { batch, db, nowIso, type DB } from "../schema.ts";
 import { cancelRun } from "./cancel.ts";
-import { claim, jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
+import { claim, jobPayload, loadJob, report, settleStoppedJob, type StoredJob } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { startRun } from "./trigger.ts";
 import { landingSlugOf } from "../../shared/timelines.ts";
 import { resolveSource } from "../timelines/sources.ts";
 import { ciSource } from "./source.ts";
 import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
+import { WorkAuthorizationError } from "./admission.ts";
 
 const PAGE = 30;
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
@@ -92,7 +93,18 @@ const toRun = (row: RunRow): CiRunSummary => ({
   coveredBy: row.covered_by,
 });
 
+const workErrorHandler: ErrorHandler<AppEnv> = (error, c) => {
+  if (error instanceof WorkAuthorizationError)
+    return c.json({ error: error.message, code: error.code }, error.status);
+  if (error.message === "migration_epoch_mismatch")
+    return c.json({ error: error.message, code: "migration_epoch_mismatch" }, 409);
+  if (error.message === "space_cutover_fenced")
+    return c.json({ error: error.message, code: "space_cutover_fenced" }, 503);
+  throw error;
+};
+
 export const ci = new Hono<AppEnv>();
+ci.onError(workErrorHandler);
 
 ci.get("/", async (c) => {
   const repo = await loadRepo(c);
@@ -469,6 +481,8 @@ ci.delete("/secrets/:secret", async (c) => {
 
 export const runner = new Hono<AppEnv>();
 
+runner.onError(workErrorHandler);
+
 /**
  * Whether the actor may run (and see the secrets of) jobs for a repo. A
  * repository being deleted still runs its previews' teardown (CORE-199); its
@@ -479,8 +493,8 @@ async function mayRun(
   actor: NonNullable<AppEnv["Variables"]["actor"]>,
   repo: string,
 ) {
-  const [owner, name] = repo.split("/");
-  const row = await findRepo(d1, actor, owner ?? "", name ?? "", { deleting: true });
+  const [space, name] = repo.split("/");
+  const row = await findRepo(d1, actor, space ?? "", name ?? "", { deleting: true });
   return row !== null && atLeast(roleFor(row, actor), "write");
 }
 
@@ -493,8 +507,8 @@ runner.post("/claim", async (c) => {
   const results = await kdb
     .selectFrom("ci_jobs as j")
     .innerJoin("repos as p", "p.id", "j.repo_id")
-    .innerJoin("accounts as o", "o.id", "p.owner_id")
-    .select(["j.id", sql<string>`o.slug || '/' || p.name`.as("repo")])
+    .innerJoin("spaces as s", "s.id", "p.space_id")
+    .select(["j.id", sql<string>`s.slug || '/' || p.name`.as("repo")])
     .where("j.runner", "=", "local")
     .where("j.status", "=", "queued")
     .orderBy(sql`j.rowid`)
@@ -507,7 +521,7 @@ runner.post("/claim", async (c) => {
       allowed.set(candidate.repo, await mayRun(c.env.DB, actor, candidate.repo));
     }
     if (!allowed.get(candidate.repo)) continue;
-    if (!(await claim(c.env.DB, candidate.id, runnerName))) continue;
+    if (!(await claim(c.env, candidate.id, runnerName))) continue;
     const job = await loadJob(c.env.DB, candidate.id);
     if (!job) continue;
     try {
@@ -526,9 +540,9 @@ runner.post("/claim", async (c) => {
       .where("status", "=", "queued")
       .execute();
     const spec = JSON.parse(job.spec) as StoredJob;
-    const token = await mintJobToken(c.env.DB, job.id, spec.timeoutMinutes);
+    const token = await mintJobToken(c.env, job.id, spec.timeoutMinutes);
     return c.json<CiClaimedJob>(
-      await jobPayload(c.env.DB, job, { origin: new URL(c.req.url).origin, token }),
+      await jobPayload(c.env, job, { origin: new URL(c.req.url).origin, token }),
     );
   }
   return c.body(null, 204);
@@ -538,9 +552,16 @@ runner.post("/jobs/:job", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const job = await loadJob(c.env.DB, c.req.param("job"));
-  if (!job || job.runner !== "local" || !(await mayRun(c.env.DB, actor, job.full_name))) {
+  if (!job || job.runner !== "local") return fail(c, 404, "No such job.");
+  const update = await readJson<CiJobReport>(c);
+  if (!(await mayRun(c.env.DB, actor, job.full_name))) {
+    // A runner that lost repository access may acknowledge its own process
+    // stopping, but may no longer publish logs, step results or success.
+    if (update.done && job.claimed_by?.startsWith(`${actor.slug}/`)) {
+      await settleStoppedJob(c.env, job.id, "Runner repository authority was revoked.");
+      return c.json({ cancelled: true });
+    }
     return fail(c, 404, "No such job.");
   }
-  const update = await readJson<CiJobReport>(c);
   return c.json(await report(c.env, job.id, update));
 });

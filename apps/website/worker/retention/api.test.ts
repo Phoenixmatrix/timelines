@@ -1,42 +1,76 @@
 import { Hono } from "hono";
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { PreviewSettings } from "../../shared/deployments.ts";
 import type { RetentionPolicy, RetentionSettings } from "../../shared/retention.ts";
 import { issueToken } from "../api/tokens.ts";
 import { scopePolicy } from "../atlas/retention.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { previewSettingsApi } from "../deployments/settings.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { accountRetentionApi, siteRetentionApi } from "./api.ts";
+import { migratedDatabase } from "../testing/d1.ts";
+import { spaceRetentionApi, personRetentionApi, instanceRetentionApi } from "./api.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { CATEGORIES } from "./categories.ts";
 import { cleanupFor } from "./cleanups/index.ts";
 import { enabledTargets } from "./policies.ts";
 
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const close of cleanups.splice(0)) close();
+});
+
 async function setup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('acc_ann', 'user', 'ann', 'Ann'), ('acc_bob', 'user', 'bob', 'Bob'),
       ('acc_cat', 'user', 'cat', 'Cat');
     INSERT INTO accounts (id, kind, slug, display_name, is_site_admin)
       VALUES ('acc_sue', 'user', 'sue', 'Sue', 1);
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role)
-      VALUES ('acc_org', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('acc_org', 'acc_ann', 'owner'), ('acc_org', 'acc_cat', 'member');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'acc_ann');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_ops', 'ops', 'acc_sue');
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
+  for (const [id, slug, person] of [
+    ["acc_org", "orbit", "acc_ann"],
+    ["acc_ann", "ann", "acc_ann"],
+    ["acc_bob", "bob", "acc_bob"],
+  ] as const)
+    await seedSpaceFixture(env.DB, {
+      organization: { id: `org_${id}`, slug: `org-${slug}`, displayName: slug, kind: "company" },
+      space: { id, slug, displayName: slug },
+      actorId: person,
+      members: [
+        {
+          accountId: person,
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "read", packageRole: "read" },
+        },
+        ...(id === "acc_org"
+          ? [
+              {
+                accountId: "acc_cat",
+                role: "member" as const,
+                grant: {
+                  role: "member" as const,
+                  repositoryRole: "read" as const,
+                  packageRole: "read" as const,
+                },
+              },
+              { accountId: "acc_sue", role: "owner" as const },
+            ]
+          : []),
+      ],
+    });
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/settings/previews", previewSettingsApi);
-  app.route("/api/accounts/:slug/settings/retention", accountRetentionApi);
-  app.route("/api/admin/retention", siteRetentionApi);
+  app.route("/api/spaces/:space/settings/previews", previewSettingsApi);
+  app.route("/api/spaces/:space/retention", spaceRetentionApi);
+  app.route("/api/admin/retention", instanceRetentionApi);
+  app.route("/api/accounts/:person/retention", personRetentionApi);
   const token = async (user: string, agent?: string) =>
     (await issueToken(env.DB, user, `t-${Math.random()}`, "write", undefined, agent)).secret;
   const tokens = {
@@ -63,7 +97,7 @@ async function setup() {
   return { call, tokens, sqlite, env };
 }
 
-const ORG = "/api/accounts/orbit/settings/retention";
+const ORG = "/api/spaces/orbit/retention";
 const SITE = "/api/admin/retention";
 const policy = (settings: RetentionSettings, id: string) =>
   settings.categories.find((c) => c.id === id) as RetentionPolicy;
@@ -120,9 +154,9 @@ describe("account retention settings", () => {
     const { status, json } = await t.call(t.tokens.ann, "GET", ORG);
     expect(status).toBe(200);
     const settings = json as RetentionSettings;
-    expect(settings).toMatchObject({ level: "account", account: "orbit", canEdit: true });
+    expect(settings).toMatchObject({ target: { kind: "space", id: "acc_org" }, canEdit: true });
     expect(settings.categories.map((c) => c.id)).toEqual(
-      CATEGORIES.filter((c) => c.scope === "account").map((c) => c.id),
+      CATEGORIES.filter((c) => c.scope === "space").map((c) => c.id),
     );
     for (const c of settings.categories.filter(
       (c) => c.control === "policy" && c.id !== "timeline-work-sources",
@@ -164,7 +198,7 @@ describe("account retention settings", () => {
         const ids = x.policies.map((p) => p.id).filter((id) => id !== "timeline-work-sources");
         return ids.length ? [[x.target, ids]] : [];
       }),
-    ).toEqual([[{ scope: "site" }, ["auth-hygiene"]]]);
+    ).toEqual([[{ kind: "instance", id: "" }, ["auth-hygiene"]]]);
   });
 
   test("enabling without values applies the defaults; values and resets are recorded", async () => {
@@ -176,7 +210,7 @@ describe("account retention settings", () => {
     let settings = enabled.json as RetentionSettings;
     expect(policy(settings, "ci-logs")).toMatchObject({
       enabled: true,
-      enabledFrom: "account",
+      enabledFrom: "space",
       values: { days: 30 },
       valuesFrom: { days: "default" },
       updatedBy: "ann",
@@ -184,7 +218,7 @@ describe("account retention settings", () => {
     expect(policy(settings, "release-notes")).toMatchObject({
       enabled: false,
       values: { days: 400 },
-      valuesFrom: { days: "account" },
+      valuesFrom: { days: "space" },
     });
     expect(settings.changes.map((c) => [c.category, c.actor, c.before, c.after])).toEqual(
       expect.arrayContaining([
@@ -196,7 +230,7 @@ describe("account retention settings", () => {
       target.policies.some((p) => p.id === "ci-logs"),
     );
     expect(targets).toHaveLength(1);
-    expect(targets[0]!.target).toEqual({ scope: "account", accountId: "acc_org" });
+    expect(targets[0]!.target).toEqual({ kind: "space", id: "acc_org" });
     expect(targets[0]!.policies.find((p) => p.id === "ci-logs")?.enabled).toBe(true);
 
     // The same values again change nothing and record nothing.
@@ -239,7 +273,7 @@ describe("account retention settings", () => {
     await bad({ categories: { "ci-logs": { enabled: "yes" } } });
     await bad({ categories: { "ci-logs": { enable: true } } });
     expect(await bad({ categories: { "auth-hygiene": { enabled: true } } })).toMatch(
-      /site category/,
+      /not a space category/,
     );
     // Atlas snapshots: an account can keep less, never more.
     expect(
@@ -265,7 +299,7 @@ describe("account retention settings", () => {
     const enable = { categories: { "ci-logs": { enabled: true } } };
     expect((await t.call(t.tokens.cat, "GET", ORG)).status).toBe(403);
     expect(((await t.call(t.tokens.ann, "GET", ORG)).json as RetentionSettings).canEdit).toBe(true);
-    expect(((await t.call(t.tokens.sue, "GET", ORG)).json as RetentionSettings).canEdit).toBe(true);
+    expect((await t.call(t.tokens.sue, "GET", ORG)).status).toBe(404);
     expect((await t.call(t.tokens.bob, "GET", ORG)).status).toBe(404);
     expect((await t.call(t.tokens.bob, "PATCH", ORG, enable)).status).toBe(404);
     expect((await t.call(t.tokens.cat, "PATCH", ORG, enable)).status).toBe(403);
@@ -273,14 +307,36 @@ describe("account retention settings", () => {
     expect(((await t.call(t.tokens.agent, "GET", ORG)).json as RetentionSettings).canEdit).toBe(
       false,
     );
-    expect((await t.call(t.tokens.sue, "PATCH", ORG, enable)).status).toBe(200);
+    expect((await t.call(t.tokens.sue, "PATCH", ORG, enable)).status).toBe(404);
     // A user's own account is theirs.
-    const bob = "/api/accounts/bob/settings/retention";
+    const bob = "/api/spaces/bob/retention";
     expect((await t.call(t.tokens.bob, "PATCH", bob, enable)).status).toBe(200);
     expect((await t.call(t.tokens.ann, "GET", bob)).status).toBe(404);
+    expect((await t.call(t.tokens.ann, "GET", "/api/spaces/nobody/retention")).status).toBe(404);
+  });
+
+  test("personal chat policies remain self-only, separate from same-id Space content", async () => {
+    const t = await setup();
+    const path = "/api/accounts/ann/retention";
+    const personal = await t.call(t.tokens.ann, "GET", path);
+    expect(personal.status).toBe(200);
+    expect((personal.json as RetentionSettings).categories.map((c) => c.id)).toEqual([
+      "assistant-chats",
+    ]);
+    expect((await t.call(t.tokens.sue, "GET", path)).status).toBe(404);
+    expect((await t.call(t.tokens.bob, "GET", path)).status).toBe(404);
+    const patch = { categories: { "assistant-chats": { enabled: true } } };
+    expect((await t.call(t.tokens.ann, "PATCH", ORG, patch)).status).toBe(400);
+    expect((await t.call(t.tokens.ann, "PATCH", path, patch)).status).toBe(200);
+    const targets = await enabledTargets(t.env.DB);
     expect(
-      (await t.call(t.tokens.ann, "GET", "/api/accounts/nobody/settings/retention")).status,
-    ).toBe(404);
+      targets
+        .find((x) => x.target.kind === "person" && x.target.id === "acc_ann")
+        ?.policies.map((p) => p.id),
+    ).toEqual(["assistant-chats"]);
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id = 'acc_org' AND account_id = 'acc_ann'");
+    expect((await t.call(t.tokens.ann, "GET", ORG)).status).toBe(404);
+    expect((await t.call(t.tokens.ann, "GET", path)).status).toBe(200);
   });
 
   test("preview settings are the previews category, both ways", async () => {
@@ -290,16 +346,16 @@ describe("account retention settings", () => {
     });
     expect(policy(changed.json, "previews")).toMatchObject({
       values: { endedDays: 2, idleDays: 3 },
-      valuesFrom: { endedDays: "account", idleDays: "account" },
+      valuesFrom: { endedDays: "space", idleDays: "space" },
     });
     expect(
-      (await t.call(t.tokens.ann, "GET", "/api/accounts/orbit/settings/previews")).json,
+      (await t.call(t.tokens.ann, "GET", "/api/spaces/orbit/settings/previews")).json,
     ).toMatchObject({
       endedDays: 2,
       idleDays: 3,
       updatedBy: "ann",
     } satisfies Partial<PreviewSettings>);
-    await t.call(t.tokens.ann, "PATCH", "/api/accounts/orbit/settings/previews", { endedDays: 0 });
+    await t.call(t.tokens.ann, "PATCH", "/api/spaces/orbit/settings/previews", { endedDays: 0 });
     const read = (await t.call(t.tokens.ann, "GET", ORG)).json as RetentionSettings;
     expect(policy(read, "previews").values).toEqual({ endedDays: 0, idleDays: 3 });
     expect(read.changes).toHaveLength(1);
@@ -312,7 +368,7 @@ describe("account retention settings", () => {
 
   test("a settings row the AI settings made stores nothing for previews", async () => {
     const t = await setup();
-    t.sqlite.exec(`INSERT INTO account_settings (account_id, ai_wiki) VALUES ('acc_org', 0)`);
+    t.sqlite.exec(`INSERT INTO space_settings (space_id, ai_wiki) VALUES ('acc_org', 0)`);
     const settings = (await t.call(t.tokens.ann, "GET", ORG)).json as RetentionSettings;
     expect(policy(settings, "previews")).toMatchObject({
       values: { endedDays: 2, idleDays: 7 },
@@ -324,9 +380,9 @@ describe("account retention settings", () => {
   test("a stored value outside today's bounds is ignored", async () => {
     const t = await setup();
     t.sqlite.exec(`
-      INSERT INTO retention_policies (account_id, category, enabled, thresholds)
-        VALUES ('acc_org', 'ci-logs', 1, '{"days": 0}'),
-               ('acc_org', 'push-log', NULL, 'not json');
+      INSERT INTO retention_policies (scope_kind, scope_id, category, enabled, thresholds)
+        VALUES ('space', 'acc_org', 'ci-logs', 1, '{"days": 0}'),
+               ('space', 'acc_org', 'push-log', NULL, 'not json');
     `);
     const settings = (await t.call(t.tokens.ann, "GET", ORG)).json as RetentionSettings;
     expect(policy(settings, "ci-logs")).toMatchObject({ enabled: true, values: { days: 30 } });
@@ -336,7 +392,7 @@ describe("account retention settings", () => {
   test("Atlas snapshots: an account keeps less, which every Atlas retention pass reads", async () => {
     const t = await setup();
     t.sqlite.exec(`
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
         ('r_org', 'acc_org', 'engine', 'private', 'a', ''),
         ('r_ann', 'acc_ann', 'notes', 'private', 'b', '');
       INSERT INTO atlas_scopes (scope, kind, repo_id) VALUES
@@ -351,7 +407,7 @@ describe("account retention settings", () => {
       control: "active",
       enabled: true,
       values: { maxPrior: 3, priorDays: 2, capGib: 2 },
-      valuesFrom: { maxPrior: "account", priorDays: "account", capGib: "default" },
+      valuesFrom: { maxPrior: "space", priorDays: "space", capGib: "default" },
       updatedBy: "ann",
     });
     expect(
@@ -406,8 +462,8 @@ describe("site retention settings", () => {
   test("site categories and site-wide defaults, which accounts inherit and override", async () => {
     const t = await setup();
     let site = (await t.call(t.tokens.sue, "GET", SITE)).json as RetentionSettings;
-    expect(site).toMatchObject({ level: "site", account: null, canEdit: true });
-    expect(site.categories.filter((c) => c.scope === "site").map((c) => c.id)).toEqual([
+    expect(site).toMatchObject({ target: { kind: "instance", id: "" }, canEdit: true });
+    expect(site.categories.filter((c) => c.scope === "instance").map((c) => c.id)).toEqual([
       "analysis-caches",
       "registry-proxy-cache",
       "registry-audit",
@@ -454,7 +510,7 @@ describe("site retention settings", () => {
     ).json;
     expect(policy(site, "registry-audit")).toMatchObject({
       enabled: true,
-      enabledFrom: "site",
+      enabledFrom: "instance",
       values: { days: 14 },
     });
     expect(site.changes.map((c) => [c.category, c.actor])).toEqual(
@@ -472,27 +528,25 @@ describe("site retention settings", () => {
     expect(policy(org, "ci-logs")).toMatchObject({
       enabled: false,
       values: { days: 60 },
-      valuesFrom: { days: "site" },
+      valuesFrom: { days: "instance" },
     });
     expect(
       (await enabledTargets(t.env.DB))
-        .filter((x) => x.target.scope === "site")
+        .filter((x) => x.target.kind === "instance")
         .map((x) => x.target),
-    ).toEqual([{ scope: "site" }]);
+    ).toEqual([{ kind: "instance", id: "" }]);
 
     // A site-wide default that enables an account category covers every
     // account that didn't decide otherwise.
     await t.call(t.tokens.sue, "PATCH", SITE, { categories: { "ci-logs": { enabled: true } } });
-    await t.call(t.tokens.bob, "PATCH", "/api/accounts/bob/settings/retention", {
+    await t.call(t.tokens.bob, "PATCH", "/api/spaces/bob/retention", {
       categories: { "ci-logs": { enabled: false } },
     });
     org = (await t.call(t.tokens.ann, "GET", ORG)).json;
-    expect(policy(org, "ci-logs")).toMatchObject({ enabled: true, enabledFrom: "site" });
+    expect(policy(org, "ci-logs")).toMatchObject({ enabled: true, enabledFrom: "instance" });
     const targets = await enabledTargets(t.env.DB);
     const accounts = targets.flatMap((x) =>
-      x.target.scope === "account" && x.policies.some((p) => p.id === "ci-logs")
-        ? [x.target.accountId]
-        : [],
+      x.target.kind === "space" && x.policies.some((p) => p.id === "ci-logs") ? [x.target.id] : [],
     );
     expect(accounts).toContain("acc_org");
     expect(accounts).toContain("acc_ann");
@@ -513,9 +567,9 @@ describe("site retention settings", () => {
       valuesFrom: { days: "default" },
       updatedAt: null,
     });
-    const targets = (await enabledTargets(t.env.DB)).filter((x) => x.target.scope === "site");
+    const targets = (await enabledTargets(t.env.DB)).filter((x) => x.target.kind === "instance");
     expect(targets.map((x) => [x.target, x.policies.map((p) => [p.id, p.values])])).toEqual([
-      [{ scope: "site" }, [["auth-hygiene", { days: 7 }]]],
+      [{ kind: "instance", id: "" }, [["auth-hygiene", { days: 7 }]]],
     ]);
   });
 });

@@ -1,6 +1,7 @@
 import { queueCandidateBranch } from "../../shared/merge-queue.ts";
 import { jobCaller } from "../deployments/job.ts";
 import { db } from "../schema.ts";
+import { resolveJobAuthority, WorkAuthorizationError } from "./admission.ts";
 
 export type QueueMergeJobAccess =
   | {
@@ -16,24 +17,31 @@ export type QueueMergeJobAccess =
 
 /** Authority shared by Git and conflict resolution; never inferred from a branch name alone. */
 export async function queueMergeJob(
-  d1: D1Database,
+  env: Env,
   secret: string,
-  owner: string,
+  space: string,
   name: string,
   queueId?: string,
 ): Promise<QueueMergeJobAccess> {
-  const job = await jobCaller(d1, secret);
+  const d1 = env.DB;
+  const job = await jobCaller(env, secret);
   if (!job)
     return {
       ok: false,
       status: 401,
       error: "This isn't a running CI job's credential (has the job ended?).",
     };
+  try {
+    await resolveJobAuthority(env, job.jobId);
+  } catch (error) {
+    if (!(error instanceof WorkAuthorizationError)) throw error;
+    return { ok: false, status: 403, error: "The job's current Space authority is unavailable." };
+  }
   const row = await db(d1)
     .selectFrom("ci_jobs as j")
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .innerJoin("repos as p", "p.id", "j.repo_id")
-    .innerJoin("accounts as o", "o.id", "p.owner_id")
+    .innerJoin("spaces as s", "s.id", "p.space_id")
     .innerJoin("merge_queue as q", (join) =>
       join.onRef("q.repo_id", "=", "p.id").onRef("q.id", "=", "r.queue_id"),
     )
@@ -47,7 +55,7 @@ export async function queueMergeJob(
       "r.ref",
       "p.id",
       "p.name",
-      "o.slug as owner",
+      "s.slug as space",
       "p.artifacts_name",
       "p.artifacts_remote",
       "q.id as queueId",
@@ -79,7 +87,7 @@ export async function queueMergeJob(
     row.runStatus !== "running" ||
     row.trigger !== "manual" ||
     row.runRepo !== row.id ||
-    row.owner !== owner ||
+    row.space !== space ||
     row.name !== name ||
     row.queueStatus !== "merging" ||
     row.merge_run_id !== job.runId ||

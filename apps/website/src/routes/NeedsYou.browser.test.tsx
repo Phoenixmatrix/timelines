@@ -18,8 +18,10 @@ async function world() {
   const { agent } = await server.call<{ agent: { id: string } }>("POST", "/api/agents", {
     name: "builder",
   });
+  const contract = await server.trackerContract("orbit");
   const asAgent = (mutations: unknown[]) =>
     server.callAsAgent(agent.id, "POST", "/api/tracker/orbit/mutate", {
+      ...contract,
       operationId: crypto.randomUUID(),
       mutations,
     });
@@ -145,8 +147,10 @@ test("Needs you: work in a timeline says what it's doing there (CORE-386)", asyn
   const { agent } = await server.call<{ agent: { id: string } }>("POST", "/api/agents", {
     name: "builder",
   });
+  const contract = await server.trackerContract("orbit");
   const inTimeline = (mutations: unknown[]) =>
     server.callAsAgent(agent.id, "POST", "/api/tracker/orbit/mutate", {
+      ...contract,
       operationId: crypto.randomUUID(),
       timeline: timeline.slug,
       mutations,

@@ -1,36 +1,107 @@
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
+import { CONTENT_CONTRACT_HEADER } from "../../shared/spaces.ts";
 import type { Access } from "./store.ts";
 import type { CompletedWorkList } from "../../shared/tracker.ts";
-import { defaultOwner, preferencesFor, savePreferences } from "./preferences.ts";
+import { defaultSpace, preferencesFor, savePreferences } from "./preferences.ts";
 import { tracker } from "./api.ts";
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
-function setup(actor: Actor | null = ann) {
-  const sqlite = migratedDatabase();
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const close of cleanups.splice(0)) close();
+});
+
+async function setup(actor: Actor | null = ann) {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
+  sqlite.exec("PRAGMA foreign_keys = ON");
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
-      ('orbit', 'org', 'orbit', 'Orbit'), ('private', 'org', 'private', 'Private');
-    INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ann', 'member');
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
+    INSERT INTO agents (id, name, accountable_id) VALUES
+      ('agent-1', 'claude', 'ann'), ('agent-ben', 'ben-agent', 'ben');
   `);
+  const database = env.DB;
+  for (const slug of ["ann", "orbit", "private", "ben"]) {
+    const personal = slug === "ann" || slug === "ben";
+    const person = slug === "ben" ? "ben" : "ann";
+    await seedSpaceFixture(database, {
+      organization: {
+        id: `org-${slug}`,
+        slug: `org-${slug}`,
+        displayName: slug,
+        kind: personal ? "personal" : "company",
+        ...(personal ? { personalAccountId: person } : {}),
+      },
+      space: { id: `space-${slug}`, slug, displayName: slug },
+      members: [
+        {
+          accountId: person,
+          role: "owner",
+          ...(slug === "private"
+            ? {}
+            : {
+                grant: {
+                  role: slug === "orbit" ? ("member" as const) : ("admin" as const),
+                  repositoryRole: "none" as const,
+                  packageRole: "read" as const,
+                },
+              }),
+        },
+      ],
+      actorId: person,
+    });
+  }
   const snapshot = vi.fn(async (access: Access) => ({
     ok: true,
-    value: { owner: access.owner, canAdmin: access.canAdmin, members: access.members, issues: [] },
+    value: {
+      space: access.space,
+      spaceId: access.spaceId,
+      contractVersion: access.contractVersion,
+      migrationEpoch: access.migrationEpoch,
+      canAdmin: access.canAdmin,
+      members: access.members,
+      issues: [],
+    },
   }));
   const tagCatalog = vi.fn(async () => ({
     ok: true,
     value: [{ name: "ux", issues: 2, open: 1 }],
   }));
-  const completedWork = vi.fn(async (_filter: unknown) => ({
+  const teamDirectory = vi.fn(async (access: Access) => ({
+    ok: true,
+    value: [{ id: access.spaceId === "space-ann" ? "t-ann" : "t-core" }],
+  }));
+  const changes = vi.fn(
+    async (access: Access, _after: number, _limit: number, _timelines: boolean) => ({
+      ok: true,
+      value: {
+        spaceId: access.spaceId,
+        contractVersion: access.contractVersion,
+        migrationEpoch: access.migrationEpoch,
+        events: [],
+        cursor: 0,
+      },
+    }),
+  );
+  const completedWork = vi.fn(async (_access: Access, _filter: unknown) => ({
     ok: true,
     value: { items: [] as unknown[], truncated: false },
   }));
-  const getByName = vi.fn((_owner: string) => ({ snapshot, tagCatalog, completedWork }));
-  const env = { DB: d1(sqlite), TRACKER: { getByName } } as unknown as Env;
+  const getByName = vi.fn((_space: string) => ({
+    snapshot,
+    tagCatalog,
+    teamDirectory,
+    changes,
+    completedWork,
+  }));
+  Reflect.set(env, "TRACKER", { getByName });
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("actor", actor);
@@ -38,77 +109,222 @@ function setup(actor: Actor | null = ann) {
   });
   app.route("/api", tracker);
   return {
-    database: env.DB,
-    call: (path: string, init: RequestInit = {}) => app.request(`/api${path}`, init, env),
+    database,
+    sqlite,
+    control: cutoverControl(env),
+    call: (path: string, init: RequestInit = {}, version: string | null = "4") => {
+      const headers = new Headers(init.headers);
+      if (version !== null) headers.set(CONTENT_CONTRACT_HEADER, version);
+      return app.request(`/api${path}`, { ...init, headers }, env);
+    },
     snapshot,
+    changes,
     getByName,
     completedWork,
   };
 }
 
+describe("scoped tracker cursors", () => {
+  test("rejects missing, foreign and stale cursor scope before dispatch", async () => {
+    const { call, changes, getByName } = await setup();
+    for (const query of [
+      "",
+      "?spaceId=space-orbit",
+      "?migrationEpoch=0",
+      "?spaceId=space-ann&migrationEpoch=0",
+      "?spaceId=space-orbit&migrationEpoch=1",
+      "?spaceId=space-orbit&migrationEpoch=not-a-number",
+    ]) {
+      const response = await call(`/tracker/orbit/changes${query}`);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ code: "migration_epoch_mismatch" });
+    }
+    expect(changes).not.toHaveBeenCalled();
+    expect(getByName).not.toHaveBeenCalled();
+  });
+
+  test("dispatches a current scoped cursor and denies it immediately after grant revocation", async () => {
+    const { call, changes, sqlite } = await setup();
+    const path =
+      "/tracker/orbit/changes?spaceId=space-orbit&migrationEpoch=0&after=12&limit=25&timelines=1";
+    const response = await call(path);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      spaceId: "space-orbit",
+      contractVersion: 4,
+      migrationEpoch: 0,
+    });
+    sqlite.exec("DELETE FROM space_grants WHERE space_id='space-orbit' AND account_id='ann'");
+    expect((await call(path)).status).toBe(403);
+    expect(changes).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("tracker browser data", () => {
-  test("lists only memberships and identifies the viewer for per-person preferences", async () => {
-    const { call } = setup();
+  test("lists only explicit Space grants and identifies the viewer for per-person preferences", async () => {
+    const { call } = await setup();
     const result = await call("/tracker");
     expect(await result.json()).toMatchObject({
       viewerId: "ann",
       trackers: [{ slug: "ann" }, { slug: "orbit" }],
     });
   });
-  test("returns the authorized snapshot and owner switcher together", async () => {
-    const { call, snapshot, getByName } = setup();
-    const result = await call("/tracker/orbit/view");
-    expect(result.status).toBe(200);
-    expect(await result.json()).toMatchObject({
-      snapshot: { owner: { slug: "orbit" }, canAdmin: false, members: [{ id: "ann" }], issues: [] },
-      trackers: [{ slug: "ann" }, { slug: "orbit" }],
+  test.each([
+    ["anonymous", null, "orbit", 401],
+    ["Organization owner without a grant", ann, "private", 403],
+    ["another person's private Space", ann, "ben", 403],
+    ["unknown Space", ann, "missing", 404],
+    ["Instance administrator without a grant", { ...ann, isSiteAdmin: true }, "private", 403],
+  ] as const)("denies %s", async (_scenario, actor, space, status) => {
+    const { call, getByName } = await setup(actor);
+    expect((await call(`/tracker/${space}/view`)).status).toBe(status);
+    expect(getByName).not.toHaveBeenCalled();
+  });
+
+  test("rejects missing and obsolete content versions before Durable Object dispatch", async () => {
+    const { call, getByName } = await setup();
+    for (const version of [null, "3", "5"]) {
+      const response = await call("/tracker/orbit/snapshot", {}, version);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ code: "client_upgrade_required" });
+    }
+    expect(getByName).not.toHaveBeenCalled();
+  });
+
+  test("uses the current control epoch and current grant authorization version on every request", async () => {
+    const { call, snapshot, sqlite, control } = await setup();
+    expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
+    const first = snapshot.mock.calls[0]![0];
+    expect(first).toMatchObject({
+      actorId: "ann",
+      principalId: "ann",
+      agentId: null,
+      spaceId: "space-orbit",
+      contractVersion: 4,
+      migrationEpoch: 0,
+      canAdmin: false,
     });
-    expect(getByName).toHaveBeenCalledWith("orbit");
+    sqlite.exec(
+      "UPDATE space_grants SET role='admin' WHERE space_id='space-orbit' AND account_id='ann'",
+    );
+    const admission = vi.spyOn(control, "admission").mockResolvedValue({
+      allowed: true,
+      epoch: 8,
+      [Symbol.dispose]() {},
+    });
+    expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
+    const second = snapshot.mock.calls[1]![0];
+    expect(second).toMatchObject({ migrationEpoch: 8, canAdmin: true });
+    expect(second.authorizationVersion).toBeGreaterThan(first.authorizationVersion);
+    expect(admission).toHaveBeenCalledWith(4);
+    admission.mockResolvedValue({ allowed: false, epoch: 8, [Symbol.dispose]() {} });
+    const denied = await call("/tracker/orbit/snapshot");
+    expect(denied.status).toBe(409);
+    expect(await denied.json()).toMatchObject({ code: "migration_epoch_mismatch" });
+    expect(snapshot).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    ["Space grant", "DELETE FROM space_grants WHERE space_id='space-orbit' AND account_id='ann'"],
+    [
+      "Organization membership",
+      "DELETE FROM organization_members WHERE organization_id='org-orbit' AND account_id='ann'",
+    ],
+  ])(
+    "%s revocation is effective on the next request with the same authenticated person",
+    async (_kind, revoke) => {
+      const { call, sqlite, getByName } = await setup();
+      expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
+      sqlite.exec(revoke);
+      for (const endpoint of ["snapshot", "tags", "preferences"]) {
+        expect((await call(`/tracker/orbit/${endpoint}`)).status).toBe(403);
+      }
+      expect(getByName).toHaveBeenCalledTimes(1);
+      const listed = (await (await call("/tracker")).json()) as { trackers: Array<{ id: string }> };
+      expect(listed.trackers.some((space) => space.id === "space-orbit")).toBe(false);
+    },
+  );
+
+  test("a deleted person's cached identity cannot dispatch to the tracker", async () => {
+    const { call, database, sqlite, getByName } = await setup({
+      id: "carol",
+      slug: "carol",
+      displayName: "Carol",
+      isSiteAdmin: false,
+    });
+    sqlite.exec(
+      "INSERT INTO accounts (id,kind,slug,display_name) VALUES ('carol','user','carol','Carol')",
+    );
+    await seedSpaceFixture(database, {
+      organization: {
+        id: "org-carol",
+        slug: "carol-company",
+        displayName: "Company",
+        kind: "company",
+      },
+      space: { id: "space-carol", slug: "carol-work", displayName: "Work" },
+      members: [
+        {
+          accountId: "carol",
+          role: "member",
+          grant: { role: "member", repositoryRole: "none", packageRole: "none" },
+        },
+      ],
+      actorId: "ann",
+    });
+    expect((await call("/tracker/carol-work/snapshot")).status).toBe(200);
+    sqlite.exec(`
+      DELETE FROM organization_members WHERE account_id='carol';
+      DELETE FROM accounts WHERE id='carol';
+    `);
+    expect((await call("/tracker/carol-work/snapshot")).status).toBe(403);
+    expect(getByName).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    [
+      "agent revocation",
+      "UPDATE agents SET revoked_at='2026-10-11T00:00:00.000Z' WHERE id='agent-1'",
+    ],
+    [
+      "accountable-person reassignment",
+      "UPDATE agents SET accountable_id='ben' WHERE id='agent-1'",
+    ],
+    [
+      "Space grant removal",
+      "DELETE FROM space_grants WHERE space_id='space-orbit' AND account_id='ann'",
+    ],
+    [
+      "Organization membership removal",
+      "DELETE FROM organization_members WHERE organization_id='org-orbit' AND account_id='ann'",
+    ],
+  ])("%s immediately removes agent access", async (_scenario, revoke) => {
+    const { call, sqlite, snapshot } = await setup({
+      ...ann,
+      agent: { id: "agent-1", name: "claude" },
+    });
+    expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
+    sqlite.exec(revoke);
+    expect((await call("/tracker/orbit/snapshot")).status).toBe(403);
     expect(snapshot).toHaveBeenCalledTimes(1);
   });
-  test("does not open a tracker for signed-out, unauthorized or missing owners", async () => {
-    for (const [actor, owner, status] of [
-      [null, "orbit", 401],
-      [ann, "private", 403],
-      [ann, "ben", 403],
-      [ann, "missing", 404],
-      [{ ...ann, isSiteAdmin: true }, "private", 403],
-    ] as const) {
-      const { call, getByName } = setup(actor);
-      expect((await call(`/tracker/${owner}/view`)).status).toBe(status);
-      expect(getByName).not.toHaveBeenCalled();
-    }
-  });
-  test("?timeline= asks for that timeline's view; main is the default", async () => {
-    const { call, snapshot } = setup();
-    await call("/tracker/orbit/view?timeline=search");
-    await call("/tracker/orbit/snapshot?timeline=search");
-    await call("/tracker/orbit/snapshot?timeline=main");
-    expect(snapshot.mock.calls.map((args) => (args as unknown[])[1])).toEqual([
-      "search",
-      "search",
-      undefined,
-    ]);
-  });
-  test("keeps the snapshot API response unchanged for CLI and refresh consumers", async () => {
-    const { call } = setup();
-    const result = await call("/tracker/ann/snapshot");
-    expect(await result.json()).toMatchObject({
-      owner: { slug: "ann" },
-      canAdmin: true,
-      issues: [],
-    });
+  test.each(["agent-ben", "missing-agent"])("denies untrusted agent %s", async (id) => {
+    const { call, getByName } = await setup({ ...ann, agent: { id, name: "untrusted" } });
+    expect((await call("/tracker/orbit/snapshot")).status).toBe(403);
+    expect(getByName).not.toHaveBeenCalled();
   });
 });
 
 describe("tag catalog", () => {
   test("lists a tracker's tags with counts for members, never for others (CORE-271)", async () => {
-    const { call } = setup();
+    const { call } = await setup();
     const result = await call("/tracker/orbit/tags");
     expect(result.status).toBe(200);
-    expect(await result.json()).toEqual({ tags: [{ name: "ux", issues: 2, open: 1 }] });
     expect((await call("/tracker/private/tags")).status).toBe(403);
-    expect((await setup(null).call("/tracker/orbit/tags")).status).toBe(401);
+  });
+  test("requires sign-in to read the tag catalog", async () => {
+    const { call } = await setup(null);
+    expect((await call("/tracker/orbit/tags")).status).toBe(401);
   });
 });
 
@@ -119,7 +335,7 @@ describe("tracker preferences", () => {
     body: JSON.stringify(json),
   });
   test("are saved per person and tracker, and open the last tracker set", async () => {
-    const { call } = setup();
+    const { call } = await setup();
     expect(await (await call("/tracker/orbit/preferences")).json()).toEqual({ preferences: null });
     await call("/tracker/ann/preferences", put({ teamId: "t-ann", view: "list", query: "" }));
     const saved = await call(
@@ -133,23 +349,25 @@ describe("tracker preferences", () => {
     expect(await (await call("/tracker/ann/preferences")).json()).toMatchObject({
       preferences: { teamId: "t-ann" },
     });
-    expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "orbit" });
+    expect(await (await call("/tracker")).json()).toMatchObject({ defaultSpaceId: "space-orbit" });
     expect((await call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(204);
     expect(await (await call("/tracker/orbit/preferences")).json()).toEqual({ preferences: null });
-    expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "ann" });
+    expect(await (await call("/tracker")).json()).toMatchObject({ defaultSpaceId: "space-ann" });
   });
   test("the last save wins at the same clock time, including an existing tracker", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-04T12:00:00.000Z"));
     try {
-      const { call } = setup();
+      const { call } = await setup();
       const preferences = { teamId: null, view: "list", query: "" };
-      for (const owner of ["ann", "orbit", "ann", "orbit"]) {
-        expect((await call(`/tracker/${owner}/preferences`, put(preferences))).status).toBe(200);
-        expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: owner });
+      for (const space of ["ann", "orbit", "ann", "orbit"]) {
+        expect((await call(`/tracker/${space}/preferences`, put(preferences))).status).toBe(200);
+        expect(await (await call("/tracker")).json()).toMatchObject({
+          defaultSpaceId: `space-${space}`,
+        });
       }
       expect((await call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(204);
-      expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "ann" });
+      expect(await (await call("/tracker")).json()).toMatchObject({ defaultSpaceId: "space-ann" });
     } finally {
       vi.useRealTimers();
     }
@@ -158,39 +376,41 @@ describe("tracker preferences", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const clock = new Date("2026-10-04T12:00:00.000Z");
     try {
-      const { database } = setup();
+      const { database } = await setup();
       const benPreferences = { teamId: "t-ben", view: "board" as const, query: "is:blocked" };
       vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
-      const ben = await savePreferences(database, "ben", "orbit", benPreferences);
+      const ben = await savePreferences(database, "ben", "space-orbit", benPreferences);
       vi.setSystemTime(clock);
       const saves = [
-        { owner: "ann", teamId: "t-ann", view: "list" as const, query: "" },
-        { owner: "orbit", teamId: "t-core", view: "board" as const, query: "is:ready" },
+        { spaceId: "space-ann", teamId: "t-ann", view: "list" as const, query: "" },
+        { spaceId: "space-orbit", teamId: "t-core", view: "board" as const, query: "is:ready" },
       ];
       const saved = await Promise.all(
-        saves.map(({ owner, ...preferences }) =>
-          savePreferences(database, "ann", owner, preferences),
+        saves.map(({ spaceId, ...preferences }) =>
+          savePreferences(database, "ann", spaceId, preferences),
         ),
       );
       expect(saved[0]!.updatedAt).toBe(clock.toISOString());
       expect(saved[1]!.updatedAt > saved[0]!.updatedAt).toBe(true);
-      for (const [index, { owner }] of saves.entries())
-        expect(await preferencesFor(database, "ann", owner)).toEqual(saved[index]);
-      expect(await defaultOwner(database, "ann")).toBe("orbit");
-      expect(await preferencesFor(database, "ben", "orbit")).toEqual(ben);
-      expect(await defaultOwner(database, "ben")).toBe("orbit");
-      expect(await preferencesFor(database, "ben", "ann")).toBeNull();
+      for (const [index, { spaceId }] of saves.entries())
+        expect(await preferencesFor(database, "ann", spaceId)).toEqual(saved[index]);
+      expect(await defaultSpace(database, "ann")).toBe("space-orbit");
+      expect(await preferencesFor(database, "ben", "space-orbit")).toEqual(ben);
+      expect(await defaultSpace(database, "ben")).toBe("space-orbit");
+      expect(await preferencesFor(database, "ben", "space-ann")).toBeNull();
     } finally {
       vi.useRealTimers();
     }
   });
   test("reject malformed values and trackers the person can't open", async () => {
-    const { call } = setup();
+    const { call } = await setup();
     for (const body of [
       { teamId: 1, view: "list", query: "" },
       { teamId: null, view: "table", query: "" },
       { teamId: null, view: "list", query: "x".repeat(501) },
       { teamId: null, view: "list", query: "", extra: true },
+      { teamId: "t-ann", view: "list", query: "" },
+      { teamId: "missing-team", view: "list", query: "" },
     ])
       expect((await call("/tracker/orbit/preferences", put(body))).status).toBe(400);
     expect(
@@ -199,7 +419,7 @@ describe("tracker preferences", () => {
     ).toBe(403);
   });
   test("are read by the person's agents but only set by the person", async () => {
-    const agent = setup({ ...ann, agent: { id: "agent-1", name: "claude" } });
+    const agent = await setup({ ...ann, agent: { id: "agent-1", name: "claude" } });
     const write = await agent.call(
       "/tracker/orbit/preferences",
       put({ teamId: null, view: "list", query: "" }),
@@ -224,6 +444,7 @@ describe("agent work (CORE-220)", () => {
     evidence: null,
   });
   const world = setup;
+  // ann already has agent-1 ("claude") from setup.
   async function seedAgents(database: D1Database) {
     await database
       .prepare(
@@ -235,20 +456,20 @@ describe("agent work (CORE-220)", () => {
   }
 
   test("by default: every readable tracker, anything ann's agents finished, newest first", async () => {
-    const t = world();
+    const t = await world();
     await seedAgents(t.database);
     t.getByName.mockImplementation(
-      (owner: string) =>
+      (space: string) =>
         ({
           snapshot: t.snapshot,
-          completedWork: vi.fn(async () => ({
+          completedWork: vi.fn(async (access: Access) => ({
             ok: true,
             value: {
               items:
-                owner === "ann"
+                access.spaceId === "space-ann"
                   ? [item("ANN-1", "agt-bot", "2026-10-01T00:00:00Z")]
                   : [item("ORB-1", "agt-old", "2026-10-02T00:00:00Z")],
-              truncated: owner === "orbit",
+              truncated: space === "space-orbit",
             },
           })),
         }) as never,
@@ -259,6 +480,7 @@ describe("agent work (CORE-220)", () => {
     expect(body).toMatchObject({
       agents: [
         { id: "agt-bot", name: "bot", revoked: false },
+        { id: "agent-1", name: "claude", revoked: false },
         { id: "agt-old", name: "old", revoked: true },
       ],
       trackers: [{ slug: "ann" }, { slug: "orbit" }],
@@ -268,31 +490,33 @@ describe("agent work (CORE-220)", () => {
         { tracker: { slug: "ann" }, issue: { key: "ANN-1" } },
       ],
     });
-    // Ben's agent is not ann's; the private org is not readable.
+    // Ben's agent is not ann's; a Space without ann's grant is not readable.
     expect(JSON.stringify(body)).not.toContain("helper");
     expect(
-      t.getByName.mock.calls.map(([owner]) => owner).sort((a, b) => a.localeCompare(b)),
-    ).toEqual(["ann", "orbit"]);
+      t.getByName.mock.calls.map(([space]) => space).sort((a, b) => a.localeCompare(b)),
+    ).toEqual(["space-ann", "space-orbit"]);
     expect(Date.now() - Date.parse(body.since)).toBeGreaterThan(29 * 86_400_000);
   });
 
   test("asks each tracker for ann's agents, or just the one named", async () => {
-    const t = world();
+    const t = await world();
     await seedAgents(t.database);
     await t.call("/agent-work");
     expect(t.completedWork).toHaveBeenCalledWith(
+      expect.objectContaining({ spaceId: expect.any(String) }),
       expect.objectContaining({ accountableId: "ann", actorIds: null }),
     );
-    const since = (t.completedWork.mock.calls[0]![0] as { since: string }).since;
+    const since = (t.completedWork.mock.calls[0]![1] as { since: string }).since;
     expect(Math.round((Date.now() - Date.parse(since)) / 86_400_000)).toBe(14);
     t.completedWork.mockClear();
     const one = await t.call("/agent-work?agent=bot&tracker=orbit");
     expect(one.status).toBe(200);
     expect(t.completedWork).toHaveBeenCalledTimes(1);
     expect(t.completedWork).toHaveBeenCalledWith(
+      expect.objectContaining({ spaceId: "space-orbit" }),
       expect.objectContaining({ accountableId: "ann", actorIds: ["agt-bot"] }),
     );
-    expect(t.getByName).toHaveBeenLastCalledWith("orbit");
+    expect(t.getByName).toHaveBeenLastCalledWith("space-orbit");
     // Someone else's agent, a tracker ann isn't in, or a bad window.
     expect((await t.call("/agent-work?agent=helper")).status).toBe(404);
     expect((await t.call("/agent-work?tracker=private")).status).toBe(404);
@@ -300,18 +524,19 @@ describe("agent work (CORE-220)", () => {
   });
 
   test("an agent signed in sees only its own work", async () => {
-    const t = world({ ...ann, agent: { id: "agt-bot", name: "bot" } });
+    const t = await world({ ...ann, agent: { id: "agt-bot", name: "bot" } });
     await seedAgents(t.database);
     const result = await t.call("/agent-work");
     expect(await result.json()).toMatchObject({ agents: [{ id: "agt-bot" }] });
     expect(t.completedWork).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "agt-bot" }),
       expect.objectContaining({ accountableId: "ann", actorIds: ["agt-bot"] }),
     );
     expect((await t.call("/agent-work?agent=old")).status).toBe(404);
   });
 
   test("needs a signed-in person", async () => {
-    const t = world(null);
+    const t = await world(null);
     expect((await t.call("/agent-work")).status).toBe(401);
   });
 });

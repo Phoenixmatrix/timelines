@@ -10,7 +10,7 @@ export async function knowledgeRepo(env: Env, repoId: string, sourceId = "canoni
   const canonical = await selectRepos(env.DB, "").where("r.id", "=", repoId).executeTakeFirst();
   if (!canonical) return null;
   const resolved = await resolveSource(env, canonical, sourceId);
-  return { ...resolved.repo, full_name: `${canonical.owner_slug}/${canonical.name}` };
+  return { ...resolved.repo, full_name: `${canonical.space_slug}/${canonical.name}` };
 }
 
 /** Only owned ready sources schedule work. Never rediscover legacy canonical bookmarks. */

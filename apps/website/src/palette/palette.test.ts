@@ -20,12 +20,33 @@ const viewer: Viewer = {
   avatarUrl: null,
   isSiteAdmin: false,
   email: null,
-  canCreateIn: [],
+  organizations: [],
+  spaces: [],
+  personalOrganizationId: null,
+  defaultSpaceId: null,
   agent: null,
 };
 
 const repo = {
-  owner: { id: "orbit", kind: "org", slug: "orbit", displayName: "Orbit" },
+  space: {
+    id: "orbit",
+    organizationId: "org-orbit",
+    slug: "orbit",
+    displayName: "Orbit",
+    archivedAt: null,
+    authorizationVersion: 1,
+    createdAt: "2026-01-01T00:00:00Z",
+    organization: {
+      id: "org-orbit",
+      slug: "orbit",
+      displayName: "Orbit",
+      kind: "company",
+      avatarUrl: null,
+      personalAccountId: null,
+      defaultSpaceId: "orbit",
+      createdAt: "2026-01-01T00:00:00Z",
+    },
+  },
   name: "engine",
   defaultBranch: "main",
   head: "abc",
@@ -108,8 +129,23 @@ describe("commands", () => {
 
 describe("before anything's typed", () => {
   const trackers = [
-    { id: "ann", slug: "ann", displayName: "Ann Lee", canAdmin: true },
-    { id: "orbit", slug: "orbit", displayName: "Orbit", canAdmin: false },
+    {
+      ...repo.space,
+      id: "ann",
+      slug: "ann",
+      displayName: "Ann Lee",
+      organizationId: "org-ann",
+      organization: {
+        ...repo.space.organization,
+        id: "org-ann",
+        slug: "ann",
+        displayName: "Ann Lee",
+        kind: "personal" as const,
+        personalAccountId: "ann",
+        defaultSpaceId: "ann",
+      },
+    },
+    repo.space,
   ];
   const home = (context: Partial<PaletteContext>) =>
     Object.fromEntries(
@@ -188,10 +224,7 @@ describe("before anything's typed", () => {
 });
 
 describe("create issue", () => {
-  const trackers = [
-    { id: "ann", slug: "ann", displayName: "Ann Lee", canAdmin: true },
-    { id: "orbit", slug: "orbit", displayName: "Orbit", canAdmin: false },
-  ];
+  const trackers = [{ ...repo.space, id: "ann", slug: "ann", displayName: "Ann Lee" }, repo.space];
   const creates = (context: Partial<PaletteContext>) =>
     commands({ trackers, ...context }).filter((c) => c.id.startsWith("create"));
 

@@ -3,7 +3,7 @@
 //
 // The source is the registry's own CI publish provenance, not a guess from
 // names: `package_sources` lists the repositories granted to publish each
-// package (a package's first CI publish names its repository; owner admins
+// package (a package's first CI publish names its repository; Space admins
 // add more), and `publishes` records every version with its repository,
 // commit, branch and run (registry/core/provenance.ts).
 //
@@ -44,7 +44,7 @@ export interface RecordedPackage {
   /** The registry's normalized name (what it matches on). */
   normalized: string;
   feedId: string;
-  /** The feed's key (its owner's slug). */
+  /** The feed's key (its Space's slug). */
   feed: string;
   /** The latest active publish from this repository, when there is one. */
   publish: {
@@ -168,6 +168,9 @@ function registryActor(actor: Actor | null): RegistryActor {
   return {
     kind: "user",
     subject: actor.id,
+    personId: actor.id,
+    agentId: actor.agent?.id ?? null,
+    credential: actor.credential,
     name: actor.slug,
     email: null,
     // Reading is all this asks; the person's roles decide the rest.
@@ -180,7 +183,7 @@ function registryActor(actor: Actor | null): RegistryActor {
 
 /**
  * Which of these feeds the caller may read now, by the registry's own rules
- * (visibility, owner roles). Feeds that no longer exist are not readable.
+ * (visibility, independent Space package grants). Missing feeds are not readable.
  */
 export async function readableFeeds(
   env: Pick<Env, "DB" | "REGISTRY_DB">,

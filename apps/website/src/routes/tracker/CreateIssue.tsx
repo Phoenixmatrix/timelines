@@ -39,7 +39,7 @@ export function CreateIssue({
   initialType,
   initialLabels,
   initialTeam,
-  initialWorkspaces,
+  initialProjects,
   busy,
   uncertain,
   onCreate,
@@ -51,7 +51,7 @@ export function CreateIssue({
   initialType: Issue["type"];
   initialLabels: string[];
   initialTeam: string;
-  initialWorkspaces: string[];
+  initialProjects: string[];
   busy: boolean;
   uncertain: boolean;
   onCreate: (data: Extract<Mutation, { kind: "issue.create" }>["data"]) => Promise<MutationOutcome>;
@@ -70,7 +70,7 @@ export function CreateIssue({
   const [timelineUse, setTimelineUse] = useState<IssueTimelineUse>("agent_decides");
   const [timelinePolicy, setTimelinePolicy] = useState<TimelinePolicy | null>(null);
   const [assigneeId, setAssigneeId] = useState("");
-  const [workspaceIds, setWorkspaceIds] = useState(initialWorkspaces);
+  const [projectIds, setProjectIds] = useState(initialProjects);
   const [requires, setRequires] = useState<IssueRequirements | null>(null);
   const [error, setError] = useState("");
   const team = snapshot.teams.find((value) => value.id === teamId && !value.archived);
@@ -118,7 +118,7 @@ export function CreateIssue({
                   timelineUse,
                   timelinePolicy,
                   assigneeId: assigneeId || null,
-                  workspaceIds,
+                  projectIds,
                   labels,
                   ...(requires ? { requires } : {}),
                 });
@@ -242,10 +242,10 @@ export function CreateIssue({
                   />
                 </section>
                 <MultiCheck
-                  label="Workspaces"
-                  options={snapshot.workspaces.filter((workspace) => !workspace.archived)}
-                  values={workspaceIds}
-                  onChange={setWorkspaceIds}
+                  label="Projects"
+                  options={snapshot.projects.filter((project) => !project.archived)}
+                  values={projectIds}
+                  onChange={setProjectIds}
                 />
               </fieldset>
               <div aria-live="polite" className="mt-3">

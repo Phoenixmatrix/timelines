@@ -5,6 +5,8 @@ import { db } from "../schema.ts";
 import { knowledgeFixtureEnabled } from "../knowledge/fixture-barrier.ts";
 import { vectorId } from "../knowledge/indexes.ts";
 import { notifyReleaseNotes } from "../release-notes/queue.ts";
+import { findUserById } from "../db.ts";
+import { issueToken } from "./tokens.ts";
 
 /** Requires the /api/dev named-agent secret middleware as well as this fixture scope. */
 export async function knowledgeFixtures(c: Context<AppEnv>) {
@@ -27,7 +29,7 @@ export async function knowledgeFixtures(c: Context<AppEnv>) {
   const store = db(c.env.DB);
   const repo = await store
     .selectFrom("repos as r")
-    .innerJoin("accounts as a", "a.id", "r.owner_id")
+    .innerJoin("spaces as a", "a.id", "r.space_id")
     .select("r.id")
     .where("a.slug", "=", "orbit")
     .where("r.name", "=", input.repo.split("/")[1]!)
@@ -79,7 +81,15 @@ export async function knowledgeFixtures(c: Context<AppEnv>) {
       .returning("id")
       .execute();
     if (!removed.length) return fail(c, 409, "Generated landing notes required.");
-    await notifyReleaseNotes(c.env, repo.id);
+    const actor = await findUserById(c.env.DB, "acc_marco");
+    if (!actor) return fail(c, 404, "Fixture person missing.");
+    const token = await issueToken(c.env.DB, actor.id, "release-fixture", "write", {
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    });
+    await notifyReleaseNotes(c.env, repo.id, {
+      ...actor,
+      credential: { kind: "token", id: token.id },
+    });
     return c.json({ removed: removed.length, receiptId: receipt.id });
   }
   const barrier = await c.env.DB.prepare(
@@ -112,6 +122,7 @@ export async function knowledgeFixtures(c: Context<AppEnv>) {
   return c.json({
     barrier,
     workflow: workflow?.status ?? null,
+    error: workflow?.error ?? null,
     outcome: typeof outcome === "string" ? outcome : null,
     commit: typeof commit === "string" ? commit : null,
     roots: roots.map((root) => root.commit_oid),

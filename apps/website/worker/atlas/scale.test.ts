@@ -14,7 +14,7 @@
 import { gzipSync } from "node:zlib";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, describe, expect, test, vi } from "vite-plus/test";
 import {
   ATLAS_OVERVIEW_MAX_BYTES,
   ATLAS_OVERVIEW_REGIONS,
@@ -25,7 +25,8 @@ import {
 } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlasPass, storeGraph, syntheticRepo } from "../testing/atlas-repo.ts";
 import { atlas } from "./api.ts";
 import { clearCompositionCache } from "./compose.ts";
@@ -33,7 +34,14 @@ import { repoScope } from "./projection.ts";
 import { workspaceAtlas } from "./workspace.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -75,16 +83,31 @@ function recording(sqlite: DatabaseSync) {
 
 /** `count` repositories of `files` files each, built and projected the way a Knowledge build does. */
 async function world(files: number, count = 1) {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(
-    `INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann')`,
+    `INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+  `,
   );
   const build = d1(sqlite);
   const names = Array.from({ length: count }, (_, i) => `r${i}`);
   for (const [i, name] of names.entries()) {
     sqlite
       .prepare(
-        `INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+        `INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
          VALUES (?, 'ann', ?, 'private', ?, '')`,
       )
       .run(`id_${name}`, name, `a-${name}`);
@@ -93,6 +116,7 @@ async function world(files: number, count = 1) {
   }
   const { db, log } = recording(sqlite);
   const env = {
+    ...fresh.env,
     DB: db,
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
   } as unknown as Env;
@@ -101,8 +125,8 @@ async function world(files: number, count = 1) {
     c.set("actor", ann);
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
-  app.route("/api/accounts/:owner/atlas", workspaceAtlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
+  app.route("/api/spaces/:space/atlas", workspaceAtlas);
   /** A request: its body, and the round trips and statements it made. */
   const call = async (path: string) => {
     // Worlds share repository ids: never one's composition in another.
@@ -199,7 +223,7 @@ describe("Atlas scale gates", () => {
       const perRoute = async (files: number, count: number) => {
         const w = await world(files, count);
         const repos = `repos=${w.names.join(",")}`;
-        const base = `/api/accounts/ann/atlas`;
+        const base = `/api/spaces/ann/atlas`;
         const overview = JSON.parse(
           (await w.call(`${base}/overview?${repos}`)).text,
         ) as AtlasWorkspaceOverview;
@@ -236,7 +260,7 @@ describe("Atlas scale gates", () => {
       const paths = [
         ...Object.values(await routes(w)),
         ...["overview", "regions?limit=100", "catalogue?q=topic", "composition"].map(
-          (r) => `/api/accounts/ann/atlas/${r}${r.includes("?") ? "&" : "?"}repos=r0,r1`,
+          (r) => `/api/spaces/ann/atlas/${r}${r.includes("?") ? "&" : "?"}repos=r0,r1`,
         ),
       ];
       const scans = new Set<string>();

@@ -1,6 +1,8 @@
 // The assistant calls Gitmatrix's own JSON API, in-process, with its agent
 // token: the same routes, permission checks and attribution as `gm` or the web.
 
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
+
 export interface ApiResult {
   status: number;
   ok: boolean;
@@ -13,7 +15,7 @@ type Fetch = (request: Request, env: Env, ctx: ExecutionContext) => Response | P
 export function allowedPath(path: string): string | null {
   if (!path.startsWith("/")) path = `/${path}`;
   if (path.startsWith("/api/")) path = path.slice(4);
-  if (/[\s#]|\.\.|\/\//.test(path)) return "Paths are plain /api routes, like /repos/owner/name.";
+  if (/[\s#]|\.\.|\/\//.test(path)) return "Paths are plain /api routes, like /repos/space/name.";
   // Credentials and identity are a person's to manage (the API refuses agents
   // anyway); dev endpoints and the CI runner protocol aren't for conversation.
   if (
@@ -45,6 +47,7 @@ export function apiClient(
         headers: {
           authorization: `Bearer ${await token()}`,
           "X-Gitmatrix-Source": "assistant",
+          [CONTENT_CONTRACT_HEADER]: String(CONTENT_CONTRACT_VERSION),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -63,4 +66,4 @@ export function apiClient(
   };
 }
 
-export type CallApi = ReturnType<typeof apiClient>;
+export type CallApi = (method: string, path: string, body?: unknown) => Promise<ApiResult>;

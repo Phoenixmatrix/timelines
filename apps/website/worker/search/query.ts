@@ -28,7 +28,7 @@ export function parseQuery(raw: string | undefined): SearchQuery | string {
 
 /** Where a page starts. Cursors are opaque to clients and bound to one query and category. */
 interface Cursor {
-  v: 1;
+  v: 4;
   c: SearchCategory;
   q: string;
   o: number;
@@ -47,7 +47,7 @@ function unbase64url(encoded: string): string {
 
 export function encodeCursor(category: SearchCategory, query: SearchQuery, offset: number): string {
   return base64url(
-    JSON.stringify({ v: 1, c: category, q: query.text, o: offset } satisfies Cursor),
+    JSON.stringify({ v: 4, c: category, q: query.text, o: offset } satisfies Cursor),
   );
 }
 
@@ -64,7 +64,7 @@ export function decodeCursor(
     return null;
   }
   const { v, c, q, o } = cursor;
-  if (v !== 1 || c !== category || q !== query.text) return null;
+  if (v !== 4 || c !== category || q !== query.text) return null;
   if (!Number.isInteger(o) || o! <= 0 || o! >= SEARCH_LIMITS.maxOffset) return null;
   return o!;
 }

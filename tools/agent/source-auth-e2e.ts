@@ -58,6 +58,7 @@ export async function runSourceAuthE2E(
     const response = await fetch(`${ctx.origin}${path}`, {
       method,
       headers: {
+        "X-Gitmatrix-Content-Version": "4",
         ...(credential ? { authorization: `Bearer ${credential}` } : {}),
         "content-type": "application/json",
       },
@@ -186,7 +187,7 @@ export async function runSourceAuthE2E(
   };
   const make = async (visibility: "private" | "public") => {
     const name = `${prefix}-${visibility}`;
-    await cli(["repo", "create", name, "--owner", "sam"], "sam", root);
+    await cli(["repo", "create", name, "--space", "sam"], "sam", root);
     const f: Fixture = {
       repo: `sam/${name}`,
       name,
@@ -227,7 +228,7 @@ export async function runSourceAuthE2E(
     const result = await json<{ repoId: string }>(
       "/api/dev/source-auth",
       "POST",
-      { repo: f.repo, owner, name },
+      { repo: f.repo, space: owner, name },
       [200],
       secret,
     );
@@ -275,7 +276,7 @@ export async function runSourceAuthE2E(
     const checkout = join(root, "sam");
     await cli(["clone", privateRepo.repo, checkout], "sam", root);
     await configure(checkout);
-    await cli(["timeline", "use", a.slug, "--owner", "sam"], "sam", checkout);
+    await cli(["timeline", "use", a.slug, "--space", "sam"], "sam", checkout);
     await writeFile(join(checkout, "gm-work.txt"), "only timeline A\n");
     await cli(["commit", "-m", "Auth gm source A"], "sam", checkout);
     await cli(["push"], "sam", checkout);
@@ -319,17 +320,17 @@ export async function runSourceAuthE2E(
     assert.notEqual(merged, nativeHead);
     assert.equal(await tip(privateRepo), canonicalHead);
     assert.equal(await tip(privateRepo, b.sourceId), privateRepo.base);
-    await cli(["timeline", "use", b.slug, "--owner", "sam"], "sam", checkout);
+    await cli(["timeline", "use", b.slug, "--space", "sam"], "sam", checkout);
     assert.equal(
       await git(["rev-parse", `refs/remotes/gm-work/timeline/${b.slug}`], checkout),
       privateRepo.base,
     );
-    await cli(["timeline", "use", "main", "--owner", "sam"], "sam", checkout);
+    await cli(["timeline", "use", "main", "--space", "sam"], "sam", checkout);
     // Unbound canonical checkout is independent of any work history retained locally.
     const unbound = join(root, "unbound");
     await cli(["clone", privateRepo.repo, unbound], "sam", root);
-    await cli(["timeline", "use", b.slug, "--owner", "sam"], "sam", unbound);
-    await cli(["timeline", "use", "main", "--owner", "sam"], "sam", unbound);
+    await cli(["timeline", "use", b.slug, "--space", "sam"], "sam", unbound);
+    await cli(["timeline", "use", "main", "--space", "sam"], "sam", unbound);
     await writeFile(join(unbound, "unbound.txt"), "explicit canonical selection\n");
     await cli(["commit", "-m", "Auth unbound canonical"], "jun", unbound);
     await cli(["push"], "jun", unbound);
@@ -361,7 +362,7 @@ export async function runSourceAuthE2E(
     await json(api(publicRepo), "PATCH", { visibility: "public" });
     await json(`${api(publicRepo)}?source=${publicWork.sourceId}`, "GET", undefined, [200], null);
 
-    await cli(["timeline", "use", a.slug, "--owner", "sam"], "sam", checkout);
+    await cli(["timeline", "use", a.slug, "--space", "sam"], "sam", checkout);
     // Uncheckpointed revisions and their context outlive an amend and a force reset.
     const contextFile = join(root, "retained-context.md");
     await writeFile(contextFile, "## Why\nPreserve the original uncheckpointed rationale.\n");
@@ -546,7 +547,7 @@ export async function runSourceAuthE2E(
     await identity(privateRepo, "sam", originalName);
     assert.equal(await tip(privateRepo, b.sourceId), renamedHead);
     assert.equal(await tip(privateRepo), unboundHead);
-    await cli(["timeline", "use", b.slug, "--owner", "sam"], "sam", checkout);
+    await cli(["timeline", "use", b.slug, "--space", "sam"], "sam", checkout);
     record({
       renamePreservedRepoId: privateRepo.id,
       transferFailedClosedWithoutTrackerMigration: true,

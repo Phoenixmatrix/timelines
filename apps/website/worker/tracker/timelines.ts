@@ -36,6 +36,7 @@ import { fail, text, type Access } from "./store.ts";
 import { RETENTION_TABLES, removedMessage, tombstone } from "./retention.ts";
 import type { WorkSourceRow, WorkSourceInput } from "../timelines/sources.ts";
 import type { SourceSnapshot } from "../../shared/code-source.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
 
 function sameSnapshot(a: SourceSnapshot | undefined, b: SourceSnapshot | undefined): boolean {
   return (
@@ -108,6 +109,7 @@ export type WithdrawRequests = (ids: string[], reason: string, actorId: string |
 
 /** How a landing is being queued (CORE-77), as the Worker found things. */
 export interface LandingRequest {
+  authority: WorkAuthority;
   trigger: Landing["trigger"];
   /**
    * For an `auto` timeline: whether the head checkpoint is green (its CI runs
@@ -130,7 +132,7 @@ const OID = /^[0-9a-f]{40}$/;
 
 /** What one push did to timelines, worked out from the push log (timelines/merges.ts). */
 export interface PushActivity {
-  repo: { id: string; owner: string; name: string };
+  repo: { id: string; spaceId: string; space: string; name: string };
   /** Who pushed: an agent's id, or the person's; and the person. */
   actorId: string | null;
   accountableId: string | null;
@@ -149,6 +151,7 @@ export interface PushActivity {
 }
 
 export interface SourcePush {
+  authority: WorkAuthority;
   operationId: string;
   timelineId: string;
   repoId: string;
@@ -172,6 +175,7 @@ export interface SourcePush {
 }
 
 export interface SourcePushRecovery {
+  authority: WorkAuthority;
   id: string;
   base: string;
   tree: string;
@@ -287,8 +291,18 @@ export class TimelineStore {
       ).map((row) => JSON.parse(row.data) as WorkSourceRow);
     });
   }
-  reserveWorkSource(repo: { id: string; owner_id: string }, input: WorkSourceInput): WorkSourceRow {
+  reserveWorkSource(repo: { id: string; space_id: string }, input: WorkSourceInput): WorkSourceRow {
     return this.transaction(() => {
+      if (
+        input.authority.spaceId !== repo.space_id ||
+        input.base.repoId !== repo.id ||
+        (input.initialHead && input.initialHead.repoId !== repo.id)
+      )
+        fail(
+          "invalid_source",
+          "Source allocation must belong to its authorized Space and repository.",
+          409,
+        );
       this.assertCreationOpen(input.timelineId);
       const found = first(
         this.sql,
@@ -303,7 +317,8 @@ export class TimelineStore {
       const row: WorkSourceRow = {
         source_id: `work_${crypto.randomUUID()}`,
         repo_id: repo.id,
-        owner_id: repo.owner_id,
+        space_id: repo.space_id,
+        authority: JSON.stringify(input.authority),
         timeline_id: input.timelineId,
         timeline_slug: input.timelineSlug,
         artifacts_name: `w-${crypto.randomUUID().replaceAll("-", "")}`,
@@ -513,6 +528,11 @@ export class TimelineStore {
   }
   beginSourcePush(input: SourcePush, projecting = false): { operationId: string } {
     return this.transaction(() => {
+      if (
+        input.accountableId !== input.authority.personId ||
+        input.actorId !== (input.authority.agentId ?? input.authority.personId)
+      )
+        fail("forbidden", "Source operation attribution does not match its authority.", 403);
       const existing = first(
         this.sql,
         tracker
@@ -605,7 +625,28 @@ export class TimelineStore {
         !timeline.repos.some((repo) => repo.id === repoId && repo.source?.sourceId === sourceId)
       )
         fail("source_expired", "Recovery requires the active owned source.", 409);
-      if (operation.recovery) return operation;
+      if (operation.recovery) {
+        const saved = operation.recovery;
+        if (
+          saved.id !== intent.id ||
+          saved.base !== intent.base ||
+          saved.tree !== intent.tree ||
+          saved.commit !== intent.commit ||
+          saved.content !== intent.content ||
+          saved.actorId !== intent.actorId ||
+          saved.accountableId !== intent.accountableId ||
+          saved.createdAt !== intent.createdAt ||
+          JSON.stringify(saved.authority) !== JSON.stringify(intent.authority)
+        )
+          fail("recovery_conflict", "Recovery identity and authority cannot be replaced.", 409);
+        return operation;
+      }
+      if (
+        intent.authority.spaceId !== source.space_id ||
+        intent.actorId !== (intent.authority.agentId ?? intent.authority.personId) ||
+        intent.accountableId !== intent.authority.personId
+      )
+        fail("forbidden", "Recovery attribution does not match its authorized Space.", 403);
       if (operation.state === "projecting")
         fail("source_busy", "Admission must be reconciled before recovery.", 409);
       const [command] = operation.commands;
@@ -1093,7 +1134,7 @@ export class TimelineStore {
       if (!input.repos.length) fail("invalid_input", "A timeline touches at least one repository.");
       for (const repo of input.repos)
         if (!/^[0-9a-f]{40}$/.test(input.commits[repo.id] ?? ""))
-          fail("invalid_input", `No fork commit for ${repo.owner}/${repo.name}.`);
+          fail("invalid_input", `No fork commit for ${repo.space}/${repo.name}.`);
       if (input.id) {
         this.assertCreationOpen(input.id);
         const reservation = first(
@@ -1640,7 +1681,7 @@ export class TimelineStore {
             409,
           );
         if (!OID.test(repo.commit) || (repo.base !== null && !OID.test(repo.base)))
-          fail("invalid_input", `Commits for ${repo.owner}/${repo.name} must be full commit ids.`);
+          fail("invalid_input", `Commits for ${repo.space}/${repo.name} must be full commit ids.`);
         if (repo.changes.length > CHECKPOINT_CHANGES)
           fail("invalid_input", `At most ${CHECKPOINT_CHANGES} changes per repository.`);
       }
@@ -1687,7 +1728,7 @@ export class TimelineStore {
         number: (previous?.number ?? 0) + 1,
         repos: input.repos.map((repo) => ({
           id: repo.id,
-          owner: repo.owner,
+          space: repo.space,
           name: repo.name,
           commit: repo.commit,
           base: repo.base,
@@ -1774,7 +1815,7 @@ export class TimelineStore {
    * approval event; the caller settles the status once the request is saved.
    */
   answerApproval(
-    access: Access,
+    access: Pick<Access, "actorId" | "principalId">,
     request: HumanRequest,
     approved: boolean,
     note: string | null,
@@ -1788,7 +1829,7 @@ export class TimelineStore {
       if (!writableRepoIds?.includes(repo.id))
         fail(
           "forbidden",
-          `Approving a checkpoint needs write access to ${repo.owner}/${repo.name}.`,
+          `Approving a checkpoint needs write access to ${repo.space}/${repo.name}.`,
           403,
         );
     const timeline = this.byId(checkpoint.timelineId);
@@ -2001,6 +2042,16 @@ export class TimelineStore {
     request: LandingRequest,
   ): { landing: Landing; queued: boolean } {
     return this.transaction(() => {
+      if (
+        request.authority.spaceId !== access.spaceId ||
+        request.authority.migrationEpoch !== access.migrationEpoch ||
+        request.authority.personId !== access.principalId ||
+        request.authority.agentId !== access.agentId ||
+        request.agentId !== access.agentId ||
+        request.authority.credential.kind !== access.credential?.kind ||
+        request.authority.credential.id !== access.credential?.id
+      )
+        fail("forbidden", "Landing authority does not match current Tracker access.", 403);
       const timeline = this.get(slug);
       if (timeline.migrationState === "frozen" || timeline.repos.some((repo) => !repo.source))
         fail("migration_required", "Migrate the legacy timeline before landing.", 409);
@@ -2093,6 +2144,7 @@ export class TimelineStore {
           ]),
       );
       const landing: Landing = {
+        authority: request.authority,
         id: retry?.id ?? `ld_${crypto.randomUUID()}`,
         timelineId: timeline.id,
         slug: timeline.slug,
@@ -2103,7 +2155,7 @@ export class TimelineStore {
           (repo): LandingRepo =>
             advanced.get(repo.id) ?? {
               id: repo.id,
-              owner: repo.owner,
+              space: repo.space,
               name: repo.name,
               commit: repo.commit,
               source: repo.source,
@@ -2188,6 +2240,7 @@ export class TimelineStore {
         checkpointId: current.checkpointId,
         checkpointNumber: current.checkpointNumber,
         trigger: current.trigger,
+        authority: current.authority,
         requestedBy: current.requestedBy,
         createdAt: current.createdAt,
         version: current.version + 1,
@@ -2214,6 +2267,36 @@ export class TimelineStore {
       if (outcome) this.landingEvent(saved, outcome, saved.reason);
       if (timeline.status !== "abandoned") this.landingStatus(timeline, saved, actorId);
       return saved;
+    });
+  }
+  /** Finalize only already-persisted effects; the RPC verifies D1 integration receipts. */
+  saveLandingForSettlement(
+    scope: { spaceId: string; landingId: string },
+    next: Landing,
+    expectedVersion: number,
+  ): Landing {
+    return this.transaction(() => {
+      const current = this.landingById(scope.landingId);
+      if (
+        (current.authority && current.authority.spaceId !== scope.spaceId) ||
+        next.id !== current.id ||
+        next.timelineId !== current.timelineId ||
+        next.checkpointId !== current.checkpointId ||
+        next.state !== "landed" ||
+        !current.repos.length ||
+        current.repos.some((repo) => repo.state !== "advanced") ||
+        JSON.stringify(next.repos) !== JSON.stringify(current.repos)
+      )
+        fail(
+          "invalid_settlement",
+          "Landing settlement must preserve proven repository effects.",
+          409,
+        );
+      return this.saveLanding(
+        { ...current, state: "landed", reason: next.reason },
+        expectedVersion,
+        current.requestedBy.actorId,
+      );
     });
   }
   private landingEvent(landing: Landing, outcome: LandingOutcome, note: string | null) {

@@ -60,6 +60,7 @@ async function setup() {
   await server.push("orbit/engine", "main", head);
   cannedFiles(server, head);
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: "jump-fixtures",
     mutations: [
       {
@@ -101,7 +102,7 @@ async function setup() {
     "INSERT INTO versions (id, package_id, version, created_at) VALUES ('v120', ?, '1.2.0', '2026-10-03T00:00:00Z')",
     pkg!.id,
   );
-  server.on("GET", "/api/repos/:owner/:name/ci/runs/:number", ({ params }) =>
+  server.on("GET", "/api/repos/:space/:name/ci/runs/:number", ({ params }) =>
     params.number === "7"
       ? ({
           id: "run7",
@@ -125,7 +126,7 @@ async function setup() {
         } satisfies CiRunDetail)
       : reply({ error: "No such run." }, 404),
   );
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ params }) =>
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", ({ params }) =>
     params.oid === head
       ? ({
           oid: head,
@@ -216,7 +217,7 @@ test("Cmd-K jumps straight to an issue key, a run, a SHA, pkg@version and a time
   );
 
   await expect
-    .poll(() => localStorage.getItem("gitmatrix:recent-places:acc_marco") ?? "")
+    .poll(() => localStorage.getItem("gitmatrix:recent-places:v4:acc_marco") ?? "")
     .toContain("Fast search");
 
   // With nothing typed, the places just visited come first, newest first.

@@ -49,11 +49,11 @@ pub enum RequestCommand {
     Cancel { id: String },
 }
 #[derive(Args)]
-pub struct WorkspaceArgs {
+pub struct ProjectArgs {
     #[command(flatten)]
     pub scope: Scope,
     #[command(subcommand)]
-    pub command: WorkspaceCommand,
+    pub command: ProjectCommand,
 }
 #[derive(Args)]
 pub struct IssueArgs {
@@ -64,9 +64,9 @@ pub struct IssueArgs {
 }
 #[derive(Args)]
 pub struct Scope {
-    /// Tracker account/organization slug; otherwise use saved tracker context.
+    /// Immutable global Space handle; otherwise use saved tracker context.
     #[arg(long, global = true)]
-    pub owner: Option<String>,
+    pub space: Option<String>,
     /// Use only this private SQLite replica. Never automatically falls back offline.
     #[arg(long, global = true)]
     pub offline: bool,
@@ -92,7 +92,7 @@ pub enum TrackerCommand {
     /// List trackers visible to the authenticated account (online only).
     List,
     /// Select a tracker and initialize its authenticated offline replica.
-    Use { owner: String },
+    Use { space: String },
     /// Replay ordered durable operations, then pull the cursor feed.
     Sync,
     /// Show replica cursor, pending operations and identity.
@@ -114,10 +114,16 @@ pub enum TrackerCommand {
     },
     /// Recover an old credential partition's outbox after verifying the same server identity.
     Recover { replica: PathBuf },
+    /// Losslessly export a fenced replica and its queued operations without selecting a tracker.
+    Export {
+        replica: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
 }
 #[derive(Args)]
 pub struct EntityCreate {
-    /// Immutable team key or workspace slug.
+    /// Immutable team key or project slug.
     pub key: String,
     #[arg(long)]
     pub name: String,
@@ -126,10 +132,10 @@ pub struct EntityCreate {
 }
 #[derive(Args)]
 pub struct Patch {
-    /// Canonical ID, team key or workspace slug.
+    /// Canonical ID, team key or project slug.
     pub id: String,
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file.
-    /// Team fields: name, description, memberIds and archived. Workspace fields:
+    /// Team fields: name, description, memberIds and archived. Project fields:
     /// name, description and archived. Member IDs are canonical.
     #[arg(long)]
     pub data: String,
@@ -144,16 +150,16 @@ pub enum TeamCommand {
     Update(Patch),
 }
 #[derive(Subcommand)]
-pub enum WorkspaceCommand {
-    /// List cross-team workspaces.
+pub enum ProjectCommand {
+    /// List cross-team projects.
     List,
-    /// Create a workspace with an immutable slug.
+    /// Create a project with an immutable slug.
     Create(EntityCreate),
     /// Update name, description or archived with version checking.
     Update(Patch),
-    /// Associate an authorized repository ID with a workspace; grants no membership.
+    /// Associate an authorized same-Space repository ID with a project; grants no membership.
     Subscribe {
-        workspace: String,
+        project: String,
         #[arg(long)]
         repo: String,
     },
@@ -195,7 +201,7 @@ pub struct IssueCreate {
     #[arg(long)]
     pub assignee: Option<String>,
     #[arg(long)]
-    pub workspace: Vec<String>,
+    pub project: Vec<String>,
     /// Work-area tag from the tracker's tag catalog; repeat for each area (e.g. --tag ux
     /// --tag frontend). `gm issue tags` lists the catalog; a new name is added to it.
     /// Tags describe the issue and do not restrict claims; --requires says which agents
@@ -235,7 +241,7 @@ pub struct IssuePatch {
     pub id: String,
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file:
     /// title, description, acceptance, type, status, closeReason, timelineUse,
-    /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds, tags
+    /// timelinePolicy, priority (0–4), assigneeId, parentId, projectIds, tags
     /// (the whole list; `labels` is its old name), pickup and requires (an object,
     /// or null; --requires writes it from terms).
     /// Relationships use canonical IDs; null clears assigneeId/parentId.
@@ -259,7 +265,7 @@ pub struct IssuePatch {
     #[arg(long)]
     pub require_issue_tags: bool,
     /// When new requirements no longer allow the agent holding the issue, release
-    /// its claim instead of keeping it (tracker owners and the agent's person).
+    /// its claim instead of keeping it (Space admins and the agent's person).
     /// Either way gm prints who's affected and the issue records it.
     #[arg(long)]
     pub release_claim: bool,
@@ -280,7 +286,7 @@ pub struct ListIssues {
     #[arg(long)]
     pub all_teams: bool,
     #[arg(long)]
-    pub workspace: Option<String>,
+    pub project: Option<String>,
     #[arg(long)]
     pub status: Option<String>,
     /// Filter by issue type, including automatic queue remediation.
@@ -390,7 +396,7 @@ pub enum IssueCommand {
         ttl: Option<u32>,
         #[command(flatten)]
         delegation: Delegation,
-        /// Take over someone else's active claim (tracker owners, as themselves). Their token stops working; the takeover is noted on the issue.
+        /// Take over someone else's active claim (Space admins, as themselves). Their token stops working; the takeover is noted on the issue.
         #[arg(long)]
         force: bool,
     },
@@ -405,7 +411,7 @@ pub enum IssueCommand {
         /// For a decision: an option (repeat for each).
         #[arg(long = "choice")]
         choices: Vec<String>,
-        /// For a credential: the secret to store the answer as, owner/repo:NAME.
+        /// For a credential: the secret to store the answer as, space/repo:NAME.
         #[arg(long)]
         secret: Option<String>,
         /// Ask this member (slug) instead of your accountable person.
@@ -467,7 +473,7 @@ pub enum IssueCommand {
         #[arg(long)]
         all_teams: bool,
         #[arg(long)]
-        workspace: Option<String>,
+        project: Option<String>,
         /// Only work under this issue (a project or other parent).
         #[arg(long)]
         under: Option<String>,
@@ -494,7 +500,7 @@ pub enum IssueCommand {
     Release {
         #[command(flatten)]
         lease: Lease,
-        /// End someone else's claim without its token (tracker owners, as themselves); noted on the issue, not counted as their failure.
+        /// End someone else's claim without its token (Space admins, as themselves); noted on the issue, not counted as their failure.
         #[arg(long)]
         force: bool,
     },
@@ -509,15 +515,15 @@ pub enum IssueCommand {
     /// Queue one atomic mutation array (max 100). Create referenced IDs before using them; '-' reads stdin, '@path' reads a file.
     Batch {
         /// JSON array of {kind,id,expectedVersion?,data?}; use canonical IDs.
-        /// Kinds: team.create/update, workspace.create/update, issue.create/update,
+        /// Kinds: team.create/update, project.create/update, issue.create/update,
         /// link.add/remove, comment.add, subscription.add/remove. Lease operations
         /// are online-only and cannot be queued.
-        /// Create data: team {key,name,description?,memberIds?}; workspace
+        /// Create data: team {key,name,description?,memberIds?}; project
         /// {slug,name,description?}; issue {teamId,title,...issue update fields}.
         /// Updates use the fields documented by `gm schema issue update`.
         /// link.add data: {fromId,toId,kind:blocks|related|duplicates}.
         /// comment.add data: {issueId,body,kind:comment|checkpoint|evidence}.
-        /// subscription.add data: {workspaceId,repoId}. Removes need only kind/id.
+        /// subscription.add data: {projectId,repoId}. Removes need only kind/id.
         /// Updates require expectedVersion. Referenced creates must appear earlier.
         data: String,
     },

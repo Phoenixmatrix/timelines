@@ -12,10 +12,10 @@ export interface HarnessContext {
 export type Persona = "priya" | "marco" | "jun" | "sam";
 
 export interface SeedManifest {
-  version: 1;
+  version: 4;
   origin: string;
   tokens: Record<Persona, string>;
   readToken: string;
-  repos: { owner: string; name: string; visibility: "public" | "private" }[];
-  tracker: { owner: string; team: string; ready: string; blocked: string; blocker: string };
+  repos: { space: string; name: string; visibility: "public" | "private" }[];
+  tracker: { space: string; team: string; ready: string; blocked: string; blocker: string };
 }

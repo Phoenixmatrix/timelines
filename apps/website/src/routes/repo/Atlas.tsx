@@ -1,6 +1,6 @@
 // The Semantic Code Atlas for a repository (CORE-168): capability territory
 // from the bounded Atlas API, never the whole graph. Since the Knowledge
-// cutover (CORE-174) it is the Knowledge tab, /:owner/:repo/knowledge (the
+// cutover (CORE-174) it is the Knowledge tab, /:space/:repo/knowledge (the
 // old /atlas address and `?node=` links redirect here), with the timeline
 // overlay, the wiki and an explicit whole-graph export around it.
 //
@@ -94,7 +94,7 @@ import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./te
 import { useMapRoutes } from "./useMapRoutes.ts";
 
 export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
-  const repo = { owner: params.owner ?? "", name: params.repo ?? "" };
+  const repo = { space: params.space ?? "", name: params.repo ?? "" };
   const url = new URL(request.url);
   // Links from the old Knowledge map named a graph node: the Atlas entity has
   // the same id.
@@ -106,7 +106,7 @@ export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
     throw redirect(`${url.pathname}${url.search}`);
   }
   const snapshot = readAtlasUrl(url.search).snapshot ?? undefined;
-  const base = `/repos/${repo.owner}/${repo.name}/knowledge`;
+  const base = `/repos/${repo.space}/${repo.name}/knowledge`;
   const quiet = <T,>(path: string, fallback: T) =>
     api<T>(path, { signal: request.signal }).catch(() => fallback);
   // Build state says whether the map is behind, rebuilding or failed; the
@@ -181,8 +181,8 @@ const NARROW = "(max-width: 1023.98px)";
 function useAtlasBase() {
   const repo = useRepo();
   return {
-    ref: { owner: repo.owner.slug, name: repo.name } satisfies AtlasRepo,
-    base: `/${repo.owner.slug}/${repo.name}/knowledge`,
+    ref: { space: repo.space.slug, name: repo.name } satisfies AtlasRepo,
+    base: `/${repo.space.slug}/${repo.name}/knowledge`,
     repo,
   };
 }
@@ -213,7 +213,7 @@ export function Atlas() {
 function useLanding(snapshot: string | null) {
   const { key } = useLocation();
   const { ref } = useAtlasBase();
-  const now: Shown = { key, scope: `${ref.owner}/${ref.name}`, snapshot };
+  const now: Shown = { key, scope: `${ref.space}/${ref.name}`, snapshot };
   const shown = useRef<Shown | null>(null);
   const place = useRef<ReaderPlace | null>(null);
   const landed = landedUnder(shown.current, now);
@@ -229,17 +229,17 @@ function useLanding(snapshot: string | null) {
  * whole view, so nothing already on screen outlives the access it was read with.
  */
 function useAccessLost() {
-  const { owner, name } = useAtlasBase().ref;
+  const { space, name } = useAtlasBase().ref;
   const revalidator = useRevalidator();
   const latest = useRef(revalidator);
   latest.current = revalidator;
   useEffect(
     () =>
-      onAtlasAccessLost({ owner, name }, () => {
+      onAtlasAccessLost({ space, name }, () => {
         // Once: the route's own reads fail the same way while it reloads.
         if (latest.current.state === "idle") void latest.current.revalidate();
       }),
-    [owner, name],
+    [space, name],
   );
 }
 
@@ -247,7 +247,7 @@ function useAccessLost() {
 function useBuildStatus(initial: KnowledgeStatus | null): KnowledgeStatus | null {
   const repo = useRepo();
   const fallback = useMemo(() => initial ?? IDLE, [initial]);
-  const status = useKnowledgeStatus(repo.owner.slug, repo.name, fallback);
+  const status = useKnowledgeStatus(repo.space.slug, repo.name, fallback);
   return initial ? status : null;
 }
 const IDLE = { state: "empty" } as KnowledgeStatus;
@@ -325,7 +325,7 @@ function Territory({
   // Where the reader was when this snapshot landed under them, if it did:
   // read once mounted, after the view this one replaces has said.
   const arrival = () =>
-    landed && place.current?.scope === `${ref.owner}/${ref.name}` ? place.current : null;
+    landed && place.current?.scope === `${ref.space}/${ref.name}` ? place.current : null;
   const [params, setParams] = useLiveSearchParams();
   const url = readAtlasUrl(params);
   const timeline = scopeOf(params);
@@ -463,8 +463,8 @@ function Territory({
     return null;
   }, [focus, territory]);
   const reader = useMemo(
-    () => repoReader({ owner: ref.owner, name: ref.name }),
-    [ref.owner, ref.name],
+    () => repoReader({ space: ref.space, name: ref.name }),
+    [ref.space, ref.name],
   );
 
   // ---- a pinned snapshot that stopped being readable mid-view --------------------
@@ -572,7 +572,7 @@ function Territory({
         Boolean(active && box.current?.contains(active));
       const outline = outlinePlace.current;
       place.current = {
-        scope: `${ref.owner}/${ref.name}`,
+        scope: `${ref.space}/${ref.name}`,
         outline: outline && { ...outline, focused: inside(tree) },
         inspector: inside(inspectorBox),
         other:
@@ -603,7 +603,7 @@ function Territory({
   const outline = (
     <AtlasOutline
       treeRef={tree}
-      label={`Outline of ${ref.owner}/${ref.name}`}
+      label={`Outline of ${ref.space}/${ref.name}`}
       roots={roots}
       rootsMore={catalogue.next !== null}
       rootsCount={overview.totalRegions}
@@ -714,7 +714,7 @@ function Territory({
         <SnapshotLine overview={overview} pinned={url.snapshot !== null} />
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Link
-            to={`/${encodeURIComponent(ref.owner)}/-/atlas?repos=${encodeURIComponent(ref.name)}`}
+            to={`/${encodeURIComponent(ref.space)}/-/atlas?repos=${encodeURIComponent(ref.name)}`}
             className="mk-btn mk-btn--ghost mk-btn--sm pointer-coarse:min-h-11"
           >
             Across repositories
@@ -1045,7 +1045,7 @@ function Lookup({
             onClick={() =>
               palette.open({
                 repo: {
-                  owner: repo.owner.slug,
+                  space: repo.space.slug,
                   name: repo.name,
                   defaultBranch: repo.defaultBranch,
                 },
@@ -1055,7 +1055,7 @@ function Lookup({
               })
             }
           >
-            <MagnifyingGlassIcon aria-hidden /> Search code and wiki in {repo.owner.slug}/
+            <MagnifyingGlassIcon aria-hidden /> Search code and wiki in {repo.space.slug}/
             {repo.name}
           </button>
           <p className="m-0 text-micro text-ink-faint">

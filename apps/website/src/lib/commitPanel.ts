@@ -1,6 +1,6 @@
 // The commit side panel's address (CORE-22): any repository page with
 // `?commit=<sha>` opens the panel for that commit over the page, and closing
-// it leaves the page as it was. Outside a repository, `/<owner>/<repo>?commit=`
+// it leaves the page as it was. Outside a repository, `/<space>/<repo>?commit=`
 // opens the repository with the panel. Other features link SHAs this way.
 
 import { useCallback } from "react";
@@ -22,8 +22,8 @@ export function isShaLike(text: string): boolean {
 }
 
 /** The repository page with the panel open: the link for SHAs outside the repository's pages. */
-export function commitPanelUrl(owner: string, name: string, sha: string): string {
-  return `/${owner}/${name}?${COMMIT_PARAM}=${encodeURIComponent(sha.toLowerCase())}`;
+export function commitPanelUrl(space: string, name: string, sha: string): string {
+  return `/${space}/${name}?${COMMIT_PARAM}=${encodeURIComponent(sha.toLowerCase())}`;
 }
 
 /** The address `location` is at, with the panel open on `sha` (or closed, for null). */
@@ -35,9 +35,9 @@ export function withCommit(location: Pick<Location, "pathname" | "search">, sha:
   return `${location.pathname}${search ? `?${search}` : ""}`;
 }
 
-/** Whether `pathname` is one of `owner/name`'s pages, so the panel opens over it. */
-export function inRepo(pathname: string, owner: string, name: string): boolean {
-  const base = `/${owner}/${name}`.toLowerCase();
+/** Whether `pathname` is one of `space/name`'s pages, so the panel opens over it. */
+export function inRepo(pathname: string, space: string, name: string): boolean {
+  const base = `/${space}/${name}`.toLowerCase();
   const path = pathname.toLowerCase();
   return path === base || path.startsWith(`${base}/`);
 }
@@ -63,15 +63,15 @@ export interface CommitHref {
   state: CommitPanelState | undefined;
 }
 
-/** The link for a commit of `owner/name` from the current page. */
+/** The link for a commit of `space/name` from the current page. */
 export function commitHref(
   location: Pick<Location, "pathname" | "search" | "state">,
-  owner: string,
+  space: string,
   name: string,
   sha: string,
 ): CommitHref {
-  if (!inRepo(location.pathname, owner, name))
-    return { to: commitPanelUrl(owner, name, sha), state: undefined };
+  if (!inRepo(location.pathname, space, name))
+    return { to: commitPanelUrl(space, name, sha), state: undefined };
   return {
     to: withCommit(location, sha),
     state: { commitPanelDepth: panelDepth(location.state) + 1 },
@@ -82,7 +82,7 @@ export function commitHref(
 export function useCommitHref() {
   const location = useLocation();
   return useCallback(
-    (owner: string, name: string, sha: string) => commitHref(location, owner, name, sha),
+    (space: string, name: string, sha: string) => commitHref(location, space, name, sha),
     [location],
   );
 }

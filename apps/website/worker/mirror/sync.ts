@@ -10,6 +10,7 @@ import { upstreamToken } from "../artifacts.ts";
 import { lsRefsRequest, parseLsRefs } from "../git/pktline.ts";
 import { productionOnly } from "../preview.ts";
 import { db, nowIso } from "../schema.ts";
+import { resolveWorkAuthority, type WorkAuthority } from "../ci/admission.ts";
 import {
   fetchRequest,
   needsPack,
@@ -133,11 +134,12 @@ function pushBody(commands: Uint8Array, pack: AsyncGenerator<Uint8Array> | null)
  * Push the source's default branch and tags to the target. Throws MirrorError
  * with a readable reason.
  */
-export async function mirrorRepository(
+async function mirrorRepository(
   env: Env,
   source: { artifactsName: string; remote: string; defaultBranch: string },
   target: Target,
   prune: boolean,
+  authorize: () => Promise<unknown>,
 ): Promise<{ updates: RefUpdate[]; head: string | null }> {
   const [from, to] = await Promise.all([
     sourceRefs(env, source.artifactsName, source.remote),
@@ -174,6 +176,7 @@ export async function mirrorRepository(
     pack = packFromFetchResponse(fetched.body);
   }
 
+  await authorize();
   const sideband = to.capabilities.has("side-band-64k");
   const pushed = await fetch(`${target.url}/git-receive-pack`, {
     method: "POST",
@@ -207,9 +210,14 @@ export async function mirrorRepository(
  * Sync one repository's mirror and record the outcome. "busy" means another
  * sync holds the lease; the caller retries later.
  */
-export async function syncMirror(env: Env, repoId: string): Promise<MirrorResult> {
+export async function syncMirror(
+  env: Env,
+  repoId: string,
+  authority: WorkAuthority,
+): Promise<MirrorResult> {
   if (!productionOnly(env, "mirror", `a mirror sync of ${repoId}`))
     throw new MirrorError("Previews don't mirror: this one never pushes anywhere.");
+  await resolveWorkAuthority(env, authority, repoId);
   const k = db(env.DB);
   const now = nowIso();
   const leased = await k
@@ -262,7 +270,9 @@ export async function syncMirror(env: Env, repoId: string): Promise<MirrorResult
       },
       { url: row.url, authorization: basic(row.username, token) },
       row.prune === 1,
+      () => resolveWorkAuthority(env, authority, repoId),
     );
+    await resolveWorkAuthority(env, authority, repoId);
     await k
       .updateTable("repo_mirrors")
       .set({

@@ -1,12 +1,20 @@
-import { describe, expect, test } from "vite-plus/test";
-import { durableStorage } from "../testing/durable.ts";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { TrackerStore, type Access } from "./store.ts";
 import { TimelineStore, type SourcePush } from "./timelines.ts";
 import type { SourceSnapshot } from "../../shared/code-source.ts";
 
 const oid = (value: number) => value.toString(16).padStart(40, "0");
-function fixture() {
-  const { sql, transactionSync } = durableStorage();
+const authority = {
+  spaceId: "org",
+  migrationEpoch: 0,
+  personId: "ann",
+  agentId: null,
+  credential: { kind: "token" as const, id: "ann-token" },
+};
+async function fixture() {
+  const { sql, transactionSync, close, scope, space } = await freshTrackerStorage();
+  onTestFinished(close);
   new TrackerStore(sql, transactionSync);
   const store = new TimelineStore(sql, transactionSync);
   const access: Access = {
@@ -15,7 +23,11 @@ function fixture() {
     agents: [],
     members: [],
     repos: [],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    credential: authority.credential,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
   };
   const base: SourceSnapshot = {
@@ -29,8 +41,8 @@ function fixture() {
   };
   const id = store.reserveTimeline(access, "work", null, "request");
   const reserved = store.reserveWorkSource(
-    { id: "repo", owner_id: "org" },
-    { timelineId: id, timelineSlug: "work", base },
+    { id: "repo", space_id: "org" },
+    { authority, timelineId: id, timelineSlug: "work", base },
   );
   const creating = store.transitionWorkSource(reserved.source_id, reserved.version, "creating");
   store.transitionWorkSource(
@@ -52,11 +64,12 @@ function fixture() {
     parent: null,
     policy: "auto",
     repos: [
-      { id: "repo", owner: "org", name: "repo", source, logicalBase: base, dependencies: [] },
+      { id: "repo", space: "org", name: "repo", source, logicalBase: base, dependencies: [] },
     ],
     commits: { repo: oid(1) },
   });
   const push: SourcePush = {
+    authority,
     operationId: "push1",
     timelineId: id,
     repoId: "repo",
@@ -70,7 +83,7 @@ function fixture() {
       repos: [
         {
           id: "repo",
-          owner: "org",
+          space: "org",
           name: "repo",
           commit: oid(2),
           base: oid(1),
@@ -85,8 +98,77 @@ function fixture() {
 }
 
 describe("owned source coordination", () => {
-  test("unacknowledged admission is recoverable without ever permitting its delayed activation", () => {
-    const f = fixture();
+  test("settlement cannot invent advances or replace immutable landing identity", async () => {
+    const f = await fixture();
+    f.store.beginSourcePush(f.push);
+    f.store.finishSourcePush(f.push.operationId, "accepted");
+    f.checkpoint();
+    const queued = f.store.beginLanding(f.access, "work", {
+      authority,
+      trigger: "request",
+      green: { ok: true, why: null },
+      agentId: null,
+    }).landing;
+    const scope = { spaceId: "org", landingId: queued.id };
+    expect(() =>
+      f.store.saveLandingForSettlement(scope, { ...queued, state: "landed" }, queued.version),
+    ).toThrow(/proven repository effects/);
+    const advanced = f.store.saveLanding(
+      {
+        ...queued,
+        state: "advancing",
+        repos: queued.repos.map((repo) => ({ ...repo, state: "advanced", merge: oid(3) })),
+      },
+      queued.version,
+      "ann",
+    );
+    expect(() =>
+      f.store.saveLandingForSettlement(
+        { ...scope, spaceId: "other" },
+        { ...advanced, state: "landed" },
+        advanced.version,
+      ),
+    ).toThrow(/proven repository effects/);
+    expect(() =>
+      f.store.saveLandingForSettlement(
+        scope,
+        {
+          ...advanced,
+          state: "landed",
+          repos: advanced.repos.map((repo) => ({ ...repo, merge: oid(4) })),
+        },
+        advanced.version,
+      ),
+    ).toThrow(/proven repository effects/);
+    const landed = f.store.saveLandingForSettlement(
+      scope,
+      { ...advanced, state: "landed" },
+      advanced.version,
+    );
+    expect(landed.state).toBe("landed");
+    expect(landed.requestedBy).toEqual(queued.requestedBy);
+    expect(landed.authority).toEqual(authority);
+  });
+
+  test("source allocation and operation provenance cannot cross Space or actor scope", async () => {
+    const f = await fixture();
+    expect(() =>
+      f.store.reserveWorkSource(
+        { id: "repo", space_id: "other" },
+        { authority, timelineId: f.timeline.id, timelineSlug: "work", base: f.base },
+      ),
+    ).toThrow(/authorized Space/);
+    expect(() =>
+      f.store.beginSourcePush({
+        ...f.push,
+        authority: { ...authority, personId: "other" },
+      }),
+    ).toThrow(/attribution/);
+    expect(f.store.sourcePushes()).toEqual([]);
+  });
+
+  test("unacknowledged admission is recoverable without ever permitting its delayed activation", async () => {
+    const f = await fixture();
     f.store.beginSourcePush(f.push, true);
     expect(f.store.sourcePushes("repo")).toMatchObject([{ state: "projecting" }]);
     expect(() => f.store.sourcePush(f.push.operationId, "different", f.source.sourceId)).toThrow(
@@ -99,15 +181,16 @@ describe("owned source coordination", () => {
     f.store.activateSourcePush("next");
     expect(f.store.sourcePush("next").state).toBe("admitted");
   });
-  test("cancellation survives restart and fences reservation, allocation, and readiness", () => {
-    const f = fixture();
-    const { sql, transactionSync } = durableStorage();
+  test("cancellation survives restart and fences reservation, allocation, and readiness", async () => {
+    const f = await fixture();
+    const { sql, transactionSync, close } = await freshTrackerStorage();
+    onTestFinished(close);
     new TrackerStore(sql, transactionSync);
     let store = new TimelineStore(sql, transactionSync);
     const id = store.reserveTimeline(f.access, "partial", null, "request");
     const allocation = store.reserveWorkSource(
-      { id: "repo", owner_id: "org" },
-      { timelineId: id, timelineSlug: "partial", base: f.base },
+      { id: "repo", space_id: "org" },
+      { authority, timelineId: id, timelineSlug: "partial", base: f.base },
     );
     const creating = store.transitionWorkSource(
       allocation.source_id,
@@ -124,8 +207,13 @@ describe("owned source coordination", () => {
     expect(() => store.reserveTimeline(f.access, "partial", null, "request")).toThrow(/cancelled/);
     expect(() =>
       store.reserveWorkSource(
-        { id: "another", owner_id: "org" },
-        { timelineId: id, timelineSlug: "partial", base: f.base },
+        { id: "another", space_id: "org" },
+        {
+          authority,
+          timelineId: id,
+          timelineSlug: "partial",
+          base: { ...f.base, repoId: "another" },
+        },
       ),
     ).toThrow(/cancelled/);
     expect(() => store.transitionWorkSource(creating.source_id, creating.version, "ready")).toThrow(
@@ -136,22 +224,28 @@ describe("owned source coordination", () => {
     expect(store.cancelReservedCreation(f.access, "partial")).toMatchObject([{ state: "purged" }]);
     expect(f.store.cancelReservedCreation(f.access, "work")).toBeNull();
   });
-  test("reservation retries retain the exact fork snapshot and owned name", () => {
-    const f = fixture();
+  test("reservation retries retain the exact fork snapshot and owned name", async () => {
+    const f = await fixture();
     expect(f.store.reserveTimeline(f.access, "work", null, "request")).toBe(f.timeline.id);
     expect(() => f.store.reserveTimeline(f.access, "work", null, "different")).toThrow(/reserved/);
     const retried = f.store.reserveWorkSource(
-      { id: "repo", owner_id: "org" },
-      { timelineId: f.timeline.id, timelineSlug: "work", base: { ...f.base, commit: oid(99) } },
+      { id: "repo", space_id: "org" },
+      {
+        authority,
+        timelineId: f.timeline.id,
+        timelineSlug: "work",
+        base: { ...f.base, commit: oid(99) },
+      },
     );
     expect(retried.artifacts_name).toBe(f.reserved.artifacts_name);
     expect(retried.fork_commit).toBe(oid(1));
   });
-  test("migration retains B separately from the initial work tip T across retry", () => {
-    const f = fixture();
+  test("migration retains B separately from the initial work tip T across retry", async () => {
+    const f = await fixture();
     const allocated = f.store.reserveWorkSource(
-      { id: "other", owner_id: "org" },
+      { id: "other", space_id: "org" },
       {
+        authority,
         timelineId: f.timeline.id,
         timelineSlug: "work",
         base: { ...f.base, repoId: "other" },
@@ -161,8 +255,9 @@ describe("owned source coordination", () => {
     expect(allocated.fork_commit).toBe(oid(1));
     expect(allocated.initial_commit).toBe(oid(8));
     const recovered = f.store.reserveWorkSource(
-      { id: "other", owner_id: "org" },
+      { id: "other", space_id: "org" },
       {
+        authority,
         timelineId: f.timeline.id,
         timelineSlug: "work",
         base: { ...f.base, repoId: "other", commit: oid(9) },
@@ -171,8 +266,8 @@ describe("owned source coordination", () => {
     expect(recovered.fork_commit).toBe(oid(1));
     expect(recovered.initial_commit).toBe(oid(8));
   });
-  test("ambiguous push holds admission and checkpoint fences until reconciled", () => {
-    const f = fixture();
+  test("ambiguous push holds admission and checkpoint fences until reconciled", async () => {
+    const f = await fixture();
     f.store.beginSourcePush(f.push);
     f.store.finishSourcePush(f.push.operationId, "ambiguous");
     expect(() => f.store.beginSourcePush({ ...f.push, operationId: "push2" })).toThrow(
@@ -183,14 +278,14 @@ describe("owned source coordination", () => {
     expect(f.checkpoint().current).toBe(true);
     expect(() => f.store.finishSourcePush(f.push.operationId, "rejected")).toThrow(/settled/);
   });
-  test("delayed canonical bookmark cleanup cannot invalidate an owned checkpoint", () => {
-    const f = fixture();
+  test("delayed canonical bookmark cleanup cannot invalidate an owned checkpoint", async () => {
+    const f = await fixture();
     f.store.beginSourcePush(f.push);
     f.store.finishSourcePush(f.push.operationId, "accepted");
     const checkpoint = f.checkpoint();
     const before = f.store.get("work");
     f.store.recordPush({
-      repo: { id: "repo", owner: "org", name: "repo" },
+      repo: { id: "repo", spaceId: "org", space: "org", name: "repo" },
       actorId: "ann",
       accountableId: "ann",
       pushed: [],
@@ -200,12 +295,17 @@ describe("owned source coordination", () => {
     expect(f.store.checkpoint("work", checkpoint.checkpoint.id).current).toBe(true);
     expect(f.store.get("work")).toEqual(before);
   });
-  test("landing retries preserve durable CAS identity and prohibit new source writes", () => {
-    const f = fixture();
+  test("landing retries preserve durable CAS identity and prohibit new source writes", async () => {
+    const f = await fixture();
     f.store.beginSourcePush(f.push);
     f.store.finishSourcePush(f.push.operationId, "accepted");
     f.checkpoint();
-    const request = { trigger: "request" as const, green: { ok: true, why: null }, agentId: null };
+    const request = {
+      authority,
+      trigger: "request" as const,
+      green: { ok: true, why: null },
+      agentId: null,
+    };
     const first = f.store.beginLanding(f.access, "work", request).landing;
     expect(() => f.store.beginSourcePush({ ...f.push, operationId: "push2" })).toThrow(/fence/);
     const failed = f.store.saveLanding(
@@ -232,12 +332,17 @@ describe("owned source coordination", () => {
       casIntent: failed.repos[0]!.casIntent,
     });
   });
-  test("retrying the same checkpoint preserves tested candidates without a CAS intent", () => {
-    const f = fixture();
+  test("retrying the same checkpoint preserves tested candidates without a CAS intent", async () => {
+    const f = await fixture();
     f.store.beginSourcePush(f.push);
     f.store.finishSourcePush(f.push.operationId, "accepted");
     f.checkpoint();
-    const request = { trigger: "request" as const, green: { ok: true, why: null }, agentId: null };
+    const request = {
+      authority,
+      trigger: "request" as const,
+      green: { ok: true, why: null },
+      agentId: null,
+    };
     const first = f.store.beginLanding(f.access, "work", request).landing;
     const stopped = f.store.saveLanding(
       {
@@ -260,8 +365,8 @@ describe("owned source coordination", () => {
     expect(retried.repos[0]).toEqual(stopped.repos[0]);
     expect(() => f.store.beginSourcePush({ ...f.push, operationId: "push2" })).toThrow(/fence/);
   });
-  test("purged allocation cannot be revived by a stale creation retry", () => {
-    const f = fixture();
+  test("purged allocation cannot be revived by a stale creation retry", async () => {
+    const f = await fixture();
     const ready = f.store.getWorkSource(f.source.sourceId);
     const purging = f.store.transitionWorkSource(ready.source_id, ready.version, "purging");
     const purged = f.store.transitionWorkSource(ready.source_id, purging.version, "purged");

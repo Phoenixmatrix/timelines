@@ -3,12 +3,13 @@ import { beforeEach, describe, expect, it } from "vite-plus/test";
 import type {
   BulkActionResult,
   FeedSummary,
-  OwnerPackages,
+  SpacePackages,
   PackageDetail,
   PackageSource,
   Published,
   PublishPage,
 } from "../../shared/packages.ts";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import { publishBody } from "../formats/npm/testing.ts";
 import { basic, makeHarness, purgedRepoObjects, type Harness } from "../testing/harness.ts";
 
@@ -18,6 +19,7 @@ describe("packages API", () => {
 
   const call = async <T>(path: string, token?: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
+    headers.set(CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION));
     if (token) headers.set("authorization", `Bearer ${token}`);
     if (init.body) headers.set("content-type", "application/json");
     const res = await h.request(`/api/packages${path}`, { ...init, headers });
@@ -37,10 +39,10 @@ describe("packages API", () => {
   /** web publishes builds from main and a feature branch; api is added as a source. */
   async function seed() {
     for (let i = 1; i <= 6; i++) {
-      const job = h.jobToken({ repo: "web", ref: i <= 4 ? "main" : "feature/login" });
+      const job = await h.jobToken({ repo: "web", ref: i <= 4 ? "main" : "feature/login" });
       expect((await deploy(`web/1.0.${i}/web.tgz`, job.token, "x".repeat(i))).status).toBe(201);
     }
-    const api = h.jobToken({ repo: "api", ref: "main" });
+    const api = await h.jobToken({ repo: "api", ref: "main" });
     expect((await post(`/test/generic/web/sources`, admin, { repo: "api" })).status).toBe(200);
     expect((await deploy(`web/2.0.0-api/web.tgz`, api.token)).status).toBe(201);
     return { api };
@@ -53,7 +55,7 @@ describe("packages API", () => {
   });
 
   it("records the work source a CI publish was built in, and none for a person's (CORE-351)", async () => {
-    const job = h.jobToken({ repo: "web" });
+    const job = await h.jobToken({ repo: "web" });
     expect((await deploy("web/3.0.0/web.tgz", job.token)).status).toBe(201);
     expect((await deploy("web/3.0.1/web.tgz", admin)).status).toBe(201);
     const { results } = await h.db
@@ -67,11 +69,14 @@ describe("packages API", () => {
     ]);
   });
 
-  it("lists an owner's packages with their sources and recent activity", async () => {
+  it("lists a Space's packages with their sources and recent activity", async () => {
     await seed();
-    const { status, body } = await call<OwnerPackages>("/test", admin);
+    const { status, body } = await call<SpacePackages>("/test", admin);
     expect(status).toBe(200);
     expect(body.access).toBe("admin");
+    expect(body.space.slug).toBe("test");
+    expect(body.space.organizationId).toBe(body.space.organization.id);
+    expect(body).not.toHaveProperty("owner");
     expect(body.packages).toHaveLength(1);
     expect(body.packages[0]).toMatchObject({
       format: "generic",
@@ -84,10 +89,29 @@ describe("packages API", () => {
     });
     expect(body.packages[0]!.spark).toHaveLength(24);
     expect(body.feeds.map((f) => [f.key, f.kind, f.packages])).toEqual([["test", "local", 1]]);
-    // Someone with no access sees the owner but none of its private packages.
-    const outsider = await call<OwnerPackages>("/test", h.token("eve"));
+    // Someone with no access sees the Space but none of its private packages.
+    const outsider = await call<SpacePackages>("/test", h.token("eve"));
     expect(outsider.body.packages).toEqual([]);
     expect(outsider.body.access).toBeNull();
+  });
+
+  it("keeps package reads independent of private source repository reads", async () => {
+    await seed();
+    h.grant("reader", "read");
+    const token = h.token("reader");
+    const detail = await call<PackageDetail>("/test/generic/web", token);
+    expect(detail.status).toBe(200);
+    expect(detail.body.access).toBe("read");
+    expect(detail.body.package.sources).toEqual([]);
+    expect(detail.body.sources.every((source) => source.repo === null)).toBe(true);
+    const associated = await call<{ packages: unknown[] }>("/-/repo-packages?repo=test/web", token);
+    expect(associated.body.packages).toEqual([]);
+    const absent = await call<{ packages: unknown[] }>("/-/repo-packages?repo=test/absent", token);
+    expect(associated).toEqual(absent);
+    const publishes = await call<Published>("/-/published?repo=test/web&run=1", token);
+    expect(publishes.body.rows).toEqual([]);
+    h.grant("reader", "none");
+    expect((await call("/test/generic/web", token)).status).toBe(404);
   });
 
   it("queries a package's history with facets and a publish-rate histogram", async () => {
@@ -137,7 +161,7 @@ describe("packages API", () => {
 
   it("deletes everything a query matches, and only admins may", async () => {
     await seed();
-    const job = h.jobToken({ repo: "web" });
+    const job = await h.jobToken({ repo: "web" });
     const refused = await post("/test/generic/web/actions", job.token, {
       action: "delete",
       query: "branch:feature/*",
@@ -162,7 +186,7 @@ describe("packages API", () => {
   });
 
   it("deprecates and tags npm versions through the package document", async () => {
-    const job = h.jobToken({ repo: "ui" });
+    const job = await h.jobToken({ repo: "ui" });
     for (const version of ["1.0.0", "1.1.0", "1.2.0"]) {
       const res = await h.request("/npm/test/@test%2fui", {
         method: "PUT",
@@ -217,9 +241,9 @@ describe("packages API", () => {
   });
 
   it("grants and revokes sources", async () => {
-    const web = h.jobToken({ repo: "web" });
+    const web = await h.jobToken({ repo: "web" });
     await deploy("web/1/a", web.token);
-    const api = h.jobToken({ repo: "api" });
+    const api = await h.jobToken({ repo: "api" });
     expect((await deploy("web/2/a", api.token)).status).toBe(403);
 
     h.grant("bob", "write");
@@ -241,10 +265,12 @@ describe("packages API", () => {
       { method: "DELETE" },
     );
     expect(revoked.body.sources.map((s) => s.repo)).toEqual(["test/web"]);
-    expect((await deploy("web/3/a", h.jobToken({ repo: "api" }).token)).status).toBe(403);
+    expect((await deploy("web/3/a", (await h.jobToken({ repo: "api" })).token)).status).toBe(403);
+    const crossSpace = await post("/test/generic/web/sources", admin, { repo: "other/api" });
+    expect(crossSpace.status).toBe(404);
   });
 
-  it("creates proxies and virtual feeds, owner admins only", async () => {
+  it("creates proxies and virtual feeds, Space admins only", async () => {
     h.grant("bob", "write");
     const denied = await post("/test/feeds", h.token("bob"), {
       format: "npm",
@@ -268,7 +294,7 @@ describe("packages API", () => {
     });
     expect(JSON.stringify(proxy.body)).not.toContain("hunter2");
 
-    // The owner's own npm registry exists on first use.
+    // The Space's own npm registry exists on first use.
     await h.request("/npm/test/-/ping", { headers: { authorization: `Bearer ${admin}` } });
     await call("/test", admin);
     const all = await post<FeedSummary>("/test/feeds", admin, {
@@ -304,7 +330,7 @@ describe("packages API", () => {
   });
 
   it("shows what a commit and a CI run published", async () => {
-    const job = h.jobToken({ repo: "web" });
+    const job = await h.jobToken({ repo: "web" });
     await deploy("web/1.0.0/web.tgz", job.token);
     const byCommit = await call<Published>(
       `/-/published?repo=test/web&commit=${job.commit}`,

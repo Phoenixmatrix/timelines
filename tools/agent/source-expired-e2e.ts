@@ -1,3 +1,4 @@
+import { fixtureSpace } from "./content-fixtures.ts";
 import assert from "node:assert/strict";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -26,7 +27,7 @@ export async function runSourceExpiredE2E(
   let created = false;
   let observed: Observation[] = [];
   try {
-    await gm(["repo", "create", name, "--owner", owner], "sam", root);
+    await gm(["repo", "create", name, "--space", owner], "sam", root);
     created = true;
     await git(["init", "--initial-branch=main"]);
     await git(["config", "user.name", "Expired Source Fixture"]);
@@ -73,7 +74,10 @@ export async function runSourceExpiredE2E(
       "/api/dev/retention",
       "POST",
       {
-        account: owner,
+        target: {
+          kind: "space",
+          id: (await fixtureSpace(ctx.origin, owner, fixtures.tokens.sam)).space.id,
+        },
         categories: { "tracker-activity": { eventDays: 365, endedTimelineDays: 180 } },
         daysAhead: 181,
         dryRun: false,

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::Path;
 
-/// owner/name of the checkout's origin, when it lives on this server.
+/// space/name of the checkout's origin, when it lives on this server.
 fn origin_repo(cwd: &Path, server: &str) -> Option<String> {
     let root = crate::profile::root_from(cwd)?;
     let out = std::process::Command::new("git")

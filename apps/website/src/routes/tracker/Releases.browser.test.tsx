@@ -8,6 +8,7 @@ import { mutate } from "../../testing/timelines.ts";
 // Exercise the real feed over persisted notes, including one team's work in two repos.
 async function releaseWorld() {
   const server = await TestServer.start({ world: true });
+  const { spaceId } = await server.trackerContract("orbit");
   await mutate(server, [
     {
       kind: "team.create",
@@ -39,15 +40,16 @@ async function releaseWorld() {
     for (const team of teams) {
       await server.sql(
         `INSERT INTO release_note_entries
-          (id, repo_id, release, subject, kind, category, title, summary, tracker_owner_id,
+          (id, repo_id, release, subject, kind, category, title, summary, tracker_space_id,
            issue_id, issue_key, team_id, team_key, inputs_hash, shipped_at, updated_at)
-         VALUES (?, ?, '@day:2026-09-20', ?, 'issue', ?, ?, '', 'acc_orbit', ?, ?, ?, ?, 'h',
+         VALUES (?, ?, '@day:2026-09-20', ?, 'issue', ?, ?, '', ?, ?, ?, ?, ?, 'h',
            '2026-09-20T00:00:00.000Z', '2026-09-20T00:00:00.000Z')`,
         `${name}-${team}`,
         repo.id,
-        `issue:acc_orbit:${team}-1`,
+        `issue:${spaceId}:${team}-1`,
         team === "OPS" ? "fix" : "feature",
         `${team} ${name} update`,
+        spaceId,
         `${team}-1`,
         `${team}-1`,
         `release-${team.toLowerCase()}`,

@@ -14,29 +14,60 @@ import { productionOnly } from "../preview.ts";
 import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
-import { landedTimelines, ownerTimelines } from "./timelines.ts";
+import { landedTimelines, spaceTimelines } from "./timelines.ts";
 import { affectedRepos, repoIssues } from "./trackers.ts";
 import { aiWork } from "../usage/ai.ts";
+import { selectRepos, roleFor, type Actor } from "../db.ts";
+import { atLeast } from "../permissions.ts";
+import { captureWorkAuthority, resolveWorkAuthority, type WorkAuthority } from "../ci/admission.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
+import { isActorCredentialLive } from "../auth.ts";
+
+/** A queued identity is evidence, never cached authorization. */
+async function authorize(env: Env, repoId: string, authority: WorkAuthority) {
+  const current = await resolveWorkAuthority(env, authority, repoId);
+  if (current.repo.deleted_at) throw new Error("release_source_deleted");
+  if (!(await resolveSpaceAccess(env.DB, current.actor, authority.spaceId)))
+    throw new Error("release_authority_revoked: an explicit current Space grant is required.");
+  return current;
+}
 
 export interface ReleaseNotesJob {
   type: "release-notes";
   repoId: string;
+  authority: WorkAuthority;
 }
 
 const DEBOUNCE_SECONDS = 20;
 const LEASE_MS = 14 * 60_000;
 
 /** Lazily rebuild old derived data; the dirty mark coalesces concurrent reads. */
-export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void> {
+export async function ensureReleaseNotes(
+  env: Env,
+  repoId: string,
+  actor: Actor | null,
+): Promise<void> {
   if (!env.AI || !productionOnly(env, "queue", "release notes")) return;
+  if (!actor) return;
+  if (!(await isActorCredentialLive(env.DB, actor, "write"))) return;
+  const repo = await selectRepos(env.DB, actor.id).where("r.id", "=", repoId).executeTakeFirst();
+  if (
+    !repo ||
+    !atLeast(roleFor(repo, actor), "write") ||
+    !(await resolveSpaceAccess(env.DB, actor, repo.space_id))
+  )
+    return;
+  const authority = await captureWorkAuthority(env, repoId, actor);
+  await authorize(env, repoId, authority);
+  const binding = JSON.stringify(authority);
   if (!(await repoAiSnapshot(env.DB, repoId)).features.releaseNotes) return;
   const claimed = await db(env.DB)
     .insertInto("release_note_state")
-    .values({ repo_id: repoId, dirty: 1, status: "generating" })
+    .values({ repo_id: repoId, dirty: 1, dirty_binding: binding, status: "generating" })
     .onConflict((oc) =>
       oc
         .column("repo_id")
-        .doUpdateSet({ dirty: 1, status: "generating" })
+        .doUpdateSet({ dirty: 1, dirty_binding: binding, status: "generating" })
         .where("format_version", "<", 1)
         .where("dirty", "=", 0)
         .where("lease_until", "<", Date.now())
@@ -47,7 +78,7 @@ export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void
     .executeTakeFirst();
   if (!claimed) return;
   try {
-    await env.JOBS.send({ type: "release-notes", repoId } satisfies ReleaseNotesJob, {
+    await env.JOBS.send({ type: "release-notes", repoId, authority } satisfies ReleaseNotesJob, {
       delaySeconds: DEBOUNCE_SECONDS,
     });
   } catch (error) {
@@ -60,16 +91,30 @@ export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void
   }
 }
 /** Something a repository's release notes depend on changed. */
-export async function notifyReleaseNotes(env: Env, repoId: string): Promise<void> {
+export async function notifyReleaseNotes(
+  env: Env,
+  repoId: string,
+  initiator: Actor | WorkAuthority,
+): Promise<void> {
   // Automatic non-AI agent environments omit provider bindings altogether.
   if (!env.AI || !productionOnly(env, "queue", "release notes")) return;
+  const authority =
+    "personId" in initiator ? initiator : await captureWorkAuthority(env, repoId, initiator);
+  const current = await resolveWorkAuthority(env, authority, repoId);
+  // Repository-only writers may push, but that does not grant use of Space providers.
+  if (
+    current.repo.deleted_at ||
+    !(await resolveSpaceAccess(env.DB, current.actor, authority.spaceId))
+  )
+    return;
+  const binding = JSON.stringify(authority);
   if (!(await repoAiSnapshot(env.DB, repoId)).features.releaseNotes) return;
   await db(env.DB)
     .insertInto("release_note_state")
-    .values({ repo_id: repoId, dirty: 1 })
-    .onConflict((oc) => oc.column("repo_id").doUpdateSet({ dirty: 1 }))
+    .values({ repo_id: repoId, dirty: 1, dirty_binding: binding })
+    .onConflict((oc) => oc.column("repo_id").doUpdateSet({ dirty: 1, dirty_binding: binding }))
     .execute();
-  await env.JOBS.send({ type: "release-notes", repoId } satisfies ReleaseNotesJob, {
+  await env.JOBS.send({ type: "release-notes", repoId, authority } satisfies ReleaseNotesJob, {
     delaySeconds: DEBOUNCE_SECONDS,
   });
 }
@@ -77,13 +122,14 @@ export async function notifyReleaseNotes(env: Env, repoId: string): Promise<void
 /** After a tracker mutation: refresh the repositories it touches. */
 export async function refreshAfterTrackerMutation(
   env: Env,
-  ownerId: string,
+  spaceId: string,
   result: MutationResult,
   removedRepoIds: string[],
+  actor: Actor,
 ): Promise<void> {
   try {
-    for (const repoId of await affectedRepos(env, ownerId, result, removedRepoIds))
-      await notifyReleaseNotes(env, repoId);
+    for (const repoId of await affectedRepos(env, spaceId, result, removedRepoIds, actor))
+      await notifyReleaseNotes(env, repoId, actor);
   } catch (error) {
     console.error("Release notes: tracker refresh failed", error);
   }
@@ -93,12 +139,14 @@ async function source(
   env: Env,
   repoId: string,
   waitUntil: (work: Promise<unknown>) => void,
+  authority: WorkAuthority,
 ): Promise<{ source: GeneratorSource; close(): Promise<void> } | null> {
   const row = await db(env.DB)
     .selectFrom("repos as r")
-    .innerJoin("accounts as a", "a.id", "r.owner_id")
-    .select(["r.id", "r.owner_id", "r.name", "r.artifacts_name", "r.artifacts_remote", "a.slug"])
+    .innerJoin("spaces as a", "a.id", "r.space_id")
+    .select(["r.id", "r.space_id", "r.name", "r.artifacts_name", "r.artifacts_remote", "a.slug"])
     .where("r.id", "=", repoId)
+    .where("r.space_id", "=", authority.spaceId)
     .where("r.deleted_at", "is", null)
     .executeTakeFirst();
   if (!row) return null;
@@ -113,6 +161,9 @@ async function source(
   const base = `/${encodeURIComponent(row.slug)}/${encodeURIComponent(row.name)}`;
   return {
     source: {
+      authorize: async () => {
+        await authorize(env, repoId, authority);
+      },
       refs: () => reader.refs(),
       log: (oid, limit, offset) => reader.log(oid, limit, offset),
       commit: (oid) => reader.commit(oid),
@@ -122,9 +173,10 @@ async function source(
           row.id,
           (await reader.refs()).headBranch,
           merges,
-          ownerTimelines(env, row.owner_id),
+          spaceTimelines(env, row.space_id, (await authorize(env, repoId, authority)).actor),
         ),
-      issues: (keys) => repoIssues(env, row, keys),
+      issues: async (keys) =>
+        repoIssues(env, row, keys, (await authorize(env, repoId, authority)).actor),
       async changes(oid) {
         try {
           const feed = await semanticFeed(reader, cache, row.id, base, {
@@ -159,7 +211,7 @@ export function runReleaseNotesJob(
   message: Message<ReleaseNotesJob>,
   waitUntil: (work: Promise<unknown>) => void,
 ): Promise<void> {
-  // Metering (CORE-207): the model calls are the repository owner's.
+  // Metering resolves the repository's immutable Space independently of authority.
   return aiWork({ feature: "release_notes", repo: message.body.repoId }, () =>
     releaseNotesJob(env, message, waitUntil),
   );
@@ -170,7 +222,7 @@ async function releaseNotesJob(
   message: Message<ReleaseNotesJob>,
   waitUntil: (work: Promise<unknown>) => void,
 ): Promise<void> {
-  const { repoId } = message.body;
+  const { repoId, authority } = message.body;
   if (!env.AI || !productionOnly(env, "queue", "release notes")) return message.ack();
   const d = db(env.DB);
   const now = Date.now();
@@ -185,6 +237,48 @@ async function releaseNotesJob(
     (!previous.ai_snapshot && !previous.dirty && previous.format_version >= 1)
   )
     return message.ack();
+  const binding = previous.ai_snapshot ? previous.generation_binding : previous.dirty_binding;
+  if (!binding) {
+    // Unbound legacy work cannot be attributed by inference; retain its frozen inputs.
+    await d
+      .updateTable("release_note_state")
+      .set({
+        status: "failed",
+        error: "client_upgrade_required: release generation authority requires reconciliation",
+      })
+      .where("repo_id", "=", repoId)
+      .where("lease_until", "<", now)
+      .where(previous.ai_snapshot ? "generation_binding" : "dirty_binding", "is", null)
+      .execute();
+    return message.ack();
+  }
+  if (binding !== JSON.stringify(authority)) return message.ack();
+  try {
+    await authorize(env, repoId, authority);
+  } catch {
+    // Preserve materialized history; discard only this rejected pending generation.
+    const rejected = await d
+      .updateTable("release_note_state")
+      .set({
+        ai_snapshot: null,
+        generation_refs: null,
+        generation_binding: null,
+        status: "failed",
+        error: "release_authority_revoked",
+      })
+      .where("repo_id", "=", repoId)
+      .where("lease_until", "<", now)
+      .where(previous.ai_snapshot ? "generation_binding" : "dirty_binding", "=", binding)
+      .returning(["dirty", "dirty_binding"])
+      .executeTakeFirst();
+    if (rejected?.dirty && rejected.dirty_binding && rejected.dirty_binding !== binding)
+      await env.JOBS.send({
+        type: "release-notes",
+        repoId,
+        authority: JSON.parse(rejected.dirty_binding),
+      } satisfies ReleaseNotesJob);
+    return message.ack();
+  }
 
   // A non-null snapshot is the generation, not the delivery. Retries, expired
   // leases and budget continuations all resume it; dirty only signals a successor.
@@ -221,7 +315,7 @@ async function releaseNotesJob(
 
   let again = false;
   try {
-    const opened = await source(env, repoId, waitUntil);
+    const opened = await source(env, repoId, waitUntil, authority);
     if (opened) {
       try {
         // Keep a push during this generation out of its continuation. The next
@@ -231,7 +325,11 @@ async function releaseNotesJob(
           : await opened.source.refs();
         const saved = await d
           .updateTable("release_note_state")
-          .set({ generation_refs: JSON.stringify(refs), ai_snapshot: JSON.stringify(snapshot) })
+          .set({
+            generation_refs: JSON.stringify(refs),
+            ai_snapshot: JSON.stringify(snapshot),
+            generation_binding: binding,
+          })
           .where("repo_id", "=", repoId)
           .where("lease_id", "=", leaseId)
           .executeTakeFirst();
@@ -247,6 +345,7 @@ async function releaseNotesJob(
         await opened.close();
       }
     }
+    await authorize(env, repoId, authority);
     const state = await d
       .updateTable("release_note_state")
       .set((eb) => ({
@@ -254,6 +353,7 @@ async function releaseNotesJob(
         lease_id: null,
         ai_snapshot: again ? JSON.stringify(snapshot) : null,
         generation_refs: again ? eb.ref("generation_refs") : null,
+        generation_binding: again ? binding : null,
         status: eb
           .case()
           .when("dirty", "=", 1)
@@ -266,13 +366,20 @@ async function releaseNotesJob(
       }))
       .where("repo_id", "=", repoId)
       .where("lease_id", "=", leaseId)
-      .returning("dirty")
+      .returning(["dirty", "dirty_binding"])
       .executeTakeFirst();
     if (!state) return message.ack();
     if (again || state.dirty)
-      await env.JOBS.send({ type: "release-notes", repoId } satisfies ReleaseNotesJob, {
-        delaySeconds: 5,
-      });
+      await env.JOBS.send(
+        {
+          type: "release-notes",
+          repoId,
+          authority: again ? authority : JSON.parse(state.dirty_binding!),
+        } satisfies ReleaseNotesJob,
+        {
+          delaySeconds: 5,
+        },
+      );
     message.ack();
   } catch (error) {
     // Logs keep an error's stack but not always its message: name it (CORE-310).

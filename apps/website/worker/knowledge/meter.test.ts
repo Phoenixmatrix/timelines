@@ -1,12 +1,15 @@
 // A Knowledge build meters its own model calls (CORE-286), and the usage
 // report adds them up per update and per full rebuild.
 
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { CatalogPrice } from "../../shared/usage.ts";
 import { db as databaseQueries } from "../schema.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { knowledgeUpdateSpend } from "../usage/report.ts";
 import { buildAiUsage, finalBuildStats, meterBuildCall, priceUsage } from "./meter.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const price = (metric: string, usdPerMillion: number): CatalogPrice =>
   ({
@@ -23,11 +26,18 @@ const price = (metric: string, usdPerMillion: number): CatalogPrice =>
     sourceUpdated: null,
   }) as CatalogPrice;
 
-function database() {
-  const sqlite = migratedDatabase();
+async function database() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES
+      ('org-ann','org-ann','Ann organization','company','ann'), ('org-bob','org-bob','Bob organization','company','bob');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES
+      ('ann','org-ann','ann','Ann Space'), ('bob','org-bob','bob','Bob Space');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('r1', 'ann', 'ledger', 'private', 'a1', ''), ('r2', 'bob', 'other', 'private', 'a2', '');
   `);
   return { sqlite, db: d1(sqlite) };
@@ -35,7 +45,7 @@ function database() {
 
 describe("build metering", () => {
   test("finalization preserves an old attempt's late answer rather than a retry snapshot", async () => {
-    const { sqlite, db } = database();
+    const { sqlite, db } = await database();
     sqlite.exec(`
       INSERT INTO kg_builds (id, repo_id, to_commit, status, stats)
         VALUES ('b1', 'r1', 'c', 'running', '{"conceptReviewsAsked":1,"conceptReviewRoundsAsked":{"0":1}}'),
@@ -102,7 +112,7 @@ describe("build metering", () => {
   });
 
   test("calls add up by model, concurrently, and are priced at list prices", async () => {
-    const { sqlite, db } = database();
+    const { sqlite, db } = await database();
     sqlite.exec(
       `INSERT INTO kg_builds (id, repo_id, to_commit, status) VALUES ('b1', 'r1', 'c', 'running')`,
     );
@@ -161,7 +171,7 @@ describe("build metering", () => {
   });
 
   test("the usage report shows what an update costs beside a full rebuild", async () => {
-    const { sqlite, db } = database();
+    const { sqlite, db } = await database();
     const now = new Date("2026-10-05T12:00:00Z");
     const build = (id: string, repo: string, stats: unknown, started = "2026-10-04T10:00:00Z") =>
       sqlite
@@ -180,7 +190,7 @@ describe("build metering", () => {
       { mode: "update", aiUsage: { calls: 1, costUsd: 9 } },
       "2026-08-01T00:00:00Z",
     );
-    // Another account's.
+    // Another Space's.
     build("x1", "r2", { mode: "update", aiUsage: { calls: 5, costUsd: 1 } });
 
     const ann = await knowledgeUpdateSpend(db, "ann", now);

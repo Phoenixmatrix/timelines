@@ -20,10 +20,10 @@ import { daysBefore } from "../engine.ts";
 import { deleteUnreferenced } from "../../steps/objects.ts";
 
 function scope(ctx: CleanupContext, id: string): [string, string] {
-  if (ctx.target.scope !== "account") throw new Error(`${id} is an account category.`);
+  if (ctx.target.kind !== "space") throw new Error(`${id} is a Space category.`);
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error(`${id} needs its days threshold.`);
-  return [ctx.target.accountId, daysBefore(ctx.now, days)];
+  return [ctx.target.id, daysBefore(ctx.now, days)];
 }
 
 interface StepItem {
@@ -35,7 +35,7 @@ interface StepItem {
 }
 
 /** Parameters: account, cutoff. `s` is the step. */
-const STEERED = `s.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+const STEERED = `s.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND s.committed_at < ? AND s.deleted_at IS NULL
   AND json_extract(s.context, '$.trimmedAt') IS NULL
   AND (coalesce(json_array_length(s.context, '$.instructions'), 0) > 0
@@ -101,7 +101,7 @@ interface ArtifactItem {
 }
 
 /** Parameters: account, cutoff. `a` is the artifact. */
-const OLD_ARTIFACT = `a.repo_id IN (SELECT id FROM repos WHERE owner_id = ?) AND a.created_at < ?`;
+const OLD_ARTIFACT = `a.repo_id IN (SELECT id FROM repos WHERE space_id = ?) AND a.created_at < ?`;
 
 export const stepArtifacts: CategoryCleanup<ArtifactItem> = {
   async select(ctx, cursor) {

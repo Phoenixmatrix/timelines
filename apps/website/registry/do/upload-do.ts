@@ -1,5 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  withCutoverAdmission,
+  withCutoverAlarmAdmission,
+} from "../../worker/durable/cutover-admission.ts";
+import { reportCutoverRuntime } from "../../worker/durable/cutover-runtime.ts";
+import {
   clearStorage,
   pendingRetirement,
   resetSoon,
@@ -12,8 +17,16 @@ import {
 
 /** One per OCI blob upload session; holds resumable state between PATCHes. */
 export class UploadDO extends DurableObject<Env> implements Purgeable {
+  cutoverRuntime(runId: string) {
+    return reportCutoverRuntime(this.env, runId, "registry-upload");
+  }
+
   async getState<T>(): Promise<T | null> {
-    return (await this.ctx.storage.get<T>("state")) ?? null;
+    return withCutoverAdmission(
+      this.env,
+      "registry-upload",
+      async () => (await this.ctx.storage.get<T>("state")) ?? null,
+    );
   }
 
   /** Optimistic write: only succeeds if `expectedVersion` matches. */
@@ -21,25 +34,31 @@ export class UploadDO extends DurableObject<Env> implements Purgeable {
     state: T,
     expectedVersion: number | null,
   ): Promise<boolean> {
-    const current = await this.ctx.storage.get<T>("state");
-    if ((current?.version ?? null) !== expectedVersion) return false;
-    await this.ctx.storage.put("state", state);
-    return true;
+    return withCutoverAdmission(this.env, "registry-upload", async () => {
+      const current = await this.ctx.storage.get<T>("state");
+      if ((current?.version ?? null) !== expectedVersion) return false;
+      await this.ctx.storage.put("state", state);
+      return true;
+    });
   }
 
   async expireAt(at: number): Promise<void> {
-    await this.ctx.storage.setAlarm(at);
+    await withCutoverAdmission(this.env, "registry-upload", () => this.ctx.storage.setAlarm(at));
   }
 
   async clear(): Promise<void> {
-    await this.ctx.storage.deleteAll();
-    await this.ctx.storage.deleteAlarm();
+    return withCutoverAdmission(this.env, "registry-upload", async () => {
+      await this.ctx.storage.deleteAll();
+      await this.ctx.storage.deleteAlarm();
+    });
   }
 
   // The purge contract (worker/durable/contract.ts, CORE-197). An upload
   // cleans itself up when it expires; purge and retire only do it sooner.
   async purge(reason: string): Promise<PurgeReport> {
-    const report = await this.#clear(reason);
+    const report = await withCutoverAdmission(this.env, "registry-upload", () =>
+      this.#clear(reason),
+    );
     resetSoon(this.ctx);
     return report;
   }
@@ -50,28 +69,32 @@ export class UploadDO extends DurableObject<Env> implements Purgeable {
   }
 
   retire(reason: string, name: string, delayMs?: number): Promise<void> {
-    return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
+    return withCutoverAdmission(this.env, "registry-upload", () =>
+      scheduleRetirement(this.ctx.storage, reason, name, delayMs),
+    );
   }
 
   storageReport() {
-    return storageReport(this.ctx.storage);
+    return withCutoverAdmission(this.env, "registry-upload", () => storageReport(this.ctx.storage));
   }
 
   override async alarm(): Promise<void> {
-    const retirement = await pendingRetirement(this.ctx.storage);
-    if (retirement) {
-      await settleRetirement({
-        storage: this.ctx.storage,
-        env: this.env,
-        className: "RegistryUpload",
-        retirement,
-        busy: false,
-        purge: (reason) => this.#clear(reason),
-      });
-      return;
-    }
-    await this.#release();
-    await this.ctx.storage.deleteAll();
+    return withCutoverAlarmAdmission(this.env, "registry-upload", this.ctx.storage, async () => {
+      const retirement = await pendingRetirement(this.ctx.storage);
+      if (retirement) {
+        await settleRetirement({
+          storage: this.ctx.storage,
+          env: this.env,
+          className: "RegistryUpload",
+          retirement,
+          busy: false,
+          purge: (reason) => this.#clear(reason),
+        });
+        return;
+      }
+      await this.#release();
+      await this.ctx.storage.deleteAll();
+    });
   }
 
   /** The upload's R2 leftovers: its multipart upload and any tails. */

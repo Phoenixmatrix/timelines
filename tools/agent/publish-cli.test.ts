@@ -11,7 +11,7 @@ function harness(statuses = [404, 404]) {
     GITMATRIX_BRANCH: "main",
     GITMATRIX_URL: "https://registry.example.test",
     GITMATRIX_TOKEN: "test-token",
-    GITMATRIX_OWNER: "orbit",
+    GITMATRIX_SPACE: "orbit",
     CARGO_TARGET_DIR: "/tmp/cli-release-cache",
   };
   const run = (binary: string, args: string[], env: NodeJS.ProcessEnv) => {
@@ -74,7 +74,7 @@ await test("build both architectures before uploading with the native executable
     "upload",
     "/tmp/cli-release-cache/aarch64-unknown-linux-gnu/release/gm",
     `gm/${version}/linux-aarch64/gm`,
-    "--owner",
+    "--space",
     "orbit",
   ]);
 });

@@ -1,8 +1,4 @@
-// Data retention (CORE-210): an account's categories (its administrators) or
-// the site's (site administrators), each with its switch, thresholds, what it
-// never deletes and its last run; "Clean up now" (choose categories, preview
-// them with a dry run, confirm, watch the run) and the run history. Shared by
-// the account and site pages in src/routes/DataRetention.tsx.
+// Space, personal, and Instance retention policies, cleanup previews, and run history.
 
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
@@ -145,8 +141,8 @@ function CategoryRow({
   overlapLabels,
 }: {
   policy: RetentionPolicy;
-  /** Which page shows it: an account's, the site's own categories, or site-wide defaults. */
-  level: "account" | "site" | "defaults";
+  /** Instance defaults are edited separately from each target's own policies. */
+  level: "space" | "person" | "instance" | "defaults";
   canEdit: boolean;
   paths: RetentionPaths;
   onSaved: (settings: RetentionSettings) => void;
@@ -175,10 +171,12 @@ function CategoryRow({
   const dirty = (policyControl && enabled !== policy.enabled) || changedThresholds.length > 0;
   const scope =
     level === "defaults"
-      ? "Default for every account"
-      : policy.scope === "site"
-        ? "Site-wide"
-        : "This account";
+      ? `Default for every ${policy.scope === "person" ? "person" : "Space"}`
+      : policy.scope === "instance"
+        ? "Instance-wide"
+        : policy.scope === "person"
+          ? "Personal"
+          : "This Space";
 
   async function save(body: {
     enabled?: boolean | null;
@@ -201,12 +199,10 @@ function CategoryRow({
     }
   }
 
+  const source = level === "defaults" ? "instance" : level;
   const stored =
-    (level === "account" && policy.enabledFrom === "account") ||
-    (level !== "account" && policy.enabledFrom === "site") ||
-    policy.thresholds.some(
-      (t) => policy.valuesFrom[t.key] === (level === "account" ? "account" : "site"),
-    );
+    policy.enabledFrom === source ||
+    policy.thresholds.some((threshold) => policy.valuesFrom[threshold.key] === source);
 
   return (
     <li
@@ -243,9 +239,11 @@ function CategoryRow({
               {policyControl && !policy.runnable && (
                 <span className="mk-chip mk-chip--tag">No cleanup yet</span>
               )}
-              {policyControl && level === "account" && policy.enabledFrom === "site" && (
-                <span>{policy.enabled ? "On" : "Off"} by the site-wide default</span>
-              )}
+              {policyControl &&
+                (level === "space" || level === "person") &&
+                policy.enabledFrom === "instance" && (
+                  <span>{policy.enabled ? "On" : "Off"} by the Instance default</span>
+                )}
             </p>
           </div>
           {policyControl ? (
@@ -308,7 +306,7 @@ function CategoryRow({
                     <span id={`${inputId}-hint`} className="text-body-sm text-ink-faint">
                       {bad
                         ? `A whole number from ${t.min} to ${t.max}.`
-                        : `Default ${quantity(t, t.default)}${from === "site" && level === "account" ? " · site default in use" : ""}`}
+                        : `Default ${quantity(t, t.default)}${from === "instance" && level !== "instance" && level !== "defaults" ? " · Instance default in use" : ""}`}
                     </span>
                   </div>
                 );
@@ -379,7 +377,8 @@ function CategoryRow({
                   })
                 }
               >
-                Reset to {level === "account" ? "defaults" : "built-in defaults"}
+                Reset to{" "}
+                {level === "space" || level === "person" ? "defaults" : "built-in defaults"}
               </button>
             )}
             {onCleanUp && policy.runnable && (
@@ -792,9 +791,11 @@ export function RetentionView({
   initialRuns,
   paths,
   preselect,
+  usageHref,
 }: {
   initial: RetentionSettings;
   initialRuns: RetentionRunPage;
+  usageHref: string;
   paths: RetentionPaths;
   /** A category to select in "Clean up now" (from the usage report's link). */
   preselect: string | null;
@@ -804,9 +805,11 @@ export function RetentionView({
   const [next, setNext] = useState(initialRuns.next);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const cleanupRef = useRef<HTMLElement>(null);
-  const site = settings.level === "site";
-  const own = settings.categories.filter((p) => p.scope === settings.level);
-  const defaults = site ? settings.categories.filter((p) => p.scope === "account") : [];
+  const instance = settings.target.kind === "instance";
+  const own = settings.categories.filter((policy) => policy.scope === settings.target.kind);
+  const defaults = instance
+    ? settings.categories.filter((policy) => policy.scope !== "instance")
+    : [];
   const runnable = own.filter((p) => p.runnable);
   const [selected, setSelected] = useState<string[]>(() =>
     preselect && runnable.some((p) => p.id === preselect) ? [preselect] : [],
@@ -836,7 +839,7 @@ export function RetentionView({
   };
 
   const canRun = settings.canEdit && runnable.length > 0;
-  const rows = (list: RetentionPolicy[], level: "account" | "site" | "defaults") => (
+  const rows = (list: RetentionPolicy[], level: "space" | "person" | "instance" | "defaults") => (
     <ul className="m-0 list-none overflow-hidden rounded-pane bg-pane p-0">
       {list.map((p) => (
         <CategoryRow
@@ -857,10 +860,15 @@ export function RetentionView({
 
   return (
     <Definitions.Provider value={settings.categories}>
-      <div className="mt-6 flex flex-col gap-8" data-retention-level={settings.level}>
+      <div className="mt-6 flex flex-col gap-8" data-retention-level={settings.target.kind}>
         {!settings.canEdit && (
           <p className="m-0 font-semibold">
-            Read-only: only a signed-in person who administers {site ? "the site" : "this account"}{" "}
+            Read-only: only a signed-in person authorized to administer{" "}
+            {instance
+              ? "the Instance"
+              : settings.target.kind === "person"
+                ? "their own personal data"
+                : "this Space"}{" "}
             can change retention or run a cleanup.
           </p>
         )}
@@ -877,25 +885,26 @@ export function RetentionView({
         <section aria-labelledby="retention-categories" className="flex flex-col gap-3">
           <div>
             <h2 id="retention-categories" className="m-0 text-title">
-              {site ? "Site data" : "Categories"}
+              {instance ? "Instance data" : "Categories"}
             </h2>
             <p className="mt-1 mb-0 max-w-[70ch] text-body-sm text-ink-muted">
-              {site
-                ? "Data no account owns: shared caches, the registry, sign-in state and records. Enabled categories run once a day."
-                : "Enabled categories run once a day with the values shown. Timeline work Git retention starts on; other policy categories start off. Values left at their default follow the site-wide default when a site administrator sets one."}
+              {instance
+                ? "Instance infrastructure: shared caches, the registry, sign-in state and records. Enabled categories run once a day."
+                : "Enabled categories run once a day with the values shown. Timeline work Git retention starts on; other policy categories start off. Values left at their default follow the Instance default when an operator sets one."}
             </p>
           </div>
-          {rows(own, settings.level)}
+          {rows(own, settings.target.kind)}
         </section>
-        {site && (
+        {instance && (
           <section aria-labelledby="retention-defaults" className="flex flex-col gap-3">
             <div>
               <h2 id="retention-defaults" className="m-0 text-title">
-                Defaults for every account
+                Defaults for Spaces and people
               </h2>
               <p className="mt-1 mb-0 max-w-[70ch] text-body-sm text-ink-muted">
-                What an account gets when its administrators haven&apos;t chosen. Turning a category
-                on here turns it on for every such account.
+                Defaults used when a Space administrator or person hasn&apos;t chosen an override.
+                Turning a category on here enables it for every applicable target without an
+                override.
               </p>
             </div>
             {rows(defaults, "defaults")}
@@ -944,15 +953,8 @@ export function RetentionView({
         )}
         <p className="m-0 text-body-sm text-ink-muted">
           The usage report shows what each category&apos;s data costs:{" "}
-          <a
-            href={
-              site
-                ? "/settings/site-usage"
-                : `/settings/usage?owner=${encodeURIComponent(settings.account ?? "")}`
-            }
-            className={link}
-          >
-            {site ? "Site usage & costs" : "Usage & costs"}
+          <a href={usageHref} className={link}>
+            {instance ? "Instance usage & costs" : "Usage & costs"}
           </a>
           .
         </p>

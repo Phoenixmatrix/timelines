@@ -74,7 +74,7 @@ import { timelinePageUrl } from "./TimelineNav.tsx";
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
     return await api<TimelineGraphData>(
-      `/tracker/${encodeURIComponent(params.owner!)}/timeline-graph`,
+      `/tracker/${encodeURIComponent(params.space!)}/timeline-graph`,
       { signal: request.signal },
     );
   } catch (error) {
@@ -91,7 +91,7 @@ export async function trackerTimelinesLoader({ request, params }: LoaderFunction
 
 const GROUP_BY: { value: GroupBy; label: string }[] = [
   { value: "status", label: "Status" },
-  { value: "workspace", label: "Workspace" },
+  { value: "project", label: "Project" },
   { value: "agent", label: "Agent" },
   { value: "person", label: "Person" },
 ];
@@ -148,8 +148,8 @@ export function TrackerTimelines() {
     });
   const rowsRef = useRef<HTMLOListElement>(null);
   const [geometry, setGeometry] = useState<RowGeometry | null>(null);
-  const owner = data.owner.slug;
-  const base = `/tracker/${encodeURIComponent(owner)}/timelines`;
+  const space = data.space.slug;
+  const base = `/tracker/${encodeURIComponent(space)}/timelines`;
   const slug = params.get("tl");
   const selected = slug ? (data.timelines.find((t) => t.slug === slug) ?? null) : null;
   // One live feed for the selected timeline: Live now and its observability view share it.
@@ -160,7 +160,7 @@ export function TrackerTimelines() {
       ? {
           kind: "timeline",
           title: selected.name,
-          detail: `timeline/${selected.slug} · ${owner}`,
+          detail: `timeline/${selected.slug} · ${space}`,
           to: `${base}?tl=${encodeURIComponent(selected.slug)}`,
         }
       : null,
@@ -267,10 +267,10 @@ export function TrackerTimelines() {
           className="relative z-10 pointer-events-auto mk-mono text-micro text-ink-faint underline underline-offset-2 max-sm:hidden"
           to={
             repo.source && repo.source.sourceId !== "canonical"
-              ? commitsUrl(repo.owner, repo.name, merge.commit, "", repo.source.sourceId)
-              : commitPanelUrl(repo.owner, repo.name, merge.commit)
+              ? commitsUrl(repo.space, repo.name, merge.commit, "", repo.source.sourceId)
+              : commitPanelUrl(repo.space, repo.name, merge.commit)
           }
-          title={`${repo.owner}/${repo.name} at ${merge.commit}`}
+          title={`${repo.space}/${repo.name} at ${merge.commit}`}
           onClick={(event) => event.stopPropagation()}
         >
           {repo.name}@{shortOid(merge.commit)}
@@ -284,8 +284,8 @@ export function TrackerTimelines() {
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <h1 className="m-0 text-title-lg">Timelines</h1>
         <SelectField
-          ariaLabel="Tracker owner"
-          value={owner}
+          ariaLabel="Tracker space"
+          value={space}
           className="w-44"
           options={data.trackers.map((tracker) => ({
             value: tracker.slug,
@@ -316,7 +316,7 @@ export function TrackerTimelines() {
           <h2 className="mk-card-title">No timelines yet</h2>
           <p className="mk-card-desc max-w-[48ch]">
             A timeline is a line of work that lands on main when it is reviewed. Forks, merges,
-            landings and abandoned timelines in {data.owner.displayName}'s tracker will appear here.
+            landings and abandoned timelines in {data.space.displayName}'s tracker will appear here.
             Any writer can start one from a checkout:
           </p>
           <pre className="mk-mono mt-3 mb-0 overflow-x-auto rounded-control bg-sunken p-3 text-mono">
@@ -324,8 +324,8 @@ export function TrackerTimelines() {
           </pre>
           <p className="mt-3 mb-0 max-w-[48ch] text-body-sm text-ink-faint">
             Or over the API:{" "}
-            <code className="mk-mono">{`POST /api/tracker/${owner}/timelines`}</code> with{" "}
-            <code className="mk-mono">{`{ "slug": "search-rewrite", "repos": ["${owner}/<repository>"] }`}</code>
+            <code className="mk-mono">{`POST /api/tracker/${space}/timelines`}</code> with{" "}
+            <code className="mk-mono">{`{ "slug": "search-rewrite", "repos": ["${space}/<repository>"] }`}</code>
           </p>
         </section>
       ) : (
@@ -536,7 +536,7 @@ export function TrackerTimelines() {
                         >
                           <RowDetails
                             row={row}
-                            owner={owner}
+                            space={space}
                             name={(id) => data.actors[id]?.name ?? "someone outside the tracker"}
                             revision={data}
                           />
@@ -560,7 +560,7 @@ export function TrackerTimelines() {
                     clear={select(null)}
                     headingRef={heading}
                     onChange={() => {
-                      refreshTimelines(owner);
+                      refreshTimelines(space);
                       void revalidator.revalidate();
                     }}
                   />
@@ -643,7 +643,7 @@ export function TrackerTimelines() {
               <div className="min-w-0 xl:col-start-1 xl:row-start-2">
                 <TimelineObservability
                   key={selected.slug}
-                  owner={owner}
+                  space={space}
                   timeline={selected}
                   feed={feed.records}
                   removed={feed.removed}
@@ -669,7 +669,7 @@ function MainSummary({
       <h2 className="m-0 font-mono text-title-lg">main</h2>
       <p className="mt-1 mb-0 text-body-sm text-ink-muted">
         {counts.open} open, {counts.landed} landed and {counts.abandoned} abandoned timelines in{" "}
-        {data.owner.displayName}'s tracker
+        {data.space.displayName}'s tracker
         {counts.stalled ? `, ${counts.stalled} of them stalled` : ""}. Select one to review its
         changes and see it with the timelines it came from and what depends on it.
       </p>
@@ -713,7 +713,7 @@ function Legend({ shape, label }: { shape: ReactNode; label: string }) {
 function TimelineIssues({ timeline, data }: { timeline: Timeline; data: TimelineGraphData }) {
   if (!data.issues) return null;
   const issues = data.issues[timeline.id] ?? [];
-  const base = `/tracker/${encodeURIComponent(data.owner.slug)}/issues/`;
+  const base = `/tracker/${encodeURIComponent(data.space.slug)}/issues/`;
   const view = `?tl=${encodeURIComponent(timeline.slug)}`;
   const label = (issue: (typeof issues)[number]) => {
     if (issue.status === "done_in_timeline" && issue.doneIn?.id === timeline.id)
@@ -757,11 +757,11 @@ function TimelineIssues({ timeline, data }: { timeline: Timeline; data: Timeline
  * panel opens so a person sees the size of the review before choosing.
  */
 function ReviewBlock({
-  owner,
+  space,
   timeline,
   events,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   events: TimelineEvent[];
 }) {
@@ -780,7 +780,7 @@ function ReviewBlock({
   );
   const many = timeline.repos.length > 1;
   const query = (repo: Timeline["repos"][number]) =>
-    many ? { repo: `${repo.owner}/${repo.name}` } : undefined;
+    many ? { repo: `${repo.space}/${repo.name}` } : undefined;
   const button = "mk-btn no-underline max-xl:min-h-11";
   return (
     <section aria-labelledby={`review-${timeline.id}`}>
@@ -790,11 +790,11 @@ function ReviewBlock({
       <div className="flex flex-wrap gap-2">
         <Link
           className={`${button} mk-btn--primary`}
-          to={timelinePageUrl(owner, timeline.slug, "changes")}
+          to={timelinePageUrl(space, timeline.slug, "changes")}
         >
           Changes
         </Link>
-        <Link className={button} to={timelinePageUrl(owner, timeline.slug, "story")}>
+        <Link className={button} to={timelinePageUrl(space, timeline.slug, "story")}>
           Story
         </Link>
       </div>
@@ -805,9 +805,9 @@ function ReviewBlock({
             <li key={repo.id} className="py-0.5">
               <Link
                 className={`${link} mk-mono`}
-                to={timelinePageUrl(owner, timeline.slug, "changes", query(repo))}
+                to={timelinePageUrl(space, timeline.slug, "changes", query(repo))}
               >
-                {repo.owner}/{repo.name}
+                {repo.space}/{repo.name}
               </Link>{" "}
               <span className="text-ink-muted" aria-live="polite">
                 {!result ? (
@@ -871,7 +871,7 @@ function TimelineDetails({
   /** After the timeline itself changed (its experimental flag). */
   onChange: () => void;
 }) {
-  const owner = data.owner.slug;
+  const space = data.space.slug;
   // Every event touching this timeline, merges into and out of it included:
   // where its work is and whether it landed (CORE-382).
   const involved = data.events.filter((e) => involves(e, timeline.id));
@@ -907,7 +907,7 @@ function TimelineDetails({
   const many = timeline.repos.length > 1;
   // One read of the checkpoints for the list and the landing panel (CORE-382).
   const [reloads, setReloads] = useState(0);
-  const loadedCheckpoints = useCheckpoints(owner, timeline.slug, `${timeline.version}.${reloads}`);
+  const loadedCheckpoints = useCheckpoints(space, timeline.slug, `${timeline.version}.${reloads}`);
   return (
     <>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -924,7 +924,7 @@ function TimelineDetails({
         </span>
       </div>
 
-      <ReviewBlock owner={owner} timeline={timeline} events={involved} />
+      <ReviewBlock space={space} timeline={timeline} events={involved} />
 
       <dl className="mt-3 mb-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-body-sm">
         <dt className="text-ink-faint">Slug</dt>
@@ -991,7 +991,7 @@ function TimelineDetails({
         defaultOpen
       >
         <TimelineCheckpoints
-          owner={owner}
+          space={space}
           timeline={timeline}
           checkpoints={loadedCheckpoints.checkpoints}
           error={loadedCheckpoints.error}
@@ -1013,7 +1013,7 @@ function TimelineDetails({
         defaultOpen
       >
         <LandingPanel
-          owner={owner}
+          space={space}
           timeline={timeline}
           checkpoints={loadedCheckpoints.checkpoints}
           failed={loadedCheckpoints.failed}
@@ -1030,7 +1030,7 @@ function TimelineDetails({
           }
           defaultOpen
         >
-          <LiveNow owner={owner} timeline={timeline} feed={feed} />
+          <LiveNow space={space} timeline={timeline} feed={feed} />
         </PanelSection>
       )}
 
@@ -1054,14 +1054,14 @@ function TimelineDetails({
         <ul className="m-0 list-none p-0">
           {timeline.repos.map((repo) => {
             const last = lastCommits[repo.id];
-            const query = many ? { repo: `${repo.owner}/${repo.name}` } : undefined;
+            const query = many ? { repo: `${repo.space}/${repo.name}` } : undefined;
             return (
               <li
                 key={repo.id}
                 className="flex flex-wrap items-baseline gap-x-3 py-0.5 text-body-sm"
               >
                 <span className="min-w-0 truncate text-ink">
-                  {repo.owner}/{repo.name}
+                  {repo.space}/{repo.name}
                 </span>
                 {!repo.source && !ended ? (
                   <span className="text-ink-muted">Source migration required</span>
@@ -1069,13 +1069,13 @@ function TimelineDetails({
                   <span className="flex flex-wrap items-baseline gap-x-3">
                     <Link
                       className={link}
-                      to={timelinePageUrl(owner, timeline.slug, "changes", query)}
+                      to={timelinePageUrl(space, timeline.slug, "changes", query)}
                     >
                       Changes
                     </Link>
                     <Link
                       className={link}
-                      to={timelinePageUrl(owner, timeline.slug, "story", query)}
+                      to={timelinePageUrl(space, timeline.slug, "story", query)}
                     >
                       Steps
                     </Link>
@@ -1085,8 +1085,8 @@ function TimelineDetails({
                           className={link}
                           to={
                             repo.source && repo.source.sourceId !== "canonical"
-                              ? treeUrl(repo.owner, repo.name, last, "", repo.source.sourceId)
-                              : commitPanelUrl(repo.owner, repo.name, last)
+                              ? treeUrl(repo.space, repo.name, last, "", repo.source.sourceId)
+                              : commitPanelUrl(repo.space, repo.name, last)
                           }
                         >
                           Last commit <span className="mk-mono">{shortOid(last)}</span>
@@ -1095,7 +1095,7 @@ function TimelineDetails({
                         <Link
                           className={link}
                           to={commitsUrl(
-                            repo.owner,
+                            repo.space,
                             repo.name,
                             repo.bookmark,
                             "",
@@ -1112,7 +1112,7 @@ function TimelineDetails({
                         <Link
                           className={link}
                           to={treeUrl(
-                            repo.owner,
+                            repo.space,
                             repo.name,
                             repo.bookmark,
                             "",
@@ -1124,7 +1124,7 @@ function TimelineDetails({
                         <Link
                           className={link}
                           to={commitsUrl(
-                            repo.owner,
+                            repo.space,
                             repo.name,
                             repo.bookmark,
                             "",
@@ -1145,7 +1145,7 @@ function TimelineDetails({
 
       <PanelSection id="agents" title="Agents seen" hint="in the last 10 minutes">
         <RecentAgents
-          endpoint={`/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}/presence`}
+          endpoint={`/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}/presence`}
         />
       </PanelSection>
 
@@ -1155,7 +1155,7 @@ function TimelineDetails({
           title="Settings"
           hint={timeline.experimental ? "experimental" : "not experimental"}
         >
-          <ExperimentalSwitch owner={owner} timeline={timeline} onChange={onChange} />
+          <ExperimentalSwitch space={space} timeline={timeline} onChange={onChange} />
         </PanelSection>
       )}
     </>
@@ -1227,14 +1227,14 @@ function PanelSection({
  * preview can be revived from here, landed and abandoned timelines included.
  */
 function TimelineCheckpoints({
-  owner,
+  space,
   timeline,
   checkpoints: list,
   error,
   actor,
   onRevived,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   /** `null` while loading or when they couldn't be read. */
   checkpoints: CheckpointView[] | null;
@@ -1265,7 +1265,7 @@ function TimelineCheckpoints({
             >
               <Link
                 className={`${link} font-semibold`}
-                to={timelinePageUrl(owner, timeline.slug, "changes", {
+                to={timelinePageUrl(space, timeline.slug, "changes", {
                   checkpoint: String(view.checkpoint.number),
                 })}
                 title={`What checkpoint #${view.checkpoint.number} added`}
@@ -1297,13 +1297,13 @@ function TimelineCheckpoints({
               )}
               <Link
                 className={link}
-                to={timelinePageUrl(owner, timeline.slug, "changes", {
+                to={timelinePageUrl(space, timeline.slug, "changes", {
                   checkpoint: String(view.checkpoint.number),
                 })}
               >
                 Review changes
               </Link>
-              <ReviveButton view={view} tracker={owner} onRevived={onRevived} />
+              <ReviveButton view={view} tracker={space} onRevived={onRevived} />
             </li>
           ))}
         </ol>
@@ -1318,11 +1318,11 @@ function TimelineCheckpoints({
  * or clears it, and its work merges anywhere.
  */
 function ExperimentalSwitch({
-  owner,
+  space,
   timeline,
   onChange,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   onChange: () => void;
 }) {
@@ -1334,7 +1334,7 @@ function ExperimentalSwitch({
     setError(null);
     try {
       await api<Timeline>(
-        `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}`,
+        `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}`,
         {
           method: "PATCH",
           json: { experimental: !timeline.experimental, expectedVersion: timeline.version },

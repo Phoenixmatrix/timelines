@@ -12,6 +12,7 @@ import type {
 } from "../../shared/assistant-skills.ts";
 import { MATCH_RANK, matchFields } from "../../shared/search.ts";
 import { edge, FRESH, move, reconcile, type Selection } from "../palette/selection.ts";
+import { api } from "../lib/api.ts";
 
 const SOURCE = {
   builtin: "Built-in skill",
@@ -65,11 +66,9 @@ export function useSkillPicker({
     setLoading(true);
     setFailed(false);
     const query = repo ? `?${new URLSearchParams({ repo })}` : "";
-    void fetch(`/api/assistant/skills${query}`, { signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error("Skills unavailable");
-        return (await response.json()) as { skills: AssistantSkillSummary[] };
-      })
+    void api<{ skills: AssistantSkillSummary[] }>(`/assistant/skills${query}`, {
+      signal: controller.signal,
+    })
       .then(({ skills }) => {
         if (!controller.signal.aborted) setCatalog({ repo, skills });
       })

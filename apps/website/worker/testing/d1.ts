@@ -7,6 +7,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 export /** Enough of D1 over node:sqlite for Kysely (kysely-d1) and Better Auth's D1 dialect. */
 function d1(sqlite: DatabaseSync): D1Database {
+  const executions = new WeakMap<object, () => unknown>();
   const statement = (sql: string, params: SQLInputValue[] = []) => {
     const run = () => {
       const total = () => (sqlite.prepare("SELECT total_changes() AS c").get() as { c: number }).c;
@@ -16,11 +17,14 @@ function d1(sqlite: DatabaseSync): D1Database {
       // D1 counts trigger writes too, not just the outer statement's changes().
       return { results, changes: total() - before };
     };
-    return {
+    const all = () => {
+      const { results, changes } = run();
+      return { results, success: true, meta: { changes, last_row_id: 0, duration: 0 } };
+    };
+    const prepared = {
       bind: (...next: SQLInputValue[]) => statement(sql, next),
       async all() {
-        const { results, changes } = run();
-        return { results, success: true, meta: { changes, last_row_id: 0, duration: 0 } };
+        return all();
       },
       async first(column?: string) {
         const row = run().results[0] ?? null;
@@ -34,11 +38,29 @@ function d1(sqlite: DatabaseSync): D1Database {
         return run().results.map((row) => Object.values(row));
       },
     };
+    executions.set(prepared, all);
+    return prepared;
   };
   return {
     prepare: (sql: string) => statement(sql),
-    batch: async (statements: { all(): Promise<unknown> }[]) =>
-      Promise.all(statements.map((s) => s.all())),
+    batch: async (statements: { all(): Promise<unknown> }[]) => {
+      const execute = statements.map((statement) => {
+        const run = executions.get(statement);
+        if (!run) throw new Error("D1 batch received a statement from another database");
+        return run;
+      });
+      // D1 serializes each batch transaction. Never yield with BEGIN open: Node
+      // callers may start another batch while this one's promise is pending.
+      sqlite.exec("BEGIN");
+      try {
+        const results = execute.map((run) => run());
+        sqlite.exec("COMMIT");
+        return results;
+      } catch (error) {
+        sqlite.exec("ROLLBACK");
+        throw error;
+      }
+    },
     exec: async (sql: string) => {
       sqlite.exec(sql);
       return { count: 0, duration: 0 };

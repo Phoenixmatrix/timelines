@@ -12,6 +12,7 @@
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
+import type { RepoSummary } from "../../../shared/api.ts";
 import type { AtlasTimeline } from "../../../shared/atlas.ts";
 import type { TimelineDetail } from "../../../shared/timelines.ts";
 import { atlasFixtureRepo, commitId, settled } from "../../testing/atlas.ts";
@@ -207,10 +208,10 @@ test("a timeline in capabilities, across repositories, ended and expired", async
   await settled(server);
   for (const { url } of server.since(mark))
     if (/\/atlas\/[a-z]+$/.test(url.pathname))
-      expect(url.pathname.startsWith("/api/accounts/orbit/atlas/"), url.pathname).toBe(true);
+      expect(url.pathname.startsWith("/api/spaces/orbit/atlas/"), url.pathname).toBe(true);
   expect(
-    server.since(mark).some((r) => r.url.pathname === "/api/accounts/orbit/atlas/timeline"),
-    "The workspace panel read GET /api/accounts/:owner/atlas/timeline",
+    server.since(mark).some((r) => r.url.pathname === "/api/spaces/orbit/atlas/timeline"),
+    "The workspace panel read GET /api/spaces/:space/atlas/timeline",
   ).toBe(true);
 
   // 5. The timeline lands: its overlay is kept read-only, and reading it asks
@@ -258,10 +259,15 @@ test("a timeline in capabilities, across repositories, ended and expired", async
 
   // 7. CORE-201: 100 days on, retention ("ended-timeline-data", 90 days)
   // removes the ended overlay's changes and pages; the panel says so.
+  const resource = await server.call<RepoSummary>("GET", repo.api);
   const { run } = await server.call<{ run: { status: string; items: number } }>(
     "POST",
     "/api/dev/retention",
-    { account: "orbit", categories: { "ended-timeline-data": { days: 90 } }, daysAhead: 100 },
+    {
+      target: { kind: "space", id: resource.space.id },
+      categories: { "ended-timeline-data": { days: 90 } },
+      daysAhead: 100,
+    },
   );
   expect(run.status).toBe("succeeded");
   expect(run.items, "The overlay's changes go").toBeGreaterThanOrEqual(4);

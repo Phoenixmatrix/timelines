@@ -1,3 +1,4 @@
+import { contentHeaders, fixtureMutationBody, fixtureSpace } from "./content-fixtures.ts";
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -27,6 +28,7 @@ import { searchItemStatus } from "./search-item-status.ts";
 import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
 import { runQueueAiE2E } from "./queue-ai-e2e.ts";
+import { runSpaceAiE2E } from "./space-ai-e2e.ts";
 import { collectGatewayLogs, reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
 import { collectModelFailureEvidence, modelFailureAttempt } from "./model-failure-evidence.ts";
 import type { Outcome, Selection, StageDefinition } from "./ai-stages.ts";
@@ -72,7 +74,7 @@ export const COPPER_FINCH_STAGES = [
   {
     id: "search",
     covers:
-      "Embeddings in Vectorize and AI Search passages becoming visible; repository isolation; the palette's code and wiki search",
+      "Embeddings in Vectorize and AI Search passages becoming visible; populated four-Space AI isolation and Organization-owner denial; repository isolation; the palette's code and wiki search",
     requires: ["knowledge"],
     paths: [
       HARNESS,
@@ -83,20 +85,31 @@ export const COPPER_FINCH_STAGES = [
       `${SHARED}/search.ts`,
       "tools/agent/index-visibility.ts",
       "tools/agent/search-item-status.ts",
+      "tools/agent/space-ai-e2e.ts",
+      `${WORKER}/api/spaces.ts`,
+      `${WORKER}/spaces/**`,
+      `${WORKER}/permissions.ts`,
+      `${SHARED}/spaces.ts`,
     ],
   },
   {
     id: "assistant",
     covers:
-      "A real assistant turn answered from the index; personal slash-skill creation, private instructions and persisted receipts; approval-gated writes, follow-ups, retry and redirect; status between steps; Gateway assistant records",
+      "A real assistant turn answered from the index; warm/cold source-grant revocation blocks retained transcript/export/UI and Atlas cursors/pins; restoration preserves the transcript; personal slash-skill creation, private instructions and persisted receipts; approval-gated writes, follow-ups, retry and redirect; status between steps; Gateway assistant records",
     requires: ["search"],
     paths: [
       HARNESS,
       `${WORKER}/assistant/**`,
       `${WORKER}/api/assistant.ts`,
       `${WORKER}/api/personal-skills.ts`,
+      `${WORKER}/api/spaces.ts`,
+      `${WORKER}/spaces/**`,
+      `${SHARED}/spaces.ts`,
       `${WORKER}/knowledge/api.ts`,
       `${WORKER}/knowledge/indexes.ts`,
+      `${WORKER}/atlas/api.ts`,
+      `${WORKER}/atlas/workspace.ts`,
+      `${WORKER}/atlas/cursor.ts`,
       `${SRC}/assistant/**`,
       `${SRC}/routes/AssistantSkills.tsx`,
       `${SHARED}/assistant.ts`,
@@ -162,7 +175,8 @@ export const COPPER_FINCH_STAGES = [
   },
   {
     id: "overlays",
-    covers: "A timeline bookmark's knowledge overlay across two pushes, leaving main untouched",
+    covers:
+      "A timeline's knowledge overlay across two pushes, leaving main untouched; a real late build is refused after abandonment, preserving the exact ended overlay and Atlas snapshot",
     requires: ["knowledge-edit"],
     paths: [HARNESS, KNOWLEDGE, `${WORKER}/timelines/**`, `${SRC}/routes/repo/TimelineOverlay.tsx`],
   },
@@ -222,6 +236,14 @@ export interface AiRun {
   outcomes: Record<string, Outcome>;
 }
 
+/** An observed restart of the same owned native app, without resetting its state. */
+export interface RuntimeRestartEvidence {
+  environmentId: string;
+  origin: string;
+  before: NonNullable<Environment["server"]>;
+  after: NonNullable<Environment["server"]>;
+}
+
 /** What a knowledge build's stats say of how it ran (only the fields read here). */
 interface BuildStats {
   analyzed?: number;
@@ -245,7 +267,13 @@ interface GatewayLog {
   provider: string;
   success: boolean;
   cached: boolean;
-  metadata?: { component?: string; account?: string; feature?: string; attempt?: string };
+  metadata?: {
+    component?: string;
+    scopeKind?: string;
+    scopeId?: string;
+    feature?: string;
+    attempt?: string;
+  };
   request: string;
   response: string;
   response_content_type: string;
@@ -266,7 +294,8 @@ interface GatewayLogSummary {
   tokensIn: number;
   tokensOut: number;
   cost?: number;
-  account?: string;
+  scopeKind?: string;
+  scopeId?: string;
   feature?: string;
   attempt?: string;
 }
@@ -347,7 +376,8 @@ async function gatewayLogs(
         tokensIn: log.tokens_in,
         tokensOut: log.tokens_out,
         cost: log.cost,
-        account: log.metadata?.account,
+        scopeKind: log.metadata?.scopeKind,
+        scopeId: log.metadata?.scopeId,
         feature: log.metadata?.feature,
         attempt: modelFailureAttempt(log.metadata?.attempt),
       },
@@ -575,6 +605,7 @@ export async function runProviderE2E(
   fixtures: SeedManifest,
   mode: "mirror" | "ai",
   run?: AiRun,
+  restartRuntime?: () => Promise<RuntimeRestartEvidence>,
 ): Promise<void> {
   if (mode === "ai" && !run) throw new Error("An AI run needs its stage selection.");
   const selected = new Set(run?.selection.stages ?? []);
@@ -667,9 +698,11 @@ export async function runProviderE2E(
     expected = 200,
     timeoutMs = 120_000,
   ) => {
+    body = await fixtureMutationBody(ctx.origin, path, fixtures.tokens[persona], body);
     const response = await fetch(`${ctx.origin}/api${path}`, {
       method,
       headers: {
+        ...contentHeaders,
         authorization: `Bearer ${fixtures.tokens[persona]}`,
         "content-type": "application/json",
       },
@@ -757,7 +790,7 @@ export async function runProviderE2E(
     const name = `provider-${randomBytes(5).toString("hex")}`;
     const base = `/repos/${encodeURIComponent(owner)}/${name}`;
     evidence.repo = `${owner}/${name}`;
-    const settingsPath = `/accounts/${owner}/settings/ai`;
+    const settingsPath = `/spaces/${owner}/settings/ai`;
     const aiSettingsEvidence: Record<string, unknown> = {};
     let capturedAi: AiSnapshot | undefined;
     let nextAi: AiSettingsView | undefined;
@@ -776,7 +809,10 @@ export async function runProviderE2E(
       const response = await fetch(
         `${ctx.origin}/api/dev/ai-usage?since=${String(evidence.startedAt).slice(0, 10)}`,
         {
-          headers: { authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET ?? ""}` },
+          headers: {
+            ...contentHeaders,
+            authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET ?? ""}`,
+          },
           signal: AbortSignal.timeout(60_000),
         },
       );
@@ -787,14 +823,14 @@ export async function runProviderE2E(
       begin("classification");
       enter("classification-selected-policy");
       const owned = await ownedEnvironment();
-      const path = `/accounts/${persona}/settings/ai`;
+      const path = `/spaces/${persona}/settings/ai`;
       const original = (await api(path)) as AiSettingsView;
       assert.equal(original.models.classification, "clef", "Clef remains the fixture default");
       const fixture = await api(`/repos/${persona}/hello-world`);
       assert.equal(typeof fixture.id, "string");
-      const accountId = `acc_${persona}`;
+      const spaceId = (await fixtureSpace(ctx.origin, persona, fixtures.tokens[persona])).space.id;
       const decisions: Record<string, unknown>[] = [];
-      const report = { account: persona, repo: fixture.id, decisions, restored: false };
+      const report = { space: persona, repo: fixture.id, decisions, restored: false };
       evidence.classification = report;
       try {
         for (const selector of ["clef-flash", "clef-omni"] as const) {
@@ -806,7 +842,10 @@ export async function runProviderE2E(
           assert.equal(persisted.models.classification, selector);
           const model = `@cf/cloudflare/${selector}`;
           const matchesUsage = (row: UsageRow) =>
-            row.account_id === accountId && row.feature === "knowledge" && row.model === model;
+            row.scope_kind === "space" &&
+            row.scope_id === spaceId &&
+            row.feature === "knowledge" &&
+            row.model === model;
           const beforeUsage = (await appUsage()).find(matchesUsage);
           const startedAt = new Date().toISOString();
           // One choice per model, no retry: select an actual outage, not a
@@ -859,7 +898,9 @@ export async function runProviderE2E(
           decisions.push(decision);
           await waitFor(`classification-${selector}-gateway`, 120_000, async () => {
             const { logs } = await gatewayLogs(owned, startedAt, "knowledge", decision.model);
-            decision.gateway = logs.filter((log) => log.account === accountId);
+            decision.gateway = logs.filter(
+              (log) => log.scopeKind === "space" && log.scopeId === spaceId,
+            );
             assert(decision.gateway.length <= 1, "Each selected classifier gets at most one call");
             if (!decision.gateway.length) return false;
             const log = decision.gateway[0]!;
@@ -894,7 +935,7 @@ export async function runProviderE2E(
       "/repos",
       "POST",
       {
-        owner,
+        spaceId: (await fixtureSpace(ctx.origin, owner, fixtures.tokens[persona])).space.id,
         name,
         visibility: "private",
         description: "Tiny isolated provider integration fixture",
@@ -928,6 +969,7 @@ export async function runProviderE2E(
         const response = await fetch(`${ctx.origin}/api/dev/${path}`, {
           method: body === undefined ? "GET" : "POST",
           headers: {
+            ...contentHeaders,
             authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET}`,
             "content-type": "application/json",
           },
@@ -1240,7 +1282,7 @@ export async function runProviderE2E(
       } finally {
         const deleted = await fetch(`${ctx.origin}/api${base}`, {
           method: "DELETE",
-          headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+          headers: { ...contentHeaders, authorization: `Bearer ${fixtures.tokens[persona]}` },
           signal: AbortSignal.timeout(60_000),
         });
         assert.equal(deleted.status, 204, "Delete only this owned mirror repository");
@@ -1435,6 +1477,22 @@ export async function runProviderE2E(
             ),
           "Another repository's search returned the fixture's results",
         );
+        const spaceAiEvidence: Record<string, unknown> = {};
+        evidence.spaceAi = spaceAiEvidence;
+        await runSpaceAiE2E(
+          ctx,
+          fixtures,
+          spaceAiEvidence,
+          {
+            repoId: fixtureRepo.id,
+            name,
+            commit: final,
+            result: evidence.search as Parameters<typeof runSpaceAiE2E>[3]["result"],
+          },
+          enter,
+          waitFor,
+        );
+        enter("palette-knowledge");
         {
           // The palette's code and wiki mode, against these real providers:
           // nothing is searched until Enter, and the code result opens the file.
@@ -1494,6 +1552,7 @@ export async function runProviderE2E(
       if (want("assistant")) {
         begin("assistant");
         enter("assistant");
+        assert(restartRuntime, "Retained-content verification requires an owned native restart");
         // CORE-290: the persona keeps its conversations' bodies (the agent
         // environment's default) but not its titles' and status lines', so the
         // gateway evidence below sees both sides of the header.
@@ -1505,6 +1564,7 @@ export async function runProviderE2E(
         const asked = await fetch(`${ctx.origin}/api/assistant/ask`, {
           method: "POST",
           headers: {
+            ...contentHeaders,
             authorization: `Bearer ${fixtures.tokens[persona]}`,
             "content-type": "application/json",
           },
@@ -1549,6 +1609,172 @@ export async function runProviderE2E(
           ),
           "The conversation must be in the person's directory",
         );
+        // Reuse this real answer: revocation proof must not require another model turn.
+        assert(chat, "A completed assistant turn must identify its persisted conversation");
+        enter("assistant-source-revocation");
+        const exportPath = `/assistant/chats/${chat.chatId}/export`;
+        const originalTranscript = await api(exportPath);
+        assert(
+          JSON.stringify(originalTranscript).includes("65521"),
+          "The authorized export must retain the source-backed answer",
+        );
+        const retainedAtlas: {
+          kind: string;
+          snapshot: string;
+          reads: { path: string; absent: string }[];
+        }[] = [];
+        const workspaceRepos = encodeURIComponent(`${name},engine`);
+        const ghost = `absent-${randomUUID()}`;
+        for (const target of [
+          {
+            kind: "repository",
+            catalogue: `${base}/atlas/catalogue?limit=1`,
+            overview: `${base}/atlas/overview?`,
+            absentCatalogue: `/repos/${owner}/${ghost}/atlas/catalogue?limit=1`,
+            absentOverview: `/repos/${owner}/${ghost}/atlas/overview?`,
+          },
+          {
+            kind: "workspace",
+            catalogue: `/spaces/${owner}/atlas/catalogue?repos=${workspaceRepos}&limit=1`,
+            overview: `/spaces/${owner}/atlas/overview?repos=${workspaceRepos}&`,
+            absentCatalogue: `/spaces/${owner}/atlas/catalogue?repos=${ghost}&limit=1`,
+            absentOverview: `/spaces/${owner}/atlas/overview?repos=${ghost}&`,
+          },
+        ]) {
+          const first = await api(target.catalogue);
+          assert(typeof first.next === "string" && first.next, "Capture a real Atlas continuation");
+          const cursor = `&cursor=${encodeURIComponent(first.next)}`;
+          const snapshot = `snapshot=${encodeURIComponent(first.snapshot.id)}`;
+          const continued = await api(target.catalogue + cursor);
+          const pinned = await api(target.overview + snapshot);
+          assert.equal(continued.snapshot.id, first.snapshot.id);
+          assert.equal(pinned.snapshot.id, first.snapshot.id);
+          if (target.kind === "workspace")
+            assert.deepEqual(
+              first.snapshot.repos.map((repo: { name: string }) => repo.name).sort(),
+              [name, "engine"].sort(),
+            );
+          retainedAtlas.push({
+            kind: target.kind,
+            snapshot: first.snapshot.id as string,
+            reads: [
+              { path: target.catalogue + cursor, absent: target.absentCatalogue + cursor },
+              { path: target.overview + snapshot, absent: target.absentOverview + snapshot },
+            ],
+          });
+        }
+        const scope = await fixtureSpace(ctx.origin, owner, fixtures.tokens[persona]);
+        assert(scope.grant && scope.capabilities.canManageGrants);
+        const grantPath = `/spaces/${owner}/grants/${scope.grant.accountId}`;
+        const grantHeaders = {
+          ...contentHeaders,
+          authorization: `Bearer ${fixtures.tokens[persona]}`,
+          "content-type": "application/json",
+        };
+        const revocationErrors: unknown[] = [];
+        const revocationEvidence = {
+          chatId: chat.chatId,
+          spaceId: scope.space.id,
+          denied: [] as string[],
+          unavailableUi: false,
+          restoredTranscript: false,
+          atlas: retainedAtlas.map(({ kind, snapshot }) => ({ kind, snapshot })),
+          coldRuntime: null as RuntimeRestartEvidence | null,
+          coldDenied: [] as string[],
+        };
+        evidence.assistantSourceRevocation = revocationEvidence;
+        try {
+          const removed = await fetch(`${ctx.origin}/api${grantPath}`, {
+            method: "DELETE",
+            headers: grantHeaders,
+            signal: AbortSignal.timeout(30_000),
+          });
+          assert.equal(
+            removed.status,
+            204,
+            "Revoke only the fixture person's explicit Space grant",
+          );
+          const directory = await api(`/spaces/${owner}`);
+          assert.equal(directory.capabilities.canManageGrants, true);
+          assert.equal(directory.capabilities.canReadContent, false);
+          const deniedReads = async (paths: string[]) => {
+            for (const path of [
+              `/assistant/chats/${chat.chatId}`,
+              exportPath,
+              `/assistant/chats/${chat.chatId}/agent/get-messages`,
+            ]) {
+              await api(path, "GET", undefined, 403);
+              paths.push(path);
+            }
+            const unavailable = (await api("/assistant/chats")).chats.find(
+              (entry: { id: string }) => entry.id === chat.chatId,
+            );
+            assert.equal(unavailable?.contentUnavailable, true);
+            for (const { path, absent } of [
+              ...retainedAtlas.flatMap((atlas) => atlas.reads),
+              {
+                path: `${base}/knowledge/search?q=copperFinchChecksum`,
+                absent: `/repos/${owner}/${ghost}/knowledge/search?q=copperFinchChecksum`,
+              },
+            ]) {
+              const hidden = await api(path, "GET", undefined, 404);
+              const missing = await api(absent, "GET", undefined, 404);
+              assert.deepEqual(hidden, missing, "Retained private reads must match absent sources");
+              paths.push(path);
+            }
+          };
+          await deniedReads(revocationEvidence.denied);
+          revocationEvidence.coldRuntime = await restartRuntime();
+          await deniedReads(revocationEvidence.coldDenied);
+
+          const browser = await chromium.launch({ headless: true });
+          try {
+            const context = await browser.newContext({ baseURL: ctx.origin });
+            const page = await context.newPage();
+            const expect = playwrightExpect.configure({ timeout: 30_000 });
+            await page.goto("/signin");
+            await page
+              .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
+              .click();
+            await page.waitForURL((url) => url.pathname !== "/signin");
+            await page.goto(`/?chat=${encodeURIComponent(chat.chatId)}`);
+            const dock = page.getByRole("complementary", { name: "Assistant" });
+            await expect(
+              dock.getByRole("region", { name: "Unavailable conversation" }),
+            ).toBeVisible();
+            await expect(dock.getByRole("textbox")).toHaveCount(0);
+            await expect(dock.getByRole("link")).toHaveCount(0);
+            await page.screenshot({
+              path: join(ctx.artifacts, "assistant-source-revoked.png"),
+              fullPage: true,
+            });
+            revocationEvidence.unavailableUi = true;
+          } finally {
+            await browser.close().catch((error: unknown) => revocationErrors.push(error));
+          }
+        } catch (error) {
+          revocationErrors.push(error);
+        }
+        // Restore the exact independent grants even when an assertion or transport failed.
+        try {
+          const restored = await fetch(`${ctx.origin}/api${grantPath}`, {
+            method: "PUT",
+            headers: grantHeaders,
+            body: JSON.stringify({
+              role: scope.grant.role,
+              repositoryRole: scope.grant.repositoryRole,
+              packageRole: scope.grant.packageRole,
+            }),
+            signal: AbortSignal.timeout(30_000),
+          });
+          assert.equal(restored.status, 204, "Restore the fixture's original explicit grant");
+        } catch (error) {
+          revocationErrors.push(error);
+        }
+        if (revocationErrors.length)
+          throw new AggregateError(revocationErrors, "Assistant source-revocation proof failed");
+        assert.deepEqual(await api(exportPath), originalTranscript);
+        revocationEvidence.restoredTranscript = true;
       }
       if (want("assistant") || want("avatars")) {
         const teamKey = `C${randomBytes(2).toString("hex").toUpperCase()}`;
@@ -1570,6 +1796,7 @@ export async function runProviderE2E(
         page.setDefaultTimeout(120_000);
         await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
         let rejectNextResponse = false;
+        let releaseChatHistory: (() => void) | undefined;
         // The turn's stream chunks, in order, for the between-steps status check.
         const chunks: { type: string; data?: { text?: string } }[] = [];
         await page.routeWebSocket(/\/api\/assistant\/chats\//, (socket) => {
@@ -1610,7 +1837,7 @@ export async function runProviderE2E(
             const skillDescription = "Create one approved tracker task and open its receipt.";
             const skillMarker = `SKILL-APPLIED-${randomBytes(8).toString("hex")}`;
             const skillBody = [
-              "For this explicit invocation only, use the owner, team and title supplied in the message.",
+              "For this explicit invocation only, use the Space, team and title supplied in the message.",
               "Call create_issue now to propose exactly one task with those values.",
               "The tool's built-in approval card must obtain approval before the write executes;",
               "do not ask for a separate conversational confirmation.",
@@ -1666,6 +1893,13 @@ export async function runProviderE2E(
               createdAt: personalSkill.createdAt,
               updatedAt: personalSkill.updatedAt,
             };
+            const chatHistoryReady = new Promise<void>((resolve) => {
+              releaseChatHistory = resolve;
+            });
+            await page.route("**/api/assistant/chats", async (route) => {
+              await chatHistoryReady;
+              await route.continue();
+            });
             await page.goto(`/${owner}/${name}`);
             await page.getByRole("button", { name: "Assistant", exact: true }).click();
             const composer = page.getByRole("textbox", { name: "Message the assistant" });
@@ -1680,10 +1914,15 @@ export async function runProviderE2E(
             await expect(composer).toHaveValue(`/${skillName} `);
             await expect(skillPicker).toBeHidden();
             await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeHidden();
-            const invocation = `/${skillName} Owner: ${persona}. Team: ${teamKey}. Title: "${title}".`;
+            const invocation = `/${skillName} Space: ${persona}. Team: ${teamKey}. Title: "${title}".`;
             skillEvidence.userInvocation = invocation;
             await composer.fill(invocation);
             await page.getByRole("button", { name: "Send", exact: true }).click();
+            await expect(page.getByRole("list", { name: "Conversation" })).toContainText(
+              invocation,
+            );
+            releaseChatHistory!();
+            skillEvidence.firstMessageBeforeHistory = true;
             await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
             const chatId = await page.evaluate(() => localStorage.getItem("gm.assistant.chat"));
             assert(chatId, "The browser must retain its conversation");
@@ -1837,7 +2076,7 @@ export async function runProviderE2E(
             );
             const declinedTitle = `Declined ${title}`;
             await composer.fill(
-              `Create one task in owner ${persona}, team ${teamKey}, titled "${declinedTitle}". Ask for my approval.`,
+              `Propose a separate new task in Space ${persona}, team ${teamKey}, titled "${declinedTitle}", using create_issue. Request fresh approval through the tool's built-in approval card. Do not reuse the earlier task's approval or execute this new write before I approve its own card.`,
             );
             await page.getByRole("button", { name: "Send", exact: true }).click();
             await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
@@ -1928,7 +2167,7 @@ export async function runProviderE2E(
             // working, and asks the small status model for the words.
             chunks.length = 0;
             await composer.fill(
-              `Use show_issue to read ${created[0].key} in owner ${persona}, then reply with its title.`,
+              `Use show_issue to read ${created[0].key} in Space ${persona}, then reply with its title.`,
             );
             await page.getByRole("button", { name: "Send", exact: true }).click();
             await waitFor(stage, 120_000, async () => {
@@ -1999,6 +2238,7 @@ export async function runProviderE2E(
             evidence.avatars = { status: options.status, images };
           }
         } finally {
+          releaseChatHistory?.();
           await page
             .screenshot({ path: join(ctx.artifacts, "assistant-approval.png"), fullPage: true })
             .catch(() => {});
@@ -2210,7 +2450,7 @@ export async function runProviderE2E(
         evidence.taggedNotes = tagged;
         evidence.releaseFeeds = { daily: feed.entries, tag: tagFeed.entries };
         enter("release-issue-tracker");
-        // A tracker issue, completed with evidence in a workspace subscribed to
+        // A tracker issue, completed with evidence in a Project subscribed to
         // the fixture, that the next commit cites by key.
         const repo = await api(base);
         const operation = () => `provider-${randomBytes(8).toString("hex")}`;
@@ -2218,18 +2458,18 @@ export async function runProviderE2E(
           operationId: operation(),
           mutations: [
             { kind: "team.create", id: "copper-team", data: { key: "CF", name: "Copper Finch" } },
-            { kind: "workspace.create", id: "copper-ws", data: { slug: "copper", name: "Copper" } },
+            { kind: "project.create", id: "copper-ws", data: { slug: "copper", name: "Copper" } },
             {
               kind: "subscription.add",
               id: "copper-sub",
-              data: { workspaceId: "copper-ws", repoId: repo.id },
+              data: { projectId: "copper-ws", repoId: repo.id },
             },
             {
               kind: "issue.create",
               id: "copper-issue",
               data: {
                 teamId: "copper-team",
-                workspaceIds: ["copper-ws"],
+                projectIds: ["copper-ws"],
                 title: "Let receivers verify a batch of Copper Finch parcels",
                 description:
                   "Receivers check many parcels at once. Add copperFinchVerifyAll, which is true only when every parcel matches its expected checksum.",
@@ -2273,14 +2513,14 @@ export async function runProviderE2E(
           assert.equal(note[field], original[field], `Knowledge must preserve evidence ${field}`);
         assert.equal(note.issue.key, "CF-1");
         assert.equal(note.issue.status, "done");
-        assert.equal(note.trackerOwner, owner);
+        assert.equal(note.trackerSpace, owner);
         assert.equal(note.url, sourceUrl);
         assert.equal(found.truncated, false);
 
         // Sam can read this repository, but is not a member of Orbit's tracker.
         await api(`${base}/collaborators/sam`, "PUT", { role: "read" });
         const repoOnly = await fetch(`${ctx.origin}/api${completionPath}`, {
-          headers: { authorization: `Bearer ${fixtures.tokens.sam}` },
+          headers: { ...contentHeaders, authorization: `Bearer ${fixtures.tokens.sam}` },
           signal: AbortSignal.timeout(60_000),
         });
         assert.equal(repoOnly.status, 200, "A repository collaborator can reach Knowledge");
@@ -2292,7 +2532,7 @@ export async function runProviderE2E(
         );
         const removed = await fetch(`${ctx.origin}/api${base}/collaborators/sam`, {
           method: "DELETE",
-          headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+          headers: { ...contentHeaders, authorization: `Bearer ${fixtures.tokens[persona]}` },
           signal: AbortSignal.timeout(60_000),
         });
         assert.equal(removed.status, 204, "Remove the temporary repository-only reader");
@@ -2302,6 +2542,7 @@ export async function runProviderE2E(
         const asked = await fetch(`${ctx.origin}/api/assistant/ask`, {
           method: "POST",
           headers: {
+            ...contentHeaders,
             authorization: `Bearer ${fixtures.tokens[persona]}`,
             "content-type": "application/json",
           },
@@ -2334,7 +2575,7 @@ export async function runProviderE2E(
           error?: unknown;
           evidence?: (Comment & {
             url: string;
-            trackerOwner: string;
+            trackerSpace: string;
             issue: { key: string; status: string };
           })[];
         };
@@ -2382,7 +2623,7 @@ export async function runProviderE2E(
           );
         assert.equal(retrieved.issue.key, "CF-1");
         assert.equal(retrieved.issue.status, "done");
-        assert.equal(retrieved.trackerOwner, owner);
+        assert.equal(retrieved.trackerSpace, owner);
         assert.equal(
           retrieved.url,
           sourceUrl,
@@ -2430,7 +2671,7 @@ export async function runProviderE2E(
           "A commit citing a completed tracker issue must become that issue's entry",
         );
         assert.equal(issueEntry.kind, "issue");
-        assert.equal(issueEntry.issue!.trackerOwner, owner);
+        assert.equal(issueEntry.issue!.trackerSpace, owner);
         assert.equal(issueEntry.issue!.team.key, "CF");
         assert.deepEqual(issueEntry.commits, [cited], "The issue entry must cite the commit");
         assert.equal(issueEntry.model, "@cf/zai-org/glm-5.3-flash");
@@ -2468,12 +2709,17 @@ export async function runProviderE2E(
           "The team's release feed must include the shipped issue",
         );
         // CORE-151: custom release notes written on demand from that release, one
-        // metered call billed to the repository's owner and labelled in the gateway.
+        // metered call billed to the repository's Space and labelled in the gateway.
         enter("release-compose");
         const composeStarted = new Date().toISOString();
         const composeCalls = async () =>
           (await appUsage())
-            .filter((row) => row.feature === "release_notes_compose" && row.slug === owner)
+            .filter(
+              (row) =>
+                row.feature === "release_notes_compose" &&
+                row.scope_kind === "space" &&
+                row.slug === owner,
+            )
             .reduce((sum, row) => sum + row.calls + row.failed, 0);
         const composeBefore = await composeCalls();
         const composed = await api(`${base}/release-notes/compose`, "POST", {
@@ -2513,10 +2759,13 @@ export async function runProviderE2E(
           1,
           "One request must be one metered call",
         );
-        const composeAccount = (await appUsage()).find(
-          (row) => row.feature === "release_notes_compose" && row.slug === owner,
-        )?.account_id;
-        assert(composeAccount, "The compose call must be billed to the repository's owner");
+        const composeSpace = (await appUsage()).find(
+          (row) =>
+            row.feature === "release_notes_compose" &&
+            row.scope_kind === "space" &&
+            row.slug === owner,
+        )?.scope_id;
+        assert(composeSpace, "The compose call must be billed to the repository's Space");
         const composeOwned = await ownedEnvironment();
         await waitFor("release-compose-gateway-evidence", 120_000, async () => {
           const logs = await collectGatewayLogs((page) =>
@@ -2530,7 +2779,8 @@ export async function runProviderE2E(
               !log.cached &&
               log.provider === "workers-ai" &&
               log.feature === "release_notes_compose" &&
-              log.account === composeAccount,
+              log.scopeKind === "space" &&
+              log.scopeId === composeSpace,
           );
         });
         passed("release-notes");
@@ -2542,8 +2792,8 @@ export async function runProviderE2E(
         await atlas;
         enter("release-highlights");
         const repo = await api(base);
-        const orgPolicy: AiSettingsView = await api(settingsPath);
-        // Highlights are organization-level, windowed to seven days: the fixture's real
+        const spacePolicy: AiSettingsView = await api(settingsPath);
+        // Highlights belong to a tracker Space, windowed to seven days: the fixture's real
         // daily note is long past, so the proof copies it to today ("recent") and to ten
         // days ago ("stale", which must never feed the summary).
         // Both come from the fixture's own clock once its copies exist.
@@ -2552,7 +2802,7 @@ export async function runProviderE2E(
         let recentLink = "";
         const raw = async (path: string, token: string) => {
           const response = await fetch(`${ctx.origin}/api${path}`, {
-            headers: { authorization: `Bearer ${token}` },
+            headers: { ...contentHeaders, authorization: `Bearer ${token}` },
             signal: AbortSignal.timeout(60_000),
           });
           const text = await response.text();
@@ -2567,14 +2817,14 @@ export async function runProviderE2E(
         const detailed = await notesFor("day:2026-01-03");
         const tagged = await notesFor("provider-v1");
         // One new viewer projection: the first summary, the scheduled refresh and the
-        // invalidation repair are each one paid call, all billed to the organization.
+        // invalidation repair are each one paid call, all billed to the Space.
         const report: Record<string, unknown> = { maximumSummaries: 3, expectedSummaries: 3 };
         evidence.highlights = report;
         type StoredHighlight = {
           scope: ReleaseHighlights["scope"];
           scope_id: string;
           viewer_id: string;
-          owner_account_id: string;
+          space_id: string | null;
           generated_at: string;
           due_at: number;
           model: string;
@@ -2583,13 +2833,20 @@ export async function runProviderE2E(
         type FixtureState = {
           day?: string;
           rows: StoredHighlight[];
-          usage: { account_id: string; model: string; calls: number; failed_calls: number }[];
+          usage: {
+            scope_kind: "space" | "person" | "instance";
+            scope_id: string;
+            model: string;
+            calls: number;
+            failed_calls: number;
+          }[];
         };
         const fixture = async (action: string): Promise<FixtureState> => {
           assert(ctx.env.GITMATRIX_AGENT_SECRET);
           const response = await fetch(`${ctx.origin}/api/dev/release-highlights-fixtures`, {
             method: "POST",
             headers: {
+              ...contentHeaders,
               authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET}`,
               "content-type": "application/json",
             },
@@ -2611,11 +2868,12 @@ export async function runProviderE2E(
           });
           observedHighlights.push(result);
           assert.equal(result.scope, "tracker");
-          assert.equal(result.owner.slug, owner);
+          assert.equal(result.space.slug, owner);
+          assert.equal(result.space.id, repo.space.id);
           assert(
             result.notes.some(
               (note) =>
-                note.repo.owner === owner &&
+                note.repo.space === owner &&
                 note.repo.name === name &&
                 note.release === recentRelease,
             ),
@@ -2642,7 +2900,7 @@ export async function runProviderE2E(
         let windowed = false;
         const proofErrors: unknown[] = [];
         try {
-          report.policies = { organization: orgPolicy };
+          report.policies = { space: spacePolicy };
           report.semanticRequirements = [
             "parcel/checksum verification",
             "batch/all/every/multiple parcels",
@@ -2650,9 +2908,9 @@ export async function runProviderE2E(
             "no entry older than seven days",
           ];
           assert.equal(
-            orgPolicy.releaseHighlights.intervalHours,
+            spacePolicy.releaseHighlights.intervalHours,
             24,
-            "Default organization cadence is daily",
+            "Default Space cadence is daily",
           );
           assert.equal(before.rows.length, 0, "Fresh proof owns exactly its new viewer projection");
           windowed = true;
@@ -2685,15 +2943,15 @@ export async function runProviderE2E(
           assert.equal(initial.rows.length, 1);
           const [row] = initial.rows;
           assert.equal(row.scope, "tracker");
-          assert.equal(row.scope_id, "acc_orbit");
+          assert.equal(row.scope_id, repo.space.id);
           assert.equal(row.viewer_id, "acc_marco");
-          assert.equal(row.owner_account_id, "acc_orbit");
+          assert.equal(row.space_id, repo.space.id);
           assert(Math.abs(row.due_at - Date.parse(row.generated_at) - 24 * 3600_000) < 180_000);
           assert.equal(row.model, summary.model);
           const manifest = JSON.parse(row.source_manifest) as {
             repoId: string;
             release: string;
-            repo: { owner: string; name: string };
+            repo: { space: string; name: string };
           }[];
           assert(
             manifest.some(
@@ -2713,7 +2971,7 @@ export async function runProviderE2E(
             ).values(),
           ]);
           // Privacy is tested with generation enabled, never hidden behind an AI-off state:
-          // a non-member gets the tracker's refusal and no prose.
+          // a person without a Space grant gets the tracker's refusal and no prose.
           const outsider = await raw(path, fixtures.tokens.sam);
           report.outsider = outsider;
           assert([403, 404].includes(outsider.status));
@@ -2735,7 +2993,7 @@ export async function runProviderE2E(
           report.beforeDue = unchanged;
           await api(settingsPath, "PATCH", { releaseHighlights: { intervalHours: 48 } });
           assert.equal((await api(settingsPath)).releaseHighlights.intervalHours, 48);
-          await fixture("due"); // Actual sweep; only the owned organization row is aged.
+          await fixture("due"); // Actual sweep; only the owned Space row is aged.
           const refreshed = await ready(summary.status.generatedAt);
           const scheduled = await fixture("inspect");
           const scheduledRow = scheduled.rows.find((value) => value.scope === "tracker")!;
@@ -2758,21 +3016,21 @@ export async function runProviderE2E(
           const browser = await chromium.launch({ headless: true });
           try {
             const trackerList: TrackerList = await api("/tracker");
-            const defaultTracker =
-              trackerList.trackers.find((tracker) => tracker.id === trackerList.defaultOwnerId) ??
-              trackerList.trackers[0];
+            const defaultTracker = trackerList.trackers.find(
+              (tracker) => tracker.id === trackerList.defaultSpaceId,
+            );
             assert(defaultTracker, "The fixture must have an accessible default tracker");
             const context = await browser.newContext({ baseURL: ctx.origin });
             const page = await context.newPage();
             if (defaultTracker.slug !== owner)
-              // Landing on another default organization must not spend on its summary.
+              // Landing on another default Space must not spend on its summary.
               await page.route(
                 `**/api/tracker/${defaultTracker.slug}/release-notes/highlights`,
                 (route) =>
                   route.fulfill({
                     json: {
                       scope: "tracker",
-                      owner: { slug: defaultTracker.slug, displayName: defaultTracker.displayName },
+                      space: defaultTracker,
                       status: { state: "disabled", generatedAt: null },
                       body: null,
                       model: null,
@@ -2786,7 +3044,7 @@ export async function runProviderE2E(
               .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
               .click();
             await page.waitForURL((url) => url.pathname !== "/signin");
-            const organizationPath = `/tracker/${encodeURIComponent(owner)}/highlights`;
+            const spacePath = `/tracker/${encodeURIComponent(owner)}/highlights`;
             const defaultPath = `/tracker/${encodeURIComponent(defaultTracker.slug)}/highlights`;
             const screenshots: string[] = [];
             const article = page.getByRole("article", { name: "Release highlights" });
@@ -2795,12 +3053,12 @@ export async function runProviderE2E(
               { width: 390, height: 844 },
             ]) {
               await page.setViewportSize(viewport);
-              for (const route of [organizationPath, "/highlights"]) {
+              for (const route of [spacePath, "/highlights"]) {
                 await page.goto(route);
                 await page.waitForURL(
                   (url) => url.pathname === (route === "/highlights" ? defaultPath : route),
                 );
-                const screenshot = `highlights-${route === "/highlights" ? "default" : "organization"}-${viewport.width}.png`;
+                const screenshot = `highlights-${route === "/highlights" ? "default" : "space"}-${viewport.width}.png`;
                 if (route === "/highlights" && defaultTracker.slug !== owner) {
                   await page.screenshot({ path: join(ctx.artifacts, screenshot), fullPage: true });
                   screenshots.push(screenshot);
@@ -2813,13 +3071,13 @@ export async function runProviderE2E(
                   screenshots.push(screenshot);
                 }
                 if (route === "/highlights" && viewport.width === 1440) {
-                  // The rail's Timelines opens the default account's graph (CORE-402).
+                  // The rail's Timelines opens the default Space's graph (CORE-402).
                   const graph = page
                     .getByRole("navigation", { name: "Places" })
                     .getByRole("link", { name: /^Timelines/ });
                   const graphPath = `/tracker/${encodeURIComponent(defaultTracker.slug)}/timelines`;
                   await playwrightExpect(graph).toBeVisible();
-                  const navigationScreenshot = "highlights-organization-navigation.png";
+                  const navigationScreenshot = "highlights-space-navigation.png";
                   await page.screenshot({
                     path: join(ctx.artifacts, navigationScreenshot),
                     fullPage: true,
@@ -2830,15 +3088,15 @@ export async function runProviderE2E(
                     page.getByRole("heading", { name: "Timelines", exact: true }),
                   ).toBeVisible();
                   report.globalNavigation = {
-                    defaultOwner: defaultTracker.slug,
+                    defaultSpace: defaultTracker.slug,
                     url: page.url(),
                     screenshot: navigationScreenshot,
                   };
                 }
               }
             }
-            // The rail: from Home it lands on the default organization; inside an
-            // organization it stays there.
+            // The rail: from Home it lands on the default Space; inside a Space it
+            // stays there.
             const rail = page
               .getByRole("navigation", { name: "Places" })
               .getByRole("link", { name: "Highlights", exact: true });
@@ -2847,27 +3105,27 @@ export async function runProviderE2E(
             await rail.click();
             await page.waitForURL((url) => url.pathname === defaultPath);
             await page.goto(`/tracker/${encodeURIComponent(owner)}/releases`);
-            await playwrightExpect(rail).toHaveAttribute("href", organizationPath);
+            await playwrightExpect(rail).toHaveAttribute("href", spacePath);
             await rail.click();
-            await page.waitForURL((url) => url.pathname === organizationPath);
+            await page.waitForURL((url) => url.pathname === spacePath);
             await playwrightExpect(article.locator("p").first()).toHaveText(restored.body!, {
               timeout: 60_000,
             });
-            // The repository's release page links to its organization's highlights, and
-            // its old highlights page is gone.
+            // The repository's release page links to its Space's highlights, and its
+            // old highlights page is gone.
             await page.goto(`/${owner}/${name}/releases`);
-            const organizationLink = page
-              .getByRole("link", { name: "View organization highlights", exact: true })
+            const spaceLink = page
+              .getByRole("link", { name: "View Space highlights", exact: true })
               .first();
-            await playwrightExpect(organizationLink).toHaveAttribute("href", organizationPath);
-            await organizationLink.click();
-            await page.waitForURL((url) => url.pathname === organizationPath);
+            await playwrightExpect(spaceLink).toHaveAttribute("href", spacePath);
+            await spaceLink.click();
+            await page.waitForURL((url) => url.pathname === spacePath);
             await playwrightExpect(article.locator("p").first()).toHaveText(restored.body!, {
               timeout: 60_000,
             });
             await page.goto(`/${owner}/${name}/releases/highlights`);
             await playwrightExpect(
-              page.getByRole("link", { name: "View organization highlights", exact: true }).first(),
+              page.getByRole("link", { name: "View Space highlights", exact: true }).first(),
             ).toBeVisible();
             await playwrightExpect(article).toHaveCount(0);
             report.screenshots = screenshots;
@@ -2876,20 +3134,24 @@ export async function runProviderE2E(
           }
           const after = await fixture("inspect");
           report.after = after;
-          // Exactly three paid summaries, all the organization's: first, scheduled
-          // refresh, invalidation repair. Nothing is billed to the viewer or the outsider.
+          // Exactly three paid summaries, all the Space's: first, scheduled refresh,
+          // invalidation repair. Nothing is billed to the viewer or the outsider.
           let calls = 0;
-          for (const account of ["acc_orbit", "acc_marco", "acc_sam"]) {
+          for (const scope of [
+            { kind: "space", id: repo.space.id, calls: 3 },
+            { kind: "person", id: "acc_marco", calls: 0 },
+            { kind: "person", id: "acc_sam", calls: 0 },
+          ]) {
             const prior = before.usage
-              .filter((row) => row.account_id === account)
+              .filter((row) => row.scope_kind === scope.kind && row.scope_id === scope.id)
               .reduce((sum, row) => sum + row.calls + row.failed_calls, 0);
             const current = after.usage
-              .filter((row) => row.account_id === account)
+              .filter((row) => row.scope_kind === scope.kind && row.scope_id === scope.id)
               .reduce((sum, row) => sum + row.calls + row.failed_calls, 0);
             assert.equal(
               current - prior,
-              account === "acc_orbit" ? 3 : 0,
-              "Each real summary is charged to the organization",
+              scope.calls,
+              "Each real summary is charged to the Space, never a person",
             );
             calls += current - prior;
           }
@@ -2914,24 +3176,25 @@ export async function runProviderE2E(
             );
             for (const row of after.rows) {
               const count = successful.filter(
-                (log) => log.account === row.owner_account_id && log.model === row.model,
+                (log) =>
+                  log.scopeKind === "space" &&
+                  log.scopeId === row.space_id &&
+                  log.model === row.model,
               ).length;
               if (count < 3) return false;
             }
             return successful.length === 3;
           });
-          passed("release-highlights");
         } catch (error) {
           proofErrors.push(error);
-          throw error;
         } finally {
           // Independent restores must all run, even if appended-entry cleanup fails.
           const cleanups = await Promise.allSettled([
             appended ? fixture("remove-appended") : Promise.resolve(),
             windowed ? fixture("remove-windowed") : Promise.resolve(),
-            api(settingsPath, "PATCH", { releaseHighlights: orgPolicy.releaseHighlights }),
+            api(settingsPath, "PATCH", { releaseHighlights: spacePolicy.releaseHighlights }),
           ]);
-          const cleanupNames = ["appended entry", "windowed copies", "organization policy"];
+          const cleanupNames = ["appended entry", "windowed copies", "Space policy"];
           const cleanupErrors = cleanups.flatMap((result, index) =>
             result.status === "rejected"
               ? [
@@ -2941,27 +3204,28 @@ export async function runProviderE2E(
                 ]
               : [],
           );
-          if (cleanupErrors.length) {
-            // Name every failure: the AggregateError's own message is all the run prints.
-            const errors = [...proofErrors, ...cleanupErrors];
-            const described = errors.map((error) => {
-              const cause: unknown = error instanceof Error ? error.cause : undefined;
-              const why =
-                cause instanceof Error
-                  ? cause.message
-                  : typeof cause === "string"
-                    ? cause
-                    : cause === undefined
-                      ? ""
-                      : JSON.stringify(cause);
-              return `${error instanceof Error ? error.message : JSON.stringify(error)}${why ? ` (cause: ${why})` : ""}`;
-            });
-            throw new AggregateError(
-              errors,
-              `Release highlights proof cleanup failed: ${described.join("; ")}`,
-            );
-          }
+          proofErrors.push(...cleanupErrors);
         }
+        if (proofErrors.length) {
+          // Name every failure: the AggregateError's own message is all the run prints.
+          const described = proofErrors.map((error) => {
+            const cause: unknown = error instanceof Error ? error.cause : undefined;
+            const why =
+              cause instanceof Error
+                ? cause.message
+                : typeof cause === "string"
+                  ? cause
+                  : cause === undefined
+                    ? ""
+                    : JSON.stringify(cause);
+            return `${error instanceof Error ? error.message : JSON.stringify(error)}${why ? ` (cause: ${why})` : ""}`;
+          });
+          throw new AggregateError(
+            proofErrors,
+            `Release highlights proof failed: ${described.join("; ")}`,
+          );
+        }
+        passed("release-highlights");
       }
       if (want("overlays") || want("timeline-pages")) {
         begin(want("overlays") ? "overlays" : "timeline-pages");
@@ -3371,6 +3635,7 @@ export async function runProviderE2E(
             const response = await fetch(`${ctx.origin}/api/dev/${path}`, {
               method: "POST",
               headers: {
+                ...contentHeaders,
                 authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET}`,
                 "content-type": "application/json",
               },
@@ -3384,6 +3649,7 @@ export async function runProviderE2E(
           type KnowledgeObservation = {
             barrier: { build_id: string | null; released: number } | null;
             workflow: string | null;
+            error: { name: string; message: string } | null;
             outcome: string | null;
             commit: string | null;
             roots: string[];
@@ -3422,16 +3688,26 @@ export async function runProviderE2E(
               await git(["push", limitsWork.remote, "HEAD:refs/heads/work"], work, true);
               const lateHead = await git(["rev-parse", "HEAD"]);
               let paused: KnowledgeObservation | undefined;
+              const endedEvidence: Record<string, unknown> = { lateHead };
+              evidence.endedKnowledge = endedEvidence;
               await waitFor("knowledge-publication-paused", 12 * 60_000, async () => {
                 const observed: KnowledgeObservation = await knowledgeFixture(
                   "inspect",
                   limitsWork.source.sourceId,
                 );
                 paused = observed;
+                endedEvidence.paused = observed;
                 if (observed.workflow === "errored")
-                  throw new Error("Late real knowledge build failed");
+                  throw new Error(
+                    `Late real knowledge build failed: ${JSON.stringify(observed.error)}`,
+                  );
                 return Boolean(observed.barrier?.build_id);
               });
+              assert(paused?.barrier?.build_id, "Real build must reach the publication barrier");
+              assert(
+                paused.roots.includes(lateHead),
+                "Paused real build must claim the pushed commit",
+              );
               await api(`/tracker/${owner}/timelines/copper-limits/abandon`, "POST", {});
               const endedPath = `${base}/knowledge/overlay?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}&limit=2000`;
               const ended = await api(endedPath);
@@ -3440,6 +3716,7 @@ export async function runProviderE2E(
               const atlasEnded = await api(
                 `${base}/atlas/timeline?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}`,
               );
+              Object.assign(endedEvidence, { ended, atlas: atlasEnded });
               await knowledgeFixture("release", limitsWork.source.sourceId);
               let finished: KnowledgeObservation | undefined;
               await waitFor("knowledge-late-build-finished", 12 * 60_000, async () => {
@@ -3448,17 +3725,24 @@ export async function runProviderE2E(
                   limitsWork.source.sourceId,
                 );
                 finished = observed;
-                if (observed.workflow === "errored")
-                  throw new Error("Late real knowledge build failed");
-                return observed.workflow === "complete";
+                endedEvidence.finished = observed;
+                if (observed.workflow === "complete")
+                  throw new Error("Ended real knowledge build unexpectedly completed");
+                return observed.workflow === "errored";
               });
               assert(finished);
-              assert.equal(
-                finished.outcome,
-                "succeeded",
-                "Late workflow must reach the real publication fence",
+              assert.equal(finished.barrier?.build_id, paused.barrier.build_id);
+              assert.match(
+                finished.error?.message ?? "",
+                /^TimelineEnded:/,
+                "Late publication must fail because its timeline ended, not an unrelated error",
               );
-              assert.equal(finished.commit, lateHead);
+              assert.equal(finished.outcome, null, "Refused publication must not claim success");
+              assert.equal(
+                finished.commit,
+                null,
+                "Refused publication must not return a published commit",
+              );
               assert.deepEqual(
                 finished.roots,
                 [],
@@ -3486,7 +3770,6 @@ export async function runProviderE2E(
                 mainBefore,
                 "Late work changed canonical graph/pages",
               );
-              evidence.endedKnowledge = { lateHead, paused, finished, ended, atlas: atlasEnded };
             } finally {
               await knowledgeFixture("delete", limitsWork.source.sourceId);
             }
@@ -3531,9 +3814,13 @@ export async function runProviderE2E(
               await page.goto("/signin");
               await page.getByRole("button", { name: /Continue as marco/i }).click();
               await page.waitForURL((url) => url.pathname !== "/signin");
+              const approvalScope = await fixtureSpace(ctx.origin, owner, fixtures.tokens[persona]);
               const approved = await context.request.post(`/api/tracker/${owner}/mutate`, {
-                headers: { origin: ctx.origin },
+                headers: { ...contentHeaders, origin: ctx.origin },
                 data: {
+                  contractVersion: 4,
+                  spaceId: approvalScope.space.id,
+                  migrationEpoch: approvalScope.migrationEpoch,
                   operationId: `provider-${randomBytes(8).toString("hex")}`,
                   mutations: [
                     {
@@ -3935,9 +4222,15 @@ export async function runProviderE2E(
         const owned = await ownedEnvironment();
         const usageEvidence: Record<string, unknown> = {};
         evidence.usageReconciliation = usageEvidence;
-        const ownerAccount = (await appUsage()).find((row) => row.slug === owner)?.account_id;
-        assert(ownerAccount, `The fixture owner ${owner} recorded no AI usage`);
-        usageEvidence.account = ownerAccount;
+        const space = await fixtureSpace(ctx.origin, owner, fixtures.tokens[persona]);
+        const usageScope = { kind: "space", id: space.space.id } as const;
+        assert(
+          (await appUsage()).some(
+            (row) => row.scope_kind === usageScope.kind && row.scope_id === usageScope.id,
+          ),
+          `The fixture Space ${owner} recorded no AI usage`,
+        );
+        usageEvidence.scope = usageScope;
         let rows: ReturnType<typeof reconcileUsage>["rows"] = [];
         await waitFor("usage-reconciliation", 180_000, async () => {
           // Release notes and their highlights log under their own components
@@ -3952,11 +4245,13 @@ export async function runProviderE2E(
               ),
             )
           ).flat();
-          const result = reconcileUsage(await appUsage(), logs, ownerAccount);
+          const result = reconcileUsage(await appUsage(), logs, usageScope);
           rows = result.rows;
           usageEvidence.rows = result.rows;
           usageEvidence.mismatched = result.mismatched;
-          usageEvidence.unlabelledLogs = logs.filter((log) => !log.account).length;
+          usageEvidence.unlabelledLogs = logs.filter(
+            (log) => !log.scopeKind || log.scopeId === undefined,
+          ).length;
           return result.rows.length > 0 && result.mismatched.length === 0;
         });
         // Agreeing isn't enough: the builds' calls must be the owner's, not
@@ -3983,7 +4278,11 @@ export async function runProviderE2E(
         const dev = async <T>(path: string, method = "GET", body?: unknown): Promise<T> => {
           const response = await fetch(`${ctx.origin}/api/dev${path}`, {
             method,
-            headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+            headers: {
+              ...contentHeaders,
+              authorization: `Bearer ${secret}`,
+              "content-type": "application/json",
+            },
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
             signal: AbortSignal.timeout(120_000),
           });
@@ -4046,13 +4345,13 @@ export async function runProviderE2E(
         // still waits for Atlas below and every visibility assertion remains.
         const deleted = await fetch(`${ctx.origin}/api${base}`, {
           method: "DELETE",
-          headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+          headers: { ...contentHeaders, authorization: `Bearer ${fixtures.tokens[persona]}` },
           signal: AbortSignal.timeout(60_000),
         });
         events.push({ stage, method: "DELETE", path: base, status: deleted.status });
         assert.equal(deleted.status, 204, "Deleting the fixture repository");
         const hidden = await fetch(`${ctx.origin}/api${base}`, {
-          headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+          headers: { ...contentHeaders, authorization: `Bearer ${fixtures.tokens[persona]}` },
           signal: AbortSignal.timeout(60_000),
         });
         assert.equal(hidden.status, 404, "A deleted repository is missing at once");

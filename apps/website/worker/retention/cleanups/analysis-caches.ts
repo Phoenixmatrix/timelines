@@ -1,7 +1,7 @@
-// Analysis caches (site category "analysis-caches", CORE-201): cached file
+// Analysis caches (Instance category "analysis-caches", CORE-201): cached file
 // analyses (kg_blob_analysis) and syntheses (kg_synthesis) no build has used
 // for `days` before the run's moment. Both caches are keyed by content, not
-// repository, so this is a site category.
+// repository, so this is an Instance category.
 //
 // "Used" is `used_at`, which builds record cheaply (worker/knowledge/
 // cache-use.ts: at most once a day per entry; null counts as USED_SINCE).
@@ -37,7 +37,7 @@ const ANALYSIS = `coalesce(a.used_at, ?) < ?
 const SYNTHESIS = `coalesce(s.used_at, ?) < ?`;
 
 function cutoff(ctx: CleanupContext): string {
-  if (ctx.target.scope !== "site") throw new Error("analysis-caches is a site category.");
+  if (ctx.target.kind !== "instance") throw new Error("analysis-caches is an Instance category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("analysis-caches needs its days threshold.");
   return daysBefore(ctx.now, days);

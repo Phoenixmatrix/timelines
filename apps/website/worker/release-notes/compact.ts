@@ -20,7 +20,8 @@ export async function compactReleaseInputs(
     const rows = await db(d1)
       .selectFrom("source_integration_receipts as r")
       .innerJoin("source_integration_inputs as i", "i.receipt_id", "r.id")
-      .innerJoin("timeline_work_sources as s", "s.source_id", "r.source_id")
+      .leftJoin("timeline_work_sources as s", "s.source_id", "r.source_id")
+      .innerJoin("repos as repository", "repository.id", "r.repo_id")
       .select([
         "r.id",
         "r.source_id",
@@ -31,6 +32,9 @@ export async function compactReleaseInputs(
         "s.timeline_id",
         "s.timeline_slug",
         "s.work_ref",
+        "s.repo_id as source_repo_id",
+        "s.space_id as source_space_id",
+        "repository.space_id as repo_space_id",
       ])
       .where("r.repo_id", "=", repoId)
       .where("r.status", "=", "complete")
@@ -38,6 +42,16 @@ export async function compactReleaseInputs(
       .where("r.canonical_commit", "in", commits.slice(start, start + 90))
       .execute();
     for (const row of rows) {
+      if (
+        !row.source_space_id ||
+        !row.repo_space_id ||
+        row.source_repo_id !== repoId ||
+        row.source_space_id !== row.repo_space_id ||
+        row.timeline_id === null ||
+        row.timeline_slug === null ||
+        row.work_ref === null
+      )
+        throw new Error("release_source_scope_mismatch: compact receipt requires reconciliation.");
       const source: SourceSnapshot = {
         sourceId: row.source_id,
         repoId,

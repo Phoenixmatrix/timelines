@@ -77,8 +77,8 @@ import { syncSearchFiles, syncSearchPages, syncVectors } from "./indexes.ts";
 import { DEFINER, synthesize } from "./synthesize.ts";
 import { buildAiUsage, finalBuildStats, meterBuildCall, type ModelUsage } from "./meter.ts";
 import { coordinator } from "./coordinator.ts";
-import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay.ts";
-import { runPageSet } from "./pages.ts";
+import { computeOverlay, overlayFailed, planOverlay, timelineEnd, toAnalyze } from "./overlay.ts";
+import { runPageSet, overlayEnded, setFor } from "./pages.ts";
 import { knowledgeFixtureBarrier } from "./fixture-barrier.ts";
 import { chunk } from "./util.ts";
 import { planWiki, updatePages, WRITER, type WikiSource, type WikiStats } from "./wiki.ts";
@@ -88,10 +88,19 @@ import { knowledgeRepo, timelineKnowledgeSource } from "./sources.ts";
 import { getWorkSource } from "../timelines/sources.ts";
 import { releaseSourceRoots } from "../retention/work-sources.ts";
 import { pinKnowledgeBase, releaseKnowledgeBase, withOverlayReader } from "./source-reader.ts";
+import { withWorkflowCutoverAdmission } from "../durable/cutover-admission.ts";
+import {
+  reportWorkflowRuntime,
+  type WorkflowRuntimeProbe,
+} from "../durable/cutover-workflow-runtime.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
+import { resolveWorkAuthority } from "../ci/admission.ts";
+import { paidWorkGuard } from "./paid-work.ts";
 
 export interface BuildParams {
   repoId: string;
   buildId: string;
+  authorization: WorkAuthority;
   /** Absent only on Workflows started before account AI settings existed. */
   policy?: KnowledgePolicy;
   /** Pin watchdog continuations to their original work, not a newer push. */
@@ -223,14 +232,23 @@ function merge(base: Syntheses, over: Syntheses): Syntheses {
   };
 }
 
-export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
+export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams | WorkflowRuntimeProbe> {
+  #waitUntil: ((work: Promise<unknown>) => void) | null = null;
+  #cleanupStep!: WorkflowStep;
+  #authorization!: WorkAuthority;
+
+  #background(work: Promise<unknown>): void {
+    if (!this.#waitUntil) throw new Error("Knowledge background work has no cutover admission");
+    this.#waitUntil(work);
+  }
+
   #reader(row: RepoRow) {
     return new RepoReader(
       this.env,
       row.artifacts_name,
       row.artifacts_remote,
       new Timing(),
-      (work) => this.ctx.waitUntil(work),
+      (work) => this.#background(work),
       row.source_id && row.source_id !== "canonical" ? "refs/heads/work" : undefined,
     );
   }
@@ -246,7 +264,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         row.id,
         row.source_id,
         snapshot,
-        (pending) => this.ctx.waitUntil(pending),
+        (pending) => this.#background(pending),
         work,
       );
     const current = await knowledgeRepo(this.env, row.id, row.source_id);
@@ -308,8 +326,35 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     return { repoId: row.id, commit: head, reader, graph, syntheses, files, analyses, readme };
   }
 
-  run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
-    // Metering (CORE-207): every model call below is the repository owner's.
+  async run(
+    event: Readonly<WorkflowEvent<BuildParams | WorkflowRuntimeProbe>>,
+    step: WorkflowStep,
+  ) {
+    if ("cutoverRuntime" in event.payload)
+      return reportWorkflowRuntime(this.env, "KNOWLEDGE_BUILD", event, event.payload, step);
+    const businessEvent = { ...event, payload: event.payload };
+    try {
+      return await withWorkflowCutoverAdmission(
+        this.env,
+        "knowledge-build",
+        event,
+        step,
+        "KNOWLEDGE_BUILD",
+        async (waitUntil) => {
+          this.#waitUntil = waitUntil;
+          return this.#attributedRun(businessEvent, step);
+        },
+      );
+    } finally {
+      this.#waitUntil = null;
+    }
+  }
+
+  async #attributedRun(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
+    this.#cleanupStep = step;
+    this.#authorization = event.payload.authorization;
+    await resolveWorkAuthority(this.env, this.#authorization, event.payload.repoId);
+    // Meter the immutable Space; the authority separately retains the initiating person.
     const feature = event.payload.overlay
       ? "knowledge_overlay"
       : event.payload.pages
@@ -319,6 +364,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     const work: AiWork = {
       feature,
       repo: event.payload.repoId,
+      spaceId: event.payload.authorization.spaceId,
       // Main's builds meter their own calls (CORE-286), retried and failed attempts included.
       ...(main
         ? {
@@ -332,11 +378,38 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     // longer running (the watchdog stopped it, or it failed) or its repository
     // is being deleted.
     const { repoId, buildId } = event.payload;
-    const live =
-      event.payload.overlay || event.payload.pages
-        ? undefined
-        : () => buildStopped(this.env.DB, repoId, buildId);
-    return aiWork(work, () => this.#run(event, paidSteps(step, work, live)));
+    const live = async () => {
+      const { repo } = await resolveWorkAuthority(this.env, event.payload.authorization, repoId);
+      if (repo.deleted_at) return "Repository is being deleted";
+      const sourceId = event.payload.overlay?.sourceId ?? event.payload.pages?.sourceId;
+      if (event.payload.overlay || event.payload.pages) {
+        if (!sourceId) return "Timeline source authorization is missing";
+        const source = await getWorkSource(this.env, repoId, sourceId);
+        if (source?.state === "archived" && source.space_id === event.payload.authorization.spaceId)
+          return { code: "TimelineEnded", message: "Timeline source has been archived" };
+        if (
+          !source ||
+          source.state !== "ready" ||
+          source.space_id !== event.payload.authorization.spaceId
+        )
+          return "Timeline source is no longer authorized";
+        const ref = event.payload.overlay?.ref ?? event.payload.pages!.ref;
+        const current = await timelineKnowledgeSource(this.env, repoId, ref);
+        if (!current || current.source_id !== sourceId) return "Timeline source identity changed";
+        if (await overlayEnded(this.env.DB, repoId, ref, sourceId))
+          return { code: "TimelineEnded", message: "Timeline overlay has ended" };
+        if (await timelineEnd(this.env, event.payload.authorization.spaceId, repoId, ref))
+          return { code: "TimelineEnded", message: "Timeline has ended" };
+        if (
+          event.payload.pages &&
+          !(await setFor(this.env.DB, { repoId, ...event.payload.pages }, buildId))
+        )
+          return "Page set is no longer assigned to this workflow";
+        return null;
+      }
+      return buildStopped(this.env.DB, repoId, buildId);
+    };
+    return aiWork(work, () => this.#run(event, paidSteps(step, work, live, 0)));
   }
 
   async #run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
@@ -345,6 +418,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     if (event.payload.overlay) return this.#overlay(event.payload, step);
     if (event.payload.pages)
       return runPageSet(this.env, { ...event.payload, pages: event.payload.pages }, step, {
+        cleanupStep: this.#cleanupStep,
         repo: async (id, ref, sourceId) => {
           const source = await timelineKnowledgeSource(this.env, id, ref);
           if (!source || source.state !== "ready" || source.source_id !== sourceId)
@@ -406,7 +480,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             to_commit: head ?? "",
             status: "running",
             phase: "snapshot",
-            ai_snapshot: JSON.stringify(policy),
+            ai_snapshot: JSON.stringify({ ...policy, authorization: event.payload.authorization }),
             stats: JSON.stringify({
               ai: policy.ai,
               mode: fullBecause ? "full" : "update",
@@ -432,7 +506,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           return !current || !(await recordsPackages(env.DB, current.id));
         });
         const atlas = missing
-          ? await this.#project(step, progress, repoId, buildId, head, null, policy)
+          ? await this.#project(progress, repoId, buildId, head, null, policy)
           : {};
         await this.#finish(step, repoId, buildId, head, { upToDate: true, ...atlas });
         return { status: "up-to-date" };
@@ -537,6 +611,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             merge(await storedSyntheses(env.DB, repoId), syntheses),
             concepts,
           );
+          await paidWorkGuard()?.check();
           const diff = await applyGraph(env.DB, repoId, buildId, head, graph);
           await recordStats(env.DB, buildId, {
             nodes: graph.nodes.length,
@@ -708,6 +783,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             true,
           );
           const graph = buildGraph(row.full_name, files, analyses, syntheses, concepts);
+          await paidWorkGuard()?.check();
           await applyGraph(env.DB, repoId, buildId, head, graph);
           await recordStats(env.DB, buildId, {
             synthesized: synthesis.components + synthesis.concepts + (synthesis.repo ? 1 : 0),
@@ -717,7 +793,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       );
       // A replay of a step recorded before readiness was returned has none.
       const readyAt = graphFinal?.readyAt ?? null;
-      const atlas = await this.#project(step, progress, repoId, buildId, head, readyAt, policy);
+      const atlas = await this.#project(progress, repoId, buildId, head, readyAt, policy);
 
       await progress("index", "index", () =>
         this.#withReader(row, async (reader) => {
@@ -766,12 +842,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             concepts,
           );
           // A full rebuild embeds every node again; an update only what changed.
+          await paidWorkGuard()?.check();
           const vectors = await syncVectors(
             env,
             repoId,
             graph.nodes,
             full ? { ...diff, changed: graph.nodes.map((n) => n.id) } : diff,
           );
+          await paidWorkGuard()?.check();
           const search = await syncSearchFiles(env, reader, repoId, head, files, analyses);
           await recordStats(env.DB, buildId, {
             vectorsUpserted: vectors.upserted,
@@ -845,6 +923,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             .select(["slug", "title", "body", "inputs_hash"])
             .where("repo_id", "=", repoId)
             .execute();
+          await paidWorkGuard()?.check();
           await syncSearchPages(env, repoId, head, pages);
           return null;
         });
@@ -866,7 +945,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       return { status: "succeeded", head };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await step.do("fail", async () => {
+      await this.#cleanupStep.do("fail", async () => {
         // A failed build's calls were paid for too (CORE-286).
         const aiUsage = await buildAiUsage(env.DB, buildId).catch(() => null);
         if (aiUsage)
@@ -978,7 +1057,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       return { status: "succeeded", commit, counts: result.counts };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await step.do("overlay-fail", async () => {
+      await this.#cleanupStep.do("overlay-fail", async () => {
         await overlayFailed(env.DB, repoId, ref, commit, message, params.overlay!.sourceId);
         await releaseSourceRoots(
           env,
@@ -1007,7 +1086,6 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
    * so slow or stale inference is never hidden inside the projection time.
    */
   async #project(
-    step: WorkflowStep,
     progress: Progress,
     repoId: string,
     buildId: string,
@@ -1043,7 +1121,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         seq: begun.seq,
         commit: head,
       };
-      // The model, prices and caps the owning account's Atlas calls run with,
+      // The model, prices and caps the owning Space's Atlas calls run with,
       // and where they came from (built-in defaults unless configured).
       type Described = DescribeStats & { model?: string; settings?: string };
       let described: Described | { error: string; fallback: Described };
@@ -1128,6 +1206,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           atlasCapacity: { storedBytes: admission.storedBytes, capBytes: admission.capBytes },
         };
       const publishedAt = await progress("atlas-publish", "atlas", async () => {
+        await paidWorkGuard()?.check();
         await publishProjection(env.DB, scope, begun.snapshotId, begun.seq);
         return Date.now();
       });
@@ -1170,7 +1249,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await step.do("atlas-fail", STEP, async () => {
+      await this.#cleanupStep.do("atlas-fail", STEP, async () => {
         await failProjection(env.DB, scope, begun.snapshotId, message);
         return null;
       });
@@ -1200,6 +1279,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       if (head) {
         // The build's file list becomes the indexed snapshot.
         const files = await loadSnapshot(env.DB, repoId, buildId);
+        await paidWorkGuard()?.check();
         if (files.length) {
           await saveSnapshot(env.DB, repoId, "current", files);
           await db(env.DB)
@@ -1228,7 +1308,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           .execute();
       }
       // Atlas paid synthesis is attributed apart from upstream Knowledge tokens.
-      const atlasSpend = await atlasRunSpend(env.DB, "build", buildId);
+      const atlasSpend = await atlasRunSpend(env.DB, "build", buildId, this.#authorization.spaceId);
       // What this build's model calls cost (CORE-286), from its own meter.
       const aiUsage = await buildAiUsage(env.DB, buildId);
       await db(env.DB)

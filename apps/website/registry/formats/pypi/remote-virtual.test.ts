@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { makeHarness, type Harness } from "../../testing/harness.ts";
 import { metadataText, sha256, uploadBody, wheel } from "./testing.ts";
 
@@ -48,7 +47,6 @@ describe("pypi remote and virtual repositories", () => {
   };
 
   beforeEach(async () => {
-    invalidateMembers();
     hits.length = 0;
     servedWheel = upstreamWheel;
     upstreamFormat = "json";
@@ -206,7 +204,7 @@ describe("pypi remote and virtual repositories", () => {
         members: MEMBERS,
       }),
     });
-    invalidateMembers();
+
     await upload(
       "/pypi/local/",
       "demo",
@@ -233,7 +231,7 @@ describe("pypi remote and virtual repositories", () => {
         members: MEMBERS,
       }),
     });
-    invalidateMembers();
+
     expect((await h.request("/pypi/all/simple/demo/")).status).toBe(404);
     expect(hits).toEqual([]);
     // Other names still reach the remote.

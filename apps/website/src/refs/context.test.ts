@@ -4,17 +4,20 @@ import { refContextFromPath, refHref } from "./context.ts";
 
 test("the address implies the ref context", () => {
   expect(refContextFromPath("/orbit/engine/commits/main")).toEqual({
-    owner: "orbit",
+    space: "orbit",
     repo: "engine",
   });
-  expect(refContextFromPath("/orbit/engine")).toEqual({ owner: "orbit", repo: "engine" });
-  expect(refContextFromPath("/orbit")).toEqual({ owner: "orbit" });
-  expect(refContextFromPath("/orbit/-/packages/npm/ui")).toEqual({ owner: "orbit" });
+  expect(refContextFromPath("/orbit/engine")).toEqual({ space: "orbit", repo: "engine" });
+  expect(refContextFromPath("/orbit")).toEqual({ space: "orbit" });
+  expect(refContextFromPath("/orbit/-/packages/npm/ui")).toEqual({ space: "orbit" });
   expect(refContextFromPath("/tracker/orbit/issues/ENG-1")).toEqual({ tracker: "orbit" });
   expect(refContextFromPath("/tracker")).toEqual({});
   expect(refContextFromPath("/settings/tokens")).toEqual({});
   expect(refContextFromPath("/-/go/ENG-1")).toEqual({});
   expect(refContextFromPath("/")).toEqual({});
+  expect(refContextFromPath("/accounts/marco")).toEqual({});
+  expect(refContextFromPath("/organizations/orbit")).toEqual({});
+  expect(refContextFromPath("/instance")).toEqual({});
 });
 
 test("a commit opens its panel over the current page inside its repository", () => {
@@ -22,7 +25,7 @@ test("a commit opens its panel over the current page inside its repository", () 
     kind: "commit",
     path: `/orbit/engine?commit=${"a".repeat(40)}`,
     label: "Commit aaaaaaa in orbit/engine",
-    owner: "orbit",
+    space: "orbit",
     repo: "engine",
     sha: "a".repeat(40),
   };
@@ -36,7 +39,7 @@ test("a commit opens its panel over the current page inside its repository", () 
     kind: "repo",
     path: "/orbit/engine",
     label: "orbit/engine",
-    owner: "orbit",
+    space: "orbit",
     name: "engine",
   };
   expect(refHref(repo, { pathname: "/orbit/engine/ci", search: "" })).toBe("/orbit/engine");

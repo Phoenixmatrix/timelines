@@ -2,17 +2,49 @@
 // storage: immutable records, approval requests that pin the head checkpoint,
 // and approvals that stop counting once the timeline moves past it.
 
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
 import type { HumanRequest, Mutation } from "../../shared/tracker.ts";
 import type { CheckpointRepo } from "../../shared/timelines.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { TrackerStore, type Access } from "./store.ts";
 import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.ts";
+import { issueToken } from "../api/tokens.ts";
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-function setup(options: { policy?: "auto" | "approval" } = {}) {
-  const { sql, transactionSync } = durableStorage();
+async function setup(options: { policy?: "auto" | "approval" } = {}) {
+  const { sql, transactionSync, close, scope, space, env } = await freshTrackerStorage(
+    "org",
+    ["ann", "ben"].map((accountId) => ({
+      accountId,
+      role: "member" as const,
+      grant: {
+        role: "admin" as const,
+        repositoryRole: "write" as const,
+        packageRole: "none" as const,
+      },
+    })),
+  );
+  onTestFinished(close);
+  await env.DB.prepare(
+    "INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ben')",
+  ).run();
+  const credentials = new Map<string, Access["credential"]>();
+  for (const [actor, person] of [
+    ["ann", "ann"],
+    ["ben", "ben"],
+    ["agt_bot", "ben"],
+  ] as const) {
+    const token = await issueToken(
+      env.DB,
+      person,
+      actor,
+      "write",
+      undefined,
+      actor === person ? undefined : actor,
+    );
+    credentials.set(actor, { kind: "token", id: token.id });
+  }
   let now = Date.parse("2026-10-03T00:00:00Z");
   const clock = () => (now += 1000);
   const tracker = new TrackerStore(sql, transactionSync, clock);
@@ -43,8 +75,12 @@ function setup(options: { policy?: "auto" | "approval" } = {}) {
   const as = (actorId: string, principalId = actorId, writable = ["app"]): Access => ({
     actorId,
     principalId,
+    credential: credentials.get(actorId),
     agents,
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: actorId === principalId ? null : actorId,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: actorId === "ann",
     members: people,
     repos: [],
@@ -54,7 +90,13 @@ function setup(options: { policy?: "auto" | "approval" } = {}) {
   const bot = as("agt_bot", "ben");
   let operation = 0;
   const mutate = (access: Access, ...mutations: Mutation[]) =>
-    tracker.mutate(access, { operationId: `op-${++operation}`, mutations });
+    tracker.mutate(access, {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
+      operationId: `op-${++operation}`,
+      mutations,
+    });
   mutate(as("ann"), {
     kind: "team.create",
     id: "team",
@@ -65,13 +107,13 @@ function setup(options: { policy?: "auto" | "approval" } = {}) {
     slug: "search",
     parent: null,
     ...(options.policy ? { policy: options.policy } : {}),
-    repos: [{ id: "app", owner: "org", name: "app" }],
+    repos: [{ id: "app", space: "org", name: "app" }],
     commits: { app: oid(1) },
   });
   const repo = (commit: number, base = 1): CheckpointRepo =>
     ownedCheckpointRepo(timelines, "search", {
       id: "app",
-      owner: "org",
+      space: "org",
       name: "app",
       commit: oid(commit),
       base: oid(base),
@@ -83,6 +125,13 @@ function setup(options: { policy?: "auto" | "approval" } = {}) {
   const admit = (commit: number) => {
     const operationId = `push-${++operation}`;
     timelines.beginSourcePush({
+      authority: {
+        spaceId: "org",
+        migrationEpoch: 0,
+        personId: "ben",
+        agentId: "agt_bot",
+        credential: bot.credential!,
+      },
       operationId,
       timelineId: timeline.id,
       repoId: "app",
@@ -147,8 +196,8 @@ function setup(options: { policy?: "auto" | "approval" } = {}) {
 }
 
 describe("checkpoints", () => {
-  test("record the commits, base, changes and summary, numbered, with an event", () => {
-    const t = setup();
+  test("record the commits, base, changes and summary, numbered, with an event", async () => {
+    const t = await setup();
     expect(() => t.checkpoint(1)).toThrow(/no commits since it forked/);
     t.push(2);
     const first = t.checkpoint(2);
@@ -189,8 +238,8 @@ describe("checkpoints", () => {
     ]);
   });
 
-  test("a migrated source needs a fresh checkpoint even when its commit is unchanged", () => {
-    const t = setup();
+  test("a migrated source needs a fresh checkpoint even when its commit is unchanged", async () => {
+    const t = await setup();
     t.push(2);
     const first = t.checkpoint(2).checkpoint;
     const legacy = {
@@ -223,8 +272,8 @@ describe("checkpoints", () => {
     );
   });
 
-  test("cover exactly the timeline's repositories, and not an ended timeline", () => {
-    const t = setup();
+  test("cover exactly the timeline's repositories, and not an ended timeline", async () => {
+    const t = await setup();
     t.push(2);
     expect(() =>
       t.timelines.createCheckpoint(t.bot, "search", {
@@ -244,8 +293,8 @@ describe("checkpoints", () => {
 });
 
 describe("approvals pinned to a checkpoint", () => {
-  test("asking makes the timeline wait; a person with write access approves the head", () => {
-    const t = setup();
+  test("asking makes the timeline wait; a person with write access approves the head", async () => {
+    const t = await setup();
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -264,6 +313,11 @@ describe("approvals pinned to a checkpoint", () => {
     // Agents never approve; people need write access to every repository.
     expect(() => t.answer(t.bot, id, true)).toThrow(/Agents can't answer/);
     expect(() => t.answer(t.as("ann", "ann", []), id, true)).toThrow(/write access to org\/app/);
+    expect(t.request(id).status).toBe("open");
+    expect(t.timelines.checkpoint("search", "1").approval).toMatchObject({
+      requestId: id,
+      state: "pending",
+    });
     t.answer(t.as("ann"), id, true, "looks good");
 
     expect(t.request(id)).toMatchObject({ status: "answered", answer: "approved · looks good" });
@@ -281,11 +335,12 @@ describe("approvals pinned to a checkpoint", () => {
       outcome: "approved",
       note: "looks good",
       actorId: "ann",
+      accountableId: "ann",
     });
   });
 
-  test("new commits invalidate an approval: it needs a new checkpoint and a new approval", () => {
-    const t = setup();
+  test("new commits invalidate an approval: it needs a new checkpoint and a new approval", async () => {
+    const t = await setup();
     t.push(2);
     const first = t.checkpoint(2).checkpoint;
     t.answer(t.ben, t.ask(first.id), true);
@@ -313,8 +368,8 @@ describe("approvals pinned to a checkpoint", () => {
 
   test.each(["logicalBase", "dependencies"] as const)(
     "renewing %s at the same work OID requires a fresh review",
-    (field) => {
-      const t = setup();
+    async (field) => {
+      const t = await setup();
       t.push(2);
       const original = t.checkpoint(2).checkpoint;
       const requestId = t.ask(original.id);
@@ -353,8 +408,8 @@ describe("approvals pinned to a checkpoint", () => {
     },
   );
 
-  test("an admitted source write fences approval before provider completion", () => {
-    const t = setup();
+  test("an admitted source write fences approval before provider completion", async () => {
+    const t = await setup();
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const requestId = t.ask(checkpoint.id);
@@ -369,8 +424,8 @@ describe("approvals pinned to a checkpoint", () => {
     });
   });
 
-  test("a push past the checkpoint withdraws its open request and unparks the lease", () => {
-    const t = setup();
+  test("a push past the checkpoint withdraws its open request and unparks the lease", async () => {
+    const t = await setup();
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const token = t.claim();
@@ -400,8 +455,8 @@ describe("approvals pinned to a checkpoint", () => {
     expect(() => t.answer(t.ben, id, true)).toThrow(/already canceled/);
   });
 
-  test("answered requests stay as they were when the timeline moves on", () => {
-    const t = setup();
+  test("answered requests stay as they were when the timeline moves on", async () => {
+    const t = await setup();
     t.push(2);
     const first = t.checkpoint(2).checkpoint;
     const approved = t.ask(first.id);
@@ -425,8 +480,8 @@ describe("approvals pinned to a checkpoint", () => {
     ]);
   });
 
-  test("a new checkpoint supersedes an open request; withdrawing ends the wait too", () => {
-    const t = setup();
+  test("a new checkpoint supersedes an open request; withdrawing ends the wait too", async () => {
+    const t = await setup();
     t.push(2);
     const first = t.checkpoint(2).checkpoint;
     const old = t.ask(first.id);
@@ -440,6 +495,9 @@ describe("approvals pinned to a checkpoint", () => {
     const id = t.ask(second.id);
     expect(t.timelines.get("search").status).toBe("waiting");
     t.tracker.mutate(t.bot, {
+      contractVersion: 4,
+      spaceId: t.bot.spaceId,
+      migrationEpoch: t.bot.migrationEpoch,
       operationId: "withdraw",
       mutations: [{ kind: "request.cancel", id }],
     });
@@ -447,12 +505,15 @@ describe("approvals pinned to a checkpoint", () => {
     expect(t.timelines.checkpoint("search", "2").approval).toBeNull();
   });
 
-  test("only approvals pin checkpoints, and only checkpoints that exist", () => {
-    const t = setup();
+  test("only approvals pin checkpoints, and only checkpoints that exist", async () => {
+    const t = await setup();
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     expect(() =>
       t.tracker.mutate(t.bot, {
+        contractVersion: 4,
+        spaceId: t.bot.spaceId,
+        migrationEpoch: t.bot.migrationEpoch,
         operationId: "question",
         mutations: [
           {
@@ -467,18 +528,24 @@ describe("approvals pinned to a checkpoint", () => {
   });
 });
 
-test("a client can't pre-claim the withdrawal of a superseded approval", () => {
-  const t = setup();
+test("a client can't pre-claim the withdrawal of a superseded approval", async () => {
+  const t = await setup();
   t.push(2);
   const first = t.checkpoint(2).checkpoint;
   const id = t.ask(first.id);
   // An agent uses the withdrawal's old operation id first.
   t.tracker.mutate(t.bot, {
+    contractVersion: 4,
+    spaceId: t.bot.spaceId,
+    migrationEpoch: t.bot.migrationEpoch,
     operationId: `superseded:${id}`,
     mutations: [{ kind: "comment.add", id: "squat", data: { issueId: "issue", body: "mine" } }],
   });
   expect(() =>
     t.tracker.mutate(t.bot, {
+      contractVersion: 4,
+      spaceId: t.bot.spaceId,
+      migrationEpoch: t.bot.migrationEpoch,
       operationId: `@superseded:${id}`,
       mutations: [{ kind: "comment.add", id: "squat2", data: { issueId: "issue", body: "x" } }],
     }),
@@ -496,15 +563,23 @@ test("a client can't pre-claim the withdrawal of a superseded approval", () => {
 });
 
 describe("approved but never landed (CORE-390)", () => {
-  const begin = (t: ReturnType<typeof setup>) =>
+  const authorityOf = (access: Access) => ({
+    spaceId: access.spaceId,
+    migrationEpoch: access.migrationEpoch,
+    personId: access.principalId,
+    agentId: access.agentId,
+    credential: access.credential!,
+  });
+  const begin = (t: Awaited<ReturnType<typeof setup>>) =>
     t.timelines.beginLanding(t.ben, "search", {
+      authority: authorityOf(t.ben),
       trigger: "approval",
       green: { ok: true, why: null },
       agentId: null,
     }).landing;
 
-  test("an approved, current head with no landing is listed with its approver until one begins", () => {
-    const t = setup({ policy: "approval" });
+  test("an approved, current head with no landing is listed with its approver until one begins", async () => {
+    const t = await setup({ policy: "approval" });
     expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
@@ -530,8 +605,8 @@ describe("approved but never landed (CORE-390)", () => {
 
   test.each(["failed", "landed"] as const)(
     "a head whose landing %s is the landing's (or a person's) to retry, not the sweep's",
-    (state) => {
-      const t = setup({ policy: "approval" });
+    async (state) => {
+      const t = await setup({ policy: "approval" });
       t.push(2);
       const { checkpoint } = t.checkpoint(2);
       t.answer(t.ben, t.ask(checkpoint.id), true);
@@ -554,13 +629,14 @@ describe("approved but never landed (CORE-390)", () => {
     },
   );
 
-  test("a retry lands only that checkpoint, only if it never had a landing", () => {
-    const t = setup({ policy: "approval" });
+  test("a retry lands only that checkpoint, only if it never had a landing", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     t.answer(t.ben, t.ask(checkpoint.id), true);
     const retry = (onlyIfUnlanded: string) =>
       t.timelines.beginLanding(t.ben, "search", {
+        authority: authorityOf(t.ben),
         trigger: "approval",
         green: { ok: true, why: null },
         agentId: null,
@@ -573,8 +649,8 @@ describe("approved but never landed (CORE-390)", () => {
     expect(t.timelines.landing("search")).toMatchObject({ id: started.id, state: "failed" });
   });
 
-  test("a timeline with a repository without a source isn't listed: landing it needs a migration", () => {
-    const t = setup({ policy: "approval" });
+  test("a timeline with a repository without a source isn't listed: landing it needs a migration", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     t.answer(t.ben, t.ask(checkpoint.id), true);
@@ -586,15 +662,15 @@ describe("approved but never landed (CORE-390)", () => {
     expect(() => begin(t)).toThrow(/Migrate the legacy timeline before landing/);
   });
 
-  test("a stale approved checkpoint, or an auto timeline, is never listed", () => {
-    const t = setup({ policy: "approval" });
+  test("a stale approved checkpoint, or an auto timeline, is never listed", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     t.answer(t.ben, t.ask(checkpoint.id), true);
     t.push(3);
     expect(t.timelines.checkpoint("search", "1")).toMatchObject({ approved: false });
     expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
-    const auto = setup({ policy: "auto" });
+    const auto = await setup({ policy: "auto" });
     auto.push(2);
     const head = auto.checkpoint(2).checkpoint;
     auto.answer(auto.ben, auto.ask(head.id), true);
@@ -603,8 +679,8 @@ describe("approved but never landed (CORE-390)", () => {
 });
 
 describe("approve when green (CORE-378)", () => {
-  test("only the person turns their own setting on or off, and each change is in the log", () => {
-    const t = setup({ policy: "approval" });
+  test("only the person turns their own setting on or off, and each change is in the log", async () => {
+    const t = await setup({ policy: "approval" });
     // Not an agent for its person, not an owner for someone else.
     expect(() => t.approveWhenGreen(t.bot, true)).toThrow(/Agents can't do that/);
     expect(() => t.approveWhenGreen(t.as("ann"), true, "ben")).toThrow(/you can only change yours/);
@@ -634,6 +710,9 @@ describe("approve when green (CORE-378)", () => {
     expect(t.tracker.snapshot(t.ben).approveWhenGreen).toEqual([]);
     expect(() =>
       t.tracker.mutate(t.ben, {
+        contractVersion: 4,
+        spaceId: t.ben.spaceId,
+        migrationEpoch: t.ben.migrationEpoch,
         operationId: "bad",
         mutations: [
           { kind: "automation.approveWhenGreen", id: "ben", data: { enabled: "yes" as never } },
@@ -642,8 +721,77 @@ describe("approve when green (CORE-378)", () => {
     ).toThrow(/enabled must be true or false/);
   });
 
-  test("approves the pinned head for its routed person, marked, as them", () => {
-    const t = setup({ policy: "approval" });
+  test("turning it on keeps the person's own work authority; none, and it's inert", async () => {
+    const t = await setup({ policy: "approval" });
+    // It acts with a credential later: never without one.
+    expect(() => t.approveWhenGreen({ ...t.ben, credential: undefined }, true)).toThrow(
+      /signed in as yourself/,
+    );
+    expect(t.tracker.workAuthority("automation:ben")).toBeNull();
+    t.approveWhenGreen(t.ben, true);
+    expect(t.tracker.workAuthority("automation:ben")).toEqual({
+      spaceId: t.ben.spaceId,
+      migrationEpoch: t.ben.migrationEpoch,
+      personId: "ben",
+      agentId: null,
+      credential: t.ben.credential,
+    });
+    t.approveWhenGreen(t.ben, false);
+    expect(t.tracker.workAuthority("automation:ben")).toBeNull();
+
+    // A setting saved before Spaces has no authority: off, and approves nothing.
+    t.sql.exec(
+      "INSERT INTO approval_automation (person_id, enabled_at) VALUES ('ben', '2026-10-01T00:00:00.000Z')",
+    );
+    expect(t.tracker.approvingWhenGreen()).toEqual([]);
+    expect(t.tracker.snapshot(t.ben).approveWhenGreen).toEqual([]);
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
+    // Turning it on again gives it one.
+    const on = t.approveWhenGreen(t.ben, true);
+    expect(on.events[0]).toMatchObject({ before: { approveWhenGreen: false } });
+    expect(t.tracker.approvingWhenGreen()).toEqual(["ben"]);
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).not.toBeNull();
+  });
+
+  test("a hand approval keeps what its landing retry acts with; a rejection doesn't", async () => {
+    const t = await setup({ policy: "approval" });
+    t.push(2);
+    const first = t.checkpoint(2).checkpoint;
+    t.answer(t.ben, t.ask(first.id), false);
+    expect(t.tracker.workAuthority(`approval:${first.id}`)).toBeNull();
+    t.answer(t.ben, t.ask(first.id), true);
+    expect(t.tracker.workAuthority(`approval:${first.id}`)).toMatchObject({
+      personId: "ben",
+      agentId: null,
+      credential: t.ben.credential,
+    });
+  });
+
+  test("a consent that can no longer act is turned off, logged", async () => {
+    const t = await setup({ policy: "approval" });
+    expect(t.tracker.retireApprovalAutomation("ben", "no longer has access to this Space")).toBe(
+      false,
+    );
+    t.approveWhenGreen(t.ben, true);
+    expect(t.tracker.retireApprovalAutomation("ben", "no longer has access to this Space")).toBe(
+      true,
+    );
+    expect(t.tracker.approvingWhenGreen()).toEqual([]);
+    expect(t.tracker.workAuthority("automation:ben")).toBeNull();
+    const changes = t.tracker.changes(t.ben, 0, 500).events;
+    expect(changes.at(-1)).toMatchObject({
+      kind: "automation.approveWhenGreen",
+      source: "automation",
+      mutationKind: "automation.approveWhenGreen (no longer has access to this Space)",
+      entity: { id: "ben", approveWhenGreen: false },
+    });
+  });
+
+  test("approves the pinned head for its routed person, marked, as them", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -687,8 +835,8 @@ describe("approve when green (CORE-378)", () => {
     expect(auto()).toBeNull();
   });
 
-  test("a hand answer never carries the marker, even when the setting is on", () => {
-    const t = setup({ policy: "approval" });
+  test("a hand answer never carries the marker, even when the setting is on", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -696,6 +844,9 @@ describe("approve when green (CORE-378)", () => {
     // No client can claim the marker.
     expect(() =>
       t.tracker.mutate(t.ben, {
+        contractVersion: 4,
+        spaceId: t.ben.spaceId,
+        migrationEpoch: t.ben.migrationEpoch,
         operationId: "claimed",
         mutations: [
           {
@@ -711,8 +862,8 @@ describe("approve when green (CORE-378)", () => {
     expect(t.timelines.checkpoint("search", "1").approval?.via).toBeUndefined();
   });
 
-  test("turning it off before CI completes means no approval", () => {
-    const t = setup({ policy: "approval" });
+  test("turning it off before CI completes means no approval", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -723,8 +874,8 @@ describe("approve when green (CORE-378)", () => {
     expect(t.timelines.checkpoint("search", "1").approved).toBe(false);
   });
 
-  test("a stale checkpoint is never approved", () => {
-    const t = setup({ policy: "approval" });
+  test("a stale checkpoint is never approved", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -739,8 +890,8 @@ describe("approve when green (CORE-378)", () => {
     expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
   });
 
-  test("why it was left to its person is noted once per reason, only for that person", () => {
-    const t = setup({ policy: "approval" });
+  test("why it was left to its person is noted once per reason, only for that person", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -765,13 +916,16 @@ describe("approve when green (CORE-378)", () => {
     expect(note(t.as("ben"), "Something else.")).toBe(false);
   });
 
-  test("only what the person or one of their own agents asked", () => {
-    const t = setup({ policy: "approval" });
+  test("only what the person or one of their own agents asked", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     t.approveWhenGreen(t.ben, true);
     const askAs = (access: Access, id: string) =>
       t.tracker.mutate(access, {
+        contractVersion: 4,
+        spaceId: access.spaceId,
+        migrationEpoch: access.migrationEpoch,
         operationId: `ask-${id}`,
         mutations: [
           {
@@ -802,18 +956,27 @@ describe("approve when green (CORE-378)", () => {
     expect(t.request("from-ben")).toMatchObject({ status: "answered", via: "auto-approve" });
   });
 
-  test("its operation id is one no client can use or pre-claim", () => {
-    const t = setup({ policy: "approval" });
+  test("its operation id is one no client can use or pre-claim", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
     t.approveWhenGreen(t.ben, true);
     const team = { kind: "team.update", id: "team", expectedVersion: 1, data: { name: "Eng" } };
     expect(() =>
-      t.tracker.mutate(t.bot, { operationId: `@auto-approve:${id}`, mutations: [team as never] }),
+      t.tracker.mutate(t.bot, {
+        contractVersion: 4,
+        spaceId: t.bot.spaceId,
+        migrationEpoch: t.bot.migrationEpoch,
+        operationId: `@auto-approve:${id}`,
+        mutations: [team as never],
+      }),
     ).toThrow(/IDs must use letters/);
     // The old spelling is just another client id: it claims nothing.
     t.tracker.mutate(t.as("ann"), {
+      contractVersion: 4,
+      spaceId: t.as("ann").spaceId,
+      migrationEpoch: t.as("ann").migrationEpoch,
       operationId: `auto-approve:${id}`,
       mutations: [team as never],
     });
@@ -823,8 +986,8 @@ describe("approve when green (CORE-378)", () => {
     });
   });
 
-  test("someone found no longer a member loses the setting, logged, and rejoining doesn't restore it", () => {
-    const t = setup({ policy: "approval" });
+  test("someone found no longer a member loses the setting, logged, and rejoining doesn't restore it", async () => {
+    const t = await setup({ policy: "approval" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);
@@ -832,7 +995,7 @@ describe("approve when green (CORE-378)", () => {
     const cursor = t.tracker.snapshot(t.ben).cursor;
     const gone = { ...t.as("ben"), members: [{ id: "ann", slug: "ann", displayName: "Ann" }] };
     expect(t.tracker.autoApprove(gone, id, checkpoint.id)).toBeNull();
-    expect(t.tracker.changes(cursor, 10).events).toMatchObject([
+    expect(t.tracker.changes(t.ben, cursor, 10).events).toMatchObject([
       {
         kind: "automation.approveWhenGreen",
         entityType: "automation",
@@ -848,8 +1011,8 @@ describe("approve when green (CORE-378)", () => {
     expect(t.request(id).status).toBe("open");
   });
 
-  test("only approval timelines", () => {
-    const t = setup({ policy: "auto" });
+  test("only approval timelines", async () => {
+    const t = await setup({ policy: "auto" });
     t.push(2);
     const { checkpoint } = t.checkpoint(2);
     const id = t.ask(checkpoint.id);

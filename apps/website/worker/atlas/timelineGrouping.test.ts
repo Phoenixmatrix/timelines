@@ -8,14 +8,16 @@
 // bounded (too large or no map: not computed, and said), and never computed
 // by reading.
 
+import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { KnowledgeOverlayChange } from "../../shared/api.ts";
 import type { AtlasTimeline } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import type { BuiltGraph } from "../knowledge/graph.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Timing } from "../timing.ts";
 import { atlasApi } from "../../src/lib/atlas.ts";
@@ -31,7 +33,14 @@ import type { GroupingInput } from "./grouping.ts";
 import { readTimelineRegrouping, regroup, storeTimelineRegrouping } from "./timelineGrouping.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -125,14 +134,28 @@ const REF = "refs/heads/timeline/plan";
 const SOURCE = "work_regroup_plan";
 let names = 0;
 
-function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
-  const sqlite = migratedDatabase();
+async function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   const artifacts = `atlas-regroup-${++names}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'private', '${artifacts}', 'https://shop');
-    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, space_id,
       artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
       fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
       initial_token_revoked, created_at, updated_at)
@@ -149,6 +172,7 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
     `${artifacts}-work`,
   );
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
@@ -159,7 +183,7 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
     c.set("timing", new Timing());
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
   const executionCtx = { waitUntil() {}, passThroughOnException() {}, props: {} };
   vi.stubGlobal("fetch", (url: RequestInfo | URL, init?: RequestInit) => {
     const href = url instanceof Request ? url.url : String(url);
@@ -174,7 +198,7 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
   return { sqlite, env, rows };
 }
 
-const repo = { owner: "ann", name: "shop" };
+const repo = { space: "ann", name: "shop" };
 
 async function all(): Promise<{ first: AtlasTimeline; items: AtlasTimeline["items"] }> {
   const pages: AtlasTimeline[] = [];
@@ -188,7 +212,7 @@ async function all(): Promise<{ first: AtlasTimeline; items: AtlasTimeline["item
 }
 
 /** Main's graph as the fixture stored it, in memory, as an overlay builds it. */
-function storedGraph(sqlite: ReturnType<typeof migratedDatabase>): BuiltGraph {
+function storedGraph(sqlite: DatabaseSync): BuiltGraph {
   const nodes = (
     sqlite
       .prepare("SELECT id, kind, name, path, data FROM kg_nodes WHERE repo_id = 'r1'")
@@ -221,7 +245,7 @@ function storedGraph(sqlite: ReturnType<typeof migratedDatabase>): BuiltGraph {
 
 describe("A timeline's regrouping", () => {
   test("is computed when its overlay is stored, and the timeline view reads it", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
     const { overlayId } = await writeAtlasFixtureOverlay(
@@ -287,7 +311,7 @@ describe("A timeline's regrouping", () => {
   });
 
   test("says which capability the timeline would split, and where its files would go", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
     const { overlayId } = await writeAtlasFixtureOverlay(
@@ -352,7 +376,7 @@ describe("A timeline's regrouping", () => {
   });
 
   test("is kept with its overlay: replaced by a newer one, kept by an ended one", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
     const first = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
@@ -373,7 +397,7 @@ describe("A timeline's regrouping", () => {
   });
 
   test("is bounded, and not computing it is said", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     // No map of main yet when the overlay is stored.
     const early = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
@@ -422,7 +446,7 @@ describe("A timeline's regrouping", () => {
   });
 
   test("reading a timeline never computes it", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
     await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);

@@ -52,12 +52,9 @@ export interface ObservabilityConnection {
   id: string;
   /**
    * The immutable content scope (Space) that owns the connection, as an opaque
-   * id; afterwards the Organization/Space cutover (CORE-361/362) makes it
-   * `spaces.id`. Until then the server derives it from `repos.owner_id`, on the
-   * CORE-360 mapping manifest's proposal that a legacy owner's id is reused as
-   * its default Space id. That proposal awaits operator approval and is not
-   * settled; if the approved mapping differs, stored values are remapped with
-   * it. Clients never treat it as an account.
+   * id: `spaces.id`, the bound repositories' `repos.space_id`. The approved
+   * cutover mapping reuses a legacy owner's id as its default Space id.
+   * Clients never treat it as an account.
    */
   spaceId: string;
   provider: ObservabilityProvider;

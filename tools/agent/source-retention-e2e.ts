@@ -1,3 +1,4 @@
+import { fixtureSpace } from "./content-fixtures.ts";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -36,7 +37,11 @@ export async function sourceRetentionFixture(
   ): Promise<T> {
     const response = await fetch(`${ctx.origin}${path}`, {
       method,
-      headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
+      headers: {
+        "X-Gitmatrix-Content-Version": "4",
+        authorization: `Bearer ${credential}`,
+        "content-type": "application/json",
+      },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(180_000),
       redirect: "error",
@@ -99,7 +104,15 @@ export async function runSourceRetentionE2E(
     const result = await json<{ run: { status: string; categories: { error: string | null }[] } }>(
       "/api/dev/retention",
       "POST",
-      { account: owner, categories, daysAhead, dryRun: false },
+      {
+        target: {
+          kind: "space",
+          id: (await fixtureSpace(ctx.origin, owner, fixtures.tokens.sam)).space.id,
+        },
+        categories,
+        daysAhead,
+        dryRun: false,
+      },
       [200],
       secret,
     );
@@ -165,7 +178,7 @@ export async function runSourceRetentionE2E(
       await delay(500);
     }
   };
-  await gm(["repo", "create", name, "--owner", owner], "sam", root);
+  await gm(["repo", "create", name, "--space", owner], "sam", root);
   await git(["init", "--initial-branch=main"]);
   await git(["config", "user.name", "Source Retention Fixture"]);
   await git(["config", "user.email", "retention@example.invalid"]);
@@ -173,7 +186,7 @@ export async function runSourceRetentionE2E(
   await git(["add", "."]);
   await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Retention fixture canonical base"]);
   await git(["push", `${ctx.origin}/${repo}.git`, "HEAD:main"]);
-  const settingsPath = `/api/accounts/${owner}/settings/retention`;
+  const settingsPath = `/api/spaces/${owner}/retention`;
   const settings = await json<RetentionSettings>(settingsPath);
   const workPolicy = settings.categories.find(
     (category) => category.id === "timeline-work-sources",
@@ -241,7 +254,7 @@ export async function runSourceRetentionE2E(
     );
     assert(policy);
     assert.deepEqual(policy.values, { landedDays: 5, abandonedDays: 10 });
-    assert.deepEqual(policy.valuesFrom, { landedDays: "account", abandonedDays: "account" });
+    assert.deepEqual(policy.valuesFrom, { landedDays: "space", abandonedDays: "space" });
     const categories = { "timeline-work-sources": policy.values };
     await retain(4, categories);
     await state(custom.landed.sourceId, "archived");

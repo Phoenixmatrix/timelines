@@ -1,5 +1,5 @@
 // Knowledge build history (category "knowledge-builds", CORE-201): an
-// account's knowledge build records (kg_builds) older than `days` before the
+// Space's knowledge build records (kg_builds) older than `days` before the
 // run's moment, with their change lists (kg_changes), keeping the latest
 // `keepLatest` builds of each repository.
 //
@@ -24,7 +24,7 @@ interface Item {
 const MAX_BUILDS = 50;
 
 /** Parameters: account id, cutoff, keepLatest - 1. `b` is the build. */
-const MATCHES = `b.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+const MATCHES = `b.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND b.status <> 'running'
   AND coalesce(b.finished_at, b.started_at) < ?
   AND (SELECT n.id FROM kg_builds n
@@ -44,11 +44,11 @@ const SIZE = `1 + (SELECT count(*) FROM kg_changes c WHERE c.repo_id = b.repo_id
     AS bytes`;
 
 function scope(ctx: CleanupContext): [string, string, number] {
-  if (ctx.target.scope !== "account") throw new Error("knowledge-builds is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("knowledge-builds is a Space category.");
   const { days, keepLatest } = ctx.thresholds;
   if (days === undefined || keepLatest === undefined)
     throw new Error("knowledge-builds needs its days and keepLatest thresholds.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days), keepLatest - 1];
+  return [ctx.target.id, daysBefore(ctx.now, days), keepLatest - 1];
 }
 
 export const knowledgeBuilds: CategoryCleanup<Item> = {
@@ -82,7 +82,7 @@ export const knowledgeBuilds: CategoryCleanup<Item> = {
       ).bind(ids, account, cutoff, offset),
       ctx.env.DB.prepare(
         `DELETE FROM kg_changes WHERE build_id IN (${matching})
-           AND repo_id IN (SELECT id FROM repos WHERE owner_id = ?)`,
+           AND repo_id IN (SELECT id FROM repos WHERE space_id = ?)`,
       ).bind(ids, account, cutoff, offset, account),
       ctx.env.DB.prepare(
         `DELETE FROM kg_builds AS b

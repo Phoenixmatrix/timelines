@@ -1,11 +1,32 @@
 import { Tooltip } from "@base-ui/react/tooltip";
-import { act } from "react";
+import { act, useEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { createMemoryRouter, RouterProvider } from "react-router";
+import { createMemoryRouter, RouterProvider, useLocation, type Location } from "react-router";
 import { expect, onTestFinished, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import { KeyboardShortcuts } from "./KeyboardShortcuts.tsx";
 import "../styles/app.css";
+
+function ShortcutFixture({
+  showButton,
+  onLocationCommitted,
+}: {
+  showButton: boolean;
+  onLocationCommitted: (location: Location) => void;
+}) {
+  const location = useLocation();
+  useEffect(() => {
+    onLocationCommitted(location);
+  }, [location, onLocationCommitted]);
+  return (
+    <>
+      <KeyboardShortcuts showButton={showButton} />
+      <input aria-label="Draft" />
+      <div contentEditable aria-label="Editor" />
+      <button type="button">Outside</button>
+    </>
+  );
+}
 
 async function mount(initial = "/tracker/orbit/timelines/search/story", showButton = true) {
   let enabled = false;
@@ -16,17 +37,16 @@ async function mount(initial = "/tracker/orbit/timelines/search/story", showButt
   });
   const container = document.body.appendChild(document.createElement("div"));
   const root = createRoot(container);
+  let committedLocation: Location | undefined;
+  const onLocationCommitted = (location: Location) => {
+    committedLocation = location;
+  };
   const router = createMemoryRouter(
     [
       {
         path: "*",
         element: (
-          <>
-            <KeyboardShortcuts showButton={showButton} />
-            <input aria-label="Draft" />
-            <div contentEditable aria-label="Editor" />
-            <button type="button">Outside</button>
-          </>
+          <ShortcutFixture showButton={showButton} onLocationCommitted={onLocationCommitted} />
         ),
       },
     ],
@@ -49,6 +69,16 @@ async function mount(initial = "/tracker/orbit/timelines/search/story", showButt
     router,
     enable: (value = true) => {
       enabled = value;
+    },
+    waitForLocation: async (path: string) => {
+      // Router state advances before its transition commits. Wait for the
+      // shortcut effect to observe that route before starting another chord.
+      await expect
+        .poll(() =>
+          committedLocation ? committedLocation.pathname + committedLocation.search : undefined,
+        )
+        .toBe(path);
+      await expect.poll(() => committedLocation?.key).toBe(router.state.location.key);
     },
   };
 }
@@ -95,34 +125,45 @@ test("help is discoverable, traps and restores focus, and blocks underlying shor
   await expect.element(button).toHaveFocus();
 });
 
+// Both keys of a chord at once: typed through the browser driver, a loaded CI
+// host can space them past the chord's one-second window.
+const chord = (keys: string) =>
+  act(async () => {
+    for (const key of keys)
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+      );
+  });
+
 test("opt-in gates all chords; issues retain tracker/settings context, packages and home use rail destinations", async () => {
-  const { router, enable } = await mount();
+  const { router, enable, waitForLocation } = await mount();
   await userEvent.keyboard("gigpgh");
   expect(router.state.location.pathname).toContain("/story");
   enable();
-  await userEvent.keyboard("gi");
-  await expect.poll(() => router.state.location.pathname).toBe("/tracker/orbit");
-  await userEvent.keyboard("gp");
-  await expect.poll(() => router.state.location.pathname).toBe("/packages");
-  await userEvent.keyboard("gh");
-  await expect.poll(() => router.state.location.pathname).toBe("/");
-  await userEvent.keyboard("gi");
-  await expect.poll(() => router.state.location.pathname).toBe("/tracker");
+  await chord("gi");
+  await waitForLocation("/tracker/orbit");
+  await chord("gp");
+  await waitForLocation("/packages");
+  await chord("gh");
+  await waitForLocation("/");
+  await chord("gi");
+  await waitForLocation("/tracker");
   for (const path of [
     "/settings/preferences?tracker=orbit",
-    "/settings/usage?owner=orbit",
-    "/settings/preferences?owner=orbit&tracker=other",
+    "/settings/usage?space=orbit",
+    "/settings/preferences?space=orbit&tracker=other",
   ]) {
     await act(async () => {
       await router.navigate(path);
     });
-    await userEvent.keyboard("gi");
-    await expect.poll(() => router.state.location.pathname).toBe("/tracker/orbit");
+    await waitForLocation(path);
+    await chord("gi");
+    await waitForLocation("/tracker/orbit");
   }
 });
 
 test("typing, dialogs, composition, modified/repeated keys and canceled/expired chords never navigate", async () => {
-  const { router, enable } = await mount("/packages");
+  const { router, enable, waitForLocation } = await mount("/packages");
   enable();
   const unchanged = () => expect(router.state.location.pathname).toBe("/packages");
   await userEvent.click(page.getByRole("textbox", { name: "Draft" }));
@@ -192,6 +233,7 @@ test("typing, dialogs, composition, modified/repeated keys and canceled/expired 
   await act(async () => {
     await router.navigate("/tracker/orbit");
   });
+  await waitForLocation("/tracker/orbit");
   await key("h");
   expect(router.state.location.pathname).toBe("/tracker/orbit");
   await key("g");

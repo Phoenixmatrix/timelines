@@ -4,6 +4,7 @@
 
 import { issueToken } from "../api/tokens.ts";
 import { db, nowIso } from "../schema.ts";
+import { hashToken } from "../auth.ts";
 
 export const ASSISTANT_NAME = "assistant";
 /** Tokens are short-lived; a chat mints a fresh one when its last runs low. */
@@ -61,6 +62,20 @@ export async function credential(
   current: AssistantCredential | null,
 ): Promise<AssistantCredential> {
   const agentId = await assistantAgent(d1, userId);
+  if (current) {
+    const live = await db(d1)
+      .selectFrom("access_tokens")
+      .select("id")
+      .where("token_hash", "=", await hashToken(current.token))
+      .where("user_id", "=", userId)
+      .where("agent_id", "=", agentId)
+      .where("scope", "=", "write")
+      .executeTakeFirst();
+    if (current.agentId !== agentId || !live)
+      throw new AssistantRevoked(
+        "This assistant conversation's credential was revoked. Start a new chat.",
+      );
+  }
   if (
     current &&
     current.agentId === agentId &&

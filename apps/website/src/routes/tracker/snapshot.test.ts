@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { Issue, MutationResult, Snapshot, TrackerEvent } from "../../../shared/tracker.ts";
-import { acknowledge } from "./snapshot.ts";
+import { acknowledge, assertTrackerSnapshot } from "./snapshot.ts";
 
 const now = "2026-10-03T12:00:00Z";
 const issue = (id: string, fields: Partial<Issue> = {}): Issue => ({
@@ -18,18 +18,39 @@ const issue = (id: string, fields: Partial<Issue> = {}): Issue => ({
   priority: 2,
   assigneeId: null,
   parentId: null,
-  workspaceIds: [],
+  projectIds: [],
   labels: [],
   claim: null,
   ...fields,
 });
 const snapshot = (issues: Issue[]): Snapshot => ({
-  owner: { id: "owner", slug: "owner", displayName: "Owner" },
+  contractVersion: 4,
+  spaceId: "space",
+  migrationEpoch: 1,
+  space: {
+    id: "space",
+    slug: "space",
+    displayName: "Space",
+    organizationId: "organization",
+    organization: {
+      id: "organization",
+      slug: "organization",
+      displayName: "Organization",
+      avatarUrl: null,
+      kind: "company",
+      personalAccountId: null,
+      defaultSpaceId: "space",
+      createdAt: now,
+    },
+    archivedAt: null,
+    authorizationVersion: 1,
+    createdAt: now,
+  },
   canAdmin: true,
   members: [],
   agents: [],
   teams: [],
-  workspaces: [],
+  projects: [],
   labels: [],
   issues,
   links: [],
@@ -56,6 +77,9 @@ const event = (
   ...fields,
 });
 const result = (events: TrackerEvent[]): MutationResult => ({
+  contractVersion: 4,
+  spaceId: "space",
+  migrationEpoch: 1,
   cursor: events.at(-1)!.cursor,
   events,
   results: [],
@@ -63,6 +87,74 @@ const result = (events: TrackerEvent[]): MutationResult => ({
 });
 
 describe("committed mutation acknowledgements", () => {
+  it("applies native epoch-zero writes without accepting a different installation epoch", () => {
+    const before = { ...snapshot([issue("1")]), migrationEpoch: 0 };
+    const receipt = {
+      ...result([event(11, "1", issue("1", { version: 2, title: "Native write" }))]),
+      migrationEpoch: 0,
+    };
+    const after = acknowledge(before, receipt);
+    expect(after.migrationEpoch).toBe(0);
+    expect(after.cursor).toBe(11);
+    expect(after.issues[0]).toMatchObject({ id: "1", version: 2, title: "Native write" });
+    expect(() => acknowledge(before, { ...receipt, migrationEpoch: 1 })).toThrow();
+    expect(() => acknowledge({ ...before, migrationEpoch: 1 }, receipt)).toThrow();
+  });
+
+  it("rejects incompatible, cross-Space and stale-epoch acknowledgements even at older cursors", () => {
+    const before = snapshot([]);
+    const receipt = result([event(1, "1", issue("1"))]);
+    for (const patch of [
+      { contractVersion: 3 },
+      { spaceId: "another-space" },
+      { migrationEpoch: 2 },
+      { migrationEpoch: -1 },
+      { migrationEpoch: undefined },
+    ]) {
+      expect(() => acknowledge(before, { ...receipt, ...patch } as MutationResult)).toThrow();
+    }
+    expect(before.issues).toEqual([]);
+    expect(before.cursor).toBe(10);
+  });
+
+  it("requires the snapshot envelope to match its immutable Space identity", () => {
+    const before = snapshot([]);
+    expect(() => assertTrackerSnapshot({ ...before, spaceId: "another-space" })).toThrow(/Space/);
+    expect(() =>
+      assertTrackerSnapshot({ ...before, contractVersion: 3 } as unknown as Snapshot),
+    ).toThrow(/client_upgrade_required/);
+    expect(() => assertTrackerSnapshot({ ...before, migrationEpoch: 2 }, before)).toThrow(
+      /migration_epoch_mismatch/,
+    );
+  });
+
+  it("does not silently discard obsolete or unknown scope-bearing event kinds", () => {
+    for (const entityType of ["workspace", "unknown-scope"]) {
+      const receipt = result([event(11, "1", null)]);
+      receipt.events[0] = { ...receipt.events[0]!, entityType } as TrackerEvent;
+      expect(() => acknowledge(snapshot([]), receipt)).toThrow(/client_upgrade_required/);
+    }
+  });
+
+  it("applies Project events without changing issue membership IDs", () => {
+    const before = snapshot([issue("1", { projectIds: ["project-1", "project-2"] })]);
+    const project = {
+      id: "project-1",
+      slug: "shipping",
+      name: "Shipping",
+      description: "",
+      archived: false,
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const next = acknowledge(
+      before,
+      result([event(11, project.id, project, { kind: "project.create", entityType: "project" })]),
+    );
+    expect(next.projects).toEqual([project]);
+    expect(next.issues[0]!.projectIds).toEqual(["project-1", "project-2"]);
+  });
   it("keeps definitions after removal and learns tags from timeline-only events on main", () => {
     const before = snapshot([]);
     before.labels = ["existing"];

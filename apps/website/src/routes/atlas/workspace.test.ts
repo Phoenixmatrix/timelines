@@ -8,6 +8,7 @@ import type {
   AtlasWorkspacePage,
   AtlasWorkspaceRepo,
 } from "../../../shared/atlas.ts";
+import type { SpaceSummary } from "../../../shared/spaces.ts";
 import { ApiError } from "../../lib/api.ts";
 import type { AtlasWorkspace } from "../../lib/atlas.ts";
 import {
@@ -17,6 +18,7 @@ import {
   parseLinkState,
   parseSelection,
   rescopeSearch,
+  scopeKey,
   tiesOf,
   toggleSelection,
   WorkspaceSession,
@@ -25,13 +27,33 @@ import {
   type WorkspaceTerritory,
 } from "./workspace.ts";
 
+const space: SpaceSummary = {
+  id: "o",
+  slug: "acme",
+  displayName: "Acme",
+  organizationId: "org-acme",
+  organization: {
+    id: "org-acme",
+    slug: "acme-company",
+    displayName: "Acme Company",
+    avatarUrl: null,
+    kind: "company",
+    personalAccountId: null,
+    defaultSpaceId: "o",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  },
+  authorizationVersion: 1,
+  archivedAt: null,
+  createdAt: "2026-01-01T00:00:00.000Z",
+};
+
 const repo = (
   id: string,
   name: string,
   state: AtlasWorkspaceRepo["state"] = "ready",
 ): AtlasWorkspaceRepo => ({
   id,
-  owner: "acme",
+  space: "acme",
   name,
   visibility: "public",
   state,
@@ -109,13 +131,18 @@ const layout = (selection: string[], repos: AtlasWorkspaceRepo[], expanded = new
   buildWorkspaceTerritory(coverageOf(selection, repos), allRegions, expanded);
 
 describe("selection", () => {
-  test("keeps selection order, drops duplicates, other owners and junk", () => {
+  test("keeps selection order, drops duplicates, other Spaces and junk", () => {
     expect(parseSelection("web, api,acme/docs,web,other/x,,a/b/c,..,../x", "acme")).toEqual([
       "web",
       "api",
       "docs",
     ]);
     expect(parseSelection(null, "acme")).toEqual([]);
+  });
+
+  test("the same repository names in distinct Spaces never share a view key", () => {
+    expect(scopeKey("space-a", ["api", "web"])).not.toBe(scopeKey("space-b", ["api", "web"]));
+    expect(scopeKey("space-a", ["api"])).not.toBe(scopeKey("space-a", ["api", "web"]));
   });
 
   test("toggling appends at the end or removes in place", () => {
@@ -267,11 +294,11 @@ function deferred<T>() {
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-const overview = (repos: AtlasWorkspaceRepo[], id = "ws1.tag.2.2"): AtlasWorkspaceOverview => {
+const overview = (repos: AtlasWorkspaceRepo[], id = "ws4.tag.2.2"): AtlasWorkspaceOverview => {
   const regions = allRegions.filter((r) => repos.some((x) => x.id === r.repoId));
   const envelope = {
     scope: "ws:o:hash",
-    owner: { id: "o", slug: "acme" },
+    space,
     snapshot: { id, repos },
   };
   return {
@@ -289,8 +316,8 @@ const overview = (repos: AtlasWorkspaceRepo[], id = "ws1.tag.2.2"): AtlasWorkspa
 };
 const childPage = (items: AtlasEntitySummary[]): AtlasWorkspacePage<AtlasEntitySummary> => ({
   scope: "ws:o:hash",
-  owner: { id: "o", slug: "acme" },
-  snapshot: { id: "ws1.tag.2.2", repos: [] },
+  space,
+  snapshot: { id: "ws4.tag.2.2", repos: [] },
   items,
   counts: { loaded: items.length, knownTotal: items.length, unknownTotal: false },
   next: null,
@@ -344,7 +371,7 @@ function track(workspace: AtlasWorkspace, client: WorkspaceClient) {
 describe("workspace session", () => {
   test("switching scope drops the previous scope's late answers", async () => {
     const { client, overviews, children, requests } = scriptedClient();
-    const first = track({ owner: "acme", repos: ["api", "web"] }, client);
+    const first = track({ space: "acme", repos: ["api", "web"] }, client);
     void first.session.open();
     overviews[0]!.resolve(overview([A, B]));
     await flush();
@@ -353,12 +380,12 @@ describe("workspace session", () => {
 
     // The selection changes: the page disposes this session and opens another.
     first.session.dispose();
-    const second = track({ owner: "acme", repos: ["docs"] }, client);
+    const second = track({ space: "acme", repos: ["docs"] }, client);
     void second.session.open();
     const seen = first.states.length;
     // The old scope's child page arrives late, then the new overview.
     children.get("r1/cap:auth")!.resolve(childPage([file("r1", "src/auth.ts")]));
-    overviews[1]!.resolve(overview([C], "ws1.other.2"));
+    overviews[1]!.resolve(overview([C], "ws4.other.2"));
     await flush();
 
     expect(first.states).toHaveLength(seen);
@@ -373,7 +400,7 @@ describe("workspace session", () => {
 
   test("an overview answering after its session is gone changes nothing", async () => {
     const { client, overviews } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api"] }, client);
+    const view = track({ space: "acme", repos: ["api"] }, client);
     void view.session.open();
     view.session.dispose();
     overviews[0]!.resolve(overview([A]));
@@ -383,7 +410,7 @@ describe("workspace session", () => {
 
   test("revocation detected mid-view discards that repository's content", async () => {
     const { client, overviews, children, requests } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api", "web"] }, client);
+    const view = track({ space: "acme", repos: ["api", "web"] }, client);
     void view.session.open();
     overviews[0]!.resolve(overview([A, B]));
     await flush();
@@ -395,8 +422,8 @@ describe("workspace session", () => {
     expect(view.last().loads.get("r1/cap:auth")?.state).toBe("ready");
     // Every child request is pinned to the composite the overview named.
     expect(requests.filter((r) => r.route.startsWith("children")).map((r) => r.snapshot)).toEqual([
-      "ws1.tag.2.2",
-      "ws1.tag.2.2",
+      "ws4.tag.2.2",
+      "ws4.tag.2.2",
     ]);
 
     // Access to "api" goes away: the pinned composite no longer matches the
@@ -409,7 +436,7 @@ describe("workspace session", () => {
       );
     await flush();
     // The session re-reads the scope: only "web" is readable now.
-    overviews[1]!.resolve(overview([B], "ws1.new.2"));
+    overviews[1]!.resolve(overview([B], "ws4.new.2"));
     await flush();
     // "web"'s page answers late; "api"'s first page answers again too late.
     children.get("r2/cap:ui")!.resolve(childPage([file("r2", "src/ui.tsx")]));
@@ -438,7 +465,7 @@ describe("workspace session", () => {
 
   test("losing every repository empties the view", async () => {
     const { client, overviews, children } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api"] }, client);
+    const view = track({ space: "acme", repos: ["api"] }, client);
     void view.session.open();
     overviews[0]!.resolve(overview([A]));
     await flush();
@@ -457,7 +484,7 @@ describe("workspace session", () => {
 
   test("an expired snapshot asks for the current view instead of switching silently", async () => {
     const { client, overviews, children } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api"] }, client);
+    const view = track({ space: "acme", repos: ["api"] }, client);
     void view.session.open();
     overviews[0]!.resolve(overview([A]));
     await flush();
@@ -473,7 +500,7 @@ describe("workspace session", () => {
 
   test("a scope nobody can read says so", async () => {
     const { client, overviews } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["secret"] }, client);
+    const view = track({ space: "acme", repos: ["secret"] }, client);
     void view.session.open();
     overviews[0]!.reject(new ApiError(404, "None of the selected repositories…", "scope_empty"));
     await flush();
@@ -484,8 +511,8 @@ describe("workspace session", () => {
 describe("composition coverage", () => {
   const composition = (repos: AtlasWorkspaceRepo[]): AtlasWorkspaceComposition => ({
     scope: "ws:o:hash",
-    owner: { id: "o", slug: "acme" },
-    snapshot: { id: "ws1.tag.2.2", repos },
+    space,
+    snapshot: { id: "ws4.tag.2.2", repos },
     items: [],
     counts: { loaded: 0, knownTotal: 3, unknownTotal: false },
     next: null,
@@ -501,13 +528,13 @@ describe("composition coverage", () => {
 
   test("is read at the overview's composite, and dropped with its scope", async () => {
     const { client, overviews, compositions, requests } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api", "web"] }, client);
+    const view = track({ space: "acme", repos: ["api", "web"] }, client);
     void view.session.open();
     overviews[0]!.resolve(overview([A, B]));
     await flush();
     expect(view.last().composition).toEqual({ status: "loading" });
     const asked = requests.find((r) => r.route === "composition")!;
-    expect(asked.snapshot).toBe("ws1.tag.2.2");
+    expect(asked.snapshot).toBe("ws4.tag.2.2");
     compositions[0]!.resolve(composition([A, B]));
     await flush();
     expect(view.last().composition).toMatchObject({
@@ -521,11 +548,11 @@ describe("composition coverage", () => {
     });
 
     // Another scope: this one's composition answer never lands.
-    const other = track({ owner: "acme", repos: ["api"] }, client);
+    const other = track({ space: "acme", repos: ["api"] }, client);
     void other.session.open();
     view.session.dispose();
     const seen = view.states.length;
-    overviews[1]!.resolve(overview([A], "ws1.solo.2"));
+    overviews[1]!.resolve(overview([A], "ws4.solo.2"));
     await flush();
     expect(requests.filter((r) => r.route === "composition")[0]!.signal!.aborted).toBe(true);
     compositions[1]!.resolve(composition([A]));
@@ -539,7 +566,7 @@ describe("composition coverage", () => {
 
   test("revocation keeps only readable repositories' rows and drops scope-wide totals", async () => {
     const { client, overviews, compositions } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api", "web"] }, client);
+    const view = track({ space: "acme", repos: ["api", "web"] }, client);
     void view.session.open();
     overviews[0]!.resolve(overview([A, B]));
     await flush();
@@ -590,8 +617,8 @@ const compositionPage = (
   knownTotal = items.length,
 ): AtlasWorkspaceComposition => ({
   scope: "ws:o:hash",
-  owner: { id: "o", slug: "acme" },
-  snapshot: { id: "ws1.tag.2.2.2", repos },
+  space,
+  snapshot: { id: "ws4.tag.2.2.2", repos },
   items,
   counts: { loaded: items.length, knownTotal, unknownTotal: false },
   next,
@@ -629,9 +656,9 @@ describe("capabilities spanning repositories", () => {
 
   test("composites are paged at the overview's composite, and revocation drops those it touched", async () => {
     const { client, overviews, compositions, requests } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api", "web", "docs"] }, client);
+    const view = track({ space: "acme", repos: ["api", "web", "docs"] }, client);
     void view.session.open();
-    overviews[0]!.resolve(overview([A, B, C], "ws1.tag.2.2.2"));
+    overviews[0]!.resolve(overview([A, B, C], "ws4.tag.2.2.2"));
     await flush();
     compositions[0]!.resolve(compositionPage([A, B, C], [billing], "cursor-2", 2));
     await flush();
@@ -643,8 +670,8 @@ describe("capabilities spanning repositories", () => {
     await flush();
     const asked = requests.filter((r) => r.route === "composition");
     expect(asked.map((r) => [r.snapshot, (r as { cursor?: string }).cursor ?? null])).toEqual([
-      ["ws1.tag.2.2.2", null],
-      ["ws1.tag.2.2.2", "cursor-2"],
+      ["ws4.tag.2.2.2", null],
+      ["ws4.tag.2.2.2", "cursor-2"],
     ]);
     expect(view.last().composition).toMatchObject({
       items: [billing, theming],
@@ -659,15 +686,15 @@ describe("capabilities spanning repositories", () => {
 
   test("a link to a composite reads just it, once, and an unknown one is missing", async () => {
     const { client, overviews, compositions, requests } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api", "web", "docs"] }, client);
+    const view = track({ space: "acme", repos: ["api", "web", "docs"] }, client);
     void view.session.open();
-    overviews[0]!.resolve(overview([A, B, C], "ws1.tag.2.2.2"));
+    overviews[0]!.resolve(overview([A, B, C], "ws4.tag.2.2.2"));
     await flush();
     // Before the first page answers, a cold link names the second composite.
     const found = view.session.composite("xcap:2");
     await flush();
     const one = requests.at(-1) as { route: string; id?: string; snapshot?: string };
-    expect(one).toMatchObject({ route: "composition", id: "xcap:2", snapshot: "ws1.tag.2.2.2" });
+    expect(one).toMatchObject({ route: "composition", id: "xcap:2", snapshot: "ws4.tag.2.2.2" });
     compositions[1]!.resolve(compositionPage([A, B, C], [theming]));
     expect(await found).toEqual(theming);
     // Once the page is read, what's on it needs no request.
@@ -690,7 +717,7 @@ describe("the workspace address", () => {
   test("a new selection keeps only the map-or-outline choice", () => {
     expect(
       rescopeSearch(
-        "repos=api&select=r1%2Fcap%3Aauth&snapshot=ws1.a.2&lens=in&q=auth&kind=file&view=outline&links=related&tl=main",
+        "repos=api&select=r1%2Fcap%3Aauth&snapshot=ws4.a.2&lens=in&q=auth&kind=file&view=outline&links=related&tl=main",
         ["api", "web"],
       ),
     ).toBe("repos=api,web&view=outline&tl=main");
@@ -706,14 +733,14 @@ describe("the workspace address", () => {
 
   test("a link pins the overview's composite; an expired one explains instead of switching", async () => {
     const { client, overviews, requests } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api"] }, client);
-    void view.session.open("ws1.tag.1");
-    expect(requests[0]).toMatchObject({ route: "overview", snapshot: "ws1.tag.1" });
+    const view = track({ space: "acme", repos: ["api"] }, client);
+    void view.session.open("ws4.tag.1");
+    expect(requests[0]).toMatchObject({ route: "overview", snapshot: "ws4.tag.1" });
     overviews[0]!.reject(
       new ApiError(410, "This Atlas snapshot has expired.", "snapshot_expired", {
         error: "This Atlas snapshot has expired.",
         code: "snapshot_expired",
-        current: { id: "ws1.tag.4", seq: null },
+        current: { id: "ws4.tag.4", seq: null },
         expired: { at: "2026-10-01T00:00:00.000Z", reason: "count" },
       }),
     );
@@ -723,7 +750,7 @@ describe("the workspace address", () => {
       overview: null,
       gone: {
         code: "snapshot_expired",
-        current: { id: "ws1.tag.4", seq: null },
+        current: { id: "ws4.tag.4", seq: null },
         expired: { reason: "count" },
       },
     });
@@ -731,14 +758,14 @@ describe("the workspace address", () => {
     void view.session.open();
     expect(requests.at(-1)).toMatchObject({ route: "overview" });
     expect((requests.at(-1) as { snapshot?: string }).snapshot).toBeUndefined();
-    overviews[1]!.resolve(overview([A], "ws1.tag.4"));
+    overviews[1]!.resolve(overview([A], "ws4.tag.4"));
     await flush();
     expect(view.last()).toMatchObject({ status: "ready", gone: null });
   });
 
   test("a region is opened once however often a link or the outline asks", async () => {
     const { client, overviews, requests } = scriptedClient();
-    const view = track({ owner: "acme", repos: ["api"] }, client);
+    const view = track({ space: "acme", repos: ["api"] }, client);
     void view.session.open();
     overviews[0]!.resolve(overview([A]));
     await flush();

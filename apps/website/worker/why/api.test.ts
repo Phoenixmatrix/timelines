@@ -4,16 +4,26 @@ import type { CheckpointState, Landing, Timeline, TimelineEvent } from "../../sh
 import type { WhyResponse } from "../../shared/why.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import type { PackCommit } from "../git/pack.ts";
 import { recordRefs } from "../ref-log/record.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { fakeHistory } from "../testing/history.ts";
 import { Timing } from "../timing.ts";
 import * as artifacts from "../artifacts.ts";
 import { byCommit, parseCommit, parseLines, why } from "./api.ts";
 
 // loadRepo's module reaches the knowledge coordinator, a Durable Object.
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: unknown;
+    public env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 
 const CHANGE = "kpqrstuvkpqrstuv";
 const file = (...lines: string[]) => ({ "src/app.ts": `${lines.join("\n")}\n` });
@@ -25,7 +35,11 @@ beforeEach(() => {
     throw new Error("no network in tests");
   });
 });
-afterEach(() => vi.unstubAllGlobals());
+const closers: (() => void)[] = [];
+afterEach(() => {
+  vi.unstubAllGlobals();
+  for (const close of closers.splice(0)) close();
+});
 
 /**
  * A timeline's life, end to end: change CHANGE is written on timeline/search
@@ -33,14 +47,27 @@ afterEach(() => vi.unstubAllGlobals());
  * checkpointed and approved again, and landed on main by a merge.
  */
 async function setup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  closers.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob'),
-      ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ann', 'owner');
+      ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "orbit-org", slug: "orbit-org", displayName: "Orbit", kind: "company" },
+    space: { id: "orbit", slug: "orbit", displayName: "General" },
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "ann",
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('app', 'orbit', 'app', 'public', 'why-${crypto.randomUUID()}', 'https://app');
   `);
   const git = fakeHistory();
@@ -65,7 +92,6 @@ async function setup() {
     "llllland",
   );
 
-  const env = { DB: d1(sqlite) } as unknown as Env;
   const reachable = (from: string[]) => {
     const seen = new Set<string>();
     for (const stack = [...from]; stack.length;) {
@@ -138,7 +164,7 @@ async function setup() {
     repos: [
       {
         id: "app",
-        owner: "orbit",
+        space: "orbit",
         name: "app",
         commit,
         base: m0,
@@ -177,17 +203,31 @@ async function setup() {
     },
   ];
   const issue = { id: "iss_7", key: "CORE-7", title: "Rank search by title", status: "done" };
+  const landingToken = await issueToken(
+    env.DB,
+    "ann",
+    "landing origin",
+    "write",
+    undefined,
+    "agt_bot",
+  );
+  const authority = await captureWorkAuthority(env, "app", {
+    id: "ann",
+    agent: { id: "agt_bot", name: "bot" },
+    credential: { kind: "token", id: landingToken.id },
+  });
   const queued: Landing = {
     id: "ld_search",
     timelineId: timeline.id,
     slug: timeline.slug,
     checkpointId: "cp_2",
     checkpointNumber: 2,
+    authority,
     state: "landed",
     repos: [
       {
         id: "app",
-        owner: "orbit",
+        space: "orbit",
         name: "app",
         commit: x2,
         base: m1,
@@ -208,7 +248,7 @@ async function setup() {
   };
   const tracker = {
     listTimelines: async () => ({ ok: true, value: [timeline] }),
-    timeline: async (slug: string) =>
+    timeline: async (_access: unknown, slug: string) =>
       slug === "search"
         ? {
             ok: true,
@@ -216,7 +256,7 @@ async function setup() {
           }
         : { ok: false, status: 404, error: "No timeline", code: "not_found" },
     checkpoints: async () => ({ ok: true, value: checkpoints }),
-    landingForCommit: async (repoId: string, commit: string) => ({
+    landingForCommit: async (_access: unknown, repoId: string, commit: string) => ({
       ok: true,
       value: queued.repos.some(
         (repo) => repo.id === repoId && repo.merge === commit && repo.state === "advanced",
@@ -225,8 +265,8 @@ async function setup() {
         : null,
     }),
     checkpoint: async () => ({ ok: true, value: checkpoints[0]! }),
-    subscribedWorkspaces: async () => ({ ok: true, value: ["ws"] }),
-    issuesByKey: async (keys: string[]) => ({
+    subscribedProjects: async () => ({ ok: true, value: ["ws"] }),
+    issuesByKey: async (_access: unknown, keys: string[]) => ({
       ok: true,
       value: keys.includes(issue.key) ? [{ ...issue, description: "", labels: [] }] : [],
     }),
@@ -236,7 +276,7 @@ async function setup() {
     // Ann's own tracker subscribes nothing to the repository.
     TRACKER: {
       getByName: (id: string) =>
-        id === "orbit" ? tracker : { subscribedWorkspaces: async () => ({ ok: true, value: [] }) },
+        id === "orbit" ? tracker : { subscribedProjects: async () => ({ ok: true, value: [] }) },
     },
   });
 
@@ -247,7 +287,7 @@ async function setup() {
     c.set("timing", new Timing());
     return next();
   });
-  app.route("/api/repos/:owner/:name", why);
+  app.route("/api/repos/:space/:name", why);
   const tokens = {
     ann: (await issueToken(env.DB, "ann", "t", "read")).secret,
     bob: (await issueToken(env.DB, "bob", "t", "read")).secret,
@@ -277,6 +317,32 @@ async function setup() {
 }
 
 describe("GET /why", () => {
+  test("an Organization owner loses private Tracker facts immediately when its Space grant is removed", async () => {
+    const t = await setup();
+    const query = `commit=${t.commits.x1}`;
+    expect((await t.get("ann", query)).body.tracker.readable).toBe(true);
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'ann'");
+    const { status, body } = await t.get("ann", query);
+    expect(status).toBe(200);
+    expect(body.tracker).toEqual({ space: "orbit", readable: false });
+    expect(body.chains[0]).toMatchObject({ timelines: [], checkpoints: [], issues: [] });
+    expect(body.chains[0]!.changeId).toBe(CHANGE);
+  });
+
+  test("a repository collaborator gains no Space Tracker facts", async () => {
+    const t = await setup();
+    t.sqlite.exec(`
+      UPDATE repos SET visibility = 'private' WHERE id = 'app';
+      INSERT INTO repo_collaborators(repo_id,user_id,role) VALUES('app','bob','read');
+    `);
+    const { status, body } = await t.get("bob", `commit=${t.commits.x1}`);
+    expect(status).toBe(200);
+    expect(body.tracker.readable).toBe(false);
+    expect(body.chains[0]).toMatchObject({ timelines: [], checkpoints: [], issues: [] });
+    t.sqlite.exec("DELETE FROM repo_collaborators WHERE repo_id = 'app' AND user_id = 'bob'");
+    expect((await t.get("bob", `commit=${t.commits.x1}`)).status).toBe(404);
+  });
+
   test("work provenance uses exact compact membership and remains truthful after source expiry", async () => {
     const t = await setup();
     const { m0, x1, x2, landing } = t.commits;
@@ -288,7 +354,7 @@ describe("GET /why", () => {
       ref: "refs/heads/work",
     };
     t.sqlite.exec(`
-      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
       VALUES('work_search','app','tl_search','search','orbit','work-search','https://work','archived','allocate','canonical','${m0}','base-tree','refs/heads/main','canonical','${m0}','base-tree','refs/heads/main',1,'now','now');
       INSERT INTO source_integration_receipts(id,landing_id,checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at,completed_at)
       VALUES('receipt','ld_search','cp_2','app','work_search','${x2}','work-tree','{}','[]','${m0}','${landing}','canonical-tree',0,'complete','now','now');
@@ -342,7 +408,7 @@ describe("GET /why", () => {
     const { x1, x2, m1, landing } = t.commits;
     const { status, body } = await t.get("ann", `path=src/app.ts&line=2-3&rev=${landing}`);
     expect(status).toBe(200);
-    expect(body.tracker).toEqual({ owner: "orbit", readable: true });
+    expect(body.tracker).toEqual({ space: "orbit", readable: true });
     expect(body.blame).toMatchObject({ source: "server", path: "src/app.ts", head: landing });
     // Line 2 came from the timeline's commit (not the landing merge); line 3 from main.
     expect(body.blame!.lines).toEqual([
@@ -370,7 +436,7 @@ describe("GET /why", () => {
       expect.objectContaining({ from: "search", into: null, commit: landing, parent: x2 }),
     ]);
     expect(chain.issues).toEqual([
-      expect.objectContaining({ key: "CORE-7", trackerOwner: "orbit", source: "commit" }),
+      expect.objectContaining({ key: "CORE-7", trackerSpace: "orbit", source: "commit" }),
     ]);
     // Both checkpoints pinned the change, the first as X1, before the rebase.
     expect(chain.checkpoints.map((c) => [c.number, c.commit, c.approval?.state])).toEqual([

@@ -1,4 +1,4 @@
-// The push log's API, per repository under /api/repos/:owner/:name:
+// The push log's API, per repository under /api/repos/:space/:name:
 //   GET /ref-updates?ref=&before=   updates, newest first: one ref's (a full
 //                                   name, or a branch or tag name) or all
 //   GET /changes/:change            the refs a change reached, and when (a
@@ -8,9 +8,11 @@ import { Hono } from "hono";
 import type { InferResult } from "kysely";
 import type { ChangeHistory, RefUpdate, RefUpdateList } from "../../shared/api.ts";
 import { fail } from "../api/http.ts";
-import { loadSourceRepo } from "../api/repos.ts";
-import type { AppEnv } from "../auth.ts";
+import { loadRepo, loadSourceRepo } from "../api/repos.ts";
+import { isActorCredentialLive, type AppEnv } from "../auth.ts";
 import { db, type DB } from "../schema.ts";
+import { resumeMentionBackfill } from "../mentions/backfill.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
 
 const PAGE = 50;
 const CHANGE_ID = /^[0-9a-z]{4,64}$/;
@@ -38,6 +40,39 @@ export const toUpdate = (row: UpdateRow): RefUpdate => ({
 });
 
 export const refLog = new Hono<AppEnv>();
+
+refLog.get("/mention-backfill", async (c) => {
+  const repo = await loadRepo(c, "write");
+  if (repo instanceof Response) return repo;
+  const actor = c.get("actor");
+  if (!actor || !(await resolveSpaceAccess(c.env.DB, actor, repo.row.space_id)))
+    return fail(c, 403, "Explicit Space access is required.");
+  const k = db(c.env.DB);
+  const done = await k
+    .selectFrom("commit_mention_backfills")
+    .select(["commits", "done_at"])
+    .where("repo_id", "=", repo.row.id)
+    .executeTakeFirst();
+  if (done) return c.json({ state: "completed", ...done });
+  const job = await k
+    .selectFrom("mention_backfill_jobs")
+    .select(["state", "error"])
+    .where("repo_id", "=", repo.row.id)
+    .executeTakeFirst();
+  return c.json(job ?? { state: "blocked", error: "originating_authority_unavailable" });
+});
+
+refLog.post("/mention-backfill", async (c) => {
+  const repo = await loadRepo(c, "write");
+  if (repo instanceof Response) return repo;
+  const actor = c.get("actor");
+  if (!actor || !(await resolveSpaceAccess(c.env.DB, actor, repo.row.space_id)))
+    return fail(c, 403, "Explicit Space access is required.");
+  if (!(await isActorCredentialLive(c.env.DB, actor, "write")))
+    return fail(c, 403, "A current write credential is required.");
+  await resumeMentionBackfill(c.env, repo.row.id, actor);
+  return c.json({ accepted: true }, 202);
+});
 
 refLog.get("/ref-updates", async (c) => {
   const repo = await loadSourceRepo(c, "read", true);

@@ -1,29 +1,5 @@
-// Retention settings API (CORE-196). Categories and resolution:
-// worker/retention/categories.ts and policies.ts; shapes: shared/retention.ts.
-//
-// /api/accounts/:slug/settings/retention (accountRetentionApi)
-//   GET    the account's categories with effective policies (the account's
-//          administrators: org owners or the user, agents acting for them
-//          read-only; other members 403, others 404)
-//   PATCH  RetentionPatch for account categories (org owners or the user
-//          themselves, and site administrators; people, not agents)
-// /api/admin/retention (siteRetentionApi; site administrators only, others 403)
-//   GET    site categories, and site-wide defaults for account categories
-//   PATCH  RetentionPatch for those
-//
-// Every PATCH is validated against the registry (unknown categories or
-// thresholds, out-of-bounds or fractional values, read-only categories: 400)
-// and records who changed what in retention_policy_changes.
-//
-// Cleanup runs (CORE-198; worker/retention/runs.ts):
-// /api/accounts/:slug/retention/runs (accountRunsApi), /api/admin/retention/runs
-//   POST      RetentionRunRequest {dryRun, categories, thresholds?}: 202 with
-//             the queued run (owners/site admins, people only). Any categories
-//             of the level that have a cleanup, enabled or not.
-//   GET       the level's runs, newest first (?before=<next>&limit=)
-//   GET /:id  one run with each category's thresholds, counts, bytes, errors
-//   Account runs: the account's administrators read (other members 403);
-//   site runs: site administrators.
+// Space retention requires a current explicit admin grant, never Organization
+// ownership or an Instance bypass. Person retention is strictly self-only.
 
 import { Hono, type Context } from "hono";
 import type {
@@ -34,13 +10,14 @@ import type {
 } from "../../shared/retention.ts";
 import { fail, requireActor, requirePerson } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
-import { load } from "../deployments/settings.ts";
+import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
+import type { Actor } from "../db.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
 import { category, validThreshold } from "./categories.ts";
 import {
-  accountPolicies,
+  instancePolicies,
   applyPatch,
   recentChanges,
-  sitePolicies,
   targetPolicies,
   validatePatch,
   type RetentionTarget,
@@ -55,67 +32,66 @@ async function body(c: { req: { json(): Promise<unknown> } }): Promise<unknown> 
   }
 }
 
-async function accountSettings(
+async function settings(
   d1: D1Database,
-  account: { id: string; slug: string },
+  target: RetentionTarget,
   canEdit: boolean,
 ): Promise<RetentionSettings> {
   const [categories, changes] = await Promise.all([
-    accountPolicies(d1, account.id),
-    recentChanges(d1, account.id),
+    target.kind === "instance" ? instancePolicies(d1) : targetPolicies(d1, target),
+    recentChanges(d1, target),
   ]);
-  return { level: "account", account: account.slug, canEdit, categories, changes };
+  return { target, canEdit, categories, changes };
 }
 
-async function siteSettings(d1: D1Database, canEdit: boolean): Promise<RetentionSettings> {
-  const [categories, changes] = await Promise.all([sitePolicies(d1), recentChanges(d1, null)]);
-  return { level: "site", account: null, canEdit, categories, changes };
+async function authorize(
+  c: Context<AppEnv>,
+  actor: Actor,
+  kind: RetentionTarget["kind"],
+): Promise<RetentionTarget | Response> {
+  if (kind === "instance") {
+    return actor.isSiteAdmin
+      ? { kind, id: "" }
+      : fail(c, 403, "Only Instance administrators manage Instance retention.");
+  }
+  if (kind === "person") {
+    if (c.req.param("person")?.toLowerCase() !== actor.slug.toLowerCase())
+      return fail(c, 404, "No such person retention.");
+    return { kind, id: actor.id };
+  }
+  const space = await findSpaceBySlug(c.env.DB, c.req.param("space") ?? "");
+  const access = space && (await resolveSpaceAccess(c.env.DB, actor, space.id));
+  if (!access) return fail(c, 404, "No such Space, or you don't have access.");
+  if (access.grant.role !== "admin")
+    return fail(c, 403, "Only Space administrators manage retention.");
+  return { kind, id: access.spaceId };
 }
 
-const READ_ONLY_ADMINS = "Only the organization's owners can see its data retention.";
+function retentionApi(kind: RetentionTarget["kind"]) {
+  const api = new Hono<AppEnv>();
+  api.get("/", async (c) => {
+    const actor = requireActor(c);
+    if (actor instanceof Response) return actor;
+    const target = await authorize(c, actor, kind);
+    if (target instanceof Response) return target;
+    return c.json<RetentionSettings>(await settings(c.env.DB, target, !actor.agent));
+  });
+  api.patch("/", async (c) => {
+    const actor = requirePerson(c);
+    if (actor instanceof Response) return actor;
+    const target = await authorize(c, actor, kind);
+    if (target instanceof Response) return target;
+    const changes = validatePatch(kind, await body(c));
+    if (typeof changes === "string") return fail(c, 400, changes);
+    await applyPatch(c.env.DB, target, changes, actor.id);
+    return c.json<RetentionSettings>(await settings(c.env.DB, target, true));
+  });
+  return api;
+}
 
-export const accountRetentionApi = new Hono<AppEnv>();
-
-accountRetentionApi.get("/", async (c) => {
-  const actor = requireActor(c);
-  if (actor instanceof Response) return actor;
-  const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  if (found.role !== "admin") return fail(c, 403, READ_ONLY_ADMINS);
-  return c.json<RetentionSettings>(await accountSettings(c.env.DB, found.account, !actor.agent));
-});
-
-accountRetentionApi.patch("/", async (c) => {
-  const actor = requirePerson(c);
-  if (actor instanceof Response) return actor;
-  const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  if (found.role !== "admin")
-    return fail(c, 403, "Only the organization's owners can change its data retention.");
-  const changes = validatePatch("account", await body(c));
-  if (typeof changes === "string") return fail(c, 400, changes);
-  await applyPatch(c.env.DB, { scope: "account", accountId: found.account.id }, changes, actor.id);
-  return c.json<RetentionSettings>(await accountSettings(c.env.DB, found.account, true));
-});
-
-export const siteRetentionApi = new Hono<AppEnv>();
-
-siteRetentionApi.get("/", async (c) => {
-  const actor = requireActor(c);
-  if (actor instanceof Response) return actor;
-  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site retention.");
-  return c.json<RetentionSettings>(await siteSettings(c.env.DB, !actor.agent));
-});
-
-siteRetentionApi.patch("/", async (c) => {
-  const actor = requirePerson(c);
-  if (actor instanceof Response) return actor;
-  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site retention.");
-  const changes = validatePatch("site", await body(c));
-  if (typeof changes === "string") return fail(c, 400, changes);
-  await applyPatch(c.env.DB, { scope: "site" }, changes, actor.id);
-  return c.json<RetentionSettings>(await siteSettings(c.env.DB, true));
-});
+export const spaceRetentionApi = retentionApi("space");
+export const personRetentionApi = retentionApi("person");
+export const instanceRetentionApi = retentionApi("instance");
 
 /**
  * Checks a run request against a level's effective policies: categories of
@@ -168,13 +144,16 @@ export function validateRunRequest(
 async function startRun(
   c: Context<AppEnv>,
   target: RetentionTarget,
-  actorId: string,
+  actor: Actor,
   request: Exclude<ReturnType<typeof validateRunRequest>, string>,
 ) {
+  const admission = await cutoverControl(c.env).admission(4);
+  if (!admission.allowed) return fail(c, 503, "space_cutover_fenced");
   const id = await createRun(c.env.DB, {
     target,
     trigger: "manual",
-    actorId,
+    actorId: actor.id,
+    authority: { ...actor, migrationEpoch: admission.epoch },
     dryRun: request.dryRun,
     categories: request.categories,
   });
@@ -198,69 +177,36 @@ function runId(c: Context<AppEnv>): number | null {
   return Number.isInteger(id) && id > 0 ? id : null;
 }
 
-/** /api/accounts/:slug/retention/runs */
-export const accountRunsApi = new Hono<AppEnv>();
+function runsApi(kind: RetentionTarget["kind"]) {
+  const api = new Hono<AppEnv>();
+  api.post("/", async (c) => {
+    const actor = requirePerson(c);
+    if (actor instanceof Response) return actor;
+    const target = await authorize(c, actor, kind);
+    if (target instanceof Response) return target;
+    const request = validateRunRequest(await body(c), await targetPolicies(c.env.DB, target));
+    if (typeof request === "string") return fail(c, 400, request);
+    return startRun(c, target, actor, request);
+  });
+  api.get("/", async (c) => {
+    const actor = requireActor(c);
+    if (actor instanceof Response) return actor;
+    const target = await authorize(c, actor, kind);
+    if (target instanceof Response) return target;
+    return c.json<RetentionRunPage>(await listRuns(c.env.DB, target, page(c)));
+  });
+  api.get("/:id", async (c) => {
+    const actor = requireActor(c);
+    if (actor instanceof Response) return actor;
+    const target = await authorize(c, actor, kind);
+    if (target instanceof Response) return target;
+    const id = runId(c);
+    const run = id === null ? null : await getRun(c.env.DB, target, id);
+    return run ? c.json<RetentionRun>(run) : fail(c, 404, "No such run.");
+  });
+  return api;
+}
 
-accountRunsApi.post("/", async (c) => {
-  const actor = requirePerson(c);
-  if (actor instanceof Response) return actor;
-  const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  if (found.role !== "admin")
-    return fail(c, 403, "Only the organization's owners can clean up its data.");
-  const target = { scope: "account", accountId: found.account.id } as const;
-  const request = validateRunRequest(await body(c), await targetPolicies(c.env.DB, target));
-  if (typeof request === "string") return fail(c, 400, request);
-  return startRun(c, target, actor.id, request);
-});
-
-accountRunsApi.get("/", async (c) => {
-  const actor = requireActor(c);
-  if (actor instanceof Response) return actor;
-  const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  if (found.role !== "admin") return fail(c, 403, READ_ONLY_ADMINS);
-  return c.json<RetentionRunPage>(
-    await listRuns(c.env.DB, { scope: "account", accountId: found.account.id }, page(c)),
-  );
-});
-
-accountRunsApi.get("/:id", async (c) => {
-  const actor = requireActor(c);
-  if (actor instanceof Response) return actor;
-  const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  if (found.role !== "admin") return fail(c, 403, READ_ONLY_ADMINS);
-  const id = runId(c);
-  const run =
-    id === null
-      ? null
-      : await getRun(c.env.DB, { scope: "account", accountId: found.account.id }, id);
-  return run ? c.json<RetentionRun>(run) : fail(c, 404, "No such run.");
-});
-
-siteRetentionApi.post("/runs", async (c) => {
-  const actor = requirePerson(c);
-  if (actor instanceof Response) return actor;
-  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site retention.");
-  const target = { scope: "site" } as const;
-  const request = validateRunRequest(await body(c), await targetPolicies(c.env.DB, target));
-  if (typeof request === "string") return fail(c, 400, request);
-  return startRun(c, target, actor.id, request);
-});
-
-siteRetentionApi.get("/runs", async (c) => {
-  const actor = requireActor(c);
-  if (actor instanceof Response) return actor;
-  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site retention.");
-  return c.json<RetentionRunPage>(await listRuns(c.env.DB, { scope: "site" }, page(c)));
-});
-
-siteRetentionApi.get("/runs/:id", async (c) => {
-  const actor = requireActor(c);
-  if (actor instanceof Response) return actor;
-  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site retention.");
-  const id = runId(c);
-  const run = id === null ? null : await getRun(c.env.DB, { scope: "site" }, id);
-  return run ? c.json<RetentionRun>(run) : fail(c, 404, "No such run.");
-});
+export const spaceRunsApi = runsApi("space");
+export const personRunsApi = runsApi("person");
+instanceRetentionApi.route("/runs", runsApi("instance"));

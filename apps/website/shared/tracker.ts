@@ -1,4 +1,5 @@
 import type { AgentCapabilities } from "./api.ts";
+import type { SpaceSummary } from "./spaces.ts";
 import type { CheckpointView, Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
 import type { QueueFailure } from "./merge-queue.ts";
 import type { IssueRequirements } from "./requirements.ts";
@@ -93,7 +94,7 @@ export interface TrackerAgent {
   capabilitiesUpdatedAt: string | null;
   revokedAt: string | null;
 }
-export interface TrackerOwner extends TrackerIdentity {
+export interface TrackerSpace extends SpaceSummary {
   canAdmin: boolean;
 }
 export interface TrackerEntity {
@@ -117,7 +118,7 @@ export interface Team extends TrackerEntity {
 
 /** Releases without completion before a team's issues escalate, unless it sets its own. */
 export const DEFAULT_ATTEMPT_LIMIT = 3;
-export interface Workspace extends TrackerEntity {
+export interface Project extends TrackerEntity {
   slug: string;
   name: string;
   description: string;
@@ -257,7 +258,7 @@ export interface Issue extends TrackerEntity {
   priority: 0 | 1 | 2 | 3 | 4;
   assigneeId: string | null;
   parentId: string | null;
-  workspaceIds: string[];
+  projectIds: string[];
   /**
    * The issue's tags, from the tracker's tag catalog. Stored and sent as
    * `labels` (its name before CORE-271); writers may also send `tags`.
@@ -353,7 +354,7 @@ export const TIMELINE_SCOPED_ISSUE_FIELDS = [
   "closeReason",
   "priority",
   "parentId",
-  "workspaceIds",
+  "projectIds",
   "labels",
   // Who finished it follows the status (CORE-220).
   "completion",
@@ -479,19 +480,25 @@ export interface Link {
 }
 export interface Subscription {
   id: string;
-  workspaceId: string;
+  projectId: string;
   repoId: string;
-  owner: string;
+  spaceId: string;
+  space: string;
   name: string;
 }
-export interface Snapshot {
-  owner: TrackerIdentity;
+export interface TrackerScope {
+  contractVersion: 4;
+  spaceId: string;
+  migrationEpoch: number;
+}
+export interface Snapshot extends TrackerScope {
+  space: SpaceSummary;
   canAdmin: boolean;
   members: TrackerIdentity[];
   /** Agents accountable to members: who an actorId names when it isn't a member. */
   agents: TrackerAgent[];
   teams: Team[];
-  workspaces: Workspace[];
+  projects: Project[];
   /**
    * The tag catalog: defined tags, shared across timelines and retained after
    * their last use. Called `labels` on the wire, its name before CORE-271.
@@ -515,7 +522,7 @@ export interface Snapshot {
   timelines?: Timeline[];
   timelineEvents?: TimelineEvent[];
 }
-/** One name in a tracker's tag catalog (`GET /api/tracker/:owner/tags`, CORE-271). */
+/** One name in a tracker's tag catalog (`GET /api/tracker/:space/tags`, CORE-271). */
 export interface TagCatalogEntry {
   name: string;
   /** Issues tagged with it on main. */
@@ -526,15 +533,15 @@ export interface TagCatalogEntry {
 /** Initial browser data; repository choices are loaded only in management. */
 export interface TrackerView {
   snapshot: Snapshot;
-  trackers: TrackerOwner[];
+  trackers: TrackerSpace[];
   /** The viewer's saved defaults for this tracker, if any. */
   preferences: TrackerPreferences | null;
 }
 export interface TrackerList {
   viewerId: string;
-  trackers: TrackerOwner[];
+  trackers: TrackerSpace[];
   /** The tracker whose defaults the viewer saved most recently: where /tracker opens. */
-  defaultOwnerId: string | null;
+  defaultSpaceId: string | null;
 }
 export const TRACKER_LAYOUTS = ["list", "board", "graph", "chronicle"] as const;
 /**
@@ -577,7 +584,7 @@ export function fallbackTeam(
 }
 export type EntityType =
   | "team"
-  | "workspace"
+  | "project"
   | "issue"
   | "link"
   | "comment"
@@ -594,7 +601,7 @@ export interface TrackerEvent {
   entityId: string;
   entity:
     | Team
-    | Workspace
+    | Project
     | Issue
     | Link
     | Comment
@@ -648,7 +655,7 @@ export type IssueFields = Pick<
   | "priority"
   | "assigneeId"
   | "parentId"
-  | "workspaceIds"
+  | "projectIds"
   | "labels"
 >;
 /** Fields a create or update may set beyond the inspector's draft fields. */
@@ -675,15 +682,15 @@ export type Mutation =
       data: Partial<Pick<Team, "name" | "description" | "memberIds" | "archived" | "attemptLimit">>;
     }
   | {
-      kind: "workspace.create";
+      kind: "project.create";
       id: string;
       data: { slug: string; name: string; description?: string };
     }
   | {
-      kind: "workspace.update";
+      kind: "project.update";
       id: string;
       expectedVersion: number;
-      data: Partial<Pick<Workspace, "name" | "description" | "archived">>;
+      data: Partial<Pick<Project, "name" | "description" | "archived">>;
     }
   | {
       kind: "issue.create";
@@ -703,7 +710,7 @@ export type Mutation =
       id: string;
       data: { issueId: string; body: string; kind?: Comment["kind"] };
     }
-  | { kind: "subscription.add"; id: string; data: { workspaceId: string; repoId: string } }
+  | { kind: "subscription.add"; id: string; data: { projectId: string; repoId: string } }
   | { kind: "subscription.remove"; id: string }
   | {
       kind: "issue.claim";
@@ -716,7 +723,7 @@ export type Mutation =
         /** Delegate to one of your agents instead of holding it yourself. */
         forActorId?: string;
         /**
-         * Take over an active claim: tracker owners only, acting as themselves
+         * Take over an active claim: Space admins only, acting as themselves
          * (not through an agent). The holder's token stops working, the
          * takeover is noted on the issue, and it isn't counted as their failure.
          */
@@ -783,7 +790,7 @@ export type Mutation =
         agent: string;
         ttlSeconds?: number;
         teamId?: string;
-        workspaceId?: string;
+        projectId?: string;
         /** Only descendants of this issue. */
         underId?: string;
         /** With underId: that issue's lease token, to pick inside your own leased subtree. */
@@ -796,10 +803,10 @@ export type Mutation =
       };
     }
   | { kind: "issue.renew"; id: string; data: { leaseToken: string; ttlSeconds?: number } }
-  /** Owners acting as themselves may end someone else's claim with force and no token. */
+  /** Space admins acting as themselves may end someone else's claim with force and no token. */
   | { kind: "issue.release"; id: string; data: { leaseToken?: string; force?: boolean } }
   | { kind: "issue.complete"; id: string; data: { leaseToken: string; evidence?: string } };
-export interface MutationRequest {
+export interface MutationRequest extends TrackerScope {
   operationId: string;
   mutations: Mutation[];
   /**
@@ -808,7 +815,7 @@ export interface MutationRequest {
    */
   timeline?: string;
 }
-export interface MutationResult {
+export interface MutationResult extends TrackerScope {
   cursor: number;
   events: TrackerEvent[];
   results: {
@@ -873,7 +880,7 @@ export interface TimelineFeedEvent {
   createdAt: string;
 }
 export const TIMELINE_FEED_TYPES = ["timeline", "timelineEvent"] as const;
-export interface Changes {
+export interface Changes extends TrackerScope {
   events: (TrackerEvent | TimelineFeedEvent)[];
   cursor: number;
   hasMore: boolean;

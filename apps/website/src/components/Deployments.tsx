@@ -116,11 +116,11 @@ export function DeploymentProvenance({ deployment }: { deployment: Deployment })
 /** Everything a CI run recorded as deployed, newest first. */
 export function DeploymentsPanel({
   deployments,
-  owner,
+  space,
   name,
 }: {
   deployments: Deployment[];
-  owner: string;
+  space: string;
   name: string;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -176,7 +176,7 @@ export function DeploymentsPanel({
               {expanded === deployment.id && (
                 <RecentAgents
                   endpoint={sourceUrl(
-                    `/repos/${owner}/${name}/deployments/${deployment.id}/presence`,
+                    `/repos/${space}/${name}/deployments/${deployment.id}/presence`,
                     deployment.sourceId,
                   )}
                 />
@@ -194,7 +194,7 @@ export function DeploymentsPanel({
  * it never waits on them.
  */
 export function useCommitDeployments(
-  owner: string,
+  space: string,
   name: string,
   oids: string[],
   sourceId?: string,
@@ -205,7 +205,7 @@ export function useCommitDeployments(
     if (!key) return;
     let current = true;
     api<DeploymentList>(
-      sourceUrl(`/repos/${owner}/${name}/deployments?limit=100&commit=${key}`, sourceId),
+      sourceUrl(`/repos/${space}/${name}/deployments?limit=100&commit=${key}`, sourceId),
     )
       .then((page) => {
         if (!current) return;
@@ -218,7 +218,7 @@ export function useCommitDeployments(
     return () => {
       current = false;
     };
-  }, [owner, name, key, sourceId]);
+  }, [space, name, key, sourceId]);
   return latest;
 }
 

@@ -26,6 +26,7 @@ import { listRefs } from "../artifacts.ts";
 import type { Actor } from "../db.ts";
 import { db } from "../schema.ts";
 import { startRun, type CiRepo, type PreviewRun } from "../ci/trigger.ts";
+import { captureWorkAuthority, resolveWorkAuthority, type WorkAuthority } from "../ci/admission.ts";
 
 type Waiter = (work: Promise<unknown>) => void;
 
@@ -41,6 +42,7 @@ export interface PreviewTarget {
   repo: PreviewRepo;
   commit: string;
   preview: PreviewRun;
+  authority?: WorkAuthority;
   /** The branch to run on, when known; otherwise looked up (previewBranch). */
   branch?: string;
 }
@@ -66,35 +68,40 @@ export async function previewBranch(env: Env, repo: PreviewRepo, slug: string): 
 export async function startPreviewRuns(
   env: Env,
   targets: PreviewTarget[],
-  actor: Pick<Actor, "id" | "agent"> | null,
+  actor: Pick<Actor, "id" | "agent" | "credential"> | null,
   waitUntil: Waiter,
 ): Promise<PreviewRunResult[]> {
   return Promise.all(
-    targets.map(async ({ repo, commit, preview, branch }): Promise<PreviewRunResult> => {
-      try {
-        const started = await startRun(env, repo, {
-          branch: branch ?? (await previewBranch(env, repo, preview.timeline)),
-          commit,
-          trigger: "preview",
-          preview,
-          actor,
-          waitUntil,
-        });
-        return "skipped" in started
-          ? {
-              repoId: repo.id,
-              skipped: started.skipped,
-              teardownUnmanaged: started.teardownUnmanaged,
-            }
-          : { repoId: repo.id, number: started.number, runId: started.runId };
-      } catch (error) {
-        console.error("Previews: could not start a run", { repo: repo.id, preview, error });
-        return {
-          repoId: repo.id,
-          skipped: `The run could not be started: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
-    }),
+    targets.map(
+      async ({ repo, commit, preview, branch, authority: saved }): Promise<PreviewRunResult> => {
+        try {
+          const authority = saved ?? (await captureWorkAuthority(env, repo.id, actor));
+          const current = await resolveWorkAuthority(env, authority, repo.id);
+          const started = await startRun(env, repo, {
+            branch: branch ?? (await previewBranch(env, repo, preview.timeline)),
+            commit,
+            trigger: "preview",
+            preview,
+            actor: current.actor,
+            authority,
+            waitUntil,
+          });
+          return "skipped" in started
+            ? {
+                repoId: repo.id,
+                skipped: started.skipped,
+                teardownUnmanaged: started.teardownUnmanaged,
+              }
+            : { repoId: repo.id, number: started.number, runId: started.runId };
+        } catch (error) {
+          console.error("Previews: could not start a run", { repo: repo.id, preview, error });
+          return {
+            repoId: repo.id,
+            skipped: `The run could not be started: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      },
+    ),
   );
 }
 
@@ -115,8 +122,9 @@ export async function previewCheckpoint(
   env: Env,
   checkpoint: Checkpoint,
   timeline: Pick<Timeline, "slug">,
-  actor: Pick<Actor, "id" | "agent"> | null,
+  actor: Pick<Actor, "id" | "agent" | "credential"> | null,
   waitUntil: Waiter,
+  authority: WorkAuthority,
 ): Promise<PreviewRunResult[]> {
   const repos = await ciRepos(
     env.DB,
@@ -130,6 +138,7 @@ export async function previewCheckpoint(
         ? [
             {
               repo: { ...row, source_id: repo.source?.sourceId ?? "canonical" },
+              authority,
               commit: repo.commit,
               // Just measured from it.
               branch:
@@ -198,8 +207,9 @@ export async function reviveCheckpoint(
   env: Env,
   checkpoint: Checkpoint,
   timeline: Pick<Timeline, "slug">,
-  actor: Pick<Actor, "id" | "agent">,
+  actor: Pick<Actor, "id" | "agent" | "credential">,
   waitUntil: Waiter,
+  authority: WorkAuthority,
 ): Promise<PreviewRunResult[]> {
   const [repos, records] = await Promise.all([
     ciRepos(
@@ -216,6 +226,7 @@ export async function reviveCheckpoint(
         ? [
             {
               repo: { ...row, source_id: repo.source?.sourceId ?? "canonical" },
+              authority,
               commit: repo.commit,
               preview: {
                 action: "create",

@@ -43,7 +43,7 @@ test("a timeline chosen in the palette scopes code, CI, Knowledge and the timeli
   await server.push("orbit/engine", bookmark, workHead, source.sourceId);
   // Files, history and runs need git objects and runners, which aren't here.
   cannedFiles(server, workHead);
-  server.on("GET", "/api/repos/:owner/:name/ci", (): CiRunList => ({ runs: [], runner: "local" }));
+  server.on("GET", "/api/repos/:space/:name/ci", (): CiRunList => ({ runs: [], runner: "local" }));
 
   const app = renderApp("/orbit/engine");
   const banner = page.getByRole("region", { name: "Timeline scope" });
@@ -140,13 +140,13 @@ test("a timeline chosen in the palette scopes code, CI, Knowledge and the timeli
 const railTimelines = () =>
   page.getByRole("navigation", { name: "Places" }).getByRole("link", { name: /^Timelines/ });
 
-test("the rail's Timelines opens the graph of the account a settings page is for", async () => {
+test("the rail's Timelines opens the graph of the Space a settings page is for", async () => {
   const server = await TestServer.start({ world: true });
   const trackers = await server.call<TrackerList>("GET", "/api/tracker");
   const personal = trackers.trackers.find((tracker) => tracker.slug === "marco")!;
-  server.on("GET", "/api/tracker", { ...trackers, defaultOwnerId: personal.id });
+  server.on("GET", "/api/tracker", { ...trackers, defaultSpaceId: personal.id });
 
-  const app = renderApp("/settings/ai?owner=orbit");
+  const app = renderApp("/settings/ai?space=orbit");
   await expect.element(railTimelines()).toHaveAttribute("href", "/tracker/orbit/timelines");
   await userEvent.click(railTimelines());
   await app.waitForUrl((url) => url.pathname === "/tracker/orbit/timelines");
@@ -154,11 +154,11 @@ test("the rail's Timelines opens the graph of the account a settings page is for
   await expect.element(railTimelines()).toHaveAttribute("aria-current", "page");
 });
 
-test("Home's rail opens the default account's graph", async () => {
+test("Home's rail opens the default Space's graph", async () => {
   const server = await TestServer.start({ world: true });
   const trackers = await server.call<TrackerList>("GET", "/api/tracker");
-  const owner = trackers.trackers.find((tracker) => tracker.slug === "orbit")!;
-  server.on("GET", "/api/tracker", { ...trackers, defaultOwnerId: owner.id });
+  const space = trackers.trackers.find((tracker) => tracker.slug === "orbit")!;
+  server.on("GET", "/api/tracker", { ...trackers, defaultSpaceId: space.id });
 
   const app = renderApp("/");
   await expect.element(railTimelines()).toHaveAttribute("href", "/timelines");
@@ -168,21 +168,21 @@ test("Home's rail opens the default account's graph", async () => {
   await expect.element(railTimelines()).toHaveAttribute("aria-current", "page");
 });
 
-test("the palette offers the timelines of the account the page is about, not the default's", async () => {
+test("the palette offers the timelines of the Space the page is about, not the default's", async () => {
   const server = await TestServer.start({ world: true });
   const timeline = await timelineWorld(server, { slug: "orbit-work", name: "Orbit work" });
   const trackers = await server.call<TrackerList>("GET", "/api/tracker");
   const personal = trackers.trackers.find((tracker) => tracker.slug === "marco")!;
-  server.on("GET", "/api/tracker", { ...trackers, defaultOwnerId: personal.id });
+  server.on("GET", "/api/tracker", { ...trackers, defaultSpaceId: personal.id });
 
-  const app = renderApp("/settings/ai?owner=orbit");
+  const app = renderApp("/settings/ai?space=orbit");
   await expect.element(railTimelines()).toBeVisible();
   await userEvent.keyboard("{Control>}k{/Control}");
   await userEvent.keyboard("Orbit work");
   await userEvent.click(page.getByRole("option", { name: /Switch to timeline Orbit work/ }));
   await app.waitForUrl((url) => url.searchParams.get("tl") === timeline.slug);
   expect(app.url().pathname).toBe("/settings/ai");
-  expect(app.url().searchParams.get("owner")).toBe("orbit");
+  expect(app.url().searchParams.get("space")).toBe("orbit");
 });
 
 test("the palette still switches back to main when the timeline list fails", async () => {
@@ -208,7 +208,7 @@ test("Home's rail still opens the graph without a resolved account", async () =>
   server.on("GET", "/api/tracker", {
     ...trackers,
     trackers: [],
-    defaultOwnerId: null,
+    defaultSpaceId: null,
   } satisfies TrackerList);
 
   const app = renderApp("/");

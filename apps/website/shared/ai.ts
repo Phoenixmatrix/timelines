@@ -1,7 +1,7 @@
-// Curated account-wide configuration for automatic AI work. Interactive chat
+// Curated Space-wide configuration for automatic AI work. Interactive chat
 // and the fixed-dimension embedding model are deliberately outside this catalog.
 export type AiRole = "classification" | "fast" | "task";
-/** A model an account added from one of its own providers (CORE-294): `<provider>:<model>`. */
+/** A model a Space added from one of its own providers (CORE-294): `<provider>:<model>`. */
 export type ProviderModelId = `${AiProviderKind}:${string}`;
 export type ClassificationModel = "clef" | "clef-flash" | "clef-omni" | ProviderModelId;
 export type GenerationModel = "glm-5.3-flash" | "gemma-4-26b-a4b-it" | ProviderModelId;
@@ -42,7 +42,7 @@ export interface AiModelOption {
   /** The price depends on what the provider routes to: no fixed per-token price. */
   variablePricing?: boolean;
   url: string;
-  /** Absent on the built-in Workers AI models; set on an account's own provider models. */
+  /** Absent on the built-in Workers AI models; set on a Space's own provider models. */
   provider?: AiProviderKind;
 }
 
@@ -129,7 +129,7 @@ export const DEFAULT_KNOWLEDGE_SCHEDULE: KnowledgeUpdateSchedule = {
 /** The longest either wait may be: one day. */
 export const MAX_KNOWLEDGE_WAIT_MINUTES = 1440;
 
-/** Refresh highlights for opened surfaces; the scope's account controls cadence. */
+/** Refresh highlights for opened surfaces; the scope's Space controls cadence. */
 export interface ReleaseHighlightsSchedule {
   intervalHours: number;
 }
@@ -143,7 +143,7 @@ export const MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS = 168;
 /**
  * What AI Gateway logs keep (CORE-290): every model call's metadata (model,
  * time, tokens) always; its request and response bodies only where this is on
- * for the call's component and account. One entry per kind of AI work.
+ * for the call's component and Space. One entry per kind of AI work.
  */
 export type AiLogComponent =
   | "knowledge"
@@ -187,11 +187,18 @@ export const AI_LOG_COMPONENTS: readonly {
   },
 ];
 
+/** Personal calls never inherit a Space's logging policy. */
+export function aiLogComponentScope(component: AiLogComponent): "person" | "space" {
+  return component === "assistant" || component === "assistant-titles" || component === "avatars"
+    ? "person"
+    : "space";
+}
+
 /** The plain retention note shown wherever this setting is. */
 export const AI_LOG_BODIES_NOTE =
   "While this is on, prompts and replies, including repository code and assistant conversations, may be stored in Cloudflare's AI Gateway logs and read by people with access to those logs. Storage is subject to Cloudflare's limits: accounts whose first gateway predates September 24, 2026 use Legacy Logs (10 MB per log; oversized logs are not stored). Legacy logs remain until deleted; at capacity the gateway can stop saving or delete the oldest logs, depending on its configuration. Newer customers use Workers Logs (256 KB per log; oversized logs are truncated; retention is 3 days on Free or 7 days on Paid). Turning this off does not delete bodies already stored.";
 
-/** One component's body logging: the site default, and an account's override. */
+/** One component's body logging: the Instance default, and a Space's override. */
 export interface AiLogBodiesEntry {
   component: AiLogComponent;
   label: string;
@@ -199,9 +206,11 @@ export interface AiLogBodiesEntry {
   /** The site default: its stored choice, else the environment's default. */
   site: boolean;
   siteFrom: "site" | "environment";
-  /** The account's override (account views only); null follows the site. */
-  account?: boolean | null;
-  /** What this account's calls (the site's, on the site view) get. */
+  /** The Space's override (Space views only); null follows the Instance. */
+  space?: boolean | null;
+  /** The person's override (self views only); null follows the Instance. */
+  person?: boolean | null;
+  /** What this Space's calls (the Instance's, on the Instance view) get. */
   effective: boolean;
 }
 
@@ -225,6 +234,16 @@ export interface SiteAiSettingsPatch {
   logBodies?: AiLogBodiesPatch;
 }
 
+/** GET/PATCH /api/accounts/:person/settings/ai: personal logging only. */
+export interface PersonAiSettingsView {
+  logBodies: AiLogBodiesView;
+  canManage: boolean;
+}
+
+export interface PersonAiSettingsPatch {
+  logBodies?: AiLogBodiesPatch;
+}
+
 export interface AiSettings extends AiConfiguration {
   knowledgeUpdates: KnowledgeUpdateSchedule;
   releaseHighlights: ReleaseHighlightsSchedule;
@@ -234,12 +253,12 @@ export interface AiSettings extends AiConfiguration {
 
 export type AiModelCatalog = Readonly<Record<AiRole, readonly AiModelOption[]>>;
 
-/** GET/PATCH /api/accounts/:slug/settings/ai. */
+/** GET/PATCH /api/spaces/:space/settings/ai. */
 export interface AiSettingsView extends AiSettings {
   canManage: boolean;
-  /** The built-in models, then the models this account added from its providers. */
+  /** The built-in models, then the models this Space added from its providers. */
   catalog: AiModelCatalog;
-  /** Gateway body logging for this account's calls: site defaults and its overrides. */
+  /** Gateway body logging for this Space's calls: Instance defaults and its overrides. */
   logBodies: AiLogBodiesView;
 }
 
@@ -277,10 +296,10 @@ export const LEGACY_AI_SNAPSHOT: AiSnapshot = {
   updatedAt: null,
 };
 
-// ---- an account's own providers (CORE-294) ------------------------------------
+// ---- a Space's own providers (CORE-294) ---------------------------------------
 
 /**
- * Providers an account connects with its own API key. Their calls go straight
+ * Providers a Space connects with its own API key. Their calls go straight
  * to the provider, billed to that key: not through Workers AI or AI Gateway.
  */
 export type AiProviderKind = "typesafe" | "openrouter";
@@ -335,7 +354,7 @@ export function parseProviderModelId(
   return { provider: provider as AiProviderKind, model };
 }
 
-/** A model an account made available from one of its providers. */
+/** A model a Space made available from one of its providers. */
 export interface AiProviderModel extends AiModelOption {
   id: ProviderModelId;
   provider: AiProviderKind;
@@ -347,7 +366,7 @@ export interface AiProviderModel extends AiModelOption {
   pricesCheckedAt: string;
 }
 
-/** A model a provider offers, before an account adds it. */
+/** A model a provider offers, before a Space adds it. */
 export type AiProviderCatalogEntry = Omit<AiProviderModel, "id" | "pricesCheckedAt"> & {
   id: ProviderModelId;
   description: string;
@@ -362,15 +381,15 @@ export interface AiProviderView extends AiProviderInfo {
   models: AiProviderModel[];
 }
 
-/** GET /api/accounts/:slug/ai-providers. */
+/** GET /api/spaces/:space/ai-providers. */
 export interface AiProvidersView {
   canManage: boolean;
   providers: AiProviderView[];
-  /** The account's current choices, so a page can say which models are in use. */
+  /** The Space's current choices, so a page can say which models are in use. */
   selection: AiModelSelection;
 }
 
-/** GET /api/accounts/:slug/ai-providers/:kind/catalog. */
+/** GET /api/spaces/:space/ai-providers/:kind/catalog. */
 export interface AiProviderCatalogView {
   provider: AiProviderKind;
   models: AiProviderCatalogEntry[];

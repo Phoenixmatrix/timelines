@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { onPush, startRun, startWorkflow } from "./trigger.ts";
 import {
   candidateProofs,
@@ -17,12 +17,17 @@ import { ci } from "./api.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { claim, jobPayload, loadJob } from "./jobs.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
+import { seedSpaceFixture } from "../testing/spaces.ts";
 
 const fixture = vi.hoisted(() => ({
   yaml: "",
   identity: "sandbox-v1:version:image" as string | null,
   execute: async (_jobId: string): Promise<void> => {},
   readIdentity: async (): Promise<void> => {},
+  landing: async (_waitUntil: (work: Promise<unknown>) => void): Promise<void> => {},
+  queue: async (_waitUntil: (work: Promise<unknown>) => void): Promise<void> => {},
   refs: [] as { shortName: string; oid: string }[],
 }));
 vi.mock("../artifacts.ts", () => ({
@@ -32,7 +37,14 @@ vi.mock("../durable/registry.ts", () => ({
   durableStub: () => ({ verificationIdentity: async () => fixture.identity }),
 }));
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: unknown;
+    env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {
     env: Env;
     constructor(_ctx: unknown, env: Env) {
@@ -50,10 +62,18 @@ vi.mock("./sandbox.ts", () => ({
   }),
 }));
 vi.mock("../timelines/landing.ts", () => ({
-  settled: async () => {},
-  afterRun: async () => {},
+  workerDeps: (_env: Env, waitUntil: (work: Promise<unknown>) => void) => ({ waitUntil }),
+  afterRun: (_env: Env, deps: { waitUntil: (work: Promise<unknown>) => void }) =>
+    fixture.landing(deps.waitUntil),
 }));
-vi.mock("../merge-queue/index.ts", () => ({ afterQueueRun: async () => {} }));
+vi.mock("../merge-queue/index.ts", () => ({
+  afterQueueRun: (
+    _env: Env,
+    _repoId: string,
+    _runId: string,
+    waitUntil: (work: Promise<unknown>) => void,
+  ) => fixture.queue(waitUntil),
+}));
 vi.mock("../steps/runs.ts", () => ({ recordStepRun: async () => {} }));
 vi.mock("../objects.ts", () => ({
   RepoReader: class {
@@ -103,15 +123,16 @@ async function setup(config = yaml) {
   fixture.yaml = config.replaceAll("steps: [true]", "steps: ['true']");
   fixture.identity = "sandbox-v1:version:image";
   fixture.readIdentity = async () => {};
+  fixture.landing = async () => {};
+  fixture.queue = async () => {};
   fixture.refs = [{ shortName: "main", oid: commit }];
   const sqlite = migratedDatabase();
-  databases.push(sqlite);
-  sqlite.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
-    VALUES('repo','owner','app','private','a','https://a');`);
+  const registry = migratedRegistryDatabase();
+  databases.push(sqlite, registry);
   const workflows = new Set<string>();
   const env = {
     DB: d1(sqlite),
+    REGISTRY_DB: d1(registry),
     CI_RUNNER: "sandbox",
     CI_RUN: {
       create: async ({ id }: { id: string }) => {
@@ -124,6 +145,34 @@ async function setup(config = yaml) {
       },
     },
   } as unknown as Env;
+  const admission = installCutoverTestControl(env);
+  databases.push(admission.state.db);
+  await initializeFreshSpaceInstallation(env);
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('person','user','person','Person')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "organization",
+      slug: "organization",
+      displayName: "Organization",
+      kind: "company",
+    },
+    space: { id: "space", slug: "owner", displayName: "Space" },
+    members: [
+      {
+        accountId: "person",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "person",
+  });
+  sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+    VALUES('repo','space','app','private','a','https://a');
+    INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four)
+    VALUES('credential','person','Fixture','write','fixture-hash','test');`);
+  const actor = { id: "person", credential: { kind: "token" as const, id: "credential" } };
   const repo = { id: "repo", artifacts_name: "a", artifacts_remote: "https://a" };
   const start = (options: Partial<Parameters<typeof startRun>[2]> = {}) =>
     startRun(env, repo, {
@@ -131,7 +180,7 @@ async function setup(config = yaml) {
       branch: target.branch,
       commit,
       trigger: "push",
-      actor: null,
+      actor,
       verification: candidate,
       waitUntil: () => {},
       ...options,
@@ -164,7 +213,7 @@ async function setup(config = yaml) {
       "INSERT INTO merge_queue(repo_id,id,status,attempts,gate_run_id,candidate,data,created_at,updated_at) VALUES('repo','queue','landed',2,'gates',?,?,'now','now')",
     )
     .run(commit, JSON.stringify(state));
-  return { sqlite, env, repo, start, state, workflows };
+  return { sqlite, env, repo, actor, start, state, workflows, admission };
 }
 
 function workflow(t: Awaited<ReturnType<typeof setup>>) {
@@ -172,6 +221,7 @@ function workflow(t: Awaited<ReturnType<typeof setup>>) {
   const executed: string[] = [];
   let before = async (_name: string) => {};
   let after = async (_name: string) => {};
+  let interrupted: unknown = null;
   fixture.execute = async (jobId) => {
     executed.push(jobId);
     t.sqlite.prepare("UPDATE ci_jobs SET status='succeeded' WHERE id=?").run(jobId);
@@ -179,22 +229,38 @@ function workflow(t: Awaited<ReturnType<typeof setup>>) {
   };
   const step = {
     async do(name: string, ...args: unknown[]) {
+      if (interrupted) throw interrupted;
       if (results.has(name)) return results.get(name);
-      await before(name);
+      // Hook failures simulate isolate death; a caught business callback error
+      // still permits the Workflow's durable admission-release step.
+      try {
+        await before(name);
+      } catch (error) {
+        interrupted = error;
+        throw error;
+      }
       const result = await (args.at(-1) as () => Promise<unknown>)();
-      await after(name);
+      try {
+        await after(name);
+      } catch (error) {
+        interrupted = error;
+        throw error;
+      }
       results.set(name, result);
       return result;
     },
   } as unknown as WorkflowStep;
-  const run = () =>
-    new CiRun({} as ExecutionContext, t.env).run(
+  const run = () => {
+    interrupted = null;
+    return new CiRun({} as ExecutionContext, t.env).run(
       {
         payload: { runId: "production" },
         timestamp: new Date(),
+        instanceId: "provider-production",
       } as WorkflowEvent<RunParams>,
       step,
     );
+  };
   return {
     run,
     executed,
@@ -215,12 +281,12 @@ async function detail(t: Awaited<ReturnType<typeof setup>>) {
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/repos/:owner/:name/ci", ci);
-  const { secret } = await issueToken(t.env.DB, "owner", "test", "read");
+  app.route("/api/repos/:space/:name/ci", ci);
+  const { secret } = await issueToken(t.env.DB, "person", "test", "read");
   const response = await app.request(
     "/api/repos/owner/app/ci/runs/2",
     {
-      headers: { authorization: `Bearer ${secret}` },
+      headers: { authorization: `Bearer ${secret}`, "X-Gitmatrix-Content-Version": "4" },
     },
     t.env,
   );
@@ -266,7 +332,7 @@ describe("landed candidate verification", () => {
       t.sqlite
         .prepare("UPDATE merge_queue SET status=?,data=?")
         .run(status, JSON.stringify(t.state));
-      await onPush(t.env, t.repo, null, () => {});
+      await onPush(t.env, t.repo, t.actor, () => {});
       expect(t.sqlite.prepare("SELECT ref,oid FROM ci_refs").all()).toEqual([
         { ref: "main", oid: commit },
       ]);
@@ -322,11 +388,11 @@ describe("landed candidate verification", () => {
       .prepare("UPDATE merge_queue SET status=?,candidate=?,data=?")
       .run(state.entry.status, state.entry.candidate, JSON.stringify(state));
     if (boundary === "different repository") {
-      t.sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
-          VALUES('other','owner','other','private','other','https://other');
+      t.sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+          VALUES('other','space','other','private','other','https://other');
           UPDATE merge_queue SET repo_id='other';`);
     }
-    await onPush(t.env, t.repo, null, () => {});
+    await onPush(t.env, t.repo, t.actor, () => {});
     expect(
       t.sqlite
         .prepare(
@@ -342,7 +408,7 @@ describe("landed candidate verification", () => {
       const t = await setup(gatePipeline);
       await t.start();
       expect((await detail(t)).jobs[0]).toMatchObject({ status: "pending", verifiedBy: null });
-      expect(await claim(t.env.DB, "production-check", "unapproved-runner")).toBe(false);
+      expect(await claim(t.env, "production-check", "unapproved-runner")).toBe(false);
       t.workflows.delete("production");
       fixture.identity = identity;
       await t.start();
@@ -707,7 +773,7 @@ describe("verified change-selection baselines", () => {
     });
     t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged')
       WHERE name='check'`);
-    const payload = await jobPayload(t.env.DB, (await loadJob(t.env.DB, "production-check"))!, {
+    const payload = await jobPayload(t.env, (await loadJob(t.env.DB, "production-check"))!, {
       origin: "https://gm.test",
       token: "test-token",
     });
@@ -742,3 +808,40 @@ describe("verified change-selection baselines", () => {
     expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
   });
 });
+
+test.each(["landing", "queue"] as const)(
+  "%s failure retains admission until its already-launched final callback settles",
+  async (callback) => {
+    const t = await setup();
+    await t.start();
+    const w = workflow(t);
+    const launched = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let published = false;
+    fixture[callback] = async (waitUntil) => {
+      waitUntil(
+        finish.promise.then(() => {
+          expect(t.admission.control.activeTickets()).toHaveLength(1);
+          t.sqlite.prepare("UPDATE ci_runs SET title='final callback' WHERE id='production'").run();
+          published = true;
+        }),
+      );
+      launched.resolve();
+      throw new Error("final callback dispatch failed");
+    };
+    const result = w.run().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await launched.promise;
+    expect(t.admission.control.activeTickets()).toHaveLength(1);
+    expect(published).toBe(false);
+    finish.resolve();
+    expect(await result).toEqual(new Error("final callback dispatch failed"));
+    expect(published).toBe(true);
+    expect(t.admission.control.activeTickets()).toEqual([]);
+    expect(t.sqlite.prepare("SELECT title FROM ci_runs WHERE id='production'").get()).toEqual({
+      title: "final callback",
+    });
+  },
+);

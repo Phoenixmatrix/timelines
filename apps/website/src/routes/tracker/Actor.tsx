@@ -40,7 +40,7 @@ export function Actor({
   const secondary = who.kind === "session" ? who.name : null;
   const profile =
     link && (who.kind === "person" || who.kind === "session") && who.person
-      ? `/${encodeURIComponent(who.person.slug)}`
+      ? `/accounts/${encodeURIComponent(who.person.slug)}`
       : null;
   const body = (
     <>

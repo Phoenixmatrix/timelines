@@ -166,13 +166,13 @@ function PinnedCommit({
   if (!repo) return <span className="mk-mono">{shortOid(oid)}</span>;
   return (
     <>
-      {repo.owner}/{repo.name}{" "}
+      {repo.space}/{repo.name}{" "}
       <Link
         className="mk-mono underline underline-offset-2"
         to={
           repo.source && repo.source.sourceId !== "canonical"
-            ? treeUrl(repo.owner, repo.name, oid, "", repo.source.sourceId)
-            : commitPanelUrl(repo.owner, repo.name, oid)
+            ? treeUrl(repo.space, repo.name, oid, "", repo.source.sourceId)
+            : commitPanelUrl(repo.space, repo.name, oid)
         }
       >
         {shortOid(oid)}
@@ -184,12 +184,12 @@ function PinnedCommit({
 /** What an expanded row shows. */
 export function RowDetails({
   row,
-  owner,
+  space,
   name,
   revision,
 }: {
   row: Row;
-  owner: string;
+  space: string;
   /** How to name a person by id. */
   name: (id: string) => string;
   /** Changes when the graph is read again, so an open checkpoint is too. */
@@ -201,7 +201,7 @@ export function RowDetails({
   if (event.kind === "checkpoint")
     return (
       <CheckpointDetails
-        owner={owner}
+        space={space}
         timeline={t}
         number={event.number}
         summary={event.summary}
@@ -231,14 +231,14 @@ export function RowDetails({
 
 /** A checkpoint's full summary, then (read when opened) its commits, CI, previews and approval. */
 function CheckpointDetails({
-  owner,
+  space,
   timeline,
   number,
   summary,
   name,
   revision,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   number: number;
   summary: string;
@@ -250,7 +250,7 @@ function CheckpointDetails({
   useEffect(() => {
     const abort = new AbortController();
     api<CheckpointView>(
-      `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}/checkpoints/${number}`,
+      `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}/checkpoints/${number}`,
       { signal: abort.signal },
     )
       .then(setView)
@@ -262,8 +262,8 @@ function CheckpointDetails({
       });
     return () => abort.abort();
     // Read again with the graph; the last view stays until the new one comes.
-  }, [owner, timeline.slug, number, revision]);
-  if (view) return <CheckpointPanel view={view} tracker={owner} name={name} />;
+  }, [space, timeline.slug, number, revision]);
+  if (view) return <CheckpointPanel view={view} tracker={space} name={name} />;
   return (
     <div className="flex flex-col gap-1 text-body-sm">
       {summary.trim() && (

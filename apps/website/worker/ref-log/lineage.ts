@@ -41,7 +41,7 @@ export async function sourceLineage(
   if (!live) return null;
   const canonicalIdentity = canonicalSource(repo);
   const owned = sourceId === "canonical" ? null : await getWorkSource(env, repo.id, sourceId);
-  if (sourceId !== "canonical" && (!owned || owned.owner_id !== repo.owner_id)) return null;
+  if (sourceId !== "canonical" && (!owned || owned.space_id !== repo.space_id)) return null;
   const source: CodeSource = owned
     ? {
         sourceId,

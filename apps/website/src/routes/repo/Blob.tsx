@@ -39,16 +39,16 @@ import { useRepo } from "./RepoLayout.tsx";
 import { WhyPanel } from "./WhyPanel.tsx";
 
 export async function blobLoader({ params, request }: LoaderFunctionArgs) {
-  const owner = params.owner ?? "";
+  const space = params.space ?? "";
   const name = params.repo ?? "";
-  const source = await requestSource(owner, name, request);
-  const blob = await routeData(repoData.blob(owner, name, params["*"] ?? "", source));
+  const source = await requestSource(space, name, request);
+  const blob = await routeData(repoData.blob(space, name, params["*"] ?? "", source));
   // The graph rail is extra: it streams in beside the code and never holds up
   // the file. No node (404) or no graph yet resolves to null.
   const knowledge =
     source && source !== "canonical"
       ? Promise.resolve(null)
-      : repoData.graphNode(owner, name, `file:${blob.path}`).catch(() => null);
+      : repoData.graphNode(space, name, `file:${blob.path}`).catch(() => null);
   return { blob, knowledge };
 }
 
@@ -72,7 +72,7 @@ export function Blob() {
   const extending = rangeOrigin?.file === file && rangeOrigin.hash === hash;
   const selectedHash = selection ? lineAnchor(selection.start, selection.end) : "";
   const lineLabel = start === end ? `line ${start}` : `lines ${start}–${end}`;
-  const permalink = `${blobUrl(repo.owner.slug, repo.name, blob.commitOid, blob.path, repo.source?.sourceId)}${selectedHash}`;
+  const permalink = `${blobUrl(repo.space.slug, repo.name, blob.commitOid, blob.path, repo.source?.sourceId)}${selectedHash}`;
 
   const selectLine = (event: MouseEvent<HTMLAnchorElement>, line: number) => {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -99,7 +99,7 @@ export function Blob() {
   const copyLink = async (pinned: boolean) => {
     const path = pinned
       ? permalink
-      : `${blobUrl(repo.owner.slug, repo.name, blob.ref, blob.path, repo.source?.sourceId)}${selectedHash}`;
+      : `${blobUrl(repo.space.slug, repo.name, blob.ref, blob.path, repo.source?.sourceId)}${selectedHash}`;
     const what = selection ? lineLabel : fileName;
     try {
       await navigator.clipboard.writeText(new URL(path, window.location.origin).href);
@@ -171,7 +171,7 @@ export function Blob() {
           view="blob"
           commit={blob.commitOid}
           onSwitch={(ref) =>
-            navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path, repo.source?.sourceId))
+            navigate(blobUrl(repo.space.slug, repo.name, ref, blob.path, repo.source?.sourceId))
           }
         />
         <FileHistory
@@ -374,7 +374,7 @@ function FileKnowledge({
   repo: RepoDetail;
 }) {
   const [more, setMore] = useState(false);
-  const owner = repo.owner.slug;
+  const space = repo.space.slug;
   const definitions = useMemo(() => {
     if (!detail) return [];
     const names = detail.outgoing.filter((l) => l.kind === "defines").map((l) => l.node.name);
@@ -392,7 +392,7 @@ function FileKnowledge({
   }
   const { node, outgoing, incoming } = detail;
   const mapUrl = (id: string) =>
-    `${repoPath(owner, repo.name, "knowledge")}?select=${encodeURIComponent(id)}`;
+    `${repoPath(space, repo.name, "knowledge")}?select=${encodeURIComponent(id)}`;
   const uses = outgoing.filter((l) => l.kind === "imports");
   const usedBy = incoming.filter((l) => l.kind === "imports" && l.node.path);
   const parts = incoming.filter((l) => l.kind === "contains" && l.node.kind === "component");
@@ -493,7 +493,7 @@ function FileKnowledge({
               use.node.kind === "file" && use.node.path ? (
                 <FileRow
                   key={use.node.id}
-                  to={blobUrl(owner, repo.name, blob.ref, use.node.path, repo.source?.sourceId)}
+                  to={blobUrl(space, repo.name, blob.ref, use.node.path, repo.source?.sourceId)}
                   path={use.node.path}
                 />
               ) : (
@@ -517,7 +517,7 @@ function FileKnowledge({
               <FileRow
                 key={user.node.id}
                 to={blobUrl(
-                  owner,
+                  space,
                   repo.name,
                   blob.ref,
                   user.node.path ?? "",

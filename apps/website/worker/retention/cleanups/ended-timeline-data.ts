@@ -1,5 +1,5 @@
 // Ended timeline data (category "ended-timeline-data", CORE-201): for each of
-// an account's timelines that ended (its bookmark went: landed, abandoned or
+// an Space's timelines that ended (its bookmark went: landed, abandoned or
 // deleted; CORE-139) more than `days` before the run's moment, the knowledge
 // overlay's changes (kg_overlay_changes), its Atlas regrouping
 // (atlas_timeline_regroupings) and its wiki page sets (kg_page_sets,
@@ -29,7 +29,7 @@ interface Item {
 const MAX_TIMELINES = 25;
 
 /** Parameters: account id, cutoff. `o` is the overlay row. */
-const MATCHES = `o.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+const MATCHES = `o.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND o.ended_at IS NOT NULL AND o.ended_at < ?
   AND o.removed_at IS NULL`;
 
@@ -60,11 +60,10 @@ const SIZE = `(SELECT count(*) ${CHANGES}) + (SELECT count(*) ${REGROUPING})
   AS bytes`;
 
 function scope(ctx: CleanupContext): [string, string] {
-  if (ctx.target.scope !== "account")
-    throw new Error("ended-timeline-data is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("ended-timeline-data is a Space category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("ended-timeline-data needs its days threshold.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days)];
+  return [ctx.target.id, daysBefore(ctx.now, days)];
 }
 
 export const endedTimelineData: CategoryCleanup<Item> = {

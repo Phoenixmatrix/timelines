@@ -29,7 +29,7 @@ import {
   MagnifyingGlassPlusIcon,
   XIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useNavigationType } from "react-router";
 import type { ChronicleIssue, WorkSpan } from "../../../shared/chronicle.ts";
 import { Tip } from "../../components/ui.tsx";
@@ -64,7 +64,7 @@ function usePhone(): boolean {
 }
 
 export function Chronicle({
-  owner,
+  space,
   base,
   query,
   params,
@@ -72,11 +72,14 @@ export function Chronicle({
   selectedIssue,
   serverNow,
 }: {
-  owner: string;
+  space: string;
   base: string;
   query: string;
   params: URLSearchParams;
-  setParams: (next: URLSearchParams, options: { replace: boolean; state?: unknown }) => void;
+  setParams: (
+    next: URLSearchParams,
+    options: { replace: boolean; state?: { chronicleNavigation: string } },
+  ) => void;
   /** The route's issue (id or key). */
   selectedIssue: string | null;
   serverNow: number;
@@ -84,7 +87,8 @@ export function Chronicle({
   const navigate = useNavigate();
   const location = useLocation();
   const navigationType = useNavigationType();
-  const navigationId = useId();
+  const navigationOwner = useId();
+  const revision = useRef(0);
   const phone = usePhone();
   const now = serverNow;
   const address = useMemo(() => readAddress(params, now), [params, now]);
@@ -93,72 +97,74 @@ export function Chronicle({
   const view = { from: live?.from ?? address.from, to: live?.to ?? address.to };
   const at = live?.at ?? address.at;
   const range = address.range;
-  const { data, loading, error } = useChronicle(owner, query, view, now);
-  // A link opened without a range gets the one it shows, so copying it keeps the moment.
-  useEffect(() => {
-    if (!params.has("from") || !params.has("to") || !params.has("at"))
-      setParams(writeAddress(params, address), { replace: true });
-  }, [params, address, setParams]);
+  const { data, loading, error } = useChronicle(space, query, view, now);
 
   // The params last written: navigation settles asynchronously, and a quick
   // second key press must build on the first.
   const latest = useRef(params);
-  const revision = useRef(0);
-  const acknowledged = useRef({ location: location.key, search: params.toString() });
+  const navigationKey = `${location.key}:${params}`;
+  const acknowledged = useRef(navigationKey);
+  const settle = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useLayoutEffect(() => {
-    const search = params.toString();
-    if (acknowledged.current.location === location.key && acknowledged.current.search === search)
+    if (acknowledged.current === navigationKey) return;
+    acknowledged.current = navigationKey;
+    const state: unknown = location.state;
+    const receipt =
+      state && typeof state === "object" && "chronicleNavigation" in state
+        ? state.chronicleNavigation
+        : null;
+    const own = typeof receipt === "string" && receipt.startsWith(`${navigationOwner}:`);
+    // An older push can land between input and keyup, or after another commit.
+    // Only the latest gesture may acknowledge itself; history remains authoritative.
+    if (navigationType !== "POP" && own && receipt !== `${navigationOwner}:${revision.current}`)
       return;
-    acknowledged.current = { location: location.key, search };
-    const receipt = location.state?.chronicleNavigation as
-      | { id?: unknown; revision?: unknown }
-      | undefined;
-    const own =
-      navigationType !== "POP" &&
-      receipt?.id === navigationId &&
-      typeof receipt.revision === "number" &&
-      receipt.revision > 0 &&
-      receipt.revision <= revision.current;
-    // A previous navigation can commit after the next key's gesture starts.
-    if (own && receipt.revision !== revision.current) return;
-    latest.current = params;
-    if (own)
-      setLive((current) =>
-        current?.from === address.from && current.to === address.to && current.at === address.at
-          ? null
-          : current,
-      );
-    else {
+    if (navigationType === "POP" || !own) {
       revision.current++;
-      setLive(null);
+      clearTimeout(settle.current);
+      settle.current = undefined;
     }
-  }, [params, address, location.key, location.state, navigationType, navigationId]);
-  const commit = (next: Partial<ChronicleAddress>, push = true) => {
-    const base = latest.current;
-    const written = writeAddress(base, { ...readAddress(base, now), ...next });
-    latest.current = written;
-    setParams(written, {
-      replace: !push,
-      state: { chronicleNavigation: { id: navigationId, revision: ++revision.current } },
-    });
-  };
+    setLive(null);
+    latest.current = params;
+  }, [navigationKey, params, location.state, navigationType, navigationOwner]);
+  const commit = useCallback(
+    (next: Partial<ChronicleAddress>, push = true) => {
+      const base = latest.current;
+      const written = writeAddress(base, { ...readAddress(base, now), ...next });
+      latest.current = written;
+      setParams(written, {
+        replace: !push,
+        state: { chronicleNavigation: `${navigationOwner}:${++revision.current}` },
+      });
+    },
+    [now, setParams, navigationOwner],
+  );
+  // Normalize through the same acknowledgement path, without repeating a pending write.
+  useEffect(() => {
+    const pending = latest.current;
+    if (!pending.has("from") || !pending.has("to") || !pending.has("at")) commit({}, false);
+  }, [params, commit]);
   // Wheel bursts settle into one history entry.
-  const settle = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onWindow = (window: { from: number; to: number }, done: boolean) => {
+    if (!done) revision.current++;
     setLive({ from: window.from, to: window.to, at });
-    if (settle.current) clearTimeout(settle.current);
+    clearTimeout(settle.current);
+    settle.current = undefined;
     if (done) commit({ from: window.from, to: window.to });
     else
-      settle.current = setTimeout(() => commit({ from: window.from, to: window.to }, false), 400);
+      settle.current = setTimeout(() => {
+        settle.current = undefined;
+        commit({ from: window.from, to: window.to }, false);
+      }, 400);
   };
   useEffect(
     () => () => {
-      if (settle.current) clearTimeout(settle.current);
+      clearTimeout(settle.current);
     },
     [],
   );
   const onPlayhead = (t: number, done: boolean) => {
     // Keep the gesture visible until navigation acknowledges it, including keyup.
+    if (!done) revision.current++;
     setLive({ ...view, at: t });
     if (done) commit({ ...view, at: t }, true);
   };
@@ -446,7 +452,7 @@ export function Chronicle({
         >
           {data && selected ? (
             <Inspector
-              owner={owner}
+              space={space}
               issue={selected}
               span={span}
               data={data}

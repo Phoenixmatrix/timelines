@@ -6,6 +6,8 @@ import { selectRepos } from "../db.ts";
 import { LANDING_FIXTURE_POINTS, landingFixtureEnabled } from "../timelines/landing-fixture.ts";
 import { LANDING_ACTIVE } from "../../shared/timelines.ts";
 import { settled, progress } from "../timelines/landing.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
+import { fixtureAccess } from "./dev-fixture-access.ts";
 
 /** Mounted ONLY behind /api/dev's named-agent secret allowlist. */
 export async function landingFixtures(c: Context<AppEnv>) {
@@ -24,16 +26,19 @@ export async function landingFixtures(c: Context<AppEnv>) {
     !["arm", "inspect", "tick", "release", "delete"].includes(input.action)
   )
     return fail(c, 400, "Invalid landing fixture.");
-  const detail = await trackerObject(c.env, "acc_orbit").timeline(input.slug, 0, 1);
+  const space = await findSpaceBySlug(c.env.DB, "orbit");
+  if (!space) return fail(c, 404, "Fixture Space missing.");
+  const access = await fixtureAccess(c.env, space, "acc_marco");
+  const detail = await trackerObject(c.env, space.id).timeline(access, input.slug, 0, 1);
   if (!detail.ok) return fail(c, 404, "Fixture timeline not found.");
   const timeline = detail.value.timeline;
   if (
     timeline.repos.length !== 2 ||
-    timeline.repos.some((repo) => repo.owner !== "orbit" || !/^queue-[a-f0-9]{8}$/.test(repo.name))
+    timeline.repos.some((repo) => repo.space !== "orbit" || !/^queue-[a-f0-9]{8}$/.test(repo.name))
   )
     return fail(c, 400, "Only two disposable owned repositories are allowed.");
   const rows = await selectRepos(c.env.DB, "acc_marco")
-    .where("r.owner_id", "=", "acc_orbit")
+    .where("r.space_id", "=", "acc_orbit")
     .where(
       "r.id",
       "in",
@@ -69,7 +74,7 @@ export async function landingFixtures(c: Context<AppEnv>) {
     .bind(timeline.id)
     .first();
   // Ledger identities come from the real Tracker landing, never supplied fixture successes.
-  const current = await trackerObject(c.env, "acc_orbit").landing(timeline.slug);
+  const current = await trackerObject(c.env, space.id).landing(access, timeline.slug);
   const landing = current.ok ? current.value : null;
   if (input.action === "tick" && landing && LANDING_ACTIVE.includes(landing.state)) {
     // Local development has no hourly cron. Drive the real recovery state

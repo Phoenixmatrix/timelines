@@ -6,7 +6,7 @@
 // cleanup reuses what is left and re-analyzes only what went.
 
 import type { DatabaseSync } from "node:sqlite";
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
 import {
   atlasDailySpend,
   reserveAtlasCall,
@@ -16,7 +16,7 @@ import {
 import { ANALYZER, loadAnalyses } from "../../knowledge/analyze.ts";
 import { reopenOverlay } from "../../knowledge/overlay.ts";
 import { cached } from "../../knowledge/synthesize.ts";
-import { d1, migratedDatabase } from "../../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../../testing/spaces.ts";
 import type { CategoryId } from "../categories.ts";
 import { advanceRun, createRun, getRun } from "../runs.ts";
 import type { RetentionTarget } from "../policies.ts";
@@ -24,21 +24,27 @@ import type { RetentionTarget } from "../policies.ts";
 const NOW = new Date("2026-12-01T12:00:00.000Z");
 const DAY = 86_400_000;
 const ago = (days: number) => new Date(NOW.getTime() - days * DAY).toISOString();
-const ORBIT: RetentionTarget = { scope: "account", accountId: "acc_orbit" };
-const SITE: RetentionTarget = { scope: "site" };
+const ORBIT: RetentionTarget = { kind: "space", id: "acc_orbit" };
+const SITE: RetentionTarget = { kind: "instance", id: "" };
 
-function seeded() {
-  const sqlite = migratedDatabase();
-  sqlite.exec(`
+async function seeded() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite, env } = fresh;
+  sqlite.exec(`BEGIN; 
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('acc_orbit', 'org', 'orbit', 'Orbit'), ('acc_sam', 'user', 'sam', 'Sam'),
-      ('acc_marco', 'user', 'marco', 'Marco');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+      ('acc_sam', 'user', 'sam', 'Sam'), ('acc_marco', 'user', 'marco', 'Marco');
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES
+      ('org_orbit','orbit-company','Orbit','company','acc_orbit'),
+      ('org_sam','sam-company','Sam','company','acc_sam');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES
+      ('acc_orbit','org_orbit','orbit','Orbit'), ('acc_sam','org_sam','sam','Sam');
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_app', 'acc_orbit', 'app', 'private', 'a', 'https://a'),
       ('r_lib', 'acc_orbit', 'lib', 'private', 'b', 'https://b'),
       ('r_sam', 'acc_sam', 'mine', 'private', 'c', 'https://c');
-  `);
-  return { sqlite, env: { DB: d1(sqlite) } as unknown as Env };
+   COMMIT;`);
+  return { sqlite, env };
 }
 
 /** A manual run of one category to the end, in batches of `limit`. */
@@ -52,8 +58,8 @@ async function run(
 ) {
   const id = await createRun(env.DB, {
     target,
-    trigger: "manual",
-    actorId: "acc_marco",
+    trigger: "schedule",
+    actorId: null,
     dryRun,
     categories: [{ id: category, thresholds }],
     now: NOW,
@@ -78,8 +84,8 @@ const count = (sqlite: DatabaseSync, table: string) =>
   (sqlite.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
 
 describe("knowledge-builds", () => {
-  function buildsSeed() {
-    const t = seeded();
+  async function buildsSeed() {
+    const t = await seeded();
     const build = t.sqlite.prepare(`
       INSERT INTO kg_builds (id, repo_id, to_commit, status, stats, started_at, finished_at)
       VALUES (?, ?, 'c', ?, '{"files":1}', ?, ?)`);
@@ -121,7 +127,7 @@ describe("knowledge-builds", () => {
   }
 
   test("removes exactly the dry run's builds with their changes, once", async () => {
-    const t = buildsSeed();
+    const t = await buildsSeed();
     const before = t.builds();
     const thresholds = { days: 90, keepLatest: 20 };
     const dry = await run(t.env, ORBIT, "knowledge-builds", thresholds, true);
@@ -149,7 +155,7 @@ describe("knowledge-builds", () => {
   });
 
   test("keep-latest per repository and the days threshold decide", async () => {
-    const t = buildsSeed();
+    const t = await buildsSeed();
     const ids = async (thresholds: Record<string, number>) =>
       ((await run(t.env, ORBIT, "knowledge-builds", thresholds, true)).seen as { id: string }[])
         .map((i) => i.id)
@@ -170,9 +176,9 @@ describe("knowledge-builds", () => {
 
 describe("ended-timeline-data", () => {
   test("page-only archived sources release their consumer root without removing canonical pages", async () => {
-    const t = seeded();
+    const t = await seeded();
     t.sqlite.exec(`INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,state,allocation_operation_id,
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,state,allocation_operation_id,
        fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
       VALUES ('work_pages','r_app','page-timeline','pages','acc_orbit','owned-pages','ready','page-allocation',
         'canonical','base','tree','refs/heads/main','canonical','head','head-tree','refs/heads/main','${ago(200)}','${ago(200)}');
@@ -191,11 +197,10 @@ describe("ended-timeline-data", () => {
     ]);
     expect(t.sqlite.prepare("SELECT source_id FROM timeline_source_roots").all()).toEqual([]);
     expect((await run(t.env, ORBIT, "ended-timeline-data", { days: 90 }, false)).items).toBe(0);
-    t.sqlite.close();
   });
 
-  function overlaysSeed() {
-    const t = seeded();
+  async function overlaysSeed() {
+    const t = await seeded();
     const overlay = t.sqlite.prepare(`
       INSERT INTO kg_overlays (repo_id, ref, overlay_id, head_commit, base_commit, stats,
                                updated_at, status, attempted_commit, ended_at, ended_reason)
@@ -267,7 +272,7 @@ describe("ended-timeline-data", () => {
   };
 
   test("removes the ended overlays' data exactly as the dry run listed, once", async () => {
-    const t = overlaysSeed();
+    const t = await overlaysSeed();
     const dry = await run(t.env, ORBIT, "ended-timeline-data", { days: 90 }, true, 1);
     expect((dry.seen as { repo: string; ref: string }[]).map((i) => [i.repo, i.ref])).toEqual([
       ["r_app", "refs/heads/timeline/old"],
@@ -301,7 +306,7 @@ describe("ended-timeline-data", () => {
   });
 
   test("a timeline that came back since select keeps its data; reopening forgets the removal", async () => {
-    const t = overlaysSeed();
+    const t = await overlaysSeed();
     const { endedTimelineData } = await import("./ended-timeline-data.ts");
     const ctx = { env: t.env, target: ORBIT, thresholds: { days: 90 }, now: NOW, limit: 10 };
     const selection = await endedTimelineData.select(ctx, null);
@@ -326,8 +331,8 @@ describe("ended-timeline-data", () => {
 
 describe("analysis-caches", () => {
   const USED = { old: 100, recent: 10 };
-  function cachesSeed(currentBuildDays = 5) {
-    const t = seeded();
+  async function cachesSeed(currentBuildDays = 5) {
+    const t = await seeded();
     const analysis = t.sqlite.prepare(`
       INSERT INTO kg_blob_analysis (blob_oid, analyzer, language, data, used_at)
       VALUES (?, ?, 'ts', '{"summary":"s"}', ?)`);
@@ -374,7 +379,7 @@ describe("analysis-caches", () => {
   }
 
   test("removes unused entries no current build references, exactly as the dry run listed, once", async () => {
-    const t = cachesSeed();
+    const t = await cachesSeed();
     const before = t.left();
     const dry = await run(t.env, SITE, "analysis-caches", { days: 30 }, true);
     const gone = ["a current v0", "a stale v1", "a unstamped v1", "s s-stale", "s s-unstamped"].map(
@@ -406,7 +411,7 @@ describe("analysis-caches", () => {
   test("a synthesis an old current build may still use stays; an unknown build protects all", async () => {
     // The current build started 50 days ago: syntheses it used were stamped
     // since (less a day), so only those older than that can go.
-    const t = cachesSeed(50);
+    const t = await cachesSeed(50);
     const syntheses = async () =>
       ((await run(t.env, SITE, "analysis-caches", { days: 30 }, true)).seen as { key?: string }[])
         .flatMap((i) => (i.key ? [i.key] : []))
@@ -418,7 +423,7 @@ describe("analysis-caches", () => {
   });
 
   test("using a cached entry records it at most daily", async () => {
-    const t = cachesSeed();
+    const t = await cachesSeed();
     const hour = new Date(Date.now() - 3_600_000).toISOString();
     t.sqlite.exec(`
       UPDATE kg_blob_analysis SET used_at = '${hour}' WHERE blob_oid = 'fresh';
@@ -450,10 +455,10 @@ describe("ai-spend", () => {
   const OLD = ago(100).slice(0, 10);
   const OLDER = ago(120).slice(0, 10);
 
-  function spendSeed() {
-    const t = seeded();
+  async function spendSeed() {
+    const t = await seeded();
     const spend = t.sqlite.prepare(`
-      INSERT INTO atlas_spend (id, account_id, day, scope, run_id, repo_id, purpose, model, status,
+      INSERT INTO atlas_spend (id, space_id, day, scope, run_id, repo_id, purpose, model, status,
                                input_tokens, output_tokens, cost_micro_usd, reserved_input_tokens,
                                reserved_output_tokens, reserved_micro_usd, created_at)
       VALUES (?, ?, ?, 'build', ?, ?, 'capability_summary', '${MODEL}', ?, 10, ?, ?, 10, 1000, 1000000, ?)`);
@@ -509,9 +514,9 @@ describe("ai-spend", () => {
   }
 
   test("rolls up exactly the dry run's days into daily totals, once", async () => {
-    const t = spendSeed();
+    const t = await spendSeed();
     const dry = await run(t.env, SITE, "ai-spend", { days: 90 }, true, 1);
-    expect((dry.seen as { account: string; day: string }[]).map((i) => [i.account, i.day])).toEqual(
+    expect((dry.seen as { spaceId: string; day: string }[]).map((i) => [i.spaceId, i.day])).toEqual(
       [
         ["acc_orbit", OLDER],
         ["acc_orbit", OLD],
@@ -529,12 +534,12 @@ describe("ai-spend", () => {
     expect(
       all(
         t.sqlite,
-        `SELECT account_id, day, calls, input_tokens, output_tokens, cost_micro_usd
-         FROM atlas_spend_daily ORDER BY account_id, day`,
+        `SELECT space_id, day, calls, input_tokens, output_tokens, cost_micro_usd
+         FROM atlas_spend_daily ORDER BY space_id, day`,
       ),
     ).toEqual([
       {
-        account_id: "acc_orbit",
+        space_id: "acc_orbit",
         day: OLDER,
         calls: 1,
         input_tokens: 10,
@@ -542,7 +547,7 @@ describe("ai-spend", () => {
         cost_micro_usd: 1_000_000,
       },
       {
-        account_id: "acc_orbit",
+        space_id: "acc_orbit",
         day: OLD,
         calls: 3,
         input_tokens: 40,
@@ -550,7 +555,7 @@ describe("ai-spend", () => {
         cost_micro_usd: 8_500_000,
       },
       {
-        account_id: "acc_sam",
+        space_id: "acc_sam",
         day: OLD,
         calls: 1,
         input_tokens: 10,
@@ -573,8 +578,8 @@ describe("ai-spend", () => {
   });
 
   test("budget checks answer the same before and after the roll-up", async () => {
-    const before = spendSeed();
-    const after = spendSeed();
+    const before = await spendSeed();
+    const after = await spendSeed();
     await run(after.env, SITE, "ai-spend", { days: 90 }, false);
     expect(count(after.sqlite, "atlas_spend")).toBe(2);
     const expected = await answers(before.env);

@@ -3,11 +3,9 @@ import { atLeast, repoRole, type RepoAccessFacts } from "./permissions.ts";
 
 const orgRepo: RepoAccessFacts = {
   visibility: "private",
-  ownerId: "acc_orbit",
-  ownerKind: "org",
-  orgMemberRepoRole: "read",
+  spaceRole: null,
+  repositoryRole: "read",
   viewer: { id: "acc_jun", isSiteAdmin: false },
-  orgRole: null,
   collaboratorRole: null,
 };
 
@@ -21,26 +19,29 @@ describe("repoRole", () => {
     expect(repoRole({ ...orgRepo, viewer: { id: "acc_priya", isSiteAdmin: true } })).toBe("admin");
   });
 
-  test("user owners administer their own repos", () => {
-    const facts: RepoAccessFacts = {
-      ...orgRepo,
-      ownerKind: "user",
-      ownerId: "acc_sam",
-      orgMemberRepoRole: null,
-      viewer: { id: "acc_sam", isSiteAdmin: false },
-    };
-    expect(repoRole(facts)).toBe("admin");
-    expect(repoRole({ ...facts, viewer: { id: "acc_jun", isSiteAdmin: false } })).toBe("none");
+  test("a matching legacy Space/person id confers no private access", () => {
+    expect(repoRole({ ...orgRepo, viewer: { id: "acc_orbit", isSiteAdmin: false } })).toBe("none");
   });
 
-  test("org owners administer, members get the org's base role", () => {
-    expect(repoRole({ ...orgRepo, orgRole: "owner" })).toBe("admin");
-    expect(repoRole({ ...orgRepo, orgRole: "member" })).toBe("read");
-    expect(repoRole({ ...orgRepo, orgRole: "member", orgMemberRepoRole: "none" })).toBe("none");
+  test("Organization administration is not a content grant", () => {
+    expect(repoRole(orgRepo)).toBe("none");
+    expect(repoRole({ ...orgRepo, visibility: "public" })).toBe("read");
+  });
+
+  test("explicit Space admins administer, members use their repository baseline", () => {
+    expect(repoRole({ ...orgRepo, spaceRole: "admin" })).toBe("admin");
+    expect(repoRole({ ...orgRepo, spaceRole: "member" })).toBe("read");
+    expect(repoRole({ ...orgRepo, spaceRole: "member", repositoryRole: "none" })).toBe("none");
+    expect(repoRole({ ...orgRepo, spaceRole: "member", repositoryRole: "write" })).toBe("write");
+  });
+
+  test("revoking a Space grant removes its rights without removing independent collaboration", () => {
+    expect(repoRole({ ...orgRepo, spaceRole: null, repositoryRole: "write" })).toBe("none");
+    expect(repoRole({ ...orgRepo, spaceRole: null, collaboratorRole: "read" })).toBe("read");
   });
 
   test("the strongest grant wins", () => {
-    expect(repoRole({ ...orgRepo, orgRole: "member", collaboratorRole: "write" })).toBe("write");
+    expect(repoRole({ ...orgRepo, spaceRole: "member", collaboratorRole: "write" })).toBe("write");
     expect(repoRole({ ...orgRepo, visibility: "public", collaboratorRole: "read" })).toBe("read");
   });
 

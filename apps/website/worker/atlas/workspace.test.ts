@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import {
   ATLAS_OVERVIEW_REGIONS,
   type AtlasEntitySummary,
@@ -16,7 +16,8 @@ import {
 import { atlasNeedsRestart, atlasWorkspaceApi } from "../../src/lib/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import {
   beginRepoProjection,
   projectEdges,
@@ -29,7 +30,14 @@ import { CURSOR_TTL_MS, enforceRetention } from "./retention.ts";
 import { workspaceAtlas } from "./workspace.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -54,12 +62,38 @@ function forbidden(name: string, touched: string[]) {
   );
 }
 
-function database() {
-  const sqlite = migratedDatabase();
+async function database() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'), ('carl', 'user', 'carl', 'Carl');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ben', 'personal-ben', 'ben', 'personal', 'ben', 'ben');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ben', 'org-ben', 'ben', 'ben');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ben', 'ben', 'owner', 'test-fixture', 'ben');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ben', 'org-ben', 'ben', 'admin', 'write', 'write', 'test-fixture', 'ben');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ben', 'org-ben', 'ben', 'ben', 'space.grant', 'ben', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_open', 'ann', 'open', 'public', 'a1', ''),
       ('r_secret', 'ann', 'secret', 'private', 'a2', ''),
       ('r_twin', 'ann', 'twin', 'private', 'a3', ''),
@@ -72,13 +106,14 @@ function database() {
       ('kb1', 'r_building', 'c1', 'running'),
       ('kb2', 'r_failed', 'c1', 'failed');
   `);
-  return sqlite;
+  return fresh;
 }
 
 /** An app over `sqlite`; a second one over the same database is a cold start. */
-function app(sqlite: DatabaseSync) {
+function app(sqlite: DatabaseSync, baseEnv: Env) {
   const touched: string[] = [];
   const env = {
+    ...baseEnv,
     DB: d1(sqlite),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
     AI: forbidden("AI", touched),
@@ -94,20 +129,20 @@ function app(sqlite: DatabaseSync) {
     c.set("actor", actor);
     await next();
   });
-  hono.route("/api/accounts/:owner/atlas", workspaceAtlas);
-  const call = (path: string, owner = "ann") =>
-    hono.request(`/api/accounts/${owner}/atlas/${path}`, {}, env);
+  hono.route("/api/spaces/:space/atlas", workspaceAtlas);
+  const call = (path: string, space = "ann") =>
+    hono.request(`/api/spaces/${space}/atlas/${path}`, {}, env);
   return {
     db: env.DB,
     touched,
     call,
     /** Status and body text, for comparing responses byte for byte. */
-    text: async (path: string, owner = "ann") => {
-      const response = await call(path, owner);
+    text: async (path: string, space = "ann") => {
+      const response = await call(path, space);
       return `${response.status} ${await response.text()}`;
     },
-    get: async <T>(path: string, owner = "ann"): Promise<T> => {
-      const response = await call(path, owner);
+    get: async <T>(path: string, space = "ann"): Promise<T> => {
+      const response = await call(path, space);
       if (response.status !== 200)
         throw new Error(`${path}: ${response.status} ${await response.text()}`);
       return (await response.json()) as T;
@@ -194,13 +229,13 @@ async function publish(db: D1Database, repo: string, commit: string) {
 
 /** ann's open (public) and secret (private, shared with ben) repositories, built. */
 async function world() {
-  const sqlite = database();
+  const { sqlite, env } = await database();
   seed(sqlite, "r_open", "Harbor", { components: 10 });
   seed(sqlite, "r_secret", SECRET, { components: 6, files: (i) => 20 - i });
-  const s = app(sqlite);
+  const s = app(sqlite, env);
   const open = await publish(s.db, "r_open", "o1");
   const secret = await publish(s.db, "r_secret", "s1");
-  return { sqlite, s, open, secret };
+  return { sqlite, env, s, open, secret };
 }
 
 const enc = encodeURIComponent;
@@ -236,7 +271,7 @@ describe("Atlas workspace scope", () => {
       "overview?repos=open,secret,nokg,building,failed,ghost",
     );
     expect(overview.scope).toMatch(/^ws:ann:[0-9a-f]{32}$/);
-    expect(overview.owner).toEqual({ id: "ann", slug: "ann" });
+    expect(overview.space.id).toBe("ann");
     // Listed by id, each with its own snapshot: no common HEAD. A name that
     // doesn't exist (ghost) is simply not there.
     expect(
@@ -337,11 +372,11 @@ describe("Atlas workspace scope", () => {
   });
 
   test("ranked pages merge repositories exactly, ties broken by repository", async () => {
-    const sqlite = database();
+    const { sqlite, env } = await database();
     // Identical repositories: every key ties across them.
     seed(sqlite, "r_open", "Same", { components: 30, files: (i) => 3 + (i % 4) });
     seed(sqlite, "r_twin", "Same", { components: 30, files: (i) => 3 + (i % 4) });
-    const s = app(sqlite);
+    const s = app(sqlite, env);
     await publish(s.db, "r_open", "o1");
     await publish(s.db, "r_twin", "t1");
 
@@ -473,13 +508,13 @@ describe("Atlas workspace scope", () => {
     // Nothing readable selected: the same answer whatever the reason.
     const empty = await s.text("overview?repos=secret");
     expect(empty).toMatch(/^404 .*scope_empty/);
-    for (const [path, owner] of [
+    for (const [path, space] of [
       ["overview?repos=ghost", "ann"],
       ["overview?repos=secret,ghost", "ann"],
       ["detail?repos=secret&id=r_secret%2Frepo", "ann"],
       ["overview?repos=secret", "nobody"],
     ] as const)
-      expect(await s.text(path, owner), path).toBe(empty);
+      expect(await s.text(path, space), path).toBe(empty);
     s.as(null);
     expect(await s.text("overview?repos=secret")).toBe(empty);
     // Another account's repository never joins ann's workspace.
@@ -556,7 +591,7 @@ describe("Atlas workspace scope", () => {
   });
 
   test("revoking access while an overview and cursors are open discloses nothing, warm or cold", async () => {
-    const { s, sqlite } = await world();
+    const { s, sqlite, env } = await world();
     s.as(ben);
     const q = "repos=open,secret";
     const before = await s.get<AtlasWorkspaceOverview>(`overview?${q}`);
@@ -573,7 +608,7 @@ describe("Atlas workspace scope", () => {
 
     sqlite.exec(`DELETE FROM repo_collaborators WHERE repo_id = 'r_secret' AND user_id = 'ben'`);
 
-    const cold = app(sqlite);
+    const cold = app(sqlite, env);
     cold.as(ben);
     for (const [label, view] of [
       ["warm", s],
@@ -671,7 +706,7 @@ describe("Atlas workspace scope", () => {
     const { s } = await world();
     s.serveClient();
     try {
-      const workspace = { owner: "ann", repos: ["secret", "open"] };
+      const workspace = { space: "ann", repos: ["secret", "open"] };
       const overview = await atlasWorkspaceApi.overview(workspace);
       expect(overview.snapshot.repos.map((r) => r.name)).toEqual(["open", "secret"]);
       const region = overview.regions[0]!;

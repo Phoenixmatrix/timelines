@@ -2,7 +2,6 @@
 // issue's requirements can't claim it, aren't given it by next or a handoff,
 // and are told why; people always can, and an explicit assignment stands.
 
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { AgentCapabilities } from "../../shared/api.ts";
 import {
@@ -14,10 +13,10 @@ import {
   type TrackerAgent,
 } from "../../shared/tracker.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
-import { trackerSql, transactional } from "../testing/tracker.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 
 const GiB = 2 ** 30;
-const databases: DatabaseSync[] = [];
+const databases: { close(): void }[] = [];
 afterEach(() => {
   for (const db of databases) db.close();
   databases.length = 0;
@@ -44,16 +43,31 @@ function agent(id: string, capabilities: AgentCapabilities | null, accountable =
   } satisfies TrackerAgent;
 }
 
-function fixture() {
-  const db = new DatabaseSync(":memory:");
-  databases.push(db);
+async function fixture() {
+  const storage = await freshTrackerStorage("org", [
+    {
+      accountId: "alice",
+      role: "owner",
+      grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+    },
+    {
+      accountId: "bob",
+      role: "member",
+      grant: { role: "member", repositoryRole: "read", packageRole: "read" },
+    },
+  ]);
+  databases.push(storage);
+  const { db, sql, transactionSync, scope, space } = storage;
   let now = Date.parse("2026-10-01T00:00:00Z");
-  const store = new TrackerStore(trackerSql(db), transactional(db), () => now);
+  const store = new TrackerStore(sql, transactionSync, () => now);
   const owner: Access = {
     actorId: "alice",
     principalId: "alice",
     agents: [agent("agt-ux", ux), agent("agt-blank", null), agent("agt-bobs", ux, bob)],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
     members: [alice, bob],
     repos: [],
@@ -62,6 +76,7 @@ function fixture() {
     ...owner,
     actorId,
     principalId,
+    agentId: actorId.startsWith("agt-") ? actorId : null,
     canAdmin,
   });
   const people = { alice: owner, bob: as("bob", "bob", false) };
@@ -72,7 +87,7 @@ function fixture() {
   };
   let n = 0;
   const run = (access: Access, ...mutations: Mutation[]) =>
-    store.mutate(access, { operationId: `op-${++n}`, mutations });
+    store.mutate(access, { ...scope, operationId: `op-${++n}`, mutations });
   run(owner, { kind: "team.create", id: "team", data: { key: "ENG", name: "Engineering" } });
   const create = (id: string, data: Record<string, unknown> = {}) =>
     run(owner, { kind: "issue.create", id, data: { teamId: "team", title: id, ...data } });
@@ -105,8 +120,8 @@ function fixture() {
 }
 
 describe("issue pickup authority", () => {
-  test("expired holders cannot resume after pickup becomes restricted", () => {
-    const f = fixture();
+  test("expired holders cannot resume after pickup becomes restricted", async () => {
+    const f = await fixture();
     f.create("work");
     f.run(f.agents.ux, {
       kind: "issue.claim",
@@ -132,8 +147,8 @@ describe("issue pickup authority", () => {
     expect(f.issue("work").claim?.expiresAt).toBe("2026-10-01T00:00:30.000Z");
   });
 
-  test("restricting a descendant cannot invalidate its ancestor's active agent lease", () => {
-    const f = fixture();
+  test("restricting a descendant cannot invalidate its ancestor's active agent lease", async () => {
+    const f = await fixture();
     f.create("parent");
     f.create("child", { parentId: "parent" });
     const token = f.run(f.agents.ux, {
@@ -159,8 +174,8 @@ describe("issue pickup authority", () => {
     });
     expect(f.issue("child").status).toBe("in_progress");
   });
-  test("restricted work is excluded from next and exact claims, even when assigned", () => {
-    const f = fixture();
+  test("restricted work is excluded from next and exact claims, even when assigned", async () => {
+    const f = await fixture();
     for (const pickup of ["not_ready", "human_only"] as const) {
       f.create(pickup, { pickup, assigneeId: "agt-ux", priority: 0 });
       expect(
@@ -184,8 +199,8 @@ describe("issue pickup authority", () => {
     expect(f.issue("human_only").claim).toBeNull();
   });
 
-  test("people can take human-only work, but nobody can take not-ready work", () => {
-    const f = fixture();
+  test("people can take human-only work, but nobody can take not-ready work", async () => {
+    const f = await fixture();
     f.create("human", { pickup: "human_only" });
     f.create("later", { pickup: "not_ready" });
     expect(
@@ -213,8 +228,8 @@ describe("issue pickup authority", () => {
     expect(f.issue("human").status).toBe("done");
   });
 
-  test("delegated subtree claims and next cannot bypass pickup", () => {
-    const f = fixture();
+  test("delegated subtree claims and next cannot bypass pickup", async () => {
+    const f = await fixture();
     f.create("parent");
     f.create("human", { parentId: "parent", pickup: "human_only" });
     f.create("later", { parentId: "parent", pickup: "not_ready" });
@@ -246,8 +261,8 @@ describe("issue pickup authority", () => {
     expect(f.issue("human").claim).toBeNull();
   });
 
-  test("agents cannot self-enable policies, including in the same mutation or batch", () => {
-    const f = fixture();
+  test("agents cannot self-enable policies, including in the same mutation or batch", async () => {
+    const f = await fixture();
     f.create("restricted", { pickup: "not_ready" });
     for (const pickup of ["anyone", "human_only"] as const) {
       expect(
@@ -289,8 +304,8 @@ describe("issue pickup authority", () => {
     expect(f.issue("restricted").claim?.actorId).toBe("agt-ux");
   });
 
-  test("direct status starts and completion cannot bypass policy", () => {
-    const f = fixture();
+  test("direct status starts and completion cannot bypass policy", async () => {
+    const f = await fixture();
     for (const pickup of ["not_ready", "human_only"] as const) {
       f.create(pickup, { pickup });
       for (const status of ["in_progress", "done"] as const) {
@@ -327,8 +342,8 @@ describe("issue pickup authority", () => {
     ).toMatchObject({ code: "pickup_not_ready" });
   });
 
-  test("active claims cannot be invalidated and human-only handoffs reject agents", () => {
-    const f = fixture();
+  test("active claims cannot be invalidated and human-only handoffs reject agents", async () => {
+    const f = await fixture();
     f.create("work");
     const token = f.run(f.agents.ux, {
       kind: "issue.claim",
@@ -385,8 +400,8 @@ describe("issue pickup authority", () => {
     expect(f.issue("work").claim?.actorId).toBe("alice");
   });
 
-  test("invalid values fail, legacy records remain ready, and actor readiness differs", () => {
-    const f = fixture();
+  test("invalid values fail, legacy records remain ready, and actor readiness differs", async () => {
+    const f = await fixture();
     for (const pickup of ["later", null, false, 1])
       expect(f.refusal(() => f.create("invalid", { pickup }))).toMatchObject({
         code: "invalid_input",
@@ -421,8 +436,8 @@ describe("issue pickup authority", () => {
 });
 
 describe("issue requirements", () => {
-  test("are stored normalized, cleared by null, and recorded in history", () => {
-    const f = fixture();
+  test("are stored normalized, cleared by null, and recorded in history", async () => {
+    const f = await fixture();
     f.create("a", { requires: { tags: ["UX", "ux"], minMemory: 16 * GiB } });
     expect(f.issue("a").requires).toEqual({ tags: ["ux"], minMemory: 16 * GiB });
     f.run(f.owner, {
@@ -453,8 +468,8 @@ describe("issue requirements", () => {
     expect("requires" in f.issue("plain")).toBe(false);
   });
 
-  test("claims: agents must meet them, people always can", () => {
-    const f = fixture();
+  test("claims: agents must meet them, people always can", async () => {
+    const f = await fixture();
     f.create("ui", { requires: { tags: ["ux"], minMemory: 64 * GiB } });
     f.create("plain");
     const refused = f.refusal(() =>
@@ -484,8 +499,8 @@ describe("issue requirements", () => {
     expect(f.issue("ui").claim?.actorId).toBe("bob");
   });
 
-  test("next skips what the agent doesn't meet and says how many", () => {
-    const f = fixture();
+  test("next skips what the agent doesn't meet and says how many", async () => {
+    const f = await fixture();
     f.create("gpu", { priority: 0, requires: { tags: ["gpu"] } });
     f.create("design", { priority: 1, requires: { tags: ["ux"], models: ["claude-opus-*"] } });
     f.create("plain", { priority: 3 });
@@ -505,7 +520,7 @@ describe("issue requirements", () => {
     expect(none.issueId).toBeUndefined();
     expect(none.skipped).toMatchObject({ requirements: 1, keys: ["ENG-1"] });
     // Without capabilities, everything with requirements is skipped, with the fix.
-    const g = fixture();
+    const g = await fixture();
     g.create("gpu", { priority: 0, requires: { tags: ["gpu"] } });
     g.create("plain", { priority: 3 });
     const blank = g.run(g.agents.blank, {
@@ -524,8 +539,8 @@ describe("issue requirements", () => {
     expect(person.skipped).toBeUndefined();
   });
 
-  test("handoffs: an offer to an agent and its acceptance both check it", () => {
-    const f = fixture();
+  test("handoffs: an offer to an agent and its acceptance both check it", async () => {
+    const f = await fixture();
     f.create("ui", { requires: { tags: ["ux"] } });
     const token = f.run(f.owner, { kind: "issue.claim", id: "ui", data: { agent: "me" } })
       .results[0]!.leaseToken!;
@@ -547,8 +562,8 @@ describe("issue requirements", () => {
     expect(f.issue("ui").claim?.actorId).toBe("agt-ux");
   });
 
-  test("assignment to an agent that doesn't meet them is a person's explicit call", () => {
-    const f = fixture();
+  test("assignment to an agent that doesn't meet them is a person's explicit call", async () => {
+    const f = await fixture();
     f.create("ui", { requires: { tags: ["ux", "gpu"] } });
     const assign = (access: Access, assigneeId: string) =>
       f.run(access, {
@@ -557,10 +572,10 @@ describe("issue requirements", () => {
         expectedVersion: f.issue("ui").version,
         data: { assigneeId },
       });
-    // Not the agent's person nor a tracker owner.
+    // Not the agent's person nor a Space admin.
     expect(f.refusal(() => assign(f.people.bob, "agt-blank"))).toMatchObject({
       code: "requirements_unmet",
-      message: expect.stringContaining("Only a tracker owner or Alice can assign it anyway."),
+      message: expect.stringContaining("Only a Space admin or Alice can assign it anyway."),
     });
     // Agents can't hand it on to one that doesn't meet them.
     expect(f.refusal(() => assign(f.agents.ux, "agt-blank"))).toMatchObject({
@@ -581,20 +596,20 @@ describe("issue requirements", () => {
 });
 
 describe("tightening requirements on a claimed issue (CORE-272)", () => {
-  const claimed = () => {
-    const f = fixture();
+  const claimed = async () => {
+    const f = await fixture();
     f.create("ui", { requires: { tags: ["ux"] } });
     f.run(f.agents.ux, { kind: "issue.claim", id: "ui", data: { agent: "laptop" } });
     return f;
   };
-  const comments = (f: ReturnType<typeof fixture>) =>
+  const comments = (f: { store: TrackerStore; owner: Access }) =>
     f.store
       .snapshot(f.owner)
       .comments.filter((c) => c.issueId === "ui")
       .map((c) => c.body);
 
-  test("keeping the claim names who's affected and what they miss, and records it", () => {
-    const f = claimed();
+  test("keeping the claim names who's affected and what they miss, and records it", async () => {
+    const f = await claimed();
     const result = f.run(f.owner, {
       kind: "issue.update",
       id: "ui",
@@ -619,8 +634,8 @@ describe("tightening requirements on a claimed issue (CORE-272)", () => {
     ]);
   });
 
-  test("releasing it ends the claim, puts the work back, and records it", () => {
-    const f = claimed();
+  test("releasing it ends the claim, puts the work back, and records it", async () => {
+    const f = await claimed();
     const result = f.run(f.owner, {
       kind: "issue.update",
       id: "ui",
@@ -648,9 +663,9 @@ describe("tightening requirements on a claimed issue (CORE-272)", () => {
     ).toBeTruthy();
   });
 
-  test("only the tracker owner or the agent's person may release, and only what tightening affects", () => {
+  test("only the Space admin or the agent's person may release, and only what tightening affects", async () => {
     // Bob is neither: his release is refused and nothing changes.
-    const f = claimed();
+    const f = await claimed();
     expect(
       f.refusal(() =>
         f.run(f.people.bob, {
@@ -684,8 +699,8 @@ describe("tightening requirements on a claimed issue (CORE-272)", () => {
     ).toBe("invalid_input");
   });
 
-  test("a person's own claim is never affected", () => {
-    const g = fixture();
+  test("a person's own claim is never affected", async () => {
+    const g = await fixture();
     g.create("ui");
     g.run(g.owner, { kind: "issue.claim", id: "ui", data: { agent: "me" } });
     expect(
@@ -698,8 +713,8 @@ describe("tightening requirements on a claimed issue (CORE-272)", () => {
     ).toBeUndefined();
   });
 
-  test("next says which requirements kept the most work and how to change the profile", () => {
-    const f = fixture();
+  test("next says which requirements kept the most work and how to change the profile", async () => {
+    const f = await fixture();
     f.create("a", { requires: { tags: ["gpu"] } });
     f.create("b", { requires: { tags: ["gpu"], minMemory: 64 * GiB } });
     f.create("c", { requires: { models: ["gpt-5*"] } });

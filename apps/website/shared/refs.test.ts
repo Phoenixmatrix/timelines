@@ -27,7 +27,7 @@ describe("scanRefs", () => {
     expect(refs("https://linear.app/acme/issue/ENG-1 and www.x.test/orbit/engine")).toEqual([]);
   });
 
-  test("finds owner/repo but not paths", () => {
+  test("finds space/repo but not paths", () => {
     expect(refs("Moved to orbit/engine.")).toEqual(["repo:orbit/engine"]);
     expect(refs("Edit src/lib/refs.ts and ./a/b, or https://github.com/a/b")).toEqual([]);
     expect(refs("orbit/engine.git works")).toEqual(["repo:orbit/engine.git"]);
@@ -89,5 +89,5 @@ test("issueUrlParts and goPath", () => {
     issue: "ENG-2",
   });
   expect(issueUrlParts("https://h.test/orbit/engine")).toBeNull();
-  expect(goPath("orbit/engine", { owner: "orbit" })).toBe("/-/go/orbit%2Fengine?owner=orbit");
+  expect(goPath("orbit/engine", { space: "orbit" })).toBe("/-/go/orbit%2Fengine?space=orbit");
 });

@@ -144,18 +144,18 @@ export function AtlasTimeline({
   const latest = useRef(0);
   // By value: the parent passes new objects on every render.
   const scopeKey = workspace
-    ? `ws\n${workspace.owner}\n${workspace.repos.join(",")}`
-    : `repo\n${repo?.owner ?? ""}\n${repo?.name ?? ""}`;
+    ? `ws\n${workspace.space}\n${workspace.repos.join(",")}`
+    : `repo\n${repo?.space ?? ""}\n${repo?.name ?? ""}`;
 
   const read = useCallback(
     (cursor: string | null, signal?: AbortSignal): Promise<Loaded> => {
-      const [kind, owner = "", names = ""] = scopeKey.split("\n");
+      const [kind, space = "", names = ""] = scopeKey.split("\n");
       const request = { snapshot: snapshot.id, within, cursor, signal };
       if (kind === "ws")
         return atlasWorkspaceApi
-          .timeline({ owner, repos: names.split(",") }, ref, request)
+          .timeline({ space, repos: names.split(",") }, ref, request)
           .then((r) => ({ head: r, items: r.items, next: r.next }));
-      return atlasApi.timeline({ owner, name: names }, ref, request).then((r) => ({
+      return atlasApi.timeline({ space, name: names }, ref, request).then((r) => ({
         head: { ...r, wiki: r.repos[0] ? { [r.repos[0].repoId]: r.wiki } : {} },
         items: r.items,
         next: r.next,
@@ -426,7 +426,7 @@ export function AtlasTimeline({
                       <Link
                         to={withScope(
                           sourceUrl(
-                            `${repoPath(p.owner, p.name, "changes")}?ref=${encodeURIComponent(at)}`,
+                            `${repoPath(p.space, p.name, "changes")}?ref=${encodeURIComponent(at)}`,
                             sourceId,
                           ),
                           timeline,
@@ -436,7 +436,7 @@ export function AtlasTimeline({
                         Syntax changes on this timeline
                       </Link>
                       <Link
-                        to={withScope(commitsUrl(p.owner, p.name, at, "", sourceId), timeline)}
+                        to={withScope(commitsUrl(p.space, p.name, at, "", sourceId), timeline)}
                         className="text-ink underline"
                       >
                         Its commits
@@ -473,7 +473,7 @@ export function AtlasTimeline({
                     ))}
                 </ul>
                 <TimelineWikiPages
-                  repo={{ owner: p.owner, name: p.name }}
+                  repo={{ space: p.space, name: p.name }}
                   ref={ref}
                   ended={Boolean(p.ended)}
                   removedAt={p.ended?.removedAt ?? null}
@@ -496,10 +496,10 @@ export function AtlasTimeline({
 /** One repository's bookmark, overlay, main base and merge base, each as known. */
 function RepoFacts({ part, many }: { part: AtlasTimelineRepo; many: boolean }) {
   return (
-    <section aria-label={`${part.owner}/${part.name} on ${part.ref}`}>
+    <section aria-label={`${part.space}/${part.name} on ${part.ref}`}>
       {many && (
         <h3 className="m-0 text-body-sm font-semibold">
-          {part.owner}/{part.name}
+          {part.space}/{part.name}
         </h3>
       )}
       <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-body-sm">
@@ -611,7 +611,7 @@ function RegionItem({
   const named = (r: { name: string | null; proposed?: boolean }) =>
     r.name ? (r.proposed ? `a new ${r.name}` : r.name) : "a capability";
   const fileCount = region.files.added + region.files.changed + region.files.removed;
-  const repo = { owner: part.owner, name: part.name };
+  const repo = { space: part.space, name: part.name };
   return (
     <li className="flex flex-col gap-0.5">
       {many && <span className="text-micro text-ink-faint">{part.name}</span>}
@@ -682,7 +682,7 @@ function RegionItem({
               key={`t:${page.slug}`}
               to={withScope(
                 sourceUrl(
-                  `${repoPath(repo.owner, repo.name, "wiki", page.slug)}?set=${encodeURIComponent(page.set)}`,
+                  `${repoPath(repo.space, repo.name, "wiki", page.slug)}?set=${encodeURIComponent(page.set)}`,
                   part.sourceId,
                 ),
                 timeline,
@@ -695,7 +695,7 @@ function RegionItem({
           {region.mainPages.map((page) => (
             <Link
               key={`m:${page.slug}`}
-              to={withScope(repoPath(repo.owner, repo.name, "wiki", page.slug), null)}
+              to={withScope(repoPath(repo.space, repo.name, "wiki", page.slug), null)}
               className="text-ink-muted underline"
               title={`Written from main at ${short(page.generatedIn)}, ${relationText(page.relation)}`}
             >
@@ -720,7 +720,7 @@ function FileItem({
   many: boolean;
   timeline: string;
 }) {
-  const repo = { owner: part.owner, name: part.name };
+  const repo = { space: part.space, name: part.name };
   // Keep evidence pinned to its source; never substitute canonical for a missing source.
   const at = part.sourceId ? part.commit : null;
   const scoped = (href: string) => withScope(sourceUrl(href, part.sourceId!), timeline);
@@ -749,7 +749,7 @@ function FileItem({
       <span className="flex flex-wrap gap-x-3 gap-y-0.5 text-micro">
         {file.change !== "removed" && at && (
           <Link
-            to={scoped(blobUrl(repo.owner, repo.name, at, file.path))}
+            to={scoped(blobUrl(repo.space, repo.name, at, file.path))}
             className="text-ink underline"
           >
             Source at {short(at)}
@@ -758,7 +758,7 @@ function FileItem({
         {file.change !== "added" && part.baseCommit && (
           <Link
             to={sourceUrl(
-              withScope(blobUrl(repo.owner, repo.name, part.baseCommit, file.path), null),
+              withScope(blobUrl(repo.space, repo.name, part.baseCommit, file.path), null),
               "canonical",
             )}
             className="text-ink underline"
@@ -769,7 +769,7 @@ function FileItem({
         {at && (
           <Link
             to={scoped(
-              `${repoPath(repo.owner, repo.name, "changes")}?${new URLSearchParams({ ref: at, path: file.path })}`,
+              `${repoPath(repo.space, repo.name, "changes")}?${new URLSearchParams({ ref: at, path: file.path })}`,
             )}
             className="text-ink underline"
           >
@@ -778,7 +778,7 @@ function FileItem({
         )}
         {at && file.change !== "removed" && (
           <Link
-            to={scoped(commitsUrl(repo.owner, repo.name, at, file.path))}
+            to={scoped(commitsUrl(repo.space, repo.name, at, file.path))}
             className="text-ink underline"
           >
             History

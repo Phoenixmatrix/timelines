@@ -22,7 +22,7 @@ interface EntityRow {
 }
 export interface TrackerDatabase {
   teams: EntityRow;
-  workspaces: EntityRow;
+  projects: EntityRow;
   issues: EntityRow;
   tracker_labels: { name: string };
   links: EntityRow;
@@ -42,6 +42,12 @@ export interface TrackerDatabase {
   receipts: { id: string; actor_id: string; request: string; result: string };
   /** People with approve-when-green on (CORE-378): a row while it's on. */
   approval_automation: { person_id: string; enabled_at: string };
+  /**
+   * The live work authority a person's own consent acts with (CORE-378,
+   * CORE-390): `automation:<person>` for approve-when-green, `approval:<checkpoint>`
+   * for the approval that should land it. Re-resolved before every use.
+   */
+  work_authorities: { key: string; authority: string; recorded_at: string };
   events: { cursor: Generated<number>; data: string };
   issue_events: { issue_id: string; cursor: number };
   tracker_migrations: { name: string };

@@ -530,7 +530,7 @@ test("an auto timeline's card says it lands when green; Revive preview starts a 
   ];
   server.on(
     "POST",
-    "/api/tracker/:owner/timelines/:slug/checkpoints/:ref/revive",
+    "/api/tracker/:space/timelines/:slug/checkpoints/:ref/revive",
     ({ url }): PreviewRevival => {
       revivals.push(url.pathname);
       return { checkpoint: view, runs: answer };
@@ -590,7 +590,7 @@ test("the timeline inspector's Checkpoints: previews per checkpoint, and revivin
   let revived = 0;
   server.on(
     "POST",
-    "/api/tracker/:owner/timelines/:slug/checkpoints/:ref/revive",
+    "/api/tracker/:space/timelines/:slug/checkpoints/:ref/revive",
     async ({ params }): Promise<PreviewRevival> => {
       expect(params.ref).toBe(first.checkpoint.id);
       revived++;

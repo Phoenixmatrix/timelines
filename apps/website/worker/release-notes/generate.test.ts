@@ -2,7 +2,6 @@ import { describe, expect, test, vi } from "vite-plus/test";
 import type { LinkedIssue } from "../../shared/release-notes.ts";
 import { AI_MODEL_CATALOG, LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type { RepoRefs } from "../artifacts.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
 import {
   ensureReleaseNotes,
@@ -15,6 +14,22 @@ import { RepoReader } from "../objects.ts";
 import { landedTimelines } from "./timelines.ts";
 import { releaseNotes } from "../retention/cleanups/release-notes.ts";
 import * as semantic from "../semantic/feed.ts";
+import {
+  releaseActor,
+  releaseEnvironment,
+  seedReleasePerson,
+  seedReleaseSpace,
+} from "./test-support.ts";
+import { resolveWorkAuthority, type WorkAuthority } from "../ci/admission.ts";
+
+const actor = releaseActor("initiator");
+const authority: WorkAuthority = {
+  spaceId: "acc",
+  migrationEpoch: 0,
+  personId: actor.id,
+  agentId: null,
+  credential: actor.credential!,
+};
 
 const DAY = `@day:${new Date(1_790_000_000_000).toISOString().slice(0, 10)}`;
 
@@ -32,22 +47,23 @@ function issue(key: string, overrides: Partial<LinkedIssue> = {}): LinkedIssue {
     type: "task",
     status: "done",
     labels: ["web"],
-    workspaceIds: ["ws"],
+    projectIds: ["ws"],
     team: { id: "team", key: "ENG", name: "Engineering" },
     completedAt: "2026-09-01T00:00:00.000Z",
     evidence: [{ body: `Shipped ${key}`, actorId: "a", createdAt: "2026-09-01T00:00:00.000Z" }],
-    trackerOwner: "org",
-    trackerOwnerId: "acc",
+    trackerSpace: "acc",
+    trackerSpaceId: "acc",
     ...overrides,
   };
 }
 
 /** A repository with linear history, tags, tracker issues and a fake model. */
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const { sqlite, env } = await releaseEnvironment();
+  seedReleasePerson(sqlite, actor.id);
+  await seedReleaseSpace(sqlite, "acc", actor.id);
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
   `);
   const calls: Call[] = [];
@@ -72,7 +88,7 @@ function setup() {
       };
     },
   };
-  const env = { DB: d1(sqlite), AI } as unknown as Env;
+  env.AI = AI as unknown as NonNullable<Env["AI"]>;
   // node:sqlite permits more bindings than deployed D1.
   const prepare = env.DB.prepare.bind(env.DB);
   env.DB.prepare = (sql) => {
@@ -110,6 +126,9 @@ function setup() {
     return hash;
   };
   const source: GeneratorSource = {
+    authorize: async () => {
+      await resolveWorkAuthority(env, authority, "repo");
+    },
     async refs(): Promise<RepoRefs> {
       return {
         headBranch: "main",
@@ -166,7 +185,7 @@ function setup() {
 
 describe("release note generation", () => {
   test("compact landing groups exact durable source inputs and regenerates after work Git expires", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set("ENG-1", issue("ENG-1"));
     const base = r.commit("Initial import");
     const wip = r.commit("Implement parser ENG-1", undefined, undefined, {
@@ -180,7 +199,7 @@ describe("release note generation", () => {
     const input = [await r.source.commit(revised), await r.source.commit(wip)];
     const compact = r.commit("Land parser", undefined, undefined, { parents: [base] });
     r.sqlite.exec(`
-      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
       VALUES('work_parser','repo','tl_parser','parser','acc','work-physical','https://work','archived','allocation','canonical','${base}','base-tree','refs/heads/main','canonical','${base}','base-tree','refs/heads/main',1,'now','now');
       INSERT INTO source_integration_receipts(id,landing_id,checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at,completed_at)
       VALUES('receipt','landing','checkpoint','repo','work_parser','${revised}','work-tree','{}','[]','${base}','${compact}','compact-tree',0,'complete','now','now');
@@ -245,7 +264,7 @@ describe("release note generation", () => {
   });
 
   test("groups commits under the issues they cite, writes each entry once, and introduces the release", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set("ENG-1", issue("ENG-1"));
     r.commit("Initial import");
     r.commit("Start the parser (ENG-1)");
@@ -297,7 +316,7 @@ describe("release note generation", () => {
   });
 
   test("a landing's work joins its issues' entries, labelled with its timeline; the rest is one landing entry", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set("ENG-1", issue("ENG-1"));
     const base = r.commit("Initial import");
     const side = (message: string, parents: string[]) =>
@@ -357,7 +376,7 @@ describe("release note generation", () => {
   });
 
   test("same-day pushes reuse unchanged entries; tags coexist without rewriting them", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set("ENG-2", issue("ENG-2"));
     r.tags.set("v1", r.commit("Base"));
     r.commit("Add search (ENG-2)");
@@ -379,7 +398,7 @@ describe("release note generation", () => {
   });
 
   test("a changed issue rewrites its entry; unresolved keys and lost tags drop out", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set(
       "ENG-3",
       issue("ENG-3", { status: "in_progress", completedAt: null, evidence: [] }),
@@ -406,7 +425,7 @@ describe("release note generation", () => {
   });
 
   test("a model budget leaves the rest for the next run without losing earlier entries", async () => {
-    const r = setup();
+    const r = await setup();
     for (let i = 0; i < 4; i++) r.commit(`Change ${i}`);
     const partial = await r.run({ maxModelCalls: 2 });
     expect(partial.more).toBe(true);
@@ -419,7 +438,7 @@ describe("release note generation", () => {
   });
 
   test("large daily groups converge, preserve pending entries and prune stale subjects within D1 limits", async () => {
-    const r = setup();
+    const r = await setup();
     const commits = Array.from({ length: 120 }, (_, i) => r.commit(`Change ${i}`));
     const subjects = commits.map((hash) => `commit:${hash}`).sort();
     try {
@@ -464,7 +483,7 @@ describe("release note generation", () => {
     }
   });
   test("UTC committer days group noncontiguous ancestry, never author or completion dates", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set("ENG-1", issue("ENG-1", { completedAt: "2040-01-01T00:00:00Z" }));
     const seconds = (date: string) => Date.parse(date) / 1000;
     r.commit("Older ancestry ENG-1", seconds("2026-09-02T23:59:00Z"), seconds("2020-01-01"));
@@ -487,7 +506,7 @@ describe("release note generation", () => {
   });
 
   test("empty histories persist no daily group and stale days and sentinels disappear", async () => {
-    const r = setup();
+    const r = await setup();
     r.sqlite.exec(`INSERT INTO release_notes (repo_id, release, to_oid, released_at, updated_at)
       VALUES ('repo', '@unreleased', 'old', '2020-01-01', '2020-01-01'),
       ('repo', '@day:2020-01-01', 'old', '2020-01-01', '2020-01-01')`);
@@ -495,7 +514,7 @@ describe("release note generation", () => {
     expect(r.sqlite.prepare("SELECT release FROM release_notes").all()).toEqual([]);
   });
   test("retention removes old releases' notes and mentions, keeps the latest, and they never come back", async () => {
-    const r = setup();
+    const r = await setup();
     const T0 = 1_790_000_000;
     const day = (n: number) =>
       `@day:${new Date((T0 + n * 86_400) * 1000).toISOString().slice(0, 10)}`;
@@ -526,7 +545,7 @@ describe("release note generation", () => {
     const now = new Date((T0 + 2.5 * 86_400) * 1000);
     const ctx = {
       env: r.env,
-      target: { scope: "account", accountId: "acc" } as const,
+      target: { kind: "space", id: "acc" } as const,
       thresholds: { days: 1 },
       now,
       limit: 10,
@@ -564,7 +583,7 @@ describe("release note generation", () => {
   });
 
   test("bounded daily history marks every observed day incomplete", async () => {
-    const r = setup();
+    const r = await setup();
     r.issues.set("ENG-1", issue("ENG-1"));
     for (let i = 0; i < 1001; i++) r.commit("ENG-1");
     await r.run();
@@ -574,7 +593,7 @@ describe("release note generation", () => {
     expect(commits).not.toContain("c0");
   });
   test("legacy stored tags upgrade in bounded batches without backfilling untouched historical tags", async () => {
-    const r = setup();
+    const r = await setup();
     for (let i = 0; i < 16; i++) r.tags.set(`v${i}`, r.commit(`chore: change ${i}`));
     for (let i = 1; i <= 12; i++)
       r.sqlite
@@ -601,19 +620,111 @@ describe("release note generation", () => {
 });
 
 describe("release note scheduling", () => {
-  function queued(ai: boolean) {
-    const sqlite = migratedDatabase();
+  test("unbound legacy generations retain frozen inputs for reconciliation without replay", async () => {
+    const r = await setup();
+    r.commit("Preserved release");
+    await r.run();
+    const before = r.entries(DAY);
+    const snapshot = JSON.stringify(LEGACY_AI_SNAPSHOT);
+    const refs = JSON.stringify(await r.source.refs());
+    r.sqlite
+      .prepare(
+        "INSERT INTO release_note_state(repo_id,dirty,status,ai_snapshot,generation_refs) VALUES ('repo',1,'generating',?,?)",
+      )
+      .run(snapshot, refs);
+    const delivery = message("repo");
+    await runReleaseNotesJob(r.env, delivery.message, () => {});
+    expect(delivery.outcome).toEqual({ acked: true, retried: false });
+    expect(
+      r.sqlite.prepare("SELECT status,ai_snapshot,generation_refs FROM release_note_state").get(),
+    ).toEqual({ status: "failed", ai_snapshot: snapshot, generation_refs: refs });
+    expect(r.entries(DAY)).toEqual(before);
+  });
+  test("repository-only writers do not gain Space provider access through push notifications", async () => {
+    const q = await queued(true);
+    q.sqlite.exec(
+      "DELETE FROM space_grants WHERE space_id='acc'; INSERT INTO repo_collaborators(repo_id,user_id,role) VALUES ('repo','initiator','write')",
+    );
+    await notifyReleaseNotes(q.env, "repo", actor);
+    expect(q.sent).toEqual([]);
+    expect(q.sqlite.prepare("SELECT * FROM release_note_state").all()).toEqual([]);
+  });
+  test("revoked initiating agents cannot consume queued release work", async () => {
+    const q = await queued(true);
+    q.sqlite.exec(
+      "INSERT INTO agents(id,name,accountable_id) VALUES ('agent','Agent','initiator'); UPDATE access_tokens SET agent_id='agent' WHERE id='token-initiator'",
+    );
+    const agentActor = { ...actor, agent: { id: "agent", name: "Agent" } };
+    await notifyReleaseNotes(q.env, "repo", agentActor);
+    q.sqlite.exec("UPDATE agents SET revoked_at=datetime('now') WHERE id='agent'");
+    const delivery = message("repo");
+    Object.assign(delivery.message.body, q.sent[0] as ReleaseNotesJob);
+    await runReleaseNotesJob(q.env, delivery.message, () => {});
+    expect(delivery.outcome).toEqual({ acked: true, retried: false });
+    expect(q.sqlite.prepare("SELECT COUNT(*) AS n FROM release_notes").get()).toEqual({ n: 0 });
+  });
+  test.each(["grant", "credential", "epoch"])(
+    "rejects delayed %s revocation without changing release history",
+    async (kind) => {
+      const r = await setup();
+      r.commit("Existing release");
+      await r.run();
+      historyFor(r);
+      const before = r.release(DAY);
+      const entries = r.entries(DAY);
+      await notifyReleaseNotes(r.env, "repo", actor);
+      if (kind === "grant") r.sqlite.exec("DELETE FROM space_grants WHERE space_id='acc'");
+      if (kind === "credential")
+        r.sqlite.exec("DELETE FROM access_tokens WHERE id='token-initiator'");
+      const delivery = message("repo");
+      if (kind === "epoch") {
+        delivery.message.body.authority = {
+          ...authority,
+          migrationEpoch: authority.migrationEpoch - 1,
+        };
+        r.sqlite
+          .prepare("UPDATE release_note_state SET dirty_binding=? WHERE repo_id='repo'")
+          .run(JSON.stringify(delivery.message.body.authority));
+      }
+      await runReleaseNotesJob(r.env, delivery.message, () => {});
+      expect(delivery.outcome).toEqual({ acked: true, retried: false });
+      expect(r.release(DAY)).toEqual(before);
+      expect(r.entries(DAY)).toEqual(entries);
+      vi.restoreAllMocks();
+    },
+  );
+
+  test("revocation during inference blocks publication and preserves existing entry identities", async () => {
+    const r = await setup();
+    r.commit("Existing release");
+    await r.run();
+    const entries = r.sqlite
+      .prepare("SELECT id,title,summary FROM release_note_entries ORDER BY id")
+      .all();
+    r.commit("New unauthorized publication");
+    const provider = r.env.AI!.run.bind(r.env.AI);
+    vi.spyOn(r.env.AI!, "run").mockImplementationOnce(async (...args) => {
+      const result = await provider(...args);
+      r.sqlite.exec("DELETE FROM access_tokens WHERE id='token-initiator'");
+      return result;
+    });
+    await expect(r.run()).rejects.toThrow();
+    expect(
+      r.sqlite.prepare("SELECT id,title,summary FROM release_note_entries ORDER BY id").all(),
+    ).toEqual(entries);
+    vi.restoreAllMocks();
+  });
+  async function queued(ai: boolean) {
+    const { sqlite, env } = await releaseEnvironment();
+    seedReleasePerson(sqlite, actor.id);
+    await seedReleaseSpace(sqlite, "acc", actor.id);
     sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
     `);
     const sent: unknown[] = [];
-    const env = {
-      DB: d1(sqlite),
-      JOBS: { send: async (body: unknown) => void sent.push(body) },
-      ...(ai ? { AI: {} } : {}),
-    } as unknown as Env;
+    env.JOBS = { send: async (body: unknown) => void sent.push(body) } as unknown as Env["JOBS"];
+    if (ai) env.AI = {} as NonNullable<Env["AI"]>;
     return { sqlite, env, sent };
   }
   const message = (repoId: string) => {
@@ -621,7 +732,7 @@ describe("release note scheduling", () => {
     return {
       outcome,
       message: {
-        body: { type: "release-notes", repoId },
+        body: { type: "release-notes", repoId, authority },
         attempts: 1,
         ack: () => void (outcome.acked = true),
         retry: () => void (outcome.retried = true),
@@ -647,7 +758,7 @@ describe("release note scheduling", () => {
   }
 
   test("disabled admission and a disabled queued consumer spend nothing and retain stored notes", async () => {
-    const r = setup();
+    const r = await setup();
     r.commit("Existing work");
     await r.run();
     r.sqlite.exec(
@@ -657,19 +768,19 @@ describe("release note scheduling", () => {
     const calls = r.calls.length;
     const sent: unknown[] = [];
     r.env.JOBS = { send: async (body: unknown) => void sent.push(body) } as unknown as Env["JOBS"];
-    await notifyReleaseNotes(r.env, "repo");
-    r.sqlite.exec("INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0)");
-    await notifyReleaseNotes(r.env, "repo");
-    await ensureReleaseNotes(r.env, "repo");
+    await notifyReleaseNotes(r.env, "repo", actor);
+    r.sqlite.exec("INSERT INTO space_settings (space_id, ai_release_notes) VALUES ('acc', 0)");
+    await notifyReleaseNotes(r.env, "repo", actor);
+    await ensureReleaseNotes(r.env, "repo", actor);
     await runReleaseNotesJob(r.env, message("repo").message, () => {});
-    expect(sent).toEqual([{ type: "release-notes", repoId: "repo" }]);
+    expect(sent).toEqual([{ type: "release-notes", repoId: "repo", authority }]);
     expect(r.calls.length).toBe(calls);
     expect(r.release(DAY)).toEqual(stored);
     expect((await releaseNotesFor(r.env.DB, "repo", DAY, new Map()))!.entries).toHaveLength(1);
   });
 
   test("a failed generation and its budget continuation retain policy and refs, then a push starts fresh", async () => {
-    const r = setup();
+    const r = await setup();
     historyFor(r);
     const glm = AI_MODEL_CATALOG.fast.find((option) => option.id === "glm-5.3-flash")!.model;
     const gemma = AI_MODEL_CATALOG.fast.find((option) => option.id === "gemma-4-26b-a4b-it")!.model;
@@ -679,16 +790,16 @@ describe("release note scheduling", () => {
       .mockRejectedValue(new Error("Provider temporarily unavailable"));
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await notifyReleaseNotes(r.env, "repo");
+      await notifyReleaseNotes(r.env, "repo", actor);
       const failed = message("repo");
       await runReleaseNotesJob(r.env, failed.message, () => {});
       expect(failed.outcome.retried).toBe(true);
       provider.mockRestore();
-      r.sqlite.exec(`INSERT INTO account_settings
-        (account_id, ai_fast_model, ai_task_model) VALUES
+      r.sqlite.exec(`INSERT INTO space_settings
+        (space_id, ai_fast_model, ai_task_model) VALUES
         ('acc', 'gemma-4-26b-a4b-it', 'gemma-4-26b-a4b-it')`);
       r.commit("Successor only");
-      await notifyReleaseNotes(r.env, "repo");
+      await notifyReleaseNotes(r.env, "repo", actor);
       await runReleaseNotesJob(r.env, message("repo").message, () => {});
       expect(r.entries(DAY)).toHaveLength(40);
       expect(r.entries(DAY).flatMap((entry) => JSON.parse(entry.commits!))).not.toContain("c41");
@@ -707,15 +818,13 @@ describe("release note scheduling", () => {
   });
 
   test("turning release notes off after start does not cancel its continuation", async () => {
-    const r = setup();
+    const r = await setup();
     historyFor(r);
     for (let i = 0; i < 41; i++) r.commit(`Accepted ${i}`);
     try {
-      await notifyReleaseNotes(r.env, "repo");
+      await notifyReleaseNotes(r.env, "repo", actor);
       await runReleaseNotesJob(r.env, message("repo").message, () => {});
-      r.sqlite.exec(
-        "INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0)",
-      );
+      r.sqlite.exec("INSERT INTO space_settings (space_id, ai_release_notes) VALUES ('acc', 0)");
       expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe(
         "generating",
       );
@@ -724,7 +833,7 @@ describe("release note scheduling", () => {
       expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe("disabled");
       r.commit("Disabled successor");
       const before = r.calls.length;
-      await notifyReleaseNotes(r.env, "repo");
+      await notifyReleaseNotes(r.env, "repo", actor);
       await runReleaseNotesJob(r.env, message("repo").message, () => {});
       expect(r.calls.length).toBe(before);
       expect(r.entries(DAY)).toHaveLength(41);
@@ -734,21 +843,19 @@ describe("release note scheduling", () => {
   });
 
   test("completed notes stay readable when a push's successor is disabled", async () => {
-    const r = setup();
+    const r = await setup();
     historyFor(r);
     const original = r.commit("Shipped work");
     const provider = r.env.AI!.run.bind(r.env.AI);
     vi.spyOn(r.env.AI!, "run").mockImplementationOnce(async (...args) => {
       const result = await provider(...args);
       r.commit("Future work");
-      await notifyReleaseNotes(r.env, "repo");
-      r.sqlite.exec(
-        "INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0)",
-      );
+      await notifyReleaseNotes(r.env, "repo", actor);
+      r.sqlite.exec("INSERT INTO space_settings (space_id, ai_release_notes) VALUES ('acc', 0)");
       return result;
     });
     try {
-      await notifyReleaseNotes(r.env, "repo");
+      await notifyReleaseNotes(r.env, "repo", actor);
       await runReleaseNotesJob(r.env, message("repo").message, () => {});
       const notes = await releaseNotesFor(r.env.DB, "repo", DAY, new Map());
       expect(notes?.entries.flatMap((entry) => entry.commits)).toEqual([original]);
@@ -764,7 +871,7 @@ describe("release note scheduling", () => {
   test.each([true, false])(
     "a refs-fetch failure leaves admission pending (enabled=%s)",
     async (enabled) => {
-      const r = setup();
+      const r = await setup();
       historyFor(r);
       r.commit("Original work");
       vi.spyOn(RepoReader.prototype, "refs").mockRejectedValueOnce(
@@ -772,17 +879,17 @@ describe("release note scheduling", () => {
       );
       vi.spyOn(console, "error").mockImplementation(() => {});
       try {
-        await notifyReleaseNotes(r.env, "repo");
+        await notifyReleaseNotes(r.env, "repo", actor);
         const failed = message("repo");
         await runReleaseNotesJob(r.env, failed.message, () => {});
         expect(failed.outcome.retried).toBe(true);
         r.sqlite
-          .prepare(`INSERT INTO account_settings
-        (account_id, ai_release_notes, ai_fast_model, ai_task_model)
+          .prepare(`INSERT INTO space_settings
+        (space_id, ai_release_notes, ai_fast_model, ai_task_model)
         VALUES ('acc', ?, 'gemma-4-26b-a4b-it', 'gemma-4-26b-a4b-it')`)
           .run(Number(enabled));
         r.commit("Newly admitted work");
-        await notifyReleaseNotes(r.env, "repo");
+        await notifyReleaseNotes(r.env, "repo", actor);
         await runReleaseNotesJob(r.env, message("repo").message, () => {});
         const gemma = AI_MODEL_CATALOG.task.find(
           (option) => option.id === "gemma-4-26b-a4b-it",
@@ -795,13 +902,16 @@ describe("release note scheduling", () => {
   );
 
   test("an expired generation lease retains its snapshot and a superseded holder cannot clear it", async () => {
-    const r = setup();
+    const r = await setup();
     historyFor(r);
     r.commit("Resumed work");
     r.sqlite
       .exec(`INSERT INTO release_note_state (repo_id, status, lease_until, lease_id, ai_snapshot)
       VALUES ('repo', 'generating', 1, 'old', '${JSON.stringify(LEGACY_AI_SNAPSHOT)}');
-      INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0);`);
+      INSERT INTO space_settings (space_id, ai_release_notes) VALUES ('acc', 0);`);
+    r.sqlite
+      .prepare("UPDATE release_note_state SET generation_binding=?")
+      .run(JSON.stringify(authority));
     try {
       vi.spyOn(RepoReader.prototype, "refs").mockImplementationOnce(async () => {
         r.sqlite.exec(
@@ -827,8 +937,8 @@ describe("release note scheduling", () => {
   });
 
   test("without AI bindings nothing is scheduled or generated", async () => {
-    const q = queued(false);
-    await notifyReleaseNotes(q.env, "repo");
+    const q = await queued(false);
+    await notifyReleaseNotes(q.env, "repo", actor);
     expect(q.sent).toEqual([]);
     expect(q.sqlite.prepare("SELECT * FROM release_note_state").all()).toEqual([]);
     const m = message("repo");
@@ -837,9 +947,9 @@ describe("release note scheduling", () => {
   });
 
   test("a change marks the repository dirty and enqueues it; a held lease defers to its holder", async () => {
-    const q = queued(true);
-    await notifyReleaseNotes(q.env, "repo");
-    expect(q.sent).toEqual([{ type: "release-notes", repoId: "repo" }]);
+    const q = await queued(true);
+    await notifyReleaseNotes(q.env, "repo", actor);
+    expect(q.sent).toEqual([{ type: "release-notes", repoId: "repo", authority }]);
     expect(q.sqlite.prepare("SELECT dirty FROM release_note_state").get()).toEqual({ dirty: 1 });
     q.sqlite.exec(`UPDATE release_note_state SET lease_until = ${Date.now() + 60_000}`);
     const m = message("repo");
@@ -849,19 +959,22 @@ describe("release note scheduling", () => {
     expect(q.sqlite.prepare("SELECT dirty FROM release_note_state").get()).toEqual({ dirty: 1 });
   });
   test("reads coalesce lazy upgrades and keep failed retries visible", async () => {
-    const q = queued(true);
+    const q = await queued(true);
     q.sqlite.exec(`INSERT INTO release_note_state (repo_id, status) VALUES ('repo', 'ready')`);
-    await Promise.all([ensureReleaseNotes(q.env, "repo"), ensureReleaseNotes(q.env, "repo")]);
-    expect(q.sent).toEqual([{ type: "release-notes", repoId: "repo" }]);
+    await Promise.all([
+      ensureReleaseNotes(q.env, "repo", actor),
+      ensureReleaseNotes(q.env, "repo", actor),
+    ]);
+    expect(q.sent).toEqual([{ type: "release-notes", repoId: "repo", authority }]);
     expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("generating");
     q.sqlite.exec(`UPDATE release_note_state SET status = 'failed', dirty = 1`);
-    await ensureReleaseNotes(q.env, "repo");
+    await ensureReleaseNotes(q.env, "repo", actor);
     expect(q.sent).toHaveLength(1);
     expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("failed");
   });
 
   test("queue continuations hide partial upgraded data until the budget converges", async () => {
-    const r = setup();
+    const r = await setup();
     const sent: unknown[] = [];
     r.env.JOBS = { send: async (body: unknown) => void sent.push(body) } as unknown as Env["JOBS"];
     for (let i = 0; i < 41; i++) r.commit(`Change ${i}`);
@@ -879,7 +992,7 @@ describe("release note scheduling", () => {
       nextCursor: null,
     });
     try {
-      await ensureReleaseNotes(r.env, "repo");
+      await ensureReleaseNotes(r.env, "repo", actor);
       const first = message("repo");
       await runReleaseNotesJob(r.env, first.message, () => {});
       expect(first.outcome).toEqual({ acked: true, retried: false });
@@ -889,7 +1002,7 @@ describe("release note scheduling", () => {
       expect(r.entries(DAY)).toHaveLength(40);
       expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).releases).toEqual([]);
       expect(await releaseNotesFor(r.env.DB, "repo", DAY, new Map())).toBeNull();
-      await ensureReleaseNotes(r.env, "repo");
+      await ensureReleaseNotes(r.env, "repo", actor);
       expect(sent).toHaveLength(2);
       const second = message("repo");
       await runReleaseNotesJob(r.env, second.message, () => {});
@@ -903,7 +1016,7 @@ describe("release note scheduling", () => {
       expect(r.calls).toHaveLength(calls);
       // Once upgraded, normal budget continuations must not erase readable history.
       for (let i = 0; i < 41; i++) r.commit(`Follow-up change ${i}`);
-      await notifyReleaseNotes(r.env, "repo");
+      await notifyReleaseNotes(r.env, "repo", actor);
       await runReleaseNotesJob(r.env, message("repo").message, () => {});
       const updating = await releaseIndex(r.env.DB, "repo", new Map(), true);
       expect(updating.status.state).toBe("generating");
@@ -920,16 +1033,16 @@ describe("release note scheduling", () => {
     }
   });
   test("failed upgrades stay private and retry without losing the failure state", async () => {
-    const q = queued(true);
+    const q = await queued(true);
     vi.spyOn(RepoReader.prototype, "refs").mockRejectedValue(new Error("History unavailable"));
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await ensureReleaseNotes(q.env, "repo");
+      await ensureReleaseNotes(q.env, "repo", actor);
       const attempt = message("repo");
       await runReleaseNotesJob(q.env, attempt.message, () => {});
       expect(attempt.outcome).toEqual({ acked: false, retried: true });
       expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("failed");
-      await ensureReleaseNotes(q.env, "repo");
+      await ensureReleaseNotes(q.env, "repo", actor);
       expect(q.sent).toHaveLength(1);
     } finally {
       errorLog.mockRestore();

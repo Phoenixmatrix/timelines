@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import type {
@@ -19,7 +19,7 @@ import {
 } from "../knowledge/budget.ts";
 import { MODELS } from "../knowledge/models.ts";
 import { sha256 } from "../knowledge/util.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlas } from "./api.ts";
 import {
   describeRepoCapabilities,
@@ -42,7 +42,14 @@ import {
 } from "./projection.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: unknown;
+    env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -111,12 +118,25 @@ function card(sqlite: DatabaseSync, path: string, blob: string, summary: string)
 }
 
 /** The capability fixture of projection.test.ts, with file cards and syntheses. */
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
+    BEGIN;
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('r1', 'ann', 'shop', 'private', 'art-r1', '');
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'Ann', 'personal', 'ann', 'space-ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('space-ann', 'org-ann', 'ann-space', 'Notes');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'bootstrap', 'ann');
+    INSERT INTO space_grants
+      (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('space-ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'bootstrap', 'ann');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('r1', 'space-ann', 'shop', 'private', 'art-r1', '');
   `);
   node(sqlite, "repo", "repository", "shop", null);
   for (const dir of ["src", "src/billing", "web", "ops", "misc"])
@@ -142,7 +162,7 @@ function setup() {
   edge(sqlite, "file:ops/canary.ts", "file:ops/rollback.ts", "imports");
   for (const [path, concepts] of Object.entries(FILES))
     for (const c of concepts) edge(sqlite, `file:${path}`, `concept:${c}`, "mentions");
-  return { sqlite, DB: d1(sqlite) };
+  return { sqlite, DB: fresh.env.DB, env: fresh.env };
 }
 
 /** Point a file at a blob with its own card (a push that changed it). */
@@ -246,14 +266,14 @@ const count = (sqlite: DatabaseSync, table: string) =>
 
 describe("capability names and summaries", () => {
   test("model names and summaries, with transitive provenance to immutable sources", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi();
     const { described, capabilities } = await build(DB, ai, "b1");
     expect(capabilities).toHaveLength(2);
     expect(described).toMatchObject({ capabilities: 2, current: 2, inferred: 2, cached: 0 });
     // One call per capability, on the reason model, recorded as Atlas spend.
     expect(ai.calls.map((c) => c.model)).toEqual([MODELS.reason, MODELS.reason]);
-    expect(await atlasRunSpend(DB, "build", "b1")).toMatchObject({
+    expect(await atlasRunSpend(DB, "build", "b1", "space-ann")).toMatchObject({
       calls: 2,
       inputTokens: 1800,
       outputTokens: 240,
@@ -350,14 +370,14 @@ describe("capability names and summaries", () => {
   });
 
   test("identical inputs reuse the cached prose: a second build makes no calls and rewrites nothing", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi();
     const first = await build(DB, ai, "b1");
     const rows = count(sqlite, "atlas_entities");
     const second = await build(DB, ai, "b2");
     expect(ai.calls).toHaveLength(2);
     expect(second.described).toMatchObject({ current: 2, cached: 2, inferred: 0 });
-    expect(await atlasRunSpend(DB, "build", "b2")).toMatchObject({ calls: 0, usd: 0 });
+    expect(await atlasRunSpend(DB, "build", "b2", "space-ann")).toMatchObject({ calls: 0, usd: 0 });
     // The capability rows are the first snapshot's, stored once.
     expect(count(sqlite, "atlas_entities")).toBe(rows);
     expect(second.capabilities).toEqual(first.capabilities);
@@ -366,7 +386,7 @@ describe("capability names and summaries", () => {
   });
 
   test("a component reworded by the model reuses the prose: only what it shares changes it", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi();
     const first = await build(DB, ai, "b1");
     // A push rewrote Ops' synthesis (any of its files changing does): new wording, same members.
@@ -393,7 +413,7 @@ describe("capability names and summaries", () => {
   });
 
   test("prose cached by its components' wording is adopted under the new key, not bought again", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi();
     const first = await build(DB, ai, "b1");
     // Restore the storage before components were keyed by their members:
@@ -421,7 +441,7 @@ describe("capability names and summaries", () => {
   });
 
   test("a wording-only change in model output never moves members or ids", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const first = await build(DB, fakeAi(), "b1");
     const before = await placements(DB, first.seq);
     // Forget the cached prose: the model now words everything differently.
@@ -443,7 +463,7 @@ describe("capability names and summaries", () => {
   });
 
   test("an exhausted budget keeps structure and interim names, prose unavailable", async () => {
-    const { DB } = setup();
+    const { DB } = await setup();
     // Stub reservations: the build's 20 calls are already spent.
     for (let i = 0; i < ATLAS_LIMITS.build.calls; i++)
       await reserveAtlasCall(
@@ -485,19 +505,19 @@ describe("capability names and summaries", () => {
     expect(charge?.parentId).not.toBe(GROUPS.unclassified);
   });
 
-  test("the account's daily ceiling stops paid work too", async () => {
-    const { sqlite, DB } = setup();
+  test("the Space's daily ceiling stops paid work too", async () => {
+    const { sqlite, DB } = await setup();
     sqlite
       .prepare(
-        `INSERT INTO atlas_spend (id, account_id, day, scope, run_id, repo_id, purpose, model, status,
+        `INSERT INTO atlas_spend (id, space_id, day, scope, run_id, repo_id, purpose, model, status,
            input_tokens, output_tokens, cost_micro_usd, reserved_input_tokens, reserved_output_tokens,
            reserved_micro_usd, created_at)
-         VALUES ('s0', 'ann', ?, 'build', 'other', 'r1', 'x', ?, 'settled', 0, 0, ?, 0, 0, 0, ?)`,
+         VALUES ('s0', 'space-ann', ?, 'build', 'other', 'r1', 'x', ?, 'settled', 0, 0, ?, 0, 0, 0, ?)`,
       )
       .run(
         new Date().toISOString().slice(0, 10),
         MODELS.reason,
-        ATLAS_LIMITS.dailyUsdPerAccount * 1_000_000,
+        ATLAS_LIMITS.dailyUsdPerSpace * 1_000_000,
         new Date().toISOString(),
       );
     const ai = fakeAi();
@@ -511,7 +531,7 @@ describe("capability names and summaries", () => {
   });
 
   test("an unpriced model disables paid synthesis", async () => {
-    const { DB } = setup();
+    const { DB } = await setup();
     const ai = fakeAi();
     const { described, capabilities } = await build(DB, ai, "b1", { prices: {} });
     expect(ai.calls).toHaveLength(0);
@@ -520,11 +540,11 @@ describe("capability names and summaries", () => {
       status: "unavailable",
       reason: "disabled",
     });
-    expect(await atlasRunSpend(DB, "build", "b1")).toMatchObject({ calls: 0 });
+    expect(await atlasRunSpend(DB, "build", "b1", "space-ann")).toMatchObject({ calls: 0 });
   });
 
   test("a provider error is charged, not retried, and leaves prose unavailable", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi(undefined, new Error("upstream 500"));
     const { described, capabilities } = await build(DB, ai, "b1");
     expect(described.reasons).toEqual({ provider_error: 2 });
@@ -541,7 +561,7 @@ describe("capability names and summaries", () => {
   });
 
   test("changing the selected model reuses prose and spends only on changed content", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const original = "@cf/zai-org/glm-5.3-flash";
     const selected = "@cf/google/gemma-4-26b-a4b-it";
     const ai = fakeAi();
@@ -555,7 +575,7 @@ describe("capability names and summaries", () => {
     expect(second.described).toMatchObject({ cached: 2, inferred: 0 });
     expect(second.capabilities).toEqual(first.capabilities);
     expect(ai.calls).toHaveLength(2);
-    expect(await atlasRunSpend(DB, "build", "b2")).toMatchObject({ calls: 0, usd: 0 });
+    expect(await atlasRunSpend(DB, "build", "b2", "space-ann")).toMatchObject({ calls: 0, usd: 0 });
     expect(count(sqlite, "kg_synthesis")).toBe(2);
 
     setFile(sqlite, "ops/deploy.ts", "ops/deploy.ts@2", "Deploys with blue-green");
@@ -579,7 +599,7 @@ describe("capability names and summaries", () => {
     expect(provenanceOf(unchanged)).toEqual(
       provenanceOf(first.capabilities.find((c) => c.id === unchanged.id)!),
     );
-    const spend = await atlasRunSpend(DB, "build", "b3");
+    const spend = await atlasRunSpend(DB, "build", "b3", "space-ann");
     expect(spend).toMatchObject({ calls: 1, inputTokens: 900, outputTokens: 120 });
     expect(spend.usd).toBeCloseTo((900 * 0.1 + 120 * 0.3) / 1_000_000, 10);
   });
@@ -590,7 +610,7 @@ describe("capability names and summaries", () => {
   ])(
     "reuses legacy %s cache rows after selecting %s without rewriting provenance",
     async (original, selected) => {
-      const { sqlite, DB } = setup();
+      const { sqlite, DB } = await setup();
       const ai = fakeAi();
       const prices = {
         [original]: { input: 0.45, output: 3.2 },
@@ -621,7 +641,10 @@ describe("capability names and summaries", () => {
       const second = await build(DB, ai, "b2", { model: selected, prices });
       expect(second.described).toMatchObject({ current: 2, cached: 2, inferred: 0 });
       expect(ai.calls).toHaveLength(2);
-      expect(await atlasRunSpend(DB, "build", "b2")).toMatchObject({ calls: 0, usd: 0 });
+      expect(await atlasRunSpend(DB, "build", "b2", "space-ann")).toMatchObject({
+        calls: 0,
+        usd: 0,
+      });
       for (const capability of second.capabilities)
         expect(provenanceOf(capability).inferred).toEqual(originalProvenance.get(capability.name));
       expect(sqlite.prepare("SELECT * FROM kg_synthesis ORDER BY key").all()).toEqual(stored);
@@ -634,7 +657,7 @@ describe("capability names and summaries", () => {
   );
 
   test("a model the provider refuses is a provider error, charged once per call", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi(undefined, new Error("5007: No such model test/unserved or task"));
     const model = "test/unserved";
     const { described, capabilities } = await build(DB, ai, "b1", {
@@ -652,7 +675,7 @@ describe("capability names and summaries", () => {
   });
 
   test("a reply without a summary is invalid and cached nowhere", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const ai = fakeAi(() => ({ name: "Only a name" }));
     const { described } = await build(DB, ai, "b1");
     expect(described.reasons).toEqual({ invalid_reply: 2 });
@@ -660,7 +683,7 @@ describe("capability names and summaries", () => {
   });
 
   test("when new prose can't be written, the previous prose stays, labelled stale with its basis", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     const first = await build(DB, fakeAi(), "b1");
     const before = first.capabilities.find(
       (c) => (c.data.counts as { files: number }).files === 3,
@@ -698,7 +721,7 @@ describe("capability names and summaries", () => {
   });
 
   test("without a model runner, cached prose is used and the rest is labelled", async () => {
-    const { sqlite, DB } = setup();
+    const { sqlite, DB } = await setup();
     await build(DB, fakeAi(), "b1");
     setFile(sqlite, "web/cart.ts", "web/cart.ts@2", "A new cart");
     const ai = fakeAi();
@@ -708,19 +731,16 @@ describe("capability names and summaries", () => {
   });
 
   test("the read API labels each region's prose and serves its provenance, with no model", async () => {
-    const { sqlite, DB } = setup();
-    await build(DB, fakeAi(), "b1");
-    setFile(sqlite, "web/cart.ts", "web/cart.ts@2", "A new cart");
-    await build(DB, fakeAi(), "b2", { prices: {} });
+    const { sqlite, DB, env: freshEnv } = await setup();
     const app = new Hono<AppEnv>();
     app.use("*", async (c, next) => {
       c.set("actor", { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false });
       await next();
     });
-    app.route("/api/repos/:owner/:name/atlas", atlas);
+    app.route("/api/repos/:space/:name/atlas", atlas);
     // Browsing has no model: any touch of AI fails the request.
     const env = {
-      DB,
+      ...freshEnv,
       BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
       AI: new Proxy(
         {},
@@ -731,8 +751,17 @@ describe("capability names and summaries", () => {
         },
       ),
     } as unknown as Env;
+    await build(DB, fakeAi(), "b1");
+    setFile(sqlite, "web/cart.ts", "web/cart.ts@2", "A new cart");
+    await build(DB, fakeAi(), "b2", { prices: {} });
     const get = async <T>(path: string) => {
-      const response = await app.request(`/api/repos/ann/shop/atlas/${path}`, {}, env);
+      const response = await app.request(
+        `/api/repos/ann-space/shop/atlas/${path}`,
+        {
+          headers: { "X-Gitmatrix-Content-Version": "4" },
+        },
+        env,
+      );
       expect(response.status).toBe(200);
       return (await response.json()) as T;
     };

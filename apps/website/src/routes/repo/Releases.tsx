@@ -32,7 +32,7 @@ import { useRepo } from "./RepoLayout.tsx";
 import { useEffect, useState } from "react";
 
 export async function releasesLoader({ request, params }: LoaderFunctionArgs) {
-  const base = `/repos/${params.owner}/${params.repo}/release-notes`;
+  const base = `/repos/${params.space}/${params.repo}/release-notes`;
   const scope = scopeOf(new URL(request.url).searchParams);
   const query = new URLSearchParams();
   if (scope) query.set("timeline", scope);
@@ -102,12 +102,12 @@ function Entry({
 
 function Sidebar({
   index,
-  owner,
+  space,
   name,
   selected,
 }: {
   index: ReleaseNotesIndex;
-  owner: string;
+  space: string;
   name: string;
   selected: string;
 }) {
@@ -124,7 +124,7 @@ function Sidebar({
           value={selected}
           onChange={(event) =>
             void navigate(
-              `${repoPath(owner, name, "releases", encodeURIComponent(event.target.value))}?${search}`,
+              `${repoPath(space, name, "releases", encodeURIComponent(event.target.value))}?${search}`,
             )
           }
         >
@@ -158,7 +158,7 @@ function Sidebar({
                 .map((release) => (
                   <li key={release.name}>
                     <Link
-                      to={`${repoPath(owner, name, "releases", encodeURIComponent(release.name))}?${search}`}
+                      to={`${repoPath(space, name, "releases", encodeURIComponent(release.name))}?${search}`}
                       aria-current={selected === release.name ? "page" : undefined}
                       className="flex min-h-11 items-baseline gap-2 rounded-plate px-2.5 py-2.5 text-body-sm text-ink-muted no-underline hover:bg-pane hover:text-ink aria-[current=page]:bg-raised aria-[current=page]:font-semibold aria-[current=page]:text-ink"
                     >
@@ -201,12 +201,10 @@ function StatusLine({ status }: { status: ReleaseNotesIndex["status"] }) {
 export function Releases() {
   const { index, release, name } = useLoaderData<typeof releasesLoader>();
   const repo = useRepo();
-  const owner = repo.owner.slug;
-  // Highlights need the organization's tracker, which only its members (or the owner) can read.
+  const space = repo.space.slug;
+  // Highlights need the Space's tracker, which only people with a live Space grant can read.
   const viewer = useViewer();
-  const canReadHighlights = Boolean(
-    viewer?.canCreateIn.some((account) => account.id === repo.owner.id),
-  );
+  const canReadHighlights = Boolean(viewer?.spaces.some((entry) => entry.id === repo.space.id));
   const location = useLocation();
   const scope = scopeOf(location.search);
   const [selected, setSelected] = useState<{
@@ -245,10 +243,10 @@ export function Releases() {
         <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
         {canReadHighlights && (
           <Link
-            to={`/tracker/${encodeURIComponent(owner)}/highlights`}
+            to={`/tracker/${encodeURIComponent(space)}/highlights`}
             className="mk-btn mk-btn--sm"
           >
-            View organization highlights
+            View Space highlights
           </Link>
         )}
         <div>
@@ -290,24 +288,24 @@ export function Releases() {
       <aside className="min-w-0 md:row-span-2 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start md:overflow-y-auto">
         {canReadHighlights && (
           <Link
-            to={`/tracker/${encodeURIComponent(owner)}/highlights`}
+            to={`/tracker/${encodeURIComponent(space)}/highlights`}
             className="mk-btn mk-btn--sm mb-4 min-h-11"
           >
-            View organization highlights
+            View Space highlights
           </Link>
         )}
-        <Sidebar index={index} owner={owner} name={repo.name} selected={name} />
+        <Sidebar index={index} space={space} name={repo.name} selected={name} />
       </aside>
       <article className="w-full min-w-0 max-w-[72ch] justify-self-center [overflow-wrap:anywhere] md:col-start-2">
         <div className="mb-6">
           <TimelineSwitcher variant="filter" />
         </div>
-        {/* Writing is billed to the owner's account: only its members are offered it. */}
+        {/* Writing is billed to the Space: only people with its grant are offered it. */}
         {release && canReadHighlights && (
           <ReleaseNotesComposer
             target={{
               kind: "repo",
-              owner,
+              space,
               name: repo.name,
               release: release.release.name,
               timeline: scope,
@@ -402,7 +400,7 @@ export function Releases() {
               <p className="m-0 text-body-sm text-ink-muted">
                 <CommitLink
                   className="mk-mono"
-                  owner={owner}
+                  space={space}
                   name={repo.name}
                   sha={release.release.toOid}
                 >
@@ -438,7 +436,7 @@ export function Releases() {
       <ReleaseNoteDetails
         selection={
           selectedEntry && selected
-            ? { entry: selectedEntry, repo: { owner, name: repo.name }, trigger: selected.trigger }
+            ? { entry: selectedEntry, repo: { space, name: repo.name }, trigger: selected.trigger }
             : null
         }
         onClose={() => setSelected(null)}

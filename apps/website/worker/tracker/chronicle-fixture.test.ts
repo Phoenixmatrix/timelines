@@ -3,7 +3,7 @@
 // exactly as planned for the showcase issue.
 
 import { afterEach, describe, expect, test } from "vite-plus/test";
-import { durableStorage } from "../testing/durable.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { runChronicleFixture } from "./chronicle-fixture.ts";
 import { TrackerStore, type Access } from "./store.ts";
 
@@ -15,9 +15,9 @@ afterEach(() => {
 
 const END = Date.parse("2026-10-04T12:00:00.000Z");
 
-function make(seed: number, issues = 120) {
-  const { db, sql, transactionSync } = durableStorage();
-  databases.push(db);
+async function make(seed: number, issues = 120) {
+  const { db, sql, transactionSync, close, scope, space } = await freshTrackerStorage();
+  databases.push({ close });
   let clock = END;
   const store = new TrackerStore(sql, transactionSync, () => clock);
   const person = (id: string, admin: boolean): Access => ({
@@ -33,7 +33,10 @@ function make(seed: number, issues = 120) {
         revokedAt: null,
       },
     ],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: admin,
     members: [
       { id: "ann", slug: "ann", displayName: "Ann" },
@@ -48,7 +51,7 @@ function make(seed: number, issues = 120) {
       return store.mutate(access, request);
     },
     [ann, person("bo", false)],
-    [{ ...ann, actorId: "agt-builder" }],
+    [{ ...ann, actorId: "agt-builder", agentId: "agt-builder" }],
     { issues, days: 30, end: END, seed, team: "CHR" },
   );
   clock = END + 60_000;
@@ -61,8 +64,8 @@ describe("the Chronicle's development history", () => {
   test(
     "makes thousands of real events over the window, and is reproducible",
     { timeout: 30_000 },
-    () => {
-      const a = make(7);
+    async () => {
+      const a = await make(7);
       const events = (a.db.prepare("SELECT count(*) AS n FROM events").get() as { n: number }).n;
       expect(events).toBeGreaterThan(1500);
       expect(a.result.applied).toBeGreaterThan(1500);
@@ -75,13 +78,13 @@ describe("the Chronicle's development history", () => {
         .get() as { first: string; last: string };
       expect(Date.parse(times.first)).toBeGreaterThanOrEqual(END - 30 * 86_400_000);
       expect(Date.parse(times.last)).toBeLessThan(END);
-      const b = make(7);
+      const b = await make(7);
       expect(b.result).toEqual(a.result);
     },
   );
 
-  test("the showcase issue reads back as its planned span", () => {
-    const { store, ann, result } = make(3, 40);
+  test("the showcase issue reads back as its planned span", async () => {
+    const { store, ann, result } = await make(3, 40);
     const page = store.chronicle(ann, {
       from: new Date(END - 30 * 86_400_000).toISOString(),
       to: new Date(END).toISOString(),

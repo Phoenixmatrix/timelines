@@ -2,6 +2,70 @@
 
 ## Unreleased
 
+### CORE-341: Organizations, Spaces and Tracker Projects
+
+- Separate personal Accounts, Organization directories and Space-owned content.
+  Organization ownership does not imply private Space access; explicit grants,
+  resource collaborators and existing Instance powers retain distinct boundaries.
+- Add Organization/Space navigation and canonical Space-qualified creation and
+  settings. Tracker Workspaces become Projects, including multi-Project issues,
+  filters, history, CLI commands and versioned synchronization.
+- Send human request answers and cancellations with the same versioned Space,
+  migration-epoch and timeline envelope as other Tracker mutations.
+- Bind content reads, queued work, AI provenance and retained assistant content
+  to current Space/source authorization. Revoked or unverifiable conversations
+  cannot be reopened, exported or reused; their stored data remains intact.
+  Mixed repository/tracker release notes revalidate both authorized projections,
+  including when only public or collaborator access survives; later reads cannot
+  overwrite the source obligations of older retained content.
+  Issue-linked work also revalidates its filtered repository content when Space
+  membership survives, and receipts bind the actual returned body rather than a
+  later, differently filtered response.
+  Retention also supports never-opened native Spaces without relaxing scope checks.
+- Preserve the assistant composer's identity and initial-history mode when delayed
+  history arrives, so opening a fresh conversation does not reset slash-skill
+  completion or discard its first sent message while loading conversation access.
+- Keep Chronicle playhead gestures ahead of older navigation acknowledgements,
+  without losing keyboard steps or overriding Back and Forward.
+- Keep fast typing in the Atlas lookup: a late address update from the field's
+  own earlier text no longer resets newer input as if it were Back/Forward.
+- Preserve Tracker sort, filters and URL fragments through keyboard navigation,
+  grouping and browser history. Stale URL updates no longer cancel release-note
+  navigation or restore an inspector closed by Forward.
+- Release a Sandbox purge's cutover admission before resetting its Durable Object,
+  so the reset cannot abort the purge response or interrupt ticket cleanup.
+- Cancel revoked CI without accepting logs or success, and settle the run only
+  after launched work acknowledges shutdown. Recheck live authority when Workflow
+  step errors cross serialization, and report late cancellation truthfully in gm.
+- Require an explicitly approved ownership manifest and source checkpoint for
+  legacy conversion. Independent fences, resumable journals and atomic cyclic
+  schema reconstruction preserve coordinated recovery before new writes reopen.
+  Incompatible clients and unresolved offline writes remain fenced with lossless
+  export rather than silent replay or discarded operations.
+  Unopened legacy Trackers ignore runtime naming metadata during approved
+  initialization, while existing business tables still prevent reinitialization.
+- Replace the Space cutover's unprovable provider drain with an Artifacts ref
+  barrier: under the fence, before write admission and once after, every
+  repository's Artifacts refs must match the push log. Divergences are
+  journaled, logged with no known pusher, and their push effects replay only
+  after admission under a current human session's credential.
+- Acknowledge cutover consumers from evidence instead of never: the drain
+  accepts a consumer once fences are closed, the preparation release serves, no
+  tickets remain and Cloudflare's documented 15-minute execution bound (plus
+  margin) has passed; Workflows instead require the provider's own instance
+  census, whose remaining legacy instances the drain terminates.
+- Make real-AI verification work from hosted source snapshots without Git metadata:
+  verify the committed manifest, select full coverage and bind resumable evidence
+  to the entire source revision without weakening the failure cooldown.
+- Extend real-provider checks to private content in four Spaces across two
+  Organizations and retained assistant/Atlas reads before and after an actual
+  native app restart. Native fixtures preserve the original source-reservation
+  credential and current Tracker epoch; they do not bypass live authorization.
+- Preserve the structured `TimelineEnded` reason across paid Knowledge workflow
+  steps, so ended-source cancellation cannot be mistaken for successful publication.
+  Inspect Atlas fixture spend through the running app instead of opening a
+  competing local SQLite runtime while builds are active.
+
 ### CORE-277: readable History checkpoints
 
 - History collects issue and timeline checkpoints into one count per issue,

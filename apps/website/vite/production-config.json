@@ -55,6 +55,15 @@
         "worker": "gitmatrix",
         "exportName": "Tracker"
       },
+      "SPACE_CUTOVER": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "SpaceCutover"
+      },
+      "CUTOVER_DEPLOYMENT_CHECKPOINT": {
+        "type": "text",
+        "value": "unversioned"
+      },
       "ASSISTANT": {
         "type": "durable-object",
         "worker": "gitmatrix",
@@ -237,6 +246,10 @@
     ],
     "exports": {
       "Tracker": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "SpaceCutover": {
         "type": "durable-object",
         "storage": "sqlite"
       },

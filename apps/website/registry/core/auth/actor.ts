@@ -23,9 +23,9 @@ export interface JobIdentity {
   jobName: string;
   runId: string;
   runNumber: number;
-  /** gitmatrix repos.id, its owner's account id, and `owner/name`. */
+  /** Immutable repository and Space IDs, and canonical `space/name`. */
   repoId: string;
-  ownerId: string;
+  spaceId: string;
   repo: string;
   commit: string;
   /**
@@ -38,11 +38,17 @@ export interface JobIdentity {
   /** Branch the run built. */
   ref: string;
   /**
-   * The repository's default branch when the job started. Only its publishes
-   * move `latest`; absent on registry tokens minted before it was recorded.
+   * The repository's current default branch. Only its publishes move `latest`;
+   * reconstructed from the live repository even for exchanged registry tokens.
    */
   defaultBranch?: string;
 }
+
+/** Non-secret binding to the live credential; JWT claims are never authority. */
+export type CredentialReference =
+  | { kind: "token"; id: string }
+  | { kind: "session"; id: string }
+  | { kind: "job"; hash: string };
 
 /** Who is calling, after authentication and before authorization. */
 export interface Actor {
@@ -50,18 +56,22 @@ export interface Actor {
   kind: "anonymous" | "user" | "job";
   /** gitmatrix account id for people; the CI job id for jobs. */
   subject: string | null;
-  /** Account slug, or `owner/repo` for jobs. */
+  /** Account slug, or `space/repo` for jobs. */
   name: string | null;
   email: string | null;
   scopes: ReadonlySet<Scope>;
   /** gitmatrix access token id, when the call used one. */
   tokenId: string | null;
+  /** Accountable person, also retained for CI jobs. */
+  personId?: string;
+  agentId?: string | null;
+  credential?: CredentialReference;
   via: "none" | "token" | "job" | "registry" | "session";
-  /** Only for `via: "registry"`: exactly what the token grants. */
+  /** Registry-issued permission cap, intersected with current resource rights. */
   access?: AccessGrant[];
   /** Only for jobs (and registry tokens issued to them). */
   job?: JobIdentity;
-  /** Site admins see and manage every owner's packages. */
+  /** Current Instance operator power, never an Organization role. */
   isSiteAdmin?: boolean;
 }
 

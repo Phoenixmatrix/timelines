@@ -5,7 +5,7 @@
 // leaves retention. Every model, index and build binding fails if touched.
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type {
   AtlasChange,
   AtlasComparison,
@@ -14,14 +14,22 @@ import type {
 } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlasApi, atlasErrorOf } from "../../src/lib/atlas.ts";
 import { caveatText, describeChange, unavailableText } from "../../src/routes/repo/atlasCompare.ts";
 import { atlas } from "./api.ts";
 import { expireAtlasPriors, publishAtlasFixture, writeAtlasFixtureGraph } from "./fixture.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -48,16 +56,31 @@ function forbidden(name: string, touched: string[]) {
   );
 }
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'private', 'art-r1', '');
   `);
   const touched: string[] = [];
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
     AI: forbidden("AI", touched),
@@ -73,7 +96,7 @@ function setup() {
     c.set("actor", actor);
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
   vi.stubGlobal("fetch", (input: string, init?: RequestInit) =>
     app.request(String(input), init ?? {}, env),
   );
@@ -89,10 +112,10 @@ function setup() {
   };
 }
 
-const repo = { owner: "ann", name: "shop" };
+const repo = { space: "ann", name: "shop" };
 
 /** Three builds: the base, the same code with prose that ran out of budget, then operations merged into search. */
-async function threeBuilds(s: ReturnType<typeof setup>) {
+async function threeBuilds(s: { env: Env }) {
   await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
   const base = await publishAtlasFixture(s.env, "r1", C1);
   const reworded = await publishAtlasFixture(s.env, "r1", C1, { unavailable: "budget_exhausted" });
@@ -121,7 +144,7 @@ const byId = (items: AtlasChange[]) => new Map(items.map((c) => [c.id, c]));
 
 describe("Atlas snapshot comparisons", () => {
   test("the same code reworded is summary-only: no source changes, no regrouping", async () => {
-    const s = setup();
+    const s = await setup();
     const { base, reworded } = await threeBuilds(s);
     const { first, items } = await all(base.snapshotId, reworded.snapshotId);
 
@@ -157,7 +180,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("a merge separates source changes from regrouping, with lineage and names", async () => {
-    const s = setup();
+    const s = await setup();
     const { reworded, merged } = await threeBuilds(s);
     const { first, items } = await all(reworded.snapshotId, merged.snapshotId);
     const changes = byId(items);
@@ -234,7 +257,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("pages traverse every record once, in a stable order, with the summary on the first", async () => {
-    const s = setup();
+    const s = await setup();
     const { base, merged } = await threeBuilds(s);
     const whole = await all(base.snapshotId, merged.snapshotId, { limit: 100 });
     const paged = await all(base.snapshotId, merged.snapshotId, { limit: 3 });
@@ -257,7 +280,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("a source edit with nothing regrouped is a source change only", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     const before = await publishAtlasFixture(s.env, "r1", C1);
     s.sqlite
@@ -283,7 +306,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("recalculated grouping evidence is counted apart, never listed as other", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     const before = await publishAtlasFixture(s.env, "r1", C1);
     // Concept extraction now also sees the ledger in a deploy script: the
@@ -358,7 +381,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("other lists what differs, even a part no field names", async () => {
-    const s = setup();
+    const s = await setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     const before = await publishAtlasFixture(s.env, "r1", C1);
     // The analysis recorded a detail with the same blob: explained by its field.
@@ -379,7 +402,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("outside retention a comparison is unavailable, never empty", async () => {
-    const s = setup();
+    const s = await setup();
     const { base, reworded, merged } = await threeBuilds(s);
     const listed = (await atlasApi.snapshots(repo)) satisfies AtlasSnapshotList;
     expect(listed.current).toBe(merged.snapshotId);
@@ -421,7 +444,7 @@ describe("Atlas snapshot comparisons", () => {
   });
 
   test("requests are checked: order, names, classes, cursors and who is asking", async () => {
-    const s = setup();
+    const s = await setup();
     const { base, reworded, merged } = await threeBuilds(s);
     const status = async (path: string) => {
       const response = await s.call(path);
@@ -479,7 +502,7 @@ describe("Atlas snapshot comparisons", () => {
       expect(response.status, path).toBe(404);
       expect(await response.text(), path).toBe(missingBody);
     }
-    // Nor can another person replay the owner's cursor.
+    // Nor can another person replay the space's cursor.
     s.as(null);
     expect((await s.call(`snapshots`)).status).toBe(404);
   });

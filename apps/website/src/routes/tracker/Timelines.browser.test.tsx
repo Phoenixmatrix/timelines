@@ -85,7 +85,7 @@ test("landed rows keep main, commit and lane controls separate from selection", 
   const world = await timelineWorld(server);
   // Landing is recorded by external git machinery; reuse the real timeline
   // and supply its completed event to exercise the graph's interaction boundary.
-  server.on("GET", "/api/tracker/:owner/timeline-graph", async () => {
+  server.on("GET", "/api/tracker/:space/timeline-graph", async () => {
     const data = await server.call<TimelineGraphData>("GET", "/api/tracker/orbit/timeline-graph");
     const timeline = data.timelines.find((t) => t.slug === world.slug)!;
     timeline.status = "landed";

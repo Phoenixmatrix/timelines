@@ -1,7 +1,7 @@
 // CORE-22's one-way links in a real browser: the CI run header links its
 // branch, timeline and the person who pushed it (an agent stays text); a
 // repository's empty Issues tab links to tracker management; package sources
-// link to their repositories; the workspace Atlas has an owner breadcrumb; a
+// link to their repositories; the Space Atlas has a Space breadcrumb; a
 // story's Timeline link uses the tracker in its address; release-note commits
 // link under the entry's own repository; wiki Markdown keeps app-absolute
 // links; tracker people link to their profiles while agents stay text.
@@ -14,9 +14,10 @@ import { expect, onTestFinished, test } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 import type { CiRunDetail, HistoryPage } from "../../../shared/api.ts";
 import type { TimelineDetail } from "../../../shared/timelines.ts";
-import type { OwnerPackages } from "../../../shared/packages.ts";
+import type { SpacePackages } from "../../../shared/packages.ts";
 import type { ReleaseFeed } from "../../../shared/release-notes.ts";
 import type { Attribution } from "../../../shared/tracker.ts";
+import type { SpacePage } from "../../../shared/spaces.ts";
 import { Markdown } from "../../components/Markdown.tsx";
 import { commitId } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
@@ -87,14 +88,14 @@ test("a CI run links its branch, its timeline and the person who pushed it", asy
       actor: null,
     }),
   };
-  server.on("GET", "/api/repos/:owner/:name/ci/runs/:number", ({ params }) => runs[params.number!]);
+  server.on("GET", "/api/repos/:space/:name/ci/runs/:number", ({ params }) => runs[params.number!]);
 
   const app = renderApp("/orbit/engine/ci/1");
   const branch = page.getByRole("link", { name: "main", exact: true });
   await expect.element(branch).toHaveAttribute("href", "/orbit/engine/commits/main");
   await expect
     .element(page.getByRole("link", { name: "marco", exact: true }))
-    .toHaveAttribute("href", "/marco");
+    .toHaveAttribute("href", "/accounts/marco");
   await expect.element(page.getByText(/Pushed by/)).toBeVisible();
 
   await app.navigate("/orbit/engine/ci/2");
@@ -103,7 +104,7 @@ test("a CI run links its branch, its timeline and the person who pushed it", asy
     .toHaveAttribute("href", "/tracker/orbit/timelines?tl=search");
   await expect
     .element(page.getByRole("link", { name: "marco", exact: true }))
-    .toHaveAttribute("href", "/marco");
+    .toHaveAttribute("href", "/accounts/marco");
   // The agent is named, never linked.
   await expect.element(page.getByText(/builder for/)).toBeVisible();
   expect(page.getByRole("link", { name: "builder" }).elements()).toHaveLength(0);
@@ -117,26 +118,20 @@ test("a CI run links its branch, its timeline and the person who pushed it", asy
     .toHaveAttribute("href", "/tracker/orbit/timelines?tl=search");
 });
 
-test("an empty Issues tab links to tracker management", async () => {
+test("an empty Issues tab links to Project administration", async () => {
   const server = await TestServer.start({ world: true });
   await server.repo("orbit", "engine");
   await server.push("orbit/engine", "main", commitId());
   renderApp("/orbit/engine/tracker");
   await expect
-    .element(page.getByRole("link", { name: "tracker management" }))
-    .toHaveAttribute("href", "/tracker/orbit?manage=true");
+    .element(page.getByRole("link", { name: "Project administration" }))
+    .toHaveAttribute("href", "/tracker/orbit/projects");
 });
 
 test("package sources link to their repositories; the name opens the package", async () => {
   const server = await TestServer.start({ world: true });
-  const data: OwnerPackages = {
-    owner: {
-      id: "acc_orbit",
-      slug: "orbit",
-      displayName: "Orbit Labs",
-      kind: "org",
-      avatarUrl: null,
-    },
+  const data: SpacePackages = {
+    space: (await server.call<SpacePage>("GET", "/api/spaces/orbit")).space,
     access: "read",
     registryUrl: location.origin,
     feeds: [],
@@ -154,8 +149,8 @@ test("package sources link to their repositories; the name opens the package", a
         sources: ["orbit/engine", "orbit/web"],
       },
     ],
-  } as OwnerPackages;
-  server.on("GET", "/api/packages/:owner", data);
+  } as SpacePackages;
+  server.on("GET", "/api/packages/:space", data);
   await page.viewport(1280, 900);
   try {
     renderApp("/orbit/-/packages");
@@ -173,7 +168,7 @@ test("package sources link to their repositories; the name opens the package", a
   }
 });
 
-test("the workspace Atlas names its owner in a breadcrumb", async () => {
+test("the workspace Atlas names its space in a breadcrumb", async () => {
   await TestServer.start({ world: true });
   renderApp("/orbit/-/atlas");
   const crumbs = page.getByRole("navigation", { name: "Breadcrumb" });
@@ -183,7 +178,7 @@ test("the workspace Atlas names its owner in a breadcrumb", async () => {
   await expect.element(crumbs).toMatchTextContent(/orbit\s*\/\s*Atlas/);
 });
 
-test("a story's Overview link opens the tracker in its address, not its repositories' owner", async () => {
+test("a story's Overview link opens the tracker in its address, not its repositories' space", async () => {
   const server = await TestServer.start({ world: true });
   await server.repo("orbit", "engine");
   const main = commitId();
@@ -199,7 +194,7 @@ test("a story's Overview link opens the tracker in its address, not its reposito
     "/api/tracker/orbit/timelines/search?limit=200",
   );
   server.on("GET", "/api/tracker/marco/timelines/search", detail);
-  server.on("GET", "/api/repos/:owner/:name/history", ({ url }): HistoryPage => ({
+  server.on("GET", "/api/repos/:space/:name/history", ({ url }): HistoryPage => ({
     ref: url.searchParams.get("at") ?? "",
     head: main,
     path: "",
@@ -221,12 +216,13 @@ test("a story's Overview link opens the tracker in its address, not its reposito
 
 test("release-note commits link under the entry's own repository", async () => {
   const server = await TestServer.start({ world: true });
+  const { space } = await server.call<SpacePage>("GET", "/api/spaces/orbit");
   const oid = "b".repeat(40);
   const feed: ReleaseFeed = {
-    owner: { slug: "orbit", displayName: "Orbit Labs" },
+    space,
     query: { filters: [], words: [], unknown: [] },
     truncated: false,
-    facets: { teams: [], repos: [], workspaces: [], categories: [], labels: [], releases: [] },
+    facets: { teams: [], repos: [], projects: [], categories: [], labels: [], releases: [] },
     entries: [
       {
         id: "entry",
@@ -238,23 +234,23 @@ test("release-note commits link under the entry's own repository", async () => {
         summary: "",
         issue: null,
         labels: [],
-        workspaceIds: [],
+        projectIds: [],
         commits: [oid],
         timeline: null,
         changes: [],
         lastCommitAt: new Date().toISOString(),
         model: null,
         updatedAt: new Date().toISOString(),
-        repo: { owner: "orbit", name: "web" },
+        repo: { space: "orbit", name: "web" },
         // Listed in another repository's groups first: not where its commits are.
         repos: [
-          { owner: "orbit", name: "engine", releases: ["@day:2026-10-01"] },
-          { owner: "orbit", name: "web", releases: ["@day:2026-10-01"] },
+          { space: "orbit", name: "engine", releases: ["@day:2026-10-01"] },
+          { space: "orbit", name: "web", releases: ["@day:2026-10-01"] },
         ],
       },
     ],
-  } as ReleaseFeed;
-  server.on("GET", "/api/tracker/:owner/release-notes", feed);
+  };
+  server.on("GET", "/api/tracker/:space/release-notes", feed);
   renderApp("/tracker/orbit/releases");
   await page.getByRole("button", { name: /Show release note details for Faster search/ }).click();
   await expect
@@ -265,7 +261,7 @@ test("release-note commits link under the entry's own repository", async () => {
 test("wiki Markdown keeps app-absolute links; repository paths still open the code", async () => {
   renderAlone(
     <Markdown
-      owner="orbit"
+      space="orbit"
       name="engine"
       refName="main"
       text={
@@ -295,7 +291,9 @@ test("tracker people link to their profile; agents stay text", async () => {
       <Actor who={person} />
     </>,
   );
-  await expect.element(page.getByRole("link", { name: /Ann Lee/ })).toHaveAttribute("href", "/ann");
+  await expect
+    .element(page.getByRole("link", { name: /Ann Lee/ }))
+    .toHaveAttribute("href", "/accounts/ann");
   expect(container.querySelectorAll("a")).toHaveLength(1);
   await expect.element(page.getByTitle(/builder · Agent/)).toBeVisible();
 });
@@ -303,6 +301,7 @@ test("tracker people link to their profile; agents stay text", async () => {
 test("an issue's assignee links to their profile", async () => {
   const server = await TestServer.start({ world: true });
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       {
@@ -321,5 +320,5 @@ test("an issue's assignee links to their profile", async () => {
   const assignee = () =>
     [...document.querySelectorAll("dt")].find((dt) => dt.textContent === "Assignee")
       ?.nextElementSibling;
-  await expect.poll(() => assignee()?.innerHTML ?? "").toContain('href="/marco"');
+  await expect.poll(() => assignee()?.innerHTML ?? "").toContain('href="/accounts/marco"');
 });

@@ -1,7 +1,7 @@
-// The Semantic Code Atlas across an account's repositories (CORE-172), at
-// /:owner/-/atlas?repos=a,b, linked as Knowledge from the account page.
+// The Semantic Code Atlas across a Space's repositories (CORE-172), at
+// /:space/-/atlas?repos=a,b, linked as Knowledge from the scope page.
 //
-// You pick the account, then the repositories, explicitly; the URL holds the
+// You pick the scope, then the repositories, explicitly; the URL holds the
 // selection, so a copied link reproduces it. Every selected repository is
 // listed with its own indexed commit and build and its state (ready,
 // building, unavailable, not enabled, partial, lagging): there is no common
@@ -19,7 +19,7 @@
 // repositories (CORE-167) are drawn as lines joining their members' regions,
 // listed first in the outline, and inspected with their cross-repository
 // evidence at immutable commits. Every read is a bounded page under
-// /api/accounts/:owner/atlas, re-authorized by the server each time.
+// /api/spaces/:space/atlas, re-authorized by the server each time.
 
 import { ArrowClockwiseIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -33,7 +33,8 @@ import {
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
 import { useLiveSearchParams } from "../../lib/searchParams.ts";
-import type { AccountPage, RepoSummary } from "../../../shared/api.ts";
+import type { RepoSummary } from "../../../shared/api.ts";
+import type { SpacePage, SpaceSummary } from "../../../shared/spaces.ts";
 import {
   ATLAS_WORKSPACE_MAX_REPOS,
   type AtlasCompositeCapability,
@@ -88,29 +89,36 @@ import {
 import { CompositeInspector, CrossLinks } from "./WorkspaceInspector.tsx";
 import { CHANGES_KEY, useRemembered } from "../repo/atlasPrefs.ts";
 
+type AtlasScopePage = SpaceSummary & { repos: RepoSummary[] };
+
 export async function workspaceAtlasLoader({ request, params }: LoaderFunctionArgs) {
-  return load<AccountPage>(`/accounts/${encodeURIComponent(params.owner ?? "")}`, request);
+  const space = encodeURIComponent(params.space ?? "");
+  const { repos } = await load<{ repos: RepoSummary[] }>(`/repos?space=${space}`, request);
+  // Resource-only readers may browse their readable repositories, but receive no
+  // Space-directory rights. An empty scope needs the directory's own authorization.
+  const summary = repos[0]?.space ?? (await load<SpacePage>(`/spaces/${space}`, request)).space;
+  return { ...summary, repos } satisfies AtlasScopePage;
 }
 
-/** The account's repositories only change with the account: the selection and view state are the view's. */
+/** The scope's repositories only change with the scope: the selection and view state are the view's. */
 export function workspaceAtlasShouldRevalidate({
   currentParams,
   nextParams,
   formMethod,
   defaultShouldRevalidate,
 }: ShouldRevalidateFunctionArgs) {
-  return currentParams.owner !== nextParams.owner || formMethod ? defaultShouldRevalidate : false;
+  return currentParams.space !== nextParams.space || formMethod ? defaultShouldRevalidate : false;
 }
 
 const short = (sha: string) => sha.slice(0, 7);
 
 export function WorkspaceAtlas() {
-  const account = useLoaderData<typeof workspaceAtlasLoader>();
+  const scope = useLoaderData<typeof workspaceAtlasLoader>();
   const location = useLocation();
   const navigate = useNavigate();
   const selection = useMemo(
-    () => parseSelection(new URLSearchParams(location.search).get("repos"), account.slug),
-    [location.search, account.slug],
+    () => parseSelection(new URLSearchParams(location.search).get("repos"), scope.slug),
+    [location.search, scope.slug],
   );
   // A new selection is a new scope: what was selected, pinned or looked up stays behind.
   const select = (next: string[]) =>
@@ -121,31 +129,31 @@ export function WorkspaceAtlas() {
       <header className="flex flex-col gap-1">
         <nav aria-label="Breadcrumb" className="text-body-sm text-ink-muted">
           <Link
-            to={`/${encodeURIComponent(account.slug)}`}
+            to={`/${encodeURIComponent(scope.slug)}`}
             className="text-ink-muted no-underline hover:text-ink"
           >
-            <bdi>{account.slug}</bdi>
+            <bdi>{scope.slug}</bdi>
           </Link>
           <span className="px-1.5 text-ink-faint">/</span>
           <span aria-current="page">Atlas</span>
         </nav>
         <h1 className="m-0 text-headline">Atlas</h1>
         <p className="m-0 max-w-[70ch] text-ink-muted">
-          Capabilities across the repositories you pick from <bdi>{account.displayName}</bdi>. Each
+          Capabilities across the repositories you pick from <bdi>{scope.displayName}</bdi>. Each
           repository is read at its own indexed commit: there's no shared head.
         </p>
       </header>
-      <ScopePicker account={account} selection={selection} onSelect={select} />
+      <ScopePicker key={scope.id} scope={scope} selection={selection} onSelect={select} />
       {selection.length === 0 ? (
         <div className="mk-empty mt-4">
           Pick one or more repositories above to see their capabilities together.
         </div>
       ) : (
         <WorkspaceView
-          key={scopeKey(account.slug, selection)}
-          owner={account.slug}
+          key={scopeKey(scope.id, selection)}
+          space={scope.slug}
           selection={selection}
-          accountRepos={account.repos}
+          spaceRepos={scope.repos}
         />
       )}
     </Page>
@@ -155,47 +163,47 @@ export function WorkspaceAtlas() {
 // ---- choosing the scope --------------------------------------------------------------
 
 function ScopePicker({
-  account,
+  scope,
   selection,
   onSelect,
 }: {
-  account: AccountPage;
+  scope: AtlasScopePage;
   selection: string[];
   onSelect: (next: string[]) => void;
 }) {
   const viewer = useViewer();
   const navigate = useNavigate();
   const [filter, setFilter] = useState("");
-  const accounts = useMemo(() => {
-    const list = [...(viewer?.canCreateIn ?? [])];
-    if (!list.some((a) => a.slug === account.slug)) list.unshift(account);
+  const spaces = useMemo(() => {
+    const list = [...(viewer?.spaces ?? [])];
+    if (!list.some((a) => a.slug === scope.slug)) list.unshift(scope);
     return list.map((a) => ({ value: a.slug, label: `${a.displayName} (@${a.slug})` }));
-  }, [viewer, account]);
-  const shown = account.repos.filter((r) =>
+  }, [viewer, scope]);
+  const shown = scope.repos.filter((r) =>
     r.name.toLowerCase().includes(filter.trim().toLowerCase()),
   );
   const full = selection.length >= ATLAS_WORKSPACE_MAX_REPOS;
 
   return (
     <section
-      aria-label="Scope"
+      aria-label="Atlas scope"
       className="mt-5 flex flex-col gap-3 rounded-pane bg-pane p-3 sm:p-4"
     >
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex min-w-0 flex-col gap-1 text-body-sm text-ink-muted">
-          Account
+          Space
           <SelectField
-            value={account.slug}
-            options={accounts}
-            ariaLabel="Account"
+            value={scope.slug}
+            options={spaces}
+            ariaLabel="Space"
             className="min-w-56"
-            // Another account is another scope: start with nothing selected.
+            // Another Space is another scope: start with nothing selected.
             onChange={(slug) => {
-              if (slug !== account.slug) void navigate(`/${slug}/-/atlas`);
+              if (slug !== scope.slug) void navigate(`/${encodeURIComponent(slug)}/-/atlas`);
             }}
           />
         </label>
-        {account.repos.length > 8 && (
+        {scope.repos.length > 8 && (
           <label className="flex min-w-0 flex-1 flex-col gap-1 text-body-sm text-ink-muted">
             Find a repository
             <input
@@ -207,7 +215,7 @@ function ScopePicker({
             />
           </label>
         )}
-        <TrackerSeed owner={account.slug} repos={account.repos} onSeed={onSelect} />
+        <TrackerSeed key={scope.id} space={scope.slug} repos={scope.repos} onSeed={onSelect} />
       </div>
 
       <fieldset className="m-0 min-w-0 border-0 p-0">
@@ -217,9 +225,9 @@ function ScopePicker({
             {selection.length} of at most {ATLAS_WORKSPACE_MAX_REPOS} selected
           </span>
         </legend>
-        {account.repos.length === 0 ? (
+        {scope.repos.length === 0 ? (
           <p className="m-0 text-body-sm text-ink-faint">
-            This account has no repositories you can read.
+            This scope has no repositories you can read.
           </p>
         ) : (
           <ul className="m-0 grid max-h-56 list-none grid-cols-[repeat(auto-fill,minmax(14rem,1fr))] gap-x-3 overflow-y-auto p-0">
@@ -277,46 +285,49 @@ function ScopePicker({
 }
 
 /**
- * Start from a tracker workspace's subscribed repositories: read once, only
+ * Start from a tracker project's subscribed repositories: read once, only
  * when asked, and only to fill the selection. Nothing is subscribed or saved.
  */
 function TrackerSeed({
-  owner,
+  space,
   repos,
   onSeed,
 }: {
-  owner: string;
+  space: string;
   repos: RepoSummary[];
   onSeed: (names: string[]) => void;
 }) {
   const [state, setState] = useState<
     | { kind: "idle" }
     | { kind: "loading" }
-    | { kind: "ready"; workspaces: { id: string; name: string; repos: string[] }[] }
+    | { kind: "ready"; projects: { id: string; name: string; repos: string[] }[] }
     | { kind: "error"; message: string }
   >({ kind: "idle" });
   useEffect(() => {
     if (state.kind !== "loading") return;
     const controller = new AbortController();
-    api<TrackerSnapshot>(`/tracker/${encodeURIComponent(owner)}/snapshot`, {
+    api<TrackerSnapshot>(`/tracker/${encodeURIComponent(space)}/snapshot`, {
       signal: controller.signal,
     })
       .then((snapshot) => {
+        if (controller.signal.aborted) return;
         const readable = new Map(repos.map((repo) => [repo.id, repo.name]));
-        const workspaces = snapshot.workspaces
+        const projects = snapshot.projects
           .filter((w) => !w.archived)
           .map((w) => ({
             id: w.id,
             name: w.name,
             repos: snapshot.subscriptions
-              .filter((subscription) => subscription.workspaceId === w.id)
+              .filter(
+                (subscription) => subscription.projectId === w.id && subscription.space === space,
+              )
               .map((subscription) => readable.get(subscription.repoId))
               .filter((name): name is string => name !== undefined)
               .filter((name, i, all) => all.indexOf(name) === i)
               .slice(0, ATLAS_WORKSPACE_MAX_REPOS),
           }))
           .filter((w) => w.repos.length > 0);
-        setState({ kind: "ready", workspaces });
+        setState({ kind: "ready", projects });
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
@@ -324,12 +335,12 @@ function TrackerSeed({
           kind: "error",
           message:
             error instanceof ApiError && (error.status === 403 || error.status === 401)
-              ? "Tracker workspaces are visible to this account's members."
-              : "Couldn't read this account's tracker workspaces.",
+              ? "Tracker projects are visible to people with access to this Space."
+              : "Couldn't read this Space's tracker projects.",
         });
       });
     return () => controller.abort();
-  }, [state.kind, owner, repos]);
+  }, [state.kind, space, repos]);
 
   return (
     <details
@@ -339,18 +350,18 @@ function TrackerSeed({
       }}
     >
       <summary className="mk-btn mk-btn--sm cursor-pointer list-none">
-        From a tracker workspace…
+        From a tracker project…
       </summary>
       <div className="mt-2 flex max-w-80 flex-col gap-1 rounded-plate bg-raised p-2">
-        {state.kind === "loading" && <p className="m-0 p-1 text-ink-faint">Loading workspaces…</p>}
+        {state.kind === "loading" && <p className="m-0 p-1 text-ink-faint">Loading projects…</p>}
         {state.kind === "error" && <p className="m-0 p-1 text-ink-muted">{state.message}</p>}
-        {state.kind === "ready" && state.workspaces.length === 0 && (
+        {state.kind === "ready" && state.projects.length === 0 && (
           <p className="m-0 p-1 text-ink-muted">
-            No workspace here subscribes to repositories of this account you can read.
+            No project here subscribes to repositories of this Space you can read.
           </p>
         )}
         {state.kind === "ready" &&
-          state.workspaces.map((w) => (
+          state.projects.map((w) => (
             <button
               key={w.id}
               type="button"
@@ -384,15 +395,15 @@ type CompositeFocus =
   | { state: "error"; id: string; message: string };
 
 function WorkspaceView({
-  owner,
+  space,
   selection,
-  accountRepos,
+  spaceRepos,
 }: {
-  owner: string;
+  space: string;
   selection: string[];
-  accountRepos: RepoSummary[];
+  spaceRepos: RepoSummary[];
 }) {
-  const base = `/${encodeURIComponent(owner)}/-/atlas`;
+  const base = `/${encodeURIComponent(space)}/-/atlas`;
   const [params, setParams] = useLiveSearchParams();
   const url = readAtlasUrl(params);
   const links = parseLinkState(params.get("links"));
@@ -416,8 +427,8 @@ function WorkspaceView({
   // ---- the session: one per scope, opened at the address's composite ----------------
   const selectionKey = selection.join(",");
   const workspace = useMemo<AtlasWorkspace>(
-    () => ({ owner, repos: selectionKey.split(",") }),
-    [owner, selectionKey],
+    () => ({ space, repos: selectionKey.split(",") }),
+    [space, selectionKey],
   );
   const reader = useMemo(() => workspaceReader(workspace), [workspace]);
   const [state, setState] = useState<WorkspaceState>(initialWorkspaceState);
@@ -823,7 +834,7 @@ function WorkspaceView({
         <>
           <AtlasInspector
             key={selected.id}
-            repo={{ owner, name: selectedRepo }}
+            repo={{ space, name: selectedRepo }}
             reader={reader}
             snapshot={{ ...selectedSnapshot, id: snapshotId }}
             entity={selected}
@@ -918,8 +929,8 @@ function WorkspaceView({
       <CoverageList
         coverage={coverage}
         regions={regions}
-        accountRepos={accountRepos}
-        owner={owner}
+        spaceRepos={spaceRepos}
+        space={space}
         empty={state.status === "empty"}
         composition={state.composition}
       />
@@ -1107,15 +1118,15 @@ const STATE_LABEL: Record<Coverage["state"], string> = {
 function CoverageList({
   coverage,
   regions,
-  accountRepos,
-  owner,
+  spaceRepos,
+  space,
   empty,
   composition,
 }: {
   coverage: Coverage[];
   regions: readonly AtlasRegion[];
-  accountRepos: RepoSummary[];
-  owner: string;
+  spaceRepos: RepoSummary[];
+  space: string;
   empty: boolean;
   composition: CompositionView | null;
 }) {
@@ -1132,7 +1143,7 @@ function CoverageList({
       <ul className="m-0 flex list-none flex-col divide-y divide-line-soft rounded-pane bg-pane p-0">
         {coverage.map((entry) => {
           const repo = entry.repo;
-          const pushedAt = accountRepos.find((r) => r.name === entry.name)?.pushedAt ?? null;
+          const pushedAt = spaceRepos.find((r) => r.name === entry.name)?.pushedAt ?? null;
           const own = repo ? regions.filter((r) => r.repoId === repo.id) : [];
           return (
             <li
@@ -1142,7 +1153,7 @@ function CoverageList({
               <span className="flex min-w-0 items-center gap-2">
                 {repo ? (
                   <Link
-                    to={`/${encodeURIComponent(owner)}/${encodeURIComponent(entry.name)}`}
+                    to={`/${encodeURIComponent(space)}/${encodeURIComponent(entry.name)}`}
                     className={`${link} min-w-0 truncate font-semibold`}
                   >
                     <bdi>{entry.name}</bdi>

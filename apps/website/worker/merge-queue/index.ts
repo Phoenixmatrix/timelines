@@ -12,6 +12,11 @@ import { forgetUpstreamTokens } from "../artifacts.ts";
 import { loadRepo } from "../api/repos.ts";
 import { queueMergeJob } from "../ci/queue-auth.ts";
 import { db } from "../schema.ts";
+import {
+  captureWorkAuthority,
+  resolveWorkAuthority,
+  WorkAuthorizationError,
+} from "../ci/admission.ts";
 import { repoAiSnapshot } from "../settings/ai.ts";
 import { queueDeps } from "./deps.ts";
 import { validateQueueIssues } from "./remediation.ts";
@@ -27,6 +32,12 @@ import {
 import { progressQueue } from "./scheduler.ts";
 export { afterQueueRun, sweepQueue } from "./scheduler.ts";
 export const queueApi = new Hono<AppEnv>();
+queueApi.onError((error, c) => {
+  if (error instanceof WorkAuthorizationError) return fail(c, 403, error.message);
+  if (error.message === "migration_epoch_mismatch" || error.message === "space_cutover_fenced")
+    return fail(c, 409, error.message);
+  throw error;
+});
 const statuses: QueueStatus[] = [
   "queued",
   "merging",
@@ -111,10 +122,11 @@ queueApi.post("/", async (c) => {
   let issueIds: string[];
   try {
     issueIds = await validateQueueIssues(c.env, {
-      ownerId: repo.row.owner_id,
+      spaceId: repo.row.space_id,
       repoId: repo.row.id,
       actorId: actor.id,
       agentId: actor.agent?.id ?? null,
+      credential: actor.credential,
       issueIds: (body.issues ?? []) as string[],
     });
   } catch (error) {
@@ -161,7 +173,7 @@ queueApi.post("/", async (c) => {
   const now = new Date().toISOString();
   const entry: QueueEntry = {
     id: body.commit,
-    repo: { id: repo.row.id, owner: repo.row.owner_slug, name: repo.row.name },
+    repo: { id: repo.row.id, space: repo.row.space_slug, name: repo.row.name },
     commit: body.commit,
     branch: repo.row.default_branch,
     sourceBranch: queueSourceBranch(body.commit),
@@ -184,6 +196,7 @@ queueApi.post("/", async (c) => {
   };
   const state: QueueState = {
     entry,
+    authority: await captureWorkAuthority(c.env, repo.row.id, actor),
     actor: { id: actor.id, ...(actor.agent ? { agent: actor.agent } : {}) },
     snapshot: await repoAiSnapshot(c.env.DB, repo.row.id),
     mergeSource: body.commit,
@@ -263,6 +276,8 @@ for (const action of ["cancel", "retry"] as const)
           ? { ...s, entry: { ...s.entry, status: "cancelled" as const } }
           : {
               ...s,
+              authority: await captureWorkAuthority(c.env, repo.row.id, actor),
+              actor: { id: actor.id, ...(actor.agent ? { agent: actor.agent } : {}) },
               mergeSource: s.entry.commit,
               combinedIds: [],
               rebaseAttempts: 0,
@@ -314,9 +329,9 @@ queueApi.post("/:id/resolve", async (c) => {
   const token = /^Bearer (gmj_[^\s]+)$/i.exec(header)?.[1];
   if (!token) return fail(c, 401, "A running queue merge job credential is required.");
   const access = await queueMergeJob(
-    c.env.DB,
+    c.env,
     token,
-    c.req.param("owner") ?? "",
+    c.req.param("space") ?? "",
     c.req.param("name") ?? "",
     id,
   );
@@ -337,6 +352,7 @@ queueApi.post("/:id/resolve", async (c) => {
     s.mergeRunId !== access.runId
   )
     return fail(c, 409, "Queue attempt changed.");
+  await resolveWorkAuthority(c.env, s.authority, access.repo.id);
   if (s.resolutionInput && s.resolutionInput !== fingerprint)
     return fail(c, 409, "This attempt already supplied different conflict files.");
   if (s.resolution) return c.json({ resolution: s.resolution });
@@ -381,6 +397,7 @@ queueApi.post("/:id/resolve", async (c) => {
       current.resolutionInput !== fingerprint
     )
       return fail(c, 409, "Queue attempt changed during resolution.");
+    await resolveWorkAuthority(c.env, current.authority, access.repo.id);
     if (current.resolution) return c.json({ resolution: current.resolution });
     const saved = await saveQueue(c.env.DB, current, {
       ...current,

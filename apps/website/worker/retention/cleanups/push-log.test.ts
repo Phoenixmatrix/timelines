@@ -3,27 +3,32 @@
 // change ref (nor, through the cascade, its first entry); dry run = run;
 // idempotent; resumable.
 
-import { describe, expect, test } from "vite-plus/test";
-import { d1, migratedDatabase } from "../../testing/d1.ts";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
+import { createFreshSpaceTestEnvironment } from "../../testing/spaces.ts";
 import { advanceRun, createRun, getRun, SimulatedCrash } from "../runs.ts";
 
 const NOW = new Date("2026-10-01T12:00:00.000Z");
 const DAY = 86_400_000;
 const ago = (days: number) => new Date(NOW.getTime() - days * DAY).toISOString();
 const oid = (n: number) => n.toString(16).padStart(40, "0");
-const ORBIT = { scope: "account", accountId: "orbit" } as const;
+const ORBIT = { kind: "space", id: "orbit" } as const;
 
 /**
  * Orbit's repository `app` has branches main and live (existing) and a
  * deleted timeline bookmark; Sam's repository is another account's. Every
  * entry and change ref is named for what the policy (365 days) must do.
  */
-function seeded() {
-  const sqlite = migratedDatabase();
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('orbit', 'org', 'orbit', 'Orbit'), ('sam', 'user', 'sam', 'Sam');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+async function seeded() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
+  sqlite.exec(`BEGIN; 
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES
+      ('org_orbit','orbit-company','Orbit','company','orbit'),
+      ('org_sam','sam-company','Sam','company','sam');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES
+      ('orbit','org_orbit','orbit','Orbit'), ('sam','org_sam','sam','Sam');
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('app', 'orbit', 'app', 'private', 'a', 'https://a'),
       ('lib', 'orbit', 'lib', 'private', 'b', 'https://b'),
       ('mine', 'sam', 'mine', 'private', 'c', 'https://c');
@@ -31,7 +36,7 @@ function seeded() {
       ('app', 'refs/heads/main', '${oid(3)}'),
       ('app', 'refs/heads/live', '${oid(20)}'),
       ('mine', 'refs/heads/main', '${oid(31)}');
-  `);
+   COMMIT;`);
   const update = sqlite.prepare(
     "INSERT INTO ref_updates (id, repo_id, ref, old_oid, new_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)",
   );
@@ -94,7 +99,7 @@ function seeded() {
     oid(15),
     ago(400),
   );
-  const env = { DB: d1(sqlite), JOBS: { send: async () => undefined } } as unknown as Env;
+  const env = { ...fresh.env, JOBS: { send: async () => undefined } } as unknown as Env;
   const updates = () =>
     (sqlite.prepare("SELECT id FROM ref_updates ORDER BY id").all() as { id: number }[]).map(
       (r) => r.id,
@@ -123,7 +128,7 @@ async function run(
 ) {
   const id = await createRun(env.DB, {
     target: ORBIT,
-    trigger: "manual",
+    trigger: "schedule",
     actorId: null,
     dryRun,
     categories: [{ id: "push-log", thresholds: { days } }],
@@ -147,7 +152,7 @@ async function run(
 
 describe("push log retention", () => {
   test("selects exactly the old entries and stale change refs; the run removes what the dry run listed", async () => {
-    const t = seeded();
+    const t = await seeded();
     const updates = t.updates();
     const changeRefs = t.changeRefs();
     const dry = await run(t.env, true);
@@ -170,7 +175,7 @@ describe("push log retention", () => {
   });
 
   test("the threshold decides the cutoff", async () => {
-    const t = seeded();
+    const t = await seeded();
     expect((await run(t.env, true, {}, 850)).seen.filter((s) => s.startsWith("u"))).toEqual(["u1"]);
     const short = await run(t.env, true, {}, 1);
     // Every old entry but the live refs' latest and the kept change ref's first.
@@ -180,7 +185,7 @@ describe("push log retention", () => {
   });
 
   test("an entry whose change ref becomes current again is kept", async () => {
-    const t = seeded();
+    const t = await seeded();
     // The old bookmark comes back: its change refs are current again.
     t.sqlite.exec(
       `INSERT INTO repo_refs (repo_id, ref, oid) VALUES ('app', 'refs/heads/timeline/old', '${oid(10)}')`,
@@ -191,10 +196,10 @@ describe("push log retention", () => {
   });
 
   test("a run interrupted after a delete resumes to the same end", async () => {
-    const t = seeded();
+    const t = await seeded();
     const id = await createRun(t.env.DB, {
       target: ORBIT,
-      trigger: "manual",
+      trigger: "schedule",
       actorId: null,
       dryRun: false,
       categories: [{ id: "push-log", thresholds: { days: 365 } }],

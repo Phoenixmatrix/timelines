@@ -12,7 +12,7 @@
  * STORY        See what can move now (Ready), narrow by clicking counts,
  *              open an issue beside the log to read and hand off, switch to
  *              the graph to trace what blocks what.
- * FIRST VIEW   One header row (owner, capture, sync), the query bar with view
+ * FIRST VIEW   One header row (space, capture, sync), the query bar with view
  *              switch, saved views, the activity strip, then the log filling
  *              the height; facets in a 17rem column that becomes the
  *              inspector when an issue opens.
@@ -46,6 +46,7 @@ import {
   useNavigation,
   useParams,
   useSearchParams,
+  type NavigateOptions,
 } from "react-router";
 import {
   fallbackTeam,
@@ -63,7 +64,7 @@ import { FormError, popMotion, SelectField, Tip, useToast } from "../../componen
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
 import { useMediaQuery } from "../../lib/useMediaQuery.ts";
-import { timelineQuery, type trackerLoader } from "./loaders.ts";
+import { timelineQuery, type trackerLoader, type trackerIndexLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
 import { parseCaptureTitle } from "./capture.ts";
@@ -80,7 +81,7 @@ import {
   withTrackerDefaults,
   type View,
 } from "./preferences.ts";
-import { acknowledge } from "./snapshot.ts";
+import { acknowledge, assertTrackerSnapshot } from "./snapshot.ts";
 import { RelationLens } from "./Lens.tsx";
 import { Chronicle } from "./Chronicle.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
@@ -105,12 +106,34 @@ import {
 } from "./query.ts";
 
 export function TrackerIndex() {
+  const { trackers } = useLoaderData<typeof trackerIndexLoader>();
+  const location = useLocation();
+  const destination =
+    location.pathname === "/timelines"
+      ? "/timelines"
+      : location.pathname === "/release-notes"
+        ? "/releases"
+        : "";
   return (
     <div className="mx-auto max-w-4xl px-4 py-7 sm:px-8">
       <h1 className="m-0 text-headline">Issue tracker</h1>
       <p className="mk-empty mt-4">
-        No trackers are available to this account. Ask an organization administrator for membership.
+        {trackers.length
+          ? "Choose a Space. Your default tracker is not available; no other Space was selected."
+          : "No trackers are available to this account. Ask an organization administrator for an explicit Space grant."}
       </p>
+      <ul className="m-0 list-none space-y-2 p-0">
+        {trackers.map((tracker) => (
+          <li key={tracker.id}>
+            <Link
+              className="mk-btn no-underline"
+              to={`/tracker/${encodeURIComponent(tracker.slug)}${destination}${location.search}${location.hash}`}
+            >
+              {tracker.organization.displayName} / {tracker.displayName}
+            </Link>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -138,15 +161,15 @@ function Freshness({ receivedAt }: { receivedAt: number }) {
   );
 }
 
-/** Filters from older links (?team=…&workspace=…&status=…) become query tokens. */
+/** Filters from older links (?team=…&project=…&status=…) become query tokens. */
 function legacyQuery(params: URLSearchParams, snapshot: Snapshot): string | null {
-  const keys = ["team", "workspace", "status", "ready", "closed"];
+  const keys = ["team", "project", "status", "ready", "closed"];
   if (!keys.some((k) => params.has(k))) return null;
   const tokens: string[] = tokenize(params.get("q") ?? DEFAULT_QUERY);
   const team = snapshot.teams.find((t) => t.id === params.get("team"));
   if (team) tokens.push(filterToken("team", team.key.toLowerCase()));
-  const ws = snapshot.workspaces.find((w) => w.id === params.get("workspace"));
-  if (ws) tokens.push(filterToken("ws", ws.slug));
+  const project = snapshot.projects.find((entry) => entry.id === params.get("project"));
+  if (project) tokens.push(filterToken("project", project.slug));
   if (params.get("status")) tokens.push(filterToken("status", params.get("status")!));
   if (params.get("ready") === "true") tokens.push("is:ready");
   if (params.get("closed") === "true") return tokens.filter((t) => t !== "is:open").join(" ");
@@ -176,7 +199,7 @@ export function Tracker() {
   const viewer = useViewer();
   return (
     <Workbench
-      key={`${data.snapshot.owner.id}:${viewer?.id}:${data.snapshot.timeline?.id ?? "main"}`}
+      key={`${data.snapshot.space.id}:${viewer?.id}:${data.snapshot.timeline?.id ?? "main"}`}
       data={data}
     />
   );
@@ -196,7 +219,7 @@ function Workbench({ data }: { data: TrackerView }) {
   const pending = useRef<MutationRequest | null>(null);
   const pendingCompletions = useRef<((outcome: MutationOutcome) => void)[]>([]);
   const [shortcuts] = useState(readTrackerShortcuts);
-  const [urlParams, setParams] = useSearchParams();
+  const [urlParams] = useSearchParams();
   const route = useParams();
   const navigate = useNavigate();
   const navigation = useNavigation();
@@ -204,22 +227,22 @@ function Workbench({ data }: { data: TrackerView }) {
   // Defaults live on the server (CORE-119); a default this browser kept from
   // before applies until it has been carried over, once, below.
   const [defaults, setDefaults] = useState(() => {
-    const saved = defaultsFromServer(data.preferences, data.snapshot.owner.id);
+    const saved = defaultsFromServer(data.preferences, data.snapshot.space.id);
     if (saved) return saved;
     const legacy = viewer ? readLegacyDefaults(viewer.id) : null;
-    return legacy?.ownerId === data.snapshot.owner.id ? legacy : null;
+    return legacy?.spaceId === data.snapshot.space.id ? legacy : null;
   });
   const toast = useToast();
   useEffect(() => {
     if (!viewer || data.preferences) return;
     const legacy = readLegacyDefaults(viewer.id);
-    if (legacy?.ownerId !== data.snapshot.owner.id) return;
-    saveTrackerDefaults(data.snapshot.owner.slug, legacy)
+    if (legacy?.spaceId !== data.snapshot.space.id) return;
+    saveTrackerDefaults(data.snapshot.space.slug, legacy)
       .then(() => forgetLegacyDefaults(viewer.id))
       .catch(() => {
         // Still applied from this browser; the next visit tries again.
       });
-  }, [viewer, data.preferences, data.snapshot.owner]);
+  }, [viewer, data.preferences, data.snapshot.space]);
   const params = useMemo(
     () => withTrackerDefaults(urlParams, defaults, snapshot),
     [urlParams, defaults, snapshot],
@@ -253,6 +276,19 @@ function Workbench({ data }: { data: TrackerView }) {
   // The palette's Create issue hands off once, in router state (never the URL):
   // open the creator, then drop the intent so back or refresh can't replay it.
   const location = useLocation();
+  const setParams = useCallback(
+    (next: URLSearchParams, options?: NavigateOptions) => {
+      void navigate(
+        {
+          pathname: window.location.pathname,
+          search: next.size ? `?${next}` : "",
+          hash: window.location.hash,
+        },
+        options,
+      );
+    },
+    [navigate],
+  );
   const intent = createIntentOf(location.state);
   useEffect(() => {
     if (!intent) return;
@@ -273,14 +309,14 @@ function Workbench({ data }: { data: TrackerView }) {
   }, [location.key]);
   const titleRef = useRef<HTMLInputElement>(null);
   const queryRef = useRef<HTMLInputElement>(null);
-  const owner = data.snapshot.owner.slug;
-  const base = `/tracker/${encodeURIComponent(owner)}`;
+  const space = data.snapshot.space.slug;
+  const base = `/tracker/${encodeURIComponent(space)}`;
   // A timeline's view (?tl=): its issues and statuses, and changes made here are its own.
   const timeline = data.snapshot.timeline ?? null;
   const scopeQuery = timelineQuery(timeline ? { tl: timeline.slug } : {});
   const selected =
     snapshot.issues.find((issue) => issue.id === route.issue || issue.key === route.issue) ?? null;
-  usePageTitle(route.issue ? issuePageTitle(selected, owner, timeline?.name) : null);
+  usePageTitle(route.issue ? issuePageTitle(selected, space, timeline?.name) : null);
   useEffect(() => {
     if (selected?.id === editOnCreate) setEditOnCreate(null);
   }, [selected?.id, editOnCreate]);
@@ -289,7 +325,12 @@ function Workbench({ data }: { data: TrackerView }) {
       ? (params.get("view") ?? "list")
       : "list"
   ) as View;
-  const admin = params.get("manage") === "true";
+  const adminSection = location.pathname.endsWith("/projects")
+    ? "projects"
+    : location.pathname.endsWith("/teams")
+      ? "teams"
+      : undefined;
+  const admin = !!adminSection || params.get("manage") === "true";
   const sort = (params.get("sort") ?? "rank") as SortKey;
   const query = params.has("q") ? (params.get("q") ?? "") : DEFAULT_QUERY;
   const [draft, setDraft] = useState(query);
@@ -323,10 +364,14 @@ function Workbench({ data }: { data: TrackerView }) {
     window.addEventListener("pointercancel", settle, { signal: done.signal });
   };
   const effective = useMemo(() => ({ ...snapshot, serverTime: time }), [snapshot, time]);
-  const href = (id?: string) =>
-    `${base}${id ? `/issues/${encodeURIComponent(id)}` : ""}${params.size ? `?${params}` : ""}`;
+  const href = (id?: string, search = params, hash = location.hash) =>
+    `${base}${id ? `/issues/${encodeURIComponent(id)}` : ""}${search.size ? `?${search}` : ""}${hash}`;
+  // Event handlers can run after the address changes but before React commits
+  // that navigation. Carry the live query, not the previous render's sort/filter.
+  const liveParams = () =>
+    withTrackerDefaults(new URLSearchParams(window.location.search), defaults, snapshot);
   const setParam = (key: string, value: string | null) => {
-    const next = new URLSearchParams(params);
+    const next = liveParams();
     if (value === null) next.delete(key);
     else next.set(key, value);
     setParams(next, { replace: true, preventScrollReset: true });
@@ -341,17 +386,36 @@ function Workbench({ data }: { data: TrackerView }) {
 
   // Materialize defaults in links; explicit and legacy URL filters always win.
   useEffect(() => {
+    // Normalization belongs to this settled address, never an older render
+    // that could cancel a link click or restore a closed issue after Forward.
+    if (
+      navigation.state !== "idle" ||
+      window.location.pathname !== location.pathname ||
+      window.location.search !== location.search ||
+      window.location.hash !== location.hash
+    )
+      return;
     const next = new URLSearchParams(params);
     const migrated = legacyQuery(urlParams, data.snapshot);
     if (migrated !== null) {
-      for (const k of ["team", "workspace", "status", "ready", "closed", "filters"]) next.delete(k);
+      for (const k of ["team", "project", "status", "ready", "closed", "filters"]) next.delete(k);
       next.set("q", migrated);
     }
     if (next.toString() !== urlParams.toString()) setParams(next, { replace: true });
-  }, [urlParams, params, data.snapshot, setParams]);
+  }, [
+    urlParams,
+    params,
+    data.snapshot,
+    setParams,
+    navigation.state,
+    location.pathname,
+    location.search,
+    location.hash,
+  ]);
 
   const accept = useCallback((next: Snapshot) => {
     const previous = latestSnapshot.current;
+    assertTrackerSnapshot(next, previous);
     if (
       next.cursor < previous.cursor ||
       (next.cursor === previous.cursor &&
@@ -383,7 +447,7 @@ function Workbench({ data }: { data: TrackerView }) {
     setRefreshing(true);
     try {
       const next = await api<Snapshot>(
-        `/tracker/${encodeURIComponent(owner)}/snapshot${scopeQuery}`,
+        `/tracker/${encodeURIComponent(space)}/snapshot${scopeQuery}`,
       );
       if (sequence === refreshSequence.current) accept(next);
       return true;
@@ -396,7 +460,7 @@ function Workbench({ data }: { data: TrackerView }) {
     } finally {
       if (sequence === refreshSequence.current) setRefreshing(false);
     }
-  }, [owner, scopeQuery, accept]);
+  }, [space, scopeQuery, accept]);
   useEffect(() => {
     const onFocus = () => {
       if (!busyRef.current) void refresh();
@@ -427,18 +491,21 @@ function Workbench({ data }: { data: TrackerView }) {
     setBusy(true);
     setError("");
     pending.current ??= {
+      contractVersion: latestSnapshot.current.contractVersion,
+      spaceId: latestSnapshot.current.spaceId,
+      migrationEpoch: latestSnapshot.current.migrationEpoch,
       operationId: crypto.randomUUID(),
       mutations,
       ...(timeline ? { timeline: timeline.slug } : {}),
     };
     try {
-      const result = await api<MutationResult>(`/tracker/${encodeURIComponent(owner)}/mutate`, {
+      const result = await api<MutationResult>(`/tracker/${encodeURIComponent(space)}/mutate`, {
         method: "POST",
         json: pending.current,
       });
+      const acknowledged = acknowledge(latestSnapshot.current, result);
       pending.current = null;
       setUncertain(false);
-      const acknowledged = acknowledge(latestSnapshot.current, result);
       if (acknowledged !== latestSnapshot.current) accept(acknowledged);
       void refresh();
       const outcome: MutationOutcome = { ok: true, events: result.events };
@@ -459,6 +526,10 @@ function Workbench({ data }: { data: TrackerView }) {
       }
       const code = cause instanceof ApiError ? cause.code : undefined;
       const recovery: Record<string, string> = {
+        client_upgrade_required:
+          "Reload Gitmatrix to use the current content contract. Your draft is kept.",
+        migration_epoch_mismatch:
+          "The Space migration epoch changed. Reload before saving; your draft is kept.",
         version_conflict:
           "Someone else changed this item. Your draft is kept; review the newer version before saving.",
         graph_cycle: "That dependency would create a loop. Choose an issue outside this chain.",
@@ -468,7 +539,7 @@ function Workbench({ data }: { data: TrackerView }) {
           "An agent is working on this issue. Wait for its claim to end before changing its status.",
         lease_lost: "The agent claim changed or expired. Refresh this issue before trying again.",
         archived:
-          "This team or workspace is archived. Choose an active one or ask an administrator to restore it.",
+          "This team or project is archived. Choose an active one or ask an administrator to restore it.",
         forbidden:
           "You no longer have permission to make this change. Ask a tracker administrator for access.",
         timeline_ended:
@@ -551,13 +622,14 @@ function Workbench({ data }: { data: TrackerView }) {
     !!(selected || route.issue) &&
     view !== "chronicle" &&
     (view !== "graph" || (graphDetails === null ? wide : graphDetails !== "0"));
-  const closeHref = (() => {
-    if (view !== "graph" || !selected) return href();
-    const next = new URLSearchParams(params);
+  const inspectorCloseHref = (search = params, hash = location.hash) => {
+    if (view !== "graph" || !selected) return href(undefined, search, hash);
+    const next = new URLSearchParams(search);
     if (wide) next.set("details", "0");
     else next.delete("details");
-    return `${base}/issues/${encodeURIComponent(selected.id)}?${next}`;
-  })();
+    return `${base}/issues/${encodeURIComponent(selected.id)}?${next}${hash}`;
+  };
+  const closeHref = inspectorCloseHref();
   // A query that already names one state makes the state column repeat itself.
   const pinsState =
     compiled.parsed.filters.filter(
@@ -610,9 +682,17 @@ function Workbench({ data }: { data: TrackerView }) {
           current < 0
             ? 0
             : Math.max(0, Math.min(listed.length - 1, current + (event.key === "j" ? 1 : -1)));
-        void navigate(href(listed[at]!.id), { preventScrollReset: true });
+        void navigate(href(listed[at]!.id, liveParams(), window.location.hash), {
+          preventScrollReset: true,
+        });
       } else if (event.key === "Escape" && selected) {
-        void navigate(showInspector ? closeHref : href(), { preventScrollReset: true });
+        const search = liveParams();
+        void navigate(
+          showInspector
+            ? inspectorCloseHref(search, window.location.hash)
+            : href(undefined, search, window.location.hash),
+          { preventScrollReset: true },
+        );
       }
     };
     document.addEventListener("keydown", onKey);
@@ -620,18 +700,16 @@ function Workbench({ data }: { data: TrackerView }) {
   });
 
   const managementParams = new URLSearchParams(params);
-  if (admin) managementParams.delete("manage");
-  else managementParams.set("manage", "true");
-  const managementHref = `${base}?${managementParams}`;
+  managementParams.delete("manage");
+  const managementHref = `${base}${admin ? "" : "/teams"}${managementParams.size ? `?${managementParams}` : ""}${location.hash}`;
   const hasTeam = snapshot.teams.some((team) => !team.archived);
-  const otherTrackers = data.trackers.filter((tracker) => tracker.slug !== owner);
+  const otherTrackers = data.trackers.filter((tracker) => tracker.slug !== space);
   const parsedUnknown = compiled.parsed.unknown;
-  const workspaceToken = tokenize(query)
-    .find((token) => token.toLowerCase().startsWith("ws:"))
-    ?.slice(3);
-  const captureWorkspace = snapshot.workspaces.find(
-    (workspace) =>
-      !workspace.archived && workspace.slug.toLowerCase() === workspaceToken?.toLowerCase(),
+  const projectToken = tokenize(query)
+    .find((token) => token.toLowerCase().startsWith("project:"))
+    ?.slice("project:".length);
+  const captureProject = snapshot.projects.find(
+    (project) => !project.archived && project.slug.toLowerCase() === projectToken?.toLowerCase(),
   );
   const createIssue = async (
     fields: Extract<Mutation, { kind: "issue.create" }>["data"],
@@ -648,7 +726,7 @@ function Workbench({ data }: { data: TrackerView }) {
       }
       const next = new URLSearchParams(params);
       if (edit && view === "graph") next.set("details", "true");
-      await navigate(`${base}/issues/${id}${next.size ? `?${next}` : ""}`);
+      await navigate(`${base}/issues/${id}${next.size ? `?${next}` : ""}${location.hash}`);
     }
     return result;
   };
@@ -682,7 +760,7 @@ function Workbench({ data }: { data: TrackerView }) {
               title: captured.title,
               type: captureType,
               labels: captured.labels,
-              workspaceIds: captureWorkspace ? [captureWorkspace.id] : [],
+              projectIds: captureProject ? [captureProject.id] : [],
             },
             false,
           );
@@ -829,7 +907,7 @@ function Workbench({ data }: { data: TrackerView }) {
     const team = key ? snapshot.teams.find((t) => t.key.toLowerCase() === key.toLowerCase()) : null;
     const next = { ...initialTrackerDefaults(defaults, snapshot), teamId: team?.id ?? "" };
     try {
-      await saveTrackerDefaults(owner, next);
+      await saveTrackerDefaults(space, next);
       setDefaults(next);
       if (viewer) forgetLegacyDefaults(viewer.id);
       toast.add({
@@ -870,7 +948,7 @@ function Workbench({ data }: { data: TrackerView }) {
       />
     </fieldset>
   ) : route.issue ? (
-    <MissingIssue owner={owner} issue={route.issue} back={href()} />
+    <MissingIssue space={space} issue={route.issue} back={href()} />
   ) : null;
 
   const content = (
@@ -878,7 +956,7 @@ function Workbench({ data }: { data: TrackerView }) {
       className={
         admin
           ? "flex min-w-0 flex-col gap-6"
-          : "flex min-h-dvh flex-col gap-3 px-4 py-3 lg:h-[calc(100dvh-var(--scope-banner))] lg:min-h-0 lg:overflow-hidden"
+          : "flex min-h-dvh flex-col gap-3 px-4 py-3 lg:min-h-0 lg:flex-1 lg:overflow-hidden"
       }
       aria-busy={navigation.state !== "idle"}
       data-shortcuts={shortcuts}
@@ -888,18 +966,26 @@ function Workbench({ data }: { data: TrackerView }) {
         <h1
           className={`m-0 flex min-h-(--size-field) items-center ${admin ? "text-headline" : "text-title-lg"}`}
         >
-          {admin ? "Teams and workspaces" : "Issues"}
+          {adminSection === "projects"
+            ? "Projects"
+            : adminSection === "teams"
+              ? "Teams"
+              : admin
+                ? "Teams and projects"
+                : "Issues"}
         </h1>
         <SelectField
-          ariaLabel="Tracker owner"
-          value={owner}
+          ariaLabel="Tracker space"
+          value={space}
           className="w-44"
           options={data.trackers.map((tracker) => ({
             value: tracker.slug,
-            label: tracker.displayName,
+            label: `${tracker.organization.displayName} / ${tracker.displayName}`,
           }))}
           onChange={(value) =>
-            navigate(`/tracker/${encodeURIComponent(value)}${admin ? "?manage=true" : ""}`)
+            navigate(
+              `/tracker/${encodeURIComponent(value)}${adminSection ? `/${adminSection}` : ""}${location.search}${location.hash}`,
+            )
           }
         />
         {!admin && hasTeam && (
@@ -952,7 +1038,7 @@ function Workbench({ data }: { data: TrackerView }) {
           initialType={createType}
           initialLabels={createLabels}
           initialTeam={createTeam}
-          initialWorkspaces={captureWorkspace ? [captureWorkspace.id] : []}
+          initialProjects={captureProject ? [captureProject.id] : []}
           busy={busy}
           uncertain={uncertain}
           onCreate={(fields) => createIssue(fields, true)}
@@ -985,18 +1071,22 @@ function Workbench({ data }: { data: TrackerView }) {
 
       {admin ? (
         <fieldset className="m-0 border-0 p-0" disabled={busy || uncertain}>
-          <TrackerAdmin snapshot={effective} mutate={mutate} busy={busy || uncertain} />
+          <TrackerAdmin
+            snapshot={effective}
+            mutate={mutate}
+            busy={busy || uncertain}
+            section={adminSection}
+          />
         </fieldset>
       ) : !hasTeam && otherTrackers.length > 0 ? (
-        // Each account has its own tracker, and /tracker may open an empty one
-        // (yours) while your organizations' hold the work (CORE-118).
+        // A Space's tracker may be empty even when another accessible Space has work.
         <section className="mk-card max-w-xl" aria-labelledby="tracker-empty">
           <h2 id="tracker-empty" className="mk-card-title">
             No teams in this tracker yet
           </h2>
           <p className="mk-card-desc max-w-[52ch]">
-            You and each organization you belong to have separate trackers. This one has no teams,
-            so it has no issues. Your work may be in another:
+            Each Space has its own tracker. This one has no teams, so it has no issues. Your work
+            may be in another Space you can access:
           </p>
           <ul
             className="m-0 mt-4 flex list-none flex-wrap gap-2 p-0"
@@ -1015,7 +1105,7 @@ function Workbench({ data }: { data: TrackerView }) {
           </ul>
           {snapshot.canAdmin && (
             <p className="m-0 mt-4 text-body-sm text-ink-muted">
-              To track work here instead, a team gives each issue an owner and a readable key.{" "}
+              To track work here instead, a team gives each issue responsibility and a readable key.{" "}
               <Link to={managementHref}>Create a team in this tracker</Link>
             </p>
           )}
@@ -1024,7 +1114,7 @@ function Workbench({ data }: { data: TrackerView }) {
         <section className="mk-card max-w-xl">
           <h2 className="mk-card-title">Start with a team</h2>
           <p className="mk-card-desc max-w-[48ch]">
-            A team gives each issue an owner and a readable key. Workspaces bring several teams
+            A team gives each issue responsibility and a readable key. Projects bring several teams
             together later.
           </p>
           <div className="mt-4">
@@ -1130,8 +1220,8 @@ function Workbench({ data }: { data: TrackerView }) {
               className={`m-0 text-micro ${parsedUnknown.length ? "text-danger-text" : queryFocused ? "text-ink-faint" : "sr-only"}`}
             >
               {parsedUnknown.length
-                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, tag:, type:, p:, since:, until:, parent:, requires:, eligible:, done-by:, done:.`
-                : "is:ready is:blocked is:container · status: · team: · ws: · assignee:me · tag: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · done-by:mine done:14d · words match key, title and tags; - excludes"}
+                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, project:, assignee:, tag:, type:, p:, since:, until:, parent:, requires:, eligible:, done-by:, done:.`
+                : "is:ready is:blocked is:container · status: · team: · project: · assignee:me · tag: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · done-by:mine done:14d · words match key, title and tags; - excludes"}
             </p>
             {defaultTeamEntry && (
               <DefaultTeamNote
@@ -1144,7 +1234,7 @@ function Workbench({ data }: { data: TrackerView }) {
                 onShowAll={() => setQuery(withoutKeys(query, ["team"]))}
                 onChange={() =>
                   void navigate(
-                    `/settings/preferences?tracker=${encodeURIComponent(snapshot.owner.slug)}`,
+                    `/settings/preferences?tracker=${encodeURIComponent(snapshot.space.slug)}`,
                   )
                 }
               />
@@ -1203,7 +1293,7 @@ function Workbench({ data }: { data: TrackerView }) {
             )}
             {view === "chronicle" ? (
               <Chronicle
-                owner={owner}
+                space={space}
                 base={base}
                 query={query}
                 params={params}
@@ -1300,7 +1390,7 @@ function Workbench({ data }: { data: TrackerView }) {
     </div>
   );
   return admin ? (
-    <SettingsPage owner={owner} tracker>
+    <SettingsPage space={space} tracker>
       {content}
     </SettingsPage>
   ) : (
@@ -1347,13 +1437,13 @@ function DefaultTeamNote({
  * An issue the snapshot doesn't have: never there, or removed by retention
  * (CORE-203), which the tracker's history endpoint says, with when and why.
  */
-function MissingIssue({ owner, issue, back }: { owner: string; issue: string; back: string }) {
+function MissingIssue({ space, issue, back }: { space: string; issue: string; back: string }) {
   const [removed, setRemoved] = useState<string | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     setRemoved(null);
     api(
-      `/tracker/${encodeURIComponent(owner)}/issues/${encodeURIComponent(issue)}/history?limit=1`,
+      `/tracker/${encodeURIComponent(space)}/issues/${encodeURIComponent(issue)}/history?limit=1`,
       { signal: controller.signal },
     ).catch((cause: unknown) => {
       if (
@@ -1364,7 +1454,7 @@ function MissingIssue({ owner, issue, back }: { owner: string; issue: string; ba
         setRemoved(cause.message);
     });
     return () => controller.abort();
-  }, [owner, issue]);
+  }, [space, issue]);
   return (
     <div className="p-4">
       <h2 className="m-0 text-title">{removed ? "Removed by retention" : "Issue not found"}</h2>

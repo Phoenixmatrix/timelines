@@ -22,7 +22,7 @@ export function refCommit(repo: RepoDetail, refName: string): string | null {
 
 /** The latest run for one commit; checked again while it's still going. */
 export function useCommitRun(
-  owner: string,
+  space: string,
   name: string,
   oid: string | null,
   sourceId?: string,
@@ -34,7 +34,7 @@ export function useCommitRun(
     let current = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = () => {
-      api<CiCommitStatuses>(sourceUrl(`/repos/${owner}/${name}/ci/status?commits=${oid}`, sourceId))
+      api<CiCommitStatuses>(sourceUrl(`/repos/${space}/${name}/ci/status?commits=${oid}`, sourceId))
         .then((statuses) => current && setRun({ oid, sourceId, run: statuses[oid] ?? null }))
         .catch(() => {});
     };
@@ -49,7 +49,7 @@ export function useCommitRun(
       current = false;
       clearTimeout(timer);
     };
-  }, [owner, name, oid, sourceId, run, active]);
+  }, [space, name, oid, sourceId, run, active]);
   return run?.oid === oid && run.sourceId === sourceId ? run.run : null;
 }
 
@@ -71,14 +71,14 @@ export function CommitCi({
   refName: string;
   oid: string | null;
 }) {
-  const run = useCommitRun(repo.owner.slug, repo.name, oid, repo.source?.sourceId);
+  const run = useCommitRun(repo.space.slug, repo.name, oid, repo.source?.sourceId);
   if (!run) return null;
   const summary = run.coveredBy ? `Covered by #${run.coveredBy}` : SUMMARY[run.status];
   const target = run.coveredBy ?? run.number;
   const on = refName.length === 40 ? refName.slice(0, 7) : refName;
   return (
     <PrefetchLink
-      to={repoPath(repo.owner.slug, repo.name, "ci", String(target))}
+      to={repoPath(repo.space.slug, repo.name, "ci", String(target))}
       className="ml-auto flex h-8 items-center gap-2 rounded-plate px-2 text-body-sm text-ink-muted no-underline transition-colors hover:bg-raised hover:text-ink max-sm:h-11"
       title={`CI on ${on}: run #${run.number}, ${summary.toLowerCase()}`}
     >

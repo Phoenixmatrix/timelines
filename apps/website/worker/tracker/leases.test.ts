@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { Issue, Mutation } from "../../shared/tracker.ts";
 import { TrackerStore, type Access } from "./store.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { ownedCheckpointRepo, ownedTimeline } from "../testing/timeline-source.ts";
 
 const databases: { close(): void }[] = [];
@@ -16,16 +16,32 @@ afterEach(() => {
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-function fixture() {
-  const { db, sql, transactionSync } = durableStorage();
-  databases.push(db);
+async function fixture() {
+  const storage = await freshTrackerStorage("org", [
+    {
+      accountId: "ann",
+      role: "owner",
+      grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+    },
+    {
+      accountId: "bob",
+      role: "member",
+      grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+    },
+  ]);
+  databases.push(storage);
+  const { db, sql, transactionSync, scope, space } = storage;
   let now = Date.parse("2026-10-01T00:00:00Z");
   const store = new TrackerStore(sql, transactionSync, () => now);
   const member = (id: string): Access => ({
     actorId: id,
     principalId: id,
     agents: [],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    credential: { kind: "token", id: "fixture-token" },
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
     members: [
       { id: "ann", slug: "ann", displayName: "Ann" },
@@ -38,6 +54,7 @@ function fixture() {
   let operation = 0;
   const mutate = (who: Access, timeline: string | undefined, ...mutations: Mutation[]) =>
     store.mutate(who, {
+      ...scope,
       operationId: `op-${++operation}`,
       mutations,
       ...(timeline ? { timeline } : {}),
@@ -52,7 +69,7 @@ function fixture() {
     store.timelines.create(ann, {
       slug,
       parent: null,
-      repos: [{ id: "app", owner: "org", name: "app" }],
+      repos: [{ id: "app", space: "org", name: "app" }],
       commits: { app: oid(1) },
     });
   const issue = (id: string, timeline?: string) =>
@@ -92,8 +109,8 @@ function fixture() {
 }
 
 describe("leases across timelines", () => {
-  test("finishing inside a timeline retains the lease: nobody else can claim it, and it doesn't expire", () => {
-    const f = fixture();
+  test("finishing inside a timeline retains the lease: nobody else can claim it, and it doesn't expire", async () => {
+    const f = await fixture();
     const search = f.fork("search");
     f.fork("other");
     f.finishIn("search");
@@ -110,8 +127,8 @@ describe("leases across timelines", () => {
     expect(f.leases()).toHaveLength(1);
   });
 
-  test("renewing a retained lease keeps the issue's locked status", () => {
-    const f = fixture();
+  test("renewing a retained lease keeps the issue's locked status", async () => {
+    const f = await fixture();
     f.fork("search");
     const token = f.finishIn("search");
     for (const where of [undefined, "search"]) {
@@ -137,8 +154,8 @@ describe("leases across timelines", () => {
     ).toThrow(/Claim expired, was superseded, or belongs to another agent/);
   });
 
-  test("a retained lease isn't released or completed by hand, but can be handed off", () => {
-    const f = fixture();
+  test("a retained lease isn't released or completed by hand, but can be handed off", async () => {
+    const f = await fixture();
     f.fork("search");
     const token = f.finishIn("search");
     for (const kind of ["issue.release", "issue.complete"] as const)
@@ -165,8 +182,8 @@ describe("leases across timelines", () => {
     });
   });
 
-  test("landing releases the lease as done", () => {
-    const f = fixture();
+  test("landing releases the lease as done", async () => {
+    const f = await fixture();
     f.fork("search");
     const token = f.finishIn("search");
     f.store.landTimeline(f.ann, "search");
@@ -177,8 +194,8 @@ describe("leases across timelines", () => {
     ).toThrow(/Claim expired/);
   });
 
-  test("abandoning releases the lease back to ready", () => {
-    const f = fixture();
+  test("abandoning releases the lease back to ready", async () => {
+    const f = await fixture();
     const search = f.fork("search");
     f.finishIn("search");
     const { timeline } = f.store.timelines.abandon(f.ann, "search", {});
@@ -192,19 +209,27 @@ describe("leases across timelines", () => {
 
   test.each([false, true])(
     "partial abandonment preserves receipts and fences unresolved CAS (%s)",
-    (unresolved) => {
-      const f = fixture();
+    async (unresolved) => {
+      const f = await fixture();
+      const authority = {
+        spaceId: f.ann.spaceId,
+        migrationEpoch: f.ann.migrationEpoch,
+        personId: f.ann.principalId,
+        agentId: f.ann.agentId,
+        credential: { kind: "token" as const, id: "fixture-token" },
+      };
       const timelines = f.store.timelines;
       const search = ownedTimeline(timelines, f.ann, {
         slug: "search",
         parent: null,
         policy: "auto",
-        repos: ["app", "lib"].map((id) => ({ id, owner: "org", name: id })),
+        repos: ["app", "lib"].map((id) => ({ id, spaceId: "org", space: "org", name: id })),
         commits: { app: oid(1), lib: oid(1) },
       });
       for (const repo of search.repos) {
         const operationId = `push-${repo.id}`;
         timelines.beginSourcePush({
+          authority,
           operationId,
           timelineId: search.id,
           repoId: repo.id,
@@ -220,7 +245,7 @@ describe("leases across timelines", () => {
         repos: search.repos.map((repo) =>
           ownedCheckpointRepo(timelines, "search", {
             id: repo.id,
-            owner: repo.owner,
+            space: repo.space,
             name: repo.name,
             commit: oid(2),
             base: oid(1),
@@ -229,6 +254,7 @@ describe("leases across timelines", () => {
         ),
       });
       const started = timelines.beginLanding(f.ann, "search", {
+        authority,
         trigger: "request",
         green: { ok: true, why: null },
         agentId: null,
@@ -277,6 +303,7 @@ describe("leases across timelines", () => {
         expect(f.leases()).toEqual([]);
         expect(() =>
           timelines.beginLanding(f.ann, "search", {
+            authority,
             trigger: "request",
             green: { ok: true, why: null },
             agentId: null,
@@ -287,14 +314,14 @@ describe("leases across timelines", () => {
     },
   );
 
-  test("merging the timeline into another moves the lease with the work", () => {
-    const f = fixture();
+  test("merging the timeline into another moves the lease with the work", async () => {
+    const f = await fixture();
     f.fork("search");
     const ui = f.fork("ui");
     f.finishIn("search");
     f.store.timelines.recordPush(
       {
-        repo: { id: "app", owner: "org", name: "app" },
+        repo: { id: "app", spaceId: "org", space: "org", name: "app" },
         actorId: "ann",
         accountableId: "ann",
         pushed: ["ui"],
@@ -310,8 +337,8 @@ describe("leases across timelines", () => {
     expect(f.issue("a")).toMatchObject({ status: "done", claim: null });
   });
 
-  test("finishing by status keeps the lease too; reopening in the timeline ends it", () => {
-    const f = fixture();
+  test("finishing by status keeps the lease too; reopening in the timeline ends it", async () => {
+    const f = await fixture();
     f.fork("search");
     const token = f.claim(f.ann, "search");
     f.mutate(f.ann, "search", {
@@ -333,8 +360,8 @@ describe("leases across timelines", () => {
     expect(f.next(f.ann, "search")).toBe("a");
   });
 
-  test("moving a leased issue without its token asks for the lease (CORE-260)", () => {
-    const f = fixture();
+  test("moving a leased issue without its token asks for the lease (CORE-260)", async () => {
+    const f = await fixture();
     const token = f.claim(f.ann);
     const cancel = (data: Record<string, unknown>) =>
       f.mutate(f.ann, undefined, {
@@ -350,8 +377,8 @@ describe("leases across timelines", () => {
     expect(f.issue("a")).toMatchObject({ status: "canceled" });
   });
 
-  test("normal leases still expire, renew and end on main", () => {
-    const f = fixture();
+  test("normal leases still expire, renew and end on main", async () => {
+    const f = await fixture();
     const token = f.claim(f.ann);
     f.advance(10 * 60 * 1000);
     f.mutate(f.ann, undefined, { kind: "issue.renew", id: "a", data: { leaseToken: token } });

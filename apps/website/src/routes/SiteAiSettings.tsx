@@ -16,7 +16,7 @@ type Choices = Record<AiLogComponent, boolean>;
 const choices = (view: SiteAiSettingsView) =>
   Object.fromEntries(view.logBodies.components.map((e) => [e.component, e.site])) as Choices;
 
-/** Site AI settings (CORE-290): the site's defaults for every account. */
+/** Instance AI settings: infrastructure defaults, separate from Space policy. */
 export function SiteAiSettings() {
   const initial = useLoaderData<typeof siteAiSettingsLoader>();
   const [saved, setSaved] = useState(initial);
@@ -60,10 +60,10 @@ export function SiteAiSettings() {
   return (
     <SettingsPage>
       <div className="max-w-3xl">
-        <h1 className="m-0 text-headline">Site AI settings</h1>
+        <h1 className="m-0 text-headline">Instance AI settings</h1>
         <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
-          Defaults for every account’s AI work. An account’s administrators can override them for
-          their own account in its AI settings.
+          Instance defaults for AI work. A Space’s explicitly authorized administrators can override
+          them for that Space in its AI settings.
         </p>
         <form
           className="mk-card mt-8 flex flex-col gap-6"
@@ -71,13 +71,16 @@ export function SiteAiSettings() {
           onSubmit={(event) => {
             event.preventDefault();
             if (saving || !saved.canManage || !dirty) return;
-            void save(patch, "Site AI settings saved. New model calls use them within a minute.");
+            void save(
+              patch,
+              "Instance AI settings saved. New model calls use them within a minute.",
+            );
           }}
         >
           <fieldset
             disabled={saving || !saved.canManage}
             className="m-0 min-w-0 border-0 p-0"
-            data-log-bodies="site"
+            data-log-bodies="instance"
           >
             <legend className="mb-2 text-title">
               Keep AI request and response bodies in gateway logs
@@ -146,7 +149,7 @@ export function SiteAiSettings() {
             <FormError message={error} />
             <p role="status" aria-live="polite" className="m-0 text-body-sm">
               {saving
-                ? "Saving site AI settings…"
+                ? "Saving Instance AI settings…"
                 : notice || (dirty ? "You have unsaved changes." : "")}
             </p>
             {saved.canManage && (
@@ -156,7 +159,7 @@ export function SiteAiSettings() {
                   className="mk-btn mk-btn--primary min-h-11"
                   disabled={saving || !dirty}
                 >
-                  {saving ? "Saving…" : "Save site AI settings"}
+                  {saving ? "Saving…" : "Save Instance AI settings"}
                 </button>
                 <button
                   type="button"
@@ -180,7 +183,7 @@ export function SiteAiSettings() {
                         Object.fromEntries(
                           saved.logBodies.components.map((e) => [e.component, null]),
                         ) as AiLogBodiesPatch,
-                        `Site AI settings reset: every part follows the environment default (${environment}).`,
+                        `Instance AI settings reset: every part follows the environment default (${environment}).`,
                       )
                     }
                   >

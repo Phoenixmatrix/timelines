@@ -1,10 +1,12 @@
 import { Hono } from "hono";
-import { afterEach, expect, test, vi } from "vite-plus/test";
+import { afterEach, expect, onTestFinished, test, vi } from "vite-plus/test";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import type { TimelineChange } from "../../shared/timelines.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { findSpaceById } from "../spaces/access.ts";
+import { accessFor } from "../tracker/access.ts";
+import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Tracker } from "../tracker/object.ts";
 import { timelines } from "../timelines/api.ts";
@@ -33,35 +35,62 @@ const sideband = (report: string) =>
   pkt("\x02progress\n") + pkt(`\x01${report.slice(0, 7)}`) + pkt(`\x01${report.slice(7)}`) + FLUSH;
 
 async function fixture() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  onTestFinished(fresh.close);
+  sqlite.exec("INSERT INTO accounts(id,kind,slug,display_name) VALUES ('ann','user','ann','Ann')");
+  await seedSpaceFixture(fresh.env.DB, {
+    organization: {
+      id: "org-ann",
+      slug: "ann",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "space-ann", slug: "ann", displayName: "Ann" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
   sqlite.exec(`
-    INSERT INTO accounts(id,kind,slug,display_name) VALUES ('ann','user','ann','Ann');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
-      VALUES ('app','ann','app','private','r-app','https://app');
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES ('app','space-ann','app','private','r-app','https://app');
   `);
   const remotes = fakeRemotes();
   remotes.add("https://app", { "refs/heads/main": old });
   vi.stubGlobal("fetch", remotes.fetch);
-  const { sql, transactionSync } = durableStorage();
+  const state = fakeDurableState({ name: "space-ann" });
+  onTestFinished(() => state.db.close());
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: remotes.artifacts,
-    TRACKER: { getByName: () => tracker },
+    TRACKER: { idFromName: fakeDurableObjectId, getByName: () => tracker },
   } as unknown as Env;
-  const tracker = new Tracker(
-    { storage: { sql, transactionSync } } as unknown as DurableObjectState,
-    env,
-  );
+  const tracker = new Tracker(state.ctx, env);
   const app = new Hono<AppEnv>();
   app.use("*", async (c, run) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     await run();
   });
-  app.route("/api/tracker/:owner/timelines", timelines);
+  app.route("/api/tracker/:space/timelines", timelines);
   app.route("/", gitHttp);
-  const secret = (await issueToken(env.DB, "ann", "test", "write")).secret;
-  const headers = { authorization: `Bearer ${secret}` };
+  const token = await issueToken(env.DB, "ann", "test", "write");
+  const space = await findSpaceById(env.DB, "space-ann");
+  if (!space) throw new Error("Missing fixture Space");
+  const access = await accessFor(env, space, "ann", null, true, {
+    kind: "token",
+    id: token.id,
+  });
+  const headers = {
+    authorization: `Bearer ${token.secret}`,
+    "X-Gitmatrix-Content-Version": "4",
+  };
   const pending: Promise<unknown>[] = [];
   const ctx = {
     waitUntil: (promise: Promise<unknown>) => pending.push(promise),
@@ -87,7 +116,13 @@ async function fixture() {
   const remote = remotes.getByName(source.artifacts_name);
   remote.commits.add(next);
   remote.parents.set(next, [old]);
-  const push = async (report: string, status: number, observed: string, capabilities: string) => {
+  const push = async (
+    report: string,
+    status: number,
+    observed: string,
+    capabilities: string,
+    authorization = headers.authorization,
+  ) => {
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
       if (url.endsWith("/git-receive-pack") && init?.body instanceof ReadableStream) {
@@ -104,7 +139,11 @@ async function fixture() {
       "/ann/app@work.git/git-receive-pack",
       {
         method: "POST",
-        headers: { ...headers, "content-type": "application/x-git-receive-pack-request" },
+        headers: {
+          ...headers,
+          authorization,
+          "content-type": "application/x-git-receive-pack-request",
+        },
         body: pkt(`${old} ${next} ${ref}\0${capabilities}\n`) + FLUSH,
       },
       env,
@@ -113,7 +152,7 @@ async function fixture() {
     await Promise.all(pending.splice(0));
     return response;
   };
-  return { sqlite, tracker, remote, sourceId, push };
+  return { sqlite, env, app, ctx, tracker, remote, sourceId, push, access };
 }
 
 test.each([
@@ -309,7 +348,7 @@ test.each([
     expect(t.sqlite.prepare("SELECT state FROM source_operations WHERE kind='push'").all()).toEqual(
       [{ state: outcome }],
     );
-    const active = t.tracker.sourcePushes("app");
+    const active = await t.tracker.sourcePushes(t.access, "app");
     if (outcome === "ambiguous")
       expect(active).toMatchObject({ ok: true, value: [{ state: "ambiguous" }] });
     else expect(active).toEqual({ ok: true, value: [] });
@@ -317,6 +356,41 @@ test.each([
     expect(t.remote.refs.get(`refs/gitmatrix/progress/${next}`)).toBe(
       outcome === "accepted" ? next : undefined,
     );
+  } finally {
+    t.sqlite.close();
+  }
+});
+
+test("a repository-only collaborator pushes to a work source with no Tracker access", async () => {
+  const t = await fixture();
+  try {
+    t.sqlite.exec(`
+      INSERT INTO accounts(id,kind,slug,display_name) VALUES
+        ('jun','user','jun','Jun'), ('cat','user','cat','Cat');
+      INSERT INTO repo_collaborators(repo_id,user_id,role) VALUES ('app','jun','write'), ('app','cat','read');
+    `);
+    const bearer = async (id: string) =>
+      `Bearer ${(await issueToken(t.env.DB, id, "test", "write")).secret}`;
+    const jun = await bearer("jun");
+    // A read collaborator can't write the repository, so not its work source either.
+    expect((await t.push(ok, 200, next, "report-status", await bearer("cat"))).status).toBe(403);
+    expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM source_operations").get()).toEqual({ n: 0 });
+    // Write access to the repository authorizes its work source; no Space grant is involved.
+    const pushed = await t.push(ok, 200, next, "report-status", jun);
+    expect(pushed.status).toBe(200);
+    expect(
+      t.sqlite.prepare("SELECT state, data FROM source_operations WHERE kind='push'").all(),
+    ).toMatchObject([
+      { state: "accepted", data: expect.stringContaining('"accountableId":"jun"') },
+    ]);
+    // The push grants nothing in the Tracker: its timelines stay closed to the collaborator.
+    const timelines = await t.app.request(
+      "/api/tracker/ann/timelines",
+      { headers: { authorization: jun, "X-Gitmatrix-Content-Version": "4" } },
+      t.env,
+      t.ctx,
+    );
+    expect([403, 404]).toContain(timelines.status);
   } finally {
     t.sqlite.close();
   }

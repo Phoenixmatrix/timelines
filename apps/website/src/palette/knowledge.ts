@@ -9,7 +9,7 @@ import { blobUrl, repoPath } from "../lib/refs.ts";
 
 /** A repository the palette is scoped to. */
 export interface ScopedRepo {
-  owner: string;
+  space: string;
   name: string;
   defaultBranch: string;
 }
@@ -20,7 +20,7 @@ export type KnowledgeState =
   | { status: "done"; repo: string; query: string; results: KnowledgeSearchResults }
   | { status: "failed"; repo: string; query: string; message: string };
 
-export const repoKey = (repo: ScopedRepo) => `${repo.owner}/${repo.name}`;
+export const repoKey = (repo: ScopedRepo) => `${repo.space}/${repo.name}`;
 
 /** Why a search failed, in words: AI off here, no access, or anything else. */
 function failure(error: unknown): string {
@@ -50,7 +50,7 @@ export function knowledgeSearch(onState: (state: KnowledgeState) => void) {
       const controller = new AbortController();
       inflight = controller;
       onState({ status: "loading", repo: repoKey(repo), query: q });
-      const path = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
+      const path = `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}`;
       api<KnowledgeSearchResults>(`${path}/knowledge/search?q=${encodeURIComponent(q)}`, {
         signal: controller.signal,
       }).then(
@@ -131,7 +131,7 @@ export function knowledgeResults(
     detail: [entity.kind, entity.path].filter(Boolean).join(" · "),
     to: atlas
       ? `${atlas.href}?select=${encodeURIComponent(entity.id)}`
-      : `${repoPath(repo.owner, repo.name, "knowledge")}?select=${encodeURIComponent(entity.id)}`,
+      : `${repoPath(repo.space, repo.name, "knowledge")}?select=${encodeURIComponent(entity.id)}`,
   }));
   const passages = (kind: "code" | "wiki") =>
     results.passages
@@ -142,8 +142,8 @@ export function knowledgeResults(
         detail: passage.text.replace(/\s+/g, " ").slice(0, 120),
         to:
           kind === "wiki"
-            ? repoPath(repo.owner, repo.name, "wiki", passage.path)
-            : blobUrl(repo.owner, repo.name, codeRef, passage.path),
+            ? repoPath(repo.space, repo.name, "wiki", passage.path)
+            : blobUrl(repo.space, repo.name, codeRef, passage.path),
       }));
   // A few of each, so Code and Wiki aren't pushed below a long list of
   // entities; the repository's Knowledge page shows everything.

@@ -2,17 +2,17 @@
 // credentials as the registry protocols (session cookie, gmx_ tokens, CI job
 // tokens), JSON in and out, errors as `{error}` like the rest of the API.
 //
-//   GET    /:owner                                   packages and feeds
-//   POST   /:owner/feeds                             create a proxy or virtual feed
-//   PATCH  /:owner/feeds/:format/:key                visibility, retention, upstream, members
-//   DELETE /:owner/feeds/:format/:key
-//   GET    /:owner/:format/:name                     one package
-//   GET    /:owner/:format/:name/publishes?q=&offset=&limit=   its console
-//   POST   /:owner/:format/:name/actions             bulk delete/yank/deprecate/tag
-//   POST   /:owner/:format/:name/sources             {repo: "owner/name"}
-//   DELETE /:owner/:format/:name/sources/:repoId
-//   GET    /-/published?repo=owner/name&commit=|run=  what a commit or run published
-//   GET    /-/repo-packages?repo=owner/name          packages a repository publishes
+//   GET    /:space                                   packages and feeds
+//   POST   /:space/feeds                             create a proxy or virtual feed
+//   PATCH  /:space/feeds/:format/:key                visibility, retention, upstream, members
+//   DELETE /:space/feeds/:format/:key
+//   GET    /:space/:format/:name                     one package
+//   GET    /:space/:format/:name/publishes?q=&offset=&limit=   its console
+//   POST   /:space/:format/:name/actions             bulk delete/yank/deprecate/tag
+//   POST   /:space/:format/:name/sources             {repo: "space/name"}
+//   DELETE /:space/:format/:name/sources/:repoId
+//   GET    /-/published?repo=space/name&commit=|run=  what a commit or run published
+//   GET    /-/repo-packages?repo=space/name          packages a repository publishes
 //   GET    /-/npm-login/:publicId, POST …/approve     npm login --auth-type=web
 //
 // Package names travel as one URL-encoded segment (`@scope%2Fname`).
@@ -33,7 +33,7 @@ import {
   createFeed,
   grantSource,
   npmLogin,
-  ownerPackages,
+  spacePackages,
   packageDetail,
   packagePublishes,
   published,
@@ -87,34 +87,34 @@ export function packagesApi(): Hono<AppEnv> {
     return c.body(null, 204);
   });
 
-  api.get("/:owner", async (c) => c.json(await ownerPackages(services(c), c.req.param("owner"))));
+  api.get("/:space", async (c) => c.json(await spacePackages(services(c), c.req.param("space"))));
 
-  api.post("/:owner/feeds", async (c) =>
+  api.post("/:space/feeds", async (c) =>
     c.json(
-      await createFeed(services(c), c.req.param("owner"), await body<CreateFeedRequest>(c)),
+      await createFeed(services(c), c.req.param("space"), await body<CreateFeedRequest>(c)),
       201,
     ),
   );
-  api.patch("/:owner/feeds/:format/:key", async (c) =>
+  api.patch("/:space/feeds/:format/:key", async (c) =>
     c.json(
       await updateFeed(
         services(c),
-        c.req.param("owner"),
+        c.req.param("space"),
         c.req.param("format"),
         c.req.param("key"),
         await body<UpdateFeedRequest>(c),
       ),
     ),
   );
-  api.delete("/:owner/feeds/:format/:key", async (c) => {
-    await removeFeed(services(c), c.req.param("owner"), c.req.param("format"), c.req.param("key"));
+  api.delete("/:space/feeds/:format/:key", async (c) => {
+    await removeFeed(services(c), c.req.param("space"), c.req.param("format"), c.req.param("key"));
     return c.body(null, 204);
   });
 
   const at = (c: Context<AppEnv>) =>
-    [c.req.param("owner") ?? "", c.req.param("format") ?? "", c.req.param("name") ?? ""] as const;
+    [c.req.param("space") ?? "", c.req.param("format") ?? "", c.req.param("name") ?? ""] as const;
 
-  api.get("/:owner/:format/:name/contents", async (c) =>
+  api.get("/:space/:format/:name/contents", async (c) =>
     c.json(
       await packageContents(services(c), ...at(c), {
         version: c.req.query("version") ?? "",
@@ -125,7 +125,7 @@ export function packagesApi(): Hono<AppEnv> {
       }),
     ),
   );
-  api.get("/:owner/:format/:name/contents/download", async (c) =>
+  api.get("/:space/:format/:name/contents/download", async (c) =>
     downloadPackageContent(
       services(c),
       ...at(c),
@@ -136,8 +136,8 @@ export function packagesApi(): Hono<AppEnv> {
       c.req.query("id") ?? "",
     ),
   );
-  api.get("/:owner/:format/:name", async (c) => c.json(await packageDetail(services(c), ...at(c))));
-  api.get("/:owner/:format/:name/publishes", async (c) =>
+  api.get("/:space/:format/:name", async (c) => c.json(await packageDetail(services(c), ...at(c))));
+  api.get("/:space/:format/:name/publishes", async (c) =>
     c.json(
       await packagePublishes(services(c), ...at(c), {
         query: c.req.query("q") ?? "",
@@ -146,15 +146,15 @@ export function packagesApi(): Hono<AppEnv> {
       }),
     ),
   );
-  api.post("/:owner/:format/:name/actions", async (c) =>
+  api.post("/:space/:format/:name/actions", async (c) =>
     c.json(await bulkAction(services(c), ...at(c), await body<BulkActionRequest>(c))),
   );
-  api.post("/:owner/:format/:name/sources", async (c) => {
+  api.post("/:space/:format/:name/sources", async (c) => {
     const { repo } = await body<{ repo?: string }>(c);
-    if (!repo) throw RegistryError.badRequest("Name the repository (owner/name).");
+    if (!repo) throw RegistryError.badRequest("Name the repository (space/name).");
     return c.json({ sources: await grantSource(services(c), ...at(c), repo) });
   });
-  api.delete("/:owner/:format/:name/sources/:repoId", async (c) =>
+  api.delete("/:space/:format/:name/sources/:repoId", async (c) =>
     c.json({ sources: await revokeSource(services(c), ...at(c), c.req.param("repoId")) }),
   );
   return api;

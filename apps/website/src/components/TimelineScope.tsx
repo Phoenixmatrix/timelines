@@ -20,7 +20,7 @@ import {
   scopeBookmark,
   scopeHint,
   scopeOf,
-  scopeOwner,
+  scopeSpace,
   switchScope,
 } from "../lib/timelineScope.ts";
 import { STATUS_LABEL } from "../routes/tracker/timelineGraph.ts";
@@ -28,19 +28,14 @@ import { popMotion } from "./ui.tsx";
 
 // ---- data ------------------------------------------------------------------
 
-const lists = new Map<string, Promise<Timeline[]>>();
 let generation = 0;
 const listeners = new Set<() => void>();
 
 /**
- * Drop an account's cached timelines (after a change), so the switcher and
- * banner refetch; with no account, every account's and the default tracker.
+ * Drop a Space's cached timelines after a change; without a Space, refresh
+ * every Space and the persisted default selection.
  */
-export function refreshTimelines(owner?: string): void {
-  if (owner === undefined) {
-    lists.clear();
-    defaultTracker = null;
-  } else lists.delete(owner);
+export function refreshTimelines(_space?: string): void {
   generation++;
   for (const listener of listeners) listener();
 }
@@ -55,43 +50,30 @@ function useGeneration(): number {
   );
 }
 
-function timelinesOf(owner: string): Promise<Timeline[]> {
-  let list = lists.get(owner);
-  if (!list) {
-    list = api<TimelineList>(`/tracker/${encodeURIComponent(owner)}/timelines`).then(
-      (reply) => reply.timelines,
-    );
-    lists.set(owner, list);
-    list.catch(() => lists.delete(owner));
-  }
-  return list;
+function timelinesOf(space: string): Promise<Timeline[]> {
+  return api<TimelineList>(`/tracker/${encodeURIComponent(space)}/timelines`).then(
+    (reply) => reply.timelines,
+  );
 }
 
-let defaultTracker: Promise<string | null> | null = null;
-
-/** Where /tracker would open: pages outside any account scope to its timelines. */
-function defaultOwner(): Promise<string | null> {
-  defaultTracker ??= api<TrackerList>("/tracker")
+/** Resolve the persisted default against current grants on each opening. */
+function defaultSpace(): Promise<string | null> {
+  return api<TrackerList>("/tracker")
     .then(
-      ({ trackers, defaultOwnerId }) =>
-        (trackers.find((t) => t.id === defaultOwnerId) ?? trackers[0])?.slug ?? null,
+      ({ trackers, defaultSpaceId }) => trackers.find((t) => t.id === defaultSpaceId)?.slug ?? null,
     )
-    .catch(() => {
-      defaultTracker = null;
-      return null;
-    });
-  return defaultTracker;
+    .catch(() => null);
 }
 
 interface Scope {
   /** The selected timeline's slug; null is main. */
   slug: string | null;
-  /** The account whose timelines the switcher lists. */
-  owner: string | null;
-  /** That account's timelines, once loaded. */
+  /** The Space whose timelines the switcher lists. */
+  space: string | null;
+  /** That Space's timelines, once loaded. */
   timelines: Timeline[] | null;
   error: string | null;
-  /** The selected timeline's record, when the account has it. */
+  /** The selected timeline's record, when the Space has it. */
   timeline: Timeline | null;
   /** The repository page's detail, for following code refs across a switch. */
   repo: RepoDetail | undefined;
@@ -104,33 +86,36 @@ function useScope(open = false): Scope {
   const repo = useRouteLoaderData("repo") as RepoDetail | undefined;
   const slug = scopeOf(location.search);
   const needed = Boolean(viewer) && (open || slug !== null);
-  const fromPath = scopeOwner(location.pathname, location.search);
-  const [fallback, setFallback] = useState<string | null>(null);
+  const fromPath = scopeSpace(location.pathname, location.search);
+  const [fallback, setFallback] = useState<{ viewerId: string; space: string | null } | null>(null);
   useEffect(() => {
-    if (fromPath || !needed) return;
+    if (fromPath || !needed || !viewer) return;
     let live = true;
-    void defaultOwner().then((owner) => live && setFallback(owner));
+    void defaultSpace().then((space) => live && setFallback({ viewerId: viewer.id, space }));
     return () => {
       live = false;
     };
-  }, [fromPath, needed]);
-  const owner = fromPath ?? (viewer ? fallback : null);
+  }, [fromPath, needed, viewer?.id, location.key]);
+  const space = fromPath ?? (viewer && fallback?.viewerId === viewer.id ? fallback.space : null);
+  const requestKey = `${viewer?.id ?? ""}:${location.key}:${space ?? ""}`;
   const gen = useGeneration();
   const [loaded, setLoaded] = useState<{
-    owner: string;
+    space: string;
+    requestKey: string;
     timelines: Timeline[] | null;
     error: string | null;
   } | null>(null);
   useEffect(() => {
     // Signed out, nobody can list timelines; the banner names the slug alone.
-    if (!owner || !needed) return;
+    if (!space || !needed) return;
     let live = true;
-    timelinesOf(owner).then(
-      (timelines) => live && setLoaded({ owner, timelines, error: null }),
+    timelinesOf(space).then(
+      (timelines) => live && setLoaded({ space, requestKey, timelines, error: null }),
       (error: unknown) =>
         live &&
         setLoaded({
-          owner,
+          space,
+          requestKey,
           timelines: null,
           error: error instanceof Error ? error.message : String(error),
         }),
@@ -138,12 +123,12 @@ function useScope(open = false): Scope {
     return () => {
       live = false;
     };
-  }, [owner, needed, gen]);
-  const current = loaded?.owner === owner ? loaded : null;
+  }, [space, needed, gen, requestKey]);
+  const current = needed && loaded?.requestKey === requestKey ? loaded : null;
   const timelines = current?.timelines ?? null;
   return {
     slug,
-    owner,
+    space,
     timelines,
     error: current?.error ?? null,
     timeline: (slug && timelines?.find((t) => t.slug === slug)) || null,
@@ -225,7 +210,7 @@ function SwitcherPanel({
           <Popover.Title className="m-0 text-title">Timeline</Popover.Title>
           <Link
             to={
-              scope.owner ? `/tracker/${encodeURIComponent(scope.owner)}/timelines` : "/timelines"
+              scope.space ? `/tracker/${encodeURIComponent(scope.space)}/timelines` : "/timelines"
             }
             onClick={close}
             className="mk-btn mk-btn--ghost mk-btn--sm ml-auto no-underline"
@@ -237,10 +222,10 @@ function SwitcherPanel({
           {filter
             ? "Filter release notes to landed work from one timeline; main shows all notes"
             : "Scope every page to main plus one line of work"}
-          {scope.owner ? (
+          {scope.space ? (
             <>
               {" "}
-              in <bdi>{scope.owner}</bdi>
+              in <bdi>{scope.space}</bdi>
             </>
           ) : null}
           .
@@ -288,9 +273,9 @@ function SwitcherPanel({
       </ul>
       {scope.error ? (
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">
-          Couldn't list {scope.owner}'s timelines: {scope.error}
+          Couldn't list {scope.space}'s timelines: {scope.error}
         </p>
-      ) : !scope.owner ? (
+      ) : !scope.space ? (
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">
           Open a repository or a tracker to choose one of its account's timelines.
         </p>
@@ -298,13 +283,13 @@ function SwitcherPanel({
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">Loading timelines…</p>
       ) : scope.timelines.length === 0 ? (
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">
-          {scope.owner} has no timelines yet. <span className="mk-mono">gm timeline start</span>{" "}
+          {scope.space} has no timelines yet. <span className="mk-mono">gm timeline start</span>{" "}
           forks one.
         </p>
       ) : words.length && !shown.length ? (
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">No timeline matches.</p>
       ) : null}
-      {scope.owner && ended.length > 0 && !showEnded && !words.length && (
+      {scope.space && ended.length > 0 && !showEnded && !words.length && (
         <div className="sticky bottom-0 mt-1 flex items-center gap-2 border-t border-line-soft bg-rail px-1.5 pt-1.5">
           <button
             type="button"
@@ -330,7 +315,7 @@ export function TimelineSwitcher({ variant }: { variant: "banner" | "filter" }) 
   const name = scope.timeline?.name ?? scope.slug;
   const onOpenChange = (next: boolean) => {
     // Fresh each time it opens: timelines start and end while you work.
-    if (next && scope.owner) refreshTimelines(scope.owner);
+    if (next && scope.space) refreshTimelines(scope.space);
     setOpen(next);
   };
   const trigger =
@@ -383,7 +368,7 @@ export function TimelineBanner() {
       }
     : null;
   const hint = missing
-    ? `${scope.owner} has no timeline ${slug}.`
+    ? `${scope.space} has no timeline ${slug}.`
     : scopeHint(
         location.pathname,
         slug,

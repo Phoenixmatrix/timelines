@@ -1,6 +1,6 @@
-// The timeline graph's data (CORE-81), under a tracker account
-// (/api/tracker/:owner/timeline-graph): every timeline, the newest events
-// across all of them, the people and agents they name and the workspaces their
+// The timeline graph's data (CORE-81), under a tracker Space
+// (/api/tracker/:space/timeline-graph): every timeline, the newest events
+// across all of them, the people and agents they name and the Projects their
 // repositories belong to. One request instead of one per timeline; the graph
 // itself is laid out in the browser.
 
@@ -25,11 +25,11 @@ timelineGraph.onError((error, c) => {
 
 timelineGraph.get("/", async (c) => {
   const access = await authorize(c);
-  const tracker = trackerObject(c.env, access.owner.id);
+  const tracker = trackerObject(c.env, access.space.id);
   const [graph, trackers, settings] = await Promise.all([
-    tracker.timelineGraph(EVENT_LIMIT),
+    tracker.timelineGraph(access, EVENT_LIMIT),
     accessible(c.env.DB, c.get("actor")!),
-    previewSettings(c.env.DB, access.owner.id),
+    previewSettings(c.env.DB, access.space.id),
   ]);
   if (!graph.ok) throw new TrackerError(graph.status, graph.code, graph.error);
   const { timelines, events, truncated, issues } = graph.value;
@@ -41,23 +41,26 @@ timelineGraph.get("/", async (c) => {
     actors[agent.id] = { name: agent.name, accountableId: agent.accountable.id };
 
   const repoIds = [...new Set(timelines.flatMap((timeline) => timeline.repos.map((r) => r.id)))];
-  const workspaces: TimelineGraphData["workspaces"] = {};
+  const projects: TimelineGraphData["projects"] = {};
   await Promise.all(
     repoIds.map(async (repoId) => {
-      const reply = await tracker.subscribedWorkspaces(repoId);
-      workspaces[repoId] = reply.ok
-        ? reply.value.map((w) => ({ id: w.workspaceId, slug: w.slug, name: w.name }))
-        : [];
+      const reply = await tracker.subscribedProjects(access, repoId);
+      if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+      projects[repoId] = reply.value.map((project) => ({
+        id: project.projectId,
+        slug: project.slug,
+        name: project.name,
+      }));
     }),
   );
   return c.json<TimelineGraphData>({
-    owner: access.owner,
+    space: access.space,
     trackers,
     timelines,
     events,
     truncated,
     actors,
-    workspaces,
+    projects,
     issues,
     idleDays: settings.idleDays,
   });

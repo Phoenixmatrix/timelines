@@ -1,31 +1,25 @@
-// What AI Gateway logs keep (CORE-290): the payload header goes with a call
-// exactly when "Keep AI request and response bodies in gateway logs" is off
-// for its component and account (the account's override, else the site
-// default, else the environment's default), and the settings are read at
-// most once a minute, not per call.
-
+// Current gateway logging policy keeps person and content overrides separate.
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import { AI_LOG_COMPONENTS, type AiLogComponent } from "../shared/ai.ts";
-import {
-  aiGatewayOptions,
-  componentOf,
-  forgetLogBodySettings,
-  type GatewayComponent,
-} from "./ai-gateway.ts";
+import { AI_LOG_COMPONENTS, aiLogComponentScope, type AiLogComponent } from "../shared/ai.ts";
+import { aiGatewayOptions, componentOf, type GatewayComponent } from "./ai-gateway.ts";
 import { decide } from "./knowledge/models.ts";
-import { d1, migratedDatabase } from "./testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "./testing/d1.ts";
+import { installCutoverTestControl } from "./testing/space-cutover.ts";
+import { initializeFreshSpaceInstallation } from "./space-cutover/installation.ts";
+import { seedSpaceFixture } from "./testing/spaces.ts";
 import { aiWork } from "./usage/ai.ts";
+import { issueToken } from "./api/tokens.ts";
+import type { Actor } from "./db.ts";
 
 const databases: DatabaseSync[] = [];
+const controls: Array<() => void> = [];
 afterEach(() => {
   vi.restoreAllMocks();
+  for (const close of controls.splice(0)) close();
   for (const sqlite of databases.splice(0)) sqlite.close();
 });
-
 const HEADER = { "cf-aig-collect-log-payload": "false" };
-
-/** Each label calls carry, and the setting it follows. */
 const COMPONENTS: [GatewayComponent, AiLogComponent][] = [
   ["knowledge", "knowledge"],
   ["assistant", "assistant"],
@@ -38,123 +32,192 @@ const COMPONENTS: [GatewayComponent, AiLogComponent][] = [
   ["merge-queue", "merge-queue"],
 ];
 
-function setup(environment?: "on" | "off") {
+async function setup(environment?: "on" | "off") {
   const sqlite = migratedDatabase();
-  databases.push(sqlite);
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('acc_a', 'user', 'ann', 'Ann'), ('acc_o', 'org', 'orbit', 'Orbit');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('repo', 'acc_o', 'app', 'private', 'n', 'https://app');
-  `);
+  const registry = migratedRegistryDatabase();
+  databases.push(sqlite, registry);
   const env = {
     DB: d1(sqlite),
+    REGISTRY_DB: d1(registry),
     AI_GATEWAY: "gw",
     ...(environment ? { AI_LOG_BODIES: environment } : {}),
   } as unknown as Env;
-  const choose = (account: string | null, component: string, keep: boolean | null) => {
-    if (account === null) {
-      sqlite.prepare("DELETE FROM site_ai_log_bodies WHERE component = ?").run(component);
-      if (keep !== null)
-        sqlite
-          .prepare("INSERT INTO site_ai_log_bodies (component, keep) VALUES (?, ?)")
-          .run(component, Number(keep));
-    } else {
+  controls.push(installCutoverTestControl(env).close);
+  await initializeFreshSpaceInstallation(env);
+  sqlite.exec(`INSERT INTO accounts (id, kind, slug, display_name) VALUES
+    ('same', 'user', 'ann', 'Ann'), ('other', 'user', 'bob', 'Bob');`);
+  for (const id of ["same", "other"]) {
+    await seedSpaceFixture(env.DB, {
+      organization: { id: `org-${id}`, slug: `company-${id}`, displayName: id, kind: "company" },
+      space: { id, slug: `space-${id}`, displayName: id },
+      actorId: "same",
+      members: [
+        {
+          accountId: "same",
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+        },
+      ],
+    });
+  }
+  sqlite.exec(`INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+    VALUES ('repo', 'same', 'app', 'private', 'n', 'https://app');`);
+  const choose = (
+    kind: "space" | "person" | "instance",
+    id: string,
+    component: string,
+    keep: boolean | null,
+  ) => {
+    const table =
+      kind === "space"
+        ? "space_ai_log_bodies"
+        : kind === "person"
+          ? "account_ai_log_bodies"
+          : "site_ai_log_bodies";
+    const column = kind === "space" ? "space_id" : "account_id";
+    const where = kind === "instance" ? "component = ?" : `${column} = ? AND component = ?`;
+    const params = kind === "instance" ? [component] : [id, component];
+    sqlite.prepare(`DELETE FROM ${table} WHERE ${where}`).run(...params);
+    if (keep !== null) {
+      const columns = kind === "instance" ? "component, keep" : `${column}, component, keep`;
       sqlite
-        .prepare("DELETE FROM account_ai_log_bodies WHERE account_id = ? AND component = ?")
-        .run(account, component);
-      if (keep !== null)
-        sqlite
-          .prepare(
-            "INSERT INTO account_ai_log_bodies (account_id, component, keep) VALUES (?, ?, ?)",
-          )
-          .run(account, component, Number(keep));
+        .prepare(
+          `INSERT INTO ${table} (${columns}) VALUES (${[...params, keep].map(() => "?").join(", ")})`,
+        )
+        .run(...params, Number(keep));
     }
-    forgetLogBodySettings(env.DB);
   };
   return { sqlite, env, choose };
 }
 
 describe("AI Gateway body logging", () => {
-  test("the header is sent exactly when the effective setting is off, for every component and level", async () => {
-    let cases = 0;
-    for (const environment of ["off", "on", undefined] as const) {
-      const { env, choose } = setup(environment);
+  test.each(["off", "on", undefined] as const)(
+    "every component follows only its matching scope override with environment %s",
+    async (environment) => {
+      const { env, choose } = await setup(environment);
       for (const [label, setting] of COMPONENTS) {
+        const kind = aiLogComponentScope(setting);
         for (const site of [null, true, false]) {
           for (const override of [null, true, false]) {
-            choose(null, setting, site);
-            choose("acc_o", setting, override);
-            // Another account's and another component's choices never leak in.
-            choose("acc_a", setting, !(override ?? site ?? environment === "on"));
-            const other = AI_LOG_COMPONENTS.find((c) => c.id !== setting)!.id;
-            choose("acc_o", other, !(override ?? site ?? environment === "on"));
+            choose("instance", "", setting, site);
+            choose(kind, "same", setting, override);
+            choose(kind, "other", setting, !(override ?? site ?? environment === "on"));
+            const other = AI_LOG_COMPONENTS.find(
+              (c) => c.id !== setting && aiLogComponentScope(c.id) === kind,
+            )!.id;
+            choose(kind, "same", other, !(override ?? site ?? environment === "on"));
             const fallback = site ?? environment === "on";
-            for (const [account, keep] of [
-              ["acc_o", override ?? fallback],
+            for (const [id, keep] of [
+              ["same", override ?? fallback],
               ["", fallback],
               [undefined, fallback],
             ] as const) {
+              const scope = { kind: id ? kind : ("instance" as const), id: id ?? "" };
               const options = await aiGatewayOptions(
                 env,
                 label,
-                account === undefined ? undefined : { account, feature: "test" },
+                id === undefined ? undefined : { scope, feature: "test" },
               );
-              const why = `${label} env=${environment} site=${site} override=${override} account=${account}`;
-              expect(options.gateway, why).toEqual({
+              expect(options.gateway).toEqual({
                 id: "gw",
                 metadata:
-                  account === undefined
+                  id === undefined
                     ? { component: label }
-                    : { component: label, account, feature: "test" },
+                    : {
+                        component: label,
+                        scopeKind: scope.kind,
+                        scopeId: scope.id,
+                        feature: "test",
+                      },
               });
-              if (keep) expect(options, why).not.toHaveProperty("extraHeaders");
-              else expect(options.extraHeaders, why).toEqual(HEADER);
-              cases++;
+              if (keep) expect(options).not.toHaveProperty("extraHeaders");
+              else expect(options.extraHeaders).toEqual(HEADER);
             }
           }
         }
       }
-    }
-    expect(cases).toBe(3 * COMPONENTS.length * 9 * 3);
+    },
+  );
+
+  test("equal person and Space IDs cannot cross logging policies", async () => {
+    const { env, choose } = await setup("off");
+    choose("person", "same", "assistant", true);
+    choose("space", "same", "knowledge", true);
+    expect(
+      await aiGatewayOptions(env, "assistant", { personId: "same", feature: "assistant" }),
+    ).not.toHaveProperty("extraHeaders");
+    expect(
+      (await aiGatewayOptions(env, "assistant", { spaceId: "same", feature: "assistant" }))
+        .extraHeaders,
+    ).toEqual(HEADER);
+    expect(
+      await aiGatewayOptions(env, "knowledge", { spaceId: "same", feature: "knowledge" }),
+    ).not.toHaveProperty("extraHeaders");
+    expect(
+      (await aiGatewayOptions(env, "knowledge", { personId: "same", feature: "knowledge" }))
+        .extraHeaders,
+    ).toEqual(HEADER);
   });
 
-  test("production's default is off, development's on; no database or a failed read means off", async () => {
-    expect((await aiGatewayOptions({ AI_GATEWAY: "gw" } as Env, "assistant")).extraHeaders).toEqual(
+  test("Instance defaults work without D1 and failed policy reads drop bodies", async () => {
+    expect((await aiGatewayOptions({ AI_GATEWAY: "gw" }, "assistant")).extraHeaders).toEqual(
       HEADER,
     );
     expect(
-      await aiGatewayOptions(
-        { AI_GATEWAY: "gw", AI_LOG_BODIES: "on" } as unknown as Env,
-        "assistant",
-      ),
+      await aiGatewayOptions({ AI_GATEWAY: "gw", AI_LOG_BODIES: "on" } as Env, "assistant"),
     ).not.toHaveProperty("extraHeaders");
-    const { env, sqlite } = setup("on");
+    const { env, sqlite } = await setup("on");
     vi.spyOn(console, "warn").mockImplementation(() => {});
     sqlite.exec("DROP TABLE site_ai_log_bodies");
-    forgetLogBodySettings(env.DB);
     expect((await aiGatewayOptions(env, "knowledge")).extraHeaders).toEqual(HEADER);
   });
 
-  test("settings are read once a minute per isolate, and at once after a change here", async () => {
-    const { env, sqlite } = setup("off");
-    const reads = vi.spyOn(env.DB, "prepare");
-    let now = 1_000_000;
-    vi.spyOn(Date, "now").mockImplementation(() => now);
-    for (let i = 0; i < 5; i++)
-      await aiGatewayOptions(env, "knowledge", { account: "acc_o", feature: "x" });
-    // One read of both tables, for every component and account.
-    expect(reads).toHaveBeenCalledTimes(2);
-    // A change made elsewhere (another isolate) is seen within the minute.
-    sqlite.exec("INSERT INTO site_ai_log_bodies (component, keep) VALUES ('knowledge', 1)");
-    now += 30_000;
-    expect((await aiGatewayOptions(env, "knowledge")).extraHeaders).toEqual(HEADER);
-    now += 30_000;
-    expect(await aiGatewayOptions(env, "knowledge")).not.toHaveProperty("extraHeaders");
-    expect(reads).toHaveBeenCalledTimes(4);
+  test("another isolate's disabled logging takes effect on the next warm call", async () => {
+    const { env, sqlite, choose } = await setup("off");
+    choose("space", "same", "knowledge", true);
+    expect(
+      await aiGatewayOptions(env, "knowledge", { spaceId: "same", feature: "x" }),
+    ).not.toHaveProperty("extraHeaders");
+    sqlite.exec(
+      "UPDATE space_ai_log_bodies SET keep = 0 WHERE space_id = 'same' AND component = 'knowledge'",
+    );
+    expect(
+      (await aiGatewayOptions(env, "knowledge", { spaceId: "same", feature: "x" })).extraHeaders,
+    ).toEqual(HEADER);
   });
 
-  test("a model call's component and account come from the work it belongs to", async () => {
+  test("personal aggregate usage follows its live explicit Space logging policy", async () => {
+    const { env, sqlite, choose } = await setup("off");
+    const token = await issueToken(env.DB, "same", "aggregate", "read");
+    const actor: Actor = {
+      id: "same",
+      slug: "ann",
+      displayName: "Ann",
+      isSiteAdmin: false,
+      credential: { kind: "token", id: token.id },
+    };
+    const work = {
+      personId: "same",
+      feature: "release_notes",
+      providerAuthority: { spaceId: "other", actor },
+    };
+    choose("space", "other", "release-notes", true);
+    const allowed = await aiGatewayOptions(env, "release-notes", work);
+    expect(allowed).not.toHaveProperty("extraHeaders");
+    expect(allowed.gateway.metadata).toEqual({
+      component: "release-notes",
+      scopeKind: "person",
+      scopeId: "same",
+      feature: "release_notes",
+    });
+    sqlite.exec("DELETE FROM space_grants WHERE space_id = 'other'");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect((await aiGatewayOptions(env, "release-notes", work)).extraHeaders).toEqual(HEADER);
+    choose("person", "same", "assistant", true);
+    expect(await aiGatewayOptions(env, "assistant", work)).not.toHaveProperty("extraHeaders");
+  });
+
+  test("model gateway metadata reconciles exact usage scope", async () => {
     expect(
       [
         "knowledge",
@@ -182,7 +245,7 @@ describe("AI Gateway body logging", () => {
       "merge-queue",
       "avatars",
     ]);
-    const { env, choose } = setup("off");
+    const { env, choose } = await setup("off");
     const calls: AiOptions[] = [];
     Object.assign(env, {
       AI: {
@@ -193,22 +256,42 @@ describe("AI Gateway body logging", () => {
       },
     });
     const question = { same: { type: "noul" as const, instructions: "Same?" } };
-    // The repository's owner keeps release-note bodies; the site keeps none.
-    choose("acc_o", "release-notes", true);
+    choose("space", "same", "release-notes", true);
     await aiWork({ feature: "release_notes", repo: "repo" }, () => decide(env, {}, question));
     await aiWork({ feature: "knowledge", repo: "repo" }, () => decide(env, {}, question));
-    // The site keeps Knowledge bodies; Orbit turns that off for its own.
-    choose(null, "knowledge", true);
-    await aiWork({ feature: "wiki", repo: "repo" }, () => decide(env, {}, question));
-    await aiWork({ feature: "wiki", account: "acc_a" }, () => decide(env, {}, question));
-    choose("acc_o", "knowledge", false);
-    await aiWork({ feature: "wiki", repo: "repo" }, () => decide(env, {}, question));
-    expect(calls.map((c) => [c.gateway?.metadata, c.extraHeaders ?? null] as const)).toMatchObject([
-      [{ component: "release-notes", account: "acc_o", feature: "release_notes" }, null],
-      [{ component: "knowledge", account: "acc_o", feature: "knowledge" }, HEADER],
-      [{ component: "knowledge", account: "acc_o", feature: "wiki" }, null],
-      [{ component: "knowledge", account: "acc_a", feature: "wiki" }, null],
-      [{ component: "knowledge", account: "acc_o", feature: "wiki" }, HEADER],
+    choose("person", "same", "assistant", true);
+    await aiWork({ feature: "assistant", personId: "same" }, () => decide(env, {}, question));
+    // Each model call also carries its own attempt id (CORE-347).
+    for (const call of calls)
+      expect(((call.gateway?.metadata ?? {}) as { attempt?: unknown }).attempt).toEqual(
+        expect.any(String),
+      );
+    expect(
+      calls.map((c) => {
+        const { attempt: _attempt, ...metadata } = (c.gateway?.metadata ?? {}) as Record<
+          string,
+          unknown
+        >;
+        return [metadata, c.extraHeaders ?? null];
+      }),
+    ).toEqual([
+      [
+        {
+          component: "release-notes",
+          scopeKind: "space",
+          scopeId: "same",
+          feature: "release_notes",
+        },
+        null,
+      ],
+      [
+        { component: "knowledge", scopeKind: "space", scopeId: "same", feature: "knowledge" },
+        HEADER,
+      ],
+      [
+        { component: "assistant", scopeKind: "person", scopeId: "same", feature: "assistant" },
+        null,
+      ],
     ]);
   });
 });

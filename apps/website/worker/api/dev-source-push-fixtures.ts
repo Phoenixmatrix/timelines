@@ -24,7 +24,7 @@ export async function sourcePushFixtures(c: Context<AppEnv>) {
   )
     return fail(c, 400, "Invalid source push fixture.");
   const source = await c.env.DB.prepare(
-    "SELECT s.repo_id,s.timeline_slug,s.state,r.name FROM timeline_work_sources s JOIN repos r ON r.id=s.repo_id WHERE s.source_id=? AND r.owner_id='acc_orbit' AND r.deleted_at IS NULL",
+    "SELECT s.repo_id,s.timeline_slug,s.state,r.name FROM timeline_work_sources s JOIN repos r ON r.id=s.repo_id WHERE s.source_id=? AND r.space_id='acc_orbit' AND r.deleted_at IS NULL",
   )
     .bind(input.sourceId)
     .first<{ repo_id: string; timeline_slug: string; state: string; name: string }>();

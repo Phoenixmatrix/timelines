@@ -66,6 +66,7 @@ test("open, search, choose: each by keyboard, with focus where it belongs", asyn
 test("before anything's typed, one Go to leads; Go to and Find are second steps", async () => {
   const server = await setup();
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: "palette-go-fixtures",
     mutations: [
       {
@@ -131,6 +132,7 @@ test("before anything's typed, one Go to leads; Go to and Find are second steps"
 test("issues and packages open their own pages", async () => {
   const server = await setup();
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: "palette-fixtures",
     mutations: [
       {
@@ -184,6 +186,7 @@ test("issues and packages open their own pages", async () => {
 test("Create issue hands the proposed title to the tracker's creator, once", async () => {
   const server = await setup();
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: "palette-team",
     mutations: [
       {

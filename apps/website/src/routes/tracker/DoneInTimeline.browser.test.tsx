@@ -13,8 +13,9 @@ test("done in a timeline: the callout, the locked picker and the way to reopen i
   const server = await TestServer.start({ world: true });
   await server.repo("orbit", "engine");
   await server.push("orbit/engine", "main", commitId());
-  const mutate = (mutations: unknown[], timeline?: string) =>
+  const mutate = async (mutations: unknown[], timeline?: string) =>
     server.call("POST", "/api/tracker/orbit/mutate", {
+      ...(await server.trackerContract("orbit")),
       operationId: crypto.randomUUID(),
       mutations,
       ...(timeline ? { timeline } : {}),

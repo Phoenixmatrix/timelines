@@ -489,6 +489,13 @@ fn cli_source(
         "x-gitmatrix-source",
         ureq::http::HeaderValue::from_static("cli"),
     );
+    // App JSON contracts are versioned; native Git and registry paths are not.
+    if request.uri().path().starts_with("/api/") {
+        request.headers_mut().insert(
+            "x-gitmatrix-content-version",
+            ureq::http::HeaderValue::from_static("4"),
+        );
+    }
     next.handle(request)
 }
 
@@ -687,6 +694,30 @@ pub fn api(config: &Config, method: &str, path: &str, body: Option<&Value>) -> R
         }
         other => other,
     }
+}
+
+/// Resolve the persisted personal default through the authorized Space directory.
+/// A person's slug is never a content scope.
+pub fn default_space(config: &Config) -> Result<String> {
+    let session = api(config, "GET", "/session", None)?;
+    default_space_from_viewer(&session["viewer"])
+}
+
+fn default_space_from_viewer(viewer: &Value) -> Result<String> {
+    let id = viewer["defaultSpaceId"]
+        .as_str()
+        .ok_or_else(|| GmError::usage("No default Space is available; pass --space <handle>."))?;
+    viewer["spaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|space| space["id"].as_str() == Some(id))
+        .and_then(|space| space["slug"].as_str())
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            GmError::usage("Your default Space is not accessible; pass --space <handle>.")
+        })
 }
 
 /// Call the JSON API with exactly this token (or none).
@@ -1211,6 +1242,29 @@ mod failure_tests {
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
+
+    #[test]
+    fn personal_default_requires_matching_authorized_space() {
+        let viewer = serde_json::json!({
+            "slug": "person",
+            "defaultSpaceId": "space-1",
+            "spaces": [{"id": "space-1", "slug": "private-work"}]
+        });
+        assert_eq!(default_space_from_viewer(&viewer).unwrap(), "private-work");
+        assert!(
+            default_space_from_viewer(&serde_json::json!({
+                "slug": "person", "defaultSpaceId": "revoked",
+                "spaces": [{"id": "space-1", "slug": "private-work"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            default_space_from_viewer(&serde_json::json!({
+                "slug": "person", "spaces": []
+            }))
+            .is_err()
+        );
+    }
 
     fn failure(stderr: &str) -> GmError {
         git_failure(

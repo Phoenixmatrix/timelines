@@ -10,10 +10,13 @@ import type { Mutation } from "../../shared/tracker.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { durableStorage } from "../testing/durable.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { tracker as trackerApi } from "./api.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
 import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { initializeFreshTrackerSpace } from "./space-migration.ts";
+import { fakeDurableObjectId } from "../testing/durable-state.ts";
 
 const closers: { close(): void }[] = [];
 afterEach(() => {
@@ -25,23 +28,54 @@ const oid = (n: number) => n.toString(16).padStart(40, "0");
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const carl: Actor = { id: "carl", slug: "carl", displayName: "Carl", isSiteAdmin: false };
 
-function world() {
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
-  closers.push(sqlite, registry);
+async function world() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite, registry } = fresh;
+  closers.push(fresh);
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
-      ('ann', 'user', 'ann', 'Ann', NULL), ('ben', 'user', 'ben', 'Ben', NULL),
-      ('carl', 'user', 'carl', 'Carl', NULL), ('orbit', 'org', 'orbit', 'Orbit', 'none'),
-      ('other', 'org', 'other', 'Other', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'member'), ('orbit', 'ben', 'member');
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
+      ('carl', 'user', 'carl', 'Carl');
+    INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four) VALUES
+      ('ann-token','ann','fixture','write','ann-fixture-hash','test'),
+      ('ben-token','ben','fixture','write','ben-fixture-hash','test'),
+      ('carl-token','carl','fixture','write','carl-fixture-hash','test');
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: { id: "company", slug: "company", displayName: "Company", kind: "company" },
+    space: { id: "orbit", slug: "orbit", displayName: "Orbit" },
+    actorId: "ann",
+    members: [
+      ...["ann", "ben"].map((accountId) => ({
+        accountId,
+        role: "member" as const,
+        grant: {
+          role: "member" as const,
+          repositoryRole: "none" as const,
+          packageRole: "read" as const,
+        },
+      })),
+      { accountId: "carl", role: "owner" },
+    ],
+  });
+  await seedSpaceFixture(d1(sqlite), {
+    organization: {
+      id: "other-company",
+      slug: "other-company",
+      displayName: "Other",
+      kind: "company",
+    },
+    space: { id: "other", slug: "other", displayName: "Other" },
+    actorId: "ann",
+    members: [],
+  });
+  sqlite.exec(`
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt-bot', 'builder', 'ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r-engine', 'orbit', 'engine', 'private', 'a1', 'https://a/1'),
       ('r-secret', 'orbit', 'secret', 'private', 'a2', 'https://a/2');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES
-      ('r-engine', 'ann', 'read'), ('r-secret', 'ben', 'write');
+      ('r-engine', 'ann', 'read'), ('r-secret', 'ben', 'write'), ('r-engine', 'carl', 'read');
     -- Agent work contexts: the issue's, in both repositories, and another issue's.
     INSERT INTO step_contexts (repo_id, change_id, commit_oid, author_id, accountable_id, timeline, issue_key, summary, context, committed_at, verified_at) VALUES
       ('r-engine', 'chgone', '${oid(6)}', 'agt-bot', 'ann', 'search', 'CORE-1', 'Add ranking', '{"why":"Results were unordered.","model":"claude-opus"}', '2026-09-01T10:00:00.000Z', '2026-09-01T10:01:00.000Z'),
@@ -51,7 +85,7 @@ function world() {
       ('r-engine', '@day:2026-09-02', '${oid(6)}', '2026-09-02T00:00:00.000Z', '2026-09-02T00:00:00.000Z'),
       ('r-secret', '@day:2026-09-02', '${oid(7)}', '2026-09-02T00:00:00.000Z', '2026-09-02T00:00:00.000Z'),
       ('r-engine', '@day:2026-09-03', '${oid(6)}', '2026-09-03T00:00:00.000Z', '2026-09-03T00:00:00.000Z');
-    INSERT INTO release_note_entries (id, repo_id, release, subject, kind, category, title, summary, tracker_owner_id, issue_id, issue_key, commits, shipped_at, inputs_hash, updated_at) VALUES
+    INSERT INTO release_note_entries (id, repo_id, release, subject, kind, category, title, summary, tracker_space_id, issue_id, issue_key, commits, shipped_at, inputs_hash, updated_at) VALUES
       ('n1', 'r-engine', '@day:2026-09-02', 'CORE-1', 'issue', 'feature', 'Search ranks results', '', 'orbit', 'work', 'CORE-1', '["${oid(6)}"]', '2026-09-02T00:00:00.000Z', 'h1', '2026-09-02T00:00:00.000Z'),
       ('n2', 'r-secret', '@day:2026-09-02', 'CORE-1', 'issue', 'feature', 'Hidden note', '', 'orbit', 'work', 'CORE-1', '["${oid(7)}"]', '2026-09-02T00:00:00.000Z', 'h2', '2026-09-02T00:00:00.000Z'),
       ('n3', 'r-engine', '@day:2026-09-03', 'CORE-1', 'issue', 'fix', 'Another tracker''s CORE-1', '', 'other', 'x', 'CORE-1', '[]', '2026-09-03T00:00:00.000Z', 'h3', '2026-09-03T00:00:00.000Z');
@@ -63,7 +97,7 @@ function world() {
       ('run10', 'r-secret', 10, '${oid(7)}', 'refs/heads/timeline/search', 'push', 'Hidden', 'failed', '2026-09-01T10:06:00.000Z', NULL);
     -- Commit messages naming CORE-1 (CORE-22): in engine, in secret, one that
     -- named another tracker's CORE-1, and one left ambiguous; a run of the first.
-    INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, change_id, resolution, tracker_owner_id, issue_id, title, committed_at, first_ref, pushed_at) VALUES
+    INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, change_id, resolution, tracker_space_id, issue_id, title, committed_at, first_ref, pushed_at) VALUES
       ('r-engine', '${oid(20)}', 'CORE-1', 'chgmention', 'linked', 'orbit', 'work', 'CORE-1: Tune ranking weights', '2026-09-03T09:00:00.000Z', 'refs/heads/main', '2026-09-03T09:01:00.000Z'),
       ('r-engine', '${oid(19)}', 'CORE-1', NULL, 'linked', 'orbit', 'work', 'Prepare for CORE-1', NULL, NULL, '2026-09-02T09:01:00.000Z'),
       ('r-secret', '${oid(21)}', 'CORE-1', NULL, 'linked', 'orbit', 'work', 'CORE-1 hidden mention', '2026-09-03T10:00:00.000Z', 'refs/heads/main', '2026-09-03T10:01:00.000Z'),
@@ -85,7 +119,7 @@ function world() {
       WHERE repo_id = 'r-engine';
   `);
   registry.exec(`
-    INSERT INTO repositories (id, owner_id, key, format, kind, visibility, config, created_at, updated_at) VALUES
+    INSERT INTO repositories (id, space_id, key, format, kind, visibility, config, created_at, updated_at) VALUES
       ('feed', 'orbit', 'orbit', 'npm', 'local', 'private', '{}', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');
     INSERT INTO packages (id, repo_id, name, normalized_name, created_at, updated_at) VALUES
       ('pkg', 'feed', '@orbit/ranker', '@orbit/ranker', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z'),
@@ -99,13 +133,47 @@ function world() {
   // The tracker: CORE-1 worked in timeline "search", which touches both repositories.
   const { db, sql, transactionSync } = durableStorage();
   closers.push(db);
+  const identity = fakeDurableObjectId("orbit");
+  Reflect.set(fresh.env, "TRACKER", { idFromName: fakeDurableObjectId });
+  await initializeFreshTrackerSpace(
+    fresh.env,
+    {
+      id: identity,
+      storage: { sql, transactionSync },
+    } as unknown as Pick<DurableObjectState, "id" | "storage">,
+    "orbit",
+  );
   let now = Date.parse("2026-09-01T09:00:00Z");
   const store = new TrackerStore(sql, transactionSync, () => now);
   const access: Access = {
     actorId: "ann",
     principalId: "ann",
+    credential: { kind: "token", id: "ann-token" },
     agents: [],
-    owner: { id: "orbit", slug: "orbit", displayName: "Orbit" },
+    agentId: null,
+    spaceId: "orbit",
+    contractVersion: 4,
+    migrationEpoch: 0,
+    authorizationVersion: 1,
+    space: {
+      id: "orbit",
+      slug: "orbit",
+      displayName: "Orbit",
+      organizationId: "company",
+      organization: {
+        id: "company",
+        slug: "company",
+        displayName: "Company",
+        avatarUrl: null,
+        kind: "company",
+        personalAccountId: null,
+        defaultSpaceId: "orbit",
+        createdAt: "",
+      },
+      archivedAt: null,
+      authorizationVersion: 1,
+      createdAt: "",
+    },
     canAdmin: true,
     members: [{ id: "ann", slug: "ann", displayName: "Ann" }],
     repos: [],
@@ -113,6 +181,9 @@ function world() {
   let n = 0;
   const mutate = (timeline: string | undefined, ...mutations: Mutation[]) =>
     store.mutate(access, {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
       operationId: `op-${++n}`,
       mutations,
       ...(timeline ? { timeline } : {}),
@@ -123,8 +194,8 @@ function world() {
     { kind: "issue.create", id: "work", data: { teamId: "team", title: "Rank search results" } },
   );
   const repos = [
-    { id: "r-engine", owner: "orbit", name: "engine" },
-    { id: "r-secret", owner: "orbit", name: "secret" },
+    { id: "r-engine", space: "orbit", name: "engine" },
+    { id: "r-secret", space: "orbit", name: "secret" },
   ];
   const search = ownedTimeline(store.timelines, access, {
     slug: "search",
@@ -192,6 +263,13 @@ function world() {
     ],
     reason: null,
     trigger: "auto",
+    authority: {
+      spaceId: "orbit",
+      migrationEpoch: 0,
+      personId: "ann",
+      agentId: null,
+      credential: { kind: "token", id: "ann-token" },
+    },
     requestedBy: { actorId: "ann", accountableId: "ann", agentId: null },
     version: 1,
     createdAt: "2026-09-01T12:00:00.000Z",
@@ -219,39 +297,57 @@ function world() {
   const stub = {
     chronicle: async (a: Access, options: Parameters<TrackerStore["chronicle"]>[1]) =>
       reply(() => store.chronicle(a, options)),
-    issueWork: async (issue: string) => reply(() => store.issueWork(issue)),
+    issueWork: async (_access: Access, issue: string) => reply(() => store.issueWork(issue)),
   };
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     REGISTRY_DB: d1(registry),
-    TRACKER: { getByName: () => stub },
+    TRACKER: { idFromName: fakeDurableObjectId, getByName: () => stub },
   } as unknown as Env;
   const call = (actor: Actor | null, path: string) => {
     const app = new Hono<AppEnv>();
     app.use("*", async (c, next) => {
-      c.set("actor", actor);
+      c.set(
+        "actor",
+        actor ? { ...actor, credential: { kind: "token", id: `${actor.id}-token` } } : null,
+      );
       await next();
     });
     app.route("/api", trackerApi);
-    return app.request(`/api${path}`, {}, env, {
+    return app.request(`/api${path}`, { headers: { "X-Gitmatrix-Content-Version": "4" } }, env, {
       waitUntil: () => {},
       passThroughOnException: () => {},
       props: {},
     } as unknown as ExecutionContext);
   };
-  return { call };
+  return { call, sqlite };
 }
 
 describe("an issue's linked work", () => {
+  test("repository read does not replace package permission and revocation applies on the next read", async () => {
+    const { call, sqlite } = await world();
+    const before = await call(ann, "/tracker/orbit/issues/CORE-1/work");
+    expect(((await before.json()) as LinkedWork).packages).not.toHaveLength(0);
+    sqlite
+      .prepare("UPDATE space_grants SET package_role='none' WHERE space_id=? AND account_id=?")
+      .run("orbit", "ann");
+    const after = await call(ann, "/tracker/orbit/issues/CORE-1/work");
+    const work = (await after.json()) as LinkedWork;
+    expect(work.commits.length).toBeGreaterThan(0);
+    expect(work.packages).toEqual([]);
+    expect(work.mentions.every((mention) => mention.packages.length === 0)).toBe(true);
+  });
+
   test("returns its commits, work contexts, runs, previews, packages, timeline and release notes", async () => {
-    const { call } = world();
+    const { call } = await world();
     const response = await call(ann, "/tracker/orbit/issues/CORE-1/work");
     expect(response.status).toBe(200);
     const work = (await response.json()) as LinkedWork;
     expect(work.issue).toMatchObject({ key: "CORE-1", status: "done_in_timeline" });
     expect(work.steps).toMatchObject([
       {
-        repo: { owner: "orbit", name: "engine" },
+        repo: { space: "orbit", name: "engine" },
         changeId: "chgone",
         commitOid: oid(6),
         summary: "Add ranking",
@@ -293,7 +389,7 @@ describe("an issue's linked work", () => {
         format: "npm",
         name: "@orbit/ranker",
         version: "1.2.0",
-        owner: "orbit",
+        space: "orbit",
         href: "/orbit/-/packages/npm/%40orbit/ranker",
       },
     ]);
@@ -315,7 +411,7 @@ describe("an issue's linked work", () => {
     ]);
     expect(work.releaseNotes).toEqual([
       {
-        repo: { id: "r-engine", owner: "orbit", name: "engine" },
+        repo: { id: "r-engine", space: "orbit", name: "engine" },
         release: "@day:2026-09-02",
         label: "2026-09-02",
         title: "Search ranks results",
@@ -328,7 +424,7 @@ describe("an issue's linked work", () => {
   });
 
   test("leaves out what lives in repositories the viewer can't read, without a trace", async () => {
-    const { call } = world();
+    const { call } = await world();
     const text = await (await call(ann, "/tracker/orbit/issues/CORE-1/work")).text();
     for (const hidden of ["secret", "r-secret", oid(3), oid(5), oid(7), "Hidden", "hidden"])
       expect(text).not.toContain(hidden);
@@ -343,13 +439,13 @@ describe("an issue's linked work", () => {
   });
 
   test("lists the commits that mention it apart, with their runs and packages, as the viewer may read them", async () => {
-    const { call } = world();
+    const { call } = await world();
     const work = (await (
       await call(ann, "/tracker/orbit/issues/CORE-1/work")
     ).json()) as LinkedWork;
     expect(work.mentions).toEqual([
       {
-        repo: { id: "r-engine", owner: "orbit", name: "engine" },
+        repo: { id: "r-engine", space: "orbit", name: "engine" },
         oid: oid(20),
         changeId: "chgmention",
         title: "CORE-1: Tune ranking weights",
@@ -397,7 +493,7 @@ describe("an issue's linked work", () => {
   });
 
   test("needs tracker membership, and names a missing issue", async () => {
-    const { call } = world();
+    const { call } = await world();
     expect((await call(null, "/tracker/orbit/issues/CORE-1/work")).status).toBe(401);
     expect((await call(carl, "/tracker/orbit/issues/CORE-1/work")).status).toBe(403);
     const missing = await call(ann, "/tracker/orbit/issues/CORE-404/work");
@@ -407,7 +503,7 @@ describe("an issue's linked work", () => {
 
 describe("the Chronicle over HTTP", () => {
   test("reads a range, validates it, and needs membership", async () => {
-    const { call } = world();
+    const { call } = await world();
     const ok = await call(
       ann,
       "/tracker/orbit/chronicle?from=2026-09-01T08:00:00Z&to=2026-09-01T12:00:00Z&q=",

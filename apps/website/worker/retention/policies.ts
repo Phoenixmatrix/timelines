@@ -1,20 +1,6 @@
-// Retention policies (CORE-196): what each account and the site have chosen
-// for every category in worker/retention/categories.ts, resolved to effective
-// values.
-//
-// Resolution, per category and threshold:
-// - account categories: the account's stored value, else the site-wide
-//   default, else the category's default; `enabled` likewise, normally false.
-// - site categories: the site's stored value, else the category's default.
-// - "active" categories always run, per account. Previews' thresholds live in
-//   account_settings (the columns the preview sweep reads), so changing them
-//   here or through /settings/previews is the same change; Atlas snapshots'
-//   in retention_policies (enabled null), which every Atlas retention pass
-//   reads (worker/atlas/retention.ts `scopePolicy`).
-// - "fixed" categories always run with their defaults, on the schedule like
-//   an enabled policy, and ignore any stored value (auth hygiene stored a site
-//   row while it was a policy; CORE-249).
-// A stored value that no longer fits its threshold's bounds is ignored.
+// Retention policies resolve within an explicit Space, person, or Instance.
+// Instance defaults can configure policy categories, never grant access to
+// personal chats or Space content. Active categories use only Space values.
 //
 // Nothing here deletes anything. The cleanup engine (runs.ts) asks
 // `targetPolicies` / `enabledTargets` what to run; `runnable` says whether a
@@ -35,8 +21,8 @@ import { batch, db, nowIso } from "../schema.ts";
 import { CATEGORIES, category, validThreshold } from "./categories.ts";
 import { cleanupFor } from "./cleanups/index.ts";
 
-/** Whose policies: one account's, or the site's. */
-export type RetentionTarget = { scope: "account"; accountId: string } | { scope: "site" };
+export type { RetentionTarget } from "../../shared/retention.ts";
+import type { RetentionTarget } from "../../shared/retention.ts";
 
 interface StoredRow {
   category: string;
@@ -127,23 +113,27 @@ async function siteRows(d1: D1Database): Promise<Map<string, StoredRow>> {
   return new Map(rows.map((r) => [r.category, r]));
 }
 
-async function accountRows(d1: D1Database, accountId: string): Promise<Map<string, StoredRow>> {
+async function scopedRows(
+  d1: D1Database,
+  target: RetentionTarget,
+): Promise<Map<string, StoredRow>> {
   const rows = await db(d1)
     .selectFrom("retention_policies as p")
     .leftJoin("accounts as a", "a.id", "p.updated_by")
     .select(["p.category", "p.enabled", "p.thresholds", "p.updated_at", "a.slug"])
-    .where("p.account_id", "=", accountId)
+    .where("p.scope_kind", "=", target.kind)
+    .where("p.scope_id", "=", target.id)
     .execute();
   return new Map(rows.map((r) => [r.category, r]));
 }
 
-/** The account_settings preview columns, as a stored policy row of `previews`. */
-async function previewRow(d1: D1Database, accountId: string): Promise<StoredRow | undefined> {
+/** Space preview settings remain shared with the preview lifecycle. */
+async function previewRow(d1: D1Database, spaceId: string): Promise<StoredRow | undefined> {
   const row = await db(d1)
-    .selectFrom("account_settings as s")
+    .selectFrom("space_settings as s")
     .leftJoin("accounts as a", "a.id", "s.updated_by")
     .select(["s.preview_ended_days", "s.preview_idle_days", "s.updated_at", "a.slug"])
-    .where("s.account_id", "=", accountId)
+    .where("s.space_id", "=", spaceId)
     .executeTakeFirst();
   // A row the AI settings created leaves the preview columns at their
   // defaults and updated_at null: nothing stored for previews.
@@ -160,87 +150,79 @@ async function previewRow(d1: D1Database, accountId: string): Promise<StoredRow 
   };
 }
 
-/** Every account category with this account's effective policy, in registry order. */
-export async function accountPolicies(
-  d1: D1Database,
-  accountId: string,
-): Promise<RetentionPolicy[]> {
-  const [site, own, preview, runs] = await Promise.all([
+/** Effective categories for exactly one content or personal target. */
+async function scopedPolicies(d1: D1Database, target: RetentionTarget): Promise<RetentionPolicy[]> {
+  const [instance, own, preview, runs] = await Promise.all([
     siteRows(d1),
-    accountRows(d1, accountId),
-    previewRow(d1, accountId),
-    lastRuns(d1, { scope: "account", accountId }),
+    scopedRows(d1, target),
+    target.kind === "space" ? previewRow(d1, target.id) : undefined,
+    lastRuns(d1, target),
   ]);
-  return CATEGORIES.filter((c) => c.scope === "account").map((c) => {
-    // Active (and any fixed) categories: the account's own values only (a
-    // fixed one never has stored values: validatePatch refuses them).
-    if (c.control !== "policy")
-      return resolve(c, [{ from: "account", row: c.id === "previews" ? preview : own.get(c.id) }]);
-    return resolve(
-      c,
-      [
-        { from: "account", row: own.get(c.id) },
-        { from: "site", row: site.get(c.id) },
-      ],
-      runs.get(c.id),
-    );
+  return CATEGORIES.filter((c) => c.scope === target.kind).map((c) => {
+    const saved = [{ from: target.kind, row: c.id === "previews" ? preview : own.get(c.id) }];
+    if (c.control === "policy") saved.push({ from: "instance", row: instance.get(c.id) });
+    return resolve(c, saved, runs.get(c.id));
   });
 }
 
-/**
- * The site level: site categories with their policy, then the account
- * categories that take a policy, with the site-wide defaults.
- */
-export async function sitePolicies(d1: D1Database): Promise<RetentionPolicy[]> {
-  const [site, runs] = await Promise.all([siteRows(d1), lastRuns(d1, { scope: "site" })]);
-  const of = (c: RetentionCategory) =>
-    resolve(c, [{ from: "site", row: site.get(c.id) }], runs.get(c.id));
-  return [
-    ...CATEGORIES.filter((c) => c.scope === "site").map(of),
-    // Site-wide defaults: their runs are each account's.
-    ...CATEGORIES.filter((c) => c.scope === "account" && c.control === "policy").map((c) =>
-      resolve(c, [{ from: "site", row: site.get(c.id) }]),
-    ),
-  ];
+export async function spacePolicies(d1: D1Database, spaceId: string): Promise<RetentionPolicy[]> {
+  return scopedPolicies(d1, { kind: "space", id: spaceId });
 }
 
-/** A target's effective policies (an account's account categories, or the site's site ones). */
+export async function personPolicies(d1: D1Database, personId: string): Promise<RetentionPolicy[]> {
+  return scopedPolicies(d1, { kind: "person", id: personId });
+}
+
+/** Instance infrastructure policies and defaults, not access to scoped records. */
+export async function instancePolicies(d1: D1Database): Promise<RetentionPolicy[]> {
+  const [instance, runs] = await Promise.all([
+    siteRows(d1),
+    lastRuns(d1, { kind: "instance", id: "" }),
+  ]);
+  return CATEGORIES.filter((c) => c.scope === "instance" || c.control === "policy").map((c) =>
+    resolve(
+      c,
+      [{ from: "instance", row: instance.get(c.id) }],
+      c.scope === "instance" ? runs.get(c.id) : undefined,
+    ),
+  );
+}
+
 export async function targetPolicies(
   d1: D1Database,
   target: RetentionTarget,
 ): Promise<RetentionPolicy[]> {
-  return target.scope === "account"
-    ? accountPolicies(d1, target.accountId)
-    : (await sitePolicies(d1)).filter((p) => p.scope === "site");
+  return target.kind === "instance"
+    ? (await instancePolicies(d1)).filter((p) => p.scope === "instance")
+    : scopedPolicies(d1, target);
 }
 
-/**
- * Every target with at least one enabled "policy" or "fixed" category, with
- * those categories: what scheduled runs cover. With nothing enabled anywhere,
- * only the site with its fixed categories.
- */
+/** Schedule independently by immutable scope, including private personal chats. */
 export async function enabledTargets(
   d1: D1Database,
 ): Promise<{ target: RetentionTarget; policies: RetentionPolicy[] }[]> {
-  const site = await sitePolicies(d1);
   const out: { target: RetentionTarget; policies: RetentionPolicy[] }[] = [];
-  const siteOn = site.filter((p) => p.scope === "site" && p.control !== "active" && p.enabled);
-  if (siteOn.length) out.push({ target: { scope: "site" }, policies: siteOn });
-  // Accounts that enabled something, or every account when a site-wide
-  // default enables an account category.
-  const defaultOn = site.some((p) => p.scope === "account" && p.enabled);
-  const accounts = defaultOn
-    ? await db(d1).selectFrom("accounts").select("id").orderBy("id").execute()
-    : await db(d1)
-        .selectFrom("retention_policies")
-        .select("account_id as id")
-        .where("enabled", "=", 1)
-        .distinct()
-        .orderBy("account_id")
-        .execute();
-  for (const { id } of accounts) {
-    const on = (await accountPolicies(d1, id)).filter((p) => p.control === "policy" && p.enabled);
-    if (on.length) out.push({ target: { scope: "account", accountId: id }, policies: on });
+  const instance = (await targetPolicies(d1, { kind: "instance", id: "" })).filter(
+    (p) => p.control !== "active" && p.enabled,
+  );
+  if (instance.length) out.push({ target: { kind: "instance", id: "" }, policies: instance });
+  const [spaces, people] = await Promise.all([
+    db(d1)
+      .selectFrom("spaces")
+      .select("id")
+      .where("archived_at", "is", null)
+      .orderBy("id")
+      .execute(),
+    db(d1).selectFrom("accounts").select("id").where("kind", "=", "user").orderBy("id").execute(),
+  ]);
+  for (const kind of ["space", "person"] as const) {
+    for (const { id } of kind === "space" ? spaces : people) {
+      const target = { kind, id };
+      const policies = (await targetPolicies(d1, target)).filter(
+        (p) => p.control === "policy" && p.enabled,
+      );
+      if (policies.length) out.push({ target, policies });
+    }
   }
   return out;
 }
@@ -267,9 +249,7 @@ export async function lastRuns(
     ])
     .where("r.id", "in", (eb) => {
       const recent = eb.selectFrom("cleanup_runs").select("id").orderBy("id", "desc").limit(100);
-      return target.scope === "site"
-        ? recent.where("account_id", "is", null)
-        : recent.where("account_id", "=", target.accountId);
+      return recent.where("scope_kind", "=", target.kind).where("scope_id", "=", target.id);
     })
     .orderBy("r.id", "desc");
   const out = new Map<string, RetentionLastRun>();
@@ -288,10 +268,10 @@ export async function lastRuns(
   return out;
 }
 
-/** The latest changes at a level (an account, or the site with null). */
+/** Latest changes for exactly one explicit target. */
 export async function recentChanges(
   d1: D1Database,
-  accountId: string | null,
+  target: RetentionTarget,
   limit = 20,
 ): Promise<RetentionChange[]> {
   let query = db(d1)
@@ -300,10 +280,7 @@ export async function recentChanges(
     .select(["c.category", "c.before", "c.after", "c.created_at", "a.slug"])
     .orderBy("c.id", "desc")
     .limit(limit);
-  query =
-    accountId === null
-      ? query.where("c.account_id", "is", null)
-      : query.where("c.account_id", "=", accountId);
+  query = query.where("c.scope_kind", "=", target.kind).where("c.scope_id", "=", target.id);
   return (await query.execute()).map((r) => ({
     category: r.category,
     actor: r.slug,
@@ -333,11 +310,10 @@ export function validatePatch(
   for (const [id, raw] of Object.entries(categories)) {
     const c = category(id);
     if (!c) return `Unknown category: ${id}.`;
-    if (level === "account" && c.scope === "site")
-      return `${id} is a site category; site administrators set it under /api/admin/retention.`;
+    if (level !== "instance" && c.scope !== level) return `${id} is not a ${level} category.`;
     if (c.control === "fixed") return `${id} is read-only.`;
-    if (level === "site" && c.control !== "policy")
-      return `${id} is set per account, not as a site-wide default.`;
+    if (level === "instance" && c.scope !== "instance" && c.control !== "policy")
+      return `${id} is set per Space, not as an Instance default.`;
     if (!raw || typeof raw !== "object" || Array.isArray(raw))
       return `${id} must be {enabled?, thresholds?}.`;
     const change: Change = {};
@@ -393,10 +369,9 @@ export async function applyPatch(
   actorId: string,
 ): Promise<void> {
   const kdb = db(d1);
-  const accountId = target.scope === "account" ? target.accountId : null;
   const [rows, preview] = await Promise.all([
-    accountId === null ? siteRows(d1) : accountRows(d1, accountId),
-    accountId === null ? undefined : previewRow(d1, accountId),
+    target.kind === "instance" ? siteRows(d1) : scopedRows(d1, target),
+    target.kind === "space" ? previewRow(d1, target.id) : undefined,
   ]);
   const at = nowIso();
   const queries: Parameters<typeof batch>[1] = [];
@@ -404,7 +379,7 @@ export async function applyPatch(
     const previews = c.id === "previews";
     const before = stored(previews ? preview : rows.get(c.id));
     let after = merge(before, change);
-    // Previews store both numbers (account_settings columns), defaults where reset.
+    // Previews store both numbers (space_settings columns), defaults where reset.
     if (previews)
       after = {
         thresholds: {
@@ -415,7 +390,8 @@ export async function applyPatch(
     if (same(before, after)) continue;
     queries.push(
       kdb.insertInto("retention_policy_changes").values({
-        account_id: accountId,
+        scope_kind: target.kind,
+        scope_id: target.id,
         category: c.id,
         actor_id: actorId,
         before: JSON.stringify(before),
@@ -423,20 +399,20 @@ export async function applyPatch(
         created_at: at,
       }),
     );
-    // Atlas retention reads the policy on every pass; flag the account's
+    // Atlas retention reads the policy on every pass; flag the Space's
     // repositories so the hourly sweep applies a tighter one without waiting
     // for their next build.
-    if (c.id === ATLAS_CATEGORY && accountId !== null)
+    if (c.id === ATLAS_CATEGORY && target.kind === "space")
       queries.push(
         kdb
           .updateTable("atlas_scopes")
           .set({ retention_pending: 1 })
           .where("kind", "=", "repo")
           .where("repo_id", "in", (eb) =>
-            eb.selectFrom("repos").select("id").where("owner_id", "=", accountId),
+            eb.selectFrom("repos").select("id").where("space_id", "=", target.id),
           ),
       );
-    if (previews && accountId !== null) {
+    if (previews && target.kind === "space") {
       const values = {
         preview_ended_days: after.thresholds!.endedDays!,
         preview_idle_days: after.thresholds!.idleDays!,
@@ -445,9 +421,9 @@ export async function applyPatch(
       };
       queries.push(
         kdb
-          .insertInto("account_settings")
-          .values({ account_id: accountId, ...values })
-          .onConflict((oc) => oc.column("account_id").doUpdateSet(values)),
+          .insertInto("space_settings")
+          .values({ space_id: target.id, ...values })
+          .onConflict((oc) => oc.column("space_id").doUpdateSet(values)),
       );
       continue;
     }
@@ -458,7 +434,7 @@ export async function applyPatch(
       updated_by: actorId,
       updated_at: at,
     };
-    if (accountId === null)
+    if (target.kind === "instance")
       queries.push(
         empty
           ? kdb.deleteFrom("retention_site_policies").where("category", "=", c.id)
@@ -472,12 +448,15 @@ export async function applyPatch(
         empty
           ? kdb
               .deleteFrom("retention_policies")
-              .where("account_id", "=", accountId)
+              .where("scope_kind", "=", target.kind)
+              .where("scope_id", "=", target.id)
               .where("category", "=", c.id)
           : kdb
               .insertInto("retention_policies")
-              .values({ account_id: accountId, category: c.id, ...values })
-              .onConflict((oc) => oc.columns(["account_id", "category"]).doUpdateSet(values)),
+              .values({ scope_kind: target.kind, scope_id: target.id, category: c.id, ...values })
+              .onConflict((oc) =>
+                oc.columns(["scope_kind", "scope_id", "category"]).doUpdateSet(values),
+              ),
       );
   }
   await batch(d1, queries);

@@ -68,7 +68,7 @@ export function TimelineWikiPages({
   removedAt = null,
   note,
 }: {
-  repo: { owner: string; name: string };
+  repo: { space: string; name: string };
   /** `timeline/<slug>`. */
   ref: string;
   /** The bookmark is there and its overlay has a main to compare with. */
@@ -79,7 +79,7 @@ export function TimelineWikiPages({
   /** The newest set's main against the map on screen, in words. */
   note: string | null;
 }) {
-  const path = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/knowledge/overlay/pages?ref=${encodeURIComponent(ref)}`;
+  const path = `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}/knowledge/overlay/pages?ref=${encodeURIComponent(ref)}`;
   const [sets, setSets] = useState<KnowledgePageSet[] | null>(null);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -135,7 +135,7 @@ export function TimelineWikiPages({
         <div className="flex flex-col gap-1.5">
           {heading(newest)}
           {note && <span className="block text-micro text-ink-faint">{note}</span>}
-          <PageSetSummary set={newest} owner={repo.owner} name={repo.name} />
+          <PageSetSummary set={newest} space={repo.space} name={repo.name} />
         </div>
       ) : (
         sets !== null && (
@@ -157,7 +157,7 @@ export function TimelineWikiPages({
             {earlier.map((set) => (
               <div key={set.key} className="flex flex-col gap-1.5">
                 {heading(set)}
-                <PageSetSummary set={set} owner={repo.owner} name={repo.name} />
+                <PageSetSummary set={set} space={repo.space} name={repo.name} />
               </div>
             ))}
           </div>

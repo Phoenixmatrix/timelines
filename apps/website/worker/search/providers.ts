@@ -11,11 +11,13 @@ import {
   type SearchCategory,
   type SearchResult,
 } from "../../shared/search.ts";
-import type { Issue, TrackerOwner } from "../../shared/tracker.ts";
+import type { Issue, TrackerSpace } from "../../shared/tracker.ts";
 import type { Actor } from "../db.ts";
-import { readableRepo, roleFor, selectRepos } from "../db.ts";
+import { readableRepo, repoSpace, roleFor, selectRepos } from "../db.ts";
 import { db } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
+import { accessFor } from "../tracker/access.ts";
+import { TrackerError } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { packages } from "./packages.ts";
 import { matchOf, matchRank, matches, type MatchColumns, type SearchQuery } from "./query.ts";
@@ -65,9 +67,9 @@ const repositories: SearchProvider<"repositories"> = {
   category: "repositories",
   async search({ env, actor }, query, page) {
     const columns: MatchColumns = {
-      identifiers: [sql`o.slug || '/' || r.name`, sql.ref("r.name")],
-      names: [sql.ref("r.name"), sql`o.slug || '/' || r.name`],
-      searched: [sql`o.slug || '/' || r.name`, sql.ref("r.description")],
+      identifiers: [sql`s.slug || '/' || r.name`, sql.ref("r.name")],
+      names: [sql.ref("r.name"), sql`s.slug || '/' || r.name`],
+      searched: [sql`s.slug || '/' || r.name`, sql.ref("r.description")],
     };
     const found = await selectRepos(env.DB, actor.id)
       .select(matchRank(columns, query).as("match_rank"))
@@ -88,15 +90,15 @@ const repositories: SearchProvider<"repositories"> = {
         .map((row): RepositoryResult => ({
           category: "repositories",
           id: `repositories:${row.id}`,
-          title: `${row.owner_slug}/${row.name}`,
+          title: `${row.space_slug}/${row.name}`,
           subtitle: row.description,
-          breadcrumb: [row.owner_slug],
+          breadcrumb: [row.space_slug],
           match: matchOf(row.match_rank),
           target: {
             kind: "path",
-            path: `/${encodeURIComponent(row.owner_slug)}/${encodeURIComponent(row.name)}`,
+            path: `/${encodeURIComponent(row.space_slug)}/${encodeURIComponent(row.name)}`,
           },
-          owner: row.owner_slug,
+          space: repoSpace(row),
           name: row.name,
           visibility: row.visibility,
           defaultBranch: row.default_branch,
@@ -132,17 +134,26 @@ const issues: SearchProvider<"issues"> = {
   category: "issues",
   async search({ env, actor }, query, page) {
     const owners = await accessible(env.DB, actor);
-    // Your own tracker first, then organizations by slug.
-    owners.sort((a, b) => Number(b.id === actor.id) - Number(a.id === actor.id));
     const searched = owners.slice(0, SEARCH_LIMITS.trackers);
     // Each tracker's best `want` are enough to fill this page and know if more follow.
     const want = page.offset + page.limit + 1;
     const answers = await pooled(searched, TRACKER_CONCURRENCY, async (owner) => {
       try {
-        const reply = await trackerObject(env, owner.id).searchIssues(query, want);
+        const access = await accessFor(
+          env,
+          owner,
+          actor.id,
+          actor.agent?.id ?? null,
+          false,
+          actor.credential,
+        );
+        const reply = await trackerObject(env, owner.id).searchIssues(access, query, want);
         if (reply.ok) return { owner, matches: reply.value };
+        if (reply.status === 403 || reply.status === 404) return { owner, matches: [] };
         console.error(`search: tracker ${owner.slug} refused`, reply.error);
       } catch (error) {
+        if (error instanceof TrackerError && (error.status === 403 || error.status === 404))
+          return { owner, matches: [] };
         console.error(`search: tracker ${owner.slug} failed`, error);
       }
       return { owner, matches: null };
@@ -185,7 +196,7 @@ const STATUS_LABEL: Record<Issue["status"], string> = {
   canceled: "Canceled",
 };
 
-function issueResult(owner: TrackerOwner, issue: Issue, rank: number): IssueResult {
+function issueResult(owner: TrackerSpace, issue: Issue, rank: number): IssueResult {
   return {
     category: "issues",
     id: `issues:${owner.id}:${issue.id}`,
@@ -198,14 +209,14 @@ function issueResult(owner: TrackerOwner, issue: Issue, rank: number): IssueResu
       path: `/tracker/${encodeURIComponent(owner.slug)}/issues/${encodeURIComponent(issue.id)}`,
     },
     key: issue.key,
-    tracker: { slug: owner.slug, displayName: owner.displayName },
+    space: owner,
     status: issue.status,
     priority: issue.priority,
     updatedAt: issue.updatedAt,
   };
 }
 
-/** People and organizations. Every profile is public (GET /api/accounts/:slug), so all are searchable. */
+/** People have public profiles; Organization directories are not Account profiles. */
 const accounts: SearchProvider<"accounts"> = {
   category: "accounts",
   async search({ env }, query, page) {
@@ -218,6 +229,7 @@ const accounts: SearchProvider<"accounts"> = {
       .selectFrom("accounts as a")
       .select(["a.id", "a.kind", "a.slug", "a.display_name"])
       .select(matchRank(columns, query).as("match_rank"))
+      .where("a.kind", "=", "user")
       .where(matches(columns, query))
       .orderBy("match_rank")
       .orderBy("a.slug")
@@ -235,8 +247,8 @@ const accounts: SearchProvider<"accounts"> = {
         subtitle: row.slug,
         breadcrumb: [],
         match: matchOf(row.match_rank),
-        target: { kind: "path", path: `/${encodeURIComponent(row.slug)}` },
-        kind: row.kind,
+        target: { kind: "path", path: `/accounts/${encodeURIComponent(row.slug)}` },
+        kind: "user",
         slug: row.slug,
       })),
     };

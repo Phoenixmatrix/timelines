@@ -4,9 +4,9 @@
 export interface PageContext {
   path: string;
   title?: string;
-  /** owner/name when on a repository page. */
+  /** Space/name when on a repository page. */
   repo?: string;
-  /** Tracker owner and issue key when on an issue. */
+  /** Explicit Space slug and issue key when on an issue. */
   tracker?: string;
   issue?: string;
   /** A file and its selected lines when reading code. */
@@ -23,6 +23,8 @@ export interface AssistantChat {
   source: "web" | "cli";
   createdAt: string;
   updatedAt: string;
+  /** Stored content is retained but cannot be read, exported or reused without current access. */
+  contentUnavailable?: boolean;
   /**
    * When retention deletes it unless it's used again (CORE-204): null while
    * the account's "assistant-chats" policy is off. A chat over the policy's
@@ -36,7 +38,7 @@ export interface AskRequest {
   question: string;
   /** Continue this chat; a new one otherwise. */
   chatId?: string;
-  /** owner/name the question is about. */
+  /** Space/name the question is about. */
   repo?: string;
   /** Allow writes (no interactive approval from a terminal). */
   write?: boolean;
@@ -117,7 +119,7 @@ export function issueTagsInput(input: Record<string, unknown>): string[] | undef
  * something the request doesn't do.
  */
 export function describeWrite(tool: string, input: Record<string, unknown>): WriteDescription {
-  const owner = str(input.owner);
+  const space = str(input.space);
   switch (tool) {
     case "create_issue": {
       const fields: [string, string][] = [["Title", str(input.title)]];
@@ -130,7 +132,7 @@ export function describeWrite(tool: string, input: Record<string, unknown>): Wri
       if (typeof input.requires === "string" && input.requires.trim())
         fields.push(["Agent requirements", input.requires.trim()]);
       return {
-        title: `Create an issue in ${str(input.team) || "a team"}${owner ? ` (${owner})` : ""}`,
+        title: `Create an issue in ${str(input.team) || "a team"}${space ? ` (${space})` : ""}`,
         fields,
         body: str(input.description) || undefined,
       };

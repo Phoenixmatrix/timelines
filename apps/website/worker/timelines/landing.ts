@@ -7,7 +7,7 @@
 import { lsRefs } from "../artifacts.ts";
 import { runOutcome, startMergeRun } from "../ci/landing.ts";
 import { startRun, startWorkflow } from "../ci/trigger.ts";
-import { actorFromRow, type AccountRow, type Actor } from "../db.ts";
+import type { Actor } from "../db.ts";
 import { afterPush, type PushedRepo } from "../git/effects.ts";
 import { db } from "../schema.ts";
 import {
@@ -27,7 +27,6 @@ import { trackerObject } from "../tracker/stub.ts";
 import { logPush } from "./activity.ts";
 import { writeRefs, type RefWrite, type RefWriteResult } from "./bookmarks.ts";
 import { getWorkSource } from "./sources.ts";
-import { writableRepoIds } from "./checkpoints.ts";
 import {
   completeReceipts,
   receiptFor,
@@ -40,6 +39,14 @@ import {
 } from "./integration.ts";
 import { notifyReleaseNotes } from "../release-notes/queue.ts";
 import { landingFixtureBarrier } from "./landing-fixture.ts";
+import {
+  captureWorkAuthority,
+  parseWorkAuthority,
+  resolveWorkAuthority,
+  WorkAuthorizationError,
+} from "../ci/admission.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
+import { findSpaceById } from "../spaces/access.ts";
 
 /** Merges tried per repository before a main that keeps moving stops the landing. */
 export const MAX_ATTEMPTS = 5;
@@ -65,6 +72,7 @@ export interface LandingDeps {
       branch: string;
       commit: string;
       actor: RunActor;
+      authority: WorkAuthority;
     },
   ): Promise<{ skipped: string } | object>;
   runOutcome(runId: string): Promise<RunOutcome | null>;
@@ -83,7 +91,7 @@ export interface LandingDeps {
  */
 const STEP_RETRY_MS = [1_000, 4_000] as const;
 
-type RunActor = Pick<Actor, "id" | "agent">;
+type RunActor = Pick<Actor, "id" | "agent" | "credential">;
 
 /** The queue as it runs in the Worker. */
 export function workerDeps(env: Env, waitUntil: (work: Promise<unknown>) => void): LandingDeps {
@@ -106,6 +114,7 @@ export function workerDeps(env: Env, waitUntil: (work: Promise<unknown>) => void
         commit: options.commit,
         trigger: "landing",
         actor: options.actor,
+        authority: options.authority,
         waitUntil,
         runId: options.runId,
         landingId: options.landingId,
@@ -124,21 +133,26 @@ function unwrap<T>(reply: TrackerReply<T>): T {
 const short = (oid: string | null) => (oid ? oid.slice(0, 12) : "none");
 
 /** The repositories a landing touches, as the push machinery needs them. */
-async function repoRows(d1: D1Database, ids: string[]): Promise<Map<string, PushedRepo>> {
+async function repoRows(
+  d1: D1Database,
+  spaceId: string,
+  ids: string[],
+): Promise<Map<string, PushedRepo>> {
   if (!ids.length) return new Map();
   const rows = await db(d1)
     .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .innerJoin("spaces as s", "s.id", "r.space_id")
     .select([
       "r.id",
-      "r.owner_id",
-      "o.slug as owner_slug",
+      "r.space_id",
+      "s.slug as space_slug",
       "r.name",
       "r.default_branch",
       "r.artifacts_name",
       "r.artifacts_remote",
     ])
     .where("r.id", "in", ids)
+    .where("r.space_id", "=", spaceId)
     .where("r.deleted_at", "is", null)
     .execute();
   return new Map(rows.map((row) => [row.id, row]));
@@ -173,7 +187,7 @@ export async function greenness(
       .where("preview_action", "is", null)
       .orderBy("number", "desc")
       .executeTakeFirst();
-    const where = `${repo.owner}/${repo.name}`;
+    const where = `${repo.space}/${repo.name}`;
     if (!run && options.requireRun)
       return {
         ok: false,
@@ -218,7 +232,11 @@ function recordCasOutcome(
 
 function actorOf(landing: Landing): RunActor {
   const { accountableId, agentId } = landing.requestedBy;
-  return { id: accountableId, ...(agentId ? { agent: { id: agentId, name: "" } } : {}) };
+  return {
+    id: accountableId,
+    credential: landing.authority?.credential,
+    ...(agentId ? { agent: { id: agentId, name: "" } } : {}),
+  };
 }
 
 function withRepo(landing: Landing, id: string, change: Partial<LandingRepo>): Landing {
@@ -303,7 +321,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
   const branch = landingBranch(landing.slug);
   const branchRef = `refs/heads/${branch}`;
   const row = (repo: LandingRepo) => ctx.rows.get(repo.id);
-  const where = (repo: LandingRepo) => `${repo.owner}/${repo.name}`;
+  const where = (repo: LandingRepo) => `${repo.space}/${repo.name}`;
 
   if (await landingFixtureBarrier(ctx.env, landing)) return null;
   for (const repo of landing.repos) {
@@ -534,6 +552,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         branch,
         commit: merge,
         actor: actorOf(saved),
+        authority: saved.authority,
       });
     } catch (error) {
       return save(ctx, saved, stopped(saved, "failed", couldnt("gates", error), repo.id));
@@ -563,6 +582,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         branch,
         commit: repo.merge!,
         actor: actorOf(landing),
+        authority: landing.authority,
       });
       if ("skipped" in started)
         return save(
@@ -718,10 +738,11 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         }),
       );
     if (await landingFixtureBarrier(ctx.env, landing, "before-cas", repo.id)) return null;
+    await resolveWorkAuthority(ctx.env, landing.authority, repo.id);
     // Durable intent and complete revision membership precede the external CAS.
     const operationId = `landing:${landing.id}:${repo.id}`;
     const admitted = await ctx.env.DB.prepare(`INSERT INTO source_operations
-      (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+      (id,space_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
       SELECT ?,?,?,?,?, 'landing','admitted',?,datetime('now'),datetime('now')
       WHERE EXISTS(SELECT 1 FROM repos WHERE id=? AND deleted_at IS NULL)
       ON CONFLICT(id) DO UPDATE SET state='admitted',data=excluded.data,updated_at=excluded.updated_at
@@ -743,6 +764,13 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
     if (!live) {
       await recordCasOutcome(ctx, operationId, "rejected");
       throw new Error("Canonical repository was tombstoned before CAS.");
+    }
+    try {
+      await resolveWorkAuthority(ctx.env, landing.authority, repo.id);
+    } catch (error) {
+      // No provider request was launched: this is rejection proof, not ambiguity.
+      await recordCasOutcome(ctx, operationId, "rejected");
+      throw error;
     }
     let result: RefWriteResult | undefined;
     try {
@@ -826,6 +854,7 @@ async function startMerge(ctx: Context, landing: Landing, repoId: string, tip: s
   if (!repo.source || !repo.logicalBase) throw new Error("migration_required");
   const keys = await landedIssueKeys(ctx.env.DB, repoId, repo.source.sourceId);
   await ctx.deps.startMerge(r, {
+    authority: landing.authority,
     runId: repo.mergeRun!.id,
     landingId: landing.id,
     slug: landing.slug,
@@ -849,6 +878,12 @@ async function publishCompleted(env: Env, ownerId: string, landing: Landing) {
     if (!repo.source) continue;
     const owned = await getWorkSource(env, repo.id, repo.source.sourceId);
     if (!owned || owned.state !== "ready") continue;
+    if (
+      owned.space_id !== ownerId ||
+      owned.timeline_id !== landing.timelineId ||
+      repo.source.repoId !== repo.id
+    )
+      throw new Error("Landing settlement source does not match its immutable Space.");
     const archived = unwrap(
       await trackerObject(env, ownerId).transitionWorkSource(
         owned.source_id,
@@ -870,7 +905,7 @@ async function publishCompleted(env: Env, ownerId: string, landing: Landing) {
       .execute();
   }
   await completeReceipts(env, landing.id);
-  for (const repo of landing.repos) await notifyReleaseNotes(env, repo.id);
+  for (const repo of landing.repos) await notifyReleaseNotes(env, repo.id, landing.authority);
   await env.DB.prepare(
     "UPDATE source_integration_receipts SET completed_at=datetime('now') WHERE landing_id=? AND status='complete' AND completed_at IS NULL",
   )
@@ -880,17 +915,9 @@ async function publishCompleted(env: Env, ownerId: string, landing: Landing) {
 
 /** Record the timeline landed (issues and leases with it), then delete its bookmarks. */
 async function complete(ctx: Context, landing: Landing): Promise<Landing | null> {
-  const owner = await db(ctx.env.DB)
-    .selectFrom("accounts")
-    .selectAll()
-    .where("id", "=", ctx.ownerId)
-    .executeTakeFirst();
-  if (!owner) return null;
-  const by = landing.requestedBy;
-  const access: Access = await accessFor(ctx.env.DB, owner, by.accountableId, by.agentId);
-  const reply = await trackerObject(ctx.env, ctx.ownerId).completeLanding(
-    access,
-    landing,
+  const reply = await trackerObject(ctx.env, ctx.ownerId).completeLandingForSettlement(
+    { spaceId: ctx.ownerId, landingId: landing.id },
+    { ...landing, state: "landed" },
     landing.version,
   );
   if (!reply.ok) {
@@ -909,7 +936,10 @@ async function complete(ctx: Context, landing: Landing): Promise<Landing | null>
       const writes: RefWrite[] = [];
       const tip = tips.get(branch);
       if (tip) writes.push({ ref: branch, old: tip, new: null });
-      if (writes.length) await ctx.deps.writeRefs(r, writes);
+      if (writes.length) {
+        await resolveWorkAuthority(ctx.env, landing.authority, repo.id);
+        await ctx.deps.writeRefs(r, writes);
+      }
       await ctx.deps.refsDeleted(r, actorOf(landing));
     } catch (error) {
       console.error("Landing: deleting a landed timeline's bookmark failed", {
@@ -940,6 +970,14 @@ export async function progress(
     env,
     deps: {
       ...deps,
+      startMerge: async (repo, options) => {
+        await resolveWorkAuthority(env, landing.authority, repo.id);
+        return deps.startMerge(repo, options);
+      },
+      startGates: async (repo, options) => {
+        await resolveWorkAuthority(env, landing.authority, repo.id);
+        return deps.startGates(repo, options);
+      },
       parents: async (repo, oid) => {
         let commits = parents.get(repo.artifacts_name);
         if (!commits) parents.set(repo.artifacts_name, (commits = new Map()));
@@ -954,6 +992,7 @@ export async function progress(
     metadata: new RevisionMetadata(),
     rows: await repoRows(
       env.DB,
+      ownerId,
       landing.repos.map((repo) => repo.id),
     ),
     ...(options.restartQueued?.length ? { restartQueued: new Set(options.restartQueued) } : {}),
@@ -968,7 +1007,11 @@ export async function progress(
       // Each step is safe to repeat: retried here after a pause, then left to
       // the next look (a run's end, the cron, `gm timeline land`). Whoever
       // asked gets the landing as it is.
-      const latest = await trackerObject(env, ownerId).landing(landing.slug);
+      const latest = await trackerObject(env, ownerId).landingForSettlement({
+        spaceId: ownerId,
+        landingId: landing.id,
+        slug: landing.slug,
+      });
       const current = latest.ok && latest.value?.id === landing.id ? latest.value : landing;
       const pause = retryMs[retries++];
       if (pause !== undefined && LANDING_ACTIVE.includes(current.state)) {
@@ -985,7 +1028,13 @@ export async function progress(
     }
     if (!next) {
       // Someone else moved it, or there's nothing to do until a run ends.
-      const latest = unwrap(await trackerObject(env, ownerId).landing(landing.slug));
+      const latest = unwrap(
+        await trackerObject(env, ownerId).landingForSettlement({
+          spaceId: ownerId,
+          landingId: landing.id,
+          slug: landing.slug,
+        }),
+      );
       if (!latest || latest.id !== landing.id || latest.version === landing.version) break;
       landing = latest;
       continue;
@@ -1005,19 +1054,25 @@ export async function requestLanding(
   access: Access,
   slug: string,
   trigger: Landing["trigger"],
+  actor: Actor,
 ): Promise<LandResult> {
-  const tracker = trackerObject(env, access.owner.id);
-  const timeline = unwrap(await tracker.timeline(slug, 0, 1)).timeline;
-  const head = unwrap(await tracker.checkpoints(timeline.slug))[0];
+  const tracker = trackerObject(env, access.space.id);
+  const timeline = unwrap(await tracker.timeline(access, slug, 0, 1)).timeline;
+  const head = unwrap(await tracker.checkpoints(access, timeline.slug))[0];
   const green =
     timeline.policy === "auto" && head
       ? await greenness(env.DB, timeline, head)
       : { ok: true, why: null };
   const agentId = access.actorId !== access.principalId ? access.actorId : null;
+  const firstRepo = timeline.repos[0];
+  if (!firstRepo)
+    throw new TrackerError(409, "invalid_source", "Landing has no source repository.");
+  const authority = await captureWorkAuthority(env, firstRepo.id, actor);
+  for (const repo of timeline.repos) await resolveWorkAuthority(env, authority, repo.id);
   const result = unwrap(
-    await tracker.beginLanding(access, timeline.slug, { trigger, green, agentId }),
+    await tracker.beginLanding(access, timeline.slug, { trigger, green, agentId, authority }),
   );
-  const landing = await progress(env, deps, access.owner.id, result.landing);
+  const landing = await progress(env, deps, access.space.id, result.landing);
   return { landing, queued: result.queued };
 }
 
@@ -1032,28 +1087,29 @@ export async function maybeLand(
   ownerId: string,
   slug: string,
   trigger: "auto" | "approval",
-  by?: { principalId: string; agentId: string | null },
+  authority: WorkAuthority,
 ): Promise<Landing | null> {
   try {
+    if (authority.spaceId !== ownerId) throw new Error("Landing Space binding mismatch.");
+    const space = await findSpaceById(env.DB, ownerId);
+    if (!space) return null;
+    const access = await accessFor(
+      env,
+      space,
+      authority.personId,
+      authority.agentId,
+      true,
+      authority.credential,
+    );
     const tracker = trackerObject(env, ownerId);
-    const timeline = unwrap(await tracker.timeline(slug, 0, 1)).timeline;
+    const timeline = unwrap(await tracker.timeline(access, slug, 0, 1)).timeline;
     if (timeline.status === "landed" || timeline.status === "abandoned") return null;
     if (trigger === "auto" && timeline.policy !== "auto") return null;
     if (trigger === "approval" && timeline.policy !== "approval") return null;
-    const owner = await db(env.DB)
-      .selectFrom("accounts")
-      .selectAll()
-      .where("id", "=", ownerId)
-      .executeTakeFirst();
-    if (!owner) return null;
-    // An auto timeline lands for the person answerable for it.
-    const access = await accessFor(
-      env.DB,
-      owner,
-      by?.principalId ?? timeline.accountableId,
-      by?.agentId ?? null,
-    );
-    return (await requestLanding(env, deps, access, slug, trigger)).landing;
+    const firstRepo = timeline.repos[0];
+    if (!firstRepo) return null;
+    const { actor } = await resolveWorkAuthority(env, authority, firstRepo.id);
+    return (await requestLanding(env, deps, access, slug, trigger, actor)).landing;
   } catch (error) {
     if (!(error instanceof TrackerError)) console.error("Landing: queueing failed", error);
     return null;
@@ -1071,35 +1127,49 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
     const run = await db(env.DB)
       .selectFrom("ci_runs as c")
       .innerJoin("repos as r", "r.id", "c.repo_id")
-      .select(["c.ref", "c.repo_id", "c.source_id", "r.owner_id", "c.step", "c.preview_action"])
+      .select([
+        "c.ref",
+        "c.repo_id",
+        "c.source_id",
+        "c.authority",
+        "c.space_id",
+        "r.space_id as repo_space_id",
+        "c.step",
+        "c.preview_action",
+      ])
       .where("c.id", "=", runId)
       .executeTakeFirst();
     // A step run is a light check, not the timeline's CI: it never lands one.
-    if (!run || run.step) return;
+    if (!run || run.step || run.space_id !== run.repo_space_id) return;
     const landingSlug = landingSlugOf(run.ref);
     if (landingSlug) {
-      const reply = await trackerObject(env, run.owner_id).landingForRun(landingSlug, runId);
-      if (reply.ok && reply.value) await progress(env, deps, run.owner_id, reply.value);
+      const reply = await trackerObject(env, run.space_id).landingForRunForSettlement({
+        spaceId: run.space_id,
+        slug: landingSlug,
+        runId,
+      });
+      if (reply.ok && reply.value) await progress(env, deps, run.space_id, reply.value);
       return;
     }
     // A preview deploys a checkpoint; it says nothing about whether it's green.
     if (run.preview_action) return;
     if (run.source_id !== "canonical") {
       const source = await getWorkSource(env, run.repo_id, run.source_id);
-      if (source?.state === "ready") {
-        const { timeline } = unwrap(
-          await trackerObject(env, run.owner_id).timeline(source.timeline_slug, 0, 1),
-        );
-        if (timeline.policy === "auto")
-          await maybeLand(env, deps, run.owner_id, timeline.slug, "auto");
-        else {
-          // An approval timeline's checkpoint may now be green for someone's
-          // approve-when-green setting (CORE-378). Loaded only then.
-          const { maybeAutoApprove } = await import("./auto-approve.ts");
-          await maybeAutoApprove(env, deps, run.owner_id, { slug: timeline.slug });
-          // An approval whose landing never began (CORE-390): try it again.
-          await retryApprovedLanding(env, deps, run.owner_id, timeline.slug);
+      if (source?.state === "ready" && source.space_id === run.space_id) {
+        // An `auto` timeline may now be green, landing for whoever started the
+        // run; maybeLand leaves approval timelines alone.
+        try {
+          const authority = parseWorkAuthority(run.authority);
+          await maybeLand(env, deps, run.space_id, source.timeline_slug, "auto", authority);
+        } catch (error) {
+          console.error("Landing: the run's work authority needs reconciliation", { runId, error });
         }
+        // An approval timeline's checkpoint may now be green for someone's
+        // approve-when-green setting (CORE-378). Loaded only then.
+        const { maybeAutoApprove } = await import("./auto-approve.ts");
+        await maybeAutoApprove(env, deps, run.space_id, { slug: source.timeline_slug });
+        // An approval whose landing never began (CORE-390): try it again.
+        await retryApprovedLanding(env, deps, run.space_id, source.timeline_slug);
       }
     }
   } catch (error) {
@@ -1134,17 +1204,21 @@ export async function sweepLandings(env: Env, deps: LandingDeps): Promise<void> 
 async function sweepStartedLandings(env: Env, deps: LandingDeps): Promise<void> {
   // Receipt completion is a cross-store outbox, not dependent on a recent CI
   // callback. Include old/partially advanced operations without a time cutoff.
-  const pending = await env.DB.prepare(`SELECT DISTINCT r.landing_id,w.owner_id,w.timeline_slug
+  const pending = await env.DB.prepare(`SELECT DISTINCT r.landing_id,w.space_id,w.timeline_slug
     FROM source_integration_receipts r JOIN timeline_work_sources w ON w.source_id=r.source_id
     WHERE r.status IN ('intent','integrated') OR (r.status='complete' AND r.completed_at IS NULL)`).all<{
     landing_id: string;
-    owner_id: string;
+    space_id: string;
     timeline_slug: string;
   }>();
   for (const row of pending.results) {
-    const reply = await trackerObject(env, row.owner_id).landing(row.timeline_slug);
+    const reply = await trackerObject(env, row.space_id).landingForSettlement({
+      spaceId: row.space_id,
+      landingId: row.landing_id,
+      slug: row.timeline_slug,
+    });
     if (reply.ok && reply.value?.id === row.landing_id)
-      await progress(env, deps, row.owner_id, reply.value);
+      await progress(env, deps, row.space_id, reply.value);
   }
   const since = new Date(Date.now() - 24 * 3600_000).toISOString();
   const runs = await db(env.DB)
@@ -1161,14 +1235,14 @@ async function sweepStartedLandings(env: Env, deps: LandingDeps): Promise<void> 
 /** Landing attempts the hourly sweep makes per run, at most (CORE-390). */
 const APPROVED_SWEEP_LIMIT = 25;
 /**
- * Candidates it lists per tracker for each attempt left (CORE-392): skipped
+ * Candidates it lists per Space for each attempt left (CORE-392): skipped
  * ones (an approver who left, say) mustn't hide landable ones behind them.
  */
 const APPROVED_SWEEP_LOOKAHEAD = 4;
-/** And at most this many per tracker per run. */
+/** And at most this many per Space per run. */
 const APPROVED_SWEEP_LISTED = 100;
-/** Trackers it looks in per run, at most; where it starts rotates hourly. */
-const APPROVED_SWEEP_OWNERS = 200;
+/** Spaces it looks in per run, at most; where it starts rotates hourly. */
+const APPROVED_SWEEP_SPACES = 200;
 /**
  * How recent an approval must be for its landing to be retried unattended:
  * landing on main deploys, so an older approval waits for a person
@@ -1177,81 +1251,81 @@ const APPROVED_SWEEP_OWNERS = 200;
 export const APPROVAL_RETRY_MS = 24 * 3600_000;
 
 /**
- * The trackers with live timeline work the sweep looks in this `hour`: at
+ * The Spaces with live timeline work the sweep looks in this `hour`: at
  * most `window`, in id order, from where the last hour's window ended,
- * wrapping round. While the number of trackers is stable, each is reached
- * within ceil(trackers / window) hours; when all fit, the first one rotates
+ * wrapping round. While the number of Spaces is stable, each is reached
+ * within ceil(spaces / window) hours; when all fit, the first one rotates
  * hourly.
  */
-export async function sweepOwners(d1: D1Database, window: number, hour: number): Promise<string[]> {
+export async function sweepSpaces(d1: D1Database, window: number, hour: number): Promise<string[]> {
   const live = () => db(d1).selectFrom("timeline_work_sources").where("state", "=", "ready");
   const counted = await live()
-    .select((eb) => eb.fn.count<number>("owner_id").distinct().as("owners"))
+    .select((eb) => eb.fn.count<number>("space_id").distinct().as("spaces"))
     .executeTakeFirst();
-  const total = Number(counted?.owners ?? 0);
+  const total = Number(counted?.spaces ?? 0);
   if (!total) return [];
-  // More trackers than fit: each hour's window starts where the last one
-  // ended. All of them fit: only the order rotates, a tracker an hour, so the
+  // More Spaces than fit: each hour's window starts where the last one
+  // ended. All of them fit: only the order rotates, a Space an hour, so the
   // attempt budget isn't always spent on the same first ones.
   const start = total > window ? (hour * window) % total : hour % total;
   const page = async (offset: number, limit: number) =>
     (
       await live()
-        .select("owner_id")
+        .select("space_id")
         .distinct()
-        .orderBy("owner_id")
+        .orderBy("space_id")
         .limit(limit)
         .offset(offset)
         .execute()
-    ).map((row) => row.owner_id);
-  const owners = await page(start, window);
-  if (owners.length < window && start > 0)
-    owners.push(...(await page(0, Math.min(window - owners.length, start))));
-  return owners;
+    ).map((row) => row.space_id);
+  const spaces = await page(start, window);
+  if (spaces.length < window && start > 0)
+    spaces.push(...(await page(0, Math.min(window - spaces.length, start))));
+  return spaces;
 }
 
 /**
  * The hourly retry of approvals whose landing never began (CORE-390): in the
- * trackers with live timeline work, each approval timeline whose head was
+ * Spaces with live timeline work, each approval timeline whose head was
  * approved in the last day, is still current and has no landing, queued again
  * for its approver. At most `limit` landing attempts per run: only a real
  * beginLanding counts, and what's skipped before one (an approver who left,
  * say) costs nothing and doesn't hide later candidates within the lookahead
- * of four times the remaining budget. A tracker that fails, including an
+ * of four times the remaining budget. A Space that fails, including an
  * unexpected failure before a landing was asked for, is logged and passed
  * over for this run. Returns the attempts made.
  */
 export async function sweepApprovedLandings(
   env: Env,
   deps: LandingDeps,
-  options: { limit?: number; owners?: number; hour?: number } = {},
+  options: { limit?: number; spaces?: number; hour?: number } = {},
 ): Promise<number> {
   let left = options.limit ?? APPROVED_SWEEP_LIMIT;
   let attempts = 0;
   const since = new Date(Date.now() - APPROVAL_RETRY_MS).toISOString();
-  const owners = await sweepOwners(
+  const spaces = await sweepSpaces(
     env.DB,
-    options.owners ?? APPROVED_SWEEP_OWNERS,
+    options.spaces ?? APPROVED_SWEEP_SPACES,
     options.hour ?? Math.floor(Date.now() / 3600_000),
   );
-  for (const ownerId of owners) {
+  for (const spaceId of spaces) {
     if (left <= 0) break;
     try {
       const listed = unwrap(
-        await trackerObject(env, ownerId).approvedUnlanded(
+        await trackerObject(env, spaceId).approvedUnlanded(
           Math.min(left * APPROVED_SWEEP_LOOKAHEAD, APPROVED_SWEEP_LISTED),
           since,
         ),
       );
       for (const { slug } of listed) {
         if (left <= 0) break;
-        if ((await retryApprovedLanding(env, deps, ownerId, slug, since)).attempted) {
+        if ((await retryApprovedLanding(env, deps, spaceId, slug, since)).attempted) {
           left--;
           attempts++;
         }
       }
     } catch (error) {
-      console.error("Landing: sweeping a tracker's approved timelines failed", { ownerId, error });
+      console.error("Landing: sweeping a Space's approved timelines failed", { spaceId, error });
     }
   }
   return attempts;
@@ -1272,24 +1346,26 @@ export interface ApprovalRetry {
  * Queue the landing an approval should have queued (CORE-390): an approval
  * timeline whose head was approved since `since` (the last day by default),
  * is still current and never had a landing, lands for the person who
- * approved it, as `maybeLand(…, "approval")` does after an answer. Not when
- * that person is no longer a member or can't write to every repository of the
- * checkpoint. beginLanding checks again in its transaction that this exact
- * checkpoint never had a landing (`onlyIfUnlanded`) and refuses anything stale.
- * Why it didn't is logged. Throws only an unexpected failure before a landing
+ * approved it, as `maybeLand(…, "approval")` does after an answer.
+ *
+ * It acts with the work authority the approval was answered with, re-resolved
+ * against that person's live credential, current Space grant and write access
+ * to every repository (ci/admission.ts). An approval without one (answered
+ * before Spaces, or by a credential no longer live) waits for a person
+ * (`gm timeline land`). Throws only an unexpected failure before a landing
  * was asked for (a failing tracker or D1), not counted as an attempt, so the
- * sweep gives up on that tracker for this run instead of grinding on.
+ * sweep gives up on that Space for this run instead of grinding on.
  */
 export async function retryApprovedLanding(
   env: Env,
   deps: LandingDeps,
-  ownerId: string,
+  spaceId: string,
   slug: string,
   since = new Date(Date.now() - APPROVAL_RETRY_MS).toISOString(),
 ): Promise<ApprovalRetry> {
   const skipped: ApprovalRetry = { attempted: false, landing: null };
   try {
-    const tracker = trackerObject(env, ownerId);
+    const tracker = trackerObject(env, spaceId);
     const { timeline, head, everLanded } = unwrap(await tracker.headCheckpoint(slug));
     if (
       timeline.policy !== "approval" ||
@@ -1298,38 +1374,39 @@ export async function retryApprovedLanding(
     )
       return skipped;
     if (!head?.approved || !head.approval?.by || !head.approval.at || everLanded) return skipped;
-    const where = { ownerId, slug, checkpoint: head.checkpoint.number };
+    const where = { spaceId, slug, checkpoint: head.checkpoint.number };
     if (head.approval.at < since) {
       console.info("Landing: an approval over a day old waits for a person to land it", where);
       return skipped;
     }
     const approverId = head.approval.by;
-    const [owner, person] = await Promise.all(
-      [ownerId, approverId].map((id) =>
-        db(env.DB).selectFrom("accounts").selectAll().where("id", "=", id).executeTakeFirst(),
-      ),
-    );
-    if (!owner) {
-      console.warn("Landing: the tracker's account is gone", where);
+    const authority = unwrap(await tracker.workAuthority(`approval:${head.checkpoint.id}`));
+    if (!authority || authority.personId !== approverId || authority.spaceId !== spaceId) {
+      console.warn(
+        "Landing: the approval has no work authority to land with; it waits for a person",
+        {
+          ...where,
+          approverId,
+        },
+      );
       return skipped;
     }
-    if (!person || person.kind !== "user") {
-      console.warn("Landing: the approver's account is gone", { ...where, approverId });
-      return skipped;
-    }
-    const access = await accessFor(env.DB, owner, person.id, null);
-    if (!access.members.some((member) => member.id === person.id)) {
-      console.warn("Landing: the approver left the tracker", { ...where, approverId });
-      return skipped;
-    }
-    const writable = await writableRepoIds(env.DB, actorFromRow(person), owner.id);
-    const unwritable = head.checkpoint.repos.find((repo) => !writable.includes(repo.id));
-    if (unwritable) {
-      console.warn("Landing: the approver can't write to the checkpoint any more", {
-        ...where,
-        approverId,
-        repo: `${unwritable.owner}/${unwritable.name}`,
-      });
+    const space = await findSpaceById(env.DB, spaceId);
+    if (!space) return skipped;
+    let access: Access;
+    try {
+      access = await accessFor(env, space, approverId, null, true, authority.credential);
+      for (const repo of head.checkpoint.repos) await resolveWorkAuthority(env, authority, repo.id);
+    } catch (error) {
+      if (!(error instanceof TrackerError || error instanceof WorkAuthorizationError)) throw error;
+      console.warn(
+        "Landing: the approver's authority can't land it any more; it waits for a person",
+        {
+          ...where,
+          approverId,
+          why: error.message,
+        },
+      );
       return skipped;
     }
     try {
@@ -1338,10 +1415,11 @@ export async function retryApprovedLanding(
           trigger: "approval",
           green: { ok: true, why: null },
           agentId: null,
+          authority,
           onlyIfUnlanded: head.checkpoint.id,
         }),
       );
-      return { attempted: true, landing: await progress(env, deps, owner.id, result.landing) };
+      return { attempted: true, landing: await progress(env, deps, spaceId, result.landing) };
     } catch (error) {
       if (
         error instanceof TrackerError &&
@@ -1366,7 +1444,7 @@ export async function retryApprovedLanding(
     // is this candidate's; anything else is the tracker or D1 failing.
     if (!(error instanceof TrackerError)) throw error;
     console.warn("Landing: an approved timeline can't be retried", {
-      ownerId,
+      spaceId,
       slug,
       code: error.code,
       why: error.message,
@@ -1453,88 +1531,80 @@ async function stalledBeforeRun(
 
 /**
  * Why the sweep mustn't restart a landing as its requester (CORE-391), or
- * null: their account is gone, they left the tracker, or they can't write to
- * every repository of the landing. The same checks as retrying an approval.
+ * null: the landing records no work authority (begun before Spaces), or that
+ * authority no longer resolves (the requester's credential was revoked or
+ * expired, they lost their Space grant, or they can't write to every
+ * repository of the landing). The same checks as retrying an approval:
+ * repository write alone (a collaborator) doesn't move a Tracker landing.
  */
-async function requesterRefuses(
-  env: Env,
-  owner: AccountRow,
-  landing: Landing,
-): Promise<string | null> {
-  const personId = landing.requestedBy.accountableId;
-  const person = await db(env.DB)
-    .selectFrom("accounts")
-    .selectAll()
-    .where("id", "=", personId)
-    .executeTakeFirst();
-  if (!person || person.kind !== "user") return "the requester's account is gone";
-  const access = await accessFor(env.DB, owner, person.id, null);
-  if (!access.members.some((member) => member.id === person.id))
-    return "the requester left the tracker";
-  const writable = await writableRepoIds(env.DB, actorFromRow(person), owner.id);
-  const unwritable = landing.repos.find((repo) => !writable.includes(repo.id));
-  return unwritable
-    ? `the requester can't write to ${unwritable.owner}/${unwritable.name} any more`
-    : null;
+async function requesterRefuses(env: Env, landing: Landing): Promise<string | null> {
+  const authority = landing.authority;
+  if (!authority) return "the landing records no work authority";
+  const space = await findSpaceById(env.DB, authority.spaceId);
+  if (!space) return "the landing's Space is gone";
+  try {
+    await accessFor(env, space, authority.personId, authority.agentId, true, authority.credential);
+  } catch (error) {
+    if (!(error instanceof TrackerError)) throw error;
+    return `the requester has no current access to the Space: ${error.message}`;
+  }
+  for (const repo of landing.repos)
+    try {
+      await resolveWorkAuthority(env, authority, repo.id);
+    } catch (error) {
+      if (!(error instanceof WorkAuthorizationError)) throw error;
+      return `the requester can't land ${repo.space}/${repo.name} any more: ${error.message}`;
+    }
+  return null;
 }
 
 /**
  * The hourly look for landings that stalled before their run started
  * (CORE-391): beginLanding committed but its reply was lost, or a step threw
  * before a merge or gate run was recorded or its Workflow started, so no run's
- * end will move them. In the same trackers as the approvals sweep, each
+ * end will move them. In the same Spaces as the approvals sweep, each
  * merging or testing landing last moved between STALLED_MAX_AGE_MS and
  * STALLED_AFTER_MS ago that stalledBeforeRun finds stalled is moved on by
  * progress(), as its requester, exactly as the normal path would: saving a
  * run id is version-checked, a run is recorded once by its id (startMergeRun,
  * startRun), and a queued run's Workflow is started for that same id. Not when
  * the requester's account is gone, they left or can't write (skipped and
- * logged, free). At most `limit` restarts per run; each tracker and each
+ * logged, free). At most `limit` restarts per run; each Space and each
  * landing on its own. One that still can't move stays as it is, logged.
  * Returns how many it restarted.
  */
 export async function sweepStalledLandings(
   env: Env,
   deps: LandingDeps,
-  options: { limit?: number; owners?: number; hour?: number } = {},
+  options: { limit?: number; spaces?: number; hour?: number } = {},
 ): Promise<number> {
   let left = options.limit ?? STALLED_SWEEP_LIMIT;
   let restarted = 0;
   const now = Date.now();
   const before = new Date(now - STALLED_AFTER_MS).toISOString();
   const since = new Date(now - STALLED_MAX_AGE_MS).toISOString();
-  const owners = await sweepOwners(
+  const spaces = await sweepSpaces(
     env.DB,
-    options.owners ?? APPROVED_SWEEP_OWNERS,
+    options.spaces ?? APPROVED_SWEEP_SPACES,
     options.hour ?? Math.floor(now / 3600_000),
   );
-  for (const ownerId of owners) {
+  for (const spaceId of spaces) {
     if (left <= 0) break;
     try {
       const listed = unwrap(
-        await trackerObject(env, ownerId).stalledLandings(
+        await trackerObject(env, spaceId).stalledLandings(
           since,
           before,
           Math.min(left * APPROVED_SWEEP_LOOKAHEAD, APPROVED_SWEEP_LISTED),
         ),
       );
-      if (!listed.length) continue;
-      const owner = await db(env.DB)
-        .selectFrom("accounts")
-        .selectAll()
-        .where("id", "=", ownerId)
-        .executeTakeFirst();
-      if (!owner) {
-        console.warn("Landing: the tracker's account is gone", { ownerId });
-        continue;
-      }
       for (const landing of listed) {
         if (left <= 0) break;
-        const where = { ownerId, slug: landing.slug, landing: landing.id, state: landing.state };
+        const where = { spaceId, slug: landing.slug, landing: landing.id, state: landing.state };
         try {
           const stalled = await stalledBeforeRun(env, landing, now);
           if (!stalled) continue;
-          const refused = await requesterRefuses(env, owner, landing);
+          const refused = await requesterRefuses(env, landing);
           if (refused) {
             console.warn("Landing: a stalled landing waits for a person", {
               ...where,
@@ -1548,7 +1618,7 @@ export async function sweepStalledLandings(
             ...where,
             restartQueued: stalled.restartQueued,
           });
-          const after = await progress(env, deps, ownerId, landing, stalled);
+          const after = await progress(env, deps, spaceId, landing, stalled);
           if (after.version === landing.version && !stalled.restartQueued.length)
             console.error("Landing: a stalled landing still didn't move", where);
         } catch (error) {
@@ -1556,7 +1626,7 @@ export async function sweepStalledLandings(
         }
       }
     } catch (error) {
-      console.error("Landing: sweeping a tracker's stalled landings failed", { ownerId, error });
+      console.error("Landing: sweeping a Space's stalled landings failed", { spaceId, error });
     }
   }
   return restarted;

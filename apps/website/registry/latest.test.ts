@@ -22,8 +22,8 @@ describe("latest follows the default branch", () => {
   let admin: string;
   const db = () => createDb(h.env.REGISTRY_DB);
 
-  const main = () => h.jobToken({ repo: "web", ref: "main" }).token;
-  const branch = () => h.jobToken({ repo: "web", ref: "agent/experiment" }).token;
+  const main = async () => (await h.jobToken({ repo: "web", ref: "main" })).token;
+  const branch = async () => (await h.jobToken({ repo: "web", ref: "agent/experiment" })).token;
 
   beforeEach(async () => {
     h = await makeHarness();
@@ -46,12 +46,12 @@ describe("latest follows the default branch", () => {
       )["dist-tags"];
 
     it("keeps branch versions and their other tags, never latest", async () => {
-      expect((await publish(main(), "1.0.0")).status).toBe(201);
+      expect((await publish(await main(), "1.0.0")).status).toBe(201);
       expect(await distTags()).toEqual({ latest: "1.0.0" });
 
       // npm sends `latest` by default; from a branch it is dropped, the version kept.
-      expect((await publish(branch(), "1.1.0")).status).toBe(201);
-      expect((await publish(branch(), "1.2.0-exp.1", "exp")).status).toBe(201);
+      expect((await publish(await branch(), "1.1.0")).status).toBe(201);
+      expect((await publish(await branch(), "1.2.0-exp.1", "exp")).status).toBe(201);
       expect(await distTags()).toEqual({ latest: "1.0.0", exp: "1.2.0-exp.1" });
       const rows = await db()
         .selectFrom("publishes")
@@ -68,7 +68,7 @@ describe("latest follows the default branch", () => {
       // Nor can a branch build point latest at it afterwards.
       const moved = await h.request("/npm/test/-/package/@test%2fui/dist-tags/latest", {
         method: "PUT",
-        headers: { authorization: `Bearer ${branch()}`, "content-type": "application/json" },
+        headers: { authorization: `Bearer ${await branch()}`, "content-type": "application/json" },
         body: JSON.stringify("1.1.0"),
       });
       expect(moved.status).toBe(403);
@@ -76,7 +76,7 @@ describe("latest follows the default branch", () => {
       expect((await distTags()).latest).toBe("1.0.0");
 
       // The default branch moves it as before.
-      expect((await publish(main(), "1.3.0")).status).toBe(201);
+      expect((await publish(await main(), "1.3.0")).status).toBe(201);
       expect((await distTags()).latest).toBe("1.3.0");
 
       // Unpublishing latest falls back to the highest default-branch version.
@@ -100,9 +100,9 @@ describe("latest follows the default branch", () => {
     });
 
     it("leaves a package only branches published without latest", async () => {
-      expect((await publish(branch(), "0.1.0")).status).toBe(201);
+      expect((await publish(await branch(), "0.1.0")).status).toBe(201);
       expect(await distTags()).toEqual({});
-      expect((await publish(main(), "0.0.9")).status).toBe(201);
+      expect((await publish(await main(), "0.0.9")).status).toBe(201);
       expect(await distTags()).toEqual({ latest: "0.0.9" });
     });
   });
@@ -122,16 +122,16 @@ describe("latest follows the default branch", () => {
     };
 
     // Only a branch has published: there is no latest.
-    expect((await deploy(branch(), "0.9.0")).status).toBe(201);
+    expect((await deploy(await branch(), "0.9.0")).status).toBe(201);
     expect(await latest()).toBeNull();
     await tick();
-    expect((await deploy(main(), "1.0.0")).status).toBe(201);
+    expect((await deploy(await main(), "1.0.0")).status).toBe(201);
     await tick();
-    expect((await deploy(branch(), "1.1.0")).status).toBe(201);
+    expect((await deploy(await branch(), "1.1.0")).status).toBe(201);
     expect(await latest()).toBe("1.0.0");
     // `gm pkg download web/latest/…` resolves through the same field.
     await tick();
-    expect((await deploy(main(), "1.2.0")).status).toBe(201);
+    expect((await deploy(await main(), "1.2.0")).status).toBe(201);
     expect(await latest()).toBe("1.2.0");
     await tick();
     expect((await deploy(admin, "1.3.0")).status).toBe(201);
@@ -154,17 +154,17 @@ describe("latest follows the default branch", () => {
         })
       ).headers.get("docker-content-digest");
 
-    const mainImage = await push(main(), "latest", "main layer");
+    const mainImage = await push(await main(), "latest", "main layer");
     expect(await tagged("latest")).toBe(mainImage.digest);
 
-    const exp = await push(branch(), "latest", "experiment layer");
+    const exp = await push(await branch(), "latest", "experiment layer");
     expect(await tagged("latest")).toBe(mainImage.digest);
     // Still pullable by digest, and by any other tag the branch pushes.
     expect(await tagged(exp.digest)).toBe(exp.digest);
-    await push(branch(), "sha-exp", "experiment layer");
+    await push(await branch(), "sha-exp", "experiment layer");
     expect(await tagged("sha-exp")).toBe(exp.digest);
 
-    const next = await push(main(), "latest", "next main layer");
+    const next = await push(await main(), "latest", "next main layer");
     expect(await tagged("latest")).toBe(next.digest);
   });
 
@@ -182,15 +182,15 @@ describe("latest follows the default branch", () => {
       return res.status === 200 ? ((await res.json()) as ReleaseDto).tag : res.status;
     };
 
-    expect((await create(branch(), "v0.9.0")).status).toBe(201);
+    expect((await create(await branch(), "v0.9.0")).status).toBe(201);
     expect(await latest()).toBe(404);
     await tick();
-    expect((await create(main(), "v1.0.0")).status).toBe(201);
+    expect((await create(await main(), "v1.0.0")).status).toBe(201);
     await tick();
-    expect((await create(branch(), "v1.1.0")).status).toBe(201);
+    expect((await create(await branch(), "v1.1.0")).status).toBe(201);
     expect(await latest()).toBe("v1.0.0");
     await tick();
-    expect((await create(main(), "v1.2.0")).status).toBe(201);
+    expect((await create(await main(), "v1.2.0")).status).toBe(201);
     expect(await latest()).toBe("v1.2.0");
   });
 
@@ -212,10 +212,10 @@ describe("latest follows the default branch", () => {
         ).json()) as { Version: string }
       ).Version;
 
-    expect((await put(main(), "v1.0.0")).status).toBe(201);
-    expect((await put(branch(), "v1.1.0")).status).toBe(201);
+    expect((await put(await main(), "v1.0.0")).status).toBe(201);
+    expect((await put(await branch(), "v1.1.0")).status).toBe(201);
     expect(await latest()).toBe("v1.0.0");
-    expect((await put(main(), "v1.2.0")).status).toBe(201);
+    expect((await put(await main(), "v1.2.0")).status).toBe(201);
     expect(await latest()).toBe("v1.2.0");
   });
 
@@ -244,10 +244,10 @@ describe("latest follows the default branch", () => {
         ).json()) as { version: string }
       ).version;
 
-    expect((await upload(main(), "1.0.0")).status).toBe(201);
-    expect((await upload(branch(), "1.1.0")).status).toBe(201);
+    expect((await upload(await main(), "1.0.0")).status).toBe(201);
+    expect((await upload(await branch(), "1.1.0")).status).toBe(201);
     expect(await latest()).toBe("1.0.0");
-    expect((await upload(main(), "1.2.0")).status).toBe(201);
+    expect((await upload(await main(), "1.2.0")).status).toBe(201);
     expect(await latest()).toBe("1.2.0");
   });
 
@@ -275,13 +275,13 @@ describe("latest follows the default branch", () => {
         })
       ).text();
 
-    await deploy(main(), "1.0");
-    await deploy(branch(), "1.1");
+    await deploy(await main(), "1.0");
+    await deploy(await branch(), "1.1");
     let xml = await metadata();
     expect(xml).toMatch(/<version>1.0<\/version>\s*<version>1.1<\/version>/);
     expect(xml).toContain("<latest>1.0</latest>");
     expect(xml).toContain("<release>1.0</release>");
-    await deploy(main(), "1.2");
+    await deploy(await main(), "1.2");
     xml = await metadata();
     expect(xml).toContain("<latest>1.2</latest>");
     expect(xml).toContain("<release>1.2</release>");

@@ -8,7 +8,6 @@ import {
   useSearchParams,
   type LoaderFunctionArgs,
 } from "react-router";
-import type { AccountSummary } from "../../shared/api.ts";
 import {
   AI_PROVIDERS,
   MAX_KNOWLEDGE_WAIT_MINUTES,
@@ -22,6 +21,7 @@ import {
   type AiSettingsPatch,
   type AiSettingsView,
   type KnowledgeUpdateSchedule,
+  type PersonAiSettingsView,
 } from "../../shared/ai.ts";
 import { modelPriceParts } from "../components/ModelPrices.tsx";
 import { SettingsPage } from "../components/SettingsPage.tsx";
@@ -32,25 +32,40 @@ import { requireViewer } from "../lib/session.ts";
 export async function aiSettingsLoader({ request }: LoaderFunctionArgs) {
   const viewer = await requireViewer(request);
   const url = new URL(request.url);
-  const owner = url.searchParams.get("owner");
-  if (!owner) throw redirect(`/settings/ai?owner=${encodeURIComponent(viewer.slug)}`);
-  const accounts = [...viewer.canCreateIn];
-  try {
-    const settings = await api<AiSettingsView>(
-      `/accounts/${encodeURIComponent(owner)}/settings/ai`,
-      { signal: request.signal },
-    );
-    if (!accounts.some((account) => account.slug === owner)) {
-      accounts.push(
-        await api<AccountSummary>(`/accounts/${encodeURIComponent(owner)}`, {
-          signal: request.signal,
-        }),
+  const spaces = [...viewer.spaces];
+  const space = url.searchParams.get("space");
+  const person = url.searchParams.get("person");
+  if (url.searchParams.has("owner") || (space && person))
+    throw new Response("Choose an explicit Space or personal AI settings scope.", { status: 400 });
+  if (person) {
+    if (person !== viewer.slug)
+      throw new Response("Personal AI settings are only available to that person.", {
+        status: 403,
+      });
+    try {
+      const settings = await api<PersonAiSettingsView>(
+        `/accounts/${encodeURIComponent(person)}/settings/ai`,
+        { signal: request.signal },
       );
+      return { scope: "person" as const, person, settings, error: "" };
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      return { scope: "person" as const, person, settings: null, error: error.message };
     }
-    return { owner, accounts, settings, error: "" };
+  }
+  if (!space) {
+    const defaultSpace = spaces.find((entry) => entry.id === viewer.defaultSpaceId);
+    if (defaultSpace) throw redirect(`/settings/ai?space=${encodeURIComponent(defaultSpace.slug)}`);
+    throw new Response("Choose an accessible Space for AI settings.", { status: 400 });
+  }
+  try {
+    const settings = await api<AiSettingsView>(`/spaces/${encodeURIComponent(space)}/settings/ai`, {
+      signal: request.signal,
+    });
+    return { scope: "space" as const, space, spaces, settings, error: "" };
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
-    return { owner, accounts, settings: null, error: error.message };
+    return { scope: "space" as const, space, spaces, settings: null, error: error.message };
   }
 }
 
@@ -123,39 +138,69 @@ export function AiSettings() {
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const switching = navigation.state !== "idle";
+  if (data.scope === "person")
+    return (
+      <SettingsPage>
+        <h1 className="m-0 text-headline">Personal AI logging</h1>
+        <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
+          Choose whether AI Gateway keeps bodies for your assistant conversations, chat titles, and
+          avatars. These settings belong to you, not an Organization or Space.
+        </p>
+        {data.settings ? (
+          <PersonalAiSettingsForm
+            key={data.person}
+            person={data.person}
+            initial={data.settings}
+            switching={switching}
+          />
+        ) : (
+          <div className="mt-6 flex flex-col items-start gap-3">
+            <FormError message={data.error} />
+            <button
+              type="button"
+              className="mk-btn mk-btn--secondary min-h-11"
+              disabled={switching || revalidator.state !== "idle"}
+              onClick={() => void revalidator.revalidate()}
+            >
+              {revalidator.state !== "idle" ? "Loading…" : "Retry loading settings"}
+            </button>
+          </div>
+        )}
+      </SettingsPage>
+    );
   return (
-    <SettingsPage owner={data.owner}>
+    <SettingsPage space={data.space}>
       <div className="max-w-3xl">
         <h1 className="m-0 text-headline">AI settings</h1>
         <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
-          Control automatic AI work across every repository owned by an account. Agent chat and
-          interactive search are unchanged.
+          Control automatic AI work across every repository in a Space. Agent chat and interactive
+          search are unchanged.
         </p>
         <div className="mt-6 flex max-w-md flex-col gap-1 text-field-label">
-          Account
+          Space
           <SelectField
-            ariaLabel="Account for AI settings"
-            value={data.owner}
+            ariaLabel="Space for AI settings"
+            value={data.space}
             options={[
-              ...data.accounts.map((account) => ({
-                value: account.slug,
-                label: `${account.displayName} (@${account.slug})`,
+              ...data.spaces.map((space) => ({
+                value: space.slug,
+                label: `${space.organization.displayName} / ${space.displayName} (@${space.slug})`,
               })),
-              ...(!data.accounts.some((account) => account.slug === data.owner)
-                ? [{ value: data.owner, label: `@${data.owner}` }]
+              ...(!data.spaces.some((space) => space.slug === data.space)
+                ? [{ value: data.space, label: `@${data.space}` }]
                 : []),
             ]}
-            onChange={(owner) => setParams({ owner })}
+            onChange={(space) => setParams({ space })}
             className="w-full"
           />
         </div>
         <p role="status" className="mt-2 mb-0 text-body-sm text-ink-muted">
-          {switching ? "Loading account settings…" : `Settings for @${data.owner}`}
+          {switching ? "Loading Space settings…" : `Settings for @${data.space}`}
         </p>
         {data.settings ? (
           <AiSettingsForm
-            key={data.owner}
-            owner={data.owner}
+            key={data.space}
+            space={data.space}
             initial={data.settings}
             switching={switching}
           />
@@ -177,12 +222,160 @@ export function AiSettings() {
   );
 }
 
-function AiSettingsForm({
-  owner,
+function PersonalAiSettingsForm({
+  person,
   initial,
   switching,
 }: {
-  owner: string;
+  person: string;
+  initial: PersonAiSettingsView;
+  switching: boolean;
+}) {
+  const [saved, setSaved] = useState(initial);
+  const [patch, setPatch] = useState<AiLogBodiesPatch>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const active = useRef(true);
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
+  const busy = saving || switching;
+  const dirty = Object.keys(patch).length > 0;
+  return (
+    <form
+      className="mk-card mt-6 flex flex-col gap-6"
+      aria-busy={busy}
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (busy || !saved.canManage || !dirty) return;
+        setSaving(true);
+        setError("");
+        setNotice("");
+        try {
+          const persisted = await api<PersonAiSettingsView>(
+            `/accounts/${encodeURIComponent(person)}/settings/ai`,
+            {
+              method: "PATCH",
+              json: { logBodies: patch },
+            },
+          );
+          if (!active.current) return;
+          setSaved(persisted);
+          setPatch({});
+          setNotice("Personal AI logging saved.");
+        } catch (cause) {
+          if (active.current)
+            setError(cause instanceof Error ? cause.message : "Couldn't save settings.");
+        } finally {
+          if (active.current) setSaving(false);
+        }
+      }}
+    >
+      <fieldset
+        disabled={busy || !saved.canManage}
+        className="m-0 min-w-0 border-0 p-0"
+        data-log-bodies="person"
+      >
+        <legend className="mb-2 text-title">
+          Keep AI request and response bodies in gateway logs
+        </legend>
+        <p className="mt-0 mb-4 max-w-[65ch] text-body-sm text-ink-muted">{saved.logBodies.note}</p>
+        <div className="flex flex-col gap-5">
+          {saved.logBodies.components.map((entry) => {
+            const choice = Object.hasOwn(patch, entry.component)
+              ? (patch[entry.component] ?? null)
+              : (entry.person ?? null);
+            const helpId = `personal-log-${entry.component}-help`;
+            return (
+              <div key={entry.component} data-log-bodies-component={entry.component}>
+                <h3 className="m-0 text-field-label">{entry.label}</h3>
+                <p id={helpId} className="mt-1 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
+                  {entry.description} Now: {(choice ?? entry.site) ? "kept" : "not kept"}.
+                </p>
+                {saved.canManage ? (
+                  <SelectField
+                    ariaLabel={`${entry.label}: keep request and response bodies`}
+                    ariaDescribedBy={helpId}
+                    value={choice === null ? "instance" : choice ? "on" : "off"}
+                    options={[
+                      {
+                        value: "instance",
+                        label: `Instance default (${entry.site ? "on" : "off"})`,
+                      },
+                      { value: "on", label: "On: keep bodies" },
+                      { value: "off", label: "Off: metadata only" },
+                    ]}
+                    className="w-full max-w-md"
+                    onChange={(value) => {
+                      if (busy) return;
+                      const next = value === "instance" ? null : value === "on";
+                      setPatch((previous) => {
+                        const updated = { ...previous };
+                        if (next === (entry.person ?? null)) delete updated[entry.component];
+                        else updated[entry.component] = next;
+                        return updated;
+                      });
+                      setNotice("");
+                      setError("");
+                    }}
+                  />
+                ) : (
+                  <p className="m-0 font-semibold">
+                    {choice === null
+                      ? `Instance default (${entry.site ? "on" : "off"})`
+                      : choice
+                        ? "On"
+                        : "Off"}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </fieldset>
+      <FormError message={error} />
+      <p role="status" aria-live="polite" className="m-0 text-body-sm">
+        {saving
+          ? "Saving personal AI logging…"
+          : notice || (dirty ? "You have unsaved changes." : "")}
+      </p>
+      {saved.canManage && (
+        <div className="mk-form-actions">
+          <button
+            type="submit"
+            className="mk-btn mk-btn--primary min-h-11"
+            disabled={busy || !dirty}
+          >
+            Save personal AI logging
+          </button>
+          <button
+            type="button"
+            className="mk-btn mk-btn--secondary min-h-11"
+            disabled={busy || !dirty}
+            onClick={() => {
+              setPatch({});
+              setError("");
+              setNotice("");
+            }}
+          >
+            Discard changes
+          </button>
+        </div>
+      )}
+    </form>
+  );
+}
+
+function AiSettingsForm({
+  space,
+  initial,
+  switching,
+}: {
+  space: string;
   initial: AiSettingsView;
   switching: boolean;
 }) {
@@ -200,9 +393,10 @@ function AiSettingsForm({
   );
   // Gateway body logging overrides (CORE-290): null follows the site default.
   const overrides = (v: AiSettingsView) =>
-    Object.fromEntries(
-      v.logBodies.components.map((e) => [e.component, e.account ?? null]),
-    ) as Record<AiLogComponent, boolean | null>;
+    Object.fromEntries(v.logBodies.components.map((e) => [e.component, e.space ?? null])) as Record<
+      AiLogComponent,
+      boolean | null
+    >;
   const [logBodies, setLogBodies] = useState(overrides(initial));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -241,7 +435,7 @@ function AiSettingsForm({
     patch.releaseHighlights = { intervalHours };
   for (const entry of saved.logBodies.components) {
     const choice = logBodies[entry.component];
-    if (choice !== (entry.account ?? null))
+    if (choice !== (entry.space ?? null))
       (patch.logBodies ??= {} as AiLogBodiesPatch)[entry.component] = choice;
   }
   const dirty = !!(
@@ -268,7 +462,7 @@ function AiSettingsForm({
         changed();
         try {
           const persisted = await api<AiSettingsView>(
-            `/accounts/${encodeURIComponent(owner)}/settings/ai`,
+            `/spaces/${encodeURIComponent(space)}/settings/ai`,
             { method: "PATCH", json: patch },
           );
           if (!active.current) return;
@@ -278,7 +472,7 @@ function AiSettingsForm({
           setSchedule(scheduleText(persisted));
           setHighlightHours(String(persisted.releaseHighlights.intervalHours));
           setLogBodies(overrides(persisted));
-          setNotice(`AI settings saved for @${owner}. New jobs will use these settings.`);
+          setNotice(`AI settings saved for @${space}. New jobs will use these settings.`);
         } catch (cause) {
           if (active.current)
             setError(cause instanceof Error ? cause.message : "Couldn't save settings. Try again.");
@@ -299,8 +493,9 @@ function AiSettingsForm({
         </p>
         {!saved.canManage && (
           <p className="m-0 font-semibold text-ink">
-            Read-only access. Only a signed-in human account owner, organization owner, or site
-            admin can change this account’s AI settings. Agents cannot change spending policy.
+            Read-only access. Only a signed-in person with an explicit Space admin grant or Instance
+            operator authority can change this Space’s AI settings. Agents cannot change spending
+            policy.
           </p>
         )}
       </div>
@@ -428,8 +623,8 @@ function AiSettingsForm({
           dates help compare model recency. Embedding models are fixed and are not changed here.
         </p>
         <p className="mt-0 mb-5 text-body-sm text-ink-muted">
-          More models: connect this account’s own TypeSafe or OpenRouter key in{" "}
-          <Link to={`/settings/ai-providers?owner=${encodeURIComponent(owner)}`} className={link}>
+          More models: connect this Space’s own TypeSafe or OpenRouter key in{" "}
+          <Link to={`/settings/ai-providers?space=${encodeURIComponent(space)}`} className={link}>
             AI providers
           </Link>
           . Their calls are billed to that key.
@@ -491,15 +686,15 @@ function AiSettingsForm({
       <fieldset
         disabled={busy || !saved.canManage}
         className="m-0 min-w-0 border-0 p-0"
-        data-log-bodies="account"
+        data-log-bodies="space"
       >
         <legend className="mb-2 text-title">
           Keep AI request and response bodies in gateway logs
         </legend>
         <p className="mt-0 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
           AI Gateway records model, time and token metadata when logging is available. Choose, for
-          this account’s calls, whether it also stores what was sent and returned, subject to
-          Cloudflare’s log limits. By default each part follows the site’s setting. Changes reach
+          this Space’s calls, whether it also stores what was sent and returned, subject to
+          Cloudflare’s log limits. By default each part follows the Instance setting. Changes reach
           new model calls within a minute, including running work.
         </p>
         <p
@@ -533,7 +728,7 @@ function AiSettingsForm({
                 <h3 className="m-0 text-field-label">{entry.label}</h3>
                 <p id={helpId} className="mt-1 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
                   {entry.description} Now: {effective ? "kept" : "not kept"}
-                  {choice === null ? " (site default)" : ""}.
+                  {choice === null ? " (Instance default)" : ""}.
                 </p>
                 {saved.canManage ? (
                   <SelectField
@@ -541,7 +736,7 @@ function AiSettingsForm({
                     ariaDescribedBy={helpId}
                     value={choice === null ? "site" : choice ? "on" : "off"}
                     options={[
-                      { value: "site", label: `Site default (${entry.site ? "on" : "off"})` },
+                      { value: "site", label: `Instance default (${entry.site ? "on" : "off"})` },
                       { value: "on", label: "On: keep bodies" },
                       { value: "off", label: "Off: metadata only" },
                     ]}
@@ -558,7 +753,7 @@ function AiSettingsForm({
                 ) : (
                   <p className="m-0 font-semibold">
                     {choice === null
-                      ? `Site default (${entry.site ? "on" : "off"})`
+                      ? `Instance default (${entry.site ? "on" : "off"})`
                       : choice
                         ? "On"
                         : "Off"}
@@ -573,12 +768,12 @@ function AiSettingsForm({
         <p className="m-0 text-body-sm text-ink-muted">
           {saved.updatedAt
             ? `Last saved ${new Date(saved.updatedAt).toLocaleString()}.`
-            : "Using account defaults; no custom settings have been saved."}
+            : "Using Space defaults; no custom settings have been saved."}
         </p>
         <FormError message={error} />
         <p role="status" aria-live="polite" className="m-0 text-body-sm">
           {saving
-            ? `Saving settings for @${owner}…`
+            ? `Saving settings for @${space}…`
             : notice || (dirty ? "You have unsaved changes." : "")}
         </p>
         {saved.canManage && (

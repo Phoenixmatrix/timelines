@@ -1,22 +1,23 @@
-import { describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type * as Artifacts from "../artifacts.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
 import { cancelRun } from "./cancel.ts";
 import { CiSandbox } from "./sandbox.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
+import { seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
 
-vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {
-    ctx: unknown;
-    env: unknown;
-    constructor(ctx: unknown, env: unknown) {
-      this.ctx = ctx;
-      this.env = env;
-    }
-  },
-}));
+const dispose: (() => void)[] = [];
+afterEach(() => {
+  for (const close of dispose.splice(0)) close();
+});
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 vi.mock("../artifacts.ts", async (original) => ({
   ...(await original<typeof Artifacts>()),
   upstreamToken: async () => "sandbox-fixture-read-token",
@@ -28,12 +29,12 @@ const tracker = vi.hoisted(() => ({
 vi.mock("../tracker/stub.ts", () => ({ trackerObject: () => tracker }));
 
 describe("Sandbox infrastructure retry cancellation", () => {
-  test.each(["stopped", "stop-failed"])(
+  test.each(["stopped", "stop-failed", "stop-unacknowledged"])(
     "%s preserves evidence and releases source purge only after confirmed shutdown",
     async (shutdown) => {
       const sqlite = migratedDatabase();
-      const durable = durableStorage();
-      const store = new TrackerStore(durable.sql, durable.transactionSync);
+      const registry = migratedRegistryDatabase();
+      const durable = fakeDurableState({ name: "org" });
       const stopping = Promise.withResolvers<void>();
       const stopped = Promise.withResolvers<void>();
       const infrastructureFailure = new Error("Fixture infrastructure failure");
@@ -69,11 +70,13 @@ describe("Sandbox infrastructure retry cancellation", () => {
           await stopped.promise;
           if (shutdown === "stop-failed") throw shutdownFailure;
           running = false;
+          if (shutdown === "stop-unacknowledged") throw shutdownFailure;
         },
       } as unknown as Container;
       const deleted: string[] = [];
       const env = {
         DB: d1(sqlite),
+        REGISTRY_DB: d1(registry),
         PUBLIC_URL: "https://gitmatrix.example",
         ARTIFACTS: {
           delete: async (name: string) => {
@@ -81,12 +84,39 @@ describe("Sandbox infrastructure retry cancellation", () => {
           },
         },
       } as unknown as Env;
+      const admission = installCutoverTestControl(env);
+      await initializeFreshSpaceInstallation(env);
+      sqlite.exec(
+        "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('person','user','person','Person')",
+      );
+      await seedSpaceFixture(env.DB, {
+        organization: {
+          id: "organization",
+          slug: "orbit-company",
+          displayName: "Orbit",
+          kind: "company",
+        },
+        space: { id: "org", slug: "orbit", displayName: "General" },
+        members: [
+          {
+            accountId: "person",
+            role: "owner",
+            grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+          },
+        ],
+        actorId: "person",
+      });
+      env.TRACKER = { idFromName: fakeDurableObjectId } as unknown as Env["TRACKER"];
+      await initializeFreshTrackerSpace(env, durable.ctx, "org");
+      const store = new TrackerStore(durable.ctx.storage.sql, (fn) =>
+        durable.ctx.storage.transactionSync(fn),
+      );
+      const credential = await issueToken(env.DB, "person", "ci", "write");
       sqlite.exec(`
-        INSERT INTO accounts(id,kind,slug,display_name) VALUES ('org','org','orbit','Orbit');
-        INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+        INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
           VALUES ('repo','org','app','private','app','https://app');
         INSERT INTO timeline_work_sources
-          (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,
+          (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,
            state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
            initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,
            created_at,updated_at,archived_at)
@@ -100,6 +130,22 @@ describe("Sandbox infrastructure retry cancellation", () => {
         INSERT INTO ci_steps(job_id,position,name,status) VALUES
           ('job',0,'build','pending'),('job',1,'later','pending');
       `);
+      sqlite
+        .prepare(
+          "UPDATE ci_runs SET actor_id=?,space_id=?,migration_epoch=?,authority=? WHERE id='run'",
+        )
+        .run(
+          "person",
+          "org",
+          0,
+          JSON.stringify({
+            spaceId: "org",
+            migrationEpoch: 0,
+            personId: "person",
+            agentId: null,
+            credential: { kind: "token", id: credential.id },
+          }),
+        );
       sqlite.prepare("UPDATE ci_jobs SET spec=? WHERE id='job'").run(
         JSON.stringify({
           secrets: [],
@@ -136,7 +182,9 @@ describe("Sandbox infrastructure retry cancellation", () => {
           state: Parameters<typeof store.timelines.transitionWorkSource>[2],
         ) => ({ ok: true, value: store.timelines.transitionWorkSource(id, version, state) }),
       );
-      const sandbox = new CiSandbox({ container } as unknown as DurableObjectState, env);
+      const state = fakeDurableState({ name: "job" });
+      Reflect.set(state.ctx, "container", container);
+      const sandbox = new CiSandbox(state.ctx, env);
       const outcome = sandbox.run("job").then(
         () => null,
         (error: unknown) => error,
@@ -162,6 +210,12 @@ describe("Sandbox infrastructure retry cancellation", () => {
         expect(executions.some((command) => command[4] === "later")).toBe(false);
         const dispatches = executions.length;
         expect(running).toBe(true);
+        expect(admission.control.activeTickets()).toHaveLength(1);
+        expect(await sandbox.cutoverDrainStatus()).toMatchObject({
+          running: true,
+          containerRunning: true,
+          drained: false,
+        });
         expect(job()).toMatchObject({
           status: "running",
           claimed_by: "sandbox",
@@ -185,9 +239,16 @@ describe("Sandbox infrastructure retry cancellation", () => {
         await expect(drainDeletedRepoSources(env, "repo")).rejects.toThrow("CI consumers");
         expect(deleted).toEqual([]);
         stopped.resolve();
-        expect(await outcome).toBe(
-          shutdown === "stopped" ? infrastructureFailure : shutdownFailure,
-        );
+        const error = await outcome;
+        if (shutdown === "stopped") expect(error).toBe(infrastructureFailure);
+        else {
+          expect(error).toBeInstanceOf(AggregateError);
+          expect((error as AggregateError).errors).toEqual([
+            infrastructureFailure,
+            shutdownFailure,
+          ]);
+        }
+        expect(admission.control.activeTickets()).toHaveLength(shutdown === "stopped" ? 0 : 1);
         expect(roots()).toEqual([{ consumer_id: "run" }]);
         if (shutdown === "stopped") {
           expect(job()).toEqual({
@@ -238,7 +299,7 @@ describe("Sandbox infrastructure retry cancellation", () => {
           await sandbox.run("job");
           expect(executions).toHaveLength(dispatches);
         } else {
-          expect(running).toBe(true);
+          expect(running).toBe(shutdown === "stop-failed");
           expect(job()).toMatchObject({ status: "running" });
           expect(roots()).toEqual([{ consumer_id: "run" }]);
           await expect(drainDeletedRepoSources(env, "repo")).rejects.toThrow("CI consumers");
@@ -248,8 +309,86 @@ describe("Sandbox infrastructure retry cancellation", () => {
         stopped.resolve();
         await outcome;
         sqlite.close();
+        registry.close();
         durable.db.close();
+        admission.close();
+        state.db.close();
       }
     },
   );
+});
+
+describe("Sandbox cutover admission", () => {
+  test("a closed fence rejects execution and alarms before business writes", async () => {
+    const state = fakeDurableState({ name: "job" });
+    const prepare = vi.fn(() => {
+      throw new Error("Unexpected business access");
+    });
+    const put = vi.spyOn(state.ctx.storage, "put");
+    const env = { DB: { prepare } } as unknown as Env;
+    const admission = installCutoverTestControl(env);
+    dispose.push(admission.close, () => state.db.close());
+    const sandbox = new CiSandbox(state.ctx, env);
+    await admission.fence();
+    await expect(sandbox.run("job")).rejects.toThrow("space_cutover_fenced");
+    await sandbox.alarm();
+    expect(await state.ctx.storage.getAlarm()).toBeGreaterThan(Date.now());
+    await expect(sandbox.retire("test", "job")).rejects.toThrow("space_cutover_fenced");
+    await expect(sandbox.purge("test")).rejects.toThrow("space_cutover_fenced");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+    expect(admission.control.activeTickets()).toEqual([]);
+  });
+
+  test("untracked pre-preparation processes remain blocked without destructive stop", async () => {
+    const env = {} as Env;
+    const admission = installCutoverTestControl(env);
+    const destroy = vi.fn();
+    const state = fakeDurableState({ name: "job" });
+    Reflect.set(state.ctx, "container", { running: true, destroy });
+    dispose.push(admission.close, () => state.db.close());
+    const sandbox = new CiSandbox(state.ctx, env);
+    await expect(sandbox.run("job")).rejects.toThrow("Untracked sandbox execution");
+    expect(await sandbox.cutoverDrainStatus()).toMatchObject({
+      ticket: null,
+      containerRunning: true,
+      drained: false,
+    });
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  test("a stopped orphan is sealed under the exact fence before its ticket can close", async () => {
+    const env = {} as Env;
+    const admission = installCutoverTestControl(env);
+    let running = true;
+    const destroy = vi.fn();
+    const state = fakeDurableState({ name: "job" });
+    Reflect.set(state.ctx, "container", {
+      get running() {
+        return running;
+      },
+      destroy,
+    });
+    dispose.push(admission.close, () => state.db.close());
+    const lease = admission.control.acquire("ci-sandbox", 3, {
+      kind: "ci-sandbox",
+      instanceId: state.ctx.id.toString(),
+    });
+    await state.ctx.storage.put("space-cutover-execution", { ...lease, jobId: "job" });
+    const sandbox = new CiSandbox(state.ctx, env);
+    const { runId } = await admission.fence();
+    await expect(
+      sandbox.cutoverReconcile("different-run", lease.ticket, lease.epoch),
+    ).rejects.toThrow("exact fenced cutover");
+    expect(await sandbox.cutoverReconcile(runId, lease.ticket, lease.epoch)).toBe(false);
+    expect(admission.control.activeTickets()).toHaveLength(1);
+    expect(destroy).not.toHaveBeenCalled();
+    running = false; // The provider, not Workflow status, now confirms shutdown.
+    expect(await sandbox.cutoverReconcile(runId, lease.ticket, lease.epoch)).toBe(true);
+    admission.control.release(lease.ticket);
+    const evicted = new CiSandbox(state.ctx, env);
+    await expect(evicted.run("job")).rejects.toThrow("sealed by cutover");
+    expect(admission.control.activeTickets()).toEqual([]);
+    expect(destroy).not.toHaveBeenCalled();
+  });
 });

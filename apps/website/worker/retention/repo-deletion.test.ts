@@ -6,16 +6,18 @@
 
 import { Hono } from "hono";
 import { FakeR2Bucket } from "@gitmatrix/testing";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { findRepo } from "../db.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { fakeDurableState } from "../testing/durable-state.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
 import { vectorId } from "../knowledge/indexes.ts";
 import { forgetRecorded } from "../durable/registry.ts";
 import { repos } from "../api/repos.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { runner } from "../ci/api.ts";
 import { SimulatedCrash } from "./runs.ts";
 import {
@@ -24,11 +26,11 @@ import {
   requestDeletion,
   resumeDeletions,
   runPurge,
+  PHASES,
   type PurgeStep,
 } from "./repo-deletion.ts";
 import { KEPT_TABLES, REPO_TABLES, repoInventory, type RepoInventory } from "./repo-inventory.ts";
 import { plantOrphans, resetOrphanSweep, sweepRepoOrphans } from "./repo-orphans.ts";
-import type { DatabaseSync } from "node:sqlite";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -155,11 +157,11 @@ function fakeArtifacts() {
 }
 
 function fakeWorkflow() {
-  const instances = new Map<string, { status: string; params: unknown }>();
+  const instances = new Map<string, { status: string; params: unknown; events: unknown[] }>();
   return {
     instances,
     create: async ({ id, params }: { id: string; params: unknown }) => {
-      instances.set(id, { status: "running", params });
+      instances.set(id, { status: "running", params, events: [] });
       return { id };
     },
     get: async (id: string) => {
@@ -168,6 +170,9 @@ function fakeWorkflow() {
       return {
         id,
         status: async () => ({ status: instance.status }),
+        sendEvent: async (event: unknown) => {
+          instance.events.push(event);
+        },
         terminate: async () => {
           instance.status = "terminated";
         },
@@ -195,9 +200,34 @@ function coordinators(envRef: () => Env) {
 
 const NODES = ["repo", "file:a.ts", "sym:a.ts#run"];
 
-async function setup() {
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+async function setup(automaticCleanup = true) {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const waits: Promise<unknown>[] = [];
+  const waitUntil = (work: Promise<unknown>) => {
+    waits.push(work);
+    // Observe immediately, retaining failures for the drain before closing storage.
+    void work.catch(() => {});
+  };
+  const drain = async () => {
+    const failures: unknown[] = [];
+    for (let cursor = 0; cursor < waits.length;) {
+      const batch = waits.slice(cursor);
+      cursor = waits.length;
+      for (const result of await Promise.allSettled(batch))
+        if (result.status === "rejected") failures.push(result.reason);
+    }
+    if (failures.length)
+      throw new AggregateError(failures, "Repository fixture background work failed");
+  };
+  const close = async () => {
+    try {
+      await drain();
+    } finally {
+      fresh.close();
+    }
+  };
+  if (automaticCleanup) onTestFinished(close);
+  const { sqlite, registry } = fresh;
   registry.exec("PRAGMA foreign_keys = OFF");
   const vectors = fakeVectorize();
   const search = fakeSearch();
@@ -210,8 +240,7 @@ async function setup() {
   let env!: Env;
   const knowledge = coordinators(() => env);
   env = {
-    DB: d1(sqlite),
-    REGISTRY_DB: d1(registry),
+    ...fresh.env,
     VECTORS: vectors,
     SEARCH: search.binding,
     ARTIFACTS: artifacts,
@@ -222,20 +251,40 @@ async function setup() {
     KNOWLEDGE_COORDINATOR: knowledge.namespace,
   } as unknown as Env;
 
-  sqlite.exec(`
+  sqlite.exec(`BEGIN; 
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'), ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ann', 'owner');
-  `);
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id)
+      VALUES ('org_orbit','orbit-company','Orbit','company','orbit');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('orbit','org_orbit','orbit','Orbit');
+    INSERT INTO organization_members (organization_id,account_id,role,origin,granted_by)
+      VALUES ('org_orbit','ann','owner','test','ann');
+    INSERT INTO space_grants (space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by)
+      VALUES ('orbit','org_orbit','ann','admin','write','write','test','ann');
+   COMMIT;`);
+  const credential = await issueToken(env.DB, ann.id, "retention-fixture", "write");
+  const initiatingActor: Actor = { ...ann, credential: { kind: "token", id: credential.id } };
   let runs = 0;
   startRun.mockReset();
-  startRun.mockImplementation(async (_env, repo: { id: string }, options) => {
+  startRun.mockImplementation(async (_env, repo: { id: string; source_id?: string }, options) => {
     runs++;
     sqlite.exec(`
       INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, preview_action, timeline_slug)
         VALUES ('teardown-${runs}', '${repo.id}', ${100 + runs}, '${options.commit}', '${options.branch}',
                 'manual', 'queued', 'teardown', '${options.preview.timeline}');
     `);
+    sqlite
+      .prepare(`UPDATE ci_runs SET source_id=?,space_id=?,migration_epoch=?,actor_id=?,agent_id=?,authority=?
+      WHERE id=?`)
+      .run(
+        repo.source_id ?? "canonical",
+        options.authority.spaceId,
+        options.authority.migrationEpoch,
+        options.authority.personId,
+        options.authority.agentId,
+        JSON.stringify(options.authority),
+        `teardown-${runs}`,
+      );
     return { runId: `teardown-${runs}`, number: 100 + runs };
   });
 
@@ -243,10 +292,11 @@ async function setup() {
   async function repository(id: string, name: string) {
     await artifacts.create(`art-${id}`);
     sqlite.exec(`
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('${id}', 'orbit', '${name}', 'private', 'art-${id}', 'https://artifacts/art-${id}');
       INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('${id}', 'ben', 'read');
       INSERT INTO ref_updates (repo_id, ref) VALUES ('${id}', 'refs/heads/main');
+      INSERT INTO mention_backfill_jobs (repo_id, authority, state) VALUES ('${id}', NULL, 'blocked');
       INSERT INTO kg_builds (id, repo_id, to_commit, status) VALUES
         ('${id}-b1', '${id}', 'c1', 'succeeded'), ('${id}-b2', '${id}', 'c2', 'running');
       INSERT INTO kg_edges (repo_id, src, dst, kind) VALUES ('${id}', 'repo', 'file:a.ts', 'contains');
@@ -267,12 +317,28 @@ async function setup() {
         ('${id}', 'timeline/t1', 't1', 'c2', 'sleeping'),
         ('${id}', 'timeline/t2', 't2', 'c2', 'active'),
         ('${id}', 'timeline/t0', 't0', 'c0', 'expired');
-      INSERT INTO atlas_spend (id, account_id, day, scope, run_id, repo_id, purpose, model, status,
+      INSERT INTO atlas_spend (id, space_id, day, scope, run_id, repo_id, purpose, model, status,
                                input_tokens, output_tokens, cost_micro_usd, reserved_input_tokens,
                                reserved_output_tokens, reserved_micro_usd, created_at) VALUES
         ('${id}-s1', 'orbit', '2020-01-01', 'build', '${id}-b1', '${id}', 'p', 'm', 'settled', 1, 1, 5, 1, 1, 5, '2020-01-01'),
         ('${id}-s2', 'orbit', '${new Date().toISOString().slice(0, 10)}', 'build', '${id}-b2', '${id}', 'p', 'm', 'reserved', 1, 1, 7, 1, 1, 7, '2020-01-01');
     `);
+    const authority = await captureWorkAuthority(env, id, initiatingActor);
+    sqlite
+      .prepare("UPDATE deployments SET authority=? WHERE repo_id=?")
+      .run(JSON.stringify(authority), id);
+    sqlite
+      .prepare(
+        `UPDATE ci_runs SET space_id=?,migration_epoch=?,actor_id=?,agent_id=?,authority=? WHERE repo_id=?`,
+      )
+      .run(
+        authority.spaceId,
+        authority.migrationEpoch,
+        authority.personId,
+        authority.agentId,
+        JSON.stringify(authority),
+        id,
+      );
     for (const node of NODES) {
       sqlite.exec(`
         INSERT INTO kg_nodes (repo_id, id, kind, name, summary, content_hash, changed_in)
@@ -295,7 +361,7 @@ async function setup() {
       metadata: { repo: id },
     });
     // Its coordinator, with state and an alarm, registered.
-    await knowledge.get(id).object.notify(id);
+    await knowledge.get(id).object.notify(id, { authorization: authority });
     sqlite.exec(`
       INSERT INTO do_instances (class, name, repo_id) VALUES ('KnowledgeCoordinator', '${id}', '${id}');
     `);
@@ -317,12 +383,11 @@ async function setup() {
 
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
-    c.set("actor", ann);
+    c.set("actor", initiatingActor);
     await next();
   });
   app.route("/api/repos", repos);
-  const waits: Promise<unknown>[] = [];
-  const ctx = { waitUntil: (p: Promise<unknown>) => waits.push(p), passThroughOnException() {} };
+  const ctx = { waitUntil, passThroughOnException() {} };
   const call = (path: string, init: RequestInit = {}) =>
     app.request(`/api/repos${path}`, init, env, ctx as unknown as ExecutionContext);
 
@@ -337,6 +402,7 @@ async function setup() {
     registry,
     env,
     vectors,
+    initiatingActor,
     search,
     artifacts,
     stepFiles,
@@ -346,6 +412,9 @@ async function setup() {
     knowledge,
     call,
     waits,
+    waitUntil,
+    drain,
+    close,
     finishTeardowns,
   };
 }
@@ -385,12 +454,14 @@ test("renaming preserves registry grants/provenance and never invokes deletion p
 function steps(
   world: World,
   crash?: { at: number; when: "before" | "after" },
-): { step: PurgeStep; names: string[]; done: () => number } {
+): { step: PurgeStep; names: string[]; workNames: string[]; done: () => number } {
   const names: string[] = [];
+  const workNames: string[] = [];
   let count = 0;
   const step: PurgeStep = {
     async do(name, _config, work) {
       names.push(name);
+      workNames.push(name);
       const n = ++count;
       if (crash?.when === "before" && crash.at === n) throw new SimulatedCrash(name);
       const result = await work();
@@ -402,11 +473,11 @@ function steps(
       world.finishTeardowns();
     },
   };
-  return { step, names, done: () => count };
+  return { step, names, workNames, done: () => count };
 }
 
 const purge = (world: World, step = steps(world).step) =>
-  runPurge(world.env, "r_doomed", step, { waitUntil: () => {} });
+  runPurge(world.env, "r_doomed", step, { waitUntil: world.waitUntil });
 
 /** What an inventory says is left, in a comparable shape. */
 function left(inventory: RepoInventory) {
@@ -450,6 +521,20 @@ const NOTHING_LEFT = {
 // ---- tests ------------------------------------------------------------------
 
 describe("repository deletion", () => {
+  test("revoked deployment credentials fence teardown without marking it unmanaged", async () => {
+    const w = await setup();
+    await requestDeletion(w.env, cleanRow, "ann");
+    w.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(w.initiatingActor.credential!.id);
+    await expect(purge(w)).rejects.toThrow("credential");
+    expect(startRun).not.toHaveBeenCalled();
+    expect(w.artifacts.repos.has("art-r_doomed")).toBe(true);
+    expect(
+      w.sqlite
+        .prepare(`SELECT count(*) AS n FROM deployments
+      WHERE repo_id='r_doomed' AND teardown_unmanaged_at IS NOT NULL`)
+        .get(),
+    ).toEqual({ n: 0 });
+  });
   test("drains an unstarted queued gate on a failed run without replacing its failure", async () => {
     const w = await setup();
     w.sqlite.exec(`
@@ -520,6 +605,7 @@ describe("repository deletion", () => {
     "waits for CI acknowledgment after tombstone (historical ambiguity: %s)",
     async (historical) => {
       const w = await setup();
+      await w.ciRuns.create({ id: "r_doomed-run1", params: { runId: "r_doomed-run1" } });
       w.sqlite
         .prepare("UPDATE ci_runs SET status=? WHERE id='r_doomed-run1'")
         .run(historical ? "cancelled" : "running");
@@ -535,7 +621,7 @@ describe("repository deletion", () => {
       // after the repository disappears from normal readers.
       const app = new Hono<AppEnv>();
       app.use("*", async (c, next) => {
-        c.set("actor", ann);
+        c.set("actor", w.initiatingActor);
         await next();
       });
       app.route("/runner", runner);
@@ -598,7 +684,7 @@ describe("repository deletion", () => {
     expect((await w.call("/orbit/doomed", { method: "DELETE" })).status).toBe(404);
     const taken = await w.call("", {
       method: "POST",
-      body: JSON.stringify({ owner: "orbit", name: "doomed" }),
+      body: JSON.stringify({ spaceId: "orbit", name: "doomed" }),
     });
     expect(taken.status).toBe(409);
     expect(await taken.text()).toMatch(/being deleted/);
@@ -667,39 +753,68 @@ describe("repository deletion", () => {
     // The name is free again.
     const reused = await w.call("", {
       method: "POST",
-      body: JSON.stringify({ owner: "orbit", name: "doomed" }),
+      body: JSON.stringify({ spaceId: "orbit", name: "doomed" }),
     });
     expect(reused.status).toBe(201);
   });
 
-  test("a crash at any step resumes to the same end, from the recorded phase", async () => {
-    const clean = await setup();
-    await requestDeletion(clean.env, cleanRow, "ann");
-    const run = steps(clean);
-    await purge(clean, run.step);
-    const total = run.done();
-    expect(total).toBeGreaterThan(20);
-    const expected = left(await repoInventory(clean.env, "r_doomed"));
-    expect(expected).toEqual(NOTHING_LEFT);
-
-    for (const when of ["before", "after"] as const)
-      for (let at = 1; at <= total; at++) {
-        const w = await setup();
-        await requestDeletion(w.env, cleanRow, "ann");
-        await expect(purge(w, steps(w, { at, when }).step)).rejects.toBeInstanceOf(SimulatedCrash);
-        // A new instance (no replayed steps) picks up where the record says.
-        expect(await purge(w)).toBe("done");
-        expect(left(await repoInventory(w.env, "r_doomed")), `${when} step ${at}`).toEqual(
-          expected,
-        );
-        expect(left(await repoInventory(w.env, "r_keep")).repo).toEqual({
-          name: "keep",
-          deletedAt: null,
-        });
-        // One teardown run per timeline, however the crash fell.
-        expect(startRun.mock.calls.length, `${when} step ${at}`).toBe(2);
+  test.each(
+    ["load", ...PHASES].flatMap((phase) =>
+      (["before", "after"] as const).map((when) => ({ phase, when })),
+    ),
+  )(
+    "a crash $when each $phase step resumes from its recorded phase",
+    async ({ phase, when }) => {
+      // Every case still builds fresh real stores. Partition the full discovered
+      // matrix by phase instead of spending one timeout on dozens of installations.
+      const clean = await setup(false);
+      let points: { at: number; name: string }[];
+      try {
+        await requestDeletion(clean.env, cleanRow, "ann");
+        const run = steps(clean);
+        await purge(clean, run.step);
+        expect(run.done()).toBeGreaterThan(20);
+        expect(left(await repoInventory(clean.env, "r_doomed"))).toEqual(NOTHING_LEFT);
+        points = run.workNames
+          .map((name, index) => ({ at: index + 1, name }))
+          .filter(({ name }) => name.split(":")[0] === phase);
+        expect(points.length).toBeGreaterThan(0);
+        expect(
+          run.workNames.every((name) => ["load", ...PHASES].includes(name.split(":")[0]!)),
+        ).toBe(true);
+      } finally {
+        await clean.close();
       }
-  }, 120_000);
+      for (const { at, name } of points) {
+        const w = await setup(false);
+        try {
+          await requestDeletion(w.env, cleanRow, "ann");
+          await expect(purge(w, steps(w, { at, when }).step)).rejects.toBeInstanceOf(
+            SimulatedCrash,
+          );
+          // A new instance (no replayed steps) picks up where the record says.
+          expect(await purge(w)).toBe("done");
+          expect(left(await repoInventory(w.env, "r_doomed")), `${when} ${name}`).toEqual(
+            NOTHING_LEFT,
+          );
+          expect(left(await repoInventory(w.env, "r_keep")).repo).toEqual({
+            name: "keep",
+            deletedAt: null,
+          });
+          expect(
+            w.sqlite
+              .prepare("SELECT state FROM mention_backfill_jobs WHERE repo_id = 'r_keep'")
+              .get(),
+          ).toEqual({ state: "blocked" });
+          // One teardown per timeline, regardless of the crash boundary.
+          expect(startRun.mock.calls.length, `${when} ${name}`).toBe(2);
+        } finally {
+          await w.close();
+        }
+      }
+    },
+    120_000,
+  );
 
   test("waits for teardown runs, and gives up on them after the limit", async () => {
     const w = await setup();
@@ -717,7 +832,7 @@ describe("repository deletion", () => {
           );
       },
     };
-    expect(await runPurge(w.env, "r_doomed", step, { waitUntil: () => {} })).toBe("done");
+    expect(await runPurge(w.env, "r_doomed", step, { waitUntil: w.waitUntil })).toBe("done");
     expect(sleeps).toBe(3);
     expect((await deletionStatus(w.env, "r_doomed"))!.progress.previews?.timedOut).toBe(2);
     expect(left(await repoInventory(w.env, "r_doomed"))).toEqual(NOTHING_LEFT);
@@ -749,7 +864,7 @@ describe("repository deletion", () => {
       },
       sleep: async () => w.finishTeardowns(),
     };
-    expect(await runPurge(w.env, "r_doomed", step, { waitUntil: () => {} })).toBe("done");
+    expect(await runPurge(w.env, "r_doomed", step, { waitUntil: w.waitUntil })).toBe("done");
     expect(seen).toEqual([
       expect.objectContaining({
         step: "artifacts:delete",
@@ -771,15 +886,15 @@ describe("repository deletion", () => {
   test("the cron restarts a purge whose Workflow died, never one still alive", async () => {
     const w = await setup();
     await requestDeletion(w.env, cleanRow, "ann");
-    await launchPurge(w.env, "r_doomed", () => {});
+    await launchPurge(w.env, "r_doomed", w.waitUntil);
     const now = Date.now() + 60 * 60_000;
     // Alive (sleeping between checks): left alone.
     w.purges.instances.get("purge-r_doomed-1")!.status = "waiting";
-    expect(await resumeDeletions(w.env, { now, waitUntil: () => {} })).toEqual([]);
+    expect(await resumeDeletions(w.env, { now, waitUntil: w.waitUntil })).toEqual([]);
     // Recently active: left alone whatever its instance says.
     w.purges.instances.get("purge-r_doomed-1")!.status = "errored";
-    expect(await resumeDeletions(w.env, { waitUntil: () => {} })).toEqual([]);
-    expect(await resumeDeletions(w.env, { now, waitUntil: () => {} })).toEqual(["r_doomed"]);
+    expect(await resumeDeletions(w.env, { waitUntil: w.waitUntil })).toEqual([]);
+    expect(await resumeDeletions(w.env, { now, waitUntil: w.waitUntil })).toEqual(["r_doomed"]);
     expect([...w.purges.instances.keys()]).toEqual(["purge-r_doomed-1", "purge-r_doomed-2"]);
     expect(await deletionStatus(w.env, "r_doomed")).toMatchObject({
       attempts: 2,
@@ -787,7 +902,7 @@ describe("repository deletion", () => {
     });
     // A finished deletion is never restarted.
     await purge(w);
-    expect(await resumeDeletions(w.env, { now, waitUntil: () => {} })).toEqual([]);
+    expect(await resumeDeletions(w.env, { now, waitUntil: w.waitUntil })).toEqual([]);
   });
 
   test("a scoped recovery leaves another unfinished repository deletion untouched", async () => {
@@ -799,16 +914,16 @@ describe("repository deletion", () => {
       "ann",
     );
     const now = Date.now() + 60 * 60_000;
-    expect(await resumeDeletions(w.env, { repoId: "r_doomed", now, waitUntil: () => {} })).toEqual([
-      "r_doomed",
-    ]);
+    expect(
+      await resumeDeletions(w.env, { repoId: "r_doomed", now, waitUntil: w.waitUntil }),
+    ).toEqual(["r_doomed"]);
     expect((await deletionStatus(w.env, "r_doomed"))?.attempts).toBe(1);
     expect(await deletionStatus(w.env, "r_keep")).toMatchObject({
       attempts: 0,
       workflowId: null,
       phase: "stop",
     });
-    expect(await resumeDeletions(w.env, { now, waitUntil: () => {} })).toEqual(["r_keep"]);
+    expect(await resumeDeletions(w.env, { now, waitUntil: w.waitUntil })).toEqual(["r_keep"]);
   });
 
   test("without a Workflow (a preview), the purge runs in the background", async () => {
@@ -830,8 +945,10 @@ describe("repository deletion", () => {
     expect(left(await repoInventory(w.env, "r_doomed")).d1).toEqual({});
   });
 
-  test("every table with a repo_id is inventoried", () => {
-    const sqlite: DatabaseSync = migratedDatabase();
+  test("every table with a repo_id is inventoried", async () => {
+    const fresh = await createFreshSpaceTestEnvironment();
+    onTestFinished(fresh.close);
+    const { sqlite } = fresh;
     const tables = (
       sqlite
         .prepare(
@@ -846,8 +963,8 @@ describe("repository deletion", () => {
 
 const cleanRow = {
   id: "r_doomed",
-  owner_id: "orbit",
-  owner_slug: "orbit",
+  space_id: "orbit",
+  space_slug: "orbit",
   name: "doomed",
   artifacts_name: "art-r_doomed",
 };
@@ -858,7 +975,11 @@ describe("the orphan sweep", () => {
     const planted = await plantOrphans(w.env);
     // A coordinator, spend and a registry grant of another long-gone repository.
     const { ctx } = fakeDurableState({ name: "repo_gone" });
-    await new KnowledgeCoordinator(ctx, w.env).notify("repo_gone");
+    w.sqlite.exec(`INSERT INTO repos (id,space_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES ('repo_gone','orbit','gone','private','gone-artifacts','https://artifacts/gone');`);
+    const authority = await captureWorkAuthority(w.env, "repo_gone", w.initiatingActor);
+    await new KnowledgeCoordinator(ctx, w.env).notify("repo_gone", { authorization: authority });
+    w.sqlite.exec("DELETE FROM repos WHERE id='repo_gone'");
     w.knowledge.instances.set("repo_gone", {
       object: new KnowledgeCoordinator(ctx, w.env),
       ctx,
@@ -876,7 +997,7 @@ describe("the orphan sweep", () => {
     await w.artifacts.create("r-young");
     // A crashed allocation older than the orphan grace is still an owned name.
     w.sqlite.exec(`INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,state,allocation_operation_id,
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,state,allocation_operation_id,
        fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
       VALUES ('work_reserved','r_keep','reserved-timeline','reserved','orbit','old-reserved','reserved','allocation-reserved',
         'canonical','head','tree','refs/heads/main','canonical','head','tree','refs/heads/main','2020-01-01','2020-01-01');`);
@@ -887,12 +1008,12 @@ describe("the orphan sweep", () => {
     await requestDeletion(w.env, cleanRow, "ann");
 
     let state = await sweepRepoOrphans(w.env, {
-      waitUntil: () => {},
+      waitUntil: w.waitUntil,
       limits: { pages: 1, perPage: 2 },
     });
     for (let i = 0; state.stage !== "done" && i < 20; i++)
       state = await sweepRepoOrphans(w.env, {
-        waitUntil: () => {},
+        waitUntil: w.waitUntil,
         limits: { pages: 1, perPage: 2 },
       });
     expect(state).toMatchObject({
@@ -923,7 +1044,7 @@ describe("the orphan sweep", () => {
     ]);
     for (const id of [planted.repoId, "repo_gone"]) {
       const { step, names } = steps(w);
-      expect(await runPurge(w.env, id, step, { waitUntil: () => {} })).toBe("done");
+      expect(await runPurge(w.env, id, step, { waitUntil: w.waitUntil })).toBe("done");
       expect(names).not.toContain("previews:claim");
       expect(names).not.toContain("artifacts:delete");
       expect(left(await repoInventory(w.env, id))).toMatchObject({
@@ -944,10 +1065,12 @@ describe("the orphan sweep", () => {
       artifacts: true,
     });
     // Done means done: the next cron call does nothing.
-    expect(await sweepRepoOrphans(w.env, { waitUntil: () => {} })).toMatchObject({ stage: "done" });
+    expect(await sweepRepoOrphans(w.env, { waitUntil: w.waitUntil })).toMatchObject({
+      stage: "done",
+    });
     await resetOrphanSweep(w.env);
     expect(
-      (await sweepRepoOrphans(w.env, { waitUntil: () => {}, limits: { minAgeMs: 0 } })).orphans,
+      (await sweepRepoOrphans(w.env, { waitUntil: w.waitUntil, limits: { minAgeMs: 0 } })).orphans,
     ).toBe(0);
   });
 });

@@ -49,7 +49,7 @@ export async function semanticResponse(c: Context<AppEnv>, row: RepoRow): Promis
         objects,
         cache,
         row.id,
-        `/${encodeURIComponent(row.owner_slug)}/${encodeURIComponent(row.name)}`,
+        `/${encodeURIComponent(row.space_slug)}/${encodeURIComponent(row.name)}`,
         query,
         source.sourceId,
       ),

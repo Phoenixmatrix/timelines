@@ -5,6 +5,8 @@ import type { NewTimeline, TimelineStore } from "../tracker/timelines.ts";
 
 /** Allocate through the real Tracker authority before creating an active fixture. */
 export function ownedTimeline(store: TimelineStore, access: Access, input: NewTimeline) {
+  const credential = access.credential;
+  if (!credential) throw new Error("Timeline fixture requires a live initiating credential");
   const id = store.reserveTimeline(access, input.slug, input.parent, JSON.stringify(input));
   const repos = input.repos.map((repo) => {
     const base: SourceSnapshot = {
@@ -17,11 +19,18 @@ export function ownedTimeline(store: TimelineStore, access: Access, input: NewTi
       tree: input.commits[repo.id]!,
     };
     const reserved = store.reserveWorkSource(
-      { id: repo.id, owner_id: access.owner.id },
+      { id: repo.id, space_id: access.spaceId },
       {
         timelineId: id,
         timelineSlug: input.slug,
         base,
+        authority: {
+          spaceId: access.spaceId,
+          migrationEpoch: access.migrationEpoch,
+          personId: access.principalId,
+          agentId: access.agentId,
+          credential,
+        },
       },
     );
     const creating = store.transitionWorkSource(reserved.source_id, reserved.version, "creating");

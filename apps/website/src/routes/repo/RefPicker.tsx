@@ -52,7 +52,7 @@ export function RefBar({
         <nav aria-label="Path" className="flex min-w-0 flex-wrap items-center gap-1 text-body">
           <PrefetchLink
             to={sourceUrl(
-              repoPath(repo.owner.slug, repo.name, "tree", encodePath(refName)),
+              repoPath(repo.space.slug, repo.name, "tree", encodePath(refName)),
               repo.source?.sourceId,
             )}
             className="font-semibold text-ink-muted no-underline hover:text-ink"
@@ -62,7 +62,7 @@ export function RefBar({
           {segments.map((segment, index) => {
             const last = index === segments.length - 1;
             const to = repoPath(
-              repo.owner.slug,
+              repo.space.slug,
               repo.name,
               "tree",
               encodePath(refName),

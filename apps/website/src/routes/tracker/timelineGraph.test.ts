@@ -25,7 +25,7 @@ function timeline(slug: string, fields: Partial<Timeline> = {}): Timeline {
     experimental: false,
     parentId: null,
     forkPoint: { commits: {}, trackerCursor: 0 },
-    repos: [{ id: "app", owner: "orbit", name: "app", bookmark: `timeline/${slug}` }],
+    repos: [{ id: "app", space: "orbit", name: "app", bookmark: `timeline/${slug}` }],
     status: "active",
     accountableId: "ann",
     startedBy: "ann",
@@ -101,7 +101,7 @@ function history() {
       ann: { name: "Ann", accountableId: null },
       agt_bot: { name: "bot", accountableId: "ann" },
     },
-    workspaces: { app: [{ id: "w1", slug: "web", name: "Web" }] },
+    projects: { app: [{ id: "w1", slug: "web", name: "Web" }] },
   };
 }
 
@@ -323,7 +323,7 @@ describe("columns", () => {
           fork("tl_b", null, 10),
         ],
         actors: {},
-        workspaces: {},
+        projects: {},
       },
       { selected: null, filters: { ...DEFAULT_FILTERS, abandoned: true } },
     );
@@ -344,7 +344,7 @@ describe("columns", () => {
         timelines: many,
         events: many.map((t, i) => fork(t.id, null, i)),
         actors: {},
-        workspaces: {},
+        projects: {},
       },
       { selected: null },
     );
@@ -359,14 +359,14 @@ describe("columns", () => {
 });
 
 describe("groups", () => {
-  test("by status, workspace, agent and person", () => {
+  test("by status, project, agent and person", () => {
     const data = history();
     const ts = data.timelines;
     expect(groupTimelines(ts, "status", data).map((g) => [g.label, g.timelines.length])).toEqual([
       ["Active", 3],
       ["Abandoned", 1],
     ]);
-    expect(groupTimelines(ts, "workspace", data).map((g) => g.label)).toEqual(["Web"]);
+    expect(groupTimelines(ts, "project", data).map((g) => g.label)).toEqual(["Web"]);
     expect(
       groupTimelines(ts, "agent", data).map((g) => [g.label, g.timelines.map((t) => t.slug)]),
     ).toEqual([
@@ -374,9 +374,7 @@ describe("groups", () => {
       ["No agent", ["search", "ui", "ui-dark"]],
     ]);
     expect(groupTimelines(ts, "person", data).map((g) => g.label)).toEqual(["Ann"]);
-    const elsewhere = { ...data, workspaces: {} };
-    expect(groupTimelines(ts, "workspace", elsewhere).map((g) => g.label)).toEqual([
-      "No workspace",
-    ]);
+    const elsewhere = { ...data, projects: {} };
+    expect(groupTimelines(ts, "project", elsewhere).map((g) => g.label)).toEqual(["No project"]);
   });
 });

@@ -1,6 +1,7 @@
 import type { CommitSummary } from "./api.ts";
 import type { SourceSnapshot } from "./code-source.ts";
 import type { IssueStatus, IssueType } from "./tracker.ts";
+import type { SpaceSummary } from "./spaces.ts";
 
 /** A tracker issue as release notes see it: what shipped, when, and the proof. */
 export interface ShippedIssue {
@@ -11,7 +12,7 @@ export interface ShippedIssue {
   type: IssueType;
   status: IssueStatus;
   labels: string[];
-  workspaceIds: string[];
+  projectIds: string[];
   team: { id: string; key: string; name: string };
   /** When the issue last became done; null while it isn't. */
   completedAt: string | null;
@@ -20,9 +21,9 @@ export interface ShippedIssue {
 
 /** A shipped issue resolved through one of the trackers subscribed to a repository. */
 export interface LinkedIssue extends ShippedIssue {
-  /** The tracker account the issue belongs to. */
-  trackerOwner: string;
-  trackerOwnerId: string;
+  /** Immutable Space partition containing the issue. */
+  trackerSpace: string;
+  trackerSpaceId: string;
 }
 
 export interface RangeCommit extends CommitSummary {
@@ -118,14 +119,14 @@ export interface ReleaseNoteEntry {
   title: string;
   summary: string;
   issue: {
-    trackerOwner: string;
+    trackerSpace: string;
     id: string;
     key: string;
     type: string;
     team: { id: string; key: string };
   } | null;
   labels: string[];
-  workspaceIds: string[];
+  projectIds: string[];
   commits: string[];
   /** The timeline the work landed with; null when it was committed to the default branch. */
   timeline: LandedTimeline | null;
@@ -143,14 +144,14 @@ export type ReleaseHighlightsState = "disabled" | "idle" | "generating" | "ready
 
 /** An authorized backlink to the exact detailed daily note, never a model-written URL. */
 export interface ReleaseHighlightsLink {
-  repo: { owner: string; name: string };
+  repo: { space: string; name: string };
   release: string;
 }
 
-/** GET highlights for a tracker organization. */
+/** GET highlights for a tracker Space. */
 export interface ReleaseHighlights {
   scope: ReleaseHighlightsScope;
-  owner: { slug: string; displayName: string };
+  space: SpaceSummary;
   status: { state: ReleaseHighlightsState; generatedAt: string | null };
   body: string | null;
   model: string | null;
@@ -171,14 +172,14 @@ export interface ReleaseSummary {
   entries: number;
 }
 
-/** GET /api/repos/:owner/:name/release-notes */
+/** GET /api/repos/:space/:name/release-notes */
 export interface ReleaseNotesIndex {
   status: { state: ReleaseNotesState; generatedAt: string | null };
   /** Daily updates first, then named tags; each group newest first. */
   releases: ReleaseSummary[];
 }
 
-/** GET /api/repos/:owner/:name/release-notes/release?name= */
+/** GET /api/repos/:space/:name/release-notes/release?name= */
 export interface ReleaseNotesRelease {
   release: ReleaseSummary & {
     fromOid: string | null;
@@ -193,9 +194,9 @@ export interface ReleaseNotesRelease {
 /** An entry in a tracker's code-update feed, with its repository and grouping. */
 export interface ReleaseFeedEntry extends ReleaseNoteEntry {
   /** The repository whose commits `commits` (and the landing) are. */
-  repo: { owner: string; name: string };
+  repo: { space: string; name: string };
   /** Repository and release-note groups containing this entry. */
-  repos: { owner: string; name: string; releases: string[] }[];
+  repos: { space: string; name: string; releases: string[] }[];
 }
 
 export interface ReleaseFeedFacet {
@@ -204,9 +205,9 @@ export interface ReleaseFeedFacet {
   count: number;
 }
 
-/** GET /api/tracker/:owner/release-notes?q= */
+/** GET /api/tracker/:space/release-notes?q= */
 export interface ReleaseFeed {
-  owner: { slug: string; displayName: string };
+  space: SpaceSummary;
   query: ParsedReleaseQuery;
   /** Latest commit first. Daily updates by default; explicit kind/release filters can select tags. */
   entries: ReleaseFeedEntry[];
@@ -215,7 +216,7 @@ export interface ReleaseFeed {
   facets: {
     teams: ReleaseFeedFacet[];
     repos: ReleaseFeedFacet[];
-    workspaces: ReleaseFeedFacet[];
+    projects: ReleaseFeedFacet[];
     categories: ReleaseFeedFacet[];
     /** The entries' issue tags (absent from servers before CORE-271: read `labels`). */
     tags?: ReleaseFeedFacet[];
@@ -230,7 +231,7 @@ export interface ReleaseFeed {
 export const RELEASE_QUERY_KEYS = [
   "team",
   "repo",
-  "ws",
+  "project",
   "type",
   "tag",
   "release",
@@ -241,7 +242,6 @@ export const RELEASE_QUERY_KEYS = [
 ] as const;
 export type ReleaseQueryKey = (typeof RELEASE_QUERY_KEYS)[number];
 const RELEASE_QUERY_ALIASES: Record<string, ReleaseQueryKey> = {
-  workspace: "ws",
   category: "type",
   // `label:` is the old name of `tag:` (CORE-271).
   label: "tag",
@@ -257,7 +257,7 @@ export interface ParsedReleaseQuery {
 
 /**
  * The release feed's query language, like the tracker's: `team:core repo:engine
- * ws:platform type:fix tag:web release:v1.2 since:2026-09-01 until:30d search
+ * project:platform type:fix tag:web release:v1.2 since:2026-09-01 until:30d search
  * words`, any filter negated with a leading `-`, values quoted when they contain
  * spaces. `tag:` is an issue tag (`label:` still works). `release:day:2026-10-02`
  * selects a UTC day; `kind:tag` selects tagged releases. Before CORE-271 `tag:`
@@ -276,6 +276,8 @@ export function parseReleaseQuery(query: string): ParsedReleaseQuery {
       continue;
     }
     const name = filter[2]!.toLowerCase();
+    if (name === "ws" || name === "workspace")
+      throw new Error("client_upgrade_required: use project: instead of workspace: or ws:.");
     const key = (RELEASE_QUERY_KEYS as readonly string[]).includes(name)
       ? (name as ReleaseQueryKey)
       : RELEASE_QUERY_ALIASES[name];

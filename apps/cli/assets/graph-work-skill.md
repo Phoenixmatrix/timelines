@@ -62,7 +62,7 @@ restricting pickup. Policy is global across timelines, not a branch-local overri
 6. **Handle human input** using the current claim's `intervention` policy (below).
    When using durable requests, `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`
    parks your lease. Never put a secret in a prompt; use a credential request
-   with `--secret owner/repo:NAME`. Read the responses with
+   with `--secret space/repo:NAME`. Read the responses with
    `gm request list --issue <issue> --status all`; once all are resolved,
    `gm issue resume <issue>` takes the lease back up.
 7. **Submit, monitor, then finish.** Ship first ({{SHIP}}); independent main work
@@ -299,7 +299,7 @@ People and other agents follow them live and read them later.
   tokens directly.
 - Don't take a PRD (`type: prd`) as work: implement its sub-issues, and complete
   the PRD once they're done.
-- `gm agent list --owner <owner>` shows the tracker's agents with their
+- `gm agent list --space <space>` shows the tracker's agents with their
   advisory profiles (harness, model, environment, tags, skills), to pick whom to
   delegate to. Profiles are self-reported: treat them as hints, not proof.
 

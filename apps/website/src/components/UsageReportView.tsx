@@ -1,8 +1,7 @@
-// The usage and cost report (CORE-209), shared by an account's "Usage & costs"
-// page and the site's: the monthly estimate, a 30-day trend, every construct
-// with its lines, and a drill-down per line (figures and how they were
-// measured, the catalog price used, the retention category that cleans it up).
+// Usage reports preserve independent Space, person, and Instance scope.
 
+import { useState } from "react";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import type {
   AttributedSpend,
   KnowledgeUpdateSpend,
@@ -13,7 +12,7 @@ import type {
   UsageLine,
   UsageReport,
 } from "../../shared/usage.ts";
-import { link } from "./ui.tsx";
+import { FormError, link } from "./ui.tsx";
 import { retentionLink } from "../lib/retention-links.ts";
 
 export const usd = (value: number) => {
@@ -102,10 +101,10 @@ function Estimated() {
 
 function CategoryLinks({
   categories,
-  owner,
+  report,
 }: {
   categories: UsageCategoryLink[];
-  owner: string | null;
+  report: Pick<UsageReport, "scope" | "subject">;
 }) {
   if (!categories.length) return null;
   return (
@@ -113,7 +112,7 @@ function CategoryLinks({
       <p className="m-0 text-ink-muted">Retention categories that clean this up:</p>
       <ul className="m-0 flex list-none flex-col gap-1 p-0">
         {categories.map((c) => {
-          const to = retentionLink(c, owner);
+          const to = retentionLink(c, report);
           return (
             <li key={c.id} data-retention-category={c.id}>
               {to ? (
@@ -124,7 +123,7 @@ function CategoryLinks({
               ) : (
                 <span className="font-semibold">{c.label}</span>
               )}
-              {c.scope === "site" && <span className="text-ink-muted"> (site-wide)</span>}
+              {c.scope === "instance" && <span className="text-ink-muted"> (Instance-wide)</span>}
               <span className="text-ink-muted"> · {c.description}</span>
             </li>
           );
@@ -169,7 +168,13 @@ function CostDetail({ cost }: { cost: UsageCost }) {
   );
 }
 
-function Line({ line, owner }: { line: UsageLine; owner: string | null }) {
+function Line({
+  line,
+  report,
+}: {
+  line: UsageLine;
+  report: Pick<UsageReport, "scope" | "subject">;
+}) {
   const headline = line.figures.find((f) => f.metric === "bytes") ?? line.figures[0];
   // Every price for the line starts later (Artifacts, AI Search): show what it will cost, and when.
   const pending =
@@ -219,7 +224,7 @@ function Line({ line, owner }: { line: UsageLine; owner: string | null }) {
             </ul>
           )}
           {line.note && <p className="m-0 text-ink-muted">{line.note}</p>}
-          <CategoryLinks categories={line.categories} owner={owner} />
+          <CategoryLinks categories={line.categories} report={report} />
         </div>
       </details>
     </li>
@@ -396,10 +401,13 @@ function Spenders({
 function Attribution({
   attribution: a,
   daysMeasured,
+  whole,
 }: {
   attribution: UsageAttribution;
   /** Days the report's own activity figures measured (it extrapolates fewer to 30). */
   daysMeasured: number;
+  /** What the report covers as a whole: the Space, the person or the Instance. */
+  whole: string;
 }) {
   const share = a.activityUsd > 0 ? Math.round((a.attributedUsd / a.activityUsd) * 100) : null;
   return (
@@ -420,7 +428,7 @@ function Attribution({
         <p className="m-0 text-body-sm" data-usage-attributed>
           {share === null
             ? "No CI or AI activity in this window."
-            : `People and agents account for ${usd(a.attributedUsd)} of the ${usd(a.activityUsd)} spent on CI and AI in this window (${share}%). The rest, and storage, belong to the account as a whole: see Not attributed.`}
+            : `People and agents account for ${usd(a.attributedUsd)} of the ${usd(a.activityUsd)} spent on CI and AI in this window (${share}%). The rest, and storage, belong to ${whole} as a whole: see Not attributed.`}
         </p>
         {daysMeasured < 30 && (
           <p className="m-0 text-body-sm text-ink-muted" data-usage-attribution-recorded>
@@ -483,16 +491,9 @@ function Attribution({
   );
 }
 
-export function UsageReportView({
-  report,
-  csvHref,
-  owner,
-}: {
-  report: UsageReport;
-  csvHref: string;
-  /** The account the page is for; null on the site page. */
-  owner: string | null;
-}) {
+export function UsageReportView({ report, csvHref }: { report: UsageReport; csvHref: string }) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
   if (!report.asOf)
     return (
       <div className="mt-6 flex flex-col gap-3">
@@ -526,34 +527,65 @@ export function UsageReportView({
           <dt className="text-ink-muted">Prices</dt>
           <dd className="m-0">Catalog version {report.catalog.version}</dd>
         </dl>
-        <a href={csvHref} download className="mk-btn mk-btn--secondary min-h-11 no-underline">
-          Download CSV
-        </a>
+        <button
+          type="button"
+          className="mk-btn mk-btn--secondary min-h-11"
+          disabled={downloading}
+          onClick={async () => {
+            setDownloading(true);
+            setDownloadError("");
+            try {
+              const response = await fetch(csvHref, {
+                credentials: "same-origin",
+                headers: { [CONTENT_CONTRACT_HEADER]: String(CONTENT_CONTRACT_VERSION) },
+              });
+              if (!response.ok) throw new Error(`Couldn't download usage (${response.status}).`);
+              const url = URL.createObjectURL(await response.blob());
+              const anchor = document.createElement("a");
+              anchor.href = url;
+              anchor.download = `usage-${report.scope}-${report.subject?.slug ?? "instance"}.csv`;
+              document.body.append(anchor);
+              anchor.click();
+              anchor.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 0);
+            } catch (error) {
+              setDownloadError(error instanceof Error ? error.message : "Couldn't download usage.");
+            } finally {
+              setDownloading(false);
+            }
+          }}
+        >
+          {downloading ? "Downloading…" : "Download CSV"}
+        </button>
+        <FormError message={downloadError} />
       </section>
 
       <Trend report={report} />
 
-      {report.accounts && (
-        <section aria-labelledby="usage-accounts">
-          <h2 id="usage-accounts" className="m-0 mb-3 text-title">
-            By account
+      {report.scope === "instance" && report.subjects && (
+        <section aria-labelledby="usage-subjects">
+          <h2 id="usage-subjects" className="m-0 mb-3 text-title">
+            By Space and person
           </h2>
-          {report.accounts.length === 0 ? (
-            <div className="mk-empty">No account usage collected yet.</div>
+          {report.subjects.length === 0 ? (
+            <div className="mk-empty">No Space or personal usage collected yet.</div>
           ) : (
             <ul className="m-0 list-none overflow-hidden rounded-pane bg-pane p-0">
-              {report.accounts.map((a) => (
+              {report.subjects.map((subject) => (
                 <li
-                  key={a.slug}
+                  key={`${subject.scope}:${subject.id}`}
                   className="flex min-h-11 flex-wrap items-center gap-x-3 border-t border-line-soft px-4 py-2 first:border-t-0"
                 >
                   <a
-                    href={`/settings/usage?owner=${encodeURIComponent(a.slug)}`}
+                    href={`/settings/usage?${subject.scope}=${encodeURIComponent(subject.slug)}`}
                     className={`${link} min-w-0 flex-1 break-words`}
                   >
-                    {a.displayName} <span className="text-ink-muted">@{a.slug}</span>
+                    {subject.displayName}{" "}
+                    <span className="text-ink-muted">
+                      @{subject.slug} · {subject.scope === "space" ? "Space" : "Person"}
+                    </span>
                   </a>
-                  <span className="font-semibold tabular-nums">{usd(a.monthlyUsd)}</span>
+                  <span className="font-semibold tabular-nums">{usd(subject.monthlyUsd)}</span>
                 </li>
               ))}
             </ul>
@@ -562,7 +594,17 @@ export function UsageReportView({
       )}
 
       {report.attribution && (
-        <Attribution attribution={report.attribution} daysMeasured={report.window.daysMeasured} />
+        <Attribution
+          attribution={report.attribution}
+          daysMeasured={report.window.daysMeasured}
+          whole={
+            report.scope === "space"
+              ? "the Space"
+              : report.scope === "person"
+                ? "the person"
+                : "the Instance"
+          }
+        />
       )}
 
       {report.knowledgeUpdates && <KnowledgeUpdates spend={report.knowledgeUpdates} />}
@@ -577,7 +619,7 @@ export function UsageReportView({
           </div>
           <ul className="m-0 list-none overflow-hidden rounded-pane bg-pane p-0">
             {c.lines.map((l) => (
-              <Line key={`${l.item}-${l.kind}`} line={l} owner={owner} />
+              <Line key={`${l.item}-${l.kind}`} line={l} report={report} />
             ))}
           </ul>
         </section>

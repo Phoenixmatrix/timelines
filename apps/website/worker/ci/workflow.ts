@@ -20,12 +20,18 @@ import { batch, db, nowIso } from "../schema.ts";
 import { releaseHeld, UNCHANGED } from "./coalesce.ts";
 import { concurrencyGate } from "./concurrency.ts";
 import { stages, type JobSpec } from "./config.ts";
-import { doneEvent, failDispatch, type StoredJob } from "./jobs.ts";
+import { doneEvent, failDispatch, settleStoppedJob, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
 import { startWorkflow, type RunParams } from "./trigger.ts";
-import { afterRun, settled } from "../timelines/landing.ts";
+import { afterRun, workerDeps } from "../timelines/landing.ts";
 import { afterQueueRun } from "../merge-queue/index.ts";
 import { prerequisitesSatisfied } from "./verification.ts";
+import { parseWorkAuthority, resolveRunAuthority, WorkAuthorizationError } from "./admission.ts";
+import { cutoverControl, withWorkflowCutoverAdmission } from "../durable/cutover-admission.ts";
+import {
+  reportWorkflowRuntime,
+  type WorkflowRuntimeProbe,
+} from "../durable/cutover-workflow-runtime.ts";
 
 interface PlannedJob {
   id: string;
@@ -71,9 +77,97 @@ async function dispatchLocalRunner(env: Env): Promise<void> {
   }
 }
 
-export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
-  async run(event: Readonly<WorkflowEvent<RunParams>>, step: WorkflowStep) {
+export class CiRun extends WorkflowEntrypoint<Env, RunParams | WorkflowRuntimeProbe> {
+  async run(event: Readonly<WorkflowEvent<RunParams | WorkflowRuntimeProbe>>, step: WorkflowStep) {
+    if ("cutoverRuntime" in event.payload)
+      return reportWorkflowRuntime(this.env, "CI_RUN", event, event.payload, step);
+    const businessEvent = { ...event, payload: event.payload };
+    return withWorkflowCutoverAdmission(
+      this.env,
+      "ci-workflow",
+      event,
+      step,
+      "CI_RUN",
+      async () => {
+        try {
+          return await this.#run(businessEvent, step);
+        } catch (error) {
+          // A failed provider step may serialize away the error's prototype.
+          // Recheck live authority rather than classifying its message or name.
+          let revoked = error instanceof WorkAuthorizationError;
+          if (!revoked) {
+            try {
+              await resolveRunAuthority(this.env, businessEvent.payload.runId);
+            } catch (authorityError) {
+              revoked = authorityError instanceof WorkAuthorizationError;
+            }
+          }
+          if (revoked) {
+            try {
+              await this.#settleRevokedRun(businessEvent.payload.runId);
+            } catch (settlementError) {
+              console.error("CI: revoked run settlement remains unresolved", settlementError);
+            }
+          }
+          throw error;
+        }
+      },
+    );
+  }
+
+  /** Cancellation only, after all launched stage promises have settled. */
+  async #settleRevokedRun(runId: string): Promise<void> {
+    const kdb = db(this.env.DB);
+    const run = await kdb
+      .selectFrom("ci_runs")
+      .select(["authority", "space_id", "migration_epoch", "actor_id", "agent_id"])
+      .where("id", "=", runId)
+      .executeTakeFirst();
+    if (!run) return;
+    // Legacy/malformed bindings do not establish current execution bookkeeping.
+    const authority = parseWorkAuthority(run.authority);
+    const admission = await cutoverControl(this.env).admission(4);
+    if (
+      !admission.allowed ||
+      authority.migrationEpoch !== admission.epoch ||
+      run.space_id !== authority.spaceId ||
+      run.migration_epoch !== authority.migrationEpoch ||
+      run.actor_id !== authority.personId ||
+      run.agent_id !== authority.agentId
+    )
+      return;
+    const jobs = await kdb
+      .selectFrom("ci_jobs")
+      .select(["id", "runner", "status", "started_at", "source_completion_pending"])
+      .where("run_id", "=", runId)
+      .execute();
+    for (const job of jobs) {
+      if (job.runner === "sandbox" && job.started_at !== null) {
+        const stopped = await sandbox(this.env, job.id).cutoverDrainStatus();
+        if (!stopped.drained || stopped.containerRunning !== false || stopped.ticket !== null)
+          return;
+      } else if (
+        job.source_completion_pending ||
+        (job.started_at !== null && ["pending", "queued", "running"].includes(job.status))
+      ) {
+        // A local timeout/cancellation request is not a terminal runner acknowledgment.
+        return;
+      }
+    }
+    for (const job of jobs)
+      await settleStoppedJob(this.env, job.id, "Run authority is no longer current.");
+    await kdb
+      .updateTable("ci_runs")
+      .set({ status: "cancelled", finished_at: nowIso() })
+      .where("id", "=", runId)
+      .where("status", "in", ["queued", "running"])
+      .execute();
+  }
+
+  async #run(event: Readonly<WorkflowEvent<RunParams>>, step: WorkflowStep) {
     const { runId } = event.payload;
+    // Authorization is live, never a durable Workflow step result.
+    await resolveRunAuthority(this.env, runId);
     const kdb = db(this.env.DB);
 
     // A timeline's push run waits out its quiet period (CORE-238): a newer
@@ -110,6 +204,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     }
 
     const jobs = await step.do("plan", DB_STEP, async () => {
+      await resolveRunAuthority(this.env, runId);
       await kdb
         .updateTable("ci_runs")
         .set({ status: "running", started_at: nowIso() })
@@ -140,15 +235,18 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     const outcome = new Map<string, JobOutcome>();
     const byName = new Map(jobs.map((j) => [j.name, j]));
     for (const stage of stages(jobs.map((j) => ({ name: j.name, needs: j.needs }) as JobSpec))) {
-      await Promise.all(
+      const results = await Promise.allSettled(
         stage.map(async ({ name }) => {
           const job = byName.get(name)!;
           outcome.set(name, await this.#job(step, runId, job, outcome));
         }),
       );
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     }
 
     await step.do("finish", DB_STEP, async () => {
+      await resolveRunAuthority(this.env, runId);
       const statuses = [...outcome.values()];
       const run = (
         await kdb.selectFrom("ci_runs").select("status").where("id", "=", runId).executeTakeFirst()
@@ -169,10 +267,14 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     });
 
     // A step run's results attach to its step (CORE-235).
-    await step.do("step-artifacts", DB_STEP, async () => recordStepRun(this.env.DB, runId));
+    await step.do("step-artifacts", DB_STEP, async () => {
+      await resolveRunAuthority(this.env, runId);
+      return recordStepRun(this.env, runId);
+    });
 
     // A slot on the branch is free: the newest held run starts, covering older ones.
     await step.do("release", DB_STEP, async () => {
+      await resolveRunAuthority(this.env, runId);
       const run = await kdb
         .selectFrom("ci_runs")
         .select(["repo_id", "source_id", "ref"])
@@ -182,25 +284,43 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         this.env.DB,
         run.repo_id,
         run.ref,
-        (id) => startWorkflow(this.env, id),
+        async (id) => {
+          await resolveRunAuthority(this.env, runId);
+          await resolveRunAuthority(this.env, id);
+          return startWorkflow(this.env, id);
+        },
         run.source_id,
       );
     });
 
     // A landing's merge or gates move the landing on; a timeline's own run may
-    // make its checkpoint green (CORE-77). Never throws.
+    // make its checkpoint green (CORE-77). Drain callbacks even when dispatch fails.
     await step.do("landing", DB_STEP, async () => {
-      await settled(this.env, (deps) => afterRun(this.env, deps, runId));
+      await resolveRunAuthority(this.env, runId);
+      const work: Promise<unknown>[] = [];
+      try {
+        await afterRun(
+          this.env,
+          workerDeps(this.env, (pending) => work.push(pending)),
+          runId,
+        );
+      } finally {
+        while (work.length) await Promise.allSettled(work.splice(0));
+      }
     });
     await step.do("merge-queue", DB_STEP, async () => {
+      await resolveRunAuthority(this.env, runId);
       const run = await kdb
         .selectFrom("ci_runs")
         .select("repo_id")
         .where("id", "=", runId)
         .executeTakeFirstOrThrow();
       const work: Promise<unknown>[] = [];
-      await afterQueueRun(this.env, run.repo_id, runId, (promise) => work.push(promise));
-      while (work.length) await Promise.allSettled(work.splice(0));
+      try {
+        await afterQueueRun(this.env, run.repo_id, runId, (promise) => work.push(promise));
+      } finally {
+        while (work.length) await Promise.allSettled(work.splice(0));
+      }
     });
   }
 
@@ -214,9 +334,10 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     const kdb = db(d1);
     const group = job.concurrency!;
     for (let check = 0; ; check++) {
-      const verdict = await step.do(`gate:${job.name}:${check}`, DB_STEP, () =>
-        concurrencyGate(d1, runId, job.id, group),
-      );
+      const verdict = await step.do(`gate:${job.name}:${check}`, DB_STEP, async () => {
+        await resolveRunAuthority(this.env, runId);
+        return concurrencyGate(d1, runId, job.id, group);
+      });
       if (verdict.kind === "go") return "go";
       if (verdict.kind === "cancelled") return "cancelled";
       if (verdict.kind === "superseded" || check >= GATE_CHECKS) {
@@ -226,6 +347,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
             : `Waited too long for another ${group} job to finish.`;
         const status = verdict.kind === "superseded" ? ("skipped" as const) : ("failed" as const);
         await step.do(`gate:${job.name}:end`, DB_STEP, async () => {
+          await resolveRunAuthority(this.env, runId);
           await batch(d1, [
             kdb
               .updateTable("ci_jobs")
@@ -258,6 +380,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     // just as it preserves a completed sandbox execution across later deployments.
     const admission = job.verification
       ? await step.do(`verification:${job.name}`, DB_STEP, async () => {
+          await resolveRunAuthority(this.env, runId);
           const row = await kdb
             .selectFrom("ci_jobs")
             .select(["status", "verified_by"])
@@ -352,6 +475,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     // Like GitHub Actions: a job runs only when everything it needs succeeded.
     const blocked = job.needs.find((need) => !prerequisitesSatisfied([need], outcome));
     const start = await step.do(`start:${job.name}`, DB_STEP, async () => {
+      await resolveRunAuthority(this.env, runId);
       const run = (
         await kdb.selectFrom("ci_runs").select("status").where("id", "=", runId).executeTakeFirst()
       )?.status;
@@ -394,6 +518,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     }
     if (job.runner === "local") {
       await step.do(`dispatch:${job.name}`, async () => {
+        await resolveRunAuthority(this.env, runId);
         await dispatchLocalRunner(this.env);
       });
     }
@@ -411,6 +536,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
             timeout: `${job.timeoutMinutes + 10} minutes`,
           },
           async () => {
+            await resolveRunAuthority(this.env, runId);
             await sandbox(this.env, job.id).run(job.id);
           },
         );
@@ -428,6 +554,9 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
       await step.do(`fail:${job.name}`, DB_STEP, async () => {
         await failDispatch(d1, job.id, message);
       });
+      // Settle launched work first; a revoked dispatch must not become a normal
+      // failed result that allows downstream publication.
+      await resolveRunAuthority(this.env, runId);
       return "failed";
     }
 

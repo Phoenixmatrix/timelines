@@ -117,8 +117,8 @@ async function register(env: Env, ids: string[]): Promise<number> {
   for (const id of ids) {
     const result = await env.DB.prepare(
       `INSERT INTO repo_deletions
-         (repo_id, owner_id, full_name, source, requested_at, phase, updated_at)
-       VALUES (?1, '', '', 'orphan-sweep', ?2, 'stop', '1970-01-01T00:00:00.000Z')
+         (repo_id, space_id, full_name, source, requested_at, phase, updated_at)
+       VALUES (?1, NULL, '', 'orphan-sweep', ?2, 'stop', '1970-01-01T00:00:00.000Z')
        ON CONFLICT (repo_id) DO NOTHING`,
     )
       .bind(id, nowIso())

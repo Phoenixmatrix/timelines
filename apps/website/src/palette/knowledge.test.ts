@@ -9,7 +9,7 @@ import {
   type KnowledgeState,
 } from "./knowledge.ts";
 
-const repo = { owner: "orbit", name: "engine", defaultBranch: "main" };
+const repo = { space: "orbit", name: "engine", defaultBranch: "main" };
 const results = (over: Partial<KnowledgeSearchResults> = {}): KnowledgeSearchResults => ({
   query: "throttle",
   entities: [
@@ -152,12 +152,12 @@ describe("code and wiki commands", () => {
     expect(commands({ viewer: null })).toEqual([]);
     expect(commands({}).map((c) => c.run)).toEqual([{ kind: "scope", scope: { kind: "pick" } }]);
     const here = commands({
-      repo: { owner: { slug: "orbit" }, name: "engine", defaultBranch: "main" } as never,
+      repo: { space: { slug: "orbit" }, name: "engine", defaultBranch: "main" } as never,
     });
     expect(here.map((c) => c.run)).toEqual([
       {
         kind: "scope",
-        scope: { kind: "repo", owner: "orbit", name: "engine", defaultBranch: "main" },
+        scope: { kind: "repo", space: "orbit", name: "engine", defaultBranch: "main" },
       },
     ]);
   });

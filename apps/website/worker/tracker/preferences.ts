@@ -4,17 +4,18 @@
 import { sql } from "kysely";
 import { TRACKER_LAYOUTS, type TrackerPreferences } from "../../shared/tracker.ts";
 import { db, nowIso } from "../schema.ts";
+import { parseQuery } from "../../shared/tracker-query.ts";
 
 export async function preferencesFor(
   d1: D1Database,
   userId: string,
-  ownerId: string,
+  spaceId: string,
 ): Promise<TrackerPreferences | null> {
   const row = await db(d1)
     .selectFrom("tracker_preferences")
     .selectAll()
     .where("user_id", "=", userId)
-    .where("owner_id", "=", ownerId)
+    .where("space_id", "=", spaceId)
     .executeTakeFirst();
   return row
     ? {
@@ -29,14 +30,20 @@ export async function preferencesFor(
 }
 
 /** The tracker whose defaults the person saved most recently. */
-export async function defaultOwner(d1: D1Database, userId: string): Promise<string | null> {
+export async function defaultSpace(d1: D1Database, userId: string): Promise<string | null> {
   const row = await db(d1)
     .selectFrom("tracker_preferences")
-    .select("owner_id")
+    .select("space_id")
     .where("user_id", "=", userId)
     .orderBy("updated_at", "desc")
     .executeTakeFirst();
-  return row?.owner_id ?? null;
+  if (row) return row.space_id;
+  const personal = await db(d1)
+    .selectFrom("organizations")
+    .select("default_space_id")
+    .where("personal_account_id", "=", userId)
+    .executeTakeFirst();
+  return personal?.default_space_id ?? null;
 }
 
 /** A valid update from a request body, or the reason it isn't. */
@@ -50,13 +57,18 @@ export function parsePreferences(body: unknown): Omit<TrackerPreferences, "updat
     return `view is one of ${TRACKER_LAYOUTS.join(", ")}.`;
   if (typeof query !== "string" || query.length > 500)
     return "query is a string of at most 500 characters.";
+  try {
+    parseQuery(query);
+  } catch (error) {
+    return error instanceof Error ? error.message : "Invalid tracker query.";
+  }
   return { teamId, view: view as TrackerPreferences["view"], query };
 }
 
 export async function savePreferences(
   d1: D1Database,
   userId: string,
-  ownerId: string,
+  spaceId: string,
   preferences: Omit<TrackerPreferences, "updatedAt">,
 ): Promise<TrackerPreferences> {
   const now = nowIso();
@@ -72,14 +84,14 @@ export async function savePreferences(
     .insertInto("tracker_preferences")
     .values({
       user_id: userId,
-      owner_id: ownerId,
+      space_id: spaceId,
       team_id: preferences.teamId,
       view: preferences.view,
       query: preferences.query,
       updated_at: updatedAt,
     })
     .onConflict((oc) =>
-      oc.columns(["user_id", "owner_id"]).doUpdateSet((eb) => ({
+      oc.columns(["user_id", "space_id"]).doUpdateSet((eb) => ({
         team_id: preferences.teamId,
         view: preferences.view,
         query: preferences.query,
@@ -91,10 +103,10 @@ export async function savePreferences(
   return { ...preferences, updatedAt: row.updated_at };
 }
 
-export async function clearPreferences(d1: D1Database, userId: string, ownerId: string) {
+export async function clearPreferences(d1: D1Database, userId: string, spaceId: string) {
   await db(d1)
     .deleteFrom("tracker_preferences")
     .where("user_id", "=", userId)
-    .where("owner_id", "=", ownerId)
+    .where("space_id", "=", spaceId)
     .execute();
 }

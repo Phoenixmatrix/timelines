@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { basic, makeHarness, type Harness } from "../../testing/harness.ts";
 
 const sha1 = (text: string) => createHash("sha1").update(text).digest("hex");
@@ -26,7 +25,6 @@ describe("maven remote and virtual repositories", () => {
   let files: Record<string, string>;
 
   beforeEach(async () => {
-    invalidateMembers();
     hits.length = 0;
     files = {
       "/maven2/org/example/util/3.0/util-3.0.jar": "upstream-jar",
@@ -136,7 +134,7 @@ describe("maven remote and virtual repositories", () => {
         members: [{ key: "central" }, { key: "local" }],
       }),
     });
-    invalidateMembers();
+
     await h.request("/maven/local/com/acme/lib/1.0/lib-1.0.jar", {
       method: "PUT",
       headers: { authorization: basic(admin) },

@@ -21,8 +21,8 @@
 
 import { readSecret } from "../../registry/core/secrets.ts";
 
-/** Payload format; v1 cursors (which stored their expiry) no longer verify. */
-const VERSION = 2;
+/** Space contract cursors; all Account-era cursors must restart after cutover. */
+const VERSION = 4;
 
 export interface CursorState<K> {
   /** Snapshot id the traversal is pinned to. */

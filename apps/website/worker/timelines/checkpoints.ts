@@ -56,14 +56,14 @@ export async function measure(
       const row = rows.find((r) => r.id === repo.id);
       const role = row ? roleFor(row, actor) : "none";
       if (!row || !atLeast(role, "read"))
-        fail("not_found", `No repository ${repo.owner}/${repo.name}.`, 404);
+        fail("not_found", `No repository ${repo.space}/${repo.name}.`, 404);
       if (!atLeast(role, "write"))
-        fail("forbidden", `A checkpoint needs write access to ${row.owner_slug}/${row.name}.`, 403);
+        fail("forbidden", `A checkpoint needs write access to ${row.space_slug}/${row.name}.`, 403);
       const physical = await resolveTimelineSource(env, row, repo);
       const bookmark = physical.source.ref;
       const refs = await lsRefs(env, physical.repo.artifacts_name, physical.repo.artifacts_remote);
       const commit = refs.find((ref) => ref.name === bookmark)?.oid;
-      if (!commit) fail("no_bookmark", `${row.owner_slug}/${row.name} has no ${bookmark}.`, 409);
+      if (!commit) fail("no_bookmark", `${row.space_slug}/${row.name} has no ${bookmark}.`, 409);
       const canonicalRefs = await lsRefs(env, row.artifacts_name, row.artifacts_remote);
       const base =
         canonicalRefs.find((ref) => ref.name === `refs/heads/${row.default_branch}`)?.oid ?? null;
@@ -226,7 +226,7 @@ export async function measure(
         .execute();
       return {
         id: row.id,
-        owner: row.owner_slug,
+        space: row.space_slug,
         name: row.name,
         commit,
         base,
@@ -252,11 +252,11 @@ export async function mayWriteAll(env: Env, actor: Actor, checkpoint: Checkpoint
     const row = rows.find((r) => r.id === repo.id);
     const role = row ? roleFor(row, actor) : "none";
     if (!row || !atLeast(role, "read"))
-      fail("not_found", `No repository ${repo.owner}/${repo.name}.`, 404);
+      fail("not_found", `No repository ${repo.space}/${repo.name}.`, 404);
     if (!atLeast(role, "write"))
       fail(
         "forbidden",
-        `Reviving a preview needs write access to ${row.owner_slug}/${row.name}.`,
+        `Reviving a preview needs write access to ${row.space_slug}/${row.name}.`,
         403,
       );
   }
@@ -362,12 +362,12 @@ export async function view(
   };
 }
 
-/** Repositories in an account the actor may write to: who may approve a checkpoint there. */
+/** Repositories in a Space the actor may write to: who may approve a checkpoint there. */
 export async function writableRepoIds(
   d1: D1Database,
   actor: Actor,
   ownerId: string,
 ): Promise<string[]> {
-  const rows = await selectRepos(d1, actor.id).where("r.owner_id", "=", ownerId).execute();
+  const rows = await selectRepos(d1, actor.id).where("r.space_id", "=", ownerId).execute();
   return rows.filter((row) => atLeast(roleFor(row, actor), "write")).map((row) => row.id);
 }

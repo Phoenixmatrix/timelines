@@ -283,7 +283,7 @@ export interface UsageCategoryLink {
   label: string;
   /** What the category removes, in plain words. */
   description: string;
-  scope: "account" | "site";
+  scope: "space" | "person" | "instance";
 }
 
 /** One thing an account keeps or does: a D1 table group, a Durable Object class, a model… */
@@ -320,10 +320,22 @@ export interface UsageTrendDay {
   measured: boolean;
 }
 
+/** Explicit storage attribution; equal person and Space IDs remain distinct. */
+export interface UsageScope {
+  kind: "space" | "person" | "instance";
+  /** Empty only for Instance attribution. */
+  id: string;
+}
+
+export interface UsageSubject {
+  id: string;
+  slug: string;
+  displayName: string;
+}
+
 export interface UsageReport {
-  scope: "account" | "site";
-  /** The account, for an account's report. */
-  account: { slug: string; displayName: string } | null;
+  scope: UsageScope["kind"];
+  subject: UsageSubject | null;
   /** The day the storage figures describe; null before the first collection. */
   asOf: string | null;
   /** The activity window: the last 30 days up to asOf. */
@@ -337,8 +349,8 @@ export interface UsageReport {
     version: number;
     sources: { product: PriceProduct; label: string; url: string; sourceUpdated: string | null }[];
   };
-  /** Site reports: each account's monthly estimate, highest first (at most 200). */
-  accounts: { slug: string; displayName: string; monthlyUsd: number }[] | null;
+  /** Instance reports: distinct Space/person estimates, highest first (at most 200). */
+  subjects: (UsageSubject & { scope: "space" | "person"; monthlyUsd: number })[] | null;
   /** Caveats every reader should see. */
   notes: string[];
   /** What Knowledge builds cost per update over the last 30 days (CORE-286). */

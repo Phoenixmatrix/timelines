@@ -82,7 +82,9 @@ fn held(config: &Config, scope: &Scope) -> Vec<(String, Kept)> {
         .into_iter()
         .filter(|(id, kept)| {
             kept.identity == scope.identity
-                && !kept.owner.is_empty()
+                && !kept.space.is_empty()
+                && kept.space_id.is_some()
+                && kept.migration_epoch.is_some()
                 && scope
                     .only
                     .is_none_or(|issue| issue == id || issue.eq_ignore_ascii_case(&kept.issue))
@@ -135,9 +137,11 @@ fn read_since(
     let mut events = Vec::new();
     let mut before = None;
     for _ in 0..PAGES {
+        // A Space handle is immutable, and migration keeps each event's
+        // cursor, so `seen` stays comparable for the lease's whole life.
         let mut path = format!(
             "/tracker/{}/issues/{issue_id}/history?limit={PAGE}",
-            kept.owner
+            kept.space
         );
         if let Some(before) = before {
             path.push_str(&format!("&before={before}"));
@@ -324,7 +328,7 @@ const NAMED_FIELDS: [&str; 5] = [
     "acceptance",
     "requires",
     "parentId",
-    "workspaceIds",
+    "projectIds",
 ];
 
 /// One history event as a line, from the holder's side; nothing for changes
@@ -477,7 +481,8 @@ mod tests {
     fn kept(seen: Option<u64>) -> Kept {
         serde_json::from_value(json!({
             "token": "t", "identity": {"kind": "person"}, "issue": "CORE-1",
-            "owner": "matrixorg", "actor": "agent", "seen": seen,
+            "space": "matrixorg", "space_id": "space-matrixorg", "migration_epoch": 1,
+            "actor": "agent", "seen": seen,
         }))
         .unwrap()
     }

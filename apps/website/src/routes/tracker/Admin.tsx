@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { CaretRightIcon } from "@phosphor-icons/react";
-import { Link } from "react-router";
+import { Link, useLocation } from "react-router";
 import type { RepoSummary } from "../../../shared/api.ts";
 import {
   DEFAULT_ATTEMPT_LIMIT,
   type Snapshot,
   type Team,
-  type Workspace,
+  type Project,
 } from "../../../shared/tracker.ts";
 import { FormError, link, SelectField, TextField } from "../../components/ui.tsx";
 import { api } from "../../lib/api.ts";
@@ -239,19 +239,19 @@ function TeamForm({
     </form>
   );
 }
-function WorkspaceForm({
-  workspace,
+function ProjectForm({
+  project,
   mutate,
   busy,
 }: {
-  workspace?: Workspace;
+  project?: Project;
   mutate: Mutate;
   busy: boolean;
 }) {
-  const [name, setName] = useState(workspace?.name ?? "");
-  const [slug, setSlug] = useState(workspace?.slug ?? "");
-  const [description, setDescription] = useState(workspace?.description ?? "");
-  const [version, setVersion] = useState(workspace?.version);
+  const [name, setName] = useState(project?.name ?? "");
+  const [slug, setSlug] = useState(project?.slug ?? "");
+  const [description, setDescription] = useState(project?.description ?? "");
+  const [version, setVersion] = useState(project?.version);
   const [saved, setSaved] = useState("");
   const [error, setError] = useState("");
   return (
@@ -263,47 +263,47 @@ function WorkspaceForm({
         setSaved("");
         setError("");
         const result = await mutate([
-          workspace
+          project
             ? {
-                kind: "workspace.update",
-                id: workspace.id,
+                kind: "project.update",
+                id: project.id,
                 expectedVersion: version!,
                 data: { name, description },
               }
             : {
-                kind: "workspace.create",
+                kind: "project.create",
                 id: crypto.randomUUID(),
                 data: { slug, name, description },
               },
         ]);
         if (result.ok) {
-          setSaved(`${workspace ? "Saved" : "Created"} workspace ${name}.`);
-          if (workspace) setVersion(version! + 1);
+          setSaved(`${project ? "Saved" : "Created"} project ${name}.`);
+          if (project) setVersion(version! + 1);
           else {
             setName("");
             setSlug("");
             setDescription("");
           }
         } else
-          setError(`Could not ${workspace ? "save" : "create"} workspace ${name}: ${result.error}`);
+          setError(`Could not ${project ? "save" : "create"} project ${name}: ${result.error}`);
       }}
     >
       <div className={GRID}>
         <TextField
-          label="Workspace name"
+          label="Project name"
           required
           maxLength={200}
           value={name}
           onChange={(event) => setName(event.target.value)}
         />
-        {workspace ? (
-          <Field label="Workspace slug">
-            <p className="mk-mono m-0 flex min-h-11 items-center">{workspace.slug}</p>
+        {project ? (
+          <Field label="Project slug">
+            <p className="mk-mono m-0 flex min-h-11 items-center">{project.slug}</p>
             <p className="mk-hint m-0">Permanent · cannot be changed.</p>
           </Field>
         ) : (
           <TextField
-            label="Workspace slug"
+            label="Project slug"
             required
             pattern="[a-z0-9]+(-[a-z0-9]+)*"
             maxLength={80}
@@ -314,19 +314,19 @@ function WorkspaceForm({
         )}
       </div>
       <TextField
-        label="Workspace description"
+        label="Project description"
         value={description}
         onChange={(event) => setDescription(event.target.value)}
       />
-      {workspace && version !== workspace.version && (
+      {project && version !== project.version && (
         <div className={CONFLICT} role="alert">
-          This workspace changed. Your fields are preserved. Current: {workspace.name}; description:{" "}
-          {workspace.description}.
+          This project changed. Your fields are preserved. Current: {project.name}; description:{" "}
+          {project.description}.
           <button
             type="button"
             className="mk-btn mk-btn--sm mt-2 flex"
             onClick={() => {
-              setVersion(workspace.version);
+              setVersion(project.version);
               setSaved("");
               setError("");
             }}
@@ -338,11 +338,11 @@ function WorkspaceForm({
       <div className="flex flex-wrap gap-2">
         <button
           className="mk-btn mk-btn--primary"
-          disabled={busy || (!!workspace && version !== workspace.version)}
+          disabled={busy || (!!project && version !== project.version)}
         >
-          {workspace ? "Save workspace" : "Create workspace"}
+          {project ? "Save project" : "Create project"}
         </button>
-        {workspace && (
+        {project && (
           <button
             type="button"
             className="mk-btn"
@@ -352,24 +352,22 @@ function WorkspaceForm({
               setError("");
               const result = await mutate([
                 {
-                  kind: "workspace.update",
-                  id: workspace.id,
-                  expectedVersion: workspace.version,
-                  data: { archived: !workspace.archived },
+                  kind: "project.update",
+                  id: project.id,
+                  expectedVersion: project.version,
+                  data: { archived: !project.archived },
                 },
               ]);
               if (result.ok) {
-                if (version === workspace.version) setVersion(workspace.version + 1);
-                setSaved(
-                  `${workspace.archived ? "Restored" : "Archived"} workspace ${workspace.name}.`,
-                );
+                if (version === project.version) setVersion(project.version + 1);
+                setSaved(`${project.archived ? "Restored" : "Archived"} project ${project.name}.`);
               } else
                 setError(
-                  `Could not ${workspace.archived ? "restore" : "archive"} workspace ${workspace.name}: ${result.error}`,
+                  `Could not ${project.archived ? "restore" : "archive"} project ${project.name}: ${result.error}`,
                 );
             }}
           >
-            {workspace.archived ? "Restore workspace" : "Archive workspace"}
+            {project.archived ? "Restore project" : "Archive project"}
           </button>
         )}
       </div>
@@ -386,11 +384,21 @@ export function TrackerAdmin({
   snapshot,
   mutate,
   busy,
+  section,
 }: {
   snapshot: Snapshot;
   mutate: Mutate;
   busy: boolean;
+  section?: "teams" | "projects";
 }) {
+  const location = useLocation();
+  const issuesHref = (slug: string) => {
+    const query = new URLSearchParams(location.search);
+    query.delete("manage");
+    query.delete("project");
+    query.set("q", `project:${slug}`);
+    return `/tracker/${encodeURIComponent(snapshot.space.slug)}?${query}${location.hash}`;
+  };
   const [repos, setRepos] = useState<RepoSummary[] | null>(null);
   const [reposError, setReposError] = useState("");
   const [reposAttempt, setReposAttempt] = useState(0);
@@ -406,16 +414,18 @@ export function TrackerAdmin({
       },
     );
     return () => controller.abort();
-  }, [snapshot.owner.id, reposAttempt]);
-  const [workspaceId, setWorkspaceId] = useState("");
+  }, [snapshot.space.id, reposAttempt]);
+  const [projectId, setProjectId] = useState("");
   const [repoId, setRepoId] = useState("");
   const [createTeamOpen, setCreateTeamOpen] = useState(!snapshot.teams.length);
-  const [createWorkspaceOpen, setCreateWorkspaceOpen] = useState(!snapshot.workspaces.length);
+  const [createProjectOpen, setCreateProjectOpen] = useState(!snapshot.projects.length);
   const [subscriptionError, setSubscriptionError] = useState("");
   const [subscriptionSaved, setSubscriptionSaved] = useState("");
   const [removalErrors, setRemovalErrors] = useState<Record<string, string>>({});
   const [removalSaved, setRemovalSaved] = useState("");
-  const administeredRepos = (repos ?? []).filter((repo) => repo.viewerRole === "admin");
+  const administeredRepos = (repos ?? []).filter(
+    (repo) => repo.viewerRole === "admin" && repo.space.id === snapshot.spaceId,
+  );
   const repositoriesById = new Map((repos ?? []).map((repo) => [repo.id, repo]));
   const subscriptionGroups = new Map<string, Snapshot["subscriptions"]>();
   for (const subscription of snapshot.subscriptions) {
@@ -425,284 +435,296 @@ export function TrackerAdmin({
   }
   return (
     <div className="w-full max-w-4xl space-y-4">
-      <section className={SECTION}>
-        <h2 className="m-0 text-title">Teams</h2>
-        <p className={INTRO}>
-          Each issue belongs to one team. Team prefixes are permanent; archive a team to stop new
-          capture without losing its issues.
-        </p>
-        {snapshot.canAdmin && (
-          <details
-            className={ITEM}
-            open={createTeamOpen}
-            onToggle={(event) => setCreateTeamOpen(event.currentTarget.open)}
-          >
-            <summary className={SUMMARY}>
-              <Caret />
-              Create a team
-            </summary>
-            <div className={BODY}>
-              <TeamForm snapshot={snapshot} mutate={mutate} busy={busy} />
-            </div>
-          </details>
-        )}
-        {snapshot.teams.map((team) => (
-          <details className={ITEM} key={team.id}>
-            <summary className={SUMMARY}>
-              <Caret />
-              <span className="min-w-0 break-words">{team.name}</span>{" "}
-              <span className="mk-mono text-body-sm font-normal text-ink-muted">
-                {team.key}
-                {team.archived ? " · Archived" : ""}
-              </span>
-            </summary>
-            <div className={BODY}>
-              {snapshot.canAdmin ? (
-                <TeamForm team={team} snapshot={snapshot} mutate={mutate} busy={busy} />
-              ) : (
-                <p className="m-0 text-body-sm">{team.description || "No description."}</p>
-              )}
-            </div>
-          </details>
-        ))}
-      </section>
-      <section className={SECTION}>
-        <h2 className="m-0 text-title">Workspaces</h2>
-        <p className={INTRO}>Group work across teams. An issue can belong to several workspaces.</p>
-        {snapshot.canAdmin && (
-          <details
-            className={ITEM}
-            open={createWorkspaceOpen}
-            onToggle={(event) => setCreateWorkspaceOpen(event.currentTarget.open)}
-          >
-            <summary className={SUMMARY}>
-              <Caret />
-              Create a workspace
-            </summary>
-            <div className={BODY}>
-              <WorkspaceForm mutate={mutate} busy={busy} />
-            </div>
-          </details>
-        )}
-        {snapshot.workspaces.map((workspace) => (
-          <details className={ITEM} key={workspace.id}>
-            <summary className={SUMMARY}>
-              <Caret />
-              <span className="min-w-0 break-words">
-                {workspace.name}
-                {workspace.archived ? " · Archived" : ""}
-              </span>
-            </summary>
-            <div className={BODY}>
-              <Link
-                className={`${link} mb-4 inline-block text-body-sm`}
-                to={`/tracker/${snapshot.owner.slug}?workspace=${workspace.id}`}
-              >
-                View workspace issues
-              </Link>
-              {snapshot.canAdmin ? (
-                <WorkspaceForm workspace={workspace} mutate={mutate} busy={busy} />
-              ) : (
-                <p className="m-0 text-body-sm">{workspace.description || "No description."}</p>
-              )}
-            </div>
-          </details>
-        ))}
-      </section>
-      <section className={SECTION}>
-        <h2 className="m-0 text-title">Repository subscriptions</h2>
-        <p className={INTRO}>
-          Repositories subscribe to workspaces for navigation only. Subscriptions never grant
-          tracker access.
-        </p>
-        {snapshot.subscriptions.length ? (
-          <div className="mt-4 space-y-4">
-            {[...subscriptionGroups].map(([id, subscriptions]) => {
-              const repository = repositoriesById.get(id);
-              const historical = subscriptions[0]!;
-              const repoName = repository
-                ? `${repository.owner.slug}/${repository.name}`
-                : `${historical.owner}/${historical.name}`;
-              return (
-                <section key={id} aria-label={`${repoName} subscriptions`}>
-                  <h3 className="m-0 text-body-sm font-semibold break-words">
-                    {repository ? (
-                      <Link className={link} to={`/${repoName}/tracker`}>
-                        {repoName}
-                      </Link>
-                    ) : (
-                      repoName
-                    )}
-                  </h3>
-                  <ul className="m-0 mt-1 list-none p-0">
-                    {subscriptions.map((subscription) => {
-                      const workspaceName =
-                        snapshot.workspaces.find(
-                          (workspace) => workspace.id === subscription.workspaceId,
-                        )?.name ?? "Unavailable workspace";
-                      return (
-                        <li
-                          key={subscription.id}
-                          className="flex items-center justify-between gap-2 border-b border-line-soft py-1.5 text-body-sm [overflow-wrap:anywhere] last:border-b-0"
-                        >
-                          <div className="min-w-0">
-                            <span>{workspaceName}</span>
-                            <FormError message={removalErrors[subscription.id]} />
-                          </div>
-                          {snapshot.canAdmin && (
-                            <button
-                              className="mk-btn mk-btn--ghost mk-btn--sm"
-                              aria-label={`Unsubscribe ${repoName} from ${workspaceName}`}
-                              disabled={busy}
-                              onClick={async () => {
-                                setRemovalSaved("");
-                                setSubscriptionSaved("");
-                                setRemovalErrors((errors) => ({
-                                  ...errors,
-                                  [subscription.id]: "",
-                                }));
-                                const result = await mutate([
-                                  { kind: "subscription.remove", id: subscription.id },
-                                ]);
-                                if (result.ok)
-                                  setRemovalSaved(
-                                    `Unsubscribed ${repoName} from ${workspaceName}.`,
-                                  );
-                                else
-                                  setRemovalErrors((errors) => ({
-                                    ...errors,
-                                    [subscription.id]: `Could not unsubscribe ${repoName} from ${workspaceName}: ${result.error}`,
-                                  }));
-                              }}
-                            >
-                              Unsubscribe
-                            </button>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </section>
-              );
-            })}
-          </div>
-        ) : (
-          <p className="mt-4 mb-0 text-body-sm text-ink-muted">No repository subscriptions yet.</p>
-        )}
-        {removalSaved && (
-          <p role="status" className="mk-hint mt-3 mb-0">
-            {removalSaved}
+      {section !== "projects" && (
+        <section className={SECTION}>
+          <h2 className="m-0 text-title">Teams</h2>
+          <p className={INTRO}>
+            Each issue belongs to one team. Team prefixes are permanent; archive a team to stop new
+            capture without losing its issues.
           </p>
-        )}
-        {reposError && (
-          <div className="mt-4">
-            <FormError message={reposError} />
-            <button
-              className="mk-btn mk-btn--sm"
-              onClick={() => setReposAttempt((attempt) => attempt + 1)}
+          {snapshot.canAdmin && (
+            <details
+              className={ITEM}
+              open={createTeamOpen}
+              onToggle={(event) => setCreateTeamOpen(event.currentTarget.open)}
             >
-              Retry repository choices
-            </button>
-          </div>
-        )}
-        {repos === null && !reposError && (
-          <p role="status" className="mk-hint mt-4 mb-0">
-            Loading repository choices…
-          </p>
-        )}
-        {snapshot.canAdmin && repos !== null && !administeredRepos.length && (
-          <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
-            You don’t administer any repositories. Ask a repository administrator to grant you admin
-            access before subscribing a repository to a workspace.
-          </p>
-        )}
-        {snapshot.canAdmin && administeredRepos.length > 0 && (
-          <form
-            className="mt-4 space-y-4 border-t border-line-soft pt-4"
-            onSubmit={async (event) => {
-              event.preventDefault();
-              setSubscriptionError("");
-              setSubscriptionSaved("");
-              setRemovalSaved("");
-              const repository = administeredRepos.find((repo) => repo.id === repoId);
-              const workspace = snapshot.workspaces.find((item) => item.id === workspaceId);
-              if (!repository || !workspace || workspace.archived) {
-                setSubscriptionError("Choose an active workspace and a repository you administer.");
-                return;
-              }
-              const repoName = `${repository.owner.slug}/${repository.name}`;
-              const result = await mutate([
-                {
-                  kind: "subscription.add",
-                  id: crypto.randomUUID(),
-                  data: { workspaceId, repoId },
-                },
-              ]);
-              if (result.ok) {
-                setSubscriptionSaved(`Subscribed ${repoName} to ${workspace.name}.`);
-                setRepoId("");
-              } else
-                setSubscriptionError(
-                  `Could not subscribe ${repoName} to ${workspace.name}: ${result.error}`,
-                );
-            }}
-          >
-            <div className={GRID}>
-              <Field label="Workspace">
-                <SelectField
-                  ariaLabel="Subscription workspace"
-                  value={workspaceId}
-                  onChange={(value) => {
-                    setWorkspaceId(value);
-                    setSubscriptionSaved("");
-                    setRemovalSaved("");
-                    setSubscriptionError("");
-                  }}
-                  options={[
-                    { value: "", label: "Choose workspace" },
-                    ...snapshot.workspaces
-                      .filter((workspace) => !workspace.archived)
-                      .map((workspace) => ({ value: workspace.id, label: workspace.name })),
-                  ]}
-                />
-              </Field>
-              <Field label="Repository you administer">
-                <SelectField
-                  ariaLabel="Subscription repository"
-                  value={repoId}
-                  onChange={(value) => {
-                    setRepoId(value);
-                    setSubscriptionSaved("");
-                    setRemovalSaved("");
-                    setSubscriptionError("");
-                  }}
-                  options={[
-                    { value: "", label: "Choose repository" },
-                    ...administeredRepos.map((repo) => ({
-                      value: repo.id,
-                      label: `${repo.owner.slug}/${repo.name}`,
-                    })),
-                  ]}
-                />
-              </Field>
-            </div>
-            <button className="mk-btn" disabled={busy || !workspaceId || !repoId}>
-              Subscribe repository
-            </button>
-            <FormError message={subscriptionError} />
-            {subscriptionSaved && (
-              <p role="status" className="mk-hint m-0">
-                {subscriptionSaved}
+              <summary className={SUMMARY}>
+                <Caret />
+                Create a team
+              </summary>
+              <div className={BODY}>
+                <TeamForm snapshot={snapshot} mutate={mutate} busy={busy} />
+              </div>
+            </details>
+          )}
+          {snapshot.teams.map((team) => (
+            <details className={ITEM} key={team.id}>
+              <summary className={SUMMARY}>
+                <Caret />
+                <span className="min-w-0 break-words">{team.name}</span>{" "}
+                <span className="mk-mono text-body-sm font-normal text-ink-muted">
+                  {team.key}
+                  {team.archived ? " · Archived" : ""}
+                </span>
+              </summary>
+              <div className={BODY}>
+                {snapshot.canAdmin ? (
+                  <TeamForm team={team} snapshot={snapshot} mutate={mutate} busy={busy} />
+                ) : (
+                  <p className="m-0 text-body-sm">{team.description || "No description."}</p>
+                )}
+              </div>
+            </details>
+          ))}
+        </section>
+      )}
+      {section !== "teams" && (
+        <>
+          <section className={SECTION}>
+            <h2 className="m-0 text-title">Projects</h2>
+            <p className={INTRO}>
+              Group work across teams. An issue can belong to several projects.
+            </p>
+            {snapshot.canAdmin && (
+              <details
+                className={ITEM}
+                open={createProjectOpen}
+                onToggle={(event) => setCreateProjectOpen(event.currentTarget.open)}
+              >
+                <summary className={SUMMARY}>
+                  <Caret />
+                  Create a project
+                </summary>
+                <div className={BODY}>
+                  <ProjectForm mutate={mutate} busy={busy} />
+                </div>
+              </details>
+            )}
+            {snapshot.projects.map((project) => (
+              <details className={ITEM} key={project.id}>
+                <summary className={SUMMARY}>
+                  <Caret />
+                  <span className="min-w-0 break-words">
+                    {project.name}
+                    {project.archived ? " · Archived" : ""}
+                  </span>
+                </summary>
+                <div className={BODY}>
+                  <Link
+                    className={`${link} mb-4 inline-block text-body-sm`}
+                    to={issuesHref(project.slug)}
+                  >
+                    View project issues
+                  </Link>
+                  {snapshot.canAdmin ? (
+                    <ProjectForm project={project} mutate={mutate} busy={busy} />
+                  ) : (
+                    <p className="m-0 text-body-sm">{project.description || "No description."}</p>
+                  )}
+                </div>
+              </details>
+            ))}
+          </section>
+          <section className={SECTION}>
+            <h2 className="m-0 text-title">Repository subscriptions</h2>
+            <p className={INTRO}>
+              Repositories subscribe to projects for navigation only. Subscriptions never grant
+              tracker access.
+            </p>
+            {snapshot.subscriptions.length ? (
+              <div className="mt-4 space-y-4">
+                {[...subscriptionGroups].map(([id, subscriptions]) => {
+                  const repository = repositoriesById.get(id);
+                  const historical = subscriptions[0]!;
+                  const repoName = repository
+                    ? `${repository.space.slug}/${repository.name}`
+                    : `${historical.space}/${historical.name}`;
+                  return (
+                    <section key={id} aria-label={`${repoName} subscriptions`}>
+                      <h3 className="m-0 text-body-sm font-semibold break-words">
+                        {repository ? (
+                          <Link className={link} to={`/${repoName}/tracker`}>
+                            {repoName}
+                          </Link>
+                        ) : (
+                          repoName
+                        )}
+                      </h3>
+                      <ul className="m-0 mt-1 list-none p-0">
+                        {subscriptions.map((subscription) => {
+                          const projectName =
+                            snapshot.projects.find(
+                              (project) => project.id === subscription.projectId,
+                            )?.name ?? "Unavailable project";
+                          return (
+                            <li
+                              key={subscription.id}
+                              className="flex items-center justify-between gap-2 border-b border-line-soft py-1.5 text-body-sm [overflow-wrap:anywhere] last:border-b-0"
+                            >
+                              <div className="min-w-0">
+                                <span>{projectName}</span>
+                                <FormError message={removalErrors[subscription.id]} />
+                              </div>
+                              {snapshot.canAdmin && (
+                                <button
+                                  className="mk-btn mk-btn--ghost mk-btn--sm"
+                                  aria-label={`Unsubscribe ${repoName} from ${projectName}`}
+                                  disabled={busy}
+                                  onClick={async () => {
+                                    setRemovalSaved("");
+                                    setSubscriptionSaved("");
+                                    setRemovalErrors((errors) => ({
+                                      ...errors,
+                                      [subscription.id]: "",
+                                    }));
+                                    const result = await mutate([
+                                      { kind: "subscription.remove", id: subscription.id },
+                                    ]);
+                                    if (result.ok)
+                                      setRemovalSaved(
+                                        `Unsubscribed ${repoName} from ${projectName}.`,
+                                      );
+                                    else
+                                      setRemovalErrors((errors) => ({
+                                        ...errors,
+                                        [subscription.id]: `Could not unsubscribe ${repoName} from ${projectName}: ${result.error}`,
+                                      }));
+                                  }}
+                                >
+                                  Unsubscribe
+                                </button>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </section>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-4 mb-0 text-body-sm text-ink-muted">
+                No repository subscriptions yet.
               </p>
             )}
-          </form>
-        )}
-        {!snapshot.canAdmin && (
-          <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
-            A tracker administrator manages teams, workspaces and subscriptions.
-          </p>
-        )}
-      </section>
+            {removalSaved && (
+              <p role="status" className="mk-hint mt-3 mb-0">
+                {removalSaved}
+              </p>
+            )}
+            {reposError && (
+              <div className="mt-4">
+                <FormError message={reposError} />
+                <button
+                  className="mk-btn mk-btn--sm"
+                  onClick={() => setReposAttempt((attempt) => attempt + 1)}
+                >
+                  Retry repository choices
+                </button>
+              </div>
+            )}
+            {repos === null && !reposError && (
+              <p role="status" className="mk-hint mt-4 mb-0">
+                Loading repository choices…
+              </p>
+            )}
+            {snapshot.canAdmin && repos !== null && !administeredRepos.length && (
+              <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
+                You don’t administer any repositories. Ask a repository administrator to grant you
+                admin access before subscribing a repository to a project.
+              </p>
+            )}
+            {snapshot.canAdmin && administeredRepos.length > 0 && (
+              <form
+                className="mt-4 space-y-4 border-t border-line-soft pt-4"
+                onSubmit={async (event) => {
+                  event.preventDefault();
+                  setSubscriptionError("");
+                  setSubscriptionSaved("");
+                  setRemovalSaved("");
+                  const repository = administeredRepos.find((repo) => repo.id === repoId);
+                  const project = snapshot.projects.find((item) => item.id === projectId);
+                  if (!repository || !project || project.archived) {
+                    setSubscriptionError(
+                      "Choose an active project and a repository you administer.",
+                    );
+                    return;
+                  }
+                  const repoName = `${repository.space.slug}/${repository.name}`;
+                  const result = await mutate([
+                    {
+                      kind: "subscription.add",
+                      id: crypto.randomUUID(),
+                      data: { projectId, repoId },
+                    },
+                  ]);
+                  if (result.ok) {
+                    setSubscriptionSaved(`Subscribed ${repoName} to ${project.name}.`);
+                    setRepoId("");
+                  } else
+                    setSubscriptionError(
+                      `Could not subscribe ${repoName} to ${project.name}: ${result.error}`,
+                    );
+                }}
+              >
+                <div className={GRID}>
+                  <Field label="Project">
+                    <SelectField
+                      ariaLabel="Subscription project"
+                      value={projectId}
+                      onChange={(value) => {
+                        setProjectId(value);
+                        setSubscriptionSaved("");
+                        setRemovalSaved("");
+                        setSubscriptionError("");
+                      }}
+                      options={[
+                        { value: "", label: "Choose project" },
+                        ...snapshot.projects
+                          .filter((project) => !project.archived)
+                          .map((project) => ({ value: project.id, label: project.name })),
+                      ]}
+                    />
+                  </Field>
+                  <Field label="Repository you administer">
+                    <SelectField
+                      ariaLabel="Subscription repository"
+                      value={repoId}
+                      onChange={(value) => {
+                        setRepoId(value);
+                        setSubscriptionSaved("");
+                        setRemovalSaved("");
+                        setSubscriptionError("");
+                      }}
+                      options={[
+                        { value: "", label: "Choose repository" },
+                        ...administeredRepos.map((repo) => ({
+                          value: repo.id,
+                          label: `${repo.space.slug}/${repo.name}`,
+                        })),
+                      ]}
+                    />
+                  </Field>
+                </div>
+                <button className="mk-btn" disabled={busy || !projectId || !repoId}>
+                  Subscribe repository
+                </button>
+                <FormError message={subscriptionError} />
+                {subscriptionSaved && (
+                  <p role="status" className="mk-hint m-0">
+                    {subscriptionSaved}
+                  </p>
+                )}
+              </form>
+            )}
+            {!snapshot.canAdmin && (
+              <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
+                A tracker administrator manages teams, projects and subscriptions.
+              </p>
+            )}
+          </section>
+        </>
+      )}
     </div>
   );
 }

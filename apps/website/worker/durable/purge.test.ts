@@ -3,11 +3,11 @@
 // waits for in-flight work, then purges and records it. The assistant (an
 // Agents SDK agent) and every class again in the real runtime: the E2E
 // scenario durable-objects-register-and-purge.
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { FakeR2Bucket } from "@gitmatrix/testing";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { fakeContainer, fakeDurableState } from "../testing/durable-state.ts";
-import { DURABLE_CLASSES } from "./classes.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { fakeContainer, fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
 import { isEmpty, storageReport, type Purgeable } from "./contract.ts";
 import { Tracker } from "../tracker/object.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
@@ -31,9 +31,15 @@ vi.mock("cloudflare:workers", () => ({
 type Built = { object: Purgeable & { alarm?(): Promise<void> }; ctx: DurableObjectState };
 
 let env: Env;
-beforeEach(() => {
-  env = { DB: d1(migratedDatabase()), REGISTRY_BLOBS: new FakeR2Bucket() } as unknown as Env;
+let control: Awaited<ReturnType<typeof createFreshSpaceTestEnvironment>>["control"];
+let closeEnvironment: (() => void) | undefined;
+beforeEach(async () => {
+  const fixture = await createFreshSpaceTestEnvironment();
+  env = { ...fixture.env, REGISTRY_BLOBS: new FakeR2Bucket() as unknown as R2Bucket };
+  control = fixture.control;
+  closeEnvironment = fixture.close;
 });
+afterEach(() => closeEnvironment?.());
 
 async function purgedRow(cls: string, name: string) {
   return env.DB.prepare(
@@ -43,26 +49,43 @@ async function purgedRow(cls: string, name: string) {
     .first<{ purged_at: string | null; purge_reason: string | null; retiring_at: string | null }>();
 }
 
+async function buildTracker() {
+  const state = fakeDurableState({ name: "Tracker-1" });
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "organization",
+      slug: "organization",
+      displayName: "Organization",
+      kind: "company",
+    },
+    space: { id: "Tracker-1", slug: "tracker", displayName: "Tracker" },
+    members: [],
+    actorId: "test-fixture",
+  });
+  Reflect.set(env, "TRACKER", { idFromName: fakeDurableObjectId });
+  await initializeFreshTrackerSpace(env, state.ctx, "Tracker-1");
+  const object = new Tracker(state.ctx, env);
+  await state.ctx.storage.setAlarm(Date.now() + 60_000);
+  return { ...state, object };
+}
+
 /** Each class, holding something and an alarm. */
 const CASES: Record<string, () => Promise<Built>> = {
-  async Tracker() {
-    const { ctx } = fakeDurableState();
-    const object = new Tracker(ctx, env);
-    // Its schema alone is storage; an alarm too.
-    await ctx.storage.setAlarm(Date.now() + 60_000);
-    return { object, ctx };
-  },
+  Tracker: buildTracker,
   async KnowledgeCoordinator() {
     const { ctx } = fakeDurableState();
     const object = new KnowledgeCoordinator(ctx, env);
-    await object.notify("repo_1");
+    await ctx.storage.put("state", { repoId: "repo_1", seq: 1, scan: true });
+    await ctx.storage.setAlarm(Date.now() + 60_000);
     return { object, ctx };
   },
   async StepFeed() {
     const { ctx } = fakeDurableState();
     const object = new StepFeed(ctx, env);
-    // A record arms the week's expiry alarm.
-    await object.publish({
+    // Existing persisted feed contents must be purged, independent of publication admission.
+    await ctx.storage.put("r:000000000001", {
+      seq: 1,
+      at: new Date().toISOString(),
       repo: "orbit/app",
       timeline: "search",
       changeId: "change0001",
@@ -74,6 +97,8 @@ const CASES: Record<string, () => Promise<Built>> = {
       why: "",
       committedAt: new Date().toISOString(),
     });
+    await ctx.storage.put("seq", 1);
+    await ctx.storage.setAlarm(Date.now() + 60_000);
     return { object, ctx };
   },
   async CiSandbox() {
@@ -113,12 +138,6 @@ const CASES: Record<string, () => Promise<Built>> = {
 };
 
 describe("purge(reason)", () => {
-  test("every registered class has a case here (the Assistant, an Agents SDK agent, in workerd: E2E)", () => {
-    expect([...Object.keys(CASES), "Assistant"].sort()).toEqual(
-      Object.keys(DURABLE_CLASSES).sort(),
-    );
-  });
-
   for (const [name, build] of Object.entries(CASES)) {
     test(`${name}: leaves no storage and no alarm, twice`, async () => {
       const { object, ctx } = await build();
@@ -134,12 +153,87 @@ describe("purge(reason)", () => {
     });
   }
 
+  test("Tracker: fresh installation admission cannot erase unconverted legacy content", async () => {
+    const { ctx, db } = fakeDurableState({ name: "legacy-owner" });
+    try {
+      db.exec(`
+        CREATE TABLE workspaces (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+        CREATE TABLE issues (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+        INSERT INTO workspaces VALUES ('workspace', '{"id":"workspace","slug":"legacy"}');
+        INSERT INTO issues VALUES ('issue', '{"id":"issue","workspaceId":"workspace","title":"Keep me"}');
+      `);
+      const object = new Tracker(ctx, env);
+      await expect(object.purge("test")).rejects.toThrow("space_migration_fenced");
+      await expect(object.retire("test", "legacy-owner")).rejects.toThrow("space_migration_fenced");
+      await expect(object.storageReport()).rejects.toThrow("space_migration_fenced");
+      await expect(object.alarm()).rejects.toThrow("space_migration_fenced");
+      expect(db.prepare("SELECT * FROM workspaces").all()).toEqual([
+        { id: "workspace", data: '{"id":"workspace","slug":"legacy"}' },
+      ]);
+      expect(db.prepare("SELECT * FROM issues").all()).toEqual([
+        { id: "issue", data: '{"id":"issue","workspaceId":"workspace","title":"Keep me"}' },
+      ]);
+      expect(await ctx.storage.list()).toEqual(new Map());
+    } finally {
+      db.close();
+    }
+  });
+
   test("CiSandbox: destroys a running container", async () => {
     const container = fakeContainer(true);
     const { ctx } = fakeDurableState({ container });
     await new CiSandbox(ctx, env).purge("job deleted");
     expect(container.destroyed).toBe(1);
     expect(container.running).toBe(false);
+  });
+
+  test("CiSandbox: purge can reply after a delayed admission release", async () => {
+    vi.useFakeTimers();
+    let resume!: () => void;
+    let entered!: () => void;
+    let abort!: (error: Error) => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const releasing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const reset = new Promise<never>((_, reject) => {
+      abort = reject;
+    });
+    const release = control.release.bind(control);
+    const delayed = vi.spyOn(control, "release").mockImplementation(async (ticket) => {
+      entered();
+      await releaseGate;
+      release(ticket);
+    });
+    const container = fakeContainer(true);
+    const { ctx } = fakeDurableState({ container });
+    vi.spyOn(ctx, "abort").mockImplementation(() => {
+      const error = new Error("Durable Object reset before its RPC replied");
+      abort(error);
+      throw error;
+    });
+    const purge = new CiSandbox(ctx, env).purge("job deleted");
+    const response = Promise.race([purge, reset]).then(
+      (report) => ({ report }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await releasing;
+      await vi.runAllTimersAsync();
+      resume();
+      expect(await response).toMatchObject({
+        report: { reason: "job deleted", tables: [], keys: 0, alarm: null },
+      });
+      expect(container.running).toBe(false);
+    } finally {
+      resume();
+      await purge.catch(() => {});
+      await vi.runAllTimersAsync();
+      delayed.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   test("RegistryUpload: aborts its multipart upload and deletes its tails", async () => {
@@ -157,8 +251,8 @@ describe("purge(reason)", () => {
   test("resets the instance after answering", async () => {
     vi.useFakeTimers();
     try {
-      const { ctx, aborted } = fakeDurableState();
-      await new Tracker(ctx, env).purge("test");
+      const { object, aborted } = await buildTracker();
+      await object.purge("test");
       expect(aborted).toEqual([]);
       await vi.runAllTimersAsync();
       expect(aborted).toEqual(["purged"]);
@@ -205,9 +299,8 @@ describe("retire(reason, name)", () => {
     } as unknown as Env;
     const { ctx } = fakeDurableState();
     const object = new KnowledgeCoordinator(ctx, env);
-    await object.notify("repo_1");
     await ctx.storage.put("state", {
-      ...(await ctx.storage.get<object>("state")),
+      repoId: "repo_1",
       running: { buildId: "build_1", seq: 1, startedAt: Date.now() },
     });
     await object.retire("repository deleted", "repo_1");

@@ -306,7 +306,7 @@ export function Requirements({
     requestAnimationFrame(() => confirm.current?.focus());
     return true;
   };
-  // Releasing someone else's agent's claim is the tracker owner's or that agent's person's call.
+  // Releasing someone else's agent's claim is the tracker space's or that agent's person's call.
   const mayRelease =
     !!pending &&
     !!viewer &&
@@ -386,7 +386,7 @@ export function Requirements({
           <p className="m-0 text-body-sm text-ink-faint">
             {mayRelease
               ? "Releasing puts the issue back in the ready queue; keeping it lets the agent finish. Either way it's recorded on the issue."
-              : `Only a tracker owner or ${pending.agent.accountable.displayName} can release it; keeping it is recorded on the issue.`}
+              : `Only a tracker space or ${pending.agent.accountable.displayName} can release it; keeping it is recorded on the issue.`}
           </p>
         </div>
       )}

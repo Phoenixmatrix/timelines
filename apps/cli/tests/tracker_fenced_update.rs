@@ -22,6 +22,8 @@ impl Server {
         let mutations = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&mutations);
         let worker = thread::spawn(move || {
+            let mut snapshot = snapshot;
+            let mut events: Vec<Value> = Vec::new();
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
                 stream
@@ -50,18 +52,39 @@ impl Server {
                 drop(reader);
                 let reply = if request == "GET /api/session HTTP/1.1" {
                     json!({"viewer":{"id":"person-a"}})
+                } else if request == "GET /api/spaces/orbit HTTP/1.1" {
+                    json!({"contractVersion":4,"migrationEpoch":1,"space":snapshot["space"]})
                 } else if request.starts_with("GET /api/tracker/orbit/snapshot?") {
                     snapshot.clone()
                 } else if request.starts_with("GET /api/tracker/orbit/changes?") {
-                    json!({"events":[],"cursor":7,"hasMore":false,"serverTime":"2026-10-08T00:00:00Z"})
+                    let after = request
+                        .split("after=")
+                        .nth(1)
+                        .unwrap()
+                        .split('&')
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap();
+                    json!({"contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,
+                        "events":events.iter().filter(|event| event["cursor"].as_u64().unwrap() > after).collect::<Vec<_>>(),
+                        "cursor":snapshot["cursor"],"hasMore":false,"serverTime":"2026-10-08T00:00:00Z"})
                 } else if request == "POST /api/tracker/orbit/mutate HTTP/1.1" {
                     let mutation: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(mutation["contractVersion"], 4);
+                    assert_eq!(mutation["spaceId"], "space-orbit");
+                    assert_eq!(mutation["migrationEpoch"], 1);
                     seen.lock().push(mutation.clone());
                     let mut issue = snapshot["issues"][0].clone();
                     issue["status"] = json!("canceled");
                     issue["closeReason"] = json!("duplicate");
                     issue["version"] = json!(2);
-                    json!({"results":[{"id":"a"}],"events":[{"entityType":"issue","entityId":"a","entity":issue}]})
+                    issue["claim"] = Value::Null;
+                    snapshot["issues"][0] = issue.clone();
+                    snapshot["cursor"] = json!(8);
+                    let event = json!({"cursor":8,"kind":"issue.update","entityType":"issue","entityId":"a","entity":issue});
+                    events.push(event.clone());
+                    json!({"contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,"cursor":8,"serverTime":"2026-10-08T00:00:00Z","results":[{"id":"a"}],"events":[event]})
                 } else {
                     json!({})
                 };
@@ -93,7 +116,10 @@ impl Drop for Server {
 fn canceling_a_claimed_issue_sends_its_kept_lease_token() {
     let dir = tempfile::tempdir().unwrap();
     let snapshot = json!({
-        "owner":{"slug":"orbit"},"teams":[],"workspaces":[],"labels":[],"links":[],"comments":[],
+        "contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,
+        "space":{"id":"space-orbit","slug":"orbit","displayName":"Orbit","organizationId":"org-o",
+            "organization":{"id":"org-o","slug":"orbit-company","displayName":"Orbit Company","kind":"company"}},
+        "teams":[],"projects":[],"labels":[],"links":[],"comments":[],
         "subscriptions":[],"requests":[],"members":[{"id":"person-a","displayName":"Ann"}],"agents":[],
         "issues":[{"id":"a","key":"CORE-60","title":"Claimed","version":1,"status":"in_progress",
                    "parentId":null,"claim":{"agent":"worker","expiresAt":"2999-01-01T00:00:00Z"}}],
@@ -114,7 +140,7 @@ fn canceling_a_claimed_issue_sends_its_kept_lease_token() {
     let gm = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_gm"))
             .args(args)
-            .args(["--owner", "orbit", "--output", "json"])
+            .args(["--space", "orbit", "--output", "json"])
             .current_dir(dir.path())
             .env("GM_SERVER", &server.origin)
             .env("GM_TOKEN", "replica-test-token")

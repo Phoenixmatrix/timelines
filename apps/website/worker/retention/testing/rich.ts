@@ -16,11 +16,15 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
 import { FakeR2Bucket } from "@gitmatrix/testing";
+import { onTestFinished } from "vite-plus/test";
+import { createFreshSpaceTestEnvironment } from "../../testing/spaces.ts";
 import { ANALYZER } from "../../knowledge/analyze.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../../testing/d1.ts";
-import { fakeDurableState } from "../../testing/durable-state.ts";
+import { fakeDurableObjectId, fakeDurableState } from "../../testing/durable-state.ts";
 import { Tracker } from "../../tracker/object.ts";
 import type { Access } from "../../tracker/store.ts";
+import { accessFor } from "../../tracker/access.ts";
+import { findSpaceById } from "../../spaces/access.ts";
+import { issueToken } from "../../api/tokens.ts";
 import type { CategoryId } from "../categories.ts";
 import type { RetentionTarget } from "../policies.ts";
 
@@ -31,9 +35,9 @@ export const ago = (days: number) => new Date(NOW.getTime() - days * DAY).toISOS
 const dayOf = (days: number) => ago(days).slice(0, 10);
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-export const ORBIT: RetentionTarget = { scope: "account", accountId: "acc_orbit" };
-export const MARCO: RetentionTarget = { scope: "account", accountId: "acc_marco" };
-export const SITE: RetentionTarget = { scope: "site" };
+export const ORBIT: RetentionTarget = { kind: "space", id: "acc_orbit" };
+export const MARCO: RetentionTarget = { kind: "person", id: "acc_marco" };
+export const SITE: RetentionTarget = { kind: "instance", id: "" };
 
 /** An assistant chat's Durable Object, as the stand-in holds it. */
 export interface ChatObject {
@@ -41,64 +45,108 @@ export interface ChatObject {
   busy: boolean;
 }
 
-/** Shared with the test's `agents` mock: chat objects by name. */
+/** Chat objects behind the fixture's Assistant namespace. */
 export const chatObjects = new Map<string, ChatObject>();
 
-export const trackerAccess: Access = {
-  actorId: "acc_marco",
-  principalId: "acc_marco",
-  agents: [],
-  owner: { id: "acc_orbit", slug: "orbit", displayName: "Orbit" },
-  canAdmin: true,
-  members: [{ id: "acc_marco", slug: "marco", displayName: "Marco" }],
-  repos: [],
-};
+async function trackerAccess(env: Env): Promise<Access> {
+  const space = await findSpaceById(env.DB, "acc_orbit");
+  if (!space) throw new Error("Missing fixture Space");
+  const token = await issueToken(env.DB, "acc_marco", "retention-fixture", "write");
+  return accessFor(env, space, "acc_marco", null, true, { kind: "token", id: token.id });
+}
 
-export type Rich = ReturnType<typeof richSeed>;
+export interface Rich {
+  sqlite: DatabaseSync;
+  registry: DatabaseSync;
+  bucket: FakeR2Bucket;
+  env: Env;
+  sent: unknown[];
+  access: Promise<Access>;
+  tracker: {
+    db: DatabaseSync;
+    ctx: DurableObjectState;
+    object: Tracker;
+    alarm: () => number | null;
+  };
+  ready: Promise<[void, void]>;
+}
 
-export function richSeed() {
+export async function richSeed(): Promise<Rich> {
   chatObjects.clear();
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite, registry } = fresh;
+  sqlite.exec("BEGIN");
   sqlite.exec(
     readFileSync(
       fileURLToPath(new URL("../../../seed/0001_dev.sql", import.meta.url).href),
       "utf8",
     ),
   );
-  const registry = migratedRegistryDatabase();
+  sqlite.exec("COMMIT");
   const bucket = new FakeR2Bucket();
   const tracker = fakeDurableState({ name: "acc_orbit" });
   const sent: unknown[] = [];
   const env = {
-    DB: d1(sqlite),
-    REGISTRY_DB: d1(registry),
+    ...fresh.env,
     REGISTRY_BLOBS: bucket,
     JOBS: { send: async (body: unknown) => void sent.push(body) },
+    ASSISTANT: {
+      getByName: (name: string) => ({
+        async __unsafe_ensureInitialized() {},
+        async purgeIfIdle(reason: string) {
+          const chat = chatObjects.get(name) ?? { messages: 0, busy: false };
+          if (chat.busy) return null;
+          chatObjects.set(name, { messages: 0, busy: false });
+          return {
+            reason,
+            purgedAt: new Date().toISOString(),
+            bytes: 0,
+            tables: [],
+            keys: 0,
+            alarm: null,
+          };
+        },
+        async storageReport() {
+          const chat = chatObjects.get(name);
+          return { bytes: (chat?.messages ?? 0) * 100, tables: [], keys: 0, alarm: null };
+        },
+      }),
+    },
   } as unknown as Env;
   const trackerObject = new Tracker(tracker.ctx, env);
-  Object.assign(env, { TRACKER: { getByName: () => trackerObject } });
+  Object.assign(env, {
+    TRACKER: { idFromName: fakeDurableObjectId, getByName: () => trackerObject },
+  });
 
   seedMain(sqlite);
   seedRegistry(registry);
-  seedTracker(trackerObject);
   seedChats(sqlite);
+  const access = trackerAccess(env);
   return {
     sqlite,
     registry,
     bucket,
     env,
     sent,
+    access,
     tracker: { db: tracker.db, ctx: tracker.ctx, object: trackerObject, alarm: tracker.alarm },
-    ready: seedBucket(bucket),
+    ready: Promise.all([
+      access.then((value) => seedTracker(trackerObject, value)),
+      seedBucket(bucket),
+    ]),
   };
 }
 
 function seedMain(sqlite: DatabaseSync) {
   sqlite.exec(`
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_app', 'acc_orbit', 'app', 'private', 'a', 'https://a'),
       ('r_lib', 'acc_orbit', 'lib', 'private', 'b', 'https://b'),
       ('r_sam', 'acc_sam', 'mine', 'private', 'c', 'https://c');
+    INSERT INTO mention_backfill_jobs (repo_id, authority, state) VALUES
+      ('r_app', NULL, 'blocked'), ('r_lib', NULL, 'blocked'),
+      ('r_sam', NULL, 'blocked');
   `);
 
   // ---- ci-logs, ci-runs: r_app's main has 25 old runs, a recent one and a
@@ -315,7 +363,7 @@ function seedMain(sqlite: DatabaseSync) {
   // ---- ai-spend (site, days 90): per-call rows of old days roll up; a
   // reservation in flight and a recent day stay.
   const spend = sqlite.prepare(`
-    INSERT INTO atlas_spend (id, account_id, day, scope, run_id, repo_id, purpose, model, status,
+    INSERT INTO atlas_spend (id, space_id, day, scope, run_id, repo_id, purpose, model, status,
                              input_tokens, output_tokens, cost_micro_usd, reserved_input_tokens,
                              reserved_output_tokens, reserved_micro_usd, created_at)
     VALUES (?, ?, ?, 'build', ?, ?, 'capability_summary', 'test/model', ?, 10, 100, 1000, 10, 1000, 1000000, ?)`);
@@ -444,25 +492,28 @@ function seedMain(sqlite: DatabaseSync) {
   // 120 days of figures; the latest day of each account and construct and
   // the recent days stay, older days roll up into months.
   const snapshot = sqlite.prepare(`
-    INSERT INTO usage_snapshots (day, account_id, construct, item, metric, kind, quantity, estimated, method, collected_at)
-    VALUES (?, ?, 'd1', 'repositories', ?, 'storage', ?, 0, 'seeded', ?)`);
+    INSERT INTO usage_snapshots (day, scope_kind, scope_id, construct, item, metric, kind, quantity, estimated, method, collected_at)
+    VALUES (?, ?, ?, 'd1', 'repositories', ?, 'storage', ?, 0, 'seeded', ?)`);
   const ai = sqlite.prepare(`
-    INSERT INTO ai_usage (day, account_id, feature, model, calls, input_tokens, output_tokens, total_tokens)
-    VALUES (?, ?, 'assistant', '@cf/model', ?, ?, ?, ?)`);
+    INSERT INTO ai_usage (day, scope_kind, scope_id, feature, model, calls, input_tokens, output_tokens, total_tokens)
+    VALUES (?, 'person', ?, 'assistant', '@cf/model', ?, ?, ?, ?)`);
   for (let days = 120; days >= 1; days--) {
-    for (const account of ["acc_orbit", ""]) {
-      snapshot.run(dayOf(days), account, "rows", 1000 + days, ago(days - 1));
-      snapshot.run(dayOf(days), account, "bytes", 4096 * days, ago(days - 1));
+    for (const target of [
+      { kind: "space", id: "acc_orbit" },
+      { kind: "instance", id: "" },
+    ]) {
+      snapshot.run(dayOf(days), target.kind, target.id, "rows", 1000 + days, ago(days - 1));
+      snapshot.run(dayOf(days), target.kind, target.id, "bytes", 4096 * days, ago(days - 1));
     }
-    ai.run(dayOf(days), "acc_orbit", days % 5, days * 10, days * 3, days * 13);
+    ai.run(dayOf(days), "acc_marco", days % 5, days * 10, days * 3, days * 13);
   }
   // An account whose collection stopped long ago: its latest day stays.
   for (let days = 200; days >= 150; days -= 10)
-    snapshot.run(dayOf(days), "acc_jun", "rows", days, ago(days));
+    snapshot.run(dayOf(days), "person", "acc_jun", "rows", days, ago(days));
   sqlite.exec(`
-    INSERT INTO usage_monthly (month, account_id, construct, item, metric, kind, quantity, days, last_day, last_quantity, method)
-    VALUES ('${dayOf(1200).slice(0, 7)}', 'acc_orbit', 'd1', 'repositories', 'rows', 'storage', 31000, 31, '${dayOf(1200)}', 1000, 'seeded'),
-           ('${dayOf(1300).slice(0, 7)}', 'acc_orbit', 'd1', 'repositories', 'rows', 'storage', 31000, 31, '${dayOf(1300)}', 1000, 'seeded');
+    INSERT INTO usage_monthly (month, scope_kind, scope_id, construct, item, metric, kind, quantity, days, last_day, last_quantity, method)
+    VALUES ('${dayOf(1200).slice(0, 7)}', 'space', 'acc_orbit', 'd1', 'repositories', 'rows', 'storage', 31000, 31, '${dayOf(1200)}', 1000, 'seeded'),
+           ('${dayOf(1300).slice(0, 7)}', 'space', 'acc_orbit', 'd1', 'repositories', 'rows', 'storage', 31000, 31, '${dayOf(1300)}', 1000, 'seeded');
   `);
 
   // ---- durable-registry (site, days 30): rows of instances purged long
@@ -471,8 +522,9 @@ function seedMain(sqlite: DatabaseSync) {
     INSERT INTO do_instances (class, name, account_id, created_at, last_active_at, purged_at, purge_reason) VALUES
       ('Assistant', 'acc_marco:gone-1', 'acc_marco', '${ago(100)}', '${ago(60)}', '${ago(40)}', 'chat deleted'),
       ('Assistant', 'acc_marco:gone-2', 'acc_marco', '${ago(100)}', '${ago(60)}', '${ago(50)}', 'chat deleted'),
-      ('Assistant', 'acc_marco:gone-recent', 'acc_marco', '${ago(100)}', '${ago(20)}', '${ago(10)}', 'chat deleted'),
-      ('Tracker', 'acc_orbit', 'acc_orbit', '${ago(500)}', '${ago(1)}', NULL, NULL);
+      ('Assistant', 'acc_marco:gone-recent', 'acc_marco', '${ago(100)}', '${ago(20)}', '${ago(10)}', 'chat deleted');
+    INSERT INTO do_instances (class,name,space_id,created_at,last_active_at)
+      VALUES ('Tracker', 'acc_orbit', 'acc_orbit', '${ago(500)}', '${ago(1)}');
   `);
 }
 
@@ -500,7 +552,7 @@ function seedChats(sqlite: DatabaseSync) {
 
 function seedRegistry(registry: DatabaseSync) {
   registry.exec(`
-    INSERT INTO repositories (id, key, format, owner_id, kind, visibility, created_at, updated_at) VALUES
+    INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at) VALUES
       ('feed_local', 'js-local', 'npm', 'acc_orbit', 'local', 'public', '${ago(900)}', '${ago(900)}'),
       ('feed_remote', 'npmjs', 'npm', 'acc_orbit', 'remote', 'public', '${ago(900)}', '${ago(900)}');
     INSERT INTO blobs (digest, r2_key, size, created_at) VALUES
@@ -539,10 +591,13 @@ async function seedBucket(bucket: FakeR2Bucket) {
     await bucket.put(key, `object ${key}`);
 }
 
-function seedTracker(tracker: Tracker) {
+async function seedTracker(tracker: Tracker, access: Access) {
   let operation = 0;
-  const mutate = (mutations: object[]) => {
-    const reply = tracker.mutate(trackerAccess, {
+  const mutate = async (mutations: object[]) => {
+    const reply = await tracker.mutate(access, {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
       operationId: `op-${++operation}`,
       mutations: mutations as never,
     });
@@ -550,11 +605,11 @@ function seedTracker(tracker: Tracker) {
   };
   // closed-issues (days 365), tracker-activity (365, 180): two closed issues
   // go (and their activity), the open one and its history stay.
-  mutate([{ kind: "team.create", id: "team", data: { key: "ORB", name: "Orbit" } }]);
+  await mutate([{ kind: "team.create", id: "team", data: { key: "ORB", name: "Orbit" } }]);
   for (const id of ["done-1", "done-2", "open"])
-    mutate([{ kind: "issue.create", id, data: { teamId: "team", title: id } }]);
+    await mutate([{ kind: "issue.create", id, data: { teamId: "team", title: id } }]);
   for (const id of ["done-1", "done-2"])
-    mutate([{ kind: "issue.update", id, expectedVersion: 1, data: { status: "done" } }]);
+    await mutate([{ kind: "issue.update", id, expectedVersion: 1, data: { status: "done" } }]);
 }
 
 // ---- what each category covers, may change and must keep ---------------------
@@ -678,7 +733,7 @@ export const FIXTURES: Record<string, Fixture> = {
     target: ORBIT,
     touches: ["tracker"],
     kept: async (t) => {
-      const snapshot = t.tracker.object.snapshot(trackerAccess);
+      const snapshot = await t.tracker.object.snapshot(await t.access);
       if (!snapshot.ok) throw new Error("No tracker snapshot");
       return [
         ...snapshot.value.issues.filter((i) => i.status !== "done").map((i) => `issue ${i.id}`),
@@ -690,7 +745,7 @@ export const FIXTURES: Record<string, Fixture> = {
     target: ORBIT,
     touches: ["tracker"],
     kept: async (t) => {
-      const snapshot = t.tracker.object.snapshot(trackerAccess);
+      const snapshot = await t.tracker.object.snapshot(await t.access);
       if (!snapshot.ok) throw new Error("No tracker snapshot");
       // Every issue and team stays; only old activity goes.
       return [
@@ -758,8 +813,8 @@ export const FIXTURES: Record<string, Fixture> = {
     kept: (t) =>
       db(
         t,
-        `SELECT day || ' ' || account_id || ' ' || metric AS k FROM usage_snapshots
-           WHERE day >= '${dayOf(89)}' OR (account_id = 'acc_jun' AND day = '${dayOf(150)}')`,
+        `SELECT day || ' ' || scope_kind || ' ' || scope_id || ' ' || metric AS k FROM usage_snapshots
+           WHERE day >= '${dayOf(89)}' OR (scope_kind = 'person' AND scope_id = 'acc_jun' AND day = '${dayOf(150)}')`,
       ),
   },
   "ai-usage": {

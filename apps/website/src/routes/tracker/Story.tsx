@@ -46,7 +46,7 @@ const WIDE = "(min-width: 64rem)";
 export async function storyLoader({ request, params }: LoaderFunctionArgs) {
   try {
     return await api<TimelineDetail>(
-      `/tracker/${encodeURIComponent(params.owner!)}/timelines/${encodeURIComponent(params.slug!)}?limit=200`,
+      `/tracker/${encodeURIComponent(params.space!)}/timelines/${encodeURIComponent(params.slug!)}?limit=200`,
       { signal: request.signal },
     );
   } catch (error) {
@@ -97,16 +97,16 @@ function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
   }>({ key: "", rows: [], error: null, loading: true, more: false });
   // Primitives, not the loader's objects: the route reloads the timeline on
   // every ?step= change, and the whole history must not be read again for it.
-  const owner = repo?.owner;
+  const space = repo?.space;
   const name = repo?.name;
   const sourceId = repo?.source?.sourceId;
   const head = repo ? headOf(detail, repo) : null;
   const fork = repo ? detail.timeline.forkPoint.commits[repo.id] : undefined;
-  const key = `${owner}/${name}@${head}`;
+  const key = `${space}/${name}@${head}`;
   useEffect(() => {
-    if (!owner || !name) return;
+    if (!space || !name) return;
     const abort = new AbortController();
-    const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+    const base = `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}`;
     setState((s) => ({ ...s, loading: true, error: null }));
     (async () => {
       const commits: CommitSummary[] = [];
@@ -183,18 +183,18 @@ function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
  * The timeline's checkpoints (CORE-382), for the dividers in the list. They
  * are context, not content: a failed read leaves the list without dividers.
  */
-function useCheckpoints(owner: string, slug: string): CheckpointView[] {
+function useCheckpoints(space: string, slug: string): CheckpointView[] {
   const [views, setViews] = useState<CheckpointView[]>([]);
   useEffect(() => {
     const abort = new AbortController();
     api<CheckpointList>(
-      `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(slug)}/checkpoints`,
+      `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(slug)}/checkpoints`,
       { signal: abort.signal },
     )
       .then((list) => setViews(list.checkpoints))
       .catch(() => {});
     return () => abort.abort();
-  }, [owner, slug]);
+  }, [space, slug]);
   return views;
 }
 
@@ -239,13 +239,13 @@ export function Story() {
   const [params, setParams] = useLiveSearchParams();
   const shortcuts = readTrackerShortcuts();
   const wide = useMediaQuery(WIDE);
-  // The timeline belongs to the tracker in the address, not to its repositories' owner.
-  const owner = useParams().owner ?? "";
+  // The timeline belongs to the tracker in the address, not to its repositories' space.
+  const space = useParams().space ?? "";
   const repo =
-    timeline.repos.find((r) => `${r.owner}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
-  const repoKey = repo ? `${repo.owner}/${repo.name}` : "";
+    timeline.repos.find((r) => `${r.space}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
+  const repoKey = repo ? `${repo.space}/${repo.name}` : "";
   const { rows, error, loading, more, retry } = useStory(detail, repo);
-  const checkpoints = useCheckpoints(owner, timeline.slug);
+  const checkpoints = useCheckpoints(space, timeline.slug);
   const agent = params.get("agent") ?? "";
   const issue = params.get("issue") ?? "";
   const shown = useMemo(
@@ -255,9 +255,15 @@ export function Story() {
       ),
     [rows, agent, issue],
   );
-  const agents = useMemo(() => [...new Set(rows.map(agentOf))].sort(), [rows]);
+  const agents = useMemo(
+    () => [...new Set(rows.map(agentOf))].sort((a, b) => a.localeCompare(b)),
+    [rows],
+  );
   const issues = useMemo(
-    () => [...new Set(rows.flatMap((r) => (r.step?.issue ? [r.step.issue] : [])))].sort(),
+    () =>
+      [...new Set(rows.flatMap((r) => (r.step?.issue ? [r.step.issue] : [])))].sort((a, b) =>
+        a.localeCompare(b),
+      ),
     [rows],
   );
   // How many steps each repository has, as far as it has been read.
@@ -270,7 +276,7 @@ export function Story() {
   const dividers = useMemo(() => {
     const byCommit = new Map<string, CheckpointView[]>();
     for (const view of checkpoints) {
-      const commit = view.checkpoint.repos.find((r) => `${r.owner}/${r.name}` === repoKey)?.commit;
+      const commit = view.checkpoint.repos.find((r) => `${r.space}/${r.name}` === repoKey)?.commit;
       if (commit) byCommit.set(commit, [...(byCommit.get(commit) ?? []), view]);
     }
     return byCommit;
@@ -402,13 +408,13 @@ export function Story() {
   }, []);
 
   const changesUrl = (query?: Record<string, string>) =>
-    timelinePageUrl(owner, timeline.slug, "changes", { repo: repoKey, ...query });
+    timelinePageUrl(space, timeline.slug, "changes", { repo: repoKey, ...query });
   const forked = !more && !agent && !issue && shown.length > 0;
   return (
     <main className="mx-auto max-w-[110rem] px-4 py-4">
       <h1 className="m-0 text-title-lg [overflow-wrap:anywhere]">{timeline.name}</h1>
       <TimelineNav
-        owner={owner}
+        space={space}
         slug={timeline.slug}
         current="story"
         query={{ repo: params.get("repo") }}
@@ -424,7 +430,7 @@ export function Story() {
             className="w-64"
             value={repoKey}
             options={timeline.repos.map((r) => {
-              const key = `${r.owner}/${r.name}`;
+              const key = `${r.space}/${r.name}`;
               const n = counts[key];
               return {
                 value: key,
@@ -677,7 +683,7 @@ function StepDetail({
   onOlder: (() => void) | null;
   onClose: () => void;
 }) {
-  const base = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
+  const base = `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}`;
   const [versions, setVersions] = useState<Step[]>(row.step ? [row.step] : []);
   const [version, setVersion] = useState(row.commit.oid);
   useEffect(() => {
@@ -774,8 +780,8 @@ function StepDetail({
         </time>
         <Link
           className={`${link} mk-mono`}
-          to={sourceUrl(commitPanelUrl(repo.owner, repo.name, version), repo.source?.sourceId)}
-          title={`Open commit ${shortOid(version)} in ${repo.owner}/${repo.name}`}
+          to={sourceUrl(commitPanelUrl(repo.space, repo.name, version), repo.source?.sourceId)}
+          title={`Open commit ${shortOid(version)} in ${repo.space}/${repo.name}`}
         >
           {shortOid(version)}
         </Link>
@@ -802,7 +808,7 @@ function StepDetail({
         <Link
           className={link}
           to={changesUrl}
-          title={`Everything ${repo.owner}/${repo.name} changed on this timeline`}
+          title={`Everything ${repo.space}/${repo.name} changed on this timeline`}
         >
           Timeline changes
         </Link>
@@ -955,7 +961,7 @@ interface DiffState {
 
 /** A commit's diff, read for the step header's totals as well as the diff below it. */
 function useDiff(repo: TimelineRepo, oid: string): DiffState {
-  const { owner, name } = repo;
+  const { space, name } = repo;
   const sourceId = repo.source?.sourceId;
   const [state, setState] = useState<DiffState>({ diff: null, error: null });
   useEffect(() => {
@@ -963,7 +969,7 @@ function useDiff(repo: TimelineRepo, oid: string): DiffState {
     setState({ diff: null, error: null });
     api<CommitDiff>(
       sourceUrl(
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/commits/${oid}/diff`,
+        `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}/commits/${oid}/diff`,
         sourceId,
       ),
       { signal: abort.signal },
@@ -977,7 +983,7 @@ function useDiff(repo: TimelineRepo, oid: string): DiffState {
           });
       });
     return () => abort.abort();
-  }, [owner, name, oid, sourceId]);
+  }, [space, name, oid, sourceId]);
   return state;
 }
 
@@ -994,7 +1000,7 @@ function Diff({
   file: string | null;
   onFile: (path: string) => void;
 }) {
-  const { owner, name } = repo;
+  const { space, name } = repo;
   const sourceId = repo.source?.sourceId;
   if (state.error) return <p className="mk-error m-0">{state.error}</p>;
   if (!state.diff) return <p className="m-0 text-body-sm text-ink-faint">Reading the diff…</p>;
@@ -1015,7 +1021,7 @@ function Diff({
         // A deleted file lives on at the first parent.
         blobHref={(path) =>
           blobUrl(
-            owner,
+            space,
             name,
             files.find((f) => f.path === path)?.status === "deleted" && parents[0]
               ? parents[0]

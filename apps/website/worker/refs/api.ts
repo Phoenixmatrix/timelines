@@ -22,10 +22,10 @@ const REPO = /^(?!\.)[A-Za-z0-9._-]{1,100}$/;
 /** A context's fields, each dropped unless it's well formed. */
 function cleanContext(raw: unknown): RefContext {
   if (typeof raw !== "object" || raw === null) return {};
-  const { owner, repo, tracker } = raw as Record<string, unknown>;
+  const { space, repo, tracker } = raw as Record<string, unknown>;
   const context: RefContext = {};
-  if (typeof owner === "string" && SLUG.test(owner)) context.owner = owner;
-  if (typeof repo === "string" && REPO.test(repo) && context.owner) context.repo = repo;
+  if (typeof space === "string" && SLUG.test(space)) context.space = space;
+  if (typeof repo === "string" && REPO.test(repo) && context.space) context.repo = repo;
   if (typeof tracker === "string" && SLUG.test(tracker)) context.tracker = tracker;
   return context;
 }
@@ -72,7 +72,7 @@ refs.get("/go/:ref{.+}", async (c) => {
   const ref = c.req.param("ref");
   if (ref.length > REF_LIMITS.length) return fail(c, 400, "That ref is too long.");
   const context = cleanContext({
-    owner: c.req.query("owner"),
+    space: c.req.query("space"),
     repo: c.req.query("repo"),
     tracker: c.req.query("tracker"),
   });

@@ -22,12 +22,12 @@ import { Page } from "./AppShell.tsx";
 /** One settings area: a readable form column, with wide reports kept explicit. */
 export function SettingsPage({
   children,
-  owner,
+  space,
   tracker = false,
   wide = false,
 }: {
   children: React.ReactNode;
-  owner?: string;
+  space?: string;
   tracker?: boolean;
   wide?: boolean;
 }) {
@@ -35,84 +35,108 @@ export function SettingsPage({
   const location = useLocation();
   const id = useId();
   const params = new URLSearchParams(location.search);
-  const account = owner ?? params.get("owner") ?? params.get("tracker") ?? viewer?.slug;
-  const accountQuery = account ? `?owner=${encodeURIComponent(account)}` : "";
-  const trackerQuery = account ? `?tracker=${encodeURIComponent(account)}` : "";
-  const trackerPath = account ? `/tracker/${encodeURIComponent(account)}` : "/tracker";
+  const selectedSpace =
+    space ??
+    params.get("space") ??
+    params.get("tracker") ??
+    viewer?.spaces.find((entry) => entry.id === viewer.defaultSpaceId)?.slug;
+  const spaceQuery = selectedSpace ? `?space=${encodeURIComponent(selectedSpace)}` : "";
+  const personQuery = viewer ? `?person=${encodeURIComponent(viewer.slug)}` : "";
+  const trackerQuery = selectedSpace ? `?tracker=${encodeURIComponent(selectedSpace)}` : "";
+  const trackerPath = selectedSpace ? `/tracker/${encodeURIComponent(selectedSpace)}` : "/tracker";
   const groups: {
     label: string;
     context: string | null;
     links: { label: string; to: string; icon: Icon; active?: boolean }[];
   }[] = [
-    {
-      label: "Account",
-      context: account ? `@${account}` : null,
-      links: [
-        {
-          label: "Teams and workspaces",
-          to: `${trackerPath}?manage=true`,
-          icon: UsersThreeIcon,
-          active: tracker,
-        },
-        { label: "AI settings", to: `/settings/ai${accountQuery}`, icon: GearSixIcon },
-        {
-          label: "AI providers",
-          to: `/settings/ai-providers${accountQuery}`,
-          icon: PlugsConnectedIcon,
-        },
-        { label: "Usage & costs", to: `/settings/usage${accountQuery}`, icon: ChartBarIcon },
-        {
-          label: "Data retention",
-          to: `/settings/retention${accountQuery}`,
-          icon: ClockCounterClockwiseIcon,
-        },
-      ],
-    },
+    ...(selectedSpace && viewer?.spaces.some((entry) => entry.slug === selectedSpace)
+      ? [
+          {
+            label: "Space",
+            context: `@${selectedSpace}`,
+            links: [
+              {
+                label: "Teams and Projects",
+                to: `${trackerPath}?manage=true`,
+                icon: UsersThreeIcon,
+                active: tracker,
+              },
+              { label: "AI settings", to: `/settings/ai${spaceQuery}`, icon: GearSixIcon },
+              {
+                label: "AI providers",
+                to: `/settings/ai-providers${spaceQuery}`,
+                icon: PlugsConnectedIcon,
+              },
+              {
+                label: "Space usage & costs",
+                to: `/settings/usage${spaceQuery}`,
+                icon: ChartBarIcon,
+              },
+              {
+                label: "Space data retention",
+                to: `/settings/retention${spaceQuery}`,
+                icon: ClockCounterClockwiseIcon,
+              },
+            ],
+          },
+        ]
+      : []),
     {
       label: "Personal",
-      context: null,
+      context: viewer ? `@${viewer.slug}` : null,
       links: [
-        { label: "Profile", to: `/settings/profile${accountQuery}`, icon: UserCircleIcon },
-        { label: "Assistant skills", to: `/settings/skills${accountQuery}`, icon: RobotIcon },
+        { label: "Profile", to: "/settings/profile", icon: UserCircleIcon },
+        { label: "Assistant skills", to: "/settings/skills", icon: RobotIcon },
+        { label: "Personal AI logging", to: `/settings/ai${personQuery}`, icon: GearSixIcon },
         {
           label: "Preferences",
           to: `/settings/preferences${trackerQuery}`,
           icon: SlidersHorizontalIcon,
         },
-        { label: "Access tokens", to: `/settings/tokens${accountQuery}`, icon: KeyIcon },
-        { label: "SSH keys", to: `/settings/ssh-keys${accountQuery}`, icon: FingerprintIcon },
-        { label: "Agents", to: `/settings/agents${accountQuery}`, icon: RobotIcon },
+        { label: "Access tokens", to: "/settings/tokens", icon: KeyIcon },
+        { label: "SSH keys", to: "/settings/ssh-keys", icon: FingerprintIcon },
+        { label: "Agents", to: "/settings/agents", icon: RobotIcon },
+        {
+          label: "Personal usage & costs",
+          to: `/settings/usage${personQuery}`,
+          icon: ChartBarIcon,
+        },
+        {
+          label: "Personal data retention",
+          to: `/settings/retention${personQuery}`,
+          icon: ClockCounterClockwiseIcon,
+        },
       ],
     },
     ...(viewer?.isSiteAdmin
       ? [
           {
-            label: "Administration",
+            label: "Instance",
             context: null,
             links: [
               {
                 label: "Invitations",
-                to: `/settings/invites${accountQuery}`,
+                to: "/settings/invites",
                 icon: EnvelopeSimpleIcon,
               },
               {
                 label: "Accounts",
-                to: `/settings/accounts${accountQuery}`,
+                to: "/settings/accounts",
                 icon: UserPlusIcon,
               },
               {
-                label: "Site AI settings",
-                to: `/settings/site-ai${accountQuery}`,
+                label: "Instance AI settings",
+                to: "/settings/site-ai",
                 icon: GearSixIcon,
               },
               {
-                label: "Site usage & costs",
-                to: `/settings/site-usage${accountQuery}`,
+                label: "Instance usage & costs",
+                to: "/settings/site-usage",
                 icon: ChartBarIcon,
               },
               {
-                label: "Site data retention",
-                to: `/settings/site-retention${accountQuery}`,
+                label: "Instance data retention",
+                to: "/settings/site-retention",
                 icon: ClockCounterClockwiseIcon,
               },
             ],
@@ -124,7 +148,15 @@ export function SettingsPage({
     ...group,
     links: group.links.map((item) => ({
       ...item,
-      active: item.active ?? location.pathname === item.to.split("?")[0],
+      active:
+        item.active ??
+        (location.pathname === item.to.split("?")[0] &&
+          (!["/settings/ai", "/settings/usage", "/settings/retention"].includes(
+            location.pathname,
+          ) ||
+            (new URLSearchParams(item.to.split("?")[1]).get("person")
+              ? params.has("person")
+              : params.has("space")))),
     })),
   }));
   const current = sections.flatMap((group) => group.links).find((item) => item.active)?.label;

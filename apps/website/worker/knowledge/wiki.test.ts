@@ -1,10 +1,16 @@
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type { RepoReader } from "../objects.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import { applyGraph, buildGraph } from "./graph.ts";
 import { planWiki, updatePages, type WikiSource } from "./wiki.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+const fixtures: { close(): void }[] = [];
+afterEach(() => {
+  for (const fixture of fixtures.splice(0)) fixture.close();
+});
 
 const analysis = (): FileAnalysis => ({
   language: "typescript",
@@ -22,14 +28,19 @@ interface Call {
 }
 
 /** A repository of two components, a fake model, and the database the wiki lives in. */
-function setup(
+async function setup(
   reply: (call: Call) => { content: string | null; finish?: string } | Error,
   stale: (state: unknown) => number = () => 0.9,
 ) {
-  const sqlite = migratedDatabase();
+  const fixture = await createFreshSpaceTestEnvironment();
+  fixtures.push(fixture);
+  const { sqlite } = fixture;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES ('org','org','Org','company','acc');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('acc','org','org','Org');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
   `);
   const files = ["web", "cli"].flatMap((dir) =>
@@ -65,7 +76,7 @@ function setup(
       };
     },
   };
-  const env = { DB: d1(sqlite), AI } as unknown as Env;
+  const env = { ...fixture.env, AI } as unknown as Env;
   const source: WikiSource = {
     repoId: "repo",
     commit: "c1",
@@ -90,13 +101,13 @@ const SLUGS = ["overview", "architecture", "components/src-cli", "components/src
 
 describe("wiki updates", () => {
   test("plans every page of a new wiki, in catalog order", async () => {
-    const c = setup(() => ({ content: "Text." }));
+    const c = await setup(() => ({ content: "Text." }));
     expect(await planWiki(c.env, c.source)).toEqual({ pending: SLUGS, unchanged: 0, removed: 0 });
   });
 
   test("saves each page as it is written, so a failed page doesn't cost the others", async () => {
     let webFails = true;
-    const c = setup(({ prompt }) =>
+    const c = await setup(({ prompt }) =>
       webFails && prompt.includes('the component "src/web"')
         ? new Error("upstream reset")
         : { content: "Text." },
@@ -122,7 +133,7 @@ describe("wiki updates", () => {
 
   test("front pages recover when the model exhausts its response without content", async () => {
     let first = true;
-    const c = setup(() => {
+    const c = await setup(() => {
       const result = first ? { content: null, finish: "length" } : { content: "Plain." };
       first = false;
       return result;
@@ -141,7 +152,7 @@ describe("wiki updates", () => {
   test("resumes missed wiki inputs after a disabled build and an unrelated push", async () => {
     const decisions: unknown[] = [];
     let body = "The web component serves requests.";
-    const c = setup(
+    const c = await setup(
       () => ({ content: body }),
       (state) => {
         decisions.push(state);
@@ -194,7 +205,7 @@ describe("wiki updates", () => {
   });
 
   test("pages the graph no longer plans are removed", async () => {
-    const c = setup(() => ({ content: "Text." }));
+    const c = await setup(() => ({ content: "Text." }));
     await updatePages(c.env, LEGACY_AI_SNAPSHOT.models, c.source, SLUGS, new Set());
     c.sqlite.exec(`
       INSERT INTO wiki_pages (repo_id, slug, title, section, position, body, inputs_hash, generated_in)

@@ -24,11 +24,11 @@ Multiple humans and agents work across machines, repositories and worktrees. CLI
 
 ## Capabilities and Constraints
 
-- Accounts/organizations own trackers independently of repositories.
-- Issues have owning teams; workspaces are cross-team project/area groupings.
-- Repositories and tracker workspaces have many-to-many subscriptions for discovery and navigation. Subscriptions do not grant tracker access.
+- Organizations are company or private personal tenants; their Spaces own repositories and independent trackers. Account is person identity, and Instance is the separate operator scope.
+- Issues have exactly one responsible Team and may belong to multiple same-Space Projects. Organization membership or ownership alone grants no private Space content access.
+- Repositories and same-Space Projects have many-to-many subscriptions for discovery and navigation. Subscriptions grant neither tracker nor repository access; explicit resource collaborators remain resource-only.
 - Dependencies distinguish blocking from parent/subtask and related links.
-- Support multiple teams and workspaces, fast issue capture, Markdown PRDs, human views and first-class gm commands.
+- Support multiple Teams and Projects, fast issue capture, Markdown PRDs, human views and first-class gm commands. A one-Space Organization starts in its real default Space with an explicit bootstrap grant.
 - Offline replicas synchronize edits; conflicts must be visible rather than silently discarding work.
 - Future autonomous coordination needs discoverable ready work, exclusive claims, durable handoff context and explicit completion.
 
@@ -38,7 +38,7 @@ The product name is **Timelines**. Preserve the incumbent MatrixKit Neo interfac
 
 ## Evidence on Hand
 
-The existing React application, Rust gm CLI, Cloudflare Worker API, account/organization membership model and MatrixKit Neo tokens/components are implementation evidence. No customer claims or performance benchmarks are supplied.
+The existing React application, Rust gm CLI, Cloudflare Worker API, Organization/Space grants, separate person identity and MatrixKit Neo tokens/components are implementation evidence. No customer claims or performance benchmarks are supplied.
 
 ## Product Principles
 

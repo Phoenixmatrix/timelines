@@ -1,12 +1,24 @@
-import { afterEach, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, expect, onTestFinished, test, vi } from "vite-plus/test";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { retainProgress, reconcileSourcePushes } from "./source-push.ts";
 import { writeRefs } from "../timelines/bookmarks.ts";
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 
 const recovery = vi.hoisted(() => ({ tip: "old", settled: [] as string[] }));
 vi.mock("../tracker/stub.ts", () => ({
   trackerObject: () => ({
-    sourcePushes: async () => ({
+    sourcePushesForSettlement: async () => ({
       ok: true,
       value: [
         {
@@ -16,8 +28,8 @@ vi.mock("../tracker/stub.ts", () => ({
         },
       ],
     }),
-    finishSourcePush: async (id: string) => {
-      recovery.settled.push(id);
+    finishSourcePushForSettlement: async (scope: { operationId: string }) => {
+      recovery.settled.push(scope.operationId);
       return { ok: true };
     },
   }),
@@ -30,8 +42,39 @@ vi.mock("../artifacts.ts", () => ({
 vi.mock("../timelines/bookmarks.ts", () => ({ writeRefs: vi.fn(async () => [{ ok: true }]) }));
 afterEach(() => vi.clearAllMocks());
 
+async function fixture() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite, env } = fresh;
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('person','user','person','Person')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "org", slug: "org", displayName: "Organization", kind: "company" },
+    space: { id: "space", slug: "space", displayName: "Space" },
+    members: [
+      {
+        accountId: "person",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "person",
+  });
+  sqlite.exec(
+    "INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','space','app','private','canonical','https://canonical')",
+  );
+  const token = await issueToken(env.DB, "person", "fixture", "write");
+  const authority = await captureWorkAuthority(env, "repo", {
+    id: "person",
+    credential: { kind: "token", id: token.id },
+  });
+  return { ...fresh, authority };
+}
+
 test("retains rewrite roots and every merged ancestor in its exact source", async () => {
-  const sqlite = migratedDatabase();
+  const fresh = await fixture();
+  const { sqlite } = fresh;
   const graph: Record<string, string[]> = {
     tip: ["left", "right"],
     left: ["base"],
@@ -40,7 +83,7 @@ test("retains rewrite roots and every merged ancestor in its exact source", asyn
   };
   const read = vi.fn(async (oid: string) => (graph[oid] ? { parents: graph[oid] } : null));
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: { get: async () => ({ readCommit: read, [Symbol.dispose]() {} }) },
   } as unknown as Env;
   const repo = {
@@ -69,15 +112,15 @@ test("retains rewrite roots and every merged ancestor in its exact source", asyn
 });
 
 test("tombstoned push recovery settles observed-new only and retains ambiguous observed-old", async () => {
-  const sqlite = migratedDatabase();
+  const fresh = await fixture();
+  const { sqlite, authority } = fresh;
   sqlite.exec(`
-    INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote,deleted_at) VALUES('repo','owner','app','private','canonical','https://canonical','2026-01-01');
-    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
-    VALUES('work_a','repo','timeline','search','owner','physical','https://physical','ready','allocate','canonical','old','tree','refs/heads/main','canonical','old','tree','refs/heads/main','2026-01-01','2026-01-01');
+    UPDATE repos SET deleted_at='2026-01-01' WHERE id='repo';
+    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,authority,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+    VALUES('work_a','repo','timeline','search','space','${JSON.stringify(authority)}','physical','https://physical','ready','allocate','canonical','old','tree','refs/heads/main','canonical','old','tree','refs/heads/main','2026-01-01','2026-01-01');
   `);
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: {
       get: async () => ({
         readCommit: async (oid: string) => ({ parents: oid === "new" ? ["old"] : [] }),

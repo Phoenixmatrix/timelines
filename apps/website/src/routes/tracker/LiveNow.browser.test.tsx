@@ -51,7 +51,7 @@ test("live now: each agent's latest step, from the feed, into the story", async 
     { ...latest, at: at(2) },
   ];
   let asked = 0;
-  server.on("GET", "/api/repos/:owner/:name/steps/live", ({ url }) => {
+  server.on("GET", "/api/repos/:space/:name/steps/live", ({ url }) => {
     asked += 1;
     expect(url.searchParams.get("timeline")).toBe(slug);
     return new Response(
@@ -94,7 +94,7 @@ test("live now says how steps arrive, and stays quiet without access", async () 
     repos: ["orbit/engine"],
   });
   let asked = 0;
-  server.on("GET", "/api/repos/:owner/:name/steps/live", () => {
+  server.on("GET", "/api/repos/:space/:name/steps/live", () => {
     asked += 1;
     return new Response(JSON.stringify({ error: "Not found." }), { status: 404 });
   });

@@ -8,8 +8,8 @@ import { db } from "./schema.ts";
 
 export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null; timing: Timing } };
 
-// DEVELOPMENT ONLY. Picking a persona sets this cookie to their account id, with
-// no secret involved. Real sign-in is Better Auth (worker/better-auth.ts).
+// DEVELOPMENT ONLY. Picking a persona issues a real revocable credential.
+// Production sign-in remains Better Auth (worker/better-auth.ts).
 const PERSONA_COOKIE = "gm_persona";
 
 /** Better Auth's session cookie (with its __Secure- variant over HTTPS). */
@@ -21,11 +21,14 @@ export async function sessionActor(c: Context<AppEnv>): Promise<Actor | null> {
     const session = await auth.api.getSession({
       headers: c.req.raw.headers,
     });
-    if (session) return findUserById(c.env.DB, session.user.id);
+    if (session) {
+      const actor = await findUserById(c.env.DB, session.user.id);
+      if (actor) actor.credential = { kind: "session", id: session.session.id };
+      return actor;
+    }
   }
-  if (c.env.DEV_MODE !== "true") return null;
-  const id = getCookie(c, PERSONA_COOKIE);
-  return id ? findUserById(c.env.DB, id) : null;
+  const secret = getCookie(c, PERSONA_COOKIE);
+  return secret ? personaActor(c.env, secret) : null;
 }
 
 /** Sign out of Better Auth (if signed in) and drop the persona cookie. */
@@ -39,12 +42,28 @@ export async function endAllSessions(c: Context<AppEnv>) {
     for (const cookie of response.headers.getSetCookie())
       c.header("set-cookie", cookie, { append: true });
   }
-  endSession(c);
+  await endSession(c);
 }
 
-export function startPersonaSession(c: Context<AppEnv>, accountId: string) {
+export async function startPersonaSession(c: Context<AppEnv>, accountId: string) {
   if (c.env.DEV_MODE !== "true") throw new Error("Persona sessions are development-only");
-  setCookie(c, PERSONA_COOKIE, accountId, {
+  const actor = await findUserById(c.env.DB, accountId);
+  if (!actor) throw new Error("No such persona");
+  await endSession(c);
+  const secret = generateTokenSecret();
+  await db(c.env.DB)
+    .insertInto("access_tokens")
+    .values({
+      id: `tok_${crypto.randomUUID()}`,
+      user_id: actor.id,
+      name: "Development persona session",
+      scope: "write",
+      token_hash: await hashToken(secret),
+      last_four: secret.slice(-4),
+      expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    })
+    .execute();
+  setCookie(c, PERSONA_COOKIE, secret, {
     path: "/",
     httpOnly: true,
     sameSite: "Lax",
@@ -53,8 +72,21 @@ export function startPersonaSession(c: Context<AppEnv>, accountId: string) {
   });
 }
 
-export function endSession(c: Context<AppEnv>) {
+export async function endSession(c: Context<AppEnv>) {
+  const secret = getCookie(c, PERSONA_COOKIE);
+  if (c.env.DEV_MODE === "true" && secret?.startsWith(TOKEN_PREFIX))
+    await db(c.env.DB)
+      .deleteFrom("access_tokens")
+      .where("token_hash", "=", await hashToken(secret))
+      .execute();
   deleteCookie(c, PERSONA_COOKIE, { path: "/" });
+}
+
+/** Resolve a development persona using the same persisted credential checks as API tokens. */
+export async function personaActor(env: Env, secret: string): Promise<Actor | null> {
+  if (env.DEV_MODE !== "true" || !secret.startsWith(TOKEN_PREFIX)) return null;
+  const credential = await credentialForSecret(env.DB, secret);
+  return credential.kind === "token" ? credential.actor : null;
 }
 
 // Personal access tokens: "gmx_" + 32 random base62 characters. Only the
@@ -117,19 +149,69 @@ export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredenti
   const secret = accessTokenSecret(header);
   if (!secret) return { kind: "invalid" };
 
-  const row = await db(c.env.DB)
+  return credentialForSecret(c.env.DB, secret);
+}
+
+async function credentialForSecret(d1: D1Database, secret: string): Promise<TokenCredential> {
+  const row = await db(d1)
     .selectFrom("access_tokens as t")
     .innerJoin("accounts as a", "a.id", "t.user_id")
     .leftJoin("agents as g", "g.id", "t.agent_id")
-    .select(["t.id as token_id", "t.scope", "t.agent_id", "g.name as agent_name", "g.revoked_at"])
+    .select([
+      "t.id as token_id",
+      "t.scope",
+      "t.agent_id",
+      "g.name as agent_name",
+      "g.revoked_at",
+      "g.accountable_id",
+    ])
     .selectAll("a")
     .where("t.token_hash", "=", await hashToken(secret))
+    .where("a.kind", "=", "user")
     .where((eb) => eb.or([eb("t.expires_at", "is", null), eb("t.expires_at", ">", sqlNow)]))
     .executeTakeFirst();
   if (!row) return { kind: "invalid" };
   // A revoked agent's tokens stop working at once, even before they're deleted.
-  if (row.agent_id && (row.revoked_at || !row.agent_name)) return { kind: "invalid" };
+  if (row.agent_id && (row.revoked_at || !row.agent_name || row.accountable_id !== row.id))
+    return { kind: "invalid" };
   const actor = actorFromRow(row);
+  actor.credential = { kind: "token", id: row.token_id };
   if (row.agent_id && row.agent_name) actor.agent = { id: row.agent_id, name: row.agent_name };
   return { kind: "token", actor, scope: row.scope, tokenId: row.token_id };
+}
+
+/** Revalidate the initiating credential before delayed work; identity alone is not authority. */
+export async function isActorCredentialLive(
+  d1: D1Database,
+  actor: Actor,
+  requiredScope: TokenScope = "read",
+): Promise<boolean> {
+  const credential = actor.credential;
+  if (!credential) return false;
+  if (credential.kind === "session") {
+    if (actor.agent) return false;
+    const session = await db(d1)
+      .selectFrom("auth_sessions as s")
+      .innerJoin("accounts as p", "p.id", "s.userId")
+      .select("s.id")
+      .where("s.id", "=", credential.id)
+      .where("s.userId", "=", actor.id)
+      .where("p.kind", "=", "user")
+      .where("s.expiresAt", ">", new Date().toISOString())
+      .executeTakeFirst();
+    return Boolean(session);
+  }
+  const token = await db(d1)
+    .selectFrom("access_tokens as t")
+    .innerJoin("accounts as p", "p.id", "t.user_id")
+    .leftJoin("agents as g", "g.id", "t.agent_id")
+    .select(["t.scope", "t.agent_id", "g.accountable_id", "g.revoked_at"])
+    .where("t.id", "=", credential.id)
+    .where("t.user_id", "=", actor.id)
+    .where("p.kind", "=", "user")
+    .where((eb) => eb.or([eb("t.expires_at", "is", null), eb("t.expires_at", ">", sqlNow)]))
+    .executeTakeFirst();
+  if (!token || (requiredScope === "write" && token.scope !== "write")) return false;
+  if (token.agent_id !== (actor.agent?.id ?? null)) return false;
+  return !token.agent_id || (token.accountable_id === actor.id && token.revoked_at === null);
 }

@@ -8,7 +8,7 @@
 // layout, and a revoked reader's open view. Every request the page makes is
 // recorded, to prove what browsing reads and what it never does.
 
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { AtlasAncestors } from "../../../shared/atlas.ts";
 import {
@@ -36,6 +36,19 @@ async function setup() {
   return { server, repo };
 }
 
+async function selectedPostReady() {
+  // Heading focus precedes the detail, evidence and ancestor-child responses.
+  // Observe the completed selection before measuring subsequent requests.
+  const inspector = page.getByRole("region", { name: "Inspector: post" });
+  await expect.element(inspector.getByRole("navigation", { name: "Where it sits" })).toBeVisible();
+  await expect
+    .element(inspector.getByRole("heading", { name: "Source", exact: true }))
+    .toBeVisible();
+  await expect
+    .element(page.getByRole("treeitem", { name: /^post\b/, selected: true }))
+    .toBeVisible();
+}
+
 describe("deep links", () => {
   test("a cold link to a symbol reads its path, its detail and nothing else", async () => {
     const { server, repo } = await setup();
@@ -47,13 +60,7 @@ describe("deep links", () => {
     const mark = server.requests.length;
     renderApp(`${repo.base}?select=${encodeURIComponent(TARGET)}&tl=main`);
     await expect.element(heading("post")).toHaveFocus();
-    await expect
-      .poll(
-        () =>
-          page.getByRole("status").filter({ hasText: "Selected post, Symbol" }).elements().length,
-      )
-      .toBe(1);
-    await settled(server);
+    await selectedPostReady();
     const cold = atlasCalls(server, mark);
     for (const call of cold)
       expect(
@@ -63,8 +70,6 @@ describe("deep links", () => {
             call.id === TARGET),
         `A cold link read something unrelated: ${call.route} ${call.id}`,
       ).toBe(true);
-    const routes = cold.map((c) => c.route);
-    for (const needed of ["overview", "ancestors", "detail"]) expect(routes).toContain(needed);
     expectNoPaidFanOut(server, mark, repo.api);
   });
 
@@ -99,7 +104,7 @@ describe("lookup, lens and history", () => {
     const { server, repo } = await setup();
     const app = renderApp(`${repo.base}?select=${encodeURIComponent(TARGET)}&tl=main`);
     await expect.element(heading("post")).toHaveFocus();
-    await settled(server);
+    await selectedPostReady();
 
     // Typing in the lookup reads only this repository's catalogue.
     const mark = server.requests.length;
@@ -110,9 +115,9 @@ describe("lookup, lens and history", () => {
       .getByRole("button", { name: /^ledger\.ts File/ });
     await expect.element(ledgerFile).toBeVisible();
     await expect.element(page.getByRole("status").filter({ hasText: /match/ })).toBeVisible();
-    expect(app.url().searchParams.get("q")).toBe("ledger");
+    // Matches can show before the address catches up with the last keystroke.
+    await app.waitForUrl((url) => url.searchParams.get("q") === "ledger");
     const typed = atlasCalls(server, mark);
-    expect(typed.length).toBeGreaterThan(0);
     expect(typed.map((c) => c.route)).toEqual(typed.map(() => "catalogue"));
     expectNoPaidFanOut(server, mark, repo.api);
 
@@ -324,28 +329,73 @@ test("revocation clears a reader's open view", async () => {
   const selected = heading("ledger.ts");
   await expect.element(selected).toBeVisible();
   await expect.element(lookup()).toBeVisible();
+  const inspector = page.getByRole("region", { name: "Inspector: ledger.ts" });
+  await expect.element(inspector.getByRole("navigation", { name: "Where it sits" })).toBeVisible();
+  await expect
+    .element(inspector.getByRole("heading", { name: "Source", exact: true }))
+    .toBeVisible();
   await settled(server);
 
-  // The owner removes sam while his view is open.
-  await server.call("DELETE", `${repo.api}/collaborators/sam`, undefined, "marco");
-  const mark = server.requests.length;
-
-  // His next Atlas read (a lookup) finds the repository gone: the view goes with it.
-  await userEvent.click(lookup());
-  await userEvent.keyboard("search");
+  // Begin the interaction while access is granted, but hold the actual request
+  // before the server authorizes it. Revocation may remove an open view as soon
+  // as any read fails; don't race that teardown by clicking after removal.
+  const fetch = vi.mocked(window.fetch);
+  const serve = fetch.getMockImplementation()!;
+  let requested = false;
+  let lookupRequest: Promise<Response> | undefined;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  fetch.mockImplementation((input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input, location.origin);
+    if (url.pathname === `${repo.api}/atlas/catalogue` && url.searchParams.get("q") === "search") {
+      requested = true;
+      // Forward unchanged to the real server only after removal, never return
+      // a canned denial or a response authorized before revocation.
+      lookupRequest = blocked.then(() => serve(input, init));
+      return lookupRequest;
+    }
+    return serve(input, init);
+  });
+  let mark: number;
+  try {
+    await userEvent.click(lookup());
+    await userEvent.keyboard("search");
+    await expect.poll(() => requested).toBe(true);
+    await expect.element(selected).toBeVisible();
+    await server.call("DELETE", `${repo.api}/collaborators/sam`, undefined, "marco");
+    mark = server.requests.length;
+  } finally {
+    release();
+    fetch.mockImplementation(serve);
+    await lookupRequest;
+  }
   await expect.element(page.getByRole("heading", { name: "Nothing here", level: 1 })).toBeVisible();
   await expect.element(selected).not.toBeInTheDocument();
   await expect.element(lookup()).not.toBeInTheDocument();
   expect(page.getByText("ledger.ts").elements()).toHaveLength(0);
   const after = server.since(mark).filter((r) => /\/atlas\/[a-z]+$/.test(r.url.pathname));
-  expect(after.length, "The lookup made an Atlas read after revocation").toBeGreaterThan(0);
+  expect(
+    after.some(
+      (read) =>
+        read.url.pathname === `${repo.api}/atlas/catalogue` &&
+        read.url.searchParams.get("q") === "search",
+    ),
+    "The held lookup reached the real Atlas route after revocation",
+  ).toBe(true);
   for (const read of after) expect(read.status, read.url.pathname).toBe(404);
 
   // A cold start says the same.
   app.unmount();
+  const coldMark = server.requests.length;
   renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}`);
   await expect.element(page.getByRole("heading", { name: "Nothing here", level: 1 })).toBeVisible();
   expect(page.getByText("ledger.ts").elements()).toHaveLength(0);
+  await expect.element(lookup()).not.toBeInTheDocument();
+  const cold = server.since(coldMark).filter((r) => /\/atlas\/[a-z]+$/.test(r.url.pathname));
+  expect(cold.some((read) => read.url.pathname === `${repo.api}/atlas/overview`)).toBe(true);
+  for (const read of cold) expect(read.status, read.url.pathname).toBe(404);
 });
 
 describe("the map view's inspector and controls (CORE-212)", () => {

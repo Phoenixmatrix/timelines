@@ -45,8 +45,8 @@ export async function publish({
   }
   const server = sourceEnv.GITMATRIX_URL;
   const token = sourceEnv.GITMATRIX_TOKEN;
-  const owner = sourceEnv.GITMATRIX_OWNER;
-  if (!server || !token || !owner)
+  const space = sourceEnv.GITMATRIX_SPACE;
+  if (!server || !token || !space)
     throw new Error("CLI publication requires CI registry credentials.");
   const env = {
     ...sourceEnv,
@@ -65,7 +65,7 @@ export async function publish({
   for (const release of releases(platform, arch)) {
     const target = `gm/${version}/${release.platform}/gm`;
     // Only a genuine 404 permits publication; auth/network failures fail CI.
-    const status = await request(`${server.replace(/\/$/, "")}/generic/${owner}/${target}`, {
+    const status = await request(`${server.replace(/\/$/, "")}/generic/${space}/${target}`, {
       method: "HEAD",
       headers: { authorization: `Bearer ${token}` },
     }).then((response) => response.status);
@@ -136,7 +136,7 @@ export async function publish({
   for (const release of missing) {
     const binary = release.target ? resolve(output, release.target, "release/gm") : gm;
     const target = `gm/${version}/${release.platform}/gm`;
-    const artifact = JSON.parse(run(gm, ["pkg", "upload", binary, target, "--owner", owner], env));
+    const artifact = JSON.parse(run(gm, ["pkg", "upload", binary, target, "--space", space], env));
     console.log(
       JSON.stringify({ event: "cli.published", version, platform: release.platform, artifact }),
     );

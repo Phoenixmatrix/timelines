@@ -3,7 +3,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { describe, expect, test } from "vite-plus/test";
 import type { Issue, Snapshot } from "../../../shared/tracker.ts";
-import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimeline.tsx";
+import {
+  doneInLinks,
+  DoneInTimelineCallout,
+  LockedStatusHint,
+  lockedIn,
+} from "./DoneInTimeline.tsx";
 import { StateDot, StateLegend } from "./Log.tsx";
 import { IssueState } from "./ui.tsx";
 
@@ -23,14 +28,14 @@ const issue = (fields: Partial<Issue> = {}): Issue => ({
   priority: 2,
   assigneeId: null,
   parentId: null,
-  workspaceIds: [],
+  projectIds: [],
   labels: [],
   claim: null,
   doneIn,
   ...fields,
 });
 const snapshot = {
-  owner: { id: "o", slug: "priya", displayName: "Priya" },
+  space: { id: "o", slug: "priya", displayName: "Priya" },
   members: [],
   agents: [],
   requests: [],
@@ -41,6 +46,19 @@ const snapshot = {
 const html = (node: ReactNode) => renderToStaticMarkup(createElement(MemoryRouter, null, node));
 
 describe("done in a timeline on an issue", () => {
+  test("timeline navigation retains Project filters, source context and evidence fragments", () => {
+    expect(
+      doneInLinks("orbit", "CORE-1", "shipping", {
+        search: "?q=project%3Amobile&source=source-1&tl=main",
+        hash: "#evidence-1",
+      }),
+    ).toEqual({
+      issue:
+        "/tracker/orbit/issues/CORE-1?q=project%3Amobile&source=source-1&tl=shipping#evidence-1",
+      timeline:
+        "/tracker/orbit/timelines?q=project%3Amobile&source=source-1&tl=shipping#evidence-1",
+    });
+  });
   test("main shows where it was done, that the status is locked, and the way there", () => {
     const callout = html(createElement(DoneInTimelineCallout, { issue: issue(), snapshot }));
     expect(callout).toContain('href="/tracker/priya/timelines?tl=search"');
@@ -65,11 +83,11 @@ describe("done in a timeline on an issue", () => {
   test("the locked status picker explains itself and links to the issue in its timeline", () => {
     expect(lockedIn(issue())).toEqual(doneIn);
     expect(lockedIn(issue({ status: "done" }))).toBeNull();
-    const hint = html(createElement(LockedStatusHint, { issue: issue(), owner: "priya" }));
+    const hint = html(createElement(LockedStatusHint, { issue: issue(), space: "priya" }));
     expect(hint).toContain("Locked while it");
     expect(hint).toContain('href="/tracker/priya/issues/CORE-1?tl=search"');
     expect(
-      html(createElement(LockedStatusHint, { issue: issue({ status: "todo" }), owner: "priya" })),
+      html(createElement(LockedStatusHint, { issue: issue({ status: "todo" }), space: "priya" })),
     ).toBe("");
   });
 

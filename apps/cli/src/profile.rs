@@ -62,7 +62,7 @@ impl InterventionMode {
                 "checkpoint what you tried and open a durable request on the issue with `gm issue ask`, ",
                 "rather than stopping the whole session for a chat reply. Use `--kind decision` with repeated ",
                 "`--choice` options for multiple choice, `--kind question` for an answer or blocker, ",
-                "`--kind approval` for permission, or `--kind credential --secret owner/repo:NAME` for a secret. ",
+                "`--kind approval` for permission, or `--kind credential --secret space/repo:NAME` for a secret. ",
                 "Include the blocker, its impact, options/tradeoffs and the specific action needed; never include secrets. ",
                 "Check existing requests to avoid duplicate asks. Link dependency blockers with `gm issue link BLOCKER ISSUE`; ",
                 "a link alone does not request human action. Requests go to your accountable person's Needs you panel ",
@@ -94,9 +94,9 @@ pub fn intervention(project: &Project, local: &Local) -> InterventionMode {
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
-    /// Tracker account or organization slug.
+    /// Immutable global Space handle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
+    pub space: Option<String>,
     /// Team key `gm issue next` picks from, e.g. CORE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
@@ -104,7 +104,7 @@ pub struct Scope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub under: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
+    pub project: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
@@ -372,7 +372,7 @@ fn read<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
         .map(Some)
         .map_err(|e| {
             GmError::new("invalid_config", format!("{}: {e}", path.display()))
-                .hint("Fix the file, or delete it and rerun `gm agent setup`.")
+                .hint("Use tracker.space (or scope.space) and project instead of owner/workspace after verifying the mapped Space. Fix the file and rerun; do not discard queued replica data.")
         })
 }
 
@@ -384,6 +384,14 @@ pub fn local_at(root: &Path) -> Result<Option<Local>> {
     read(&root.join(LOCAL_FILE))
 }
 
+/// Validate scope before commands can use advisory defaults from `current`.
+pub fn validate_current() -> Result<()> {
+    if let Some(root) = root() {
+        project_at(&root)?;
+        local_at(&root)?;
+    }
+    Ok(())
+}
 /// This checkout's configuration, if any; a broken file counts as none here
 /// (`gm agent setup` reports the error).
 pub fn current() -> (Project, Local) {
@@ -473,7 +481,7 @@ fn resolve(project: &Project, local: &Local) -> Defaults {
         team_from,
         agent: local.name.clone(),
         scope: Scope {
-            owner: pick(&local.scope.owner, &project.tracker.owner),
+            space: pick(&local.scope.space, &project.tracker.space),
             // A checkout scoped under an issue isn't also limited by the project's team.
             team: if local.scope.under.is_some() {
                 local.scope.team.clone()
@@ -481,7 +489,7 @@ fn resolve(project: &Project, local: &Local) -> Defaults {
                 pick(&local.scope.team, &project.tracker.team)
             },
             under: pick(&local.scope.under, &project.tracker.under),
-            workspace: pick(&local.scope.workspace, &project.tracker.workspace),
+            project: pick(&local.scope.project, &project.tracker.project),
         },
         ttl: local.ttl.or(project.ttl).unwrap_or(DEFAULT_TTL),
         intervention: intervention(project, local),
@@ -553,14 +561,14 @@ mod tests {
     #[test]
     fn a_checkout_overrides_the_project() {
         let project: Project = serde_yaml_ng::from_str(
-            "tracker:\n  owner: orbit\n  team: CORE\nttl: 3600\ninstructions:\n  ship: gm push\n",
+            "tracker:\n  space: orbit\n  team: CORE\nttl: 3600\ninstructions:\n  ship: gm push\n",
         )
         .unwrap();
         let local: Local =
             serde_yaml_ng::from_str("name: builder\nscope:\n  under: CORE-4\n").unwrap();
         let d = resolve(&project, &local);
         assert_eq!(d.agent.as_deref(), Some("builder"));
-        assert_eq!(d.scope.owner.as_deref(), Some("orbit"));
+        assert_eq!(d.scope.space.as_deref(), Some("orbit"));
         // Under an issue, the project's team no longer narrows it.
         assert_eq!(
             (d.scope.under.as_deref(), d.scope.team),
@@ -582,6 +590,23 @@ mod tests {
         assert!(serde_yaml_ng::from_str::<Project>("tracker:\n  teem: CORE\n").is_err());
         let text = serde_yaml_ng::to_string(&local).unwrap();
         assert_eq!(serde_yaml_ng::from_str::<Local>(&text).unwrap(), local);
+    }
+
+    #[test]
+    fn legacy_scope_is_rejected_instead_of_broadening_selection() {
+        for text in [
+            "tracker:\n  owner: orbit\n",
+            "tracker:\n  workspace: launch\n",
+            "tracker:\n  space: orbit\n  owner: other\n",
+        ] {
+            assert!(serde_yaml_ng::from_str::<Project>(text).is_err());
+        }
+        assert!(serde_yaml_ng::from_str::<Local>("scope:\n  owner: orbit\n").is_err());
+        assert!(serde_yaml_ng::from_str::<Local>("scope:\n  workspace: launch\n").is_err());
+        let config: Project =
+            serde_yaml_ng::from_str("tracker:\n  space: orbit\n  project: launch\n").unwrap();
+        assert_eq!(config.tracker.space.as_deref(), Some("orbit"));
+        assert_eq!(config.tracker.project.as_deref(), Some("launch"));
     }
 
     #[test]

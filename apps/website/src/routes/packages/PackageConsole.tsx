@@ -101,7 +101,7 @@ const CELLS = {
 const CHECKBOX = "m-0 size-4 cursor-pointer accent-signal";
 
 export async function packageConsoleLoader({ request, params }: LoaderFunctionArgs) {
-  const owner = params.owner ?? "";
+  const space = params.space ?? "";
   const format = params.format as FormatId;
   const name = params["*"] ?? "";
   const url = new URL(request.url);
@@ -111,7 +111,7 @@ export async function packageConsoleLoader({ request, params }: LoaderFunctionAr
     ? `${DEFAULT_QUERY} ${filterToken("branch", scopeBookmark(scope))}`
     : DEFAULT_QUERY;
   const query = url.searchParams.get("q") ?? defaultQuery;
-  const base = packageApi(owner, format, name);
+  const base = packageApi(space, format, name);
   const detail = load<PackageDetail>(base, request);
   // Awaited below; an abort mid-navigation mustn't surface as unhandled first.
   detail.catch(() => undefined);
@@ -595,7 +595,7 @@ function StatusChip({ status }: { status: PublishRow["status"] }) {
 
 function VersionRow({
   row,
-  owner,
+  space,
   selected,
   selectable,
   onSelect,
@@ -603,14 +603,14 @@ function VersionRow({
   contentsHref,
 }: {
   row: PublishRow;
-  owner: string;
+  space: string;
   selected: boolean;
   selectable: boolean;
   onSelect: (row: PublishRow, extend: boolean) => void;
   onFilter: (key: QueryKey, value: string) => void;
   contentsHref: string;
 }) {
-  const [repoOwner, repoName] = row.repo?.split("/") ?? [];
+  const [repoSpace, repoName] = row.repo?.split("/") ?? [];
   return (
     <div
       role="row"
@@ -651,9 +651,9 @@ function VersionRow({
         <StatusChip status={row.status} />
       </span>
       <span role="cell" className={CELLS.source}>
-        {row.repo && repoOwner && repoName ? (
-          <Link to={repoPath(repoOwner, repoName)} className={`${link} truncate`} title={row.repo}>
-            {repoOwner === owner ? repoName : row.repo}
+        {row.repo && repoSpace && repoName ? (
+          <Link to={repoPath(repoSpace, repoName)} className={`${link} truncate`} title={row.repo}>
+            {repoSpace === space ? repoName : row.repo}
           </Link>
         ) : (
           <span
@@ -665,9 +665,9 @@ function VersionRow({
         )}
       </span>
       <span role="cell" className={CELLS.commit}>
-        {row.commit && repoOwner && repoName && (
+        {row.commit && repoSpace && repoName && (
           <Link
-            to={commitPanelUrl(repoOwner, repoName, row.commit)}
+            to={commitPanelUrl(repoSpace, repoName, row.commit)}
             className="mk-chip mk-chip--tag mk-mono no-underline"
             title={`Open commit ${shortOid(row.commit)} in ${row.repo}`}
           >
@@ -690,8 +690,8 @@ function VersionRow({
         )}
       </span>
       <span role="cell" className={`${CELLS.run} font-mono`}>
-        {row.runNumber !== null && repoOwner && repoName && (
-          <Link to={repoPath(repoOwner, repoName, "ci", String(row.runNumber))} className={link}>
+        {row.runNumber !== null && repoSpace && repoName && (
+          <Link to={repoPath(repoSpace, repoName, "ci", String(row.runNumber))} className={link}>
             #{row.runNumber}
           </Link>
         )}
@@ -844,7 +844,7 @@ function VersionTable({
                 {r ? (
                   <VersionRow
                     row={r}
-                    owner={data.detail.owner.slug}
+                    space={data.detail.space.slug}
                     selected={selection.all || selection.versions.has(r.version)}
                     selectable={selectable}
                     onSelect={(r, extend) => onSelect(r, extend, selectableRows)}
@@ -1155,7 +1155,7 @@ function Sources({ detail, base }: { detail: PackageDetail; base: string }) {
             className="mk-input mk-input--code min-w-0 flex-1 text-body-sm"
             value={repo}
             onChange={(e) => setRepo(e.currentTarget.value)}
-            placeholder={`${detail.owner.slug}/repository`}
+            placeholder={`${detail.space.slug}/repository`}
             aria-label="Repository to allow"
             aria-invalid={error ? "true" : undefined}
           />
@@ -1196,8 +1196,8 @@ export function PackageConsole() {
   useRememberPlace({
     kind: "package",
     title: pkg.name,
-    detail: `${formatLabel(pkg.format)} · ${detail.owner.slug}`,
-    to: packagePath(detail.owner.slug, pkg.format, pkg.name),
+    detail: `${formatLabel(pkg.format)} · ${detail.space.slug}`,
+    to: packagePath(detail.space.slug, pkg.format, pkg.name),
   });
   const selectable = detail.actions.length > 0;
   // A query that doesn't parse keeps the last results on screen, dimmed.
@@ -1307,12 +1307,12 @@ export function PackageConsole() {
     <Page wide>
       <header className="flex flex-col gap-3">
         <nav aria-label="Breadcrumb" className="text-body-sm text-ink-muted">
-          <Link to={`/${detail.owner.slug}`} className="text-ink-muted no-underline hover:text-ink">
-            {detail.owner.slug}
+          <Link to={`/${detail.space.slug}`} className="text-ink-muted no-underline hover:text-ink">
+            {detail.space.slug}
           </Link>
           <span className="px-1.5 text-ink-faint">/</span>
           <Link
-            to={packagesPath(detail.owner.slug)}
+            to={packagesPath(detail.space.slug)}
             className="text-ink-muted no-underline hover:text-ink"
           >
             Packages

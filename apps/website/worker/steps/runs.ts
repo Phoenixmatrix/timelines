@@ -3,12 +3,13 @@
 
 import type { StepJobResult, StepTestSummary } from "../../shared/steps.ts";
 import { db, nowIso } from "../schema.ts";
+import { resolveRunAuthority } from "../ci/admission.ts";
 
 const JOB_STATUSES = new Set(["succeeded", "failed", "cancelled", "skipped"]);
 
 /** Record a finished step run's test summary. Not a step run: nothing. */
-export async function recordStepRun(d1: D1Database, runId: string): Promise<boolean> {
-  const kdb = db(d1);
+export async function recordStepRun(env: Env, runId: string): Promise<boolean> {
+  const kdb = db(env.DB);
   const run = await kdb
     .selectFrom("ci_runs")
     .select(["repo_id", "commit_oid", "status", "step"])
@@ -41,6 +42,7 @@ export async function recordStepRun(d1: D1Database, runId: string): Promise<bool
     failed: jobs.filter((job) => job.status === "failed").length,
     jobs,
   };
+  await resolveRunAuthority(env, runId);
   await kdb
     .insertInto("step_artifacts")
     .values({

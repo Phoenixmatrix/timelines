@@ -18,8 +18,13 @@ const KIND_LABEL = {
 export async function goLoader({ params, request }: LoaderFunctionArgs) {
   const ref = (params["*"] ?? "").trim();
   const url = new URL(request.url);
+  if (url.searchParams.has("owner"))
+    throw new Response(
+      "This reference uses an obsolete owner scope. Open it with an explicit space parameter.",
+      { status: 400 },
+    );
   const context: RefContext = {};
-  for (const key of ["owner", "repo", "tracker"] as const) {
+  for (const key of ["space", "repo", "tracker"] as const) {
     const value = url.searchParams.get(key);
     if (value) context[key] = value;
   }
@@ -68,7 +73,7 @@ export function GoPage() {
                 <span className="text-body-sm text-ink-faint">
                   {KIND_LABEL[target.kind]}
                   {target.kind === "issue" ? ` in the ${target.tracker} tracker` : ""}
-                  {target.kind === "package" ? ` in ${target.owner}'s packages` : ""}
+                  {target.kind === "package" ? ` in ${target.space}'s packages` : ""}
                 </span>
               </Link>
             </li>

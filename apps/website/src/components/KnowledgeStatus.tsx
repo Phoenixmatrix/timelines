@@ -70,7 +70,7 @@ function describe(status: KnowledgeStatus): string {
  * revalidates the page when the graph changes or the build finishes, so new
  * content appears on its own.
  */
-export function useKnowledgeStatus(owner: string, name: string, initial: KnowledgeStatus) {
+export function useKnowledgeStatus(space: string, name: string, initial: KnowledgeStatus) {
   const [status, setStatus] = useState(initial);
   const revalidator = useRevalidator();
   const wasBusy = useRef(initial.state === "building" || initial.state === "queued");
@@ -86,7 +86,7 @@ export function useKnowledgeStatus(owner: string, name: string, initial: Knowled
     const timer = setTimeout(
       async () => {
         try {
-          const next = await api<KnowledgeStatus>(`/repos/${owner}/${name}/knowledge/status`);
+          const next = await api<KnowledgeStatus>(`/repos/${space}/${name}/knowledge/status`);
           setStatus(next);
           const nowBusy = next.state === "building" || next.state === "queued";
           // A build writes the graph and wiki pages long before it finishes: show
@@ -104,7 +104,7 @@ export function useKnowledgeStatus(owner: string, name: string, initial: Knowled
       later ? 30_000 : 2000,
     );
     return () => clearTimeout(timer);
-  }, [status, owner, name, revalidator]);
+  }, [status, space, name, revalidator]);
 
   return status;
 }
@@ -115,7 +115,7 @@ export function KnowledgeStatusPill({
 }: {
   status: KnowledgeStatus;
   /** Given, a repository admin can start a pending update now (CORE-286). */
-  repo?: { owner: string; name: string };
+  repo?: { space: string; name: string };
 }) {
   const busy = status.state === "building" || status.state === "queued";
   const dot = busy
@@ -150,7 +150,7 @@ export function KnowledgeStatusPill({
           onClick={async () => {
             setAsked("asking");
             try {
-              await api(`/repos/${repo.owner}/${repo.name}/knowledge/update`, { method: "POST" });
+              await api(`/repos/${repo.space}/${repo.name}/knowledge/update`, { method: "POST" });
               setAsked("asked");
             } catch {
               setAsked("failed");

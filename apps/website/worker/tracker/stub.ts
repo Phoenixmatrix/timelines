@@ -1,7 +1,7 @@
 import { durableStub } from "../durable/registry.ts";
 import type { Tracker } from "./object.ts";
 
-/** The tracker Durable Object for an account. */
-export function trackerObject(env: Env, ownerId: string): DurableObjectStub<Tracker> {
-  return durableStub(env, "Tracker", ownerId);
+/** Immutable Space identity preserves the mapped Tracker's physical Durable Object. */
+export function trackerObject(env: Env, spaceId: string): DurableObjectStub<Tracker> {
+  return durableStub(env, "Tracker", spaceId);
 }

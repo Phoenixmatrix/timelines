@@ -1,4 +1,4 @@
-// Auth hygiene (site category "auth-hygiene", CORE-206): sign-in state that
+// Auth hygiene (Instance category "auth-hygiene", CORE-206): sign-in state that
 // ended more than `days` before the run's moment. Each table's own expiry:
 // - auth_sessions (`expiresAt`): expired sign-in sessions;
 // - auth_verifications (`expiresAt`): emailed sign-in codes;
@@ -75,7 +75,7 @@ interface Item {
 }
 
 function cutoff(ctx: CleanupContext): string {
-  if (ctx.target.scope !== "site") throw new Error("auth-hygiene is a site category.");
+  if (ctx.target.kind !== "instance") throw new Error("auth-hygiene is an Instance category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("auth-hygiene needs its days threshold.");
   return daysBefore(ctx.now, days);

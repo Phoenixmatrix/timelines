@@ -6,8 +6,7 @@
 // the timelines it was worked in. CI runs, deployments and published
 // packages are found by those commits; landings add their own runs.
 //
-// Only repositories the tracker covers (the owner's, those subscribed to the
-// tracker, and those its timelines touch) are searched, and of those only
+// Only repositories in the tracker's Space are searched, and of those only
 // what the viewer can read is returned: an unreadable repository's items are
 // left out without a trace. Every list is bounded (WORK_LIMIT).
 //
@@ -38,13 +37,14 @@ import { readableRepo, roleFor, selectRepos, type Actor } from "../db.ts";
 import { sql, type Selectable } from "kysely";
 import { db, type Database } from "../schema.ts";
 import type { IssueWork } from "./store.ts";
+import { canReadSpacePackages } from "../../registry/core/acl.ts";
 
 /** Commits looked up for runs, deployments and packages, newest first. */
 const COMMITS = 60;
 
 const enc = encodeURIComponent;
 const repoHref = (repo: WorkRepo, ...rest: string[]) =>
-  `/${repo.owner}/${repo.name}${rest.length ? `/${rest.join("/")}` : ""}`;
+  `/${repo.space}/${repo.name}${rest.length ? `/${rest.join("/")}` : ""}`;
 /**
  * The commit panel (CORE-22): the repository's page with `?commit=<full sha>`,
  * in the work source that has the commit when it isn't main's (CORE-296).
@@ -66,33 +66,20 @@ function chunks<T>(items: T[], size = 90): T[][] {
 export async function linkedWork(
   env: Env,
   actor: Actor,
-  owner: { id: string; slug: string },
+  space: { id: string; slug: string },
   work: IssueWork,
 ): Promise<LinkedWork> {
   const k = db(env.DB);
   const { issue } = work;
   let truncated = false;
 
-  // The repositories the tracker covers, then the ones the viewer can read.
-  const timelineRepoIds = work.timelines.flatMap(({ timeline }) => timeline.repos.map((r) => r.id));
-  const subscribed = await k
-    .selectFrom("tracker_repo_subscriptions")
-    .select("repo_id")
-    .where("tracker_owner_id", "=", owner.id)
-    .execute();
-  const candidates = new Set([...subscribed.map((r) => r.repo_id), ...timelineRepoIds]);
-  const scope = await selectRepos(env.DB, actor.id)
-    .where((eb) =>
-      eb.or([
-        eb("r.owner_id", "=", owner.id),
-        ...(candidates.size ? [eb("r.id", "in", [...candidates])] : []),
-      ]),
-    )
-    .execute();
+  // Associations are discovery only; even corrupt cross-Space subscriptions
+  // or timeline references cannot widen the authoritative repository scope.
+  const scope = await selectRepos(env.DB, actor.id).where("r.space_id", "=", space.id).execute();
   const readable = new Map<string, WorkRepo>();
   for (const row of scope)
     if (roleFor(row, actor) !== "none")
-      readable.set(row.id, { id: row.id, owner: row.owner_slug, name: row.name });
+      readable.set(row.id, { id: row.id, space: row.space_slug, name: row.name });
   const repoIds = [...readable.keys()];
 
   const commits = new Map<string, WorkCommit>();
@@ -196,7 +183,7 @@ export async function linkedWork(
     ? await k
         .selectFrom("release_note_entries")
         .select(["repo_id", "release", "title", "category", "commits", "shipped_at"])
-        .where("tracker_owner_id", "=", owner.id)
+        .where("tracker_space_id", "=", space.id)
         .where("issue_key", "=", issue.key)
         .where("repo_id", "in", repoIds)
         .orderBy("shipped_at", "desc")
@@ -230,7 +217,7 @@ export async function linkedWork(
   const landingRuns: { repoId: string; number: number }[] = [];
   const checkpointIds: string[] = [];
   for (const { timeline, checkpoints, landings } of work.timelines) {
-    const href = `/tracker/${enc(owner.slug)}/timelines?tl=${enc(timeline.slug)}`;
+    const href = `/tracker/${enc(space.slug)}/timelines?tl=${enc(timeline.slug)}`;
     timelines.push({
       id: timeline.id,
       slug: timeline.slug,
@@ -374,14 +361,14 @@ export async function linkedWork(
   if (deployments.length > WORK_LIMIT) truncated = true;
 
   // Packages published from those commits.
-  const packages = await packagesOf(env, byRepo, readable);
+  const packages = await packagesOf(env, actor, byRepo, readable);
   if (packages.length > WORK_LIMIT) truncated = true;
 
   // Commits that mention it (CORE-22), apart from the evidence above.
   const mentionRows = await k
     .selectFrom("commit_issue_mentions as m")
     .innerJoin("repos as r", "r.id", "m.repo_id")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .innerJoin("spaces as s", "s.id", "r.space_id")
     .select([
       "m.repo_id",
       "m.commit_oid",
@@ -392,9 +379,10 @@ export async function linkedWork(
       "m.pushed_at",
       "m.source_id",
       "r.name",
-      "o.slug as owner_slug",
+      "s.slug as space_slug",
     ])
-    .where("m.tracker_owner_id", "=", owner.id)
+    .where("m.tracker_space_id", "=", space.id)
+    .where("r.space_id", "=", space.id)
     .where("m.issue_id", "=", issue.id)
     .where("m.resolution", "=", "linked")
     .where("r.deleted_at", "is", null)
@@ -407,11 +395,14 @@ export async function linkedWork(
   const mentioned = new Map<string, WorkRepo>();
   const mentionedOids = new Map<string, string[]>();
   for (const row of mentionRows.slice(0, WORK_LIMIT)) {
-    mentioned.set(row.repo_id, { id: row.repo_id, owner: row.owner_slug, name: row.name });
+    mentioned.set(row.repo_id, { id: row.repo_id, space: row.space_slug, name: row.name });
     mentionedOids.set(row.repo_id, [...(mentionedOids.get(row.repo_id) ?? []), row.commit_oid]);
   }
   const [mentionRuns, mentionPackages] = mentionRows.length
-    ? await Promise.all([runsOf(k, mentionedOids), packagesOf(env, mentionedOids, mentioned)])
+    ? await Promise.all([
+        runsOf(k, mentionedOids),
+        packagesOf(env, actor, mentionedOids, mentioned),
+      ])
     : [[], []];
   const mentions: WorkMention[] = mentionRows.slice(0, WORK_LIMIT).map((row) => {
     const repo = mentioned.get(row.repo_id)!;
@@ -488,6 +479,7 @@ function workRun(row: Selectable<Database["ci_runs"]>, repo: WorkRepo): WorkRun 
 /** Packages published from `byRepo`'s commits, newest first, in `readable` repositories. */
 async function packagesOf(
   env: Env,
+  actor: Actor,
   byRepo: Map<string, string[]>,
   readable: Map<string, WorkRepo>,
 ): Promise<WorkPackage[]> {
@@ -495,7 +487,8 @@ async function packagesOf(
     format: string;
     name: string;
     version: string;
-    owner_id: string;
+    space_id: string;
+    visibility: "public" | "internal" | "private";
     commit_oid: string;
     git_repo_id: string;
     at: string;
@@ -503,7 +496,7 @@ async function packagesOf(
   for (const [repoId, oids] of byRepo)
     for (const part of chunks(oids, 80)) {
       const { results } = await env.REGISTRY_DB.prepare(
-        `SELECT u.format, p.name, u.version, r.owner_id, u.commit_oid, u.git_repo_id, u.at
+        `SELECT u.format, p.name, u.version, r.space_id, r.visibility, u.commit_oid, u.git_repo_id, u.at
          FROM publishes u
          JOIN packages p ON p.id = u.package_id
          JOIN repositories r ON r.id = u.feed_id
@@ -515,28 +508,29 @@ async function packagesOf(
         .all<(typeof publishRows)[number]>();
       publishRows.push(...results);
     }
-  const feedOwners = [...new Set(publishRows.map((row) => row.owner_id))];
-  const ownerSlugs = feedOwners.length
+  const feedSpaces = [...new Set(publishRows.map((row) => row.space_id))];
+  const spaceSlugs = feedSpaces.length
     ? new Map(
         (
           await db(env.DB)
-            .selectFrom("accounts")
+            .selectFrom("spaces")
             .select(["id", "slug"])
-            .where("id", "in", feedOwners)
+            .where("id", "in", feedSpaces)
             .execute()
         ).map((a) => [a.id, a.slug]),
       )
     : new Map<string, string>();
   const packages: WorkPackage[] = [];
   for (const row of publishRows) {
-    const slug = ownerSlugs.get(row.owner_id);
+    const slug = spaceSlugs.get(row.space_id);
     const repo = readable.get(row.git_repo_id);
     if (!slug || !repo) continue;
+    if (!(await canReadSpacePackages(env.DB, actor, row.space_id, row.visibility))) continue;
     packages.push({
       format: row.format,
       name: row.name,
       version: row.version,
-      owner: slug,
+      space: slug,
       commit: row.commit_oid,
       repo,
       at: row.at,

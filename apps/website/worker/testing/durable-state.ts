@@ -23,8 +23,19 @@ export function fakeContainer(running = true): FakeContainer {
   return container;
 }
 
-export function fakeDurableState(options: { name?: string; container?: FakeContainer } = {}) {
-  const db = new DatabaseSync(":memory:");
+export function fakeDurableObjectId(name?: string): DurableObjectId {
+  return {
+    name,
+    toString: () => name ?? "id",
+    equals: (other: DurableObjectId) => other.toString() === (name ?? "id"),
+  };
+}
+
+export function fakeDurableState(
+  options: { name?: string; container?: FakeContainer; db?: DatabaseSync } = {},
+) {
+  // A given database (a restored snapshot) stands in for a fresh empty one.
+  const db = options.db ?? new DatabaseSync(":memory:");
   const kv = () => db.exec("CREATE TABLE IF NOT EXISTS _cf_KV (key TEXT PRIMARY KEY, value TEXT)");
   let alarm: number | null = null;
   const aborted: string[] = [];
@@ -41,10 +52,17 @@ export function fakeDurableState(options: { name?: string; container?: FakeConta
           [Symbol.iterator]: () => [][Symbol.iterator](),
         };
       }
-      const rows = db.prepare(query).all(...(bindings as SQLInputValue[])) as Record<
-        string,
-        unknown
-      >[];
+      // Native DO SQL binds/returns ArrayBuffer; node:sqlite uses byte views.
+      const inputs = bindings.map((value) =>
+        value instanceof ArrayBuffer ? new Uint8Array(value) : value,
+      ) as SQLInputValue[];
+      const rows = db.prepare(query).all(...inputs) as Record<string, unknown>[];
+      for (const row of rows) {
+        for (const [key, value] of Object.entries(row)) {
+          if (value instanceof Uint8Array)
+            row[key] = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+        }
+      }
       return {
         toArray: () => rows,
         one: () => {
@@ -126,7 +144,7 @@ export function fakeDurableState(options: { name?: string; container?: FakeConta
   };
 
   const ctx = {
-    id: { name: options.name, toString: () => options.name ?? "id" },
+    id: fakeDurableObjectId(options.name),
     storage,
     container: options.container,
     waitUntil: () => {},

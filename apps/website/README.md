@@ -15,10 +15,41 @@ names and sender addresses remain unchanged. The production application uses
 Sign-in email display names and copy use Timelines.
 
 ```
-git client ──Basic user:token──▶ Worker /:owner/:repo.git/*  ──Bearer art_…──▶ Artifacts git remote
+git client ──Basic user:token──▶ Worker /:space/:repo.git/*  ──Bearer art_…──▶ Artifacts git remote
 browser    ──cookie──▶ Worker /api/*  ──env.ARTIFACTS──▶ log / readTree / readFile
-                          └── D1: accounts, org_members, repos, repo_collaborators, access_tokens
+                          └── D1: accounts, organizations, organization_members, spaces, space_grants, repos, repo_collaborators, access_tokens
 ```
+
+### Organizations, Spaces and people
+
+An Account is a person, not a content tenant. Organizations are company or
+private personal tenants; each has a persisted default Space. A Space owns
+repositories, its Tracker, Projects, packages and content policy. Its globally
+unique handle and Organization association are immutable. Person profiles live at
+`/accounts/:person`, Organization directories at `/organizations/:organization`,
+Space homes at `/:space`, and Trackers at `/tracker/:space`. The Space home's
+Repositories section creates repositories at `/:space/-/repositories/new`.
+Personal shortcuts use the persisted personal Organization/default Space, never
+an inferred Account slug.
+
+Organization owners administer the directory and explicit grants; they do not
+inherit private content access. A current Space grant joined to current
+Organization membership gives `admin` or `member` access, with independent
+repository and package baselines (`none`, `read`, `write`). Removing membership
+revokes those grants. Direct repository collaborators retain only that resource's
+rights; public resources remain public. Existing Instance operator powers stay
+separate and do not grant Tracker membership. Space retention and usage require
+an explicit admin grant even for an Instance operator.
+Directory/grant administration does not wrap content settings: explicit members
+can read Space AI settings and providers, while the existing separate Instance
+AI-configuration powers remain unchanged.
+
+Content JSON requests use `X-Gitmatrix-Content-Version: 4`; snapshots and changes
+bind immutable Space ID and migration epoch. Mutations carry
+`{contractVersion:4, spaceId, migrationEpoch, operationId, mutations, timeline?}`.
+Missing/unsupported contracts and mismatched epochs fail closed; old tracker
+Workspace APIs and filters are not aliases. Git and package protocols retain
+their standard transports and canonical Space-qualified locators.
 
 ## Run it
 
@@ -58,8 +89,10 @@ patch makes local `cf d1` commands exit normally; do not terminate them early
 after merely seeing output.
 
 The canonical source host remains a separate, owner-managed environment:
-from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port 5180 and
-`.wrangler/state`. Its AI is opt-in: plain `vp dev` binds no Workers AI, AI
+from this directory, `vp run db:migrate` and `vp dev` use port 5180 and
+`.wrangler/state`. Run `vp run db:seed` only after canonical-v4 bootstrap, never
+against an uninitialized or nonempty legacy installation. Its AI is opt-in:
+plain `vp dev` binds no Workers AI, AI
 Gateway, Vectorize or AI Search and prints `AI is off` when it starts;
 `GITMATRIX_DEV_AI=enabled vp dev` binds the shared development resources
 (`gitmatrix-dev`, `gitmatrix-knowledge`, `gitmatrix`), and every repository
@@ -137,6 +170,14 @@ Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
 Locator text with an apostrophe is safer as a RegExp. Restore what a test
 changes in the page (viewport, theme, emulated media) in a `finally`.
 
+Before sending another keyboard chord, wait for the route's committed render,
+not only the router's advanced location. Before measuring requests attributable
+to an interaction, observe the initial view's loaded content: a quiet request
+counter does not prove that pending responses and their follow-up effects have
+finished. For bounded polling, verify automatic completion, the paused state,
+manual recovery and no further requests; busy loaders may legitimately skip
+individual interval ticks.
+
 Polling tests should fake only their interval clocks, leaving runner timeouts
 and browser actions on real time. Hold a response behind a promise to exercise
 the busy state and its elapsed-time bound; release it in `onTestFinished` too.
@@ -170,10 +211,10 @@ removes expired observations even when refresh fails, and says explicitly that
 this is approximate—not proof that an agent remains online or is editing.
 Deployment presence loads only when expanded.
 
-The read-only endpoints are `/repos/:owner/:name/ci/runs/:number/presence`,
-`/repos/:owner/:name/deployments/:id/presence`,
-`/repos/:owner/:name/commits/:oid/presence`, and
-`/tracker/:owner/timelines/:slug/presence`, all under `/api`. Existing resource
+The read-only endpoints are `/repos/:space/:name/ci/runs/:number/presence`,
+`/repos/:space/:name/deployments/:id/presence`,
+`/repos/:space/:name/commits/:oid/presence`, and
+`/tracker/:space/timelines/:slug/presence`, all under `/api`. Existing resource
 permissions apply; repository observations are isolated by code source.
 Revoked agents are omitted. D1 retains only the latest observation per
 agent/resource/source, returns at most 30 recent agents, and incrementally
@@ -187,7 +228,7 @@ when no context was recorded; enumerating a list does not mark every item as vis
 
 There is no commit page (CORE-22): any repository page with `?commit=<sha>`
 opens the commit as a side panel over it (`src/routes/repo/CommitPanel.tsx`,
-mounted in the repository layout), and `/<owner>/<repo>?commit=<sha>` opens
+mounted in the repository layout), and `/<space>/<repo>?commit=<sha>` opens
 it over the Code page from anywhere else. A short hash is resolved first.
 Closing it (Escape, ×) returns to the page: Back, when a link on the page
 opened it (parents opened from the panel are Back steps too); otherwise it
@@ -214,7 +255,7 @@ chain; a path's history includes additions, deletions and mode changes but does
 not follow renames. Co-authors (including agents) come from `Co-authored-by`
 commit trailers, not verified account identities.
 
-`GET /api/repos/:owner/:name/history` accepts `at=<ref>/<path>` or `ref` and
+`GET /api/repos/:space/:name/history` accepts `at=<ref>/<path>` or `ref` and
 `path`, plus `entries=true` for immediate-child metadata. Each request scans at
 most 100 commits. `next` is the next commit to scan; pass it as `cursor` and pin
 `ref` to the returned `head` for subsequent pages. The file list loads this
@@ -302,6 +343,110 @@ a shared prefix, a new four-digit name or an invalid timestamp. A migration
 merged after a newer one still applies, since D1 diffs by name, so write each
 one to stand on its own. Update `worker/schema.ts` or `registry/core/db.ts` in
 the same change.
+
+**Fresh canonical-v4 bootstrap and legacy cutover.** Ordinary migrations precede
+Worker startup. Fresh empty application and registry stores are initialized into
+canonical-v4 under the independent control fence before development seeding;
+the harness requires authenticated canonical-v4 readiness first
+(`tools/agent/main.ts`, `worker/space-cutover/canonical-schema.ts`). Nonempty
+legacy business data is not a fresh installation and is never guessed into
+Spaces. It requires a separately reviewed migration or an explicit disposable
+environment reset. Historical migration filenames remain unchanged.
+Native-v4 installations use migration epoch `0`; converted installations use
+their controller's positive epoch. Clients accept both, while still rejecting
+responses and acknowledgements from a different Space or epoch. Runtime-owned
+SQLite naming metadata is not legacy business data and is not exported or
+restored as application state.
+
+The additive preparation migrations do not activate existing installations.
+`node tools/space-cutover.ts --help` exposes the application operator protocol;
+use `cf` separately for Cloudflare operations. This guide does not claim
+production approval or activation.
+Every invocation requires an explicit `--origin` and private `--state` path.
+Keep operator state, cookies and inventory exports outside the source checkout.
+
+1. `inventory --cookie-file FILE --out FILE` reads the installation's current
+   ownership under a human Instance-admin session. Author and review an explicit
+   manifest; no production mapping is inferred. `prepare --manifest FILE
+--checkpoint SHA --cookie-file FILE` saves a new mode-0600 recovery capability
+   before enrollment. If the response is lost, `status` recovers the enrolled
+   run identity without repeating enrollment.
+2. A current human must `approve --digest EXACT_DIGEST --checkpoint SHA
+--cookie-file FILE`. Approval binds that manifest and source checkpoint; it
+   neither fences traffic nor activates migration. `fence` then closes ordinary
+   admission and installs independent application/registry storage fences.
+3. Inspect `status`, run `reconcile-refs` until its fenced pass is clean, then
+   `drain` before `begin`. Artifacts documents no drain for Git writes it has
+   already accepted, and none is needed: Artifacts is outside every checkpoint and
+   the migration never rewrites it, while the storage fence rejects a late write's
+   bookkeeping. `reconcile-refs` lists every repository's and work source's refs
+   in Artifacts, journals each move the push log lacks, and logs it (pusher
+   unknown) through the run's own fenced authority. `begin` refuses until a
+   complete pass finds none.
+   `drain` then acknowledges each consumer only from evidence the journal
+   computes itself: both fences closed, the preparation release still serving,
+   no live tickets, and Cloudflare's documented 15-minute maximum wall time
+   (queues, cron, Durable Object alarms; objects restart on deploy) plus a
+   5-minute margin since the bound start. The bound starts when the release was
+   prepared, and starts again whenever another release served since (a
+   rollback, even one reverted, or a gradual deployment): the journal sees its
+   own version change, and the provider's deployment history shows the rest.
+   After the bound, run `workflow-census --account ACCOUNT_ID --worker NAME`
+   (read-only `cf workflows instances list` of every instance and status, every
+   page, listed twice; `cf workers deployments list`), refused if `cf` is
+   configured for another account. The census is incomplete, and blocks, if
+   D1's in-flight CI runs, Knowledge builds or repository purges name an
+   instance the provider holds but did not list; one the provider doesn't hold
+   is recorded as orphaned. The next `drain` terminates every unticketed
+   instance created before the bound start, journaling each one as it goes;
+   instances created since run this release's admitted code. `begin` also
+   needs a deployment history no older than 10 minutes. `status` shows each
+   acknowledgement's evidence and any terminated instance to re-run after
+   opening. Zero tickets, elapsed time or new-deployment acknowledgements still
+   prove nothing; do not use a production installation to test recovery.
+4. After a proved drain, `begin` and bounded `advance --steps 1..500` persist
+   checkpoints and progress in the independent control journal. Interrupted
+   steps resume from that journal. Before new writes are admitted, `recover`
+   followed by `advance` restores and reconciles the original application,
+   registry and physical Tracker stores. Never restore a business database
+   independently or delete the control journal to clear a fence.
+5. Reopening either reconciled Space ownership or restored legacy ownership
+   requires a separate human release approval. While fenced, use interactive
+   `operator-login --cookie-file NEW_FILE`: the recovery capability initiates a
+   one-time code to the enrolled operator's verified email, and verification
+   saves a 15-minute maintenance-only session. It does not approve a release.
+   `approve-release --digest EXACT_DIGEST --checkpoint SHA --version-id ID
+--mode space|legacy --cookie-file FILE` binds the actual deployed version.
+   `drain` obtains acknowledgements from the required runtime consumers. Run
+   `reconcile-refs` again in the reconciled (or restored) phase;
+   `open-admission` refuses until that phase's latest pass is clean, and also
+   refuses incomplete reconciliation or incompatible runtimes. After opening,
+   `reconcile-refs --cookie-file FILE` (a current session of the enrolled
+   operator) runs one more pass and replays journaled push effects under that
+   person's credential, timeline activity and mentions included, from the
+   push-log entries the barrier wrote. Live pushes race this pass, so it repairs
+   a divergence only once two observations 90 seconds apart agree, no Git
+   request holds an admission ticket and the push log gained nothing for that
+   repository in between; until then it is deferred, and a push that logs
+   itself keeps its pusher. A replay that can't run (no write access in its
+   Space, a failed delivery) is blocked with its reason and holds up nothing
+   else; a person with write access there re-triggers it with
+   `replay-refs --cookie-file THEIR_SESSION --run RUN_ID --replay PASS:REPO:SOURCE`.
+   The barrier is complete when the post-open pass is clean with no pending
+   replays; `status` lists any blocked ones. After a legacy reopening the
+   post-open pass still logs late writes, but journaled effects can't replay on
+   restored stores: they are blocked with that reason.
+   Once new Space writes can enter either database, recovery is forward-only.
+
+The recovery capability is run- and installation-scoped, survives business-store
+restoration, and cannot replace human mapping or release approval. Retain it and
+the original source checkpoint through recovery. A later migration uses a new
+run and monotonically newer epoch without overwriting previous run evidence.
+
+Canonical reconstruction creates each bounded, mutually dependent table group
+and every member's write-fence triggers in one authorized atomic batch. Recovery
+inspects the complete group before replaying lost progress, so interruption at
+a committed table-creation boundary remains restorable from the original checkpoint.
 
 **Parallel pushes.** The deploy job has `concurrency: production`: one deploy per
 repository at a time, and a deploy still waiting when a newer push's run reaches
@@ -512,11 +657,11 @@ into the story. `gm steps --follow` streams the same feed.
 
 A step's why, challenges, tests and coverage are kept as long as the
 repository. Three data-retention categories (CORE-244; see "Retention
-categories" below) cover the rest, on the account's Data retention page:
+categories" below) cover the rest, on the Space's Data retention page:
 `step-steering` trims instructions and steering text to a placeholder a year
 after the step's commit (sources and times stay), `step-artifacts` removes
 step-run summaries after 90 days, and `step-feed` keeps live feed records up
-to 7 days (an account can keep fewer). Like every policy category, the first
+to 7 days (a Space can keep fewer). Like every policy category, the first
 two run once an administrator turns them on.
 
 ### Why on a line
@@ -530,7 +675,7 @@ links to the step in the timeline's story; `gm why` prints the same.
 
 ### The story view
 
-A timeline's **Story** (`/tracker/:owner/timelines/:slug/story`, linked from
+A timeline's **Story** (`/tracker/:space/timelines/:slug/story`, linked from
 the timeline page; `src/routes/tracker/Story.tsx`) lists its commits newest
 first along the first-parent line of the timeline's owned source ref, retained
 after landing; abandoned timelines pin the source's last commit. Historical
@@ -589,10 +734,10 @@ prompt; one generation makes at most `MAX_GENERATION_CALLS` (10) model calls,
 so a refused prompt can't leave someone short without spending more than that.
 
 **Organization icons** (CORE-128) work the same way, under
-`/api/accounts/:slug/avatar` (and `/options`): an org's owners and site admins
-(people, not agents) set, crop, generate (once per organization, from
-logo-style presets) and remove it, from **Change icon** on the organization's
-page (`viewerCanManage` on `AccountPage` shows the control). Icons show as
+`/api/organizations/:organization/avatar` (and `/options`): an Organization's
+owners and Instance operators (people, not agents) set, crop, generate (once per
+Organization, from logo-style presets) and remove it from the Organization page.
+Icons show as
 squircles wherever the organization appears: its page, the rail, repository
 lists and package pages.
 
@@ -634,18 +779,19 @@ rejects persona cookies and dev sign-in/token/seed endpoints; this mechanism is
 not production authentication. Isolated environments require a private capability
 for headless bootstrap. Always use a separate browser context for each environment.
 
-| Persona    | Access                                                         |
-| ---------- | -------------------------------------------------------------- |
-| Priya      | Site admin: admin everywhere                                   |
-| Marco      | Owner of the Orbit Labs org: admin on its repos                |
-| Jun        | Orbit member (read), plus write collaborator on `orbit/engine` |
-| Sam        | Read collaborator on `orbit/engine`; owns private `sam/notes`  |
-| Francois   | hello@fward.me: superuser, also signs in by email code         |
-| Signed out | Public repos, read only                                        |
+| Persona    | Access                                                                           |
+| ---------- | -------------------------------------------------------------------------------- |
+| Priya      | Instance operator; no implicit Tracker membership                                |
+| Marco      | Orbit Labs Organization owner with an explicit Orbit Space admin grant           |
+| Jun        | Orbit Space member (repository read), plus write collaborator on `orbit/engine`  |
+| Sam        | Read collaborator on `orbit/engine`; personal Space contains private `sam/notes` |
+| Francois   | hello@fward.me: superuser, also signs in by email code                           |
+| Signed out | Public repos, read only                                                          |
 
-Roles add up: public → read, org member → the org's base role, collaborator →
-their role, owner/org owner/site admin → admin (`worker/permissions.ts`).
-Repos you can't read return 404, never 403.
+Repository roles combine public read, the explicit Space repository baseline,
+direct collaborator grants and the separately preserved Instance admin power
+(`worker/permissions.ts`). Organization ownership alone contributes no content
+role. Repositories you cannot read return 404, never 403.
 
 ## Git over HTTPS
 
@@ -721,29 +867,30 @@ For direct HTTP clients, use the environment's printed origin and a scoped token
 never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 `/api/dev/environment` require the harness capability in isolated environments.
 
-| Route                                                                                     | Does                                                                           |
-| ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a dev token; capability required in isolated environments                 |
-| `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                                 |
-| `GET /api/session`                                                                        | Who the token or cookie belongs to                                             |
-| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                                |
-| `GET /api/search?q=&categories=&limit=&cursor=`                                           | Global search: see [Global search](#global-search)                             |
-| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                                         |
-| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                                  |
-| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                                          |
-| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                                                  |
-| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                                                           |
-| `GET /api/repos/:owner/:name/semantic?ref=&cursor=&limit=&path=&kind=&language=`          | Individual syntax changes with source links and analysis coverage              |
-| `GET /api/repos/:owner/:name/sources/:sourceId/pushes`                                    | Pending owned-source push operations, including incomplete recovery projection |
-| `GET /api/repos/:owner/:name/sources/:sourceId/pushes/:operationId`                       | Exact retained operation, including terminal outcome and recovery audit        |
-| `POST /api/repos/:owner/:name/sources/:sourceId/pushes/:operationId/recover` `{}`         | Prove acceptance or durably CAS-fence an interrupted owned-source push         |
-| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                                          |
-| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                                    |
-| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie; DELETE also ends an email sign-in                      |
-| `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)                           |
-| `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                                 |
-| `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                                      |
-| `GET\|POST /api/admin/accounts`, `PUT /api/admin/accounts/:username/password`             | Password accounts: create, list, set a new password (site admins, as a person) |
+| Route                                                                                       | Does                                                                               |
+| ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `POST /api/dev/tokens` `{persona, scope?, name?}`                                           | Mint a dev token; capability required in isolated environments                     |
+| `POST /api/dev/seed`                                                                        | Reconcile empty sample repositories (dev only)                                     |
+| `GET /api/session`                                                                          | Who the token or cookie belongs to                                                 |
+| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:person`                          | People and person profiles                                                         |
+| `/api/organizations`, `/api/spaces`                                                         | Organization directory and explicit Space management                               |
+| `GET /api/search?q=&categories=&limit=&cursor=`                                             | Global search: see [Global search](#global-search)                                 |
+| `GET /api/repos`, `POST /api/repos` `{spaceId, name, visibility, description?, importUrl?}` | List, create or import in an immutable Space                                       |
+| `GET\|PATCH\|DELETE /api/repos/:space/:name`                                                | Detail with branches and tags, update, delete                                      |
+| `GET /api/repos/:space/:name/tree?ref=&path=`                                               | Folder listing, latest commit, README                                              |
+| `GET /api/repos/:space/:name/blob?ref=&path=`                                               | File contents                                                                      |
+| `GET /api/repos/:space/:name/commits?ref=&page=`                                            | History, 30 per page                                                               |
+| `GET /api/repos/:space/:name/semantic?ref=&cursor=&limit=&path=&kind=&language=`            | Individual syntax changes with source links and analysis coverage                  |
+| `GET /api/repos/:space/:name/sources/:sourceId/pushes`                                      | Pending owned-source push operations, including incomplete recovery projection     |
+| `GET /api/repos/:space/:name/sources/:sourceId/pushes/:operationId`                         | Exact retained operation, including terminal outcome and recovery audit            |
+| `POST /api/repos/:space/:name/sources/:sourceId/pushes/:operationId/recover` `{}`           | Prove acceptance or durably CAS-fence an interrupted owned-source push             |
+| `GET\|PUT\|DELETE /api/repos/:space/:name/collaborators[/:user]` `{role}`                   | Manage access (admin)                                                              |
+| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                           | Your tokens                                                                        |
+| `POST\|DELETE /api/session` `{accountId}`                                                   | Browser persona cookie; DELETE also ends an email sign-in                          |
+| `/api/identity/*`                                                                           | Better Auth: email codes, device login (`/device/*`)                               |
+| `POST /api/tokens/device` (Bearer: device session)                                          | Trade a one-time device session for a gm token                                     |
+| `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                      | Invitations (site admins)                                                          |
+| `GET\|POST /api/admin/accounts`, `PUT /api/admin/accounts/:username/password`               | Password accounts: create, list, set a new password (Instance admins, as a person) |
 
 ### Renaming a repository in place
 
@@ -791,16 +938,16 @@ glass in the rail (the top bar on phones), from any page but sign-in. Type to
 filter; **↑/↓** choose, **Enter** opens, **Esc** closes and returns focus to where
 you were. It lists, in labelled groups:
 
-- **In owner/name**: the current repository's sections (the same list as its tabs);
+- **In space/name**: the current repository's sections (the same list as its tabs);
 - **Go to**: the app's places (tracker, Needs you, packages, settings…);
 - **Actions**: things to do, such as opening the assistant, and **Create issue
   in …** for each tracker you can use (the current one first);
-- **Repositories**, **Issues**, **Packages**, **People and organizations**,
+- **Repositories**, **Issues**, **Packages**, **People**,
   **Conversations**: from `/api/search` as you type (debounced; signed-in
   only). Issues show their key, status and tracker; packages their format and
-  owner; choosing a conversation reopens it in the assistant.
-- **Find**: **Find a repository…**, **an issue…**, **a person or
-  organization…**, **a package…**, **a conversation…** narrow search to that one
+  Space; choosing a conversation reopens it in the assistant.
+- **Find**: **Find a repository…**, **an issue…**, **a person or organization…**,
+  **a package…**, **a conversation…** narrow search to that one
   category, with up to 20 results instead of 5.
 
 Before anything is typed (CORE-152), the places don't fill the list: it opens
@@ -819,7 +966,7 @@ they are. Each second step (Go to, Find, code and wiki) shows above the input;
   that CI run, `pkg@1.2.0` for that version in its package's console, and a
   timeline's slug (or `timeline/<slug>`). `src/lib/resolveRefs.ts` is the one
   place references resolve: issue keys, hashes (in this repository, or each
-  recently visited one) and packages (the page owner's) through
+  recently visited one) and packages (the page's Space) through
   `POST /api/refs/resolve`, runs through the CI API, timelines from the
   tracker's list;
 - **Recent**: with nothing typed, right under **Go to…** (which stays
@@ -886,18 +1033,22 @@ permission-aware matching over names and titles, never inference, embeddings or
 AI Search. The contract is `shared/search.ts`; each category is a provider in
 `worker/search/providers.ts` (packages in `worker/search/packages.ts`).
 
-| Category        | Matches                                                                     | Leads to                        |
-| --------------- | --------------------------------------------------------------------------- | ------------------------------- |
-| `repositories`  | `owner/name` and description, readable repos only                           | `/owner/name`                   |
-| `issues`        | Key, title and description, open and closed, in every tracker you belong to | `/tracker/owner/issues/id`      |
-| `packages`      | `owner/name`, name and format, in feeds the registry lets you read          | `/owner/-/packages/format/name` |
-| `accounts`      | Slug and display name; every profile is public                              | `/slug`                         |
-| `conversations` | Titles of the viewer's own assistant chats, all of them                     | the chat (`{kind: "chat"}`)     |
+| Category        | Matches                                                       | Leads to                        |
+| --------------- | ------------------------------------------------------------- | ------------------------------- |
+| `repositories`  | `space/name` and description, readable repos only             | `/space/name`                   |
+| `issues`        | Key, title and description, in explicitly accessible Trackers | `/tracker/space/issues/id`      |
+| `packages`      | `space/name`, name and format, in readable feeds              | `/space/-/packages/format/name` |
+| `accounts`      | Person slug and display name; public profiles                 | `/accounts/person`              |
+| `conversations` | Titles of the viewer's own assistant chats, all of them       | the chat (`{kind: "chat"}`)     |
+
+The palette's `accounts` category searches person profiles. Organization directories
+use the separate `/organizations/:organization` routes; they are not Account-profile
+results.
 
 - **Signed in only.** `q` is trimmed and whitespace collapsed: 1–100
   characters, at most 6 words, each of which must match. Empty, oversized or
   malformed requests get 400; nothing enumerates a directory.
-- **Ranking.** `exact` (an identifier equals the query: `owner/name`, a repo
+- **Ranking.** `exact` (an identifier equals the query: `space/name`, a repo
   name, a slug, a title), then `prefix`, `word` (a word in a name starts with
   it; `-`, `_`, `.` and `/` separate words) and `contains`; ties go to the most
   recently pushed or updated, then name, then ID. Every result says its `match`.
@@ -924,11 +1075,11 @@ AI Search. The contract is `shared/search.ts`; each category is a provider in
 - **Packages from the registry's rules.** The provider builds the registry's
   own `Services` from the request, so it authenticates exactly as
   `/api/packages` does (cookies, tokens, CI job tokens), keeps only feeds
-  `AccessControl.can(feed, "read")` allows (visibility, owner roles, repository
-  collaborators, source-derived job grants), and matches packages in SQL only
-  inside those feeds. Owner, format and name together identify a result, so
-  equal names in other owners or formats stay distinct; ties go to name,
-  format, owner, ID. Publication history and artifact contents aren't searched.
+  `AccessControl.can(feed, "read")` allows (public visibility, explicit Space
+  package grants, separately preserved Instance powers and scoped job/source
+  permissions). Repository collaboration is not a Space-wide package grant.
+  Space, format and name identify a result; equal names in other Spaces or
+  formats stay distinct. Publication history and artifact contents aren't searched.
 - **Failures stay local.** A category that throws or takes over 5 seconds
   comes back `{status: "unavailable", error}`, which is not "no matches", and
   the other groups are unaffected.
@@ -936,7 +1087,7 @@ AI Search. The contract is `shared/search.ts`; each category is a provider in
 ## References in text
 
 Issue keys (`CORE-12`), this deployment's tracker issue URLs, commit hashes,
-`owner/repo` and `pkg@version` become links wherever people read text
+`space/repo` and `pkg@version` become links wherever people read text
 (CORE-22): commit titles (history, the file list), CI run titles and logs
 (hashes only), release-note titles and summaries, issue and comment
 Markdown, READMEs, wiki pages and assistant answers. Code (inline and
@@ -947,18 +1098,18 @@ fenced) is never touched, and nothing inside another address is a ref.
 
 ```jsonc
 // request: at most 100 refs of at most 300 characters
-{ "refs": ["CORE-12", "3f2a9c1", "orbit/engine"], "context": { "owner": "orbit", "repo": "engine", "tracker": "orbit" } }
+{ "refs": ["CORE-12", "3f2a9c1", "orbit/engine"], "context": { "space": "orbit", "repo": "engine", "tracker": "orbit" } }
 // response: one result per ref, in order
 { "results": [
   { "ref": "CORE-12", "status": "resolved", "target": { "kind": "issue", "path": "/tracker/orbit/issues/…", "label": "CORE-12 · Title", "tracker": "orbit", "id": "…", "key": "CORE-12", "title": "…", "status": "todo" } },
-  { "ref": "3f2a9c1", "status": "resolved", "target": { "kind": "commit", "path": "/orbit/engine?commit=<40 hex>", "label": "…", "owner": "orbit", "repo": "engine", "sha": "<40 hex>" } },
+  { "ref": "3f2a9c1", "status": "resolved", "target": { "kind": "commit", "path": "/orbit/engine?commit=<40 hex>", "label": "…", "space": "orbit", "repo": "engine", "sha": "<40 hex>" } },
   { "ref": "orbit/engine", "status": "unresolved" } // or "ambiguous", with "candidates"
 ] }
 ```
 
 - **Issue keys** link only to an issue in a Timelines tracker the viewer
   belongs to. The page's tracker (`context.tracker`) is asked first, then the
-  trackers subscribed to the page's repository (and its owner's), then the
+  page repository's Space Tracker, then the
   viewer's others (at most 25). The first tier with a match decides; two
   matches there are `ambiguous` and render as a small chooser. A key nobody's
   tracker has (`JIRA-9`, `UTF-8`) stays exactly as written: no dead links and
@@ -975,9 +1126,9 @@ fenced) is never touched, and nothing inside another address is a ref.
   hashes to avoid linking words and numbers; explicit lookups also accept
   letters-only and numeric abbreviations. A hash opens the commit panel:
   inside the repository, the current page with `?commit=<full hash>` (other
-  parameters kept), elsewhere `/<owner>/<repo>?commit=<full hash>`.
-- **`owner/repo`** must be readable; **`pkg@version`** looks in
-  `context.owner`'s feeds the registry lets the viewer read (the same name in
+  parameters kept), elsewhere `/<space>/<repo>?commit=<full hash>`.
+- **`space/repo`** must be readable; **`pkg@version`** looks in
+  `context.space`'s feeds the registry lets the viewer read (the same name in
   two formats is `ambiguous`).
 
 Responses are `private, no-store`; each request reads every tracker,
@@ -988,7 +1139,7 @@ once and only gains link styling when the answer arrives; a failure leaves it
 as text. `LinkedText` is the plain-text linkifier, `useRefMarkdown` the remark
 plugin plus its `gm-ref` component.
 
-`/-/go/<ref>` (with optional `?owner=&repo=&tracker=`) opens whatever a ref
+`/-/go/<ref>` (with optional `?space=&repo=&tracker=`) opens whatever a ref
 names, for plain-text contexts and the palette: one match redirects, several
 get a chooser, none says so. `GET /api/refs/go/<ref>` is the same for scripts:
 a 302 to the target (or to `/-/go/` when it's ambiguous or unresolved), or the
@@ -997,7 +1148,7 @@ unresolved). `/go/` itself belongs to the Go module proxy.
 
 ## Semantic changes
 
-The repository **Changes** tab (`/:owner/:repo/changes`) is a functional
+The repository **Changes** tab (`/:space/:repo/changes`) is a functional
 work-in-progress feed of individual changes, not commit rows. Each entry links
 to its originating commit and before/after source lines, with syntax-highlighted
 excerpts. Ref, exact-path, change-kind and language filters are independent of
@@ -1052,7 +1203,7 @@ clipboard access shows an error rather than claiming the copy succeeded.
 
 ### API and pagination
 
-`GET /api/repos/:owner/:name/semantic` returns the versioned
+`GET /api/repos/:space/:name/semantic` returns the versioned
 `SemanticFeedResponse` from `shared/semantic/types.ts`: `entries`, immutable
 `head`, `nextCursor`, and separate file-analysis `coverage`. Kinds use
 `<entity>.added|removed|changed|renamed`, plus `symbol.signature_changed`.
@@ -1135,7 +1286,7 @@ quality and real-service E2E gate in addition to this semantic-specific smoke.
 
 ## Distributed issue tracker
 
-Open `/tracker` from the global navigation. Select an account, create a team,
+Open `/tracker` from the global navigation. Select a Space, create a team,
 and capture an issue with the default **Create** action. The compact type selector
 supports Bug, Research / investigation, and the other existing issue types.
 Prefix a title with `(tag)`, or several `(tag) (another tag)` groups, to apply
@@ -1144,12 +1295,17 @@ and reuses the catalog spelling. Unknown tags offer **Define tag**; creation
 waits until those definitions are accepted. Definitions remain drafts until the
 issue saves successfully. Parentheses elsewhere remain ordinary title text.
 The adjacent arrow opens **Add details**: the dialog carries the parsed title,
-tags, type, selected team and workspace scope, and adds a Markdown description,
+tags, type, selected team and Project scope, and adds a Markdown description,
 status, priority and assignee. **Create and edit** saves the issue and immediately
 opens the existing editor for acceptance criteria, tags and relationships,
-including from the blocker graph. Rejected submissions keep the draft; an
+including from the blocker graph. Opening the created issue preserves the current
+query parameters, source selection and fragment. Rejected submissions keep the draft; an
 unconfirmed submission stays open with an idempotent retry rather than creating
 another issue.
+
+On desktop, the issue workbench fills the space remaining below the Organization
+and Space controls and timeline banner. Its list and inspector scroll within the
+viewport; other pages and the phone layout keep normal document scrolling.
 
 The **Tags** picker searches the tracker's **tag catalog** and offers **Create tag**
 for a new name. Selecting or removing a tag in the issue editor saves immediately;
@@ -1176,7 +1332,7 @@ the release feed; `gm issue create|update --label` is an alias of `--tag`; the
 assistant's `labels`/`label` parameters are aliases of `tags`/`tag`; the release
 feed's `facets.labels` repeats `facets.tags`. Before CORE-271 the release feed
 read `tag:` as `release:`; `tag:day:…`, and a `tag:` naming a release the feed
-has, still do. `GET /api/tracker/:owner/tags` lists the catalog with counts
+has, still do. `GET /api/tracker/:space/tags` lists the catalog with counts
 (`{tags: [{name, issues, open}]}`) and `gm issue tags` prints it from the replica.
 
 The workbench keeps the list, board or blocker graph beside the selected issue;
@@ -1259,19 +1415,20 @@ name the policy the timeline must use, Auto or Approval. The API stores it as
 `approval` or null, allowed only with `required`); issues from before the field
 read as `agent_decides`.
 
-- **Ownership:** a personal account or organization owns each tracker. An issue
-  has one team and zero or more cross-team workspaces. Team prefixes and workspace
-  slugs are permanent; archival preserves history.
-- **Repository subscriptions:** any number of repositories can subscribe to any
-  number of workspaces. The repository's **Issues** tab previews ready issues
-  only from trackers the viewer already belongs to. A subscription grants neither
-  tracker membership nor repository access. Managing one requires both tracker
-  ownership and repository administration. After a repository is deleted, its
-  tracker owner can remove the orphan association.
-- **Permissions:** account members can read the tracker. Owners administer teams,
-  workspaces and subscriptions. A nonempty team membership list restricts issue
-  writes and assignees; an empty list permits all current account members. A site
-  administrator is not automatically a member of every tracker.
+- **Ownership:** each Space owns one Tracker. An issue has exactly one same-Space
+  Team and zero or more same-Space Projects. Team keys and Project slugs are
+  permanent; archival preserves history. Wire fields use `projectIds`, mutations
+  use `project.create/update`, and filters use `project:`.
+- **Repository subscriptions:** repositories can subscribe to Projects only in
+  the same Space. The repository's **Issues** tab previews ready issues only
+  from Trackers the viewer can access. A subscription grants neither Tracker
+  nor repository access. Managing one requires Space administration and
+  repository administration; Space admins can remove orphan associations.
+- **Permissions:** explicit Space members can read and work in the Tracker.
+  Space admins administer Teams, Projects and subscriptions. A nonempty Team
+  membership list restricts issue writes and assignees; an empty list permits
+  current Space members. Neither Organization ownership nor Instance
+  administration automatically grants Tracker access.
   Team membership edits check an assigned agent's accountable person, not the
   agent ID: retaining that person permits renaming the team, while removing them
   from a restricted team requires reassigning their agents' issues first.
@@ -1321,7 +1478,7 @@ read as `agent_decides`.
   - _Capability profiles (CORE-33)_ extend those identities with self-reported
     harness/model, OS/architecture, runtime, CPU/memory, tags and installed skill
     metadata. `gm agent detect` observes locally; `configure [NAME]` publishes;
-    `show [NAME]` and `list --owner OWNER` expose profiles for human/agent choice.
+    `show [NAME]` and `list --space SPACE` expose profiles for human/agent choice.
     Tracker snapshots include member-accountable agents' capabilities, report
     timestamps and revocation state, but never their tokens. Capabilities do not
     alter membership or permissions; they only decide eligibility for issues
@@ -1351,7 +1508,7 @@ read as `agent_decides`.
     are 409 `requirements_unmet` with one `unmet` entry per requirement; an
     agent with no reported capabilities is told to run `gm agent setup`.
     People bypass capability requirements, not pickup or readiness rules. Assigning
-    an agent that doesn't meet them takes a person, the tracker owner or the agent's
+    an agent that doesn't meet them takes a person, a Space admin or the agent's
     accountable person; assignment overrides capabilities only. The inspector shows the mismatch. This is
     eligibility, not authorization: capabilities are self-reported, and
     permissions apply as before. The inspector edits requirements as chips and
@@ -1368,7 +1525,7 @@ read as `agent_decides`.
     and offers **Release the claim** or **Keep it**. `issue.update` then reports
     `results[].claimEffect {actorId, agent, session, unmet, released}` and adds a
     comment recording either choice. `releaseClaim: true` releases it (the issue
-    goes back to `todo`, unassigned from that agent so `next` does not hand it back); only a tracker owner or the agent's accountable person,
+    goes back to `todo`, unassigned from that agent so `next` does not hand it back); only a Space admin or the agent's accountable person,
     acting as themselves, may (403 otherwise). Without it the claim is kept. A
     claim's own assignment doesn't exempt its holder here; people's claims are
     never affected. gm prints the effect and takes `--release-claim`, and the
@@ -1402,8 +1559,8 @@ read as `agent_decides`.
   - _Handoff:_ `issue.offer` returns a single-use code bound to the current
     lease token; `issue.accept` moves the lease (and its accountability) with a
     fresh token and fences the giver's at that moment.
-  - _Owner override:_ when a claim's holder won't finish (a lost session, a
-    deleted token, a stuck agent), a tracker owner acting as themselves (not
+  - _Space-admin override:_ when a claim's holder won't finish (a lost session,
+    a deleted token, a stuck agent), a Space admin acting as themselves (not
     through an agent token) can take it over with `issue.claim {force: true}`
     (`gm issue claim KEY --force`), getting a fresh token, or end it with
     `issue.release {force: true}` (`gm issue release KEY --force`, or End claim
@@ -1413,17 +1570,17 @@ read as `agent_decides`.
   - _Escalation:_ releases without completion count as attempts; at the team's
     `attemptLimit` (default 3, 0 off) the issue asks its accountable person what
     to do differently, with the latest checkpoints, and waits until answered.
-- **Distribution:** each account has one `TRACKER` SQLite Durable Object authority.
+- **Distribution:** each Space has one `TRACKER` SQLite Durable Object authority.
   Atomic batches, actor/payload-bound operation receipts, version checks and an
   ordered event cursor synchronize private CLI replicas. Lost acknowledgements
   replay the same operation; conflicts preserve local intent for explicit
   resolution. This is not Git-based issue storage. See the
   [offline CLI and agent workflow](../cli/README.md#distributed-issue-tracker).
 - **Human workbench:** closed work is hidden by default; readiness, team and
-  workspace filters stay in the URL. Desktop collection/detail panes scroll
+  Project filters stay in the URL. Desktop collection/detail panes scroll
   independently; mobile filters and account actions are disclosed on demand.
   Closed board lanes retain their counts and expand to show closed issues.
-  Add subtasks from the parent without leaving it; only active workspaces are
+  Add subtasks from the parent without leaving it; only active Projects are
   inherited. Checkpoints, claims, blockers and completion evidence remain distinct.
 - **Completion evidence** (CORE-126): issue detail has a dedicated section and
   summary link at `#completion-evidence`, with a stable fragment target for every
@@ -1439,7 +1596,7 @@ read as `agent_decides`.
   without opening history. Expand **Audit history** for newest-first events,
   including comments, requests, relations and parent changes. Entries default to
   compact actor/time rows with changed-field deltas: short before/after values,
-  added/removed tags and workspace associations, and changed words for descriptions
+  added/removed tags and Project associations, and changed words for descriptions
   and other long text. Previews show at most three fields and four text changes,
   with bounded excerpts; large rewrites use a truncated preview instead of an
   expensive diff. Creation events do not repeat every default field, and missing
@@ -1450,7 +1607,7 @@ read as `agent_decides`.
   reference-field previews readable; full values retain the original IDs.
   **Load older events** pages through the history. History loads only while
   expanded, refreshes when the snapshot cursor advances, and resets on
-  issue/account changes. Activity & handoff remains the comments workspace.
+  issue/Space changes. Activity & handoff remains the comments work area.
   Legacy attribution/source gaps are labeled unknown; current-directory identity
   resolution is labeled separately from mutation-time snapshots.
 - **Startup defaults:** in **Account menu → Preferences → Default view and team**, choose
@@ -1483,17 +1640,16 @@ read as `agent_decides`.
   avoid text entry, composition and other dialogs; help traps focus and Escape
   restores it. Cmd/Ctrl-K search and Cmd/Ctrl-J assistant shortcuts are unchanged
   outside help.
-- **Settings:** the gear at the bottom of the navigation rail opens a shared
-  settings area, starting with **Teams and workspaces** for the current tracker,
-  or your default tracker when outside a tracker. A left-hand section navigation
-  brings together **AI settings**, **AI providers**, profile, preferences, access tokens, SSH keys,
-  agents, and invitations for site admins. On smaller screens it becomes a
-  collapsible section menu. Account context follows section links; personal
-  settings still belong to the signed-in person. Existing permissions apply.
-  Tracker administration includes teams, workspaces, and repository subscriptions;
-  changing its account stays in Settings. **Back to issues** retains the current
-  filters and layout.
-  Profile, personal, account and site forms share a left-aligned 48rem content
+- **Settings:** the navigation rail opens grouped **Space**, **Personal** and
+  **Instance** sections (`src/components/SettingsPage.tsx`). **Teams and Projects**
+  opens the selected Tracker's administration. Space links retain `?space=`;
+  personal AI logging, retention and usage use `?person=` and belong only to the
+  signed-in person. Profile, preferences, credentials, agents and assistant skills
+  are personal. Instance invitations, infrastructure and global policies remain
+  operator-only. Changing the Space does not move personal settings.
+  Tracker administration includes Teams, Projects and same-Space repository
+  subscriptions; **Back to issues** retains filters and layout.
+  Profile, personal, Space and Instance forms share a left-aligned 48rem content
   column (`SettingsPage`), the kit's 20px section padding, and wrapping,
   left-aligned primary actions (`mk-form-actions`, 44px minimum targets).
   Validation feedback sits above the action row rather than squeezing its
@@ -1516,7 +1672,7 @@ read as `agent_decides`.
   default team, then all teams. `gm issue next`, `create`, `list` and `ready`
   report the team they used and why in `team`; `gm tracker status` shows
   `defaultTeam`. Agents read their person's default but can't change it, and a
-  `next` scoped to a workspace or parent doesn't add it.
+  `next` scoped to a Project or parent doesn't add it.
 - **Inline editing:** click an issue title or its description/acceptance text to
   edit just that field in place. Each text section also has a keyboard-accessible
   **Edit** button, and empty sections offer an **Add** action. Markdown preview
@@ -1530,7 +1686,7 @@ read as `agent_decides`.
   a pending save keeps newer text until its own versioned save completes.
   The complete **Edit issue** form stays open while moving between fields.
   Text fields save on blur; tag selection/removal, selects, the parent picker, and
-  workspace checkboxes save immediately. Saves are serialized, preserving edits
+  Project checkboxes save immediately. Saves are serialized, preserving edits
   made while an earlier request is running, including when **Done** closes the
   form before either request finishes. The editor shows Updating, Updated, or
   an error with retry/discard controls; closing an issue waits for a close reason.
@@ -1551,7 +1707,7 @@ read as `agent_decides`.
   status and parent relationships still resolve and enforce covering leases.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
-  fields are retained. Tags and workspace membership compare as sets, so
+  fields are retained. Tags and Project membership compare as sets, so
   reordering does not overwrite another person's changes. Errors remain beside
   the failed action. A known conflict is reported immediately, without waiting
   for the background refresh that supplies newer comparison fields.
@@ -1565,15 +1721,15 @@ read as `agent_decides`.
   interacting with form controls. The enabled legend lists the available keys;
   `?` or the rail’s **Keyboard shortcuts** button opens global help.
 
-| Route                                                             | Contract                                                                                                |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `GET /api/tracker`                                                | Trackers accessible to the authenticated account                                                        |
-| `GET /api/tracker/:owner/snapshot`                                | Complete authorized replica snapshot and cursor                                                         |
-| `GET /api/tracker/:owner/changes?after=N&limit=200`               | Ordered event page; resume from the returned cursor                                                     |
-| `…/snapshot?timelines=1`, `…/changes?…&timelines=1`               | Also timelines and their events (entity types `timeline`, `timelineEvent`), for replicas that know them |
-| `GET /api/tracker/:owner/issues/:issue/history?before=N&limit=50` | Authorized issue audit; ID or key, newest first, exclusive cursor, default 50 / maximum 100 events      |
-| `POST /api/tracker/:owner/mutate`                                 | `{operationId, mutations:[{kind,id,expectedVersion?,data?}]}`; 1–100 ordered operations, all or nothing |
-| `GET /api/repos/:owner/:name/tracker`                             | Accessible subscribed workspaces for repository navigation                                              |
+| Route                                                             | Contract                                                                                                                                         |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /api/tracker`                                                | Trackers accessible to the authenticated account                                                                                                 |
+| `GET /api/tracker/:space/snapshot`                                | Complete authorized replica snapshot and cursor                                                                                                  |
+| `GET /api/tracker/:space/changes?after=N&limit=200`               | Ordered event page; resume from the returned cursor                                                                                              |
+| `…/snapshot?timelines=1`, `…/changes?…&timelines=1`               | Also timelines and their events (entity types `timeline`, `timelineEvent`), for replicas that know them                                          |
+| `GET /api/tracker/:space/issues/:issue/history?before=N&limit=50` | Authorized issue audit; ID or key, newest first, exclusive cursor, default 50 / maximum 100 events                                               |
+| `POST /api/tracker/:space/mutate`                                 | `{contractVersion:4,spaceId,migrationEpoch,operationId,mutations:[{kind,id,expectedVersion?,data?}],timeline?}`; 1–100 atomic ordered operations |
+| `GET /api/repos/:space/:name/tracker`                             | Accessible subscribed Projects for repository navigation                                                                                         |
 
 Updates require the version last read; stale writes return `409 version_conflict`
 with current state. Issue IDs are stable client-generated identifiers; the authority
@@ -1583,8 +1739,9 @@ the browser sends `web`. This is a provenance hint, never authentication.
 History retains immutable actor snapshots and before/after state, excludes
 lease and credential secrets, and requires the same tracker membership as snapshots.
 `shared/tracker.ts` defines the wire types; `gm schema issue batch` exposes the
-CLI contract. No new D1 migration is needed: the Durable Object initializes its
-own schema. Generate the new binding with `cf workers types`.
+CLI contract. The Durable Object initializes its schema and records transactional
+Project migration; legacy receipts and immutable replay evidence are retained
+separately from ordinary retention. Generate binding types with `cf workers types`.
 
 These primitives support durable agent handoffs. An autonomous hours/days-long
 execution loop is not included.
@@ -1596,7 +1753,7 @@ serve it; the shapes and the pure readers (`stateAt`, `summarize`) are in
 `shared/chronicle.ts`, the replay in `worker/tracker/chronicle.ts` and the
 linked work in `worker/tracker/work.ts`.
 
-The view switcher and account's default-layout picker both call this **History**:
+The view switcher and person's default-layout picker both call this **History**:
 it shows what happened, not a new kind of work or a planning schedule. The stable
 `chronicle` view ID, saved preferences, URLs, API routes and implementation names
 are unchanged, so existing links still open the same view. **Timelines** remains
@@ -1605,8 +1762,8 @@ in CORE-280.
 
 | Route                                                                          | Contract                                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/tracker/:owner/chronicle?from&to[&q][&cursor][&limit=100][&quiet=1]` | Issues matching tracker query `q`, each as of `from` with every state change, work span and marker until `to`; paged by issue key (`next`), at most 200 issues and ~20,000 events read per page; the first page adds the event density over the whole history |
-| `GET /api/tracker/:owner/issues/:issue/work`                                   | The issue's commits, agent work contexts (steps), CI runs, deployments, published packages, timelines with checkpoints and landings, and release-note entries, each with the `href` the web app opens                                                         |
+| `GET /api/tracker/:space/chronicle?from&to[&q][&cursor][&limit=100][&quiet=1]` | Issues matching tracker query `q`, each as of `from` with every state change, work span and marker until `to`; paged by issue key (`next`), at most 200 issues and ~20,000 events read per page; the first page adds the event density over the whole history |
+| `GET /api/tracker/:space/issues/:issue/work`                                   | The issue's commits, agent work contexts (steps), CI runs, deployments, published packages, timelines with checkpoints and landings, and release-note entries, each with the `href` the web app opens                                                         |
 
 - **As of.** An issue's state at a time is the state after its last event at
   or before it. A change made in a timeline reads as the timeline saw it,
@@ -1626,8 +1783,8 @@ in CORE-280.
   says before when events may be missing, and an affected row's
   `historyFrom` says where its own history begins; `history.removedIssues`
   counts issues `closed-issues` removed.
-- **Linked work** searches the repositories the tracker covers (the owner's,
-  those subscribed to it, and those its timelines touch) and returns only
+- **Linked work** searches same-Space repositories covered by the Tracker
+  (its repositories, subscriptions and timeline sources) and returns only
   what the viewer can read: unreadable repositories' items are omitted
   without a count. Steps are found by issue key (index
   `step_contexts_issue`), release-note entries by tracker and key
@@ -1636,22 +1793,30 @@ in CORE-280.
 - **Mentions** (CORE-22, `mentions` in the response) are commits whose
   message names the issue's key, kept apart from that evidence: the issue
   page and the inspector label them "Mentioned in". After each push the push
-  log's commit read (`worker/ref-log/record.ts`) feeds `worker/mentions`,
-  which resolves each key (`issueKeys()`) to a Timelines tracker issue: first
-  trackers whose workspaces subscribe to the repository, then the owner's,
-  then (for a person's repository) their organizations'. Within a tier the
-  owner's tracker breaks a tie; otherwise the key is recorded `ambiguous` and
-  links nothing, and keys no tracker knows aren't recorded. Rows
-  (`commit_issue_mentions`) are one per repository, commit and key, keep
-  their first ref and time, and are listed by issue id in any repository the
-  viewer can read, with their own CI runs and packages; each SHA opens the
-  commit panel (`/<owner>/<repo>?commit=<sha>`). History pushed before the
-  index is read by the hourly cron: 20 repositories a run, the latest 200
-  first-parent commits of each default branch, once per repository
-  (`commit_mention_backfills`). Release notes resolve keys no subscribed
-  workspace covers through the same tiers (`repoIssues()`).
+  log's commit read (`worker/ref-log/record.ts`) feeds `worker/mentions`.
+  `issueKeys()` resolves only in the repository's immutable Space through
+  freshly authorized Tracker access. There are no cross-Organization or
+  cross-Space fallback tiers. Unknown keys are omitted. Rows in
+  `commit_issue_mentions` retain repository/commit/key, original source ID,
+  first ref and time; the commit panel opens `/<space>/<repo>?commit=<sha>`.
+  Release-note key resolution uses the same Space boundary.
 
-**The view** (`/tracker/:owner?view=chronicle`, CORE-251; `src/routes/tracker/Chronicle*.tsx`,
+  History backfill uses durable `mention_backfill_jobs`
+  (`worker/mentions/backfill.ts`). Authenticated producers capture the initiating
+  person/agent credential, repository, immutable Space and epoch in real work
+  authority. The hourly sweep consumes at most 20 pending jobs, reading at most
+  200 default-branch first-parent commits each, and revalidates authority before
+  history reads and before indexing. Success records `commit_mention_backfills`;
+  failures and revoked authority stay blocked, never marked completed.
+  Legacy work without captured authority remains blocked with
+  `originating_authority_unavailable`: no guessed owner, token or credential.
+  `GET /api/repos/:space/:name/mention-backfill` inspects state/error or completed
+  commit count/time; `POST` resumes under the caller's current write credential
+  and returns 202. Both require repository write access and an explicit current
+  Space grant (`worker/ref-log/api.ts`). Repository deletion inventories and
+  removes these jobs; their storage is metered to the repository's Space.
+
+**The view** (`/tracker/:space?view=chronicle`, CORE-251; `src/routes/tracker/Chronicle*.tsx`,
 pure model in `chronicleModel.ts`): presets, zoom, group by and layout over the
 query bar; a brushable density overview; a canvas ruler and lanes (status,
 work spans, markers) with the playhead and a selectable range; the range
@@ -1663,18 +1828,17 @@ change feed. The layout toggle is **Chart / List**: Chart names the visual
 time-axis layout without conflicting with the separate Timelines feature.
 Phones get the List layout, the accessible equivalent of the canvas.
 Design: root `DESIGN.md`, "History (time axis)".
-The List scrubber preserves newer keyboard positions when an earlier address
-write finishes. Each committed gesture carries an instance/revision receipt in
-router history state: only the latest receipt can acknowledge its matching
-position, even when a gesture returns to the same address. Snapshot refreshes
-alone do not reset the scrubber. Acknowledgement runs before paint; external
-navigation and Back/Forward restore the position from that history entry.
+The List scrubber preserves in-flight keyboard positions until its latest
+address write is acknowledged. Gesture revisions in navigation state prevent
+older pushes from clearing newer input, including between keydown and keyup;
+snapshot refreshes alone do not reset it. Back, Forward and external navigation
+remain authoritative and cancel pending wheel commits.
 
-**Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
-(agent secret) makes `issues` issues of a new team worked by the account's
+**Development history:** `POST /api/dev/chronicle {space, team, issues?, days?, seed?, link?}`
+(agent secret) makes `issues` issues of a new Team worked by the Space's granted
 people and a "builder" agent over `days`, through real tracker mutations
 under a controlled clock (`worker/tracker/chronicle-fixture.ts`). With
-`link: {repo: "owner/name", commit}` the showcase issue (its first) gets a
+`link: {repo: "space/name", commit}` the showcase issue (its first) gets a
 step context at that commit and a release-note entry naming it, as the
 generator would store them, so its linked work reaches a real commit and its
 CI runs. E2E `browser-chronicle-scrub-range-span-and-links`
@@ -1682,7 +1846,7 @@ CI runs. E2E `browser-chronicle-scrub-range-span-and-links`
 
 ### Timelines
 
-A timeline is an account-wide line of work. Each `(timeline, canonical repository)`
+A timeline is a Space-wide line of work. Each `(timeline, canonical repository)`
 owns one Artifacts work repository, shared by its agents, with an opaque
 `work_<id>` source and physical `refs/heads/work` (`bookmark: "work"`).
 `timeline/<slug>` remains a logical overlay/environment label, not its Git ref.
@@ -1696,17 +1860,17 @@ wire types.
 
 | Route                                                   | Contract                                                                                                                       |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /api/tracker/:owner/timelines?status=&stalled=`    | Every timeline, newest first; `stalled=true`: open, no push for the idle period, not experimental                              |
-| `POST /api/tracker/:owner/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: reserve and initialize pinned owned sources, then publish the record |
-| `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                                                 |
-| `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                                                     |
-| `POST /api/tracker/:owner/timelines/:slug/abandon`      | End the timeline and archive owned sources read-only; preserve completed integration receipts                                  |
-| `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data                                    |
-| `POST /api/tracker/:owner/timelines/:slug/land`         | Queue the head checkpoint to land (`LandResult`), or 409 with why not                                                          |
-| `GET /api/tracker/:owner/timelines/:slug/landing`       | `{landing}`: its newest landing, or null                                                                                       |
+| `GET /api/tracker/:space/timelines?status=&stalled=`    | Every timeline, newest first; `stalled=true`: open, no push for the idle period, not experimental                              |
+| `POST /api/tracker/:space/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: reserve and initialize pinned owned sources, then publish the record |
+| `GET /api/tracker/:space/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                                                 |
+| `PATCH /api/tracker/:space/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                                                     |
+| `POST /api/tracker/:space/timelines/:slug/abandon`      | End the timeline and archive owned sources read-only; preserve completed integration receipts                                  |
+| `GET /api/tracker/:space/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and Projects: the graph's data                                      |
+| `POST /api/tracker/:space/timelines/:slug/land`         | Queue the head checkpoint to land (`LandResult`), or 409 with why not                                                          |
+| `GET /api/tracker/:space/timelines/:slug/landing`       | `{landing}`: its newest landing, or null                                                                                       |
 
 - **Forking** needs tracker membership and canonical-repository write access;
-  repositories must belong to that account (at most 20 per timeline). The
+  repositories must belong to that Space (at most 20 per timeline). The
   parent source, commit and tree are pinned before allocation: the parent's
   owned work head, otherwise canonical main, or the requested `{repo, commit}`.
   The Tracker reserves a provider name and durable allocation intent before
@@ -1714,7 +1878,7 @@ wire types.
   tip. Readiness requires the exact pinned commit/tree, a verified CAS of
   `refs/heads/work`, and revocation of initial provider credentials.
 - **Source routing** preserves canonical authorization and deletion tombstones.
-  Git uses `/<owner>/<repo>@<slug>.git`; object/history APIs use
+  Git uses `/<space>/<repo>@<slug>.git`; object/history APIs use
   `?source=work_<id>` (`canonical` is qualified by repository). The slug routes
   to a durable owned-source identity even after Tracker detail expires. Canonical
   `timeline/*` pushes are refused with the actual timeline URL; the old
@@ -1735,7 +1899,7 @@ wire types.
   trusted origin, canonical repository, slug and source-ID pin before checkout.
 - **Interrupted push recovery** (CORE-321) is explicit: inspect with
   `gm timeline pushes [OPERATION]`, then use `gm timeline recover-push OPERATION`.
-  Both support `--timeline SLUG --repo OWNER/NAME` without changing local bindings.
+  Both support `--timeline SLUG --repo SPACE/NAME` without changing local bindings.
   The API list returns `{sourceId, operations}`; exact inspection returns the
   retained operation's ID, state, original commands/attribution and, when present,
   its recovery intent/outcome. Reads require repository access and tracker membership;
@@ -1783,13 +1947,13 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   When `syncRequired` is true, run normal `gm sync` before retrying publication,
   preserving the marker in the synchronized history or making a new commit.
   Recovery never edits the local checkout and never force-pushes.
-- **The graph** (`/tracker/:owner/timelines`, linked from Issues and Release
+- **The graph** (`/tracker/:space/timelines`, linked from Issues and Release
   notes; CORE-81) draws main down the middle and a lane per timeline, newest
   first: forks, merges between timelines, landings on main, abandoned lanes
   ending with a mark and experimental lanes dashed. It centres on `?tl=<slug>`
   (the selection, its parents and what depends on it) or, with main selected,
   the ten most recently active timelines; landed timelines fold into one node
-  on main, and the rest are listed by status, workspace, agent or person. The
+  on main, and the rest are listed by status, Project, agent or person. The
   layout is in `src/routes/tracker/timelineGraph.ts`.
   Main and timeline summary rows are full-width native selection links with
   aligned labels, visible Select/Selected cues and keyboard focus (CORE-229).
@@ -1802,7 +1966,7 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   work merges like any other's, and it can still land. Views of stalled or
   idle work leave flagged timelines out, since stalling is expected of them
   (`isStalled` in `shared/timelines.ts`: active or idle, no push for the
-  account's idle period, 7 days by default): the graph's Stalled filter, its
+  Space's idle period, 7 days by default): the graph's Stalled filter, its
   status groups (quiet experiments are grouped apart), `?stalled=true` and
   `gm timeline list --stalled`.
 - **Merges and progress** retain the work source's full Git history and
@@ -1850,24 +2014,29 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   a landing (CORE-390); beginLanding re-checks that last part in its
   transaction (`onlyIfUnlanded`). Only approvals from the last 24 hours are
   retried: landing on main deploys, so an older one waits for a person to run
-  `gm timeline land`. Not when the approver left the tracker or can't write to
-  every repository; a stopped landing stays a person's to retry. The sweep
-  makes at most 25 landing attempts per run (only a real beginLanding counts;
-  skips cost nothing and don't hide later candidates within the lookahead of
-  four times the remaining budget) across up to 200 trackers, each hour's
-  window starting where the last one ended, so each tracker is reached within
-  ceil(total/window) hours while the number of trackers is stable. An
-  unexpected failure in a tracker ends that tracker's turn for the run.
-  The same sweep restarts, as its requester, a landing that stalled before its
-  run (its `beginLanding` reply was lost, or a step threw before the run
-  started; CORE-391): merging or testing, unmoved for 10 minutes but moved in
-  the last 24 hours, with no run recorded at its stage, a run row still queued
-  whose Workflow can't be confirmed, or every unadvanced repository tested. Not
-  when the requester's account is gone, they left the tracker or can't write
-  to every repository; older ones wait for a person (`gm timeline land`). At
-  most 25 per run. It never starts from an advancing or stopped landing, though
-  progress follows a landing that moves on to advancing, where compare-and-swap
-  and receipts guard main.
+  `gm timeline land`. The retry acts with the work authority the approval was
+  answered with (the Tracker keeps it as `approval:<checkpoint>` in
+  `work_authorities`), re-resolved against the approver's live credential,
+  current Space grant and write access to every repository; an approval without
+  one, or whose credential or grant is gone, waits for a person. A stopped
+  landing stays a person's to retry. The sweep makes at most 25 landing attempts
+  per run (only a real beginLanding counts; skips cost nothing and don't hide
+  later candidates within the lookahead of four times the remaining budget)
+  across up to 200 Spaces, each hour's window starting where the last one
+  ended, so each Space is reached within ceil(total/window) hours while the
+  number of Spaces is stable. An unexpected failure in a Space ends that
+  Space's turn for the run.
+  The same sweep restarts a landing that stalled before its run (its
+  `beginLanding` reply was lost, or a step threw before the run started;
+  CORE-391): merging or testing, unmoved for 10 minutes but moved in the last
+  24 hours, with no run recorded at its stage, a run row still queued whose
+  Workflow can't be confirmed, or every unadvanced repository tested. It acts
+  with the landing's own recorded work authority, re-resolved for every
+  repository; a landing without one, or whose requester's credential, Space
+  grant or write access is gone, waits for a person, as do older ones (`gm
+timeline land`). At most 25 per run. It never starts from an advancing or
+  stopped landing, though progress follows a landing that moves on to
+  advancing, where compare-and-swap and receipts guard main.
   - _Approve when green_ (CORE-378, `worker/timelines/auto-approve.ts`): a
     person may turn on, for themselves in one tracker (Preferences, or the
     `automation.approveWhenGreen` mutation with their own id), approving the
@@ -1878,8 +2047,15 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
     preview's deploy (`greenness(…, {requireRun: true})`; previews never count
     for `auto` either). The setting lives in the tracker Durable Object
     (`approval_automation`), each change an `automation` event in its log;
-    agents, the assistant and tracker owners can't set it for anyone, and
-    someone found no longer a member loses it (logged, source `automation`).
+    agents, the assistant and Space admins can't set it for anyone. Turning it
+    on records the person's own work authority (`automation:<person>` in
+    `work_authorities`: Space, epoch, person and the session or token used,
+    never an agent's), and every use re-resolves it: the credential must still
+    be live, with a current Space grant and write access to each repository.
+    A revoked or expired credential, a lost grant or a migration epoch since
+    turns the setting off (logged, source `automation`); the person turns it on
+    again. A setting saved without an authority is inert and shows as off.
+    There is no credential-less automation path.
     A request is still required: the tracker answers it as that person
     (`source: "automation"`, operation `@auto-approve:<request>`, which no
     client id can spell, `via: "auto-approve"` on the request, the timeline's
@@ -1983,7 +2159,7 @@ shared fields (version, claim, assignee, waiting), and something only a
 timeline has is absent (`entity: null`). A timeline's view
 (`GET …/snapshot?timeline=<slug>`, `?tl=<slug>` in the web app, `--timeline`
 or `GM_TIMELINE` in gm) is main's with the scoped fields (title, description,
-acceptance, type, status, close reason, priority, parent, workspaces, tags)
+acceptance, type, status, close reason, priority, parent, Projects, tags)
 and the links and comments of the timeline, its ancestors and the timelines
 merged into them replayed on top in event order. `issue.next` in a timeline
 picks from its view. Landing folds a timeline into main's tables as
@@ -2039,7 +2215,7 @@ status each had in it, even after main's copies went back to do.
 **The app-wide scope** (CORE-82, `src/lib/timelineScope.ts`). `?tl=<slug>`
 scopes every page to main plus that timeline; no `tl` is main, and `tl=main`
 names main explicitly, which is how a link leaves a timeline. The switcher in
-the rail lists the account's timelines (the page's account, else the default
+the rail lists the Space's timelines (the page's Space, else the default
 tracker's) and a banner above every page names the selected one and says what
 the scope means there; from 640px it stays in view (`--scope-banner` offsets
 page-level sticky elements and the tracker's height), and on phones the rail's
@@ -2070,8 +2246,8 @@ landed-note filter, which remains readable after work-source retention expires.
 
 The switcher's **Timeline graph** link sits beside its title, above the changing
 list and loading/error messages, so resolving the list does not move a footer
-link during a click. It remains a native link and follows the page's account,
-including an explicitly selected account in Settings.
+link during a click. It remains a native link and follows the page's Space,
+including an explicitly selected Space in Settings.
 
 ## Release notes
 
@@ -2081,19 +2257,19 @@ Git committer timestamps. Neither authored dates nor tracker completion dates
 decide which day a change belongs to. Tags remain optional named checkpoints;
 successful CI alone is not treated as proof of deployment.
 
-`GET /api/repos/:owner/:name/release-notes/range` still provides explicit Git
+`GET /api/repos/:space/:name/release-notes/range` still provides explicit Git
 ranges and the tracker issues their commits mention (`shared/release-notes.ts`).
 Without parameters it walks the default branch back to the nearest tagged commit;
 `?to=<tag>` includes that tag's own commit, and `?from=<ref>` sets the base explicitly.
 Ranges follow first-parent history and stop at 1,000 commits with `truncated: true`.
 
 Issue keys (`TEAM-N`, e.g. `(CORE-13)` or `CORE-15:`) are parsed from commit
-messages and resolved only through trackers that subscribe a workspace to the
-repository and that the caller can read. Anonymous callers, non-members and
-unsubscribed trackers get the commits without issues. Key-shaped words such as
+messages and resolved only in the repository's Space, when a Project subscribes
+to the repository and the caller has a current Space grant. Anonymous callers,
+non-members and unsubscribed Trackers get commits without issues. Words such as
 `UTF-8` match no team and drop out. Each issue carries its team, completion time
 (when it last became done) and evidence. The tracker also answers which issues
-were completed in a time window, for team and organization views.
+were completed in a time window, for Team and Space views.
 
 **Generated entries** (`worker/release-notes/generate.ts`) belong to a daily digest
 (`@day:YYYY-MM-DD`) or a named tag snapshot. Colons cannot occur in Git tag names,
@@ -2122,7 +2298,7 @@ Work runs on the `gitmatrix-jobs` queue: pushes, tracker changes to cited issues
 and subscription changes mark the repository dirty and enqueue it after 20
 seconds; a D1 lease allows one run per repository, and runs are capped at 40
 model calls, continuing in a follow-up run. Server-side resolution uses the
-repository owner's tracker plus subscriptions mirrored into
+repository Space's tracker plus subscriptions mirrored into
 `tracker_repo_subscriptions` as they change. An introduction lists the trackers
 whose issues shaped it, so readers without access to them can be shown entries
 without it. Without AI bindings (automatic non-AI test environments) nothing is
@@ -2172,44 +2348,47 @@ feed this constraint intersects with every `q` filter, including positive or
 negated `timeline:` terms, before result limits and facet counts. It does not
 generate notes for unlanded work or grant additional access.
 
-**Highlights** are separate, person-specific summaries of an organization's
+**Highlights** are separate, person-specific summaries of a tracker Space's
 authorized daily entries from today and the previous seven UTC days:
-`GET /api/tracker/:owner/release-notes/highlights`. The response is
-private/no-store and requires a person sign-in. There are no repository or site
-levels: those endpoints answer 404 and stale queued jobs for them are skipped.
+`GET /api/tracker/:space/release-notes/highlights`. The response is
+private/no-store and requires a person sign-in with a live explicit grant on the
+Space; Organization administration and Instance operator power confer no access.
+There are no repository or site levels: those endpoints answer 404 and stale
+queued jobs or rows for them are skipped or deleted without a model call.
 Exact daily-note backlinks are server-generated, never model-generated.
 Detailed notes are not modified. The signed-in `/highlights` page is an
-app-owned, reserved route, not an account slug: it redirects to the person's
-default organization's highlights, as the rail does when no organization is open.
-A repository's release page links to its organization's highlights.
+app-owned, reserved route, not a Space handle: it redirects to the person's
+default Space's highlights, as the rail does when no Space is open. A
+repository's release page links to its Space's highlights for people with a
+grant on that Space.
 
 Opening the page creates the viewer projection. The existing hourly cron checks
-at most 25 due projections; the account's cadence defaults to 24 hours and can be
-set to 1–168 hours (the organization's setting).
+at most 25 due projections; the Space's cadence defaults to 24 hours and can be
+set to 1–168 hours in the Space's AI settings.
 New entries alone wait for that cadence. Every read and model invocation checks
 authorization and the summarized entries' digests; changed, deleted, or revoked
 sources suppress old prose immediately. The window only chooses sources for a new
 summary: entries ageing out of it never blank an existing summary or reset its due
-time, and wait for the next scheduled refresh, which regenerates from the current window. A bounded source manifest tracks source
-repositories/accounts for deletion cleanup. D1 leases coalesce concurrent requests;
+time, and wait for the next scheduled refresh, which regenerates from the current
+window. A bounded source manifest tracks source repositories and Spaces for
+deletion cleanup. D1 leases coalesce concurrent requests;
 failed attempts persist an error and wait for the next cadence, without a tight
 paid retry loop. The release-notes feature switch and missing AI bindings prevent
 new highlights calls. Calls meter as their own feature, `release_highlights`
 (AI Gateway label `release-highlights`, following the release-notes body-logging
-setting), billed to the organization and attributed to the reader who asked,
-with the configured task model and stored model/time provenance.
+setting), billed to the Space (`scope_kind` `space`) and attributed to the reader
+who asked, with the configured task model and stored model/time provenance.
 Persisted highlights are included in release-notes storage usage, charged to
-`owner_account_id`: the organization. A different viewer does not take on the
-organization's storage charge.
+their `space_id`. A different viewer does not take on the Space's storage charge.
 
 The `release-highlights` real-provider stage proves the seven-day window with a
-recent and a stale copy of the fixture's daily note, and that a non-member is
-refused without prose. Its three-call ceiling covers the first summary, a
-scheduled refresh and repair after cited-source removal, all billed to the
-organization. It checks the retired repository and site endpoints, configurable
-cadence, unchanged detailed notes, exact backlinks, generated desktop/mobile
-surfaces, the `/highlights` and rail navigation to the default organization, and
-the repository page's link.
+recent and a stale copy of the fixture's daily note, and that a person without a
+Space grant is refused without prose. Its three-call ceiling covers the first
+summary, a scheduled refresh and repair after cited-source removal, all billed to
+the Space, never the viewer or the outsider. It checks the retired repository and
+site endpoints, configurable cadence, unchanged detailed notes, exact backlinks,
+generated desktop/mobile surfaces, the `/highlights` and rail navigation to the
+default Space, and the repository page's link.
 
 **Custom release notes** (CORE-151) are written on demand, in the words a person
 asks for (a customer announcement, a changelog, an email), from release notes
@@ -2217,23 +2396,24 @@ the viewer may already read. Nothing is stored.
 
 | Route                                                | Body                                                                                  |
 | ---------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `POST /api/repos/:owner/:name/release-notes/compose` | `{ prompt, release?, timeline? }`: one release (the newest daily update when omitted) |
-| `POST /api/tracker/:owner/release-notes/compose`     | `{ prompt, q?, timeline? }`: the feed `q` selects, as the page shows it               |
+| `POST /api/repos/:space/:name/release-notes/compose` | `{ prompt, release?, timeline? }`: one release (the newest daily update when omitted) |
+| `POST /api/tracker/:space/release-notes/compose`     | `{ prompt, q?, timeline? }`: the feed `q` selects, as the page shows it               |
 
 Both answer `{ markdown, model, entries, truncated }` with
 `cache-control: private, no-store`. They need a signed-in person or an agent
 acting for one (401 otherwise); the prompt is 1 to 2,000 characters and `q` at
-most 500 (400); an unknown release is 404. Only members of the billed account
-may write: the repository route answers 403 ("Only members of <account> can
-write custom release notes.") to anyone else who can read the repository (a
-private one still 404s), and site admins count as members; the organization
-route keeps the feed's membership check (403). Each person writes at most 50 a
-day per account (`ai_usage` calls plus failed attempts for the feature, UTC
+most 500 (400); an unknown release is 404. Only people with a live explicit
+grant on the billed Space may write: the repository route answers 403 ("Only
+people with access to <Space> can write custom release notes.") to anyone else
+who can read the repository (a private one still 404s); neither Instance
+operators nor Organization owners without a Space grant are exempt. The tracker
+route keeps the feed's explicit grant check (403). Each person writes at most 50
+a day per Space (`ai_usage` calls plus failed attempts for the feature, UTC
 day): the 51st is 429. Entries come from the same readers as the read APIs, so
 tracker-private entries a viewer cannot read are absent. Paid work needs
-`env.AI` (503) and the billed account's AI release notes switched on (409, "AI
-release-note writing is off for <account>"); the billed account is the
-repository's owner or the organization. With no entries the answer is 422 and
+`env.AI` (503) and the billed Space's AI release notes switched on (409, "AI
+release-note writing is off for <Space>"); the billed Space is the repository's
+or the tracker's. With no entries the answer is 422 and
 no model is called. A model that fails or rate-limits is a 502 ("The model
 didn't answer. Try again in a minute."), never retried. Entries are serialized
 compactly (at most 200 and 60,000 characters; one entry larger than that has its
@@ -2243,14 +2423,14 @@ the request, which sets audience, tone and format; the shared writing rules
 inventing facts or availability dates, and allow no images and links only when
 asked.
 
-One request is one model call on the account's Task model (rate-limit retries
-off), at most 2,000 output tokens. It meters as `release_notes_compose` for the person (and the
-agent) who asked (AI Gateway label `release-notes-compose`, following the
+One request is one model call on the Space's Task model (rate-limit retries
+off), at most 2,000 output tokens. It meters as `release_notes_compose` to the
+Space, for the person (and the agent) who asked (AI Gateway label `release-notes-compose`, following the
 release-notes body-logging setting). The assistant's built-in `release-notes-writer`
 skill teaches the same rules and how to fetch the notes, so the sidebar can do it too.
 
-On both release-notes pages, for members of the account, **Write custom release
-notes** (`ReleaseNotesComposer.tsx`) opens, collapsed by default, a request box with
+On both release-notes pages, for people with a grant on the Space, **Write custom
+release notes** (`ReleaseNotesComposer.tsx`) opens, collapsed by default, a request box with
 starting prompts and a line naming what it writes from (the selected release, or
 the current filter). The result renders as plain Markdown (no images, no autolinked issue keys or
 commit refs) and exports as: **Copy**
@@ -2263,27 +2443,27 @@ one compose call and checks its content, its single metered call and its
 
 | Route                                                       | Contract                                   |
 | ----------------------------------------------------------- | ------------------------------------------ |
-| `GET /api/repos/:owner/:name/release-notes`                 | `ReleaseNotesIndex`: status and releases   |
-| `GET /api/repos/:owner/:name/release-notes/release?name=`   | `ReleaseNotesRelease`: intro and entries   |
-| `GET /api/repos/:owner/:name/release-notes/range?to=&from=` | `ReleaseRangeResponse`: commits and issues |
-| `GET /api/tracker/:owner/release-notes?q=`                  | `ReleaseFeed`: a tracker account's entries |
+| `GET /api/repos/:space/:name/release-notes`                 | `ReleaseNotesIndex`: status and releases   |
+| `GET /api/repos/:space/:name/release-notes/release?name=`   | `ReleaseNotesRelease`: intro and entries   |
+| `GET /api/repos/:space/:name/release-notes/range?to=&from=` | `ReleaseRangeResponse`: commits and issues |
+| `GET /api/tracker/:space/release-notes?q=`                  | `ReleaseFeed`: a tracker Space's entries   |
 
-**Team and organization views** (`worker/release-notes/feed.ts`): a tracker
-account's **Release notes** page (`/tracker/:owner/releases`, a place in the
+**Team and Space views** (`worker/release-notes/feed.ts`): a tracker
+Space's **Release notes** page (`/tracker/:space/releases`, a place in the
 navigation rail; `/release-notes` opens your default tracker's) defaults to daily changes in its repositories and changes citing
 its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Tagged
 releases do not duplicate entries in the default feed. An explicit `kind:tag` or
 positive `release:` filter selects tagged releases (the "Tagged releases" chip) when requested; `kind:daily`
 selects daily history. An issue may have distinct updates on several days.
-A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
-`ws:`, `type:` (feature, fix, improvement, internal), `tag:` (issue tags;
+A team's notes use `team:KEY`. Other filters are `repo:` (name or space/name),
+`project:`, `type:` (feature, fix, improvement, internal), `tag:` (issue tags;
 `label:` is the old spelling),
 `release:` (a literal tag or `day:YYYY-MM-DD`), `timeline:` (what landed with
 `timeline/<slug>`), `since:`/`until:` (a date or `30d`,
 `2w`, `12h`), search words, and `-` to exclude; unknown tokens are reported back.
-Facets count the matching entries. It requires membership in the tracker
-account, and also applies repository visibility and per-entry tracker access.
-`gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
+Facets count the matching entries. It requires an explicit current Space grant,
+and also applies repository visibility and per-entry Tracker access.
+`gm release feed [QUERY] [--team KEY] [--space SPACE]` is the CLI equivalent.
 
 The tracker feed uses a centered 72rem composition with bounded note text.
 From 1024px, facets occupy a separate right-hand rail; below that, the same
@@ -2295,8 +2475,8 @@ button with the same scroll icon as the navigation rail and a 44px minimum touch
 target. It carries the current single-team scope, including a saved default team;
 explicit URL filters take precedence. It drops
 issue-only filters so completed work is included. With no single team selected,
-the shortcut opens all account notes. The navigation rail always opens the
-account-wide feed.
+the shortcut opens all Space notes. The navigation rail always opens the
+Space-wide feed.
 
 Real-provider coverage in `vp run agent test-ai` checks daily generation without
 tags, a second commit on a different UTC committer date despite unchanged
@@ -2315,12 +2495,13 @@ model budget is exhausted, and stale-subject pruning within D1 binding limits.
 
 ## Automatic AI settings
 
-`/settings/ai?owner=<account>` controls automatic work across repositories owned
-by that personal or organization account. Open **Settings → AI settings** in the
-shared section navigation. Account members can read; only the human account owner,
-organization owners, and site admins can save. Agent credentials cannot change spending policy.
-Agent chat and interactive search, including query embeddings and reranking, are
-unchanged.
+`/settings/ai?space=<handle>` controls automatic work across that Space's
+repositories. Explicit Space members can read; human Space admins and the
+separately authorized Instance operators can save. Organization ownership is not
+a content grant. Agent credentials cannot change spending policy.
+Personal AI logging lives at `/settings/ai?person=<slug>` and
+`/api/accounts/:person/settings/ai`, separately from Space feature/model policy.
+Agent chat and interactive search still require current resource authorization.
 
 Four independent preferences default to enabled:
 
@@ -2352,20 +2533,20 @@ and [Clef Omni](https://developers.cloudflare.com/workers-ai/models/clef-omni/)
 are classification-only alternatives; their published prices were checked on
 2026-10-11. The request's model selector follows the selected provider model.
 
-`GET/PATCH /api/accounts/:slug/settings/ai` returns features, selected option IDs,
+`GET/PATCH /api/spaces/:space/settings/ai` returns features, selected option IDs,
 the catalog, save provenance and `canManage`. PATCH accepts partial nested
 `features`, `models` and `knowledgeUpdates` (`quietMinutes`, `maxWaitMinutes`,
 whole minutes 0–1440) objects; unknown keys, out-of-role model IDs and other
 waits are rejected.
 PATCH also accepts `logBodies` (`{<component>: true|false|null}`, null removes the
-account's override): whether AI Gateway logs keep request and response bodies for
-the account's calls (CORE-290). The view's `logBodies` lists each component's site
-value, the account's override and the effective value, with the retention note.
-The site default is `GET/PATCH /api/admin/ai` (`{logBodies}`; site administrators,
-people only to change; null returns a component to the environment's default) and
-the **Site AI settings** page (`/settings/site-ai`). Tables: `site_ai_log_bodies`,
-`account_ai_log_bodies`; `worker/ai-gateway.ts` resolves them per call from a
-once-a-minute isolate cache.
+Space's override): whether AI Gateway logs keep request and response bodies for
+the Space's content calls (CORE-290). `logBodies` shows the Instance default,
+scoped override and effective value. Personal components use personal overrides,
+not the selected employer's policy. Instance defaults use `GET/PATCH /api/admin/ai`
+(`{logBodies}`, human Instance operators to change) and `/settings/site-ai`.
+Tables are `site_ai_log_bodies`, `space_ai_log_bodies` and personal
+`account_ai_log_bodies`; `worker/ai-gateway.ts` reads current policy on every
+call rather than retaining a stale authorization or logging choice in an isolate.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
 
 **Body logging privacy and provider limits** (CORE-293). The shared notice in
@@ -2399,10 +2580,11 @@ or reproduce a size-related logging failure.
 
 ### AI providers (CORE-294)
 
-An account can add models from its own providers, with its own API keys, on
-**Settings → AI providers** (`/settings/ai-providers?owner=<account>`). The same
-people who save AI settings manage it; members see what is connected and which
-models are offered, never a key.
+A Space can add models from its own providers, with its own API keys, on
+**Settings → AI providers** (`/settings/ai-providers?space=<handle>`). Human Space
+admins and separately authorized Instance operators manage it; explicit members
+see connected providers and models, never a key. Organization ownership alone
+does not expose provider metadata.
 
 - **TypeSafe:** Jev (`typesafe:jev-latest`, $0.042 per million input tokens,
   output free) answers typed `choice`/`score`/`noul` questions like Clef, so it
@@ -2420,7 +2602,7 @@ provider model's published price otherwise. "Refresh prices" re-reads them.
 
 A key is checked with the provider (TypeSafe `GET /v1/models`, OpenRouter
 `GET /api/v1/key`) before it is sealed with `REGISTRY_KEK` into `ai_providers`
-(one per account and kind); views carry its last four characters only. Replacing
+(one per Space and kind); views carry its last four characters only. Replacing
 a key keeps the row, so running work uses the new key. Added models are
 `ai_provider_models`, with the name and prices the provider published (never
 taken from the request). A model chosen for a role can't be removed, nor its
@@ -2428,25 +2610,39 @@ provider disconnected, until another model is chosen: one guarded `DELETE`
 each. Should a chosen model go missing anyway, new work falls back to the role's
 default rather than failing.
 
-API: `GET /api/accounts/:slug/ai-providers` (`AiProvidersView`),
+API: `GET /api/spaces/:space/ai-providers` (`AiProvidersView`),
 `GET …/:kind/catalog`, `PUT …/:kind {apiKey}`, `DELETE …/:kind`,
 `POST …/:kind/models {model}`, `DELETE …/:kind/models?model=`,
 `POST …/:kind/models/refresh` (`worker/ai-providers/api.ts`). The AI settings
-`catalog` lists the built-in models, then the account's provider models for the
+`catalog` lists the built-in models, then the Space's provider models for the
 roles their capability allows, and PATCH validates against it.
 
 Snapshots name a provider model as `<kind>:<provider row id>:<model>` and carry
 its prices (`AiSnapshot.prices`). `worker/knowledge/models.ts` sends those calls
-to the provider with the account's key (`worker/ai-providers/providers.ts`)
+to the provider with the Space's key (`worker/ai-providers/providers.ts`)
 instead of Workers AI: they are billed to that key and **don't pass through AI
 Gateway**, so gateway logging doesn't apply to them. They keep the same
 deadlines, rate-limit backoff (429, and 503/529 overload) and usage metering, recorded as
 `<kind>:<model>`. Tests fake both providers (`worker/testing/ai-providers.ts`).
 
+Content AI carries immutable Space/resource scope and the initiating live
+person/agent authority through admission, provider calls and publication.
+Knowledge, Search and Atlas reauthorize source repositories before provider
+queries; old cursors, pinned composites and cached answers are not credentials.
+Assistant conversations and skills stay personal, while content tools require
+explicit Space context and fresh source access. Membership, Space-grant,
+collaborator or agent revocation is enforced on the next applicable request.
+External provider IDs, sealed keys, model IDs, source/build/snapshot/vector IDs
+and opaque Artifacts/R2 provenance are not renamed into new identities by the
+cutover. These are implementation contracts, not evidence of a production
+activation or a completed real-provider verification run.
+
 Policy is frozen when a Workflow is admitted or a release generation captures its
 refs. Retries, watchdog restarts and budget continuations keep that policy,
 including Atlas prices and limits; queued successors read the latest settings.
-Existing in-progress legacy work keeps its former Task model, Qwen 3.8 27B.
+Frozen model policy never freezes authorization: revoked authority blocks future
+consumption/publication. Legacy model snapshots may retain their recorded Qwen
+3.8 27B Task model only under valid current admission.
 Saving neither cancels running work nor enqueues a rebuild. Re-enabled features
 resume on normal triggers or explicit generation requests. Existing content remains
 readable, and changing models does not invalidate cached output or rewrite its
@@ -2484,7 +2680,7 @@ repository-only reader cannot retrieve tracker evidence, then asks the real
 assistant without putting the evidence body, receipt or URL in its prompt.
 Assertions require a completed answer quoting the original evidence and source
 anchor, and a successful persisted Knowledge tool receipt preserving the exact
-original evidence fields, issue status, tracker owner and source URL. Either
+original evidence fields, issue status, Tracker Space and source URL. Either
 `search_code` for this repository or `api_get` to its completion-evidence
 endpoint can supply that receipt; the model's tool choice is not the contract.
 These are gate requirements, not a claim of a successful run or a five-minute
@@ -2492,12 +2688,12 @@ full-gate guarantee; use the run's retained outcomes and timings.
 
 ### Live completion evidence (CORE-126)
 
-`GET /api/repos/:owner/:name/knowledge/completion-evidence?q=KEY` reads original
+`GET /api/repos/:space/:name/knowledge/completion-evidence?q=KEY` reads original
 tracker evidence directly, independently of graph/wiki indexing. It requires
 sign-in and repository read authorization, then restricts results to readable
-trackers and issues currently in an **unarchived workspace subscribed to this
+trackers and issues currently in an **unarchived Project subscribed to this
 repository**. Repository access alone grants no tracker access. Removing the
-subscription or archiving the workspace removes that live source from results.
+subscription or archiving the Project removes that live source from results.
 
 A query shaped like an issue key (for example `CORE-126`) matches that key
 exactly, case-insensitively, rather than notes that happen to mention it.
@@ -2505,8 +2701,8 @@ Other queries search issue keys, titles and evidence bodies. The response is
 `{query, evidence, truncated}`: at most 30 notes, newest first, with `truncated`
 indicating more matches. Each result retains the original comment fields
 (`id`, `issueId`, `kind`, `body`, `actorId`, `createdAt`), current issue context
-(`id`, `key`, `title`, `status`, `doneIn`), `trackerOwner`, `trackerOwnerId` and a
-`url` pointing to `/tracker/<owner>/issues/<key>#evidence-<comment-id>`.
+(`id`, `key`, `title`, `status`, `doneIn`), `trackerSpace`, `trackerSpaceId` and a
+`url` pointing to `/tracker/<space>/issues/<key>#evidence-<comment-id>`.
 Evidence remains searchable after reopening; current status is context, not a
 rewrite of the original verification claim.
 
@@ -2532,9 +2728,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 - **Batched, asynchronous updates** (CORE-286). A push to main marks the
   repository's Knowledge pending: the coordinator records main's new head, how
   many pushes are waiting and when the first and last came. One update then
-  runs at the latest head once pushes have paused for the account's quiet
+  runs at the latest head once pushes have paused for the Space's quiet
   period, and never later than its longest wait after the first pending push
-  (10 and 30 minutes by default; `knowledgeUpdates` in the account's AI
+  (10 and 30 minutes by default; `knowledgeUpdates` in the Space's AI
   settings, 0–1440 minutes each; development environments shorten both with
   `GITMATRIX_KNOWLEDGE_QUIET_SECONDS` / `GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS`).
   Pushes during an update wait for their own window. A repository's first
@@ -2633,7 +2829,7 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 - **Paid work stops (CORE-285, `paid-work.ts`, `paid-steps.ts`):** each
   Workflow step re-enters the build's metering context (AsyncLocalStorage
   doesn't cross `step.do`), so its calls record in `ai_usage` for the
-  repository owner, not as `unattributed`. No call starts after a step
+  repository Space, not as `unattributed`. No call starts after a step
   attempt's timeout (in-flight calls are aborted: the runtime has retried the
   step), or once main's build is no longer `running` (the watchdog stopped it,
   it failed, or the repository is being deleted), which fails the step without
@@ -2641,9 +2837,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   already ended, even when only its status was unreadable. A failed batch of
   model calls starts nothing more and waits for those in flight.
 - **Metering matches the Gateway:** every call's AI Gateway log carries the
-  `account` and `feature` it is recorded under; failed attempts (rate limits,
-  timeouts, stops) count in `ai_usage.failed_calls`. `test-ai` reconciles the
-  fixture owner's `ai_usage` with the owned gateway's logs per feature and
+  `scopeKind`, `scopeId` and `feature` it is recorded under; failed attempts
+  (rate limits, timeouts, stops) count in `ai_usage.failed_calls`. `test-ai`
+  reconciles the fixture scope's `ai_usage` with the owned gateway's logs per feature and
   model (`tools/agent/usage-reconciliation.ts`). Pagination follows the raw
   provider page size, not the filtered count: sparse or empty filtered pages
   must not truncate the audit. When comparing with the
@@ -2788,16 +2984,16 @@ Model calls the Semantic Code Atlas adds go through this module; upstream
 Knowledge inference, release notes and the assistant don't, so their spend
 stays where it was (build stats' `tokens`, `kg_synthesis`), and each build's
 stats carry Atlas spend separately as `atlasSpend`. Caps (`ATLAS_LIMITS`): per
-repository build 20 calls, 100,000 input and 10,000 output tokens; per account
+repository build 20 calls, 100,000 input and 10,000 output tokens; per Space
 grouping pass 10 calls, 50,000 input and 5,000 output tokens; and **$10 per
-UTC day per owning account** (the repository owner), shared by every
-repository, scope and principal. Prices are `ATLAS_PRICES` (USD per million
+UTC day per owning Space**, shared by its repositories, scopes and principals.
+Prices are `ATLAS_PRICES` (USD per million
 input/output tokens per model id, from `cf ai models list`); a model without one
 returns `disabled`. Each call is reserved before it runs at its maximum cost
 (input estimate + `max_tokens`) by one guarded `INSERT … SELECT` into
 `atlas_spend`, so concurrent callers can't overshoot, then reconciled to
 reported usage. The first cap reached is recorded in
-`atlas_budget_exhaustions` and stops that run (the ceiling: the account until
+`atlas_budget_exhaustions` and stops that run (the ceiling: the Space until
 UTC midnight); a failed call stays charged and nothing retries automatically.
 Integrate with `runAtlasCall(env.DB, {scope, purpose, model, maxInputTokens,
 maxOutputTokens}, call)` (or `reserveAtlasCall` then `settleAtlasCall`,
@@ -2818,10 +3014,10 @@ snapshots (`worker/atlas/projection.ts`) are bounded by `ATLAS_RETENTION`:
   exist (UTF-8 length of every column plus 160 bytes per entity row and 96 per
   edge row for keys and indexes). Over the cap, the oldest prior is evicted
   first (`storage`), one at a time, its rows reclaimed before measuring again.
-  Account-level composition (workspace scopes, not built yet) gets **2 GiB per
-  account** across all its scopes and principals, lineage and provenance
+  Space-level materialized composition (not built yet) gets **2 GiB per
+  Space** across its scopes and principals, lineage and provenance
   included: `enforceRetention` takes a pool of scopes with
-  `ACCOUNT_COMPOSITION_RETENTION`, so changing scope can't multiply the allowance.
+  `SPACE_COMPOSITION_RETENTION`, so changing scope can't multiply the allowance.
 - **Never current:** a new snapshot that doesn't fit with every prior gone
   fails before publication (`status = failed`, `failure = capacity`, a
   readable `error`); the previous snapshot stays current, stale, and
@@ -2839,38 +3035,38 @@ reason, current}` or `{state: "unknown"}`; an expired snapshot is never
   served from current silently. Cursors expire **30 minutes** after issue or at
   their snapshot's expiry, whichever is first (`CURSOR_TTL_MS`,
   `cursorExpiresAt`), and never hold off eviction. The Atlas read API
-  (`worker/atlas/api.ts`, `/api/repos/:owner/:name/atlas`) resolves every pinned
+  (`worker/atlas/api.ts`, `/api/repos/:space/:name/atlas`) resolves every pinned
   request and every cursor page this way before reading a row (410
   `snapshot_expired` naming `current`), its cursors carry their issue time, and
   its overview reports `capacityFailure` so the UI can show a stale snapshot.
 
 **Atlas workspace scope** (`worker/atlas/workspace.ts`, CORE-161). The same
-read API over several repositories of one account lives at
-`/api/accounts/:owner/atlas/{overview,regions,children,detail,ancestors,relations,evidence,catalogue}?repos=a,b`
+read API over several repositories of one Space lives at
+`/api/spaces/:space/atlas/{overview,regions,children,detail,ancestors,relations,evidence,catalogue}?repos=a,b`
 (at most 50; `src/lib/atlas.ts` `atlasWorkspaceApi`). The selection is
 explicit and re-authorized on every request, cursor pages included: one SQL
 query keeps the selected repositories the caller can read now (`readableRepo`),
 so an unreadable repository looks exactly like a missing one, is never counted,
-and changes nothing in the response. The scope id, `ws:<ownerId>:<hash>`, names
+and changes nothing in the response. The scope id, `ws:<spaceId>:<hash>`, names
 that authorized set; cursors are bound to it, so revoking access (or a
 visibility change) turns open cursors and pinned composites into
 `cursor_invalid` / `snapshot_unknown` before any row is read. Selecting a
 repository stores nothing, subscribes to nothing and never starts a Knowledge
-build (a tracker workspace's repositories can seed the selection client-side).
+build (a tracker Project's repositories can seed the selection client-side).
 
 Composition is virtual: responses read each repository's own published
 snapshot, ranked together (capabilities across repositories by primary files,
 groups after), with entity ids namespaced `<repoId>/<id>`. Each response lists
 the repositories it read with their own state (`ready`, `building`,
 `unavailable`, `not-enabled`) and snapshot vector, never a common HEAD; the
-composite id `ws1.<tag>.<seq per repository>` pins them all and each is
+opaque composite ID pins them all; each source is
 resolved through retention on every page. Nothing composed mixes repositories:
 every name, summary and count comes from one repository's projection, so
 narrowing the scope can't leave a hidden repository's labels behind.
 Virtual composition stores nothing.
 
 **The Knowledge tab is the Atlas** (`src/routes/repo/Atlas.tsx`, CORE-174).
-`/:owner/:repo/knowledge` reads only bounded `/atlas/*` pages (overview,
+`/:space/:repo/knowledge` reads only bounded `/atlas/*` pages (overview,
 children, detail, relations, evidence, ancestors, catalogue) plus the build
 status, the wiki catalog and timelines' overlays; nothing in normal navigation
 reads the whole graph. The old eager `GET …/knowledge/graph/map`, its
@@ -3007,9 +3203,9 @@ the selected capability, and hands off to source at either commit, history and
 syntax changes; Back returns to the same comparison.
 
 **Workspace Atlas page** (`src/routes/atlas/`, CORE-172), at
-`/:owner/-/atlas?repos=a,b`, linked as **Knowledge** from the account page. Pick the
-account, then repositories you can read (or fill the selection from a tracker
-workspace's subscribed repositories, read once on request); the URL keeps the
+`/:space/-/atlas?repos=a,b`, linked as **Knowledge** from the Space page. Pick the
+Space, then repositories you can read (or fill the selection from a tracker
+Project's subscribed repositories, read once on request); the URL keeps the
 selection in pick order. Coverage lists every selected name with its own
 commit, build and state (ready, partial, lagging, building, unavailable, not
 enabled, unavailable to you) and whether its published packages are recorded
@@ -3018,7 +3214,7 @@ repository without Knowledge starts nothing. The map draws each ready
 repository's own territory in its own fixed-width column, in pick order, from
 its own layout slots (`workspace.ts` `buildWorkspaceTerritory`), so shared slot
 numbers never collide and a repository growing never moves another. Changing
-the selection or account remounts the view (`WorkspaceSession`): in-flight
+the selection or Space remounts the view (`WorkspaceSession`): in-flight
 requests are aborted and late answers dropped. When a pinned request reports
 the authorized set changed (revocation mid-view), the page re-reads the scope,
 discards everything from repositories no longer readable and offers the
@@ -3026,7 +3222,7 @@ current view.
 
 **Cross-repository composition** (`worker/atlas/compose.ts`, CORE-167,
 `COMPOSITION_VERSION`). Over a workspace scope,
-`/api/accounts/:owner/atlas/composition?repos=…` pages capabilities spanning
+`/api/spaces/:space/atlas/composition?repos=…` pages capabilities spanning
 repositories, and `/links?repos=…&id=<repoId>/<capability>&state=resolved|unresolved|related`
 (`direction=in` with `id=<repoId>/repo` for dependents of a repository) pages
 one capability's cross-repository links (`atlasWorkspaceApi.composition` and
@@ -3057,9 +3253,9 @@ principal: a reader with the same access gets the same content, but never
 another's warm answer, whose timing would tell them someone else just looked. A denied
 repository is never read, so every response is byte-identical to a selection
 without it. Materializing would multiply snapshots per selection and principal
-policy inside the one 2 GiB account composition pool and need invalidation on
+policy inside the one 2 GiB Space composition pool and need invalidation on
 every visibility change; computing needs neither, so the pool stays unused and
-no account grouping budget is drawn.
+no Space grouping budget is drawn.
 
 The model catalog lives in `shared/ai.ts`; provider adapters live in
 `worker/knowledge/models.ts`. `POST /api/dev/clef` with
@@ -3069,7 +3265,7 @@ uses the repository's admitted classification policy, with metering and no
 automatic retry. The independent `test-ai` stage `classification` uses this
 path for one real decision each on Clef Flash and Clef Omni: distinguishing an
 ongoing outage from a healthy status and a hypothetical question. It checks
-persisted selector acceptance and uncached, account-attributed Gateway records.
+persisted selector acceptance and uncached, scope-attributed Gateway records.
 Classifier Gateway records can omit token counts, so application metering must
 also show exactly one added successful call and positive input tokens.
 The proof restores the original selection in `finally`; Clef remains the default.
@@ -3325,7 +3521,7 @@ the wire types (`worker/deployments/`).
 | `GET /api/repos/:o/:n/deployments/live-timelines`              | `{timelines}`: slugs with an active or sleeping record in any source, nothing else; readers and the repository's CI jobs (CORE-372)                                                     |
 | `GET`, `PATCH /api/repos/:o/:n/deployments/:id`                | One record; `PATCH {status?, url?, expiresAt?, exposedFrom?, exposedUntil?, percentage?}`; provenance fields answer `409`                                                               |
 | `GET /api/repos/:o/:n/environments`                            | `production` and each recorded environment, with its newest deployment and, for a canary, `split`: every live record of its provider deployment                                         |
-| `GET`, `PATCH /api/accounts/:slug/settings/previews`           | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                                                                   |
+| `GET`, `PATCH /api/spaces/:space/settings/previews`            | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; human Space admins or Instance operators change them                                                                     |
 | `POST /api/tracker/:o/timelines/:slug/checkpoints/:ref/revive` | Rebuild a checkpoint's preview: `{checkpoint, runs: [{repoId, number, runId} \| {repoId, skipped}]}`; write access to every repository                                                  |
 
 - **Who records.** Anyone with write access, with a personal or agent token
@@ -3347,7 +3543,7 @@ the wire types (`worker/deployments/`).
 - **`gm deploy record --url <url>`** in a job; outside CI add `--commit`.
   `gm deploy list` and `gm deploy update <id> --status expired` read and
   change records.
-- **Expiry.** A timeline preview follows the account's retention (below)
+- **Expiry.** A timeline preview follows the Space's retention (below)
   unless the recorder pins an `expiresAt` (on record or by `PATCH`); other
   records don't expire unless told.
 
@@ -3515,12 +3711,12 @@ checkpoint, revived}`.
 **Expiry** (`worker/deployments/sweep.ts`, on the hourly cron). A timeline
 preview is torn down `endedDays` after its timeline lands or is abandoned
 (the timeline's last change) and `idleDays` after the timeline's last push,
-whichever comes first: 2 and 7 by default, set per account with `PATCH
-/api/accounts/:slug/settings/previews` (`shared/deployments.ts`,
+whichever comes first: 2 and 7 by default, set per Space with `PATCH
+/api/spaces/:space/settings/previews` (`shared/deployments.ts`,
 `previewExpiry`). The sweep keeps each preview's `expiresAt` to these rules
 unless it's pinned. A timeline's previews in one repository are torn down
 together once every one is due: they're marked `expired` with `tornDownAt`
-(and `teardownRun` when a run started), and the records stay. If the account's
+(and `teardownRun` when a run started), and the records stay. If the Space's
 tracker can't answer, nothing is torn down until the next hour.
 
 **Revival.** A checkpoint's preview can be rebuilt while its recorded source
@@ -3757,7 +3953,7 @@ its routes (`shared/worker-first.ts`, the same list production uses) and
 
 ## Packages
 
-Every owner gets a package registry in each format the first time something is
+Every Space gets a package registry in each format the first time something is
 published to it: npm, Docker/OCI, PyPI, Maven, Cargo, Go, Helm, APT, RPM,
 Homebrew, generic files and releases. The engine (`registry/`,
 `packages/formats`) comes from artifatrix and runs in this same Worker on its
@@ -3765,7 +3961,7 @@ own D1 database (`REGISTRY_DB`), R2 bucket (`REGISTRY_BLOBS`), Durable Objects
 and queue. Accounts and permissions stay in gitmatrix's `DB`.
 
 ```
-npm / docker / pip / cargo … ──▶ /npm/<owner>/… /v2/<owner>/<image>/… /pypi/<owner>/…  (registry/app.ts)
+npm / docker / pip / cargo … ──▶ /npm/<space>/… /v2/<space>/<image>/… /pypi/<space>/…  (registry/app.ts)
 web app, gm                  ──▶ /api/packages/…   (registry/manage: console queries, housekeeping, feeds)
 every publish                ──▶ publishes: version, repository, branch, commit, CI run, actor
 ```
@@ -3776,11 +3972,11 @@ every publish                ──▶ publishes: version, repository, branch, c
 $GITMATRIX_IMAGE_PREFIX/app:tag`, `twine upload`, `cargo publish --registry
 gitmatrix`, `mvn deploy` (server id `gitmatrix`), `helm push`, Go modules
   through `GOPROXY`, and `gm pkg upload` for files (`worker/ci/registry.ts`).
-- **Packages remember their sources.** The first CI publish of a package claims
-  it for the job's repository. After that, only its sources' jobs and people
-  who can write to a source may publish it. Owner admins grant more
-  repositories, cross-owner ones included (`package_sources`). People without
-  write access to a source get a 403 naming the sources.
+- **Packages remember their sources.** CI publication binds a package to its
+  source repository. Source authorization and feed/package authorization are
+  separate checks; association alone grants neither. Space admins manage source
+  associations (`package_sources`); jobs bind current repository and Space.
+  Original package, publication, file/blob and source provenance IDs remain stable.
 - **Only the default branch moves `latest`.** A CI job building any other
   branch still publishes its versions, with the branch in their history, but
   they never become `latest`: not npm's dist-tag, an OCI `:latest` push (the
@@ -3788,15 +3984,16 @@ gitmatrix`, `mvn deploy` (server id `gitmatrix`), `helm push`, Go modules
   chart, Maven's `<latest>`/`<release>`, or the newest-publish fallback the
   console and `gm pkg download …/latest` use (`publishes.off_default_branch`).
   People publishing by hand move it as before.
-- **Access follows the owner.**
-  - The owner and org owners are admins. Org members get read, or write when
-    the org gives members write. Collaborators who can write one of the
-    owner's repositories get write.
+- **Access follows explicit Space grants.**
+  - Space admins administer packages; members use the independent package
+    baseline (`none`, `read`, `write`). Neither Organization ownership nor
+    collaboration on another repository grants feed/package access. Existing
+    Instance registry powers remain separate.
   - Deleting versions takes admin, and CI jobs never delete.
   - Feeds are private by default.
   - Tokens: `gmx_` access tokens and SSH sessions, `gmj_` job tokens, Docker's
     token flow, and the web session.
-- **The console.** `/:owner/-/packages/:format/:name` queries a package's
+- **The console.** `/:space/-/packages/:format/:name` queries a package's
   publish history:
   - a query language (`source:web branch:main status:active since:7d
 commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
@@ -3813,9 +4010,9 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
 
   Repositories have a Packages tab, and CI runs list what they published.
 
-- **Feeds and proxies.** `/:owner/-/feeds` sets visibility and retention (keep
+- **Feeds and proxies.** `/:space/-/feeds` sets visibility and retention (keep
   the newest N versions, or remove them after N days; tagged versions stay),
-  and adds proxies (`<owner>.<name>`, credentials sealed with `REGISTRY_KEK`)
+  and adds proxies (`<space>.<name>`, credentials sealed with `REGISTRY_KEK`)
   and virtual feeds over several of them. An hourly cron sweeps retention, and
   a GC deletes unreferenced blobs.
 - **npm login** works both ways: an access token as the password, or
@@ -3823,13 +4020,13 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
 
 Deployed, package indexes embed https://timelinesapp.fward.dev (or
 `GITMATRIX_PUBLIC_URL`), and the `REGISTRY_KEK` secret seals keys. Development uses a fixed public key. `pnpm run
-db:migrate` applies both databases' migrations. Account slugs must not take
-the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
-`helm`, `apt`, `rpm`, `brew`, `generic`, `releases`) or `-`.
+db:migrate` applies both databases' migrations. Space handles exclude every
+reserved application and registry route prefix, including `accounts` and
+`organizations`; canonical validation uses the shared reserved-name registry.
 
 ### Version contents
 
-`GET /api/packages/:owner/:format/:name/contents?version=…` returns a
+`GET /api/packages/:space/:format/:name/contents?version=…` returns a
 `PackageContents` page. Encode the package name as one API path segment.
 `offset` and `limit` paginate entries; `path` selects an npm archive directory
 or a directory of distribution files, and `manifest` selects a manifest
@@ -3912,12 +4109,26 @@ narrow panel without resetting the conversation or draft. Phones already use
 the full screen. Short prompts use a compact one-row field; longer drafts grow
 to a height cap and scroll inside the field. The composer can also scroll in a
 short viewport, independently of the conversation.
+Lazy loading and delayed conversation-history responses retain the same mounted
+composer, including its draft, caret and active slash-skill completion.
 
 - **Where it runs.** `worker/assistant/agent.ts`: an `AIChatAgent` (Cloudflare
   Agents SDK) Durable Object per conversation, named `<userId>:<chatId>` by
   `worker/api/assistant.ts` from the signed-in actor, so nobody reaches someone
   else's chat by naming it. Transcripts persist in the object's SQLite; the
   directory is `assistant_chats` in D1 (`GET /api/assistant/chats`).
+- **Current source access.** Reopening, exporting and continuing a conversation
+  revalidate its source receipts and the current initiating credentials. Losing
+  source access, or having a legacy transcript without verifiable provenance,
+  makes its content unavailable: no stored tool output, download or composer.
+  The stored transcript is retained, not erased or treated as authorization.
+  Restoring verifiable access permits it again; a new chat starts independently.
+  Release-note projections combine repository and tracker rights, so their receipts
+  cover the actual authorized response, not just one surviving grant. Public or
+  collaborator repository access cannot preserve revoked private tracker content;
+  tracker access cannot preserve a revoked private repository's feed entries.
+  Later tool calls retain earlier source obligations, and a projection changed
+  during a read is rejected rather than attached to different retained bytes.
 - **Who it is.** It acts as an `assistant` agent identity accountable to the
   person (created on first use, `identity.ts`), with a short-lived token, and
   calls the real JSON API in-process (`internal.ts`, `worker/app.ts`), so every
@@ -3960,8 +4171,8 @@ short viewport, independently of the conversation.
   each, bodies preloaded for the turn's groups and otherwise one
   `activate_skill` away. Every tool-using turn preloads both the API catalog and
   browser navigation routes, including ordinary answers that cite pages without
-  navigating. Release-note browser links use `/:owner/:repo/releases` (or
-  `/tracker/:owner/releases` for the tracker feed); `/release-notes` is a JSON API
+  navigating. Release-note browser links use `/:space/:repo/releases` (or
+  `/tracker/:space/releases` for the tracker feed); `/release-notes` is a JSON API
   suffix, not a page. Enabled personal skills and a repository's own
   `.agents/skills/*/SKILL.md` join the catalog when the chat includes that repository.
   Personal skills are available without repository context. Duplicate names resolve
@@ -3971,13 +4182,13 @@ short viewport, independently of the conversation.
   **Settings → Personal → Assistant skills**, opens `/settings/skills`. Add or
   edit a name, optional description and Markdown instructions; disable a skill
   without deleting it, or confirm its removal. Skills belong to the signed-in
-  person, not the selected settings owner or an agent capability profile.
+  person, not the selected settings Space or an agent capability profile.
   `GET/POST /api/account/skills` and `PUT/DELETE /api/account/skills/:id` manage
   `assistant_personal_skills` in D1. Names use lowercase letters, digits and
   hyphens (1–64 characters); descriptions allow 500 characters and instructions
   20,000. Human-only CRUD checks ownership on every request.
 - **Slash commands.** Start a message with `/` to list authorized skills from
-  `GET /api/assistant/skills?repo=owner/name`; filtering matches names and
+  `GET /api/assistant/skills?repo=space/name`; filtering matches names and
   descriptions. Arrow keys move selection, Enter or Tab inserts the command
   without sending, and Escape dismisses the list. Send `/name` with optional
   arguments to preload its instructions for that turn, including approval and
@@ -4090,11 +4301,9 @@ the Cloudflare reader (CORE-352) returns it, and History and the entity views
   service's evidence.
 - **Scope.** A connection, and an issue's link to an observation, carry an
   opaque `spaceId`; reads are keyed by `repoId`, `connectionId` and
-  `bindingId`. The Organization/Space cutover (CORE-361/362) makes `spaceId`
-  `spaces.id`. Until then the server derives it from `repos.owner_id`, on the
-  CORE-360 mapping manifest's proposal that a legacy owner's id is reused as
-  its default Space id. That proposal awaits operator approval and is not
-  settled; if the approved mapping differs, stored values move with it.
+  `bindingId`. `spaceId` is `spaces.id`, the bound repositories'
+  `repos.space_id`; the cutover mapping reuses a legacy owner's id as its
+  default Space id.
   Authorization (`worker/permissions.ts` `repoRole`, through `loadRepo`) is
   re-checked on every read, link and cursor. A repository or connection the
   caller can't read looks exactly like a missing one; `denied` means only
@@ -4222,37 +4431,38 @@ durations or disable that policy. Preview teardown and Atlas snapshots retain
 their always-active controls.
 
 - **Categories** are defined once in `worker/retention/categories.ts`: id
-  (kebab-case, stored, never renamed), scope (`account` or `site`), label,
+  (kebab-case, stored, never renamed), scope (`space`, `person` or `instance`), label,
   description, `never` (what it never deletes, in plain words) and thresholds
   (whole numbers with `min`, `max` and the PRD `default`). `control` is
   `policy` (configurable; `defaultEnabled` otherwise defaults false), `active`
   (always runs: preview teardown, whose
-  numbers are the `account_settings` preview columns, the same ones
-  `/settings/previews` changes, and Atlas snapshot retention, which an account
+  numbers are the `space_settings` preview columns, the same ones
+  `/settings/previews?space=` changes, and Atlas snapshot retention, which a Space
   can tighten within `ATLAS_RETENTION_BOUNDS` but never loosen) or `fixed`
   (always runs with its defaults, shown read-only; stored values are ignored:
   auth hygiene). Shapes for clients are in
   `shared/retention.ts`.
 - **Policies** (`worker/retention/policies.ts`) store only what was changed:
-  `retention_policies` per account, `retention_site_policies` for site
-  categories and site-wide defaults of account categories. Each value
-  resolves account, then site-wide default, then category default; `enabled`
-  ends at `defaultEnabled ?? false`. Enabling a category without values
-  applies its defaults. A stored value outside today's bounds is ignored.
-  `enabledTargets(d1)` lists what scheduled runs cover: explicit account/site
-  choices, inherited default-enabled policies and the site's fixed categories.
+  `retention_policies` keyed by `scope_kind` and `scope_id`;
+  `retention_site_policies` holds Instance categories and configurable policy
+  defaults. Values resolve the selected Space/person, then Instance policy
+  default, then category default; active categories use only their scoped values.
+  `enabled` ends at `defaultEnabled ?? false`. Invalid stored values are ignored.
+  `enabledTargets(d1)` lists scheduled Space, person and Instance targets.
+  Defaults never grant access to another person's chats or a Space's content.
 - **Audit:** every change records who changed which category from what to
   what in `retention_policy_changes`; the settings responses include the
   latest 20.
 
-| Route                                          | Contract                                                                                                                          |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/accounts/:slug/settings/retention`   | The account's categories with effective `enabled`, `values` and where each comes from (administrators; members 403, others 404)   |
-| `PATCH /api/accounts/:slug/settings/retention` | `{categories: {<id>: {enabled?, thresholds?}}}`; `null` resets to inherit (org owners, the user, site admins; people, not agents) |
-| `GET`, `PATCH /api/admin/retention`            | Site categories and site-wide defaults for account `policy` categories (site administrators; others 403)                          |
+| Route                                          | Contract                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------ |
+| `GET`, `PATCH /api/spaces/:space/retention`    | Space categories; explicit Space admins only, including for Instance operators |
+| `GET`, `PATCH /api/accounts/:person/retention` | Personal categories, self-only                                                 |
+| `GET`, `PATCH /api/admin/retention`            | Instance categories and configurable policy defaults; Instance operators       |
 
-Unknown categories or thresholds, fractional or out-of-bounds values, site
-categories at account level and read-only categories are rejected with 400,
+PATCH is human-only and accepts `{categories: {<id>: {enabled?, thresholds?}}}`;
+`null` resets to the applicable default. Unknown categories/thresholds,
+fractional/out-of-bounds values, wrong-scope and read-only categories return 400,
 and a rejected request stores nothing.
 
 **Owned timeline work archives.** Landing/abandonment archives full WIP history
@@ -4277,7 +4487,7 @@ unmanaged previews have no invented teardown job. Unknown Workflow state or a
 failed stop keeps its claim. Completed output metadata does not pin Git forever.
 Revision origins and integration receipts survive source Git expiry; canonical
 repository deletion removes them with the rest of its provenance.
-Usage meters this retained evidence to its canonical repository's owner.
+Usage meters this retained evidence to its canonical repository's Space.
 Retained child dependencies protect required bases and exact ancestry evidence.
 Once eligible sources enter purge, reads return `source_expired` (410), never
 canonical fallback. Canonical deletion tombstones immediately block all work
@@ -4288,170 +4498,176 @@ reservations before allocation begins.
 ### Categories, defaults and what they never delete
 
 Generated from `worker/retention/categories.ts` (`docs.test.ts` fails when it
-drifts; regenerate with `node apps/website/worker/retention/docs.ts`). Account
-categories are set by the account's administrators (site administrators can
-set a site-wide default for every account that hasn't chosen); site
-categories cover data no account owns. Thresholds are whole numbers within the
-bounds shown.
+drifts; regenerate with `node apps/website/worker/retention/docs.ts`). Space
+categories require explicit Space administration; person categories are self-only.
+Instance operators set infrastructure categories and configurable defaults, not
+implicit content grants. Thresholds are whole numbers within the bounds shown.
 
 <!-- retention-categories:start (generated by worker/retention/docs.ts) -->
 
-**Account scope**
+**Space scope**
 
-- **CI logs** (`ci-logs`, account scope; off until enabled). Log text of CI jobs
+- **CI logs** (`ci-logs`, space scope; off until enabled). Log text of CI jobs
   that finished more than the given days ago. Defaults when enabled: Days after
   the job finished: 30 (`days`, 1–3650). Never deletes: logs of pending, queued
   or running jobs; the run, job and step records themselves. Can select the same
   records as `ci-runs`: a dry run of both counts them under each, a run removes
   each once.
-- **CI run history** (`ci-runs`, account scope; off until enabled). CI runs
-  older than the given days, with their jobs, steps and logs. Defaults when
-  enabled: Days after the run: 180 (`days`, 1–3650); Runs kept per ref: 20
-  (`keepLatest`, 1–1000). Never deletes: the latest runs of each ref (the count
-  below); running or queued runs, and runs with a job still running; runs a
-  deployment, a landing or a package publish refers to. Can select the same
-  records as `ci-logs`, `step-artifacts`: a dry run of both counts them under
-  each, a run removes each once.
-- **Expired preview deployment records** (`preview-records`, account scope; off
+- **CI run history** (`ci-runs`, space scope; off until enabled). CI runs older
+  than the given days, with their jobs, steps and logs. Defaults when enabled:
+  Days after the run: 180 (`days`, 1–3650); Runs kept per ref: 20 (`keepLatest`,
+  1–1000). Never deletes: the latest runs of each ref (the count below); running
+  or queued runs, and runs with a job still running; runs a deployment, a
+  landing or a package publish refers to. Can select the same records as
+  `ci-logs`, `step-artifacts`: a dry run of both counts them under each, a run
+  removes each once.
+- **Expired preview deployment records** (`preview-records`, space scope; off
   until enabled). Records of preview deployments that expired more than the
   given days ago. Defaults when enabled: Days after expiry: 30 (`days`, 1–3650).
   Never deletes: live or sleeping deployments; production deployments; failed
   deployments.
-- **Knowledge build history** (`knowledge-builds`, account scope; off until
+- **Knowledge build history** (`knowledge-builds`, space scope; off until
   enabled). Knowledge graph build records and their change lists older than the
   given days. Defaults when enabled: Days after the build: 90 (`days`, 1–3650);
   Builds kept per repository: 20 (`keepLatest`, 1–1000). Never deletes: the
   current graph, wiki and Atlas snapshot; the latest builds (the count below).
-- **Ended timeline overlays and page sets** (`ended-timeline-data`, account
-  scope; off until enabled). Knowledge overlays, regroupings and page sets of
-  timelines that ended more than the given days ago. Defaults when enabled: Days
-  after the timeline ended: 90 (`days`, 1–3650). Never deletes: data of open
-  timelines; anything on the main line.
-- **Step instructions and steering** (`step-steering`, account scope; off until
+- **Ended timeline overlays and page sets** (`ended-timeline-data`, space scope;
+  off until enabled). Knowledge overlays, regroupings and page sets of timelines
+  that ended more than the given days ago. Defaults when enabled: Days after the
+  timeline ended: 90 (`days`, 1–3650). Never deletes: data of open timelines;
+  anything on the main line.
+- **Step instructions and steering** (`step-steering`, space scope; off until
   enabled). The text of steps' instructions and steering (what people told their
   agents), the given days after the step's commit, trimmed to a placeholder.
   Defaults when enabled: Days after the step's commit: 365 (`days`, 1–3650).
   Never deletes: a step's why, challenges, tests or coverage; the step itself
   and its commit.
-- **Step run artifacts** (`step-artifacts`, account scope; off until enabled).
+- **Step run artifacts** (`step-artifacts`, space scope; off until enabled).
   What step runs produced (test summaries), the given days after the run.
   Defaults when enabled: Days after the step run: 90 (`days`, 1–3650). Never
   deletes: the step and its context; the CI run that produced them. Can select
   the same records as `ci-runs`: a dry run of both counts them under each, a run
   removes each once.
-- **Live step feed** (`step-feed`, account scope; always on (it ran before
+- **Live step feed** (`step-feed`, space scope; always on (it ran before
   retention policies existed)). Each timeline's live feed keeps a step's small
   record for the given days, enough for readers to catch up; the step itself
-  stays. An account can keep less, never more. Defaults: Days a feed record is
+  stays. A Space can keep less, never more. Defaults: Days a feed record is
   kept: 7 (`days`, 1–7). Never deletes: steps and their context.
-- **Timeline work Git repositories** (`timeline-work-sources`, account scope; on
+- **Timeline work Git repositories** (`timeline-work-sources`, space scope; on
   by default). Read-only work Git repositories expire independently of Tracker
   details and published outputs, after landing or abandonment. Defaults: Days
   after landing: 30 (`landedDays`, 1–3650); Days after abandonment: 90
   (`abandonedDays`, 1–3650). Never deletes: canonical Git repositories and
   historical canonical sources; open timeline sources; sources required by live
   dependencies or unacknowledged consumers.
-- **Push log** (`push-log`, account scope; off until enabled). Push log entries
+- **Push log** (`push-log`, space scope; off until enabled). Push log entries
   older than the given days, and records of changes on branches or bookmarks
   that no longer exist, last seen before then. Defaults when enabled: Days after
   the push: 365 (`days`, 1–3650). Never deletes: commits, refs or any git
   history; the latest push log entry of each branch or tag that exists; a
   change's record on a branch or tag that exists, or the push log entry it
   points to.
-- **Unreachable git data** (`unreachable-git`, account scope; off until enabled;
+- **Unreachable git data** (`unreachable-git`, space scope; off until enabled;
   no cleanup, so it never deletes anything). Git objects no ref reaches any more
   (deleted branches, landed or abandoned timeline bookmarks). Artifacts can't
   prune them yet: they are measured in the usage report, never deleted. Defaults
   when enabled: Days after becoming unreachable: 30 (`days`, 1–3650). Never
   deletes: reachable history of any branch, tag or bookmark; anything, until
   Artifacts can prune.
-- **Closed and canceled issues** (`closed-issues`, account scope; off until
+- **Closed and canceled issues** (`closed-issues`, space scope; off until
   enabled). Issues closed or canceled more than the given days ago, with their
   comments, links and events. Defaults when enabled: Days after closing: 365
-  (`days`, 1–3650). Never deletes: open issues; issue keys (never reused). Can
-  select the same records as `tracker-activity`: a dry run of both counts them
-  under each, a run removes each once.
-- **Tracker activity logs and ended timelines** (`tracker-activity`, account
+  (`days`, 1–3650). Never deletes: open issues; issue keys (never reused);
+  migration operation deduplication evidence. Can select the same records as
+  `tracker-activity`: a dry run of both counts them under each, a run removes
+  each once.
+- **Tracker activity logs and ended timelines** (`tracker-activity`, space
   scope; off until enabled). Tracker activity log entries older than the given
   days, and ended timelines. Defaults when enabled: Days to keep activity: 365
   (`eventDays`, 1–3650); Days after a timeline ended: 180 (`endedTimelineDays`,
   1–3650). Never deletes: activity that open issues and timelines still show;
-  open timelines. Can select the same records as `closed-issues`: a dry run of
-  both counts them under each, a run removes each once.
-- **Assistant chats** (`assistant-chats`, account scope; off until enabled).
-  Assistant chats nobody has used for the given days. Defaults when enabled:
-  Days without activity: 90 (`days`, 1–3650); Chats kept per person (0 for no
-  limit): 0 (`maxPerUser`, 0–10000). Never deletes: chats used within the period
-  (unless over the per-person limit); a chat with a turn in progress; the newest
-  chats up to the per-person limit.
-- **Release notes** (`release-notes`, account scope; off until enabled). Release
+  open timelines; migration operation deduplication evidence. Can select the
+  same records as `closed-issues`: a dry run of both counts them under each, a
+  run removes each once.
+- **Release notes** (`release-notes`, space scope; off until enabled). Release
   notes older than the given days, with their entries and mentions. Defaults
   when enabled: Days after publishing: 730 (`days`, 1–3650). Never deletes: each
   repository's latest daily and latest tagged release notes.
-- **Timeline previews** (`previews`, account scope; always on (it ran before
+- **Timeline previews** (`previews`, space scope; always on (it ran before
   retention policies existed)). Live timeline previews are torn down after their
   timeline lands or is abandoned, or after a period without pushes. Their
   records stay (see expired preview deployment records). Defaults: Days after
   the timeline ended: 2 (`endedDays`, 0–365); Days without pushes: 7
   (`idleDays`, 1–365). Never deletes: previews with an expiry their recorder
   pinned; production deployments.
-- **Atlas snapshots** (`atlas-snapshots`, account scope; always on (it ran
-  before retention policies existed)). Each repository keeps its current Atlas
-  snapshot and recent prior ones; older priors expire and their rows are
-  reclaimed. An account can keep fewer, never more. Defaults: Prior snapshots
-  kept: 20 (`maxPrior`, 0–20); Days a prior snapshot is kept: 7 (`priorDays`,
-  1–7); Storage per repository: 2 GiB (`capGib`, 1–2 GiB). Never deletes: the
-  current snapshot.
+- **Atlas snapshots** (`atlas-snapshots`, space scope; always on (it ran before
+  retention policies existed)). Each repository keeps its current Atlas snapshot
+  and recent prior ones; older priors expire and their rows are reclaimed. A
+  Space can keep fewer, never more. Defaults: Prior snapshots kept: 20
+  (`maxPrior`, 0–20); Days a prior snapshot is kept: 7 (`priorDays`, 1–7);
+  Storage per repository: 2 GiB (`capGib`, 1–2 GiB). Never deletes: the current
+  snapshot.
 
-**Site scope**
+**Person scope**
 
-- **Analysis caches** (`analysis-caches`, site scope; off until enabled). Cached
-  file analyses and syntheses no repository's current build has used for the
-  given days. Defaults when enabled: Days unused: 30 (`days`, 1–3650). Never
+- **Assistant chats** (`assistant-chats`, person scope; off until enabled).
+  Assistant chats nobody has used for the given days. Defaults when enabled:
+  Days without activity: 90 (`days`, 1–3650); Chats kept per person (0 for no
+  limit): 0 (`maxPerUser`, 0–10000). Never deletes: chats used within the period
+  (unless over the per-person limit); a chat with a turn in progress; the newest
+  chats up to the per-person limit.
+
+**Instance scope**
+
+- **Analysis caches** (`analysis-caches`, instance scope; off until enabled).
+  Cached file analyses and syntheses no repository's current build has used for
+  the given days. Defaults when enabled: Days unused: 30 (`days`, 1–3650). Never
   deletes: entries any current build uses.
-- **Registry proxy cache and derived objects** (`registry-proxy-cache`, site
+- **Registry proxy cache and derived objects** (`registry-proxy-cache`, instance
   scope; off until enabled). Cached upstream package entries and derived files
   unused for the given days, so garbage collection can reclaim their blobs.
   Defaults when enabled: Days unused: 30 (`days`, 1–3650). Never deletes: blobs
   any version, tag or kept cache entry refers to; published packages; derived
   files in use, or written within the last day.
-- **Registry audit log and publish records** (`registry-audit`, site scope; off
-  until enabled). Registry audit entries and publish records older than the
+- **Registry audit log and publish records** (`registry-audit`, instance scope;
+  off until enabled). Registry audit entries and publish records older than the
   given days. Defaults when enabled: Days to keep: 365 (`days`, 1–3650). Never
   deletes: package versions and their contents; the newest publish record of
   each version still published; records of versions published from another
   branch (they keep them from becoming latest).
-- **Auth hygiene** (`auth-hygiene`, site scope; always on, read-only). Expired
-  sign-in sessions, sign-in and device codes, lockouts, SSH challenges and
-  expired tokens, the given days after they ended. Defaults: Days after expiry:
-  7 (`days`, 1–3650). Never deletes: live sessions, valid tokens and active
-  lockouts.
-- **AI spend records** (`ai-spend`, site scope; off until enabled). Per-call AI
-  spend records older than the given days, rolled up to daily totals. Defaults
-  when enabled: Days of per-call detail: 90 (`days`, 7–3650). Never deletes:
-  totals budgets are enforced against; reservations still in flight.
-- **Usage history** (`usage-history`, site scope; off until enabled). Daily
+- **Auth hygiene** (`auth-hygiene`, instance scope; always on, read-only).
+  Expired sign-in sessions, sign-in and device codes, lockouts, SSH challenges
+  and expired tokens, the given days after they ended. Defaults: Days after
+  expiry: 7 (`days`, 1–3650). Never deletes: live sessions, valid tokens and
+  active lockouts.
+- **AI spend records** (`ai-spend`, instance scope; off until enabled). Per-call
+  AI spend records older than the given days, rolled up to daily totals.
+  Defaults when enabled: Days of per-call detail: 90 (`days`, 7–3650). Never
+  deletes: totals budgets are enforced against; reservations still in flight.
+- **Usage history** (`usage-history`, instance scope; off until enabled). Daily
   usage figures older than the given days, rolled up to monthly figures; monthly
   figures older than the given months. Defaults when enabled: Days of daily
   figures: 90 (`days`, 32–3650); Months of monthly figures: 24 (`months`,
-  1–120). Never deletes: the latest figures of each account and construct (the
-  report's current usage); totals: a month's roll-up keeps the sum of its days.
-- **AI usage records** (`ai-usage`, site scope; off until enabled). Daily AI
+  1–120). Never deletes: the latest figures of each explicit scope and construct
+  (the report's current usage); totals: a month's roll-up keeps the sum of its
+  days.
+- **AI usage records** (`ai-usage`, instance scope; off until enabled). Daily AI
   call and token records older than the given days, rolled up to monthly totals
-  per account, feature and model. Defaults when enabled: Days of daily records:
-  90 (`days`, 7–3650). Never deletes: totals: a month's roll-up keeps the sum of
-  its days; records of the current period.
-- **Durable Object registry rows** (`durable-registry`, site scope; off until
-  enabled). Rows of Durable Object instances purged more than the given days
-  ago. Defaults when enabled: Days after the purge: 30 (`days`, 1–3650). Never
-  deletes: rows of live instances, or of instances used again since their purge.
+  per explicit scope, feature and model. Defaults when enabled: Days of daily
+  records: 90 (`days`, 7–3650). Never deletes: totals: a month's roll-up keeps
+  the sum of its days; records of the current period.
+- **Durable Object registry rows** (`durable-registry`, instance scope; off
+  until enabled). Rows of Durable Object instances purged more than the given
+  days ago. Defaults when enabled: Days after the purge: 30 (`days`, 1–3650).
+  Never deletes: rows of live instances, or of instances used again since their
+  purge.
 
 <!-- retention-categories:end -->
 
 ### Cleanup runs
 
-The engine (CORE-198) runs categories' cleanups for one target (an account,
-or the site), as a **dry run** (select only) or a **run** (select, then
+The engine (CORE-198) runs categories' cleanups for one explicit target (Space,
+person or Instance), as a **dry run** (select only) or a **run** (select, then
 remove), and records each run in `cleanup_runs` and `cleanup_run_categories`:
 trigger (`schedule` or `manual` with its actor), target, categories with the
 thresholds used, counts, estimated bytes, batches, errors and timings.
@@ -4475,15 +4691,20 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
   still run.
 - **Scheduled runs:** the hourly cron (`retentionCron`) starts one run a day
   per target for its _enabled_ and fixed categories that have a cleanup, and
-  restarts runs whose lease lapsed. With nothing enabled, its only run is the
-  site's daily auth hygiene, which touches nothing else (gate 1,
-  `worker/retention/engine.test.ts`).
+  restarts runs whose lease lapsed. Fixed auth hygiene always runs; default-enabled
+  timeline-work-source retention is independent of opt-in cleanup categories.
+- **Fresh Tracker Spaces:** selection and removal pass the immutable Space ID.
+  A never-opened active Space initializes under independent admission, including
+  native epoch zero; an empty dry run does not need a prior Tracker snapshot.
+  Physical-object identity, persisted scope/epoch and legacy-storage guards
+  still reject incompatible targets.
 
-| Route                                          | Contract                                                                                                                                                             |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /api/accounts/:slug/retention/runs`      | `{dryRun, categories: [<id>], thresholds?: {<id>: {key: n}}}`: any account categories with a cleanup, enabled or not; 202 with the run (owners, site admins; people) |
-| `GET /api/accounts/:slug/retention/runs[/:id]` | Runs newest first (`?before=<next>&limit=`), or one run with each category's thresholds, counts, bytes, estimated cost and errors (administrators)                   |
-| `POST`, `GET /api/admin/retention/runs[/:id]`  | The same for site categories (site administrators)                                                                                                                   |
+| Route                                                    | Contract                                                                                  |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `POST /api/spaces/:space/retention/runs`                 | `{dryRun,categories:[<id>],thresholds?:{<id>:{key:n}}}`; 202; human explicit Space admins |
+| `GET /api/spaces/:space/retention/runs[/:id]`            | Scoped run history/detail; explicit Space admins                                          |
+| `POST`, `GET /api/accounts/:person/retention/runs[/:id]` | Personal runs; self-only, human-only to start                                             |
+| `POST`, `GET /api/admin/retention/runs[/:id]`            | Instance categories; Instance operators, human-only to start                              |
 
 The settings responses show each category's `runnable` and `lastRun`.
 
@@ -4499,11 +4720,11 @@ removes each record once. Preview them one at a time for exact figures.
 
 ### Data retention pages and `gm retention`
 
-CORE-210. **Settings → Data retention** (`/settings/retention?owner=`, the
-account's administrators) and **Settings → Site data retention**
-(`/settings/site-retention`, site administrators; site categories and the
-site-wide defaults for every account), in `src/routes/DataRetention.tsx` and
-`src/components/RetentionView.tsx`:
+CORE-210. **Space data retention** (`/settings/retention?space=<handle>`, explicit
+Space admins), **Personal data retention** (`/settings/retention?person=<slug>`,
+self-only), and **Instance data retention** (`/settings/site-retention`, Instance
+operators) use `src/routes/DataRetention.tsx` and `src/components/RetentionView.tsx`.
+The Instance page also configures default policy values, not access grants.
 
 - Every category with its scope, an on/off switch (off by default; `active`
   ones say "Always on"), its thresholds with their defaults and units (days,
@@ -4521,12 +4742,17 @@ site-wide defaults for every account), in `src/routes/DataRetention.tsx` and
   (`?cleanup=<id>#category-<id>`).
 
 `gm retention show|set|run|runs` (apps/cli) is the same from the command line:
-`gm retention set assistant-chats --enable --threshold days=60`, `gm
---dry-run retention run ci-logs ci-runs` (a preview), `gm retention run
-ci-logs --yes` (deleting needs `--yes`), `--owner <slug>` or `--site`.
+`gm retention set assistant-chats --person <slug> --enable --threshold days=60`,
+`gm --dry-run retention run ci-logs ci-runs --space <handle>` previews cleanup;
+`gm retention run ci-logs --space <handle> --yes` deletes. Use `--site` for Instance
+categories; Space and person selectors are independent and mutually exclusive.
 E2E `browser-data-retention-account-and-site`; dev `POST
 /api/dev/retention-cron` runs the hourly cron and lists the scheduled runs'
 categories.
+
+The environment-capability-protected `POST /api/dev/retention` time-travel fixture
+uses the scheduled-service path. Interactive manual runs use the scoped
+`retention/runs` APIs and retain their current-person, credential and grant checks.
 
 ### CI retention
 
@@ -4561,7 +4787,7 @@ CORE-201, `worker/retention/cleanups/`:
   Knowledge tab's timeline panel says the overlay and wiki pages were removed
   by retention. A bookmark that comes back reopens the overlay and computes it
   afresh.
-- **`analysis-caches`** (site) deletes `kg_blob_analysis` and `kg_synthesis`
+- **`analysis-caches`** (Instance) deletes `kg_blob_analysis` and `kg_synthesis`
   entries no build has used for `days`. Builds record use cheaply in
   `used_at` (`worker/knowledge/cache-use.ts`: at most once a day per entry;
   null counts as 2026-10-04, when the column came). Never: an analysis of a
@@ -4569,16 +4795,16 @@ CORE-201, `worker/retention/cleanups/`:
   synthesis used since the oldest current or running build started (less a
   day); with a graph whose build record is gone, no synthesis goes. A later
   build re-analyzes only what was removed.
-- **`ai-spend`** (site; at least 7 days) rolls `atlas_spend` rows of whole
+- **`ai-spend`** (Instance; at least 7 days) rolls `atlas_spend` rows of whole
   UTC days older than `days` (not in-flight reservations) into
-  `atlas_spend_daily` per account and day, deleting them in the same
+  `atlas_spend_daily` per Space and day, deleting them in the same
   transaction. Daily budget checks add that table, so they answer exactly as
   before; a rolled-up run no longer shows its per-call detail.
-- **`atlas-snapshots`** is `active`: `PATCH …/settings/retention` stores an
-  account's `maxPrior` (0–20), `priorDays` (1–7) and `capGib` (1–2) in
+- **`atlas-snapshots`** is `active`: `PATCH /api/spaces/:space/retention` stores a
+  Space's `maxPrior` (0–20), `priorDays` (1–7) and `capGib` (1–2) in
   `retention_policies`, every Atlas retention pass reads them
   (`scopePolicy`), a shorter period brings stamped priors' expiry forward, and
-  a change flags the account's scopes so the hourly sweep applies it.
+  a change flags the Space's scopes so the hourly sweep applies it.
 
 ### Auth hygiene and release notes
 
@@ -4628,8 +4854,8 @@ CORE-211 proves the PRD's gates for every category, in three places:
 
 - **`worker/retention/safety.test.ts`** (runs in `vp test`, so in
   `vp run ready`), on one rich deployment (`worker/retention/testing/rich.ts`:
-  both D1 databases, the registry's R2 bucket, an account's real Tracker
-  Durable Object and assistant chats), with a fixture for every category that
+  both D1 databases, the registry's R2 bucket, a Space's real Tracker
+  Durable Object and personal assistant chats), with a fixture for every category that
   has a cleanup (a cleanup registered without one fails the suite):
   - **Gate 1:** policies stored but none enabled; every hourly retention job
     (`retentionCron`, `sweepDurableInstances`, `resumeDeletions`,
@@ -4646,8 +4872,9 @@ CORE-211 proves the PRD's gates for every category, in three places:
     knows a turn is running); the next run lists it again.
   - **Gate 3:** a Tracker holding data purges to nothing through the
     registry; `worker/durable/purge.test.ts` (every class in
-    `DURABLE_CLASSES` has a purge case; the Assistant's is the E2E below) and
-    `conformance.test.ts` cover the rest.
+    `DURABLE_CLASSES` has a purge case; the Assistant's is the E2E below)
+    covers the other business objects. Independent Space cutover control is
+    outside this tenant purge lifecycle.
   - **Authorization:** every retention, usage and price route for anonymous
     callers, outsiders, members, an administrator's agent, administrators and
     site administrators; refused writes store nothing.
@@ -4671,15 +4898,15 @@ CORE-211 proves the PRD's gates for every category, in three places:
 
 ### Usage and costs
 
-**Settings → Usage & costs** (`/settings/usage?owner=<slug>`, an account's
-administrators: org owners, the user themselves, site administrators) and
-**Settings → Site usage & costs** (`/settings/site-usage`, site
-administrators) price the daily `usage_snapshots` (CORE-207, `worker/usage/`)
-with the price catalog (CORE-208, `cloudflare_prices`). The report
-(`worker/usage/report.ts`, shapes in `shared/usage.ts`):
+**Space usage & costs** (`/settings/usage?space=<handle>`) requires an explicit
+Space admin grant. **Personal usage & costs** (`/settings/usage?person=<slug>`)
+is self-only. **Instance usage & costs** (`/settings/site-usage`) is for Instance
+operators. Reports price the daily `usage_snapshots` by explicit
+`scope_kind`/`scope_id` (Space, person or Instance), using `cloudflare_prices`
+(`worker/usage/report.ts`, shapes in `shared/usage.ts`).
 
-- **Storage** is the latest day whose collection finished for the account (or
-  the whole site; the `usage:collect` cursor says which), priced as if it
+- **Storage** is the latest day whose collection finished for that scope (or
+  the whole Instance; the `usage:collect` cursor says which), priced as if it
   stayed that size for a month. **Activity** (Workers AI tokens) is the 30 days
   before that day; with fewer days measured it's extrapolated to 30 and marked
   estimated.
@@ -4719,12 +4946,11 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
   (only `minutes`) stay unpriced.
 - Every line carries its figures with `estimated` and `method`, its costs
   with the price and source page, and the retention categories that clean it
-  up (account pages list account categories only). `RETENTION_PAGES` in
-  `src/lib/retention-links.ts` turns those into links once the Data retention
-  pages exist (CORE-210).
-- The site report sums every account and the site's own figures (account
-  `''`), counting registry blobs once (`registry_blobs_all`), and totals each
-  account (at most 200, highest first).
+  up (scoped pages list only applicable categories). `RETENTION_PAGES` in
+  `src/lib/retention-links.ts` links each category to its scoped retention page.
+- The Instance report sums Space, person and Instance figures, counting registry
+  blobs once (`registry_blobs_all`), and lists `subjects` with explicit scope
+  (at most 200 Space/person estimates, highest first).
 - The trend is each of the last 30 days: that day's storage at a thirtieth of
   its monthly cost plus that day's activity.
 - **By person, agent and timeline** (CORE-222, `worker/usage/attribution.ts`):
@@ -4748,17 +4974,20 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
   anyone's request. Attribution is daily: monthly rollups keep account,
   feature and model only, so older months show no breakdown.
 
-| Route                           | Contract                                                                                                                      |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/accounts/:slug/usage` | `UsageReport`; `?format=csv` for one row per figure with its price and monthly cost (administrators; members 403, others 404) |
-| `GET /api/admin/usage`          | The site's `UsageReport` with `accounts`; `?format=csv` (site administrators)                                                 |
+| Route                           | Contract                                                   |
+| ------------------------------- | ---------------------------------------------------------- |
+| `GET /api/spaces/:space/usage`  | `UsageReport`; explicit Space admins, no Instance bypass   |
+| `GET /api/accounts/:slug/usage` | Personal `UsageReport`; self-only                          |
+| `GET /api/admin/usage`          | Instance `UsageReport` with `subjects`; Instance operators |
+
+All three support `?format=csv` with identical authorization.
 
 ### Repository deletion
 
 Deleting a repository (CORE-199, `worker/retention/repo-deletion.ts`) removes
 everything it owned, everywhere, in two steps:
 
-- **Tombstone.** `DELETE /api/repos/:owner/:name` sets `repos.deleted_at` and
+- **Tombstone.** `DELETE /api/repos/:space/:name` sets `repos.deleted_at` and
   records the deletion in `repo_deletions`, in one transaction. From then on
   the repository is missing to every reader (`selectRepos`/`findRepo` and the
   other repository lookups skip it; pass `{deleting: true}` only where a
@@ -4774,7 +5003,7 @@ everything it owned, everywhere, in two steps:
   ids from `kg_nodes`, then the `repo` metadata filter until nothing is
   found), `search` (AI Search items from `kg_search_items`, then by metadata and
   key prefix), `durable` (every registered instance it owns), `links`
-  (earlier days' `atlas_spend` go, today's stay detached for the account's
+  (earlier days' `atlas_spend` go, today's stay detached for the Space's
   ceiling; registry `package_sources` go, `publishes` keep the package history
   without the repository), `artifacts`, and `rows` (large children in batches,
   then the repository row and its cascade). The hourly cron
@@ -4791,7 +5020,7 @@ everything it owned, everywhere, in two steps:
   found elsewhere; the sweep records the index's vector count beside the
   count live graphs account for.
 
-`GET /api/dev/repo-inventory?repo=<id|owner/name>` lists what a repository
+`GET /api/dev/repo-inventory?repo=<id|space/name>` lists what a repository
 holds in every store (D1 tables, registry, Durable Objects, Artifacts,
 Vectorize, AI Search, previews) and its deletion's progress;
 `POST /api/dev/repo-purge {repo, action: "terminate"|"resume"}` kills or
@@ -4818,7 +5047,7 @@ preview's teardown, a killed purge resumed, the name reused) and the
   jobs); `registry/manage/`: the packages API behind the console, feeds and gm
 - `packages/formats` (repo root): IO-free protocol libraries for every package format
 - `worker/retention/*`, `shared/retention.ts`: retention categories, policies and cleanup
-- `worker/tracker/*`: account-level authority, transactional graph store and sync API
+- `worker/tracker/*`: Space-level authority, transactional graph store and sync API
 - `worker/search/*`, `shared/search.ts`: global search providers, ranking and `/api/search`
 - `shared/tracker.ts`: shared tracker entities, mutations and readiness semantics
 - `shared/observability.ts`: provider-neutral runtime observability read contracts and validators
@@ -4838,7 +5067,5 @@ preview's teardown, a killed purge resumed, the name reused) and the
   is set when receive-pack returns 200, even if Git rejected a ref inside the response.
 - READMEs render Markdown without raw HTML, so `<details>` and `<br>` show as text.
 - In testing, imports brought over the default branch only, without tags.
-- Owner slugs `signin`, `new`, `settings`, `tracker`, `api`, `cli-auth`, `-` and the registry prefixes
-  collide with routes and should be reserved once accounts can be created.
 - Packages: the tag facet lives in the header's tag plates rather than the side
   column; retention can't yet keep a branch's builds longer than another's.

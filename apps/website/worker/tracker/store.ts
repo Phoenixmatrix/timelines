@@ -1,4 +1,12 @@
-import { timingSafeEqual } from "node:crypto";
+import {
+  assertTrackerSpaceOpen,
+  initializeTrackerMigrationProof,
+  convertTrackerSpaceJson,
+} from "./space-migration.ts";
+import type { SpaceSummary } from "../../shared/spaces.ts";
+import type { TrackerScope } from "../../shared/tracker.ts";
+import { TrackerQueryUpgradeError } from "../../shared/tracker-query.ts";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   CLOSE_REASONS,
   DEFAULT_ATTEMPT_LIMIT,
@@ -42,7 +50,7 @@ import {
   type TimelineFeedEvent,
   type TrackerEvent,
   type TrackerIdentity,
-  type Workspace,
+  type Project,
   type ClaimEffect,
   type CompletedWork,
 } from "../../shared/tracker.ts";
@@ -59,6 +67,7 @@ import {
 } from "../../shared/requirements.ts";
 import { tighteningEffect } from "../../shared/tracker-query.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
 import { sql as raw } from "kysely";
 import {
   all,
@@ -129,7 +138,7 @@ export class TrackerError extends Error {
   public code: string;
   public details: {
     currentVersion?: number;
-    current?: Team | Workspace | Issue;
+    current?: Team | Project | Issue;
     /** For requirements_unmet (CORE-32): each requirement the agent doesn't meet. */
     unmet?: UnmetRequirement[];
   };
@@ -152,21 +161,27 @@ export interface Access {
   source?: AuditSource;
   /** Whose memberships and permissions apply: the person (an agent's accountable human). */
   principalId: string;
+  agentId: string | null;
+  credential?: { kind: "token" | "session"; id: string };
+  contractVersion: 4;
+  spaceId: string;
+  migrationEpoch: number;
+  authorizationVersion: number;
   /** Agents accountable to members: they may hold leases and be assigned work. */
   agents: TrackerAgent[];
-  owner: TrackerIdentity;
+  space: SpaceSummary;
   canAdmin: boolean;
   members: TrackerIdentity[];
-  repos: { id: string; owner: string; name: string }[];
+  repos: { id: string; spaceId: string; space: string; name: string }[];
   /** D1-confirmed missing repositories; permits removing their orphan associations only. */
   deletedRepoIds?: string[];
   /** Repositories the person may write to, from D1: checked when approving a checkpoint. */
   writableRepoIds?: string[];
 }
-type Entity = Team | Workspace | Issue | Link | Comment | HumanRequest | Subscription;
+type Entity = Team | Project | Issue | Link | Comment | HumanRequest | Subscription;
 const tables = {
   team: "teams",
-  workspace: "workspaces",
+  project: "projects",
   issue: "issues",
   link: "links",
   comment: "comments",
@@ -246,7 +261,19 @@ function canonical(value: unknown): string {
 }
 export function validateRequest(value: unknown): MutationRequest {
   const body = object(value);
-  keys(body, ["operationId", "mutations", "timeline"]);
+  if (body.contractVersion !== 4)
+    fail("client_upgrade_required", "Tracker mutations require content contract version 4.", 409);
+  keys(body, [
+    "contractVersion",
+    "spaceId",
+    "migrationEpoch",
+    "operationId",
+    "mutations",
+    "timeline",
+  ]);
+  id(body.spaceId);
+  if (!Number.isSafeInteger(body.migrationEpoch) || Number(body.migrationEpoch) < 0)
+    fail("migration_epoch_mismatch", "Provide the current snapshot's migrationEpoch.", 409);
   id(body.operationId);
   const timeline = body.timeline === undefined ? undefined : text(body.timeline, "timeline", 100);
   if (!Array.isArray(body.mutations) || body.mutations.length < 1 || body.mutations.length > 100)
@@ -255,6 +282,14 @@ export function validateRequest(value: unknown): MutationRequest {
     const mutation = object(entry);
     keys(mutation, ["kind", "id", "expectedVersion", "data"]);
     text(mutation.kind, "kind", 40);
+    if (
+      String(mutation.kind).startsWith("workspace.") ||
+      (mutation.data &&
+        Object.keys(mutation.data as object).some(
+          (key) => key === "workspaceId" || key === "workspaceIds",
+        ))
+    )
+      fail("client_upgrade_required", "Upgrade tracker mutations to the Project contract.", 409);
     id(mutation.id);
     if (mutation.data !== undefined) object(mutation.data);
     if (
@@ -264,6 +299,9 @@ export function validateRequest(value: unknown): MutationRequest {
       fail("invalid_input", "expectedVersion must be a positive integer.");
   }
   return {
+    contractVersion: 4,
+    spaceId: String(body.spaceId),
+    migrationEpoch: Number(body.migrationEpoch),
     operationId: String(body.operationId),
     mutations: body.mutations as Mutation[],
     ...(timeline === undefined ? {} : { timeline }),
@@ -307,6 +345,7 @@ export function lockedStatus(issue: Issue): never {
 /** All state and event writes run synchronously inside the caller's SQLite transaction. */
 export class TrackerStore {
   private sql: SqlDatabase;
+  private readonly scope: Readonly<TrackerScope>;
   private transaction: <T>(fn: () => T) => T;
   private clock: () => number;
   /** While reading or changing a timeline's view: how it differs from main's tables. */
@@ -325,12 +364,13 @@ export class TrackerStore {
     transaction: <T>(fn: () => T) => T,
     clock: () => number = Date.now,
   ) {
+    this.scope = assertTrackerSpaceOpen(sql);
     this.sql = sql;
     this.transaction = transaction;
     this.clock = clock;
     sql.exec(TIMELINE_TABLES);
     sql.exec(`CREATE TABLE IF NOT EXISTS teams (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tracker_labels (name TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS links (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -342,9 +382,10 @@ export class TrackerStore {
       CREATE TABLE IF NOT EXISTS offers (issue_id TEXT PRIMARY KEY, code TEXT NOT NULL, lease_token TEXT NOT NULL, to_actor TEXT, expires_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS approval_automation (person_id TEXT PRIMARY KEY, enabled_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS work_authorities (key TEXT PRIMARY KEY, authority TEXT NOT NULL, recorded_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS team_keys ON teams(json_extract(data, '$.key'));
-      CREATE UNIQUE INDEX IF NOT EXISTS workspace_slugs ON workspaces(json_extract(data, '$.slug'));
+      CREATE UNIQUE INDEX IF NOT EXISTS project_slugs ON projects(json_extract(data, '$.slug'));
       CREATE INDEX IF NOT EXISTS blockers ON links(json_extract(data, '$.toId'), json_extract(data, '$.kind'));
       CREATE INDEX IF NOT EXISTS subscriptions_repo ON subscriptions(json_extract(data, '$.repoId'));
       CREATE INDEX IF NOT EXISTS parents ON issues(json_extract(data, '$.parentId'));
@@ -356,6 +397,7 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS event_times ON events(json_extract(data, '$.createdAt'));
       CREATE INDEX IF NOT EXISTS event_timelines ON events(json_extract(data, '$.timelineId'));`);
     sql.exec(RETENTION_TABLES);
+    initializeTrackerMigrationProof(sql);
     initializeAudit(sql, transaction);
     if (
       !first(
@@ -389,8 +431,17 @@ export class TrackerStore {
       this.withdrawSuperseded(ids, reason, actorId),
     );
   }
+  private assertScope(access: Access) {
+    if (access.contractVersion !== 4)
+      fail("client_upgrade_required", "Tracker access requires content contract version 4.", 409);
+    if (access.spaceId !== this.scope.spaceId || access.space.id !== this.scope.spaceId)
+      fail("space_mismatch", "Access does not belong to this tracker Space.", 409);
+    if (access.migrationEpoch !== this.scope.migrationEpoch)
+      fail("migration_epoch_mismatch", "Access belongs to a stale tracker migration epoch.", 409);
+  }
   /** Admission only: resolve main-view issues and enforce the submitter's team write scope. */
   validateQueueIssues(access: Access, references: string[]): string[] {
+    this.assertScope(access);
     const refs = strings(references, "issues", 20);
     const issues = this.all<Issue>("issue");
     return [
@@ -421,12 +472,13 @@ export class TrackerStore {
     access: Access,
     input: { repoId: string; issueIds: string[]; failure: QueueFailure },
   ): { id: string; key: string } {
+    this.assertScope(access);
     const failure = input.failure;
     text(input.repoId, "repoId", 100);
     for (const field of ["queueId", "commit"] as const)
       if (!/^[0-9a-f]{40}$/.test(failure[field])) fail("invalid_input", `Invalid ${field}.`);
     if (!/^[^/\s]+\/[^/\s]+$/.test(text(failure.repo, "repo", 200)))
-      fail("invalid_input", "repo must be owner/name.");
+      fail("invalid_input", "repo must be space/name.");
     choice(failure.stage, ["merge", "gates", "deployment"], "failure stage");
     choice(
       failure.kind,
@@ -548,7 +600,7 @@ export class TrackerStore {
         priority: 0,
         assigneeId: null,
         parentId: null,
-        workspaceIds: [],
+        projectIds: [],
         labels: [],
         claim: null,
         createdBy: actor,
@@ -612,12 +664,14 @@ export class TrackerStore {
    */
   private withdrawSuperseded(ids: string[], reason: string, actorId: string | null) {
     const by = actorId ?? "gitmatrix";
-    const access: Access = {
+    const access: Omit<Access, "space"> = {
+      ...this.scope,
+      agentId: null,
+      authorizationVersion: 0,
       actorId: by,
       principalId: by,
       source: "unknown",
       agents: [],
-      owner: { id: "", slug: "", displayName: "" },
       canAdmin: true,
       members: [],
       repos: [],
@@ -636,6 +690,7 @@ export class TrackerStore {
       const asked = opened ? (JSON.parse(opened.data) as TrackerEvent).timelineId : undefined;
       const timeline = asked ? findTimeline(this.sql, asked) : null;
       const request: MutationRequest = {
+        ...this.scope,
         // "@" no client operationId can start with (validateRequest): none can
         // pre-claim it. Only open requests come here, so receipts made under
         // the old `superseded:` spelling are never replayed.
@@ -644,7 +699,9 @@ export class TrackerStore {
       };
       this.withdrawing = reason;
       try {
-        this.within(timeline, () => this.apply(access, request, canonical(request), timeline));
+        const encoded = canonical(request);
+        if (!this.committed(access, request, encoded))
+          this.within(timeline, () => this.apply(access, request, encoded, timeline));
       } finally {
         this.withdrawing = null;
       }
@@ -744,14 +801,18 @@ export class TrackerStore {
    * `withTimelines`, the timeline records and their events too.
    */
   snapshot(access: Access, timeline?: string, withTimelines = false): Snapshot {
+    this.assertScope(access);
     const scope = this.timeline(timeline);
     return this.within(scope, () => ({
-      owner: access.owner,
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
+      space: access.space,
       canAdmin: access.canAdmin,
       members: access.members,
       agents: access.agents,
       teams: this.all("team"),
-      workspaces: this.all("workspace"),
+      projects: this.all("project"),
       labels: all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
         .map((row) => row.name)
         .sort(),
@@ -799,22 +860,69 @@ export class TrackerStore {
       .map((row) => ({ name: row.name, ...(counts.get(row.name) ?? { issues: 0, open: 0 }) }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
-  /** People with approve-when-green on here (CORE-378). */
+  /**
+   * People with approve-when-green on here (CORE-378): only those whose
+   * consent carries the work authority it acts with. A setting saved without
+   * one (before Spaces) is inert and shows as off until turned on again.
+   */
   approvingWhenGreen(): string[] {
     return all(
       this.sql,
-      tracker.selectFrom("approval_automation").select("person_id").orderBy("person_id"),
+      tracker
+        .selectFrom("approval_automation as a")
+        .select("a.person_id")
+        .where(
+          raw<boolean>`EXISTS (SELECT 1 FROM work_authorities w WHERE w.key = 'automation:' || a.person_id)`,
+        )
+        .orderBy("a.person_id"),
     ).map((row) => row.person_id);
   }
   private approvesWhenGreen(personId: string): string | null {
-    return (
-      first(
-        this.sql,
-        tracker
-          .selectFrom("approval_automation")
-          .select("enabled_at")
-          .where("person_id", "=", personId),
-      )?.enabled_at ?? null
+    return this.workAuthority(`automation:${personId}`)
+      ? (first(
+          this.sql,
+          tracker
+            .selectFrom("approval_automation")
+            .select("enabled_at")
+            .where("person_id", "=", personId),
+        )?.enabled_at ?? null)
+      : null;
+  }
+  /**
+   * The work authority a person's consent was given with, by key
+   * (`automation:<person>` or `approval:<checkpoint>`), or null. A saved
+   * binding grants nothing: the Worker re-resolves it before acting.
+   */
+  workAuthority(key: string): WorkAuthority | null {
+    const row = first(
+      this.sql,
+      tracker.selectFrom("work_authorities").select("authority").where("key", "=", key),
+    );
+    return row ? (JSON.parse(row.authority) as WorkAuthority) : null;
+  }
+  /** Save the person's own live authority under `key`, inside the caller's transaction. */
+  private keepWorkAuthority(key: string, access: Omit<Access, "space">, now: string) {
+    if (access.agentId !== null || access.actorId !== access.principalId || !access.credential)
+      fail(
+        "forbidden",
+        "This acts with your own credential later: do it signed in as yourself, not as an agent.",
+        403,
+      );
+    const authority: WorkAuthority = {
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
+      personId: access.principalId,
+      agentId: null,
+      credential: { kind: access.credential.kind, id: access.credential.id },
+    };
+    run(
+      this.sql,
+      tracker
+        .insertInto("work_authorities")
+        .values({ key, authority: JSON.stringify(authority), recorded_at: now })
+        .onConflict((oc) =>
+          oc.column("key").doUpdateSet({ authority: JSON.stringify(authority), recorded_at: now }),
+        ),
     );
   }
   /**
@@ -849,12 +957,34 @@ export class TrackerStore {
       return null;
     return request;
   }
+  /**
+   * Turn approve-when-green off for someone whose consent can no longer act
+   * (CORE-378): the Durable Object has just found their Space grant gone or
+   * their credential revoked or expired. Logged; they turn it on again.
+   */
+  retireApprovalAutomation(personId: string, why: string): boolean {
+    return this.transaction(() => {
+      if (!this.approvesWhenGreen(personId)) return false;
+      this.dropApprovalAutomation(
+        { actorId: personId, principalId: personId, members: [], agents: [] },
+        why,
+      );
+      return true;
+    });
+  }
   /** Turn a person's approve-when-green off on the tracker's own account, logged. */
-  private dropApprovalAutomation(access: Access, why: string) {
+  private dropApprovalAutomation(
+    access: Pick<Access, "actorId" | "principalId" | "members" | "agents">,
+    why: string,
+  ) {
     const personId = access.principalId;
     const since = this.approvesWhenGreen(personId);
     if (!since) return;
     run(this.sql, tracker.deleteFrom("approval_automation").where("person_id", "=", personId));
+    run(
+      this.sql,
+      tracker.deleteFrom("work_authorities").where("key", "=", `automation:${personId}`),
+    );
     const now = new Date(this.clock()).toISOString();
     this.record({
       operationId: `@approval-automation-dropped:${personId}:${crypto.randomUUID()}`,
@@ -881,6 +1011,7 @@ export class TrackerStore {
    * the checkpoint still the head. Null when any of that no longer holds; it never rejects.
    */
   autoApprove(access: Access, requestId: string, checkpointId: string): MutationResult | null {
+    this.assertScope(access);
     return this.transaction(() => {
       if (!this.eligibleApproval(access, requestId, checkpointId)) return null;
       if (!this.approvesWhenGreen(access.principalId)) return null;
@@ -907,6 +1038,7 @@ export class TrackerStore {
       const asked = opened ? (JSON.parse(opened.data) as TrackerEvent).timelineId : undefined;
       const timeline = asked ? findTimeline(this.sql, asked) : null;
       const mutation: MutationRequest = {
+        ...this.scope,
         // No client operationId can start with "@" (validateRequest): none can pre-claim it.
         operationId: `@auto-approve:${requestId}`,
         mutations: [
@@ -943,6 +1075,7 @@ export class TrackerStore {
     checkpointId: string,
     reason: string,
   ): boolean {
+    this.assertScope(access);
     return this.transaction(() => {
       const request = this.eligibleApproval(access, requestId, checkpointId);
       if (!request) return false;
@@ -1190,36 +1323,33 @@ export class TrackerStore {
   }
 
   /** Count each ready issue once across this repository's active subscriptions. */
-  repoReadySummary(repoId: string, timeline?: string): { ready: number; workspaces: number } {
-    const workspaces = this.subscribedWorkspaces(repoId);
-    if (!workspaces.length) return { ready: 0, workspaces: 0 };
+  repoReadySummary(repoId: string, timeline?: string): { ready: number; projects: number } {
+    const projects = this.subscribedProjects(repoId);
+    if (!projects.length) return { ready: 0, projects: 0 };
     const scope = this.timeline(timeline);
     return this.within(scope, () => {
-      const ids = new Set(workspaces.map((workspace) => workspace.workspaceId));
+      const ids = new Set(projects.map((project) => project.projectId));
       const issues = this.all<Issue>("issue");
       const graph = readinessIndex(issues, this.all<Link>("link"));
       const now = new Date(this.clock()).toISOString();
       let ready = 0;
       for (const issue of issues)
-        if (
-          issue.workspaceIds.some((id) => ids.has(id)) &&
-          readiness(issue, graph, now) === "ready"
-        )
+        if (issue.projectIds.some((id) => ids.has(id)) && readiness(issue, graph, now) === "ready")
           ready++;
-      return { ready, workspaces: workspaces.length };
+      return { ready, projects: projects.length };
     });
   }
-  subscribedWorkspaces(repoId: string): { workspaceId: string; slug: string; name: string }[] {
+  subscribedProjects(repoId: string): { projectId: string; slug: string; name: string }[] {
     id(repoId);
     return all(
       this.sql,
       tracker
         .selectFrom("subscriptions as s")
-        .innerJoin("workspaces as w", (join) =>
-          join.on("w.id", "=", json<string>("s.data", "$.workspaceId")),
+        .innerJoin("projects as w", (join) =>
+          join.on("w.id", "=", json<string>("s.data", "$.projectId")),
         )
         .select([
-          "w.id as workspaceId",
+          "w.id as projectId",
           json<string>("w.data", "$.slug").as("slug"),
           json<string>("w.data", "$.name").as("name"),
         ])
@@ -1229,12 +1359,12 @@ export class TrackerStore {
         .orderBy("slug"),
     );
   }
-  /** Live evidence for Knowledge, scoped to this repo's subscribed workspaces.
+  /** Live evidence for Knowledge, scoped to this repo's subscribed projects.
    * Every member may read issues; the caller must authorize tracker membership.
    */
   completionEvidence(repoId: string, query: SearchQuery, limit = 30) {
-    const workspaces = this.subscribedWorkspaces(repoId).map((w) => w.workspaceId);
-    if (!workspaces.length) return [];
+    const projects = this.subscribedProjects(repoId).map((w) => w.projectId);
+    if (!projects.length) return [];
     const columns = {
       identifiers: [json<string>("i.data", "$.key")],
       names: [json<string>("i.data", "$.title")],
@@ -1254,8 +1384,8 @@ export class TrackerStore {
         .select(["c.data as comment", "i.data as issue"])
         .where(json("c.data", "$.kind"), "=", "evidence")
         .where(raw<boolean>`EXISTS (
-          SELECT 1 FROM json_each(json_extract(i.data, '$.workspaceIds')) AS workspace
-          WHERE workspace.value IN (${raw.join(workspaces)})
+          SELECT 1 FROM json_each(json_extract(i.data, '$.projectIds')) AS project
+          WHERE project.value IN (${raw.join(projects)})
         )`)
         .where(
           /^[a-z][a-z0-9]{1,5}-\d+$/.test(query.lower)
@@ -1292,9 +1422,9 @@ export class TrackerStore {
         .where("id", "in", subscriptionIds),
     ).map((row) => row.repoId);
   }
-  /** Every workspace's id and slug, archived ones included, for resolving filters. */
-  workspaceSlugs(): { id: string; slug: string }[] {
-    return this.all<Workspace>("workspace").map(({ id, slug }) => ({ id, slug }));
+  /** Every project's id and slug, archived ones included, for resolving filters. */
+  projectSlugs(): { id: string; slug: string }[] {
+    return this.all<Project>("project").map(({ id, slug }) => ({ id, slug }));
   }
   /** Every team's key and name, archived ones included, for labelling filters (CORE-395). */
   teamNames(): { key: string; name: string }[] {
@@ -1431,7 +1561,7 @@ export class TrackerStore {
       type: issue.type,
       status: issue.status,
       labels: issue.labels,
-      workspaceIds: issue.workspaceIds,
+      projectIds: issue.projectIds,
       team: { id: team.id, key: team.key, name: team.name },
       completedAt: issue.status === "done" ? completedAt : null,
       evidence,
@@ -1441,7 +1571,8 @@ export class TrackerStore {
    * Events after a cursor. Timeline records and events (`TIMELINE_FEED_TYPES`)
    * are left out unless the replica asks for them with `withTimelines`.
    */
-  changes(after: number, limit: number, withTimelines = false): Changes {
+  changes(access: Access, after: number, limit: number, withTimelines = false): Changes {
+    this.assertScope(access);
     if (
       !Number.isSafeInteger(after) ||
       after < 0 ||
@@ -1472,7 +1603,22 @@ export class TrackerStore {
         (row) =>
           ({ ...JSON.parse(row.data), cursor: row.cursor }) as TrackerEvent | TimelineFeedEvent,
       );
+    for (const event of events)
+      if (
+        !Object.hasOwn(tables, event.entityType) &&
+        // Approve when green's per-person setting (CORE-378) has no replicated table.
+        event.entityType !== "automation" &&
+        !(TIMELINE_FEED_TYPES as readonly string[]).includes(event.entityType)
+      )
+        fail(
+          "client_upgrade_required",
+          "Unknown tracker event scope; upgrade the client and refresh its snapshot.",
+          409,
+        );
     return {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
       events,
       cursor: events.at(-1)?.cursor ?? after,
       hasMore: rows.length > limit,
@@ -1480,6 +1626,7 @@ export class TrackerStore {
     };
   }
   history(access: Access, issueId: string, before: number | null, limit: number) {
+    this.assertScope(access);
     id(issueId);
     if (
       (before !== null && (!Number.isSafeInteger(before) || before < 1)) ||
@@ -1527,6 +1674,7 @@ export class TrackerStore {
    * it and what happened to it until `to`. Main's view.
    */
   chronicle(access: Access, options: ChronicleOptions): Chronicle {
+    this.assertScope(access);
     const from = Date.parse(options.from);
     const to = Date.parse(options.to);
     if (Number.isNaN(from) || Number.isNaN(to))
@@ -1541,15 +1689,18 @@ export class TrackerStore {
     )
       fail("invalid_input", `limit must be 1–${CHRONICLE_MAX_PAGE}.`);
     if (options.query.length > 500) fail("invalid_input", "The query is at most 500 characters.");
-    if (options.cursor !== null && (options.cursor.length > 100 || !options.cursor))
-      fail("invalid_input", "cursor must be an issue key from a previous page.");
+    if (options.cursor !== null && (options.cursor.length > 8192 || !options.cursor))
+      fail("invalid_input", "cursor must be a bounded opaque token from a previous page.");
     const snapshot = {
-      owner: access.owner,
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
+      space: access.space,
       canAdmin: access.canAdmin,
       members: access.members,
       agents: access.agents,
       teams: this.all<Team>("team"),
-      workspaces: this.all<Workspace>("workspace"),
+      projects: this.all<Project>("project"),
       labels: all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
         .map((row) => row.name)
         .sort(),
@@ -1561,16 +1712,26 @@ export class TrackerStore {
       cursor: 0,
       serverTime: new Date(this.clock()).toISOString(),
     } satisfies Snapshot;
-    return buildChronicle(
-      this.sql,
-      { viewerId: access.actorId, snapshot, known: (id) => auditActor(access, id) },
-      {
-        ...options,
-        from: new Date(from).toISOString(),
-        to: new Date(to).toISOString(),
-      },
-      this.clock(),
-    );
+    try {
+      return buildChronicle(
+        this.sql,
+        {
+          viewerId: access.actorId,
+          authorizationVersion: access.authorizationVersion,
+          snapshot,
+          known: (id) => auditActor(access, id),
+        },
+        {
+          ...options,
+          from: new Date(from).toISOString(),
+          to: new Date(to).toISOString(),
+        },
+        this.clock(),
+      );
+    } catch (error) {
+      if (error instanceof TrackerQueryUpgradeError) fail(error.code, error.message, 409);
+      throw error;
+    }
   }
   /**
    * What the tracker knows of an issue's work (CORE-250): the timelines it was
@@ -1638,11 +1799,22 @@ export class TrackerStore {
     };
   }
   mutate(access: Access, input: unknown): MutationResult {
+    this.assertScope(access);
     const request = validateRequest(input);
+    if (request.spaceId !== access.spaceId || access.space.id !== access.spaceId)
+      fail("space_mismatch", "Mutation Space does not match the authorized tracker.", 409);
+    if (request.migrationEpoch !== access.migrationEpoch)
+      fail(
+        "migration_epoch_mismatch",
+        "Fetch a current snapshot before submitting this operation.",
+        409,
+      );
     const encoded = canonical(request);
     if (new TextEncoder().encode(encoded).byteLength > 1_048_576)
       fail("body_too_large", "Mutation body exceeds 1 MiB.", 413);
     return this.transaction(() => {
+      const committed = this.committed(access, request, encoded);
+      if (committed) return committed;
       const timeline = this.timeline(request.timeline);
       if (timeline && (timeline.status === "landed" || timeline.status === "abandoned"))
         fail(
@@ -1661,7 +1833,10 @@ export class TrackerStore {
    * the timeline landed; views then leave the landed timeline out, since main
    * has its changes. Landing twice changes nothing.
    */
-  landTimeline(access: Access, ref: string): TrackerEvent[] {
+  landTimeline(
+    access: Pick<Access, "actorId" | "members" | "agents" | "source">,
+    ref: string,
+  ): TrackerEvent[] {
     return this.transaction(() => {
       const timeline = this.timeline(ref);
       if (!timeline) fail("invalid_input", "Main doesn't land.");
@@ -1850,6 +2025,7 @@ export class TrackerStore {
    * Running it again changes nothing.
    */
   timelineAbandoned(access: Access, timeline: Timeline): TrackerEvent[] {
+    this.assertScope(access);
     return this.transaction(() => {
       const issues = this.doneIn(timeline.id);
       if (!issues.length) return [];
@@ -1870,7 +2046,7 @@ export class TrackerStore {
         if (!views.has(t.id)) views.set(t.id, overlayOf(this.sql, t));
         return views.get(t.id)!;
       };
-      const url = `/tracker/${encodeURIComponent(access.owner.slug)}/timelines?tl=${encodeURIComponent(timeline.slug)}`;
+      const url = `/tracker/${encodeURIComponent(access.space.slug)}/timelines?tl=${encodeURIComponent(timeline.slug)}`;
       const events: TrackerEvent[] = [];
       for (const issue of issues) {
         const keeper = merged.find(
@@ -1990,12 +2166,78 @@ export class TrackerStore {
     }
     return out;
   }
-  private apply(
-    access: Access,
+  private committed(
+    access: Omit<Access, "space">,
     request: MutationRequest,
     encoded: string,
-    timeline: Timeline | null,
-  ): MutationResult {
+  ): MutationResult | null {
+    // This evidence is independent of ordinary receipt/event retention. Never
+    // rewrite it: equality is actor-bound against the original committed batch.
+    const proof = this.sql
+      .exec<{
+        actor_id: string;
+        request: string;
+        result: string;
+        source_epoch: number;
+        request_digest: string | null;
+        result_digest: string | null;
+      }>(
+        "SELECT actor_id,request,result,source_epoch,request_digest,result_digest FROM space_migration_receipt_proof WHERE id=?",
+        request.operationId,
+      )
+      .toArray()[0];
+    if (proof) {
+      const legacy = proof.source_epoch < access.migrationEpoch;
+      if (proof.source_epoch > access.migrationEpoch)
+        fail(
+          "migration_epoch_mismatch",
+          "Operation evidence belongs to a newer migration epoch.",
+          409,
+        );
+      if (
+        legacy &&
+        (proof.request_digest !== createHash("sha256").update(proof.request).digest("hex") ||
+          proof.result_digest !== createHash("sha256").update(proof.result).digest("hex"))
+      )
+        fail(
+          "export_required",
+          "Original operation evidence is incomplete; export the queued intent for reconciliation.",
+          409,
+        );
+      const original = object(JSON.parse(proof.request));
+      if ("spaceId" in original && original.spaceId !== access.spaceId)
+        fail("space_mismatch", "Original operation evidence belongs to another Space.", 409);
+      if ("migrationEpoch" in original && original.migrationEpoch !== proof.source_epoch)
+        fail("export_required", "Original operation epoch does not match its retained proof.", 409);
+      const converted = legacy
+        ? object(convertTrackerSpaceJson(original, access.spaceId))
+        : object(original);
+      const expected = legacy
+        ? {
+            ...converted,
+            contractVersion: 4,
+            spaceId: access.spaceId,
+            migrationEpoch: access.migrationEpoch,
+          }
+        : converted;
+      if (proof.actor_id !== access.actorId || canonical(expected) !== encoded)
+        fail(
+          "operation_conflict",
+          "operationId was already committed by a different actor or with a different payload.",
+          409,
+        );
+      const result = (
+        legacy
+          ? convertTrackerSpaceJson(JSON.parse(proof.result), access.spaceId)
+          : JSON.parse(proof.result)
+      ) as MutationResult;
+      return {
+        ...result,
+        contractVersion: 4,
+        spaceId: access.spaceId,
+        migrationEpoch: access.migrationEpoch,
+      };
+    }
     const receipt = first(
       this.sql,
       tracker
@@ -2012,6 +2254,14 @@ export class TrackerStore {
         );
       return JSON.parse(receipt.result) as MutationResult;
     }
+    return null;
+  }
+  private apply(
+    access: Omit<Access, "space">,
+    request: MutationRequest,
+    encoded: string,
+    timeline: Timeline | null,
+  ): MutationResult {
     const now = new Date(this.clock()).toISOString();
     const events: TrackerEvent[] = [];
     const results: MutationResult["results"] = [];
@@ -2151,11 +2401,11 @@ export class TrackerStore {
     };
     const admin = () => {
       if (!access.canAdmin)
-        fail("forbidden", "Tracker administration requires account ownership.", 403);
+        fail("forbidden", "Tracker administration requires an explicit Space admin grant.", 403);
     };
     const member = (memberId: string) => {
       if (!access.members.some((m) => m.id === memberId))
-        fail("invalid_member", "User is not a current account member.");
+        fail("invalid_member", "User is not a current Space member.");
     };
     /** A member, or an agent accountable to one: the human who answers for it. */
     const answerable = (actorId: string) => {
@@ -2193,7 +2443,7 @@ export class TrackerStore {
       )
         fail("already_exists", `${type} ID already exists.`, 409);
     };
-    const version = (entity: Team | Workspace | Issue, expected: unknown) => {
+    const version = (entity: Team | Project | Issue, expected: unknown) => {
       if (!Number.isSafeInteger(expected) || Number(expected) < 1)
         fail("invalid_input", "expectedVersion is required and must be a positive integer.");
       if (entity.version !== expected)
@@ -2317,7 +2567,7 @@ export class TrackerStore {
     };
     /**
      * Assigning work to an agent that doesn't meet its requirements is a
-     * person's explicit call: a tracker owner's, or the agent's accountable
+     * person's explicit call: a Space admin's, or the agent's accountable
      * person's. The issue then shows the mismatch.
      */
     const assignedAnyway = (issue: Issue) => {
@@ -2332,7 +2582,7 @@ export class TrackerStore {
         "requirements_unmet",
         `${unmetText(agent.name, issue.key, unmet)} ${
           person
-            ? `Only a tracker owner or ${agent.accountable.displayName} can assign it anyway.`
+            ? `Only a Space admin or ${agent.accountable.displayName} can assign it anyway.`
             : "An agent can't assign it to an agent that doesn't meet them; a person can."
         }`,
         { unmet },
@@ -2341,7 +2591,7 @@ export class TrackerStore {
     /**
      * Tightened requirements no longer allow the agent holding `issue`
      * (CORE-272). Never silent: the edit either releases the claim (asked
-     * with `releaseClaim`, by a tracker owner or the agent's accountable
+     * with `releaseClaim`, by a Space admin or the agent's accountable
      * person) or keeps it, and a comment records which and what it misses.
      */
     const claimEffect = (
@@ -2356,7 +2606,7 @@ export class TrackerStore {
         if (!person || (!access.canAdmin && effect.agent.accountable.id !== access.principalId))
           fail(
             "forbidden",
-            `Only a tracker owner or ${effect.agent.accountable.displayName}, acting as themselves, can release ${effect.agent.name}'s claim. Save without releasing it to keep the claim.`,
+            `Only a Space admin or ${effect.agent.accountable.displayName}, acting as themselves, can release ${effect.agent.name}'s claim. Save without releasing it to keep the claim.`,
             403,
           );
         if (claim.retainedIn)
@@ -2543,7 +2793,7 @@ export class TrackerStore {
     const pick = (
       scope: {
         teamId?: string;
-        workspaceId?: string;
+        projectId?: string;
         underId?: string;
         /** The caller holds underId's lease: its own subtree is open to it. */
         own?: Issue;
@@ -2614,7 +2864,7 @@ export class TrackerStore {
           issue.type !== "prd" &&
           (issue.assigneeId === null || issue.assigneeId === access.actorId) &&
           (!scope.teamId || issue.teamId === scope.teamId) &&
-          (!scope.workspaceId || issue.workspaceIds.includes(scope.workspaceId)) &&
+          (!scope.projectId || issue.projectIds.includes(scope.projectId)) &&
           (!scope.underId || under(issue)) &&
           tagged(issue) &&
           writable(issue),
@@ -2787,14 +3037,14 @@ export class TrackerStore {
           }
         }
       }
-      if ("workspaceIds" in data) {
-        const workspaceIds = strings(data.workspaceIds, "workspaceIds");
-        for (const workspaceId of workspaceIds) {
-          const workspace = this.get<Workspace>("workspace", workspaceId);
-          if (workspace.archived && (creating || !issue.workspaceIds.includes(workspaceId)))
-            fail("archived", "Cannot add work to an archived workspace.", 409);
+      if ("projectIds" in data) {
+        const projectIds = strings(data.projectIds, "projectIds");
+        for (const projectId of projectIds) {
+          const project = this.get<Project>("project", projectId);
+          if (project.archived && (creating || !issue.projectIds.includes(projectId)))
+            fail("archived", "Cannot add work to an archived project.", 409);
         }
-        issue.workspaceIds = workspaceIds;
+        issue.projectIds = projectIds;
       }
       if ("labels" in data) issue.labels = strings(data.labels, "labels", 50);
       if ("timelineUse" in data) {
@@ -2854,20 +3104,20 @@ export class TrackerStore {
           );
           break;
         }
-        case "workspace.create": {
+        case "project.create": {
           admin();
           keys(data, ["slug", "name", "description"]);
-          unique("workspace", entityId);
+          unique("project", entityId);
           const slug = text(data.slug, "slug", 80);
           if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug))
             fail(
               "invalid_input",
-              "Workspace slug must be lowercase letters/digits separated by hyphens.",
+              "Project slug must be lowercase letters/digits separated by hyphens.",
             );
-          if (this.all<Workspace>("workspace").some((w) => w.slug === slug))
-            fail("already_exists", "Workspace slug already exists.", 409);
+          if (this.all<Project>("project").some((w) => w.slug === slug))
+            fail("already_exists", "Project slug already exists.", 409);
           emit(
-            "workspace",
+            "project",
             entityId,
             {
               ...base,
@@ -2886,16 +3136,16 @@ export class TrackerStore {
           break;
         }
         case "team.update":
-        case "workspace.update": {
+        case "project.update": {
           admin();
-          const type = mutation.kind === "team.update" ? "team" : "workspace";
+          const type = mutation.kind === "team.update" ? "team" : "project";
           keys(
             data,
             type === "team"
               ? ["name", "description", "memberIds", "archived", "attemptLimit"]
               : ["name", "description", "archived"],
           );
-          const entity = this.get<Team | Workspace>(type, entityId);
+          const entity = this.get<Team | Project>(type, entityId);
           version(entity, mutation.expectedVersion);
           if ("name" in data) entity.name = text(data.name, "name");
           if ("description" in data)
@@ -2955,7 +3205,7 @@ export class TrackerStore {
             "priority",
             "assigneeId",
             "parentId",
-            "workspaceIds",
+            "projectIds",
             "labels",
             "requires",
             ...(creating ? ["teamId"] : ["leaseToken", "releaseClaim"]),
@@ -2995,7 +3245,7 @@ export class TrackerStore {
               priority: 2,
               assigneeId: null,
               parentId: null,
-              workspaceIds: [],
+              projectIds: [],
               labels: [],
               claim: null,
             };
@@ -3139,24 +3389,33 @@ export class TrackerStore {
         }
         case "subscription.add": {
           admin();
-          keys(data, ["workspaceId", "repoId"]);
+          keys(data, ["projectId", "repoId"]);
           unique("subscription", entityId);
-          const workspaceId = id(data.workspaceId);
-          if (this.get<Workspace>("workspace", workspaceId).archived)
-            fail("archived", "Cannot subscribe to an archived workspace.", 409);
+          const projectId = id(data.projectId);
+          if (this.get<Project>("project", projectId).archived)
+            fail("archived", "Cannot subscribe to an archived project.", 409);
           const repoId = id(data.repoId);
           const repo = access.repos.find((r) => r.id === repoId);
           if (!repo) fail("forbidden", "Repository administration is required.", 403);
+          if (repo.spaceId !== access.spaceId)
+            fail("space_mismatch", "Repository and Project must belong to the same Space.", 409);
           if (
             this.all<Subscription>("subscription").some(
-              (s) => s.workspaceId === workspaceId && s.repoId === repoId,
+              (s) => s.projectId === projectId && s.repoId === repoId,
             )
           )
-            fail("already_exists", "Repository already subscribes to this workspace.", 409);
+            fail("already_exists", "Repository already subscribes to this project.", 409);
           emit(
             "subscription",
             entityId,
-            { id: entityId, workspaceId, repoId, owner: repo.owner, name: repo.name },
+            {
+              id: entityId,
+              projectId,
+              repoId,
+              spaceId: repo.spaceId,
+              space: repo.space,
+              name: repo.name,
+            },
             mutation.kind,
           );
           break;
@@ -3178,7 +3437,7 @@ export class TrackerStore {
             "agent",
             "ttlSeconds",
             "teamId",
-            "workspaceId",
+            "projectId",
             "underId",
             "underToken",
             "forActorId",
@@ -3193,7 +3452,7 @@ export class TrackerStore {
             strings(value, name, 50).map((tag) => tag.toLowerCase());
           const scope = {
             ...(data.teamId === undefined ? {} : { teamId: id(data.teamId) }),
-            ...(data.workspaceId === undefined ? {} : { workspaceId: id(data.workspaceId) }),
+            ...(data.projectId === undefined ? {} : { projectId: id(data.projectId) }),
             ...(data.underId === undefined ? {} : { underId: id(data.underId) }),
             ...(data.tags === undefined ? {} : { tags: lower(data.tags, "tags") }),
             ...(data.excludeTags === undefined
@@ -3201,7 +3460,7 @@ export class TrackerStore {
               : { excludeTags: lower(data.excludeTags, "excludeTags") }),
           };
           if (scope.teamId) this.get<Team>("team", scope.teamId);
-          if (scope.workspaceId) this.get<Workspace>("workspace", scope.workspaceId);
+          if (scope.projectId) this.get<Project>("project", scope.projectId);
           let own: Issue | null = null;
           if (scope.underId) {
             const under = this.get<Issue>("issue", scope.underId);
@@ -3263,7 +3522,7 @@ export class TrackerStore {
             const repo = text(target.repo, "secret.repo", 200);
             const name = text(target.name, "secret.name", 100);
             if (!/^[^/\s]+\/[^/\s]+$/.test(repo))
-              fail("invalid_input", "secret.repo must be owner/name.");
+              fail("invalid_input", "secret.repo must be space/name.");
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
               fail("invalid_input", "secret.name must be letters, digits and underscores.");
             secret = { repo, name };
@@ -3341,7 +3600,7 @@ export class TrackerStore {
                 fail("invalid_input", "Approve or reject: approved must be true or false.");
               const note = data.answer === undefined ? null : text(data.answer, "answer", 20000);
               request.answer = `${data.approved ? "approved" : "rejected"}${note === null ? "" : ` · ${note}`}`;
-              if (request.checkpoint)
+              if (request.checkpoint) {
                 this.timelines.answerApproval(
                   access,
                   request,
@@ -3350,6 +3609,10 @@ export class TrackerStore {
                   access.writableRepoIds,
                   via,
                 );
+                // What a retried landing acts with (CORE-390), re-resolved before it does.
+                if (data.approved && access.credential)
+                  this.keepWorkAuthority(`approval:${request.checkpoint.id}`, access, now);
+              }
               if (via) request.via = via;
             } else {
               // The value went to the secret store; the tracker only records where.
@@ -3394,19 +3657,28 @@ export class TrackerStore {
             approveWhenGreen: since !== null,
             enabledAt: since,
           };
-          // Turning it on again keeps when it was first turned on.
-          if (data.enabled && !since)
-            run(
-              this.sql,
-              tracker
-                .insertInto("approval_automation")
-                .values({ person_id: entityId, enabled_at: now }),
-            );
-          if (!data.enabled && since)
+          if (data.enabled) {
+            // It acts later with this credential, re-resolved each time: turning it
+            // on again renews that consent, and keeps when it was first turned on.
+            this.keepWorkAuthority(`automation:${entityId}`, access, now);
+            if (!since)
+              run(
+                this.sql,
+                tracker
+                  .insertInto("approval_automation")
+                  .values({ person_id: entityId, enabled_at: now })
+                  .onConflict((oc) => oc.column("person_id").doUpdateSet({ enabled_at: now })),
+              );
+          } else {
             run(
               this.sql,
               tracker.deleteFrom("approval_automation").where("person_id", "=", entityId),
             );
+            run(
+              this.sql,
+              tracker.deleteFrom("work_authorities").where("key", "=", `automation:${entityId}`),
+            );
+          }
           events.push(
             this.record({
               operationId: request.operationId,
@@ -3613,7 +3885,7 @@ export class TrackerStore {
               if (force && (!access.canAdmin || access.actorId !== access.principalId))
                 fail(
                   "forbidden",
-                  "Only a tracker owner, acting as themselves rather than through an agent, can take over a claim.",
+                  "Only a Space admin, acting as themselves rather than through an agent, can take over a claim.",
                   403,
                 );
               const taken = force && hasActiveClaim(issue, now) ? issue.claim : null;
@@ -3690,7 +3962,7 @@ export class TrackerStore {
               if (!access.canAdmin || access.actorId !== access.principalId)
                 fail(
                   "forbidden",
-                  "Only a tracker owner, acting as themselves rather than through an agent, can end someone else's claim.",
+                  "Only a Space admin, acting as themselves rather than through an agent, can end someone else's claim.",
                   403,
                 );
               if (!ended || !hasActiveClaim(issue, now))
@@ -3770,7 +4042,15 @@ export class TrackerStore {
       if (issue.status === "in_progress" || issue.status === "done") unblocked(issue);
       if (issue.status === "done") childrenClosed(issue);
     }
-    const result: MutationResult = { cursor: this.cursor(), events, results, serverTime: now };
+    const result: MutationResult = {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
+      cursor: this.cursor(),
+      events,
+      results,
+      serverTime: now,
+    };
     run(
       this.sql,
       tracker.insertInto("receipts").values({

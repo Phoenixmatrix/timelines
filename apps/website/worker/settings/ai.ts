@@ -3,6 +3,7 @@ import type { Insertable } from "kysely";
 import {
   AI_LOG_BODIES_NOTE,
   AI_LOG_COMPONENTS,
+  aiLogComponentScope,
   AI_MODEL_CATALOG,
   DEFAULT_AI_CONFIGURATION,
   DEFAULT_KNOWLEDGE_SCHEDULE,
@@ -21,18 +22,20 @@ import {
   type KnowledgeUpdateSchedule,
   type SiteAiSettingsPatch,
   type SiteAiSettingsView,
+  type PersonAiSettingsView,
 } from "../../shared/ai.ts";
-import { environmentKeepsBodies, forgetLogBodySettings } from "../ai-gateway.ts";
-import { accountCatalog, resolveProviderModel } from "../ai-providers/store.ts";
+import { environmentKeepsBodies } from "../ai-gateway.ts";
+import { spaceCatalog, resolveProviderModel } from "../ai-providers/store.ts";
 import { fail, requireActor, requirePerson } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
-import { findAccountBySlug, type AccountRow, type Actor } from "../db.ts";
+import { findAccountBySlug, type Actor } from "../db.ts";
+import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
 import { db, nowIso, type Database } from "../schema.ts";
 
-/** Stored account choices, independent of preview retention and its provenance. */
-export async function aiSettings(d1: D1Database, accountId: string): Promise<AiSettings> {
+/** Stored Space choices, independent of preview retention and its provenance. */
+export async function aiSettings(d1: D1Database, spaceId: string): Promise<AiSettings> {
   const row = await db(d1)
-    .selectFrom("account_settings as s")
+    .selectFrom("space_settings as s")
     .leftJoin("accounts as a", "a.id", "s.ai_updated_by")
     .select([
       "s.ai_knowledge",
@@ -48,7 +51,7 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
       "s.release_highlights_interval_hours",
       "a.slug",
     ])
-    .where("s.account_id", "=", accountId)
+    .where("s.space_id", "=", spaceId)
     .executeTakeFirst();
   if (!row)
     return {
@@ -85,22 +88,23 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
 export async function repoAiSnapshot(d1: D1Database, repoId: string): Promise<AiSnapshot> {
   const repo = await db(d1)
     .selectFrom("repos")
-    .select("owner_id")
+    .select("space_id")
     .where("id", "=", repoId)
     .executeTakeFirst();
   if (!repo) throw new Error("Cannot resolve AI settings: no such repository.");
-  return accountAiSnapshot(d1, repo.owner_id);
+  return spaceAiSnapshot(d1, repo.space_id);
 }
 
-/** Resolve account-owned work without inventing a repository for site/tracker scopes. */
-export async function accountAiSnapshot(d1: D1Database, accountId: string): Promise<AiSnapshot> {
-  const account = await db(d1)
-    .selectFrom("accounts")
+/** Resolve Space-owned work; callers authorize its current resource before admission. */
+export async function spaceAiSnapshot(d1: D1Database, spaceId: string): Promise<AiSnapshot> {
+  const space = await db(d1)
+    .selectFrom("spaces")
     .select("id")
-    .where("id", "=", accountId)
+    .where("id", "=", spaceId)
+    .where("archived_at", "is", null)
     .executeTakeFirst();
-  if (!account) throw new Error("Cannot resolve AI settings: no such account.");
-  const settings = await aiSettings(d1, accountId);
+  if (!space) throw new Error("Cannot resolve AI settings: no such active Space.");
+  const settings = await aiSettings(d1, spaceId);
   const prices: NonNullable<AiSnapshot["prices"]> = {};
   const builtIn = (role: AiRole, id: string) => {
     const option = AI_MODEL_CATALOG[role].find((entry) => entry.id === id);
@@ -111,13 +115,8 @@ export async function accountAiSnapshot(d1: D1Database, accountId: string): Prom
     const id = settings.models[role];
     const custom = parseProviderModelId(id);
     if (!custom) return builtIn(role, id);
-    const resolved = await resolveProviderModel(d1, accountId, custom.provider, custom.model);
-    // Removing a model in use is refused (worker/ai-providers/api.ts); should one
-    // still go missing, new work uses the default rather than failing every read.
-    if (!resolved) {
-      console.warn(`AI settings: ${id} is no longer available; using the default ${role} model.`);
-      return builtIn(role, DEFAULT_AI_CONFIGURATION.models[role]);
-    }
+    const resolved = await resolveProviderModel(d1, spaceId, custom.provider, custom.model);
+    if (!resolved) throw new Error(`AI model ${id} is no longer available in this Space.`);
     if (!resolved.option.variablePricing)
       prices[resolved.ref] = {
         input: resolved.option.inputUsdPerMillion,
@@ -140,11 +139,11 @@ export async function accountAiSnapshot(d1: D1Database, accountId: string): Prom
 }
 
 /**
- * When a repository's pushes update its Knowledge (CORE-286): its account's
+ * When a repository's pushes update its Knowledge (CORE-286): its Space's
  * schedule, in milliseconds. Development environments may shorten both waits
  * (`GITMATRIX_KNOWLEDGE_QUIET_SECONDS` and `GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS`,
  * the KNOWLEDGE_QUIET_SECONDS / KNOWLEDGE_MAX_WAIT_SECONDS text bindings);
- * deployed Workers use the account's settings.
+ * deployed Workers use the Space's settings.
  */
 export async function knowledgeSchedule(
   env: Env,
@@ -152,11 +151,11 @@ export async function knowledgeSchedule(
 ): Promise<{ quietMs: number; maxWaitMs: number }> {
   const repo = await db(env.DB)
     .selectFrom("repos")
-    .select("owner_id")
+    .select("space_id")
     .where("id", "=", repoId)
     .executeTakeFirst();
   const schedule: KnowledgeUpdateSchedule = repo
-    ? (await aiSettings(env.DB, repo.owner_id)).knowledgeUpdates
+    ? (await aiSettings(env.DB, repo.space_id)).knowledgeUpdates
     : DEFAULT_KNOWLEDGE_SCHEDULE;
   const seconds = (name: string) => {
     const raw = Reflect.get(env, name);
@@ -170,19 +169,29 @@ export async function knowledgeSchedule(
 }
 
 /**
- * Gateway body logging (CORE-290) as the site sets it, and with `accountId`
- * that account's overrides and what its calls get. Read fresh, not from the
+ * Gateway body logging (CORE-290) as the Instance sets it, and with `spaceId`
+ * that Space's overrides and what its calls get. Read fresh, not from the
  * per-call cache in worker/ai-gateway.ts.
  */
-export async function logBodiesView(env: Env, accountId: string | null): Promise<AiLogBodiesView> {
-  const [site, account] = await Promise.all([
+export async function logBodiesView(
+  env: Env,
+  spaceId: string | null,
+  scope: "space" | "person" = "space",
+): Promise<AiLogBodiesView> {
+  const [site, space] = await Promise.all([
     db(env.DB).selectFrom("site_ai_log_bodies").select(["component", "keep"]).execute(),
-    accountId
-      ? db(env.DB)
-          .selectFrom("account_ai_log_bodies")
-          .select(["component", "keep"])
-          .where("account_id", "=", accountId)
-          .execute()
+    spaceId
+      ? scope === "person"
+        ? db(env.DB)
+            .selectFrom("account_ai_log_bodies")
+            .select(["component", "keep"])
+            .where("account_id", "=", spaceId)
+            .execute()
+        : db(env.DB)
+            .selectFrom("space_ai_log_bodies")
+            .select(["component", "keep"])
+            .where("space_id", "=", spaceId)
+            .execute()
       : Promise.resolve([]),
   ]);
   const environmentDefault = environmentKeepsBodies(env);
@@ -193,28 +202,41 @@ export async function logBodiesView(env: Env, accountId: string | null): Promise
   return {
     environmentDefault,
     note: AI_LOG_BODIES_NOTE,
-    components: AI_LOG_COMPONENTS.map(({ id, label, description }) => {
+    components: AI_LOG_COMPONENTS.filter(
+      (entry) => spaceId === null || aiLogComponentScope(entry.id) === scope,
+    ).map(({ id, label, description }) => {
       const siteChoice = stored(site, id);
       const siteValue = siteChoice ?? environmentDefault;
-      const accountChoice = accountId ? stored(account, id) : null;
+      const spaceChoice = spaceId ? stored(space, id) : null;
       return {
         component: id,
         label,
         description,
         site: siteValue,
         siteFrom: siteChoice === null ? "environment" : "site",
-        ...(accountId ? { account: accountChoice } : {}),
-        effective: accountChoice ?? siteValue,
+        ...(spaceId ? (scope === "person" ? { person: spaceChoice } : { space: spaceChoice }) : {}),
+        effective: spaceChoice ?? siteValue,
       };
     }),
   };
 }
 
-function validateLogBodies(value: unknown, field: string): AiLogBodiesPatch | string {
+function validateLogBodies(
+  value: unknown,
+  field: string,
+  scope?: "space" | "person",
+): AiLogBodiesPatch | string {
   if (!object(value)) return `${field} must be an object of components, each true, false or null.`;
   for (const [key, choice] of Object.entries(value)) {
     if (!AI_LOG_COMPONENTS.some((component) => component.id === key))
       return `Unknown component: ${field}.${key}. Components: ${AI_LOG_COMPONENTS.map((c) => c.id).join(", ")}.`;
+    if (
+      scope &&
+      !AI_LOG_COMPONENTS.some(
+        (component) => component.id === key && aiLogComponentScope(component.id) === scope,
+      )
+    )
+      return `${field}.${key} is not a ${scope} setting.`;
     if (choice !== null && typeof choice !== "boolean")
       return `${field}.${key} must be true, false or null (inherit).`;
   }
@@ -224,14 +246,15 @@ function validateLogBodies(value: unknown, field: string): AiLogBodiesPatch | st
 /** Store a level's choices: true/false sets, null removes (inherit). */
 async function saveLogBodies(
   d1: D1Database,
-  accountId: string | null,
+  spaceId: string | null,
   patch: AiLogBodiesPatch,
   actorId: string,
+  scope: "space" | "person" = "space",
 ) {
   const statements: D1PreparedStatement[] = [];
   const now = nowIso();
   for (const [component, choice] of Object.entries(patch)) {
-    if (accountId === null)
+    if (spaceId === null)
       statements.push(
         choice === null
           ? d1.prepare("DELETE FROM site_ai_log_bodies WHERE component = ?1").bind(component)
@@ -244,44 +267,45 @@ async function saveLogBodies(
               )
               .bind(component, Number(choice), actorId, now),
       );
-    else
+    else if (scope === "person")
       statements.push(
         choice === null
           ? d1
               .prepare("DELETE FROM account_ai_log_bodies WHERE account_id = ?1 AND component = ?2")
-              .bind(accountId, component)
+              .bind(spaceId, component)
+          : d1
+              .prepare(`INSERT INTO account_ai_log_bodies (account_id, component, keep, updated_by, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT (account_id, component) DO UPDATE SET
+                  keep = excluded.keep, updated_by = excluded.updated_by, updated_at = excluded.updated_at`)
+              .bind(spaceId, component, Number(choice), actorId, now),
+      );
+    else
+      statements.push(
+        choice === null
+          ? d1
+              .prepare("DELETE FROM space_ai_log_bodies WHERE space_id = ?1 AND component = ?2")
+              .bind(spaceId, component)
           : d1
               .prepare(
-                `INSERT INTO account_ai_log_bodies (account_id, component, keep, updated_by, updated_at)
+                `INSERT INTO space_ai_log_bodies (space_id, component, keep, updated_by, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (account_id, component) DO UPDATE SET
+                 ON CONFLICT (space_id, component) DO UPDATE SET
                    keep = excluded.keep, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
               )
-              .bind(accountId, component, Number(choice), actorId, now),
+              .bind(spaceId, component, Number(choice), actorId, now),
       );
   }
   if (statements.length) await d1.batch(statements);
-  forgetLogBodySettings(d1);
 }
 
-async function standing(d1: D1Database, account: AccountRow, actor: Actor) {
-  if (actor.isSiteAdmin) return "admin";
-  if (account.kind === "user") return account.id === actor.id ? "admin" : "none";
-  const membership = await db(d1)
-    .selectFrom("org_members")
-    .select("role")
-    .where("org_id", "=", account.id)
-    .where("user_id", "=", actor.id)
-    .executeTakeFirst();
-  if (!membership) return "none";
-  return membership.role === "owner" ? "admin" : "member";
-}
-
-/** The account named in the route and the actor's standing in it; null when not a member. */
+/** Current explicit Space grant, or the separately preserved Instance settings power. */
 export async function load(c: Context<AppEnv>, actor: Actor) {
-  const account = await findAccountBySlug(c.env.DB, c.req.param("slug") ?? "");
-  const role = account ? await standing(c.env.DB, account, actor) : "none";
-  return account && role !== "none" ? { account, role } : null;
+  const space = await findSpaceBySlug(c.env.DB, c.req.param("space") ?? "");
+  if (!space || space.archivedAt !== null) return null;
+  const access = await resolveSpaceAccess(c.env.DB, actor, space.id);
+  const role = actor.isSiteAdmin ? "admin" : access?.grant.role;
+  return role ? { space, role } : null;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -347,7 +371,7 @@ function validate(body: unknown, catalog: AiModelCatalog): AiSettingsPatch | str
     }
   }
   if (body.logBodies !== undefined) {
-    const logBodies = validateLogBodies(body.logBodies, "logBodies");
+    const logBodies = validateLogBodies(body.logBodies, "logBodies", "space");
     if (typeof logBodies === "string") return logBodies;
   }
   return body as AiSettingsPatch;
@@ -359,12 +383,12 @@ aiSettingsApi.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
+  if (!found) return fail(c, 404, "No such Space, or you do not have a current grant.");
   return c.json<AiSettingsView>({
-    ...(await aiSettings(c.env.DB, found.account.id)),
+    ...(await aiSettings(c.env.DB, found.space.id)),
     canManage: found.role === "admin" && !actor.agent,
-    catalog: await accountCatalog(c.env.DB, found.account.id),
-    logBodies: await logBodiesView(c.env, found.account.id),
+    catalog: await spaceCatalog(c.env.DB, found.space.id),
+    logBodies: await logBodiesView(c.env, found.space.id),
   });
 });
 
@@ -372,24 +396,20 @@ aiSettingsApi.patch("/", async (c) => {
   const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
+  if (!found) return fail(c, 404, "No such Space, or you do not have a current grant.");
   if (found.role !== "admin")
-    return fail(
-      c,
-      403,
-      "Only the account owner, organization owners, or site admins can change AI settings.",
-    );
+    return fail(c, 403, "Only Space administrators or Instance operators can change AI settings.");
   let body: unknown;
   try {
     body = await c.req.json();
   } catch {
     return fail(c, 400, "AI settings must be valid JSON.");
   }
-  const patch = validate(body, await accountCatalog(c.env.DB, found.account.id));
+  const patch = validate(body, await spaceCatalog(c.env.DB, found.space.id));
   if (typeof patch === "string") return fail(c, 400, patch);
   // Only supplied columns participate in the upsert. No read/merge/write window:
   // concurrent changes to other choices or preview retention cannot be overwritten.
-  const values: Partial<Insertable<Database["account_settings"]>> = {};
+  const values: Partial<Insertable<Database["space_settings"]>> = {};
   if (patch.features?.knowledge !== undefined)
     values.ai_knowledge = Number(patch.features.knowledge);
   if (patch.features?.wiki !== undefined) values.ai_wiki = Number(patch.features.wiki);
@@ -410,17 +430,17 @@ aiSettingsApi.patch("/", async (c) => {
     values.ai_updated_by = actor.id;
     values.ai_updated_at = nowIso();
     await db(c.env.DB)
-      .insertInto("account_settings")
-      .values({ ...values, account_id: found.account.id })
-      .onConflict((oc) => oc.column("account_id").doUpdateSet(values))
+      .insertInto("space_settings")
+      .values({ ...values, space_id: found.space.id })
+      .onConflict((oc) => oc.column("space_id").doUpdateSet(values))
       .execute();
   }
-  if (patch.logBodies) await saveLogBodies(c.env.DB, found.account.id, patch.logBodies, actor.id);
+  if (patch.logBodies) await saveLogBodies(c.env.DB, found.space.id, patch.logBodies, actor.id);
   return c.json<AiSettingsView>({
-    ...(await aiSettings(c.env.DB, found.account.id)),
+    ...(await aiSettings(c.env.DB, found.space.id)),
     canManage: true,
-    catalog: await accountCatalog(c.env.DB, found.account.id),
-    logBodies: await logBodiesView(c.env, found.account.id),
+    catalog: await spaceCatalog(c.env.DB, found.space.id),
+    logBodies: await logBodiesView(c.env, found.space.id),
   });
 });
 
@@ -462,5 +482,44 @@ siteAiSettingsApi.patch("/", async (c) => {
   return c.json<SiteAiSettingsView>({
     logBodies: await logBodiesView(c.env, null),
     canManage: true,
+  });
+});
+
+/** Personal logging is self-service, never Organization or Space administration. */
+export const personAiSettingsApi = new Hono<AppEnv>();
+
+personAiSettingsApi.get("/", async (c) => {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  const person = await findAccountBySlug(c.env.DB, c.req.param("person") ?? "");
+  if (!person || person.id !== actor.id) return fail(c, 404, "No such person.");
+  return c.json<PersonAiSettingsView>({
+    canManage: !actor.agent,
+    logBodies: await logBodiesView(c.env, actor.id, "person"),
+  });
+});
+
+personAiSettingsApi.patch("/", async (c) => {
+  const actor = requirePerson(c);
+  if (actor instanceof Response) return actor;
+  const person = await findAccountBySlug(c.env.DB, c.req.param("person") ?? "");
+  if (!person || person.id !== actor.id) return fail(c, 404, "No such person.");
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return fail(c, 400, "Personal AI settings must be valid JSON.");
+  }
+  if (!object(body)) return fail(c, 400, "Personal AI settings must be a JSON object.");
+  for (const key of Object.keys(body))
+    if (key !== "logBodies") return fail(c, 400, `Unknown field: ${key}.`);
+  if (body.logBodies !== undefined) {
+    const patch = validateLogBodies(body.logBodies, "logBodies", "person");
+    if (typeof patch === "string") return fail(c, 400, patch);
+    await saveLogBodies(c.env.DB, actor.id, patch, actor.id, "person");
+  }
+  return c.json<PersonAiSettingsView>({
+    canManage: true,
+    logBodies: await logBodiesView(c.env, actor.id, "person"),
   });
 });

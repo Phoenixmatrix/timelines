@@ -3,6 +3,7 @@ import { lsRefs } from "../artifacts.ts";
 import { startMergeRun, runOutcome } from "../ci/landing.ts";
 import { startRun, startWorkflow } from "../ci/trigger.ts";
 import { revokeJobTokens } from "../ci/registry.ts";
+import { resolveWorkAuthority } from "../ci/admission.ts";
 import { afterQueuedPush, type PushedRepo } from "../git/effects.ts";
 import { diffTrees } from "../knowledge/overlay.ts";
 import { db, batch } from "../schema.ts";
@@ -74,6 +75,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       live(repo, () =>
         startMergeRun(env, repo, {
           runId: s.mergeRunId!,
+          authority: s.authority,
           queueId: s.entry.id,
           attempt: s.entry.attempts,
           branch: s.entry.candidateBranch,
@@ -90,6 +92,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       live(repo, () =>
         startRun(env, repo, {
           runId: s.gateRunId!,
+          authority: s.authority,
           queueId: s.entry.id,
           queueAttempt: s.entry.attempts,
           branch: s.entry.candidateBranch,
@@ -103,6 +106,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       live(repo, () =>
         startRun(env, repo, {
           runId: s.deployRunId!,
+          authority: s.authority,
           verification: { queueId: s.entry.id, attempt: s.entry.attempts, gateRunId: s.gateRunId! },
           branch: s.entry.branch,
           commit: s.entry.candidate!,
@@ -145,8 +149,13 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       const instance = await env.CI_RUN.get(id).catch(() => null);
       await instance?.terminate();
     },
-    effects: (repo, s) => live(repo, () => afterQueuedPush(env, repo, s.actor)),
+    effects: async (repo, s) => {
+      const { actor } = await resolveWorkAuthority(env, s.authority, repo.id);
+      return live(repo, () => afterQueuedPush(env, repo, actor, s.authority));
+    },
     classify: async (repo, s, entries) => {
+      await resolveWorkAuthority(env, s.authority, repo.id);
+      for (const entry of entries) await resolveWorkAuthority(env, entry.authority, repo.id);
       if (entries.length < 2)
         return {
           action: "separate",
@@ -177,16 +186,19 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       }
       return classifyQueue(env, s.snapshot, { repoId: repo.id, entries: inputs });
     },
-    remediate: (repo, s, failure) =>
-      live(repo, () =>
+    remediate: async (repo, s, failure) => {
+      await resolveWorkAuthority(env, s.authority, repo.id);
+      return live(repo, () =>
         recordQueueFailure(env, {
-          ownerId: repo.owner_id,
+          spaceId: repo.space_id,
           repoId: repo.id,
           actorId: s.actor.id,
           agentId: s.actor.agent?.id ?? null,
+          credential: s.authority.credential,
           issueIds: s.entry.issueIds,
           failure,
         }),
-      ),
+      );
+    },
   };
 }

@@ -41,7 +41,7 @@ import type {
 import { api, ApiError } from "./api.ts";
 
 export interface AtlasRepo {
-  owner: string;
+  space: string;
   name: string;
 }
 
@@ -66,7 +66,7 @@ function path(
   for (const [key, value] of Object.entries(query))
     if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
   const search = params.toString();
-  return `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/atlas/${route}${search ? `?${search}` : ""}`;
+  return `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}/atlas/${route}${search ? `?${search}` : ""}`;
 }
 
 const get = <T>(
@@ -85,7 +85,7 @@ const get = <T>(
 
 // ---- access lost (CORE-178) ----------------------------------------------------
 
-const repoKey = (repo: AtlasRepo) => `${repo.owner}/${repo.name}`.toLowerCase();
+const repoKey = (repo: AtlasRepo) => `${repo.space}/${repo.name}`.toLowerCase();
 const lostListeners = new Map<string, Set<() => void>>();
 
 /**
@@ -210,10 +210,10 @@ export const atlasApi = {
  * An explicit workspace selection: repository names under one owning account.
  * The server re-authorizes it on every call and silently keeps only what the
  * caller can read; `snapshot.repos` in each response says which, and their
- * states. A tracker workspace's repositories can seed `repos`.
+ * states. A tracker Project's repositories can seed `repos`.
  */
 export interface AtlasWorkspace {
-  owner: string;
+  space: string;
   repos: string[];
 }
 
@@ -226,7 +226,7 @@ function workspacePath(
   params.set("repos", [...new Set(workspace.repos)].sort().join(","));
   for (const [key, value] of Object.entries(query))
     if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
-  return `/accounts/${encodeURIComponent(workspace.owner)}/atlas/${route}?${params.toString()}`;
+  return `/spaces/${encodeURIComponent(workspace.space)}/atlas/${route}?${params.toString()}`;
 }
 
 const getIn = <T>(

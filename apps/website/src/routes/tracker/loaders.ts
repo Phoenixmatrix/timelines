@@ -2,16 +2,32 @@ import { data, redirect, type LoaderFunctionArgs } from "react-router";
 import type { TrackerList, TrackerView } from "../../../shared/tracker.ts";
 import { api, ApiError } from "../../lib/api.ts";
 import { readLegacyDefaults } from "./preferences.ts";
+import { assertTrackerSnapshot } from "./snapshot.ts";
+import { tokenize } from "./query.ts";
+
+export function assertCurrentTrackerFilters(url: URL): void {
+  if (
+    url.searchParams.has("workspace") ||
+    url.searchParams.has("ws") ||
+    tokenize(url.searchParams.get("q") ?? "").some((term) => /^-?(workspace|ws):/i.test(term))
+  )
+    throw data(
+      {
+        message:
+          "client_upgrade_required: This link uses obsolete Workspace filters. Replace them with project: filters; no broader query was opened.",
+      },
+      { status: 400 },
+    );
+}
 
 /** These endpoints authenticate the request themselves; avoid a serial session preflight. */
-async function loadTracker<T>(path: string, request: Request): Promise<T> {
+async function loadTracker<T>(path: string, request: Request, url: URL): Promise<T> {
   try {
     return await api<T>(path, { signal: request.signal });
   } catch (error) {
     if (error instanceof ApiError) {
       if (error.status === 401) {
-        const url = new URL(request.url);
-        throw redirect(`/signin?next=${encodeURIComponent(url.pathname + url.search)}`);
+        throw redirect(`/signin?next=${encodeURIComponent(url.pathname + url.search + url.hash)}`);
       }
       throw data({ message: error.message }, { status: error.status });
     }
@@ -20,33 +36,35 @@ async function loadTracker<T>(path: string, request: Request): Promise<T> {
 }
 
 /** Open a page of your default tracker; with none to open, list the trackers. */
-async function intoDefaultTracker(request: Request, page: string) {
-  const { viewerId, trackers, defaultOwnerId } = await loadTracker<TrackerList>(
+async function intoDefaultTracker(request: Request, url: URL, page: string) {
+  const { viewerId, trackers, defaultSpaceId } = await loadTracker<TrackerList>(
     "/tracker",
     request,
+    url,
   );
   // Server defaults first; a default this browser kept from before still counts.
-  const preferred = defaultOwnerId ?? readLegacyDefaults(viewerId)?.ownerId;
-  const tracker = trackers.find((entry) => entry.id === preferred) ?? trackers[0];
-  if (tracker) throw redirect(`/tracker/${tracker.slug}${page}${new URL(request.url).search}`);
+  const preferred = defaultSpaceId ?? readLegacyDefaults(viewerId)?.spaceId;
+  const tracker = trackers.find((entry) => entry.id === preferred);
+  assertCurrentTrackerFilters(url);
+  if (tracker) throw redirect(`/tracker/${tracker.slug}${page}${url.search}${url.hash}`);
   return { trackers };
 }
 
-export function trackerIndexLoader({ request }: LoaderFunctionArgs) {
-  return intoDefaultTracker(request, "");
+export function trackerIndexLoader({ request, url }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, url, "");
 }
 
 /** `/timelines`, `/release-notes` and `/highlights`, the rail's places: your default tracker's. */
-export function timelinesIndexLoader({ request }: LoaderFunctionArgs) {
-  return intoDefaultTracker(request, "/timelines");
+export function timelinesIndexLoader({ request, url }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, url, "/timelines");
 }
 
-export function releaseNotesIndexLoader({ request }: LoaderFunctionArgs) {
-  return intoDefaultTracker(request, "/releases");
+export function releaseNotesIndexLoader({ request, url }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, url, "/releases");
 }
 
-export function highlightsIndexLoader({ request }: LoaderFunctionArgs) {
-  return intoDefaultTracker(request, "/highlights");
+export function highlightsIndexLoader({ request, url }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, url, "/highlights");
 }
 
 /** `?tl=<slug>` selects a timeline's view; main's is the default. */
@@ -55,9 +73,31 @@ export function timelineQuery(search: ConstructorParameters<typeof URLSearchPara
   return tl && tl !== "main" ? `?timeline=${encodeURIComponent(tl)}` : "";
 }
 
-export function trackerLoader({ request, params }: LoaderFunctionArgs) {
-  return loadTracker<TrackerView>(
-    `/tracker/${encodeURIComponent(params.owner!)}/view${timelineQuery(new URL(request.url).search)}`,
+export async function trackerLoader({ request, params, url }: LoaderFunctionArgs) {
+  assertCurrentTrackerFilters(url);
+  const view = await loadTracker<TrackerView>(
+    `/tracker/${encodeURIComponent(params.space!)}/view${timelineQuery(url.search)}`,
     request,
+    url,
   );
+  assertTrackerSnapshot(view.snapshot);
+  if (view.snapshot.space.slug !== params.space)
+    throw data(
+      { message: "The response does not belong to the requested Space." },
+      { status: 409 },
+    );
+  for (const [key, entries] of [
+    ["project", view.snapshot.projects],
+    ["team", view.snapshot.teams],
+  ] as const) {
+    const id = url.searchParams.get(key);
+    if (id !== null && !entries.some((entry) => entry.id === id))
+      throw data(
+        {
+          message: `The ${key} filter is unavailable in this Space. Update the link; no broader query was opened.`,
+        },
+        { status: 400 },
+      );
+  }
+  return view;
 }

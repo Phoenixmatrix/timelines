@@ -1,23 +1,48 @@
-import { describe, expect, test } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, describe, expect, test } from "vite-plus/test";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "./admission.ts";
 import { activeRun, inFlight, lastPassed, releaseHeld, UNCHANGED } from "./coalesce.ts";
 import { ConfigError, parsePipeline } from "./config.ts";
 
-function setup() {
-  const sqlite = migratedDatabase();
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_org', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('repo', 'acc_org', 'app', 'private', 'a', 'https://a');
-  `);
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const close of cleanups.splice(0)) close();
+});
+
+async function setup() {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('person','user','person','Person')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "org", slug: "org", displayName: "Org", kind: "company" },
+    space: { id: "space", slug: "space", displayName: "Space" },
+    members: [
+      {
+        accountId: "person",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "person",
+  });
+  sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+    VALUES('repo','space','app','private','a','https://a');
+    INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four)
+    VALUES('credential','person','Fixture','write','fixture-hash','test');`);
+  const authority = await captureWorkAuthority(env, "repo", {
+    id: "person",
+    credential: { kind: "token", id: "credential" },
+  });
   const run = (
     number: number,
     status: string,
     options: { held?: boolean; created?: string; ref?: string } = {},
   ) =>
     sqlite.exec(`
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, held_at, created_at)
-        VALUES ('run-${number}', 'repo', ${number}, 'c${number}', '${options.ref ?? "main"}', 'push',
+      INSERT INTO ci_runs (id, repo_id, space_id, migration_epoch, authority, actor_id, agent_id, number, commit_oid, ref, trigger, status, held_at, created_at)
+        VALUES ('run-${number}', 'repo', 'space', ${authority.migrationEpoch}, '${JSON.stringify(authority)}', 'person', NULL, ${number}, 'c${number}', '${options.ref ?? "main"}', 'push',
                 '${status}', ${options.held ? `'${new Date().toISOString()}'` : "NULL"},
                 '${options.created ?? new Date().toISOString()}');
     `);
@@ -29,11 +54,11 @@ function setup() {
     `);
   const runRow = (number: number) =>
     sqlite.prepare("SELECT status, held_at, covered_by FROM ci_runs WHERE number = ?").get(number);
-  return { sqlite, db: d1(sqlite), run, job, runRow };
+  return { sqlite, db: env.DB, run, job, runRow };
 }
 
 test("identical branch and commit in different sources never share gates or held coverage", async () => {
-  const c = setup();
+  const c = await setup();
   c.run(1, "running");
   c.run(2, "queued", { held: true });
   c.run(3, "queued", { held: true });
@@ -57,12 +82,11 @@ test("identical branch and commit in different sources never share gates or held
   expect(started).toEqual(["run-3"]);
   expect(c.runRow(2)).toMatchObject({ covered_by: 3 });
   expect(c.runRow(1)).toMatchObject({ status: "running", covered_by: null });
-  c.sqlite.close();
 });
 
 describe("dedupe and load", () => {
   test("a commit in flight on its branch is found; finished runs and other branches aren't", async () => {
-    const c = setup();
+    const c = await setup();
     c.run(1, "running");
     c.run(2, "succeeded");
     expect(await activeRun(c.db, "repo", "main", "c1")).toMatchObject({ number: 1 });
@@ -71,7 +95,7 @@ describe("dedupe and load", () => {
   });
 
   test("held runs and runs stuck for hours don't count as in flight", async () => {
-    const c = setup();
+    const c = await setup();
     c.run(1, "running");
     c.run(2, "queued");
     c.run(3, "queued", { held: true });
@@ -83,7 +107,7 @@ describe("dedupe and load", () => {
 
 describe("unchanged jobs", () => {
   test("the base is the last run where the job passed with the same spec, unchanged skips included", async () => {
-    const c = setup();
+    const c = await setup();
     c.run(1, "succeeded");
     c.job(1, "cli", "succeeded", '{"v":1}');
     c.run(2, "failed");
@@ -106,7 +130,7 @@ describe("unchanged jobs", () => {
 
 describe("releasing held runs", () => {
   test("the newest held run starts and covers the older ones", async () => {
-    const c = setup();
+    const c = await setup();
     c.run(1, "running");
     for (const n of [2, 3, 4]) {
       c.run(n, "queued", { held: true });
@@ -130,7 +154,7 @@ describe("releasing held runs", () => {
   });
 
   test("a start that fails puts the run back on hold and covers nothing", async () => {
-    const c = setup();
+    const c = await setup();
     c.run(1, "queued", { held: true });
     c.run(2, "queued", { held: true });
     await expect(

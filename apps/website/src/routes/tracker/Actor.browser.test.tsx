@@ -31,7 +31,9 @@ test("recorded agents lead with their own name and expose accountability without
   const identity = page.getByTitle("builder · Agent · Accountable: Ann Lee");
   await expect.element(identity).toBeVisible();
   await expect.element(identity.getByText("builder", { exact: true })).toBeVisible();
-  await expect.element(page.getByRole("link", { name: "Ann Lee" })).toHaveAttribute("href", "/ann");
+  await expect
+    .element(page.getByRole("link", { name: "Ann Lee" }))
+    .toHaveAttribute("href", "/accounts/ann");
   await expect.element(page.getByTitle("missing · Unknown identity")).toBeVisible();
   expect(container.querySelectorAll("a")).toHaveLength(1);
 });

@@ -1,10 +1,20 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { RepoRow } from "../db.ts";
 import { findRepo } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { fakeHistory } from "../testing/history.ts";
 import { ancestorSet, sourceLineage } from "./lineage.ts";
 
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: unknown;
+    public env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 const graph = vi.hoisted(() => ({ head: "", commits: new Map<string, ArtifactsCommitMetadata>() }));
 vi.mock("../artifacts.ts", () => ({
   lsRefs: async () => [{ name: "refs/heads/main", oid: graph.head }],
@@ -17,23 +27,42 @@ vi.mock("../objects.ts", () => ({
     async close() {}
   },
 }));
-const closers: { close(): void }[] = [];
+const closers: (() => void)[] = [];
 afterEach(() => {
-  for (const closer of closers.splice(0)) closer.close();
+  for (const close of closers.splice(0)) close();
   graph.commits.clear();
 });
 
 async function setup() {
-  const sqlite = migratedDatabase();
-  closers.push(sqlite);
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  closers.push(close);
   sqlite.exec(`
     INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','owner','app','public','canonical-physical','https://canonical');
-    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "owner-org",
+      slug: "owner-org",
+      displayName: "Owner",
+      kind: "personal",
+      personalAccountId: "owner",
+    },
+    space: { id: "owner", slug: "owner", displayName: "General" },
+    members: [
+      {
+        accountId: "owner",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "owner",
+  });
+  sqlite.exec(`
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','owner','app','public','canonical-physical','https://canonical');
+    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
     VALUES('work_a','repo','timeline','topic','owner','work-physical','https://work','ready','allocate','canonical','base','tree','refs/heads/main','canonical','base','tree','refs/heads/main',1,'now','now');
     INSERT INTO source_progress_members(repo_id,source_id,commit_oid,operation_id,created_at) VALUES('repo','work_a','wip','push','now');
   `);
-  const env = { DB: d1(sqlite) } as Env;
   const repo = (await findRepo(env.DB, null, "owner", "app")) as RepoRow;
   const history = fakeHistory();
   const base = history.commit({ files: { file: "base" } });

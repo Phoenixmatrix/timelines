@@ -8,7 +8,10 @@ import type {
 import { all, first, json, run, tracker, type SqlDatabase } from "./sql.ts";
 import type { Access } from "./store.ts";
 
-export function auditActor(access: Access, id = access.actorId): AuditActor {
+export function auditActor(
+  access: Pick<Access, "actorId" | "members" | "agents">,
+  id = access.actorId,
+): AuditActor {
   const agent = access.agents.find((candidate) => candidate.id === id);
   if (agent) {
     // History keeps who, not how they looked: no profile picture URLs.

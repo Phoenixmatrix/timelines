@@ -1,4 +1,4 @@
-// Settings → AI providers (CORE-294): an account connects its own TypeSafe or
+// Settings → AI providers (CORE-294): a Space connects its own TypeSafe or
 // OpenRouter key and chooses which of the provider's models automatic AI work
 // may use. Choosing the model for each role stays in AI settings.
 
@@ -12,7 +12,6 @@ import {
   useSearchParams,
   type LoaderFunctionArgs,
 } from "react-router";
-import type { AccountSummary } from "../../shared/api.ts";
 import type {
   AiModelSelection,
   AiProviderCatalogEntry,
@@ -30,24 +29,24 @@ import { requireViewer } from "../lib/session.ts";
 export async function aiProvidersLoader({ request }: LoaderFunctionArgs) {
   const viewer = await requireViewer(request);
   const url = new URL(request.url);
-  const owner = url.searchParams.get("owner");
-  if (!owner) throw redirect(`/settings/ai-providers?owner=${encodeURIComponent(viewer.slug)}`);
-  const accounts = [...viewer.canCreateIn];
+  const spaces = [...viewer.spaces];
+  const space = url.searchParams.get("space");
+  if (url.searchParams.has("owner") || url.searchParams.has("person"))
+    throw new Response("AI providers require an explicit Space scope.", { status: 400 });
+  if (!space) {
+    const defaultSpace = spaces.find((entry) => entry.id === viewer.defaultSpaceId);
+    if (defaultSpace)
+      throw redirect(`/settings/ai-providers?space=${encodeURIComponent(defaultSpace.slug)}`);
+    throw new Response("Choose an accessible Space for AI providers.", { status: 400 });
+  }
   try {
-    const view = await api<AiProvidersView>(`/accounts/${encodeURIComponent(owner)}/ai-providers`, {
+    const view = await api<AiProvidersView>(`/spaces/${encodeURIComponent(space)}/ai-providers`, {
       signal: request.signal,
     });
-    if (!accounts.some((account) => account.slug === owner)) {
-      accounts.push(
-        await api<AccountSummary>(`/accounts/${encodeURIComponent(owner)}`, {
-          signal: request.signal,
-        }),
-      );
-    }
-    return { owner, accounts, view, error: "" };
+    return { space, spaces, view, error: "" };
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
-    return { owner, accounts, view: null, error: error.message };
+    return { space, spaces, view: null, error: error.message };
   }
 }
 
@@ -75,41 +74,41 @@ export function AiProviders() {
   const revalidator = useRevalidator();
   const switching = navigation.state !== "idle";
   return (
-    <SettingsPage owner={data.owner}>
+    <SettingsPage space={data.space}>
       <div className="max-w-3xl">
         <h1 className="m-0 text-headline">AI providers</h1>
         <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
-          Connect an account’s own API keys to make more models available to its automatic AI work.
+          Connect a Space’s own API keys to make more models available to its automatic AI work.
           Calls to these models go straight to the provider and are billed to the key; AI Gateway
           doesn’t see or log them. Choose which model does each job in{" "}
-          <Link to={`/settings/ai?owner=${encodeURIComponent(data.owner)}`} className={link}>
+          <Link to={`/settings/ai?space=${encodeURIComponent(data.space)}`} className={link}>
             AI settings
           </Link>
           .
         </p>
         <div className="mt-6 flex max-w-md flex-col gap-1 text-field-label">
-          Account
+          Space
           <SelectField
-            ariaLabel="Account for AI providers"
-            value={data.owner}
+            ariaLabel="Space for AI providers"
+            value={data.space}
             options={[
-              ...data.accounts.map((account) => ({
-                value: account.slug,
-                label: `${account.displayName} (@${account.slug})`,
+              ...data.spaces.map((space) => ({
+                value: space.slug,
+                label: `${space.organization.displayName} / ${space.displayName} (@${space.slug})`,
               })),
-              ...(!data.accounts.some((account) => account.slug === data.owner)
-                ? [{ value: data.owner, label: `@${data.owner}` }]
+              ...(!data.spaces.some((space) => space.slug === data.space)
+                ? [{ value: data.space, label: `@${data.space}` }]
                 : []),
             ]}
-            onChange={(owner) => setParams({ owner })}
+            onChange={(space) => setParams({ space })}
             className="w-full"
           />
         </div>
         <p role="status" className="mt-2 mb-0 text-body-sm text-ink-muted">
-          {switching ? "Loading account providers…" : `Providers for @${data.owner}`}
+          {switching ? "Loading Space providers…" : `Providers for @${data.space}`}
         </p>
         {data.view ? (
-          <Providers key={data.owner} owner={data.owner} initial={data.view} />
+          <Providers key={data.space} space={data.space} initial={data.view} />
         ) : (
           <div className="mt-6 flex flex-col items-start gap-3">
             <FormError message={data.error} />
@@ -128,20 +127,21 @@ export function AiProviders() {
   );
 }
 
-function Providers({ owner, initial }: { owner: string; initial: AiProvidersView }) {
+function Providers({ space, initial }: { space: string; initial: AiProvidersView }) {
   const [view, setView] = useState(initial);
   return (
     <div className="mt-6 flex flex-col gap-10">
       {!view.canManage && (
         <p className="m-0 text-body-sm font-semibold text-ink">
-          Read-only access. Only a signed-in human account owner, organization owner, or site admin
-          can connect providers, since a key spends money. Agents cannot change them.
+          Read-only access. Only a signed-in person with an explicit Space admin grant or Instance
+          operator authority can connect providers, since a key spends money. Agents cannot change
+          them.
         </p>
       )}
       {view.providers.map((provider) => (
         <ProviderSection
           key={provider.kind}
-          owner={owner}
+          space={space}
           provider={provider}
           canManage={view.canManage}
           selection={view.selection}
@@ -191,19 +191,19 @@ function useMutation(onChange: (view: AiProvidersView) => void) {
 }
 
 function ProviderSection({
-  owner,
+  space,
   provider,
   canManage,
   selection,
   onChange,
 }: {
-  owner: string;
+  space: string;
   provider: AiProviderView;
   canManage: boolean;
   selection: AiModelSelection;
   onChange: (view: AiProvidersView) => void;
 }) {
-  const base = `/accounts/${encodeURIComponent(owner)}/ai-providers/${provider.kind}`;
+  const base = `/spaces/${encodeURIComponent(space)}/ai-providers/${provider.kind}`;
   const { busy, error, notice, run } = useMutation(onChange);
   const [apiKey, setApiKey] = useState("");
   const [replacing, setReplacing] = useState(false);
@@ -391,7 +391,7 @@ function ProviderSection({
               </button>
             }
             title={`Disconnect ${provider.name}?`}
-            description={`Its key and ${provider.models.length === 1 ? "its model" : `its ${provider.models.length} models`} are removed from @${owner}. Work already running with them fails instead of continuing.`}
+            description={`Its key and ${provider.models.length === 1 ? "its model" : `its ${provider.models.length} models`} are removed from @${space}. Work already running with them fails instead of continuing.`}
             confirmLabel="Disconnect"
             busy={busy === "disconnect"}
             onConfirm={() =>

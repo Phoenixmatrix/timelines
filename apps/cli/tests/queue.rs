@@ -63,7 +63,7 @@ struct State {
 
 fn entry(id: &str, status: &str) -> Value {
     json!({
-        "id": id, "repo": {"id": "repo", "owner": "orbit", "name": "engine"},
+        "id": id, "repo": {"id": "repo", "space": "orbit", "name": "engine"},
         "commit": id, "branch": "main", "sourceBranch": format!("gitmatrix/queue/{id}"),
         "candidateBranch": format!("gitmatrix/landing/queue-{id}"), "status": status,
         "base": null, "candidate": null, "mergeRun": null, "gateRun": null,
@@ -88,7 +88,7 @@ impl Api {
         let stop = Arc::new(AtomicBool::new(false));
         let (shared, halt) = (state.clone(), stop.clone());
         let worker = thread::spawn(move || {
-            let owner = remote
+            let space = remote
                 .parent()
                 .unwrap()
                 .file_name()
@@ -96,7 +96,7 @@ impl Api {
                 .to_str()
                 .unwrap();
             let name = remote.file_stem().unwrap().to_str().unwrap();
-            let prefix = format!("/api/repos/{owner}/{name}/queue");
+            let prefix = format!("/api/repos/{space}/{name}/queue");
             for stream in listener.incoming() {
                 if halt.load(Ordering::Acquire) {
                     break;
@@ -161,7 +161,7 @@ impl Api {
                         }
                         (201, json!({"entry": e}))
                     }
-                } else if method == "POST" && path == format!("/api/repos/{owner}/{name}/steps") {
+                } else if method == "POST" && path == format!("/api/repos/{space}/{name}/steps") {
                     state.step_writes += 1;
                     let oid = body["commitOid"].as_str().unwrap();
                     assert_eq!(
@@ -202,7 +202,7 @@ impl Api {
                         None => (404, json!({"error": "not_found"})),
                     }
                 } else if method == "GET"
-                    && path.starts_with(&format!("/api/repos/{owner}/{name}/ci/runs/"))
+                    && path.starts_with(&format!("/api/repos/{space}/{name}/ci/runs/"))
                 {
                     let number: i64 = path.rsplit('/').next().unwrap().parse().unwrap();
                     match state.runs.get(&number) {

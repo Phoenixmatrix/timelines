@@ -1,60 +1,63 @@
 import { expect, test } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
-import type { AccountPage, RepoIssueSummary } from "../../../shared/api.ts";
+import type { RepoIssueSummary } from "../../../shared/api.ts";
+import type { Snapshot } from "../../../shared/tracker.ts";
 import { commitId } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 import { mutate } from "../../testing/timelines.ts";
 
-// Real account membership and tracker storage, with no AI responses involved.
-test("account teams and repo counts require tracker membership, not public repo visibility", async () => {
+// Real explicit Space grants and tracker storage, with no AI responses involved.
+test("Space teams and repo counts require explicit grants, not public repo visibility", async () => {
   const server = await TestServer.start({ world: true });
   const repo = await server.repo("orbit", "engine");
   await mutate(server, [
     { kind: "team.create", id: "eng", data: { key: "ENG", name: "Engineering" } },
-    { kind: "workspace.create", id: "workspace", data: { slug: "engine", name: "Engine" } },
+    { kind: "project.create", id: "workspace", data: { slug: "engine", name: "Engine" } },
     {
       kind: "subscription.add",
       id: "subscription",
-      data: { workspaceId: "workspace", repoId: repo.id },
+      data: { projectId: "workspace", repoId: repo.id },
     },
     {
       kind: "issue.create",
       id: "ready",
-      data: { teamId: "eng", title: "Ready work", status: "todo", workspaceIds: ["workspace"] },
+      data: { teamId: "eng", title: "Ready work", status: "todo", projectIds: ["workspace"] },
     },
   ]);
-  expect((await server.call<AccountPage>("GET", "/api/accounts/orbit")).teams).toEqual([
-    { id: "eng", key: "ENG", name: "Engineering" },
+  expect((await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot")).teams).toEqual([
+    expect.objectContaining({ id: "eng", key: "ENG", name: "Engineering" }),
   ]);
   expect(
     await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: 1, workspaces: 1 });
-  expect((await server.call<AccountPage>("GET", "/api/accounts/marco")).teams).toEqual([]);
-  // Remove only tracker membership; the repository remains public and subscribed.
-  await server.sql("DELETE FROM org_members WHERE org_id = 'acc_orbit' AND user_id = 'acc_marco'");
-  expect((await server.call<AccountPage>("GET", "/api/accounts/orbit")).teams).toBeNull();
+  ).toEqual({ ready: 1, projects: 1 });
+  expect((await server.call<Snapshot>("GET", "/api/tracker/marco/snapshot")).teams).toEqual([]);
+  // Revoke only the Space grant; Organization membership and the public repository remain.
+  await server.sql(
+    "DELETE FROM space_grants WHERE space_id = (SELECT id FROM spaces WHERE slug = 'orbit') AND account_id = 'acc_marco'",
+  );
+  await expect(server.call("GET", "/api/tracker/orbit/snapshot")).rejects.toThrow("403");
   expect(
     await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: null, workspaces: 0 });
+  ).toEqual({ ready: null, projects: 0 });
   expect(
     (await server.call<{ canManage: boolean }>("GET", "/api/repos/orbit/engine/tracker")).canManage,
   ).toBe(false);
   await server.as("priya");
   // Site-wide repository administration still does not grant private tracker access.
-  expect((await server.call<AccountPage>("GET", "/api/accounts/orbit")).teams).toBeNull();
+  await expect(server.call("GET", "/api/tracker/orbit/snapshot")).rejects.toThrow("403");
   expect(
     await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: null, workspaces: 0 });
+  ).toEqual({ ready: null, projects: 0 });
   await server.as(null);
-  expect((await server.call<AccountPage>("GET", "/api/accounts/orbit")).teams).toBeNull();
-  expect((await server.call<AccountPage>("GET", "/api/accounts/marco")).teams).toBeNull();
+  await expect(server.call("GET", "/api/tracker/orbit/snapshot")).rejects.toThrow("401");
+  await expect(server.call("GET", "/api/tracker/marco/snapshot")).rejects.toThrow("401");
   expect(
     await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: null, workspaces: 0 });
+  ).toEqual({ ready: null, projects: 0 });
 });
 
-test("account team links open the intended filtered work and personal Issues opens an empty tracker", async () => {
+test("Space team links open filtered work and personal Space Issues opens an empty tracker", async () => {
   const server = await TestServer.start({ world: true });
   await mutate(server, [
     { kind: "team.create", id: "eng", data: { key: "ENG", name: "Engineering" } },
@@ -96,11 +99,11 @@ test("About uses actual zero and positive ready counts, opens repository Issues 
   });
   await mutate(server, [
     { kind: "team.create", id: "eng", data: { key: "ENG", name: "Engineering" } },
-    { kind: "workspace.create", id: "workspace", data: { slug: "engine", name: "Engine" } },
+    { kind: "project.create", id: "workspace", data: { slug: "engine", name: "Engine" } },
     {
       kind: "subscription.add",
       id: "subscription",
-      data: { workspaceId: "workspace", repoId: repo.id },
+      data: { projectId: "workspace", repoId: repo.id },
     },
   ]);
   const app = renderApp("/orbit/engine");
@@ -112,7 +115,7 @@ test("About uses actual zero and positive ready counts, opens repository Issues 
     {
       kind: "issue.create",
       id: "ready",
-      data: { teamId: "eng", title: "Ready work", status: "todo", workspaceIds: ["workspace"] },
+      data: { teamId: "eng", title: "Ready work", status: "todo", projectIds: ["workspace"] },
     },
   ]);
   await app.navigate("/orbit/engine");
@@ -153,7 +156,7 @@ test("About uses actual zero and positive ready counts, opens repository Issues 
     "GET",
     "/api/repos/orbit/empty/tracker/summary",
   );
-  expect(emptySummary).toEqual({ ready: null, workspaces: 0 });
+  expect(emptySummary).toEqual({ ready: null, projects: 0 });
   let releaseSummary!: () => void;
   const summaryPending = new Promise<void>((resolve) => {
     releaseSummary = resolve;

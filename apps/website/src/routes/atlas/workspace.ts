@@ -82,14 +82,14 @@ const NAME = /^(?!\.)[A-Za-z0-9._-]{1,100}$/;
 
 /**
  * The selected repository names from `?repos=`, in selection order, without
- * duplicates. `owner/name` under this owner counts as `name`; anything else
+ * duplicates. `space/name` under this space counts as `name`; anything else
  * that isn't a repository name is dropped.
  */
-export function parseSelection(raw: string | null | undefined, owner: string): string[] {
+export function parseSelection(raw: string | null | undefined, space: string): string[] {
   const names: string[] = [];
   for (const part of (raw ?? "").split(",")) {
     let entry = part.trim();
-    if (entry.startsWith(`${owner}/`)) entry = entry.slice(owner.length + 1);
+    if (entry.startsWith(`${space}/`)) entry = entry.slice(space.length + 1);
     if (NAME.test(entry) && !names.includes(entry)) names.push(entry);
     if (names.length === ATLAS_WORKSPACE_MAX_REPOS) break;
   }
@@ -136,8 +136,8 @@ export function parseLinkState(raw: string | null): AtlasLinkState {
 }
 
 /** What a view is about: another key is another scope, with nothing carried over. */
-export const scopeKey = (owner: string, selection: readonly string[]) =>
-  `${owner}\n${selection.join(",")}`;
+export const scopeKey = (space: string, selection: readonly string[]) =>
+  `${space}\n${selection.join(",")}`;
 
 // ---- what each selected repository is in this view --------------------------------
 

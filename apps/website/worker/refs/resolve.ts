@@ -1,5 +1,5 @@
 // Resolving refs found in text (CORE-22) for one viewer: issue keys, tracker
-// issue URLs of this deployment, commit hashes in a repository, `owner/repo`
+// issue URLs of this deployment, commit hashes in a repository, `space/repo`
 // and `pkg@version`. Every answer is permission-checked (tracker membership,
 // repository read, registry feed read); anything the viewer can't open, or
 // that might belong to an external tracker, is `unresolved` and stays text.
@@ -20,14 +20,15 @@ import {
   type RefResolution,
   type RefTarget,
 } from "../../shared/refs.ts";
-import type { Issue, TrackerOwner } from "../../shared/tracker.ts";
+import type { Issue, TrackerSpace } from "../../shared/tracker.ts";
 import { readableRepo, roleFor, selectRepos, type Actor, type RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
-import { repoTrackers } from "../mentions/index.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
 import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { accessible } from "../tracker/api.ts";
+import { accessFor } from "../tracker/access.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { Services } from "../../registry/core/context.ts";
 import { listRepos } from "../../registry/core/repos.ts";
@@ -62,12 +63,12 @@ async function pooled<T, R>(items: T[], limit: number, work: (item: T) => Promis
   return results;
 }
 
-function issueTarget(owner: Pick<TrackerOwner, "slug">, issue: IssueRow): IssueTarget {
+function issueTarget(space: Pick<TrackerSpace, "slug">, issue: IssueRow): IssueTarget {
   return {
     kind: "issue",
-    path: `/tracker/${encodeURIComponent(owner.slug)}/issues/${encodeURIComponent(issue.id)}`,
+    path: `/tracker/${encodeURIComponent(space.slug)}/issues/${encodeURIComponent(issue.id)}`,
     label: `${issue.key} · ${issue.title}`,
-    tracker: owner.slug,
+    tracker: space.slug,
     id: issue.id,
     key: issue.key,
     title: issue.title,
@@ -105,9 +106,9 @@ export async function resolveRefs(
 
   // The page's repository, when the viewer can read it.
   const contextRepo =
-    context.owner && context.repo
-      ? await readableRepos(scope, [[context.owner, context.repo]]).then(
-          (found) => found.get(`${context.owner}/${context.repo}`) ?? null,
+    context.space && context.repo
+      ? await readableRepos(scope, [[context.space, context.repo]]).then(
+          (found) => found.get(`${context.space}/${context.repo}`) ?? null,
         )
       : null;
 
@@ -115,7 +116,7 @@ export async function resolveRefs(
     resolveIssues(scope, of("issue"), of("issue-url"), context, contextRepo, answers),
     resolveRepos(scope, of("repo"), answers),
     resolveCommits(scope, of("commit"), contextRepo, answers),
-    resolvePackages(scope, of("package"), context.owner, answers),
+    resolvePackages(scope, of("package"), context.space, answers),
   ]);
   return refs.map((ref) => answers.get(ref) ?? { ref, status: "unresolved" });
 }
@@ -142,16 +143,25 @@ async function resolveIssues(
   const bySlug = new Map(trackers.map((t) => [t.slug, t]));
   // One lookup per tracker for the whole batch.
   const lookups = new Map<string, Promise<IssueRow[] | null>>();
-  const lookup = (owner: TrackerOwner, wanted: string[]) => {
-    const cacheKey = `${owner.id}\n${wanted.join("\n")}`;
+  const lookup = (space: TrackerSpace, wanted: string[]) => {
+    const cacheKey = `${space.id}\n${wanted.join("\n")}`;
     let pending = lookups.get(cacheKey);
     if (!pending) {
       // An RPC answers with a promise; a test's in-process object may not (await takes both).
       pending = (async () => {
-        const reply = await trackerObject(scope.env, owner.id).issueRefs(wanted);
+        const actor = scope.actor!;
+        const access = await accessFor(
+          scope.env,
+          space,
+          actor.id,
+          actor.agent?.id ?? null,
+          false,
+          actor.credential,
+        );
+        const reply = await trackerObject(scope.env, space.id).issueRefs(access, wanted);
         return reply.ok ? (reply.value as IssueRow[]) : null;
       })().catch((error: unknown) => {
-        console.error(`refs: tracker ${owner.slug} failed`, error);
+        console.error(`refs: tracker ${space.slug} failed`, error);
         return null;
       });
       lookups.set(cacheKey, pending);
@@ -160,7 +170,7 @@ async function resolveIssues(
   };
 
   // URLs: this deployment's tracker, by id or key.
-  const urlsByTracker = new Map<TrackerOwner, { ref: string; issue: string }[]>();
+  const urlsByTracker = new Map<TrackerSpace, { ref: string; issue: string }[]>();
   for (const ref of urls) {
     const parts = issueUrlParts(ref);
     if (!parts || !scope.origins.includes(parts.origin)) continue;
@@ -188,18 +198,10 @@ async function resolveIssues(
   const keyWork = (async () => {
     if (!keys.length || !trackers.length) return;
     const first = context.tracker ? bySlug.get(context.tracker) : undefined;
-    // The repository's subscribing trackers and its owner's: one tier here
-    // (the push-time mention index splits them, worker/mentions).
-    const related = contextRepo
-      ? await repoTrackers(scope.env.DB, contextRepo.id, { orgs: false })
-      : null;
-    const subscribed = new Set(
-      related ? [...related.subscribed.map((t) => t.id), related.owner.id] : [],
-    );
-    const rest = trackers
-      .filter((t) => t !== first && !subscribed.has(t.id))
-      // Your own tracker first, then organizations by slug.
-      .sort((a, b) => Number(b.id === scope.actor!.id) - Number(a.id === scope.actor!.id));
+    // Repository subscriptions are confined to its own Space. Repository-only
+    // collaborators do not gain Tracker access: every tier comes from grants.
+    const subscribed = new Set(contextRepo ? [contextRepo.space_id] : []);
+    const rest = trackers.filter((t) => t !== first && !subscribed.has(t.id));
     const tiers = [
       first ? [first] : [],
       trackers.filter((t) => t !== first && subscribed.has(t.id)),
@@ -233,17 +235,17 @@ async function resolveIssues(
 
 // ── Repositories ──────────────────────────────────────────────────────────
 
-/** Readable repositories among `pairs`, by `owner/name`. */
+/** Readable repositories among `pairs`, by `space/name`. */
 async function readableRepos(
   scope: ResolveScope,
   pairs: [string, string][],
-): Promise<Map<string, RepoRow & { owner_slug: string }>> {
+): Promise<Map<string, RepoRow>> {
   if (!pairs.length) return new Map();
   const rows = await selectRepos(scope.env.DB, scope.actor?.id ?? "")
     .where(readableRepo(scope.actor))
     .where((eb) =>
       eb.or(
-        pairs.map(([owner, name]) => eb.and([eb("o.slug", "=", owner), eb("r.name", "=", name)])),
+        pairs.map(([space, name]) => eb.and([eb("s.slug", "=", space), eb("r.name", "=", name)])),
       ),
     )
     .execute();
@@ -251,7 +253,7 @@ async function readableRepos(
     rows
       // permissions.ts stays the authority; readableRepo already agrees with it.
       .filter((row) => atLeast(roleFor(row, scope.actor), "read"))
-      .map((row) => [`${row.owner_slug}/${row.name}`, row]),
+      .map((row) => [`${row.space_slug}/${row.name}`, row]),
   );
 }
 
@@ -270,9 +272,9 @@ async function resolveRepos(
         status: "resolved",
         target: {
           kind: "repo",
-          path: `/${encodeURIComponent(row.owner_slug)}/${encodeURIComponent(row.name)}`,
-          label: `${row.owner_slug}/${row.name}`,
-          owner: row.owner_slug,
+          path: `/${encodeURIComponent(row.space_slug)}/${encodeURIComponent(row.name)}`,
+          label: `${row.space_slug}/${row.name}`,
+          space: row.space_slug,
           name: row.name,
         },
       });
@@ -291,24 +293,16 @@ async function resolveRepos(
 async function resolveCommits(
   scope: ResolveScope,
   refs: string[],
-  repo: (RepoRow & { owner_slug?: string }) | null,
+  repo: RepoRow | null,
   answers: Map<string, RefResolution>,
 ) {
   if (!refs.length || !repo) return;
-  const owner =
-    repo.owner_slug ??
-    (
-      await db(scope.env.DB)
-        .selectFrom("accounts")
-        .select("slug")
-        .where("id", "=", repo.owner_id)
-        .executeTakeFirstOrThrow()
-    ).slug;
+  const space = repo.space_slug;
   const target = (sha: string): CommitTarget => ({
     kind: "commit",
-    path: commitPath(owner, repo.name, sha),
-    label: `Commit ${sha.slice(0, 7)} in ${owner}/${repo.name}`,
-    owner,
+    path: commitPath(space, repo.name, sha),
+    label: `Commit ${sha.slice(0, 7)} in ${space}/${repo.name}`,
+    space,
     repo: repo.name,
     sha,
   });
@@ -365,26 +359,22 @@ async function resolveCommits(
 // ── Packages ──────────────────────────────────────────────────────────────
 
 /**
- * `name@version` among the page owner's packages, in feeds the registry lets
+ * `name@version` among the page Space's packages, in feeds the registry lets
  * the viewer read. The same name in two formats is ambiguous.
  */
 async function resolvePackages(
   scope: ResolveScope,
   refs: string[],
-  ownerSlug: string | undefined,
+  spaceSlug: string | undefined,
   answers: Map<string, RefResolution>,
 ) {
-  if (!refs.length || !ownerSlug) return;
-  const owner = await db(scope.env.DB)
-    .selectFrom("accounts")
-    .select(["id", "slug"])
-    .where("slug", "=", ownerSlug)
-    .executeTakeFirst();
-  if (!owner) return;
+  if (!refs.length || !spaceSlug) return;
+  const space = await findSpaceBySlug(scope.env.DB, spaceSlug);
+  if (!space) return;
   const services = new Services(scope.env, scope.request, scope.waitUntil);
   const access = await services.access();
   const feeds: string[] = [];
-  for (const feed of await listRepos(services.db, undefined, owner.id))
+  for (const feed of await listRepos(services.db, undefined, space.id))
     if (await access.can(feed, "read")) feeds.push(feed.id);
   if (!feeds.length) return;
   const wanted = refs.map((ref) => {
@@ -421,9 +411,9 @@ async function resolvePackages(
         const format = row.format as keyof typeof FORMATS;
         return {
           kind: "package",
-          path: `${packagePath(owner.slug, format, row.name)}?version=${encodeURIComponent(row.version)}`,
+          path: `${packagePath(space.slug, format, row.name)}?version=${encodeURIComponent(row.version)}`,
           label: `${row.name}@${row.version} · ${FORMATS[format].label}`,
-          owner: owner.slug,
+          space: space.slug,
           format,
           name: row.name,
           version: row.version,

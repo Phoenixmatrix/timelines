@@ -1,12 +1,13 @@
-import { describe, expect, test } from "vite-plus/test";
-import { durableStorage } from "../testing/durable.ts";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { TrackerStore, type Access } from "./store.ts";
 import { TimelineStore, type NewTimeline } from "./timelines.ts";
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-function setup() {
-  const { sql, transactionSync } = durableStorage();
+async function setup() {
+  const { sql, transactionSync, close, scope, space } = await freshTrackerStorage();
+  onTestFinished(close);
   let now = Date.parse("2026-10-03T00:00:00Z");
   // Its tables, the event log among them, come first, as in the Durable Object.
   new TrackerStore(sql, transactionSync);
@@ -27,7 +28,10 @@ function setup() {
     actorId,
     principalId,
     agents,
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: actorId === principalId ? null : actorId,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: actorId === "ann",
     members: people,
     repos: [],
@@ -36,15 +40,15 @@ function setup() {
     store.create(access, {
       slug,
       parent,
-      repos: [{ id: "app", owner: "org", name: "app" }],
+      repos: [{ id: "app", space: "org", name: "app" }],
       commits: { app: oid(1) },
     } satisfies NewTimeline);
   return { store, as, fork };
 }
 
 describe("timeline records", () => {
-  test("a fork records who started it, who answers for it, and a fork event", () => {
-    const t = setup();
+  test("a fork records who started it, who answers for it, and a fork event", async () => {
+    const t = await setup();
     const bot = t.as("agt_bot", "ben");
     const created = t.fork(bot, "search");
     expect(created).toMatchObject({
@@ -54,7 +58,7 @@ describe("timeline records", () => {
       experimental: false,
       parentId: null,
       forkPoint: { commits: { app: oid(1) }, trackerCursor: 0 },
-      repos: [{ id: "app", owner: "org", name: "app", bookmark: "timeline/search" }],
+      repos: [{ id: "app", space: "org", name: "app", bookmark: "timeline/search" }],
       status: "active",
       accountableId: "ben",
       startedBy: "agt_bot",
@@ -67,8 +71,8 @@ describe("timeline records", () => {
     ]);
   });
 
-  test("slugs are unique, never main, and a fork from a timeline is in both histories", () => {
-    const t = setup();
+  test("slugs are unique, never main, and a fork from a timeline is in both histories", async () => {
+    const t = await setup();
     const ann = t.as("ann");
     const parent = t.fork(ann, "search");
     expect(() => t.fork(ann, "search")).toThrow(/already exists/);
@@ -84,16 +88,16 @@ describe("timeline records", () => {
     expect(t.store.detail("ranking", 0, 50).events).toHaveLength(1);
   });
 
-  test("nobody forks from an ended timeline", () => {
-    const t = setup();
+  test("nobody forks from an ended timeline", async () => {
+    const t = await setup();
     const ann = t.as("ann");
     t.fork(ann, "search");
     t.store.abandon(ann, "search", { app: oid(2) });
     expect(() => t.store.prepare("ranking", "search")).toThrow(/abandoned/);
   });
 
-  test("any writer renames it or flags it experimental; slug and policy stay", () => {
-    const t = setup();
+  test("any writer renames it or flags it experimental; slug and policy stay", async () => {
+    const t = await setup();
     t.fork(t.as("ann"), "search");
     const updated = t.store.update("search", { experimental: true, name: "Search rewrite" });
     expect(updated).toMatchObject({ experimental: true, name: "Search rewrite", version: 2 });
@@ -104,8 +108,8 @@ describe("timeline records", () => {
 });
 
 describe("abandoning", () => {
-  test("only the accountable person, as themselves, or the agent that started it", () => {
-    const t = setup();
+  test("only the accountable person, as themselves, or the agent that started it", async () => {
+    const t = await setup();
     t.fork(t.as("agt_bot", "ben"), "search");
     for (const access of [t.as("ann"), t.as("agt_helper", "ben")])
       expect(() => t.store.abandon(access, "search", {})).toThrow(/accountable person/);
@@ -123,8 +127,8 @@ describe("abandoning", () => {
     });
   });
 
-  test("abandoning again changes nothing, so bookmark deletion can be retried", () => {
-    const t = setup();
+  test("abandoning again changes nothing, so bookmark deletion can be retried", async () => {
+    const t = await setup();
     const ben = t.as("ben");
     t.fork(ben, "search");
     t.store.abandon(ben, "search", { app: oid(5) });
@@ -137,13 +141,13 @@ describe("abandoning", () => {
 });
 
 describe("pushes and merges", () => {
-  const repo = { id: "app", owner: "org", name: "app" };
+  const repo = { id: "app", spaceId: "org", space: "org", name: "app" };
 
-  test("a push notes the agent, and a bookmark in another repository adds that repository", () => {
-    const t = setup();
+  test("a push notes the agent, and a bookmark in another repository adds that repository", async () => {
+    const t = await setup();
     t.fork(t.as("ben"), "search");
     t.store.recordPush({
-      repo: { id: "lib", owner: "org", name: "lib" },
+      repo: { id: "lib", spaceId: "org", space: "org", name: "lib" },
       actorId: "agt_helper",
       accountableId: "ben",
       pushed: ["search", "someone-elses-branch"],
@@ -155,8 +159,8 @@ describe("pushes and merges", () => {
     expect(timeline.repos.map((r) => r.id)).toEqual(["app", "lib"]);
   });
 
-  test("merges between timelines and with main are events in each side's history, once", () => {
-    const t = setup();
+  test("merges between timelines and with main are events in each side's history, once", async () => {
+    const t = await setup();
     const ann = t.as("ann");
     const search = t.fork(ann, "search");
     const ranking = t.fork(ann, "ranking");
@@ -180,8 +184,8 @@ describe("pushes and merges", () => {
     expect(t.store.detail("ranking", 0, 50).events.map((e) => e.kind)).toEqual(["fork", "merge"]);
   });
 
-  test("an experimental timeline's work merges like any other's, into timelines and main", () => {
-    const t = setup();
+  test("an experimental timeline's work merges like any other's, into timelines and main", async () => {
+    const t = await setup();
     const ann = t.as("ann");
     const search = t.fork(ann, "search");
     const ranking = t.store.create(ann, {
@@ -210,8 +214,8 @@ describe("pushes and merges", () => {
     expect(t.store.get("ranking")).toMatchObject({ experimental: true, status: "active" });
   });
 
-  test("events page in order", () => {
-    const t = setup();
+  test("events page in order", async () => {
+    const t = await setup();
     t.fork(t.as("ann"), "search");
     t.store.recordPush({
       repo,

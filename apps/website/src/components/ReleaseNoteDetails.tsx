@@ -10,7 +10,7 @@ import { link, Tip } from "./ui.tsx";
 
 export type ReleaseNoteDetailsSelection = {
   entry: ReleaseNoteEntry;
-  repo: { owner: string; name: string } | null;
+  repo: { space: string; name: string } | null;
   trigger: HTMLButtonElement;
 };
 
@@ -100,7 +100,7 @@ export function ReleaseNoteDetails({
                 {entry.issue ? (
                   <Link
                     className={`${link} mk-mono text-body-sm`}
-                    to={`/tracker/${encodeURIComponent(entry.issue.trackerOwner)}/issues/${encodeURIComponent(entry.issue.id)}`}
+                    to={`/tracker/${encodeURIComponent(entry.issue.trackerSpace)}/issues/${encodeURIComponent(entry.issue.id)}`}
                   >
                     {entry.issue.key}
                   </Link>
@@ -127,7 +127,7 @@ export function ReleaseNoteDetails({
                           {repo ? (
                             <CommitLink
                               className={link}
-                              owner={repo.owner}
+                              space={repo.space}
                               name={repo.name}
                               sha={oid}
                               // Phones show one dialog at a time: the commit replaces these details.
@@ -150,7 +150,7 @@ export function ReleaseNoteDetails({
                   {repo ? (
                     <CommitLink
                       className={`${link} mk-mono text-body-sm`}
-                      owner={repo.owner}
+                      space={repo.space}
                       name={repo.name}
                       sha={entry.timeline.landing}
                       onClick={phone ? onClose : undefined}
@@ -174,7 +174,7 @@ export function ReleaseNoteDetails({
                     <Link
                       className={`${link} text-body-sm`}
                       to={commitsUrl(
-                        repo.owner,
+                        repo.space,
                         repo.name,
                         provenance.source.commit,
                         "",

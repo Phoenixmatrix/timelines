@@ -11,6 +11,7 @@ import { db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import type { GraphDiff, GraphNode, SnapshotFile } from "./graph.ts";
 import { embed } from "./models.ts";
+import { paidWorkGuard } from "./paid-work.ts";
 import { chunk, pool, sha256 } from "./util.ts";
 
 export const SEARCH_INSTANCE = "knowledge";
@@ -60,11 +61,15 @@ export async function syncVectors(
         },
       })),
     );
+    await paidWorkGuard()?.check();
     await env.VECTORS.upsert(records);
     upserted += records.length;
   }
   const removed = await Promise.all(diff.removed.map((id) => vectorId(repoId, id)));
-  for (const group of chunk(removed, 100)) await env.VECTORS.deleteByIds(group);
+  for (const group of chunk(removed, 100)) {
+    await paidWorkGuard()?.check();
+    await env.VECTORS.deleteByIds(group);
+  }
   return { upserted, deleted: removed.length };
 }
 
@@ -101,10 +106,13 @@ async function upload(
   previous: SearchItemRow | undefined,
 ) {
   const items = env.SEARCH.get(SEARCH_INSTANCE).items;
+  await paidWorkGuard()?.check();
   if (previous) await items.delete(previous.item_id).catch(() => undefined);
+  await paidWorkGuard()?.check();
   const info = await items.upload(itemName(repoId, key), body, {
     metadata: { repo: repoId, ...metadata, sourceId: "canonical" },
   });
+  await paidWorkGuard()?.check();
   await db(env.DB)
     .insertInto("kg_search_items")
     .values({ repo_id: repoId, key, item_id: info.id, version, bytes: utf8Bytes(body) })
@@ -124,9 +132,11 @@ function utf8Bytes(body: string): number {
 }
 
 async function forget(env: Env, repoId: string, row: SearchItemRow) {
+  await paidWorkGuard()?.check();
   await env.SEARCH.get(SEARCH_INSTANCE)
     .items.delete(row.item_id)
     .catch(() => undefined);
+  await paidWorkGuard()?.check();
   await db(env.DB)
     .deleteFrom("kg_search_items")
     .where("repo_id", "=", repoId)

@@ -1,14 +1,25 @@
 // The development probe behind E2E durable-objects-register-and-purge
 // (CORE-267): on a slow host its own retire() alarm must not fire mid-probe.
-import { afterEach, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import type { PurgeReport, StorageReport } from "./contract.ts";
 import { forgetRecorded } from "./registry.ts";
 import { probeDurableObjects } from "./probe.ts";
 
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+
+let baseEnv: Env;
+let close: () => void;
+beforeEach(async () => {
+  const fixture = await createFreshSpaceTestEnvironment();
+  baseEnv = fixture.env;
+  close = fixture.close;
+});
+
 afterEach(() => {
   vi.useRealTimers();
   forgetRecorded();
+  close?.();
 });
 
 test("a slow host never lets the retire alarm purge the instance before the probe does", async () => {
@@ -38,18 +49,25 @@ test("a slow host never lets the retire alarm purge the instance before the prob
     },
   };
   const env = {
-    DB: d1(migratedDatabase()),
+    ...baseEnv,
     TRACKER: { getByName: () => stub },
   } as unknown as Env;
   const [result] = await probeDurableObjects(env, "acc_jun", ["Tracker"]);
   expect(result!.before).toMatchObject({ keys: 1, alarm: expect.any(Number) });
   expect(result!.purged).toMatchObject({ keys: 0, alarm: null, reason: "probe" });
   expect(result!.row?.purge_reason).toBe("probe");
+  expect(await env.DB.prepare("SELECT space_id, account_id FROM do_instances").first()).toEqual({
+    space_id: null,
+    account_id: null,
+  });
+  expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM spaces").first()).toEqual({
+    count: 0,
+  });
 });
 
 test("a failure names the class and the stage it failed at", async () => {
   const env = {
-    DB: d1(migratedDatabase()),
+    ...baseEnv,
     TRACKER: {
       getByName: () => ({
         async retire() {},

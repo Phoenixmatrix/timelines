@@ -8,21 +8,21 @@ import { dialogMotion, fadeMotion, link, Tip } from "./ui.tsx";
 /** Global navigation mirrors the rail; no palette or assistant provider is needed. */
 export function KeyboardShortcuts({ showButton = true }: { showButton?: boolean }) {
   const location = useLocation();
-  const tracker = useMatch("/tracker/:owner/*");
+  const tracker = useMatch("/tracker/:space/*");
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const restoreFocus = useRef<HTMLElement | null>(null);
   const close = useRef<HTMLButtonElement>(null);
   const params = new URLSearchParams(location.search);
-  const owner =
-    tracker?.params.owner ??
+  const space =
+    tracker?.params.space ??
     (location.pathname.startsWith("/settings/")
-      ? (params.get("owner") ??
+      ? (params.get("space") ??
         (location.pathname === "/settings/preferences" ? params.get("tracker") : null))
       : null);
-  const issues = owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker";
-  const preferences = owner
-    ? `/settings/preferences?tracker=${encodeURIComponent(owner)}`
+  const issues = space ? `/tracker/${encodeURIComponent(space)}` : "/tracker";
+  const preferences = space
+    ? `/settings/preferences?tracker=${encodeURIComponent(space)}`
     : "/settings/preferences";
   const focusedPage = location.pathname === "/signin" || location.pathname === "/device";
   const enabled = readTrackerShortcuts();
@@ -175,7 +175,7 @@ export function KeyboardShortcuts({ showButton = true }: { showButton?: boolean 
               <dt>
                 <kbd>g i</kbd>
               </dt>
-              <dd className="m-0">Go to issues{owner ? ` in ${owner}` : ""}</dd>
+              <dd className="m-0">Go to issues{space ? ` in ${space}` : ""}</dd>
               <dt>
                 <kbd>g p</kbd>
               </dt>

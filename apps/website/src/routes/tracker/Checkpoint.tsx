@@ -89,7 +89,7 @@ export function ReviveButton({
       );
       const name = (repoId: string) => {
         const repo = view.checkpoint.repos.find((r) => r.id === repoId);
-        return repo ? `${repo.owner}/${repo.name}` : repoId;
+        return repo ? `${repo.space}/${repo.name}` : repoId;
       };
       const started = revival.runs.filter((run) => "number" in run);
       setMessage({
@@ -217,7 +217,7 @@ function useDiffstat(repo: CheckpointRepo, base: string | null, enabled: boolean
     if (base) query.set("base", base);
     if (workSource) query.set("source", workSource);
     api<CompareDiff>(
-      `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/compare?${query}`,
+      `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}/compare?${query}`,
       { signal: controller.signal },
     )
       .then((diff) =>
@@ -234,7 +234,7 @@ function useDiffstat(repo: CheckpointRepo, base: string | null, enabled: boolean
         if (!controller.signal.aborted) setStat({ state: "failed" });
       });
     return () => controller.abort();
-  }, [repo.owner, repo.name, repo.commit, base, workSource, enabled]);
+  }, [repo.space, repo.name, repo.commit, base, workSource, enabled]);
   return stat;
 }
 
@@ -290,8 +290,8 @@ function CheckpointRepoRow({
   const workSource = workSourceOf(repo);
   const stat = useDiffstat(repo, previous?.commit ?? repo.base, Boolean(readableSource) && ready);
   const commitsLink = workSource
-    ? commitsUrl(repo.owner, repo.name, repo.commit, "", workSource)
-    : commitPanelUrl(repo.owner, repo.name, repo.commit);
+    ? commitsUrl(repo.space, repo.name, repo.commit, "", workSource)
+    : commitPanelUrl(repo.space, repo.name, repo.commit);
   const changeCount = repo.changes.length === 1 ? "1 change" : `${repo.changes.length} changes`;
   const commitsLinkEl = (
     <Link
@@ -306,13 +306,13 @@ function CheckpointRepoRow({
     <li className="flex flex-col gap-1">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="font-semibold">
-          {repo.owner}/{repo.name}
+          {repo.space}/{repo.name}
         </span>
         {!readableSource ? (
           <span className="text-ink-muted">Source migration required</span>
         ) : workSource ? (
           <Link
-            to={treeUrl(repo.owner, repo.name, repo.commit, "", workSource)}
+            to={treeUrl(repo.space, repo.name, repo.commit, "", workSource)}
             className="mk-chip mk-chip--tag mk-mono no-underline"
             title={`Browse files at ${shortOid(repo.commit)}`}
           >
@@ -320,7 +320,7 @@ function CheckpointRepoRow({
           </Link>
         ) : (
           <Link
-            to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
+            to={commitPanelUrl(repo.space, repo.name, repo.commit)}
             className="mk-chip mk-chip--tag mk-mono no-underline"
             title={`Open commit ${shortOid(repo.commit)}`}
           >
@@ -331,7 +331,7 @@ function CheckpointRepoRow({
           <Link
             to={timelinePageUrl(tracker, timeline.slug, "changes", {
               checkpoint: String(checkpoint.number),
-              repo: `${repo.owner}/${repo.name}`,
+              repo: `${repo.space}/${repo.name}`,
             })}
             className="mk-btn mk-btn--sm no-underline"
           >
@@ -351,7 +351,7 @@ function CheckpointRepoRow({
           runs.map((run) => (
             <Link
               key={run.number}
-              to={repoPath(repo.owner, repo.name, "ci", String(run.number))}
+              to={repoPath(repo.space, repo.name, "ci", String(run.number))}
               className="inline-flex items-center gap-1 no-underline"
               title={`CI run #${run.number}: ${ciLabel(run.status)}`}
             >
@@ -373,7 +373,7 @@ function CheckpointRepoRow({
             <span>
               onto main{" "}
               <Link
-                to={commitPanelUrl(repo.owner, repo.name, repo.base)}
+                to={commitPanelUrl(repo.space, repo.name, repo.base)}
                 className="mk-mono"
                 title="Main when the checkpoint was made"
               >
@@ -390,7 +390,7 @@ function CheckpointRepoRow({
               <Link
                 className="mk-mono"
                 to={treeUrl(
-                  repo.owner,
+                  repo.space,
                   repo.name,
                   repo.logicalBase.commit,
                   "",
@@ -407,7 +407,7 @@ function CheckpointRepoRow({
               <Link
                 className="mk-mono"
                 to={treeUrl(
-                  repo.owner,
+                  repo.space,
                   repo.name,
                   dependency.source.commit,
                   "",
@@ -420,7 +420,7 @@ function CheckpointRepoRow({
           ))}
           {readableSource && stat.state === "done" && commitsLinkEl}
           <Link
-            to={`${repoPath(repo.owner, repo.name, "knowledge")}?timeline=${encodeURIComponent(timeline.slug)}`}
+            to={`${repoPath(repo.space, repo.name, "knowledge")}?timeline=${encodeURIComponent(timeline.slug)}`}
           >
             Knowledge diff
           </Link>
@@ -538,7 +538,7 @@ export function CheckpointPanel({
       </ul>
       {unchanged.length > 0 && (
         <p className="m-0 text-body-sm text-ink-muted">
-          Unchanged: {unchanged.map((repo) => `${repo.owner}/${repo.name}`).join(", ")}
+          Unchanged: {unchanged.map((repo) => `${repo.space}/${repo.name}`).join(", ")}
         </p>
       )}
       <div>
@@ -551,18 +551,18 @@ export function CheckpointPanel({
           <section
             key={set.repoId}
             className="flex flex-col gap-1.5 border-t border-line-soft pt-2"
-            aria-label={`Wiki pages in ${repo.owner}/${repo.name}`}
+            aria-label={`Wiki pages in ${repo.space}/${repo.name}`}
           >
             <h4 className="m-0 text-body-sm font-semibold">
               Wiki pages
               {checkpoint.repos.length > 1 && (
                 <span className="font-normal text-ink-muted">
                   {" "}
-                  in {repo.owner}/{repo.name}
+                  in {repo.space}/{repo.name}
                 </span>
               )}
             </h4>
-            <PageSetSummary set={set} owner={repo.owner} name={repo.name} />
+            <PageSetSummary set={set} space={repo.space} name={repo.name} />
           </section>
         );
       })}

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  assertOrdinaryOwnershipMigration,
   deployAndRecord,
   liveRecorder,
   plan,
@@ -79,6 +80,35 @@ await test("the public site deploys for its own sources, docs and shared inputs 
   }
   // The site is its own Worker: its changes never redeploy the website.
   assert.equal(plan(["apps/site/src/pages/index.astro"]).worker, false);
+});
+
+await test("Space preparation always deploys the tagged fence-aware Worker", () => {
+  assert.equal(
+    plan(["apps/website/migrations/20261011171726_organization_space_prepare.sql"]).worker,
+    true,
+  );
+  assert.equal(
+    plan(["apps/website/registry/migrations/20261011171727_space_ownership_prepare.sql"]).worker,
+    true,
+  );
+});
+
+await test("ordinary deployment accepts additive preparation but rejects live ownership transformation", () => {
+  const filename = "20261011171726_organization_space_prepare.sql";
+  assert.doesNotThrow(() =>
+    assertOrdinaryOwnershipMigration(
+      filename,
+      "CREATE TABLE spaces(id TEXT PRIMARY KEY); ALTER TABLE repos ADD COLUMN space_id TEXT;",
+    ),
+  );
+  for (const sql of [
+    "ALTER TABLE repos RENAME COLUMN owner_id TO space_id;",
+    "DROP TABLE org_members;",
+    "UPDATE repos SET space_id=owner_id;",
+    "INSERT INTO space_grants SELECT * FROM org_members;",
+    "DELETE FROM accounts WHERE kind='org';",
+  ])
+    assert.throws(() => assertOrdinaryOwnershipMigration(filename, sql), /approved|operator/);
 });
 
 // Recording what deployed (CORE-351), with fake cf and gm.

@@ -14,7 +14,7 @@ vi.mock("../usage/ai.ts", () => ({
   aiWork: (_context: unknown, work: () => unknown) => work(),
   recordAiCall: async () => {},
   tokensOf: () => ({}),
-  attribution: async () => ({ account: "", feature: "merge_queue" }),
+  attribution: async () => ({ scope: { kind: "space", id: "space" }, feature: "merge_queue" }),
 }));
 const snapshot: AiSnapshot = {
   version: 1,

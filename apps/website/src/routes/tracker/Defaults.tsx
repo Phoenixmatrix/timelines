@@ -26,7 +26,7 @@ export function TrackerDefaultsForm({
     setBusy(true);
     setError("");
     try {
-      await saveTrackerDefaults(snapshot.owner.slug, next);
+      await saveTrackerDefaults(snapshot.space.slug, next);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save your defaults. Try again.");
       return;
@@ -43,7 +43,7 @@ export function TrackerDefaultsForm({
         Default view and team
       </h2>
       <p className="mt-1 mb-4 text-body-sm text-ink-muted">
-        Open Issues in {snapshot.owner.displayName} with these defaults. Saved for your account on
+        Open Issues in {snapshot.space.displayName} with these defaults. Saved for your account on
         every device; links with explicit filters take precedence.
       </p>
       <form
@@ -68,7 +68,12 @@ export function TrackerDefaultsForm({
             <SelectField
               ariaLabel="Default issue view"
               value={draft.query}
-              options={VIEWS.map((view) => ({ value: view.query, label: view.label }))}
+              options={[
+                ...(!VIEWS.some((view) => view.query === draft.query)
+                  ? [{ value: draft.query, label: `Saved filter · ${draft.query}` }]
+                  : []),
+                ...VIEWS.map((view) => ({ value: view.query, label: view.label })),
+              ]}
               onChange={(query) => setDraft({ ...draft, query })}
             />
           </div>
@@ -79,6 +84,10 @@ export function TrackerDefaultsForm({
               value={draft.teamId}
               options={[
                 { value: "", label: "All teams" },
+                ...(draft.teamId &&
+                !snapshot.teams.some((team) => team.id === draft.teamId && !team.archived)
+                  ? [{ value: draft.teamId, label: "Unavailable team · choose a replacement" }]
+                  : []),
                 ...snapshot.teams
                   .filter((team) => !team.archived)
                   .map((team) => ({ value: team.id, label: `${team.key} · ${team.name}` })),
@@ -89,12 +98,20 @@ export function TrackerDefaultsForm({
         </div>
         <p className="m-0 text-micro text-ink-muted">
           A default team is also the team for new issues, and gm and your agents use it when no team
-          is given (unless a checkout sets its own team). Archived or unavailable teams fall back to
-          all teams.
+          is given (unless a checkout sets its own team). An unavailable team keeps the view
+          narrowed until you explicitly choose a replacement or All teams.
         </p>
         {error && <FormError message={error} />}
         <div className="mk-form-actions">
-          <button type="submit" className="mk-btn mk-btn--primary" disabled={busy}>
+          <button
+            type="submit"
+            className="mk-btn mk-btn--primary"
+            disabled={
+              busy ||
+              (!!draft.teamId &&
+                !snapshot.teams.some((team) => team.id === draft.teamId && !team.archived))
+            }
+          >
             Save defaults
           </button>
           <button

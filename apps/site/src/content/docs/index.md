@@ -17,9 +17,11 @@ It hosts git repositories, runs CI, keeps a package registry and an issue tracke
 
 The aim is that an agent can do the whole loop without a person, and that a person can quickly see and trust what happened.
 
+Your **Account** identifies you as a person. An **Organization** administers its directory and explicit grants; it contains **Spaces**, each with its own repositories, Tracker, cross-team Projects, packages and content settings. Organization membership or ownership is not private content access: that requires an explicit Space grant or a resource-specific grant. A repository collaborator grant covers that repository, not its Space's Tracker, packages or sibling repositories. Instance operator powers are separate from Organization roles.
+
 ## The loop
 
-1. **Clone.** `gm clone owner/name` gives you a normal git repository set up for gm.
+1. **Clone.** `gm clone space/name` gives you a normal git repository set up for gm. The first component is the globally unique Space handle, not a person or Organization name.
 2. **Change.** gm is change-based, like jujutsu. Your edits always live in a change, every operation can be undone, and rewriting a change rebases everything built on it. Commit early and often; there is no staging area.
 3. **Push to trunk.** There are no pull requests. `gm push` lands your changes on trunk. Larger or riskier work can go to a [timeline](/docs/concepts/timelines/) first and land on main later, automatically or after a person approves it.
 4. **CI checks it.** Each push runs the pipeline in the repository's `.gitmatrix/ci.yml`. `gm runs wait` blocks until the run finishes and exits non-zero if it failed.

@@ -1,26 +1,27 @@
-// The artifact store as the web app and gm see it: owners' packages, each
+// The artifact store as the web app and gm see it: Spaces' packages, each
 // package's publish history (the console), sources, feeds and proxies.
 
 import type { FormatId, RepoKind, Visibility as FeedVisibility } from "@gitmatrix/formats/info";
+import type { SpaceSummary } from "./spaces.ts";
 
 export type { FeedVisibility, FormatId, RepoKind };
 export type PublishStatus = "active" | "yanked" | "deprecated" | "deleted";
 export type PackageAccess = "read" | "write" | "admin";
 
-export function packagesPath(owner: string): string {
-  return `/${owner}/-/packages`;
+export function packagesPath(space: string): string {
+  return `/${space}/-/packages`;
 }
 
 /** Package names keep their slashes in the page URL (`@scope/name`, `team/image`). */
-export function packagePath(owner: string, format: FormatId, name: string): string {
-  return `${packagesPath(owner)}/${format}/${name.split("/").map(encodeURIComponent).join("/")}`;
+export function packagePath(space: string, format: FormatId, name: string): string {
+  return `${packagesPath(space)}/${format}/${name.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 export interface PackageSummary {
   id: string;
   format: FormatId;
   name: string;
-  /** The feed's key (the owner's slug for their own registry). */
+  /** The feed's key (the Space's slug for its own registry). */
   feed: string;
   latest: string | null;
   lastPublishedAt: string | null;
@@ -29,7 +30,7 @@ export interface PackageSummary {
   /** Publishes in the last 24 hours, and per hour over them (oldest first). */
   publishes24h: number;
   spark: number[];
-  /** Repositories that publish it (`owner/name`). */
+  /** Readable repositories that publish it (`space/name`). */
   sources: string[];
 }
 
@@ -53,14 +54,8 @@ export interface Retention {
   deleteUntagged?: boolean;
 }
 
-export interface OwnerPackages {
-  owner: {
-    id: string;
-    slug: string;
-    displayName: string;
-    kind: "user" | "org";
-    avatarUrl: string | null;
-  };
+export interface SpacePackages {
+  space: SpaceSummary;
   access: PackageAccess | null;
   /** Where clients reach the registry (the site's public URL). */
   registryUrl: string;
@@ -70,7 +65,7 @@ export interface OwnerPackages {
 
 export interface PackageSource {
   repoId: string;
-  /** `owner/name`, or null when the repository is gone. */
+  /** `space/name`, or null when the repository is gone or unreadable. */
   repo: string | null;
   grantedBy: string | null;
   grantedAt: string;
@@ -82,7 +77,7 @@ export interface PackageSource {
 export interface PackageDetail {
   package: PackageSummary;
   feed: FeedSummary;
-  owner: OwnerPackages["owner"];
+  space: SpaceSummary;
   registryUrl: string;
   access: PackageAccess;
   /** npm dist-tags and friends: tag → version. */
@@ -158,7 +153,7 @@ export interface BulkActionResult {
 export interface CreateFeedRequest {
   format: FormatId;
   kind: "remote" | "virtual";
-  /** Becomes `<owner>.<name>`. */
+  /** Becomes `<space>.<name>`. */
   name: string;
   visibility?: FeedVisibility;
   description?: string;
@@ -193,14 +188,14 @@ export interface NpmLoginRequest {
 // ── The console's query language ───────────────────────────────────────────
 //
 //   1.4            versions containing "1.4"
-//   source:web     from a repository (`web` or `owner/web`); `source:none` by hand
+//   source:web     from a repository (`web` or `space/web`); `source:none` by hand
 //   branch:main    built from a branch (`ref:` works too); globs: `release/*`
 //   status:active  active, yanked, deprecated or deleted
 //   since:7d       published in the last 7 days (m, h, d, w), or since a date
 //   until:2026-09-01
 //   commit:4f2a    from a commit (prefix)
 //   run:128        from CI run #128
-//   by:alice       published by someone (slug or `owner/repo` for CI)
+//   by:alice       published by someone (slug or `space/repo` for CI)
 //   tag:latest     a version a tag points at
 //
 // Prefix a filter or a word with `-` to exclude it. Filters on the same key are ORed,

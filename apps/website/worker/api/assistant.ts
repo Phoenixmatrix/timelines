@@ -4,11 +4,12 @@
 
 import { Hono } from "hono";
 import type { AskRequest, AssistantChat } from "../../shared/assistant.ts";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import type { AppEnv } from "../auth.ts";
 import { durableAgent, purgeInstance } from "../durable/registry.ts";
-import { accountPolicies } from "../retention/policies.ts";
+import { personPolicies } from "../retention/policies.ts";
 import { db } from "../schema.ts";
-import { fail, readJson, requireActor } from "./http.ts";
+import { fail, readJson, requireActor, requirePerson } from "./http.ts";
 import { buildSkillRegistry } from "../assistant/skills.ts";
 import type { CallApi } from "../assistant/internal.ts";
 
@@ -20,12 +21,13 @@ assistant.get("/skills", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const repo = c.req.query("repo") ?? null;
-  if (repo !== null && !/^[\w.-]+\/[\w.-]+$/.test(repo)) return fail(c, 400, "repo is owner/name.");
+  if (repo !== null && !/^[\w.-]+\/[\w.-]+$/.test(repo)) return fail(c, 400, "repo is space/name.");
   // Re-enter the actual repository routes as this caller; never trust a repo selector alone.
   const api: CallApi = async (method, path) => {
     // Static import creates app -> assistant -> app during route registration.
     const { app } = await import("../app.ts");
     const headers = new Headers();
+    headers.set(CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION));
     for (const key of ["authorization", "cookie"]) {
       const value = c.req.header(key);
       if (value) headers.set(key, value);
@@ -65,9 +67,7 @@ assistant.get("/chats", async (c) => {
     .orderBy("updated_at", "desc")
     .limit(200)
     .execute();
-  const policy = (await accountPolicies(c.env.DB, actor.id)).find(
-    (p) => p.id === "assistant-chats",
-  );
+  const policy = (await personPolicies(c.env.DB, actor.id)).find((p) => p.id === "assistant-chats");
   const now = new Date().toISOString();
   const expires = (updatedAt: string, index: number) => {
     if (!policy?.enabled) return null;
@@ -75,10 +75,14 @@ assistant.get("/chats", async (c) => {
     if (maxPerUser > 0 && index >= maxPerUser) return now;
     return new Date(Date.parse(updatedAt) + days * 86_400_000).toISOString();
   };
+  const readable = await Promise.all(
+    rows.map(async (row) => (await stub(c.env, actor.id, row.id)).canReadTranscript(actor)),
+  );
   return c.json({
     chats: rows.map((row, index): AssistantChat => ({
       id: row.id,
-      title: row.title,
+      title: readable[index] ? row.title : "Content unavailable",
+      contentUnavailable: !readable[index],
       source: row.source,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -99,7 +103,41 @@ assistant.get("/chats/:id", async (c) => {
     .executeTakeFirst();
   if (!row) return fail(c, 404, "No such chat.");
   const agent = await stub(c.env, actor.id, id);
-  return c.json({ id, title: row.title, source: row.source, messages: await agent.transcript() });
+  if (!(await agent.canReadTranscript(actor)))
+    return fail(
+      c,
+      403,
+      "This conversation's source access cannot be verified. Its transcript is retained; start a new chat with currently accessible sources.",
+    );
+  return c.json({
+    id,
+    title: row.title,
+    source: row.source,
+    messages: await agent.transcript(actor),
+  });
+});
+
+// Downloading stored source content requires the same current access as reading it.
+assistant.get("/chats/:id/export", async (c) => {
+  const actor = requirePerson(c);
+  if (actor instanceof Response) return actor;
+  const id = c.req.param("id");
+  if (!CHAT_ID.test(id)) return fail(c, 400, "Invalid chat id.");
+  const chat = await db(c.env.DB)
+    .selectFrom("assistant_chats")
+    .select("id")
+    .where("id", "=", id)
+    .where("user_id", "=", actor.id)
+    .executeTakeFirst();
+  if (!chat) return fail(c, 404, "No such chat.");
+  const agent = await stub(c.env, actor.id, id);
+  if (!(await agent.canReadTranscript(actor)))
+    return fail(c, 403, "This conversation's source access cannot be verified.");
+  const exported = await agent.exportTranscript(actor);
+  c.header("content-disposition", `attachment; filename="assistant-${id}.json"`);
+  c.header("cache-control", "private, no-store");
+  c.header("content-type", "application/json");
+  return c.body(exported);
 });
 
 assistant.delete("/chats/:id", async (c) => {
@@ -122,14 +160,18 @@ assistant.all("/chats/:id/agent/*", async (c) => {
   if (actor instanceof Response) return actor;
   const id = c.req.param("id");
   if (!CHAT_ID.test(id)) return fail(c, 400, "Invalid chat id.");
-  return passThrough(await (await stub(c.env, actor.id, id)).fetch(c.req.raw));
+  const request = new Request(c.req.raw);
+  request.headers.set("X-Gitmatrix-Assistant-Actor", JSON.stringify(actor));
+  return passThrough(await (await stub(c.env, actor.id, id)).fetch(request));
 });
 assistant.all("/chats/:id/agent", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const id = c.req.param("id");
   if (!CHAT_ID.test(id)) return fail(c, 400, "Invalid chat id.");
-  return passThrough(await (await stub(c.env, actor.id, id)).fetch(c.req.raw));
+  const request = new Request(c.req.raw);
+  request.headers.set("X-Gitmatrix-Assistant-Actor", JSON.stringify(actor));
+  return passThrough(await (await stub(c.env, actor.id, id)).fetch(request));
 });
 
 // One question from `gm ask`, streamed back as newline-delimited JSON events.
@@ -141,7 +183,7 @@ assistant.post("/ask", async (c) => {
   if (!question) return fail(c, 400, "Ask a question.");
   if (question.length > 20_000) return fail(c, 400, "Keep the question under 20,000 characters.");
   if (body.repo !== undefined && !/^[\w.-]+\/[\w.-]+$/.test(body.repo))
-    return fail(c, 400, "repo is owner/name.");
+    return fail(c, 400, "repo is space/name.");
   const chatId = body.chatId ?? crypto.randomUUID();
   if (!CHAT_ID.test(chatId)) return fail(c, 400, "Invalid chat id.");
   if (body.chatId) {
@@ -156,10 +198,10 @@ assistant.post("/ask", async (c) => {
   const origin = new URL(c.req.url).origin;
   const agent = await stub(c.env, actor.id, chatId);
   const stream = await agent.ask(question, {
+    actor,
     write: body.write === true,
     repo: body.repo,
     url: `${origin}/?chat=${chatId}`,
-    agent: actor.agent?.id,
   });
   return new Response(stream, {
     headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" },

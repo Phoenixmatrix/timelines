@@ -1,11 +1,17 @@
 import type { Context } from "hono";
 import type { AppEnv } from "../auth.ts";
-import type { Checkpoint, Landing, Timeline } from "../../shared/timelines.ts";
+import type {
+  LegacyCheckpoint as Checkpoint,
+  LegacyLanding as Landing,
+  LegacyTimeline as Timeline,
+} from "../tracker/legacy-source-fixture.ts";
 import { selectRepos } from "../db.ts";
 import { lsRefs } from "../artifacts.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { fail, readJson } from "./http.ts";
 import { writeRefs } from "../timelines/bookmarks.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
+import { fixtureAccess } from "./dev-fixture-access.ts";
 
 interface LegacySeed {
   slug: string;
@@ -37,7 +43,10 @@ export async function sourceFixtures(c: Context<AppEnv>) {
   )
     return fail(c, 400, "Invalid bounded legacy fixture.");
   const tracker = trackerObject(c.env, "acc_orbit");
-  const parent = input.parent ? await tracker.timeline(input.parent, 0, 1) : null;
+  const space = await findSpaceBySlug(c.env.DB, "orbit");
+  if (!space) return fail(c, 404, "Fixture Space missing.");
+  const access = await fixtureAccess(c.env, space, "acc_marco");
+  const parent = input.parent ? await tracker.timeline(access, input.parent, 0, 1) : null;
   if (parent && !parent.ok) return fail(c, 400, "Legacy parent does not exist.");
   const entries = [];
   for (const entry of input.repos) {
@@ -49,7 +58,7 @@ export async function sourceFixtures(c: Context<AppEnv>) {
     )
       return fail(c, 400, "Only disposable native Git fixture repositories are allowed.");
     const repo = await selectRepos(c.env.DB, "acc_marco")
-      .where("r.owner_id", "=", "acc_orbit")
+      .where("r.space_id", "=", "acc_orbit")
       .where("r.name", "=", entry.name)
       .executeTakeFirst();
     if (!repo) return fail(c, 404, "Fixture repository is missing or deleted.");
@@ -152,18 +161,22 @@ export async function sourceFixtures(c: Context<AppEnv>) {
         })),
         reason: "Pre-cutover operation",
         trigger: "request",
-        requestedBy: { actorId: "acc_marco", accountableId: "acc_marco", agentId: null },
+        requestedBy: { actorId: "acc_marco", accountableId: "acc_marco" },
         version: 1,
         createdAt: now,
         updatedAt: now,
       }
     : null;
-  const result = await tracker.seedLegacySourceFixture(agentId, {
-    timeline,
-    checkpoint,
-    landing,
-    approved: true,
-  });
+  const result = await tracker.seedLegacySourceFixture(
+    agentId,
+    {
+      timeline,
+      checkpoint,
+      landing,
+      approved: true,
+    },
+    access,
+  );
   if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
   return c.json({ timeline: result.value, checkpoint, landing }, 201);
 }

@@ -5,8 +5,13 @@
 
 import type { UsageCost } from "./usage.ts";
 
-/** Whose data a category covers: one account's, or the site's (global caches, auth). */
-export type RetentionScope = "account" | "site";
+/** Content, private person data, and operator infrastructure are distinct scopes. */
+export type RetentionScope = "space" | "person" | "instance";
+export interface RetentionTarget {
+  kind: RetentionScope;
+  /** Immutable Space/person ID; empty string for the Instance. */
+  id: string;
+}
 
 /**
  * How a category is controlled:
@@ -53,9 +58,9 @@ export interface RetentionCategory {
 }
 
 /** Where an effective value comes from. */
-export type PolicySource = "default" | "site" | "account";
+export type PolicySource = "default" | RetentionScope;
 
-/** A category with its effective policy at one level (an account, or the site). */
+/** A category with its effective policy at one explicit target. */
 export interface RetentionPolicy extends RetentionCategory {
   enabled: boolean;
   enabledFrom: PolicySource;
@@ -87,14 +92,12 @@ export interface StoredPolicy {
 }
 
 /**
- * GET /api/accounts/:slug/settings/retention: the account's categories.
- * GET /api/admin/retention: site-scope categories, plus site-wide defaults for
- * the account categories that take a policy.
+ * GET /api/spaces/:space/retention: Space content categories.
+ * GET /api/accounts/:person/retention: the person's private chat categories.
+ * GET /api/admin/retention: Instance categories and configurable defaults.
  */
 export interface RetentionSettings {
-  level: RetentionScope;
-  /** The account's slug; null at site level. */
-  account: string | null;
+  target: RetentionTarget;
   /** True when the viewer may change these settings. */
   canEdit: boolean;
   categories: RetentionPolicy[];
@@ -103,8 +106,8 @@ export interface RetentionSettings {
 }
 
 /**
- * PATCH body for both levels. `enabled: null` or a threshold `null` removes
- * the stored value, so it inherits again (site default, then PRD default).
+ * PATCH body for each scope. `enabled: null` or a threshold `null` removes
+ * the stored value, so it inherits again (Instance default, then PRD default).
  */
 export interface RetentionPatch {
   categories: Record<
@@ -153,9 +156,7 @@ export interface RetentionRunCategory {
 /** A cleanup run: scheduled or manual, dry or real, with what each category did. */
 export interface RetentionRun {
   id: number;
-  level: RetentionScope;
-  /** The account's slug; null for a site run. */
-  account: string | null;
+  target: RetentionTarget;
   trigger: "schedule" | "manual";
   /** Who started a manual run. */
   actor: string | null;
@@ -184,7 +185,7 @@ export interface RetentionRunPage {
 }
 
 /**
- * POST /api/accounts/:slug/retention/runs, POST /api/admin/retention/runs:
+ * POST …/retention/runs for the explicit Space, person, or Instance:
  * any categories of that level that have a cleanup, enabled or not, at their
  * effective thresholds unless overridden here (same bounds as policies).
  */

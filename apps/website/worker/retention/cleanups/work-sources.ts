@@ -21,21 +21,20 @@ interface Candidate {
 /** Owns only native work Git bytes; never consults rich Tracker retention pins. */
 export const timelineWorkSources: CategoryCleanup<string> = {
   async select(ctx, cursor) {
-    if (ctx.target.scope !== "account")
-      throw new Error("timeline-work-sources is an account category.");
-    const ownerId = ctx.target.accountId;
+    if (ctx.target.kind !== "space") throw new Error("timeline-work-sources is a Space category.");
+    const spaceId = ctx.target.id;
     const cutoffs = workSourceCutoffs(ctx);
     const page = await ctx.env.DB.prepare(`SELECT DISTINCT timeline_id FROM timeline_work_sources
-      WHERE owner_id=? AND timeline_id>? AND state IN ('archived','purging')
+      WHERE space_id=? AND timeline_id>? AND state IN ('archived','purging')
       ORDER BY timeline_id LIMIT ?`)
-      .bind(ownerId, cursor ?? "", ctx.limit)
+      .bind(spaceId, cursor ?? "", ctx.limit)
       .all<{ timeline_id: string }>();
     if (!page.results.length) return { items: [], next: null, bytes: 0 };
     const ids = page.results.map((row) => row.timeline_id);
     const rows =
       await ctx.env.DB.prepare(`SELECT timeline_id,source_id,state,archived_at,archive_disposition
-      FROM timeline_work_sources WHERE owner_id=? AND timeline_id IN (SELECT value FROM json_each(?))`)
-        .bind(ownerId, JSON.stringify(ids))
+      FROM timeline_work_sources WHERE space_id=? AND timeline_id IN (SELECT value FROM json_each(?))`)
+        .bind(spaceId, JSON.stringify(ids))
         .all<Candidate>();
     const eligible = new Set(ids);
     let count = 0;
@@ -50,9 +49,9 @@ export const timelineWorkSources: CategoryCleanup<string> = {
       }
       // A dry run reads legacy evidence without projecting or fencing anything.
       if (!source.archive_disposition) {
-        const reply = await trackerObject(ctx.env, ownerId).getWorkSource(source.source_id);
+        const reply = await trackerObject(ctx.env, spaceId).getWorkSource(source.source_id);
         if (!reply.ok) throw new Error(reply.error);
-        if (reply.value.timeline_id !== source.timeline_id || reply.value.owner_id !== ownerId)
+        if (reply.value.timeline_id !== source.timeline_id || reply.value.space_id !== spaceId)
           throw new Error("Source archive ownership mismatch.");
         source.archive_disposition = reply.value.archive_disposition;
         source.archived_at = reply.value.archived_at;
@@ -69,17 +68,16 @@ export const timelineWorkSources: CategoryCleanup<string> = {
     return { items, next: ids.at(-1)!, count, bytes: 0 };
   },
   async remove(ctx, items) {
-    if (ctx.target.scope !== "account")
-      throw new Error("timeline-work-sources is an account category.");
+    if (ctx.target.kind !== "space") throw new Error("timeline-work-sources is a Space category.");
     if (!items.length) return { count: 0, bytes: 0 };
-    const ownerId = ctx.target.accountId;
+    const spaceId = ctx.target.id;
     const remaining = async () =>
       (await ctx.env.DB.prepare(`SELECT count(*) AS n FROM timeline_work_sources
-      WHERE owner_id=? AND timeline_id IN (SELECT value FROM json_each(?)) AND state!='purged'`)
-        .bind(ownerId, JSON.stringify(items))
+      WHERE space_id=? AND timeline_id IN (SELECT value FROM json_each(?)) AND state!='purged'`)
+        .bind(spaceId, JSON.stringify(items))
         .first<number>("n")) ?? 0;
     const before = await remaining();
-    await expireArchivedSources(ctx.env, ownerId, workSourceCutoffs(ctx), items);
+    await expireArchivedSources(ctx.env, spaceId, workSourceCutoffs(ctx), items);
     return { count: before - (await remaining()), bytes: 0 };
   },
 };

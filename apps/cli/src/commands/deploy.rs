@@ -126,7 +126,7 @@ pub struct RecordArgs {
     #[arg(long, value_enum)]
     pub status: Option<Status>,
     /// When the deployment expires: an ISO time, a duration from now (`30m`, `12h`, `2d`),
-    /// or `never`. Default: none, except timeline previews (the account's idle period).
+    /// or `never`. Default: none, except timeline previews (the Space's idle period).
     #[arg(long)]
     pub expires: Option<String>,
     /// Deployed revision or full commit hash (default in CI: the job's commit). Required outside CI.
@@ -134,7 +134,7 @@ pub struct RecordArgs {
     pub commit: Option<String>,
     #[command(flatten)]
     pub provenance: ProvenanceArgs,
-    /// Repository as owner/name (default: $GITMATRIX_REPOSITORY, then this repository's origin).
+    /// Repository as space/name (default: $GITMATRIX_REPOSITORY, then this repository's origin).
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
 }
@@ -219,15 +219,15 @@ fn repo_arg(ctx: &Ctx, repo: &Option<String>) -> Result<String> {
         None => current_repo(ctx)?,
     };
     match repo.split_once('/') {
-        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+        Some((space, name)) if !space.is_empty() && !name.is_empty() && !name.contains('/') => {
             let mut path = String::from("/repos/");
-            encode_into(&mut path, owner);
+            encode_into(&mut path, space);
             path.push('/');
             encode_into(&mut path, name);
             Ok(path)
         }
         _ => Err(GmError::usage(
-            "Name the repository with --repo owner/name.",
+            "Name the repository with --repo space/name.",
         )),
     }
 }

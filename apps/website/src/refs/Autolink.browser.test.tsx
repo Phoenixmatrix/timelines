@@ -9,30 +9,30 @@ const HEAD = "3f2a9c1b".padEnd(40, "0");
 /** Where the rest of a commit title goes: that commit's panel over the history page (CORE-22). */
 const panelOver = (sha: string) => `/orbit/engine/commits/main?commit=${sha}`;
 
-/** Apply tracker mutations to `owner`'s tracker as `as` (the world's persona by default). */
-async function mutate(server: TestServer, owner: string, mutations: Mutation[], as?: Persona) {
+/** Apply tracker mutations to `space`'s tracker as `as` (the world's persona by default). */
+async function mutate(server: TestServer, space: string, mutations: Mutation[], as?: Persona) {
   await server.call(
     "POST",
-    `/api/tracker/${owner}/mutate`,
-    { operationId: crypto.randomUUID(), mutations },
+    `/api/tracker/${space}/mutate`,
+    { ...(await server.trackerContract(space, as)), operationId: crypto.randomUUID(), mutations },
     as,
   );
 }
 
-/** A team ENG in `owner`'s tracker, and its first issue (ENG-1). */
+/** A team ENG in `space`'s tracker, and its first issue (ENG-1). */
 async function engIssue(
   server: TestServer,
-  owner: string,
+  space: string,
   id: string,
   title: string,
   as?: Persona,
 ) {
   await mutate(
     server,
-    owner,
+    space,
     [
-      { kind: "team.create", id: `${owner}-team`, data: { key: "ENG", name: "Eng" } },
-      { kind: "issue.create", id, data: { teamId: `${owner}-team`, title } },
+      { kind: "team.create", id: `${space}-team`, data: { key: "ENG", name: "Eng" } },
+      { kind: "issue.create", id, data: { teamId: `${space}-team`, title } },
     ],
     as,
   );
@@ -51,7 +51,7 @@ function commit(oid: string, message: string): CommitSummary {
 
 /** Canned history for every repository, newest first. */
 function history(server: TestServer, commits: CommitSummary[]) {
-  server.on("GET", "/api/repos/:owner/:name/history", ({ url }): HistoryPage => ({
+  server.on("GET", "/api/repos/:space/:name/history", ({ url }): HistoryPage => ({
     ref: url.searchParams.get("at") || "main",
     head: commits[0]!.oid,
     path: "",
@@ -194,8 +194,8 @@ test("a CI run's title links refs; its log links hashes alone", async () => {
       },
     ],
   };
-  server.on("GET", "/api/repos/:owner/:name/ci/runs/:number", () => run);
-  server.on("GET", "/api/repos/:owner/:name/ci/jobs/:job/logs", (): CiLogs => ({
+  server.on("GET", "/api/repos/:space/:name/ci/runs/:number", () => run);
+  server.on("GET", "/api/repos/:space/:name/ci/jobs/:job/logs", (): CiLogs => ({
     chunks: [{ seq: 1, step: 1, text: "Checked out 3f2a9c1b for ENG-1\nfailed in orbit/engine\n" }],
     next: 1,
     done: true,

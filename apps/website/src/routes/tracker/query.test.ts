@@ -38,7 +38,7 @@ function issue(key: string, fields: Partial<Issue> = {}): Issue {
     priority: 2,
     assigneeId: null,
     parentId: null,
-    workspaceIds: [],
+    projectIds: [],
     labels: [],
     claim: null,
     ...fields,
@@ -47,7 +47,28 @@ function issue(key: string, fields: Partial<Issue> = {}): Issue {
 
 function snapshot(issues: Issue[], links: Link[] = []): Snapshot {
   return {
-    owner: { id: "o", slug: "priya", displayName: "Priya" },
+    contractVersion: 4,
+    spaceId: "o",
+    migrationEpoch: 1,
+    space: {
+      id: "o",
+      slug: "priya",
+      displayName: "Priya",
+      organizationId: "personal",
+      organization: {
+        id: "personal",
+        slug: "personal",
+        displayName: "Personal",
+        kind: "personal",
+        avatarUrl: null,
+        personalAccountId: "m-priya",
+        defaultSpaceId: "o",
+        createdAt: ago(30),
+      },
+      archivedAt: null,
+      authorizationVersion: 1,
+      createdAt: ago(30),
+    },
     canAdmin: true,
     members: [
       { id: "m-priya", slug: "priya", displayName: "Priya Raman" },
@@ -79,7 +100,7 @@ function snapshot(issues: Issue[], links: Link[] = []): Snapshot {
         updatedAt: ago(30),
       },
     ],
-    workspaces: [
+    projects: [
       {
         id: "w-pkg",
         slug: "packages",
@@ -340,8 +361,8 @@ describe("query language", () => {
   });
 
   it("resolves aliases and reports unknown keys", () => {
-    const parsed = parseQuery("workspace:packages priority:1 colour:red -flaky");
-    expect(parsed.filters.map((f) => `${f.key}:${f.value}`)).toEqual(["ws:packages", "p:1"]);
+    const parsed = parseQuery("project:packages priority:1 colour:red -flaky");
+    expect(parsed.filters.map((f) => `${f.key}:${f.value}`)).toEqual(["project:packages", "p:1"]);
     expect(parsed.unknown).toEqual(["colour:red"]);
     expect(parsed.words).toEqual([{ text: "flaky", negated: true }]);
   });
@@ -351,7 +372,7 @@ describe("query language", () => {
       issue("CORE-1", { labels: ["perf"] }),
       issue("WEB-1", { teamId: "t-web" }),
       issue("CORE-2", { status: "done" }),
-      issue("CORE-3", { assigneeId: "m-jun", workspaceIds: ["w-pkg"] }),
+      issue("CORE-3", { assigneeId: "m-jun", projectIds: ["w-pkg"] }),
     ];
     const snap = snapshot(issues);
     const index = buildIndex(snap, snap.serverTime);
@@ -361,7 +382,7 @@ describe("query language", () => {
     };
     expect(keys("team:core team:web is:open")).toEqual(["CORE-1", "WEB-1", "CORE-3"]);
     expect(keys("team:core -tag:perf")).toEqual(["CORE-2", "CORE-3"]);
-    expect(keys("assignee:jun ws:packages")).toEqual(["CORE-3"]);
+    expect(keys("assignee:jun project:packages")).toEqual(["CORE-3"]);
     expect(keys("assignee:none is:closed")).toEqual(["CORE-2"]);
     expect(keys("web-1")).toEqual(["WEB-1"]);
     expect(keys("is:open -core")).toEqual(["WEB-1"]);

@@ -44,7 +44,7 @@ export interface StepContextBody {
   model: string | null;
 }
 
-/** What gm sends for one step (POST /api/repos/:owner/:name/steps). */
+/** What gm sends for one step (POST /api/repos/:space/:name/steps). */
 export interface StepUpload extends Partial<StepContextBody> {
   changeId: string;
   commitOid: string;
@@ -146,14 +146,14 @@ export type StepArtifact = {
   | { kind: "document"; data: StepDocument }
 );
 
-/** GET /api/repos/:owner/:name/steps: a page of steps, newest first. */
+/** GET /api/repos/:space/:name/steps: a page of steps, newest first. */
 export interface StepPage {
   steps: Step[];
   /** Pass back as `cursor` for older steps; null at the start. */
   cursor: string | null;
 }
 
-/** GET /api/repos/:owner/:name/steps/:changeId: every version, newest first. */
+/** GET /api/repos/:space/:name/steps/:changeId: every version, newest first. */
 export interface StepVersions {
   changeId: string;
   versions: Step[];
@@ -179,7 +179,7 @@ export const EMPTY_CONTEXT: StepContextBody = {
   model: null,
 };
 
-/** The live feed keeps a record this many days at most (CORE-244: an account may keep fewer). */
+/** The live feed keeps a record this many days at most (CORE-244: a Space may keep fewer). */
 export const STEP_FEED_DAYS = 7;
 
 /** The placeholder retention leaves for trimmed instructions and steering (CORE-244). */
@@ -192,7 +192,7 @@ export const TRIMMED_TEXT = "(Removed by retention.)";
  */
 export interface StepFeedRecord {
   seq: number;
-  /** owner/name */
+  /** space/name */
   repo: string;
   timeline: string;
   changeId: string;

@@ -1,55 +1,70 @@
-import { describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { KnowledgeCoordinator } from "./coordinator.ts";
 import { claimSet, closeSet, queueSet } from "./pages.ts";
 import { LEGACY_KNOWLEDGE_POLICY } from "./policy.ts";
 import { reconcileExpiredKnowledge } from "./source-claims.ts";
 
-vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {
-    ctx: unknown;
-    env: unknown;
-    constructor(ctx: unknown, env: unknown) {
-      this.ctx = ctx;
-      this.env = env;
-    }
-  },
-}));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const oid = "a".repeat(40);
 const ref = "refs/heads/timeline/work";
 
-function fixture() {
-  const sqlite = migratedDatabase();
+async function fixture() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite, env } = fresh;
+  onTestFinished(fresh.close);
   sqlite.exec(`
-    INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','org','orbit','Orbit');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+    INSERT INTO accounts (id,kind,slug,display_name) VALUES ('ann','user','ann','Ann');
+  `);
+  await seedSpaceFixture(d1(sqlite), {
+    organization: { id: "org", slug: "org", displayName: "Organization", kind: "company" },
+    space: { id: "owner", slug: "orbit", displayName: "Orbit" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
       VALUES('repo','owner','app','private','app','https://app');
-    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,
+    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,
       artifacts_name,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
       initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
       VALUES('work','repo','timeline','work','owner','work','ready','allocation','canonical',
         '${oid}','${oid}','refs/heads/main','canonical','${oid}','${oid}','refs/heads/main','2025-01-01','2025-01-01');
   `);
-  return sqlite;
+  const token = await issueToken(env.DB, "ann", "Knowledge test", "write");
+  const authorization = await captureWorkAuthority(env, "repo", {
+    id: "ann",
+    credential: { kind: "token", id: token.id },
+  });
+  return { sqlite, env, authorization };
 }
 
 describe("knowledge consumer completion", () => {
   test("page attempts retain distinct claims while published output survives source expiry", async () => {
-    const sqlite = fixture();
+    const { sqlite, env, authorization } = await fixture();
     const database = d1(sqlite);
     const set = { repoId: "repo", sourceId: "work", ref, key: "checkpoint" };
-    const request = { ...set, commit: oid, checkpoint: null, requestedBy: null };
     const states = new Map([
       ["old-build", "running"],
       ["new-build", "running"],
     ]);
-    const env = {
+    Object.assign(env, {
       DB: database,
       KNOWLEDGE_BUILD: {
         get: async (id: string) => ({ status: async () => ({ status: states.get(id) }) }),
       },
-    } as unknown as Env;
+    } as unknown as Env);
+    const request = { ...set, commit: oid, checkpoint: null, requestedBy: "ann", authorization };
     const roots = () =>
       sqlite
         .prepare("SELECT consumer_kind,consumer_id FROM timeline_source_roots ORDER BY consumer_id")
@@ -74,7 +89,7 @@ describe("knowledge consumer completion", () => {
       expect(roots()).toEqual([
         { consumer_kind: "knowledge-pages-build", consumer_id: "new-build" },
       ]);
-      await expect(queueSet(database, { ...request, key: "too-late" })).rejects.toThrow();
+      await queueSet(database, { ...request, key: "too-late" });
       states.set("new-build", "complete");
       await reconcileExpiredKnowledge(env, "owner", ["timeline"]);
       expect(roots()).toEqual([]);
@@ -95,7 +110,7 @@ describe("knowledge consumer completion", () => {
     ["pages", "status-unavailable"],
     ["pages", "stop-unconfirmed"],
   ])("%s retains its source claim when %s", async (kind, failure) => {
-    const sqlite = fixture();
+    const { sqlite, env } = await fixture();
     const consumerKind = kind === "overlay" ? "knowledge-overlay" : "knowledge-pages-build";
     const consumerId = kind === "overlay" ? "repo:work:build" : "build";
     sqlite
@@ -125,6 +140,20 @@ describe("knowledge consumer completion", () => {
         },
       ],
     ]);
+    Object.assign(env, {
+      DB: d1(sqlite),
+      KNOWLEDGE_BUILD: {
+        get: async () => ({
+          status: async () => {
+            if (failure === "status-unavailable") throw new Error("Workflow status unavailable");
+            return { status: "running" };
+          },
+          terminate: async () => {
+            throw new Error("Workflow termination not acknowledged");
+          },
+        }),
+      },
+    } as unknown as Env);
     const coordinator = new KnowledgeCoordinator(
       {
         storage: {
@@ -136,20 +165,7 @@ describe("knowledge consumer completion", () => {
         },
         blockConcurrencyWhile: async (work: () => Promise<unknown>) => work(),
       } as unknown as DurableObjectState,
-      {
-        DB: d1(sqlite),
-        KNOWLEDGE_BUILD: {
-          get: async () => ({
-            status: async () => {
-              if (failure === "status-unavailable") throw new Error("Workflow status unavailable");
-              return { status: "running" };
-            },
-            terminate: async () => {
-              throw new Error("Workflow termination not acknowledged");
-            },
-          }),
-        },
-      } as unknown as Env,
+      env,
     );
     try {
       await expect(coordinator.alarm()).rejects.toThrow(

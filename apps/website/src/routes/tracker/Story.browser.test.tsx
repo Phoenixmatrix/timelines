@@ -70,7 +70,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   ];
   // The physical work ref and its objects exist only in the timeline's
   // namespace. An unqualified read cannot accidentally pass against main.
-  server.on("GET", "/api/repos/:owner/:name/history", ({ url }) => {
+  server.on("GET", "/api/repos/:space/:name/history", ({ url }) => {
     if (url.searchParams.get("source") !== source.sourceId)
       return reply({ message: "No branch, tag or commit named work." }, 404);
     const at = url.searchParams.get("at");
@@ -119,7 +119,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   // Checkpoint #1 was made when the rank step was the tip.
   server.on(
     "GET",
-    "/api/tracker/:owner/timelines/:slug/checkpoints",
+    "/api/tracker/:space/timelines/:slug/checkpoints",
     () =>
       ({
         checkpoints: [
@@ -128,7 +128,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
               id: "checkpoint-1",
               timelineId: detail.timeline.id,
               number: 1,
-              repos: [{ id: "x", owner: "orbit", name: "engine", commit: rank, base: fork }],
+              repos: [{ id: "x", space: "orbit", name: "engine", commit: rank, base: fork }],
               summary: "",
               actorId: "a",
               accountableId: "a",
@@ -148,7 +148,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   diffs[rank]!.files.push({
     ...diffFor(rank, "src/util/clock.ts", [" tick", "+now()"]).files[0]!,
   });
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ params, url }) =>
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", ({ params, url }) =>
     url.searchParams.get("source") === source.sourceId
       ? diffs[params.oid!]
       : reply({ message: "Commit not found in the canonical source." }, 404),
@@ -614,8 +614,8 @@ test("ended Story keeps owned work separate from historical canonical merge pare
           ]
         : [...original.events, mergeEvent],
     };
-    server.on("GET", "/api/tracker/:owner/timelines/:slug", () => detail);
-    server.on("GET", "/api/repos/:owner/:name/history", ({ url }) => {
+    server.on("GET", "/api/tracker/:space/timelines/:slug", () => detail);
+    server.on("GET", "/api/repos/:space/:name/history", ({ url }) => {
       if (
         url.searchParams.get("source") !== source.sourceId ||
         url.searchParams.get("at") !== expectedAt
@@ -640,7 +640,7 @@ test("ended Story keeps owned work separate from historical canonical merge pare
         ],
       } satisfies HistoryPage;
     });
-    server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ url, params }) => {
+    server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", ({ url, params }) => {
       if (url.searchParams.get("source") !== source.sourceId || params.oid !== oid)
         return reply({ message: "Commit unavailable in this source." }, 404);
       return {
@@ -693,7 +693,7 @@ test("a step's screenshots and diagram, compared with the step before (CORE-383)
     [middle, "Redraw the board", 2, first],
     [first, "Add the board", 1, fork],
   ] as const;
-  server.on("GET", "/api/repos/:owner/:name/history", ({ url }): HistoryPage => {
+  server.on("GET", "/api/repos/:space/:name/history", ({ url }): HistoryPage => {
     expect(url.searchParams.get("source")).toBe(source.sourceId);
     return {
       ref: "work",
@@ -712,7 +712,7 @@ test("a step's screenshots and diagram, compared with the step before (CORE-383)
       entries: {},
     };
   });
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
     oid: params.oid!,
     parents: [],
     message: "",
@@ -769,11 +769,11 @@ test("a step's screenshots and diagram, compared with the step before (CORE-383)
     [first]: [shot("Home", "same", 1), shot("Board", "before", 1)],
   };
   const withArtifacts = (step: Step): Step => ({ ...step, artifacts: artifacts[step.commitOid]! });
-  server.on("GET", "/api/repos/:owner/:name/steps", async ({ url }): Promise<StepPage> => {
+  server.on("GET", "/api/repos/:space/:name/steps", async ({ url }): Promise<StepPage> => {
     const page = await server.call<StepPage>("GET", `/api/repos/orbit/engine/steps${url.search}`);
     return { ...page, steps: page.steps.map(withArtifacts) };
   });
-  server.on("GET", "/api/repos/:owner/:name/steps/:changeId", async ({ params }) => {
+  server.on("GET", "/api/repos/:space/:name/steps/:changeId", async ({ params }) => {
     const versions = await server.call<StepVersions>(
       "GET",
       `/api/repos/orbit/engine/steps/${params.changeId}`,
@@ -857,7 +857,7 @@ test("story: several repositories are never silently one of many (CORE-382)", as
     web: commits("web"),
     docs: commits("docs"),
   };
-  server.on("GET", "/api/repos/:owner/:name/history", ({ params }): HistoryPage => ({
+  server.on("GET", "/api/repos/:space/:name/history", ({ params }): HistoryPage => ({
     ref: "work",
     head: lines[params.name!]![0]!.oid,
     path: "",
@@ -866,7 +866,7 @@ test("story: several repositories are never silently one of many (CORE-382)", as
     commits: lines[params.name!]!,
     entries: {},
   }));
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
     oid: params.oid!,
     parents: [],
     message: "",
@@ -924,7 +924,7 @@ test("story: a failed read can be retried (CORE-382)", async () => {
   let failing = true;
   server.on(
     "GET",
-    "/api/repos/:owner/:name/history",
+    "/api/repos/:space/:name/history",
     (): HistoryPage | ReturnType<typeof reply> => {
       if (failing) return reply({ message: "The history is unavailable." }, 500);
       return {
@@ -947,7 +947,7 @@ test("story: a failed read can be retried (CORE-382)", async () => {
       };
     },
   );
-  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
+  server.on("GET", "/api/repos/:space/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
     oid: params.oid!,
     parents: [],
     message: "",

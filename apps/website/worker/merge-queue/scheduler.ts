@@ -8,6 +8,7 @@ import type { PushedRepo } from "../git/effects.ts";
 import { jobRuns } from "../ci/config.ts";
 import type { StoredJob } from "../ci/jobs.ts";
 import { db } from "../schema.ts";
+import { resolveWorkAuthority, resolveRunAuthority } from "../ci/admission.ts";
 import { queueDeps, type QueueDeps, type Outcome, type Waiter } from "./deps.ts";
 import { getQueue, listQueue, saveQueue, type StoredQueue } from "./store.ts";
 const ACTIVE = ["merging", "testing", "advancing"] as const;
@@ -23,11 +24,11 @@ const freshId = () => crypto.randomUUID().replaceAll("-", "");
 async function repoFor(env: Env, id: string): Promise<PushedRepo | undefined> {
   return db(env.DB)
     .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .innerJoin("spaces as o", "o.id", "r.space_id")
     .select([
       "r.id",
-      "r.owner_id",
-      "o.slug as owner_slug",
+      "r.space_id",
+      "o.slug as space_slug",
       "r.name",
       "r.default_branch",
       "r.artifacts_name",
@@ -116,7 +117,7 @@ async function failure(
   }
   const evidence: QueueFailure = {
     queueId: e.id,
-    repo: `${e.repo.owner}/${e.repo.name}`,
+    repo: `${e.repo.space}/${e.repo.name}`,
     commit: e.commit,
     attempt: e.attempts,
     stage,
@@ -206,6 +207,7 @@ async function releaseCombined(env: Env, s: StoredQueue) {
 }
 async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps) {
   if (!(await repoFor(env, repo.id))) return;
+  await resolveWorkAuthority(env, s.authority, repo.id);
   await db(env.DB)
     .updateTable("merge_queue")
     .set({ recovered_at: new Date().toISOString() })
@@ -349,6 +351,8 @@ async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps:
     );
     return;
   }
+  await resolveWorkAuthority(env, s.authority, repo.id);
+  await resolveRunAuthority(env, run.id);
   const saved = await saveQueue(env.DB, s, {
     ...s,
     deployRunId: run.id,
@@ -369,6 +373,12 @@ async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps:
 }
 
 async function step(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps): Promise<boolean> {
+  await resolveWorkAuthority(env, s.authority, repo.id);
+  for (const id of s.combinedIds) {
+    const member = await getQueue(env.DB, repo.id, id);
+    if (!member) throw new Error("Combined queue authority is unavailable.");
+    await resolveWorkAuthority(env, member.authority, repo.id);
+  }
   if (!(await repoFor(env, repo.id))) return false;
   const e = s.entry;
   if (e.status === "queued") {
@@ -493,6 +503,8 @@ async function step(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps)
           }
         }
       }
+      await resolveWorkAuthority(env, claimed.authority, repo.id);
+      for (const member of combined) await resolveWorkAuthority(env, member.authority, repo.id);
       const saved = await saveQueue(env.DB, claimed, {
         ...claimed,
         mergeSource: selected,
@@ -717,6 +729,12 @@ async function step(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps)
     if (main === e.base) {
       // The ref read can overlap repository deletion. Never publish its stale snapshot.
       if (!(await repoFor(env, repo.id))) return false;
+      await resolveWorkAuthority(env, s.authority, repo.id);
+      for (const id of s.combinedIds) {
+        const member = await getQueue(env.DB, repo.id, id);
+        if (!member) throw new Error("Combined queue authority is unavailable.");
+        await resolveWorkAuthority(env, member.authority, repo.id);
+      }
       try {
         await deps.write(repo, [
           { ref: `refs/heads/${e.branch}`, old: e.base!, new: e.candidate! },
@@ -842,6 +860,8 @@ export async function afterQueueRun(
   _runId: string,
   waitUntil: Waiter,
 ): Promise<void> {
+  const current = await resolveRunAuthority(env, _runId);
+  if (current.repo.id !== repoId) throw new Error("Queue callback repository mismatch.");
   await progressQueue(env, repoId, waitUntil);
 }
 export async function sweepQueue(env: Env, waitUntil: Waiter): Promise<void> {

@@ -25,18 +25,10 @@ let loaded: Promise<BrowserApiModule> | undefined;
  */
 function browserApi(): Promise<BrowserApiModule> {
   if (!loaded) {
-    const stub = [
-      "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }",
-      "export class WorkflowEntrypoint {}",
-      "export class WorkerEntrypoint {}",
-      "export class RpcTarget {}",
-      "export class EmailMessage {}",
-      "export const env = {};",
-    ].join("\n");
+    const runtime = new URL("../worker/testing/runtime.ts", import.meta.url).href;
     registerHooks({
       resolve(specifier, context, next) {
-        if (specifier.startsWith("cloudflare:"))
-          return { url: `data:text/javascript,${encodeURIComponent(stub)}`, shortCircuit: true };
+        if (specifier.startsWith("cloudflare:")) return { url: runtime, shortCircuit: true };
         return next(specifier, context);
       },
     });

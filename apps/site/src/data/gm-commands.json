@@ -9,10 +9,10 @@
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -39,7 +39,7 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "owner",
+          "name": "space",
           "required": true
         }
       ],
@@ -65,7 +65,7 @@
         }
       ],
       "summary": "Select a tracker and initialize its authenticated offline replica",
-      "usage": "gm tracker use [OPTIONS] <OWNER>"
+      "usage": "gm tracker use [OPTIONS] <SPACE>"
     },
     {
       "arguments": [],
@@ -76,10 +76,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -109,10 +109,10 @@
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -142,10 +142,10 @@
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -194,10 +194,10 @@
           "required": true
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -243,10 +243,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -279,15 +279,15 @@
       ],
       "command": "gm tracker recover",
       "examples": [
-        "gm tracker recover /private/old/orbit.sqlite --owner orbit"
+        "gm tracker recover /private/old/orbit.sqlite --space orbit"
       ],
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -309,6 +309,54 @@
       "usage": "gm tracker recover [OPTIONS] <REPLICA>"
     },
     {
+      "arguments": [
+        {
+          "description": "",
+          "flag": false,
+          "multiple": false,
+          "name": "replica",
+          "required": true
+        }
+      ],
+      "command": "gm tracker export",
+      "examples": [
+        "gm tracker export /private/old/orbit.sqlite --destination /private/recovery.sqlite"
+      ],
+      "mutates": true,
+      "options": [
+        {
+          "description": "",
+          "flag": false,
+          "multiple": false,
+          "name": "--destination",
+          "required": true
+        },
+        {
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
+          "flag": false,
+          "multiple": false,
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Use only this private SQLite replica. Never automatically falls back offline",
+          "flag": true,
+          "multiple": false,
+          "name": "--offline",
+          "required": false
+        },
+        {
+          "description": "Work in a timeline (its slug): read its view of the issues, and make changes in it. Defaults to GM_TIMELINE, then this checkout's timeline (`gm timeline use`); `main` is main's view",
+          "flag": false,
+          "multiple": false,
+          "name": "--timeline",
+          "required": false
+        }
+      ],
+      "summary": "Losslessly export a fenced replica and its queued operations without selecting a tracker",
+      "usage": "gm tracker export [OPTIONS] --destination <DESTINATION> <REPLICA>"
+    },
+    {
       "arguments": [],
       "command": "gm team list",
       "examples": [
@@ -317,10 +365,10 @@
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -344,7 +392,7 @@
     {
       "arguments": [
         {
-          "description": "Immutable team key or workspace slug",
+          "description": "Immutable team key or project slug",
           "flag": false,
           "multiple": false,
           "name": "key",
@@ -373,10 +421,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -400,7 +448,7 @@
     {
       "arguments": [
         {
-          "description": "Canonical ID, team key or workspace slug",
+          "description": "Canonical ID, team key or project slug",
           "flag": false,
           "multiple": false,
           "name": "id",
@@ -414,17 +462,17 @@
       "mutates": true,
       "options": [
         {
-          "description": "JSON object of mutable fields; use '-' for stdin or '@path' for a file. Team fields: name, description, memberIds and archived. Workspace fields: name, description and archived. Member IDs are canonical",
+          "description": "JSON object of mutable fields; use '-' for stdin or '@path' for a file. Team fields: name, description, memberIds and archived. Project fields: name, description and archived. Member IDs are canonical",
           "flag": false,
           "multiple": false,
           "name": "--data",
           "required": true
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -447,17 +495,17 @@
     },
     {
       "arguments": [],
-      "command": "gm workspace list",
+      "command": "gm project list",
       "examples": [
-        "gm workspace list"
+        "gm project list"
       ],
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -475,22 +523,22 @@
           "required": false
         }
       ],
-      "summary": "List cross-team workspaces",
-      "usage": "gm workspace list [OPTIONS]"
+      "summary": "List cross-team projects",
+      "usage": "gm project list [OPTIONS]"
     },
     {
       "arguments": [
         {
-          "description": "Immutable team key or workspace slug",
+          "description": "Immutable team key or project slug",
           "flag": false,
           "multiple": false,
           "name": "key",
           "required": true
         }
       ],
-      "command": "gm workspace create",
+      "command": "gm project create",
       "examples": [
-        "gm workspace create launch --name Launch"
+        "gm project create launch --name Launch"
       ],
       "mutates": true,
       "options": [
@@ -510,10 +558,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -531,37 +579,37 @@
           "required": false
         }
       ],
-      "summary": "Create a workspace with an immutable slug",
-      "usage": "gm workspace create [OPTIONS] --name <NAME> <KEY>"
+      "summary": "Create a project with an immutable slug",
+      "usage": "gm project create [OPTIONS] --name <NAME> <KEY>"
     },
     {
       "arguments": [
         {
-          "description": "Canonical ID, team key or workspace slug",
+          "description": "Canonical ID, team key or project slug",
           "flag": false,
           "multiple": false,
           "name": "id",
           "required": true
         }
       ],
-      "command": "gm workspace update",
+      "command": "gm project update",
       "examples": [
-        "gm workspace update launch --data '{\"archived\":true}'"
+        "gm project update launch --data '{\"archived\":true}'"
       ],
       "mutates": true,
       "options": [
         {
-          "description": "JSON object of mutable fields; use '-' for stdin or '@path' for a file. Team fields: name, description, memberIds and archived. Workspace fields: name, description and archived. Member IDs are canonical",
+          "description": "JSON object of mutable fields; use '-' for stdin or '@path' for a file. Team fields: name, description, memberIds and archived. Project fields: name, description and archived. Member IDs are canonical",
           "flag": false,
           "multiple": false,
           "name": "--data",
           "required": true
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -580,7 +628,7 @@
         }
       ],
       "summary": "Update name, description or archived with version checking",
-      "usage": "gm workspace update [OPTIONS] --data <DATA> <ID>"
+      "usage": "gm project update [OPTIONS] --data <DATA> <ID>"
     },
     {
       "arguments": [
@@ -588,13 +636,13 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "workspace",
+          "name": "project",
           "required": true
         }
       ],
-      "command": "gm workspace subscribe",
+      "command": "gm project subscribe",
       "examples": [
-        "gm workspace subscribe launch --repo REPO_ID"
+        "gm project subscribe launch --repo REPO_ID"
       ],
       "mutates": true,
       "options": [
@@ -606,10 +654,10 @@
           "required": true
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -627,8 +675,8 @@
           "required": false
         }
       ],
-      "summary": "Associate an authorized repository ID with a workspace; grants no membership",
-      "usage": "gm workspace subscribe [OPTIONS] --repo <REPO> <WORKSPACE>"
+      "summary": "Associate an authorized same-Space repository ID with a project; grants no membership",
+      "usage": "gm project subscribe [OPTIONS] --repo <REPO> <PROJECT>"
     },
     {
       "arguments": [
@@ -640,17 +688,17 @@
           "required": true
         }
       ],
-      "command": "gm workspace unsubscribe",
+      "command": "gm project unsubscribe",
       "examples": [
-        "gm workspace unsubscribe SUBSCRIPTION_ID"
+        "gm project unsubscribe SUBSCRIPTION_ID"
       ],
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -669,7 +717,7 @@
         }
       ],
       "summary": "Remove a subscription by its canonical ID",
-      "usage": "gm workspace unsubscribe [OPTIONS] <ID>"
+      "usage": "gm project unsubscribe [OPTIONS] <ID>"
     },
     {
       "arguments": [
@@ -833,7 +881,7 @@
           "description": "",
           "flag": false,
           "multiple": true,
-          "name": "--workspace",
+          "name": "--project",
           "required": false
         },
         {
@@ -851,10 +899,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -879,7 +927,7 @@
       "arguments": [],
       "command": "gm issue list",
       "examples": [
-        "gm issue list --workspace launch --limit 20",
+        "gm issue list --project launch --limit 20",
         "gm issue list --type remediation"
       ],
       "mutates": false,
@@ -902,7 +950,7 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--workspace",
+          "name": "--project",
           "required": false
         },
         {
@@ -957,10 +1005,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1008,7 +1056,7 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--workspace",
+          "name": "--project",
           "required": false
         },
         {
@@ -1063,10 +1111,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1092,15 +1140,15 @@
       "command": "gm issue tags",
       "examples": [
         "gm issue tags",
-        "gm issue tags --owner orbit -o json"
+        "gm issue tags --space orbit -o json"
       ],
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1146,10 +1194,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1182,8 +1230,8 @@
       ],
       "command": "gm issue history",
       "examples": [
-        "gm issue history ENG-1 --owner orbit --limit 50",
-        "gm issue history ENG-1 --owner orbit --before 120 --json"
+        "gm issue history ENG-1 --space orbit --limit 50",
+        "gm issue history ENG-1 --space orbit --before 120 --json"
       ],
       "mutates": false,
       "options": [
@@ -1203,10 +1251,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1292,7 +1340,7 @@
       "mutates": true,
       "options": [
         {
-          "description": "JSON object of mutable fields; use '-' for stdin or '@path' for a file: title, description, acceptance, type, status, closeReason, timelineUse, timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds, tags (the whole list; `labels` is its old name), pickup and requires (an object, or null; --requires writes it from terms). Relationships use canonical IDs; null clears assigneeId/parentId. Setting status to canceled requires closeReason: duplicate, not_planned, obsolete, cannot_reproduce or other. Leaving canceled clears closeReason automatically, as leaving required clears timelinePolicy",
+          "description": "JSON object of mutable fields; use '-' for stdin or '@path' for a file: title, description, acceptance, type, status, closeReason, timelineUse, timelinePolicy, priority (0–4), assigneeId, parentId, projectIds, tags (the whole list; `labels` is its old name), pickup and requires (an object, or null; --requires writes it from terms). Relationships use canonical IDs; null clears assigneeId/parentId. Setting status to canceled requires closeReason: duplicate, not_planned, obsolete, cannot_reproduce or other. Leaving canceled clears closeReason automatically, as leaving required clears timelinePolicy",
           "flag": false,
           "multiple": false,
           "name": "--data",
@@ -1332,7 +1380,7 @@
           "required": false
         },
         {
-          "description": "When new requirements no longer allow the agent holding the issue, release its claim instead of keeping it (tracker owners and the agent's person). Either way gm prints who's affected and the issue records it",
+          "description": "When new requirements no longer allow the agent holding the issue, release its claim instead of keeping it (Space admins and the agent's person). Either way gm prints who's affected and the issue records it",
           "flag": true,
           "multiple": false,
           "name": "--release-claim",
@@ -1377,10 +1425,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1438,10 +1486,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1479,10 +1527,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1527,10 +1575,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1575,10 +1623,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1623,10 +1671,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1695,17 +1743,17 @@
           "required": false
         },
         {
-          "description": "Take over someone else's active claim (tracker owners, as themselves). Their token stops working; the takeover is noted on the issue",
+          "description": "Take over someone else's active claim (Space admins, as themselves). Their token stops working; the takeover is noted on the issue",
           "flag": true,
           "multiple": false,
           "name": "--force",
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1772,7 +1820,7 @@
           "required": false
         },
         {
-          "description": "For a credential: the secret to store the answer as, owner/repo:NAME",
+          "description": "For a credential: the secret to store the answer as, space/repo:NAME",
           "flag": false,
           "multiple": false,
           "name": "--secret",
@@ -1800,10 +1848,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1848,10 +1896,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1911,10 +1959,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -1959,10 +2007,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2014,10 +2062,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2062,10 +2110,10 @@
           "required": true
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2122,7 +2170,7 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--workspace",
+          "name": "--project",
           "required": false
         },
         {
@@ -2168,10 +2216,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2223,10 +2271,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2272,17 +2320,17 @@
           "required": false
         },
         {
-          "description": "End someone else's claim without its token (tracker owners, as themselves); noted on the issue, not counted as their failure",
+          "description": "End someone else's claim without its token (Space admins, as themselves); noted on the issue, not counted as their failure",
           "flag": true,
           "multiple": false,
           "name": "--force",
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2335,10 +2383,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2362,7 +2410,7 @@
     {
       "arguments": [
         {
-          "description": "JSON array of {kind,id,expectedVersion?,data?}; use canonical IDs. Kinds: team.create/update, workspace.create/update, issue.create/update, link.add/remove, comment.add, subscription.add/remove. Lease operations are online-only and cannot be queued. Create data: team {key,name,description?,memberIds?}; workspace {slug,name,description?}; issue {teamId,title,...issue update fields}. Updates use the fields documented by `gm schema issue update`. link.add data: {fromId,toId,kind:blocks|related|duplicates}. comment.add data: {issueId,body,kind:comment|checkpoint|evidence}. subscription.add data: {workspaceId,repoId}. Removes need only kind/id. Updates require expectedVersion. Referenced creates must appear earlier",
+          "description": "JSON array of {kind,id,expectedVersion?,data?}; use canonical IDs. Kinds: team.create/update, workspace.create/update, issue.create/update, link.add/remove, comment.add, subscription.add/remove. Lease operations are online-only and cannot be queued. Create data: team {key,name,description?,memberIds?}; workspace {slug,name,description?}; issue {teamId,title,...issue update fields}. Updates use the fields documented by `gm schema issue update`. link.add data: {fromId,toId,kind:blocks|related|duplicates}. comment.add data: {issueId,body,kind:comment|checkpoint|evidence}. subscription.add data: {projectId,repoId}. Removes need only kind/id. Updates require expectedVersion. Referenced creates must appear earlier",
           "flag": false,
           "multiple": false,
           "name": "data",
@@ -2376,10 +2424,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2432,10 +2480,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2503,10 +2551,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -2544,10 +2592,10 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Immutable global Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -3337,7 +3385,7 @@
           "short": "r"
         },
         {
-          "description": "Repository on the server as owner/name (default: this repository's origin)",
+          "description": "Repository on the server as space/name (default: this repository's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -3441,7 +3489,7 @@
     {
       "arguments": [
         {
-          "description": "Repository as owner/name",
+          "description": "Repository as space/name",
           "flag": false,
           "multiple": false,
           "name": "repository",
@@ -3774,7 +3822,7 @@
           "required": false
         },
         {
-          "description": "Repositories it touches, owner/name (repeatable). Default: this checkout's repository, or the parent timeline's repositories with --from <timeline>",
+          "description": "Repositories it touches, space/name (repeatable). Default: this checkout's repository, or the parent timeline's repositories with --from <timeline>",
           "flag": false,
           "multiple": true,
           "name": "--repo",
@@ -3788,12 +3836,11 @@
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Start a timeline forked from main (or another timeline), then work in it here",
@@ -3820,19 +3867,18 @@
           "required": false
         },
         {
-          "description": "Only open timelines with no push for the account's idle period; experimental ones, which aren't expected to land, are left out",
+          "description": "Only open timelines with no push for the Space's idle period; experimental ones, which aren't expected to land, are left out",
           "flag": true,
           "multiple": false,
           "name": "--stalled",
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "List the tracker's timelines, newest first",
@@ -3872,12 +3918,11 @@
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Show a timeline (default: this checkout's) and its events",
@@ -3902,12 +3947,11 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Work in a timeline here: pushes go to its bookmark, never to main (`use main` to go back)",
@@ -3961,12 +4005,11 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "End a timeline and archive its work sources; keep this checkout's push guard",
@@ -4006,12 +4049,11 @@
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Record a checkpoint: the timeline's pushed commits now, with a summary, for a person to approve",
@@ -4035,12 +4077,11 @@
       "mutates": false,
       "options": [
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "List a timeline's checkpoints, newest first, with CI runs, previews and approvals",
@@ -4073,12 +4114,11 @@
           "short": "c"
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Revive a checkpoint's preview (default: the newest): rebuild it from its commits in CI",
@@ -4125,12 +4165,11 @@
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "The wiki pages a timeline affects, written at its checkpoints (or now, with --write)",
@@ -4155,12 +4194,11 @@
       "mutates": true,
       "options": [
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Land the approved source tree compactly onto main after gates pass",
@@ -4210,12 +4248,11 @@
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Rename a timeline (default: this checkout's), or flag it experimental or clear the flag",
@@ -4266,12 +4303,11 @@
           "required": false
         },
         {
-          "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",
+          "description": "Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Convert a legacy timeline to owned work sources; renew its checkpoint and approval afterward",
@@ -4302,7 +4338,7 @@
           "required": false
         },
         {
-          "description": "Canonical repository owner/name (default: this checkout's origin)",
+          "description": "Canonical repository space/name (default: this checkout's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -4337,7 +4373,7 @@
           "required": false
         },
         {
-          "description": "Canonical repository owner/name (default: this checkout's origin)",
+          "description": "Canonical repository space/name (default: this checkout's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -4671,17 +4707,24 @@
       "arguments": [],
       "command": "gm settings ai show",
       "examples": [
-        "gm settings ai show",
-        "gm settings ai show --owner orbit",
+        "gm settings ai show --space orbit",
+        "gm settings ai show --person jun",
         "gm settings ai show --site"
       ],
       "mutates": false,
       "options": [
         {
-          "description": "Account slug; defaults to the signed-in person, never the repository owner",
+          "description": "Space handle; defaults to your authorized personal default Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Personal assistant/avatar logging for this person (self-only)",
+          "flag": false,
+          "multiple": false,
+          "name": "--person",
           "required": false
         },
         {
@@ -4699,19 +4742,26 @@
       "arguments": [],
       "command": "gm settings ai set",
       "examples": [
-        "gm settings ai set --owner orbit --knowledge off --dry-run",
+        "gm settings ai set --space orbit --knowledge off --dry-run",
+        "gm settings ai set --person jun --log-bodies assistant=off",
         "gm settings ai set --site --log-bodies on",
-        "gm settings ai set --owner orbit --log-bodies assistant=off --log-bodies avatars=default",
-        "gm settings ai set --owner orbit --classification clef --fast glm-5.3-flash --task gemma-4-26b-a4b-it",
-        "gm settings ai set --owner orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60"
+        "gm settings ai set --space orbit --classification clef --fast glm-5.3-flash --task gemma-4-26b-a4b-it",
+        "gm settings ai set --space orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60"
       ],
       "mutates": true,
       "options": [
         {
-          "description": "Account slug; defaults to the signed-in person, never the repository owner",
+          "description": "Space handle; defaults to your authorized personal default Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Personal assistant/avatar body logging (self-only); only --log-bodies applies",
+          "flag": false,
+          "multiple": false,
+          "name": "--person",
           "required": false
         },
         {
@@ -4801,14 +4851,14 @@
           "required": false
         },
         {
-          "description": "Keep AI request and response bodies in gateway logs: on|off|default for every component, or COMPONENT=on|off|default (repeatable). default follows the site (with --site: the environment). While on, prompts and replies, including repository code and assistant conversations, are kept in Cloudflare's AI Gateway logs, readable in the Cloudflare dashboard, and deleted oldest-first",
+          "description": "Keep AI request and response bodies in gateway logs: on|off|default for every component in this scope, or COMPONENT=on|off|default (repeatable). default follows the site (with --site: the environment). While on, prompts and replies, including repository code and assistant conversations, are kept in Cloudflare's AI Gateway logs, readable in the Cloudflare dashboard, and deleted oldest-first",
           "flag": false,
           "multiple": true,
           "name": "--log-bodies",
           "required": false
         }
       ],
-      "summary": "Change future jobs only; human account/org owner or site admin required",
+      "summary": "Change future jobs only; Space admin or site admin required",
       "usage": "gm settings ai set [OPTIONS] <--knowledge <KNOWLEDGE>|--wiki <WIKI>|--atlas <ATLAS>|--release-notes <RELEASE_NOTES>|--classification <CLASSIFICATION>|--fast <FAST>|--task <TASK>|--knowledge-quiet-minutes <KNOWLEDGE_QUIET_MINUTES>|--knowledge-max-wait-minutes <KNOWLEDGE_MAX_WAIT_MINUTES>|--log-bodies <[COMPONENT=]on|off|default>>"
     },
     {
@@ -4892,17 +4942,25 @@
       ],
       "command": "gm retention show",
       "examples": [
-        "gm retention show",
-        "gm retention show ci-logs --owner orbit",
+        "gm retention show --space orbit",
+        "gm retention show ci-logs --space orbit",
+        "gm retention show --person jun",
         "gm retention show --site"
       ],
       "mutates": false,
       "options": [
         {
-          "description": "Account slug; defaults to the signed-in person, never the repository owner",
+          "description": "Space handle; defaults to your authorized personal default Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Personal categories for this person (self-only), separate from Space content",
+          "flag": false,
+          "multiple": false,
+          "name": "--person",
           "required": false
         },
         {
@@ -4928,7 +4986,7 @@
       ],
       "command": "gm retention set",
       "examples": [
-        "gm retention set ci-logs --enable --owner orbit",
+        "gm retention set ci-logs --enable --space orbit",
         "gm retention set ci-runs --threshold days=90 --threshold keepLatest=10",
         "gm retention set ci-logs --inherit --reset days",
         "gm retention set registry-audit --enable --site"
@@ -4971,10 +5029,17 @@
           "required": false
         },
         {
-          "description": "Account slug; defaults to the signed-in person, never the repository owner",
+          "description": "Space handle; defaults to your authorized personal default Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Personal categories for this person (self-only), separate from Space content",
+          "flag": false,
+          "multiple": false,
+          "name": "--person",
           "required": false
         },
         {
@@ -4985,7 +5050,7 @@
           "required": false
         }
       ],
-      "summary": "Enable, disable or reset a category, or change its thresholds (account owners or site administrators)",
+      "summary": "Enable, disable or reset a category, or change its thresholds (Space admins or site administrators)",
       "usage": "gm retention set [OPTIONS] <--enable|--disable|--inherit|--threshold <KEY=VALUE>|--reset <KEY>> <CATEGORY>"
     },
     {
@@ -5000,8 +5065,8 @@
       ],
       "command": "gm retention run",
       "examples": [
-        "gm retention run ci-logs ci-runs --dry-run",
-        "gm retention run ci-logs --threshold ci-logs.days=14 --yes",
+        "gm retention run ci-logs ci-runs --space orbit --dry-run",
+        "gm retention run ci-logs --space orbit --threshold ci-logs.days=14 --yes",
         "gm retention run auth-hygiene --site --dry-run"
       ],
       "mutates": true,
@@ -5036,10 +5101,17 @@
           "required": false
         },
         {
-          "description": "Account slug; defaults to the signed-in person, never the repository owner",
+          "description": "Space handle; defaults to your authorized personal default Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Personal categories for this person (self-only), separate from Space content",
+          "flag": false,
+          "multiple": false,
+          "name": "--person",
           "required": false
         },
         {
@@ -5065,9 +5137,9 @@
       ],
       "command": "gm retention runs",
       "examples": [
-        "gm retention runs",
+        "gm retention runs --space orbit",
         "gm retention runs --site --limit 5",
-        "gm retention runs 12 --owner orbit"
+        "gm retention runs 12 --space orbit"
       ],
       "mutates": false,
       "options": [
@@ -5086,10 +5158,17 @@
           "required": false
         },
         {
-          "description": "Account slug; defaults to the signed-in person, never the repository owner",
+          "description": "Space handle; defaults to your authorized personal default Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
+          "required": false
+        },
+        {
+          "description": "Personal categories for this person (self-only), separate from Space content",
+          "flag": false,
+          "multiple": false,
+          "name": "--person",
           "required": false
         },
         {
@@ -5126,17 +5205,17 @@
       ],
       "command": "gm repo create",
       "examples": [
-        "gm repo create demo",
-        "gm repo create engine --owner orbit --import https://github.com/lukeed/clsx"
+        "gm repo create demo --space orbit",
+        "gm repo create engine --space orbit --import https://github.com/lukeed/clsx"
       ],
       "mutates": true,
       "options": [
         {
-          "description": "Owner (you, or an org you belong to). Default: you",
+          "description": "Immutable global Space handle in which to create the repository",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false
+          "name": "--space",
+          "required": true
         },
         {
           "description": "",
@@ -5161,7 +5240,7 @@
         }
       ],
       "summary": "Create a repository, empty or imported from a public Git URL",
-      "usage": "gm repo create [OPTIONS] <NAME>"
+      "usage": "gm repo create [OPTIONS] --space <SPACE> <NAME>"
     },
     {
       "arguments": [
@@ -5355,7 +5434,7 @@
       "mutates": false,
       "options": [
         {
-          "description": "Repository as owner/name (default: this repository's origin)",
+          "description": "Repository as space/name (default: this repository's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -5419,7 +5498,7 @@
       "mutates": false,
       "options": [
         {
-          "description": "Repository as owner/name (default: this repository's origin)",
+          "description": "Repository as space/name (default: this repository's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -5449,7 +5528,7 @@
       "mutates": false,
       "options": [
         {
-          "description": "Repository as owner/name (default: this repository's origin)",
+          "description": "Repository as space/name (default: this repository's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -5479,9 +5558,9 @@
       ],
       "command": "gm release feed",
       "examples": [
-        "gm release feed --owner orbit",
+        "gm release feed --space orbit",
         "gm release feed --team CORE since:30d",
-        "gm release feed kind:tag repo:engine -o json",
+        "gm release feed project:launch -o json",
         "gm release feed release:day:2026-10-02"
       ],
       "mutates": false,
@@ -5494,10 +5573,10 @@
           "required": false
         },
         {
-          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "description": "Tracker Space handle; otherwise use saved tracker context",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -5521,7 +5600,7 @@
       "mutates": false,
       "options": [
         {
-          "description": "Repository as owner/name (default: this repository's origin)",
+          "description": "Repository as space/name (default: this repository's origin)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -5758,7 +5837,7 @@
       "mutates": false,
       "options": [
         {
-          "description": "Only take jobs from this repository (owner/name)",
+          "description": "Only take jobs from this repository (space/name)",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -6268,10 +6347,10 @@
           "required": false
         },
         {
-          "description": "Tracker owner; seeds .gitmatrix/agents.yml (default: origin's owner)",
+          "description": "Tracker Space; seeds .gitmatrix/agents.yml (default: origin's Space)",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         },
         {
@@ -6279,6 +6358,13 @@
           "flag": false,
           "multiple": false,
           "name": "--team",
+          "required": false
+        },
+        {
+          "description": "Project `gm issue next` picks from",
+          "flag": false,
+          "multiple": false,
+          "name": "--project",
           "required": false
         },
         {
@@ -6382,7 +6468,7 @@
       "command": "gm agent list",
       "examples": [
         "gm agent list",
-        "gm agent list --owner orbit"
+        "gm agent list --space orbit"
       ],
       "mutates": false,
       "options": [
@@ -6390,11 +6476,11 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
+          "name": "--space",
           "required": false
         }
       ],
-      "summary": "Your agents and advisory capabilities, optionally from an owner's tracker",
+      "summary": "Your agents and advisory capabilities, optionally from a Space's tracker",
       "usage": "gm agent list [OPTIONS]"
     },
     {
@@ -6751,7 +6837,7 @@
       "mutates": false,
       "options": [
         {
-          "description": "owner/name it's about; defaults to this checkout's repository",
+          "description": "space/name it's about; defaults to this checkout's repository",
           "flag": false,
           "multiple": false,
           "name": "--repo",
@@ -6830,20 +6916,19 @@
       "command": "gm pkg list",
       "examples": [
         "gm pkg list",
-        "gm pkg list -O orbit"
+        "gm pkg list --space orbit"
       ],
       "mutates": false,
       "options": [
         {
-          "description": "Owner (user or org). Default: this repository's owner, else you",
+          "description": "Space handle. Default: this repository's Space or saved tracker Space",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
-      "summary": "An owner's packages, most recently published first",
+      "summary": "A Space's packages, most recently published first",
       "usage": "gm pkg list [OPTIONS]"
     },
     {
@@ -6867,9 +6952,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "One package: latest version, tags, sources, counts and the install command",
@@ -6923,9 +7007,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "A package's publishes, newest first, filtered by a query",
@@ -6974,12 +7057,11 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
-      "summary": "Delete versions (owner admins); name them, or select them with --query",
+      "summary": "Delete versions (Space admins); name them, or select them with --query",
       "usage": "gm pkg delete [OPTIONS] <PACKAGE> [VERSIONS]..."
     },
     {
@@ -7024,9 +7106,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Yank versions (Cargo, PyPI): still resolvable when pinned, never chosen",
@@ -7074,9 +7155,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Undo a yank or a deprecation",
@@ -7124,9 +7204,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Deprecate npm versions with a message",
@@ -7167,9 +7246,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Point a tag at a version (npm dist-tag, Docker tag)",
@@ -7195,9 +7273,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Repositories allowed to publish a package",
@@ -7230,12 +7307,11 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
-      "summary": "Allow a repository (owner/name) to publish a package",
+      "summary": "Allow a repository (space/name) to publish a package",
       "usage": "gm pkg grant [OPTIONS] <PACKAGE> <REPO>"
     },
     {
@@ -7265,9 +7341,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Stop a repository publishing a package",
@@ -7337,9 +7412,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         }
       ],
       "summary": "Upload a file as a generic package: gm pkg upload dist/app.tgz app/1.4.0",
@@ -7357,7 +7431,7 @@
       ],
       "command": "gm pkg download",
       "examples": [
-        "gm pkg download gm/latest/linux-x86_64/gm -O orbit --dest ./gm",
+        "gm pkg download gm/latest/linux-x86_64/gm --space orbit --dest ./gm",
         "gm pkg download app/1.4.0/app.tgz"
       ],
       "mutates": true,
@@ -7366,9 +7440,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         },
         {
           "description": "Destination file (default: the artifact's basename)",
@@ -7400,9 +7473,9 @@
       ],
       "command": "gm pkg install",
       "examples": [
-        "gm pkg install gm -O orbit",
-        "gm pkg install gm -O orbit --force",
-        "gm pkg install gm -O orbit --version <commit> --bin-dir ./bin"
+        "gm pkg install gm --space orbit",
+        "gm pkg install gm --space orbit --force",
+        "gm pkg install gm --space orbit --version <commit> --bin-dir ./bin"
       ],
       "mutates": true,
       "options": [
@@ -7410,9 +7483,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         },
         {
           "default": "latest",
@@ -7452,7 +7524,7 @@
       "command": "gm pkg setup",
       "examples": [
         "gm pkg setup",
-        "gm pkg setup -O orbit --write npm,docker"
+        "gm pkg setup --space orbit --write npm,docker"
       ],
       "mutates": true,
       "options": [
@@ -7460,9 +7532,8 @@
           "description": "",
           "flag": false,
           "multiple": false,
-          "name": "--owner",
-          "required": false,
-          "short": "O"
+          "name": "--space",
+          "required": false
         },
         {
           "description": "Also write it: npm (~/.npmrc) and docker (docker login)",
@@ -7472,7 +7543,7 @@
           "required": false
         }
       ],
-      "summary": "Configure npm, Docker, pip, Cargo… on this machine for an owner's registries",
+      "summary": "Configure npm, Docker, pip, Cargo… on this machine for a Space's registries",
       "usage": "gm pkg setup [OPTIONS]"
     },
     {
@@ -7495,7 +7566,7 @@
       "command": "gm api",
       "examples": [
         "gm api GET /repos",
-        "gm api POST /repos -d '{\"owner\":\"jun\",\"name\":\"x\",\"visibility\":\"private\"}'"
+        "gm api POST /repos -d '{\"spaceId\":\"SPACE_ID\",\"name\":\"x\",\"visibility\":\"private\"}'"
       ],
       "mutates": true,
       "options": [

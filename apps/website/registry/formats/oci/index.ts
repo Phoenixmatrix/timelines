@@ -399,6 +399,9 @@ async function patchUpload(c: AppContext, name: OciName, uuid: string): Promise<
     tailKey = await writeTail(svc.bucket, claimed, appended.tail);
     const next = await commit(stub, claimed, {
       repoId: claimed.repoId,
+      spaceId: claimed.spaceId,
+      migrationEpoch: claimed.migrationEpoch,
+      initiator: claimed.initiator,
       name: claimed.name,
       r2Key: claimed.r2Key,
       partSize: claimed.partSize,

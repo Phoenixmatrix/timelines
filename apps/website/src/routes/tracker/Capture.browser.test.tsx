@@ -15,12 +15,12 @@ test("capture menu preserves the draft and scope without submitting; Enter still
       data: { key: "ENG", name: "Engineering", memberIds: ["acc_marco"] },
     },
     {
-      kind: "workspace.create",
-      id: "capture-workspace",
+      kind: "project.create",
+      id: "capture-project",
       data: { slug: "mobile", name: "Mobile" },
     },
   ]);
-  renderApp("/tracker/orbit?captureTeam=capture-team&q=ws%3Amobile");
+  renderApp("/tracker/orbit?captureTeam=capture-team&q=project%3Amobile");
   const title = page.getByRole("textbox", { name: "New issue title", exact: true });
   await title.fill("Keep the capture draft");
   const mark = server.requests.length;
@@ -48,7 +48,7 @@ test("capture menu preserves the draft and scope without submitting; Enter still
     expect.objectContaining({
       title: "Keep the capture draft",
       teamId: "capture-team",
-      workspaceIds: ["capture-workspace"],
+      projectIds: ["capture-project"],
     }),
   ]);
 });
@@ -191,22 +191,72 @@ test("capture tags wrap below the fields without moving the heading or tracker p
   ]);
   renderApp("/tracker/orbit?captureTeam=capture-team");
   const heading = page.getByRole("heading", { name: "Issues", level: 1 });
-  const owner = page.getByRole("combobox", { name: "Tracker owner" });
+  const space = page.getByRole("combobox", { name: "Tracker space" });
   const title = page.getByRole("textbox", { name: "New issue title", exact: true });
   await expect.element(title).toBeVisible();
   const centre = (box: DOMRect) => box.top + box.height / 2;
   const before = {
     heading: centre(heading.element().getBoundingClientRect()),
-    owner: centre(owner.element().getBoundingClientRect()),
+    space: centre(space.element().getBoundingClientRect()),
     title: centre(title.element().getBoundingClientRect()),
   };
   expect(Math.abs(before.heading - before.title)).toBeLessThanOrEqual(1);
-  expect(Math.abs(before.owner - before.title)).toBeLessThanOrEqual(1);
+  expect(Math.abs(before.space - before.title)).toBeLessThanOrEqual(1);
   await title.fill("(latency) Investigate slow startup");
   await expect
     .element(page.getByRole("button", { name: "Define tag “latency”", exact: true }))
     .toBeVisible();
   expect(centre(heading.element().getBoundingClientRect())).toBeCloseTo(before.heading, 0);
-  expect(centre(owner.element().getBoundingClientRect())).toBeCloseTo(before.owner, 0);
+  expect(centre(space.element().getBoundingClientRect())).toBeCloseTo(before.space, 0);
   expect(centre(title.element().getBoundingClientRect())).toBeCloseTo(before.title, 0);
+});
+
+test("multi-Project creation and editing retain Team identity and send the exact Space contract", async () => {
+  const server = await TestServer.start({ world: true });
+  await mutate(server, [
+    { kind: "team.create", id: "multi-team", data: { key: "MUL", name: "Multi project" } },
+    { kind: "project.create", id: "mobile", data: { slug: "mobile", name: "Mobile" } },
+    { kind: "project.create", id: "shipping", data: { slug: "shipping", name: "Shipping" } },
+  ]);
+  const scope = await server.trackerContract("orbit");
+  const operations: string[] = [];
+  server.on("POST", "/api/tracker/orbit/mutate", ({ body }) => {
+    expect(body).toMatchObject(scope);
+    const request = body as { operationId: string };
+    expect(request.operationId).toBeTruthy();
+    operations.push(request.operationId);
+    return server.call("POST", "/api/tracker/orbit/mutate", body);
+  });
+  const app = renderApp(
+    "/tracker/orbit?captureTeam=multi-team&q=project%3Amobile&source=source-1#evidence-context",
+  );
+  await page
+    .getByRole("textbox", { name: "New issue title", exact: true })
+    .fill("Ship on two projects");
+  await page.getByRole("button", { name: "More create options" }).click();
+  await page.getByRole("menuitem", { name: "Add details" }).click();
+  const dialog = page.getByRole("dialog", { name: "Create an issue" });
+  await expect.element(dialog.getByRole("checkbox", { name: "Mobile", exact: true })).toBeChecked();
+  await dialog.getByRole("checkbox", { name: "Shipping", exact: true }).click();
+  await dialog.getByRole("button", { name: "Create and edit" }).click();
+  await expect.element(dialog).not.toBeInTheDocument();
+  let snapshot = await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot");
+  const created = snapshot.issues.find((issue) => issue.title === "Ship on two projects")!;
+  expect(created).toMatchObject({ teamId: "multi-team", key: "MUL-1" });
+  expect([...created.projectIds].sort()).toEqual(["mobile", "shipping"]);
+  await page.getByRole("checkbox", { name: "Shipping", exact: true }).click();
+  await expect
+    .poll(async () => {
+      snapshot = await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot");
+      return snapshot.issues.find((issue) => issue.id === created.id)!.projectIds;
+    })
+    .toEqual(["mobile"]);
+  expect(snapshot.issues.find((issue) => issue.id === created.id)).toMatchObject({
+    teamId: "multi-team",
+    key: "MUL-1",
+  });
+  await app.waitForUrl(
+    (url) => url.searchParams.get("source") === "source-1" && url.hash === "#evidence-context",
+  );
+  expect(new Set(operations).size).toBe(operations.length);
 });

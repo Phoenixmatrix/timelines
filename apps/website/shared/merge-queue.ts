@@ -37,7 +37,7 @@ export interface QueueFailure {
 }
 export interface QueueEntry {
   id: string;
-  repo: { id: string; owner: string; name: string };
+  repo: { id: string; space: string; name: string };
   commit: string;
   branch: string;
   sourceBranch: string;

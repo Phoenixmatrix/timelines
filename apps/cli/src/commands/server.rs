@@ -480,17 +480,17 @@ pub fn git_credential(operation: &str) {
     }
 }
 
-/// owner/name of the repository in the current directory, from its origin URL.
+/// space/name of the repository in the current directory, from its origin URL.
 pub(crate) fn current_repo(ctx: &Ctx) -> Result<String> {
     let repo = git2::Repository::discover(&ctx.cwd)
-        .map_err(|_| GmError::usage("Name a repository: owner/name."))?;
+        .map_err(|_| GmError::usage("Name a repository: space/name."))?;
     // Transport rewrites must not replace the canonical repository identity.
     let config = repo.config()?;
     let origin = config.get_entry("remote.origin.url").ok();
     let url = origin
         .as_ref()
         .and_then(|entry| entry.value().ok())
-        .ok_or_else(|| GmError::usage("This repository has no origin; name one: owner/name."))?;
+        .ok_or_else(|| GmError::usage("This repository has no origin; name one: space/name."))?;
     let path = url.trim_end_matches('/').trim_end_matches(".git");
     let mut parts = path.rsplit('/');
     match (parts.next(), parts.next()) {
@@ -507,27 +507,31 @@ pub fn repo(ctx: &Ctx, command: &RepoCommand) -> Result<Json> {
         RepoCommand::List => Ok(Json(remote::api(&config, "GET", "/repos", None)?)),
         RepoCommand::Create {
             name,
-            owner,
+            space,
             description,
             public,
             import,
         } => {
-            let owner = match owner {
-                Some(o) => o.clone(),
-                None => {
-                    let session = remote::api(&config, "GET", "/session", None)?;
-                    session["viewer"]["slug"]
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| {
-                            GmError::new("unauthenticated", "Sign in to create repositories.")
-                                .hint("`gm auth login --persona <name>`")
-                                .exit(exit::AUTH)
-                        })?
-                }
-            };
+            if space.is_empty()
+                || !space
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(GmError::usage("Pass --space <global-space-handle>."));
+            }
+            let destination = remote::api(&config, "GET", &format!("/spaces/{space}"), None)?;
+            if destination["capabilities"]["canCreateRepository"] != true {
+                return Err(GmError::new(
+                    "forbidden",
+                    "You cannot create repositories in this Space.",
+                )
+                .exit(exit::AUTH));
+            }
+            let space_id = destination["space"]["id"].as_str().ok_or_else(|| {
+                GmError::new("protocol_error", "The Space response has no immutable id.")
+            })?;
             let body = json!({
-                "owner": owner,
+                "spaceId": space_id,
                 "name": name,
                 "description": description.clone().unwrap_or_default(),
                 "visibility": if *public { "public" } else { "private" },
@@ -537,7 +541,7 @@ pub fn repo(ctx: &Ctx, command: &RepoCommand) -> Result<Json> {
                 return Ok(Json(json!({ "dry_run": true, "request": body })));
             }
             let mut created = remote::api(&config, "POST", "/repos", Some(&body))?;
-            created["clone"] = json!(format!("gm clone {owner}/{name}"));
+            created["clone"] = json!(format!("gm clone {space}/{name}"));
             Ok(Json(created))
         }
         RepoCommand::Mirror(command) => mirror(ctx, &config, command),

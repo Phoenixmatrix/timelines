@@ -130,9 +130,18 @@ export function AtlasLookup({
 }) {
   const [text, setText] = useState(url.q);
   const written = useRef(url.q);
+  // Addresses this field wrote that haven't arrived yet, oldest first: a late
+  // one is the field's own earlier text, never a reason to undo newer typing.
+  const pending = useRef<string[]>([]);
   // Back/Forward change the address under the field: follow it.
   useEffect(() => {
+    const own = pending.current.indexOf(url.q);
+    if (own >= 0) {
+      pending.current.splice(0, own + 1);
+      return;
+    }
     if (url.q === written.current) return;
+    pending.current = [];
     written.current = url.q;
     setText(url.q);
   }, [url.q]);
@@ -195,6 +204,7 @@ export function AtlasLookup({
             onChange={(event) => {
               setText(event.target.value);
               written.current = event.target.value;
+              pending.current.push(event.target.value);
               setShowMatches(true);
               onQuery(event.target.value);
             }}

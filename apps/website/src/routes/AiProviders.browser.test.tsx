@@ -1,4 +1,4 @@
-// Settings → AI providers (CORE-294): an account owner connects OpenRouter
+// Settings → AI providers (CORE-294): an explicit Space admin connects OpenRouter
 // with their own key, finds a model by searching its catalog, adds it, and
 // chooses it in AI settings; models in use can't be removed. TypeSafe and
 // OpenRouter are the in-memory fakes in worker/testing/ai-providers.ts.
@@ -16,9 +16,9 @@ async function choose(name: string, option: string) {
   await expect.element(page.getByRole("listbox")).not.toBeInTheDocument();
 }
 
-test("an owner connects OpenRouter, adds a model from search and uses it for Fast work", async () => {
+test("a Space admin connects OpenRouter, adds a model from search and uses it for Fast work", async () => {
   const server = await TestServer.start({ world: true, persona: "marco" });
-  const app = renderApp("/settings/ai-providers?owner=orbit");
+  const app = renderApp("/settings/ai-providers?space=orbit");
   await expect.element(page.getByRole("heading", { name: "AI providers", level: 1 })).toBeVisible();
   const openRouter = page.getByRole("region", { name: "OpenRouter" });
   await expect.element(openRouter.getByText("Not connected")).toBeVisible();
@@ -32,7 +32,7 @@ test("an owner connects OpenRouter, adds a model from search and uses it for Fas
   await userEvent.click(openRouter.getByRole("button", { name: "Replace key" }));
   await expect.element(openRouter.getByLabelText("New OpenRouter API key")).toHaveValue("");
   await userEvent.click(openRouter.getByRole("button", { name: "Keep current key" }));
-  const stored = await server.call<AiProvidersView>("GET", "/api/accounts/orbit/ai-providers");
+  const stored = await server.call<AiProvidersView>("GET", "/api/spaces/orbit/ai-providers");
   expect(JSON.stringify(stored)).not.toContain("browser-9999");
 
   // The catalog offers only text models, searchable by name or id.
@@ -69,7 +69,7 @@ test("an owner connects OpenRouter, adds a model from search and uses it for Fas
   await choose("Fast model", "Google: Gemini 3 Flash (OpenRouter)");
   await userEvent.click(page.getByRole("button", { name: "Save AI settings" }));
   await expect.element(page.getByText(/AI settings saved for @orbit/)).toBeVisible();
-  const settings = await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai");
+  const settings = await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai");
   expect(settings.models.fast).toBe("openrouter:google/gemini-3-flash");
   expect(settings.catalog.classification.map((option) => option.id)).not.toContain(
     "openrouter:google/gemini-3-flash",
@@ -90,7 +90,7 @@ test("an owner connects OpenRouter, adds a model from search and uses it for Fas
 
 test("TypeSafe's refused key saves nothing; Jev becomes a Classification choice once added", async () => {
   const server = await TestServer.start({ world: true, persona: "marco" });
-  renderApp("/settings/ai-providers?owner=orbit");
+  renderApp("/settings/ai-providers?space=orbit");
   const typeSafe = page.getByRole("region", { name: "TypeSafe" });
   await userEvent.fill(typeSafe.getByLabelText("TypeSafe API key"), "wrong-key-1234");
   await userEvent.click(typeSafe.getByRole("button", { name: "Connect" }));
@@ -108,23 +108,23 @@ test("TypeSafe's refused key saves nothing; Jev becomes a Classification choice 
   await expect
     .element(typeSafe.getByRole("heading", { name: "Add models" }))
     .not.toBeInTheDocument();
-  const settings = await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai");
+  const settings = await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai");
   expect(settings.catalog.classification.map((option) => option.id)).toContain(
     "typesafe:jev-latest",
   );
   expect(settings.catalog.fast.some((option) => option.provider)).toBe(false);
 });
 
-test("an organization member sees the account's providers read-only", async () => {
+test("an explicitly granted Space member sees the Space's providers read-only", async () => {
   const server = await TestServer.start({ world: true, persona: "marco" });
-  await server.call("PUT", "/api/accounts/orbit/ai-providers/openrouter", {
+  await server.call("PUT", "/api/spaces/orbit/ai-providers/openrouter", {
     apiKey: "sk-or-v1-owner-4321",
   });
-  await server.call("POST", "/api/accounts/orbit/ai-providers/openrouter/models", {
+  await server.call("POST", "/api/spaces/orbit/ai-providers/openrouter/models", {
     model: "anthropic/claude-sonnet-5",
   });
   await server.as("jun");
-  renderApp("/settings/ai-providers?owner=orbit");
+  renderApp("/settings/ai-providers?space=orbit");
   await expect.element(page.getByText(/Read-only access/)).toBeVisible();
   const openRouter = page.getByRole("region", { name: "OpenRouter" });
   await expect.element(openRouter.getByText(/key ending 4321/)).toBeVisible();

@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { STEP_ARTIFACT_LIMITS } from "../../apps/website/shared/steps.ts";
 import { collectCandidates, planUploads } from "../visuals/upload.ts";
 
-test("planUploads takes pngs and mermaid files, sorted, and warns about the rest", () => {
+await test("planUploads takes pngs and mermaid files, sorted, and warns about the rest", () => {
   const { uploads, warnings } = planUploads([
     { file: "b shot.png", size: 10 },
     { file: "notes.txt", size: 1 },
@@ -21,7 +21,7 @@ test("planUploads takes pngs and mermaid files, sorted, and warns about the rest
   assert.equal(warnings.length, 2);
 });
 
-test("planUploads stops at the per-run limit", () => {
+await test("planUploads stops at the per-run limit", () => {
   const files = Array.from({ length: STEP_ARTIFACT_LIMITS.perRun + 2 }, (_, n) => ({
     file: `shot ${String(n).padStart(3, "0")}.png`,
     size: 1,
@@ -31,7 +31,7 @@ test("planUploads stops at the per-run limit", () => {
   assert.equal(warnings.length, 2);
 });
 
-test("collectCandidates warns about a dangling link and a directory instead of failing", async () => {
+await test("collectCandidates warns about a dangling link and a directory instead of failing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "visuals-"));
   try {
     await writeFile(join(dir, "ok.png"), "x");

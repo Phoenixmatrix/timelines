@@ -3,14 +3,14 @@
 # graph-work skill current, and records each checkout's agent (name, harness,
 # model, tags) in .gitmatrix/agent.local.yml, which isn't committed.
 #
-# tracker:       owner, and the default scope for `gm issue next`:
+# tracker:       space, and the default scope for `gm issue next`:
 #                team: CORE, or under: CORE-4 for one project
 # ttl:           seconds per lease (renew before it ends)
 # instructions:  file: AGENTS.md (default: the harness's own)
 #                ship: how work ships before an issue is completed
 
 tracker:
-  owner: matrixorg
+  space: matrixorg
   team: CORE
 ttl: 3600
 instructions:

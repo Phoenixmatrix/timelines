@@ -48,7 +48,7 @@ function items(w: LinkedWork): Item[] {
       group: "Agent work",
       key: `step:${s.repo.id}:${s.commitOid}`,
       label: s.summary || s.commitOid.slice(0, 10),
-      meta: `${s.repo.owner}/${s.repo.name} · ${short(s.commitOid)} · ${s.author.name ?? s.author.id}${s.verified ? "" : " · unverified"}`,
+      meta: `${s.repo.space}/${s.repo.name} · ${short(s.commitOid)} · ${s.author.name ?? s.author.id}${s.verified ? "" : " · unverified"}`,
       href: s.href,
       at: s.committedAt,
     })),
@@ -56,7 +56,7 @@ function items(w: LinkedWork): Item[] {
       group: "Commits",
       key: `commit:${c.repo.id}:${c.oid}`,
       label: c.summary ?? `Commit ${short(c.oid)}`,
-      meta: `${c.repo.owner}/${c.repo.name} · ${short(c.oid)} · ${c.sources.join(", ")}`,
+      meta: `${c.repo.space}/${c.repo.name} · ${short(c.oid)} · ${c.sources.join(", ")}`,
       href: c.href,
       at: c.at,
     })),
@@ -64,7 +64,7 @@ function items(w: LinkedWork): Item[] {
       group: "CI runs",
       key: `run:${r.repo.id}:${r.number}`,
       label: `Run #${r.number} ${r.title ? `· ${r.title}` : ""}`,
-      meta: `${r.repo.owner}/${r.repo.name} · ${r.status} · ${r.kind}`,
+      meta: `${r.repo.space}/${r.repo.name} · ${r.status} · ${r.kind}`,
       href: r.href,
       at: r.createdAt,
     })),
@@ -73,7 +73,7 @@ function items(w: LinkedWork): Item[] {
       key: `deploy:${d.id}`,
       label: d.environment,
       meta: [
-        `${d.repo.owner}/${d.repo.name} · ${d.status} · ${short(d.commit)}`,
+        `${d.repo.space}/${d.repo.name} · ${d.status} · ${short(d.commit)}`,
         d.provider
           ? `${d.provider.service} ${d.provider.versionId.slice(0, 8)}${d.percentage !== null ? ` (${d.percentage}%)` : ""}`
           : "no provider version recorded",
@@ -125,7 +125,7 @@ function items(w: LinkedWork): Item[] {
       group: "Release notes",
       key: `note:${n.repo.id}:${n.release}:${n.title}`,
       label: n.title,
-      meta: `${n.repo.owner}/${n.repo.name} · ${n.label} · ${n.category}`,
+      meta: `${n.repo.space}/${n.repo.name} · ${n.label} · ${n.category}`,
       href: n.href,
       at: n.shippedAt,
     })),
@@ -161,7 +161,7 @@ function ItemRow({ item }: { item: Item }) {
 
 /** A mentioning commit, then its runs and packages, indented under it. */
 function MentionRow({ mention }: { mention: WorkMention }) {
-  const repo = `${mention.repo.owner}/${mention.repo.name}`;
+  const repo = `${mention.repo.space}/${mention.repo.name}`;
   const at = mention.committedAt ?? mention.pushedAt;
   return (
     <li data-linked-work="Mentioned in" data-commit={mention.oid}>
@@ -218,14 +218,14 @@ function MentionRow({ mention }: { mention: WorkMention }) {
  * section headings so the panel matches where it sits.
  */
 export function LinkedWorkPanel({
-  owner,
+  space,
   issueId,
   issueKey,
   span = null,
   now = Date.now(),
   headingClassName = "m-0 text-label text-ink-muted",
 }: {
-  owner: string;
+  space: string;
   issueId: string;
   issueKey: string;
   span?: WorkSpan | null;
@@ -237,7 +237,7 @@ export function LinkedWorkPanel({
     const controller = new AbortController();
     setWork({ state: "loading" });
     api<LinkedWork>(
-      `/tracker/${encodeURIComponent(owner)}/issues/${encodeURIComponent(issueId)}/work`,
+      `/tracker/${encodeURIComponent(space)}/issues/${encodeURIComponent(issueId)}/work`,
       { signal: controller.signal },
     )
       .then((value) => setWork({ state: "ready", work: value }))
@@ -250,7 +250,7 @@ export function LinkedWorkPanel({
         });
       });
     return () => controller.abort();
-  }, [owner, issueId]);
+  }, [space, issueId]);
 
   if (work.state === "loading")
     return (

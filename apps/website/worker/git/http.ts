@@ -4,6 +4,7 @@ import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { landingJob } from "../ci/landing.ts";
 import { queueMergeJob } from "../ci/queue-auth.ts";
+import { captureWorkAuthority, resolveWorkAuthority } from "../ci/admission.ts";
 import { findRepo, roleFor, sqlNow } from "../db.ts";
 import { jobSecret } from "../deployments/job.ts";
 import { invalidateRefs } from "../objects.ts";
@@ -28,9 +29,9 @@ import { TrackerError } from "../tracker/store.ts";
 import { errorDetails } from "../api/http.ts";
 
 // Git smart HTTP: https://git-scm.com/docs/http-protocol
-//   GET  /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
-//   POST /:owner/:repo.git/git-upload-pack    (clone, fetch)
-//   POST /:owner/:repo.git/git-receive-pack   (push)
+//   GET  /:space/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
+//   POST /:space/:repo.git/git-upload-pack    (clone, fetch)
+//   POST /:space/:repo.git/git-receive-pack   (push)
 // Each request is authorized here, then streamed to the repository's
 // Artifacts remote with a short-lived repo token the client never sees.
 // Personal and agent tokens (gmx_…) act as their account; a CI job's
@@ -60,7 +61,7 @@ export function scrubbedError(error: unknown): string {
     .slice(0, 300);
 }
 
-gitHttp.get("/:owner/:repo{[^/]+\\.git}/info/refs", async (c) => {
+gitHttp.get("/:space/:repo{[^/]+\\.git}/info/refs", async (c) => {
   const service = c.req.query("service");
   if (!service || !SERVICES.has(service)) {
     // The "dumb" protocol is not offered.
@@ -69,7 +70,7 @@ gitHttp.get("/:owner/:repo{[^/]+\\.git}/info/refs", async (c) => {
   return proxy(c, service as Service, "info/refs");
 });
 
-gitHttp.post("/:owner/:repo{[^/]+\\.git}/:service{git-(?:upload|receive)-pack}", (c) => {
+gitHttp.post("/:space/:repo{[^/]+\\.git}/:service{git-(?:upload|receive)-pack}", (c) => {
   const service = c.req.param("service") as Service;
   return proxy(c, service, service);
 });
@@ -84,7 +85,7 @@ function challenge(message: string) {
 type UpstreamRepo = { artifacts_name: string; artifacts_remote: string };
 
 async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
-  const owner = c.req.param("owner") ?? "";
+  const space = c.req.param("space") ?? "";
   const address = (c.req.param("repo") ?? "").replace(/\.git$/, "");
   const separator = address.indexOf("@");
   const name = separator < 0 ? address : address.slice(0, separator);
@@ -102,18 +103,18 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   const jobToken = jobSecret(c.req.header("authorization"));
   if (jobToken) {
     if (timelineSlug !== null) {
-      const job = await jobCaller(c.env.DB, jobToken);
+      const job = await jobCaller(c.env, jobToken);
       if (!job || job.sourceId === "canonical" || service !== "git-upload-pack")
         return c.text("This job cannot access this source.\n", 403);
       const source = await getWorkSource(c.env, job.repoId, job.sourceId);
       if (!source || source.timeline_slug !== timelineSlug)
         return c.text("This job cannot access this source.\n", 403);
       const resolved = await ciSource(c.env, job.repoId, job.sourceId, { runId: job.runId });
-      if (resolved.owner_slug !== owner || resolved.name !== name)
+      if (resolved.space_slug !== space || resolved.name !== name)
         return c.text("Repository not found.\n", 404);
       return workRead(c, resolved, service, endpoint);
     }
-    return landingProxy(c, service, endpoint, owner, name, jobToken);
+    return landingProxy(c, service, endpoint, space, name, jobToken);
   }
 
   const credential = await tokenCredential(c);
@@ -122,9 +123,9 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   }
   const actor = credential.kind === "token" ? credential.actor : null;
   const repo =
-    (await findRepo(c.env.DB, actor, owner, name)) ??
+    (await findRepo(c.env.DB, actor, space, name)) ??
     (service === "git-upload-pack" && actor
-      ? await teardownCheckout(c.env.DB, actor, owner, name)
+      ? await teardownCheckout(c.env.DB, actor, space, name)
       : null);
   const role = repo ? roleFor(repo, actor) : "none";
 
@@ -134,7 +135,7 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   }
   if (!atLeast(role, needed)) {
     return actor
-      ? c.text(`${actor.slug} does not have write access to ${owner}/${name}.\n`, 403)
+      ? c.text(`${actor.slug} does not have write access to ${space}/${name}.\n`, 403)
       : challenge("Authentication required to push.\n");
   }
   if (needed === "write" && credential.kind === "token" && credential.scope !== "write") {
@@ -145,7 +146,7 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
       .selectFrom("timeline_work_sources")
       .selectAll()
       .where("repo_id", "=", repo.id)
-      .where("owner_id", "=", repo.owner_id)
+      .where("space_id", "=", repo.space_id)
       .where("timeline_slug", "=", timelineSlug)
       .executeTakeFirst();
     if (!source) return c.text("Timeline work source not found; migrate legacy work first.\n", 404);
@@ -296,6 +297,9 @@ async function workPush(
   timelineId: string,
   actor: Actor,
 ) {
+  // A repository write: the pusher's credential and write right on this
+  // repository, re-resolved below, never a Tracker grant (collaborators have none).
+  const authority = await captureWorkAuthority(c.env, repo.id, actor);
   const encoding = c.req.header("content-encoding")?.toLowerCase();
   if (encoding && encoding !== "identity" && encoding !== "gzip")
     return c.text("Unsupported content encoding.\n", 415);
@@ -320,10 +324,19 @@ async function workPush(
       await forward(c, repo, "git-receive-pack", "git-receive-pack", request.body, true),
     );
   const operationId = crypto.randomUUID();
-  const tracker = trackerObject(c.env, repo.owner_id);
-  if ((await reconcileSourcePushes(c.env, repo.id, repo.source_id)).length) {
-    await recordPush(c.env, repo, null);
-    afterPush(c.env, repo, null, (work) => c.executionCtx.waitUntil(work));
+  const tracker = trackerObject(c.env, repo.space_id);
+  for (const settledId of await reconcileSourcePushes(c.env, repo.id, repo.source_id)) {
+    const settled = await tracker.sourcePushForSettlement({
+      spaceId: repo.space_id,
+      repoId: repo.id,
+      sourceId: repo.source_id,
+      operationId: settledId,
+    });
+    if (!settled.ok) throw new Error(settled.error);
+    if (settled.value.state !== "accepted") continue;
+    const initiating = await resolveWorkAuthority(c.env, settled.value.authority, repo.id);
+    await recordPush(c.env, repo, initiating.actor);
+    afterPush(c.env, repo, initiating.actor, (work) => c.executionCtx.waitUntil(work));
   }
   const commands = request.commands.map((command) => ({
     ...command,
@@ -331,6 +344,7 @@ async function workPush(
     new: command.new,
   }));
   const admitted = await tracker.beginSourcePush({
+    authority,
     operationId,
     timelineId,
     repoId: repo.id,
@@ -362,6 +376,7 @@ async function workPush(
           operationId,
           "before-provider",
         );
+        await resolveWorkAuthority(c.env, authority, repo.id);
         forwarding = true;
         await sourcePushFixtureBoundary(
           c.env,
@@ -399,15 +414,18 @@ async function workPush(
       for (const command of commands) await retainProgress(c.env, repo, operationId, command.new);
       await recordPush(c.env, repo, actor);
     }
-    const finished = await tracker.finishSourcePush(
-      operationId,
+    const finished = await tracker.finishSourcePushForSettlement(
+      { spaceId: repo.space_id, repoId: repo.id, sourceId: repo.source_id, operationId },
       accepted ? "accepted" : "rejected",
     );
     if (!finished.ok) throw new Error(finished.error);
     if (accepted) afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
     return new Response(bytes, { status: response.status, headers: response.headers });
   } catch (error) {
-    await tracker.finishSourcePush(operationId, forwarding ? "ambiguous" : "rejected");
+    await tracker.finishSourcePushForSettlement(
+      { spaceId: repo.space_id, repoId: repo.id, sourceId: repo.source_id, operationId },
+      forwarding ? "ambiguous" : "rejected",
+    );
     throw error;
   }
 }
@@ -421,10 +439,10 @@ async function workPush(
 async function teardownCheckout(
   d1: D1Database,
   actor: NonNullable<Parameters<typeof findRepo>[1]>,
-  owner: string,
+  space: string,
   name: string,
 ) {
-  const repo = await findRepo(d1, actor, owner, name, { deleting: true });
+  const repo = await findRepo(d1, actor, space, name, { deleting: true });
   if (!repo?.deleted_at || !atLeast(roleFor(repo, actor), "write")) return null;
   const running = await db(d1)
     .selectFrom("ci_jobs as j")
@@ -449,12 +467,12 @@ async function landingProxy(
   c: Context<AppEnv>,
   service: Service,
   endpoint: string,
-  owner: string,
+  space: string,
   name: string,
   secret: string,
 ) {
-  const landing = await landingJob(c.env.DB, secret, owner, name);
-  const access = landing.ok ? landing : await queueMergeJob(c.env.DB, secret, owner, name);
+  const landing = await landingJob(c.env, secret, space, name);
+  const access = landing.ok ? landing : await queueMergeJob(c.env, secret, space, name);
   if (!access.ok) return c.text(`${access.error}\n`, access.status);
   if (service === "git-upload-pack" || endpoint === "info/refs")
     return respond(await forward(c, access.repo, service, endpoint, c.req.raw.body));
@@ -482,7 +500,7 @@ async function landingProxy(
     return c.text(`${refusal}\n`, 403);
   }
   if (!("slug" in access)) {
-    const current = await queueMergeJob(c.env.DB, secret, owner, name, access.queueId);
+    const current = await queueMergeJob(c.env, secret, space, name, access.queueId);
     if (!current.ok || current.runId !== access.runId || current.attempt !== access.attempt) {
       await request.body.cancel().catch(() => {});
       return c.text("This queue merge attempt is no longer current.\n", 403);

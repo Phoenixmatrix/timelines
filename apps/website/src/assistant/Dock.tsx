@@ -10,7 +10,7 @@ import {
   TrashIcon,
   XIcon,
 } from "@phosphor-icons/react";
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState, type ComponentProps } from "react";
 import type { AssistantChat } from "../../shared/assistant.ts";
 import { popMotion, Tip } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
@@ -83,8 +83,8 @@ export function AssistantDock() {
   }, []);
 
   if (!assistant.open) return null;
-  // Once preloaded, render it directly: even a resolved lazy() waits a frame.
-  const Chat = loaded?.default ?? LazyChat;
+  // Keep the lazy component identity after preload. Swapping to its resolved
+  // component remounts a live composer when the history request finishes.
   const current = chats?.find((c) => c.id === assistant.chatId);
   const title = assistant.fresh ? "New conversation" : current?.title || "Conversation";
 
@@ -153,26 +153,52 @@ export function AssistantDock() {
             </button>
           </Tip>
         </header>
-        <Suspense
-          fallback={
-            loaded ? (
-              <loaded.ChatPlaceholder page={page} />
-            ) : (
-              <div className="flex-1" aria-busy="true" />
-            )
-          }
-        >
-          <Chat
+        {current?.contentUnavailable ? (
+          <section className="flex flex-1 flex-col gap-3 p-4" aria-label="Unavailable conversation">
+            <h3 className="m-0 text-title">Content unavailable</h3>
+            <p className="m-0 text-body-sm text-ink-muted">
+              This conversation contains content whose current access cannot be verified. It cannot
+              be reopened, downloaded or reused by the assistant. The original conversation remains
+              stored; start a new chat with sources you can currently access.
+            </p>
+          </section>
+        ) : (
+          <Conversation
             key={assistant.chatId}
             chatId={assistant.chatId}
             fresh={assistant.fresh}
+            loading={chats === null}
             page={page}
             compact={phone}
             onTurnEnd={refresh}
           />
-        </Suspense>
+        )}
       </aside>
     </div>
+  );
+}
+
+function Conversation({
+  loading,
+  ...props
+}: ComponentProps<typeof LazyChat> & { loading: boolean }) {
+  // Sending the first message persists the chat, but must not replace its live
+  // connection with an access loader or start a competing initial-history read.
+  const [fresh] = useState(props.fresh);
+  if (loading && !fresh)
+    return <div className="flex-1" aria-busy="true" aria-label="Loading conversation access" />;
+  return (
+    <Suspense
+      fallback={
+        loaded ? (
+          <loaded.ChatPlaceholder page={props.page} />
+        ) : (
+          <div className="flex-1" aria-busy="true" />
+        )
+      }
+    >
+      <LazyChat {...props} fresh={fresh} />
+    </Suspense>
   );
 }
 

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { AgentPresence } from "../../shared/agent-presence.ts";
 import {
   branchEnvironment,
@@ -11,44 +11,119 @@ import {
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { mintJobToken } from "../ci/registry.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import { CONTENT_CONTRACT_HEADER } from "../../shared/spaces.ts";
 import { deployments, placement } from "./api.ts";
 import { jobRoute } from "./job.ts";
 import { previewSettingsApi } from "./settings.ts";
+import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
+import { Tracker } from "../tracker/object.ts";
+import { accessFor } from "../tracker/access.ts";
+import { findSpaceById } from "../spaces/access.ts";
 
 // loadRepo's module reaches the knowledge coordinator, a Durable Object.
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 const DAY = 24 * 60 * 60 * 1000;
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, registry, env, close } = await createFreshSpaceTestEnvironment();
+  onTestFinished(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('acc_ann', 'user', 'ann', 'Ann'), ('acc_bob', 'user', 'bob', 'Bob'),
       ('acc_cat', 'user', 'cat', 'Cat');
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role)
-      VALUES ('acc_org', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('acc_org', 'acc_ann', 'owner'), ('acc_org', 'acc_cat', 'member');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'acc_ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
-      ('repo', 'acc_org', 'app', 'private', 'a', 'https://a'),
-      ('other', 'acc_org', 'site', 'private', 'b', 'https://b');
-    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, agent_id, status)
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "org", slug: "orbit-company", displayName: "Orbit", kind: "company" },
+    space: { id: "space", slug: "orbit", displayName: "Orbit" },
+    actorId: "acc_ann",
+    members: [
+      {
+        accountId: "acc_ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+      {
+        accountId: "acc_cat",
+        role: "member",
+        grant: { role: "member", repositoryRole: "read", packageRole: "read" },
+      },
+    ],
+  });
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "bob-org",
+      slug: "bob-personal",
+      displayName: "Bob",
+      kind: "personal",
+      personalAccountId: "acc_bob",
+    },
+    space: { id: "bob-space", slug: "bob", displayName: "Bob" },
+    actorId: "acc_bob",
+    members: [
+      {
+        accountId: "acc_bob",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+      ('repo', 'space', 'app', 'private', 'a', 'https://a'),
+      ('other', 'space', 'site', 'private', 'b', 'https://b');`);
+  const ann = await issueToken(env.DB, "acc_ann", "ann", "write");
+  const agent = await issueToken(env.DB, "acc_ann", "agent", "write", undefined, "agt_builder");
+  const state = fakeDurableState({ name: "space" });
+  onTestFinished(() => state.db.close());
+  Reflect.set(env, "TRACKER", { idFromName: fakeDurableObjectId });
+  await initializeFreshTrackerSpace(env, state.ctx, "space");
+  const tracker = new Tracker(state.ctx, env);
+  Reflect.set(env, "TRACKER", {
+    idFromName: fakeDurableObjectId,
+    getByName(name: string) {
+      if (name !== "space") throw new Error(`Unexpected Tracker Space ${name}`);
+      return tracker;
+    },
+  });
+  const space = await findSpaceById(env.DB, "space");
+  if (!space) throw new Error("Missing seeded Space");
+  const access = await accessFor(env, space, "acc_ann", null, true, {
+    kind: "token",
+    id: ann.id,
+  });
+  const createdTimeline = await tracker.createTimeline(access, {
+    slug: "fast-search",
+    parent: null,
+    repos: [{ id: "repo", space: "orbit", name: "app" }],
+    commits: { repo: oid(8) },
+  });
+  if (!createdTimeline.ok) throw new Error(createdTimeline.error);
+  const authority = await captureWorkAuthority(env, "repo", {
+    id: "acc_ann",
+    credential: { kind: "token", id: ann.id },
+  });
+  const agentAuthority = await captureWorkAuthority(env, "repo", {
+    id: "acc_ann",
+    agent: { id: "agt_builder", name: "builder" },
+    credential: { kind: "token", id: agent.id },
+  });
+  sqlite.exec(`
+    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, agent_id, status, space_id, migration_epoch, authority)
       VALUES
-      ('run1', 'repo', 7, '${oid(7)}', 'main', 'push', 'acc_ann', 'agt_builder', 'running'),
-      ('run2', 'repo', 8, '${oid(8)}', 'timeline/fast-search', 'push', 'acc_ann', NULL, 'running'),
-      ('run3', 'repo', 9, '${oid(9)}', 'topic', 'push', 'acc_ann', NULL, 'running');
+      ('run1', 'repo', 7, '${oid(7)}', 'main', 'push', 'acc_ann', 'agt_builder', 'running', 'space', ${agentAuthority.migrationEpoch}, '${JSON.stringify(agentAuthority)}'),
+      ('run2', 'repo', 8, '${oid(8)}', 'timeline/fast-search', 'push', 'acc_ann', NULL, 'running', 'space', ${authority.migrationEpoch}, '${JSON.stringify(authority)}'),
+      ('run3', 'repo', 9, '${oid(9)}', 'topic', 'push', 'acc_ann', NULL, 'running', 'space', ${authority.migrationEpoch}, '${JSON.stringify(authority)}');
     INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
       ('job1', 'run1', 'repo', 'deploy', '{}', 'running', 'sandbox'),
       ('job2', 'run2', 'repo', 'preview', '{}', 'running', 'sandbox'),
       ('job3', 'run3', 'repo', 'preview', '{}', 'running', 'sandbox'),
       ('job4', 'run1', 'repo', 'done', '{}', 'succeeded', 'sandbox');
   `);
-  const registry = migratedRegistryDatabase();
-  const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as unknown as Env;
   const app = new Hono<AppEnv>();
   // As worker/app.ts: a job credential passes only to its deployment routes.
   app.use("*", async (c, next) => {
@@ -62,19 +137,19 @@ async function setup() {
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/settings/previews", previewSettingsApi);
-  app.route("/api/repos/:owner/:name", deployments);
+  app.route("/api/spaces/:space/settings/previews", previewSettingsApi);
+  app.route("/api/repos/:space/:name", deployments);
   const token = async (user: string, scope: "read" | "write" = "write", agent?: string) =>
     (await issueToken(env.DB, user, `t-${Math.random()}`, scope, undefined, agent)).secret;
   const tokens = {
-    ann: await token("acc_ann"),
-    agent: await token("acc_ann", "write", "agt_builder"),
+    ann: ann.secret,
+    agent: agent.secret,
     bob: await token("acc_bob"),
     cat: await token("acc_cat"),
-    deploy: await mintJobToken(env.DB, "job1", 30),
-    preview: await mintJobToken(env.DB, "job2", 30),
-    topic: await mintJobToken(env.DB, "job3", 30),
-    ended: await mintJobToken(env.DB, "job4", 30),
+    deploy: await mintJobToken(env, "job1", 30),
+    preview: await mintJobToken(env, "job2", 30),
+    topic: await mintJobToken(env, "job3", 30),
+    ended: await mintJobToken(env, "job4", 30),
   };
   const call = async (token: string, method: string, path: string, body?: unknown) => {
     const pending: Promise<unknown>[] = [];
@@ -82,7 +157,11 @@ async function setup() {
       path,
       {
         method,
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          [CONTENT_CONTRACT_HEADER]: "4",
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
       },
       env,
@@ -97,8 +176,95 @@ async function setup() {
     await Promise.all(pending);
     return { status: response.status, json: (await response.json()) as never };
   };
-  return { call, tokens, sqlite, registry, env };
+  return {
+    call,
+    tokens,
+    sqlite,
+    registry,
+    env,
+    authority,
+    agentAuthority,
+    close,
+    timeline: createdTimeline.value,
+  };
 }
+
+test("a running job cannot publish after its original initiating credential is revoked", async () => {
+  const t = await setup();
+  try {
+    t.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(t.agentAuthority.credential.id);
+    expect(
+      (
+        await t.call(t.tokens.deploy, "POST", "/api/repos/orbit/app/deployments", {
+          url: "https://app.example.com",
+        })
+      ).status,
+    ).toBe(401);
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM deployments").get()).toEqual({ n: 0 });
+  } finally {
+    t.close();
+  }
+});
+
+test("a person with write access takes over a pre-Spaces deployment with their own authority", async () => {
+  const t = await setup();
+  try {
+    // Converted from before Spaces: no initiating authority, none inferred.
+    t.sqlite
+      .exec(`INSERT INTO deployments (id, repo_id, environment, commit_oid, url, status, authority)
+      VALUES (50, 'repo', 'production', '${oid(50)}', 'https://legacy.example.com', 'active', NULL)`);
+    const path = "/api/repos/orbit/app/deployments/50";
+    const row = () =>
+      t.sqlite.prepare("SELECT status, authority FROM deployments WHERE id = 50").get() as {
+        status: string;
+        authority: string | null;
+      };
+    // A reader can't; nor can an agent or a CI job act for a record no person holds.
+    expect((await t.call(t.tokens.cat, "PATCH", path, { status: "expired" })).status).toBe(403);
+    expect((await t.call(t.tokens.agent, "PATCH", path, { status: "expired" })).status).toBe(403);
+    expect((await t.call(t.tokens.deploy, "PATCH", path, { status: "expired" })).status).toBe(403);
+    expect(row()).toEqual({ status: "active", authority: null });
+
+    const changed = await t.call(t.tokens.ann, "PATCH", path, { status: "expired" });
+    expect(changed.status).toBe(200);
+    expect(row().status).toBe("expired");
+    const kept = JSON.parse(row().authority!) as Record<string, unknown>;
+    expect(kept).toMatchObject({ personId: "acc_ann", agentId: null, spaceId: "space" });
+
+    // From then on the record's own authority governs it, as for any other.
+    t.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(t.authority.credential.id);
+    const fresh = await issueToken(t.env.DB, "acc_ann", "replacement", "write");
+    expect((await t.call(fresh.secret, "PATCH", path, { status: "active" })).status).toBe(403);
+  } finally {
+    t.close();
+  }
+});
+
+test("a live replacement token cannot adopt a deployment whose original credential was revoked", async () => {
+  const t = await setup();
+  try {
+    const created = await t.call(t.tokens.deploy, "POST", "/api/repos/orbit/app/deployments", {
+      url: "https://original.example.com",
+    });
+    expect(created.status).toBe(201);
+    const id = (created.json as Deployment).id;
+    t.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(t.agentAuthority.credential.id);
+    const changed = await t.call(t.tokens.ann, "PATCH", `/api/repos/orbit/app/deployments/${id}`, {
+      status: "expired",
+      url: "https://replacement.example.com",
+    });
+    expect(changed.status).toBe(403);
+    expect(
+      t.sqlite.prepare("SELECT status,url,authority FROM deployments WHERE id=?").get(id),
+    ).toEqual({
+      status: "active",
+      url: "https://original.example.com",
+      authority: JSON.stringify(t.agentAuthority),
+    });
+  } finally {
+    t.close();
+  }
+});
 
 describe("recording deployments", () => {
   test("a CI job records its run's commit, inferring production from the default branch", async () => {
@@ -142,8 +308,7 @@ describe("recording deployments", () => {
     expect(deployment).toMatchObject({
       environment: "timeline/fast-search",
       timeline: "fast-search",
-      // No tracker in this test: the slug is kept, the id unknown.
-      timelineId: null,
+      timelineId: t.timeline.id,
       checkpoint: "cp_3",
       commit: oid(8),
       run: 8,
@@ -157,13 +322,13 @@ describe("recording deployments", () => {
   test("a revival's preview run records a rebuilt preview of its checkpoint (CORE-79)", async () => {
     const t = await setup();
     t.sqlite.exec(`
-      INSERT INTO deployments (id, repo_id, environment, timeline_slug, checkpoint_id, commit_oid, url, status)
-        VALUES (40, 'repo', 'timeline/fast-search', 'fast-search', 'cp_2', '${oid(11)}', 'https://old.example', 'expired');
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status,
+      INSERT INTO deployments (id, repo_id, environment, timeline_slug, checkpoint_id, commit_oid, url, status, authority)
+        VALUES (40, 'repo', 'timeline/fast-search', 'fast-search', 'cp_2', '${oid(11)}', 'https://old.example', 'expired', '${JSON.stringify(t.authority)}');
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status, space_id, migration_epoch, authority,
                            preview_action, timeline_slug, checkpoint_id, preview_revived, preview_rebuilt_from)
-        VALUES ('run5', 'repo', 11, '${oid(11)}', 'timeline/fast-search', 'manual', 'acc_ann', 'running',
+        VALUES ('run5', 'repo', 11, '${oid(11)}', 'timeline/fast-search', 'manual', 'acc_ann', 'running', 'space', ${t.authority.migrationEpoch}, '${JSON.stringify(t.authority)}',
                 'create', 'fast-search', 'cp_2', 1, 40),
-               ('run6', 'repo', 12, '${oid(12)}', 'timeline/fast-search', 'manual', 'acc_ann', 'running',
+               ('run6', 'repo', 12, '${oid(12)}', 'timeline/fast-search', 'manual', 'acc_ann', 'running', 'space', ${t.authority.migrationEpoch}, '${JSON.stringify(t.authority)}',
                 'create', 'fast-search', 'cp_3', 0, NULL);
       INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
         ('job6', 'run5', 'repo', 'preview', '{}', 'running', 'sandbox'),
@@ -171,7 +336,7 @@ describe("recording deployments", () => {
     `);
     const path = "/api/repos/orbit/app/deployments";
     const url = "https://fast-search.preview.example.com";
-    const rebuilt = await t.call(await mintJobToken(t.env.DB, "job6", 30), "POST", path, { url });
+    const rebuilt = await t.call(await mintJobToken(t.env, "job6", 30), "POST", path, { url });
     expect(rebuilt.status).toBe(201);
     expect(rebuilt.json as Deployment).toMatchObject({
       environment: "timeline/fast-search",
@@ -182,7 +347,7 @@ describe("recording deployments", () => {
       expiryPinned: false,
     });
     // A first build is the original; an explicit expiry is pinned.
-    const original = await t.call(await mintJobToken(t.env.DB, "job7", 30), "POST", path, {
+    const original = await t.call(await mintJobToken(t.env, "job7", 30), "POST", path, {
       url,
       expiresAt: "2030-01-01T00:00:00Z",
     });
@@ -229,13 +394,13 @@ describe("recording deployments", () => {
   test("a job on a nested branch records into its normalised branch/<name>", async () => {
     const t = await setup();
     t.sqlite.exec(`
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status)
-        VALUES ('run4', 'repo', 10, '${oid(10)}', 'Feature/Login_v2.1+fix', 'push', 'acc_ann', 'running');
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status, space_id, migration_epoch, authority)
+        VALUES ('run4', 'repo', 10, '${oid(10)}', 'Feature/Login_v2.1+fix', 'push', 'acc_ann', 'running', 'space', ${t.authority.migrationEpoch}, '${JSON.stringify(t.authority)}');
       INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
         VALUES ('job5', 'run4', 'repo', 'preview', '{}', 'running', 'sandbox');
     `);
     const { status, json } = await t.call(
-      await mintJobToken(t.env.DB, "job5", 30),
+      await mintJobToken(t.env, "job5", 30),
       "POST",
       "/api/repos/orbit/app/deployments",
       { url: "https://login.example.com" },
@@ -288,6 +453,18 @@ describe("recording deployments", () => {
       agent: "builder",
       expiresAt: "2026-12-01T00:00:00.000Z",
     });
+    // A slug the tracker doesn't know still records, unlinked from any timeline.
+    const unknown = await t.call(t.tokens.ann, "POST", path, {
+      url: "https://b.example.com",
+      commit: oid(1),
+      timeline: "not-a-timeline",
+    });
+    expect(unknown.status).toBe(201);
+    expect(unknown.json as Deployment).toMatchObject({
+      environment: "timeline/not-a-timeline",
+      timeline: "not-a-timeline",
+      timelineId: null,
+    });
     // Readers can't record; strangers don't see the repository.
     expect(
       (await t.call(t.tokens.cat, "POST", path, { url: "https://a.example.com", commit: oid(1) }))
@@ -334,26 +511,34 @@ describe("reading and updating", () => {
         for (const [index, source] of ["work-a", "work-b"].entries()) {
           t.sqlite
             .prepare(
-              `INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,
+              `INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,
                 artifacts_name,artifacts_remote,state,initial_token_revoked,allocation_operation_id,
                 fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
-                VALUES(?,'repo',?,?,'acc_org',?,'https://owned','ready',1,?,
+                VALUES(?,'repo',?,?,'space',?,'https://owned','ready',1,?,
                   'canonical','head','tree','refs/heads/main','canonical','head','tree','refs/heads/main','now','now')`,
             )
             .run(source, source, source, source, source);
           t.sqlite
             .prepare(
-              `INSERT INTO ci_runs(id,repo_id,source_id,number,commit_oid,ref,trigger,status)
-                VALUES(?,'repo',?,?,?,'work','manual','running')`,
+              `INSERT INTO ci_runs(id,repo_id,source_id,number,commit_oid,ref,trigger,status,
+                actor_id,space_id,migration_epoch,authority)
+                VALUES(?,'repo',?,?,?,'work','manual','running','acc_ann','space',?,?)`,
             )
-            .run(source, source, 20 + index, oid(20 + index));
+            .run(
+              source,
+              source,
+              20 + index,
+              oid(20 + index),
+              t.authority.migrationEpoch,
+              JSON.stringify(t.authority),
+            );
           t.sqlite
             .prepare(
               `INSERT INTO ci_jobs(id,run_id,repo_id,source_id,name,spec,status,runner)
                 VALUES(?,?,'repo',?,'deploy','{}','running','sandbox')`,
             )
             .run(source, source, source);
-          callers.push({ source, token: await mintJobToken(t.env.DB, source, 30) });
+          callers.push({ source, token: await mintJobToken(t.env, source, 30) });
         }
         const made = new Map<string, Deployment>();
         for (const { source, token } of callers) {
@@ -478,9 +663,10 @@ describe("reading and updating", () => {
 describe("live timelines", () => {
   test("a job sees every source's live timeline slugs, and nothing else", async () => {
     const t = await setup();
+    const bound = `'space', ${t.authority.migrationEpoch}, '${JSON.stringify(t.authority)}'`;
     t.sqlite.exec(`
-      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
-      VALUES('work_a','repo','tl_a','search','acc_org','work-a','https://work-a','ready','allocate','canonical','c','t','refs/heads/main','canonical','c','t','refs/heads/main','2026-01-01','2026-01-01');
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES('work_a','repo','tl_a','search','space','work-a','https://work-a','ready','allocate','canonical','c','t','refs/heads/main','canonical','c','t','refs/heads/main','2026-01-01','2026-01-01');
       INSERT INTO deployments(repo_id,source_id,environment,timeline_slug,commit_oid,url,status) VALUES
         ('repo','work_a','timeline/search','search','${oid(1)}','https://secret-a.example','active'),
         ('repo','work_a','timeline/search','search','${oid(2)}','https://secret-b.example','sleeping'),
@@ -489,8 +675,8 @@ describe("live timelines", () => {
         ('repo','canonical','timeline/broken','broken','${oid(5)}',NULL,'failed'),
         ('repo','canonical','production',NULL,'${oid(6)}','https://app.example','active'),
         ('other','canonical','timeline/elsewhere','elsewhere','${oid(7)}','https://e.example','active');
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status)
-        VALUES ('run9', 'other', 1, '${oid(9)}', 'main', 'push', 'acc_ann', 'running');
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status, space_id, migration_epoch, authority)
+        VALUES ('run9', 'other', 1, '${oid(9)}', 'main', 'push', 'acc_ann', 'running', ${bound});
       INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
         VALUES ('job9', 'run9', 'other', 'reconcile', '{}', 'running', 'sandbox');
     `);
@@ -506,26 +692,34 @@ describe("live timelines", () => {
       timelines: ["search", "zebra"],
     });
     // Another repository's job may not; nor may a job that has ended.
-    const other = await mintJobToken(t.env.DB, "job9", 30);
+    const other = await mintJobToken(t.env, "job9", 30);
     expect((await t.call(other, "GET", path)).status).toBe(403);
     expect((await t.call(t.tokens.ended, "GET", path)).status).toBe(401);
     expect(
       (await t.call(other, "GET", "/api/repos/orbit/site/deployments/live-timelines")).json,
     ).toEqual({ timelines: ["elsewhere"] });
 
-    // A work source's own job (the timeline's preview runs, since CORE-255)
-    // sees every source's too.
+    // A work source's own job (the timeline's preview teardown runs reconcile,
+    // since CORE-255) sees every source's slugs too: the repository-wide
+    // exception that keeps CORE-372's janitor working. Records stay exact-source.
     t.sqlite.exec(`
       UPDATE timeline_work_sources SET initial_token_revoked=1 WHERE source_id='work_a';
-      INSERT INTO ci_runs (id, repo_id, source_id, number, commit_oid, ref, trigger, actor_id, status)
-        VALUES ('run10', 'repo', 'work_a', 10, '${oid(10)}', 'work', 'push', 'acc_ann', 'running');
+      INSERT INTO ci_runs (id, repo_id, source_id, number, commit_oid, ref, trigger, actor_id, status, space_id, migration_epoch, authority)
+        VALUES ('run10', 'repo', 'work_a', 10, '${oid(10)}', 'work', 'push', 'acc_ann', 'running', ${bound});
       INSERT INTO ci_jobs (id, run_id, repo_id, source_id, name, spec, status, runner)
         VALUES ('job10', 'run10', 'repo', 'work_a', 'preview-reconcile', '{}', 'running', 'sandbox');
     `);
-    const work = await mintJobToken(t.env.DB, "job10", 30);
+    const work = await mintJobToken(t.env, "job10", 30);
     const fromWork = await t.call(work, "GET", path);
     expect(fromWork.status).toBe(200);
     expect(fromWork.json).toEqual({ timelines: ["search", "zebra"] });
+    // Its deployment and environment lists remain its own source's only.
+    for (const list of ["deployments", "environments"]) {
+      const base = `/api/repos/orbit/app/${list}`;
+      expect((await t.call(work, "GET", base)).status).toBe(403);
+      expect((await t.call(work, "GET", `${base}?source=canonical`)).status).toBe(403);
+      expect((await t.call(work, "GET", `${base}?source=work_a`)).status).toBe(200);
+    }
   });
 });
 
@@ -582,7 +776,7 @@ describe("branchEnvironment", () => {
 describe("preview settings", () => {
   test("default to 2 and 7 days; owners change them, members read them", async () => {
     const t = await setup();
-    const path = "/api/accounts/orbit/settings/previews";
+    const path = "/api/spaces/orbit/settings/previews";
     expect((await t.call(t.tokens.cat, "GET", path)).json).toEqual({
       endedDays: 2,
       idleDays: 7,
@@ -612,9 +806,9 @@ describe("preview settings", () => {
     expect(days).toBeLessThanOrEqual(3);
   });
 
-  test("a user's own account is theirs to change", async () => {
+  test("a person's explicit personal Space grant permits settings changes", async () => {
     const t = await setup();
-    const path = "/api/accounts/bob/settings/previews";
+    const path = "/api/spaces/bob/settings/previews";
     expect((await t.call(t.tokens.bob, "PATCH", path, { endedDays: 5 })).status).toBe(200);
     expect((await t.call(t.tokens.ann, "GET", path)).status).toBe(404);
   });
@@ -669,7 +863,7 @@ describe("deployment recent presence", () => {
       );
       expect((secondPresence.json as AgentPresence).agents).toMatchObject([{ id: "agt_builder" }]);
     } finally {
-      t.sqlite.close();
+      t.close();
     }
   });
 });
@@ -688,8 +882,8 @@ describe("deployment provenance (CORE-351)", () => {
   /** Registry publishes: this repo's CI at each source and commit, a sibling, and strays. */
   function publishes(t: Awaited<ReturnType<typeof setup>>) {
     t.registry.exec(`
-      INSERT INTO repositories (id, owner_id, key, format, kind, visibility, config, created_at, updated_at) VALUES
-        ('feed', 'acc_org', 'orbit', 'npm', 'local', 'private', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+      INSERT INTO repositories (id, space_id, key, format, kind, visibility, config, created_at, updated_at) VALUES
+        ('feed', 'space', 'orbit', 'npm', 'local', 'private', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
       INSERT INTO packages (id, repo_id, name, normalized_name, created_at, updated_at) VALUES
         ('pkg', 'feed', '@orbit/app', '@orbit/app', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z'),
         ('sib', 'feed', '@orbit/sibling', '@orbit/sibling', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');

@@ -26,8 +26,8 @@ impl Render for Shown {
         if self.0.get("issueId").is_some() && self.0.get("events").is_some() {
             return history_text(&self.0);
         }
-        if let (Some(owner), Some(tags)) = (self.0["catalog"].as_str(), self.0["tags"].as_array()) {
-            return catalog_text(owner, tags);
+        if let (Some(space), Some(tags)) = (self.0["catalog"].as_str(), self.0["tags"].as_array()) {
+            return catalog_text(space, tags);
         }
         if let (Some(updates), Some(held)) =
             (self.0["leaseUpdates"].as_array(), self.0["held"].as_u64())
@@ -117,10 +117,10 @@ fn claim_effect_text(effect: &Value) -> String {
     }
 }
 /// `gm issue tags`: one line per tag, "ux  4 issues, 2 open".
-fn catalog_text(owner: &str, tags: &[Value]) -> String {
+fn catalog_text(space: &str, tags: &[Value]) -> String {
     if tags.is_empty() {
         return format!(
-            "{owner}'s tag catalog is empty. Tag an issue (gm issue create --tag ux) to start it."
+            "{space}'s tag catalog is empty. Tag an issue (gm issue create --tag ux) to start it."
         );
     }
     let width = tags
@@ -129,7 +129,7 @@ fn catalog_text(owner: &str, tags: &[Value]) -> String {
         .map(|n| n.chars().count())
         .max()
         .unwrap_or(0);
-    let mut out = format!("{owner}'s tag catalog\n");
+    let mut out = format!("{space}'s tag catalog\n");
     for tag in tags {
         let issues = tag["issues"].as_u64().unwrap_or(0);
         out.push_str(&format!(
@@ -330,14 +330,21 @@ pub(crate) struct Kept {
     pub(crate) issue: String,
     #[serde(default)]
     expires_at: Option<String>,
-    /// The tracker it's held in, and by whom (the claim's actor): what lease
-    /// updates (CORE-261) read, and whose own changes they leave out.
+    /// The Space whose tracker it's held in (its handle, immutable id and the
+    /// migration epoch its cursor belongs to), and by whom (the claim's actor):
+    /// what lease updates (CORE-261) read, and whose own changes they leave out.
+    /// A lease kept before Spaces has none, and is never asked about.
     #[serde(default)]
-    pub(crate) owner: String,
+    pub(crate) space: String,
+    #[serde(default)]
+    pub(crate) space_id: Option<String>,
+    #[serde(default)]
+    pub(crate) migration_epoch: Option<u64>,
     #[serde(default)]
     pub(crate) actor: Option<String>,
     /// The newest tracker cursor the holder has been told about: changes after
-    /// it are news. Set when the lease is taken; renewing keeps it.
+    /// it are news. Set when the lease is taken; renewing keeps it. It is only
+    /// meaningful within `space_id` and `migration_epoch`.
     #[serde(default)]
     pub(crate) seen: Option<u64>,
     /// The checkout it was taken in: hooks there tell its session.
@@ -406,7 +413,9 @@ pub(crate) fn kept_lease(config: &Config, issue_id: &str) -> Option<Kept> {
         identity: config.identity().unwrap_or(remote::Identity::Person),
         issue: String::new(),
         expires_at: None,
-        owner: String::new(),
+        space: String::new(),
+        space_id: None,
+        migration_epoch: None,
         actor: None,
         seen: None,
         checkout: None,
@@ -418,7 +427,7 @@ pub(crate) fn update_kept(config: &Config, issue_id: &str, change: impl FnOnce(&
     let Some(mut kept) = kept_lease(config, issue_id) else {
         return;
     };
-    if kept.owner.is_empty() || !change(&mut kept) {
+    if kept.space.is_empty() || !change(&mut kept) {
         return;
     }
     let _ = keep_lease(config, issue_id, &kept);
@@ -516,7 +525,7 @@ fn lease_token(
             "No lease token for {}: gm didn't claim it on this machine.",
             lease.issue
         ))
-        .hint("Pass --lease-token or GM_LEASE_TOKEN, or take work with `gm issue next`. A tracker owner can take a stuck claim over with `gm issue claim --force`.")
+        .hint("Pass --lease-token or GM_LEASE_TOKEN, or take work with `gm issue next`. A Space admin can take a stuck claim over with `gm issue claim --force`.")
     })?;
     Ok((kept.token, Some(kept.identity)))
 }
@@ -542,23 +551,42 @@ fn root(config: &Config) -> Result<PathBuf> {
         .join("tracker")
         .join(digest(&format!("{}\n{auth}", config.server()))))
 }
-/// The tracker account to act on: explicit, else `gm tracker use`, else .gitmatrix/agents.yml.
-pub(crate) fn selected_owner(config: &Config, explicit: Option<String>) -> Result<String> {
-    let owner = explicit
-        .or_else(|| fs::read_to_string(root(config).ok()?.join("selected")).ok())
-        .or_else(|| crate::profile::defaults().scope.owner)
-        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER`, pass --owner OWNER, or set tracker.owner in .gitmatrix/agents.yml."))?;
-    safe_owner(&owner)?;
-    Ok(owner)
+/// Explicit Space, else the immutable saved selection, else repository configuration.
+pub(crate) fn selected_space(config: &Config, explicit: Option<String>) -> Result<String> {
+    if let Some(space) = explicit {
+        safe_space(&space)?;
+        return Ok(space);
+    }
+    let root = root(config)?;
+    let selected = root.join("selected-v4.json");
+    if !selected.exists() && root.join("selected").exists() {
+        return Err(GmError::new(
+            "client_upgrade_required",
+            "Legacy tracker selection must be reconciled explicitly; run gm tracker use SPACE after recovering its replica.",
+        ));
+    }
+    let saved: Option<Value> = if selected.exists() {
+        Some(serde_json::from_str(&fs::read_to_string(selected)?)?)
+    } else {
+        None
+    };
+    if let Some(saved) = &saved {
+        validate_scope(saved, None)?;
+    }
+    let space = saved.as_ref().and_then(|s| s["slug"].as_str().map(str::to_owned))
+        .or_else(|| crate::profile::defaults().scope.space)
+        .ok_or_else(|| GmError::usage("Select `gm tracker use SPACE`, pass --space SPACE, or set tracker.space in .gitmatrix/agents.yml."))?;
+    safe_space(&space)?;
+    Ok(space)
 }
-fn safe_owner(owner: &str) -> Result<()> {
-    if owner.is_empty()
-        || !owner
+fn safe_space(space: &str) -> Result<()> {
+    if space.is_empty()
+        || !space
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err(GmError::usage(
-            "Owner must be an account slug (letters, numbers, '-' or '_').",
+            "Space must be a global handle (letters, numbers, '-' or '_').",
         ));
     }
     Ok(())
@@ -566,12 +594,290 @@ fn safe_owner(owner: &str) -> Result<()> {
 // Version 1 includes creator backfill, which did not produce change-feed events.
 // Version 2 includes timelines and their events (asked for with `timelines=1`).
 // Version 3 includes the durable tag catalog, backfilled without feed events.
-const SNAPSHOT_SCHEMA: &str = "3";
+const SNAPSHOT_SCHEMA: &str = "4";
+
+fn export_required() -> GmError {
+    GmError::new("export_required", "This replica or queued batch cannot be replayed safely. Original SQLite and operation IDs are retained.")
+        .hint("Run `gm tracker export REPLICA --destination ARCHIVE.sqlite`, then `gm tracker recover REPLICA --space SPACE` online. Missing or expired receipt proof requires explicit reconciliation, never automatic replay.")
+}
+
+fn validate_scope(value: &Value, previous: Option<&Value>) -> Result<()> {
+    if value["contractVersion"] != 4
+        || value["spaceId"].as_str().is_none_or(str::is_empty)
+        || value["migrationEpoch"].as_u64().is_none()
+    {
+        return Err(export_required());
+    }
+    if let Some(previous) = previous {
+        if value["spaceId"] != previous["spaceId"] {
+            return Err(GmError::new(
+                "space_mismatch",
+                "Immutable Space identity changed; queued intent is retained for export.",
+            ));
+        }
+        if value["migrationEpoch"] != previous["migrationEpoch"] {
+            return Err(GmError::new(
+                "migration_epoch_mismatch",
+                "Migration epoch changed; export and recover retained intent before continuing.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fence_legacy(db: &Connection) -> Result<()> {
+    let exists: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if !exists {
+        return Ok(());
+    }
+    let schema: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key='snapshot_schema'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let snapshot: Option<String> = db
+        .query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(db_err)?;
+    if let Some(snapshot) = snapshot {
+        let value: Value = serde_json::from_str(&snapshot).map_err(|_| export_required())?;
+        if schema
+            .as_deref()
+            .is_some_and(|schema| schema != SNAPSHOT_SCHEMA)
+        {
+            return Err(export_required());
+        }
+        validate_scope(&value, None)?;
+    }
+    Ok(())
+}
+
+fn export_replica(source: &Path, output: &Path, dry_run: bool) -> Result<Shown> {
+    let source = fs::canonicalize(source)?;
+    if output.exists() {
+        return Err(GmError::usage(
+            "Export destination must not exist; no retained archive is overwritten.",
+        ));
+    }
+    let mut lock = fd_lock::RwLock::new(private_file(&source.with_extension("lock"))?);
+    let _guard = lock.write()?;
+    let db = Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(db_err)?;
+    if !dry_run {
+        // SQLite produces a consistent complete logical copy, including unknown
+        // tables and raw operation bodies; never decode/re-encode queued intent.
+        private_file(output)?;
+        db.execute("VACUUM INTO ?", [output.to_string_lossy().as_ref()])
+            .map_err(db_err)?;
+    }
+    Ok(Shown(
+        json!({"dryRun":dry_run,"source":source,"export":output,"format":"sqlite","originalPreserved":true}),
+    ))
+}
+
+fn recover_replica(r: &Replica, source: &Path, dry_run: bool) -> Result<Shown> {
+    let source = fs::canonicalize(source)?;
+    let destination = fs::canonicalize(root(&r.config)?.join(format!("{}.v4.sqlite", r.space)))?;
+    if source == destination {
+        return Err(GmError::usage(
+            "Recovery source must differ from the destination.",
+        ));
+    }
+    let mut lock = fd_lock::RwLock::new(private_file(&source.with_extension("lock"))?);
+    let _guard = lock.write()?;
+    let db = Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(db_err)?;
+    let meta = |key: &str| -> Result<String> {
+        db.query_row("SELECT value FROM meta WHERE key=?", [key], |row| {
+            row.get(0)
+        })
+        .map_err(db_err)
+    };
+    r.verify()?;
+    r.pull()?;
+    let binding = r.snapshot()?;
+    let actor = meta("actor")?;
+    let old: Value = serde_json::from_str(&meta("snapshot")?)?;
+    let version = meta("snapshot_schema")?;
+    if meta("server")? != r.config.server() || Some(actor.clone()) != r.meta("actor")? {
+        return Err(GmError::new(
+            "identity_mismatch",
+            "Recovery requires the same authenticated actor and server; source remains untouched.",
+        ));
+    }
+    let identity_record = r.meta("identity")?.ok_or_else(export_required)?;
+    let identity: Value = serde_json::from_str(&identity_record)?;
+    let effective_actor = identity["actorId"].as_str().ok_or_else(export_required)?;
+    if version == SNAPSHOT_SCHEMA && meta("identity")? != identity_record {
+        return Err(GmError::new(
+            "identity_mismatch",
+            "Recovery requires the same accountable person and exact agent identity.",
+        ));
+    }
+    let source_space = if version == "3" {
+        &old["owner"]["id"]
+    } else {
+        &old["spaceId"]
+    };
+    if source_space != &binding["spaceId"] {
+        return Err(export_required());
+    }
+    let mut stmt = db
+        .prepare("SELECT operation,body,state,error FROM outbox ORDER BY seq")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    let operations: Vec<Value> = rows
+        .iter()
+        .map(|(id, body, _, _)| {
+            let request: Value = serde_json::from_str(body)?;
+            if request["operationId"] != *id {
+                return Err(export_required());
+            }
+            Ok(request)
+        })
+        .collect::<Result<_>>()?;
+    if version != "3" && version != SNAPSHOT_SCHEMA {
+        return Err(export_required());
+    }
+    let recovery_key = format!("recovery:{}", digest(&source.to_string_lossy()));
+    if r.meta(&recovery_key)?.is_some() {
+        return Err(GmError::new(
+            "already_recovered",
+            "This retained source was already recovered. Sync the destination; do not import its original operation IDs again.",
+        ));
+    }
+    if version == SNAPSHOT_SCHEMA {
+        validate_scope(&old, Some(&binding))?;
+        for request in &operations {
+            validate_scope(request, Some(&binding))?;
+            validate_batch(
+                request["mutations"]
+                    .as_array()
+                    .ok_or_else(export_required)?,
+            )?;
+        }
+        if !r.queued()?.is_empty() {
+            return Err(GmError::usage(
+                "Destination outbox must be empty before recovery.",
+            ));
+        }
+        if !dry_run {
+            let tx = r.db.unchecked_transaction().map_err(db_err)?;
+            for (id, body, state, error) in &rows {
+                r.db.execute(
+                    "INSERT INTO outbox(operation,body,state,error) VALUES (?,?,?,?)",
+                    params![id, body, state, error],
+                )
+                .map_err(db_err)?;
+            }
+            r.set(&recovery_key, &json!({"source":source,"operationIds":rows.iter().map(|r|&r.0).collect::<Vec<_>>(),"state":"imported"}).to_string())?;
+            tx.commit().map_err(db_err)?;
+        }
+        return Ok(Shown(
+            json!({"dryRun":dry_run,"recovered":rows.len(),"source":source,"originalPreserved":true,"next":"Run gm tracker sync; ordered batches retain original operation IDs."}),
+        ));
+    }
+    let mut proofs = Vec::with_capacity(operations.len());
+    let mut pages = Vec::new();
+    // Endpoint bounds count operations, not mutations: never split an atomic batch.
+    for start in (0..operations.len().max(1)).step_by(100) {
+        let end = (start + 100).min(operations.len());
+        let page = remote::api(
+            &r.config,
+            "POST",
+            &r.path("recover"),
+            Some(
+                &json!({"sourceContractVersion":3,"sourceSpaceId":source_space,"actorId":effective_actor,"operations":&operations[start..end]}),
+            ),
+        )?;
+        validate_scope(&page, Some(&binding))?;
+        let page_proofs = page["operations"].as_array().ok_or_else(export_required)?;
+        verify_recovery_proofs(&operations[start..end], page_proofs, effective_actor)?;
+        proofs.extend(page_proofs.iter().cloned());
+        pages.push(page);
+    }
+    let unresolved = verify_recovery_proofs(&operations, &proofs, effective_actor)?;
+    if !dry_run {
+        let tx = r.db.unchecked_transaction().map_err(db_err)?;
+        // Durable evidence precedes any opening of the new replica. The source
+        // is read-only and remains a complete archive even after verification.
+        r.set(
+            &format!("{recovery_key}:proof"),
+            &json!({"pages":pages}).to_string(),
+        )?;
+        if !unresolved {
+            r.set(
+                &recovery_key,
+                &json!({"source":source,"state":"committed"}).to_string(),
+            )?;
+            r.set("legacy_reconciled", "true")?;
+        }
+        tx.commit().map_err(db_err)?;
+    }
+    if unresolved {
+        return Err(export_required());
+    }
+    Ok(Shown(
+        json!({"dryRun":dry_run,"verifiedCommitted":proofs.len(),"source":source,"originalPreserved":true,"replayed":0}),
+    ))
+}
+fn verify_recovery_proofs(operations: &[Value], proofs: &[Value], actor: &str) -> Result<bool> {
+    if proofs.len() != operations.len() {
+        return Err(export_required());
+    }
+    let mut unresolved = false;
+    for (request, proof) in operations.iter().zip(proofs) {
+        if proof["operationId"] != request["operationId"] {
+            return Err(export_required());
+        }
+        if proof["state"] == "export_required" {
+            unresolved = true;
+            continue;
+        }
+        let original = proof["originalRequest"]
+            .as_str()
+            .ok_or_else(export_required)?;
+        let original_request: Value = serde_json::from_str(original)?;
+        if proof["state"] != "committed"
+            || proof["actorId"] != actor
+            || original_request != *request
+            || proof["sourceEpoch"].as_u64().is_none()
+            || proof["requestDigest"] != digest(original)
+            || proof["originalResult"].as_str().is_none()
+            || !proof["result"].is_object()
+        {
+            return Err(export_required());
+        }
+    }
+    Ok(unresolved)
+}
 
 struct Replica {
     db: Connection,
     config: Config,
-    owner: String,
+    space: String,
     /// The timeline whose view this works in (`--timeline`); None for main.
     timeline: Option<String>,
     /// Each operation the server acknowledged in this run, with its per-mutation
@@ -598,13 +904,13 @@ impl Replica {
         let raw = self.meta("snapshot")?.ok_or_else(|| {
             GmError::new(
                 "replica_uninitialized",
-                "Initialize online with `gm tracker use OWNER` before offline work.",
+                "Initialize online with `gm tracker use SPACE` before offline work.",
             )
         })?;
         Ok(serde_json::from_str(&raw)?)
     }
     fn path(&self, suffix: &str) -> String {
-        format!("/tracker/{}/{}", self.owner, suffix)
+        format!("/tracker/{}/{}", self.space, suffix)
     }
     /// The base this replica views: main's snapshot, or the timeline's view as last fetched.
     /// The server projects a timeline's view (main's issues with the timeline's changes);
@@ -632,6 +938,7 @@ impl Replica {
             &self.path(&format!("snapshot?timeline={slug}")),
             None,
         )?;
+        validate_scope(&view, Some(&self.snapshot()?))?;
         redact(&mut view);
         if !view["issues"].is_array() || !view["timeline"].is_object() {
             return Err(GmError::new("protocol_error", "Invalid timeline view."));
@@ -639,12 +946,14 @@ impl Replica {
         self.set(&format!("view:{slug}"), &serde_json::to_string(&view)?)
     }
     /// A request carries the timeline it was made in.
-    fn request(&self, mutations: Value) -> Value {
-        let mut request = json!({"operationId":uid(),"mutations":mutations});
+    fn request(&self, mutations: Value) -> Result<Value> {
+        let snapshot = self.snapshot()?;
+        validate_scope(&snapshot, None)?;
+        let mut request = json!({"contractVersion":4,"spaceId":snapshot["spaceId"],"migrationEpoch":snapshot["migrationEpoch"],"operationId":uid(),"mutations":mutations});
         if let Some(slug) = &self.timeline {
             request["timeline"] = json!(slug);
         }
-        request
+        Ok(request)
     }
     fn verify(&self) -> Result<()> {
         let session = remote::api(&self.config, "GET", "/session", None)?;
@@ -660,6 +969,34 @@ impl Replica {
                 "This replica belongs to another authenticated identity; select an explicit SSH key or use a separate XDG_DATA_HOME. No outbox was sent.",
             ));
         }
+        let effective_actor = session["viewer"]["agent"]["id"].as_str().unwrap_or(actor);
+        let identity = json!({"actorId":effective_actor,"principalId":actor,"agentId":session["viewer"]["agent"]["id"]}).to_string();
+        if self.meta("identity")?.is_some_and(|old| old != identity) {
+            return Err(GmError::new(
+                "identity_changed",
+                "Replica person/agent binding changed; export retained intent before recovery.",
+            ));
+        }
+        let scope = remote::api(
+            &self.config,
+            "GET",
+            &format!("/spaces/{}", self.space),
+            None,
+        )?;
+        let binding = json!({"contractVersion":scope["contractVersion"],"spaceId":scope["space"]["id"],"migrationEpoch":scope["migrationEpoch"]});
+        let previous = self
+            .meta("snapshot")?
+            .map(|raw| serde_json::from_str::<Value>(&raw))
+            .transpose()?;
+        validate_scope(&binding, previous.as_ref())?;
+        let selection = root(&self.config)?.join("selected-v4.json");
+        if selection.exists() {
+            let saved: Value = serde_json::from_str(&fs::read_to_string(selection)?)?;
+            if saved["slug"] == self.space {
+                validate_scope(&binding, Some(&saved))?;
+            }
+        }
+        self.set("identity", &identity)?;
         self.set("server", &self.config.server())?;
         self.set("actor", actor)
     }
@@ -686,6 +1023,13 @@ impl Replica {
                 &self.path("snapshot?timelines=1"),
                 None,
             )?;
+            validate_scope(&snapshot, None)?;
+            if snapshot["space"]["slug"] != self.space {
+                return Err(GmError::new(
+                    "space_mismatch",
+                    "Snapshot does not belong to the selected Space.",
+                ));
+            }
             redact(&mut snapshot);
             if !snapshot["issues"].is_array() || !snapshot["cursor"].is_u64() {
                 return Err(GmError::new("protocol_error", "Invalid tracker snapshot."));
@@ -707,11 +1051,16 @@ impl Replica {
                 &self.config,
                 "GET",
                 &self.path(&format!(
-                    "changes?after={before}&limit=200&timelines=1{}",
+                    "changes?after={before}&limit=200&timelines=1&spaceId={}&migrationEpoch={}{}",
+                    path_segment(snapshot["spaceId"].as_str().ok_or_else(export_required)?),
+                    snapshot["migrationEpoch"]
+                        .as_u64()
+                        .ok_or_else(export_required)?,
                     if directory { "&directory=1" } else { "" }
                 )),
                 None,
             )?;
+            validate_scope(&feed, Some(&snapshot))?;
             if std::mem::take(&mut directory) {
                 for key in ["members", "agents", "canAdmin"] {
                     if !feed[key].is_null() {
@@ -761,7 +1110,15 @@ impl Replica {
     }
     fn view(&self) -> Result<Value> {
         let mut snapshot = self.base()?;
+        validate_scope(&snapshot, None)?;
         for row in self.queued()? {
+            validate_scope(&row["request"], Some(&snapshot))?;
+            validate_batch(
+                row["request"]["mutations"]
+                    .as_array()
+                    .ok_or_else(export_required)?,
+            )
+            .map_err(|_| export_required())?;
             // Queued changes to main show in every view; a timeline's only in its own.
             if !in_view(&row["request"], self.timeline.as_deref()) {
                 continue;
@@ -774,6 +1131,20 @@ impl Replica {
     }
     fn sync(&self) -> Result<()> {
         self.verify()?;
+        if self.meta("snapshot")?.is_none() {
+            self.pull()?;
+        }
+        let binding = self.snapshot()?;
+        for row in self.queued()? {
+            validate_scope(&row["request"], Some(&binding))?;
+            let mutations = row["request"]["mutations"]
+                .as_array()
+                .ok_or_else(export_required)?;
+            validate_batch(mutations).map_err(|_| export_required())?;
+            if row["operationId"] != row["request"]["operationId"] {
+                return Err(export_required());
+            }
+        }
         // Replay before pulling: an uncertain ack must never be rewritten/rebased.
         for row in self.queued()? {
             let operation = row["operationId"].as_str().unwrap();
@@ -794,6 +1165,7 @@ impl Replica {
                 Some(&row["request"]),
             ) {
                 Ok(reply) => {
+                    validate_scope(&reply, Some(&binding))?;
                     if !reply["events"].is_array() || !reply["results"].is_array() {
                         return Err(GmError::new(
                             "uncertain_ack",
@@ -878,7 +1250,7 @@ impl Replica {
     fn submit(&self, ctx: &Ctx, offline: bool, mut mutations: Vec<Value>) -> Result<Shown> {
         issue_tags_alias(&mut mutations)?;
         validate_batch(&mutations)?;
-        let request = self.request(json!(mutations));
+        let request = self.request(json!(mutations))?;
         let operation = request["operationId"].as_str().unwrap().to_string();
         if ctx.dry_run {
             let mut preview = self.view()?;
@@ -924,7 +1296,7 @@ impl Replica {
         let mut mutations = vec![mutation];
         issue_tags_alias(&mut mutations)?;
         validate_batch(&mutations)?;
-        let mut request = self.request(json!(mutations));
+        let mut request = self.request(json!(mutations))?;
         let operation = request["operationId"].as_str().unwrap().to_string();
         let mut preview = self.view()?;
         project(&mut preview, &request["mutations"][0])?;
@@ -947,6 +1319,7 @@ impl Replica {
                     drop_lease(&self.config, &fence);
                 }
             })?;
+        validate_scope(&reply, Some(&self.snapshot()?))?;
         if !reply["events"].is_array() || !reply["results"].is_array() {
             return Err(GmError::new(
                 "uncertain_ack",
@@ -1004,33 +1377,53 @@ fn with_replica(
     refresh: bool,
     f: impl FnOnce(&Replica) -> Result<Shown>,
 ) -> Result<Shown> {
+    with_replica_mode(scope, ctx, refresh, false, f)
+}
+fn with_replica_mode(
+    scope: &Scope,
+    ctx: &Ctx,
+    refresh: bool,
+    recovering: bool,
+    f: impl FnOnce(&Replica) -> Result<Shown>,
+) -> Result<Shown> {
     let config = Config::load();
     let root = root(&config)?;
-    let owner = selected_owner(&config, scope.owner.clone())?;
-    if scope.offline && !root.join(format!("{owner}.sqlite")).exists() {
+    let space = selected_space(&config, scope.space.clone())?;
+    let path = root.join(format!("{space}.v4.sqlite"));
+    let legacy = root.join(format!("{space}.sqlite"));
+    if legacy.exists() && !path.exists() && !recovering {
+        return Err(export_required().hint(format!("Legacy replica retained at {}. Export it, then run `gm tracker recover {} --space {space}`.", legacy.display(), legacy.display())));
+    }
+    if scope.offline && !path.exists() {
         return Err(GmError::new(
             "replica_uninitialized",
             format!(
-                "Initialize this identity/owner online with `gm tracker use OWNER`. Retained credential partitions: {}. After token rotation, use `gm tracker recover OLD_REPLICA --owner OWNER` to recover the old outbox.",
+                "Initialize this identity/Space online with `gm tracker use SPACE`. Retained credential partitions: {}. After token rotation, use `gm tracker recover OLD_REPLICA --space SPACE` to recover the old outbox.",
                 root.parent().unwrap().display()
             ),
         ));
     }
     private_dir(&root)?;
-    let mut lock = fd_lock::RwLock::new(private_file(&root.join(format!("{owner}.lock")))?);
+    let mut lock = fd_lock::RwLock::new(private_file(&path.with_extension("lock"))?);
     let _guard = lock.write()?;
-    let path = root.join(format!("{owner}.sqlite"));
     private_file(&path)?;
     let db = Connection::open(path).map_err(db_err)?;
+    fence_legacy(&db)?;
     db.busy_timeout(Duration::from_secs(30)).map_err(db_err)?;
     db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT UNIQUE NOT NULL,body TEXT NOT NULL,state TEXT NOT NULL,error TEXT);").map_err(db_err)?;
     let replica = Replica {
         db,
         config,
-        owner,
+        space,
         timeline: scope.timeline(),
         receipts: Default::default(),
     };
+    if legacy.exists()
+        && !recovering
+        && replica.meta("legacy_reconciled")?.as_deref() != Some("true")
+    {
+        return Err(export_required());
+    }
     if !scope.offline && refresh && !ctx.dry_run {
         replica.sync()?;
     }
@@ -1064,7 +1457,7 @@ fn in_view(request: &Value, timeline: Option<&str>) -> bool {
 fn collection(kind: &str) -> Option<&'static str> {
     match kind {
         "team" => Some("teams"),
-        "workspace" => Some("workspaces"),
+        "project" => Some("projects"),
         "issue" => Some("issues"),
         "link" => Some("links"),
         "comment" => Some("comments"),
@@ -1100,6 +1493,22 @@ fn apply_event(snapshot: &mut Value, event: &Value) -> Result<()> {
             labels.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
         }
     }
+    if kind == "automation" {
+        // A person's approve-when-green setting (CORE-378): the snapshot lists who has it on.
+        let id = event["entityId"].as_str().unwrap_or_default();
+        if !snapshot["approveWhenGreen"].is_array() {
+            snapshot["approveWhenGreen"] = json!([]);
+        }
+        let on = snapshot["approveWhenGreen"]
+            .as_array_mut()
+            .ok_or_else(|| GmError::new("protocol_error", "Missing approve-when-green list."))?;
+        on.retain(|person| person != id);
+        if event["entity"]["approveWhenGreen"] == true {
+            on.push(json!(id));
+            on.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+        return Ok(());
+    }
     let table = if let Some(table) = collection(kind) {
         table
     } else if let Some(table) = timeline_collection(kind) {
@@ -1109,8 +1518,12 @@ fn apply_event(snapshot: &mut Value, event: &Value) -> Result<()> {
         }
         table
     } else {
-        // Entity types newer than this gm: skip them, so older binaries keep syncing.
-        return Ok(());
+        return Err(GmError::new(
+            "client_upgrade_required",
+            format!(
+                "Unknown tracker event entity {kind}; cursor retained. Upgrade gm before syncing."
+            ),
+        ));
     };
     let rows = snapshot[table]
         .as_array_mut()
@@ -1181,8 +1594,8 @@ fn validate_batch(mutations: &[Value]) -> Result<()> {
         if ![
             "team.create",
             "team.update",
-            "workspace.create",
-            "workspace.update",
+            "project.create",
+            "project.update",
             "issue.create",
             "issue.update",
             "link.add",
@@ -1236,7 +1649,7 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "priority",
                 "assigneeId",
                 "parentId",
-                "workspaceIds",
+                "projectIds",
                 "labels",
                 "requires",
                 "pickup",
@@ -1433,10 +1846,10 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         }
         let mut row = match entity {
             "issue" => {
-                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","pickup":"anyone","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
+                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","pickup":"anyone","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"projectIds":[],"labels":[],"claim":null})
             }
             "team" => json!({"description":"","memberIds":[],"archived":false}),
-            "workspace" => json!({"description":"","archived":false}),
+            "project" => json!({"description":"","archived":false}),
             _ => json!({}),
         };
         for (key, value) in data {
@@ -1604,6 +2017,23 @@ fn patch(snapshot: &Value, entity: &str, p: &Patch) -> Result<Value> {
 }
 
 pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
+    if let TrackerCommand::Export {
+        replica,
+        destination,
+    } = &args.command
+    {
+        return export_replica(replica, destination, ctx.dry_run);
+    }
+    if let TrackerCommand::Recover { replica } = &args.command {
+        if args.scope.offline {
+            return Err(GmError::usage(
+                "Recovery requires online receipt verification.",
+            ));
+        }
+        return with_replica_mode(&args.scope, ctx, false, true, |r| {
+            recover_replica(r, replica, ctx.dry_run)
+        });
+    }
     if matches!(args.command, TrackerCommand::List) {
         if args.scope.offline {
             return Err(GmError::usage(
@@ -1617,27 +2047,28 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
             None,
         )?));
     }
-    if let TrackerCommand::Use { owner } = &args.command {
-        safe_owner(owner)?;
+    if let TrackerCommand::Use { space } = &args.command {
+        safe_space(space)?;
         if args.scope.offline {
             return Err(GmError::usage(
                 "Initialize and select a tracker online first.",
             ));
         }
         if ctx.dry_run {
-            return Ok(Shown(json!({"dryRun":true,"owner":owner})));
+            return Ok(Shown(json!({"dryRun":true,"space":space})));
         }
         let scope = Scope {
-            owner: Some(owner.clone()),
+            space: Some(space.clone()),
             offline: false,
             timeline: None,
         };
         return with_replica(&scope, ctx, true, |r| {
             let root = root(&r.config)?;
-            private_file(&root.join("selected"))?;
-            fs::write(root.join("selected"), owner)?;
+            let snapshot = r.snapshot()?;
+            private_file(&root.join("selected-v4.json"))?;
+            fs::write(root.join("selected-v4.json"), json!({"contractVersion":4,"slug":space,"spaceId":snapshot["spaceId"],"migrationEpoch":snapshot["migrationEpoch"]}).to_string())?;
             Ok(Shown(
-                json!({"owner":owner,"identity":r.meta("actor")?,"replica":root.join(format!("{owner}.sqlite")),"cursor":r.snapshot()?["cursor"]}),
+                json!({"space":space,"spaceId":r.snapshot()?["spaceId"],"identity":r.meta("actor")?,"replica":root.join(format!("{space}.v4.sqlite")),"cursor":r.snapshot()?["cursor"]}),
             ))
         });
     }
@@ -1668,75 +2099,7 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
                 r.preferred_team(&snapshot)?,
             );
             Ok(Shown(
-                json!({"owner":r.owner,"identity":r.meta("actor")?,"defaultTeam":choice.describe(&r.owner, false),"cursor":r.snapshot()?["cursor"],"timelines":timelines(&r.snapshot()?),"operations":r.queued()?,"replica":root(&r.config)?.join(format!("{}.sqlite",r.owner)),"credentialPartitions":root(&r.config)?.parent(),"credentialRotation":"Old credential partitions remain intact. To reconnect a rotated token to its old outbox, use tracker recover with the old replica path after verifying the same identity."}),
-            ))
-        }
-        TrackerCommand::Recover { replica: source } => {
-            if args.scope.offline {
-                return Err(GmError::usage(
-                    "Recovery must verify the authenticated identity online.",
-                ));
-            }
-            r.verify()?;
-            if !r.queued()?.is_empty() {
-                return Err(GmError::usage(
-                    "Destination outbox must be empty before recovery.",
-                ));
-            }
-            let source = fs::canonicalize(source)?;
-            let destination =
-                fs::canonicalize(root(&r.config)?.join(format!("{}.sqlite", r.owner)))?;
-            if source == destination {
-                return Err(GmError::usage(
-                    "Source and destination are the same replica.",
-                ));
-            }
-            let mut lock = fd_lock::RwLock::new(private_file(&source.with_extension("lock"))?);
-            let _guard = lock.write()?;
-            r.db.execute(
-                "ATTACH DATABASE ? AS recovery",
-                [source.to_string_lossy().as_ref()],
-            )
-            .map_err(db_err)?;
-            let actor: String =
-                r.db.query_row(
-                    "SELECT value FROM recovery.meta WHERE key='actor'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(db_err)?;
-            let server: String =
-                r.db.query_row(
-                    "SELECT value FROM recovery.meta WHERE key='server'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(db_err)?;
-            let raw: String =
-                r.db.query_row(
-                    "SELECT value FROM recovery.meta WHERE key='snapshot'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(db_err)?;
-            let snapshot: Value = serde_json::from_str(&raw)?;
-            if Some(actor) != r.meta("actor")?
-                || server != r.config.server()
-                || snapshot["owner"]["slug"] != r.owner
-            {
-                return Err(GmError::new(
-                    "identity_mismatch",
-                    "Recovery requires the same verified actor, server and tracker owner.",
-                ));
-            }
-            let count: i64 =
-                r.db.query_row("SELECT COUNT(*) FROM recovery.outbox", [], |row| row.get(0))
-                    .map_err(db_err)?;
-            if !ctx.dry_run {
-                r.db.execute_batch("BEGIN IMMEDIATE; INSERT INTO main.outbox(operation,body,state,error) SELECT operation,body,state,error FROM recovery.outbox ORDER BY seq; INSERT INTO main.meta(key,value) SELECT key,value FROM recovery.meta WHERE key='snapshot' ON CONFLICT(key) DO UPDATE SET value=excluded.value; DELETE FROM main.meta WHERE key='snapshot_schema'; DELETE FROM recovery.outbox; COMMIT;").map_err(db_err)?;
-            }
-            Ok(Shown(
-                json!({"dryRun":ctx.dry_run,"recovered":count,"source":source,"replica":destination,"next":"Run gm tracker sync. Original operation IDs and uncertain receipts were preserved."}),
+                json!({"space":r.space,"identity":r.meta("actor")?,"defaultTeam":choice.describe(&r.space, false),"cursor":r.snapshot()?["cursor"],"timelines":timelines(&r.snapshot()?),"operations":r.queued()?,"replica":root(&r.config)?.join(format!("{}.v4.sqlite",r.space)),"credentialPartitions":root(&r.config)?.parent(),"credentialRotation":"Old credential partitions remain intact. Recover only after verifying the exact person, agent, Space and epoch."}),
             ))
         }
         TrackerCommand::Conflicts => {
@@ -1807,10 +2170,18 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
                 ));
             }
             r.verify()?;
+            let binding = r.snapshot()?;
+            validate_scope(&binding, None)?;
             Ok(Shown(remote::api(
                 &r.config,
                 "GET",
-                &r.path(&format!("changes?after={after}&limit={limit}")),
+                &r.path(&format!(
+                    "changes?after={after}&limit={limit}&spaceId={}&migrationEpoch={}",
+                    path_segment(binding["spaceId"].as_str().ok_or_else(export_required)?),
+                    binding["migrationEpoch"]
+                        .as_u64()
+                        .ok_or_else(export_required)?
+                )),
                 None,
             )?))
         }
@@ -1944,7 +2315,7 @@ pub fn request(ctx: &Ctx, args: &RequestArgs) -> Result<Shown> {
                 json!({"kind":"request.answer","id":q["id"],"data":data})
             }
         };
-        let request = json!({"operationId":uid(),"mutations":[mutation]});
+        let request = r.request(json!([mutation]))?;
         if ctx.dry_run {
             return Ok(Shown(json!({"dryRun":true,"request":request})));
         }
@@ -1980,24 +2351,27 @@ pub fn team(ctx: &Ctx, args: &TeamArgs) -> Result<Shown> {
         r.submit(ctx, args.scope.offline, vec![mutation])
     })
 }
-pub fn workspace(ctx: &Ctx, args: &WorkspaceArgs) -> Result<Shown> {
+pub fn projects(ctx: &Ctx, args: &ProjectArgs) -> Result<Shown> {
     with_replica(&args.scope, ctx, true, |r| {
         let snapshot = r.view()?;
         let mutation = match &args.command {
-            WorkspaceCommand::List => {
+            ProjectCommand::List => {
                 return Ok(Shown(
-                    json!({"workspaces":snapshot["workspaces"],"subscriptions":snapshot["subscriptions"],"offline":args.scope.offline,"cursor":snapshot["cursor"]}),
+                    json!({"projects":snapshot["projects"],"subscriptions":snapshot["subscriptions"],"offline":args.scope.offline,"cursor":snapshot["cursor"]}),
                 ));
             }
-            WorkspaceCommand::Create(a) => create(
-                "workspace",
+            ProjectCommand::Create(a) => create(
+                "project",
                 json!({"slug":a.key,"name":a.name,"description":a.description}),
             ),
-            WorkspaceCommand::Update(p) => patch(&snapshot, "workspace", p)?,
-            WorkspaceCommand::Subscribe { workspace, repo } => {
-                json!({"kind":"subscription.add","id":uid(),"data":{"workspaceId":id(&snapshot,"workspaces",workspace)?,"repoId":repo}})
+            ProjectCommand::Update(p) => patch(&snapshot, "project", p)?,
+            ProjectCommand::Subscribe {
+                project: grouping,
+                repo,
+            } => {
+                json!({"kind":"subscription.add","id":uid(),"data":{"projectId":id(&snapshot,"projects",grouping)?,"repoId":repo}})
             }
-            WorkspaceCommand::Unsubscribe { id } => json!({"kind":"subscription.remove","id":id}),
+            ProjectCommand::Unsubscribe { id } => json!({"kind":"subscription.remove","id":id}),
         };
         r.submit(ctx, args.scope.offline, vec![mutation])
     })
@@ -2158,7 +2532,7 @@ fn listing(
     snapshot: &Value,
     args: &ListIssues,
     choice: &TeamChoice,
-    owner: &str,
+    space: &str,
     only_ready: bool,
     offline: bool,
 ) -> Result<Shown> {
@@ -2167,10 +2541,10 @@ fn listing(
         .as_deref()
         .map(|v| id(snapshot, "teams", v))
         .transpose()?;
-    let workspace = args
-        .workspace
+    let grouping = args
+        .project
         .as_deref()
-        .map(|v| id(snapshot, "workspaces", v))
+        .map(|v| id(snapshot, "projects", v))
         .transpose()?;
     let now = Utc::now();
     let search = args.search.as_ref().map(|s| s.to_lowercase());
@@ -2180,8 +2554,8 @@ fn listing(
         .flatten()
         .filter(|i| {
             team.as_ref().is_none_or(|t| i["teamId"] == *t)
-                && workspace.as_ref().is_none_or(|w| {
-                    i["workspaceIds"]
+                && grouping.as_ref().is_none_or(|w| {
+                    i["projectIds"]
                         .as_array()
                         .is_some_and(|a| a.iter().any(|v| v == w))
                 })
@@ -2199,7 +2573,7 @@ fn listing(
                 && (!only_ready || ready(snapshot, i, now))
         })
         .collect();
-    let unknown_tags = unknown_filter_tags(snapshot, &args.tags, owner);
+    let unknown_tags = unknown_filter_tags(snapshot, &args.tags, space);
     matching.sort_by(|a, b| {
         a["priority"]
             .as_u64()
@@ -2207,7 +2581,7 @@ fn listing(
             .then_with(|| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    let mut shown = json!({"team":choice.describe(owner, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"timeline":snapshot["timeline"],"next":"Acquire an online claim before starting exclusive work."});
+    let mut shown = json!({"team":choice.describe(space, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"timeline":snapshot["timeline"],"next":"Acquire an online claim before starting exclusive work."});
     if !unknown_tags.is_empty() {
         shown["unknownTags"] = json!(unknown_tags);
     }
@@ -2237,7 +2611,7 @@ fn dedup_tags(tags: &[String]) -> Vec<String> {
 }
 /// Filter tags the catalog doesn't have, warned on stderr with the closest name:
 /// a typo would otherwise just match nothing.
-fn unknown_filter_tags(snapshot: &Value, filter: &TagFilter, owner: &str) -> Vec<Value> {
+fn unknown_filter_tags(snapshot: &Value, filter: &TagFilter, space: &str) -> Vec<Value> {
     let catalog: Vec<String> = snapshot["labels"]
         .as_array()
         .into_iter()
@@ -2249,7 +2623,7 @@ fn unknown_filter_tags(snapshot: &Value, filter: &TagFilter, owner: &str) -> Vec
     for u in &unknown {
         eprintln!(
             "gm: warning: {}, so it matches no issue; `gm issue tags` lists the catalog.",
-            requirements::unknown_tag_warning(u, owner)
+            requirements::unknown_tag_warning(u, space)
         );
     }
     unknown
@@ -2565,9 +2939,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             ));
         }
         let config = Config::load();
-        let owner = selected_owner(&config, args.scope.owner.clone())?;
+        let space = selected_space(&config, args.scope.space.clone())?;
         let encoded = path_segment(issue);
-        let mut path = format!("/tracker/{owner}/issues/{encoded}/history?limit={limit}");
+        let mut path = format!("/tracker/{space}/issues/{encoded}/history?limit={limit}");
         if let Some(before) = before {
             path.push_str(&format!("&before={before}"));
         }
@@ -2625,8 +2999,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 let choice = choose_team(
                     a.team.as_deref(),
                     a.all_teams,
-                    a.workspace.is_none().then_some(&defaults),
-                    a.workspace.is_some(),
+                    a.project.is_none().then_some(&defaults),
+                    a.project.is_some(),
                     r.preferred_team(&snapshot)?,
                 );
                 let only_ready = matches!(args.command, IssueCommand::Ready(_));
@@ -2634,7 +3008,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     &snapshot,
                     a,
                     &choice,
-                    &r.owner,
+                    &r.space,
                     only_ready,
                     args.scope.offline,
                 );
@@ -2673,7 +3047,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             IssueCommand::History { .. } | IssueCommand::Updates { .. } => {
                 unreachable!("handled before opening the replica")
             }
-            IssueCommand::Tags => return Ok(Shown(tag_catalog(&snapshot, &r.owner))),
+            IssueCommand::Tags => return Ok(Shown(tag_catalog(&snapshot, &r.space))),
             IssueCommand::Create(a) => {
                 if a.description_file.as_deref() == Some(Path::new("-"))
                     && a.acceptance_file.as_deref() == Some(Path::new("-"))
@@ -2694,11 +3068,11 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 };
                 let team = id(&snapshot, "teams", team)?;
                 if choice.source != TeamSource::Flag {
-                    picked = Some(choice.describe(&r.owner, false));
+                    picked = Some(choice.describe(&r.space, false));
                 }
                 let mut mutation = create(
                     "issue",
-                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.tags}),
+                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"projectIds":a.project.iter().map(|w|id(&snapshot,"projects",w)).collect::<Result<Vec<_>>>()?,"labels":a.tags}),
                 );
                 timeline_fields(&a.timeline, &mut mutation["data"]);
                 requires_field(&a.requires, false, &mut mutation["data"])?;
@@ -2768,7 +3142,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 if let Some(target) = secret {
                     let (repo, name) = target.split_once(':').ok_or_else(|| {
-                        GmError::usage("--secret is owner/repo:NAME, e.g. orbit/app:DEPLOY_TOKEN.")
+                        GmError::usage("--secret is space/repo:NAME, e.g. orbit/app:DEPLOY_TOKEN.")
                     })?;
                     data["secret"] = json!({"repo":repo,"name":name});
                 }
@@ -2847,7 +3221,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 agent,
                 team,
                 all_teams,
-                workspace,
+                project: grouping,
                 under,
                 tags,
                 ttl,
@@ -2857,7 +3231,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     json!({"agent":session(agent)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 delegate(&snapshot, delegation, &mut data)?;
                 // Tags narrow whatever scope applies, configured or given (CORE-253).
-                unknown_filter_tags(&snapshot, tags, &r.owner);
+                unknown_filter_tags(&snapshot, tags, &r.space);
                 if !tags.tags.is_empty() {
                     data["tags"] = json!(dedup_tags(&tags.tags));
                 }
@@ -2866,25 +3240,25 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 // No scope given: this checkout's, else the project's (.gitmatrix/agents.yml),
                 // else your default team.
-                let configured = team.is_none() && workspace.is_none() && under.is_none();
-                let (workspace, under) = if configured {
-                    (&defaults.scope.workspace, &defaults.scope.under)
+                let configured = team.is_none() && grouping.is_none() && under.is_none();
+                let (grouping, under) = if configured {
+                    (&defaults.scope.project, &defaults.scope.under)
                 } else {
-                    (workspace, under)
+                    (grouping, under)
                 };
                 let choice = choose_team(
                     team.as_deref(),
                     *all_teams,
                     configured.then_some(&defaults),
-                    workspace.is_some() || under.is_some(),
+                    grouping.is_some() || under.is_some(),
                     r.preferred_team(&snapshot)?,
                 );
-                picked = Some(choice.describe(&r.owner, true));
+                picked = Some(choice.describe(&r.space, true));
                 if let Some(t) = &choice.team {
                     data["teamId"] = json!(id(&snapshot, "teams", t)?);
                 }
-                if let Some(w) = workspace {
-                    data["workspaceId"] = json!(id(&snapshot, "workspaces", w)?);
+                if let Some(w) = grouping {
+                    data["projectId"] = json!(id(&snapshot, "projects", w)?);
                 }
                 if let Some(u) = under {
                     data["underId"] = json!(id(&snapshot, "issues", u)?);
@@ -2920,7 +3294,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
         };
         locked_status(&snapshot, &mutation)?;
         if lease_command {
-            let mut request = r.request(json!([mutation]));
+            let mut request = r.request(json!([mutation]))?;
             if ctx.dry_run {
                 redact(&mut request);
                 return Ok(Shown(json!({"dryRun":true,"request":request})));
@@ -2956,6 +3330,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     return Err(e.hint("Lease outcome may be uncertain after transport failure. Inspect the issue online; do not assume ownership without the returned fencing token."));
                 }
             };
+            validate_scope(&response, Some(&snapshot))?;
             if !response["results"].is_array()
                 || !response["events"].is_array()
                 || (matches!(
@@ -3016,8 +3391,13 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                         // what it has been told (a resume's fresh token included); a new
                         // claim starts from now (CORE-261).
                         let identity = holder.clone().unwrap_or(current.clone());
-                        let before = kept_lease(&r.config, issue)
-                            .filter(|k| k.identity == identity && k.seen.is_some());
+                        // A cursor from another Space binding or epoch tells nothing here.
+                        let before = kept_lease(&r.config, issue).filter(|k| {
+                            k.identity == identity
+                                && k.seen.is_some()
+                                && k.space_id.as_deref() == snapshot["spaceId"].as_str()
+                                && k.migration_epoch == snapshot["migrationEpoch"].as_u64()
+                        });
                         let checkout =
                             before
                                 .as_ref()
@@ -3045,7 +3425,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                                 identity,
                                 issue: key.to_string(),
                                 expires_at: expires_at.map(str::to_string),
-                                owner: r.owner.clone(),
+                                space: r.space.clone(),
+                                space_id: snapshot["spaceId"].as_str().map(str::to_string),
+                                migration_epoch: snapshot["migrationEpoch"].as_u64(),
                                 actor,
                                 seen,
                                 checkout,
@@ -3118,7 +3500,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             return Ok(Shown(response));
         }
-        let notes = tag_notes(&snapshot, &mutation, &r.owner);
+        let notes = tag_notes(&snapshot, &mutation, &r.space);
         let mut shown = r.submit(ctx, args.scope.offline, vec![mutation])?;
         if let Some(team) = picked {
             shown.0["team"] = team;
@@ -3131,8 +3513,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
 }
 
 /// The tracker's tag catalog from a snapshot (CORE-271), as the server lists it
-/// (`GET /tracker/:owner/tags`): every defined tag with its issues and open issues.
-fn tag_catalog(snapshot: &Value, owner: &str) -> Value {
+/// (`GET /tracker/:space/tags`): every defined tag with its issues and open issues.
+fn tag_catalog(snapshot: &Value, space: &str) -> Value {
     let issues = snapshot["issues"].as_array().cloned().unwrap_or_default();
     let tags: Vec<Value> = snapshot["labels"]
         .as_array()
@@ -3155,13 +3537,13 @@ fn tag_catalog(snapshot: &Value, owner: &str) -> Value {
             json!({ "name": name, "issues": tagged.len(), "open": open })
         })
         .collect();
-    json!({ "catalog": owner, "tags": tags })
+    json!({ "catalog": space, "tags": tags })
 }
 /// What an issue edit means for the tracker's tag catalog (CORE-271): tags it adds
 /// to the catalog, and `tag:` requirements naming tags the catalog doesn't have
 /// (warned on stderr, never refused: an agent may still report that tag). None
 /// when there's nothing to say.
-fn tag_notes(snapshot: &Value, mutation: &Value, owner: &str) -> Option<Value> {
+fn tag_notes(snapshot: &Value, mutation: &Value, space: &str) -> Option<Value> {
     if !matches!(
         mutation["kind"].as_str(),
         Some("issue.create" | "issue.update")
@@ -3192,7 +3574,7 @@ fn tag_notes(snapshot: &Value, mutation: &Value, owner: &str) -> Option<Value> {
     for u in &unknown {
         eprintln!(
             "gm: warning: requires {}. Only agents that report it can claim the issue; `gm issue tags` lists the catalog.",
-            requirements::unknown_tag_warning(u, owner)
+            requirements::unknown_tag_warning(u, space)
         );
     }
     if new.is_empty() && unknown.is_empty() {
@@ -3207,7 +3589,7 @@ enum TeamSource {
     AllTeams,
     Checkout,
     Project,
-    /// A workspace or parent narrows the command instead.
+    /// A Project or parent narrows the command instead.
     Narrowed,
     Default,
     None,
@@ -3223,7 +3605,7 @@ struct TeamChoice {
 /// Which team a command uses (CORE-119), most specific first: `--team`, this
 /// checkout's scope, the project's, then your default team from the web, else
 /// all teams. `configured` is the .gitmatrix scope when it applies; a command
-/// already narrowed by a workspace or parent doesn't take your default team.
+/// already narrowed by a Project or parent doesn't take your default team.
 fn choose_team(
     flag: Option<&str>,
     all_teams: bool,
@@ -3259,7 +3641,7 @@ fn choose_team(
 
 impl TeamChoice {
     /// `widen`: the command takes --all-teams.
-    fn describe(&self, owner: &str, widen: bool) -> Value {
+    fn describe(&self, space: &str, widen: bool) -> Value {
         let (source, why) = match self.source {
             TeamSource::Flag => ("flag", "--team".to_owned()),
             TeamSource::AllTeams => ("all-teams", "--all-teams".to_owned()),
@@ -3273,15 +3655,15 @@ impl TeamChoice {
             ),
             TeamSource::Narrowed => (
                 "scope",
-                "all teams: a workspace or parent scope narrows this instead".to_owned(),
+                "all teams: a Project or parent scope narrows this instead".to_owned(),
             ),
             TeamSource::Default => (
                 "default",
-                format!("your default team in {owner}, set in the web tracker"),
+                format!("your default team in {space}, set in the web tracker"),
             ),
             TeamSource::None => (
                 "none",
-                format!("all teams: no team given and no default team in {owner}"),
+                format!("all teams: no team given and no default team in {space}"),
             ),
         };
         let flags = if widen {
@@ -3303,15 +3685,20 @@ impl TeamChoice {
 mod tests {
     use super::*;
     #[test]
-    fn unknown_entity_types_are_skipped_and_timelines_kept() {
+    fn unknown_entity_types_are_fenced_and_timelines_kept() {
         let mut s = snapshot();
         let before = s.clone();
         apply_event(
             &mut s,
             &json!({"entityType":"discussion","entityId":"d","entity":{"id":"d"}}),
         )
-        .unwrap();
+        .unwrap_err();
         assert_eq!(s, before, "an entity type newer than gm changes nothing");
+        apply_event(&mut s, &json!({"entityType":"automation","entityId":"ben","entity":{"id":"ben","approveWhenGreen":true,"enabledAt":"2026-10-03T00:00:00Z"}})).unwrap();
+        assert_eq!(s["approveWhenGreen"], json!(["ben"]));
+        apply_event(&mut s, &json!({"entityType":"automation","entityId":"ben","entity":{"id":"ben","approveWhenGreen":false,"enabledAt":null}})).unwrap();
+        assert_eq!(s["approveWhenGreen"], json!([]));
+        s.as_object_mut().unwrap().remove("approveWhenGreen");
         apply_event(&mut s,&json!({"entityType":"timeline","entityId":"tl_1","entity":{"id":"tl_1","slug":"search","name":"Search","status":"active","parentId":null,"createdAt":"2026-10-03T00:00:00Z"}})).unwrap();
         apply_event(&mut s,&json!({"entityType":"timeline","entityId":"tl_2","entity":{"id":"tl_2","slug":"ranking","name":"Ranking","status":"active","parentId":"tl_1","createdAt":"2026-10-03T01:00:00Z"}})).unwrap();
         apply_event(&mut s,&json!({"entityType":"timelineEvent","entityId":"fork:tl_1","entity":{"id":"fork:tl_1","seq":1,"kind":"fork"}})).unwrap();
@@ -3335,7 +3722,7 @@ mod tests {
         assert!(!in_view(&search, None));
         assert!(!in_view(&search, Some("ranking")));
         let scope = |timeline: Option<&str>| Scope {
-            owner: None,
+            space: None,
             offline: false,
             timeline: timeline.map(str::to_string),
         };
@@ -3351,7 +3738,9 @@ mod tests {
                 name: "builder".into(),
             },
             issue: "CORE-1".into(),
-            owner: String::new(),
+            space: String::new(),
+            space_id: None,
+            migration_epoch: None,
             actor: None,
             seen: None,
             checkout: None,
@@ -3381,7 +3770,105 @@ mod tests {
     }
 
     fn snapshot() -> Value {
-        json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"labels":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+        json!({"contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,"space":{"id":"space-orbit","slug":"orbit"},"teams":[],"projects":[],"labels":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+    }
+    #[test]
+    fn scope_negotiation_fences_legacy_unknown_and_stale_intent() {
+        let current = snapshot();
+        assert!(validate_scope(&current, None).is_ok());
+        for field in ["contractVersion", "spaceId", "migrationEpoch"] {
+            let mut missing = current.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                validate_scope(&missing, None).unwrap_err().code,
+                "export_required"
+            );
+        }
+        let mut stale = current.clone();
+        stale["migrationEpoch"] = json!(0);
+        assert_eq!(
+            validate_scope(&stale, Some(&current)).unwrap_err().code,
+            "migration_epoch_mismatch"
+        );
+        stale["spaceId"] = json!("another");
+        assert_eq!(
+            validate_scope(&stale, Some(&current)).unwrap_err().code,
+            "space_mismatch"
+        );
+    }
+    #[test]
+    fn legacy_replica_detection_never_rewrites_original_intent() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE outbox(operation TEXT,body TEXT); INSERT INTO meta VALUES ('snapshot_schema','3'),('snapshot','{\"owner\":{\"id\":\"original\"}}'); INSERT INTO outbox VALUES ('same-operation','{\"unknownLegacyIntent\":true}');").unwrap();
+        assert_eq!(fence_legacy(&db).unwrap_err().code, "export_required");
+        let body: String = db
+            .query_row(
+                "SELECT body FROM outbox WHERE operation='same-operation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "{\"unknownLegacyIntent\":true}");
+        let schema: String = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='snapshot_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, "3");
+    }
+    #[test]
+    fn fenced_export_preserves_unknown_tables_and_exact_queued_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.sqlite");
+        let archive = dir.path().join("archive.sqlite");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("CREATE TABLE outbox(seq INTEGER PRIMARY KEY,operation TEXT,body TEXT); CREATE TABLE future_metadata(bytes BLOB); INSERT INTO future_metadata VALUES (x'00ff');").unwrap();
+        let raw = "{ \"operationId\": \"unchanged\", \"futureIntent\": [3,2,1] }";
+        db.execute("INSERT INTO outbox VALUES (9,'unchanged',?)", [raw])
+            .unwrap();
+        drop(db);
+        let before = fs::read(&source).unwrap();
+        export_replica(&source, &archive, false).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), before);
+        let exported = Connection::open(&archive).unwrap();
+        let row: (i64, String, String) = exported
+            .query_row("SELECT seq,operation,body FROM outbox", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, (9, "unchanged".into(), raw.into()));
+        let bytes: Vec<u8> = exported
+            .query_row("SELECT bytes FROM future_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bytes, vec![0, 255]);
+        assert!(export_replica(&source, &archive, false).is_err());
+    }
+    #[test]
+    fn recovery_requires_original_actor_digest_and_retained_receipt() {
+        let request = json!({"operationId":"original","mutations":[{"kind":"workspace.create","id":"same-project","data":{"slug":"launch","name":"Launch"}}]});
+        let raw = request.to_string();
+        let requests = [request];
+        let proof = json!({"state":"committed","operationId":"original","actorId":"agent-a","sourceEpoch":0,"requestDigest":digest(&raw),"originalRequest":raw,"originalResult":"{}","result":{}});
+        assert!(
+            !verify_recovery_proofs(&requests, std::slice::from_ref(&proof), "agent-a").unwrap()
+        );
+        assert!(
+            verify_recovery_proofs(&requests, std::slice::from_ref(&proof), "agent-b").is_err()
+        );
+        let mut corrupt = proof;
+        corrupt["requestDigest"] = json!("wrong");
+        assert!(verify_recovery_proofs(&requests, &[corrupt], "agent-a").is_err());
+        assert!(
+            verify_recovery_proofs(
+                &requests,
+                &[json!({"operationId":"original","state":"export_required"})],
+                "agent-a"
+            )
+            .unwrap()
+        );
+        assert!(verify_recovery_proofs(&requests, &[], "agent-a").is_err());
     }
     #[test]
     fn completion_evidence_is_optional_input_and_not_hidden_by_recent_notes() {
@@ -3443,7 +3930,9 @@ mod tests {
                 token: "secret".into(),
                 identity: remote::Identity::Person,
                 issue: "ENG-1".into(),
-                owner: String::new(),
+                space: String::new(),
+                space_id: None,
+                migration_epoch: None,
                 actor: None,
                 seen: None,
                 checkout: None,
@@ -4291,7 +4780,7 @@ mod tests {
         let r = Replica {
             db,
             config: Config::default(),
-            owner: "orbit".into(),
+            space: "orbit".into(),
             timeline: None,
             receipts: Default::default(),
         };
@@ -4317,13 +4806,13 @@ mod tests {
         let r = Replica {
             db,
             config: Config::default(),
-            owner: "orbit".into(),
+            space: "orbit".into(),
             timeline: None,
             receipts: Default::default(),
         };
         r.set("snapshot", &snapshot().to_string()).unwrap();
-        let first = json!({"operationId":"one","mutations":[{"kind":"issue.create","id":"stable","data":{"title":"Offline"}}]});
-        let second = json!({"operationId":"two","mutations":[{"kind":"issue.update","id":"stable","expectedVersion":1,"data":{"title":"Later"}}]});
+        let first = json!({"contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,"operationId":"one","mutations":[{"kind":"issue.create","id":"stable","data":{"title":"Offline"}}]});
+        let second = json!({"contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,"operationId":"two","mutations":[{"kind":"issue.update","id":"stable","expectedVersion":1,"data":{"title":"Later"}}]});
         r.db.execute(
             "INSERT INTO outbox(operation,body,state) VALUES (?,?,?)",
             params!["one", first.to_string(), "sending"],
@@ -4349,7 +4838,7 @@ mod tests {
         let r = Replica {
             db,
             config: Config::default(),
-            owner: "orbit".into(),
+            space: "orbit".into(),
             timeline: Some("search".into()),
             receipts: Default::default(),
         };
@@ -4360,12 +4849,12 @@ mod tests {
         view["issues"] = json!([{"id":"a","key":"ENG-1","title":"Made in search","version":1}]);
         r.set("view:search", &view.to_string()).unwrap();
         assert_eq!(
-            r.request(json!([]))["timeline"],
+            r.request(json!([])).unwrap()["timeline"],
             "search",
             "changes are made in the timeline"
         );
         let queue = |operation: &str, timeline: Option<&str>, title: &str| {
-            let mut request = json!({"operationId":operation,"mutations":[{"kind":"issue.update","id":"a","expectedVersion":1,"data":{"title":title}}]});
+            let mut request = json!({"contractVersion":4,"spaceId":"space-orbit","migrationEpoch":1,"operationId":operation,"mutations":[{"kind":"issue.update","id":"a","expectedVersion":1,"data":{"title":title}}]});
             if let Some(timeline) = timeline {
                 request["timeline"] = json!(timeline);
             }

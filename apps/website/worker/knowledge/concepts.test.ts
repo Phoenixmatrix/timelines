@@ -1,7 +1,7 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type { FileAnalysis } from "./analyze.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import {
   alignPairs,
   ALIGNER,
@@ -15,6 +15,8 @@ import {
   type Decision,
 } from "./concepts.ts";
 import { buildGraph } from "./graph.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const decisions = (entries: [string, string, number, number?, number?][]) =>
   new Map<string, Decision>(
@@ -204,10 +206,15 @@ test("buildGraph merges aliases, links part_of and turns trimmed concepts into t
 });
 
 test("alignPairs counts stored pair decisions only, not reviews", async () => {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES ('org','org','Org','company','acc');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('acc','org','org','Org');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
     INSERT INTO kg_concept_reviews (repo_id, a, b, score, inputs_hash)
       VALUES ('repo', 'billing', 'invoice', 0, 'h');
@@ -225,7 +232,7 @@ test("alignPairs counts stored pair decisions only, not reviews", async () => {
             },
           },
   };
-  const env = { DB: d1(sqlite), AI } as unknown as Env;
+  const env = { ...fresh.env, AI } as unknown as Env;
   const files = [{ path: "src/a.ts", blob: "a1", mode: "100644" }];
   const analyses = new Map([
     ["a1", { concepts: ["Theme", "Theme Switching"], skipped: undefined } as never],
@@ -237,10 +244,15 @@ test("alignPairs counts stored pair decisions only, not reviews", async () => {
 });
 
 test("alignPairs decides what a newcomer changes in its neighbours' closest candidates (CORE-286)", async () => {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES ('org','org','Org','company','acc');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('acc','org','org','Org');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
   `);
   const asked: string[] = [];
@@ -262,7 +274,7 @@ test("alignPairs decides what a newcomer changes in its neighbours' closest cand
       };
     },
   };
-  const env = { DB: d1(sqlite), AI } as unknown as Env;
+  const env = { ...fresh.env, AI } as unknown as Env;
   const stores = ["Token Store", "Session Store", "Blob Store", "Key Store", "Cache Store"];
   const file = (path: string, concepts: string[]) => ({
     file: { path, blob: path, mode: "100644" },
@@ -298,10 +310,15 @@ test("alignPairs decides what a newcomer changes in its neighbours' closest cand
 });
 
 test("review totals survive partial retries, cached replay, later rounds and later builds", async () => {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES ('org','org','Org','company','acc');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('acc','org','org','Org');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
     INSERT INTO kg_builds (id, repo_id, to_commit, status)
       VALUES ('b1', 'repo', 'c1', 'running'), ('b2', 'repo', 'c2', 'running');
@@ -317,7 +334,7 @@ test("review totals survive partial retries, cached replay, later rounds and lat
   let fail = true;
   let calls = 0;
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     AI: {
       run: async (_model: string, input: { state: { entry_b: { name: string } } }) => {
         calls++;

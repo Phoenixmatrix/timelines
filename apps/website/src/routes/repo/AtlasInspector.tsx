@@ -259,7 +259,7 @@ export function AtlasInspector({
       </p>
       {wiki && (
         <Link
-          to={repoPath(repo.owner, repo.name, "wiki", wiki.slug)}
+          to={repoPath(repo.space, repo.name, "wiki", wiki.slug)}
           className="self-start text-body-sm text-ink underline"
         >
           Wiki: {wiki.title}
@@ -595,7 +595,7 @@ function Contributing({
             {commit && l.srcPath ? (
               <Link
                 to={blobUrl(
-                  repo.owner,
+                  repo.space,
                   repo.name,
                   commit,
                   l.srcPath,
@@ -672,7 +672,7 @@ function Evidence({
           return (
             <li key={`${e.entityId}|${e.via}`} className="flex items-baseline gap-2 text-micro">
               <Link
-                to={`${blobUrl(repo.owner, repo.name, e.commit, e.path, e.sourceId ?? "canonical")}${anchor}`}
+                to={`${blobUrl(repo.space, repo.name, e.commit, e.path, e.sourceId ?? "canonical")}${anchor}`}
                 className="min-w-0 flex-1 truncate font-mono text-ink-muted hover:text-ink pointer-coarse:py-2.5"
                 title={`${e.path} at ${e.commit.slice(0, 7)}`}
               >

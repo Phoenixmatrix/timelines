@@ -4,7 +4,6 @@ import { gzipSync, writeTar } from "@gitmatrix/formats/archive";
 import { parseIndex } from "@gitmatrix/formats/helm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { basic, makeHarness, REGISTRY_URL, type Harness } from "../../testing/harness.ts";
 
 function chart(name: string, version: string, values = "replicas: 1\n"): Uint8Array {
@@ -227,7 +226,6 @@ generated: "2026-01-01T00:00:00Z"
 `;
 
   beforeEach(async () => {
-    invalidateMembers();
     hits.length = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -335,7 +333,7 @@ generated: "2026-01-01T00:00:00Z"
         members: [{ key: "bitnami" }, { key: "mine" }],
       }),
     });
-    invalidateMembers();
+
     await h.request("/helm/mine/api/charts", {
       method: "POST",
       headers: { authorization: basic(admin) },

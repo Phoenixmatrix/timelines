@@ -2,19 +2,48 @@
 // asked by the routed person or by one of their own agents that hasn't been
 // revoked; and who asked is looked up in D1 a bounded number of ids at a time.
 
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
 import { autoApprovable, type HumanRequest, type Mutation } from "../../shared/tracker.ts";
+import { issueToken } from "../api/tokens.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { durableStorage } from "../testing/durable.ts";
 import { ownedCheckpointRepo, ownedTimeline } from "../testing/timeline-source.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { agentsAmong, LOOKUP_CHUNK } from "./access.ts";
 import { TrackerStore, type Access } from "./store.ts";
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
 /** Ben, his agent bot, an approval timeline at checkpoint #1, and approve-when-green on. */
-function setup() {
-  const { sql, transactionSync } = durableStorage();
+async function setup() {
+  const grant = {
+    role: "admin" as const,
+    repositoryRole: "write" as const,
+    packageRole: "none" as const,
+  };
+  const { sql, transactionSync, close, scope, space, env } = await freshTrackerStorage("org", [
+    { accountId: "ann", role: "member" as const, grant },
+    { accountId: "ben", role: "member" as const, grant },
+  ]);
+  onTestFinished(close);
+  await env.DB.prepare(
+    "INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ben')",
+  ).run();
+  const credentials = new Map<string, Access["credential"]>();
+  for (const [actor, person] of [
+    ["ann", "ann"],
+    ["ben", "ben"],
+    ["agt_bot", "ben"],
+  ] as const) {
+    const token = await issueToken(
+      env.DB,
+      person,
+      actor,
+      "write",
+      undefined,
+      actor === person ? undefined : actor,
+    );
+    credentials.set(actor, { kind: "token", id: token.id });
+  }
   let now = Date.parse("2026-10-03T00:00:00Z");
   const tracker = new TrackerStore(sql, transactionSync, () => (now += 1000));
   const people = [
@@ -33,8 +62,12 @@ function setup() {
   const as = (actorId: string, principalId = actorId): Access => ({
     actorId,
     principalId,
+    agentId: actorId === principalId ? null : actorId,
+    credential: credentials.get(actorId),
     agents,
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: actorId === "ann",
     members: people,
     repos: [],
@@ -42,18 +75,31 @@ function setup() {
   });
   let operation = 0;
   const mutate = (access: Access, ...mutations: Mutation[]) =>
-    tracker.mutate(access, { operationId: `op-${++operation}`, mutations });
+    tracker.mutate(access, {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
+      operationId: `op-${++operation}`,
+      mutations,
+    });
   mutate(as("ann"), { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } });
   mutate(as("ben"), { kind: "issue.create", id: "issue", data: { teamId: "team", title: "S" } });
   const timeline = ownedTimeline(tracker.timelines, as("agt_bot", "ben"), {
     slug: "search",
     parent: null,
     policy: "approval",
-    repos: [{ id: "app", owner: "org", name: "app" }],
+    repos: [{ id: "app", space: "org", name: "app" }],
     commits: { app: oid(1) },
   });
   tracker.timelines.finishSourcePush(
     tracker.timelines.beginSourcePush({
+      authority: {
+        spaceId: "org",
+        migrationEpoch: scope.migrationEpoch,
+        personId: "ben",
+        agentId: "agt_bot",
+        credential: credentials.get("agt_bot")!,
+      },
       operationId: "push",
       timelineId: timeline.id,
       repoId: "app",
@@ -69,7 +115,7 @@ function setup() {
     repos: [
       ownedCheckpointRepo(tracker.timelines, "search", {
         id: "app",
-        owner: "org",
+        space: "org",
         name: "app",
         commit: oid(2),
         base: oid(1),
@@ -90,8 +136,8 @@ function setup() {
 }
 
 describe("a revoked agent's approval request", () => {
-  test("isn't approved by approve-when-green; Ben's own still is", () => {
-    const t = setup();
+  test("isn't approved by approve-when-green; Ben's own still is", async () => {
+    const t = await setup();
     t.ask(t.as("agt_bot", "ben"), "from-bot");
     t.ask(t.as("ben"), "from-ben");
     // Ben revokes the bot while its request waits.

@@ -1,10 +1,10 @@
-// An account's own AI providers and the models it made available (CORE-294),
+// A Space's own AI providers and the models it made available (CORE-294),
 // and how a job's frozen AI snapshot names them.
 //
-// Account settings store a provider model by its id, `<provider>:<model>`
+// Space settings store a provider model by its id, `<provider>:<model>`
 // (shared/ai.ts). A snapshot, captured when work starts, names the provider
 // row too, `<provider>:<provider row id>:<model>`, so a call made hours later
-// by a workflow step finds its key without knowing whose work it is.
+// by a workflow step finds its key after revalidating the work's current Space.
 
 import { unseal } from "../../registry/core/seal.ts";
 import {
@@ -70,7 +70,7 @@ function toModel(row: ModelRow): AiProviderModel {
   };
 }
 
-async function modelRows(d1: D1Database, accountId: string): Promise<ModelRow[]> {
+async function modelRows(d1: D1Database, spaceId: string): Promise<ModelRow[]> {
   return db(d1)
     .selectFrom("ai_provider_models as m")
     .innerJoin("ai_providers as p", "p.id", "m.provider_id")
@@ -85,21 +85,21 @@ async function modelRows(d1: D1Database, accountId: string): Promise<ModelRow[]>
       "m.json_mode",
       "m.checked_at",
     ])
-    .where("p.account_id", "=", accountId)
+    .where("p.space_id", "=", spaceId)
     .orderBy("m.name")
     .execute();
 }
 
-/** Every provider, connected or not, with the account's models from each. */
-export async function providerViews(d1: D1Database, accountId: string): Promise<AiProviderView[]> {
+/** Every provider, connected or not, with the Space's models from each. */
+export async function providerViews(d1: D1Database, spaceId: string): Promise<AiProviderView[]> {
   const [providers, models] = await Promise.all([
     db(d1)
       .selectFrom("ai_providers as p")
       .leftJoin("accounts as a", "a.id", "p.updated_by")
       .select(["p.kind", "p.key_last_four", "p.updated_at", "a.slug"])
-      .where("p.account_id", "=", accountId)
+      .where("p.space_id", "=", spaceId)
       .execute(),
-    modelRows(d1, accountId),
+    modelRows(d1, spaceId),
   ]);
   return AI_PROVIDERS.map((info) => {
     const row = providers.find((provider) => provider.kind === info.kind);
@@ -114,9 +114,9 @@ export async function providerViews(d1: D1Database, accountId: string): Promise<
   });
 }
 
-/** The built-in models, then the account's provider models, for each role they can fill. */
-export async function accountCatalog(d1: D1Database, accountId: string): Promise<AiModelCatalog> {
-  const models = (await modelRows(d1, accountId)).map(toModel);
+/** The built-in models, then the Space's provider models, for each role they can fill. */
+export async function spaceCatalog(d1: D1Database, spaceId: string): Promise<AiModelCatalog> {
+  const models = (await modelRows(d1, spaceId)).map(toModel);
   const roles = Object.keys(AI_MODEL_CATALOG) as AiRole[];
   return Object.fromEntries(
     roles.map((role) => [
@@ -146,7 +146,7 @@ export interface ProviderModelRef {
   kind: AiProviderKind;
   providerId: string;
   model: string;
-  /** What usage records call it: the account-facing id, without the row. */
+  /** What usage records call it: the user-facing id, without the row. */
   usageName: string;
 }
 
@@ -168,29 +168,38 @@ export function parseProviderModelRef(ref: string): ProviderModelRef | null {
   };
 }
 
-/** The snapshot reference and prices for an account's provider model id, or null if it's gone. */
+/** The snapshot reference and prices for a Space's provider model id, or null if it's gone. */
 export async function resolveProviderModel(
   d1: D1Database,
-  accountId: string,
+  spaceId: string,
   kind: AiProviderKind,
   model: string,
 ): Promise<{ ref: string; option: AiProviderModel } | null> {
-  const row = (await modelRows(d1, accountId)).find(
+  const row = (await modelRows(d1, spaceId)).find(
     (entry) => entry.kind === kind && entry.model === model,
   );
   return row ? { ref: providerModelRef(kind, row.provider_id, model), option: toModel(row) } : null;
 }
 
-/** The provider's API key for a snapshot's model; throws once the provider is removed. */
-export async function providerKey(env: Env, ref: ProviderModelRef): Promise<string> {
+/** Revalidate the frozen reference against its current Space and model before unsealing.
+ * The caller must authorize the current resource and actor before every use.
+ */
+export async function providerKey(
+  env: Env,
+  ref: ProviderModelRef,
+  spaceId: string,
+): Promise<string> {
   const row = await db(env.DB)
-    .selectFrom("ai_providers")
-    .select(["key_sealed", "kind"])
-    .where("id", "=", ref.providerId)
+    .selectFrom("ai_providers as p")
+    .innerJoin("spaces as s", "s.id", "p.space_id")
+    .innerJoin("ai_provider_models as m", "m.provider_id", "p.id")
+    .select("p.key_sealed")
+    .where("p.id", "=", ref.providerId)
+    .where("p.kind", "=", ref.kind)
+    .where("p.space_id", "=", spaceId)
+    .where("m.model", "=", ref.model)
+    .where("s.archived_at", "is", null)
     .executeTakeFirst();
-  if (!row || row.kind !== ref.kind)
-    throw new Error(
-      `The ${ref.kind} provider this work started with was removed from its account; ${ref.usageName} can't be called.`,
-    );
+  if (!row) throw new Error(`The requested provider model is no longer available in this Space.`);
   return unseal(env, row.key_sealed);
 }

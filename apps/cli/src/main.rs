@@ -46,7 +46,7 @@ fn build_command(agent: bool) -> clap::Command {
                     }
                     if m.mutates {
                         extra.push_str("\nSupports --dry-run.\n");
-                        if ["tracker ", "team ", "workspace ", "issue "].iter().any(|p| m.path.starts_with(p)) {
+                        if ["tracker ", "team ", "project ", "issue "].iter().any(|p| m.path.starts_with(p)) {
                             extra.push_str("Tracker changes are not reversed by `gm undo`; use an explicit versioned edit.\n");
                         } else if m.path.starts_with("timeline ") {
                             extra.push_str("`gm undo` reverses only the local part (working copy, merges), not timeline records on the server or this checkout's binding.\n");
@@ -119,6 +119,27 @@ fn recorded_command(argv: &[String]) -> String {
 }
 
 fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
+    let uses_content_scope = matches!(
+        &command,
+        Command::Tracker(_)
+            | Command::Team(_)
+            | Command::Project(_)
+            | Command::Issue(_)
+            | Command::Request(_)
+            | Command::Timeline(_)
+            | Command::Agent(_)
+            | Command::Release(_)
+            | Command::Pkg(_)
+            | Command::Settings(_)
+            | Command::Retention(_)
+    );
+    let exports_replica = matches!(
+        &command,
+        Command::Tracker(a) if matches!(&a.command, tracker_cli::TrackerCommand::Export { .. })
+    );
+    if uses_content_scope && !exports_replica {
+        profile::validate_current()?;
+    }
     let f = ctx.format;
     fn out<T: Render>(f: Format, r: Result<T, GmError>) -> Result<(), GmError> {
         emit(f, &r?);
@@ -127,7 +148,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
     match command {
         Command::Tracker(a) => out(f, commands::tracker::tracker(ctx, &a)),
         Command::Team(a) => out(f, commands::tracker::team(ctx, &a)),
-        Command::Workspace(a) => out(f, commands::tracker::workspace(ctx, &a)),
+        Command::Project(a) => out(f, commands::tracker::projects(ctx, &a)),
         Command::Issue(a) => out(f, commands::tracker::issue(ctx, &a)),
         Command::Request(a) => out(f, commands::tracker::request(ctx, &a)),
         Command::Status => out(f, local::status(ctx)),

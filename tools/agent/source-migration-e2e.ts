@@ -120,7 +120,7 @@ export async function runSourceMigrationE2E(
     for (const status of ["landed", "abandoned"] as const) {
       const name = slug(status);
       await seed(name, [{ f: a, base: B, head: T }], { status });
-      await gm(["timeline", "migrate", name, "--owner", "orbit"], "marco", a.root);
+      await gm(["timeline", "migrate", name, "--space", "orbit"], "marco", a.root);
       const historical = await a.json<TimelineDetail>(path(name));
       assert.equal(historical.timeline.status, status);
       assert.equal(historical.timeline.repos[0]?.source?.kind, "canonical-historical");
@@ -133,7 +133,7 @@ export async function runSourceMigrationE2E(
     assert.equal(oldApproval.approved, true, "Fixture really persisted an approved old checkpoint");
     // Parent-first migration is mandatory; a child cannot guess its foreign baseline.
     await gm(
-      ["timeline", "migrate", child, "--owner", "orbit"],
+      ["timeline", "migrate", child, "--space", "orbit"],
       "marco",
       a.root,
       /parent first|historical dependency/i,
@@ -141,8 +141,8 @@ export async function runSourceMigrationE2E(
     await a.git(["checkout", "--detach", B]);
     const M = await commit(a, "independent.txt", "independent canonical edit\n");
     const attempts = await Promise.allSettled([
-      gm(["timeline", "migrate", parent, "--owner", "orbit"], "marco", a.root),
-      gm(["timeline", "migrate", parent, "--owner", "orbit"], "marco", a.root),
+      gm(["timeline", "migrate", parent, "--space", "orbit"], "marco", a.root),
+      gm(["timeline", "migrate", parent, "--space", "orbit"], "marco", a.root),
       a.git(["push", "origin", `${M}:main`]),
     ]);
     assert.equal(
@@ -154,7 +154,7 @@ export async function runSourceMigrationE2E(
       attempts.slice(0, 2).some((result) => result.status === "fulfilled"),
       "At least one concurrent migration completes",
     );
-    await gm(["timeline", "migrate", parent, "--owner", "orbit"], "marco", a.root);
+    await gm(["timeline", "migrate", parent, "--space", "orbit"], "marco", a.root);
     const migrated = (await a.json<TimelineDetail>(path(parent))).timeline;
     const entry = migrated.repos[0]!;
     assert.equal(entry.logicalBase?.commit, B);
@@ -168,7 +168,7 @@ export async function runSourceMigrationE2E(
       T,
       "Work source must pin legacy T, not moving main M or logical base B",
     );
-    await gm(["timeline", "migrate", parent, "--owner", "orbit"], "marco", a.root);
+    await gm(["timeline", "migrate", parent, "--space", "orbit"], "marco", a.root);
     assert.equal(
       (await a.json<TimelineDetail>(path(parent))).timeline.repos[0]?.source?.sourceId,
       sourceId,
@@ -198,7 +198,7 @@ export async function runSourceMigrationE2E(
       "",
       "Stale canonical client cannot recreate the retired bookmark",
     );
-    await gm(["timeline", "migrate", child, "--owner", "orbit"], "marco", a.root);
+    await gm(["timeline", "migrate", child, "--space", "orbit"], "marco", a.root);
     const nested = (await a.json<TimelineDetail>(path(child))).timeline;
     assert.equal(nested.experimental, true);
     assert.equal(nested.repos[0]?.logicalBase?.commit, T);
@@ -238,7 +238,7 @@ export async function runSourceMigrationE2E(
     assert.equal(checkpoint.checkpoint.repos[0]?.source?.commit, W);
     assert.equal(checkpoint.approved, false);
     await a.json(`${path(parent)}/land`, "POST", {}, [409]);
-    assert.equal(fixtures.tracker.owner, "orbit");
+    assert.equal(fixtures.tracker.space, "orbit");
     const issueId = randomUUID();
     const requestId = randomUUID();
     await a.json("/api/tracker/orbit/mutate", "POST", {
@@ -339,7 +339,7 @@ export async function runSourceMigrationE2E(
     record({ nested: child, logicalBase: T, integratedParent: C, canonical: nestedCanonical });
 
     await gm(
-      ["timeline", "migrate", inflight, "--owner", "orbit"],
+      ["timeline", "migrate", inflight, "--space", "orbit"],
       "marco",
       a.root,
       /Resolve the legacy landing|landing_unresolved/i,
@@ -349,7 +349,7 @@ export async function runSourceMigrationE2E(
       action: "cancel-unadvanced",
       note: "No canonical advance; cancel old operation",
     });
-    await gm(["timeline", "migrate", inflight, "--owner", "orbit"], "marco", a.root);
+    await gm(["timeline", "migrate", inflight, "--space", "orbit"], "marco", a.root);
     assert.equal(
       (await a.json<TimelineDetail>(path(inflight))).timeline.repos[0]?.source?.kind,
       "timeline-work",
@@ -384,7 +384,7 @@ export async function runSourceMigrationE2E(
       { operation: "partial" },
     );
     await gm(
-      ["timeline", "migrate", partial, "--owner", "orbit"],
+      ["timeline", "migrate", partial, "--space", "orbit"],
       "marco",
       a.root,
       /Resolve the legacy landing|landing_unresolved/i,
@@ -400,7 +400,7 @@ export async function runSourceMigrationE2E(
       action: "accept-partial-and-abandon",
       note: "Preserve first receipt despite revert; remaining work needs new timeline",
     });
-    await gm(["timeline", "migrate", partial, "--owner", "orbit"], "marco", a.root);
+    await gm(["timeline", "migrate", partial, "--space", "orbit"], "marco", a.root);
     const abandoned = (await a.json<TimelineDetail>(path(partial))).timeline;
     assert.equal(abandoned.status, "abandoned");
     assert(abandoned.repos.every((repo) => repo.source?.kind === "canonical-historical"));
@@ -420,7 +420,7 @@ export async function runSourceMigrationE2E(
     const replacement = join(ctx.work, `${partial}-replacement`);
     await gm(["clone", b.repo, replacement], "marco");
     await gm(
-      ["timeline", "start", slug("replacement"), "--owner", "orbit", "--policy", "auto"],
+      ["timeline", "start", slug("replacement"), "--space", "orbit", "--policy", "auto"],
       "marco",
       replacement,
     );
@@ -439,7 +439,7 @@ export async function runSourceMigrationE2E(
     await b.json(b.api, "DELETE", undefined, [204]);
     deleted.add(b.repo);
     await gm(
-      ["timeline", "migrate", tombstone, "--owner", "orbit"],
+      ["timeline", "migrate", tombstone, "--space", "orbit"],
       "marco",
       b.root,
       /deleted|not found|write access|forbidden|404/i,

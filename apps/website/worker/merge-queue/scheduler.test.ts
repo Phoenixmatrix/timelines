@@ -6,7 +6,8 @@ import {
   queueSourceBranch,
   type QueueDecision,
 } from "../../shared/merge-queue.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { runOutcome } from "../ci/landing.ts";
 import { startRun } from "../ci/trigger.ts";
 import type { QueueDeps } from "./deps.ts";
@@ -20,7 +21,16 @@ import {
   type StoredQueue,
 } from "./store.ts";
 import * as queueStore from "./store.ts";
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: DurableObjectState;
+    public env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 const files = vi.hoisted(() => ({ ciYml: "" }));
 vi.mock("../objects.ts", () => ({
   RepoReader: class {
@@ -36,19 +46,44 @@ vi.mock("../objects.ts", () => ({
     async close() {}
   },
 }));
-const databases: DatabaseSync[] = [];
+const environments: Array<() => void> = [];
 afterEach(() => {
   vi.restoreAllMocks();
-  for (const database of databases.splice(0)) database.close();
+  for (const close of environments.splice(0)) close();
 });
 const oid = (n: number) => n.toString(16).padStart(40, "0");
-function setup() {
-  const sqlite = migratedDatabase();
-  databases.push(sqlite);
+async function setup() {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  environments.push(close);
+  Object.assign(env, { CI_RUNNER: "local" });
   sqlite.exec(
-    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner'); INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','owner','app','private','a','https://a');",
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner'); INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four) VALUES('owner-token','owner','Queue','write','queue-token-hash','hash');",
   );
-  const env = { DB: d1(sqlite), CI_RUNNER: "local" } as Env;
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "organization",
+      slug: "organization",
+      displayName: "Organization",
+      kind: "personal",
+      personalAccountId: "owner",
+    },
+    space: { id: "space", slug: "owner", displayName: "Queue Space" },
+    members: [
+      {
+        accountId: "owner",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "owner",
+  });
+  sqlite.exec(
+    "INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','space','app','private','a','https://a')",
+  );
+  const authority = await captureWorkAuthority(env, "repo", {
+    id: "owner",
+    credential: { kind: "token", id: "owner-token" },
+  });
   const refs = new Map([["refs/heads/main", oid(1)]]),
     parents = new Map<string, string[]>();
   let sequence = 0;
@@ -73,7 +108,7 @@ function setup() {
     const number = ++sequence;
     sqlite
       .prepare(
-        "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,queue_id) VALUES(?,'repo',?,?,?,?,?,?)",
+        "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,queue_id,space_id,migration_epoch,authority,actor_id,agent_id) VALUES(?,'repo',?,?,?,?,?,?,?,?,?,?,?)",
       )
       .run(
         id,
@@ -83,6 +118,11 @@ function setup() {
         kind === "deploy" ? "push" : "manual",
         status === "skipped" ? "succeeded" : status,
         kind === "deploy" ? null : s.entry.id,
+        s.authority.spaceId,
+        s.authority.migrationEpoch,
+        JSON.stringify(s.authority),
+        s.authority.personId,
+        s.authority.agentId,
       );
     sqlite
       .prepare(
@@ -153,7 +193,7 @@ function setup() {
     const state: QueueState = {
       entry: {
         id: commit,
-        repo: { id: "repo", owner: "owner", name: "app" },
+        repo: { id: "repo", space: "owner", name: "app" },
         commit,
         branch: "main",
         sourceBranch: queueSourceBranch(commit),
@@ -174,6 +214,7 @@ function setup() {
         createdAt: now,
         updatedAt: now,
       },
+      authority,
       actor: { id: "owner" },
       snapshot: LEGACY_AI_SNAPSHOT,
       mergeSource: commit,
@@ -238,6 +279,7 @@ function usePersistedPipeline(
         queueId: deploy ? undefined : s.entry.id,
         runId: deploy ? s.deployRunId! : s.gateRunId!,
         actor: s.actor,
+        authority: s.authority,
         waitUntil: () => {},
       },
     );
@@ -255,8 +297,24 @@ function usePersistedPipeline(
   t.deps.deploy = vi.fn(async (_repo, s) => start(s, true));
 }
 describe("durable independent merge queue", () => {
+  test.each(["grant", "credential"] as const)(
+    "revoking the initiating %s blocks queued execution without losing its authority",
+    async (kind) => {
+      const t = await setup();
+      const admitted = await t.admit(2);
+      if (kind === "grant") t.sqlite.exec("DELETE FROM space_grants WHERE space_id='space'");
+      else t.sqlite.exec("DELETE FROM access_tokens WHERE id='owner-token'");
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      await t.progress();
+      expect(t.deps.merge).not.toHaveBeenCalled();
+      expect(t.deps.gates).not.toHaveBeenCalled();
+      expect(t.deps.write).not.toHaveBeenCalled();
+      expect(t.refs.get("refs/heads/main")).toBe(oid(1));
+      expect((await t.state(2)).authority).toEqual(admitted.authority);
+    },
+  );
   test("concurrent admissions and progress claim one repository slot, land once, and retain exact gate proof", async () => {
-    const t = setup(),
+    const t = await setup(),
       s = await t.admit(2);
     expect(await Promise.all(Array.from({ length: 4 }, () => admitQueue(t.env.DB, s)))).toEqual([
       false,
@@ -278,7 +336,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(3)).entry.base).toBe((await t.state(2)).entry.candidate);
   });
   test("persisted trigger restrictions let successful landing gates advance main and finish deployment", async () => {
-    const t = setup();
+    const t = await setup();
     usePersistedPipeline(t);
     await t.admit(2);
     await t.settle(2);
@@ -315,7 +373,7 @@ describe("durable independent merge queue", () => {
   test.each(["failed", "skipped"])(
     "a persisted push-and-step gate that is %s still blocks main despite another successful gate",
     async (status) => {
-      const t = setup();
+      const t = await setup();
       usePersistedPipeline(t);
       await t.admit(2);
       await t.settle(2);
@@ -341,7 +399,7 @@ describe("durable independent merge queue", () => {
     },
   );
   test("a persisted step-only pipeline has no runnable landing gates and never advances main", async () => {
-    const t = setup();
+    const t = await setup();
     usePersistedPipeline(t, "on: step\njobs:\n  step-only:\n    on: step\n    steps: [check]\n");
     await t.admit(2);
     await t.settle(2);
@@ -356,7 +414,7 @@ describe("durable independent merge queue", () => {
   test.each(["failed", "cancelled", "skipped", "none"])(
     "%s gates fail closed and the next good submission still lands",
     async (gates) => {
-      const t = setup();
+      const t = await setup();
       await t.admit(2);
       t.behavior.gates = gates;
       t.behavior.trackerFails = true;
@@ -371,7 +429,7 @@ describe("durable independent merge queue", () => {
     },
   );
   test("wrong ordered candidate parents never start gates or advance main", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.badParents = true;
     await t.admit(2);
     await t.settle(2);
@@ -380,7 +438,7 @@ describe("durable independent merge queue", () => {
     expect(t.refs.get("refs/heads/main")).toBe(oid(1));
   });
   test("uncertain successful main CAS is recognized without a second merge", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.uncertainCas = true;
     await t.admit(2);
     await t.settle(2);
@@ -388,7 +446,7 @@ describe("durable independent merge queue", () => {
     expect(t.deps.merge).toHaveBeenCalledTimes(1);
   });
   test("a stale main requires a fresh candidate, attempt ref, and gates", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     await t.progress();
     await t.progress();
@@ -404,7 +462,7 @@ describe("durable independent merge queue", () => {
     expect(t.deps.gates).toHaveBeenCalledTimes(2);
   });
   test("late old-attempt state cannot overwrite a cancellation and retry", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     await t.progress();
     const old = await t.state(2);
@@ -428,7 +486,7 @@ describe("durable independent merge queue", () => {
     expect(latest.mergeRunId).not.toBe(old.mergeRunId);
   });
   test("missing merge rows and missing Workflow callbacks are recovered from durable queue state", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     await t.progress();
     let s = await t.state(2);
@@ -440,7 +498,7 @@ describe("durable independent merge queue", () => {
     expect(t.deps.merge).toHaveBeenCalledTimes(2);
   });
   test("a running gate whose start lost its answer is still reported on the entry", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.gates = "running";
     const gates = t.deps.gates;
     // The run row commits, then the Workflow start's response is lost (CORE-256).
@@ -460,7 +518,7 @@ describe("durable independent merge queue", () => {
     expect(t.deps.recover).toHaveBeenCalledWith(s.gateRunId);
   });
   test("concurrent recovery never starts a merge while a paid scheduling claim is in flight", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     const entered = Promise.withResolvers<void>(),
       answer = Promise.withResolvers<QueueDecision>();
@@ -477,7 +535,7 @@ describe("durable independent merge queue", () => {
     await first;
   });
   test("only proven descendants are covered and a combined failure splits the members", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.combine = true;
     t.behavior.gates = "failed";
     await t.admit(2);
@@ -495,7 +553,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(3)).entry.status).toBe("landed");
   });
   test("combined cancellation fences the candidate but requeues unrelated submissions", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.combine = true;
     await t.admit(2);
     await t.admit(3);
@@ -517,7 +575,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(2)).entry.status).toBe("landed");
   });
   test("a paused old release cannot detach a recombined member from its new cancellation fence", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.combine = true;
     await t.admit(2);
     await t.admit(3);
@@ -567,8 +625,8 @@ describe("durable independent merge queue", () => {
         t.deps,
         {
           id: "repo",
-          owner_id: "owner",
-          owner_slug: "owner",
+          space_id: "space",
+          space_slug: "owner",
           name: "app",
           default_branch: "main",
           artifacts_name: "a",
@@ -580,7 +638,7 @@ describe("durable independent merge queue", () => {
     ).toBe(false);
   });
   test("progression releases old members even when its recovery pre-pass preceded the requeue", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.combine = true;
     await t.admit(2);
     await t.admit(3);
@@ -632,7 +690,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(3)).entry.status).toBe("landed");
   });
   test("successful coverage is only reported after the real candidate lands", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.combine = true;
     await t.admit(2);
     await t.admit(3);
@@ -644,7 +702,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(3)).entry.candidate).toBe((await t.state(2)).entry.candidate);
   });
   test("main effects and remediation recover independently after landing", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.effectsFail = true;
     await t.admit(2);
     await t.settle(2);
@@ -656,7 +714,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(2)).entry.deployStatus).toBe("succeeded");
   });
   test("notification outage cannot block deployment startup or its failure remediation", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.effectsFail = true;
     t.behavior.deploy = "failed";
     await t.admit(2);
@@ -675,7 +733,7 @@ describe("durable independent merge queue", () => {
   test.each(["succeeded", "failed", "missing"] as const)(
     "delayed main effects with missing old pipeline follow newer main only with real %s coverage",
     async (status) => {
-      const t = setup();
+      const t = await setup();
       t.behavior.effectsFail = true;
       t.behavior.deploy = "running";
       await t.admit(2);
@@ -687,9 +745,17 @@ describe("durable independent merge queue", () => {
       if (status !== "missing") {
         t.sqlite
           .prepare(
-            "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status) VALUES('new-main','repo',99,?,'main','push',?)",
+            "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,space_id,migration_epoch,authority,actor_id,agent_id) VALUES('new-main','repo',99,?,'main','push',?,?,?,?,?,?)",
           )
-          .run(oid(900), status);
+          .run(
+            oid(900),
+            status,
+            landed.authority.spaceId,
+            landed.authority.migrationEpoch,
+            JSON.stringify(landed.authority),
+            landed.authority.personId,
+            landed.authority.agentId,
+          );
         t.sqlite
           .prepare(
             "INSERT INTO ci_jobs(id,run_id,repo_id,name,spec,status,runner) VALUES('new-main-job','new-main','repo','deploy','{}',?,'local')",
@@ -732,7 +798,7 @@ describe("durable independent merge queue", () => {
     },
   );
   test("a transient step failure is retried in place instead of failing the entry", async () => {
-    const t = setup();
+    const t = await setup();
     t.deps.stepRetryMs = [0, 0];
     vi.mocked(t.deps.merge).mockImplementationOnce(async () => {
       throw new Error("Peer closed WebSocket: 1006");
@@ -745,7 +811,7 @@ describe("durable independent merge queue", () => {
     warn.mockRestore();
   });
   test("a step that keeps failing fails the entry after its retries", async () => {
-    const t = setup();
+    const t = await setup();
     t.deps.stepRetryMs = [0, 0];
     vi.mocked(t.deps.merge).mockImplementation(async () => {
       throw new Error("Peer closed WebSocket: 1006");
@@ -763,7 +829,7 @@ describe("durable independent merge queue", () => {
     error.mockRestore();
   });
   test("cyclic Git ancestry never invents coverage", async () => {
-    const t = setup();
+    const t = await setup();
     t.parents.set(oid(2), [oid(3)]);
     t.parents.set(oid(3), [oid(2)]);
     expect(
@@ -771,8 +837,8 @@ describe("durable independent merge queue", () => {
         t.deps,
         {
           id: "repo",
-          owner_id: "owner",
-          owner_slug: "owner",
+          space_id: "space",
+          space_slug: "owner",
           name: "app",
           default_branch: "main",
           artifacts_name: "a",
@@ -786,7 +852,7 @@ describe("durable independent merge queue", () => {
   test.each([false, true])(
     "already-included source (deeper ancestor=%s) reports existing main without a merge or invented gates",
     async (deeper) => {
-      const t = setup();
+      const t = await setup();
       await t.admit(2);
       t.refs.set("refs/heads/main", deeper ? oid(5) : oid(2));
       if (deeper) t.parents.set(oid(5), [oid(4)]);
@@ -804,7 +870,7 @@ describe("durable independent merge queue", () => {
     },
   );
   test("main deployment failure creates remediation without rewinding landed state or blocking the next push", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.deploy = "failed";
     await t.admit(2);
     await t.settle(2);
@@ -826,7 +892,7 @@ describe("durable independent merge queue", () => {
   ] as const)(
     "deployment %s survives interruption %s its terminal evidence commit",
     async (status, interruption) => {
-      const t = setup();
+      const t = await setup();
       t.behavior.combine = true;
       t.behavior.deploy = "running";
       await t.admit(2);
@@ -899,7 +965,7 @@ describe("durable independent merge queue", () => {
     },
   );
   test("main CI coverage cycles fail honestly while main remains landed", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.deploy = "running";
     await t.admit(2);
     await t.settle(2);
@@ -915,7 +981,7 @@ describe("durable independent merge queue", () => {
     expect(failed.entry.remediationIssueId).toBe("remediation");
   });
   test("advance winning the cancellation race leaves both combined members unchanged", async () => {
-    const t = setup();
+    const t = await setup();
     t.behavior.combine = true;
     await t.admit(2);
     await t.admit(3);
@@ -929,7 +995,7 @@ describe("durable independent merge queue", () => {
     expect((await t.state(2)).entry.status).toBe("advancing");
   });
   test("repository deletion cascades queue ownership and cannot strand an active slot", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     await t.progress();
     t.sqlite.exec("DELETE FROM repos WHERE id='repo'");
@@ -939,7 +1005,7 @@ describe("durable independent merge queue", () => {
   test.each(["queued", "merging", "testing", "advancing", "landed", "failed"] as const)(
     "a tombstone fences %s work, pending effects, retries and admission",
     async (status) => {
-      const t = setup();
+      const t = await setup();
       const admission = await t.admit(2);
       const before = await t.state(2);
       const saved = (await saveQueue(t.env.DB, before, {
@@ -973,7 +1039,7 @@ describe("durable independent merge queue", () => {
     },
   );
   test("deletion during the advancing ref read prevents publishing the tested candidate", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     const before = await t.state(2);
     await saveQueue(t.env.DB, before, {
@@ -990,7 +1056,7 @@ describe("durable independent merge queue", () => {
     expect(t.refs.get("refs/heads/main")).toBe(oid(1));
   });
   test("an expired uncertain scheduling answer falls back to FIFO without provider replay", async () => {
-    const t = setup();
+    const t = await setup();
     await t.admit(2);
     const s = await t.state(2);
     await saveQueue(t.env.DB, s, {

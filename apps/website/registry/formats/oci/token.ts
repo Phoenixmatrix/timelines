@@ -32,7 +32,12 @@ async function grantsFor(
     const admin =
       scope.name === "catalog" &&
       access.actor.scopes.has("packages:admin") &&
-      (await access.isAdmin());
+      (await access.isAdmin()) &&
+      (access.actor.via !== "registry" ||
+        (access.actor.access ?? []).some(
+          (grant) =>
+            grant.type === "registry" && grant.name === "catalog" && grant.actions.includes("*"),
+        ));
     return admin ? [{ type: "registry", name: "catalog", actions: ["*"] }] : [];
   }
   if (scope.type !== "repository") return [];
@@ -46,7 +51,10 @@ async function grantsFor(
   const granted = new Set<string>();
   const extra: AccessGrant[] = [];
 
-  if ((all || wants.has("pull") || wants.has("push")) && (await access.can(repo, "read"))) {
+  if (
+    (all || wants.has("pull") || wants.has("push")) &&
+    (await access.can(repo, "read", scope.name))
+  ) {
     granted.add("pull");
   }
   const target =
@@ -57,17 +65,17 @@ async function grantsFor(
       ["push", "write"],
       ["delete", "delete"],
     ] as const) {
-      if (!(all || wants.has(action)) || !(await access.can(target, needs))) continue;
+      if (!(all || wants.has(action)) || !(await access.can(target, needs, targetName))) continue;
       granted.add(action);
       if (target !== repo) {
         extra.push({ type: "repository", name: targetName, actions: ["pull", action] });
       }
     }
-    if (all && target === repo && (await access.can(repo, "admin"))) granted.add("*");
+    if (all && target === repo && (await access.can(repo, "admin", scope.name))) granted.add("*");
   }
   if (repo.kind === "virtual" && granted.has("pull")) {
     for (const member of await members(svc, repo)) {
-      if (await access.can(member.repo, "read")) {
+      if (await access.can(member.repo, "read", `${member.repo.key}/${name.image}`)) {
         extra.push({
           type: "repository",
           name: `${member.repo.key}/${name.image}`,
@@ -153,7 +161,18 @@ export async function tokenEndpoint(c: AppContext): Promise<Response> {
     if (scope) grants.push(...(await grantsFor(svc, access, scope)));
   }
   const service = params.get("service") || new URL(svc.baseUrl).host;
-  const issued = await issueRegistryToken(svc.env, actor, mergeGrants(grants), service);
+  // Exchanges cannot widen a per-image JWT cap, including virtual feed aliases.
+  const granted = mergeGrants(grants).flatMap((grant) => {
+    if (actor.via !== "registry") return [grant];
+    const caps = (actor.access ?? []).filter(
+      (cap) => cap.type === grant.type && cap.name === grant.name,
+    );
+    const actions = grant.actions.filter((action) =>
+      caps.some((cap) => cap.actions.includes("*") || cap.actions.includes(action)),
+    );
+    return actions.length ? [{ ...grant, actions }] : [];
+  });
+  const issued = await issueRegistryToken(svc.env, actor, granted, service);
   return c.json(
     {
       token: issued.token,

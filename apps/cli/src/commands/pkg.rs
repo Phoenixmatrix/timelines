@@ -1,4 +1,4 @@
-//! Packages: what an owner publishes, each package's history (queried like
+//! Packages: what a Space publishes, each package's history (queried like
 //! the web console), housekeeping, the repositories allowed to publish, and
 //! setting up package tools on this machine. In a CI job gm acts as the job
 //! (GITMATRIX_URL / GITMATRIX_TOKEN), so `gm pkg upload` needs no setup there.
@@ -70,12 +70,12 @@ fn split_package(package: &str) -> Result<(String, String)> {
     Ok((format.to_string(), name.to_string()))
 }
 
-/// --owner, else the CI job's owner, else this repository's, else you.
-fn owner(ctx: &Ctx, config: &Config, explicit: &Option<String>) -> Result<String> {
+/// --space, else the CI job's Space, this repository's, or the authorized personal default.
+fn space(ctx: &Ctx, config: &Config, explicit: &Option<String>) -> Result<String> {
     if let Some(o) = explicit {
         return Ok(o.clone());
     }
-    if let Ok(o) = std::env::var("GITMATRIX_OWNER")
+    if let Ok(o) = std::env::var("GITMATRIX_SPACE")
         && !o.is_empty()
     {
         return Ok(o);
@@ -85,15 +85,11 @@ fn owner(ctx: &Ctx, config: &Config, explicit: &Option<String>) -> Result<String
     {
         return Ok(o.to_string());
     }
-    let session = remote::api(config, "GET", "/session", None)?;
-    session["viewer"]["slug"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| GmError::usage("Name the owner with --owner, or sign in."))
+    remote::default_space(config)
 }
 
-fn base(owner: &str, format: &str, name: &str) -> String {
-    format!("/packages/{owner}/{format}/{}", encode(name))
+fn base(space: &str, format: &str, name: &str) -> String {
+    format!("/packages/{space}/{format}/{}", encode(name))
 }
 
 fn publish_line(row: &Value) -> String {
@@ -133,12 +129,12 @@ fn publish_line(row: &Value) -> String {
 pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
     let config = Config::load();
     match command {
-        PkgCommand::List { owner: o } => {
-            let owner = owner(ctx, &config, o)?;
-            let value = remote::api(&config, "GET", &format!("/packages/{owner}"), None)?;
+        PkgCommand::List { space: o } => {
+            let space = space(ctx, &config, o)?;
+            let value = remote::api(&config, "GET", &format!("/packages/{space}"), None)?;
             let packages = value["packages"].as_array().cloned().unwrap_or_default();
             let text = if packages.is_empty() {
-                format!("{owner} hasn't published anything you can see.")
+                format!("{space} hasn't published anything you can see.")
             } else {
                 packages
                     .iter()
@@ -164,13 +160,13 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             };
             Ok(Shown { value, text })
         }
-        PkgCommand::Show { package, owner: o } => {
+        PkgCommand::Show { package, space: o } => {
             let (format, name) = split_package(package)?;
-            let owner = owner(ctx, &config, o)?;
-            let value = remote::api(&config, "GET", &base(&owner, &format, &name), None)?;
+            let space = space(ctx, &config, o)?;
+            let value = remote::api(&config, "GET", &base(&space, &format, &name), None)?;
             let p = &value["package"];
             let mut text = format!(
-                "{} ({format}) in {owner}\nlatest {}  ·  {} installable  ·  {} publishes  ·  {} today\n",
+                "{} ({format}) in {space}\nlatest {}  ·  {} installable  ·  {} publishes  ·  {} today\n",
                 s(p, "name"),
                 p["latest"].as_str().unwrap_or("-"),
                 p["versions"],
@@ -210,16 +206,16 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             query,
             limit,
             offset,
-            owner: o,
+            space: o,
         } => {
             let (format, name) = split_package(package)?;
-            let owner = owner(ctx, &config, o)?;
+            let space = space(ctx, &config, o)?;
             let value = remote::api(
                 &config,
                 "GET",
                 &format!(
                     "{}/publishes?q={}&limit={limit}&offset={offset}",
-                    base(&owner, &format, &name),
+                    base(&space, &format, &name),
                     encode(query)
                 ),
                 None,
@@ -245,21 +241,21 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             package,
             version,
             tag,
-            owner: o,
+            space: o,
         } => {
             let action = PkgAction {
                 package: package.clone(),
                 versions: vec![version.clone()],
                 query: None,
                 reason: None,
-                owner: o.clone(),
+                space: o.clone(),
             };
             act(ctx, &config, "tag", &action, Some(tag))
         }
-        PkgCommand::Sources { package, owner: o } => {
+        PkgCommand::Sources { package, space: o } => {
             let (format, name) = split_package(package)?;
-            let owner = owner(ctx, &config, o)?;
-            let detail = remote::api(&config, "GET", &base(&owner, &format, &name), None)?;
+            let space = space(ctx, &config, o)?;
+            let detail = remote::api(&config, "GET", &base(&space, &format, &name), None)?;
             let value = json!({ "sources": detail["sources"] });
             Ok(Shown {
                 text: sources_text(&value["sources"]),
@@ -269,10 +265,10 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
         PkgCommand::Grant {
             package,
             repo,
-            owner: o,
+            space: o,
         } => {
             let (format, name) = split_package(package)?;
-            let owner = owner(ctx, &config, o)?;
+            let space = space(ctx, &config, o)?;
             if ctx.dry_run {
                 return Ok(Shown {
                     text: format!("Would let {repo} publish {package}."),
@@ -282,7 +278,7 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             let value = remote::api(
                 &config,
                 "POST",
-                &format!("{}/sources", base(&owner, &format, &name)),
+                &format!("{}/sources", base(&space, &format, &name)),
                 Some(&json!({ "repo": repo })),
             )?;
             Ok(Shown {
@@ -293,16 +289,16 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
         PkgCommand::Revoke {
             package,
             repo,
-            owner: o,
+            space: o,
         } => {
             let (format, name) = split_package(package)?;
-            let owner = owner(ctx, &config, o)?;
-            let path = base(&owner, &format, &name);
+            let space = space(ctx, &config, o)?;
+            let path = base(&space, &format, &name);
             let detail = remote::api(&config, "GET", &path, None)?;
             let wanted = if repo.contains('/') {
                 repo.clone()
             } else {
-                format!("{owner}/{repo}")
+                format!("{space}/{repo}")
             };
             let id = detail["sources"]
                 .as_array()
@@ -389,9 +385,9 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
         PkgCommand::Upload {
             file,
             target,
-            owner: o,
+            space: o,
         } => {
-            let owner = owner(ctx, &config, o)?;
+            let space = space(ctx, &config, o)?;
             let mut parts: Vec<&str> = target.split('/').filter(|p| !p.is_empty()).collect();
             if parts.len() < 2 {
                 return Err(GmError::usage(
@@ -407,7 +403,7 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
                 parts.push(&file_name);
             }
             let path = format!(
-                "/generic/{owner}/{}",
+                "/generic/{space}/{}",
                 parts
                     .iter()
                     .map(|p| encode(p))
@@ -432,18 +428,18 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
         }
         PkgCommand::Download {
             target,
-            owner: o,
+            space: o,
             dest,
             force,
         } => {
-            let owner = owner(ctx, &config, o)?;
+            let space = space(ctx, &config, o)?;
             let destination = dest
                 .clone()
                 .unwrap_or_else(|| target.rsplit('/').next().unwrap_or("").into());
             save_artifact(
                 ctx,
                 &config,
-                &owner,
+                &space,
                 target,
                 &ctx.cwd.join(destination),
                 *force,
@@ -452,14 +448,14 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
         }
         PkgCommand::Install {
             name,
-            owner: o,
+            space: o,
             version,
             file,
             bin_dir,
             force,
         } => {
             path_segment(name)?;
-            let owner = owner(ctx, &config, o)?;
+            let space = space(ctx, &config, o)?;
             let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
             let file = file.clone().unwrap_or_else(|| format!("{platform}/{name}"));
             let directory = match bin_dir {
@@ -473,7 +469,7 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             let mut shown = save_artifact(
                 ctx,
                 &config,
-                &owner,
+                &space,
                 &format!("{name}/{version}/{file}"),
                 &destination,
                 *force,
@@ -490,7 +486,7 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             }
             Ok(shown)
         }
-        PkgCommand::Setup { owner: o, write } => setup(ctx, &config, o, write),
+        PkgCommand::Setup { space: o, write } => setup(ctx, &config, o, write),
     }
 }
 
@@ -530,14 +526,14 @@ fn check_destination(path: &Path, force: bool) -> Result<()> {
 fn save_artifact(
     ctx: &Ctx,
     config: &Config,
-    owner: &str,
+    space: &str,
     target: &str,
     destination: &Path,
     force: bool,
     install: bool,
 ) -> Result<Shown> {
     use std::os::unix::fs::PermissionsExt;
-    path_segment(owner)?;
+    path_segment(space)?;
     let mut segments = target.splitn(3, '/');
     let name = segments.next().unwrap_or("");
     let requested = segments.next().unwrap_or("");
@@ -549,7 +545,7 @@ fn save_artifact(
     }
     check_destination(destination, force)?;
     let version = if requested == "latest" {
-        let detail = remote::api(config, "GET", &base(&encode(owner), "generic", name), None)?;
+        let detail = remote::api(config, "GET", &base(&encode(space), "generic", name), None)?;
         detail["package"]["latest"]
             .as_str()
             .filter(|v| !v.is_empty())
@@ -563,7 +559,7 @@ fn save_artifact(
     path_segment(&version)?;
     let path = format!(
         "/generic/{}/{}/{}/{}",
-        encode(owner),
+        encode(space),
         encode(name),
         encode(&version),
         file.split('/').map(encode).collect::<Vec<_>>().join("/")
@@ -676,7 +672,7 @@ fn act(
     tag: Option<&String>,
 ) -> Result<Shown> {
     let (format, name) = split_package(&a.package)?;
-    let owner = owner(ctx, config, &a.owner)?;
+    let space = space(ctx, config, &a.space)?;
     if a.versions.is_empty() && a.query.is_none() {
         return Err(GmError::usage(
             "Name the versions, or select them with --query (e.g. -q \"branch:feature/* since:30d\").",
@@ -693,7 +689,7 @@ fn act(
     if let Some(tag) = tag {
         body["tag"] = json!(tag);
     }
-    let path = format!("{}/actions", base(&owner, &format, &name));
+    let path = format!("{}/actions", base(&space, &format, &name));
     if ctx.dry_run {
         let what = match &a.query {
             Some(q) => {
@@ -702,7 +698,7 @@ fn act(
                     "GET",
                     &format!(
                         "{}/publishes?q={}&limit=1",
-                        base(&owner, &format, &name),
+                        base(&space, &format, &name),
                         encode(q)
                     ),
                     None,
@@ -731,9 +727,9 @@ fn act(
     Ok(Shown { value, text })
 }
 
-/// Client configuration for an owner's registries on this machine.
+/// Client configuration for a Space's registries on this machine.
 fn setup(ctx: &Ctx, config: &Config, o: &Option<String>, write: &[String]) -> Result<Shown> {
-    let owner = owner(ctx, config, o)?;
+    let space = space(ctx, config, o)?;
     let server = config.server();
     let host = server
         .split("://")
@@ -747,29 +743,29 @@ fn setup(ctx: &Ctx, config: &Config, o: &Option<String>, write: &[String]) -> Re
             .exit(crate::output::exit::AUTH)
     })?;
     let npmrc = format!(
-        "@{owner}:registry={server}/npm/{owner}/\n//{host}/npm/{owner}/:_authToken={token}\n"
+        "@{space}:registry={server}/npm/{space}/\n//{host}/npm/{space}/:_authToken={token}\n"
     );
     let value = json!({
-        "owner": owner,
+        "space": space,
         "npmrc": npmrc,
-        "docker": { "registry": host, "imagePrefix": format!("{host}/{owner}") },
-        "pip": { "indexUrl": format!("{server}/pypi/{owner}/simple/") },
-        "cargo": { "index": format!("sparse+{server}/cargo/{owner}/index/") },
-        "goproxy": format!("{server}/go/{owner}"),
-        "maven": format!("{server}/maven/{owner}/"),
-        "helm": format!("{server}/helm/{owner}"),
-        "generic": format!("{server}/generic/{owner}/"),
+        "docker": { "registry": host, "imagePrefix": format!("{host}/{space}") },
+        "pip": { "indexUrl": format!("{server}/pypi/{space}/simple/") },
+        "cargo": { "index": format!("sparse+{server}/cargo/{space}/index/") },
+        "goproxy": format!("{server}/go/{space}"),
+        "maven": format!("{server}/maven/{space}/"),
+        "helm": format!("{server}/helm/{space}"),
+        "generic": format!("{server}/generic/{space}/"),
     });
     let mut text = format!(
-        "Registries for {owner} on {server}\n\n\
+        "Registries for {space} on {server}\n\n\
          npm      add to ~/.npmrc (or run with --write npm):\n{}\n\
-         docker   echo $TOKEN | docker login {host} -u {owner} --password-stdin   (or --write docker)\n\
-         \x20        images are {host}/{owner}/<name>:<tag>\n\
-         pip/uv   --index-url {server}/pypi/{owner}/simple/\n\
-         cargo    [registries.{owner}] index = \"sparse+{server}/cargo/{owner}/index/\"\n\
-         go       GOPROXY={server}/go/{owner},https://proxy.golang.org,direct\n\
-         maven    {server}/maven/{owner}/\n\
-         helm     helm repo add {owner} {server}/helm/{owner}\n\
+         docker   echo $TOKEN | docker login {host} -u {space} --password-stdin   (or --write docker)\n\
+         \x20        images are {host}/{space}/<name>:<tag>\n\
+         pip/uv   --index-url {server}/pypi/{space}/simple/\n\
+         cargo    [registries.{space}] index = \"sparse+{server}/cargo/{space}/index/\"\n\
+         go       GOPROXY={server}/go/{space},https://proxy.golang.org,direct\n\
+         maven    {server}/maven/{space}/\n\
+         helm     helm repo add {space} {server}/helm/{space}\n\
          files    gm pkg upload <file> <name>/<version>\n",
         npmrc
             .lines()
@@ -789,20 +785,20 @@ fn setup(ctx: &Ctx, config: &Config, o: &Option<String>, write: &[String]) -> Re
                 let kept: String = existing
                     .lines()
                     .filter(|l| {
-                        !l.starts_with(&format!("@{owner}:registry="))
-                            && !l.starts_with(&format!("//{host}/npm/{owner}/:"))
+                        !l.starts_with(&format!("@{space}:registry="))
+                            && !l.starts_with(&format!("//{host}/npm/{space}/:"))
                     })
                     .map(|l| format!("{l}\n"))
                     .collect();
                 std::fs::write(&path, format!("{kept}{npmrc}"))?;
                 text.push_str(&format!(
-                    "\nWrote the {owner} registry to {}.",
+                    "\nWrote the {space} registry to {}.",
                     path.display()
                 ));
             }
             "docker" => {
                 let mut child = Command::new("docker")
-                    .args(["login", &host, "-u", &owner, "--password-stdin"])
+                    .args(["login", &host, "-u", &space, "--password-stdin"])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { basic, makeHarness, type Harness } from "../../testing/harness.ts";
 import { bearer, jwtClaims, OCI_MANIFEST, pushImage, sha, streamOf } from "./testing.ts";
 import { resetUpstreamTokens } from "./upstream.ts";
@@ -31,7 +30,6 @@ describe("OCI remote and virtual repositories", () => {
   let tamper: boolean;
 
   beforeEach(async () => {
-    invalidateMembers();
     resetUpstreamTokens();
     hits = [];
     realmAuth = [];

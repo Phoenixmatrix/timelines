@@ -35,7 +35,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 
 type Requests = Arc<Mutex<Vec<(String, String, Value)>>>;
 
-/// The timelines API for one timeline, `search`, in the account `orbit`.
+/// The timelines API for one timeline, `search`, in the Space `orbit`.
 struct Api {
     address: SocketAddr,
     requests: Requests,
@@ -50,7 +50,7 @@ fn checkpoint_view(summary: &Value) -> Value {
     json!({
         "checkpoint": {
             "id": "cp_1", "timelineId": "tl_search", "number": 1, "summary": summary,
-            "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "commit": "a".repeat(40),
+            "repos": [{"id": "r1", "space": "orbit", "name": "engine", "commit": "a".repeat(40),
                        "base": "b".repeat(40), "changes": [{"changeId": "kxyz", "commit": "a".repeat(40)}]}],
             "actorId": "agt_bot", "accountableId": "ann", "createdAt": "2026-10-03T00:00:00Z"
         },
@@ -95,7 +95,7 @@ fn record(status: &str) -> Value {
     json!({
         "id": "tl_search", "slug": "search", "name": "Search", "policy": "approval",
         "experimental": false, "parentId": null, "status": status,
-        "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "bookmark": "work",
+        "repos": [{"id": "r1", "space": "orbit", "name": "engine", "bookmark": "work",
             "source": {"sourceId": "work_search", "repoId": "r1", "timelineId": "tl_search",
                 "kind": "timeline-work", "ref": "refs/heads/work"}}],
     })
@@ -511,7 +511,7 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -526,7 +526,7 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -621,11 +621,11 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
     );
 
     // Listing and showing know which timeline this checkout is in.
-    let list = s.ok(&["timeline", "list", "-O", "orbit"]);
+    let list = s.ok(&["timeline", "list", "--space", "orbit"]);
     assert_eq!(list["current"], "search");
-    let text = s.ok(&["timeline", "list", "-O", "orbit", "-o", "text"]);
+    let text = s.ok(&["timeline", "list", "--space", "orbit", "-o", "text"]);
     assert!(text.as_str().unwrap().starts_with("* search"), "{text}");
-    let shown = s.ok(&["timeline", "show", "-O", "orbit"]);
+    let shown = s.ok(&["timeline", "show", "--space", "orbit"]);
     assert_eq!(shown["current"], true);
     assert_eq!(shown["events"][0]["kind"], "fork");
 
@@ -666,12 +666,12 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
     assert_eq!(value["error"]["code"], "timeline_bound");
 
     // Abandon keeps the ended-source guard until explicitly leaving.
-    s.ok(&["timeline", "use", "search", "-O", "orbit"]);
+    s.ok(&["timeline", "use", "search", "--space", "orbit"]);
     assert!(s.work().join("feature.txt").exists());
-    let dry = s.ok(&["timeline", "abandon", "-O", "orbit", "--dry-run"]);
+    let dry = s.ok(&["timeline", "abandon", "--space", "orbit", "--dry-run"]);
     assert_eq!(dry["unbind"], false);
     assert_eq!(s.api.requests("POST").len(), 1);
-    let abandoned = s.ok(&["timeline", "abandon", "-O", "orbit"]);
+    let abandoned = s.ok(&["timeline", "abandon", "--space", "orbit"]);
     assert_eq!(abandoned["timeline"]["status"], "abandoned");
     assert_eq!(
         s.api.requests("POST")[1].0,
@@ -682,7 +682,7 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
     s.ok(&["timeline", "use", "main"]);
     assert!(!s.binding().contains("timeline"));
     assert_eq!(
-        s.err(&["timeline", "use", "search", "-O", "orbit"]),
+        s.err(&["timeline", "use", "search", "--space", "orbit"]),
         "timeline_ended"
     );
 }
@@ -711,7 +711,7 @@ fn checkpoints_pin_the_pushed_commits_with_a_summary() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -720,7 +720,7 @@ fn checkpoints_pin_the_pushed_commits_with_a_summary() {
     let made = s.ok(&[
         "timeline",
         "checkpoint",
-        "-O",
+        "--space",
         "orbit",
         "-m",
         "Ranking v2",
@@ -740,13 +740,13 @@ fn checkpoints_pin_the_pushed_commits_with_a_summary() {
         "{made}"
     );
 
-    let listed = s.ok(&["timeline", "checkpoints", "-O", "orbit"]);
+    let listed = s.ok(&["timeline", "checkpoints", "--space", "orbit"]);
     assert_eq!(listed["timeline"], "search");
     assert_eq!(listed["checkpoints"][0]["runs"][0]["number"], 4);
 
     // People read the same as text: commits, CI, preview, approval state.
     let (code, value, _) = s.run_with(
-        &["timeline", "checkpoints", "-O", "orbit", "-o", "text"],
+        &["timeline", "checkpoints", "--space", "orbit", "-o", "text"],
         &[],
     );
     assert_eq!(code, 0);
@@ -768,20 +768,23 @@ fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
     ]);
     // Every repository of the bound timeline, newest set first.
-    let listed = s.ok(&["timeline", "pages", "-O", "orbit"]);
+    let listed = s.ok(&["timeline", "pages", "--space", "orbit"]);
     assert_eq!(listed["timeline"], "search");
     assert_eq!(listed["repos"][0]["repo"], "orbit/engine");
     assert_eq!(
         listed["repos"][0]["sets"][0]["pages"][0]["slug"],
         "components/src-web"
     );
-    let (code, value, _) = s.run_with(&["timeline", "pages", "-O", "orbit", "-o", "text"], &[]);
+    let (code, value, _) = s.run_with(
+        &["timeline", "pages", "--space", "orbit", "-o", "text"],
+        &[],
+    );
     assert_eq!(code, 0);
     let text = value.as_str().unwrap_or_default().to_string();
     assert!(
@@ -791,7 +794,7 @@ fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
     assert!(text.contains("Serves refunds."), "{text}");
 
     // One checkpoint's pages come with the checkpoint.
-    let one = s.ok(&["timeline", "pages", "-O", "orbit", "--checkpoint", "1"]);
+    let one = s.ok(&["timeline", "pages", "--space", "orbit", "--checkpoint", "1"]);
     assert_eq!(one["checkpoint"], "cp_1");
     assert_eq!(one["repos"][0]["sets"][0]["key"], "cp_1");
 
@@ -799,7 +802,7 @@ fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
     let page = s.ok(&[
         "timeline",
         "pages",
-        "-O",
+        "--space",
         "orbit",
         "--page",
         "components/src-web",
@@ -809,10 +812,17 @@ fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
 
     // Writing now: a dry run asks nothing; the real one queues a set per repository.
     let before = s.api.requests("POST").len();
-    let dry = s.ok(&["timeline", "pages", "-O", "orbit", "--write", "--dry-run"]);
+    let dry = s.ok(&[
+        "timeline",
+        "pages",
+        "--space",
+        "orbit",
+        "--write",
+        "--dry-run",
+    ]);
     assert_eq!(dry["dry_run"], true);
     assert_eq!(s.api.requests("POST").len(), before);
-    let wrote = s.ok(&["timeline", "pages", "-O", "orbit", "--write"]);
+    let wrote = s.ok(&["timeline", "pages", "--space", "orbit", "--write"]);
     assert_eq!(wrote["repos"][0]["sets"][0]["state"], "queued");
     let (path, _) = s.api.requests("POST").pop().unwrap();
     assert_eq!(
@@ -851,7 +861,7 @@ fn work_on_an_older_main_goes_to_a_newly_started_timeline() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -918,7 +928,7 @@ fn push_sync_in_a_timeline_keeps_the_working_copy_on_the_stack() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -990,7 +1000,7 @@ fn work_on_another_remote_bookmark_stays_behind_when_a_timeline_starts() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -1010,7 +1020,7 @@ fn compact_sync_replays_only_unlanded_suffix_and_keeps_push_guard() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -1063,7 +1073,7 @@ fn compact_sync_preserves_edited_same_change_revision_and_recovery_root() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -1145,7 +1155,7 @@ fn unresolved_or_expired_lineage_never_discards_local_work() {
             "timeline",
             "start",
             "search",
-            "-O",
+            "--space",
             "orbit",
             "--repo",
             "orbit/engine",
@@ -1178,7 +1188,7 @@ fn legacy_metadata_never_falls_back_to_a_canonical_timeline_bookmark() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",
@@ -1194,9 +1204,9 @@ fn legacy_metadata_never_falls_back_to_a_canonical_timeline_bookmark() {
     assert_eq!(s.err(&["sync"]), "source_migration_required");
     assert_eq!(s.remote(&["show-ref"]), before);
     assert!(s.binding().contains("timeline: search"));
-    let migrated = s.ok(&["timeline", "migrate", "-O", "orbit"]);
+    let migrated = s.ok(&["timeline", "migrate", "--space", "orbit"]);
     assert_eq!(migrated["repos"][0]["source"]["sourceId"], "work_search");
-    s.ok(&["timeline", "use", "search", "-O", "orbit"]);
+    s.ok(&["timeline", "use", "search", "--space", "orbit"]);
 }
 
 #[test]
@@ -1206,7 +1216,7 @@ fn compact_sync_surfaces_conflicts_without_losing_the_local_revision() {
         "timeline",
         "start",
         "search",
-        "-O",
+        "--space",
         "orbit",
         "--repo",
         "orbit/engine",

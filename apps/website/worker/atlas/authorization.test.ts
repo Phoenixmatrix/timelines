@@ -4,7 +4,7 @@
 // people, an agent, an organization, public and private repositories, and the
 // real migrations under D1. Every Atlas surface is exercised: the repository
 // routes (/api/repos/:o/:n/atlas/*), the workspace routes
-// (/api/accounts/:owner/atlas/*), their cursors and pinned snapshots, and the
+// (/api/spaces/:space/atlas/*), their cursors and pinned snapshots, and the
 // other reads the Knowledge page's loader makes (status, the wiki catalog,
 // timeline overlays) plus the explicit graph export.
 //
@@ -28,7 +28,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { FakeR2Bucket } from "@gitmatrix/testing";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type {
   AtlasCrossLink,
   AtlasDetail,
@@ -48,14 +48,21 @@ import {
   atlasNeedsRestart,
   onAtlasAccessLost,
 } from "../../src/lib/atlas.ts";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import { app as server } from "../app.ts";
 import { issueToken } from "../api/tokens.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
-import { fakeDurableState } from "../testing/durable-state.ts";
+import { d1, migratedRegistryDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
 import { runPurge } from "../retention/repo-deletion.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Tracker } from "../tracker/object.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
+import { TrackerStore } from "../tracker/store.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
+import { sha256 } from "../knowledge/util.ts";
+import { cursorSecret, signCursor, verifyCursor, type CursorBinding } from "./cursor.ts";
 import { clearCompositionCache } from "./compose.ts";
 import { publishAtlasFixture, writeAtlasFixtureGraph } from "./fixture.ts";
 import {
@@ -108,10 +115,17 @@ function forbidden(name: string, touched: string[]) {
 }
 
 const REPOS = [
-  { id: "r_vault", owner: "ann", name: "vault", visibility: "private", marker: VAULT },
-  { id: "r_other", owner: "ann", name: "other", visibility: "private", marker: OTHER },
-  { id: "r_open", owner: "ann", name: "open", visibility: "public", marker: OPEN },
-  { id: "r_core", owner: "acme", name: "core", visibility: "private", marker: CORE },
+  { id: "r_vault", space: "ann", name: "vault", visibility: "private", marker: VAULT },
+  { id: "r_other", space: "ann", name: "other", visibility: "private", marker: OTHER },
+  { id: "r_open", space: "ann", name: "open", visibility: "public", marker: OPEN },
+  { id: "r_core", space: "acme", name: "core", visibility: "private", marker: CORE },
+  {
+    id: "r_private",
+    space: "acme-private",
+    name: "private",
+    visibility: "private",
+    marker: "Ivoryhaven",
+  },
 ] as const;
 
 type Who = "ann" | "ben" | "carl" | "dora" | "annBot" | "benBot" | "anonymous";
@@ -119,35 +133,63 @@ type Who = "ann" | "ben" | "carl" | "dora" | "annBot" | "benBot" | "anonymous";
 let artifactsNames = 0;
 
 /**
- * The world: ann owns vault (ben reads it as a collaborator), other (hers
- * alone) and open (public); the acme organization owns core, which its member
- * dora reads by the organization's default member access. carl reads nothing
- * private. annBot and benBot are agents acting for ann and ben. Every
+ * The world: ann has an explicit grant to vault (ben reads it as a collaborator),
+ * other and public open. Dora reads acme/core through an explicit Space grant,
+ * but cannot read acme-private in the same Organization. Carl owns that
+ * Organization without any content grant. annBot and benBot act for people. Every
  * repository has a published fixture Atlas (projected the way a Knowledge
  * build does, without a model), a wiki page and a timeline overlay.
  */
 async function world() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   const run = ++artifactsNames;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
-      ('ann', 'user', 'ann', 'Ann', NULL), ('ben', 'user', 'ben', 'Ben', NULL),
-      ('carl', 'user', 'carl', 'Carl', NULL), ('dora', 'user', 'dora', 'Dora', NULL),
-      ('acme', 'org', 'acme', 'Acme', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES ('acme', 'dora', 'member');
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
+      ('carl', 'user', 'carl', 'Carl'), ('dora', 'user', 'dora', 'Dora');
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, default_space_id)
+      VALUES ('org-acme', 'acme', 'Acme', 'company', 'acme');
+    INSERT INTO spaces (id, organization_id, slug, display_name) VALUES
+      ('acme', 'org-acme', 'acme', 'Core'), ('acme-private', 'org-acme', 'acme-private', 'Private');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by) VALUES
+      ('org-acme', 'carl', 'owner', 'test-fixture', 'carl'),
+      ('org-acme', 'dora', 'member', 'test-fixture', 'carl'),
+      ('org-acme', 'ann', 'member', 'test-fixture', 'carl');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by) VALUES
+      ('acme', 'org-acme', 'dora', 'member', 'read', 'read', 'test-fixture', 'carl'),
+      ('acme-private', 'org-acme', 'ann', 'admin', 'write', 'write', 'test-fixture', 'carl');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail) VALUES
+      ('audit-dora', 'org-acme', 'acme', 'carl', 'space.grant', 'dora', '{"origin":"test-fixture"}'),
+      ('audit-private', 'org-acme', 'acme-private', 'carl', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
     INSERT INTO agents (id, name, accountable_id) VALUES
       ('agt_ann', 'ann-bot', 'ann'), ('agt_ben', 'ben-bot', 'ben');
   `);
   const git = fakeRemotes();
   const head = oid(1);
   for (const r of REPOS) {
-    const ownerId = r.owner;
+    const spaceId = r.space;
     sqlite
       .prepare(
-        `INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+        `INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(r.id, ownerId, r.name, r.visibility, `authz-${run}-${r.id}`, `https://${r.id}`);
+      .run(r.id, spaceId, r.name, r.visibility, `authz-${run}-${r.id}`, `https://${r.id}`);
     git.add(`https://${r.id}`, { "refs/heads/main": head }, undefined, `authz-${run}-${r.id}`);
     git.add(
       `https://${r.id}-work`,
@@ -156,11 +198,11 @@ async function world() {
       `authz-${run}-${r.id}-work`,
     );
     sqlite.exec(`
-      INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+      INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, space_id,
         artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
         fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
         initial_token_revoked, created_at, updated_at)
-      VALUES ('work_${r.id}', '${r.id}', 'plan-${ownerId}', 'plan', '${ownerId}',
+      VALUES ('work_${r.id}', '${r.id}', 'plan-${spaceId}', 'plan', '${spaceId}',
         'authz-${run}-${r.id}-work', 'https://${r.id}-work', 'ready', 'allocate-${r.id}',
         'canonical', '${head}', '${head}', 'refs/heads/main',
         'canonical', '${head}', '${head}', 'refs/heads/main', 1, '', '');
@@ -204,12 +246,36 @@ async function world() {
       batch: inner.batch.bind(inner),
       exec: inner.exec.bind(inner),
     }) as unknown as D1Database;
+  const trackerStates = new Map<string, { ctx: DurableObjectState; db: DatabaseSync }>();
+  fresh.env.TRACKER = { idFromName: fakeDurableObjectId } as Env["TRACKER"];
+  for (const { id } of sqlite.prepare("SELECT id FROM spaces").all()) {
+    const spaceId = String(id);
+    const state = fakeDurableState({ name: spaceId });
+    onTestFinished(() => state.db.close());
+    await initializeFreshTrackerSpace(fresh.env, state.ctx, spaceId);
+    new TrackerStore(state.ctx.storage.sql, (work) => state.ctx.storage.transactionSync(work));
+    for (const source of sqlite
+      .prepare("SELECT * FROM timeline_work_sources WHERE space_id = ?")
+      .all(spaceId)) {
+      state.db
+        .prepare(
+          "INSERT INTO timeline_source_allocations (source_id, timeline_id, repo_id, data) VALUES (?, ?, ?, ?)",
+        )
+        .run(
+          String(source.source_id),
+          String(source.timeline_id),
+          String(source.repo_id),
+          JSON.stringify(source),
+        );
+    }
+    trackerStates.set(spaceId, state);
+  }
   /** Fresh bindings over the same database: a cold isolate. */
   const environment = () => {
     const coordinators = new Map<string, KnowledgeCoordinator>();
     const trackers = new Map<string, Tracker>();
-    const allocations = sqlite.prepare("SELECT * FROM timeline_work_sources").all();
     const env = {
+      ...fresh.env,
       DB: counted(d1(sqlite)),
       REGISTRY_DB: forbidden("REGISTRY_DB", touched),
       BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
@@ -224,23 +290,13 @@ async function world() {
       // Deleting a repository starts its purge (CORE-199); the test runs it.
       REPO_PURGE: { create: async () => ({}) },
       TRACKER: {
+        idFromName: fakeDurableObjectId,
         getByName: (id: string) => {
           let found = trackers.get(id);
           if (!found) {
-            const state = fakeDurableState({ name: id });
+            const state = trackerStates.get(id);
+            if (!state) throw new Error(`Unknown Tracker Space ${id}`);
             found = new Tracker(state.ctx, env);
-            for (const source of allocations.filter((row) => row.owner_id === id)) {
-              state.db
-                .prepare(
-                  "INSERT INTO timeline_source_allocations (source_id, timeline_id, repo_id, data) VALUES (?, ?, ?, ?)",
-                )
-                .run(
-                  String(source.source_id),
-                  String(source.timeline_id),
-                  String(source.repo_id),
-                  JSON.stringify(source),
-                );
-            }
             trackers.set(id, found);
           }
           return found;
@@ -266,6 +322,7 @@ async function world() {
     const href = input instanceof Request ? input.url : String(input);
     if (!href.startsWith("/api/") || !clientEnv) return git.fetch(input, init);
     const headers = new Headers(init?.headers);
+    headers.set(CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION));
     if (browser !== "anonymous") headers.set("authorization", `Bearer ${tokens[browser]}`);
     return server.request(href, { ...init, headers }, clientEnv, executionCtx);
   });
@@ -276,16 +333,12 @@ async function world() {
   } as unknown as ExecutionContext;
 
   const view = (env: Env) => {
-    const call = (who: Who, path: string, init: RequestInit = {}) =>
-      server.request(
-        path,
-        {
-          ...init,
-          headers: who === "anonymous" ? {} : { authorization: `Bearer ${tokens[who]}` },
-        },
-        env,
-        executionCtx,
-      );
+    const call = (who: Who, path: string, init: RequestInit = {}) => {
+      const headers = new Headers(init.headers);
+      headers.set(CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION));
+      if (who !== "anonymous") headers.set("authorization", `Bearer ${tokens[who]}`);
+      return server.request(path, { ...init, headers }, env, executionCtx);
+    };
     return {
       call,
       /** Status and body, for byte-for-byte comparison. */
@@ -370,7 +423,7 @@ async function writeFixture(
 type World = Awaited<ReturnType<typeof world>>;
 type View = Pick<World, "call" | "text" | "get">;
 
-const repoBase = (owner: string, name: string) => `/api/repos/${owner}/${name}`;
+const repoBase = (space: string, name: string) => `/api/repos/${space}/${name}`;
 
 /** What a viewer has open in a repository's Atlas: ids, a pinned snapshot and a cursor per paged route. */
 interface Open {
@@ -384,8 +437,8 @@ interface Open {
 }
 
 /** Open a repository's Atlas as `who`, the way the Knowledge tab does, and page one step everywhere. */
-async function openAtlas(v: View, who: Who, owner: string, name: string): Promise<Open> {
-  const atlas = `${repoBase(owner, name)}/atlas`;
+async function openAtlas(v: View, who: Who, space: string, name: string): Promise<Open> {
+  const atlas = `${repoBase(space, name)}/atlas`;
   const overview = await v.get<AtlasOverview>(who, `${atlas}/overview`);
   const capabilities = [...overview.regions, ...overview.catalogue.items].filter(
     (r) => r.kind === "capability",
@@ -505,6 +558,7 @@ describe("Atlas authorization, revocation and privacy", () => {
   test("an unreadable private repository is a 404 identical to a missing one, on every surface", async () => {
     const vault = await openAtlas(w, "ann", "ann", "vault");
     const core = await openAtlas(w, "dora", "acme", "core");
+    const privateSpace = await openAtlas(w, "ann", "acme-private", "private");
     const cases: [Who, string, string, Open, string[]][] = [
       ["carl", "ann", "vault", vault, [VAULT, "r_vault"]],
       ["anonymous", "ann", "vault", vault, [VAULT, "r_vault"]],
@@ -513,26 +567,58 @@ describe("Atlas authorization, revocation and privacy", () => {
       ["ben", "acme", "core", core, [CORE, "r_core"]],
       ["benBot", "acme", "core", core, [CORE, "r_core"]],
       ["anonymous", "acme", "core", core, [CORE, "r_core"]],
+      ["dora", "acme-private", "private", privateSpace, ["Ivoryhaven", "r_private"]],
+      ["carl", "acme-private", "private", privateSpace, ["Ivoryhaven", "r_private"]],
     ];
-    for (const [who, owner, name, open, secrets] of cases) {
+    for (const [who, space, name, open, secrets] of cases) {
       for (const path of surfaces(open)) {
-        const hidden = await w.text(who, `${repoBase(owner, name)}${path}`);
-        const missing = await w.text(who, `${repoBase(owner, "ghost")}${path}`);
-        expect(hidden, `${who} ${owner}/${name}${path}`).toBe(missing);
+        const hidden = await w.text(who, `${repoBase(space, name)}${path}`);
+        const missing = await w.text(who, `${repoBase(space, "ghost")}${path}`);
+        expect(hidden, `${who} ${space}/${name}${path}`).toBe(missing);
         expect(hidden.startsWith("404 "), `${who} ${path}`).toBe(true);
         hides(hidden, ...secrets);
       }
-      // An owner that doesn't exist looks the same too.
-      expect(await w.text(who, `${repoBase(owner, name)}/atlas/overview`)).toBe(
+      // A Space that doesn't exist looks the same too.
+      expect(await w.text(who, `${repoBase(space, name)}/atlas/overview`)).toBe(
         await w.text(who, `${repoBase("nobody", name)}/atlas/overview`),
       );
+    }
+  });
+
+  test("Organization ownership and sibling Space membership do not reveal a private composition", async () => {
+    const base = "/api/spaces/acme-private/atlas";
+    const overview = await w.get<AtlasWorkspaceOverview>("ann", `${base}/overview?repos=private`);
+    const page = await w.get<AtlasWorkspacePage<AtlasRegion>>(
+      "ann",
+      `${base}/regions?repos=private&limit=1`,
+    );
+    expect(page.next).not.toBeNull();
+    await w.get<AtlasWorkspaceComposition>("ann", `${base}/composition?repos=private`);
+    for (const who of ["carl", "dora"] as const) {
+      for (const openView of [() => w, () => w.cold()]) {
+        const view = openView();
+        for (const route of [
+          "overview",
+          `overview?snapshot=${enc(overview.snapshot.id)}`,
+          `regions?limit=1&cursor=${enc(page.next!)}`,
+          "composition",
+          `composition?snapshot=${enc(overview.snapshot.id)}`,
+          "links?id=r_private%2Frepo&state=resolved",
+        ]) {
+          const join = route.includes("?") ? "&" : "?";
+          const denied = await view.text(who, `${base}/${route}${join}repos=private`);
+          expect(denied).toBe(await view.text(who, `${base}/${route}${join}repos=ghost`));
+          expect(denied).toMatch(/^404 /);
+          hides(denied, "Ivoryhaven", "r_private", overview.snapshot.id);
+        }
+      }
     }
   });
 
   const revocations: {
     label: string;
     who: Who;
-    owner: string;
+    space: string;
     name: string;
     marker: string;
     id: string;
@@ -542,7 +628,7 @@ describe("Atlas authorization, revocation and privacy", () => {
     {
       label: "a collaborator removed",
       who: "ben",
-      owner: "ann",
+      space: "ann",
       name: "vault",
       marker: VAULT,
       id: "r_vault",
@@ -557,7 +643,7 @@ describe("Atlas authorization, revocation and privacy", () => {
     {
       label: "a public repository made private",
       who: "carl",
-      owner: "ann",
+      space: "ann",
       name: "open",
       marker: OPEN,
       id: "r_open",
@@ -574,31 +660,59 @@ describe("Atlas authorization, revocation and privacy", () => {
     {
       label: "an organization membership ended",
       who: "dora",
-      owner: "acme",
+      space: "acme",
       name: "core",
       marker: CORE,
       id: "r_core",
       status: 404,
       revoke: async (w) => {
-        w.sqlite.exec(`DELETE FROM org_members WHERE org_id = 'acme' AND user_id = 'dora'`);
+        w.sqlite.exec(
+          `DELETE FROM organization_members WHERE organization_id = 'org-acme' AND account_id = 'dora'`,
+        );
       },
     },
     {
-      label: "an organization's default member access withdrawn",
+      label: "a Space repository baseline withdrawn",
       who: "dora",
-      owner: "acme",
+      space: "acme",
       name: "core",
       marker: CORE,
       id: "r_core",
       status: 404,
       revoke: async (w) => {
-        w.sqlite.exec(`UPDATE accounts SET member_repo_role = 'none' WHERE id = 'acme'`);
+        w.sqlite.exec(
+          `UPDATE space_grants SET repository_role = 'none' WHERE space_id = 'acme' AND account_id = 'dora'`,
+        );
+      },
+    },
+    {
+      label: "an explicit Space grant revoked",
+      who: "dora",
+      space: "acme",
+      name: "core",
+      marker: CORE,
+      id: "r_core",
+      status: 404,
+      revoke: async (w) => {
+        w.sqlite.exec(`DELETE FROM space_grants WHERE space_id = 'acme' AND account_id = 'dora'`);
+      },
+    },
+    {
+      label: "a personal Space grant revoked despite matching person and Space IDs",
+      who: "ann",
+      space: "ann",
+      name: "vault",
+      marker: VAULT,
+      id: "r_vault",
+      status: 404,
+      revoke: async (w) => {
+        w.sqlite.exec(`DELETE FROM space_grants WHERE space_id = 'ann' AND account_id = 'ann'`);
       },
     },
     {
       label: "an agent revoked",
       who: "benBot",
-      owner: "ann",
+      space: "ann",
       name: "vault",
       marker: VAULT,
       id: "r_vault",
@@ -612,32 +726,174 @@ describe("Atlas authorization, revocation and privacy", () => {
 
   test.each(revocations)(
     "$label: the next request, mid-traversal or pinned, warm or cold, discloses nothing",
-    async ({ who, owner, name, marker, id, revoke, status }) => {
+    async ({ who, space, name, marker, id, revoke, status }) => {
       // The viewer has the overview, the loader's reads and a cursor on every paged route open.
-      const open = await openAtlas(w, who, owner, name);
-      const base = repoBase(owner, name);
+      const open = await openAtlas(w, who, space, name);
+      const base = repoBase(space, name);
       expect(await w.text(who, `${base}/atlas/overview`)).toContain(marker);
       for (const path of surfaces(open))
         if (!path.includes("does-not-exist") && !path.includes("made-up"))
           expect((await w.call(who, `${base}${path}`)).status, path).toBe(200);
+      const workspace = `/api/spaces/${space}/atlas`;
+      const selected = `repos=${enc(name)}`;
+      const overview = await w.get<AtlasWorkspaceOverview>(
+        who,
+        `${workspace}/overview?${selected}`,
+      );
+      const page = await w.get<AtlasWorkspacePage<AtlasRegion>>(
+        who,
+        `${workspace}/regions?${selected}&limit=1`,
+      );
+      expect(page.next).not.toBeNull();
+      const composition = await w.get<AtlasWorkspaceComposition>(
+        who,
+        `${workspace}/composition?${selected}`,
+      );
+      expect(composition.coverage.map((entry) => entry.repoId)).toEqual([id]);
+      const workspacePaths = [
+        "overview",
+        `overview?snapshot=${enc(overview.snapshot.id)}`,
+        `regions?limit=1&cursor=${enc(page.next!)}`,
+        "composition",
+        `composition?snapshot=${enc(overview.snapshot.id)}`,
+      ];
 
       await revoke(w);
 
-      for (const [label, v] of [
-        ["warm", w],
-        ["cold", w.cold()],
+      for (const [label, openView] of [
+        ["warm", () => w],
+        ["cold", () => w.cold()],
       ] as const) {
+        const v = openView();
         for (const path of surfaces(open)) {
           const after = await v.text(who, `${base}${path}`);
           expect(after, `${label} ${path}`).toBe(
-            await v.text(who, `${repoBase(owner, "ghost")}${path}`),
+            await v.text(who, `${repoBase(space, "ghost")}${path}`),
           );
           expect(after.startsWith(`${status} `), `${label} ${path}: ${after}`).toBe(true);
           hides(after, marker, id, open.snapshot);
         }
+        for (const path of workspacePaths) {
+          const join = path.includes("?") ? "&" : "?";
+          const after = await v.text(who, `${workspace}/${path}${join}${selected}`);
+          expect(after, `${label} workspace ${path}`).toBe(
+            await v.text(who, `${workspace}/${path}${join}repos=ghost`),
+          );
+          expect(after.startsWith(`${status} `), `${label} workspace ${path}`).toBe(true);
+          hides(after, marker, id, overview.snapshot.id);
+        }
       }
     },
   );
+
+  test("validly signed cursors with a mismatched migration epoch are refused warm and cold", async () => {
+    const repo = await openAtlas(w, "dora", "acme", "core");
+    const base = "/api/spaces/acme/atlas";
+    const overview = await w.get<AtlasWorkspaceOverview>("dora", `${base}/overview?repos=core`);
+    const regions = await w.get<AtlasWorkspacePage<AtlasRegion>>(
+      "dora",
+      `${base}/regions?repos=core&limit=1`,
+    );
+    expect(regions.next).not.toBeNull();
+    const admission = await cutoverControl(w.env).admission(CONTENT_CONTRACT_VERSION);
+    expect(admission.allowed).toBe(true);
+    const secret = await cursorSecret(w.env);
+    const version = overview.space.authorizationVersion;
+    const repoBinding: CursorBinding = {
+      route: "regions",
+      scope: `repo:r_core:space:acme:authorization:${version}:epoch:${admission.epoch}`,
+      filters: {},
+      principal: "user:dora",
+    };
+    const workspaceBinding: CursorBinding = {
+      route: "workspace/regions",
+      scope: overview.scope,
+      filters: {},
+      principal: "user:dora",
+    };
+    const cases = [
+      {
+        binding: repoBinding,
+        cursor: repo.cursors.regions!,
+        path: "/api/repos/acme/core/atlas/regions?limit=1",
+      },
+      {
+        binding: workspaceBinding,
+        cursor: regions.next!,
+        path: `${base}/regions?repos=core&limit=1`,
+      },
+    ];
+    // Deliberately mismatched persisted tokens, not a fabricated successful activation.
+    for (const epoch of [admission.epoch - 1, admission.epoch + 1]) {
+      const hash = await sha256(JSON.stringify([4, epoch, "acme", version, ["r_core"]]));
+      for (const entry of cases) {
+        const current = await verifyCursor(secret, entry.binding, entry.cursor);
+        expect(current.ok).toBe(true);
+        if (!current.ok) throw new Error("The real request must issue an authentic cursor");
+        const binding = {
+          ...entry.binding,
+          scope:
+            entry.binding.route === "regions"
+              ? `repo:r_core:space:acme:authorization:${version}:epoch:${epoch}`
+              : `ws:acme:${hash.slice(0, 32)}`,
+        };
+        const mismatched = await signCursor(secret, binding, current.state);
+        expect((await verifyCursor(secret, binding, mismatched)).ok).toBe(true);
+        for (const openView of [() => w, () => w.cold()]) {
+          const view = openView();
+          const rejected = await view.text("dora", `${entry.path}&cursor=${enc(mismatched)}`);
+          expect(rejected).toMatch(/^400 .*cursor_invalid/);
+          expect(rejected).toBe(await view.text("dora", `${entry.path}&cursor=malformed`));
+          hides(rejected, CORE, mismatched);
+        }
+      }
+    }
+  });
+
+  test("authorization-version changes invalidate old cursors and composite pins without rebuilding repositories", async () => {
+    const repo = await openAtlas(w, "dora", "acme", "core");
+    const base = "/api/spaces/acme/atlas";
+    const overview = await w.get<AtlasWorkspaceOverview>("dora", `${base}/overview?repos=core`);
+    const regions = await w.get<AtlasWorkspacePage<AtlasRegion>>(
+      "dora",
+      `${base}/regions?repos=core&limit=1`,
+    );
+    expect(regions.next).not.toBeNull();
+    await w.get<AtlasWorkspaceComposition>("dora", `${base}/composition?repos=core`);
+    w.sqlite.exec(
+      `UPDATE spaces SET authorization_version = authorization_version + 1 WHERE id = 'acme'`,
+    );
+    for (const openView of [() => w, () => w.cold()]) {
+      const view = openView();
+      expect(
+        await view.text(
+          "dora",
+          `/api/repos/acme/core/atlas/regions?limit=1&cursor=${enc(repo.cursors.regions!)}`,
+        ),
+      ).toMatch(/^400 .*cursor_invalid/);
+      expect(
+        await view.text("dora", `${base}/regions?repos=core&limit=1&cursor=${enc(regions.next!)}`),
+      ).toMatch(/^400 .*cursor_invalid/);
+      for (const route of ["overview", "composition"]) {
+        const rejected = await view.text(
+          "dora",
+          `${base}/${route}?repos=core&snapshot=${enc(overview.snapshot.id)}`,
+        );
+        expect(rejected).toMatch(/^404 .*snapshot_unknown/);
+        hides(rejected, CORE, overview.snapshot.id);
+      }
+      const current = await view.get<AtlasWorkspaceOverview>("dora", `${base}/overview?repos=core`);
+      expect(current.snapshot.id).not.toBe(overview.snapshot.id);
+      expect(
+        (
+          await view.get<AtlasOverview>(
+            "dora",
+            `/api/repos/acme/core/atlas/overview?snapshot=${enc(repo.snapshot)}`,
+          )
+        ).snapshot.id,
+      ).toBe(repo.snapshot);
+    }
+  });
 
   test("cursors are bound to their principal, repository, route and filters", async () => {
     const atlas = (name: string) => `${repoBase("ann", name)}/atlas`;
@@ -659,7 +915,7 @@ describe("Atlas authorization, revocation and privacy", () => {
     };
     for (const [route, path] of Object.entries(continued)) {
       const cursor = cursors[route]!;
-      // The owner continues her own traversal.
+      // Ann continues her own traversal.
       expect((await w.call("ann", `${atlas("vault")}/${path(cursor)}`)).status, route).toBe(200);
       // ben reads vault too, but not through ann's cursor; nor does ann's own agent.
       await invalid("ben", "vault", path(cursor));
@@ -705,12 +961,12 @@ describe("Atlas authorization, revocation and privacy", () => {
     // A repository cursor isn't a workspace cursor, nor the other way round.
     const ws = await w.get<AtlasWorkspacePage<AtlasRegion>>(
       "ann",
-      "/api/accounts/ann/atlas/regions?repos=vault&limit=1",
+      "/api/spaces/ann/atlas/regions?repos=vault&limit=1",
     );
     await invalid("ann", "vault", `regions?limit=1&cursor=${enc(ws.next!)}`);
     const wsText = await w.text(
       "ann",
-      `/api/accounts/ann/atlas/regions?repos=vault&limit=1&cursor=${enc(cursors.regions!)}`,
+      `/api/spaces/ann/atlas/regions?repos=vault&limit=1&cursor=${enc(cursors.regions!)}`,
     );
     expect(wsText).toMatch(/^400 .*cursor_invalid/);
   });
@@ -746,7 +1002,7 @@ describe("Atlas authorization, revocation and privacy", () => {
     const ann = await openAtlas(w, "ann", "ann", "vault");
     const ws = await w.get<AtlasWorkspaceOverview>(
       "ben",
-      "/api/accounts/ann/atlas/overview?repos=vault,open",
+      "/api/spaces/ann/atlas/overview?repos=vault,open",
     );
     expect(JSON.stringify(ws)).toContain(VAULT);
     const scope = repoScope("r_vault");
@@ -797,7 +1053,7 @@ describe("Atlas authorization, revocation and privacy", () => {
 
     // A new repository takes the name, with an Atlas of its own.
     w.sqlite.exec(`
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('r_vault2', 'ann', 'vault', 'private', 'authz-vault2', 'https://r_vault');
       INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('r_vault2', 'ben', 'read');
     `);
@@ -809,10 +1065,11 @@ describe("Atlas authorization, revocation and privacy", () => {
       ["ben", ben],
       ["ann", ann],
     ] as const) {
-      for (const [label, v] of [
-        ["warm", w],
-        ["cold", w.cold()],
+      for (const [label, openView] of [
+        ["warm", () => w],
+        ["cold", () => w.cold()],
       ] as const) {
+        const v = openView();
         for (const path of surfaces(open)) {
           const text = await v.text(who, `${repoBase("ann", "vault")}${path}`);
           hides(text, VAULT, 'r_vault"', open.snapshot);
@@ -827,14 +1084,14 @@ describe("Atlas authorization, revocation and privacy", () => {
     // The workspace reads only the namesake.
     const after = await w.get<AtlasWorkspaceOverview>(
       "ben",
-      "/api/accounts/ann/atlas/overview?repos=vault,open",
+      "/api/spaces/ann/atlas/overview?repos=vault,open",
     );
     expect(after.snapshot.repos.map((r) => r.id)).toEqual(["r_open", "r_vault2"]);
     hides(JSON.stringify(after), VAULT);
     expect(
       await w.text(
         "ben",
-        `/api/accounts/ann/atlas/overview?repos=vault,open&snapshot=${enc(ws.snapshot.id)}`,
+        `/api/spaces/ann/atlas/overview?repos=vault,open&snapshot=${enc(ws.snapshot.id)}`,
       ),
     ).toMatch(/^404 .*snapshot_unknown/);
   });
@@ -854,7 +1111,7 @@ describe("Atlas authorization, revocation and privacy", () => {
     );
     expect(((await retired.json()) as AtlasError).lineage).toBeDefined();
 
-    const ws = "/api/accounts/ann/atlas";
+    const ws = "/api/spaces/ann/atlas";
     const both = "repos=open,vault";
     const overview = await w.get<AtlasWorkspaceOverview>("ben", `${ws}/overview?${both}`);
     expect(JSON.stringify(overview)).toContain(VAULT);
@@ -914,10 +1171,11 @@ describe("Atlas authorization, revocation and privacy", () => {
     ];
     // Pages issued in the same millisecond: byte-for-byte comparable cursors.
     vi.spyOn(Date, "now").mockReturnValue(Date.now());
-    for (const [label, v] of [
-      ["warm", w],
-      ["cold", w.cold()],
+    for (const [label, openView] of [
+      ["warm", () => w],
+      ["cold", () => w.cold()],
     ] as const) {
+      const v = openView();
       for (const path of cursors) {
         const text = await v.text("ben", `${ws}/${path}`);
         expect(text, `${label} ${path}`).toMatch(/^400 .*cursor_invalid/);
@@ -1035,10 +1293,10 @@ describe("Atlas authorization, revocation and privacy", () => {
 
   test("an open view hears that its repository became unreadable, and nothing else does", async () => {
     w.serveClient("ben");
-    const vault = { owner: "ann", name: "vault" };
+    const vault = { space: "ann", name: "vault" };
     const lost = { vault: 0, open: 0 };
     const stop = onAtlasAccessLost(vault, () => lost.vault++);
-    onAtlasAccessLost({ owner: "ann", name: "open" }, () => lost.open++)();
+    onAtlasAccessLost({ space: "ann", name: "open" }, () => lost.open++)();
     const overview = await atlasApi.overview(vault);
     const page = await atlasApi.regions(vault, { cursor: overview.catalogue.next, limit: 1 });
     expect(page.next).not.toBeNull();
@@ -1066,12 +1324,12 @@ describe("Atlas authorization, revocation and privacy", () => {
     await atlasApi.overview(vault).catch(() => null);
     expect(lost.vault).toBe(2);
     expect(
-      (await atlasApi.overview({ owner: "ann", name: "open" })).regions.length,
+      (await atlasApi.overview({ space: "ann", name: "open" })).regions.length,
     ).toBeGreaterThan(0);
   });
 
   test("a composition one reader computed is never served warm to another", async () => {
-    const path = "/api/accounts/ann/atlas/composition?repos=open,vault";
+    const path = "/api/spaces/ann/atlas/composition?repos=open,vault";
     const cost = async (who: Who) => {
       const before = w.queries.count;
       const text = await w.text(who, path);

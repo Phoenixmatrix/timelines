@@ -1,6 +1,7 @@
 import { PlusIcon } from "@phosphor-icons/react";
 import { Link, useLoaderData } from "react-router";
-import type { RepoSummary } from "../../shared/api.ts";
+import type { RepoSummary, SessionResponse } from "../../shared/api.ts";
+import type { SpacePage } from "../../shared/spaces.ts";
 import { Page } from "../components/AppShell.tsx";
 import { RepoList } from "../components/RepoList.tsx";
 import { GitmatrixLogo } from "../components/GitmatrixLogo.tsx";
@@ -9,11 +10,19 @@ import { greeting } from "../lib/format.ts";
 import { useViewer } from "../lib/session.ts";
 
 export async function homeLoader({ request }: { request: Request }) {
-  return load<{ repos: RepoSummary[] }>("/repos", request);
+  const [{ repos }, { viewer }] = await Promise.all([
+    load<{ repos: RepoSummary[] }>("/repos", request),
+    load<SessionResponse>("/session", request),
+  ]);
+  const defaultSpace = viewer?.spaces.find((space) => space.id === viewer.defaultSpaceId);
+  const home = defaultSpace
+    ? await load<SpacePage>(`/spaces/${encodeURIComponent(defaultSpace.slug)}`, request)
+    : null;
+  return { repos, creationSpace: home?.capabilities.canCreateRepository ? home.space : null };
 }
 
 export function Home() {
-  const { repos } = useLoaderData<typeof homeLoader>();
+  const { repos, creationSpace } = useLoaderData<typeof homeLoader>();
   const viewer = useViewer();
 
   return (
@@ -36,16 +45,19 @@ export function Home() {
               : "You're browsing signed out, so only public repositories show."}
           </p>
         </div>
-        {viewer ? (
-          <Link to="/new" className="mk-btn mk-btn--primary no-underline">
+        {creationSpace ? (
+          <Link
+            to={`/${encodeURIComponent(creationSpace.slug)}/-/repositories/new`}
+            className="mk-btn mk-btn--primary no-underline"
+          >
             <PlusIcon weight="bold" aria-hidden />
             New repository
           </Link>
-        ) : (
+        ) : !viewer ? (
           <Link to="/signin" className="mk-btn mk-btn--primary no-underline">
             Sign in
           </Link>
-        )}
+        ) : null}
       </header>
 
       <div className="mt-8">
@@ -56,7 +68,11 @@ export function Home() {
               No repositories yet.
               <br />
               <span className="text-body-sm text-ink-faint">
-                {viewer ? "Create one to get started." : "Sign in to see private ones."}
+                {creationSpace
+                  ? "Create one to get started."
+                  : viewer
+                    ? "Open a Space to see its repositories."
+                    : "Sign in to see private ones."}
               </span>
             </>
           }

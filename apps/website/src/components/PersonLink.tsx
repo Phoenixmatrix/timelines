@@ -1,4 +1,4 @@
-// A person's name as a link to their profile (/<slug>). Agents are never
+// A person's name as a link to their profile (/accounts/<slug>). Agents are never
 // linked: callers pass only person accounts, and the name stays text when no
 // slug is known.
 
@@ -25,7 +25,7 @@ export function PersonLink({
   if (!slug) return <>{children}</>;
   return (
     <Link
-      to={`/${encodeURIComponent(slug)}`}
+      to={`/accounts/${encodeURIComponent(slug)}`}
       className={`${prose ? link : personLink} ${className}`.trim()}
     >
       {children}

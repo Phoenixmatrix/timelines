@@ -1,4 +1,4 @@
-// CI logs (category "ci-logs", CORE-200): the log text of an account's CI
+// CI logs (category "ci-logs", CORE-200): the log text of an Space's CI
 // jobs that finished more than `days` before the run's moment.
 //
 // An item is a job with log chunks left; its count is its chunks and its
@@ -23,17 +23,17 @@ interface Item {
 const MAX_JOBS = 50;
 
 /** Parameters: account id, cutoff. `j` is the job. */
-const FINISHED = `j.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+const FINISHED = `j.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND j.status NOT IN ('pending', 'queued', 'running')
   AND j.finished_at IS NOT NULL AND j.finished_at < ?`;
 
 const MATCHES = `${FINISHED} AND EXISTS (SELECT 1 FROM ci_logs l WHERE l.job_id = j.id)`;
 
 function scope(ctx: CleanupContext): [string, string] {
-  if (ctx.target.scope !== "account") throw new Error("ci-logs is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("ci-logs is a Space category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("ci-logs needs its days threshold.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days)];
+  return [ctx.target.id, daysBefore(ctx.now, days)];
 }
 
 export const ciLogs: CategoryCleanup<Item> = {

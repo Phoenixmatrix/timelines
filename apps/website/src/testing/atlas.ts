@@ -14,9 +14,9 @@ export function commitId(): string {
 }
 
 export interface AtlasFixtureRepo {
-  owner: string;
+  space: string;
   name: string;
-  /** /api/repos/:owner/:name */
+  /** /api/repos/:space/:name */
   api: string;
   /** The Knowledge tab. */
   base: string;
@@ -30,7 +30,7 @@ export interface AtlasFixtureRepo {
 export async function atlasFixtureRepo(
   server: TestServer,
   {
-    owner = "orbit",
+    space = "orbit",
     name = "fixture",
     variant = "base" as AtlasFixtureVariant,
     /** An npm package the registry should say this repository publishes. */
@@ -38,11 +38,11 @@ export async function atlasFixtureRepo(
     visibility = "public" as "public" | "private",
   } = {},
 ): Promise<AtlasFixtureRepo> {
-  await server.repo(owner, name, visibility);
+  await server.repo(space, name, visibility);
   const head = commitId();
-  await server.push(`${owner}/${name}`, "main", head);
+  await server.push(`${space}/${name}`, "main", head);
   const dev = <T = unknown>(body: Record<string, unknown>) =>
-    server.call<T>("POST", "/api/dev/atlas", { repo: `${owner}/${name}`, ...body });
+    server.call<T>("POST", "/api/dev/atlas", { repo: `${space}/${name}`, ...body });
   const first = await dev<{ snapshotId: string; seq: number }>({
     action: "publish",
     commit: head,
@@ -50,10 +50,10 @@ export async function atlasFixtureRepo(
     ...(publishes ? { publishes } : {}),
   });
   return {
-    owner,
+    space,
     name,
-    api: `/api/repos/${owner}/${name}`,
-    base: `/${owner}/${name}/knowledge`,
+    api: `/api/repos/${space}/${name}`,
+    base: `/${space}/${name}/knowledge`,
     head,
     first,
     dev,

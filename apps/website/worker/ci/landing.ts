@@ -13,6 +13,7 @@ import { landingBranch, landingSlugOf } from "../../shared/timelines.ts";
 import { QUEUE_MERGE_SCRIPT } from "./queue-script.ts";
 import { COMPACT_SCRIPT } from "./compact-script.ts";
 import type { SourceSnapshot } from "../../shared/code-source.ts";
+import { resolveRunAuthority, resolveWorkAuthority, type WorkAuthority } from "./admission.ts";
 
 /** The exit code the merge step ends with when the merge conflicts. */
 export const CONFLICT_EXIT = 42;
@@ -47,6 +48,7 @@ export async function startMergeRun(
     title: string;
     author: { name: string; email: string };
     actor: { id: string; agentId: string | null } | null;
+    authority: WorkAuthority;
   } & (
     | {
         landingId: string;
@@ -63,6 +65,7 @@ export async function startMergeRun(
   // CI_RUN is production's Workflow: a preview can't run the merge, so it can't land.
   if (!productionOnly(env, "workflow", `the merge run of ${options.queueId ?? options.landingId}`))
     throw new PreviewModeError("workflow", "Previews don't run CI, so nothing lands in one.");
+  await resolveWorkAuthority(env, options.authority, repo.id);
   const kdb = db(env.DB);
   const sourceId = "source" in options ? options.source.sourceId : "canonical";
   const spec: LandingJobSpec | QueueMergeJobSpec = {
@@ -115,6 +118,9 @@ export async function startMergeRun(
         "id",
         "repo_id",
         "source_id",
+        "space_id",
+        "migration_epoch",
+        "authority",
         "number",
         "commit_oid",
         "ref",
@@ -133,12 +139,15 @@ export async function startMergeRun(
             eb.val(options.runId).as("id"),
             eb.val(repo.id).as("repo_id"),
             eb.val(sourceId).as("source_id"),
+            eb.val(options.authority.spaceId).as("space_id"),
+            eb.val(options.authority.migrationEpoch).as("migration_epoch"),
+            eb.val(JSON.stringify(options.authority)).as("authority"),
             eb(eb.fn.coalesce(eb.fn.max("number"), eb.lit(0)), "+", eb.lit(1)).as("number"),
             eb.val(options.commit).as("commit_oid"),
             eb.val(options.branch).as("ref"),
             eb.val("manual" as const).as("trigger"),
-            eb.val(options.actor?.id ?? null).as("actor_id"),
-            eb.val(options.actor?.agentId ?? null).as("agent_id"),
+            eb.val(options.authority.personId).as("actor_id"),
+            eb.val(options.authority.agentId).as("agent_id"),
             eb.val(options.title.slice(0, 200)).as("title"),
             eb.val("queued" as const).as("status"),
             eb.val(options.landingId ?? null).as("landing_id"),
@@ -179,6 +188,7 @@ export async function startMergeRun(
     .select(["number", "status"])
     .where("id", "=", options.runId)
     .executeTakeFirst();
+  await resolveRunAuthority(env, options.runId);
   // Its Workflow, once: another look may have started it already.
   if (row?.status === "queued")
     try {
@@ -245,33 +255,33 @@ export type LandingJobAccess =
   | { ok: false; status: 401 | 403; error: string };
 
 /**
- * What a job credential (gmj_…) may do in `owner/name`'s git: only a
+ * What a job credential (gmj_…) may do in `space/name`'s git: only a
  * landing's own merge job, while it runs, in its own repository, gets its
  * landing's slug, and with it a push to that landing's branch (git/http.ts).
  */
 export async function landingJob(
-  d1: D1Database,
+  env: Env,
   secret: string,
-  owner: string,
+  space: string,
   name: string,
 ): Promise<LandingJobAccess> {
-  const job = await jobCaller(d1, secret);
+  const job = await jobCaller(env, secret);
   if (!job)
     return {
       ok: false,
       status: 401,
       error: "This isn't a running CI job's credential (has the job ended?).",
     };
-  const row = await db(d1)
+  const row = await db(env.DB)
     .selectFrom("ci_jobs as j")
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .innerJoin("repos as p", "p.id", "j.repo_id")
-    .innerJoin("accounts as o", "o.id", "p.owner_id")
+    .innerJoin("spaces as o", "o.id", "p.space_id")
     .select([
       "j.spec",
       "p.id",
       "p.name",
-      "o.slug as owner",
+      "o.slug as space",
       "p.artifacts_name",
       "p.artifacts_remote",
     ])
@@ -291,7 +301,7 @@ export async function landingJob(
     job.ref !== landingBranch(slug) ||
     landingSlugOf(landingBranch(slug)) !== slug ||
     job.jobName !== LANDING_JOB ||
-    row.owner !== owner ||
+    row.space !== space ||
     row.name !== name
   )
     return {

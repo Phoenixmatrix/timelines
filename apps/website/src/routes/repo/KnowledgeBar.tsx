@@ -19,7 +19,7 @@ export function KnowledgeBar({
   status,
   overlays,
 }: {
-  repo: { owner: string; name: string };
+  repo: { space: string; name: string };
   /** The Knowledge page, e.g. `/orbit/engine/knowledge`. */
   base: string;
   status: KnowledgeStatus | null;
@@ -41,7 +41,7 @@ export function KnowledgeBar({
       )}
       <Link
         className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
-        to={repoPath(repo.owner, repo.name, "wiki")}
+        to={repoPath(repo.space, repo.name, "wiki")}
       >
         <BookOpenTextIcon weight="bold" aria-hidden />
         Wiki
@@ -57,7 +57,7 @@ function ExportGraph({
   repo,
   disabled,
 }: {
-  repo: { owner: string; name: string };
+  repo: { space: string; name: string };
   disabled: boolean;
 }) {
   const [state, setState] = useState<"idle" | "busy" | "failed">("idle");
@@ -65,7 +65,7 @@ function ExportGraph({
     setState("busy");
     try {
       const graph = await api<{ commit: string | null }>(
-        `/repos/${repo.owner}/${repo.name}/knowledge/graph/export`,
+        `/repos/${repo.space}/${repo.name}/knowledge/graph/export`,
       );
       const url = URL.createObjectURL(
         new Blob([JSON.stringify(graph)], { type: "application/json" }),

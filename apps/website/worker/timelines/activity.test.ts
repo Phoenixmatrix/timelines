@@ -1,13 +1,24 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { PackCommit } from "../git/pack.ts";
 import { recordRefs, type CommitReader } from "../ref-log/record.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { timelineActivity } from "./activity.ts";
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: DurableObjectState;
+    public env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 
 const repo = {
   id: "repo",
-  owner_id: "acc_ann",
-  owner_slug: "ann",
+  space_id: "space_ann",
+  space_slug: "ann",
   name: "app",
   default_branch: "main",
   artifacts_name: "a",
@@ -15,14 +26,34 @@ const repo = {
 };
 const builder = { id: "acc_ann", agent: { id: "agt_builder", name: "builder" } };
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite, env } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_ann', 'user', 'ann', 'Ann');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'acc_ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('repo', 'acc_ann', 'app', 'private', 'a', 'https://a');
   `);
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "org_ann",
+      slug: "ann",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "acc_ann",
+    },
+    space: { id: "space_ann", slug: "ann", displayName: "Ann" },
+    members: [
+      {
+        accountId: "acc_ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "acc_ann",
+  });
+  sqlite.exec(`INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+    VALUES ('repo', 'space_ann', 'app', 'private', 'a', 'https://a');`);
   // The repository's commit graph, and a reader answering like the fetch does.
   const commits = new Map<string, PackCommit>();
   const commit = (...parents: string[]) => {
@@ -55,7 +86,7 @@ function setup() {
 
 describe("timeline activity from the push log", () => {
   test("pushing work to a bookmark notes who worked in it, but forking doesn't", async () => {
-    const t = setup();
+    const t = await setup();
     const m1 = t.commit();
     await t.push({ main: m1 });
     // A fork only notes where the bookmark points.
@@ -66,7 +97,7 @@ describe("timeline activity from the push log", () => {
     });
     const a1 = t.commit(m1);
     expect(await t.push({ "timeline/search": a1 })).toEqual({
-      repo: { id: "repo", owner: "ann", name: "app" },
+      repo: { id: "repo", spaceId: "space_ann", space: "ann", name: "app" },
       actorId: "agt_builder",
       accountableId: "acc_ann",
       pushed: ["search"],
@@ -76,7 +107,7 @@ describe("timeline activity from the push log", () => {
   });
 
   test("merges from main, between timelines, and into main", async () => {
-    const t = setup();
+    const t = await setup();
     const m1 = t.commit();
     await t.push({ main: m1, "timeline/search": m1, "timeline/ranking": m1 });
     const a1 = t.commit(m1);
@@ -106,7 +137,7 @@ describe("timeline activity from the push log", () => {
   });
 
   test("a parent that is main's tip and a fresh fork's counts as main", async () => {
-    const t = setup();
+    const t = await setup();
     const m1 = t.commit();
     await t.push({ main: m1, "timeline/search": m1 });
     const a1 = t.commit(m1);
@@ -120,7 +151,7 @@ describe("timeline activity from the push log", () => {
   });
 
   test("merges from other branches, and pushes to other branches, are not timelines'", async () => {
-    const t = setup();
+    const t = await setup();
     const m1 = t.commit();
     await t.push({ main: m1, feature: m1 });
     const f1 = t.commit(m1);

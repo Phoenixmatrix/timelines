@@ -30,13 +30,14 @@
 //   and does not reproduce, the PRD's 4-core / 8 GiB client.
 
 import { createServer, type Server } from "node:http";
+import type { DatabaseSync } from "node:sqlite";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { cpus, tmpdir, totalmem } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import {
   ATLAS_OVERVIEW_MAX_BYTES,
   ATLAS_OVERVIEW_REGIONS,
@@ -45,10 +46,12 @@ import {
   type AtlasPage,
   type AtlasWorkspaceOverview,
 } from "../../shared/atlas.ts";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import { app as server } from "../app.ts";
 import { issueToken } from "../api/tokens.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
-import { d1 as wrap, migratedDatabase } from "../testing/d1.ts";
+import { d1 as wrap } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import {
   atlasPass,
@@ -172,7 +175,7 @@ async function pass(
   };
 }
 
-function sizeOf(sqlite: ReturnType<typeof migratedDatabase>, repoIds: string[]) {
+function sizeOf(sqlite: DatabaseSync, repoIds: string[]) {
   const scopes = JSON.stringify(repoIds.map(repoScope));
   const one = (sql: string) => Number((sqlite.prepare(sql).get(scopes) as { n: number }).n);
   return {
@@ -226,13 +229,28 @@ const memory = () => {
 };
 
 async function buildWorld(log: (line: string) => void) {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(
-    `INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann')`,
+    `INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+  `,
   );
   const git = fakeRemotes();
   const insert = sqlite.prepare(
-    `INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    `INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
      VALUES (?, 'ann', ?, 'private', ?, ?)`,
   );
   for (const [id, name] of [
@@ -289,6 +307,7 @@ async function buildWorld(log: (line: string) => void) {
   const token = (await issueToken(db, "ann", "bench", "read")).secret;
   const coordinators = new Map<string, KnowledgeCoordinator>();
   const env = {
+    ...fresh.env,
     DB: db,
     BETTER_AUTH_SECRET: "bench-secret-bench-secret-bench-secret",
     ARTIFACTS: git.artifacts,
@@ -312,6 +331,7 @@ async function buildWorld(log: (line: string) => void) {
   } as unknown as ExecutionContext;
   const request = (path: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
+    headers.set(CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION));
     headers.set("authorization", `Bearer ${token}`);
     return server.request(path, { ...init, headers }, env, executionCtx);
   };
@@ -440,7 +460,7 @@ async function singleRoutes(w: World) {
 }
 
 async function workspaceRoutes(w: World) {
-  const base = `/api/accounts/ann/atlas`;
+  const base = `/api/spaces/ann/atlas`;
   const repos = `repos=${workspaceNames.join(",")}`;
   const overview = (await (
     await w.request(`${base}/overview?${repos}`)

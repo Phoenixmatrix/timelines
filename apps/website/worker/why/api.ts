@@ -1,4 +1,4 @@
-// GET /api/repos/:owner/:name/why: "why did this change?" (CORE-85).
+// GET /api/repos/:space/:name/why: "why did this change?" (CORE-85).
 //
 //   ?path=src/app.ts&line=12[-20][&rev=main]
 //       The Worker blames the lines (why/blame.ts) and resolves each commit's chain.
@@ -40,6 +40,7 @@ import { sourceLineage } from "../ref-log/lineage.ts";
 import { linkedIssues } from "../release-notes/api.ts";
 import { db } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
+import { accessFor } from "../tracker/access.ts";
 import type { TrackerReply } from "../tracker/object.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { BlameError, blameLines } from "./blame.ts";
@@ -81,25 +82,34 @@ function unwrap<T>(reply: TrackerReply<T>, fallback: T): T {
   return reply.ok ? reply.value : fallback;
 }
 
-/** The owner's tracker, when the actor may read it. */
-async function ownerTracker(
+/** The Space's tracker, when the actor may read it. */
+async function spaceTracker(
   env: Env,
   actor: Actor | null,
   row: RepoRow,
 ): Promise<WhyTracker | null> {
   if (!actor) return null;
-  const owners = await accessible(env.DB, actor);
-  if (!owners.some((owner) => owner.id === row.owner_id)) return null;
-  const stub = trackerObject(env, row.owner_id);
+  const spaces = await accessible(env.DB, actor);
+  const space = spaces.find((space) => space.id === row.space_id);
+  if (!space) return null;
+  const access = await accessFor(
+    env,
+    space,
+    actor.id,
+    actor.agent?.id ?? null,
+    false,
+    actor.credential,
+  );
+  const stub = trackerObject(env, space.id);
   return {
-    owner: row.owner_slug,
-    timelines: async () => unwrap(await stub.listTimelines(), []),
+    space: row.space_slug,
+    timelines: async () => unwrap(await stub.listTimelines(access), []),
     timeline: async (slug) => {
       const events: TimelineEvent[] = [];
       let issues: TimelineIssue[] = [];
       let after = 0;
       for (let page = 0; page < EVENT_PAGES; page++) {
-        const reply = await stub.timeline(slug, after, 500);
+        const reply = await stub.timeline(access, slug, after, 500);
         if (!reply.ok) return page ? { events, issues } : null;
         events.push(...reply.value.events);
         issues = reply.value.issues ?? [];
@@ -108,11 +118,11 @@ async function ownerTracker(
       }
       return { events, issues };
     },
-    checkpoints: async (slug) => unwrap(await stub.checkpoints(slug), []),
+    checkpoints: async (slug) => unwrap(await stub.checkpoints(access, slug), []),
     landing: async (commit) => {
-      const landing = unwrap(await stub.landingForCommit(row.id, commit), null);
+      const landing = unwrap(await stub.landingForCommit(access, row.id, commit), null);
       if (!landing) return null;
-      const checkpoint = await stub.checkpoint(landing.slug, landing.checkpointId);
+      const checkpoint = await stub.checkpoint(access, landing.slug, landing.checkpointId);
       return checkpoint.ok ? { landing, checkpoint: checkpoint.value } : null;
     },
   };
@@ -167,7 +177,7 @@ async function headerChangeId(env: Env, row: RepoRow, oid: string): Promise<stri
   }
 }
 
-/** The Worker's sources: D1's push log, the repository, and the owner's tracker. */
+/** The Worker's sources: D1's push log, the repository, and the Space's tracker. */
 export async function workerSources(
   c: Context<AppEnv>,
   row: RepoRow & { source_id?: string },
@@ -229,7 +239,7 @@ export async function workerSources(
         lastSeenAt: r.last_seen_at,
       }));
     },
-    tracker: await ownerTracker(c.env, actor, row),
+    tracker: await spaceTracker(c.env, actor, row),
     issues: (keys) => linkedIssues(c.env, actor, row, keys),
   });
 }
@@ -423,8 +433,8 @@ why.get("/why", async (c) => {
     for (const chain of chains) chain.step = steps.get(chain.oid) ?? null;
     return c.json<WhyResponse>({
       source: loaded.source,
-      repo: { owner: row.owner_slug, name: row.name, defaultBranch: row.default_branch },
-      tracker: { owner: row.owner_slug, readable: sources.tracker !== null },
+      repo: { space: row.space_slug, name: row.name, defaultBranch: row.default_branch },
+      tracker: { space: row.space_slug, readable: sources.tracker !== null },
       blame,
       chains,
       people: await names(c.env.DB, [...new Set(chains.flatMap(mentionedIds))]),

@@ -1,5 +1,5 @@
 // References in text (CORE-22): issue keys, Gitmatrix tracker issue URLs,
-// commit hashes, `owner/repo` and `pkg@version`. The scanner finds candidates;
+// commit hashes, `space/repo` and `pkg@version`. The scanner finds candidates;
 // only the server decides what they are (POST /api/refs/resolve), for the
 // viewer, so nothing becomes a link that the viewer can't open, and nothing
 // that might belong to someone else's tracker is guessed at.
@@ -24,13 +24,13 @@ export type RefKind = "issue" | "issue-url" | "commit" | "repo" | "package";
 
 /**
  * Where the text is being read, which disambiguates refs:
- * - `owner` and `repo`: the repository a page belongs to (commit hashes need it;
- *   its subscribed trackers come second for issue keys; `pkg@version` looks in
- *   `owner`'s packages);
- * - `tracker`: the tracker (owner slug) a page belongs to, first for issue keys.
+ * - `space` and `repo`: the repository a page belongs to (commit hashes need it;
+ *   its Space's tracker comes second for issue keys; `pkg@version` looks in
+ *   that Space's packages);
+ * - `tracker`: the tracker (Space slug) a page belongs to, first for issue keys.
  */
 export interface RefContext {
-  owner?: string;
+  space?: string;
   repo?: string;
   tracker?: string;
 }
@@ -49,7 +49,7 @@ interface TargetBase {
 
 export interface IssueTarget extends TargetBase {
   kind: "issue";
-  /** The tracker (owner slug) the issue belongs to. */
+  /** The tracker (Space slug) the issue belongs to. */
   tracker: string;
   id: string;
   key: string;
@@ -59,7 +59,7 @@ export interface IssueTarget extends TargetBase {
 
 export interface CommitTarget extends TargetBase {
   kind: "commit";
-  owner: string;
+  space: string;
   repo: string;
   /** The full 40-character hash, also for a short one that was resolved. */
   sha: string;
@@ -67,13 +67,13 @@ export interface CommitTarget extends TargetBase {
 
 export interface RepoTarget extends TargetBase {
   kind: "repo";
-  owner: string;
+  space: string;
   name: string;
 }
 
 export interface PackageTarget extends TargetBase {
   kind: "package";
-  owner: string;
+  space: string;
   format: FormatId;
   name: string;
   version: string;
@@ -123,7 +123,7 @@ const ISSUE_URL_EXACT = new RegExp(`^${ISSUE_URL.source}$`);
 const SHA = /(?<![A-Za-z0-9_./-])[0-9a-f]{7,40}(?![A-Za-z0-9_-])/g;
 /** Explicit lookup does not apply the prose scanner's word/number heuristic. */
 const SHA_EXACT = /^[0-9a-f]{7,40}$/;
-/** An account slug, a slash and a repository name, not part of a longer path. */
+/** A Space slug, a slash and a repository name, not part of a longer path. */
 const REPO =
   /(?<![A-Za-z0-9_.@/:-])([a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38})\/((?!\.)[A-Za-z0-9._-]{1,100})(?![A-Za-z0-9_/@-])/g;
 /** `name@version` (npm scopes included): the version starts with a digit. */
@@ -235,8 +235,8 @@ export function issueUrlParts(
 }
 
 /** The in-app path a commit opens: the repository with its commit panel (`?commit=`). */
-export function commitPath(owner: string, repo: string, sha: string): string {
-  return `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}?commit=${sha}`;
+export function commitPath(space: string, repo: string, sha: string): string {
+  return `/${encodeURIComponent(space)}/${encodeURIComponent(repo)}?commit=${sha}`;
 }
 
 /**

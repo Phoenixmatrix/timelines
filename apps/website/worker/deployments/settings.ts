@@ -1,29 +1,26 @@
-// Preview retention per account (TIMELINES-RESEARCH.md, Decisions: previews
-// are torn down 2 days after their timeline lands or is abandoned and after 7
-// days without pushes; each org can change both). Stored here; CORE-79
-// enforces them.
-//
-// Under /api/accounts/:slug/settings/previews:
-//   GET    the account's numbers (its members, or the user themselves)
-//   PATCH  {endedDays?, idleDays?} (org owners, or the user; people, not agents)
+// Preview retention per Space. Explicit Space members may read; Space admins
+// and the existing separate Instance operator may change the policy.
+// Mounted at /api/spaces/:space/settings/previews.
 
 import { Hono, type Context } from "hono";
 import { DEFAULT_PREVIEW_SETTINGS, type PreviewSettings } from "../../shared/deployments.ts";
 import { fail, readJson, requireActor, requirePerson } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
-import { findAccountBySlug, type AccountRow, type Actor } from "../db.ts";
+import type { Actor } from "../db.ts";
+import type { SpaceSummary } from "../../shared/spaces.ts";
+import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
 import { db, nowIso } from "../schema.ts";
 
 const ENDED_DAYS = { min: 0, max: 365 };
 const IDLE_DAYS = { min: 1, max: 365 };
 
-/** An account's preview retention, with the defaults filled in. */
-export async function previewSettings(d1: D1Database, accountId: string): Promise<PreviewSettings> {
+/** A Space's preview retention, with the defaults filled in. */
+export async function previewSettings(d1: D1Database, spaceId: string): Promise<PreviewSettings> {
   const row = await db(d1)
-    .selectFrom("account_settings as s")
+    .selectFrom("space_settings as s")
     .leftJoin("accounts as a", "a.id", "s.updated_by")
     .select(["s.preview_ended_days", "s.preview_idle_days", "s.updated_at", "a.slug"])
-    .where("s.account_id", "=", accountId)
+    .where("s.space_id", "=", spaceId)
     .executeTakeFirst();
   if (!row) return { ...DEFAULT_PREVIEW_SETTINGS, updatedAt: null, updatedBy: null };
   return {
@@ -34,29 +31,21 @@ export async function previewSettings(d1: D1Database, accountId: string): Promis
   };
 }
 
-/** The viewer's standing in an account: none, a member, or one who may change its settings. */
+/** Current explicit Space standing, with the existing separate operator power. */
 export async function standing(
   d1: D1Database,
-  account: AccountRow,
+  space: SpaceSummary,
   actor: Actor,
 ): Promise<"none" | "member" | "admin"> {
   if (actor.isSiteAdmin) return "admin";
-  if (account.kind === "user") return account.id === actor.id ? "admin" : "none";
-  const membership = await db(d1)
-    .selectFrom("org_members")
-    .select("role")
-    .where("org_id", "=", account.id)
-    .where("user_id", "=", actor.id)
-    .executeTakeFirst();
-  if (!membership) return "none";
-  return membership.role === "owner" ? "admin" : "member";
+  return (await resolveSpaceAccess(d1, actor, space.id))?.grant.role ?? "none";
 }
 
-/** The route's account (`:slug`) and the viewer's standing; null when they aren't a member. */
+/** Resolve the immutable Space locator independently from its grants. */
 export async function load(c: Context<AppEnv>, actor: Actor) {
-  const account = await findAccountBySlug(c.env.DB, c.req.param("slug") ?? "");
-  const role = account ? await standing(c.env.DB, account, actor) : "none";
-  return account && role !== "none" ? { account, role } : null;
+  const space = await findSpaceBySlug(c.env.DB, c.req.param("space") ?? "");
+  const role = space ? await standing(c.env.DB, space, actor) : "none";
+  return space && role !== "none" ? { space, role } : null;
 }
 
 function days(value: unknown, name: string, range: { min: number; max: number }): number | string {
@@ -76,21 +65,21 @@ previewSettingsApi.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  return c.json<PreviewSettings>(await previewSettings(c.env.DB, found.account.id));
+  if (!found) return fail(c, 404, "No such Space, or you aren't a member.");
+  return c.json<PreviewSettings>(await previewSettings(c.env.DB, found.space.id));
 });
 
 previewSettingsApi.patch("/", async (c) => {
   const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
+  if (!found) return fail(c, 404, "No such Space, or you aren't a member.");
   if (found.role !== "admin")
-    return fail(c, 403, "Only the organization's owners can change its preview settings.");
+    return fail(c, 403, "Only Space admins can change its preview settings.");
   const body = await readJson<{ endedDays: unknown; idleDays: unknown }>(c);
   for (const key of Object.keys(body))
     if (key !== "endedDays" && key !== "idleDays") return fail(c, 400, `Unknown field: ${key}.`);
-  const current = await previewSettings(c.env.DB, found.account.id);
+  const current = await previewSettings(c.env.DB, found.space.id);
   const ended =
     body.endedDays === undefined
       ? current.endedDays
@@ -106,9 +95,9 @@ previewSettingsApi.patch("/", async (c) => {
     updated_at: nowIso(),
   };
   await db(c.env.DB)
-    .insertInto("account_settings")
-    .values({ account_id: found.account.id, ...values })
-    .onConflict((oc) => oc.column("account_id").doUpdateSet(values))
+    .insertInto("space_settings")
+    .values({ space_id: found.space.id, ...values })
+    .onConflict((oc) => oc.column("space_id").doUpdateSet(values))
     .execute();
-  return c.json<PreviewSettings>(await previewSettings(c.env.DB, found.account.id));
+  return c.json<PreviewSettings>(await previewSettings(c.env.DB, found.space.id));
 });

@@ -45,10 +45,10 @@ describe("OCI registry (local repositories)", () => {
       ["pub", "public"],
       ["secret", "private"],
     ] as const) {
-      // `secret` belongs to another org, so bob (a member of the test org) can't read it.
-      const owner = key === "secret" ? "elsewhere" : undefined;
+      // `secret` belongs to another Space, with no package grant for Bob.
+      const space = key === "secret" ? "elsewhere" : undefined;
       expect(
-        (await h.createRepo({ key, format: "oci", kind: "local", visibility, owner })).status,
+        (await h.createRepo({ key, format: "oci", kind: "local", visibility, space })).status,
       ).toBe(201);
     }
     await grant("images", "user:bob", "write");
@@ -438,6 +438,37 @@ describe("OCI registry (local repositories)", () => {
         (await h.request(start.headers.get("location")!, { headers: { authorization: auth } }))
           .status,
       ).toBe(404);
+    });
+
+    it("does not resume a pinned upload after its initiating credential is revoked", async () => {
+      const start = await h.request("/v2/images/app/blobs/uploads/", {
+        method: "POST",
+        headers: { authorization: basic(bob) },
+      });
+      expect(start.status).toBe(202);
+      h.gitmatrix.applySql("DELETE FROM access_tokens WHERE user_id = 'acc_bob'");
+      const replacement = h.token("bob");
+      const resumed = await h.request(start.headers.get("location")!, {
+        method: "PATCH",
+        headers: { authorization: basic(replacement) },
+        body: "revoked-upload",
+      });
+      expect(resumed.status).toBe(404);
+    });
+
+    it("does not resume a warm upload after package access is revoked", async () => {
+      const start = await h.request("/v2/images/app/blobs/uploads/", {
+        method: "POST",
+        headers: { authorization: basic(bob) },
+      });
+      expect(start.status).toBe(202);
+      h.gitmatrix.applySql("DELETE FROM space_grants WHERE account_id = 'acc_bob'");
+      const resumed = await h.request(start.headers.get("location")!, {
+        method: "PATCH",
+        headers: { authorization: basic(bob) },
+        body: "revoked-grant",
+      });
+      expect(resumed.status).toBe(403);
     });
   });
 

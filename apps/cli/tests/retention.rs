@@ -14,20 +14,45 @@ use std::time::Duration;
 
 type Requests = Arc<Mutex<Vec<(String, String, Value)>>>;
 
-fn policy(id: &str, enabled: bool) -> Value {
-    json!({
-        "id": id, "scope": "account", "control": "policy", "label": id, "description": "",
+fn policy(id: &str, scope: &str, enabled: bool) -> Value {
+    let mut policy = json!({
+        "id": id, "scope": scope, "control": "policy", "label": id, "description": "",
         "never": [], "thresholds": [{"key": "days", "label": "Days", "unit": "days", "min": 1, "max": 3650, "default": 30}],
-        "enabled": enabled, "enabledFrom": "account", "values": {"days": 30}, "valuesFrom": {"days": "default"},
+        "enabled": enabled, "enabledFrom": scope, "values": {"days": 30}, "valuesFrom": {"days": "default"},
         "runnable": true, "lastRun": null, "updatedAt": null, "updatedBy": null
-    })
+    });
+    if id == "ci-runs" {
+        policy["thresholds"].as_array_mut().unwrap().push(json!({
+            "key": "keepLatest", "label": "Runs kept per ref", "unit": "runs",
+            "min": 1, "max": 10000, "default": 20
+        }));
+        policy["values"]["keepLatest"] = json!(20);
+        policy["valuesFrom"]["keepLatest"] = json!("default");
+    } else if id == "auth-hygiene" {
+        policy["control"] = json!("fixed");
+    }
+    policy
 }
 
-fn settings(level: &str, enabled: bool) -> Value {
+fn settings(scope: &str, enabled: bool) -> Value {
+    let (id, categories) = match scope {
+        "person" => (
+            "person-ann",
+            vec![policy("assistant-chats", scope, enabled)],
+        ),
+        "instance" => ("", vec![policy("auth-hygiene", scope, enabled)]),
+        _ => (
+            "space-studio",
+            vec![
+                policy("ci-logs", scope, enabled),
+                policy("ci-runs", scope, enabled),
+            ],
+        ),
+    };
     json!({
-        "level": level, "account": if level == "site" { Value::Null } else { json!("ann") },
+        "target": {"kind": scope, "id": id},
         "canEdit": true, "changes": [],
-        "categories": [policy("ci-logs", enabled), policy("ci-runs", false)]
+        "categories": categories
     })
 }
 
@@ -36,20 +61,25 @@ fn run(id: u64, status: &str, dry_run: bool) -> Value {
         "queued" => "pending",
         other => other,
     };
+    let (scope, target, category) = match id {
+        9 => ("instance", "", "auth-hygiene"),
+        10 => ("person", "person-ann", "assistant-chats"),
+        _ => ("space", "space-studio", "ci-logs"),
+    };
     json!({
-        "id": id, "level": "account", "account": "ann", "trigger": "manual", "actor": "ann",
+        "id": id, "target": {"kind": scope, "id": target}, "trigger": "manual", "actor": "ann",
         "dryRun": dry_run, "status": status, "asOf": "2026-10-04T00:00:00Z",
         "createdAt": "2026-10-04T00:00:00Z", "startedAt": null, "finishedAt": null,
         "items": 3, "bytes": 2048, "error": null,
-        "categories": [{"category": "ci-logs", "label": "CI logs", "status": category_status,
+        "categories": [{"category": category, "label": category, "status": category_status,
             "thresholds": {"days": 30}, "items": 3, "bytes": 2048, "batches": 1,
             "error": if status == "failed" { json!("boom") } else { Value::Null },
             "startedAt": null, "finishedAt": null}]
     })
 }
 
-/// The retention API for the person `ann`: run 7 is a dry run that succeeds on
-/// its second read, run 8 a real run that fails; `/api/accounts/bob/…` is 403.
+/// Ann has an explicit admin grant to studio and a member grant to shared.
+/// Person retention is self-only; Instance access uses a separate operator token.
 struct Api {
     address: SocketAddr,
     requests: Requests,
@@ -81,15 +111,18 @@ impl Api {
                 let method = parts.next().unwrap_or("").to_string();
                 let path = parts.next().unwrap_or("").to_string();
                 let mut length = 0;
+                let mut operator = false;
                 loop {
                     line.clear();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().unwrap_or(0);
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        } else if name.eq_ignore_ascii_case("authorization") {
+                            operator = value.trim() == "Bearer operator-token";
+                        }
                     }
                 }
                 let mut body = vec![0; length];
@@ -102,20 +135,33 @@ impl Api {
                 let (code, reply) = match (method.as_str(), path.as_str()) {
                     ("GET", "/api/session") => (
                         200,
-                        json!({"viewer": {"slug": "ann", "isSiteAdmin": false}}),
+                        json!({"viewer": {
+                            "id": "person-ann", "slug": "ann", "isSiteAdmin": operator,
+                            "defaultSpaceId": "space-studio",
+                            "spaces": [
+                                {"id": "space-studio", "slug": "studio"},
+                                {"id": "space-shared", "slug": "shared"}
+                            ]
+                        }}),
                     ),
-                    ("GET", "/api/accounts/ann/settings/retention") => {
-                        (200, settings("account", false))
+                    ("GET", "/api/spaces/studio/retention") => (200, settings("space", false)),
+                    ("PATCH", "/api/spaces/studio/retention") => (200, settings("space", true)),
+                    ("GET", "/api/accounts/ann/retention") => (200, settings("person", false)),
+                    ("PATCH", "/api/accounts/ann/retention") => (200, settings("person", true)),
+                    (_, p) if p.starts_with("/api/accounts/bob/") => {
+                        (404, json!({"error": "No such person retention."}))
                     }
-                    ("PATCH", "/api/accounts/ann/settings/retention") => {
-                        (200, settings("account", true))
-                    }
-                    ("GET", "/api/admin/retention") => (200, settings("site", false)),
-                    (_, p) if p.starts_with("/api/accounts/bob/") => (
+                    (_, p) if p.starts_with("/api/spaces/shared/") => (
                         403,
-                        json!({"error": "Only the organization's owners can change its data retention."}),
+                        json!({"error": "Only Space administrators manage retention."}),
                     ),
-                    ("POST", "/api/accounts/ann/retention/runs") => {
+                    (_, p) if p.starts_with("/api/admin/retention") && !operator => (
+                        403,
+                        json!({"error": "Only Instance administrators manage Instance retention."}),
+                    ),
+                    ("GET", "/api/admin/retention") => (200, settings("instance", false)),
+                    ("POST", "/api/accounts/ann/retention/runs") => (202, run(10, "queued", true)),
+                    ("POST", "/api/spaces/studio/retention/runs") => {
                         if body["dryRun"] == json!(true) {
                             (202, run(7, "queued", true))
                         } else {
@@ -123,7 +169,7 @@ impl Api {
                         }
                     }
                     ("POST", "/api/admin/retention/runs") => (202, run(9, "queued", true)),
-                    ("GET", "/api/accounts/ann/retention/runs/7") => {
+                    ("GET", "/api/spaces/studio/retention/runs/7") => {
                         reads_of_7 += 1;
                         let status = if reads_of_7 < 2 {
                             "running"
@@ -132,8 +178,10 @@ impl Api {
                         };
                         (200, run(7, status, true))
                     }
-                    ("GET", "/api/accounts/ann/retention/runs/8") => (200, run(8, "failed", false)),
-                    ("GET", p) if p.starts_with("/api/accounts/ann/retention/runs") => (
+                    ("GET", "/api/spaces/studio/retention/runs/8") => {
+                        (200, run(8, "failed", false))
+                    }
+                    ("GET", p) if p.starts_with("/api/spaces/studio/retention/runs") => (
                         200,
                         json!({"runs": [run(8, "failed", false), run(7, "succeeded", true)], "next": 7}),
                     ),
@@ -189,12 +237,19 @@ impl Env {
     }
 
     fn gm(&self, args: &[&str]) -> (i32, Value) {
+        self.gm_with_token(args, "test-token")
+    }
+
+    fn gm_with_token(&self, args: &[&str], token: &str) -> (i32, Value) {
         let output = Command::new(env!("CARGO_BIN_EXE_gm"))
             .current_dir(&self.root)
             .args(args)
+            .env_clear()
+            .env("HOME", &self.root)
+            .env("PATH", "/usr/bin:/bin")
             .env("GM_AGENT", "1")
             .env("GM_SERVER", format!("http://{}", self.api.address))
-            .env("GM_TOKEN", "test-token")
+            .env("GM_TOKEN", token)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_DATA_HOME", self.root.join("data"))
             .output()
@@ -209,14 +264,17 @@ impl Env {
 }
 
 #[test]
-fn show_and_set_use_the_signed_in_account_or_the_site() {
+fn show_and_set_use_authorized_space_or_instance_scope() {
     let env = Env::new();
     let (code, shown) = env.gm(&["retention", "show"]);
     assert_eq!(code, 0, "{shown}");
-    assert_eq!(shown["level"], "account");
+    assert_eq!(
+        shown["target"],
+        json!({"kind": "space", "id": "space-studio"})
+    );
     assert_eq!(shown["categories"].as_array().unwrap().len(), 2);
 
-    let (code, one) = env.gm(&["retention", "show", "ci-runs", "--owner", "ann"]);
+    let (code, one) = env.gm(&["retention", "show", "ci-runs", "--space", "studio"]);
     assert_eq!(code, 0, "{one}");
     assert_eq!(one["categories"][0]["id"], "ci-runs");
     assert_eq!(one["categories"].as_array().unwrap().len(), 1);
@@ -225,14 +283,14 @@ fn show_and_set_use_the_signed_in_account_or_the_site() {
     assert_eq!(code, 3, "{missing}");
     assert_eq!(missing["error"]["code"], "unknown_category");
 
-    let (code, site) = env.gm(&["retention", "show", "--site"]);
+    let (code, site) = env.gm_with_token(&["retention", "show", "--site"], "operator-token");
     assert_eq!(code, 0, "{site}");
-    assert_eq!(site["level"], "site");
+    assert_eq!(site["target"], json!({"kind": "instance", "id": ""}));
 
     let (code, set) = env.gm(&[
         "retention",
         "set",
-        "ci-logs",
+        "ci-runs",
         "--enable",
         "--threshold",
         "days=14",
@@ -240,7 +298,7 @@ fn show_and_set_use_the_signed_in_account_or_the_site() {
         "keepLatest",
     ]);
     assert_eq!(code, 0, "{set}");
-    assert_eq!(set["category"]["id"], "ci-logs");
+    assert_eq!(set["category"]["id"], "ci-runs");
     assert_eq!(set["category"]["enabled"], true);
 
     let (code, dry) = env.gm(&["retention", "set", "ci-logs", "--disable", "--dry-run"]);
@@ -251,25 +309,24 @@ fn show_and_set_use_the_signed_in_account_or_the_site() {
         json!({"categories": {"ci-logs": {"enabled": false}}})
     );
 
-    let (code, refused) = env.gm(&["retention", "set", "ci-logs", "--enable", "--owner", "bob"]);
-    assert_ne!(code, 0, "{refused}");
-    assert!(
-        refused["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("owners"),
-        "{refused}"
-    );
+    let (code, refused) = env.gm(&[
+        "retention",
+        "set",
+        "ci-logs",
+        "--enable",
+        "--space",
+        "shared",
+    ]);
+    assert_eq!(code, 5, "{refused}");
 
     let requests = env.api.requests();
     let patches: Vec<_> = requests.iter().filter(|r| r.0 == "PATCH").collect();
-    // The dry run sends nothing; the server refuses bob's.
     assert_eq!(patches.len(), 2, "{patches:?}");
-    assert_eq!(patches[0].1, "/api/accounts/ann/settings/retention");
-    assert_eq!(patches[1].1, "/api/accounts/bob/settings/retention");
+    assert_eq!(patches[0].1, "/api/spaces/studio/retention");
+    assert_eq!(patches[1].1, "/api/spaces/shared/retention");
     assert_eq!(
         patches[0].2,
-        json!({"categories": {"ci-logs": {"enabled": true, "thresholds": {"days": 14, "keepLatest": null}}}})
+        json!({"categories": {"ci-runs": {"enabled": true, "thresholds": {"days": 14, "keepLatest": null}}}})
     );
     assert!(requests.iter().any(|r| r.1 == "/api/admin/retention"));
 }
@@ -309,15 +366,18 @@ fn run_previews_waits_and_fails_loudly() {
         "{failed}"
     );
 
-    // --no-wait returns the queued run; the site has its own path.
-    let (code, queued) = env.gm(&[
-        "retention",
-        "run",
-        "auth-hygiene",
-        "--site",
-        "--dry-run",
-        "--no-wait",
-    ]);
+    // --no-wait returns the queued run; Instance cleanup requires operator authority.
+    let (code, queued) = env.gm_with_token(
+        &[
+            "retention",
+            "run",
+            "auth-hygiene",
+            "--site",
+            "--dry-run",
+            "--no-wait",
+        ],
+        "operator-token",
+    );
     assert_eq!(code, 0, "{queued}");
     assert_eq!(queued["id"], 9);
 
@@ -335,7 +395,7 @@ fn run_previews_waits_and_fails_loudly() {
     assert_eq!(posts[2].1, "/api/admin/retention/runs");
     let polls_of_7 = requests
         .iter()
-        .filter(|r| r.1 == "/api/accounts/ann/retention/runs/7")
+        .filter(|r| r.1 == "/api/spaces/studio/retention/runs/7")
         .count();
     assert_eq!(polls_of_7, 2, "polled until it succeeded");
 }
@@ -354,7 +414,60 @@ fn runs_lists_history_and_shows_one_run() {
     assert!(
         requests
             .iter()
-            .any(|r| r.1 == "/api/accounts/ann/retention/runs?before=9&limit=2"),
+            .any(|r| r.1 == "/api/spaces/studio/retention/runs?before=9&limit=2"),
         "{requests:?}"
     );
+}
+
+#[test]
+fn personal_retention_and_instance_authority_do_not_grant_space_admin_access() {
+    let env = Env::new();
+    let (code, personal) = env.gm(&["retention", "show", "--person", "ann"]);
+    assert_eq!(code, 0, "{personal}");
+    assert_eq!(
+        personal["target"],
+        json!({"kind": "person", "id": "person-ann"})
+    );
+    assert_eq!(personal["categories"][0]["id"], "assistant-chats");
+
+    let (code, queued) = env.gm(&[
+        "retention",
+        "run",
+        "assistant-chats",
+        "--person",
+        "ann",
+        "--dry-run",
+        "--no-wait",
+    ]);
+    assert_eq!(code, 0, "{queued}");
+    assert_eq!(queued["target"], personal["target"]);
+    assert_eq!(queued["status"], "queued");
+
+    let (code, denied) = env.gm(&["retention", "show", "--person", "bob"]);
+    assert_eq!(code, 3, "{denied}");
+    let (code, denied) = env.gm(&["retention", "show", "--site"]);
+    assert_eq!(code, 5, "{denied}");
+    let (code, denied) = env.gm_with_token(
+        &[
+            "retention",
+            "set",
+            "ci-logs",
+            "--enable",
+            "--space",
+            "shared",
+        ],
+        "operator-token",
+    );
+    assert_eq!(code, 5, "{denied}");
+    let (code, denied) =
+        env.gm_with_token(&["retention", "show", "--person", "bob"], "operator-token");
+    assert_eq!(code, 3, "{denied}");
+
+    let requests = env.api.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| { r.0 == "POST" && r.1 == "/api/accounts/ann/retention/runs" })
+    );
+    assert!(!requests.iter().any(|r| r.1 == "/api/spaces/ann/retention"));
 }

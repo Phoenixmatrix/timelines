@@ -1,25 +1,52 @@
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { CiLogs, CiRunDetail, CiRunList } from "../../shared/api.ts";
 import type { AgentPresence } from "../../shared/agent-presence.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
 import { ci } from "./api.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { CONTENT_CONTRACT_HEADER } from "../../shared/spaces.ts";
 
 // loadRepo's module reaches the knowledge coordinator, a Durable Object.
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+
+const closers: Array<() => void> = [];
+afterEach(() => {
+  for (const close of closers.splice(0)) close();
+});
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  closers.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_ann', 'user', 'ann', 'Ann');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_monitor', 'monitor', 'acc_ann');
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_bob', 'user', 'bob', 'Bob');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
-      ('repo', 'acc_ann', 'app', 'private', 'a', 'https://a');
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "organization",
+      slug: "ann-personal",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "acc_ann",
+    },
+    space: { id: "space", slug: "ann", displayName: "General" },
+    members: [
+      {
+        accountId: "acc_ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "acc_ann",
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+      ('repo', 'space', 'app', 'private', 'a', 'https://a');
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
       ('run1', 'repo', 1, '${oid(1)}', 'main', 'push', 'succeeded'),
       ('run2', 'repo', 2, '${oid(2)}', 'timeline/fast-search', 'push', 'failed'),
@@ -30,14 +57,13 @@ async function setup() {
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, queue_id) VALUES
       ('run6', 'repo', 6, '${oid(6)}', 'gitmatrix/landing/queue-${oid(6)}-1', 'manual', 'running', '${oid(6)}');
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/repos/:owner/:name/ci", ci);
+  app.route("/api/repos/:space/:name/ci", ci);
   const { secret } = await issueToken(env.DB, "acc_ann", "t", "read");
   const agent = (await issueToken(env.DB, "acc_ann", "monitor", "read", undefined, "agt_monitor"))
     .secret;
@@ -46,7 +72,7 @@ async function setup() {
     const pending: Promise<unknown>[] = [];
     const response = await app.request(
       path,
-      { headers: { authorization: `Bearer ${token}` } },
+      { headers: { authorization: `Bearer ${token}`, [CONTENT_CONTRACT_HEADER]: "4" } },
       env,
       {
         waitUntil: (work: Promise<unknown>) => {

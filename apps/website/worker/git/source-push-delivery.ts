@@ -8,21 +8,27 @@ import { recordPush } from "../ref-log/record.ts";
 import { db } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { TrackerError } from "../tracker/store.ts";
+import { resolveWorkAuthority } from "../ci/admission.ts";
 
 /** CI delivery is an exact-operation obligation, not a moved-ref notification. */
 export async function deliverRecoveredSourcePush(
   env: Env,
   repo: PushedRepo & { source_id: string },
   operationId: string,
-  actor: Pick<Actor, "id" | "agent"> | null,
+  actor: Pick<Actor, "id" | "agent" | "credential"> | null,
   waitUntil: (work: Promise<unknown>) => void,
 ) {
-  const tracker = trackerObject(env, repo.owner_id);
+  const tracker = trackerObject(env, repo.space_id);
   const kdb = db(env.DB);
-  const operation = await tracker.sourcePush(operationId, repo.id, repo.source_id);
+  const operation = await tracker.sourcePushForSettlement({
+    spaceId: repo.space_id,
+    operationId,
+    repoId: repo.id,
+    sourceId: repo.source_id,
+  });
   if (!operation.ok) throw new TrackerError(operation.status, operation.code, operation.error);
   const runIds: Partial<Record<"push" | "step", string>> = {};
-  if (!operation.value.delivery) {
+  if (!operation.value.delivery && operation.value.authority) {
     const head =
       operation.value.recovery?.head ??
       (operation.value.state === "accepted" ? operation.value.commands[0]?.new : null);
@@ -32,6 +38,8 @@ export async function deliverRecoveredSourcePush(
         .select(["id", "step"])
         .where("repo_id", "=", repo.id)
         .where("source_id", "=", repo.source_id)
+        .where("space_id", "=", repo.space_id)
+        .where("authority", "=", JSON.stringify(operation.value.authority))
         .where("ref", "=", "work")
         .where("commit_oid", "=", head)
         .where("preview_action", "is", null)
@@ -87,11 +95,31 @@ export async function deliverRecoveredSourcePush(
   for (const trigger of ["push", "step"] as const) {
     const run = delivery.runs[trigger];
     if (run.state !== "pending") continue;
+    // A completed launch remains an obligation even when its initiator was revoked.
+    const existing = await kdb
+      .selectFrom("ci_runs")
+      .select(["id", "status"])
+      .where("id", "=", run.id)
+      .where("repo_id", "=", repo.id)
+      .where("source_id", "=", repo.source_id)
+      .where("commit_oid", "=", delivery.head)
+      .where("space_id", "=", repo.space_id)
+      .where("step", "=", trigger === "step" ? 1 : 0)
+      .executeTakeFirst();
+    if (existing && ["succeeded", "failed", "cancelled"].includes(existing.status)) {
+      const completed = await tracker.completeSourcePushDelivery(operationId, trigger, run.id, {
+        runId: existing.id,
+      });
+      if (!completed.ok) throw new TrackerError(completed.status, completed.code, completed.error);
+      continue;
+    }
+    const current = await resolveWorkAuthority(env, operation.value.authority, repo.id);
     const result = await startRun(env, repo, {
       branch: "work",
       commit: delivery.head,
       trigger,
-      actor,
+      actor: current.actor,
+      authority: operation.value.authority,
       waitUntil,
       runId: run.id,
       sourceRecovery: true,
@@ -104,5 +132,6 @@ export async function deliverRecoveredSourcePush(
     );
     if (!completed.ok) throw new TrackerError(completed.status, completed.code, completed.error);
   }
-  await notifyKnowledge(env, repo.id);
+  await resolveWorkAuthority(env, operation.value.authority, repo.id);
+  await notifyKnowledge(env, repo.id, { authorization: operation.value.authority });
 }

@@ -147,7 +147,7 @@ pub fn run(ctx: &Ctx, command: &QueueCommand) -> Result<Shown> {
                     .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         })
     {
-        return Err(GmError::usage("Name a repository as owner/name."));
+        return Err(GmError::usage("Name a repository as space/name."));
     }
     let config = Config::load();
     let base = format!("/repos/{repo}/queue");

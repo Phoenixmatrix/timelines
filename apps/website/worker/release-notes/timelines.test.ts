@@ -1,7 +1,13 @@
 import { describe, expect, test, vi } from "vite-plus/test";
 import { mergedBranch } from "../../shared/landings.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { landedTimelines, ownerTimelines } from "./timelines.ts";
+import { d1 } from "../testing/d1.ts";
+import { landedTimelines, spaceTimelines } from "./timelines.ts";
+import {
+  releaseActor,
+  releaseEnvironment,
+  seedReleasePerson,
+  seedReleaseSpace,
+} from "./test-support.ts";
 
 const merge = (hash: string, message: string, parents = ["main", `${hash}-tip`]) =>
   ({ hash, message, parents }) as unknown as ArtifactsCommitMetadata;
@@ -18,10 +24,11 @@ describe("landed timelines", () => {
   });
 
   test("the push log names the merged commit's timeline branch first", async () => {
-    const sqlite = migratedDatabase();
+    const { sqlite } = await releaseEnvironment();
+    seedReleasePerson(sqlite, "person");
+    await seedReleaseSpace(sqlite, "acc", "person");
     sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
       INSERT INTO ref_updates (repo_id, ref, old_oid, new_oid) VALUES
         ('repo', 'refs/heads/wip', NULL, 'A-tip'),
@@ -62,7 +69,10 @@ describe("landed timelines", () => {
     });
   });
 
-  test("timeline ids come from the tracker of the repository's owner", async () => {
+  test("timeline ids require a current grant to the repository's immutable Space", async () => {
+    const { sqlite, env } = await releaseEnvironment();
+    seedReleasePerson(sqlite, "person");
+    await seedReleaseSpace(sqlite, "acc", "person");
     const getByName = vi.fn(() => ({
       listTimelines: async () => ({
         ok: true,
@@ -72,10 +82,13 @@ describe("landed timelines", () => {
         ],
       }),
     }));
-    const env = { TRACKER: { getByName } } as unknown as Env;
-    expect(await ownerTimelines(env, "acc")(["search", "missing"])).toEqual(
+    env.TRACKER = { getByName } as unknown as Env["TRACKER"];
+    expect(await spaceTimelines(env, "acc", releaseActor("person"))(["search", "missing"])).toEqual(
       new Map([["search", "tl_search"]]),
     );
     expect(getByName).toHaveBeenCalledWith("acc");
+    sqlite.exec("DELETE FROM space_grants WHERE space_id='acc'");
+    expect(await spaceTimelines(env, "acc", releaseActor("person"))(["search"])).toEqual(new Map());
+    expect(getByName).toHaveBeenCalledTimes(1);
   });
 });

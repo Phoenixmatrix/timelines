@@ -1,7 +1,7 @@
 import { gzipSync } from "node:zlib";
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import {
   ATLAS_OVERVIEW_MAX_BYTES,
   ATLAS_OVERVIEW_REGIONS,
@@ -19,7 +19,8 @@ import {
 } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlasApi, atlasNeedsRestart } from "../../src/lib/atlas.ts";
 import { atlas } from "./api.ts";
 import {
@@ -34,7 +35,14 @@ import {
 import { admitProjection, CURSOR_TTL_MS, enforceRetention } from "./retention.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -56,17 +64,32 @@ function forbidden(name: string, touched: string[]) {
   );
 }
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup(): Promise<Setup> {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'engine', 'private', 'art-r1', ''),
       ('r2', 'ann', 'other', 'private', 'art-r2', '');
   `);
   const touched: string[] = [];
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
     AI: forbidden("AI", touched),
@@ -82,7 +105,7 @@ function setup() {
     c.set("actor", actor);
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
   const call = (path: string, repo = "engine") =>
     app.request(`/api/repos/ann/${repo}/atlas/${path}`, {}, env);
   const get = async <T>(path: string, repo = "engine"): Promise<T> => {
@@ -108,7 +131,15 @@ function setup() {
   };
 }
 
-type Setup = ReturnType<typeof setup>;
+interface Setup {
+  sqlite: DatabaseSync;
+  db: D1Database;
+  serveClient(): void;
+  touched: string[];
+  call(path: string, repo?: string): Response | Promise<Response>;
+  get<T>(path: string, repo?: string): Promise<T>;
+  as(actor: Actor | null): void;
+}
 
 function node(
   sqlite: DatabaseSync,
@@ -217,7 +248,7 @@ async function traverse<T>(
 
 describe("Atlas read API", () => {
   test("the overview ranks at most 12 regions by primary files and pages the rest", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 40 });
     const { snapshotId, seq } = await publish(s.db, "r1", "c1");
 
@@ -276,7 +307,7 @@ describe("Atlas read API", () => {
   });
 
   test("children, relations and evidence traverse completely while a newer snapshot publishes", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 250, importers: 230 });
     const first = await publish(s.db, "r1", "c1");
 
@@ -353,7 +384,7 @@ describe("Atlas read API", () => {
   });
 
   test("pages hold at most 100 records whatever the request asks", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 150, importers: 120 });
     await publish(s.db, "r1", "c1");
     const children = await s.get<AtlasPage<unknown>>("children?id=component%3Ac0000&limit=5000");
@@ -371,7 +402,7 @@ describe("Atlas read API", () => {
   });
 
   test("the initial overview stays well inside 256 KiB on a large projection", async () => {
-    const s = setup();
+    const s = await setup();
     const long = "Handles a great many things in a very particular way. ".repeat(200);
     node(s.sqlite, "r1", "repo", "repository", "engine", null, long, {
       techStack: Array.from({ length: 500 }, (_, i) => `tech-${i}`),
@@ -411,7 +442,7 @@ describe("Atlas read API", () => {
   }, 30_000); // A large projection: seconds on a loaded 4-core host (CORE-247).
 
   test("forged and replayed cursors are rejected, recoverably", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 2, filesPerComponent: () => 30, importers: 30 });
     seed(s.sqlite, "r2", { components: 2, filesPerComponent: () => 30, importers: 30 });
     s.sqlite.exec(`UPDATE repos SET visibility = 'public'`);
@@ -478,7 +509,7 @@ describe("Atlas read API", () => {
   });
 
   test("unknown and expired snapshots are explicit, never the current one", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1");
     const missing = await s.call("overview");
     expect(missing.status).toBe(404);
@@ -531,7 +562,7 @@ describe("Atlas read API", () => {
   });
 
   test("an unreadable repository looks exactly like a missing one, cursor or not", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 20 });
     await publish(s.db, "r1", "c1");
     const page = await s.get<AtlasPage<unknown>>("children?id=component%3Ac0000&limit=5");
@@ -565,7 +596,7 @@ describe("Atlas read API", () => {
   });
 
   test("detail, ancestors, evidence and catalogue serve deep links without a model", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1");
     await publish(s.db, "r1", "c1");
 
@@ -644,7 +675,7 @@ describe("Atlas read API", () => {
   });
 
   test("a partial snapshot says its totals are floors", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1");
     node(s.sqlite, "r1", "file:late.ts", "file", "late.ts", "late.ts", "", { pending: true });
     await publish(s.db, "r1", "c1");
@@ -655,12 +686,12 @@ describe("Atlas read API", () => {
   });
 
   test("the typed client pages through a pinned traversal and knows when to restart", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 7 });
     const first = await publish(s.db, "r1", "c1");
     s.serveClient();
     try {
-      const repo = { owner: "ann", name: "engine" };
+      const repo = { space: "ann", name: "engine" };
       const overview = await atlasApi.overview(repo);
       expect(overview.snapshot.id).toBe(first.snapshotId);
       const ids: string[] = [];
@@ -697,31 +728,31 @@ describe("Atlas read API", () => {
       vi.unstubAllGlobals();
     }
   });
-  test("retention evicting a snapshot mid-traversal stops its cursor and pins explicitly", async () => {
-    const scenarios = [
-      {
-        reason: "count",
-        evict: (db: D1Database) =>
-          enforceRetention(db, [repoScope("r1")], { policy: { maxPrior: 0 } }),
+  test.each([
+    {
+      reason: "count",
+      evict: (db: D1Database) =>
+        enforceRetention(db, [repoScope("r1")], { policy: { maxPrior: 0 } }),
+    },
+    {
+      reason: "storage",
+      evict: (db: D1Database) =>
+        enforceRetention(db, [repoScope("r1")], { policy: { capBytes: 1 } }),
+    },
+    {
+      reason: "age",
+      // Stamped now, due in an hour; read past that, before any sweep marks it.
+      evict: async (db: D1Database) => {
+        await enforceRetention(db, [repoScope("r1")], { policy: { priorTtlMs: 60 * 60 * 1000 } });
+        const now = Date.now();
+        vi.spyOn(Date, "now").mockReturnValue(now + 61 * 60 * 1000);
+        return null;
       },
-      {
-        reason: "storage",
-        evict: (db: D1Database) =>
-          enforceRetention(db, [repoScope("r1")], { policy: { capBytes: 1 } }),
-      },
-      {
-        reason: "age",
-        // Stamped now, due in an hour; read past that, before any sweep marks it.
-        evict: async (db: D1Database) => {
-          await enforceRetention(db, [repoScope("r1")], { policy: { priorTtlMs: 60 * 60 * 1000 } });
-          const now = Date.now();
-          vi.spyOn(Date, "now").mockReturnValue(now + 61 * 60 * 1000);
-          return null;
-        },
-      },
-    ] as const;
-    for (const { reason, evict } of scenarios) {
-      const s = setup();
+    },
+  ] as const)(
+    "retention eviction by $reason stops existing cursors and pins",
+    async ({ reason, evict }) => {
+      const s = await setup();
       seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 30 });
       const one = await publish(s.db, "r1", "c1");
       const first = await s.get<AtlasPage<AtlasEntitySummary>>(
@@ -764,11 +795,11 @@ describe("Atlas read API", () => {
       // The current snapshot is unaffected.
       expect((await s.get<AtlasOverview>("overview")).snapshot.id).toBe(two.snapshotId);
       vi.restoreAllMocks();
-    }
-  });
+    },
+  );
 
   test("cursors expire 30 minutes after issue by retention's rule, each page issuing anew", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 30 });
     await publish(s.db, "r1", "c1");
     const start = Date.now();
@@ -792,7 +823,7 @@ describe("Atlas read API", () => {
   });
 
   test("the overview reports a capacity failure that left the current snapshot stale", async () => {
-    const s = setup();
+    const s = await setup();
     seed(s.sqlite, "r1");
     const one = await publish(s.db, "r1", "c1");
     s.sqlite.exec(`UPDATE kg_nodes SET summary = 'v2' WHERE repo_id = 'r1' AND id = 'repo'`);
@@ -819,7 +850,7 @@ describe("Atlas read API", () => {
   });
 
   test("a grouped projection leads with capabilities, groups after, areas beneath", async () => {
-    const s = setup();
+    const s = await setup();
     const sqlite = s.sqlite;
     node(sqlite, "r1", "repo", "repository", "shop", null, "A shop");
     const cluster = (dir: string, n: number) => {

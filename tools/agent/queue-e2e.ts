@@ -1,3 +1,4 @@
+import { contentHeaders, fixtureMutationBody, fixtureSpace } from "./content-fixtures.ts";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -59,9 +60,11 @@ export async function queueFixture(
     statuses = [200],
     credential: string | null = token,
   ): Promise<T> {
+    body = await fixtureMutationBody(ctx.origin, path, credential, body);
     const response = await fetch(`${ctx.origin}${path}`, {
       method,
       headers: {
+        ...contentHeaders,
         ...(credential ? { authorization: `Bearer ${credential}` } : {}),
         "content-type": "application/json",
       },
@@ -109,7 +112,8 @@ export async function queueFixture(
             : resolve(raw ? stdout : stdout.trim()),
       );
     });
-  await json("/api/repos", "POST", { owner: "orbit", name, visibility: "private" }, [201]);
+  const spaceId = (await fixtureSpace(ctx.origin, "orbit", token)).space.id;
+  await json("/api/repos", "POST", { spaceId, name, visibility: "private" }, [201]);
   await git(["init", "--initial-branch=main"]);
   await git(["config", "user.name", "Queue Fixture"]);
   await git(["config", "user.email", "queue@example.invalid"]);
@@ -307,7 +311,7 @@ export async function runQueueE2E(
   assert.equal(await f.tip(), beforeFailure);
 
   const sourceIssue = randomUUID();
-  const tracker = `/api/tracker/${fixtures.tracker.owner}`;
+  const tracker = `/api/tracker/${fixtures.tracker.space}`;
   await f.json(`${tracker}/mutate`, "POST", {
     operationId: randomUUID(),
     mutations: [
@@ -329,7 +333,8 @@ export async function runQueueE2E(
   assert.equal(stopped.status, "failed");
   assert(stopped.failure?.conflictPaths.includes("value.ts"));
   assert.equal(await f.tip(), beforeConflict);
-  await f.show(conflictId);
+  // The terminal verdict and its durable remediation outbox precede publication.
+  const remediated = await f.wait(conflictId, (entry) => entry.remediationIssueId !== null);
   await f.show(conflictId);
   const snapshot = await f.json<Snapshot>(`${tracker}/snapshot`);
   const remediation = snapshot.issues.filter(
@@ -339,7 +344,7 @@ export async function runQueueE2E(
   const issue = remediation[0]!;
   assert.equal(issue.priority, 0);
   assert.equal(issue.status, "todo");
-  assert.equal(issue.id, stopped.remediationIssueId);
+  assert.equal(issue.id, remediated.remediationIssueId);
   assert.deepEqual(
     snapshot.issues.find((item) => item.id === sourceIssue)?.queueFailure,
     issue.queueFailure,
@@ -349,8 +354,8 @@ export async function runQueueE2E(
       "issue",
       "claim",
       issue.id,
-      "--owner",
-      fixtures.tracker.owner,
+      "--space",
+      fixtures.tracker.space,
       "--agent",
       "queue-remediation",
     ]),
@@ -361,8 +366,8 @@ export async function runQueueE2E(
       "issue",
       "complete",
       issue.id,
-      "--owner",
-      fixtures.tracker.owner,
+      "--space",
+      fixtures.tracker.space,
       "--evidence",
       "Rejected stale lease",
     ],
@@ -428,8 +433,8 @@ export async function runQueueE2E(
       "issue",
       "complete",
       issue.id,
-      "--owner",
-      fixtures.tracker.owner,
+      "--space",
+      fixtures.tracker.space,
       "--evidence",
       `Manually retained both values; queue ${fixed.id} gates passed at ${fixed.candidate}`,
     ],
@@ -595,7 +600,8 @@ async function runActiveQueueDeletion(
   assert.equal(purged.deletion?.progress.artifacts?.deleted, true);
 
   const name = f.repo.split("/")[1]!;
-  await f.json("/api/repos", "POST", { owner: "orbit", name, visibility: "private" }, [201]);
+  const spaceId = (await fixtureSpace(ctx.origin, "orbit", fixtures.tokens.marco)).space.id;
+  await f.json("/api/repos", "POST", { spaceId, name, visibility: "private" }, [201]);
   const fresh = await inventory();
   assert.notEqual(fresh.repoId, before.repoId, "Same name is a new repository identity");
   const freshDetail = await f.json<RepoDetail>(f.api);
@@ -605,7 +611,7 @@ async function runActiveQueueDeletion(
   await f.json(`${f.api}/queue/${id}/cancel`, "POST", {}, [404]);
   await f.json(`${f.api}/ci/runs/${entry.gateRun}`, "GET", undefined, [404]);
   await f.json(`${f.api}/queue`, "POST", { commit: id }, [409]);
-  const tracker = `/api/tracker/${fixtures.tracker.owner}/snapshot`;
+  const tracker = `/api/tracker/${fixtures.tracker.space}/snapshot`;
   // Observe through the original hold's completion window, not just a clean
   // instant after deletion: late callbacks must not publish or recreate work.
   const settleUntil = Math.max(Date.now() + 5_000, holdObservedAt + (holdSeconds + 5) * 1_000);

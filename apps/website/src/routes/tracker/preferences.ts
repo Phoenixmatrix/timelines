@@ -1,6 +1,6 @@
 import type { Snapshot, TrackerPreferences } from "../../../shared/tracker.ts";
 import { api } from "../../lib/api.ts";
-import { DEFAULT_QUERY, filterToken, VIEWS } from "./query.ts";
+import { DEFAULT_QUERY, filterToken } from "./query.ts";
 
 export const VIEW_LABEL = {
   list: "List",
@@ -11,7 +11,7 @@ export const VIEW_LABEL = {
 export type View = keyof typeof VIEW_LABEL;
 
 export interface TrackerDefaults {
-  ownerId: string;
+  spaceId: string;
   view: View;
   query: string;
   teamId: string;
@@ -42,20 +42,26 @@ export function readLegacyDefaults(viewerId: string): TrackerDefaults | null {
     const value: unknown = JSON.parse(localStorage.getItem(storageKey(viewerId)) ?? "null");
     if (typeof value !== "object" || value === null) return null;
     const stored = value as Record<string, unknown>;
+    // The approved one-to-one cutover preserves legacy owner IDs as Space IDs.
+    // Callers still require that ID in an authorized list or the loaded snapshot.
+    const spaceId = stored.spaceId ?? stored.ownerId;
     if (
-      typeof stored.ownerId !== "string" ||
+      typeof spaceId !== "string" ||
       typeof stored.teamId !== "string" ||
       typeof stored.view !== "string" ||
       !Object.hasOwn(VIEW_LABEL, stored.view) ||
-      !VIEWS.some((view) => view.query === stored.query)
+      typeof stored.query !== "string"
     ) {
       return null;
     }
     return {
-      ownerId: stored.ownerId,
+      spaceId,
       teamId: stored.teamId,
       view: stored.view as View,
-      query: stored.query as string,
+      // Stored local preferences are explicitly migrated; obsolete URL syntax is rejected.
+      query: stored.query.replace(/(-?[A-Za-z]+:)?"[^"]*"|\S+/g, (term) =>
+        term.replace(/^(-?)(?:ws|workspace):/i, "$1project:"),
+      ),
     };
   } catch {
     return null;
@@ -73,11 +79,11 @@ export function forgetLegacyDefaults(viewerId: string): void {
 /** The tracker view's saved preferences, as the defaults the page applies. */
 export function defaultsFromServer(
   preferences: TrackerPreferences | null,
-  ownerId: string,
+  spaceId: string,
 ): TrackerDefaults | null {
   return preferences
     ? {
-        ownerId,
+        spaceId,
         view: preferences.view,
         query: preferences.query,
         teamId: preferences.teamId ?? "",
@@ -91,10 +97,10 @@ export function defaultsFromServer(
  * the save failed instead of claiming it worked.
  */
 export async function saveTrackerDefaults(
-  owner: string,
+  space: string,
   defaults: TrackerDefaults | null,
 ): Promise<TrackerDefaults | null> {
-  const path = `/tracker/${encodeURIComponent(owner)}/preferences`;
+  const path = `/tracker/${encodeURIComponent(space)}/preferences`;
   if (!defaults) {
     await api(path, { method: "DELETE" });
     return null;
@@ -110,16 +116,25 @@ export async function saveTrackerDefaults(
 export function withTrackerDefaults(
   params: URLSearchParams,
   defaults: TrackerDefaults | null,
-  snapshot: Pick<Snapshot, "owner" | "teams">,
+  snapshot: Pick<Snapshot, "space" | "teams">,
 ): URLSearchParams {
   const next = new URLSearchParams(params);
-  if (defaults?.ownerId !== snapshot.owner.id) return next;
+  if (defaults?.spaceId !== snapshot.space.id) return next;
   const team = snapshot.teams.find((entry) => entry.id === defaults.teamId && !entry.archived);
   if (!next.has("view")) next.set("view", defaults.view);
-  if (!["q", "team", "workspace", "status", "ready", "closed"].some((key) => next.has(key))) {
+  if (
+    !["q", "team", "project", "workspace", "ws", "status", "ready", "closed"].some((key) =>
+      next.has(key),
+    )
+  ) {
     next.set(
       "q",
-      [defaults.query, ...(team ? [filterToken("team", team.key.toLowerCase())] : [])]
+      [
+        defaults.query,
+        ...(defaults.teamId
+          ? [filterToken("team", team?.key.toLowerCase() ?? defaults.teamId)]
+          : []),
+      ]
         .filter(Boolean)
         .join(" "),
     );
@@ -130,15 +145,8 @@ export function withTrackerDefaults(
 
 export function initialTrackerDefaults(
   defaults: TrackerDefaults | null,
-  snapshot: Pick<Snapshot, "owner" | "teams">,
+  snapshot: Pick<Snapshot, "space" | "teams">,
 ): TrackerDefaults {
-  if (defaults?.ownerId === snapshot.owner.id) {
-    return {
-      ...defaults,
-      teamId: snapshot.teams.some((team) => team.id === defaults.teamId && !team.archived)
-        ? defaults.teamId
-        : "",
-    };
-  }
-  return { ownerId: snapshot.owner.id, view: "list", query: DEFAULT_QUERY, teamId: "" };
+  if (defaults?.spaceId === snapshot.space.id) return { ...defaults };
+  return { spaceId: snapshot.space.id, view: "list", query: DEFAULT_QUERY, teamId: "" };
 }

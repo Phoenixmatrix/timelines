@@ -1,5 +1,12 @@
 import { Suspense } from "react";
-import { Await, Link, useLoaderData, useRevalidator, type LoaderFunctionArgs } from "react-router";
+import {
+  Await,
+  Link,
+  useLoaderData,
+  useLocation,
+  useRevalidator,
+  type LoaderFunctionArgs,
+} from "react-router";
 import type { Issue, Snapshot } from "../../../shared/tracker.ts";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { requireViewer } from "../../lib/session.ts";
@@ -7,36 +14,39 @@ import { buildIndex, sortIssues } from "../tracker/query.ts";
 import { useRepo } from "./RepoLayout.tsx";
 import { link } from "../../components/ui.tsx";
 import { scopeOf } from "../../lib/timelineScope.ts";
+import { assertTrackerSnapshot } from "../tracker/snapshot.ts";
 
-interface RepoWorkspace {
-  trackerOwner: string;
-  workspaceId: string;
+interface RepoProject {
+  trackerSpace: string;
+  projectId: string;
   slug: string;
   name: string;
 }
-interface WorkspaceWork {
+interface ProjectWork {
   ready: Issue[];
   counts: Record<"ready" | "in_progress" | "blocked" | "open", number>;
 }
 type ReadyPreview =
-  | { ok: true; workspaces: Record<string, WorkspaceWork> }
+  | { ok: true; projects: Record<string, ProjectWork> }
   | { ok: false; error: string };
 
 async function readyPreview(
-  owner: string,
+  space: string,
   request: Request,
-  repoOwner: string,
+  repoSpace: string,
 ): Promise<ReadyPreview> {
   try {
     // Repository subscriptions never grant access: this endpoint checks tracker membership itself.
-    const timeline = owner === repoOwner ? scopeOf(new URL(request.url).search) : null;
+    const timeline = space === repoSpace ? scopeOf(new URL(request.url).search) : null;
     const snapshot = await api<Snapshot>(
-      `/tracker/${encodeURIComponent(owner)}/snapshot${timeline ? `?${new URLSearchParams({ timeline })}` : ""}`,
+      `/tracker/${encodeURIComponent(space)}/snapshot${timeline ? `?${new URLSearchParams({ timeline })}` : ""}`,
       { signal: request.signal },
     );
+    assertTrackerSnapshot(snapshot);
+    if (snapshot.space.slug !== space) throw new Error("The snapshot belongs to another Space.");
     const index = buildIndex(snapshot, snapshot.serverTime);
-    const work = new Map<string, WorkspaceWork>(
-      snapshot.workspaces.map((w) => [
+    const work = new Map<string, ProjectWork>(
+      snapshot.projects.map((w) => [
         w.id,
         { ready: [], counts: { ready: 0, in_progress: 0, blocked: 0, open: 0 } },
       ]),
@@ -44,7 +54,7 @@ async function readyPreview(
     for (const issue of snapshot.issues) {
       const state = index.state.get(issue.id);
       if (state === "done" || state === "canceled") continue;
-      for (const id of issue.workspaceIds) {
+      for (const id of issue.projectIds) {
         const w = work.get(id);
         if (!w) continue;
         w.counts.open++;
@@ -56,7 +66,7 @@ async function readyPreview(
       }
     }
     for (const w of work.values()) w.ready = sortIssues(w.ready, index, "priority").slice(0, 8);
-    return { ok: true, workspaces: Object.fromEntries(work) };
+    return { ok: true, projects: Object.fromEntries(work) };
   } catch (error) {
     if (request.signal.aborted) throw error;
     return {
@@ -64,24 +74,24 @@ async function readyPreview(
       error:
         error instanceof ApiError && [401, 403, 404].includes(error.status)
           ? "This tracker is no longer available to your account."
-          : "Ready issues could not be loaded. Retry to check this workspace.",
+          : "Ready issues could not be loaded. Retry to check this project.",
     };
   }
 }
 
 export async function repoTrackerLoader({ request, params }: LoaderFunctionArgs) {
   await requireViewer(request);
-  const { workspaces, canManage } = await load<{ workspaces: RepoWorkspace[]; canManage: boolean }>(
-    `/repos/${encodeURIComponent(params.owner!)}/${encodeURIComponent(params.repo!)}/tracker`,
+  const { projects, canManage } = await load<{ projects: RepoProject[]; canManage: boolean }>(
+    `/repos/${encodeURIComponent(params.space!)}/${encodeURIComponent(params.repo!)}/tracker`,
     request,
   );
   const previews = Object.fromEntries(
-    [...new Set(workspaces.map((workspace) => workspace.trackerOwner))].map((owner) => [
-      owner,
-      readyPreview(owner, request, params.owner!),
+    [...new Set(projects.map((project) => project.trackerSpace))].map((space) => [
+      space,
+      readyPreview(space, request, params.space!),
     ]),
   );
-  return { workspaces, previews, canManage };
+  return { projects, previews, canManage };
 }
 const COUNTS = [
   { key: "ready", label: "ready", query: "is:ready", dot: "bg-online" },
@@ -91,36 +101,41 @@ const COUNTS = [
 ] as const;
 
 export function RepoTracker() {
-  const { workspaces, previews, canManage } = useLoaderData<typeof repoTrackerLoader>();
+  const { projects, previews, canManage } = useLoaderData<typeof repoTrackerLoader>();
   const revalidator = useRevalidator();
   const repo = useRepo();
+  const location = useLocation();
   return (
     <section className="flex flex-col gap-4">
       <header>
         <h2 className="m-0 text-title">Work for this repository</h2>
         <p className="mt-1 mb-0 max-w-[48ch] text-body-sm text-ink-muted">
-          Issues belong to teams; workspaces connect them here. Only trackers you can access appear.
+          Issues belong to teams; projects connect them here. Only trackers you can access appear.
         </p>
       </header>
-      {workspaces.length ? (
-        workspaces.map((workspace) => {
-          const base = `/tracker/${encodeURIComponent(workspace.trackerOwner)}`;
-          const scoped = (q: string) =>
-            `?${new URLSearchParams({ q: `ws:${workspace.slug} ${q}`.trim(), ...(workspace.trackerOwner !== repo.owner.slug ? { tl: "main" } : {}) })}`;
+      {projects.length ? (
+        projects.map((project) => {
+          const base = `/tracker/${encodeURIComponent(project.trackerSpace)}`;
+          const scoped = (q: string) => {
+            const query = new URLSearchParams(location.search);
+            query.set("q", `project:${project.slug} ${q}`.trim());
+            if (project.trackerSpace !== repo.space.slug) query.set("tl", "main");
+            return `?${query}${location.hash}`;
+          };
           return (
             <section
-              key={`${workspace.trackerOwner}:${workspace.workspaceId}`}
-              aria-label={workspace.name}
+              key={`${project.trackerSpace}:${project.projectId}`}
+              aria-label={project.name}
               className="rounded-pane bg-pane"
             >
               <header className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-line-soft px-3 py-2.5">
                 <h3 className="m-0 text-body font-semibold">
                   <Link className="gm-link" to={`${base}${scoped("is:open")}`}>
-                    {workspace.name}
+                    {project.name}
                   </Link>
                 </h3>
                 <span className="font-mono text-micro text-ink-faint">
-                  {workspace.trackerOwner}/{workspace.slug}
+                  {project.trackerSpace}/{project.slug}
                 </span>
               </header>
               <Suspense
@@ -130,7 +145,7 @@ export function RepoTracker() {
                   </p>
                 }
               >
-                <Await resolve={previews[workspace.trackerOwner]!}>
+                <Await resolve={previews[project.trackerSpace]!}>
                   {(preview: ReadyPreview) => {
                     if (!preview.ok)
                       return (
@@ -142,17 +157,17 @@ export function RepoTracker() {
                             className="mk-btn mk-btn--sm"
                             disabled={revalidator.state !== "idle"}
                             onClick={() => void revalidator.revalidate()}
-                            aria-label={`Retry loading issues for ${workspace.name}`}
+                            aria-label={`Retry loading issues for ${project.name}`}
                           >
                             {revalidator.state === "idle" ? "Retry" : "Loading…"}
                           </button>
                         </div>
                       );
-                    const work = preview.workspaces[workspace.workspaceId];
+                    const work = preview.projects[project.projectId];
                     if (!work)
                       return (
                         <p className="m-0 px-3 py-3 text-body-sm text-ink-muted">
-                          This workspace is no longer available.
+                          This project is no longer available.
                         </p>
                       );
                     return (
@@ -210,16 +225,16 @@ export function RepoTracker() {
         })
       ) : (
         <div className="mk-empty max-w-[44rem]">
-          No subscribed workspaces are visible.
+          No subscribed projects are visible.
           {canManage && (
             <>
               {" "}
-              Connect a workspace from{" "}
+              Connect a project from{" "}
               <Link
                 className={link}
-                to={`/tracker/${encodeURIComponent(repo.owner.slug)}?manage=true`}
+                to={`/tracker/${encodeURIComponent(repo.space.slug)}/projects${location.search}${location.hash}`}
               >
-                tracker management
+                Project administration
               </Link>
               .
             </>

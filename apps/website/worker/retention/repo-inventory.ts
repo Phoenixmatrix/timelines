@@ -42,6 +42,7 @@ export const REPO_TABLES = [
   "kg_search_items",
   "kg_state",
   "merge_queue",
+  "mention_backfill_jobs",
   "ref_updates",
   "release_note_entries",
   "release_note_mentions",

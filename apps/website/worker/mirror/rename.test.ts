@@ -1,35 +1,67 @@
 import { Hono } from "hono";
 import { afterEach, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { Timing } from "../timing.ts";
 import { mirrors } from "./api.ts";
 import { sealMirrorToken } from "./sync.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {}, WorkflowEntrypoint: class {} }));
-const closers: { close(): void }[] = [];
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: unknown;
+    public env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+  WorkflowEntrypoint: class {},
+}));
+const closers: (() => void)[] = [];
 afterEach(() => {
   vi.unstubAllGlobals();
-  for (const closer of closers.splice(0)) closer.close();
+  for (const close of closers.splice(0)) close();
 });
 
 async function setup(viewer = "owner", preview = false) {
-  const sqlite = migratedDatabase();
-  closers.push(sqlite);
+  const fixture = await createFreshSpaceTestEnvironment();
+  closers.push(fixture.close);
+  const { sqlite } = fixture;
   sqlite.exec(`
     INSERT INTO accounts(id,kind,slug,display_name,email) VALUES
       ('owner','user','owner','Owner','owner@example.com'),
       ('writer','user','writer','Writer','writer@example.com');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
-      VALUES('repo','owner','app','private','physical','https://storage');
+  `);
+  // The owner's personal Organization and default Space; the writer is a
+  // repository-only collaborator, which never administers the mirror.
+  await seedSpaceFixture(fixture.env.DB, {
+    organization: {
+      id: "org_owner",
+      slug: "owner-personal",
+      displayName: "Owner",
+      kind: "personal",
+      personalAccountId: "owner",
+    },
+    space: { id: "space_owner", slug: "owner", displayName: "Owner" },
+    members: [
+      {
+        accountId: "owner",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "owner",
+  });
+  sqlite.exec(`
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES('repo','space_owner','app','private','physical','https://storage');
     INSERT INTO repo_collaborators(repo_id,user_id,role) VALUES('repo','writer','write');
   `);
-  const env = {
-    DB: d1(sqlite),
+  const env = Object.assign(fixture.env, {
     OWNER_EMAIL: "owner@example.com",
     REGISTRY_KEK: btoa("01234567890123456789012345678901"),
     ...(preview ? { PREVIEW_MODE: "true" } : {}),
-  } as unknown as Env;
+  }) as Env;
   const sealed = await sealMirrorToken(env, "push-only-token");
   sqlite
     .prepare(`INSERT INTO repo_mirrors(repo_id,url,username,token_sealed,enabled,prune,status,last_synced_commit)

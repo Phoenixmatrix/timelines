@@ -126,15 +126,15 @@ fn summary(profile: &Value) -> String {
 /// vocabulary issues are tagged with, so `requires tag:ux` finds agents tagged ux.
 /// Unknown names warn on stderr and are kept, never refused. Null when no tracker is
 /// known or its catalog can't be read (an older server, offline, no access).
-pub fn tag_check(config: &Config, owner: Option<&str>, tags: &[String]) -> Value {
-    let Some(owner) = owner.filter(|o| {
+pub fn tag_check(config: &Config, space: Option<&str>, tags: &[String]) -> Value {
+    let Some(space) = space.filter(|o| {
         !o.is_empty()
             && o.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     }) else {
         return Value::Null;
     };
-    let Ok(response) = remote::api(config, "GET", &format!("/tracker/{owner}/tags"), None) else {
+    let Ok(response) = remote::api(config, "GET", &format!("/tracker/{space}/tags"), None) else {
         return Value::Null;
     };
     let Some(entries) = response["tags"].as_array() else {
@@ -148,7 +148,7 @@ pub fn tag_check(config: &Config, owner: Option<&str>, tags: &[String]) -> Value
     for u in &unknown {
         eprintln!(
             "gm: warning: {}; the agent keeps it, and issues that require tag:{} match it.",
-            super::requirements::unknown_tag_warning(u, owner),
+            super::requirements::unknown_tag_warning(u, space),
             u["tag"].as_str().unwrap_or("")
         );
     }
@@ -162,19 +162,19 @@ pub fn tag_check(config: &Config, owner: Option<&str>, tags: &[String]) -> Value
         .filter(|name| !tags.iter().any(|tag| tag.eq_ignore_ascii_case(name)))
         .take(12)
         .collect();
-    json!({ "owner": owner, "unknown": unknown, "suggestions": suggestions })
+    json!({ "space": space, "unknown": unknown, "suggestions": suggestions })
 }
 
 /// The catalog check as text lines, or nothing without one.
 pub fn tag_check_text(check: &Value) -> String {
-    let Some(owner) = check["owner"].as_str() else {
+    let Some(space) = check["space"].as_str() else {
         return String::new();
     };
     let mut out = String::new();
     for u in check["unknown"].as_array().into_iter().flatten() {
         out.push_str(&format!(
             "  warning: {}\n",
-            terminal(&super::requirements::unknown_tag_warning(u, owner))
+            terminal(&super::requirements::unknown_tag_warning(u, space))
         ));
     }
     let suggestions: Vec<String> = check["suggestions"]
@@ -186,7 +186,7 @@ pub fn tag_check_text(check: &Value) -> String {
         .collect();
     if !suggestions.is_empty() {
         out.push_str(&format!(
-            "  {owner}'s tag catalog: {} (add one with --tag NAME)\n",
+            "  {space}'s tag catalog: {} (add one with --tag NAME)\n",
             suggestions.join(", ")
         ));
     }
@@ -240,7 +240,7 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
             | AgentCommand::Revoke { .. }
             | AgentCommand::Configure { name: Some(_), .. }
             | AgentCommand::Show { name: Some(_) }
-            | AgentCommand::List { owner: None }
+            | AgentCommand::List { space: None }
     ) {
         config.acting = remote::Acting::Person;
     }
@@ -251,8 +251,9 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
             model,
             tags,
             drop_tags,
-            owner,
+            space,
             team,
+            project,
             under,
             ttl,
             intervention,
@@ -269,8 +270,9 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
                 model: model.clone(),
                 tags: tags.clone(),
                 drop_tags: drop_tags.clone(),
-                owner: owner.clone(),
+                space: space.clone(),
                 team: team.clone(),
+                project: project.clone(),
                 under: under.clone(),
                 ttl: *ttl,
                 intervention: *intervention,
@@ -353,8 +355,8 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
             let mut shown = shown_agent(remote::api(&config, method, &path, Some(&body))?);
             // Tags given now are checked against the tracker's tag catalog (CORE-271).
             if !args.tags.is_empty() {
-                let owner = super::tracker::selected_owner(&config, None).ok();
-                let check = tag_check(&config, owner.as_deref(), &args.tags);
+                let space = super::tracker::selected_space(&config, None).ok();
+                let check = tag_check(&config, space.as_deref(), &args.tags);
                 if !check.is_null() {
                     shown.text.push('\n');
                     shown.text.push_str(tag_check_text(&check).trim_end());
@@ -376,19 +378,19 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
             }
             Ok(shown)
         }
-        AgentCommand::List { owner } => {
-            let list = if let Some(owner) = owner {
-                if owner.is_empty()
-                    || !owner
+        AgentCommand::List { space } => {
+            let list = if let Some(space) = space {
+                if space.is_empty()
+                    || !space
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
                 {
                     return Err(GmError::usage(
-                        "Owner must be an account slug (letters, numbers, '-' or '_').",
+                        "Space must be a Space handle (letters, numbers, '-' or '_').",
                     ));
                 }
                 let snapshot =
-                    remote::api(&config, "GET", &format!("/tracker/{owner}/snapshot"), None)?;
+                    remote::api(&config, "GET", &format!("/tracker/{space}/snapshot"), None)?;
                 snapshot["agents"].as_array().cloned().ok_or_else(|| {
                     GmError::new("protocol_error", "Tracker snapshot has no agents array.")
                 })?

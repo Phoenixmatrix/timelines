@@ -1,6 +1,6 @@
 //! `gm timeline`: parallel lines of work (TIMELINES-RESEARCH.md).
 //!
-//! A timeline is an account-wide tracker record with one owned work repository
+//! A timeline is a Space-wide tracker record with one owned work repository
 //! per canonical repository. Canonical origin stays unchanged; bound operations
 //! fetch and push the source-addressed Timelines endpoint.
 //!
@@ -100,7 +100,7 @@ pub struct MigrateArgs {
     #[arg(long, requires = "resolve")]
     pub note: Option<String>,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -108,7 +108,7 @@ pub struct PushSelection {
     /// Timeline slug (default: this checkout's binding).
     #[arg(long)]
     pub timeline: Option<String>,
-    /// Canonical repository owner/name (default: this checkout's origin).
+    /// Canonical repository space/name (default: this checkout's origin).
     #[arg(long)]
     pub repo: Option<String>,
 }
@@ -141,7 +141,7 @@ pub struct CheckpointArgs {
     #[arg(long)]
     pub sync_main: bool,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -152,7 +152,7 @@ pub struct ReviveArgs {
     #[arg(short, long)]
     pub checkpoint: Option<String>,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -160,7 +160,7 @@ pub struct CheckpointsArgs {
     /// The timeline's slug (default: the one this checkout works in).
     pub slug: Option<String>,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -177,7 +177,7 @@ pub struct PagesArgs {
     #[arg(long)]
     pub page: Option<String>,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -185,14 +185,14 @@ pub struct LandArgs {
     /// The timeline's slug (default: the one this checkout works in).
     pub slug: Option<String>,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
-pub struct Owner {
-    /// Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`).
-    #[arg(long, short = 'O')]
-    pub owner: Option<String>,
+pub struct Space {
+    /// Tracker Space (default: .gitmatrix/agents.yml's, else origin's space, else `gm tracker use`).
+    #[arg(long)]
+    pub space: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -219,7 +219,7 @@ pub struct StartArgs {
     /// What it forks from: main, or another timeline's slug.
     #[arg(long, default_value = "main")]
     pub from: String,
-    /// Repositories it touches, owner/name (repeatable). Default: this checkout's
+    /// Repositories it touches, space/name (repeatable). Default: this checkout's
     /// repository, or the parent timeline's repositories with --from <timeline>.
     #[arg(long = "repo")]
     pub repos: Vec<String>,
@@ -227,7 +227,7 @@ pub struct StartArgs {
     #[arg(long)]
     pub no_use: bool,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -235,12 +235,12 @@ pub struct ListArgs {
     /// Only timelines with this status (active, idle, waiting, landing, partly_landed, landed, abandoned).
     #[arg(long)]
     pub status: Option<String>,
-    /// Only open timelines with no push for the account's idle period; experimental ones,
+    /// Only open timelines with no push for the Space's idle period; experimental ones,
     /// which aren't expected to land, are left out.
     #[arg(long)]
     pub stalled: bool,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -254,7 +254,7 @@ pub struct ShowArgs {
     #[arg(long, default_value_t = 200)]
     pub limit: u32,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -262,7 +262,7 @@ pub struct UseArgs {
     /// The timeline's slug, or `main` to stop working in a timeline.
     pub slug: String,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -279,7 +279,7 @@ pub struct AbandonArgs {
     /// The timeline's slug (default: the one this checkout works in).
     pub slug: Option<String>,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 #[derive(Args)]
@@ -297,7 +297,7 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub no_experimental: bool,
     #[command(flatten)]
-    pub owner: Owner,
+    pub space: Space,
 }
 
 /// JSON for agents, text for people.
@@ -323,7 +323,7 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Start(a) => start(ctx, a),
         TimelineCommand::List(a) => list(ctx, a),
         TimelineCommand::Show(a) => show(ctx, a),
-        TimelineCommand::Use(a) => use_timeline(ctx, &a.slug, a.owner.owner.clone()),
+        TimelineCommand::Use(a) => use_timeline(ctx, &a.slug, a.space.space.clone()),
         TimelineCommand::Merge(a) => merge(ctx, a),
         TimelineCommand::Abandon(a) => abandon(ctx, a),
         TimelineCommand::Checkpoint(a) => checkpoint(ctx, a),
@@ -370,36 +370,36 @@ fn require_checkout(ctx: &Ctx, what: &str) -> Result<PathBuf> {
     })
 }
 
-/// The tracker account timelines live in: explicit, the checkout's
-/// configured tracker, origin's owner (a timeline touches its own account's
+/// The tracker Space timelines live in: explicit, the checkout's
+/// configured tracker, origin's space (a timeline touches its own Space's
 /// repositories), else the selected tracker.
-fn owner(ctx: &Ctx, config: &Config, explicit: Option<String>) -> Result<String> {
+fn space(ctx: &Ctx, config: &Config, explicit: Option<String>) -> Result<String> {
     let found = explicit
-        .or_else(|| profile::defaults().scope.owner)
+        .or_else(|| profile::defaults().scope.space)
         .or_else(|| {
             server::current_repo(ctx)
                 .ok()
-                .and_then(|repo| repo.split_once('/').map(|(owner, _)| owner.to_string()))
+                .and_then(|repo| repo.split_once('/').map(|(space, _)| space.to_string()))
         });
     match found {
-        Some(owner) => {
-            if owner.is_empty()
-                || !owner
+        Some(space) => {
+            if space.is_empty()
+                || !space
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             {
                 return Err(GmError::usage(format!(
-                    "`{owner}` isn't an account slug; pass --owner OWNER."
+                    "`{space}` isn't a Space handle; pass --space SPACE."
                 )));
             }
-            Ok(owner)
+            Ok(space)
         }
-        None => super::tracker::selected_owner(config, None),
+        None => super::tracker::selected_space(config, None),
     }
 }
 
-fn base(owner: &str) -> String {
-    format!("/tracker/{owner}/timelines")
+fn base(space: &str) -> String {
+    format!("/tracker/{space}/timelines")
 }
 
 /// The timeline gm works in here (binding or GM_TIMELINE).
@@ -418,11 +418,11 @@ fn named_or_current(slug: &Option<String>, command: &str) -> Result<String> {
     }
 }
 
-fn fetch_record(config: &Config, owner: &str, slug: &str) -> Result<Value> {
+fn fetch_record(config: &Config, space: &str, slug: &str) -> Result<Value> {
     let detail = remote::api(
         config,
         "GET",
-        &format!("{}/{slug}?limit=1", base(owner)),
+        &format!("{}/{slug}?limit=1", base(space)),
         None,
     )?;
     Ok(detail["timeline"].clone())
@@ -450,7 +450,7 @@ fn line(t: &Value, bound: Option<&str>) -> String {
                 .map(|r| {
                     format!(
                         "{}/{}",
-                        r["owner"].as_str().unwrap_or("?"),
+                        r["space"].as_str().unwrap_or("?"),
                         r["name"].as_str().unwrap_or("?")
                     )
                 })
@@ -484,7 +484,7 @@ fn describe(t: &Value) -> String {
     for repo in t["repos"].as_array().into_iter().flatten() {
         out.push_str(&format!(
             "Repo     : {}/{} on {}\n",
-            repo["owner"].as_str().unwrap_or("?"),
+            repo["space"].as_str().unwrap_or("?"),
             repo["name"].as_str().unwrap_or("?"),
             repo["bookmark"].as_str().unwrap_or("?")
         ));
@@ -599,7 +599,7 @@ fn with(op: &OpResult, extra: Value) -> Result<Value> {
 
 fn list(ctx: &Ctx, args: &ListArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let mut query = Vec::new();
     if let Some(status) = &args.status {
         if !status.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
@@ -612,7 +612,7 @@ fn list(ctx: &Ctx, args: &ListArgs) -> Result<Shown> {
     if args.stalled {
         query.push("stalled=true".into());
     }
-    let mut path = base(&owner);
+    let mut path = base(&space);
     if !query.is_empty() {
         path.push_str(&format!("?{}", query.join("&")));
     }
@@ -625,26 +625,26 @@ fn list(ctx: &Ctx, args: &ListArgs) -> Result<Shown> {
             .collect::<Vec<_>>()
             .join("\n"),
         _ if args.stalled => format!(
-            "No timeline in {owner} has stalled (no push for {} days); experimental ones aren't counted.",
+            "No timeline in {space} has stalled (no push for {} days); experimental ones aren't counted.",
             value["idleDays"].as_u64().unwrap_or(7)
         ),
-        _ => format!("{owner} has no timelines. Start one with `gm timeline start <slug>`."),
+        _ => format!("{space} has no timelines. Start one with `gm timeline start <slug>`."),
     };
-    value["owner"] = json!(owner);
+    value["space"] = json!(space);
     value["current"] = json!(bound);
     Ok(Shown { value, text })
 }
 
 fn show(ctx: &Ctx, args: &ShowArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let slug = named_or_current(&args.slug, "show")?;
     let mut value = remote::api(
         &config,
         "GET",
         &format!(
             "{}/{slug}?after={}&limit={}",
-            base(&owner),
+            base(&space),
             args.after,
             args.limit
         ),
@@ -667,7 +667,7 @@ fn show(ctx: &Ctx, args: &ShowArgs) -> Result<Shown> {
     if let Ok(landing) = remote::api(
         &config,
         "GET",
-        &format!("{}/{slug}/landing", base(&owner)),
+        &format!("{}/{slug}/landing", base(&space)),
         None,
     ) && landing["landing"].is_object()
     {
@@ -708,7 +708,7 @@ fn landing_text(l: &Value) -> String {
             .collect::<Vec<_>>();
         out.push_str(&format!(
             "  {}/{:<20} {:<9} {} onto {}{}{}\n",
-            r["owner"].as_str().unwrap_or("?"),
+            r["space"].as_str().unwrap_or("?"),
             r["name"].as_str().unwrap_or("?"),
             r["state"].as_str().unwrap_or("?"),
             short(&r["commit"]),
@@ -734,9 +734,9 @@ fn landing_text(l: &Value) -> String {
 fn land(ctx: &Ctx, args: &LandArgs) -> Result<Shown> {
     let slug = named_or_current(&args.slug, "land")?;
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     if ctx.dry_run {
-        let record = fetch_record(&config, &owner, &slug)?;
+        let record = fetch_record(&config, &space, &slug)?;
         if let Some(status) = ended(&record) {
             return Err(GmError::new(
                 "timeline_ended",
@@ -750,13 +750,13 @@ fn land(ctx: &Ctx, args: &LandArgs) -> Result<Shown> {
                 repo_names(Some(&record)),
                 record["policy"].as_str().unwrap_or("?")
             ),
-            value: json!({"dry_run": true, "owner": owner, "timeline": record}),
+            value: json!({"dry_run": true, "space": space, "timeline": record}),
         });
     }
     let result = remote::api(
         &config,
         "POST",
-        &format!("{}/{slug}/land", base(&owner)),
+        &format!("{}/{slug}/land", base(&space)),
         Some(&json!({})),
     )?;
     let landing = &result["landing"];
@@ -777,7 +777,7 @@ fn land(ctx: &Ctx, args: &LandArgs) -> Result<Shown> {
         ));
     }
     Ok(Shown {
-        value: json!({"owner": owner, "landing": landing, "queued": result["queued"]}),
+        value: json!({"space": space, "landing": landing, "queued": result["queued"]}),
         text,
     })
 }
@@ -847,7 +847,7 @@ pub fn checkpoint_text(v: &Value) -> String {
             .collect();
         out.push_str(&format!(
             "  {}/{} {} onto main {} · {} change(s) · {}{}\n",
-            repo["owner"].as_str().unwrap_or("?"),
+            repo["space"].as_str().unwrap_or("?"),
             repo["name"].as_str().unwrap_or("?"),
             short(&repo["commit"]),
             short(&repo["base"]),
@@ -936,7 +936,7 @@ fn set_text(repo: &str, set: &Value) -> String {
 
 fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let slug = named_or_current(&args.slug, "pages")?;
     let reference = query(&format!("timeline/{slug}"));
     // Pages for one checkpoint come with it.
@@ -944,7 +944,7 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
         let view = remote::api(
             &config,
             "GET",
-            &format!("{}/{slug}/checkpoints/{}", base(&owner), query(checkpoint)),
+            &format!("{}/{slug}/checkpoints/{}", base(&space), query(checkpoint)),
             None,
         )?;
         let id = view["checkpoint"]["id"].as_str().unwrap_or("").to_string();
@@ -959,7 +959,7 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
                 .map(|r| {
                     format!(
                         "{}/{}",
-                        r["owner"].as_str().unwrap_or("?"),
+                        r["space"].as_str().unwrap_or("?"),
                         r["name"].as_str().unwrap_or("?")
                     )
                 })
@@ -1003,14 +1003,14 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
             .map(|set| json!({"repo": name_of(&set["repoId"]), "sets": [set]}))
             .collect();
         return Ok(Shown {
-            value: json!({"owner": owner, "timeline": slug, "checkpoint": id, "repos": repos_out}),
+            value: json!({"space": space, "timeline": slug, "checkpoint": id, "repos": repos_out}),
             text,
         });
     }
     let detail = remote::api(
         &config,
         "GET",
-        &format!("{}/{slug}?limit=1", base(&owner)),
+        &format!("{}/{slug}?limit=1", base(&space)),
         None,
     )?;
     let names: Vec<String> = detail["timeline"]["repos"]
@@ -1020,7 +1020,7 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
         .map(|r| {
             format!(
                 "{}/{}",
-                r["owner"].as_str().unwrap_or("?"),
+                r["space"].as_str().unwrap_or("?"),
                 r["name"].as_str().unwrap_or("?")
             )
         })
@@ -1057,7 +1057,7 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
                 "dry run: nothing was changed\nWould write {slug}'s wiki pages at its bookmarks' tips in {}.",
                 names.join(", ")
             ),
-            value: json!({"dry_run": true, "owner": owner, "timeline": slug, "repos": names}),
+            value: json!({"dry_run": true, "space": space, "timeline": slug, "repos": names}),
         });
     }
     let mut repos = Vec::new();
@@ -1089,7 +1089,7 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
         format!("gm timeline pages {slug} --page <slug>  # one page in full")
     };
     text.push_str(&format!("Next: {next}\n"));
-    let mut value = json!({"owner": owner, "timeline": slug, "repos": repos, "next": next});
+    let mut value = json!({"space": space, "timeline": slug, "repos": repos, "next": next});
     if args.write {
         value["dry_run"] = json!(false);
     }
@@ -1151,7 +1151,7 @@ fn summary(message: &[String]) -> Result<String> {
 
 fn checkpoint(ctx: &Ctx, args: &CheckpointArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let slug = named_or_current(&args.slug, "checkpoint")?;
     let summary = summary(&args.message)?;
     let mut body = json!({ "summary": summary });
@@ -1168,13 +1168,13 @@ fn checkpoint(ctx: &Ctx, args: &CheckpointArgs) -> Result<Shown> {
                     ""
                 }
             ),
-            value: json!({"dry_run": true, "owner": owner, "timeline": slug, "request": body}),
+            value: json!({"dry_run": true, "space": space, "timeline": slug, "request": body}),
         });
     }
     let mut value = remote::api(
         &config,
         "POST",
-        &format!("{}/{slug}/checkpoints", base(&owner)),
+        &format!("{}/{slug}/checkpoints", base(&space)),
         Some(&body),
     )?;
     let id = value["checkpoint"]["id"]
@@ -1195,12 +1195,12 @@ fn checkpoint(ctx: &Ctx, args: &CheckpointArgs) -> Result<Shown> {
 
 fn checkpoints(ctx: &Ctx, args: &CheckpointsArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let slug = named_or_current(&args.slug, "checkpoints")?;
     let mut value = remote::api(
         &config,
         "GET",
-        &format!("{}/{slug}/checkpoints", base(&owner)),
+        &format!("{}/{slug}/checkpoints", base(&space)),
         None,
     )?;
     let text = match value["checkpoints"].as_array() {
@@ -1211,7 +1211,7 @@ fn checkpoints(ctx: &Ctx, args: &CheckpointsArgs) -> Result<Shown> {
             .join("\n"),
         _ => format!("{slug} has no checkpoints. Record one with `gm timeline checkpoint -m '…'`."),
     };
-    value["owner"] = json!(owner);
+    value["space"] = json!(space);
     value["timeline"] = json!(slug);
     Ok(Shown { value, text })
 }
@@ -1228,7 +1228,7 @@ fn revival_text(value: &Value) -> String {
             .map(|r| {
                 format!(
                     "{}/{}",
-                    r["owner"].as_str().unwrap_or("?"),
+                    r["space"].as_str().unwrap_or("?"),
                     r["name"].as_str().unwrap_or("?")
                 )
             })
@@ -1259,7 +1259,7 @@ fn revival_text(value: &Value) -> String {
 
 fn revive(ctx: &Ctx, args: &ReviveArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let slug = named_or_current(&args.slug, "revive")?;
     let checkpoint = match &args.checkpoint {
         Some(reference) => reference.trim().to_string(),
@@ -1267,7 +1267,7 @@ fn revive(ctx: &Ctx, args: &ReviveArgs) -> Result<Shown> {
             let list = remote::api(
                 &config,
                 "GET",
-                &format!("{}/{slug}/checkpoints", base(&owner)),
+                &format!("{}/{slug}/checkpoints", base(&space)),
                 None,
             )?;
             list["checkpoints"][0]["checkpoint"]["id"]
@@ -1285,19 +1285,19 @@ fn revive(ctx: &Ctx, args: &ReviveArgs) -> Result<Shown> {
             "`{checkpoint}` isn't a checkpoint: use its number or id (`gm timeline checkpoints`)."
         )));
     }
-    let path = format!("{}/{slug}/checkpoints/{checkpoint}/revive", base(&owner));
+    let path = format!("{}/{slug}/checkpoints/{checkpoint}/revive", base(&space));
     if ctx.dry_run {
         return Ok(Shown {
             text: format!(
                 "dry run: nothing was changed\nWould revive the preview of checkpoint {checkpoint} of {slug}."
             ),
-            value: json!({"dry_run": true, "owner": owner, "timeline": slug, "checkpoint": checkpoint, "path": path}),
+            value: json!({"dry_run": true, "space": space, "timeline": slug, "checkpoint": checkpoint, "path": path}),
         });
     }
     let mut value = remote::api(&config, "POST", &path, None)?;
     let text = revival_text(&value);
     value["dry_run"] = json!(false);
-    value["owner"] = json!(owner);
+    value["space"] = json!(space);
     Ok(Shown { value, text })
 }
 
@@ -1311,13 +1311,13 @@ fn start(ctx: &Ctx, args: &StartArgs) -> Result<Shown> {
         Some(slug_arg(&args.from)?.to_string())
     };
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let here = server::current_repo(ctx).ok();
     let repos: Vec<String> = if !args.repos.is_empty() {
         args.repos.clone()
     } else if parent.is_none() {
         vec![here.clone().ok_or_else(|| {
-            GmError::usage("Name the repositories it touches: --repo owner/name.")
+            GmError::usage("Name the repositories it touches: --repo space/name.")
                 .hint("Inside a checkout, its own repository is the default.")
         })?]
     } else {
@@ -1354,7 +1354,7 @@ fn start(ctx: &Ctx, args: &StartArgs) -> Result<Shown> {
 
     if ctx.dry_run {
         let text = format!(
-            "dry run: nothing was changed\nWould start timeline {slug} in {owner}, forked from {from}{}{}.",
+            "dry run: nothing was changed\nWould start timeline {slug} in {space}, forked from {from}{}{}.",
             if repos.is_empty() {
                 String::new()
             } else {
@@ -1365,7 +1365,7 @@ fn start(ctx: &Ctx, args: &StartArgs) -> Result<Shown> {
         return Ok(Shown {
             value: json!({
                 "dry_run": true,
-                "owner": owner,
+                "space": space,
                 "request": body,
                 "use": binds,
             }),
@@ -1373,21 +1373,21 @@ fn start(ctx: &Ctx, args: &StartArgs) -> Result<Shown> {
         });
     }
 
-    let created = remote::api(&config, "POST", &base(&owner), Some(&body))?;
+    let created = remote::api(&config, "POST", &base(&space), Some(&body))?;
     let mut text = format!(
-        "Started timeline {slug} in {owner}, forked from {from}.\n{}",
+        "Started timeline {slug} in {space}, forked from {from}.\n{}",
         bookmarks_text(&created["bookmarks"])
     );
     let mut value = json!({
         "dry_run": false,
-        "owner": owner,
+        "space": space,
         "timeline": created["timeline"],
         "bookmarks": created["bookmarks"],
     });
     if binds {
         // This checkout's repository may not be one of the timeline's (--repo
         // elsewhere): then there's nothing to bind, which isn't a failure.
-        match use_timeline(ctx, &slug, Some(owner.clone())) {
+        match use_timeline(ctx, &slug, Some(space.clone())) {
             Ok(used) => {
                 text.push_str(&used.text);
                 value["use"] = used.value;
@@ -1429,19 +1429,19 @@ pub(crate) struct WorkSource {
 
 pub(crate) fn work_source(ctx: &Ctx, config: &Config, slug: &str) -> Result<WorkSource> {
     slug_arg(slug)?;
-    let owner = owner(ctx, config, None)?;
+    let space = space(ctx, config, None)?;
     let name = server::current_repo(ctx)?;
-    selected_work_source(ctx, config, slug, &owner, &name)
+    selected_work_source(ctx, config, slug, &space, &name)
 }
 
 fn selected_work_source(
     ctx: &Ctx,
     config: &Config,
     slug: &str,
-    owner: &str,
+    space: &str,
     name: &str,
 ) -> Result<WorkSource> {
-    let record = fetch_record(config, owner, slug)?;
+    let record = fetch_record(config, space, slug)?;
     let entry = record["repos"]
         .as_array()
         .into_iter()
@@ -1449,7 +1449,7 @@ fn selected_work_source(
         .find(|r| {
             format!(
                 "{}/{}",
-                r["owner"].as_str().unwrap_or(""),
+                r["space"].as_str().unwrap_or(""),
                 r["name"].as_str().unwrap_or("")
             ) == name
         })
@@ -1543,7 +1543,7 @@ fn source_push(
     let account = if selection.repo.is_some() {
         repo_owner.to_owned()
     } else {
-        owner(ctx, &config, None)?
+        space(ctx, &config, None)?
     };
     let source = selected_work_source(ctx, &config, &slug, &account, &name)?;
     let mut path = format!("/repos/{name}/sources/{}/pushes", source.id);
@@ -1696,8 +1696,8 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
     let config = Config::load();
     let record = match &slug {
         Some(slug) => {
-            let owner = owner(ctx, &config, explicit_owner)?;
-            let record = fetch_record(&config, &owner, slug)?;
+            let space = space(ctx, &config, explicit_owner)?;
+            let record = fetch_record(&config, &space, slug)?;
             if let Some(status) = ended(&record) {
                 return Err(GmError::new(
                     "timeline_ended",
@@ -1941,7 +1941,7 @@ fn repo_names(record: Option<&Value>) -> String {
         .map(|r| {
             format!(
                 "{}/{}",
-                r["owner"].as_str().unwrap_or("?"),
+                r["space"].as_str().unwrap_or("?"),
                 r["name"].as_str().unwrap_or("?")
             )
         })
@@ -2039,14 +2039,14 @@ fn merge(ctx: &Ctx, args: &MergeArgs) -> Result<Shown> {
 fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
     let slug = named_or_current(&args.slug, "abandon")?;
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let root = checkout(ctx);
     let bound_here = root
         .as_deref()
         .and_then(profile::bound_timeline)
         .is_some_and(|b| b == slug);
     if ctx.dry_run {
-        let record = fetch_record(&config, &owner, &slug)?;
+        let record = fetch_record(&config, &space, &slug)?;
         if let Some(status) = ended(&record) {
             return Err(GmError::new(
                 "timeline_ended",
@@ -2066,7 +2066,7 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
         return Ok(Shown {
             value: json!({
                 "dry_run": true,
-                "owner": owner,
+                "space": space,
                 "timeline": record,
                 "unbind": false,
             }),
@@ -2076,7 +2076,7 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
     let result = remote::api(
         &config,
         "POST",
-        &format!("{}/{slug}/abandon", base(&owner)),
+        &format!("{}/{slug}/abandon", base(&space)),
         Some(&json!({})),
     )?;
     if result["cancelled"] == true {
@@ -2086,7 +2086,7 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
             ),
             value: json!({
                 "dry_run": false,
-                "owner": owner,
+                "space": space,
                 "cancelled": true,
                 "slug": result["slug"],
                 "bookmarks": result["bookmarks"],
@@ -2099,7 +2099,7 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
     );
     let value = json!({
         "dry_run": false,
-        "owner": owner,
+        "space": space,
         "timeline": result["timeline"],
         "bookmarks": result["bookmarks"],
     });
@@ -2111,7 +2111,7 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
 
 fn migrate(ctx: &Ctx, args: &MigrateArgs) -> Result<Shown> {
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     let slug = named_or_current(&args.slug, "migrate")?;
     if let Some(resolution) = args.resolve {
         let action = match resolution {
@@ -2139,7 +2139,7 @@ fn migrate(ctx: &Ctx, args: &MigrateArgs) -> Result<Shown> {
         let value = remote::api(
             &config,
             "POST",
-            &format!("{}/{slug}/migration/resolve", base(&owner)),
+            &format!("{}/{slug}/migration/resolve", base(&space)),
             Some(&body),
         )?;
         let next = match resolution {
@@ -2166,7 +2166,7 @@ fn migrate(ctx: &Ctx, args: &MigrateArgs) -> Result<Shown> {
     let value = remote::api(
         &config,
         "POST",
-        &format!("{}/{slug}/migrate", base(&owner)),
+        &format!("{}/{slug}/migrate", base(&space)),
         Some(&json!({})),
     )?;
     let next = if ended(&value).is_some() {
@@ -2224,26 +2224,26 @@ fn update(ctx: &Ctx, args: &UpdateArgs) -> Result<Shown> {
     let slug = named_or_current(&args.slug, "update")?;
     let body = update_body(args)?;
     let config = Config::load();
-    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let space = space(ctx, &config, args.space.space.clone())?;
     if ctx.dry_run {
-        let record = fetch_record(&config, &owner, &slug)?;
+        let record = fetch_record(&config, &space, &slug)?;
         return Ok(Shown {
             text: format!(
                 "dry run: nothing was changed\nWould update:\n{}",
                 update_text(&slug, &body)
             ),
-            value: json!({ "dry_run": true, "owner": owner, "timeline": record, "request": body }),
+            value: json!({ "dry_run": true, "space": space, "timeline": record, "request": body }),
         });
     }
     let timeline = remote::api(
         &config,
         "PATCH",
-        &format!("{}/{slug}", base(&owner)),
+        &format!("{}/{slug}", base(&space)),
         Some(&Value::Object(body.clone())),
     )?;
     Ok(Shown {
         text: update_text(&slug, &body),
-        value: json!({ "dry_run": false, "owner": owner, "timeline": timeline }),
+        value: json!({ "dry_run": false, "space": space, "timeline": timeline }),
     })
 }
 
@@ -2258,8 +2258,8 @@ mod tests {
                 "checkpoint": {
                     "number": 3,
                     "repos": [
-                        {"id": "r1", "owner": "orbit", "name": "app"},
-                        {"id": "r2", "owner": "orbit", "name": "lib"}
+                        {"id": "r1", "space": "orbit", "name": "app"},
+                        {"id": "r2", "space": "orbit", "name": "lib"}
                     ]
                 },
                 "timeline": {"slug": "search-v2"}
@@ -2279,7 +2279,7 @@ mod tests {
     #[test]
     fn checkpoints_mark_rebuilt_previews() {
         let view = json!({
-            "checkpoint": {"number": 1, "id": "cp_1", "repos": [{"id": "r1", "owner": "o", "name": "a", "commit": "abc", "base": null, "changes": []}]},
+            "checkpoint": {"number": 1, "id": "cp_1", "repos": [{"id": "r1", "space": "o", "name": "a", "commit": "abc", "base": null, "changes": []}]},
             "timeline": {"slug": "s"},
             "runs": [],
             "previews": [
@@ -2298,7 +2298,7 @@ mod tests {
             "checkpointNumber": 3, "trigger": "approval", "state": "conflict",
             "reason": "Checkpoint #3 conflicts with orbit/app's main.",
             "repos": [{
-                "owner": "orbit", "name": "app", "state": "conflict",
+                "space": "orbit", "name": "app", "state": "conflict",
                 "commit": "a".repeat(40), "base": "b".repeat(40), "merge": null,
                 "mergeRun": {"id": "r", "number": 12}, "gateRun": null,
             }],
@@ -2322,7 +2322,7 @@ mod tests {
     fn lists_mark_the_current_timeline() {
         let t = json!({
             "slug": "search-v2", "name": "Search v2", "status": "active", "policy": "approval",
-            "experimental": true, "repos": [{"owner": "orbit", "name": "engine", "bookmark": "timeline/search-v2"}],
+            "experimental": true, "repos": [{"space": "orbit", "name": "engine", "bookmark": "timeline/search-v2"}],
         });
         let text = line(&t, Some("search-v2"));
         assert!(text.starts_with("* search-v2"), "{text}");
@@ -2373,7 +2373,7 @@ mod tests {
             name: name.map(str::to_string),
             experimental: on,
             no_experimental: off,
-            owner: Owner { owner: None },
+            space: Space { space: None },
         };
         let flagged = update_body(&args(None, true, false)).unwrap();
         assert_eq!(

@@ -21,7 +21,7 @@ import {
 /** Where a timeline stands, for drawing: still going, landed on main, or abandoned. */
 export type LineState = "open" | "landed" | "abandoned";
 
-export type GroupBy = "status" | "workspace" | "agent" | "person";
+export type GroupBy = "status" | "project" | "agent" | "person";
 
 export interface GraphFilters {
   open: boolean;
@@ -197,14 +197,14 @@ function matches(timeline: Timeline, words: string[]): boolean {
 }
 
 /**
- * Group timelines; a timeline in several workspaces is listed under each. By
+ * Group timelines; a timeline in several projects is listed under each. By
  * status, stalled work gets a group of its own and quiet experimental
  * timelines one apart from it: stalling is expected of them.
  */
 export function groupTimelines(
   timelines: Timeline[],
   by: GroupBy,
-  data: Pick<TimelineGraphData, "actors" | "workspaces">,
+  data: Pick<TimelineGraphData, "actors" | "projects">,
   /** When given, stalled timelines are grouped apart (by status). */
   stalled?: { now: number; idleDays?: number },
 ): Group[] {
@@ -222,11 +222,11 @@ export function groupTimelines(
       if (quiet && timeline.experimental) add("experimental", "Experimental, quiet", timeline);
       else if (quiet) add("stalled", "Stalled", timeline);
       else add(timeline.status, STATUS_LABEL[timeline.status], timeline);
-    } else if (by === "workspace") {
+    } else if (by === "project") {
       const seen = new Map<string, string>();
       for (const repo of timeline.repos)
-        for (const w of data.workspaces[repo.id] ?? []) seen.set(w.id, w.name);
-      if (!seen.size) add("", "No workspace", timeline);
+        for (const w of data.projects[repo.id] ?? []) seen.set(w.id, w.name);
+      if (!seen.size) add("", "No project", timeline);
       for (const [id, name] of seen) add(id, name, timeline);
     } else if (by === "agent") {
       const agent = isAgent(timeline.startedBy, data.actors)
@@ -257,7 +257,7 @@ function isAgent(id: string, actors: Record<string, TimelineActor>): boolean {
 }
 
 export function layoutGraph(
-  data: Pick<TimelineGraphData, "timelines" | "events" | "actors" | "workspaces">,
+  data: Pick<TimelineGraphData, "timelines" | "events" | "actors" | "projects">,
   options: GraphOptions,
 ): TimelineGraph {
   const filters = options.filters ?? DEFAULT_FILTERS;

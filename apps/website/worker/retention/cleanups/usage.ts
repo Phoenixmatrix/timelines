@@ -1,4 +1,4 @@
-// Site categories over what metering (CORE-207) and the Durable Object
+// Instance categories over what metering (CORE-207) and the Durable Object
 // registry (CORE-197) keep (CORE-225).
 //
 // "usage-history" (`days`, `months`), in two phases:
@@ -6,11 +6,11 @@
 // - "s": daily figures (`usage_snapshots`) older than `days`, each rolled up
 //   into its month's row (sums and day counts, so totals over whole months
 //   stay exactly the same; worker/usage/history.ts reads both), or dropped
-//   when its month is itself past `months`. Never the latest day of an
-//   account and construct: the report's current figures.
+//   when its month is itself past `months`. Never the latest day of a
+//   (scope kind, scope ID, construct): the report's current figures.
 //   Monthly rows go first, so what this run rolls up waits for a later run.
 // - "ai-usage" (`days`): daily AI records (`ai_usage`) older than `days`
-//   rolled up into `ai_usage_monthly` per account, feature and model.
+//   rolled up into `ai_usage_monthly` per scope kind, scope ID, feature and model.
 // - "durable-registry" (`days`): `do_instances` rows of instances purged more
 //   than `days` ago and not used since (a use clears `purged_at`).
 //
@@ -25,7 +25,7 @@ import { daysBefore } from "../engine.ts";
 type Item = string;
 
 function site(ctx: CleanupContext, id: string, ...keys: string[]): number[] {
-  if (ctx.target.scope !== "site") throw new Error(`${id} is a site category.`);
+  if (ctx.target.kind !== "instance") throw new Error(`${id} is an Instance category.`);
   return keys.map((key) => {
     const value = ctx.thresholds[key];
     if (value === undefined) throw new Error(`${id} needs its ${key} threshold.`);
@@ -89,15 +89,15 @@ const total = (results: { bytes: number }[]) => ({
 
 const HISTORY = ["m", "s"];
 const SNAPSHOT_BYTES = (t: string) =>
-  `(64 + length(${t}day) + length(${t}account_id) + length(${t}construct) + length(${t}item)
+  `(64 + length(${t}day) + length(${t}scope_kind) + length(${t}scope_id) + length(${t}construct) + length(${t}item)
     + length(${t}metric) + length(${t}method) + length(${t}collected_at))`;
 const MONTHLY_BYTES = (t: string) =>
-  `(72 + length(${t}month) + length(${t}account_id) + length(${t}construct) + length(${t}item)
+  `(72 + length(${t}month) + length(${t}scope_kind) + length(${t}scope_id) + length(${t}construct) + length(${t}item)
     + length(${t}metric) + length(${t}method))`;
-/** Daily figures past ?1 (a day), as `t`, but never an account and construct's latest day. */
+/** Daily figures past ?1, but never a scope kind, scope ID and construct's latest day. */
 const PAST_DAILY = `t.day < ?1 AND t.day < (
   SELECT max(l.day) FROM usage_snapshots l
-  WHERE l.account_id = t.account_id AND l.construct = t.construct)`;
+  WHERE l.scope_kind = t.scope_kind AND l.scope_id = t.scope_id AND l.construct = t.construct)`;
 
 export const usageHistory: CategoryCleanup<Item> = {
   async select(ctx, cursor) {
@@ -140,14 +140,14 @@ export const usageHistory: CategoryCleanup<Item> = {
       // Into its month (bare columns of a max() aggregate come from that latest day's row).
       d1
         .prepare(
-          `INSERT INTO usage_monthly (month, account_id, construct, item, metric, kind, quantity,
+          `INSERT INTO usage_monthly (month, scope_kind, scope_id, construct, item, metric, kind, quantity,
              days, last_day, last_quantity, estimated, method)
-           SELECT substr(t.day, 1, 7), t.account_id, t.construct, t.item, t.metric, t.kind,
+           SELECT substr(t.day, 1, 7), t.scope_kind, t.scope_id, t.construct, t.item, t.metric, t.kind,
              sum(t.quantity), count(*), max(t.day), t.quantity,
              CASE WHEN sum(t.estimated) > 0 THEN 1 ELSE 0 END, t.method
            FROM usage_snapshots t WHERE ${matching} AND substr(t.day, 1, 7) >= ?3
-           GROUP BY substr(t.day, 1, 7), t.account_id, t.construct, t.item, t.metric
-           ON CONFLICT (month, account_id, construct, item, metric) DO UPDATE SET
+           GROUP BY substr(t.day, 1, 7), t.scope_kind, t.scope_id, t.construct, t.item, t.metric
+           ON CONFLICT (month, scope_kind, scope_id, construct, item, metric) DO UPDATE SET
              quantity = usage_monthly.quantity + excluded.quantity,
              days = usage_monthly.days + excluded.days,
              last_quantity = CASE WHEN excluded.last_day > usage_monthly.last_day
@@ -172,7 +172,7 @@ export const usageHistory: CategoryCleanup<Item> = {
 // ---- ai-usage ---------------------------------------------------------------------
 
 const AI_BYTES = (t: string) =>
-  `(56 + length(${t}day) + length(${t}account_id) + length(${t}feature) + length(${t}model))`;
+  `(56 + length(${t}day) + length(${t}scope_kind) + length(${t}scope_id) + length(${t}feature) + length(${t}model))`;
 
 export const aiUsage: CategoryCleanup<Item> = {
   async select(ctx, cursor) {
@@ -196,14 +196,14 @@ export const aiUsage: CategoryCleanup<Item> = {
     const [, removed] = await d1.batch<{ bytes: number }>([
       d1
         .prepare(
-          `INSERT INTO ai_usage_monthly (month, account_id, feature, model, calls, input_tokens,
+          `INSERT INTO ai_usage_monthly (month, scope_kind, scope_id, feature, model, calls, input_tokens,
              output_tokens, total_tokens, failed_calls, days)
-           SELECT substr(t.day, 1, 7), t.account_id, t.feature, t.model, sum(t.calls),
+           SELECT substr(t.day, 1, 7), t.scope_kind, t.scope_id, t.feature, t.model, sum(t.calls),
              sum(t.input_tokens), sum(t.output_tokens), sum(t.total_tokens), sum(t.failed_calls),
              count(DISTINCT t.day)
            FROM ai_usage t WHERE ${matching}
-           GROUP BY substr(t.day, 1, 7), t.account_id, t.feature, t.model
-           ON CONFLICT (month, account_id, feature, model) DO UPDATE SET
+           GROUP BY substr(t.day, 1, 7), t.scope_kind, t.scope_id, t.feature, t.model
+           ON CONFLICT (month, scope_kind, scope_id, feature, model) DO UPDATE SET
              calls = ai_usage_monthly.calls + excluded.calls,
              input_tokens = ai_usage_monthly.input_tokens + excluded.input_tokens,
              output_tokens = ai_usage_monthly.output_tokens + excluded.output_tokens,

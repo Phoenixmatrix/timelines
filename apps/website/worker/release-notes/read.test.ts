@@ -1,13 +1,16 @@
 import { describe, expect, test } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { releaseIndex, releaseNotesFor } from "./read.ts";
 import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
+import { releaseEnvironment, seedReleasePerson, seedReleaseSpace } from "./test-support.ts";
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const { sqlite } = await releaseEnvironment();
+  seedReleasePerson(sqlite, "reader");
+  await seedReleaseSpace(sqlite, "acc", "reader");
+  await seedReleaseSpace(sqlite, "secret", "reader");
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
     INSERT INTO release_notes (repo_id, release, to_oid, from_tag, released_at, updated_at, intro, intro_model, intro_trackers)
       VALUES ('repo', 'v1', 'c1', NULL, '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'v1 intro', 'm', '[]'),
@@ -26,7 +29,7 @@ function setup() {
     sqlite
       .prepare(
         `INSERT INTO release_note_entries (id, repo_id, release, subject, kind, category, title, summary,
-          tracker_owner_id, issue_id, issue_key, team_id, team_key, issue_type, commits, shipped_at, model, inputs_hash, updated_at)
+          tracker_space_id, issue_id, issue_key, team_id, team_key, issue_type, commits, shipped_at, model, inputs_hash, updated_at)
          VALUES (?, 'repo', ?, ?, ?, ?, ?, 'Summary.', ?, ?, ?, ?, ?, 'task', '["c1"]', ?, 'm', ?, '2026-10-01T00:00:00Z')`,
       )
       .run(
@@ -54,7 +57,7 @@ function setup() {
 
 describe("reading release notes", () => {
   test("lists daily digests first, then tags newest first, counting what the viewer can see", async () => {
-    const { db } = setup();
+    const { db } = await setup();
     const member = await releaseIndex(db, "repo", new Map([["acc", "org"]]), true);
     expect(member.status).toEqual({ state: "ready", generatedAt: "2026-10-01T00:00:00Z" });
     expect(member.releases.map((r) => [r.name, r.entries, r.fromTag])).toEqual([
@@ -67,9 +70,9 @@ describe("reading release notes", () => {
     expect(anonymous.releases[1]!.entries).toBe(2);
   });
 
-  test("account opt-out reports disabled without hiding stored notes or masking a started generation", async () => {
-    const { db, sqlite } = setup();
-    sqlite.exec(`INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0);
+  test("Space opt-out reports disabled without hiding stored notes or masking a started generation", async () => {
+    const { db, sqlite } = await setup();
+    sqlite.exec(`INSERT INTO space_settings (space_id, ai_release_notes) VALUES ('acc', 0);
       UPDATE release_note_state SET status = 'generating', dirty = 1;`);
     const disabled = await releaseIndex(db, "repo", new Map(), true);
     expect(disabled.status.state).toBe("disabled");
@@ -87,7 +90,7 @@ describe("reading release notes", () => {
   });
 
   test("hides entries and introductions shaped by trackers the viewer can't read", async () => {
-    const { db } = setup();
+    const { db } = await setup();
     const member = (await releaseNotesFor(db, "repo", "v2", new Map([["acc", "org"]])))!;
     // Features newest first, then fixes, then internal work.
     expect(member.entries.map((e) => e.id)).toEqual([
@@ -97,7 +100,7 @@ describe("reading release notes", () => {
       "chore",
     ]);
     expect(member.entries[1]!.issue).toEqual({
-      trackerOwner: "org",
+      trackerSpace: "org",
       id: "issue-open-feature",
       key: "ENG-12",
       type: "task",
@@ -124,7 +127,7 @@ describe("reading release notes", () => {
   });
 
   test("timeline scope filters visible daily and tagged entries and suppresses broad introductions", async () => {
-    const { db, sqlite } = setup();
+    const { db, sqlite } = await setup();
     sqlite.exec(`
       UPDATE release_note_entries SET timeline_branch = 'timeline/search', landing_oid = 'landed'
         WHERE id IN ('open-fix', 'private', 'later-feature');
@@ -172,7 +175,7 @@ describe("reading release notes", () => {
     }
   });
   test("old format rows and their tracker-shaped introductions stay hidden until cutover", async () => {
-    const { db, sqlite } = setup();
+    const { db, sqlite } = await setup();
     sqlite.exec("UPDATE release_note_state SET format_version = 0");
     expect(
       (await releaseIndex(db, "repo", new Map([["secret", "secret-co"]]), true)).releases,

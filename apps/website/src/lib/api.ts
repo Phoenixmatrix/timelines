@@ -1,4 +1,5 @@
 import { data } from "react-router";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -18,6 +19,7 @@ export class ApiError extends Error {
 export async function api<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const { json, ...rest } = init ?? {};
   const headers = new Headers(rest.headers);
+  headers.set(CONTENT_CONTRACT_HEADER, String(CONTENT_CONTRACT_VERSION));
   if (json !== undefined) headers.set("content-type", "application/json");
   if (rest.method?.toUpperCase() === "POST" && /^\/tracker\/[^/]+\/mutate$/.test(path))
     headers.set("X-Gitmatrix-Source", "web");

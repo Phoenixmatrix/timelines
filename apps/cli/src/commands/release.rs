@@ -3,7 +3,7 @@
 use super::Ctx;
 use super::semantic::encode_into;
 use super::server::current_repo;
-use super::tracker::selected_owner;
+use super::tracker::selected_space;
 use crate::cli::{ReleaseCommand, ReleaseFeedArgs, ReleaseNotesArgs};
 use crate::output::{GmError, Render, Result};
 use crate::remote::{self, Config};
@@ -71,19 +71,19 @@ fn title(name: &str, kind: &str) -> String {
 }
 
 fn base(repo: &str) -> Result<String> {
-    let (owner, name) = repo
+    let (space, name) = repo
         .split_once('/')
-        .ok_or_else(|| GmError::usage("Name the repository with --repo owner/name."))?;
-    if [owner, name]
+        .ok_or_else(|| GmError::usage("Name the repository with --repo space/name."))?;
+    if [space, name]
         .iter()
         .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('/'))
     {
         return Err(GmError::usage(
-            "Name the repository with --repo owner/name.",
+            "Name the repository with --repo space/name.",
         ));
     }
     let mut path = String::from("/repos/");
-    encode_into(&mut path, owner);
+    encode_into(&mut path, space);
     path.push('/');
     encode_into(&mut path, name);
     path.push_str("/release-notes");
@@ -248,7 +248,7 @@ fn feed_query(args: &ReleaseFeedArgs) -> String {
 fn feed_text(value: &Value, internal: bool) -> String {
     let mut out = format!(
         "# Release notes: {}\n",
-        value["owner"]["displayName"].as_str().unwrap_or("")
+        value["space"]["displayName"].as_str().unwrap_or("")
     );
     let unknown: Vec<&str> = value["query"]["unknown"]
         .as_array()
@@ -294,7 +294,7 @@ fn feed_text(value: &Value, internal: bool) -> String {
                 .collect();
             refs.push(format!(
                 "{}/{} {}",
-                s(repo, "owner"),
+                s(repo, "space"),
                 s(repo, "name"),
                 releases.join(", ")
             ));
@@ -327,9 +327,9 @@ fn feed_text(value: &Value, internal: bool) -> String {
 pub fn run(ctx: &Ctx, command: &ReleaseCommand) -> Result<Shown> {
     if let ReleaseCommand::Feed(args) = command {
         let config = Config::load();
-        let owner = selected_owner(&config, args.owner.clone())?;
+        let space = selected_space(&config, args.space.clone())?;
         let mut path = String::from("/tracker/");
-        encode_into(&mut path, &owner);
+        encode_into(&mut path, &space);
         path.push_str("/release-notes?q=");
         encode_into(&mut path, &feed_query(args));
         let value = remote::api(&config, "GET", &path, None)?;
@@ -379,7 +379,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn paths_encode_owner_name_and_release() {
+    fn paths_encode_space_name_and_release() {
         assert_eq!(
             base("orbit/engine").unwrap(),
             "/repos/orbit/engine/release-notes"
@@ -441,13 +441,13 @@ mod tests {
     #[test]
     fn feed_preserves_repository_and_tracker_provenance() {
         let value = json!({
-            "owner": {"displayName": "Orbit Labs"},
+            "space": {"displayName": "Orbit Labs"},
             "query": {"unknown": ["color:red"]},
             "truncated": false,
             "facets": {},
             "entries": [
                 {"category": "fix", "title": "Fix rollback", "summary": "Rollbacks finish.", "releaseKind": "daily", "lastCommitAt": "2026-09-25T00:00:00Z", "issue": {"key": "OPS-3"},
-                 "repos": [{"owner": "orbit", "name": "engine", "releases": ["v2", "@day:2026-09-25"]}]}
+                 "repos": [{"space": "orbit", "name": "engine", "releases": ["v2", "@day:2026-09-25"]}]}
             ]
         });
         let text = feed_text(&value, true);

@@ -36,7 +36,7 @@ export async function landingFixtureBarrier(
     !landingFixtureEnabled(env) ||
     !/^source-landing-[a-f0-9]{8}-[a-z-]+$/.test(landing.slug) ||
     landing.repos.length !== 2 ||
-    landing.repos.some((repo) => repo.owner !== "orbit" || !/^queue-[a-f0-9]{8}$/.test(repo.name))
+    landing.repos.some((repo) => repo.space !== "orbit" || !/^queue-[a-f0-9]{8}$/.test(repo.name))
   )
     return false;
   const exists = await env.DB.prepare(

@@ -1,18 +1,54 @@
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { PackCommit } from "../git/pack.ts";
 import { DELIM, FLUSH, pkt } from "../git/pktline.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { buildPack, commitBody, objectId } from "../testing/pack.ts";
 import { readNewCommits, recordRefs, type CommitReader } from "./record.ts";
 
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: unknown;
+    public env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
+const closers: (() => void)[] = [];
+afterEach(() => {
+  for (const close of closers.splice(0)) close();
+});
 const ann = { id: "acc_ann", agent: { id: "agt_builder", name: "builder" } };
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  closers.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_ann', 'user', 'ann', 'Ann');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'acc_ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "ann-org",
+      slug: "ann-org",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "acc_ann",
+    },
+    space: { id: "acc_ann", slug: "ann", displayName: "General" },
+    members: [
+      {
+        accountId: "acc_ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "acc_ann",
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc_ann', 'app', 'private', 'a', 'https://a');
   `);
   // A commit graph standing in for the repository, and a reader over it that
@@ -57,7 +93,7 @@ function setup() {
 
 describe("recordRefs", () => {
   test("identical refs and OIDs in three sources retain independent rewrite histories", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("samechange");
     const rewritten = t.commit("samechange");
     const push = (source: string, oid: string) =>
@@ -92,7 +128,7 @@ describe("recordRefs", () => {
   });
 
   test("source-scoped change batches remain within D1's binding limit", async () => {
-    const t = setup();
+    const t = await setup();
     let tip = t.commit("change0");
     for (let n = 1; n < 35; n++) tip = t.commit(`change${n}`, tip);
     const database = d1(t.sqlite);
@@ -120,7 +156,7 @@ describe("recordRefs", () => {
   });
 
   test("a first push logs the created refs, attributed to the person and agent, with their changes", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("aaaa");
     const b = t.commit("bbbb", a);
     const logged = await t.push({ "refs/heads/main": b, "refs/tags/v1": a });
@@ -156,7 +192,7 @@ describe("recordRefs", () => {
   });
 
   test("a push verifies step context reported for its commits (CORE-231)", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("aaaa");
     const other = "f".repeat(40);
     t.sqlite.exec(`
@@ -177,7 +213,7 @@ describe("recordRefs", () => {
   });
 
   test("fast-forwards, force pushes and deletions are all logged", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("aaaa");
     const b = t.commit("bbbb", a);
     await t.push({ "refs/heads/main": a, "refs/heads/topic": b });
@@ -211,7 +247,7 @@ describe("recordRefs", () => {
   });
 
   test("a new branch records only the commits no other ref had", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("aaaa");
     await t.push({ "refs/heads/main": a });
     const f = t.commit("ffff", a);
@@ -223,7 +259,7 @@ describe("recordRefs", () => {
   });
 
   test("racing recordings of the same push log it once", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("aaaa");
     await t.push({ "refs/heads/main": a });
     const b = t.commit("bbbb", a);
@@ -237,7 +273,7 @@ describe("recordRefs", () => {
   });
 
   test("an update is logged even when its commits can't be read, with forced unknown", async () => {
-    const t = setup();
+    const t = await setup();
     const a = t.commit("aaaa");
     await t.push({ "refs/heads/main": a });
     const b = t.commit("bbbb", a);

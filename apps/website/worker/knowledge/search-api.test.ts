@@ -3,27 +3,60 @@ import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { KnowledgeSearchResults } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { issueToken } from "../api/tokens.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { knowledge } from "./api.ts";
 
-vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
-  WorkflowEntrypoint: class {},
-}));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
 
-afterEach(() => vi.restoreAllMocks());
+const fixtures: { close(): void }[] = [];
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const fixture of fixtures.splice(0)) fixture.close();
+});
 
 /** A repository with one indexed entity and passage; providers can be told to fail. */
-function setup({ ai = true } = {}) {
-  const sqlite = migratedDatabase();
+async function setup({
+  ai = true,
+  beforeEmbedding,
+  beforePassages,
+}: {
+  ai?: boolean;
+  beforeEmbedding?: () => void;
+  beforePassages?: () => void;
+} = {}) {
+  const fixture = await createFreshSpaceTestEnvironment();
+  fixtures.push(fixture);
+  const { sqlite } = fixture;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('r1', 'ann', 'engine', 'private', 'art-r1', '');
+  `);
+  await seedSpaceFixture(fixture.env.DB, {
+    organization: {
+      id: "ann-org",
+      slug: "ann-org",
+      displayName: "Ann organization",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "ann-space", slug: "ann", displayName: "Ann Space" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+      { accountId: "ben", role: "owner" },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('r1', 'ann-space', 'engine', 'private', 'art-r1', '');
     INSERT INTO kg_nodes (repo_id, id, kind, name, path, summary, content_hash, changed_in)
       VALUES ('r1', 'sym:throttle.ts#throttle', 'symbol', 'throttle', 'throttle.ts', 'Limits starts', 'h', 'c1');
   `);
@@ -40,10 +73,11 @@ function setup({ ai = true } = {}) {
     },
   );
   const env = {
-    DB: d1(sqlite),
+    ...fixture.env,
     AI: ai
       ? {
           run: async () => {
+            beforeEmbedding?.();
             if (failing.has("entities")) throw new Error("embedding failed");
             return { data: [[0.1, 0.2]] };
           },
@@ -60,6 +94,7 @@ function setup({ ai = true } = {}) {
     SEARCH: {
       get: () => ({
         search: async (request: unknown) => {
+          beforePassages?.();
           searches.push(request);
           if (failing.has("passages")) throw new Error("AI Search unavailable");
           return {
@@ -80,22 +115,27 @@ function setup({ ai = true } = {}) {
     KNOWLEDGE: untouchable,
     KNOWLEDGE_QUEUE: untouchable,
   } as unknown as Env;
-  let actor: Actor | null = ann;
+  const actors = new Map<string, Actor>();
+  for (const person of [ann, ben]) {
+    const token = await issueToken(env.DB, person.id, "knowledge-search", "read");
+    actors.set(person.id, { ...person, credential: { kind: "token", id: token.id } });
+  }
+  let actor: Actor | null = actors.get(ann.id)!;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("actor", actor);
     await next();
   });
-  app.route("/api/repos/:owner/:name/knowledge", knowledge);
-  const call = (q: string) =>
-    app.request(`/api/repos/ann/engine/knowledge/search?q=${encodeURIComponent(q)}`, {}, env);
+  app.route("/api/repos/:space/:name/knowledge", knowledge);
+  const call = (q: string, name = "engine") =>
+    app.request(`/api/repos/ann/${name}/knowledge/search?q=${encodeURIComponent(q)}`, {}, env);
   return {
     sqlite,
     failing,
     vectorQueries,
     searches,
     as: (next: Actor | null) => {
-      actor = next;
+      actor = next ? actors.get(next.id)! : null;
     },
     call,
     search: async (q: string) => {
@@ -108,7 +148,7 @@ function setup({ ai = true } = {}) {
 
 describe("knowledge search status", () => {
   test("reports a built index and both providers answering", async () => {
-    const s = setup();
+    const s = await setup();
     s.sqlite.exec(`INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('r1', 'c1')`);
     const result = await s.search("throttle");
     expect(result.providers).toEqual({ entities: "ok", passages: "ok" });
@@ -128,7 +168,7 @@ describe("knowledge search status", () => {
 
   test("tells a failed provider apart from no matches, keeping the other's results", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const s = setup();
+    const s = await setup();
     s.sqlite.exec(`INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('r1', 'c1')`);
     s.failing.add("passages");
     const passagesDown = await s.search("throttle");
@@ -143,7 +183,7 @@ describe("knowledge search status", () => {
   });
 
   test("says when nothing is indexed yet, or a build is running, without starting one", async () => {
-    const s = setup();
+    const s = await setup();
     expect((await s.search("throttle")).index).toEqual({ state: "none", indexedCommit: null });
     s.sqlite.exec(`
       INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('r1', 'c1');
@@ -152,12 +192,67 @@ describe("knowledge search status", () => {
     expect((await s.search("throttle")).index).toEqual({ state: "building", indexedCommit: "c1" });
   });
 
-  test("is off without AI, and closed to people who can't read the repository", async () => {
-    expect((await setup({ ai: false }).call("throttle")).status).toBe(503);
-    const s = setup();
+  test("is off without AI, and an Organization owner needs an explicit Space grant", async () => {
+    expect((await (await setup({ ai: false })).call("throttle")).status).toBe(503);
+    const s = await setup();
     s.as(ben);
-    expect((await s.call("throttle")).status).toBe(404);
+    const denied = await s.call("throttle");
+    const absent = await s.call("throttle", "absent");
+    expect(denied.status).toBe(404);
+    expect(absent.status).toBe(denied.status);
+    expect(await denied.text()).toBe(await absent.text());
     expect(s.searches).toEqual([]);
     expect(s.vectorQueries).toEqual([]);
   });
+
+  test.each(["space grant", "organization membership", "collaborator"])(
+    "revoking %s denies the next warm and cold search before either provider",
+    async (kind) => {
+      const warm = await setup();
+      const cold = await setup();
+      for (const s of [warm, cold]) {
+        if (kind === "collaborator") {
+          s.sqlite.exec(
+            `INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('r1','ben','read')`,
+          );
+          s.as(ben);
+        }
+      }
+      await warm.search("throttle");
+      for (const s of [warm, cold]) {
+        if (kind === "space grant")
+          s.sqlite.exec("DELETE FROM space_grants WHERE account_id='ann'");
+        else if (kind === "organization membership")
+          s.sqlite.exec("DELETE FROM organization_members WHERE account_id='ann'");
+        else s.sqlite.exec("DELETE FROM repo_collaborators WHERE user_id='ben'");
+        const queries = s.vectorQueries.length;
+        const searches = s.searches.length;
+        const denied = await s.call("throttle");
+        const absent = await s.call("throttle", "absent");
+        expect(denied.status).toBe(404);
+        expect(absent.status).toBe(denied.status);
+        expect(await denied.text()).toBe(await absent.text());
+        expect(s.vectorQueries).toHaveLength(queries);
+        expect(s.searches).toHaveLength(searches);
+      }
+    },
+  );
+
+  test.each(["embedding", "passages"])(
+    "revocation during %s cannot publish a private search result",
+    async (stage) => {
+      const revoke = () => {
+        s.sqlite.exec("DELETE FROM space_grants WHERE account_id='ann'");
+      };
+      const s = await setup(
+        stage === "embedding" ? { beforeEmbedding: revoke } : { beforePassages: revoke },
+      );
+      const denied = await s.call("throttle");
+      const absent = await s.call("throttle", "absent");
+      expect(denied.status).toBe(404);
+      expect(absent.status).toBe(denied.status);
+      expect(await denied.text()).toBe(await absent.text());
+      if (stage === "embedding") expect(s.vectorQueries).toEqual([]);
+    },
+  );
 });

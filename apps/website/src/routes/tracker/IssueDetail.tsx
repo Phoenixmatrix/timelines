@@ -84,7 +84,7 @@ const fieldNames: Record<keyof IssueFields, string> = {
   priority: "Priority",
   assigneeId: "Assignee",
   parentId: "Parent issue",
-  workspaceIds: "Workspaces",
+  projectIds: "Projects",
   labels: "Tags",
 };
 const fieldKeys = Object.keys(fieldNames) as (keyof IssueFields)[];
@@ -102,9 +102,23 @@ const fieldsOf = (issue: Issue): IssueFields => ({
   priority: issue.priority,
   assigneeId: issue.assigneeId,
   parentId: issue.parentId,
-  workspaceIds: issue.workspaceIds,
+  projectIds: issue.projectIds,
   labels: issue.labels,
 });
+
+/** The immutable Space/issue key still addresses drafts written before the Project cutover. */
+function restoreDraft(saved: string): Draft {
+  const draft = JSON.parse(saved) as Draft;
+  const migrate = (fields: IssueFields & { workspaceIds?: string[] }): IssueFields => {
+    const { workspaceIds, ...current } = fields;
+    return { ...current, projectIds: current.projectIds ?? workspaceIds ?? [] };
+  };
+  return {
+    ...draft,
+    fields: migrate(draft.fields),
+    ...(draft.base ? { base: migrate(draft.base) } : {}),
+  };
+}
 
 // The detail renders in a narrow inspector: hairline-split sections, small headings.
 const SECTION = "border-t border-line-soft py-4";
@@ -153,12 +167,12 @@ export function IssueDetail({
   href: (id?: string) => string;
   initialEditing?: boolean;
 }) {
-  const storageKey = `gitmatrix:issue-draft:${snapshot.owner.id}:${issue.id}`;
+  const storageKey = `gitmatrix:issue-draft:${snapshot.space.id}:${issue.id}`;
   useRememberPlace({
     kind: "issue",
     title: issue.key,
     detail: issue.title,
-    to: `/tracker/${encodeURIComponent(snapshot.owner.slug)}/issues/${encodeURIComponent(issue.id)}`,
+    to: href(issue.id),
   });
   const initial: Draft = {
     version: issue.version,
@@ -168,7 +182,7 @@ export function IssueDetail({
   const [draft, setDraft] = useState<Draft>(() => {
     try {
       const saved = sessionStorage.getItem(storageKey);
-      return saved ? (JSON.parse(saved) as Draft) : initial;
+      return saved ? restoreDraft(saved) : initial;
     } catch {
       return initial;
     }
@@ -297,6 +311,11 @@ export function IssueDetail({
   const completionEvidence = comments.filter((comment) => comment.kind === "evidence");
   const activityNotes = comments.filter((comment) => comment.kind !== "evidence");
   const { hash } = useLocation();
+  const projectHref = (id: string) => {
+    const target = new URL(href(), "https://gitmatrix.invalid");
+    target.searchParams.set("project", id);
+    return `${target.pathname}${target.search}${target.hash}`;
+  };
   const evidenceAnchor = useMemo(() => {
     try {
       const id = decodeURIComponent(hash.slice(1));
@@ -314,7 +333,7 @@ export function IssueDetail({
     if (!evidenceAnchor || !evidenceAnchorExists) return;
     const target = document.getElementById(evidenceAnchor);
     if (target && detailRef.current?.contains(target)) target.scrollIntoView();
-  }, [evidenceAnchor, evidenceAnchorExists, issue.id, snapshot.owner.id]);
+  }, [evidenceAnchor, evidenceAnchorExists, issue.id, snapshot.space.id]);
   // The issue's own lease, or an ancestor's: either way only its holder changes the status.
   // A lease retained by a timeline (CORE-75) doesn't guard a reopen there.
   const covering =
@@ -518,8 +537,8 @@ export function IssueDetail({
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
   const parent = issue.parentId ? index.byId.get(issue.parentId) : undefined;
   const children = (index.children.get(issue.id) ?? []).flatMap((id) => index.byId.get(id) ?? []);
-  const inheritedWorkspaces = snapshot.workspaces.filter(
-    (workspace) => !workspace.archived && issue.workspaceIds.includes(workspace.id),
+  const inheritedProjects = snapshot.projects.filter(
+    (project) => !project.archived && issue.projectIds.includes(project.id),
   );
   const displayField = (key: keyof IssueFields, fields: IssueFields) => {
     const value = fields[key];
@@ -531,13 +550,12 @@ export function IssueDetail({
       const item = typeof value === "string" ? index.byId.get(value) : undefined;
       return item ? `${item.key} · ${item.title}` : value ? "Unavailable issue" : "No parent";
     }
-    if (key === "workspaceIds")
+    if (key === "projectIds")
       return (
-        fields.workspaceIds
+        fields.projectIds
           .map(
             (id) =>
-              snapshot.workspaces.find((workspace) => workspace.id === id)?.name ??
-              "Unavailable workspace",
+              snapshot.projects.find((project) => project.id === id)?.name ?? "Unavailable project",
           )
           .join(", ") || "None"
       );
@@ -568,7 +586,7 @@ export function IssueDetail({
       ...draft.fields,
       closeReason: draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
       labels: normalizedSet(draft.fields.labels),
-      workspaceIds: normalizedSet(draft.fields.workspaceIds),
+      projectIds: normalizedSet(draft.fields.projectIds),
     };
     const changes = Object.fromEntries(
       pendingFields
@@ -892,7 +910,7 @@ export function IssueDetail({
                   </option>
                 ))}
               </select>
-              <LockedStatusHint issue={issue} owner={snapshot.owner.slug} />
+              <LockedStatusHint issue={issue} space={snapshot.space.slug} />
             </Field>
             {draft.fields.status === "canceled" && (
               <CloseReasonField
@@ -954,13 +972,12 @@ export function IssueDetail({
             />
           </div>
           <MultiCheck
-            label="Workspaces"
-            options={snapshot.workspaces.filter(
-              (workspace) =>
-                !workspace.archived || draft.fields.workspaceIds.includes(workspace.id),
+            label="Projects"
+            options={snapshot.projects.filter(
+              (project) => !project.archived || draft.fields.projectIds.includes(project.id),
             )}
-            values={draft.fields.workspaceIds}
-            onChange={(values) => change("workspaceIds", values)}
+            values={draft.fields.projectIds}
+            onChange={(values) => change("projectIds", values)}
           />
         </>
       )}
@@ -1113,18 +1130,18 @@ export function IssueDetail({
               "Unassigned"
             )}
           </dd>
-          {issue.workspaceIds.length > 0 && (
+          {issue.projectIds.length > 0 && (
             <>
-              <dt className="text-ink-faint">Workspaces</dt>
+              <dt className="text-ink-faint">Projects</dt>
               <dd className="m-0 flex min-w-0 flex-wrap gap-x-3 gap-y-1">
-                {issue.workspaceIds.map((id) => (
+                {issue.projectIds.map((id) => (
                   <Link
                     className={`${LINK} max-md:inline-flex max-md:min-h-11 max-md:items-center`}
                     key={id}
-                    to={`/tracker/${snapshot.owner.slug}?workspace=${encodeURIComponent(id)}`}
+                    to={projectHref(id)}
                   >
-                    {snapshot.workspaces.find((workspace) => workspace.id === id)?.name ??
-                      "Unavailable workspace"}
+                    {snapshot.projects.find((project) => project.id === id)?.name ??
+                      "Unavailable project"}
                   </Link>
                 ))}
               </dd>
@@ -1246,7 +1263,7 @@ export function IssueDetail({
                 issue.handoff.expiresAt > snapshot.serverTime &&
                 ` It's handing the work to ${issue.handoff.to ? actorName(snapshot, issue.handoff.to) : "whoever has its code"}.`}
             </span>
-            {/* Owners can end a claim nobody is going to finish (a lost session, a stuck agent). */}
+            {/* Space admins can end a claim nobody is going to finish (a lost session, a stuck agent). */}
             {covering === issue && snapshot.canAdmin && viewer && !viewer.agent && (
               <ConfirmDialog
                 trigger={
@@ -1562,7 +1579,7 @@ export function IssueDetail({
                     title,
                     teamId: issue.teamId,
                     parentId: issue.id,
-                    workspaceIds: inheritedWorkspaces.map((workspace) => workspace.id),
+                    projectIds: inheritedProjects.map((project) => project.id),
                   },
                 },
               ]);
@@ -1589,14 +1606,14 @@ export function IssueDetail({
             <button className="mk-btn h-(--size-field)" disabled={busy || !subtaskTitle.trim()}>
               Add subtask
             </button>
-            {issue.workspaceIds.length > 0 && (
+            {issue.projectIds.length > 0 && (
               <p className="mk-hint max-w-[48ch]">
-                {inheritedWorkspaces.length > 0
-                  ? `Subtasks inherit active workspaces: ${inheritedWorkspaces.map((workspace) => workspace.name).join(", ")}.`
-                  : "This issue's workspaces are archived. New subtasks will have no workspace."}
-                {inheritedWorkspaces.length > 0 &&
-                  inheritedWorkspaces.length < issue.workspaceIds.length &&
-                  " Archived workspaces are not inherited."}
+                {inheritedProjects.length > 0
+                  ? `Subtasks inherit active projects: ${inheritedProjects.map((project) => project.name).join(", ")}.`
+                  : "This issue's projects are archived. New subtasks will have no project."}
+                {inheritedProjects.length > 0 &&
+                  inheritedProjects.length < issue.projectIds.length &&
+                  " Archived projects are not inherited."}
               </p>
             )}
             <FormError message={subtaskError} />
@@ -1720,8 +1737,8 @@ export function IssueDetail({
       </section>
       <section className={SECTION} aria-label="Linked work" data-issue-linked-work>
         <LinkedWorkPanel
-          key={`${snapshot.owner.id}:${issue.id}`}
-          owner={snapshot.owner.slug}
+          key={`${snapshot.space.id}:${issue.id}`}
+          space={snapshot.space.slug}
           issueId={issue.id}
           issueKey={issue.key}
           headingClassName={HEADING}
@@ -1777,7 +1794,7 @@ export function IssueDetail({
         </button>
       </section>
       <AuditHistory
-        key={`${snapshot.owner.id}:${issue.id}`}
+        key={`${snapshot.space.id}:${issue.id}`}
         issueId={issue.id}
         snapshot={snapshot}
       />

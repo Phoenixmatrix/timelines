@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type {
   CheckpointList,
   CheckpointView,
@@ -11,8 +11,12 @@ import type {
 import type { OpenRequests } from "../../shared/tracker.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { accessFor } from "../tracker/access.ts";
+import { findSpaceById } from "../spaces/access.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 import { durableStorage } from "../testing/durable.ts";
+import { fakeDurableObjectId } from "../testing/durable-state.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Tracker } from "../tracker/object.ts";
 import { tracker as trackerRoutes } from "../tracker/api.ts";
@@ -33,7 +37,7 @@ import {
   settled,
   sweepApprovedLandings,
   sweepLandings,
-  sweepOwners,
+  sweepSpaces,
   sweepStalledLandings,
   workerDeps,
 } from "./landing.ts";
@@ -70,21 +74,59 @@ async function setup(missingRepoError?: (name: string) => Error) {
   vi.stubGlobal("caches", {
     default: { match: async () => undefined, put: async () => {}, delete: async () => false },
   });
-  const sqlite = migratedDatabase();
-  // Ann owns Orbit; Ben and Cat are members, and Ben can write to both its
-  // repositories; Dan is outside. Ben's agent bot acts for him.
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  onTestFinished(fresh.close);
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
-      ('ann', 'user', 'ann', 'Ann', NULL), ('ben', 'user', 'ben', 'Ben', NULL),
-      ('cat', 'user', 'cat', 'Cat', NULL), ('dan', 'user', 'dan', 'Dan', NULL),
-      ('orbit', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'owner'), ('orbit', 'ben', 'member'), ('orbit', 'cat', 'member');
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
+      ('cat', 'user', 'cat', 'Cat'), ('dan', 'user', 'dan', 'Dan');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+  `);
+  await seedSpaceFixture(fresh.env.DB, {
+    organization: { id: "org_orbit", slug: "orbit", displayName: "Orbit", kind: "company" },
+    space: { id: "orbit", slug: "orbit", displayName: "Orbit" },
+    actorId: "ann",
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+      ...["ben", "cat"].map((accountId) => ({
+        accountId,
+        role: "member" as const,
+        grant: {
+          role: "member" as const,
+          repositoryRole: "read" as const,
+          packageRole: "read" as const,
+        },
+      })),
+    ],
+  });
+  await seedSpaceFixture(fresh.env.DB, {
+    organization: {
+      id: "org_ben",
+      slug: "ben",
+      displayName: "Ben",
+      kind: "personal",
+      personalAccountId: "ben",
+    },
+    space: { id: "space_ben", slug: "ben", displayName: "Ben" },
+    actorId: "ben",
+    members: [
+      {
+        accountId: "ben",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('app', 'orbit', 'app', 'private', 'r-app', 'https://app'),
       ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://lib'),
-      ('side', 'ben', 'side', 'private', 'r-side', 'https://side');
+      ('side', 'space_ben', 'side', 'private', 'r-side', 'https://side');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES
       ('app', 'ben', 'write'), ('lib', 'ben', 'write');
   `);
@@ -108,16 +150,20 @@ async function setup(missingRepoError?: (name: string) => Error) {
   const trackers = new Map<string, Tracker>();
   const contexts = new Map<string, DurableObjectState>();
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: git.artifacts,
     // Landing (CORE-77) starts merge runs: their Workflow is a no-op here.
     CI_RUNNER: "local",
     CI_RUN: { create: async () => ({}) },
     TRACKER: {
+      idFromName: fakeDurableObjectId,
       getByName: (id: string) => {
         if (!trackers.has(id)) {
           const { sql, transactionSync } = durableStorage();
-          const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
+          const ctx = {
+            id: fakeDurableObjectId(id),
+            storage: { sql, transactionSync },
+          } as unknown as DurableObjectState;
           contexts.set(id, ctx);
           trackers.set(id, new Tracker(ctx, env));
         }
@@ -136,7 +182,7 @@ async function setup(missingRepoError?: (name: string) => Error) {
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  server.route("/api/tracker/:owner/timelines", timelines);
+  server.route("/api/tracker/:space/timelines", timelines);
   server.route("/api", trackerRoutes);
   server.route("/api/repos", repoRoutes);
   server.route("/", gitHttp);
@@ -147,7 +193,29 @@ async function setup(missingRepoError?: (name: string) => Error) {
     dan: (await issueToken(env.DB, "dan", "t", "write")).secret,
     bot: (await issueToken(env.DB, "ben", "t", "write", undefined, "agt_bot")).secret,
     reader: (await issueToken(env.DB, "ben", "read-only", "read")).secret,
+    // Ben's other write token: what a test turns approve-when-green on with, then revokes.
+    approver: (await issueToken(env.DB, "ben", "approver", "write")).secret,
   };
+  const fixtureToken = await issueToken(env.DB, "ben", "fixture", "write");
+  const actor = {
+    id: "ben",
+    slug: "ben",
+    displayName: "Ben",
+    isSiteAdmin: false,
+    credential: { kind: "token", id: fixtureToken.id } as const,
+  };
+  const space = await findSpaceById(env.DB, "orbit");
+  if (!space) throw new Error("Missing fixture Space");
+  const access = await accessFor(env, space, "ben", null, true, actor.credential);
+  const authority = await captureWorkAuthority(env, "app", actor);
+  const botToken = await issueToken(env.DB, "ben", "fixture bot", "write", undefined, "agt_bot");
+  const botActor = {
+    ...actor,
+    agent: { id: "agt_bot", name: "bot" },
+    credential: { kind: "token", id: botToken.id } as const,
+  };
+  const botAccess = await accessFor(env, space, "ben", "agt_bot", true, botActor.credential);
+  const botAuthority = await captureWorkAuthority(env, "app", botActor);
   const pending: Promise<unknown>[] = [];
   const executionCtx = {
     waitUntil: (work: Promise<unknown>) => pending.push(work),
@@ -161,9 +229,23 @@ async function setup(missingRepoError?: (name: string) => Error) {
         method,
         headers: {
           authorization: `Bearer ${tokens[who]}`,
+          "X-Gitmatrix-Content-Version": "4",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined
+          ? {}
+          : {
+              body: JSON.stringify(
+                path.endsWith("/mutate")
+                  ? {
+                      contractVersion: 4,
+                      spaceId: path.startsWith("/tracker/ben/") ? "space_ben" : "orbit",
+                      migrationEpoch: access.migrationEpoch,
+                      ...(body as object),
+                    }
+                  : body,
+              ),
+            }),
       },
       env,
       executionCtx,
@@ -182,6 +264,12 @@ async function setup(missingRepoError?: (name: string) => Error) {
     return Object.assign(git.getByName(row.artifacts_name), { sourceId: row.source_id });
   };
   return {
+    access,
+    actor,
+    authority,
+    botAccess,
+    botActor,
+    botAuthority,
     sqlite,
     git,
     app,
@@ -245,7 +333,9 @@ describe("recent timeline presence", () => {
     expect((await t.call("bot", "POST", "/search/land")).status).toBe(409);
     expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
 
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    t.sqlite.exec(
+      "DELETE FROM organization_members WHERE organization_id = 'org_orbit' AND account_id = 'ben'",
+    );
     expect((await t.call("bot", "GET", "/search")).status).toBe(403);
     expect((await t.call("bot", "GET", "/search/presence")).status).toBe(403);
     expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
@@ -339,7 +429,7 @@ describe("forking", () => {
     );
     const sourceId = t.work().sourceId;
     expect((await t.raw("ann", "PATCH", "/repos/orbit/app", { name: "renamed" })).status).toBe(200);
-    t.sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+    t.sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
       VALUES('replacement','orbit','app','private','r-replacement','https://replacement')`);
     const child = await t.call("ben", "POST", "", { slug: "child", parent: "search" });
     expect(child.status).toBe(201);
@@ -365,7 +455,7 @@ describe("forking", () => {
     expect(made.status).toBe(201);
     const frozen = made.body as CheckpointView;
     expect((await t.raw("ann", "PATCH", "/repos/orbit/app", { name: "renamed" })).status).toBe(200);
-    t.sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+    t.sqlite.exec(`INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
       VALUES('replacement','orbit','app','private','r-replacement','https://replacement')`);
 
     const liveRepos = [{ ...created.body.timeline.repos[0], name: "renamed" }];
@@ -381,8 +471,8 @@ describe("forking", () => {
     expect(
       (await t.call("cat", "GET", "/search/checkpoints")).body.checkpoints[0].checkpoint,
     ).toEqual(liveCheckpoint);
-    const storedTimeline = await t.trackers.get("orbit")!.timeline("search", 0, 1);
-    const storedCheckpoint = await t.trackers.get("orbit")!.checkpoint("search", "1");
+    const storedTimeline = await t.trackers.get("orbit")!.timeline(t.access, "search", 0, 1);
+    const storedCheckpoint = await t.trackers.get("orbit")!.checkpoint(t.access, "search", "1");
     expect(storedTimeline).toMatchObject({
       ok: true,
       value: { timeline: { repos: created.body.timeline.repos } },
@@ -415,14 +505,14 @@ describe("forking", () => {
       repos: [
         {
           id: "app",
-          owner: "orbit",
+          space: "orbit",
           name: "app",
           bookmark: "work",
           source: { sourceId: t.work().sourceId, kind: "timeline-work" },
         },
         {
           id: "lib",
-          owner: "orbit",
+          space: "orbit",
           name: "lib",
           bookmark: "work",
           source: { sourceId: t.work("search", "lib").sourceId, kind: "timeline-work" },
@@ -670,17 +760,13 @@ describe("forking", () => {
     });
     await entered.promise;
     const tracker = t.trackers.get("orbit")!;
-    const access = {
-      actorId: "ben",
-      principalId: "ben",
-      agents: [],
-      members: [],
-      repos: [],
-      owner: { id: "orbit", slug: "orbit", displayName: "Orbit" },
-      canAdmin: false,
-    };
-    // RPC persists the cancellation fence before its first await.
+    const access = t.access;
+    // Wait for the admitted cancellation to persist before releasing the fork.
     const cancelling = tracker.cancelReservedCreation(access, "partial");
+    await vi.waitFor(async () => {
+      const result = await tracker.reserveTimeline(access, "partial", null, "");
+      expect(result).toMatchObject({ ok: false, code: "creation_cancelled" });
+    });
     resume.resolve();
     expect((await creating).status).toBe(409);
     expect(await cancelling).toMatchObject({
@@ -807,9 +893,9 @@ describe("checkpoints", () => {
         VALUES (1, 'app', '${t.work().sourceId}', 'refs/heads/work', '${oid(1)}', '${oid(9)}');
       INSERT INTO change_refs (repo_id, source_id, change_id, ref, first_commit_oid, first_update_id, last_commit_oid)
         VALUES ('app', '${t.work().sourceId}', 'kxyz', 'refs/heads/work', '${oid(8)}', 1, '${oid(9)}');
-      INSERT INTO ci_runs (id, repo_id, source_id, number, commit_oid, ref, trigger, status)
-        VALUES ('run1', 'app', '${t.work().sourceId}', 4, '${oid(9)}', 'work', 'push', 'succeeded'),
-               ('run0', 'app', 'canonical', 3, '${oid(1)}', 'main', 'push', 'succeeded');
+      INSERT INTO ci_runs (id, repo_id, source_id, number, commit_oid, ref, trigger, status, space_id, migration_epoch, authority, actor_id, agent_id)
+        VALUES ('run1', 'app', '${t.work().sourceId}', 4, '${oid(9)}', 'work', 'push', 'succeeded', 'orbit', ${t.authority.migrationEpoch}, '${JSON.stringify(t.authority)}', 'ben', NULL),
+               ('run0', 'app', 'canonical', 3, '${oid(1)}', 'main', 'push', 'succeeded', 'orbit', ${t.authority.migrationEpoch}, '${JSON.stringify(t.authority)}', 'ben', NULL);
     `);
     // Cat can read the repository but not write to it.
     expect((await t.call("cat", "POST", "/search/checkpoints", { syncMain: true })).status).toBe(
@@ -828,7 +914,7 @@ describe("checkpoints", () => {
         repos: [
           {
             id: "app",
-            owner: "orbit",
+            space: "orbit",
             name: "app",
             commit: oid(9),
             base: oid(1),
@@ -1008,7 +1094,7 @@ describe("approving a checkpoint", () => {
       checkpoint: {
         checkpoint: {
           summary: "Ready",
-          repos: [{ id: "app", owner: "orbit", name: "renamed", commit: oid(9), base: oid(1) }],
+          repos: [{ id: "app", space: "orbit", name: "renamed", commit: oid(9), base: oid(1) }],
         },
         current: true,
         approval: { state: "pending" },
@@ -1025,7 +1111,7 @@ describe("approving a checkpoint", () => {
     // Approved while it's the head: the approval timeline enters the landing queue (CORE-77).
     expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("landing");
     expect((await t.call("ben", "GET", "/search/landing")).body.landing.repos).toMatchObject([
-      { id: "app", owner: "orbit", name: "renamed", commit: oid(9) },
+      { id: "app", space: "orbit", name: "renamed", commit: oid(9) },
     ]);
   });
 });
@@ -1039,7 +1125,7 @@ describe("approve when green (CORE-378)", () => {
     t.work().refs.set("refs/heads/work", oid(9));
     const made = (await t.call("bot", "POST", "/search/checkpoints", { summary: "Ready" }))
       .body as CheckpointView;
-    const mutate = (who: "ann" | "ben" | "cat" | "bot", ...mutations: unknown[]) =>
+    const mutate = (who: "ann" | "ben" | "cat" | "bot" | "approver", ...mutations: unknown[]) =>
       t.raw(who, "POST", "/tracker/orbit/mutate", {
         operationId: crypto.randomUUID(),
         mutations,
@@ -1070,7 +1156,7 @@ describe("approve when green (CORE-378)", () => {
       expect(reply.status).toBe(200);
       return id;
     };
-    const setting = (who: "ann" | "ben" | "bot", enabled: boolean, person = "ben") =>
+    const setting = (who: "ann" | "ben" | "bot" | "approver", enabled: boolean, person = "ben") =>
       mutate(who, { kind: "automation.approveWhenGreen", id: person, data: { enabled } });
     let runs = 0;
     /** The timeline's CI run of the checkpoint's commit, as CI records it. */
@@ -1078,7 +1164,7 @@ describe("approve when green (CORE-378)", () => {
       const id = `run-${++runs}`;
       t.sqlite
         .prepare(
-          "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id, preview_action) VALUES (?, 'app', ?, ?, 'work', ?, ?, ?, ?, ?)",
+          "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id, preview_action, space_id, migration_epoch, authority, actor_id, agent_id) VALUES (?, 'app', ?, ?, 'work', ?, ?, ?, ?, ?, 'orbit', ?, ?, 'ben', 'agt_bot')",
         )
         .run(
           id,
@@ -1089,6 +1175,8 @@ describe("approve when green (CORE-378)", () => {
           step,
           t.work().sourceId,
           preview,
+          t.botAuthority.migrationEpoch,
+          JSON.stringify(t.botAuthority),
         );
       return id;
     };
@@ -1261,16 +1349,16 @@ describe("approve when green (CORE-378)", () => {
     expect((await t.checkpoint()).approved).toBe(false);
   });
 
-  test("someone who left the tracker approves nothing, setting or not", async () => {
+  test("someone who lost their Space grant approves nothing, setting or not", async () => {
     const t = await green();
     await t.setting("ben", true);
     const id = await t.ask();
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    t.sqlite.exec(`CREATE TEMP TABLE kept AS SELECT * FROM space_grants
+      WHERE space_id = 'orbit' AND account_id = 'ben';
+      DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'ben';`);
     const passed = t.run("succeeded");
     await t.finished(passed);
-    t.sqlite.exec(
-      "INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ben', 'member')",
-    );
+    t.sqlite.exec("INSERT INTO space_grants SELECT * FROM kept; DROP TABLE kept;");
     expect((await t.request(id)).status).toBe("open");
     expect((await t.checkpoint()).approved).toBe(false);
     // Rejoining doesn't bring back the consent given before leaving.
@@ -1279,6 +1367,40 @@ describe("approve when green (CORE-378)", () => {
     );
     await t.finished(passed);
     expect((await t.request(id)).status).toBe("open");
+  });
+
+  test("it acts only with the credential it was turned on with, live: revoked, it turns off", async () => {
+    const t = await green();
+    expect((await t.setting("approver", true)).status).toBe(200);
+    const id = await t.ask();
+    t.sqlite.exec("DELETE FROM access_tokens WHERE user_id = 'ben' AND name = 'approver'");
+    await t.finished(t.run("succeeded"));
+    expect((await t.request(id)).status).toBe("open");
+    expect((await t.checkpoint()).approved).toBe(false);
+    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("waiting");
+    // Off, logged, until Ben turns it on again: then it approves.
+    const snapshot = (await t.raw("ben", "GET", "/tracker/orbit/snapshot")).body;
+    expect(snapshot.approveWhenGreen).toEqual([]);
+    expect((await t.setting("ben", true)).status).toBe(200);
+    expect(await t.request(id)).toMatchObject({ status: "answered", via: "auto-approve" });
+  });
+
+  test("a setting saved without a work authority is inert until turned on again", async () => {
+    const t = await green();
+    await t.setting("ben", true);
+    // As saved before Spaces: the setting, but no authority to act with.
+    const storage = t.contexts.get("orbit")!.storage as unknown as {
+      sql: { exec(query: string): unknown };
+    };
+    storage.sql.exec("DELETE FROM work_authorities WHERE key = 'automation:ben'");
+    const id = await t.ask();
+    await t.finished(t.run("succeeded"));
+    expect((await t.request(id)).status).toBe("open");
+    expect((await t.raw("ben", "GET", "/tracker/orbit/snapshot")).body.approveWhenGreen).toEqual(
+      [],
+    );
+    await t.setting("ben", true);
+    expect(await t.request(id)).toMatchObject({ status: "answered", via: "auto-approve" });
   });
 
   test("a preview's deploy is never green, and its run ending sets nothing off", async () => {
@@ -1402,8 +1524,9 @@ describe("approved but never landed (CORE-390)", () => {
     expect(
       (await mutate("ben", { kind: "request.answer", id: "req", data: { approved: true } })).status,
     ).toBe(200);
+    // Read with Ben's other token: a test revokes the one he approved with.
     const landing = async () =>
-      (await t.call("ben", "GET", "/search/landing")).body.landing as {
+      (await t.call("approver", "GET", "/search/landing")).body.landing as {
         id: string;
         checkpointId: string;
         trigger: string;
@@ -1419,8 +1542,9 @@ describe("approved but never landed (CORE-390)", () => {
 
   type Landed = { id: string; checkpointId: string; state: string; trigger: string } | null;
   /**
-   * In an existing world: Ben approves checkpoint #1 of a timeline in `owner`'s
-   * tracker, on `repo` (its id), and the landing fails to begin `failures` times.
+   * In an existing world: Ben approves checkpoint #1 of a timeline in the
+   * `owner` Space's tracker, on `repo` (its id), and the landing fails to begin
+   * `failures` times.
    */
   async function approveIn(
     t: Awaited<ReturnType<typeof setup>>,
@@ -1460,7 +1584,7 @@ describe("approved but never landed (CORE-390)", () => {
         checkpoint: checkpoint.checkpoint.id,
       },
     });
-    const tracker = t.trackers.get(owner)!;
+    const tracker = t.trackers.get(owner === "ben" ? "space_ben" : owner)!;
     const begin = tracker.beginLanding.bind(tracker);
     let left = failures;
     tracker.beginLanding = ((...args: Parameters<typeof begin>) => {
@@ -1484,28 +1608,35 @@ describe("approved but never landed (CORE-390)", () => {
     repo: string,
   ) {
     const approved = await approveIn(t, owner, repo);
-    approved.tracker.beginLanding = ((...args: Parameters<typeof approved.begin>) => {
-      approved.begin(...args);
+    const spaceId = owner === "ben" ? "space_ben" : owner;
+    approved.tracker.beginLanding = (async (...args: Parameters<typeof approved.begin>) => {
+      await approved.begin(...args);
       throw new Error("The reply was lost");
     }) as typeof approved.tracker.beginLanding;
-    await settled(t.env, (deps) => retryApprovedLanding(t.env, deps, owner, "search"));
+    await settled(t.env, (deps) => retryApprovedLanding(t.env, deps, spaceId, "search"));
     approved.tracker.beginLanding = approved.begin;
-    const landing = () => {
-      const reply = approved.tracker.landing("search");
+    // Read as Ben, who holds a grant in both Spaces, with his access as it is
+    // now: tests change his grants, and a stale grant version is refused.
+    const landing = async () => {
+      const space = (await findSpaceById(t.env.DB, spaceId))!;
+      const access = await accessFor(t.env, space, "ben", null, true, t.actor.credential);
+      const reply = await approved.tracker.landing(access, "search");
       if (!reply.ok) throw new Error(reply.error);
       return reply.value!;
     };
-    expect(landing()).toMatchObject({
+    const begun = await landing();
+    expect(begun).toMatchObject({
       state: "merging",
       repos: [{ state: "merging", mergeRun: null }],
     });
-    const runs = () =>
+    // Counted by the landing's id, so a reader who has since left can't hide them.
+    const runs = async () =>
       (
         t.sqlite
           .prepare("SELECT count(*) AS n FROM ci_runs WHERE landing_id = ?")
-          .get(landing().id) as { n: number }
+          .get(begun.id) as { n: number }
       ).n;
-    expect(runs()).toBe(0);
+    expect(await runs()).toBe(0);
     return { ...approved, stalled: landing, runs };
   }
   /** Run `fn` with the clock `minutes` ahead. */
@@ -1525,10 +1656,10 @@ describe("approved but never landed (CORE-390)", () => {
     const sweep = () => settled(t.env, (deps) => sweepLandings(t.env, deps));
     // Under ten minutes old: it may still be on its way.
     await sweep();
-    expect(orbit.runs()).toBe(0);
+    expect(await orbit.runs()).toBe(0);
     await later(11, sweep);
-    expect(orbit.runs()).toBe(1);
-    const moved = orbit.stalled();
+    expect(await orbit.runs()).toBe(1);
+    const moved = await orbit.stalled();
     expect(moved).toMatchObject({
       state: "merging",
       repos: [{ mergeRun: { id: expect.any(String) } }],
@@ -1546,23 +1677,23 @@ describe("approved but never landed (CORE-390)", () => {
       }),
     );
     expect(restarted).toBe(0);
-    expect(orbit.runs()).toBe(1);
-    expect(orbit.stalled().version).toBe(moved.version);
+    expect(await orbit.runs()).toBe(1);
+    expect((await orbit.stalled()).version).toBe(moved.version);
   });
 
   test("a stopped landing isn't restarted (CORE-391)", async () => {
     const t = await setup();
     const orbit = await stalledIn(t, "orbit", "app");
-    const landing = orbit.stalled();
-    const stopped = orbit.tracker.saveLanding(
+    const landing = await orbit.stalled();
+    const stopped = await orbit.tracker.saveLanding(
       { ...landing, state: "failed", reason: "Gates failed" },
       landing.version,
       "ben",
     );
     expect(stopped.ok).toBe(true);
     await later(11, () => settled(t.env, (deps) => sweepStalledLandings(t.env, deps, { hour: 0 })));
-    expect(orbit.runs()).toBe(0);
-    expect(orbit.stalled()).toMatchObject({ state: "failed" });
+    expect(await orbit.runs()).toBe(0);
+    expect(await orbit.stalled()).toMatchObject({ state: "failed" });
   });
 
   /** The stalled-landing sweep with the clock `minutes` ahead; how many it restarted. */
@@ -1586,33 +1717,42 @@ describe("approved but never landed (CORE-390)", () => {
     const t = await setup();
     const orbit = await stalledIn(t, "orbit", "app");
     expect(await sweepStalled(t, 25 * 60)).toBe(0);
-    expect(orbit.runs()).toBe(0);
+    expect(await orbit.runs()).toBe(0);
     expect(await sweepStalled(t, 23 * 60)).toBe(1);
-    expect(orbit.runs()).toBe(1);
+    expect(await orbit.runs()).toBe(1);
   });
 
   test("not as a requester who left or can't write, and that costs no budget (CORE-391)", async () => {
     const t = await setup();
     const side = await stalledIn(t, "ben", "side");
     const orbit = await stalledIn(t, "orbit", "app");
-    // Ben can't write to side any more: his own tracker's landing is skipped, free.
-    t.sqlite.exec("UPDATE repos SET owner_id = 'ann' WHERE id = 'side'");
+    // Ben can't write to side any more (his grant there is read-only): skipped, free.
+    const grant = (role: string, repository: string) =>
+      t.sqlite
+        .prepare(
+          "UPDATE space_grants SET role = ?, repository_role = ? WHERE space_id = 'space_ben' AND account_id = 'ben'",
+        )
+        .run(role, repository);
+    grant("member", "read");
     let restarted = -1;
     await later(11, () =>
       settled(t.env, async (deps) => {
         restarted = await sweepStalledLandings(t.env, deps, { limit: 1, hour: 0 });
       }),
     );
-    t.sqlite.exec("UPDATE repos SET owner_id = 'ben' WHERE id = 'side'");
+    grant("admin", "write");
     expect(restarted).toBe(1);
-    expect(side.runs()).toBe(0);
-    expect(orbit.runs()).toBe(1);
-    // Ben left orbit: its next stalled landing isn't restarted as him.
+    expect(await side.runs()).toBe(0);
+    expect(await orbit.runs()).toBe(1);
+    // Ben left orbit: its next stalled landing isn't restarted as him, though he
+    // still collaborates on app (repository write alone doesn't move a landing).
     const fresh = await setup();
     const left = await stalledIn(fresh, "orbit", "app");
-    fresh.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    fresh.sqlite.exec(
+      "DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'ben'; DELETE FROM organization_members WHERE organization_id = 'org_orbit' AND account_id = 'ben'",
+    );
     expect(await sweepStalled(fresh, 11)).toBe(0);
-    expect(left.runs()).toBe(0);
+    expect(await left.runs()).toBe(0);
   });
 
   test("a queued merge run without its Workflow is started again, once (CORE-391)", async () => {
@@ -1631,7 +1771,7 @@ describe("approved but never landed (CORE-390)", () => {
       },
     });
     expect(await sweepStalled(t, 11)).toBe(1);
-    const run = orbit.stalled().repos[0]!.mergeRun!.id;
+    const run = (await orbit.stalled()).repos[0]!.mergeRun!.id;
     expect(created).toEqual([run]);
     // Its row stays queued: young, or with its Workflow confirmed, it's left alone.
     t.sqlite
@@ -1648,7 +1788,7 @@ describe("approved but never landed (CORE-390)", () => {
     confirmed.delete(run);
     expect(await sweepStalled(t, 30)).toBe(1);
     expect(created).toEqual([run, run]);
-    expect(orbit.runs()).toBe(1);
+    expect(await orbit.runs()).toBe(1);
   });
 
   test("a merge run's Workflow counts as started only when its status confirms it (CORE-391)", async () => {
@@ -1666,7 +1806,7 @@ describe("approved but never landed (CORE-390)", () => {
       }),
     });
     await sweepStalled(t, 11);
-    expect(orbit.stalled()).toMatchObject({
+    expect(await orbit.stalled()).toMatchObject({
       state: "failed",
       reason: expect.stringMatching(/Couldn't start the merge job/),
     });
@@ -1680,7 +1820,7 @@ describe("approved but never landed (CORE-390)", () => {
       get: async () => ({ status: async () => ({ status: "queued" }) }),
     });
     await sweepStalled(u, 11);
-    expect(fine.stalled()).toMatchObject({
+    expect(await fine.stalled()).toMatchObject({
       state: "merging",
       repos: [{ mergeRun: { id: expect.any(String) } }],
     });
@@ -1689,8 +1829,8 @@ describe("approved but never landed (CORE-390)", () => {
   test("a gate run saved but never started is started once (CORE-391)", async () => {
     const t = await setup();
     const orbit = await stalledIn(t, "orbit", "app");
-    const landing = orbit.stalled();
-    const saved = orbit.tracker.saveLanding(
+    const landing = await orbit.stalled();
+    const saved = await orbit.tracker.saveLanding(
       {
         ...landing,
         repos: landing.repos.map((repo) => ({
@@ -1716,7 +1856,7 @@ describe("approved but never landed (CORE-390)", () => {
     });
     expect(await sweepStalled(t, 11, spy)).toBe(1);
     expect(gates).toEqual(["gates"]);
-    expect(orbit.stalled().repos[0]!.state).not.toBe("testing");
+    expect((await orbit.stalled()).repos[0]!.state).not.toBe("testing");
     // Its gates aren't started again.
     await sweepStalled(t, 30, spy);
     expect(gates).toEqual(["gates"]);
@@ -1725,8 +1865,8 @@ describe("approved but never landed (CORE-390)", () => {
   test("a merging landing with every repository tested moves on to advancing (CORE-391)", async () => {
     const t = await setup();
     const orbit = await stalledIn(t, "orbit", "app");
-    const landing = orbit.stalled();
-    const saved = orbit.tracker.saveLanding(
+    const landing = await orbit.stalled();
+    const saved = await orbit.tracker.saveLanding(
       {
         ...landing,
         repos: landing.repos.map((repo) => ({
@@ -1756,37 +1896,37 @@ describe("approved but never landed (CORE-390)", () => {
     const t = await setup();
     const side = await stalledIn(t, "ben", "side");
     const orbit = await stalledIn(t, "orbit", "app");
-    // Hour 0 starts with ben. With a bound of one, only ben's is restarted.
+    // Hour 1 starts with space_ben (by id, after orbit). With a bound of one, only ben's is restarted.
     let restarted = -1;
     await later(11, () =>
       settled(t.env, async (deps) => {
-        restarted = await sweepStalledLandings(t.env, deps, { limit: 1, hour: 0 });
+        restarted = await sweepStalledLandings(t.env, deps, { limit: 1, hour: 1 });
       }),
     );
     expect(restarted).toBe(1);
-    expect(side.runs()).toBe(1);
-    expect(orbit.runs()).toBe(0);
+    expect(await side.runs()).toBe(1);
+    expect(await orbit.runs()).toBe(0);
     // Now ben's tracker fails: orbit's is still restarted.
     side.tracker.stalledLandings = () => {
       throw new Error("Durable Object overloaded");
     };
-    await later(11, () => settled(t.env, (deps) => sweepStalledLandings(t.env, deps, { hour: 0 })));
-    expect(orbit.runs()).toBe(1);
+    await later(11, () => settled(t.env, (deps) => sweepStalledLandings(t.env, deps, { hour: 1 })));
+    expect(await orbit.runs()).toBe(1);
   });
 
   test("the sweep's budget is for landing attempts, and where it starts rotates", async () => {
     const t = await setup();
-    // Ben's own tracker is stuck: every landing attempt fails. Orbit's isn't.
+    // Ben's own Space is stuck: every landing attempt fails. Orbit's isn't.
     const stuck = await approveIn(t, "ben", "side", Infinity);
     const orbit = await approveIn(t, "orbit", "app");
     const sweep = (hour: number) =>
       settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { limit: 1, hour }));
-    // Hour 0 starts with ben (by id): its one failed attempt spends the budget.
-    await sweep(0);
+    // Hour 1 starts with space_ben (by id, after orbit): its one failed attempt spends the budget.
+    await sweep(1);
     expect(await stuck.landing()).toBeNull();
     expect(await orbit.landing()).toBeNull();
-    // Hour 1 starts with orbit: it lands, though ben is still stuck.
-    await sweep(1);
+    // Hour 2 starts with orbit again: it lands, though ben is still stuck.
+    await sweep(2);
     expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
     expect(await stuck.landing()).toBeNull();
   });
@@ -1795,13 +1935,20 @@ describe("approved but never landed (CORE-390)", () => {
     const t = await setup();
     const side = await approveIn(t, "ben", "side");
     const orbit = await approveIn(t, "orbit", "app");
-    // Ben can't write to side any more (it moved to Ann): skipped without trying.
-    t.sqlite.exec("UPDATE repos SET owner_id = 'ann' WHERE id = 'side'");
+    // Ben can't write to side any more (his grant there is read-only): skipped without trying.
+    const grant = (role: string, repository: string) =>
+      t.sqlite
+        .prepare(
+          "UPDATE space_grants SET role = ?, repository_role = ? WHERE space_id = 'space_ben' AND account_id = 'ben'",
+        )
+        .run(role, repository);
+    grant("member", "read");
     let attempts = -1;
+    // Hour 1 starts with space_ben, then orbit.
     await settled(t.env, async (deps) => {
-      attempts = await sweepApprovedLandings(t.env, deps, { limit: 1, hour: 0 });
+      attempts = await sweepApprovedLandings(t.env, deps, { limit: 1, hour: 1 });
     });
-    t.sqlite.exec("UPDATE repos SET owner_id = 'ben' WHERE id = 'side'");
+    grant("admin", "write");
     expect(attempts).toBe(1);
     expect(await side.landing()).toBeNull();
     expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
@@ -1819,14 +1966,15 @@ describe("approved but never landed (CORE-390)", () => {
       if (query.includes("source_integration_receipts")) throw new Error("D1 overloaded");
       return prepare(query);
     };
-    // Pinned to an hour whose sweep starts with ben (two trackers: even hours
-    // start with the first by id), so ben's failure comes before orbit's turn.
+    // Pinned to an hour whose sweep starts with space_ben (two Spaces, by id
+    // orbit then space_ben: odd hours start with the second), so ben's failure
+    // comes before orbit's turn.
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const next = Math.floor(Date.now() / 3600_000) + 1;
-      vi.setSystemTime((next + (next % 2)) * 3600_000);
-      expect(await sweepOwners(t.env.DB, 200, Math.floor(Date.now() / 3600_000))).toEqual([
-        "ben",
+      vi.setSystemTime((next + ((next + 1) % 2)) * 3600_000);
+      expect(await sweepSpaces(t.env.DB, 200, Math.floor(Date.now() / 3600_000))).toEqual([
+        "space_ben",
         "orbit",
       ]);
       await settled(t.env, (deps) => sweepLandings(t.env, deps));
@@ -1841,7 +1989,7 @@ describe("approved but never landed (CORE-390)", () => {
     const side = await approveIn(t, "ben", "side");
     const orbit = await approveIn(t, "orbit", "app");
     // A tracker's refusal is the candidate's: skipped, not an attempt.
-    side.tracker.headCheckpoint = () => ({
+    side.tracker.headCheckpoint = async () => ({
       ok: false,
       status: 404,
       code: "not_found",
@@ -1850,7 +1998,7 @@ describe("approved but never landed (CORE-390)", () => {
     });
     let retried: Awaited<ReturnType<typeof retryApprovedLanding>> | null = null;
     await settled(t.env, async (deps) => {
-      retried = await retryApprovedLanding(t.env, deps, "ben", "search");
+      retried = await retryApprovedLanding(t.env, deps, "space_ben", "search");
     });
     expect(retried).toEqual({ attempted: false, landing: null });
     // The tracker itself failing: thrown, so the sweep stops there for this run.
@@ -1860,10 +2008,10 @@ describe("approved but never landed (CORE-390)", () => {
       throw new Error("Durable Object overloaded");
     };
     await expect(
-      settled(t.env, (deps) => retryApprovedLanding(t.env, deps, "ben", "search")),
+      settled(t.env, (deps) => retryApprovedLanding(t.env, deps, "space_ben", "search")),
     ).rejects.toThrow("Durable Object overloaded");
     calls = 0;
-    side.tracker.approvedUnlanded = () => ({
+    side.tracker.approvedUnlanded = async () => ({
       ok: true,
       value: ["one", "two", "three"].map((slug) => ({
         slug,
@@ -1872,15 +2020,15 @@ describe("approved but never landed (CORE-390)", () => {
         approvedAt: new Date().toISOString(),
       })),
     });
-    // Hour 0 starts with ben: its first failure ends its turn, and orbit still lands.
-    await settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { hour: 0 }));
+    // Hour 1 starts with space_ben: its first failure ends its turn, and orbit still lands.
+    await settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { hour: 1 }));
     expect(calls).toBe(1);
     expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
   });
 
   test("skipped candidates don't hide a landable one behind them (CORE-392)", async () => {
     const t = await setup();
-    // Cat can write to app, so she can approve.
+    // Cat can write to app (a collaborator, with her orbit grant), so she can approve.
     t.sqlite.exec(
       "INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('app', 'cat', 'write')",
     );
@@ -1929,7 +2077,9 @@ describe("approved but never landed (CORE-390)", () => {
     await approve("beta", "cat");
     failing = false;
     // Cat leaves orbit: her approvals are skipped, without an attempt.
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'cat'");
+    t.sqlite.exec(
+      "DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'cat'; DELETE FROM organization_members WHERE organization_id = 'org_orbit' AND account_id = 'cat'",
+    );
     let attempts = -1;
     await settled(t.env, async (deps) => {
       attempts = await sweepApprovedLandings(t.env, deps, { limit: 1, hour: 0 });
@@ -1980,7 +2130,7 @@ describe("approved but never landed (CORE-390)", () => {
       expect(await orbit.landing()).toBeNull();
       t.sqlite
         .prepare(
-          "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id) VALUES ('run', 'app', 1, ?, 'work', 'push', 'succeeded', 0, ?)",
+          "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id, space_id) VALUES ('run', 'app', 1, ?, 'work', 'push', 'succeeded', 0, ?, 'orbit')",
         )
         .run(oid(9), t.work("search", "app").sourceId);
       await settled(t.env, (deps) => afterRun(t.env, deps, "run"));
@@ -1997,16 +2147,17 @@ describe("approved but never landed (CORE-390)", () => {
     const t = await setup();
     const orbit = await approveIn(t, "orbit", "app");
     // Someone lands it by hand just before the retry's call, and it stops.
-    orbit.tracker.beginLanding = ((...args: Parameters<typeof orbit.begin>) => {
+    orbit.tracker.beginLanding = (async (...args: Parameters<typeof orbit.begin>) => {
       const [access, slug, request] = args;
       if (request.onlyIfUnlanded) {
-        const started = orbit.begin(access, slug, {
+        const started = await orbit.begin(access, slug, {
           trigger: "request",
           green: { ok: true, why: null },
           agentId: null,
+          authority: request.authority,
         });
         if (!started.ok) throw new Error(started.error);
-        const stopped = orbit.tracker.saveLanding(
+        const stopped = await orbit.tracker.saveLanding(
           { ...started.value.landing, state: "failed", reason: "Gates failed" },
           started.value.landing.version,
           "ben",
@@ -2047,7 +2198,7 @@ describe("approved but never landed (CORE-390)", () => {
     const t = await approvedUnlanded();
     t.sqlite
       .prepare(
-        "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id) VALUES ('run', 'app', 1, ?, 'work', 'push', 'succeeded', 0, ?)",
+        "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id, space_id) VALUES ('run', 'app', 1, ?, 'work', 'push', 'succeeded', 0, ?, 'orbit')",
       )
       .run(oid(9), t.work().sourceId);
     await settled(t.env, (deps) => afterRun(t.env, deps, "run"));
@@ -2058,13 +2209,13 @@ describe("approved but never landed (CORE-390)", () => {
     });
   });
 
-  test("not for an approver who left the tracker or can't write to it any more", async () => {
+  test("not for an approver who lost their Space grant or can't write to it any more", async () => {
     const t = await approvedUnlanded();
-    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    t.sqlite.exec(`CREATE TEMP TABLE kept AS SELECT * FROM space_grants
+      WHERE space_id = 'orbit' AND account_id = 'ben';
+      DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'ben';`);
     await t.sweep();
-    t.sqlite.exec(
-      "INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ben', 'member')",
-    );
+    t.sqlite.exec("INSERT INTO space_grants SELECT * FROM kept; DROP TABLE kept;");
     expect(await t.landing()).toBeNull();
     t.sqlite.exec("DELETE FROM repo_collaborators WHERE repo_id = 'app' AND user_id = 'ben'");
     await t.sweep();
@@ -2075,6 +2226,41 @@ describe("approved but never landed (CORE-390)", () => {
     );
     await t.sweep();
     expect(await t.landing()).toMatchObject({ requestedBy: { accountableId: "ben" } });
+  });
+
+  test("it lands with the approval's own credential: revoked, it waits for a person", async () => {
+    const t = await approvedUnlanded();
+    // The approval was answered with Ben's `ben` token; revoke just that one.
+    const authority = (await t.trackers
+      .get("orbit")!
+      .workAuthority(`approval:${t.checkpoint.checkpoint.id}`)) as {
+      ok: true;
+      value: { personId: string; agentId: null; credential: { id: string } };
+    };
+    expect(authority.value).toMatchObject({ personId: "ben", agentId: null });
+    t.sqlite
+      .prepare("UPDATE access_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(authority.value.credential.id);
+    await t.sweep();
+    expect(await t.landing()).toBeNull();
+    // A person still can, with their own live credential.
+    expect((await t.call("approver", "POST", "/search/land")).status).toBe(202);
+    expect(await t.landing()).toMatchObject({ trigger: "request" });
+  });
+
+  test("an approval saved without a work authority waits for a person", async () => {
+    const t = await approvedUnlanded();
+    const storage = t.contexts.get("orbit")!.storage as unknown as {
+      sql: { exec(query: string, ...bindings: unknown[]): unknown };
+    };
+    storage.sql.exec("DELETE FROM work_authorities WHERE key LIKE 'approval:%'");
+    let retried: Awaited<ReturnType<typeof retryApprovedLanding>> | null = null;
+    await settled(t.env, async (deps) => {
+      retried = await retryApprovedLanding(t.env, deps, "orbit", "search");
+    });
+    expect(retried).toEqual({ attempted: false, landing: null });
+    await t.sweep();
+    expect(await t.landing()).toBeNull();
   });
 });
 
@@ -2099,6 +2285,7 @@ test("interrupted progress-root recording blocks checkpoints until both rewritte
   const tracker = t.trackers.get("orbit")!;
   const operation = (operationId: string, old: string, next: string) => ({
     operationId,
+    authority: t.authority,
     timelineId: timeline.id,
     repoId: "app",
     sourceId,
@@ -2112,7 +2299,17 @@ test("interrupted progress-root recording blocks checkpoints until both rewritte
   remote.parents.set(oid(7), [oid(1)]);
   remote.refs.set("refs/heads/work", oid(7));
   await retainProgress(t.env, source, "original", oid(7));
-  await tracker.finishSourcePush("original", "accepted");
+  await tracker.finishSourcePushForSettlement(
+    {
+      spaceId: "orbit",
+      repoId: "app",
+      sourceId: t.sqlite
+        .prepare("SELECT source_id FROM source_operations WHERE id=?")
+        .get("original")!.source_id as string,
+      operationId: "original",
+    },
+    "accepted",
+  );
   await tracker.beginSourcePush(operation("interrupted", oid(7), oid(8)));
   remote.commits.add(oid(8));
   remote.parents.set(oid(8), [oid(1)]); // An amend removes 7 from the active graph.
@@ -2162,6 +2359,7 @@ test.each(["accepted", "rejected"] as const)(
     const tracker = t.trackers.get("orbit")!;
     const operation = {
       operationId: `projection-${outcome}`,
+      authority: t.authority,
       timelineId: timeline.id,
       repoId: "app",
       sourceId: timeline.repos[0]!.source!.sourceId,
@@ -2176,11 +2374,21 @@ test.each(["accepted", "rejected"] as const)(
         throw new Error("projection interrupted");
       return prepare(query);
     });
-    await expect(tracker.finishSourcePush(operation.operationId, outcome)).rejects.toThrow(
-      "projection interrupted",
-    );
+    await expect(
+      tracker.finishSourcePushForSettlement(
+        {
+          spaceId: "orbit",
+          repoId: "app",
+          sourceId: t.sqlite
+            .prepare("SELECT source_id FROM source_operations WHERE id=?")
+            .get(operation.operationId)!.source_id as string,
+          operationId: operation.operationId,
+        },
+        outcome,
+      ),
+    ).rejects.toThrow("projection interrupted");
     failed.mockRestore();
-    expect(tracker.sourcePushes("app")).toMatchObject({
+    expect(await tracker.sourcePushes(t.access, "app")).toMatchObject({
       ok: true,
       value: [{ state: outcome, projectionPending: true }],
     });
@@ -2218,6 +2426,7 @@ test("failed admission projection cannot authorize a provider push or leave its 
   const tracker = t.trackers.get("orbit")!;
   const operation = {
     operationId: "admission-failure",
+    authority: t.authority,
     timelineId: timeline.id,
     repoId: "app",
     sourceId: timeline.repos[0]!.source!.sourceId,
@@ -2233,15 +2442,27 @@ test("failed admission projection cannot authorize a provider push or leave its 
   });
   await expect(tracker.beginSourcePush(operation)).rejects.toThrow("admission projection failed");
   failure.mockRestore();
-  expect(tracker.sourcePush(operation.operationId, "app", operation.sourceId)).toMatchObject({
+  expect(
+    await tracker.sourcePush(t.access, operation.operationId, "app", operation.sourceId),
+  ).toMatchObject({
     ok: true,
     value: { state: "rejected" },
   });
-  expect(tracker.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  expect(await tracker.sourcePushes(t.access, "app")).toMatchObject({ ok: true, value: [] });
   expect(
     await tracker.beginSourcePush({ ...operation, operationId: "next-admission" }),
   ).toMatchObject({ ok: true });
-  await tracker.finishSourcePush("next-admission", "rejected");
+  await tracker.finishSourcePushForSettlement(
+    {
+      spaceId: "orbit",
+      repoId: "app",
+      sourceId: t.sqlite
+        .prepare("SELECT source_id FROM source_operations WHERE id=?")
+        .get("next-admission")!.source_id as string,
+      operationId: "next-admission",
+    },
+    "rejected",
+  );
   t.sqlite.close();
 });
 
@@ -2323,6 +2544,7 @@ async function pendingRecovery() {
   const tracker = t.trackers.get("orbit")!;
   const operation = {
     operationId: crypto.randomUUID(),
+    authority: t.botAuthority,
     timelineId: timeline.id,
     repoId: "app",
     sourceId,
@@ -2331,11 +2553,32 @@ async function pendingRecovery() {
     accountableId: "ben",
   };
   expect(await tracker.beginSourcePush(operation)).toMatchObject({ ok: true });
-  expect(await tracker.finishSourcePush(operation.operationId, "ambiguous")).toMatchObject({
+  expect(
+    await tracker.finishSourcePushForSettlement(
+      {
+        spaceId: "orbit",
+        repoId: "app",
+        sourceId: t.sqlite
+          .prepare("SELECT source_id FROM source_operations WHERE id=?")
+          .get(operation.operationId)!.source_id as string,
+        operationId: operation.operationId,
+      },
+      "ambiguous",
+    ),
+  ).toMatchObject({
     ok: true,
   });
   const path = `/repos/orbit/app/sources/${sourceId}/pushes`;
-  return { ...t, tracker, operation, sourceId, path, remote: t.work("recovery") };
+  return {
+    ...t,
+    access: t.botAccess,
+    authority: t.botAuthority,
+    tracker,
+    operation,
+    sourceId,
+    path,
+    remote: t.work("recovery"),
+  };
 }
 
 test("source recovery API scopes inspection and rejects read-only, wrong-source and canonical writes", async () => {
@@ -2366,7 +2609,9 @@ test("source recovery API scopes inspection and rejects read-only, wrong-source 
   );
   const anonymous = await t.server.request(`/api${recover}`, { method: "POST", body: "{}" }, t.env);
   expect(anonymous.status).toBe(401);
-  expect(t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId)).toMatchObject({
+  expect(
+    await t.tracker.sourcePush(t.access, t.operation.operationId, "app", t.sourceId),
+  ).toMatchObject({
     ok: true,
     value: { state: "ambiguous", commands: t.operation.commands },
   });
@@ -2406,11 +2651,23 @@ test("concurrent recovery uses one durable same-tree marker and preserves origin
   const writes = t.remote.pushes.length;
   expect((await t.raw("ben", "POST", recover, {})).body).toEqual(replies[0].body);
   expect(t.remote.pushes).toHaveLength(writes);
-  expect(await t.tracker.finishSourcePush(t.operation.operationId, "accepted")).toMatchObject({
+  expect(
+    await t.tracker.finishSourcePushForSettlement(
+      {
+        spaceId: "orbit",
+        repoId: "app",
+        sourceId: t.sqlite
+          .prepare("SELECT source_id FROM source_operations WHERE id=?")
+          .get(t.operation.operationId)!.source_id as string,
+        operationId: t.operation.operationId,
+      },
+      "accepted",
+    ),
+  ).toMatchObject({
     ok: false,
     code: "operation_settled",
   });
-  expect(t.tracker.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  expect(await t.tracker.sourcePushes(t.access, "app")).toMatchObject({ ok: true, value: [] });
   expect(
     t.sqlite
       .prepare("SELECT commit_oid FROM source_progress_members WHERE source_id=?")
@@ -2431,7 +2688,19 @@ test("unchanged old head stays fenced after a refused marker; replay keeps its i
   const first = (await t.raw("ben", "GET", `${t.path}/${t.operation.operationId}`)).body;
   expect(first.state).toBe("ambiguous");
   expect(first.recovery.commit).not.toBe(oid(1));
-  expect(await t.tracker.finishSourcePush(t.operation.operationId, "rejected")).toMatchObject({
+  expect(
+    await t.tracker.finishSourcePushForSettlement(
+      {
+        spaceId: "orbit",
+        repoId: "app",
+        sourceId: t.sqlite
+          .prepare("SELECT source_id FROM source_operations WHERE id=?")
+          .get(t.operation.operationId)!.source_id as string,
+        operationId: t.operation.operationId,
+      },
+      "rejected",
+    ),
+  ).toMatchObject({
     ok: false,
     code: "recovery_active",
   });
@@ -2453,8 +2722,9 @@ test("original provider CAS winning the recovery race is accepted, not fenced aw
   const t = await pendingRecovery();
   const fetch = t.git.fetch;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (
-      String(input).endsWith("/git-receive-pack") &&
+      url.endsWith("/git-receive-pack") &&
       init?.body instanceof Uint8Array &&
       new TextDecoder().decode(init.body).includes("refs/heads/work")
     ) {
@@ -2475,9 +2745,10 @@ test("lost marker response is resolved from its ref, and projection failure repl
   const t = await pendingRecovery();
   const fetch = t.git.fetch;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const response = await fetch(input, init);
     if (
-      String(input).endsWith("/git-receive-pack") &&
+      url.endsWith("/git-receive-pack") &&
       init?.body instanceof Uint8Array &&
       new TextDecoder().decode(init.body).includes("refs/heads/work")
     )
@@ -2493,14 +2764,13 @@ test("lost marker response is resolved from its ref, and projection failure repl
   await expect(
     recoverSourcePush(
       t.env,
-      { id: "app", owner_id: "orbit" },
+      { id: "app", space_id: "orbit" },
       t.sourceId,
       t.operation.operationId,
-      "ben",
-      "ben",
+      t.actor,
     ),
   ).rejects.toThrow("projection interrupted");
-  expect(t.tracker.sourcePushes("app")).toMatchObject({
+  expect(await t.tracker.sourcePushes(t.access, "app")).toMatchObject({
     ok: true,
     value: [
       {
@@ -2520,7 +2790,10 @@ test("lost marker response is resolved from its ref, and projection failure repl
     await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {}),
   ).toMatchObject({ status: 200, body: { state: "rejected", syncRequired: true } });
   expect(t.remote.pushes).toHaveLength(writes);
-  expect(t.trackers.get("orbit")!.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  expect(await t.trackers.get("orbit")!.sourcePushes(t.access, "app")).toMatchObject({
+    ok: true,
+    value: [],
+  });
   t.sqlite.close();
 });
 
@@ -2628,9 +2901,10 @@ test("marker-written recovery resumes after failed progress retention without ch
   const t = await pendingRecovery();
   const fetch = t.git.fetch;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const response = await fetch(input, init);
     if (
-      String(input).endsWith("/git-receive-pack") &&
+      url.endsWith("/git-receive-pack") &&
       init?.body instanceof Uint8Array &&
       new TextDecoder().decode(init.body).includes("refs/heads/work")
     )
@@ -2640,16 +2914,15 @@ test("marker-written recovery resumes after failed progress retention without ch
   await expect(
     recoverSourcePush(
       t.env,
-      { id: "app", owner_id: "orbit" },
+      { id: "app", space_id: "orbit" },
       t.sourceId,
       t.operation.operationId,
-      "ben",
-      "ben",
+      t.actor,
     ),
   ).rejects.toThrow("retain progress");
   const marker = t.remote.refs.get("refs/heads/work");
   expect(marker).not.toBe(oid(1));
-  expect(t.tracker.sourcePushes("app")).toMatchObject({
+  expect(await t.tracker.sourcePushes(t.access, "app")).toMatchObject({
     ok: true,
     value: [{ state: "ambiguous", recovery: { commit: marker } }],
   });
@@ -2696,10 +2969,22 @@ test("historical recovery replay keeps the latest source head and delivers curre
   t.remote.commits.add(oid(8));
   t.remote.parents.set(oid(8), [first.body.head]);
   t.remote.refs.set("refs/heads/work", oid(8));
-  expect(await t.tracker.finishSourcePush(next.operationId, "accepted")).toMatchObject({
+  expect(
+    await t.tracker.finishSourcePushForSettlement(
+      {
+        spaceId: "orbit",
+        repoId: "app",
+        sourceId: t.sqlite
+          .prepare("SELECT source_id FROM source_operations WHERE id=?")
+          .get(next.operationId)!.source_id as string,
+        operationId: next.operationId,
+      },
+      "accepted",
+    ),
+  ).toMatchObject({
     ok: true,
   });
-  await onPush(t.env, recoveryRepo(t), null, () => {});
+  await onPush(t.env, recoveryRepo(t), t.botActor, () => {});
   expect((await t.raw("ben", "POST", path, {})).body).toEqual(first.body);
   expect(t.remote.refs.get("refs/heads/work")).toBe(oid(8));
   expect(
@@ -2727,15 +3012,15 @@ test("CI job credentials cannot inspect or recover source operations", async () 
   const t = await pendingRecovery();
   t.sqlite
     .prepare(`INSERT INTO ci_runs
-    (id,repo_id,number,commit_oid,ref,trigger,status,source_id)
-    VALUES ('recovery-run','app',1,?,'work','push','running',?)`)
-    .run(oid(1), t.sourceId);
+    (id,repo_id,number,commit_oid,ref,trigger,status,source_id,space_id,migration_epoch,authority,actor_id,agent_id)
+    VALUES ('recovery-run','app',1,?,'work','push','running',?,'orbit',?,?,'ben','agt_bot')`)
+    .run(oid(1), t.sourceId, t.authority.migrationEpoch, JSON.stringify(t.authority));
   t.sqlite
     .prepare(`INSERT INTO ci_jobs
     (id,run_id,repo_id,name,spec,status,runner,source_id)
     VALUES ('recovery-job','recovery-run','app','build','{"steps":[]}','running','sandbox',?)`)
     .run(t.sourceId);
-  const token = await mintJobToken(t.env.DB, "recovery-job", 30);
+  const token = await mintJobToken(t.env, "recovery-job", 30);
   for (const method of ["GET", "POST"]) {
     const path = method === "GET" ? t.path : `${t.path}/${t.operation.operationId}/recover`;
     const response = await t.server.request(
@@ -2749,7 +3034,9 @@ test("CI job credentials cannot inspect or recover source operations", async () 
     );
     expect(response.status).toBe(401);
   }
-  expect(t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId)).toMatchObject({
+  expect(
+    await t.tracker.sourcePush(t.access, t.operation.operationId, "app", t.sourceId),
+  ).toMatchObject({
     ok: true,
     value: { state: "ambiguous" },
   });
@@ -2763,8 +3050,8 @@ function recoveryRepo(t: { sqlite: DatabaseSync; sourceId: string }) {
   return {
     ...source,
     id: "app",
-    owner_id: "orbit",
-    owner_slug: "orbit",
+    space_id: "orbit",
+    space_slug: "orbit",
     name: "app",
     default_branch: "work",
     source_id: t.sourceId,
@@ -2825,11 +3112,10 @@ test("deletion drains a proven recovery whose terminal D1 projection failed", as
   await expect(
     recoverSourcePush(
       t.env,
-      { id: "app", owner_id: "orbit" },
+      { id: "app", space_id: "orbit" },
       t.sourceId,
       t.operation.operationId,
-      "ben",
-      "ben",
+      t.actor,
     ),
   ).rejects.toThrow("projection interrupted");
   failure.mockRestore();
@@ -2844,7 +3130,7 @@ test("deletion drains a proven recovery whose terminal D1 projection failed", as
   await drainDeletedRepoSources(t.env, "app");
   await drainDeletedRepoSources(t.env, "app");
   expect(transport).not.toHaveBeenCalled();
-  expect(t.tracker.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  expect(await t.tracker.sourcePushes(t.access, "app")).toMatchObject({ ok: true, value: [] });
   expect(
     t.sqlite.prepare("SELECT state FROM source_operations WHERE id=?").get(t.operation.operationId),
   ).toEqual({ state: "rejected" });
@@ -2859,11 +3145,10 @@ test("recovery retries CI admission after cursor observation, across restart, wi
   const pipeline = recoveryPipeline(t.env);
   const result = await recoverSourcePush(
     t.env,
-    { id: "app", owner_id: "orbit" },
+    { id: "app", space_id: "orbit" },
     t.sourceId,
     t.operation.operationId,
-    "ben",
-    "ben",
+    t.actor,
   );
   const physical = recoveryRepo(t);
   const prepare = t.env.DB.prepare.bind(t.env.DB);
@@ -2879,7 +3164,7 @@ test("recovery retries CI admission after cursor observation, across restart, wi
     t.sqlite.prepare("SELECT oid FROM ci_refs WHERE source_id=? AND ref='work'").get(t.sourceId),
   ).toEqual({ oid: result.head });
   expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()).toEqual({ n: 0 });
-  const pending = t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId);
+  const pending = await t.tracker.sourcePush(t.access, t.operation.operationId, "app", t.sourceId);
   if (!pending.ok) throw new Error(pending.error);
   expect(pending.value.delivery?.runs.push.state).toBe("pending");
   t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
@@ -2895,14 +3180,26 @@ test("recovery retries CI admission after cursor observation, across restart, wi
     operationId: "later-delivery",
     commands: [{ ref: "refs/heads/work", old: result.head, new: oid(8) }],
   };
-  expect(await t.trackers.get("orbit")!.beginSourcePush(next)).toMatchObject({ ok: true });
+  expect(await t.trackers.get("orbit")!.beginSourcePush(next)).toMatchObject({
+    ok: true,
+  });
   t.remote.commits.add(oid(8));
   t.remote.parents.set(oid(8), [result.head!]);
   t.remote.refs.set("refs/heads/work", oid(8));
   expect(
-    await t.trackers.get("orbit")!.finishSourcePush(next.operationId, "accepted"),
+    await t.trackers.get("orbit")!.finishSourcePushForSettlement(
+      {
+        spaceId: "orbit",
+        repoId: "app",
+        sourceId: t.sqlite
+          .prepare("SELECT source_id FROM source_operations WHERE id=?")
+          .get(next.operationId)!.source_id as string,
+        operationId: next.operationId,
+      },
+      "accepted",
+    ),
   ).toMatchObject({ ok: true });
-  await onPush(t.env, physical, null, () => {});
+  await onPush(t.env, physical, t.botActor, () => {});
   const count = t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get();
   t.sqlite.exec("UPDATE ci_runs SET status='succeeded'");
   await deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {});
@@ -2918,11 +3215,10 @@ test("recovery resumes a persisted queued CI run after Workflow startup failure"
   const pipeline = recoveryPipeline(t.env);
   await recoverSourcePush(
     t.env,
-    { id: "app", owner_id: "orbit" },
+    { id: "app", space_id: "orbit" },
     t.sourceId,
     t.operation.operationId,
-    "ben",
-    "ben",
+    t.actor,
   );
   const physical = recoveryRepo(t);
   const create = vi
@@ -2945,11 +3241,10 @@ test("recovery replays lost CI acknowledgement after the Workflow completed usin
   recoveryPipeline(t.env);
   await recoverSourcePush(
     t.env,
-    { id: "app", owner_id: "orbit" },
+    { id: "app", space_id: "orbit" },
     t.sourceId,
     t.operation.operationId,
-    "ben",
-    "ben",
+    t.actor,
   );
   const ack = vi.spyOn(t.tracker, "completeSourcePushDelivery").mockImplementationOnce(() => {
     throw new Error("Delivery acknowledgement lost");
@@ -2972,21 +3267,25 @@ test("first recovery delivery adopts completed ordinary runs rather than rerunni
   const pipeline = recoveryPipeline(t.env);
   await recoverSourcePush(
     t.env,
-    { id: "app", owner_id: "orbit" },
+    { id: "app", space_id: "orbit" },
     t.sourceId,
     t.operation.operationId,
-    "ben",
-    "ben",
+    t.actor,
   );
   const physical = recoveryRepo(t);
-  await onPush(t.env, physical, null, () => {});
+  await onPush(t.env, physical, t.botActor, () => {});
   const runs = t.sqlite.prepare("SELECT id FROM ci_runs ORDER BY step").all();
   expect(runs).toHaveLength(2);
   t.sqlite.exec("UPDATE ci_runs SET status='succeeded'");
   await deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {});
   expect(t.sqlite.prepare("SELECT id FROM ci_runs ORDER BY step").all()).toEqual(runs);
   expect(pipeline.started.size).toBe(2);
-  const inspected = t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId);
+  const inspected = await t.tracker.sourcePush(
+    t.access,
+    t.operation.operationId,
+    "app",
+    t.sourceId,
+  );
   if (!inspected.ok) throw new Error(inspected.error);
   expect(inspected.value.delivery?.runs).toMatchObject({
     push: { id: runs[0]!.id, state: "started" },

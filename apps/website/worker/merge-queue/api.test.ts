@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { Hono } from "hono";
-import type { DatabaseSync } from "node:sqlite";
 import { hashToken, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import {
   queueSourceBranch,
   queueCandidateBranch,
@@ -11,7 +10,16 @@ import {
 import { queueApi } from "./index.ts";
 import { getQueue, saveQueue } from "./store.ts";
 import * as ai from "./ai.ts";
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: DurableObjectState;
+    public env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 const boundary = vi.hoisted(() => ({
   refs: new Map<string, string>(),
   /** Ref reads that fail before one succeeds, as storage briefly can. */
@@ -35,10 +43,10 @@ vi.mock("./deps.ts", () => ({
     cancel: boundary.cancel,
   }),
 }));
-const databases: DatabaseSync[] = [];
+const environments: Array<() => void> = [];
 afterEach(() => {
   vi.restoreAllMocks();
-  for (const database of databases.splice(0)) database.close();
+  for (const close of environments.splice(0)) close();
 });
 beforeEach(() => {
   boundary.refs.clear();
@@ -46,20 +54,51 @@ beforeEach(() => {
   boundary.cancel.mockClear();
 });
 const commit = "a".repeat(40);
-function setup() {
-  const sqlite = migratedDatabase();
-  databases.push(sqlite);
+async function setup() {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  environments.push(close);
   sqlite.exec(
-    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner'),('other','user','other','Other'); INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','owner','app','private','a','https://a');",
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner'),('other','user','other','Other'); INSERT INTO access_tokens(id,user_id,name,scope,token_hash,last_four) VALUES('owner-token','owner','Queue','write','owner-token-hash','hash'),('other-token','other','Queue','write','other-token-hash','hash');",
   );
-  const env = { DB: d1(sqlite) } as Env;
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "organization",
+      slug: "organization",
+      displayName: "Organization",
+      kind: "personal",
+      personalAccountId: "owner",
+    },
+    space: { id: "space", slug: "owner", displayName: "Queue Space" },
+    members: [
+      {
+        accountId: "owner",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "owner",
+  });
+  sqlite.exec(
+    "INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','space','app','private','a','https://a')",
+  );
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const id = c.req.header("x-actor");
-    c.set("actor", id ? { id, slug: id, displayName: id, isSiteAdmin: false } : null);
+    c.set(
+      "actor",
+      id
+        ? {
+            id,
+            slug: id,
+            displayName: id,
+            isSiteAdmin: false,
+            credential: { kind: "token", id: `${id}-token` },
+          }
+        : null,
+    );
     await next();
   });
-  app.route("/api/repos/:owner/:name/queue", queueApi);
+  app.route("/api/repos/:space/:name/queue", queueApi);
   const pending: Promise<unknown>[] = [];
   const context = {
     waitUntil: (work: Promise<unknown>) => {
@@ -88,7 +127,7 @@ function setup() {
 }
 describe("queue HTTP authority and transitions", () => {
   test("private existence is concealed and source admission needs exact pinned ref", async () => {
-    const t = setup();
+    const t = await setup();
     expect((await t.call("", "GET", undefined, null)).status).toBe(404);
     expect((await t.call("", "GET", undefined, "other")).status).toBe(404);
     expect((await t.call("", "POST", { commit })).status).toBe(409);
@@ -99,7 +138,7 @@ describe("queue HTTP authority and transitions", () => {
   });
   test("a storage read failing right after the source push is retried, then answered as retryable", async () => {
     // CORE-309: production answered an opaque 500 and admitted nothing.
-    const t = setup();
+    const t = await setup();
     boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, commit);
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     boundary.refFailures = 2;
@@ -126,18 +165,18 @@ describe("queue HTTP authority and transitions", () => {
     { commit, issues: [12] },
     { commit, issues: Array(51).fill("X") },
   ])("malformed admission is rejected: %j", async (body) => {
-    const t = setup();
+    const t = await setup();
     expect((await t.call("", "POST", body)).status).toBe(400);
     expect(t.sqlite.prepare("SELECT count(*) AS n FROM merge_queue").get()).toEqual({ n: 0 });
   });
   test("actual request bytes are bounded even without content-length", async () => {
-    const t = setup();
+    const t = await setup();
     expect(
       (await t.call("", "POST", JSON.stringify({ commit, issues: ["x".repeat(40000)] }))).status,
     ).toBe(400);
   });
   test("repeated and concurrent admission returns one original record, not a second merge", async () => {
-    const t = setup();
+    const t = await setup();
     boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, commit);
     const responses = await Promise.all(
       Array.from({ length: 4 }, () => t.call("", "POST", { commit })),
@@ -151,13 +190,13 @@ describe("queue HTTP authority and transitions", () => {
     expect((await t.call("", "POST", { commit })).status).toBe(200);
   });
   test("write permission is required even when a public repository is readable", async () => {
-    const t = setup();
+    const t = await setup();
     t.sqlite.exec("UPDATE repos SET visibility='public'");
     expect((await t.call("", "GET", undefined, "other")).status).toBe(200);
     expect((await t.call("", "POST", { commit }, "other")).status).toBe(403);
   });
   test("cancel and retry are version fenced; advancing and landed cannot be cancelled", async () => {
-    const t = setup();
+    const t = await setup();
     boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, commit);
     await t.call("", "POST", { commit });
     expect((await t.call(`/${commit}/cancel`, "POST")).status).toBe(200);
@@ -171,13 +210,13 @@ describe("queue HTTP authority and transitions", () => {
     expect((await t.call(`/${commit}/cancel`, "POST")).status).toBe(409);
   });
   test("a regular repository writer cannot invoke the paid repair endpoint", async () => {
-    const t = setup();
+    const t = await setup();
     expect((await t.call(`/${commit}/resolve`, "POST", { files: [] })).status).toBe(401);
     expect((await t.call("?status=green")).status).toBe(400);
     expect((await t.call("/invalid")).status).toBe(400);
   });
   test("running-attempt resolution is cached and duplicate callbacks cannot replay paid inference", async () => {
-    const t = setup();
+    const t = await setup();
     boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, commit);
     await t.call("", "POST", { commit });
     const original = (await getQueue(t.env.DB, "repo", commit))!;
@@ -195,9 +234,18 @@ describe("queue HTTP authority and transitions", () => {
     });
     t.sqlite
       .prepare(
-        "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,queue_id) VALUES('merge','repo',1,?,?,'manual','running',?)",
+        "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,queue_id,space_id,migration_epoch,authority,actor_id,agent_id) VALUES('merge','repo',1,?,?,'manual','running',?,?,?,?,?,?)",
       )
-      .run(commit, branch, commit);
+      .run(
+        commit,
+        branch,
+        commit,
+        original.authority.spaceId,
+        original.authority.migrationEpoch,
+        JSON.stringify(original.authority),
+        original.authority.personId,
+        original.authority.agentId,
+      );
     t.sqlite
       .prepare(
         "INSERT INTO ci_jobs(id,run_id,repo_id,name,spec,status,runner) VALUES('job','merge','repo','land',?,'running','local')",

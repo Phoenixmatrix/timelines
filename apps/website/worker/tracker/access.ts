@@ -1,38 +1,61 @@
-// A tracker Access built from D1: by a request once it checked membership
-// (api.ts authorize), or by the Worker finishing work on someone's behalf
-// later, like a landing (timelines/landing.ts).
+// Current Space grants, person and agent identity are re-resolved at every boundary.
 
 import { avatarUrl } from "../avatars/api.ts";
 import { chunk } from "../knowledge/util.ts";
-import type { AccountRow } from "../db.ts";
+import type { AccountRow, Actor } from "../db.ts";
+import type { SpaceSummary } from "../../shared/spaces.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
+import { TrackerError } from "./store.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type { TrackerAgent, TrackerIdentity } from "../../shared/tracker.ts";
 import type { Access } from "./store.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
 
-/**
- * The tracker access of a person (or an agent acting for one), who is known
- * to be a member: what a request builds after checking, and what work the
- * Worker finishes later on someone's behalf (a landing, CORE-77) rebuilds.
- */
 export async function accessFor(
-  d1: D1Database,
-  owner: AccountRow,
+  env: Env,
+  space: SpaceSummary,
   principalId: string,
   agentId: string | null,
-  canAdmin = false,
   includeMembers = true,
+  credential?: Actor["credential"],
 ): Promise<Access> {
+  const d1 = env.DB;
+  const actor: Actor = {
+    id: principalId,
+    slug: "",
+    displayName: "",
+    isSiteAdmin: false,
+    ...(agentId ? { agent: { id: agentId, name: "" } } : {}),
+    ...(credential ? { credential } : {}),
+  };
+  const current = await resolveSpaceAccess(d1, actor, space.id);
+  if (!current)
+    throw new TrackerError(
+      403,
+      "forbidden",
+      "Tracker access requires a current explicit Space grant.",
+    );
+  const admission = await cutoverControl(env).admission(4);
+  if (!admission.allowed || !Number.isSafeInteger(admission.epoch))
+    throw new TrackerError(
+      409,
+      "migration_epoch_mismatch",
+      "Space migration is not admitted. Refresh after maintenance.",
+    );
   const members: AccountRow[] = !includeMembers
     ? []
-    : owner.kind === "user"
-      ? [owner]
-      : await gitmatrixDb(d1)
-          .selectFrom("accounts as a")
-          .innerJoin("org_members as m", "m.user_id", "a.id")
-          .selectAll("a")
-          .where("m.org_id", "=", owner.id)
-          .orderBy("a.slug")
-          .execute();
+    : await gitmatrixDb(d1)
+        .selectFrom("accounts as a")
+        .innerJoin("space_grants as g", "g.account_id", "a.id")
+        .innerJoin("organization_members as m", (join) =>
+          join
+            .onRef("m.account_id", "=", "a.id")
+            .onRef("m.organization_id", "=", "g.organization_id"),
+        )
+        .selectAll("a")
+        .where("g.space_id", "=", space.id)
+        .orderBy("a.slug")
+        .execute();
   const identities = members.map((m): TrackerIdentity => ({
     id: m.id,
     slug: m.slug,
@@ -43,8 +66,14 @@ export async function accessFor(
     // An agent's actions are its own; its human's memberships let it in.
     actorId: agentId ?? principalId,
     principalId,
-    owner: { id: owner.id, slug: owner.slug, displayName: owner.display_name },
-    canAdmin,
+    agentId,
+    credential,
+    spaceId: current.spaceId,
+    space: current.space,
+    contractVersion: 4,
+    migrationEpoch: admission.epoch,
+    authorizationVersion: current.authorizationVersion,
+    canAdmin: current.grant.role === "admin",
     members: identities,
     agents: await agentsOf(d1, identities),
     repos: [],

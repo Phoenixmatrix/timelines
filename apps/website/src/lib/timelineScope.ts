@@ -55,16 +55,25 @@ export function withScope(href: string, slug: string | null): string {
 }
 
 /** An in-app href with the current scope, unless it names one itself. */
-export function carryScope(href: string, current: string | null): string {
+export function carryScope(
+  href: string,
+  current: string | null,
+  currentSpace: string | null,
+): string {
   if (!current || !href.startsWith("/") || href.startsWith("//") || href.startsWith("/api/"))
     return href;
   const { path, params, hash } = split(href);
-  if (params.has(SCOPE_PARAM)) return href;
+  if (
+    params.has(SCOPE_PARAM) ||
+    !currentSpace ||
+    scopeSpace(path, params.toString()) !== currentSpace
+  )
+    return href;
   params.set(SCOPE_PARAM, current);
   return join(path, params, hash);
 }
 
-/** `/:owner/:repo/knowledge` used `?timeline=` before the switcher (CORE-83). */
+/** `/:space/:repo/knowledge` used `?timeline=` before the switcher (CORE-83). */
 const KNOWLEDGE = /^\/[^/]+\/[^/]+\/knowledge\/?$/;
 
 /**
@@ -75,7 +84,7 @@ const KNOWLEDGE = /^\/[^/]+\/[^/]+\/knowledge\/?$/;
  */
 export function scopeRedirect(
   target: { pathname: string; search: string; hash?: string },
-  from: { search: string } | null,
+  from: { pathname: string; search: string } | null,
 ): { to: string; replace: boolean } | null {
   const params = new URLSearchParams(target.search);
   if (KNOWLEDGE.test(target.pathname) && params.has("timeline")) {
@@ -85,6 +94,8 @@ export function scopeRedirect(
     return { to: join(target.pathname, params, target.hash ?? ""), replace: true };
   }
   if (!from || params.has(SCOPE_PARAM)) return null;
+  const sourceSpace = scopeSpace(from.pathname, from.search);
+  if (!sourceSpace || scopeSpace(target.pathname, target.search) !== sourceSpace) return null;
   const current = scopeOf(from.search);
   if (!current) return null;
   params.set(SCOPE_PARAM, current);
@@ -111,43 +122,49 @@ export const timelineScopeMiddleware: MiddlewareFunction = ({ request }, next) =
 export function scopeLinks(router: DataRouter): void {
   const createHref = router.createHref.bind(router);
   router.createHref = (location) =>
-    carryScope(createHref(location), scopeOf(router.state.location.search));
+    carryScope(
+      createHref(location),
+      scopeOf(router.state.location.search),
+      scopeSpace(router.state.location.pathname, router.state.location.search),
+    );
 }
 
-/** First path segments that are the app's own places, not accounts. */
-const PLACES = new Set([
-  "",
-  "-",
-  "agent-work",
-  "api",
-  "cli-auth",
-  "device",
-  "highlights",
-  "needs-you",
-  "new",
-  "packages",
-  "release-notes",
-  "settings",
-  "signin",
-  "timelines",
-  "tracker",
-]);
+/** First path segments that are the app's own places, not Spaces. */
+const PLACES: Record<string, true> = {
+  "": true,
+  "agent-work": true,
+  api: true,
+  accounts: true,
+  organizations: true,
+  instance: true,
+  timelines: true,
+  "release-notes": true,
+  "-": true,
+  "cli-auth": true,
+  device: true,
+  highlights: true,
+  "needs-you": true,
+  new: true,
+  packages: true,
+  settings: true,
+  signin: true,
+  tracker: true,
+};
 
 /**
- * The account whose timelines a page is about: the tracker's owner, or the
- * account in the path (`/:owner`, `/:owner/:repo/...`, `/:owner/-/...`), or
- * settings' account context. Null on pages that belong to no account.
+ * The Space whose timelines a page is about. Person and Organization pages
+ * have no content scope; settings must name their Space explicitly.
  */
-export function scopeOwner(pathname: string, search = ""): string | null {
+export function scopeSpace(pathname: string, search = ""): string | null {
   const [first = "", second] = pathname.split("/").slice(1);
   if (first === "tracker") return second ? decodeURIComponent(second) : null;
   if (first === "settings") {
     const params = new URLSearchParams(search);
     return (
-      params.get("owner") ?? (pathname === "/settings/preferences" ? params.get("tracker") : null)
+      params.get("space") ?? (pathname === "/settings/preferences" ? params.get("tracker") : null)
     );
   }
-  return PLACES.has(first) ? null : decodeURIComponent(first);
+  return PLACES[first] ? null : decodeURIComponent(first);
 }
 
 /** The repository a code page is about, and the ref named in its path. */
@@ -172,7 +189,7 @@ export function switchScope(
   let pathname = location.pathname;
   const code = repo ? CODE.exec(pathname) : null;
   if (repo && code) {
-    const [, owner, name, view, tail] = code as unknown as [string, string, string, string, string];
+    const [, space, name, view, tail] = code as unknown as [string, string, string, string, string];
     const old = scopeOf(location.search);
     const from = [
       repo.defaultBranch,
@@ -187,7 +204,7 @@ export function switchScope(
         bookmark && (repo.targetSource || repo.branches.includes(bookmark))
           ? bookmark
           : repo.defaultBranch;
-      pathname = `/${owner}/${name}/${view}/${to}${tail.slice(from.length)}`;
+      pathname = `/${space}/${name}/${view}/${to}${tail.slice(from.length)}`;
     }
   }
   const params = new URLSearchParams(location.search);
@@ -236,7 +253,7 @@ export function scopeHint(
   }
   if (parts[1] === "-" && parts[2] === "packages" && parts.length > 3)
     return `Versions built from ${bookmark}.`;
-  if (parts.length >= 2 && !PLACES.has(parts[0]!) && parts[1] !== "-") {
+  if (parts.length >= 2 && !PLACES[parts[0]!] && parts[1] !== "-") {
     const section = parts[2] ?? "";
     if (section === "knowledge")
       return "Main's graph, with what this timeline adds, changes and removes.";

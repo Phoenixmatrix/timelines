@@ -1,13 +1,15 @@
 // The Atlas read API (CORE-160): bounded, snapshot-pinned pages over a
 // repository's published Atlas projection. Served by worker/atlas/api.ts under
-// /api/repos/:owner/:name/atlas, read by src/lib/atlas.ts. The same pages over
+// /api/repos/:space/:name/atlas, read by src/lib/atlas.ts. The same pages over
 // an explicit workspace scope (CORE-161) are served by worker/atlas/workspace.ts
-// under /api/accounts/:owner/atlas (the Atlas Workspace types below).
+// under /api/spaces/:space/atlas (the Atlas Workspace types below).
 //
 // Every response names the snapshot it was read from. A request may pin one
 // (`?snapshot=<id>`); continuation cursors always do. A pinned snapshot that is
 // unknown or expired is an explicit error (AtlasErrorCode), never a silent
 // switch to the current one. Browsing never runs a model.
+
+import type { SpaceSummary } from "./spaces.ts";
 
 /** Records per page, at most. */
 export const ATLAS_PAGE_MAX = 100;
@@ -273,7 +275,7 @@ export type AtlasDescriptionStatus = "current" | "stale" | "unavailable";
 
 /** Why prose is stale or unavailable. */
 export type AtlasUnavailableReason =
-  /** A per-build cap or the account's daily Atlas ceiling was reached (see `exhausted`). */
+  /** A per-build cap or the Space's daily Atlas ceiling was reached (see `exhausted`). */
   | "budget_exhausted"
   /** Atlas paid synthesis is off (the model has no configured price). */
   | "disabled"
@@ -451,7 +453,7 @@ export interface AtlasLineage {
 
 // ---- workspace scope (CORE-161) ------------------------------------------------
 //
-// A workspace scope is an explicit selection of one account's repositories
+// A workspace scope is an explicit selection of one Space's repositories
 // (`?repos=a,b`), re-authorized on every request: the server keeps only the
 // selected repositories the caller can read now, and a response never says
 // anything about the rest, not even how many. Composition is virtual: each
@@ -470,7 +472,7 @@ export type AtlasRepoState = "ready" | "building" | "unavailable" | "not-enabled
 /** One selected, readable repository and its own place in the composite. */
 export interface AtlasWorkspaceRepo {
   id: string;
-  owner: string;
+  space: string;
   name: string;
   visibility: "public" | "private";
   state: AtlasRepoState;
@@ -499,9 +501,9 @@ export interface AtlasWorkspaceSnapshot {
 
 /** What every workspace response carries. */
 export interface AtlasWorkspaceEnvelope {
-  /** "ws:<ownerId>:<hash>": names exactly the authorized repository set. */
+  /** "ws:<spaceId>:<hash>": names exactly the authorized repository set. */
   scope: string;
-  owner: { id: string; slug: string };
+  space: SpaceSummary;
   snapshot: AtlasWorkspaceSnapshot;
 }
 
@@ -509,7 +511,7 @@ type InWorkspace<T> = Omit<T, "scope" | "snapshot"> & AtlasWorkspaceEnvelope;
 
 export type AtlasWorkspacePage<T> = InWorkspace<AtlasPage<T>>;
 
-/** GET /api/accounts/:owner/atlas/overview */
+/** GET /api/spaces/:space/atlas/overview */
 export interface AtlasWorkspaceOverview extends AtlasWorkspaceEnvelope {
   /**
    * The first top-level regions of every ready repository, ranked together:
@@ -563,7 +565,7 @@ export type AtlasResolutionRule =
 export interface AtlasPublisher {
   /** A selected, readable repository: the package names it a source. */
   repoId: string;
-  /** The registry package: its format, feed (owner key) and name. */
+  /** The registry package: its format, feed (Space key) and name. */
   registry: { format: string; feed: string; name: string };
   /** Its latest publish from that repository when the snapshot was built, if any. */
   publish: {
@@ -682,7 +684,7 @@ export interface AtlasCompositionCoverage {
   imports: { considered: number; truncated: boolean };
 }
 
-/** GET /api/accounts/:owner/atlas/composition */
+/** GET /api/spaces/:space/atlas/composition */
 export interface AtlasWorkspaceComposition extends AtlasWorkspacePage<AtlasCompositeCapability> {
   coverage: AtlasCompositionCoverage[];
   /** Resolved cross-repository dependencies (capability, package) in the scope. */
@@ -929,7 +931,7 @@ export interface AtlasTimelineRepo {
   repoId: string;
   /** Null when this repository does not participate in the timeline. */
   sourceId: string | null;
-  owner: string;
+  space: string;
   name: string;
   /** The bookmark, `timeline/<slug>`. */
   ref: string;
@@ -1140,7 +1142,7 @@ export interface AtlasTimeline extends AtlasPage<AtlasTimelineFile> {
 }
 
 /**
- * GET /api/accounts/:owner/atlas/timeline?repos=…&ref=timeline/<slug>[&within=]:
+ * GET /api/spaces/:space/atlas/timeline?repos=…&ref=timeline/<slug>[&within=]:
  * a timeline across a workspace (CORE-186). Each selected repository's own
  * overlay of the bookmark, read against its own snapshot in the composite, as
  * a repository's /timeline reads it: every repository's part is independent

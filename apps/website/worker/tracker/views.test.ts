@@ -1,13 +1,27 @@
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { Issue, Mutation, Snapshot } from "../../shared/tracker.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { durableStorage } from "../testing/durable.ts";
 import { TrackerStore, type Access } from "./store.ts";
 import { TimelineStore } from "./timelines.ts";
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
+const databases: { close(): void }[] = [];
+afterEach(() => {
+  for (const storage of databases) storage.close();
+  databases.length = 0;
+});
 
-function setup() {
-  const { sql, db, transactionSync } = durableStorage();
+async function setup() {
+  const storage = await freshTrackerStorage("org", [
+    {
+      accountId: "ann",
+      role: "owner",
+      grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+    },
+  ]);
+  databases.push(storage);
+  const { sql, db, transactionSync, scope, space } = storage;
   let now = Date.parse("2026-10-03T00:00:00Z");
   const clock = () => (now += 1000);
   const store = new TrackerStore(sql, transactionSync, clock);
@@ -16,7 +30,10 @@ function setup() {
     actorId: "ann",
     principalId: "ann",
     agents: [],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
     members: [{ id: "ann", slug: "ann", displayName: "Ann" }],
     repos: [],
@@ -24,6 +41,7 @@ function setup() {
   let operation = 0;
   const mutate = (timeline: string | undefined, ...mutations: Mutation[]) =>
     store.mutate(access, {
+      ...scope,
       operationId: `op-${++operation}`,
       mutations,
       ...(timeline ? { timeline } : {}),
@@ -32,7 +50,7 @@ function setup() {
     timelines.create(access, {
       slug,
       parent,
-      repos: [{ id: "app", owner: "org", name: "app" }],
+      repos: [{ id: "app", space: "org", name: "app" }],
       commits: { app: oid(1) },
     });
   const issue = (snapshot: Snapshot, id: string) => snapshot.issues.find((i) => i.id === id);
@@ -50,8 +68,8 @@ function setup() {
 }
 
 describe("timeline views of the tracker", () => {
-  test("landing a comment preserves its original agent rather than attributing it to the lander", () => {
-    const t = setup();
+  test("landing a comment preserves its original agent rather than attributing it to the lander", async () => {
+    const t = await setup();
     t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
     t.fork("search");
     const agent = {
@@ -63,8 +81,11 @@ describe("timeline views of the tracker", () => {
       revokedAt: null,
     };
     t.store.mutate(
-      { ...t.access, actorId: agent.id, agents: [agent] },
+      { ...t.access, actorId: agent.id, agentId: agent.id, agents: [agent] },
       {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
         operationId: "agent-comment",
         timeline: "search",
         mutations: [{ kind: "comment.add", id: "note", data: { issueId: "a", body: "Built it" } }],
@@ -84,8 +105,8 @@ describe("timeline views of the tracker", () => {
     expect(t.view().comments).toEqual([original]);
   });
 
-  test("pickup stays global across old timeline views and cannot be loosened by an agent", () => {
-    const t = setup();
+  test("pickup stays global across old timeline views and cannot be loosened by an agent", async () => {
+    const t = await setup();
     t.mutate(undefined, {
       kind: "issue.create",
       id: "work",
@@ -104,16 +125,16 @@ describe("timeline views of the tracker", () => {
     t.update("old-view", "work", { pickup: "human_only" });
     expect(t.issue(t.view(), "work")?.pickup).toBe("human_only");
     t.access.actorId = "agt-worker";
+    t.access.agentId = "agt-worker";
     expect(() => t.update("old-view", "work", { pickup: "anyone", status: "in_progress" })).toThrow(
       /Only a person/,
     );
     expect(() => t.update("old-view", "work", { status: "done" })).toThrow(/human only/);
     expect(t.issue(t.view(), "work")?.pickup).toBe("human_only");
-    t.db.close();
   });
 
-  test("pickup restrictions never invalidate retained timeline leases", () => {
-    const t = setup();
+  test("pickup restrictions never invalidate retained timeline leases", async () => {
+    const t = await setup();
     t.mutate(undefined, {
       kind: "issue.create",
       id: "work",
@@ -140,10 +161,9 @@ describe("timeline views of the tracker", () => {
       data: { leaseToken: token },
     });
     expect(t.issue(t.view("work-view"), "work")?.status).toBe("done");
-    t.db.close();
   });
-  test("shares timeline-only tag definitions with main and backfills timeline history", () => {
-    const t = setup();
+  test("shares timeline-only tag definitions with main and backfills timeline history", async () => {
+    const t = await setup();
     t.fork("tags");
     t.fork("other");
     t.mutate("tags", {
@@ -161,8 +181,8 @@ describe("timeline views of the tracker", () => {
     expect(reopened.snapshot(t.access).labels).toEqual(["timeline-only"]);
     expect(reopened.snapshot(t.access, "tags").issues[0]!.labels).toEqual([]);
   });
-  test("an issue made in a timeline is the timeline's, and absent from main", () => {
-    const t = setup();
+  test("an issue made in a timeline is the timeline's, and absent from main", async () => {
+    const t = await setup();
     const search = t.fork("search");
     const result = t.mutate("search", {
       kind: "issue.create",
@@ -207,8 +227,8 @@ describe("timeline views of the tracker", () => {
     ]);
   });
 
-  test("a timeline's changes stay in its view and its descendants'; shared fields are everyone's", () => {
-    const t = setup();
+  test("a timeline's changes stay in its view and its descendants'; shared fields are everyone's", async () => {
+    const t = await setup();
     t.mutate(undefined, {
       kind: "issue.create",
       id: "a",
@@ -237,8 +257,8 @@ describe("timeline views of the tracker", () => {
     expect(t.issue(t.view(), "a")).toMatchObject({ title: "Ship search v2", status: "backlog" });
   });
 
-  test("links removed in a timeline stay on main, and readiness follows the view", () => {
-    const t = setup();
+  test("links removed in a timeline stay on main, and readiness follows the view", async () => {
+    const t = await setup();
     t.mutate(
       undefined,
       {
@@ -266,8 +286,8 @@ describe("timeline views of the tracker", () => {
     expect(t.view("search").links).toEqual([]);
   });
 
-  test("work on a timeline's own issue goes through claim, batch edits and completion", () => {
-    const t = setup();
+  test("work on a timeline's own issue goes through claim, batch edits and completion", async () => {
+    const t = await setup();
     t.fork("search");
     t.mutate("search", { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
     const claimed = t.mutate("search", {
@@ -299,8 +319,8 @@ describe("timeline views of the tracker", () => {
     expect(t.view().comments).toEqual([]);
   });
 
-  test("ended and unknown timelines take no changes", () => {
-    const t = setup();
+  test("ended and unknown timelines take no changes", async () => {
+    const t = await setup();
     t.fork("search");
     t.timelines.abandon(t.access, "search", {});
     const create: Mutation = {
@@ -315,15 +335,15 @@ describe("timeline views of the tracker", () => {
     expect(t.mutate("main", create).events[0]).not.toHaveProperty("timelineId");
   });
 
-  test("a timeline merged into another is part of its view", () => {
-    const t = setup();
+  test("a timeline merged into another is part of its view", async () => {
+    const t = await setup();
     t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
     t.fork("search");
     t.fork("ranking");
     t.update("ranking", "a", { priority: 0 });
     expect(t.issue(t.view("search"), "a")!.priority).toBe(2);
     t.timelines.recordPush({
-      repo: { id: "app", owner: "org", name: "app" },
+      repo: { id: "app", spaceId: "org", space: "org", name: "app" },
       actorId: "ann",
       accountableId: "ann",
       pushed: ["search"],
@@ -333,8 +353,8 @@ describe("timeline views of the tracker", () => {
     expect(t.issue(t.view(), "a")!.priority).toBe(2);
   });
 
-  test("landing folds a timeline's changes into main, once", () => {
-    const t = setup();
+  test("landing folds a timeline's changes into main, once", async () => {
+    const t = await setup();
     t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
     const search = t.fork("search");
     t.fork("ranking", "search");
@@ -361,8 +381,8 @@ describe("timeline views of the tracker", () => {
     expect(t.store.landTimeline(t.access, "search")).toEqual([]);
   });
 
-  test("main's view and its event log are unchanged for work outside timelines", () => {
-    const t = setup();
+  test("main's view and its event log are unchanged for work outside timelines", async () => {
+    const t = await setup();
     t.fork("search");
     const result = t.mutate(undefined, {
       kind: "issue.create",
@@ -376,13 +396,13 @@ describe("timeline views of the tracker", () => {
     expect((t.issue(t.view("search"), "a") as Issue).title).toBe("Main work");
   });
 
-  test("timelines reach the change feed and snapshot only for replicas that ask", () => {
-    const t = setup();
+  test("timelines reach the change feed and snapshot only for replicas that ask", async () => {
+    const t = await setup();
     const search = t.fork("search");
     t.timelines.update("search", { name: "Search" }, undefined, t.access);
     t.mutate("search", { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
     const kinds = (withTimelines: boolean) =>
-      t.store.changes(0, 100, withTimelines).events.map((e) => [e.entityType, e.kind]);
+      t.store.changes(t.access, 0, 100, withTimelines).events.map((e) => [e.entityType, e.kind]);
     expect(kinds(false)).toEqual([
       ["team", "team.create"],
       ["issue", "issue.create"],
@@ -394,7 +414,7 @@ describe("timeline views of the tracker", () => {
       ["timeline", "timeline.update"],
       ["issue", "issue.create"],
     ]);
-    expect(t.store.changes(0, 100, true).events[2]).toMatchObject({
+    expect(t.store.changes(t.access, 0, 100, true).events[2]).toMatchObject({
       entityId: `fork:${search.id}`,
       actorId: "ann",
       entity: { kind: "fork", seq: 1, timelineId: search.id },

@@ -39,8 +39,8 @@ pub enum Command {
     Tracker(crate::tracker_cli::TrackerArgs),
     /// Tracker teams, membership and immutable issue-key prefixes
     Team(crate::tracker_cli::TeamArgs),
-    /// Cross-team tracker workspaces and repository subscriptions
-    Workspace(crate::tracker_cli::WorkspaceArgs),
+    /// Cross-team tracker projects and repository subscriptions
+    Project(crate::tracker_cli::ProjectArgs),
     /// Agent-first issues, PRDs, dependency graph, checkpoints and fenced claims
     Issue(crate::tracker_cli::IssueArgs),
     /// Requests to people: what agents are waiting on, and answering them
@@ -134,7 +134,7 @@ pub enum Command {
     /// Sign in to a Timelines server
     #[command(subcommand)]
     Auth(AuthCommand),
-    /// Account-wide settings for a person or organization
+    /// Space content policy and separate Instance settings
     #[command(subcommand)]
     Settings(crate::commands::settings::SettingsCommand),
     /// Data retention: policies per category, clean up now (with --dry-run previews) and run history
@@ -460,14 +460,14 @@ pub struct WhyArgs {
     /// Revision to blame at (default: the working copy).
     #[arg(short, long = "rev", visible_alias = "revision", default_value = "@")]
     pub revision: String,
-    /// Repository on the server as owner/name (default: this repository's origin).
+    /// Repository on the server as space/name (default: this repository's origin).
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
 }
 
 #[derive(Args)]
 pub struct CloneArgs {
-    /// Repository as owner/name.
+    /// Repository as space/name.
     pub repository: String,
     /// Directory to clone into (default: the repository name).
     pub directory: Option<PathBuf>,
@@ -598,9 +598,9 @@ pub enum RepoCommand {
     Create {
         /// Repository name.
         name: String,
-        /// Owner (you, or an org you belong to). Default: you.
+        /// Immutable global Space handle in which to create the repository.
         #[arg(long)]
-        owner: Option<String>,
+        space: String,
         #[arg(long)]
         description: Option<String>,
         /// Make it public (default private).
@@ -670,7 +670,7 @@ pub enum MirrorCommand {
 pub enum ReleaseCommand {
     /// Releases with notes: unreleased work first, then tags newest first
     List {
-        /// Repository as owner/name (default: this repository's origin).
+        /// Repository as space/name (default: this repository's origin).
         #[arg(short = 'R', long)]
         repo: Option<String>,
     },
@@ -688,9 +688,9 @@ pub struct ReleaseFeedArgs {
     /// Only this team's work (adds `team:KEY`).
     #[arg(long)]
     pub team: Option<String>,
-    /// Tracker account/organization slug; otherwise use saved tracker context.
+    /// Tracker Space handle; otherwise use saved tracker context.
     #[arg(long)]
-    pub owner: Option<String>,
+    pub space: Option<String>,
     /// Include internal entries (chores, refactors, tests, tooling).
     #[arg(long)]
     pub internal: bool,
@@ -700,7 +700,7 @@ pub struct ReleaseFeedArgs {
 pub struct ReleaseNotesArgs {
     /// A tag, or `unreleased` for the default branch's work since the newest tag.
     pub release: Option<String>,
-    /// Repository as owner/name (default: this repository's origin).
+    /// Repository as space/name (default: this repository's origin).
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
     /// Include internal entries (chores, refactors, tests, tooling).
@@ -716,7 +716,7 @@ pub enum SemanticCommand {
 
 #[derive(Args)]
 pub struct SemanticListArgs {
-    /// Repository as owner/name (default: this repository's origin).
+    /// Repository as space/name (default: this repository's origin).
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
     /// Server branch or commit id (default: repository default branch).
@@ -782,7 +782,7 @@ pub enum QueueCommand {
 pub enum RunsCommand {
     /// Recent runs, newest first
     List {
-        /// Repository as owner/name (default: this repository's origin).
+        /// Repository as space/name (default: this repository's origin).
         #[arg(short = 'R', long)]
         repo: Option<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -843,7 +843,7 @@ pub enum RunsCommand {
 
 #[derive(Args)]
 pub struct RunnerArgs {
-    /// Only take jobs from this repository (owner/name).
+    /// Only take jobs from this repository (space/name).
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
     /// Name shown on the jobs this runner takes (default: the host name).
@@ -905,12 +905,15 @@ pub enum AgentCommand {
         /// Remove a profile tag (repeat)
         #[arg(long = "drop-tag")]
         drop_tags: Vec<String>,
-        /// Tracker owner; seeds .gitmatrix/agents.yml (default: origin's owner)
+        /// Tracker Space; seeds .gitmatrix/agents.yml (default: origin's Space)
         #[arg(long)]
-        owner: Option<String>,
+        space: Option<String>,
         /// Team `gm issue next` picks from
         #[arg(long)]
         team: Option<String>,
+        /// Project `gm issue next` picks from
+        #[arg(long)]
+        project: Option<String>,
         /// Only work under this issue, e.g. a project
         #[arg(long)]
         under: Option<String>,
@@ -948,10 +951,10 @@ pub enum AgentCommand {
         #[arg(long)]
         remove: bool,
     },
-    /// Your agents and advisory capabilities, optionally from an owner's tracker
+    /// Your agents and advisory capabilities, optionally from a Space's tracker
     List {
         #[arg(long)]
-        owner: Option<String>,
+        space: Option<String>,
     },
     /// Detect local advisory capabilities without network access
     Detect {
@@ -1037,7 +1040,7 @@ pub struct AskArgs {
     /// The question; '-' reads it from stdin.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub question: Vec<String>,
-    /// owner/name it's about; defaults to this checkout's repository.
+    /// space/name it's about; defaults to this checkout's repository.
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
     /// Continue a conversation (an id from the last answer or `gm assistant list`).
@@ -1092,17 +1095,17 @@ pub struct SchemaArgs {
 /// A package is `<format>/<name>`: `npm/@orbit/web`, `oci/engine`, `pypi/orbit-sdk`.
 #[derive(Subcommand)]
 pub enum PkgCommand {
-    /// An owner's packages, most recently published first
+    /// A Space's packages, most recently published first
     List {
-        /// Owner (user or org). Default: this repository's owner, else you.
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        /// Space handle. Default: this repository's Space or saved tracker Space.
+        #[arg(long)]
+        space: Option<String>,
     },
     /// One package: latest version, tags, sources, counts and the install command
     Show {
         package: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
     /// A package's publishes, newest first, filtered by a query
     Versions {
@@ -1114,10 +1117,10 @@ pub enum PkgCommand {
         limit: usize,
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
-    /// Delete versions (owner admins); name them, or select them with --query
+    /// Delete versions (Space admins); name them, or select them with --query
     Delete(PkgAction),
     /// Yank versions (Cargo, PyPI): still resolvable when pinned, never chosen
     Yank(PkgAction),
@@ -1130,28 +1133,28 @@ pub enum PkgCommand {
         package: String,
         version: String,
         tag: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
     /// Repositories allowed to publish a package
     Sources {
         package: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
-    /// Allow a repository (owner/name) to publish a package
+    /// Allow a repository (space/name) to publish a package
     Grant {
         package: String,
         repo: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
     /// Stop a repository publishing a package
     Revoke {
         package: String,
         repo: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
     /// What a CI run or a commit published (default: the latest run)
     Published {
@@ -1169,15 +1172,15 @@ pub enum PkgCommand {
         file: PathBuf,
         /// <name>/<version>[/<path>]; the file name is used when no path is given.
         target: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
     },
     /// Download a generic artifact, verifying its SHA-256 before saving
     Download {
         /// <name>/<version>/<path>; use latest to resolve the newest published version.
         target: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
         /// Destination file (default: the artifact's basename).
         #[arg(long)]
         dest: Option<PathBuf>,
@@ -1189,8 +1192,8 @@ pub enum PkgCommand {
     Install {
         /// Generic package and installed executable name.
         name: String,
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
         #[arg(long, default_value = "latest")]
         version: String,
         /// Artifact path within the version (default: <os>-<arch>/<name>).
@@ -1202,10 +1205,10 @@ pub enum PkgCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Configure npm, Docker, pip, Cargo… on this machine for an owner's registries
+    /// Configure npm, Docker, pip, Cargo… on this machine for a Space's registries
     Setup {
-        #[arg(short = 'O', long)]
-        owner: Option<String>,
+        #[arg(long)]
+        space: Option<String>,
         /// Also write it: npm (~/.npmrc) and docker (docker login).
         #[arg(long, value_delimiter = ',')]
         write: Vec<String>,
@@ -1223,6 +1226,62 @@ pub struct PkgAction {
     /// Why (shown to npm users on deprecation; recorded on yanks).
     #[arg(long)]
     pub reason: Option<String>,
-    #[arg(short = 'O', long)]
-    pub owner: Option<String>,
+    #[arg(long)]
+    pub space: Option<String>,
+}
+
+#[cfg(test)]
+mod space_surface_tests {
+    use super::*;
+
+    #[test]
+    fn projects_and_explicit_space_are_the_only_tracker_surface() {
+        for args in [
+            vec!["gm", "project", "list", "--space", "orbit"],
+            vec!["gm", "project", "subscribe", "launch", "--repo", "repo-id"],
+            vec![
+                "gm",
+                "issue",
+                "list",
+                "--project",
+                "launch",
+                "--space",
+                "orbit",
+            ],
+            vec![
+                "gm",
+                "issue",
+                "create",
+                "Title",
+                "--team",
+                "ENG",
+                "--project",
+                "launch",
+                "--project",
+                "docs",
+            ],
+            vec![
+                "gm",
+                "tracker",
+                "export",
+                "old.sqlite",
+                "--destination",
+                "recovery.sqlite",
+                "--output",
+                "json",
+            ],
+            vec!["gm", "repo", "create", "demo", "--space", "orbit"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+        }
+        for args in [
+            vec!["gm", "workspace", "list"],
+            vec!["gm", "issue", "list", "--owner", "orbit"],
+            vec!["gm", "issue", "list", "--workspace", "launch"],
+            vec!["gm", "repo", "create", "demo"],
+            vec!["gm", "pkg", "list", "--owner", "orbit"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
 }

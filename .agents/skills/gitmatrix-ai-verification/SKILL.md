@@ -57,7 +57,7 @@ a `checksum.ts` file linked to `copperFinchChecksum`; a generated overview
 explaining checksum behavior at that commit; and both the matching Vectorize
 entity and an AI Search code passage containing the fixture function and modulus.
 After daily/tag release-note stages, it completes `CF-1` in a subscribed
-workspace and pushes a citing commit on a new day. That day's issue entry must
+Project and pushes a citing commit on a new day. That day's issue entry must
 record `CF-1`, team `CF`, the commit and a model, be non-internal and describe
 batch parcel verification; the earlier tag stays unchanged and `team:cf` includes
 it (`issueNotes`, `teamFeed` in `ai-e2e.json`).
@@ -66,7 +66,7 @@ The owned-source stages in `tools/agent/provider-e2e.ts` create `copper-limits`
 through the timeline API at a pinned earlier canonical snapshot. They assert
 `work_<id>` identity, `timeline-work` kind, timeline/repository identity,
 `refs/heads/work`, and exact logical-base commit/tree, then push twice through
-`/<owner>/<repo>@<slug>.git` to `HEAD:refs/heads/work`. The local branch
+`/<space>/<repo>@<slug>.git` to `HEAD:refs/heads/work`. The local branch
 and overlay label `timeline/copper-limits` are not a canonical timeline branch.
 Source-qualified overlays must track both exact heads, add `limits.ts` and its
 symbols, measure against main's indexed graph from the pinned fork point, and

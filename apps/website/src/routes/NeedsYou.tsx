@@ -5,7 +5,13 @@
 
 import { useState } from "react";
 import { Link, useLoaderData, useRevalidator, type LoaderFunctionArgs } from "react-router";
-import type { Mutation, OpenRequest, OpenRequests, RequestHistory } from "../../shared/tracker.ts";
+import type {
+  Mutation,
+  OpenRequest,
+  OpenRequests,
+  RequestHistory,
+  Snapshot,
+} from "../../shared/tracker.ts";
 import { Page } from "../components/AppShell.tsx";
 import { FormError } from "../components/ui.tsx";
 import { api, ApiError, load } from "../lib/api.ts";
@@ -60,9 +66,18 @@ function Waiting({ requests, names }: OpenRequests) {
 
   const send = async (item: OpenRequest, mutation: Mutation) => {
     try {
+      const snapshot = await api<Snapshot>(
+        `/tracker/${encodeURIComponent(item.tracker.slug)}/snapshot`,
+      );
       await api(`/tracker/${encodeURIComponent(item.tracker.slug)}/mutate`, {
         method: "POST",
-        json: { operationId: crypto.randomUUID(), mutations: [mutation] },
+        json: {
+          contractVersion: snapshot.contractVersion,
+          spaceId: snapshot.spaceId,
+          migrationEpoch: snapshot.migrationEpoch,
+          operationId: crypto.randomUUID(),
+          mutations: [mutation],
+        },
       });
       await revalidator.revalidate();
       // The rail's count follows what was just answered or cancelled.

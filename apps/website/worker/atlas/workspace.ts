@@ -1,5 +1,5 @@
 // The Atlas across an explicit workspace scope (CORE-161), mounted at
-// /api/accounts/:owner/atlas.
+// /api/spaces/:space/atlas.
 //
 //   GET /overview?repos=a,b[&snapshot=]                 regions of every selected repository, ranked together,
 //                                                       and each repository's imports between its own
@@ -13,16 +13,16 @@
 //   GET /timeline?repos=…&ref=timeline/<slug>[&within=]  a timeline across the selected repositories (CORE-186)
 //
 // The scope. A workspace scope is the set of repositories the caller selected
-// (`repos`, names under :owner, at most ATLAS_WORKSPACE_MAX_REPOS) intersected
+// (`repos`, names under :space, at most ATLAS_WORKSPACE_MAX_REPOS) intersected
 // with what they can read *now*: one SQL query with readableRepo (worker/db.ts)
-// on every request, cursor or not. Its id is `ws:<ownerId>:<hash of the sorted
+// on every request, cursor or not. Its id is `ws:<spaceId>:<hash of the sorted
 // authorized repository ids>`, so it names exactly the authorized input set.
 // Nothing about a selected repository the caller can't read reaches the
 // response: a hidden or nonexistent name is dropped by the same query, the
 // response is byte-for-byte what selecting only the readable ones gives, and
 // it is never counted. Selection is a query parameter, not stored state: no
 // subscription, and nothing here starts or enables a Knowledge build (a tracker
-// workspace's repositories can seed it client-side).
+// project's repositories can seed it client-side).
 //
 // Composition is virtual. Every response reads the selected repositories' own
 // published projections (worker/atlas/projection.ts) at read time; nothing is
@@ -40,7 +40,7 @@
 //
 // Why not materialize? A materialized composite would be a cache keyed by the
 // authorized set and principal policy, multiply storage per selection (against
-// the account composition pool in retention.ts) and need invalidation on every
+// the Space composition pool in retention.ts) and need invalidation on every
 // visibility change. Reading per-repository snapshots needs none of that: its
 // cache identity is the per-repository snapshots themselves, which only an
 // authorized request ever touches, so a denied repository can't influence
@@ -88,7 +88,10 @@ import {
   type AtlasTimelineRepo,
 } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
-import { findAccountBySlug, readableRepo, selectRepos } from "../db.ts";
+import type { SpaceSummary } from "../../shared/spaces.ts";
+import { readableRepo, selectRepos } from "../db.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
 import { sha256 } from "../knowledge/util.ts";
 import {
   analysisOf,
@@ -161,7 +164,7 @@ export const workspaceAtlas = new Hono<AppEnv>();
 
 type C = Context<AppEnv>;
 
-const SNAPSHOT_VERSION = "ws1";
+const SNAPSHOT_VERSION = "ws4";
 
 /** A selected repository the caller can read. */
 interface Member {
@@ -177,7 +180,7 @@ interface Read extends Member {
 }
 
 interface Scope<K> {
-  owner: { id: string; slug: string };
+  space: SpaceSummary;
   scope: string;
   /** Short form of the scope hash; composite snapshot ids carry it. */
   tag: string;
@@ -195,7 +198,7 @@ interface Scope<K> {
 // ---- the authorized scope ------------------------------------------------------
 
 /** Repository names the request selects, or a response saying why it can't. */
-function selection(c: C, ownerSlug: string): string[] | Response {
+function selection(c: C, spaceSlug: string): string[] | Response {
   const raw = c.req.query("repos") ?? "";
   if (raw.length > 8192) return failWith(c, 400, "bad_request", "That selection is too long.");
   const names = new Set<string>();
@@ -203,9 +206,9 @@ function selection(c: C, ownerSlug: string): string[] | Response {
     const entry = part.trim();
     if (!entry) continue;
     const slash = entry.indexOf("/");
-    // "name" or "<owner>/name"; another owner's repository never matches.
+    // "name" or "<space>/name"; another Space's repository never matches.
     const name =
-      slash < 0 ? entry : entry.slice(0, slash) === ownerSlug ? entry.slice(slash + 1) : null;
+      slash < 0 ? entry : entry.slice(0, slash) === spaceSlug ? entry.slice(slash + 1) : null;
     if (name && name.length <= 100 && !name.includes("/")) names.add(name);
     else names.add("\u0000"); // Matches nothing, like a name that doesn't exist.
   }
@@ -224,22 +227,20 @@ function selection(c: C, ownerSlug: string): string[] | Response {
 const SCOPE_EMPTY = "None of the selected repositories has an Atlas you can open.";
 
 /**
- * Resolve the scope: the owner, then the selected repositories the actor can
+ * Resolve the scope: the Space, then the selected repositories the actor can
  * read, authorized in SQL so a hidden repository never leaves the database.
  */
 async function authorize(
   c: C,
-): Promise<
-  { owner: { id: string; slug: string }; members: Member[]; scope: string; tag: string } | Response
-> {
-  const ownerSlug = c.req.param("owner") ?? "";
-  const owner = await findAccountBySlug(c.env.DB, ownerSlug);
-  if (!owner) return failWith(c, 404, "scope_empty", SCOPE_EMPTY);
-  const names = selection(c, owner.slug);
+): Promise<{ space: SpaceSummary; members: Member[]; scope: string; tag: string } | Response> {
+  const spaceSlug = c.req.param("space") ?? "";
+  const space = await findSpaceBySlug(c.env.DB, spaceSlug);
+  if (!space) return failWith(c, 404, "scope_empty", SCOPE_EMPTY);
+  const names = selection(c, space.slug);
   if (names instanceof Response) return names;
   const actor = c.get("actor");
   const rows = await selectRepos(c.env.DB, actor?.id ?? "")
-    .where("r.owner_id", "=", owner.id)
+    .where("r.space_id", "=", space.id)
     .where("r.name", "in", names)
     .where(readableRepo(actor))
     .orderBy("r.id")
@@ -251,11 +252,28 @@ async function authorize(
     visibility: r.visibility,
     scope: repoScope(r.id),
   }));
-  const hash = await sha256(JSON.stringify(members.map((m) => m.id)));
+  const admission = await cutoverControl(c.env).admission(4);
+  if (!admission.allowed)
+    return c.json(
+      {
+        error: "Content is fenced for Space migration. Retry after activation.",
+        code: "space_cutover_fenced",
+      },
+      503,
+    );
+  const hash = await sha256(
+    JSON.stringify([
+      4,
+      admission.epoch,
+      space.id,
+      space.authorizationVersion,
+      members.map((m) => m.id),
+    ]),
+  );
   return {
-    owner: { id: owner.id, slug: owner.slug },
+    space,
     members,
-    scope: `ws:${owner.id}:${hash.slice(0, 32)}`,
+    scope: `ws:${space.id}:${hash.slice(0, 32)}`,
     tag: hash.slice(0, 12),
   };
 }
@@ -303,7 +321,7 @@ async function pin<K>(
 ): Promise<{ ctx: Scope<K>; target: Read | null } | Response> {
   const authorized = await authorize(c);
   if (authorized instanceof Response) return authorized;
-  const { owner, members, scope, tag } = authorized;
+  const { space, members, scope, tag } = authorized;
   const d1 = c.env.DB;
   const secret = await cursorSecret(c.env);
   const binding: CursorBinding = {
@@ -394,7 +412,7 @@ async function pin<K>(
   }
   const snapshotId = pinnedId ?? currentId;
   return {
-    ctx: { owner, scope, tag, members, read, snapshotId, cursor, binding, secret },
+    ctx: { space, scope, tag, members, read, snapshotId, cursor, binding, secret },
     target: target ? (read.find((r) => r.id === target.id) ?? null) : null,
   };
 }
@@ -461,7 +479,7 @@ async function describe(
             : "not-enabled";
       const repo: AtlasWorkspaceRepo = {
         id: r.id,
-        owner: ctx.owner.slug,
+        space: ctx.space.slug,
         name: r.name,
         visibility: r.visibility,
         state,
@@ -482,7 +500,7 @@ async function envelope(
 ): Promise<AtlasWorkspaceEnvelope> {
   return {
     scope: ctx.scope,
-    owner: ctx.owner,
+    space: ctx.space,
     snapshot: { id: ctx.snapshotId, repos: await describe(c, ctx, which, withCapacity) },
   };
 }

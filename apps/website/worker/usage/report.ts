@@ -1,9 +1,8 @@
-// The usage and cost report (CORE-209): CORE-207's daily usage snapshots priced
-// with CORE-208's catalog, for one account (its administrators) or the whole
-// site (site administrators).
+// Usage and cost reports: live Space administrators, personal self-service,
+// or Instance operators. Attribution always includes kind and immutable ID.
 //
-// - Storage is as of the latest day whose collection finished for the account
-//   (or the site), priced as if it stayed that size for a month (GB-month).
+// - Storage is as of the latest day whose collection finished for the scope
+//   (or the Instance aggregate), priced as if it stayed that size for a month (GB-month).
 // - Activity (Workers AI tokens) is summed over the 30 days up to then; with
 //   fewer days measured it is extrapolated to 30 and labelled estimated.
 // - Every cost is the figure × the catalog's list price in effect that day, in
@@ -11,8 +10,8 @@
 //   on the Cloudflare account, so nothing is subtracted: gross list price.
 //   A price whose billing hasn't started yet (Artifacts until 2026-10-14, AI
 //   Search until 2026-11-01) is shown with its start and kept out of totals.
-// - Bounded: one account's window is ≤ 30 days of its rows; the site report
-//   reads SQL aggregates, and at most MAX_ACCOUNTS accounts' totals.
+// - Bounded: one scope's window is ≤ 30 days of its rows; Instance reports
+//   read SQL aggregates and return at most MAX_SUBJECTS distinct subjects.
 
 import {
   GB,
@@ -31,6 +30,8 @@ import {
   type UsageLine,
   type UsageAttribution,
   type UsageReport,
+  type UsageScope,
+  type UsageSubject,
   type UsageTrendDay,
 } from "../../shared/usage.ts";
 import { category } from "../retention/categories.ts";
@@ -41,9 +42,7 @@ import { catalogVersion, priceOn, priceTimeline } from "./prices.ts";
 import { TABLE_GROUPS } from "./tables.ts";
 
 export const WINDOW_DAYS = 30;
-export const MAX_ACCOUNTS = 200;
-/** Where the site's own figures (data no account owns) are filed. */
-const SITE = "";
+export const MAX_SUBJECTS = 200;
 
 export interface SnapshotRow {
   day: string;
@@ -121,6 +120,7 @@ const R2_ITEMS: Record<string, string> = {
   registry_derived: "Registry index files",
   registry_blobs_all: "Registry blobs (every blob once)",
   avatars: "Profile pictures",
+  organization_avatars: "Organization pictures",
 };
 const OTHER_ITEMS: Record<string, string> = {
   "artifacts/repositories": "Git repositories",
@@ -152,13 +152,13 @@ const CATEGORY_IDS: Record<string, string[]> = {
 export function lineCategories(
   construct: UsageConstruct,
   item: string,
-  scope: "account" | "site",
+  scope: UsageScope["kind"],
 ): UsageCategoryLink[] {
   const ids = CATEGORY_IDS[`${construct}/${item}`] ?? (construct === "d1" ? [item] : []);
   return ids.flatMap((id) => {
     const found = category(id);
-    // An account's administrators manage only account categories.
-    if (!found || (scope === "account" && found.scope !== "account")) return [];
+    // Scoped pages must not link to another scope's policy.
+    if (!found || (scope !== "instance" && found.scope !== scope)) return [];
     return [
       { id: found.id, label: found.label, description: found.description, scope: found.scope },
     ];
@@ -239,7 +239,7 @@ function pricedFigure(
 
 function line(
   pricing: Pricing,
-  scope: "account" | "site",
+  scope: UsageScope["kind"],
   construct: UsageConstruct,
   item: string,
   kind: "storage" | "activity",
@@ -284,31 +284,35 @@ export const addDays = (day: string, n: number) =>
 /** The collection's progress (CORE-207's cursor): which days are complete for whom. */
 export interface CollectionCursor {
   day: string;
-  account: string;
+  scope: UsageScope;
   done: boolean;
 }
 
-/** Whether `day`'s collection has finished for an account (or, with null, the whole site). */
-export function collected(cursor: CollectionCursor | null, day: string, account: string | null) {
+/** Null requests the complete Instance aggregate, not a single attribution. */
+export function collected(cursor: CollectionCursor | null, day: string, scope: UsageScope | null) {
   if (!cursor || cursor.day > day) return true;
   if (cursor.day < day) return false;
   if (cursor.done) return true;
-  // Accounts are collected in id order after the site ('').
-  return account !== null && account !== cursor.account && account < cursor.account;
+  // Collection order is Instance, people by ID, then Spaces by ID.
+  return (
+    scope !== null &&
+    (scope.kind < cursor.scope.kind ||
+      (scope.kind === cursor.scope.kind && scope.id < cursor.scope.id))
+  );
 }
 
 // ---- the report -------------------------------------------------------------------
 
 export interface ReportInput {
-  scope: "account" | "site";
-  account: { slug: string; displayName: string } | null;
-  /** Every snapshot row in the window (for the site, summed over accounts). */
+  scope: UsageScope["kind"];
+  subject: UsageSubject | null;
+  /** Every snapshot row in the window; Instance reports aggregate all scopes. */
   rows: readonly SnapshotRow[];
   /** The day storage figures describe. */
   asOf: string | null;
   timeline: readonly CatalogPrice[];
   version: number;
-  accounts?: UsageReport["accounts"];
+  subjects?: UsageReport["subjects"];
   partial?: boolean;
 }
 
@@ -353,7 +357,7 @@ export function pricing(
 /** Group a window's rows into priced lines: storage as of `asOf`, activity summed. */
 export function priceLines(
   rows: readonly SnapshotRow[],
-  scope: "account" | "site",
+  scope: UsageScope["kind"],
   p: Pricing,
   from: string,
 ): UsageLine[] {
@@ -410,7 +414,7 @@ export function buildReport(input: ReportInput): UsageReport {
     const today = new Date().toISOString().slice(0, 10);
     return {
       scope: input.scope,
-      account: input.account,
+      subject: input.subject,
       asOf: null,
       window: { ...windowOf(today), daysMeasured: 0 },
       collectedAt: null,
@@ -418,7 +422,7 @@ export function buildReport(input: ReportInput): UsageReport {
       constructs: [],
       trend: [],
       catalog,
-      accounts: input.accounts ?? null,
+      subjects: input.subjects ?? null,
       notes: [...notes, "Usage hasn't been collected yet; the hourly collection fills this in."],
     };
   }
@@ -482,7 +486,7 @@ export function buildReport(input: ReportInput): UsageReport {
   );
   return {
     scope: input.scope,
-    account: input.account,
+    subject: input.subject,
     asOf: input.asOf,
     window: { from, to, daysMeasured: measured.size },
     collectedAt,
@@ -490,7 +494,7 @@ export function buildReport(input: ReportInput): UsageReport {
     constructs,
     trend,
     catalog,
-    accounts: input.accounts ?? null,
+    subjects: input.subjects ?? null,
     notes: input.partial
       ? [...notes, "Today's collection is still running; these are the latest complete figures."]
       : notes,
@@ -503,7 +507,7 @@ async function loadCursor(d1: D1Database): Promise<CollectionCursor | null> {
   const row = await db(d1)
     .selectFrom("job_cursors")
     .select("cursor")
-    .where("name", "=", "usage:collect")
+    .where("name", "=", "usage:collect:v4")
     .executeTakeFirst();
   if (!row) return null;
   try {
@@ -513,10 +517,10 @@ async function loadCursor(d1: D1Database): Promise<CollectionCursor | null> {
   }
 }
 
-/** The latest storage day whose collection finished for the account (or site), else the latest. */
+/** Latest storage day whose collection finished for this scope, else the latest. */
 async function reportDay(
   d1: D1Database,
-  accountId: string | null,
+  scope: UsageScope | null,
 ): Promise<{ asOf: string | null; partial: boolean }> {
   let query = db(d1)
     .selectFrom("usage_snapshots")
@@ -525,9 +529,10 @@ async function reportDay(
     .where("kind", "=", "storage")
     .orderBy("day", "desc")
     .limit(2);
-  if (accountId !== null) query = query.where("account_id", "=", accountId);
+  if (scope !== null)
+    query = query.where("scope_kind", "=", scope.kind).where("scope_id", "=", scope.id);
   const [days, cursor] = await Promise.all([query.execute(), loadCursor(d1)]);
-  const complete = days.find((d) => collected(cursor, d.day, accountId));
+  const complete = days.find((d) => collected(cursor, d.day, scope));
   return {
     asOf: complete?.day ?? days[0]?.day ?? null,
     partial: Boolean(days[0] && complete?.day !== days[0].day),
@@ -558,15 +563,13 @@ function asRow(r: {
   };
 }
 
-/** One account's report. */
 /**
- * What Knowledge builds cost over the last 30 days (CORE-286), from each
- * build's own meter: updates after pushes and full rebuilds, for one account
- * (or every account, `null`).
+ * Knowledge build costs over the last 30 days, for one Space or the
+ * operator-only Instance aggregate (`null`). Never called for person usage.
  */
 export async function knowledgeUpdateSpend(
   d1: D1Database,
-  accountId: string | null,
+  spaceId: string | null,
   now = new Date(),
 ): Promise<KnowledgeUpdateSpend> {
   const from = addDays(now.toISOString().slice(0, 10), -WINDOW_DAYS);
@@ -580,11 +583,11 @@ export async function knowledgeUpdateSpend(
               coalesce(sum(json_extract(b.stats, '$.aiUsage.costUsd')), 0) AS cost
          FROM kg_builds b
          JOIN repos r ON r.id = b.repo_id
-         JOIN accounts o ON o.id = r.owner_id
-        WHERE b.started_at >= ?1 AND b.status <> 'running' AND (?2 IS NULL OR r.owner_id = ?2)
+         JOIN spaces o ON o.id = r.space_id
+        WHERE b.started_at >= ?1 AND b.status <> 'running' AND (?2 IS NULL OR r.space_id = ?2)
         GROUP BY r.id, mode`,
     )
-    .bind(from, accountId)
+    .bind(from, spaceId)
     .all<{
       name: string;
       mode: string;
@@ -638,12 +641,21 @@ export async function knowledgeUpdateSpend(
   };
 }
 
-export async function accountUsageReport(
+export function spaceUsageReport(d1: D1Database, space: UsageSubject): Promise<UsageReport> {
+  return scopedUsageReport(d1, "space", space);
+}
+
+export function personUsageReport(d1: D1Database, person: UsageSubject): Promise<UsageReport> {
+  return scopedUsageReport(d1, "person", person);
+}
+
+async function scopedUsageReport(
   d1: D1Database,
-  account: { id: string; slug: string; display_name: string },
+  kind: "space" | "person",
+  subject: UsageSubject,
 ): Promise<UsageReport> {
   const [{ asOf, partial }, timeline, version] = await Promise.all([
-    reportDay(d1, account.id),
+    reportDay(d1, { kind, id: subject.id }),
     priceTimeline(d1),
     catalogVersion(d1),
   ]);
@@ -662,7 +674,8 @@ export async function accountUsageReport(
             "method",
             "collected_at",
           ])
-          .where("account_id", "=", account.id)
+          .where("scope_kind", "=", kind)
+          .where("scope_id", "=", subject.id)
           .where("day", ">=", windowOf(asOf).from)
           .where("day", "<=", asOf)
           .limit(20_000)
@@ -670,8 +683,8 @@ export async function accountUsageReport(
       ).map(asRow)
     : [];
   const report = buildReport({
-    scope: "account",
-    account: { slug: account.slug, displayName: account.display_name },
+    scope: kind,
+    subject: { id: subject.id, slug: subject.slug, displayName: subject.displayName },
     rows,
     asOf,
     timeline,
@@ -680,15 +693,15 @@ export async function accountUsageReport(
   });
   return {
     ...report,
-    knowledgeUpdates: await knowledgeUpdateSpend(d1, account.id),
-    attribution: await attributionFor(d1, account.id, report, timeline),
+    knowledgeUpdates: kind === "space" ? await knowledgeUpdateSpend(d1, subject.id) : null,
+    attribution: await attributionFor(d1, { kind, id: subject.id }, report, timeline),
   };
 }
 
 /** The report's window costs by person, agent and timeline (CORE-222), priced like it. */
 async function attributionFor(
   d1: D1Database,
-  account: string | null,
+  scope: UsageScope | null,
   report: UsageReport,
   timeline: readonly CatalogPrice[],
 ): Promise<UsageAttribution | null> {
@@ -696,7 +709,8 @@ async function attributionFor(
   // Attribution reads every job and call in the window: nothing to extrapolate.
   const p = pricing(timeline, report.asOf, WINDOW_DAYS);
   return attributionReport(d1, {
-    account,
+    // Null: the whole Instance.
+    scope,
     from: report.window.from,
     to: report.window.to,
     asOf: report.asOf,
@@ -704,16 +718,15 @@ async function attributionFor(
       .flatMap((c) => c.lines)
       .filter((l) => l.kind === "storage")
       .reduce((sum, l) => sum + l.monthlyUsd, 0),
-    price: (rows) => priceLines(rows, account ? "account" : "site", p, report.window.from),
+    price: (rows) => priceLines(rows, scope?.kind ?? "instance", p, report.window.from),
   });
 }
 
 /**
- * The site's report: every account's figures summed (an account's registry
- * blobs overlap with other accounts', so the site counts the registry's own
- * once-per-blob figure instead), the site's own data, and each account's total.
+ * Instance aggregate: all attributed figures, shared registry blobs counted
+ * once, and separate Space/person totals.
  */
-export async function siteUsageReport(d1: D1Database): Promise<UsageReport> {
+export async function instanceUsageReport(d1: D1Database): Promise<UsageReport> {
   const [{ asOf, partial }, timeline, version] = await Promise.all([
     reportDay(d1, null),
     priceTimeline(d1),
@@ -721,13 +734,13 @@ export async function siteUsageReport(d1: D1Database): Promise<UsageReport> {
   ]);
   if (!asOf)
     return buildReport({
-      scope: "site",
-      account: null,
+      scope: "instance",
+      subject: null,
       rows: [],
       asOf,
       timeline,
       version,
-      accounts: [],
+      subjects: [],
     });
   const { from } = windowOf(asOf);
   const summed = await d1
@@ -736,69 +749,87 @@ export async function siteUsageReport(d1: D1Database): Promise<UsageReport> {
               MIN(method) AS method, MAX(collected_at) AS collected_at
          FROM usage_snapshots
         WHERE day >= ?1 AND day <= ?2
-          AND NOT (account_id <> ?3 AND construct = 'r2' AND item = 'registry_blobs')
+          AND NOT (scope_kind <> 'instance' AND construct = 'r2' AND item = 'registry_blobs')
         GROUP BY day, construct, item, metric, kind
         LIMIT 20000`,
     )
-    .bind(from, asOf, SITE)
+    .bind(from, asOf)
     .all<Parameters<typeof asRow>[0]>();
   const rows = summed.results.map(asRow);
   const p = pricing(timeline, asOf, activityDays(rows, from, asOf).size);
 
-  // Each account's total: its latest storage and the window's activity, priced figures only.
-  const metrics = PRICED_METRICS.map((_, i) => `?${i + 5}`).join(", ");
-  const perAccount = await d1
+  // Both identity columns participate in grouping, including legacy equal IDs.
+  const metrics = PRICED_METRICS.map((_, i) => `?${i + 4}`).join(", ");
+  const perSubject = await d1
     .prepare(
-      `SELECT s.account_id AS account_id,
-              CASE s.kind WHEN 'storage' THEN ?2 ELSE ?4 END AS day,
-              s.construct AS construct, s.item AS item,
-              s.metric AS metric, s.kind AS kind, SUM(s.quantity) AS quantity,
+      `SELECT s.scope_kind, s.scope_id, n.slug, n.display_name,
+              CASE s.kind WHEN 'storage' THEN ?2 ELSE ?3 END AS day,
+              s.construct, s.item, s.metric, s.kind, SUM(s.quantity) AS quantity,
               MAX(s.estimated) AS estimated, '' AS method, MAX(s.collected_at) AS collected_at
          FROM usage_snapshots s
-         JOIN (SELECT account_id, MAX(day) AS latest FROM usage_snapshots
-                WHERE kind = 'storage' AND day >= ?1 AND day <= ?2 AND account_id <> ?3
-                GROUP BY account_id) l ON l.account_id = s.account_id
+         JOIN (SELECT scope_kind, scope_id, MAX(day) AS latest FROM usage_snapshots
+                WHERE kind = 'storage' AND day >= ?1 AND day <= ?2 AND scope_kind <> 'instance'
+                GROUP BY scope_kind, scope_id) l
+           ON l.scope_kind = s.scope_kind AND l.scope_id = s.scope_id
+         JOIN (SELECT 'space' AS scope_kind, id, slug, display_name FROM spaces
+               UNION ALL SELECT 'person', id, slug, display_name FROM accounts) n
+           ON n.scope_kind = s.scope_kind AND n.id = s.scope_id
         WHERE ((s.kind = 'storage' AND s.day = l.latest) OR (s.kind = 'activity' AND s.day >= ?1 AND s.day <= ?2))
           AND s.metric IN (${metrics})
-        GROUP BY s.account_id, s.construct, s.item, s.metric, s.kind
+        GROUP BY s.scope_kind, s.scope_id, s.construct, s.item, s.metric, s.kind
         LIMIT 20000`,
     )
-    .bind(from, asOf, SITE, windowOf(asOf).to, ...PRICED_METRICS)
-    .all<Parameters<typeof asRow>[0] & { account_id: string }>();
-  const totals = new Map<string, number>();
-  const byAccount = new Map<string, SnapshotRow[]>();
-  for (const r of perAccount.results) {
-    const list = byAccount.get(r.account_id) ?? [];
-    list.push(asRow(r));
-    byAccount.set(r.account_id, list);
+    .bind(from, asOf, windowOf(asOf).to, ...PRICED_METRICS)
+    .all<
+      Parameters<typeof asRow>[0] & {
+        scope_kind: "space" | "person";
+        scope_id: string;
+        slug: string;
+        display_name: string;
+      }
+    >();
+  const groups = new Map<
+    string,
+    {
+      subject: UsageSubject & { scope: "space" | "person" };
+      rows: SnapshotRow[];
+    }
+  >();
+  for (const r of perSubject.results) {
+    const key = `${r.scope_kind}:${r.scope_id}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        subject: { scope: r.scope_kind, id: r.scope_id, slug: r.slug, displayName: r.display_name },
+        rows: [],
+      };
+      groups.set(key, group);
+    }
+    group.rows.push(asRow(r));
   }
-  for (const [id, list] of byAccount) {
-    const lines = priceLines(list, "site", p, from);
-    totals.set(
-      id,
-      lines.reduce((sum, l) => sum + l.monthlyUsd, 0),
-    );
-  }
-  const ids = [...totals.keys()];
-  const names = ids.length
-    ? await db(d1)
-        .selectFrom("accounts")
-        .select(["id", "slug", "display_name"])
-        .where("id", "in", ids.slice(0, 1000))
-        .execute()
-    : [];
-  const accounts = names
-    .map((a) => ({ slug: a.slug, displayName: a.display_name, monthlyUsd: totals.get(a.id) ?? 0 }))
-    .toSorted((a, b) => b.monthlyUsd - a.monthlyUsd || a.slug.localeCompare(b.slug))
-    .slice(0, MAX_ACCOUNTS);
+  const subjects = [...groups.values()]
+    .map(({ subject, rows }) => ({
+      ...subject,
+      monthlyUsd: priceLines(rows, subject.scope, p, from).reduce(
+        (sum, line) => sum + line.monthlyUsd,
+        0,
+      ),
+    }))
+    .toSorted(
+      (a, b) =>
+        b.monthlyUsd - a.monthlyUsd ||
+        a.scope.localeCompare(b.scope) ||
+        a.slug.localeCompare(b.slug),
+    )
+    .slice(0, MAX_SUBJECTS);
   const report = buildReport({
-    scope: "site",
-    account: null,
+    scope: "instance",
+    subject: null,
     rows,
     asOf,
     timeline,
     version,
-    accounts,
+    subjects,
     partial,
   });
   return {

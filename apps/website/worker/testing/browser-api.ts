@@ -5,7 +5,7 @@
 // over the migrated schema and the development seed, without a dev server.
 //
 // Each test makes its own "world": a database with the personas, the
-// repositories it creates and the refs it pushes, and a tracker per account.
+// repositories it creates and the refs it pushes, and a tracker per Space.
 // Requests act as the world's persona. Bindings are the non-AI agent
 // environment's: no model, index or queue; Artifacts remotes hold refs and
 // accept ref-only pushes (worker/testing/remote.ts) but no objects; the
@@ -15,18 +15,20 @@
 // Anything that needs more (file contents, CI runners, real sessions) belongs
 // in a canned response or in E2E.
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import type { AppEnv } from "../auth.ts";
+import { isActorCredentialLive, type AppEnv } from "../auth.ts";
 import { accounts } from "../api/accounts.ts";
 import { personalSkillsApi } from "../api/personal-skills.ts";
 import { assistant } from "../api/assistant.ts";
 import { dev } from "../api/dev.ts";
 import { repos } from "../api/repos.ts";
+import { organizations } from "../api/organizations.ts";
+import { spaces } from "../api/spaces.ts";
+import { contentContractGate } from "../api/content-contract.ts";
 import { workspaceAtlas } from "../atlas/workspace.ts";
 import { atlas } from "../atlas/api.ts";
 import { findRepo, findUserById } from "../db.ts";
@@ -36,9 +38,17 @@ import { refs } from "../refs/api.ts";
 import { trackerReleaseNotes } from "../release-notes/api.ts";
 import { search } from "../search/api.ts";
 import { aiProvidersApi } from "../ai-providers/api.ts";
-import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
+import { aiSettingsApi, personAiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
+import {
+  spaceRetentionApi,
+  spaceRunsApi,
+  personRetentionApi,
+  personRunsApi,
+  instanceRetentionApi,
+} from "../retention/api.ts";
+import { spaceUsageApi, personUsageApi, instanceUsageApi } from "../usage/report-api.ts";
 import { steps } from "../steps/api.ts";
-import { StepFeed } from "../steps/feed.ts";
+import { StepFeed, sseEvent, sseRemoved, type StepFeedAccess } from "../steps/feed.ts";
 import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
 import { resolveSource } from "../timelines/sources.ts";
@@ -49,10 +59,11 @@ import { agents } from "../api/agents.ts";
 import { createAuth } from "../better-auth.ts";
 import { Tracker } from "../tracker/object.ts";
 import { fakeProviders, isProviderUrl } from "./ai-providers.ts";
-import { d1, migratedDatabase } from "./d1.ts";
-import { durableStorage } from "./durable.ts";
-import { fakeDurableState } from "./durable-state.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "./d1.ts";
+import { fakeDurableObjectId, fakeDurableState } from "./durable-state.ts";
 import { fakeRemotes } from "./remote.ts";
+import { installCutoverTestControl } from "./space-cutover.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 
 /** Who a world's requests act as: a seeded persona, or nobody (signed out). */
 export type Persona = "priya" | "marco" | "jun" | "sam" | "fward" | null;
@@ -80,6 +91,9 @@ interface World {
   persona: Persona;
   env: Env;
   git: ReturnType<typeof fakeRemotes>;
+  credentials: Map<string, string>;
+  pending: Set<Promise<void>>;
+  close(): void;
 }
 
 const worlds = new Map<string, World>();
@@ -90,13 +104,6 @@ function sqlFiles(dir: string): string[] {
     .filter((f) => f.endsWith(".sql"))
     .sort()
     .map((f) => readFileSync(join(path, f), "utf8"));
-}
-
-function registryDatabase(): DatabaseSync {
-  const sqlite = new DatabaseSync(":memory:");
-  for (const sql of sqlFiles(new URL("../../registry/migrations/", import.meta.url).href))
-    sqlite.exec(sql);
-  return sqlite;
 }
 
 /** A binding the in-memory API must never reach: the call fails loudly. */
@@ -118,24 +125,33 @@ class BrowserStepFeed extends StepFeed {
     const url = new URL(request.url);
     const raw = request.headers.get("last-event-id") ?? url.searchParams.get("after");
     const after = raw && /^\d+$/.test(raw) ? Number(raw) : 0;
-    return new Response(await this.replay(after), {
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-store",
+    const access = JSON.parse(
+      request.headers.get("x-step-feed-access") ?? "null",
+    ) as StepFeedAccess | null;
+    if (!access) return new Response("Step feed access required.", { status: 403 });
+    // As the real feed replays: every removal (CORE-399), then the records after `after`.
+    const backlog = await this.since(access, after);
+    const removals = await this.removals();
+    return new Response(
+      `retry: 5000\n: ${backlog.length} record(s)\n\n${removals.map(sseRemoved).join("")}${backlog.map(sseEvent).join("")}`,
+      {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-store",
+        },
       },
-    });
+    );
   }
 }
 
-function createWorld(persona: Persona): string {
+async function createWorld(persona: Persona): Promise<string> {
   const sqlite = migratedDatabase();
-  for (const sql of sqlFiles(new URL("../../seed/", import.meta.url).href)) sqlite.exec(sql);
   const git = fakeRemotes();
   const trackers = new Map<string, Tracker>();
   const feeds = new Map<string, BrowserStepFeed>();
   const env: Env = {
     DB: d1(sqlite),
-    REGISTRY_DB: d1(registryDatabase()),
+    REGISTRY_DB: d1(migratedRegistryDatabase()),
     DEV_MODE: "true",
     BETTER_AUTH_SECRET: "browser-tests-browser-tests-browser-tests",
     // Password sign-in counts failures here; nothing is ever locked out.
@@ -152,10 +168,10 @@ function createWorld(persona: Persona): string {
       }),
     },
     TRACKER: {
+      idFromName: fakeDurableObjectId,
       getByName: (id: string) => {
         if (!trackers.has(id)) {
-          const { sql, transactionSync } = durableStorage();
-          const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
+          const ctx = fakeDurableState({ name: id }).ctx;
           trackers.set(id, new Tracker(ctx, env));
         }
         return trackers.get(id);
@@ -184,8 +200,25 @@ function createWorld(persona: Persona): string {
     KNOWLEDGE_QUEUE: absent("KNOWLEDGE_QUEUE"),
     KNOWLEDGE_BUILD: absent("KNOWLEDGE_BUILD"),
   } as unknown as Env;
+  const cutover = installCutoverTestControl(env);
+  await initializeFreshSpaceInstallation(env);
+  sqlite.exec("BEGIN");
+  try {
+    for (const sql of sqlFiles(new URL("../../seed/", import.meta.url).href)) sqlite.exec(sql);
+    sqlite.exec("COMMIT");
+  } catch (error) {
+    sqlite.exec("ROLLBACK");
+    throw error;
+  }
   const id = randomUUID();
-  worlds.set(id, { persona, env, git });
+  worlds.set(id, {
+    persona,
+    env,
+    git,
+    credentials: new Map(),
+    pending: new Set(),
+    close: cutover.close,
+  });
   return id;
 }
 
@@ -231,29 +264,66 @@ app.use(async (c, next) => {
     const person = await findUserById(c.env.DB, agent.accountable_id);
     c.set("actor", person ? { ...person, agent: { id: agent.id, name: agent.name } } : null);
   } else c.set("actor", persona ? await findUserById(c.env.DB, `acc_${persona}`) : null);
+  const actor = c.get("actor");
+  if (actor) {
+    const key = `${actor.id}:${actor.agent?.id ?? ""}`;
+    let tokenId = world.credentials.get(key);
+    if (!tokenId) {
+      tokenId = `browser_token_${randomUUID()}`;
+      const secret = randomUUID();
+      await c.env.DB.prepare(
+        `INSERT INTO access_tokens (id, user_id, agent_id, name, scope, token_hash, last_four)
+         VALUES (?, ?, ?, 'browser fixture', 'write', ?, ?)`,
+      )
+        .bind(
+          tokenId,
+          actor.id,
+          actor.agent?.id ?? null,
+          createHash("sha256").update(secret).digest("hex"),
+          secret.slice(-4),
+        )
+        .run();
+      world.credentials.set(key, tokenId);
+    }
+    actor.credential = { kind: "token", id: tokenId };
+    // Never replace a revoked/deleted fixture credential on the next request.
+    if (!(await isActorCredentialLive(c.env.DB, actor))) c.set("actor", null);
+  }
   await next();
 });
+app.use("/api/*", contentContractGate);
+app.route("/api/organizations", organizations);
+app.route("/api/spaces", spaces);
+app.route("/api/spaces/:space/atlas", workspaceAtlas);
 // Sign-in (password accounts, CORE-404). A session it starts doesn't change
 // who the world acts as: that stays the persona.
 app.on(["GET", "POST"], "/api/identity/*", async (c) =>
   (await createAuth(c.env, new URL(c.req.url).origin)).handler(c.req.raw),
 );
 app.route("/api/admin/accounts", adminAccounts);
-app.route("/api/accounts/:owner/atlas", workspaceAtlas);
 app.route("/api/agents", agents);
-app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);
-app.route("/api/accounts/:slug/ai-providers", aiProvidersApi);
+app.route("/api/spaces/:space/settings/ai", aiSettingsApi);
+app.route("/api/accounts/:person/settings/ai", personAiSettingsApi);
+app.route("/api/spaces/:space/ai-providers", aiProvidersApi);
 app.route("/api/admin/ai", siteAiSettingsApi);
+app.route("/api/spaces/:space/retention", spaceRetentionApi);
+app.route("/api/spaces/:space/retention/runs", spaceRunsApi);
+app.route("/api/accounts/:person/retention", personRetentionApi);
+app.route("/api/accounts/:person/retention/runs", personRunsApi);
+app.route("/api/admin/retention", instanceRetentionApi);
+app.route("/api/spaces/:space/usage", spaceUsageApi);
+app.route("/api/accounts/:slug/usage", personUsageApi);
+app.route("/api/admin/usage", instanceUsageApi);
 app.route("/api", accounts);
 app.route("/api/account/skills", personalSkillsApi);
 app.route("/api/assistant", assistant);
-app.route("/api/tracker/:owner/release-notes", trackerReleaseNotes);
-app.route("/api/tracker/:owner/timelines", timelines);
-app.route("/api/tracker/:owner/timeline-graph", timelineGraph);
+app.route("/api/tracker/:space/release-notes", trackerReleaseNotes);
+app.route("/api/tracker/:space/timelines", timelines);
+app.route("/api/tracker/:space/timeline-graph", timelineGraph);
 app.route("/api", tracker);
-app.route("/api/repos/:owner/:name/knowledge", knowledge);
-app.route("/api/repos/:owner/:name/atlas", atlas);
-app.route("/api/repos/:owner/:name/steps", steps);
+app.route("/api/repos/:space/:name/knowledge", knowledge);
+app.route("/api/repos/:space/:name/atlas", atlas);
+app.route("/api/repos/:space/:name/steps", steps);
 app.route("/api/repos", repos);
 app.route("/api/dev", dev);
 app.route("/api/search", search);
@@ -267,32 +337,39 @@ app.onError((error, c) => {
 /** A request from the page under test, answered by the real routes. */
 export async function serve(request: ServedRequest): Promise<ServedResponse> {
   const world = worldOf(request.world);
-  const headers = new Headers(request.headers);
-  headers.set("x-browser-test-world", request.world);
-  if (request.as !== undefined) headers.set("x-browser-test-as", request.as ?? "");
-  const pending: Promise<unknown>[] = [];
-  const response = await app.request(
-    `http://localhost${request.url}`,
-    { method: request.method, headers, body: request.body },
-    world.env,
-    {
-      // Background work (cache warming) may fail without objects; it never answers.
-      waitUntil: (work: Promise<unknown>) => void pending.push(work.catch(() => {})),
-      passThroughOnException() {},
-      props: {},
-    } as unknown as ExecutionContext,
-  );
-  await Promise.all(pending);
-  return {
-    status: response.status,
-    headers: [...response.headers],
-    body: await response.text(),
-  };
+  const finished = Promise.withResolvers<void>();
+  world.pending.add(finished.promise);
+  try {
+    const headers = new Headers(request.headers);
+    headers.set("x-browser-test-world", request.world);
+    if (request.as !== undefined) headers.set("x-browser-test-as", request.as ?? "");
+    const pending: Promise<unknown>[] = [];
+    const response = await app.request(
+      `http://localhost${request.url}`,
+      { method: request.method, headers, body: request.body },
+      world.env,
+      {
+        // Background work (cache warming) may fail without objects; it never answers.
+        waitUntil: (work: Promise<unknown>) => void pending.push(work.catch(() => {})),
+        passThroughOnException() {},
+        props: {},
+      } as unknown as ExecutionContext,
+    );
+    await Promise.all(pending);
+    return {
+      status: response.status,
+      headers: [...response.headers],
+      body: await response.text(),
+    };
+  } finally {
+    world.pending.delete(finished.promise);
+    finished.resolve();
+  }
 }
 
 async function remoteOf(world: World, repo: string, sourceId?: string | null) {
-  const [owner, name] = repo.split("/");
-  const row = await findRepo(world.env.DB, null, owner ?? "", name ?? "");
+  const [space, name] = repo.split("/");
+  const row = await findRepo(world.env.DB, null, space ?? "", name ?? "");
   if (!row) throw new Error(`No repository ${repo}`);
   const resolved = await resolveSource(world.env, row, sourceId);
   const remote = world.git.remotes.get(resolved.repo.artifacts_remote);
@@ -305,10 +382,20 @@ export async function world(action: string, input: unknown): Promise<unknown> {
   const args = (input ?? {}) as Record<string, string | null | undefined>;
   switch (action) {
     case "create":
-      return { world: createWorld("persona" in args ? (args.persona as Persona) : "marco") };
-    case "dispose":
-      worlds.delete(args.world ?? "");
+      return { world: await createWorld("persona" in args ? (args.persona as Persona) : "marco") };
+    case "dispose": {
+      const id = args.world ?? "";
+      const current = worlds.get(id);
+      if (current) {
+        // Router revalidation can still be in flight when the page unmounts.
+        while (current.pending.size) await Promise.all(current.pending);
+        if (worlds.get(id) === current) {
+          current.close();
+          worlds.delete(id);
+        }
+      }
       return null;
+    }
     case "as":
       worldOf(args.world ?? "").persona = (args.persona as Persona) ?? null;
       return null;
@@ -319,12 +406,12 @@ export async function world(action: string, input: unknown): Promise<unknown> {
       const artifacts = `bt-${randomUUID()}`;
       const remote = `${REMOTES}/${args.world}/${artifacts}`;
       await world.env.DB.prepare(
-        `INSERT INTO repos (id, owner_id, name, description, visibility, artifacts_name, artifacts_remote)
-         VALUES (?, (SELECT id FROM accounts WHERE slug = ?), ?, ?, ?, ?, ?)`,
+        `INSERT INTO repos (id, space_id, name, description, visibility, artifacts_name, artifacts_remote)
+         VALUES (?, (SELECT id FROM spaces WHERE slug = ?), ?, ?, ?, ?, ?)`,
       )
         .bind(
           id,
-          args.owner ?? "",
+          args.space ?? "",
           args.name ?? "",
           args.description ?? "",
           args.visibility ?? "public",
@@ -333,7 +420,7 @@ export async function world(action: string, input: unknown): Promise<unknown> {
         )
         .run();
       world.git.add(remote, {}, "refs/heads/main", artifacts);
-      return { id, owner: args.owner, name: args.name };
+      return { id, space: args.space, name: args.name };
     }
     case "push": {
       // Move a branch, as a push would: the routes read it through ls-refs.

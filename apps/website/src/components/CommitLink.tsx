@@ -5,11 +5,11 @@ import { Link, type LinkProps } from "react-router";
 import { useCommitHref } from "../lib/commitPanel.ts";
 
 export function CommitLink({
-  owner,
+  space,
   name,
   sha,
   ...props
-}: Omit<LinkProps, "to" | "state"> & { owner: string; name: string; sha: string }) {
-  const href = useCommitHref()(owner, name, sha);
+}: Omit<LinkProps, "to" | "state"> & { space: string; name: string; sha: string }) {
+  const href = useCommitHref()(space, name, sha);
   return <Link {...props} to={href.to} state={href.state} preventScrollReset />;
 }

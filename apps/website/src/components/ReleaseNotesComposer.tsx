@@ -16,8 +16,8 @@ import { FormError, link, useToast } from "./ui.tsx";
 
 /** Where the notes are written from. The server reads them again, as this viewer may. */
 export type ComposeTarget =
-  | { kind: "repo"; owner: string; name: string; release: string; timeline: string | null }
-  | { kind: "tracker"; owner: string; q: string; timeline: string | null };
+  | { kind: "repo"; space: string; name: string; release: string; timeline: string | null }
+  | { kind: "tracker"; space: string; q: string; timeline: string | null };
 
 interface Composed {
   markdown: string;
@@ -129,7 +129,7 @@ export function ReleaseNotesComposer({
   }, [open]);
 
   const from = describe(target, label);
-  const base = target.kind === "repo" ? target.name : target.owner;
+  const base = target.kind === "repo" ? target.name : target.space;
   const text = prompt.trim();
 
   const generate = async () => {
@@ -139,8 +139,8 @@ export function ReleaseNotesComposer({
     try {
       const path =
         target.kind === "repo"
-          ? `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.name)}/release-notes/compose`
-          : `/tracker/${encodeURIComponent(target.owner)}/release-notes/compose`;
+          ? `/repos/${encodeURIComponent(target.space)}/${encodeURIComponent(target.name)}/release-notes/compose`
+          : `/tracker/${encodeURIComponent(target.space)}/release-notes/compose`;
       const body =
         target.kind === "repo"
           ? { prompt: text, release: target.release, timeline: target.timeline ?? undefined }
@@ -217,8 +217,8 @@ export function ReleaseNotesComposer({
             </p>
           ) : aiOff ? (
             <p className="m-0 text-body-sm text-ink-muted">
-              AI writing is off here, so custom release notes can&apos;t be written. An owner can
-              turn on AI release notes in the account&apos;s AI settings.
+              AI writing is off here, so custom release notes can&apos;t be written. A Space admin
+              can turn on AI release notes in the Space&apos;s AI settings.
             </p>
           ) : (
             <>
@@ -277,7 +277,7 @@ export function ReleaseNotesComposer({
                 <FormError
                   message={
                     error.status === 409
-                      ? `${error.message} An owner can turn it on in the account's AI settings.`
+                      ? `${error.message} A Space admin can turn it on in the Space's AI settings.`
                       : error.message
                   }
                 />

@@ -11,6 +11,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import type { StepFeedRecord, StepFeedRemoval } from "../../../shared/steps.ts";
 import type { Timeline } from "../../../shared/timelines.ts";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../../shared/spaces.ts";
 import { link } from "../../components/ui.tsx";
 import { fullDate, timeAgo } from "../../lib/format.ts";
 
@@ -54,7 +55,7 @@ export function useStepFeed(timeline: Pick<Timeline, "slug" | "repos" | "status"
   const [records, setRecords] = useState<StepFeedRecord[]>([]);
   const [removed, setRemoved] = useState<ReadonlySet<string>>(new Set());
   const live = timeline.status !== "landed" && timeline.status !== "abandoned";
-  const repos = timeline.repos.map((r) => `${r.owner}/${r.name}`).join(",");
+  const repos = timeline.repos.map((r) => `${r.space}/${r.name}`).join(",");
   useEffect(() => {
     setRecords([]);
     setRemoved(new Set());
@@ -86,7 +87,10 @@ export function useStepFeed(timeline: Pick<Timeline, "slug" | "repos" | "status"
               `/api/repos/${repo}/steps/live?timeline=${encodeURIComponent(timeline.slug)}`,
               {
                 signal: abort.signal,
-                headers: last ? { "last-event-id": String(last) } : {},
+                headers: {
+                  [CONTENT_CONTRACT_HEADER]: String(CONTENT_CONTRACT_VERSION),
+                  ...(last ? { "last-event-id": String(last) } : {}),
+                },
                 credentials: "same-origin",
               },
             );
@@ -133,11 +137,11 @@ export function latestByAgent(records: StepFeedRecord[]) {
 
 /** The feed is the page's (useStepFeed), shared with the timeline's observability view. */
 export function LiveNow({
-  owner,
+  space,
   timeline,
   feed,
 }: {
-  owner: string;
+  space: string;
   timeline: Timeline;
   feed: ReturnType<typeof useStepFeed>;
 }) {
@@ -150,7 +154,7 @@ export function LiveNow({
   }, []);
   if (!live) return null;
   const agents = latestByAgent(records);
-  const story = `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}/story`;
+  const story = `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(timeline.slug)}/story`;
   return (
     <section aria-label="Live now">
       <h3 className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">Live now</h3>

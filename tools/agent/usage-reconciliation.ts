@@ -1,10 +1,11 @@
 // Reconciling the application's AI usage with the AI Gateway's logs
-// (CORE-285): per account, feature and model, from ai_usage (via
-// /api/dev/ai-usage) and from Gateway log metadata, which models.ts labels
-// with the same account and feature.
+// (CORE-285): per explicit scope, feature and model, from ai_usage (via
+// /api/dev/ai-usage) and Gateway metadata. Person and Space IDs may be equal;
+// their scope kinds remain distinct.
 
 export interface UsageRow {
-  account_id: string;
+  scope_kind: "space" | "person" | "instance";
+  scope_id: string;
   slug: string | null;
   feature: string;
   model: string;
@@ -16,7 +17,7 @@ export interface UsageRow {
 
 /**
  * The application's ai_usage against the owned gateway's logs, per feature and
- * model, for one account (CORE-285). Every attempt is on both sides: the app's
+ * model, for one exact scope (CORE-285). Every attempt is on both sides: the app's
  * calls plus failed attempts equal the gateway's logs. A call the app cut off
  * at its deadline may still have completed, and been billed, upstream: the
  * gateway may hold more successes than the app, never fewer, and tokens must
@@ -29,12 +30,13 @@ export function reconcileUsage(
     success: boolean;
     cached: boolean;
     model: string;
-    account?: string;
+    scopeKind?: string;
+    scopeId?: string;
     feature?: string;
     tokensIn: number;
     tokensOut: number;
   }[],
-  account: string,
+  scope: { kind: UsageRow["scope_kind"]; id: string },
 ) {
   const keys = new Map<
     string,
@@ -56,7 +58,7 @@ export function reconcileUsage(
     return found;
   };
   for (const row of usage) {
-    if (row.account_id !== account) continue;
+    if (row.scope_kind !== scope.kind || row.scope_id !== scope.id) continue;
     const e = entry(row.feature, row.model);
     e.app.calls += row.calls;
     e.app.failed += row.failed;
@@ -64,7 +66,7 @@ export function reconcileUsage(
     e.app.output += row.output;
   }
   for (const log of logs) {
-    if (log.account !== account || log.cached) continue;
+    if (log.scopeKind !== scope.kind || log.scopeId !== scope.id || log.cached) continue;
     const e = entry(log.feature ?? "?", log.model);
     if (log.success) {
       e.gateway.calls += 1;

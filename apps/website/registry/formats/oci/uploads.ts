@@ -4,6 +4,11 @@ import { commitBlob, newBlobKey, PART_SIZE, type StoredBlob } from "../../core/b
 import type { Services } from "../../core/context.ts";
 import { OciError } from "./errors.ts";
 import { durableStub } from "../../../worker/durable/registry.ts";
+import { AccessControl } from "../../core/acl.ts";
+import type { Actor } from "../../core/auth/actor.ts";
+import { resolveCredentialActor } from "../../core/auth/authenticate.ts";
+import { getRepoById } from "../../core/repos.ts";
+import { cutoverControl } from "../../../worker/durable/cutover-admission.ts";
 
 /**
  * Chunked blob uploads. The Worker streams bytes straight to an R2 multipart
@@ -23,6 +28,9 @@ const BUSY_MS = 15 * 60 * 1000;
 export interface UploadState {
   version: number;
   repoId: string;
+  spaceId: string;
+  migrationEpoch: number;
+  initiator: Actor;
   name: string;
   r2Key: string;
   r2UploadId: string | null;
@@ -54,11 +62,21 @@ function unknownUpload(): OciError {
 }
 
 export async function startUpload(svc: Services, repoId: string, name: string) {
+  const repo = await getRepoById(svc.db, repoId);
+  if (!repo) throw unknownUpload();
+  const access = await svc.access();
+  await access.require(repo, "write", `${repo.key}/${name}`);
+  const admission = await cutoverControl(svc.env).admission(4);
+  if (!admission.allowed)
+    throw new OciError("UNKNOWN", "Space migration is not active", { status: 503 });
   const uuid = crypto.randomUUID();
   const now = Date.now();
   const state: UploadState = {
     version: 1,
     repoId,
+    spaceId: repo.spaceId,
+    migrationEpoch: admission.epoch,
+    initiator: access.actor,
     name,
     r2Key: newBlobKey(),
     r2UploadId: null,
@@ -87,6 +105,27 @@ export async function loadUpload(
   const stub = uploadStub(svc, uuid);
   const state = await stub.getState<UploadState>();
   if (!state || state.repoId !== repoId || state.name !== name) throw unknownUpload();
+  const repo = await getRepoById(svc.db, repoId);
+  if (!repo || state.spaceId !== repo.spaceId || !state.initiator) throw unknownUpload();
+  const admission = await cutoverControl(svc.env).admission(4);
+  if (!admission.allowed || state.migrationEpoch !== admission.epoch)
+    throw new OciError("UNKNOWN", "Upload migration epoch changed; restart this upload", {
+      status: 503,
+    });
+  const initiator = await resolveCredentialActor(svc.env, state.initiator);
+  if (!initiator) throw unknownUpload();
+  const current = await svc.actor();
+  if (
+    current.subject !== initiator.subject ||
+    current.personId !== initiator.personId ||
+    (current.agentId ?? null) !== (initiator.agentId ?? null)
+  )
+    throw unknownUpload();
+  await new AccessControl(svc.db, svc.env.DB, initiator).require(
+    repo,
+    "write",
+    `${repo.key}/${name}`,
+  );
   if (state.expiresAt < Date.now()) {
     await discard(svc.bucket, state);
     await stub.clear();

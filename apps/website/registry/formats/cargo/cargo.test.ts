@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { encodePublishBody, parseIndexFile } from "@gitmatrix/formats/cargo";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { makeHarness, type Harness } from "../../testing/harness.ts";
 
 const sha256 = (data: Uint8Array | string) => createHash("sha256").update(data).digest("hex");
@@ -301,7 +300,6 @@ describe("cargo remote and virtual repositories", () => {
     .join("\n");
 
   beforeEach(async () => {
-    invalidateMembers();
     hits.length = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);

@@ -10,11 +10,11 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import { hashToken, type AppEnv } from "../auth.ts";
+import type { AppEnv } from "../auth.ts";
+import { issueToken } from "../api/tokens.ts";
 import { mintJobToken } from "../ci/registry.ts";
 import { queueMergeJob } from "../ci/queue-auth.ts";
 import { queueCandidateBranch } from "../../shared/merge-queue.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
 import { gitBackend, run, serve } from "../testing/git-http.ts";
 import { gitHttp, landingPushRefusal, queuePushRefusal, scrubbedError } from "./http.ts";
 import { FLUSH, pkt } from "./pktline.ts";
@@ -23,8 +23,10 @@ import { recordPush } from "../ref-log/record.ts";
 import { steps } from "../steps/api.ts";
 import { encodeCommit, hashObject, PackWriter } from "@gitmatrix/formats/git";
 import { writeRefs } from "../timelines/bookmarks.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 vi.mock("./effects.ts", () => ({ afterPush: vi.fn() }));
 
 const ZERO = "0".repeat(40);
@@ -89,15 +91,36 @@ async function setup(queue = false, changeId?: string) {
   }
   const merge = git(work, "rev-parse", "HEAD");
 
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  closers.push(async () => fresh.close());
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('orbit','user','orbit-person','Orbit')",
+  );
+  await seedSpaceFixture(fresh.env.DB, {
+    organization: {
+      id: "organization-orbit",
+      slug: "orbit-company",
+      displayName: "Orbit",
+      kind: "company",
+    },
+    space: { id: "orbit", slug: "orbit", displayName: "General" },
+    actorId: "orbit",
+    members: [
+      {
+        accountId: "orbit",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
   const landing = JSON.stringify({ steps: [], landing: { slug: "search", sourceId: "work_test" } });
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('app', 'orbit', 'app', 'private', 'r-app', 'https://artifacts.test/app.git'),
       ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://artifacts.test/lib.git');
     INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,
        allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
        initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
       VALUES ('work_test','app','timeline','search','orbit','work-app','https://artifacts.test/work-app.git','ready',
@@ -129,7 +152,7 @@ async function setup(queue = false, changeId?: string) {
       .run(JSON.stringify({ steps: [], queue: { id: main, attempt: 1 } }));
   }
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     ARTIFACTS: {
       get: async (name: string) => ({
         createToken: async (scope: string) => ({
@@ -141,12 +164,20 @@ async function setup(queue = false, changeId?: string) {
       }),
     },
   } as unknown as Env;
+  const initiator = await issueToken(env.DB, "orbit", "initiator", "write");
+  const authority = await captureWorkAuthority(env, "app", {
+    id: "orbit",
+    credential: { kind: "token", id: initiator.id },
+  });
+  sqlite
+    .prepare("UPDATE ci_runs SET actor_id=?,space_id=?,migration_epoch=?,authority=?")
+    .run("orbit", authority.spaceId, authority.migrationEpoch, JSON.stringify(authority));
   const backend = gitBackend(root);
   vi.stubGlobal("fetch", backend.fetch);
   const app = new Hono<AppEnv>().route("/", gitHttp);
   const server = await serve(app, env);
   closers.push(server.close);
-  const token = (job = "land") => mintJobToken(env.DB, job, 30);
+  const token = (job = "land") => mintJobToken(env, job, 30);
   const ref = (name: string) => git(remote, "rev-parse", name);
 
   /** Real git in `work`, through the proxy, with a job credential. */
@@ -205,6 +236,7 @@ async function setup(queue = false, changeId?: string) {
   return {
     root,
     work,
+    authority,
     env,
     sqlite,
     backend,
@@ -239,6 +271,47 @@ test.each([
   expect(t.backend.requests).toEqual([]);
 });
 
+test("native Git denies revoked Space grants without treating Organization ownership as access", async () => {
+  const t = await setup();
+  const { secret } = await issueToken(t.env.DB, "orbit", "native", "write");
+  const app = new Hono<AppEnv>().route("/", gitHttp);
+  const request = async () => {
+    const pending: Promise<unknown>[] = [];
+    const response = await app.request(
+      "/orbit/app.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: `Bearer ${secret}` } },
+      t.env,
+      {
+        waitUntil: (work: Promise<unknown>) => {
+          pending.push(work);
+        },
+        passThroughOnException() {},
+        props: {},
+      } as ExecutionContext,
+    );
+    await Promise.all(pending);
+    return response;
+  };
+  expect((await request()).status).toBe(200);
+  const forwarded = t.backend.requests.length;
+  t.sqlite.exec("DELETE FROM space_grants WHERE space_id='orbit' AND account_id='orbit'");
+  expect((await request()).status).toBe(404);
+  expect(t.backend.requests).toHaveLength(forwarded);
+  expect(
+    t.sqlite.prepare("SELECT role FROM organization_members WHERE account_id='orbit'").get(),
+  ).toEqual({ role: "owner" });
+});
+
+test("job Git credentials are capped by the initiating credential on every request", async () => {
+  const t = await setup();
+  const secret = await t.token();
+  expect((await t.infoRefs(secret, "git-upload-pack")).status).toBe(200);
+  const forwarded = t.backend.requests.length;
+  t.sqlite.prepare("DELETE FROM access_tokens WHERE id=?").run(t.authority.credential.id);
+  expect((await t.infoRefs(secret, "git-upload-pack")).status).toBe(401);
+  expect(t.backend.requests).toHaveLength(forwarded);
+});
+
 test("job credentials cannot cross source identities or write work refs", async () => {
   const t = await setup();
   t.sqlite.exec(
@@ -264,12 +337,7 @@ test("job credentials cannot cross source identities or write work refs", async 
 
 test("unmigrated canonical timeline pushes fail with the native timeline address", async () => {
   const t = await setup();
-  const secret = "gmx_legacy_timeline_test";
-  t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
-  t.sqlite
-    .prepare(`INSERT INTO access_tokens
-      (id,user_id,name,scope,token_hash,last_four) VALUES ('legacy-pat','orbit','test','write',?,'test')`)
-    .run(await hashToken(secret));
+  const { secret } = await issueToken(t.env.DB, "orbit", "test", "write");
   const pushed = await t.receivePack(secret, [
     `${"0".repeat(40)} ${t.merge} refs/heads/timeline/unmigrated`,
   ]);
@@ -449,7 +517,7 @@ describe("a queue merge job's credential", () => {
     expect(pushed.status, pushed.stderr).toBe(0);
     expect(t.ref(`refs/heads/${t.candidate}`)).toBe(t.merge);
     expect(t.ref("refs/heads/main")).toBe(t.main);
-    expect(await queueMergeJob(t.env.DB, secret, "orbit", "app", t.main)).toMatchObject({
+    expect(await queueMergeJob(t.env, secret, "orbit", "app", t.main)).toMatchObject({
       ok: true,
       queueId: t.main,
       attempt: 1,
@@ -505,7 +573,7 @@ describe("a queue merge job's credential", () => {
       expect((await t.infoRefs(secret, "git-upload-pack")).status).toBe(status);
       const push = await t.receivePack(secret, [`${t.main} ${t.merge} refs/heads/${t.candidate}`]);
       expect(push.status).toBe(status);
-      expect(await queueMergeJob(t.env.DB, secret, "orbit", "app", t.main)).toMatchObject({
+      expect(await queueMergeJob(t.env, secret, "orbit", "app", t.main)).toMatchObject({
         ok: false,
         status,
       });
@@ -517,9 +585,9 @@ describe("a queue merge job's credential", () => {
     const t = await setup(true);
     const oldSecret = await t.token();
     t.sqlite.prepare("UPDATE merge_queue SET data=?").run(JSON.stringify({ mergeSource: t.merge }));
-    expect(await queueMergeJob(t.env.DB, oldSecret, "orbit", "app")).toMatchObject({ ok: false });
+    expect(await queueMergeJob(t.env, oldSecret, "orbit", "app")).toMatchObject({ ok: false });
     t.sqlite.prepare("UPDATE ci_runs SET commit_oid=? WHERE id='merge'").run(t.merge);
-    expect(await queueMergeJob(t.env.DB, oldSecret, "orbit", "app")).toMatchObject({ ok: true });
+    expect(await queueMergeJob(t.env, oldSecret, "orbit", "app")).toMatchObject({ ok: true });
     const nextBranch = queueCandidateBranch(t.main, 2);
     t.sqlite
       .prepare(`INSERT INTO ci_runs
@@ -527,14 +595,19 @@ describe("a queue merge job's credential", () => {
       VALUES ('replacement','app',4,?,?,'manual','running',?)`)
       .run(t.merge, nextBranch, t.main);
     t.sqlite
+      .prepare(
+        "UPDATE ci_runs SET actor_id=?,space_id=?,migration_epoch=?,authority=? WHERE id='replacement'",
+      )
+      .run("orbit", t.authority.spaceId, t.authority.migrationEpoch, JSON.stringify(t.authority));
+    t.sqlite
       .prepare(`INSERT INTO ci_jobs
       (id,run_id,repo_id,name,spec,status,runner)
       VALUES ('replacement-job','replacement','app','land',?,'running','sandbox')`)
       .run(JSON.stringify({ steps: [], queue: { id: t.main, attempt: 2 } }));
     t.sqlite.exec("UPDATE merge_queue SET attempts=2,merge_run_id='replacement'");
     const nextSecret = await t.token("replacement-job");
-    expect(await queueMergeJob(t.env.DB, oldSecret, "orbit", "app")).toMatchObject({ ok: false });
-    expect(await queueMergeJob(t.env.DB, nextSecret, "orbit", "app")).toMatchObject({
+    expect(await queueMergeJob(t.env, oldSecret, "orbit", "app")).toMatchObject({ ok: false });
+    expect(await queueMergeJob(t.env, nextSecret, "orbit", "app")).toMatchObject({
       ok: true,
       attempt: 2,
       branch: nextBranch,
@@ -553,7 +626,7 @@ describe("a queue merge job's credential", () => {
   test("denies a different queue's resolve request", async () => {
     const t = await setup(true);
     expect(
-      await queueMergeJob(t.env.DB, await t.token(), "orbit", "app", "a".repeat(40)),
+      await queueMergeJob(t.env, await t.token(), "orbit", "app", "a".repeat(40)),
     ).toMatchObject({ ok: false, status: 403 });
   });
 });
@@ -562,12 +635,7 @@ describe("ordinary queue source staging", () => {
   test("records source provenance before context upload and preserves ordinary pushes", async () => {
     const changeId = "queuestep01";
     const t = await setup(false, changeId);
-    const secret = "gmx_proxy_staging_test";
-    t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
-    t.sqlite
-      .prepare(`INSERT INTO access_tokens
-      (id,user_id,name,scope,token_hash,last_four) VALUES ('pat','orbit','test','write',?,'test')`)
-      .run(await hashToken(secret));
+    const { secret, id: tokenId } = await issueToken(t.env.DB, "orbit", "test", "write");
     const source = `refs/heads/gitmatrix/queue/${t.merge}`;
     const staged = await t.gitWith(secret, "push", t.proxyUrl, `HEAD:${source}`);
     expect(staged.status, staged.stderr).toBe(0);
@@ -582,10 +650,16 @@ describe("ordinary queue source staging", () => {
     ).toEqual([{ change_id: changeId, first_commit_oid: t.merge, last_commit_oid: t.merge }]);
     const context = new Hono<AppEnv>();
     context.use("*", async (c, next) => {
-      c.set("actor", { id: "orbit", slug: "orbit", displayName: "Orbit", isSiteAdmin: false });
+      c.set("actor", {
+        id: "orbit",
+        slug: "orbit-person",
+        displayName: "Orbit",
+        isSiteAdmin: false,
+        credential: { kind: "token", id: tokenId },
+      });
       await next();
     });
-    context.route("/api/repos/:owner/:name/steps", steps);
+    context.route("/api/repos/:space/:name/steps", steps);
     const uploaded = await context.request(
       "/api/repos/orbit/app/steps",
       {
@@ -625,12 +699,7 @@ test.each(["canonical", "staging"] as const)(
   "records %s push history after the provider finishes its streamed response",
   async (kind) => {
     const t = await setup();
-    const secret = "gmx_proxy_streamed_push_test";
-    t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
-    t.sqlite
-      .prepare(`INSERT INTO access_tokens
-      (id,user_id,name,scope,token_hash,last_four) VALUES ('pat','orbit','test','write',?,'test')`)
-      .run(await hashToken(secret));
+    const { secret } = await issueToken(t.env.DB, "orbit", "test", "write");
     const pending: Promise<unknown>[] = [];
     vi.mocked(afterPush).mockImplementation((env, repo, actor, waitUntil) => {
       const recorded = recordPush(env, repo, actor);
@@ -685,7 +754,7 @@ test("native clones select current work HEAD and hide inherited canonical branch
   const t = await setup();
   git(t.work, "push", "--quiet", "origin", "HEAD:refs/heads/work");
   t.sqlite.exec(`
-    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
     VALUES('work_a','app','native-timeline','native','orbit','r-work','https://artifacts.test/app.git','ready','allocate','canonical','${t.main}','tree','refs/heads/main','canonical','${t.main}','tree','refs/heads/main',1,'2026-01-01','2026-01-01');
     UPDATE ci_runs SET source_id='work_a' WHERE id='push';
     UPDATE ci_jobs SET source_id='work_a' WHERE run_id='push';

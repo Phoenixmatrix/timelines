@@ -1,16 +1,21 @@
 import type { Context } from "hono";
 import type { AppEnv } from "../auth.ts";
-import { findAccountBySlug, selectRepos } from "../db.ts";
+import { selectRepos } from "../db.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
+import { fixtureAccess } from "./dev-fixture-access.ts";
 import { db } from "../schema.ts";
 import { isArtifactsError } from "../artifacts.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { canonicalSource, ensureWorkSource } from "../timelines/sources.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
 import {
   expireArchivedSources,
   pinSourceRoot,
   releaseSourceRoots,
 } from "../retention/work-sources.ts";
 import { fail, readJson } from "./http.ts";
+import { accessFor } from "../tracker/access.ts";
 
 /** Fault-state fixture only; never available outside the disposable agent namespace. */
 export async function sourceRetentionFixture(c: Context<AppEnv>) {
@@ -47,7 +52,7 @@ export async function sourceRetentionFixture(c: Context<AppEnv>) {
   if (typeof body.repo !== "string")
     return fail(c, 400, "An owned fixture repository is required.");
   const [owner, name] = body.repo.split("/");
-  const account = await findAccountBySlug(c.env.DB, owner ?? "");
+  const space = await findSpaceBySlug(c.env.DB, owner ?? "");
   const providerId = /^provider-([a-f0-9]{10})$/.exec(name ?? "")?.[1];
   const scopedExpiry =
     body.action === "expire" &&
@@ -58,17 +63,30 @@ export async function sourceRetentionFixture(c: Context<AppEnv>) {
       (owner === "priya" &&
         providerId !== undefined &&
         body.timeline === `mirror-work-${providerId}`));
-  if (!account || !name || (!name.startsWith("source-retention-") && !scopedExpiry))
+  if (!space || !name || (!name.startsWith("source-retention-") && !scopedExpiry))
     return fail(c, 400, "An owned source-retention fixture is required.");
-  const repo = await selectRepos(c.env.DB, account.id)
-    .where("r.owner_id", "=", account.id)
+  const principalId =
+    space.slug === "orbit"
+      ? "acc_marco"
+      : space.slug === "priya"
+        ? "acc_priya"
+        : space.slug === "sam"
+          ? "acc_sam"
+          : null;
+  if (!principalId) return fail(c, 400, "No fixture principal for this Space.");
+  const access =
+    body.action === "initialize"
+      ? await accessFor(c.env, space, principalId, null)
+      : await fixtureAccess(c.env, space, principalId);
+  const repo = await selectRepos(c.env.DB, principalId)
+    .where("r.space_id", "=", space.id)
     .where("r.name", "=", name)
     .executeTakeFirst();
   if (!repo) return fail(c, 404, "No live fixture repository.");
   const store = db(c.env.DB);
   if (body.action === "expire") {
     if (!body.timeline) return fail(c, 400, "An exact ended fixture timeline is required.");
-    const detail = await trackerObject(c.env, account.id).timeline(body.timeline, 0, 1);
+    const detail = await trackerObject(c.env, space.id).timeline(access, body.timeline, 0, 1);
     if (!detail.ok) return fail(c, detail.status, detail.error);
     const timeline = detail.value.timeline;
     const source = timeline.repos[0]?.source;
@@ -83,7 +101,7 @@ export async function sourceRetentionFixture(c: Context<AppEnv>) {
     // Age only this ended fixture past both disposition-specific boundaries.
     // Keep the exact timeline fence: never expire unrelated owned resources.
     const cutoff = new Date(Date.now() + 86_400_000).toISOString();
-    await expireArchivedSources(c.env, account.id, { landed: cutoff, abandoned: cutoff }, [
+    await expireArchivedSources(c.env, space.id, { landed: cutoff, abandoned: cutoff }, [
       timeline.id,
     ]);
     const current = await store
@@ -101,11 +119,15 @@ export async function sourceRetentionFixture(c: Context<AppEnv>) {
     if (!commit) return fail(c, 404, "Pinned commit missing.");
     const timelineId = `retention_${crypto.randomUUID()}`;
     const input = {
+      authority: await captureWorkAuthority(c.env, repo.id, {
+        id: principalId,
+        credential: access.credential,
+      }),
       timelineId,
       timelineSlug: timelineId,
       base: { ...canonicalSource(repo), commit: body.commit, tree: commit.treeHash },
     };
-    const reserved = await trackerObject(c.env, account.id).reserveWorkSource(repo, input);
+    const reserved = await trackerObject(c.env, space.id).reserveWorkSource(access, repo, input);
     if (!reserved.ok) return fail(c, reserved.status, reserved.error);
     await store.insertInto("timeline_work_sources").values(reserved.value).execute();
     // Deliberately stop after provider success. The authoritative reservation and
@@ -168,7 +190,12 @@ export async function sourceRetentionFixture(c: Context<AppEnv>) {
     .executeTakeFirst();
   if (!source) return fail(c, 404, "No owned fixture source.");
   if (body.action === "initialize") {
-    const initialized = await ensureWorkSource(c.env, repo, {
+    if (!source.authority) return fail(c, 409, "Source fixture has no initiating authority.");
+    const authority: WorkAuthority = JSON.parse(source.authority);
+    // Resume under the original real credential; the normal initializer revalidates it.
+    access.credential = authority.credential;
+    const initialized = await ensureWorkSource(c.env, access, repo, {
+      authority,
       timelineId: source.timeline_id,
       timelineSlug: source.timeline_slug,
       base: { ...canonicalSource(repo), commit: source.fork_commit, tree: source.fork_tree },

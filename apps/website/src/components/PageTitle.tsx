@@ -30,7 +30,9 @@ const labels: Record<string, string> = {
   home: "Home",
   signin: "Sign in",
   device: "Authorize device",
-  new: "New repository",
+  ":space/-/repositories/new": "New repository",
+  organizations: "Organizations",
+  instance: "Instance",
   tracker: "Issues",
   timelines: "Timelines",
   "release-notes": "Release notes",
@@ -45,21 +47,23 @@ const labels: Record<string, string> = {
   "settings/preferences": "Preferences",
   "settings/ai": "AI settings",
   "settings/ai-providers": "AI providers",
-  "settings/site-ai": "Site AI settings",
+  "settings/site-ai": "Instance AI settings",
   "settings/usage": "Usage and costs",
-  "settings/site-usage": "Site usage and costs",
+  "settings/site-usage": "Instance usage and costs",
   "settings/retention": "Data retention",
-  "settings/site-retention": "Site data retention",
+  "settings/site-retention": "Instance data retention",
   "settings/invites": "Invites",
   "settings/accounts": "Accounts",
   "settings/ssh-keys": "SSH keys",
   "cli-auth/npm/:id": "Authorize npm",
-  "tracker/:owner": "Issues",
-  "tracker/:owner/releases": "Release notes",
-  "tracker/:owner/timelines": "Timelines",
-  ":owner/-/packages": "Packages",
-  ":owner/-/feeds": "Package feeds",
-  ":owner/-/atlas": "Workspace Atlas",
+  "tracker/:space": "Issues",
+  projects: "Projects",
+  teams: "Teams",
+  "tracker/:space/releases": "Release notes",
+  "tracker/:space/timelines": "Timelines",
+  ":space/-/packages": "Packages",
+  ":space/-/feeds": "Package feeds",
+  ":space/-/atlas": "Atlas scope",
   code: "Code",
   "commits/*": "Commits",
   changes: "Changes",
@@ -91,6 +95,8 @@ function join(...parts: (string | null | undefined)[]): string {
 // Projection of existing loader values; the declared route is the discriminator.
 interface RouteTitleData {
   displayName?: string;
+  space?: { displayName: string };
+  organization?: { displayName: string };
   tree?: TreeResponse | null;
   blob?: BlobResponse;
   page?: WikiPage | null;
@@ -114,17 +120,21 @@ function routeTitle(matches: UIMatch[], search: string): string {
   const match = matches.findLast((item) => titleKind(item));
   if (!match) return "Page unavailable";
   const kind = titleKind(match)!;
-  const { owner, repo, number, slug } = match.params;
+  const { space, repo, number, slug, person, organization } = match.params;
   const data = match.loaderData as RouteTitleData | undefined;
-  const resource = repo ? `${owner}/${repo}` : owner;
+  const resource = repo ? `${space}/${repo}` : space;
   const scope = new URLSearchParams(search).get("tl");
-  const timeline = scope && scope !== "main" && owner ? `Timeline ${scope}` : null;
+  const timeline = scope && scope !== "main" && space ? `Timeline ${scope}` : null;
   const label = labels[kind];
   switch (kind) {
-    case ":owner": {
-      return join(data?.displayName, owner, "Account");
+    case ":space": {
+      return join(data?.space?.displayName, space, "Space");
     }
-    case ":owner/:repo":
+    case "accounts/:person":
+      return join(data?.displayName, person, "Account");
+    case "organizations/:organization":
+      return join(data?.organization?.displayName, organization, "Organization");
+    case ":space/:repo":
       return join(resource, "Code", timeline);
     case "tree/*":
     case "code": {
@@ -142,22 +152,22 @@ function routeTitle(matches: UIMatch[], search: string): string {
     case "releases/*": {
       return join(data?.name, resource, "Releases", timeline);
     }
-    case ":owner/-/packages/:format/*": {
-      return join(data?.detail?.package.name, "Packages", owner, match.params.format);
+    case ":space/-/packages/:format/*": {
+      return join(data?.detail?.package.name, "Packages", space, match.params.format);
     }
-    case "tracker/:owner/timelines/:slug/changes": {
-      return join(data?.timeline?.name ?? slug, "Changes", owner);
+    case "tracker/:space/timelines/:slug/changes": {
+      return join(data?.timeline?.name ?? slug, "Changes", space);
     }
-    case "tracker/:owner/timelines/:slug/story": {
-      return join(data?.timeline?.name ?? slug, "Story", owner);
+    case "tracker/:space/timelines/:slug/story": {
+      return join(data?.timeline?.name ?? slug, "Story", space);
     }
     case "issues/:issue": {
-      const tracker = matches.find((item) => titleKind(item) === "tracker/:owner");
+      const tracker = matches.find((item) => titleKind(item) === "tracker/:space");
       const view = tracker?.loaderData as TrackerView | undefined;
       const issue = view?.snapshot.issues.find(
         (item) => item.id === match.params.issue || item.key === match.params.issue,
       );
-      return issuePageTitle(issue, owner ?? "", view?.snapshot.timeline?.name);
+      return issuePageTitle(issue, space ?? "", view?.snapshot.timeline?.name);
     }
     case "*":
       return "Page not found";
@@ -169,13 +179,13 @@ function routeTitle(matches: UIMatch[], search: string): string {
 /** Shared by the loader fallback and the tracker snapshot, including deletion/live edits. */
 export function issuePageTitle(
   issue: { key: string; title: string } | null | undefined,
-  owner: string,
+  space: string,
   timeline?: string,
 ): string {
   return join(
     issue ? `${issue.key} ${issue.title}` : "Issue unavailable",
     "Issues",
-    owner,
+    space,
     timeline,
   );
 }

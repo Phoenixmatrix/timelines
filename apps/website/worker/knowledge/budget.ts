@@ -24,11 +24,11 @@
 //     unavailable/stale and surface `outcome` (exhausted cap, resetsAt) or
 //     "disabled" (no configured price).
 //
-// Caps: a repository build's Atlas calls, an account grouping pass's calls,
-// and a shared daily ceiling per *owning* account (the repository owner, not
+// Caps: a repository build's Atlas calls, a Space grouping pass's calls,
+// and a shared daily ceiling per *owning* Space (the repository's Space, not
 // the principal or scope that asked), so no scope or viewer can evade it. The
 // first cap a reservation runs into is recorded and stops that run (and, for
-// the ceiling, the account until UTC midnight): no automatic paid retries.
+// the ceiling, the Space until UTC midnight): no automatic paid retries.
 // A model without a configured price disables Atlas paid synthesis.
 //
 // Each reservation is one guarded INSERT … SELECT: D1 runs statements one at
@@ -58,15 +58,15 @@ export interface RunLimits {
 export interface AtlasLimits {
   build: RunLimits;
   grouping: RunLimits;
-  /** Shared by every repository, scope and principal of one owning account. */
-  dailyUsdPerAccount: number;
+  /** Shared by every repository, scope and principal of one owning Space. */
+  dailyUsdPerSpace: number;
 }
 
 /** Per-run caps and the daily ceiling, from the CORE-155 PRD. */
 export const ATLAS_LIMITS: Readonly<AtlasLimits> = {
   build: { calls: 20, inputTokens: 100_000, outputTokens: 10_000 },
   grouping: { calls: 10, inputTokens: 50_000, outputTokens: 5_000 },
-  dailyUsdPerAccount: 10,
+  dailyUsdPerSpace: 10,
 };
 
 export interface ModelPrice {
@@ -104,10 +104,10 @@ export const ATLAS_PRICES: PriceTable = {
 };
 
 export type AtlasScope =
-  /** A repository's Knowledge build: the account is the repository's owner. */
+  /** A repository's Knowledge build: charged to the repository's Space. */
   | { kind: "build"; repoId: string; buildId: string }
-  /** An account grouping pass across that account's repositories. */
-  | { kind: "grouping"; accountId: string; passId: string };
+  /** A Space grouping pass across that Space's repositories. */
+  | { kind: "grouping"; spaceId: string; passId: string };
 
 export interface AtlasCallRequest {
   scope: AtlasScope;
@@ -125,7 +125,7 @@ export type AtlasCap = "daily_usd" | "calls" | "input_tokens" | "output_tokens";
 /** What a caller keeps between reserving and settling; plain JSON (workflow steps can return it). */
 export interface AtlasSpendHandle {
   id: string;
-  accountId: string;
+  spaceId: string;
   day: string;
   model: string;
   price: ModelPrice;
@@ -137,7 +137,7 @@ export interface AtlasSpendHandle {
 export interface AtlasExhausted {
   status: "exhausted";
   cap: AtlasCap;
-  accountId: string;
+  spaceId: string;
   exhaustedAt: string;
   /** Next UTC midnight for the daily ceiling; null for a run cap (the next run starts fresh). */
   resetsAt: string | null;
@@ -165,9 +165,9 @@ export type ReportedUsage = { inputTokens?: number | undefined; outputTokens?: n
 export interface BudgetOptions {
   /** The clock (tests move it across midnight). */
   now?: Date;
-  /** The price table (tests and configured accounts use their own; else ATLAS_PRICES). */
+  /** The price table (tests and configured Spaces use their own; else ATLAS_PRICES). */
   prices?: PriceTable;
-  /** The caps (configured accounts may set their own; else ATLAS_LIMITS). */
+  /** The caps (configured Spaces may set their own; else ATLAS_LIMITS). */
   limits?: Readonly<AtlasLimits>;
 }
 
@@ -203,32 +203,43 @@ const tokens = (n: number) => {
 };
 
 interface ResolvedScope {
-  accountId: string;
+  spaceId: string;
   scope: "build" | "grouping";
   runId: string;
   repoId: string | null;
 }
 
 async function resolveScope(d1: D1Database, scope: AtlasScope): Promise<ResolvedScope> {
-  if (scope.kind === "grouping")
-    return { accountId: scope.accountId, scope: "grouping", runId: scope.passId, repoId: null };
-  // Budgets follow the repository's owner, never whoever is asking.
+  // This is resource attribution, not authorization. The caller must authorize
+  // current source and provider access before making the paid call.
+  if (scope.kind === "grouping") {
+    const space = await db(d1)
+      .selectFrom("spaces")
+      .select("id")
+      .where("id", "=", scope.spaceId)
+      .where("archived_at", "is", null)
+      .executeTakeFirst();
+    if (!space) throw new Error(`Atlas budget: unknown or archived Space ${scope.spaceId}`);
+    return { spaceId: space.id, scope: "grouping", runId: scope.passId, repoId: null };
+  }
   const repo = await db(d1)
     .selectFrom("repos")
-    .select("owner_id")
-    .where("id", "=", scope.repoId)
+    .innerJoin("spaces", "spaces.id", "repos.space_id")
+    .select("spaces.id as space_id")
+    .where("repos.id", "=", scope.repoId)
+    .where("spaces.archived_at", "is", null)
     .executeTakeFirst();
-  if (!repo) throw new Error(`Atlas budget: unknown repository ${scope.repoId}`);
-  return { accountId: repo.owner_id, scope: "build", runId: scope.buildId, repoId: scope.repoId };
+  if (!repo) throw new Error(`Atlas budget: unknown repository or inactive Space ${scope.repoId}`);
+  return { spaceId: repo.space_id, scope: "build", runId: scope.buildId, repoId: scope.repoId };
 }
 
-const runKey = (r: ResolvedScope) => `${r.scope}:${r.accountId}:${r.runId}`;
-const dayKey = (accountId: string, day: string) => `day:${accountId}:${day}`;
+const runKey = (r: ResolvedScope) => `${r.scope}:${r.spaceId}:${r.runId}`;
+const dayKey = (spaceId: string, day: string) => `day:${spaceId}:${day}`;
 
 /**
  * Reserve one Atlas model call before making it. `reserved` carries the handle
  * to settle; `exhausted` names the first cap reached (recorded, so the run, or
- * for the ceiling the account until `resetsAt`, does no more paid work);
+ * for the ceiling the Space until `resetsAt`, does no more paid work);
  * `disabled` means the model has no configured price.
  */
 export async function reserveAtlasCall(
@@ -246,7 +257,7 @@ export async function reserveAtlasCall(
   const run = await resolveScope(d1, request.scope);
   const caps = options.limits ?? ATLAS_LIMITS;
   const limits = caps[run.scope];
-  const dailyMicroUsd = caps.dailyUsdPerAccount * MICRO;
+  const dailyMicroUsd = caps.dailyUsdPerSpace * MICRO;
 
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = crypto.randomUUID();
@@ -254,25 +265,25 @@ export async function reserveAtlasCall(
     // One statement checks every cap and charges the call, atomically.
     const inserted = await d1
       .prepare(
-        `INSERT INTO atlas_spend (id, account_id, day, scope, run_id, repo_id, purpose, model, status,
+        `INSERT INTO atlas_spend (id, space_id, day, scope, run_id, repo_id, purpose, model, status,
            input_tokens, output_tokens, cost_micro_usd,
            reserved_input_tokens, reserved_output_tokens, reserved_micro_usd, created_at)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reserved', ?9, ?10, ?11, ?9, ?10, ?11, ?12
          WHERE NOT EXISTS (SELECT 1 FROM atlas_budget_exhaustions WHERE key IN (?13, ?14))
            AND (SELECT COALESCE(SUM(cost_micro_usd), 0) FROM atlas_spend
-                 WHERE account_id = ?2 AND day = ?3)
+                 WHERE space_id = ?2 AND day = ?3)
              + (SELECT COALESCE(SUM(cost_micro_usd), 0) FROM atlas_spend_daily
-                 WHERE account_id = ?2 AND day = ?3) + ?11 <= ?15
+                 WHERE space_id = ?2 AND day = ?3) + ?11 <= ?15
            AND (SELECT COUNT(*) FROM atlas_spend
-                 WHERE scope = ?4 AND run_id = ?5 AND account_id = ?2 AND status <> 'released') < ?16
+                 WHERE scope = ?4 AND run_id = ?5 AND space_id = ?2 AND status <> 'released') < ?16
            AND (SELECT COALESCE(SUM(input_tokens), 0) FROM atlas_spend
-                 WHERE scope = ?4 AND run_id = ?5 AND account_id = ?2) + ?9 <= ?17
+                 WHERE scope = ?4 AND run_id = ?5 AND space_id = ?2) + ?9 <= ?17
            AND (SELECT COALESCE(SUM(output_tokens), 0) FROM atlas_spend
-                 WHERE scope = ?4 AND run_id = ?5 AND account_id = ?2) + ?10 <= ?18`,
+                 WHERE scope = ?4 AND run_id = ?5 AND space_id = ?2) + ?10 <= ?18`,
       )
       .bind(
         id,
-        run.accountId,
+        run.spaceId,
         day,
         run.scope,
         run.runId,
@@ -284,7 +295,7 @@ export async function reserveAtlasCall(
         cost,
         at,
         runKey(run),
-        dayKey(run.accountId, day),
+        dayKey(run.spaceId, day),
         dailyMicroUsd,
         limits.calls,
         limits.inputTokens,
@@ -296,7 +307,7 @@ export async function reserveAtlasCall(
         status: "reserved",
         handle: {
           id,
-          accountId: run.accountId,
+          spaceId: run.spaceId,
           day,
           model: request.model,
           price,
@@ -334,15 +345,15 @@ async function recordExhaustion(
     k
       .selectFrom("atlas_budget_exhaustions")
       .selectAll()
-      .where("key", "in", [runKey(run), dayKey(run.accountId, day)])
+      .where("key", "in", [runKey(run), dayKey(run.spaceId, day)])
       .orderBy("exhausted_at")
       .execute();
   const existing = await recorded();
   const own = existing.find((e) => e.key === runKey(run));
   if (own) return asExhausted(own);
-  const ceiling = existing.find((e) => e.key === dayKey(run.accountId, day));
+  const ceiling = existing.find((e) => e.key === dayKey(run.spaceId, day));
   if (ceiling) {
-    // The account's ceiling stopped this run too: say so in the run's record.
+    // The Space's ceiling stopped this run too: say so in the run's record.
     await insertExhaustions(d1, [
       { ...ceiling, key: runKey(run), scope: run.scope, run_id: run.runId },
     ]);
@@ -359,16 +370,16 @@ async function recordExhaustion(
       ])
       .where("scope", "=", run.scope)
       .where("run_id", "=", run.runId)
-      .where("account_id", "=", run.accountId)
+      .where("space_id", "=", run.spaceId)
       .where("status", "<>", "released")
       .executeTakeFirstOrThrow(),
     k
       .selectFrom("atlas_spend")
       .select((eb) => eb.fn.coalesce(eb.fn.sum<number>("cost_micro_usd"), eb.lit(0)).as("cost"))
-      .where("account_id", "=", run.accountId)
+      .where("space_id", "=", run.spaceId)
       .where("day", "=", day)
       .executeTakeFirstOrThrow(),
-    rolledUpCost(d1, run.accountId, day),
+    rolledUpCost(d1, run.spaceId, day),
   ]);
   const limits = caps[run.scope];
   // A run's own caps first: they stop only that run.
@@ -379,18 +390,18 @@ async function recordExhaustion(
         ? "input_tokens"
         : Number(runTotals.output) + wanted.outputTokens > limits.outputTokens
           ? "output_tokens"
-          : Number(dayTotals.cost) + rolledUp + wanted.cost > caps.dailyUsdPerAccount * MICRO
+          : Number(dayTotals.cost) + rolledUp + wanted.cost > caps.dailyUsdPerSpace * MICRO
             ? "daily_usd"
             : null;
   if (!cap) return null;
 
   const at = now.toISOString();
   const resetsAt = cap === "daily_usd" ? nextUtcMidnight(now) : null;
-  const record = { account_id: run.accountId, day, cap, exhausted_at: at, resets_at: resetsAt };
+  const record = { space_id: run.spaceId, day, cap, exhausted_at: at, resets_at: resetsAt };
   await insertExhaustions(d1, [
     { ...record, key: runKey(run), scope: run.scope, run_id: run.runId },
     ...(cap === "daily_usd"
-      ? [{ ...record, key: dayKey(run.accountId, day), scope: "day" as const, run_id: null }]
+      ? [{ ...record, key: dayKey(run.spaceId, day), scope: "day" as const, run_id: null }]
       : []),
   ]);
   const stored = (await recorded()).find((e) => e.key === runKey(run));
@@ -398,15 +409,15 @@ async function recordExhaustion(
 }
 
 /**
- * An account's spend on a day that the "ai-spend" retention category rolled
+ * A Space's spend on a day that the "ai-spend" retention category rolled
  * up into atlas_spend_daily (CORE-201); 0 for a day with every call still
  * recorded on its own. Daily totals add it, so a roll-up changes no answer.
  */
-async function rolledUpCost(d1: D1Database, accountId: string, day: string): Promise<number> {
+async function rolledUpCost(d1: D1Database, spaceId: string, day: string): Promise<number> {
   const row = await db(d1)
     .selectFrom("atlas_spend_daily")
     .select("cost_micro_usd")
-    .where("account_id", "=", accountId)
+    .where("space_id", "=", spaceId)
     .where("day", "=", day)
     .executeTakeFirst();
   return Number(row?.cost_micro_usd ?? 0);
@@ -426,14 +437,14 @@ async function insertExhaustions(
 
 function asExhausted(row: {
   cap: AtlasCap;
-  account_id: string;
+  space_id: string;
   exhausted_at: string;
   resets_at: string | null;
 }): AtlasExhausted {
   return {
     status: "exhausted",
     cap: row.cap,
-    accountId: row.account_id,
+    spaceId: row.space_id,
     exhaustedAt: row.exhausted_at,
     resetsAt: row.resets_at,
   };
@@ -468,6 +479,7 @@ export async function settleAtlasCall(
       settled_at: nowIso(),
     })
     .where("id", "=", handle.id)
+    .where("space_id", "=", handle.spaceId)
     .where("status", "=", "reserved")
     .executeTakeFirst();
   return Number(result.numUpdatedRows) === 1;
@@ -482,6 +494,7 @@ export async function failAtlasCall(d1: D1Database, handle: AtlasSpendHandle): P
     .updateTable("atlas_spend")
     .set({ status: "failed", settled_at: nowIso() })
     .where("id", "=", handle.id)
+    .where("space_id", "=", handle.spaceId)
     .where("status", "=", "reserved")
     .executeTakeFirst();
   return Number(result.numUpdatedRows) === 1;
@@ -499,6 +512,7 @@ export async function releaseAtlasCall(d1: D1Database, handle: AtlasSpendHandle)
       settled_at: nowIso(),
     })
     .where("id", "=", handle.id)
+    .where("space_id", "=", handle.spaceId)
     .where("status", "=", "reserved")
     .executeTakeFirst();
   return Number(result.numUpdatedRows) === 1;
@@ -554,6 +568,7 @@ export async function atlasRunSpend(
   d1: D1Database,
   scope: "build" | "grouping",
   runId: string,
+  spaceId: string,
 ): Promise<AtlasRunSpend> {
   const k = db(d1);
   const [totals, exhaustion] = await Promise.all([
@@ -567,6 +582,7 @@ export async function atlasRunSpend(
       ])
       .where("scope", "=", scope)
       .where("run_id", "=", runId)
+      .where("space_id", "=", spaceId)
       .where("status", "<>", "released")
       .executeTakeFirstOrThrow(),
     k
@@ -574,6 +590,7 @@ export async function atlasRunSpend(
       .select(["cap", "exhausted_at", "resets_at"])
       .where("scope", "=", scope)
       .where("run_id", "=", runId)
+      .where("space_id", "=", spaceId)
       .orderBy("exhausted_at")
       .executeTakeFirst(),
   ]);
@@ -588,10 +605,10 @@ export async function atlasRunSpend(
   };
 }
 
-/** An account's Atlas spend for one UTC day against its ceiling. */
+/** A Space's Atlas spend for one UTC day against its ceiling. */
 export async function atlasDailySpend(
   d1: D1Database,
-  accountId: string,
+  spaceId: string,
   options: { now?: Date; limits?: Readonly<AtlasLimits> } = {},
 ): Promise<{ day: string; usd: number; limitUsd: number; resetsAt: string; exhausted: boolean }> {
   const now = options.now ?? new Date();
@@ -601,20 +618,20 @@ export async function atlasDailySpend(
     k
       .selectFrom("atlas_spend")
       .select((eb) => eb.fn.coalesce(eb.fn.sum<number>("cost_micro_usd"), eb.lit(0)).as("cost"))
-      .where("account_id", "=", accountId)
+      .where("space_id", "=", spaceId)
       .where("day", "=", day)
       .executeTakeFirstOrThrow(),
-    rolledUpCost(d1, accountId, day),
+    rolledUpCost(d1, spaceId, day),
     k
       .selectFrom("atlas_budget_exhaustions")
       .select("key")
-      .where("key", "=", dayKey(accountId, day))
+      .where("key", "=", dayKey(spaceId, day))
       .executeTakeFirst(),
   ]);
   return {
     day,
     usd: (Number(spent.cost) + rolledUp) / MICRO,
-    limitUsd: (options.limits ?? ATLAS_LIMITS).dailyUsdPerAccount,
+    limitUsd: (options.limits ?? ATLAS_LIMITS).dailyUsdPerSpace,
     resetsAt: nextUtcMidnight(now),
     exhausted: Boolean(exhaustion),
   };
@@ -647,18 +664,18 @@ export function atlasInfer(d1: D1Database, scope: AtlasScope, options: BudgetOpt
 // ---- configuration --------------------------------------------------------------
 //
 // What a build's Atlas calls run with: the model that writes capability prose,
-// the prices it may spend at and the caps, for the repository's owning account.
+// the prices it may spend at and the caps, for the repository's owning Space.
 // Deployed, the selected Task model uses ATLAS_PRICES and ATLAS_LIMITS.
 // An environment can override them with the ATLAS_CONFIG text binding
 // (only development environments declare it, cloudflare.config.ts):
 //
 //   { "model"?, "prices"?, "limits"?,            the environment's defaults
-//     "accounts"?: { "<owner slug>": { … } } }  per owning account, over them
+//     "spaces"?: { "<Space slug>": { … } } }  per owning Space, over them
 //
 // `prices` replaces the table (an empty one leaves every model unpriced, so
 // paid synthesis is disabled); `limits` overrides only the caps it names.
 // The live provider verification (tools/agent/provider-e2e.ts) runs one
-// account with Atlas disabled, one whose model the provider refuses and one
+// Space with Atlas disabled, one whose model the provider refuses and one
 // with a one-call build cap through exactly this, against the real provider.
 
 export interface AtlasConfigEntry {
@@ -667,20 +684,20 @@ export interface AtlasConfigEntry {
   limits?: {
     build?: Partial<RunLimits>;
     grouping?: Partial<RunLimits>;
-    dailyUsdPerAccount?: number;
+    dailyUsdPerSpace?: number;
   };
 }
 
 export interface AtlasConfig extends AtlasConfigEntry {
-  accounts?: Record<string, AtlasConfigEntry>;
+  spaces?: Record<string, AtlasConfigEntry>;
 }
 
 export interface AtlasSettings {
   model: string;
   prices: PriceTable;
   limits: Readonly<AtlasLimits>;
-  /** Built-in defaults, the environment's configuration, or its entry for the owning account. */
-  source: "default" | "configured" | "account";
+  /** Built-in defaults, the environment's configuration, or its entry for the owning Space. */
+  source: "default" | "configured" | "space";
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -713,6 +730,10 @@ function parseEntry(raw: unknown, where: string): AtlasConfigEntry {
   }
   if (raw.limits !== undefined) {
     if (!isRecord(raw.limits)) throw new Error(`ATLAS_CONFIG: ${where}.limits must be an object`);
+    if ("dailyUsdPerAccount" in raw.limits)
+      throw new Error(
+        `ATLAS_CONFIG: ${where}.limits.dailyUsdPerAccount is obsolete; use dailyUsdPerSpace`,
+      );
     const limits: NonNullable<AtlasConfigEntry["limits"]> = {};
     for (const scope of ["build", "grouping"] as const) {
       const run = raw.limits[scope];
@@ -724,10 +745,10 @@ function parseEntry(raw: unknown, where: string): AtlasConfigEntry {
         if (run[cap] !== undefined)
           limits[scope][cap] = amount(run[cap], `${where}.limits.${scope}.${cap}`);
     }
-    if (raw.limits.dailyUsdPerAccount !== undefined)
-      limits.dailyUsdPerAccount = amount(
-        raw.limits.dailyUsdPerAccount,
-        `${where}.limits.dailyUsdPerAccount`,
+    if (raw.limits.dailyUsdPerSpace !== undefined)
+      limits.dailyUsdPerSpace = amount(
+        raw.limits.dailyUsdPerSpace,
+        `${where}.limits.dailyUsdPerSpace`,
       );
     entry.limits = limits;
   }
@@ -745,12 +766,14 @@ export function parseAtlasConfig(raw: unknown): AtlasConfig | null {
     throw new Error("ATLAS_CONFIG is not valid JSON");
   }
   const config: AtlasConfig = parseEntry(json, "config");
-  const accounts = (json as Record<string, unknown>).accounts;
-  if (accounts !== undefined) {
-    if (!isRecord(accounts)) throw new Error("ATLAS_CONFIG: accounts must be an object");
-    config.accounts = {};
-    for (const [slug, entry] of Object.entries(accounts))
-      config.accounts[slug.toLowerCase()] = parseEntry(entry, `accounts.${slug}`);
+  if ("accounts" in (json as Record<string, unknown>))
+    throw new Error("ATLAS_CONFIG: accounts is obsolete; use spaces with explicit Space slugs");
+  const spaces = (json as Record<string, unknown>).spaces;
+  if (spaces !== undefined) {
+    if (!isRecord(spaces)) throw new Error("ATLAS_CONFIG: spaces must be an object");
+    config.spaces = {};
+    for (const [slug, entry] of Object.entries(spaces))
+      config.spaces[slug.toLowerCase()] = parseEntry(entry, `spaces.${slug}`);
   }
   return config;
 }
@@ -766,15 +789,15 @@ function apply(base: AtlasSettings, entry: AtlasConfigEntry): Omit<AtlasSettings
     limits: {
       build: run("build"),
       grouping: run("grouping"),
-      dailyUsdPerAccount: entry.limits?.dailyUsdPerAccount ?? base.limits.dailyUsdPerAccount,
+      dailyUsdPerSpace: entry.limits?.dailyUsdPerSpace ?? base.limits.dailyUsdPerSpace,
     },
   };
 }
 
-/** The settings for one owning account (its slug), under a parsed configuration. */
+/** The settings for one owning Space (its slug), under a parsed configuration. */
 export function resolveAtlasSettings(
   config: AtlasConfig | null,
-  accountSlug: string | null,
+  spaceSlug: string | null,
   taskModel: string = MODELS.reason,
 ): AtlasSettings {
   let settings: AtlasSettings = {
@@ -786,25 +809,24 @@ export function resolveAtlasSettings(
   if (!config) return settings;
   if (config.model !== undefined || config.prices !== undefined || config.limits !== undefined)
     settings = { ...apply(settings, config), source: "configured" };
-  const own = accountSlug ? config.accounts?.[accountSlug.toLowerCase()] : undefined;
-  return own ? { ...apply(settings, own), source: "account" } : settings;
+  const own = spaceSlug ? config.spaces?.[spaceSlug.toLowerCase()] : undefined;
+  return own ? { ...apply(settings, own), source: "space" } : settings;
 }
 
-/** What a build of `repoId` runs its Atlas calls with (its owning account's settings). */
+/** What a build of `repoId` runs its Atlas calls with (its owning Space's settings). */
 export async function atlasSettings(
   env: Env,
   repoId: string,
   taskModel: string = MODELS.reason,
 ): Promise<AtlasSettings> {
   const config = parseAtlasConfig(Reflect.get(env, "ATLAS_CONFIG"));
-  if (!config) return resolveAtlasSettings(null, null, taskModel);
-  const owner = config.accounts
-    ? await db(env.DB)
-        .selectFrom("repos")
-        .innerJoin("accounts", "accounts.id", "repos.owner_id")
-        .select("accounts.slug")
-        .where("repos.id", "=", repoId)
-        .executeTakeFirst()
-    : undefined;
-  return resolveAtlasSettings(config, owner?.slug ?? null, taskModel);
+  const space = await db(env.DB)
+    .selectFrom("repos")
+    .innerJoin("spaces", "spaces.id", "repos.space_id")
+    .select("spaces.slug")
+    .where("repos.id", "=", repoId)
+    .where("spaces.archived_at", "is", null)
+    .executeTakeFirst();
+  if (!space) throw new Error(`Atlas budget: unknown repository or inactive Space ${repoId}`);
+  return resolveAtlasSettings(config, space.slug, taskModel);
 }

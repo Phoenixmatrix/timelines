@@ -733,7 +733,7 @@ function factsOf(
   return {
     repoId: repo.id,
     sourceId: state.sourceId,
-    owner: repo.owner_slug,
+    space: repo.space_slug,
     name: repo.name,
     ref: state.ref.replace(/^refs\/heads\//, ""),
     state:
@@ -800,14 +800,14 @@ export async function timelineFacts(
 
 /** A repository with neither the timeline's bookmark nor a kept overlay of it. */
 export function timelineAbsent(
-  repo: Pick<RepoRow, "id" | "owner_slug" | "name">,
+  repo: Pick<RepoRow, "id" | "space_slug" | "name">,
   ref: string,
   projectionCommit: string | null,
 ): AtlasTimelineRepo {
   return {
     repoId: repo.id,
     sourceId: null,
-    owner: repo.owner_slug,
+    space: repo.space_slug,
     name: repo.name,
     ref: ref.replace(/^refs\/heads\//, ""),
     state: "none",

@@ -6,12 +6,14 @@
 
 import { useEffect } from "react";
 import { useViewer } from "./session.ts";
+import { parseQuery } from "../../shared/tracker-query.ts";
+import { scopeSpace } from "./timelineScope.ts";
 
 export type PlaceKind = "repo" | "issue" | "run" | "package" | "timeline" | "commit";
 
 export interface RecentPlace {
   kind: PlaceKind;
-  /** The name people know it by: owner/name, an issue key, #12, a package name. */
+  /** The name people know it by: space/name, an issue key, #12, a package name. */
   title: string;
   /** Where it lives, or what it is: the issue's title, the run's repository. */
   detail: string;
@@ -27,7 +29,7 @@ export const RECENT_LIMIT = 8;
 const KINDS: readonly PlaceKind[] = ["repo", "issue", "run", "package", "timeline", "commit"];
 
 export function recentKey(viewerId: string | null): string {
-  return `gitmatrix:recent-places:${viewerId ?? "signed-out"}`;
+  return `gitmatrix:recent-places:v4:${viewerId ?? "signed-out"}`;
 }
 
 function valid(value: unknown): value is RecentPlace {
@@ -44,12 +46,62 @@ function valid(value: unknown): value is RecentPlace {
   );
 }
 
+/** Content locators retain their handles; migrate only known saved filter syntax. */
+function migrateLegacy(raw: string): RecentPlace[] | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || !parsed.every(valid)) return null;
+    const migrated: RecentPlace[] = [];
+    for (const place of parsed) {
+      const url = new URL(place.to, "https://gitmatrix.invalid");
+      if (!scopeSpace(url.pathname, url.search) || url.searchParams.has("owner")) return null;
+      const query = url.searchParams.get("q");
+      const nextQuery = query?.replace(/(-?[A-Za-z]+:)?"[^"]*"|\S+/g, (token) =>
+        token.replace(/^(-?)(?:workspace|ws):/i, "$1project:"),
+      );
+      if (nextQuery !== undefined && parseQuery(nextQuery).unknown.length) return null;
+      if (nextQuery !== undefined && nextQuery !== query) url.searchParams.set("q", nextQuery);
+      migrated.push({
+        ...place,
+        to:
+          nextQuery !== query && query !== null
+            ? `${url.pathname}${url.search}${url.hash}`
+            : place.to,
+      });
+    }
+    return migrated;
+  } catch {
+    return null;
+  }
+}
+
+/** Unknown saved schemas stay in their original key and are explicitly exportable. */
+export function readRecentRecovery(
+  viewerId: string | null,
+  storage = safeStorage(),
+): string | null {
+  try {
+    const raw = storage?.getItem(`gitmatrix:recent-places:${viewerId ?? "signed-out"}`);
+    return raw && migrateLegacy(raw) === null ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The viewer's recent places, newest first; empty when storage can't be read. */
 export function readRecent(viewerId: string | null, storage = safeStorage()): RecentPlace[] {
   try {
     const raw = storage?.getItem(recentKey(viewerId));
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.filter(valid).slice(0, RECENT_LIMIT) : [];
+    if (raw !== null && raw !== undefined) {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(valid).slice(0, RECENT_LIMIT) : [];
+    }
+    const legacy = storage?.getItem(`gitmatrix:recent-places:${viewerId ?? "signed-out"}`);
+    if (!legacy) return [];
+    const migrated = migrateLegacy(legacy);
+    if (!migrated) return [];
+    storage?.setItem(recentKey(viewerId), JSON.stringify(migrated));
+    return migrated.slice(0, RECENT_LIMIT);
   } catch {
     return [];
   }

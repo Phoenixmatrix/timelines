@@ -37,14 +37,14 @@
 //   (capability, package) rows each, read with indexed queries, so a 50
 //   repository scope reads a bounded few thousand rows (coverage reports any
 //   truncation). Pages of the result stay within 100 records.
-// - A materialized account snapshot would be one per authorized selection and
-//   principal policy, all drawing on the account's single 2 GiB composition
+// - A materialized Space snapshot would be one per authorized selection and
+//   principal policy, all drawing on the Space's single 2 GiB composition
 //   pool (retention.ts), and every visibility change would have to invalidate
 //   it. Computing from per-repository snapshots needs no invalidation: a denied
 //   repository is simply never read, so it can't change content, counts or
 //   cache identity, and pinning is exactly the per-repository pins.
 // - So nothing here is stored and the composition pool stays unused; no
-//   inference means no account grouping budget is drawn either.
+//   inference means no Space grouping budget is drawn either.
 
 import type {
   AtlasCompositeCapability,

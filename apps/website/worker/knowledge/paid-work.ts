@@ -13,21 +13,26 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
+/** Stable cancellation identity, separate from its human-readable explanation. */
+export type PaidWorkStopReason = string | { code: string; message: string };
+
 /** Why paid work stopped: its step attempt expired, or the work was stopped. */
 export class PaidWorkStopped extends Error {
   override name = "PaidWorkStopped";
   readonly kind: "expired" | "stopped";
-  constructor(kind: "expired" | "stopped", message: string) {
-    super(message);
+  readonly code: string | undefined;
+  constructor(kind: "expired" | "stopped", reason: PaidWorkStopReason) {
+    super(typeof reason === "string" ? reason : reason.message);
     this.kind = kind;
+    this.code = typeof reason === "string" ? undefined : reason.code;
   }
 }
 
 export interface PaidWorkLimits {
   /** Epoch ms after which no call may start, and calls in flight are aborted. */
   deadline?: number;
-  /** Null while the work is wanted; otherwise why it isn't. Errors count as wanted. */
-  live?: () => Promise<string | null>;
+  /** Null while the work is wanted; otherwise why it isn't. Errors stop work. */
+  live?: () => Promise<PaidWorkStopReason | null>;
   /** How often `live` is asked, in ms (default 10 s). */
   every?: number;
 }
@@ -58,8 +63,8 @@ export class PaidWorkGuard {
     return reason instanceof PaidWorkStopped && reason.kind === "stopped" ? reason : null;
   }
 
-  stop(kind: PaidWorkStopped["kind"], message: string) {
-    if (!this.signal.aborted) this.#controller.abort(new PaidWorkStopped(kind, message));
+  stop(kind: PaidWorkStopped["kind"], reason: PaidWorkStopReason) {
+    if (!this.signal.aborted) this.#controller.abort(new PaidWorkStopped(kind, reason));
   }
 
   /** Throws the PaidWorkStopped if no more calls may be made. */
@@ -70,7 +75,7 @@ export class PaidWorkGuard {
     const { live, every = 10_000 } = this.#limits;
     if (live && Date.now() - this.#checkedAt >= every) {
       this.#pending ??= live()
-        .catch(() => null)
+        .catch(() => "Work authorization could not be verified")
         .then((reason) => {
           this.#checkedAt = Date.now();
           if (reason) this.stop("stopped", reason);

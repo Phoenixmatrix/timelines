@@ -96,7 +96,7 @@ export async function runSourcePushRecoveryE2E(
     const cwd = join(ctx.work, slug);
     clones.push(cwd);
     await gm(["clone", f!.repo, cwd], "marco");
-    await gm(["timeline", "start", slug, "--owner", "orbit", "--policy", policy], "marco", cwd);
+    await gm(["timeline", "start", slug, "--space", "orbit", "--policy", policy], "marco", cwd);
     const detail = await f!.json<TimelineDetail>(`/api/tracker/orbit/timelines/${slug}`);
     const source = detail.timeline.repos[0]!.source!;
     assert.equal(source.kind, "timeline-work");

@@ -3,10 +3,12 @@
 // tombstones (404 with a reason, keys and slugs never reused), and replicas
 // converging through the change feed (or starting over below its floor).
 
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test } from "vite-plus/test";
 import type { Mutation, Snapshot, TrackerEvent } from "../../shared/tracker.ts";
-import { durableStorage } from "../testing/durable.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import { TrackerStore, type Access } from "./store.ts";
+import type { SqlDatabase } from "./sql.ts";
+import { initializeTrackerMigrationProof } from "./space-migration.ts";
 import {
   feedFloor,
   removeActivity,
@@ -20,15 +22,28 @@ const DAY = 86_400_000;
 const T0 = Date.parse("2025-01-01T00:00:00Z");
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-function setup() {
-  const { db, sql, transactionSync } = durableStorage();
+async function setup() {
+  const {
+    db,
+    sql,
+    transactionSync,
+    close: disposeStorage,
+    scope,
+    space,
+  } = await freshTrackerStorage();
+  onTestFinished(disposeStorage);
   let now = T0;
   const store = new TrackerStore(sql, transactionSync, () => now);
   const access: Access = {
     actorId: "ann",
     principalId: "ann",
+    // Recorded by settings that act later (approve-when-green); the store doesn't check it live.
+    credential: { kind: "token", id: "tok_ann" },
     agents: [],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
     members: [{ id: "ann", slug: "ann", displayName: "Ann" }],
     repos: [],
@@ -36,6 +51,9 @@ function setup() {
   let operation = 0;
   const mutate = (mutations: Mutation[], timeline?: string) =>
     store.mutate(access, {
+      contractVersion: 4,
+      spaceId: access.spaceId,
+      migrationEpoch: access.migrationEpoch,
       operationId: `op-${++operation}`,
       mutations,
       ...(timeline ? { timeline } : {}),
@@ -53,7 +71,7 @@ function setup() {
     store.timelines.create(access, {
       slug,
       parent,
-      repos: [{ id: "app", owner: "org", name: "app" }],
+      repos: [{ id: "app", space: "org", name: "app" }],
       commits: { app: oid(1) },
     });
   mutate([{ kind: "team.create", id: "team", data: { key: "ENG", name: "Engineering" } }]);
@@ -74,7 +92,9 @@ function setup() {
   };
 }
 
-type Fixture = ReturnType<typeof setup>;
+interface Fixture {
+  sql: SqlDatabase;
+}
 
 /**
  * Closed on day 0 and quiet since (A, B linked, A with a comment): removed.
@@ -82,8 +102,8 @@ type Fixture = ReturnType<typeof setup>;
  * commented on day 300), G (closed on day 300), H (closed, changed in a
  * timeline still on record), D and P (open).
  */
-function seeded() {
-  const f = setup();
+async function seeded() {
+  const f = await setup();
   for (const id of ["A", "B", "C", "D", "E", "F", "G", "H", "P"]) f.issue(id);
   f.update("E", { parentId: "P" });
   f.mutate([
@@ -140,7 +160,7 @@ function replay(base: Snapshot, events: TrackerEvent[]): Snapshot {
     comment: "comments",
     request: "requests",
     team: "teams",
-    workspace: "workspaces",
+    project: "projects",
     subscription: "subscriptions",
   };
   for (const event of events) {
@@ -153,8 +173,23 @@ function replay(base: Snapshot, events: TrackerEvent[]): Snapshot {
 }
 
 describe("closed issues", () => {
-  test("removes quiet closed components only, never open, linked, active or recent work", () => {
-    const f = seeded();
+  test("migration operation proof survives receipt expiry and issue pruning byte-for-byte", async () => {
+    const f = await seeded();
+    initializeTrackerMigrationProof(f.sql);
+    const original = f.sql
+      .exec("SELECT * FROM space_migration_receipt_proof ORDER BY id")
+      .toArray();
+    expect(original.length).toBeGreaterThan(0);
+    pages(f, "closed", CLOSED, true);
+    pages(f, "activity", ACTIVITY, true);
+    expect(f.sql.exec("SELECT * FROM space_migration_receipt_proof ORDER BY id").toArray()).toEqual(
+      original,
+    );
+    expect(f.sql.exec("SELECT id FROM receipts").toArray().length).toBeLessThan(original.length);
+  });
+
+  test("removes quiet closed components only, never open, linked, active or recent work", async () => {
+    const f = await seeded();
     const selected = pages(f, "closed", CLOSED, false).flatMap((page) => page.items);
     expect(selected).toEqual(["A", "B"]);
     // Not yet: 365 days after closing is day 365.
@@ -164,8 +199,8 @@ describe("closed issues", () => {
     ).toMatchObject({ items: [], next: null });
   });
 
-  test("a dry run lists exactly what the run removes, batch by batch, and runs twice harmlessly", () => {
-    const f = seeded();
+  test("a dry run lists exactly what the run removes, batch by batch, and runs twice harmlessly", async () => {
+    const f = await seeded();
     const dry = pages(f, "closed", CLOSED, false);
     const logged = f.db
       .prepare(
@@ -189,7 +224,7 @@ describe("closed issues", () => {
     const left = f.db
       .prepare(
         `SELECT count(*) AS n FROM events WHERE json_extract(data, '$.entityId') IN ('A', 'B', 'c-a', 'l-ab')
-           AND json_extract(data, '$.kind') != 'retention.remove'`,
+         AND json_extract(data, '$.kind') != 'retention.remove'`,
       )
       .get() as { n: number };
     expect(left.n).toBe(0);
@@ -203,8 +238,8 @@ describe("closed issues", () => {
     ).toEqual([]);
   });
 
-  test("removed issues answer 404 with the reason, and keys and ids are never reused", () => {
-    const f = seeded();
+  test("removed issues answer 404 with the reason, and keys and ids are never reused", async () => {
+    const f = await seeded();
     pages(f, "closed", CLOSED, true);
     for (const ref of ["ENG-1", "eng-1", "A"])
       expect(() => f.store.history(f.access, ref, null, 10)).toThrow(
@@ -227,11 +262,11 @@ describe("closed issues", () => {
     );
   });
 
-  test("a replica converges through the change feed", () => {
-    const f = seeded();
+  test("a replica converges through the change feed", async () => {
+    const f = await seeded();
     const replica = f.snapshot();
     pages(f, "closed", CLOSED, true);
-    const feed = f.store.changes(replica.cursor, 500);
+    const feed = f.store.changes(f.access, replica.cursor, 500);
     expect(feed.events.map((event) => [event.kind, event.entityType, event.entityId])).toEqual(
       expect.arrayContaining([
         ["retention.remove", "issue", "A"],
@@ -248,8 +283,8 @@ describe("closed issues", () => {
 });
 
 describe("activity logs and ended timelines", () => {
-  test("a retained source dependency keeps ancestor evidence without a parent or merge event", () => {
-    const f = setup();
+  test("a retained source dependency keeps ancestor evidence without a parent or merge event", async () => {
+    const f = await setup();
     const ancestor = f.fork("ancestor");
     f.store.timelines.abandon(f.access, "ancestor", { app: oid(1) });
     const child = f.fork("independent");
@@ -278,8 +313,8 @@ describe("activity logs and ended timelines", () => {
     f.db.close();
   });
 
-  function timelines() {
-    const f = seeded();
+  async function timelines() {
+    const f = await seeded();
     // "old" (H changed in it) and "gone" ended on day 0; "parent" too, but
     // "child", still open, forked from it; "open" is active.
     f.at(0);
@@ -292,8 +327,8 @@ describe("activity logs and ended timelines", () => {
     return f;
   }
 
-  test("keeps open work's history, the newest event of what exists, and open or referenced timelines", () => {
-    const f = timelines();
+  test("keeps open work's history, the newest event of what exists, and open or referenced timelines", async () => {
+    const f = await timelines();
     f.at(400);
     const selected = pages(f, "activity", ACTIVITY, false, 500).flatMap((page) => page.items);
     const timelineItems = selected.filter((item) => item.startsWith("t:"));
@@ -333,8 +368,8 @@ describe("activity logs and ended timelines", () => {
     expect(selected.some((item) => item.startsWith("r:"))).toBe(true);
   });
 
-  test("dry run = run, idempotent, and replicas below the floor start over", () => {
-    const f = timelines();
+  test("dry run = run, idempotent, and replicas below the floor start over", async () => {
+    const f = await timelines();
     const replica = f.snapshot(true);
     const dry = pages(f, "activity", ACTIVITY, false, 3);
     expect(pages(f, "activity", ACTIVITY, true, 3)).toEqual(dry);
@@ -363,12 +398,12 @@ describe("activity logs and ended timelines", () => {
     expect(() => f.fork("gone")).toThrow(/removed by retention; choose another name/);
     // The feed below its floor: 410, so gm fetches a fresh snapshot.
     expect(feedFloor(f.sql)).toBeGreaterThan(0);
-    expect(() => f.store.changes(replica.cursor, 500)).not.toThrow();
-    expect(() => f.store.changes(0, 500)).toThrow(
+    expect(() => f.store.changes(f.access, replica.cursor, 500)).not.toThrow();
+    expect(() => f.store.changes(f.access, 0, 500)).toThrow(
       expect.objectContaining({ status: 410, code: "cursor_expired" }),
     );
     // From the replica's cursor (above the floor), timeline removals arrive as deletions.
-    const feed = f.store.changes(replica.cursor, 500, true);
+    const feed = f.store.changes(f.access, replica.cursor, 500, true);
     expect(
       feed.events
         .filter((event) => event.kind === "retention.remove")
@@ -383,8 +418,8 @@ describe("activity logs and ended timelines", () => {
 });
 
 describe("approve-when-green settings (CORE-378)", () => {
-  test("keep the newest change of a setting that's on; old changes and ones turned off go", () => {
-    const f = setup();
+  test("keep the newest change of a setting that's on; old changes and ones turned off go", async () => {
+    const f = await setup();
     const set = (enabled: boolean) =>
       f.mutate([{ kind: "automation.approveWhenGreen", id: "ann", data: { enabled } }]);
     const first = set(true).events[0]!.cursor;

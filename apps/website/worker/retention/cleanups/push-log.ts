@@ -1,5 +1,5 @@
 // The push log (category "push-log", CORE-202): ref_updates and change_refs
-// past the policy, in an account's repositories. Git history itself is never
+// past the policy, in an Space's repositories. Git history itself is never
 // touched; these are Gitmatrix's records of pushes (worker/ref-log).
 //
 // Selects, older than `days` before the run's moment:
@@ -32,9 +32,9 @@ interface Item {
 const stale = (m: string) => `${m}.last_seen_at < ?2
   AND NOT EXISTS (SELECT 1 FROM repo_refs r WHERE r.repo_id = ${m}.repo_id AND r.ref = ${m}.ref)`;
 
-const STALE_CHANGE_REF = `m.repo_id IN (SELECT id FROM repos WHERE owner_id = ?1) AND ${stale("m")}`;
+const STALE_CHANGE_REF = `m.repo_id IN (SELECT id FROM repos WHERE space_id = ?1) AND ${stale("m")}`;
 
-const OLD_UPDATE = `u.repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)
+const OLD_UPDATE = `u.repo_id IN (SELECT id FROM repos WHERE space_id = ?1)
   AND u.created_at < ?2
   AND NOT EXISTS (SELECT 1 FROM change_refs k WHERE k.first_update_id = u.id AND NOT (${stale("k")}))
   AND NOT (EXISTS (SELECT 1 FROM repo_refs r WHERE r.repo_id = u.repo_id AND r.ref = u.ref)
@@ -49,10 +49,10 @@ const updateBytes = (u: string) => `(100 + length(${u}repo_id) + length(${u}ref)
   + coalesce(length(${u}actor_id), 0) + coalesce(length(${u}agent_id), 0) + length(${u}created_at))`;
 
 function scope(ctx: CleanupContext): [string, string] {
-  if (ctx.target.scope !== "account") throw new Error("push-log is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("push-log is a Space category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("push-log needs its days threshold.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days)];
+  return [ctx.target.id, daysBefore(ctx.now, days)];
 }
 
 async function selectChangeRefs(ctx: CleanupContext, after: number, limit: number) {

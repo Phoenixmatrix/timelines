@@ -1,13 +1,13 @@
 // CORE-184 in a real browser (formerly the E2E scenario
 // browser-atlas-workspace-composites-and-address): the workspace Atlas
-// (/:owner/-/atlas?repos=) over two repositories, one publishing the npm
+// (/:space/-/atlas?repos=) over two repositories, one publishing the npm
 // package the other's billing imports, composed into capabilities spanning
 // both. From the workspace page a person finds one, reads it, drills through
 // each member to a file and cites the two source locations at each
 // repository's own commit; the selection, lens and snapshot are in the
 // address, so Back/Forward and a copied link come back to the same place;
 // an expired link explains before offering the current view; a phone opens
-// on the outline. Only bounded /api/accounts/:owner/atlas pages are read.
+// on the outline. Only bounded /api/spaces/:space/atlas pages are read.
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
@@ -20,7 +20,7 @@ import { TestServer, type Recorded } from "../../testing/server.ts";
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const heading = (text: string) => page.getByRole("heading", { name: text, exact: true, level: 2 });
 const usedBy = () => page.getByRole("button", { name: "Used by", exact: true });
-const workspaceApi = "/api/accounts/orbit/atlas";
+const workspaceApi = "/api/spaces/orbit/atlas";
 
 /** Browsing reads only bounded workspace pages: no graph, search or repository Atlas. */
 function expectBounded(reads: Recorded[]) {
@@ -59,6 +59,7 @@ async function setup() {
     shop,
     repos,
     composite: composite!,
+    snapshot: composition.snapshot.id,
     shopMember: member(shop.name),
     ledgerMember: member(ledger.name),
     base: "/orbit/-/atlas",
@@ -66,7 +67,8 @@ async function setup() {
 }
 
 test("a capability across repositories, read, drilled into and cited at each commit", async () => {
-  const { server, ledger, shop, repos, composite, shopMember, ledgerMember, base } = await setup();
+  const { server, ledger, shop, repos, composite, snapshot, shopMember, ledgerMember, base } =
+    await setup();
   expect(composite.counts.files, "A composite counts each file once").toBe(
     (shopMember.counts.files ?? 0) + (ledgerMember.counts.files ?? 0),
   );
@@ -90,8 +92,8 @@ test("a capability across repositories, read, drilled into and cited at each com
   // Find the capability spanning both and read it.
   await userEvent.click(compositeRow);
   await app.waitForUrl((url) => url.searchParams.get("select") === composite.id);
-  expect(app.url().searchParams.get("snapshot"), "Selecting pins the composite snapshot").toMatch(
-    /^ws1\./,
+  expect(app.url().searchParams.get("snapshot"), "Selecting pins the composite snapshot").toBe(
+    snapshot,
   );
   await expect.element(heading(composite.name)).toBeVisible();
   await expect.element(page.getByText(/each file counted once/)).toBeVisible();

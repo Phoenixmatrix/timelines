@@ -31,6 +31,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadEnvFile } from "node:process";
 import {
+  CONTENT_CONTRACT_HEADER,
+  CONTENT_CONTRACT_VERSION,
+} from "../../apps/website/shared/spaces.ts";
+import {
   previewAccess,
   previewVariables,
   type PreviewAccess,
@@ -1180,7 +1184,7 @@ export const GM_DOWNLOAD_TIMEOUT_MS = 120_000;
 
 /**
  * gm for `gm deploy record` and the fixture pushes: GITMATRIX_PREVIEW_GM when
- * given, else the newest gm main published to the job owner's generic
+ * given, else the newest gm main published to the job Space's generic
  * registry (README: "Gitmatrix publishes Linux x86-64 and ARM64 release
  * binaries from main"), checked against its SHA-256 as `gm pkg install` does.
  */
@@ -1191,12 +1195,15 @@ export async function installGm(
 ): Promise<string> {
   if (env.GITMATRIX_PREVIEW_GM) return resolve(env.GITMATRIX_PREVIEW_GM);
   const server = env.GITMATRIX_URL?.replace(/\/+$/, "");
-  const owner = env.GITMATRIX_OWNER;
+  const space = env.GITMATRIX_SPACE;
   const token = env.GITMATRIX_TOKEN;
-  if (!server || !owner || !token)
-    throw new Error("Installing gm needs a CI job's GITMATRIX_URL, GITMATRIX_OWNER and token.");
-  const headers = { Authorization: `Bearer ${token}` };
-  const owned = encodeURIComponent(owner);
+  if (!server || !space || !token)
+    throw new Error("Installing gm needs a CI job's GITMATRIX_URL, GITMATRIX_SPACE and token.");
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    [CONTENT_CONTRACT_HEADER]: String(CONTENT_CONTRACT_VERSION),
+  };
+  const owned = encodeURIComponent(space);
   const detail = await request(`${server}/api/packages/${owned}/generic/gm`, {
     headers,
     signal: AbortSignal.timeout(GITMATRIX_TIMEOUT_MS),

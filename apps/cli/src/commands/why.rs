@@ -192,7 +192,7 @@ fn repo_api_base(repo: &str) -> Result<String> {
                 .iter()
                 .all(|p| !p.is_empty() && !matches!(**p, "." | "..") && !p.contains('/'))
         })
-        .ok_or_else(|| GmError::usage("Name the repository with --repo owner/name."))?;
+        .ok_or_else(|| GmError::usage("Name the repository with --repo space/name."))?;
     let mut path = String::from("/repos/");
     encode_into(&mut path, owner);
     path.push('/');
@@ -832,8 +832,8 @@ mod tests {
         // What the server sends in commit mode: the edit isn't pushed (a local rebase),
         // but its change id found the change's history.
         let server = json!({
-            "repo": {"owner": "orbit", "name": "app", "defaultBranch": "main"},
-            "tracker": {"owner": "orbit", "readable": true},
+            "repo": {"space": "orbit", "name": "app", "defaultBranch": "main"},
+            "tracker": {"space": "orbit", "readable": true},
             "blame": null,
             "chains": [
                 {"oid": root.to_string(), "commit": {"oid": root.to_string(), "message": "Start"},

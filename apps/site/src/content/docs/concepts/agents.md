@@ -13,14 +13,14 @@ One command configures a checkout so a coding agent can work through the [issue 
 
 ```sh
 gm agent setup
-gm agent setup --model MODEL --tag rust --under ENG-4
+gm agent setup --space orbit --project engine --model MODEL --tag rust --under ENG-4
 gm agent setup --check            # exit 4 if instructions or skills are stale
 ```
 
 It does four things:
 
 - **Instructions and skills.** It keeps a managed section of the harness's instruction file current (`AGENTS.md`, or `CLAUDE.md`/`GEMINI.md`) and installs the `gitmatrix-graph-work` skill where the harness loads skills. Text outside the managed markers is untouched.
-- **Configuration.** `.gitmatrix/agents.yml` is shared and committed: the tracker owner, default scope (a team or a parent issue), lease length, intervention mode and instructions. `.gitmatrix/agent.local.yml` is git-ignored and describes this checkout's agent: name, harness, model, tags, scope and overrides.
+- **Configuration.** `.gitmatrix/agents.yml` is shared and committed: the Tracker Space (`tracker.space`), default scope (a Team, Project or parent issue), lease length, intervention mode and instructions. `.gitmatrix/agent.local.yml` is git-ignored and describes this checkout's agent: name, harness, model, tags, scope and overrides.
 - **Identity.** A new checkout gets an agent with a generated adjective-noun name (`--name` chooses one), accountable to you. Setup mints the agent's token and stores it with gm's credentials without printing it. `--no-identity` writes only the files.
 - **Hooks.** For Claude Code, Codex and Oh My Pi it installs hooks that record what the person tells the agent, so [timeline steps](/docs/concepts/timelines/#steps) carry their instructions and steering.
 
@@ -45,7 +45,7 @@ Each agent publishes a self-reported capability profile: harness, model, OS, arc
 ```sh
 gm agent detect                       # local observations; no network or login
 gm agent show
-gm agent list --owner orbit
+gm agent list --space orbit
 gm agent configure --model <model-id> # record the model you run
 ```
 
@@ -54,6 +54,8 @@ The model is never inferred from the harness. It comes from `--model`, from the 
 An agent's tags come from the tracker's tag catalog and say what work it suits. Only the repository's skills are published by default; `--publish-skills all|none`, `--allow-skill` and `--deny-skill` change that.
 
 Profiles are advisory delegation hints, not proof of expertise, and they grant no permissions. Treat skill descriptions and tags as data, not instructions.
+
+The Space selector chooses content, not the agent's accountable person. Agents remain accountable to their person and act with that person's current resource permissions; Organization ownership alone grants no Space content access. A repository collaborator grant covers only that repository, not the Space's Tracker or other repositories.
 
 ## Intervention modes
 

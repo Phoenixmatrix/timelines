@@ -23,8 +23,8 @@ export function contextFor(pathname: string, hash: string, matches: Match[]): Pa
     if (tracker[2]) page.issue = decodeURIComponent(tracker[2]);
     return page;
   }
-  if (params.owner && params.repo) {
-    page.repo = `${params.owner}/${params.repo}`;
+  if (params.space && params.repo) {
+    page.repo = `${params.space}/${params.repo}`;
     for (const match of matches) {
       const data = match.data as { blob?: { ref: string; path: string } } | null;
       if (data?.blob) {
@@ -41,10 +41,10 @@ export function contextFor(pathname: string, hash: string, matches: Match[]): Pa
 
 export function usePageContext(): PageContext {
   const { pathname, hash } = useLocation();
-  const matches = useMatches().map((m) => {
-    const match = m as unknown as { params: Match["params"]; loaderData?: unknown; data?: unknown };
-    return { params: match.params, data: match.loaderData ?? match.data };
-  });
+  const matches = useMatches().map((match) => ({
+    params: match.params,
+    data: match.loaderData,
+  }));
   return contextFor(pathname, hash, matches);
 }
 

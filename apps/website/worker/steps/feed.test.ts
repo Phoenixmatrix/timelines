@@ -1,9 +1,13 @@
 // A timeline's live feed (CORE-239): what it keeps and what a reader gets.
 
-import { describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { StepFeedRecord } from "../../shared/steps.ts";
 import { fakeDurableState } from "../testing/durable-state.ts";
-import { FEED_KEEP, FEED_TTL_MS, StepFeed } from "./feed.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority, type WorkAuthority } from "../ci/admission.ts";
+import { FEED_KEEP, FEED_TTL_MS, StepFeed, type StepFeedAccess } from "./feed.ts";
+import type { SpaceCutover } from "../space-cutover/control.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -16,6 +20,46 @@ vi.mock("cloudflare:workers", () => ({
   },
   WorkflowEntrypoint: class {},
 }));
+
+let env: Env;
+let closeControl: (() => void) | undefined;
+let control: SpaceCutover;
+let authority: WorkAuthority;
+let access: StepFeedAccess;
+beforeEach(async () => {
+  const fixture = await createFreshSpaceTestEnvironment();
+  env = fixture.env;
+  closeControl = fixture.close;
+  control = fixture.control;
+  fixture.sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('ann','user','ann','Ann')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "orbit-org", slug: "orbit-org", displayName: "Orbit", kind: "company" },
+    space: { id: "orbit", slug: "orbit", displayName: "General" },
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "ann",
+  });
+  fixture.sqlite.exec(
+    "INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote) VALUES('repo','orbit','app','private','physical','https://artifacts')",
+  );
+  const token = await issueToken(env.DB, "ann", "feed", "write");
+  authority = await captureWorkAuthority(env, "repo", {
+    id: "ann",
+    credential: { kind: "token", id: token.id },
+  });
+  access = { ...authority, repoId: "repo", timeline: "search" };
+});
+afterEach(async () => {
+  await vi.waitFor(() => expect(control.activeTickets()).toEqual([]));
+  closeControl?.();
+});
 
 const record = (n: number): Omit<StepFeedRecord, "seq" | "at"> => ({
   repo: "orbit/app",
@@ -61,7 +105,10 @@ async function events(response: Response, count: number) {
 const subscribe = (feed: StepFeed, last?: number) =>
   feed.fetch(
     new Request("https://step-feed/subscribe", {
-      headers: last === undefined ? {} : { "last-event-id": String(last) },
+      headers: {
+        "x-step-feed-access": JSON.stringify(access),
+        ...(last === undefined ? {} : { "last-event-id": String(last) }),
+      },
     }),
   );
 
@@ -72,18 +119,75 @@ const removal = (n: number) => ({
 });
 
 describe("the step feed", () => {
+  test("revoked credentials cannot publish or reuse a warm feed cursor", async () => {
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx, env);
+    await feed.publish("repo", authority, record(1));
+    await env.DB.prepare("DELETE FROM access_tokens WHERE id = ?")
+      .bind(authority.credential.id)
+      .run();
+    await expect(feed.publish("repo", authority, record(2))).rejects.toThrow();
+    await expect(feed.since(access, 0)).rejects.toThrow();
+    const cold = new StepFeed(ctx, env);
+    await expect(cold.since(access, 0)).rejects.toThrow();
+    expect(await ctx.storage.get("seq")).toBe(1);
+  });
+
+  test("stale epochs and mismatched Space or timeline cannot read or publish", async () => {
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx, env);
+    await feed.publish("repo", authority, record(1));
+    await expect(
+      feed.since({ ...access, migrationEpoch: access.migrationEpoch + 1 }, 0),
+    ).rejects.toThrow();
+    await expect(feed.since({ ...access, spaceId: "other-space" }, 0)).rejects.toThrow();
+    await expect(feed.since({ ...access, timeline: "other" }, 0)).rejects.toThrow();
+    await expect(
+      feed.publish("repo", { ...authority, spaceId: "other-space" }, record(2)),
+    ).rejects.toThrow();
+    expect(await ctx.storage.get("seq")).toBe(1);
+  });
+
+  test("Organization administration without a current Space grant cannot reuse feed access", async () => {
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx, env);
+    await feed.publish("repo", authority, record(1));
+    await env.DB.prepare("DELETE FROM space_grants WHERE space_id = 'orbit'").run();
+    await expect(feed.since(access, 0)).rejects.toThrow();
+    await expect(feed.publish("repo", authority, record(2))).rejects.toThrow();
+  });
+
+  test("anonymous readers retain public repository access but never private feed access", async () => {
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx, env);
+    await feed.publish("repo", authority, record(1));
+    const anonymous: StepFeedAccess = {
+      ...access,
+      personId: null,
+      agentId: null,
+      credential: null,
+    };
+    await expect(feed.since(anonymous, 0)).rejects.toThrow();
+    await env.DB.prepare("UPDATE repos SET visibility = 'public' WHERE id = 'repo'").run();
+    expect(await feed.since(anonymous, 0)).toHaveLength(1);
+    await env.DB.prepare("UPDATE repos SET visibility = 'private' WHERE id = 'repo'").run();
+    await expect(feed.since(anonymous, 0)).rejects.toThrow();
+  });
+
   test("a reader gets what's there after its last event, then each new step", async () => {
-    const { ctx } = fakeDurableState();
-    const feed = new StepFeed(ctx as never, {} as Env);
-    for (let n = 1; n <= 3; n++) await feed.publish(record(n));
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx as never, env);
+    for (let n = 1; n <= 3; n++) await feed.publish("repo", authority, record(n));
     const response = await feed.fetch(
-      new Request("https://step-feed/subscribe", { headers: { "last-event-id": "1" } }),
+      new Request("https://step-feed/subscribe", {
+        headers: { "last-event-id": "1", "x-step-feed-access": JSON.stringify(access) },
+      }),
     );
     expect(response.headers.get("content-type")).toContain("text/event-stream");
     const reading = events(response, 3);
     // Delivered live once connected.
-    await vi.waitFor(() => expect(feed.subscribers()).toBe(1));
-    await feed.publish(record(4));
+    await vi.waitFor(async () => expect(await feed.subscribers()).toBe(1));
+    await feed.publish("repo", authority, record(4));
     const got = await reading;
     expect(got.map((e) => [e.id, e.data.summary])).toEqual([
       [2, "Step 2"],
@@ -97,30 +201,30 @@ describe("the step feed", () => {
     });
   });
 
-  test("an account's shorter keep period expires its records sooner (CORE-244)", async () => {
-    const { ctx } = fakeDurableState();
-    const feed = new StepFeed(ctx as never, {} as Env);
-    await feed.publish(record(1), 24 * 60 * 60_000);
-    await feed.publish(record(2));
+  test("a Space's shorter keep period expires its records sooner (CORE-244)", async () => {
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx as never, env);
+    await feed.publish("repo", authority, record(1), 24 * 60 * 60_000);
+    await feed.publish("repo", authority, record(2));
     vi.useFakeTimers({ now: Date.now() + 2 * 24 * 60 * 60_000 });
     try {
-      expect((await feed.since(0)).map((r) => r.seq)).toEqual([2]);
+      expect((await feed.since(access, 0)).map((r) => r.seq)).toEqual([2]);
       await feed.alarm();
-      expect((await feed.since(0)).map((r) => r.seq)).toEqual([2]);
+      expect((await feed.since(access, 0)).map((r) => r.seq)).toEqual([2]);
       // Never longer than the week.
-      await feed.publish(record(3), 30 * 24 * 60 * 60_000);
+      await feed.publish("repo", authority, record(3), 30 * 24 * 60 * 60_000);
       vi.setSystemTime(Date.now() + FEED_TTL_MS);
-      expect(await feed.since(0)).toEqual([]);
+      expect(await feed.since(access, 0)).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
   });
 
   test("keeps the newest records for a week", async () => {
-    const { ctx } = fakeDurableState();
-    const feed = new StepFeed(ctx as never, {} as Env);
-    for (let n = 1; n <= FEED_KEEP + 5; n++) await feed.publish(record(n));
-    const kept = await feed.since(0);
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx as never, env);
+    for (let n = 1; n <= FEED_KEEP + 5; n++) await feed.publish("repo", authority, record(n));
+    const kept = await feed.since(access, 0);
     expect(kept).toHaveLength(FEED_KEEP);
     expect(kept[0]!.seq).toBe(6);
     expect(await ctx.storage.getAlarm()).not.toBeNull();
@@ -128,23 +232,23 @@ describe("the step feed", () => {
     vi.useFakeTimers({ now: Date.now() + FEED_TTL_MS + 1 });
     try {
       await feed.alarm();
-      expect(await feed.since(0)).toEqual([]);
+      expect(await feed.since(access, 0)).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
   });
 
   test("forgets a deleted step: gone from the backlog, readers told, live and on reconnect (CORE-399)", async () => {
-    const { ctx } = fakeDurableState();
-    const feed = new StepFeed(ctx as never, {} as Env);
-    for (let n = 1; n <= 3; n++) await feed.publish(record(n));
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx as never, env);
+    for (let n = 1; n <= 3; n++) await feed.publish("repo", authority, record(n));
     // Connected since step 3: told live.
     const reading = events(await subscribe(feed, 3), 1);
-    await vi.waitFor(() => expect(feed.subscribers()).toBe(1));
+    await vi.waitFor(async () => expect(await feed.subscribers()).toBe(1));
     expect(await feed.forget([{ ...removal(2), repo: "orbit/renamed" }])).toBe(1);
     // The record's own repository, which readers match on.
     expect((await reading).removed).toEqual([removal(2)]);
-    expect((await feed.since(0)).map((r) => r.seq)).toEqual([1, 3]);
+    expect((await feed.since(access, 0)).map((r) => r.seq)).toEqual([1, 3]);
     // A reader that already had step 2 and missed that is told on reconnect.
     const back = await events(await subscribe(feed, 3), 1);
     expect(back.removed).toEqual([removal(2)]);
@@ -154,30 +258,30 @@ describe("the step feed", () => {
   });
 
   test("forgetting is idempotent, and a publish in flight can't bring the step back", async () => {
-    const { ctx } = fakeDurableState();
-    const feed = new StepFeed(ctx as never, {} as Env);
-    await feed.publish(record(1));
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx as never, env);
+    await feed.publish("repo", authority, record(1));
     expect(await feed.forget([removal(1)])).toBe(1);
     const reading = events(await subscribe(feed, 1), 3);
-    await vi.waitFor(() => expect(feed.subscribers()).toBe(1));
+    await vi.waitFor(async () => expect(await feed.subscribers()).toBe(1));
     // Again: nothing new, nobody told twice.
     expect(await feed.forget([removal(1)])).toBe(0);
     // Deleted before its publish arrived (it runs after the upload's answer).
     expect(await feed.forget([removal(2)])).toBe(1);
-    expect(await feed.publish(record(2))).toBeNull();
-    await feed.publish(record(3));
+    expect(await feed.publish("repo", authority, record(2))).toBeNull();
+    await feed.publish("repo", authority, record(3));
     const got = await reading;
     expect(got.removed).toEqual([removal(1), removal(2)]);
     expect(got.map((e) => e.data.summary)).toEqual(["Step 3"]);
-    expect((await feed.since(0)).map((r) => r.summary)).toEqual(["Step 3"]);
+    expect((await feed.since(access, 0)).map((r) => r.summary)).toEqual(["Step 3"]);
   });
 
   test("remembers a forgotten step for a week, then lets go", async () => {
-    const { ctx } = fakeDurableState();
-    const feed = new StepFeed(ctx as never, {} as Env);
+    const { ctx } = fakeDurableState({ name: "repo:search" });
+    const feed = new StepFeed(ctx as never, env);
     // No record (evicted, or never here): still remembered, as a reader may hold one.
     await feed.forget([removal(1)]);
-    expect(await feed.since(0)).toEqual([]);
+    expect(await feed.since(access, 0)).toEqual([]);
     expect(await feed.removals()).toEqual([removal(1)]);
     expect(await ctx.storage.getAlarm()).not.toBeNull();
     vi.useFakeTimers({ now: Date.now() + FEED_TTL_MS + 1 });

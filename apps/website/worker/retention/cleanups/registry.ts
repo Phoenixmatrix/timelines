@@ -1,4 +1,4 @@
-// The package registry's site categories (CORE-205), over REGISTRY_DB and
+// The package registry's Instance categories (CORE-205), over REGISTRY_DB and
 // the REGISTRY_BLOBS bucket.
 //
 // "registry-proxy-cache" (`days`), in two phases:
@@ -48,7 +48,7 @@ function following(name: string, phases: string[]): string | null {
 }
 
 function cutoff(ctx: CleanupContext, id: string): string {
-  if (ctx.target.scope !== "site") throw new Error(`${id} is a site category.`);
+  if (ctx.target.kind !== "instance") throw new Error(`${id} is an Instance category.`);
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error(`${id} needs its days threshold.`);
   return daysBefore(ctx.now, days);

@@ -6,11 +6,11 @@ import { RoleChip, VisibilityChip } from "./ui.tsx";
 
 export function RepoList({
   repos,
-  showOwner = true,
+  showSpace = true,
   empty,
 }: {
   repos: RepoSummary[];
-  showOwner?: boolean;
+  showSpace?: boolean;
   empty: React.ReactNode;
 }) {
   if (repos.length === 0) return <div className="mk-empty">{empty}</div>;
@@ -19,20 +19,15 @@ export function RepoList({
       {repos.map((repo) => (
         <li key={repo.id} className="mk-enter-up">
           <PrefetchLink
-            to={`/${repo.owner.slug}/${repo.name}`}
+            to={`/${repo.space.slug}/${repo.name}`}
             className="flex items-start gap-3 px-4 py-3.5 text-ink no-underline transition-colors hover:bg-raised"
           >
-            <Monogram
-              name={repo.owner.displayName}
-              shape={repo.owner.kind === "org" ? "place" : "person"}
-              size="sm"
-              src={repo.owner.avatarUrl}
-            />
+            <Monogram name={repo.space.displayName} shape="place" size="sm" />
             <span className="min-w-0 flex-1">
               <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span className="font-semibold">
-                  {showOwner && (
-                    <span className="font-normal text-ink-muted">{repo.owner.slug} / </span>
+                  {showSpace && (
+                    <span className="font-normal text-ink-muted">{repo.space.slug} / </span>
                   )}
                   <bdi>{repo.name}</bdi>
                 </span>

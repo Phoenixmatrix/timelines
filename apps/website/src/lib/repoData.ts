@@ -13,55 +13,45 @@ import { sourceUrl } from "./refs.ts";
 import type { TimelineDetail } from "../../shared/timelines.ts";
 import { scopeOf } from "./timelineScope.ts";
 
-// Every repository read goes through this cache, so a link that was hovered
-// (and prefetched) opens instantly, and going back to a page doesn't refetch.
-// Data addressed by a commit id never changes; anything addressed by a branch
-// name is reused for a short while.
-
-const FRESH_MS = 15_000;
-const COMMIT_ID = /(?:^|[?&])(?:at|ref)=[0-9a-f]{40}(?:%2F|\/|&|$)/;
-
-const cache = new Map<string, { at: number; promise: Promise<unknown> }>();
+// Share concurrent reads only. Even immutable Git content must reauthorize on
+// the next navigation after a Space grant or collaborator access is revoked.
+const cache = new Map<string, Promise<unknown>>();
 
 function cached<T>(path: string): Promise<T> {
   const hit = cache.get(path);
-  if (
-    hit &&
-    ((!path.includes("source=") && COMMIT_ID.test(path)) || Date.now() - hit.at < FRESH_MS)
-  ) {
-    return hit.promise as Promise<T>;
-  }
-  // Not tied to any one navigation's abort signal: a prefetch and the
-  // navigation that follows it share this request.
+  if (hit) return hit as Promise<T>;
   const promise = api<T>(path);
-  cache.set(path, { at: Date.now(), promise });
-  promise.catch(() => cache.delete(path));
+  cache.set(path, promise);
+  const release = () => {
+    if (cache.get(path) === promise) cache.delete(path);
+  };
+  void promise.then(release, release);
   return promise;
 }
 
-const base = (owner: string, name: string) =>
-  `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+const base = (space: string, name: string) =>
+  `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}`;
 
 export const repoData = {
-  detail: (owner: string, name: string, source?: string | null, metadataOnly = false) =>
+  detail: (space: string, name: string, source?: string | null, metadataOnly = false) =>
     cached<RepoDetail>(
-      sourceUrl(`${base(owner, name)}${metadataOnly ? "?metadata=1" : ""}`, source),
+      sourceUrl(`${base(space, name)}${metadataOnly ? "?metadata=1" : ""}`, source),
     ),
   /** `at` is the URL tail after /tree/: "<ref>/<path>", split by the server. */
-  tree: (owner: string, name: string, at: string, source?: string | null) =>
+  tree: (space: string, name: string, at: string, source?: string | null) =>
     cached<TreeResponse>(
-      sourceUrl(`${base(owner, name)}/tree?at=${encodeURIComponent(at)}`, source),
+      sourceUrl(`${base(space, name)}/tree?at=${encodeURIComponent(at)}`, source),
     ),
-  blob: (owner: string, name: string, at: string, source?: string | null) =>
+  blob: (space: string, name: string, at: string, source?: string | null) =>
     cached<BlobResponse>(
-      sourceUrl(`${base(owner, name)}/blob?at=${encodeURIComponent(at)}`, source),
+      sourceUrl(`${base(space, name)}/blob?at=${encodeURIComponent(at)}`, source),
     ),
-  commits: (owner: string, name: string, at: string, page: number, source?: string | null) =>
+  commits: (space: string, name: string, at: string, page: number, source?: string | null) =>
     cached<CommitsResponse>(
-      sourceUrl(`${base(owner, name)}/commits?at=${encodeURIComponent(at)}&page=${page}`, source),
+      sourceUrl(`${base(space, name)}/commits?at=${encodeURIComponent(at)}&page=${page}`, source),
     ),
   history: (
-    owner: string,
+    space: string,
     name: string,
     at: string,
     entries = false,
@@ -70,23 +60,23 @@ export const repoData = {
   ) =>
     cached<HistoryPage>(
       sourceUrl(
-        `${base(owner, name)}/history?at=${encodeURIComponent(at)}&entries=${entries}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        `${base(space, name)}/history?at=${encodeURIComponent(at)}&entries=${entries}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
         source,
       ),
     ),
   /** One knowledge-graph node with its neighbors ("repo", "file:<path>", ...). */
-  graphNode: (owner: string, name: string, id: string) =>
+  graphNode: (space: string, name: string, id: string) =>
     cached<GraphNodeDetail>(
-      `${base(owner, name)}/knowledge/graph/node?id=${encodeURIComponent(id)}`,
+      `${base(space, name)}/knowledge/graph/node?id=${encodeURIComponent(id)}`,
     ),
   /** The latest CI runs, newest first (for side rails; the CI page polls its own). */
-  ciRuns: (owner: string, name: string, source?: string | null) =>
-    cached<CiRunList>(sourceUrl(`${base(owner, name)}/ci`, source)),
+  ciRuns: (space: string, name: string, source?: string | null) =>
+    cached<CiRunList>(sourceUrl(`${base(space, name)}/ci`, source)),
 };
 
 /** Resolve timeline scope before object reads; an unmigrated active source must not show main. */
 export async function requestSource(
-  owner: string,
+  space: string,
   name: string,
   request: Request,
 ): Promise<string | null> {
@@ -97,13 +87,13 @@ export async function requestSource(
   if (!slug) return null;
   const detail = await routeData(
     cached<TimelineDetail>(
-      `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(slug)}`,
+      `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(slug)}`,
     ),
   );
-  let entry = detail.timeline.repos.find((repo) => repo.owner === owner && repo.name === name);
+  let entry = detail.timeline.repos.find((repo) => repo.space === space && repo.name === name);
   if (!entry) {
     // Timeline labels are historical; canonical identity survives a rename.
-    const canonical = await routeData(repoData.detail(owner, name, "canonical"));
+    const canonical = await routeData(repoData.detail(space, name, "canonical"));
     entry = detail.timeline.repos.find((repo) => repo.id === canonical.id);
   }
   if (!entry) return null;
@@ -117,8 +107,8 @@ export async function requestSource(
 }
 
 /** Drop everything cached for a repository (after changing it). */
-export function forgetRepoData(owner: string, name: string) {
-  const prefix = base(owner, name);
+export function forgetRepoData(space: string, name: string) {
+  const prefix = base(space, name);
   for (const key of cache.keys()) {
     if (key === prefix || key.startsWith(`${prefix}/`) || key.startsWith(`${prefix}?`))
       cache.delete(key);
@@ -140,24 +130,40 @@ export async function routeData<T>(promise: Promise<T>): Promise<T> {
   }
 }
 
-const APP_ROUTES = new Set(["signin", "new", "settings", "api"]);
+const APP_ROUTES: Record<string, true> = {
+  accounts: true,
+  organizations: true,
+  instance: true,
+  signin: true,
+  new: true,
+  settings: true,
+  api: true,
+  tracker: true,
+  timelines: true,
+  "release-notes": true,
+  highlights: true,
+  "needs-you": true,
+  packages: true,
+  "cli-auth": true,
+  "-": true,
+};
 
 /** Warm the cache for an in-app URL before it is clicked. */
 export function prefetchRoute(to: string) {
   const url = new URL(to, window.location.origin);
-  const [owner, name, view, ...rest] = url.pathname
+  const [space, name, view, ...rest] = url.pathname
     .split("/")
     .filter(Boolean)
     .map(decodeURIComponent);
-  if (!owner || !name || APP_ROUTES.has(owner)) return;
+  if (!space || !name || name === "-" || APP_ROUTES[space]) return;
   const tail = rest.join("/");
   const ignore = () => {};
   const source = url.searchParams.get("source");
-  repoData.detail(owner, name, source).catch(ignore);
-  if (view === undefined) repoData.tree(owner, name, "", source).catch(ignore);
-  else if (view === "tree") repoData.tree(owner, name, tail, source).catch(ignore);
-  else if (view === "blob") repoData.blob(owner, name, tail, source).catch(ignore);
+  repoData.detail(space, name, source).catch(ignore);
+  if (view === undefined) repoData.tree(space, name, "", source).catch(ignore);
+  else if (view === "tree") repoData.tree(space, name, tail, source).catch(ignore);
+  else if (view === "blob") repoData.blob(space, name, tail, source).catch(ignore);
   else if (view === "commits") {
-    repoData.history(owner, name, tail, false, "", source).catch(ignore);
+    repoData.history(space, name, tail, false, "", source).catch(ignore);
   }
 }

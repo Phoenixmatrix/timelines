@@ -5,13 +5,13 @@ import { DIFF_LIMITS } from "../../shared/diff.ts";
 import type { AgentPresence } from "../../shared/agent-presence.ts";
 import { issueToken } from "./tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { fakeHistory } from "../testing/history.ts";
 import { Timing } from "../timing.ts";
 import { repos } from "./repos.ts";
 
 // loadRepo's module reaches the knowledge coordinator, a Durable Object.
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {}, WorkflowEntrypoint: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 beforeEach(() => {
   vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
@@ -19,21 +19,33 @@ beforeEach(() => {
     throw new Error("no network in tests");
   });
 });
-afterEach(() => vi.unstubAllGlobals());
+const closers: Array<() => void> = [];
+afterEach(() => {
+  vi.unstubAllGlobals();
+  for (const close of closers.splice(0)) close();
+});
 
 async function setup(visibility = "private") {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite, env } = fresh;
+  closers.push(fresh.close);
   sqlite.exec(`
+    BEGIN;
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob'), ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ann', 'owner');
+      ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob');
+    INSERT INTO organizations(id,slug,display_name,kind,default_space_id) VALUES('company','company','Company','company','space');
+    INSERT INTO spaces(id,organization_id,slug,display_name) VALUES('space','company','orbit','Orbit');
+    INSERT INTO organization_members(organization_id,account_id,role,origin,granted_by) VALUES('company','ann','owner','bootstrap','ann');
+    INSERT INTO space_grants(space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by)
+      VALUES('space','company','ann','admin','write','write','bootstrap','ann');
     INSERT INTO agents (id, name, accountable_id) VALUES
       ('inspector', 'Inspector', 'ann'), ('reader', 'Reader', 'ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('app', 'orbit', 'app', '${visibility}', 'diff-${crypto.randomUUID()}', 'https://app');
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('app', 'space', 'app', '${visibility}', 'diff-${crypto.randomUUID()}', 'https://app');
+    COMMIT;
   `);
   const git = fakeHistory();
-  const env = { DB: d1(sqlite), ARTIFACTS: git.artifacts } as unknown as Env;
+  Reflect.set(env, "ARTIFACTS", git.artifacts);
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
@@ -170,10 +182,10 @@ describe("commit recent agent presence", () => {
     const { git, request, presence, sqlite } = await setup();
     const oid = git.commit({ files: { a: "a\n" } });
     sqlite.exec(`INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,
        allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
        initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
-      VALUES('work','app','timeline','test','orbit','diff-work-${crypto.randomUUID()}','https://work','ready',
+      VALUES('work','app','timeline','test','space','diff-work-${crypto.randomUUID()}','https://work','ready',
        'allocation','canonical','${oid}','${"a".repeat(40)}','refs/heads/main',
        'canonical','${oid}','${"a".repeat(40)}','refs/heads/main','now','now',1)`);
     expect((await request(`commits/${oid}/diff?source=work`, "inspector")).status).toBe(200);

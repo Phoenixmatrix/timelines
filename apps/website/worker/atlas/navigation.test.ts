@@ -4,11 +4,12 @@
 // model, index and search binding wired to fail if touched.
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AtlasEntitySummary, AtlasOverview } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlasApi, atlasErrorOf } from "../../src/lib/atlas.ts";
 import {
   CatalogueLookup,
@@ -21,7 +22,14 @@ import { atlas } from "./api.ts";
 import { expireAtlasPriors, publishAtlasFixture, writeAtlasFixtureGraph } from "./fixture.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -47,15 +55,30 @@ function forbidden(name: string, touched: string[]) {
 }
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'private', 'art-r1', ''),
       ('r2', 'ann', 'other', 'private', 'art-r2', '');
   `);
   const touched: string[] = [];
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
     AI: forbidden("AI", touched),
@@ -70,7 +93,7 @@ async function setup() {
     c.set("actor", ann);
     await next();
   });
-  app.route("/api/repos/:owner/:name/atlas", atlas);
+  app.route("/api/repos/:space/:name/atlas", atlas);
   // Everything the browser client asks for, as "<route>?<query>", in order.
   const requests: string[] = [];
   let delay: (url: URL) => Promise<void> = async () => {};
@@ -91,7 +114,7 @@ async function setup() {
   };
 }
 
-const repo = { owner: "ann", name: "shop" };
+const repo = { space: "ann", name: "shop" };
 const route = (request: string) => {
   const url = new URL(request, "http://atlas.test");
   return {

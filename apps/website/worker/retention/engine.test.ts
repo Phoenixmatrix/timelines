@@ -5,9 +5,13 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vite-plus/test";
-import { d1, migratedDatabase } from "../testing/d1.ts";
-import { accountPolicies } from "./policies.ts";
+import { afterEach, describe, expect, test } from "vite-plus/test";
+import { migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
+import { spacePolicies } from "./policies.ts";
+import { issueToken } from "../api/tokens.ts";
+import type { RetentionAuthority } from "./runs.ts";
 import {
   advanceRun,
   continueRun,
@@ -23,19 +27,27 @@ const DAY = 86_400_000;
 const ago = (days: number) => new Date(NOW.getTime() - days * DAY).toISOString();
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const close of cleanups.splice(0)) close();
+});
+
 /**
  * Orbit (org) and Sam (user) with deployments of every kind; ids 1..12 are
  * Orbit's expired records past 30 days, which the policy at its default
  * selects; the rest must survive.
  */
-function seeded() {
-  const sqlite = migratedDatabase();
+async function seeded() {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
+  sqlite.exec("BEGIN");
   sqlite.exec(
     readFileSync(fileURLToPath(new URL("../../seed/0001_dev.sql", import.meta.url).href), "utf8"),
   );
+  sqlite.exec("COMMIT");
   sqlite.exec(`
     INSERT INTO retention_site_policies(category,enabled) VALUES ('timeline-work-sources',0);
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_app', 'acc_orbit', 'app', 'private', 'a', 'https://a'),
       ('r_lib', 'acc_orbit', 'lib', 'private', 'b', 'https://b'),
       ('r_sam', 'acc_sam', 'mine', 'private', 'c', 'https://c');
@@ -44,7 +56,7 @@ function seeded() {
     INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, finished_at)
       VALUES ('job_old', 'run_live', 'r_app', 'build', '{}', 'succeeded', 'sandbox', '${ago(400)}');
     INSERT INTO ci_logs (job_id, seq, step, text) VALUES ('job_old', 0, 0, 'hello');
-    INSERT INTO account_settings (account_id, preview_ended_days, preview_idle_days)
+    INSERT INTO space_settings (space_id, preview_ended_days, preview_idle_days)
       VALUES ('acc_orbit', 3, 9);
   `);
   const insert = sqlite.prepare(`
@@ -87,10 +99,7 @@ function seeded() {
   add(28, "r_app", "expired", ago(90));
   sqlite.exec(`UPDATE ci_runs SET preview_rebuilt_from = 28 WHERE id = 'run_live'`);
   const sent: RetentionJob[] = [];
-  const env = {
-    DB: d1(sqlite),
-    JOBS: { send: async (body: RetentionJob) => void sent.push(body) },
-  } as unknown as Env;
+  Reflect.set(env, "JOBS", { send: async (body: RetentionJob) => void sent.push(body) });
   const deployments = () =>
     (sqlite.prepare("SELECT id FROM deployments ORDER BY id").all() as { id: number }[]).map(
       (r) => r.id,
@@ -99,7 +108,7 @@ function seeded() {
 }
 
 const SELECTED = Array.from({ length: 12 }, (_, i) => i + 1);
-const ORBIT = { scope: "account", accountId: "acc_orbit" } as const;
+const ORBIT = { kind: "space", id: "acc_orbit" } as const;
 
 /** Every table's rows, for byte-for-byte comparison. */
 function dump(sqlite: ReturnType<typeof migratedDatabase>): Record<string, unknown[]> {
@@ -116,6 +125,20 @@ function dump(sqlite: ReturnType<typeof migratedDatabase>): Record<string, unkno
   );
 }
 
+async function manualAuthority(env: Env): Promise<RetentionAuthority> {
+  const token = await issueToken(env.DB, "acc_marco", crypto.randomUUID(), "write");
+  const admission = await cutoverControl(env).admission(4);
+  if (!admission.allowed) throw new Error("Fixture has no active Space admission");
+  return {
+    id: "acc_marco",
+    slug: "marco",
+    displayName: "Marco Bellini",
+    isSiteAdmin: false,
+    credential: { kind: "token", id: token.id },
+    migrationEpoch: admission.epoch,
+  };
+}
+
 async function run(
   env: Env,
   dryRun: boolean,
@@ -126,6 +149,7 @@ async function run(
     target: ORBIT,
     trigger: "manual",
     actorId: "acc_marco",
+    authority: await manualAuthority(env),
     dryRun,
     categories: [{ id: "preview-records", thresholds }],
     now: NOW,
@@ -150,14 +174,13 @@ async function run(
 
 describe("the cleanup engine with expired preview records", () => {
   test("a dry run and the run after it select the same items; a second run removes nothing", async () => {
-    const t = seeded();
+    const t = await seeded();
     const before = t.deployments();
     const dry = await run(t.env, true);
     expect(dry.seen).toEqual(SELECTED);
     expect(t.deployments()).toEqual(before);
     expect(dry.run).toMatchObject({
-      level: "account",
-      account: "orbit",
+      target: ORBIT,
       trigger: "manual",
       actor: "marco",
       dryRun: true,
@@ -191,24 +214,25 @@ describe("the cleanup engine with expired preview records", () => {
   });
 
   test("thresholds decide the cutoff", async () => {
-    const t = seeded();
+    const t = await seeded();
     expect((await run(t.env, true, {}, { days: 40 })).seen).toEqual([10, 11, 12]);
     expect((await run(t.env, true, {}, { days: 1 })).seen).toEqual([...SELECTED, 20]);
   });
 
   test("bounded calls: a budget stops between batches and the queue carries on", async () => {
-    const t = seeded();
+    const t = await seeded();
     const limited = await run(t.env, false, { maxBatches: 1 });
     // Three batches, then one call that finds nothing left to do.
     expect(limited.calls).toBe(3);
     expect(limited.seen).toEqual(SELECTED);
     expect(limited.run.categories[0]).toMatchObject({ batches: 3, items: 12 });
 
-    const fresh = seeded();
+    const fresh = await seeded();
     const id = await createRun(fresh.env.DB, {
       target: ORBIT,
       trigger: "manual",
-      actorId: null,
+      actorId: "acc_marco",
+      authority: await manualAuthority(fresh.env),
       dryRun: true,
       categories: [{ id: "preview-records", thresholds: { days: 30 } }],
       now: NOW,
@@ -222,12 +246,13 @@ describe("the cleanup engine with expired preview records", () => {
   });
 
   test("a run interrupted mid-way resumes without duplicates or misses", async () => {
-    const t = seeded();
+    const t = await seeded();
     const dry = await run(t.env, true);
     const id = await createRun(t.env.DB, {
       target: ORBIT,
       trigger: "manual",
-      actorId: null,
+      actorId: "acc_marco",
+      authority: await manualAuthority(t.env),
       dryRun: false,
       categories: [{ id: "preview-records", thresholds: { days: 30 } }],
       now: NOW,
@@ -267,11 +292,12 @@ describe("the cleanup engine with expired preview records", () => {
   });
 
   test("a failing category fails the run with its error, and other categories still run", async () => {
-    const t = seeded();
+    const t = await seeded();
     const id = await createRun(t.env.DB, {
       target: ORBIT,
       trigger: "manual",
-      actorId: null,
+      actorId: "acc_marco",
+      authority: await manualAuthority(t.env),
       dryRun: true,
       categories: [
         { id: "preview-records", thresholds: {} },
@@ -295,14 +321,14 @@ describe("the cleanup engine with expired preview records", () => {
 
 describe("scheduled runs", () => {
   test("gate 1: with nothing enabled, a cron cycle only runs auth hygiene, daily", async () => {
-    const t = seeded();
+    const t = await seeded();
     // Policies stored, none enabled: thresholds changed, a category turned
     // off explicitly, site-wide defaults without enabling anything, and auth
     // hygiene's row from when it was a policy (ignored: it always runs at 7).
     t.sqlite.exec(`
-      INSERT INTO retention_policies (account_id, category, enabled, thresholds) VALUES
-        ('acc_orbit', 'preview-records', 0, '{"days": 1}'),
-        ('acc_orbit', 'ci-logs', NULL, '{"days": 1}');
+      INSERT INTO retention_policies (scope_kind, scope_id, category, enabled, thresholds) VALUES
+        ('space', 'acc_orbit', 'preview-records', 0, '{"days": 1}'),
+        ('space', 'acc_orbit', 'ci-logs', NULL, '{"days": 1}');
       INSERT INTO retention_site_policies (category, enabled, thresholds) VALUES
         ('preview-records', 0, '{"days": 1}'),
         ('auth-hygiene', 0, '{"days": 1}');
@@ -319,7 +345,7 @@ describe("scheduled runs", () => {
     }
     expect(scheduled).toHaveLength(3);
     for (const id of scheduled)
-      expect(await getRun(t.env.DB, { scope: "site" }, id)).toMatchObject({
+      expect(await getRun(t.env.DB, { kind: "instance", id: "" }, id)).toMatchObject({
         trigger: "schedule",
         dryRun: false,
         status: "succeeded",
@@ -337,12 +363,12 @@ describe("scheduled runs", () => {
   });
 
   test("an enabled category runs once a day, deleting what its dry run listed", async () => {
-    const t = seeded();
+    const t = await seeded();
     t.sqlite.exec(`
-      INSERT INTO retention_policies (account_id, category, enabled, thresholds)
-        VALUES ('acc_orbit', 'preview-records', 1, '{}');
+      INSERT INTO retention_policies (scope_kind, scope_id, category, enabled, thresholds)
+        VALUES ('space', 'acc_orbit', 'preview-records', 1, '{}');
       -- Stored as enabled, but not a policy category with a cleanup: skipped.
-      INSERT INTO retention_policies (account_id, category, enabled) VALUES ('acc_sam', 'atlas-snapshots', 1);
+      INSERT INTO retention_policies (scope_kind, scope_id, category, enabled) VALUES ('space', 'acc_sam', 'atlas-snapshots', 1);
     `);
     const dry = await run(t.env, true);
     // Each cycle also schedules the site's always-on auth hygiene.
@@ -363,7 +389,7 @@ describe("scheduled runs", () => {
     });
     expect(t.deployments()).toEqual([20, 21, 22, 23, 24, 25, 26, 27, 28]);
     // The policy shows the last run.
-    const policies = await accountPolicies(t.env.DB, "acc_orbit");
+    const policies = await spacePolicies(t.env.DB, "acc_orbit");
     expect(policies.find((p) => p.id === "preview-records")).toMatchObject({
       runnable: true,
       lastRun: { runId: scheduled.id, dryRun: false, trigger: "schedule", items: 12 },
@@ -382,4 +408,50 @@ describe("scheduled runs", () => {
     expect((await orbitRuns(second.scheduled)).map((r) => r.items)).toEqual([1]);
     expect(t.deployments()).toEqual([21, 22, 23, 24, 25, 26, 27, 28]);
   });
+});
+
+test("a queued manual cleanup cannot outlive its explicit Space grant", async () => {
+  const t = await seeded();
+  const before = t.deployments();
+  const id = await createRun(t.env.DB, {
+    target: ORBIT,
+    trigger: "manual",
+    actorId: "acc_marco",
+    dryRun: false,
+    categories: [{ id: "preview-records", thresholds: { days: 30 } }],
+    now: NOW,
+    authority: await manualAuthority(t.env),
+  });
+  t.sqlite.exec(
+    "DELETE FROM space_grants WHERE space_id = 'acc_orbit' AND account_id = 'acc_marco'",
+  );
+  await advanceRun(t.env, id, { now: NOW });
+  expect((await getRun(t.env.DB, ORBIT, id))?.status).toBe("failed");
+  expect(t.deployments()).toEqual(before);
+});
+
+test("manual cleanup fails closed for missing, stale-epoch, or revoked original authority", async () => {
+  const t = await seeded();
+  const before = t.deployments();
+  const authority = await manualAuthority(t.env);
+  for (const saved of [
+    undefined,
+    { ...authority, migrationEpoch: authority.migrationEpoch - 1 },
+    authority,
+  ]) {
+    const id = await createRun(t.env.DB, {
+      target: ORBIT,
+      trigger: "manual",
+      actorId: "acc_marco",
+      authority: saved,
+      dryRun: false,
+      categories: [{ id: "preview-records", thresholds: { days: 30 } }],
+      now: NOW,
+    });
+    if (saved === authority)
+      t.sqlite.prepare("DELETE FROM access_tokens WHERE id = ?").run(authority.credential!.id);
+    await advanceRun(t.env, id, { now: NOW });
+    expect((await getRun(t.env.DB, ORBIT, id))?.status).toBe("failed");
+    expect(t.deployments()).toEqual(before);
+  }
 });

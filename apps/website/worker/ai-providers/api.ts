@@ -1,6 +1,6 @@
-// /api/accounts/:slug/ai-providers (CORE-294): an account's own AI providers.
+// /api/spaces/:space/ai-providers (CORE-294): a Space's own AI providers.
 // Members can see which providers are connected and which models they offer;
-// only a person who manages the account's AI settings can change them, since
+// only a person who manages the Space's AI settings can change them, since
 // a key spends money. The API key is verified with the provider before it is
 // sealed and stored, and is never returned: views carry its last four.
 //
@@ -40,27 +40,23 @@ function kindOf(c: Context<AppEnv>): AiProviderKind | null {
 
 const nameOf = (kind: AiProviderKind) => AI_PROVIDERS.find((info) => info.kind === kind)!.name;
 
-async function view(d1: D1Database, accountId: string, canManage: boolean) {
+async function view(d1: D1Database, spaceId: string, canManage: boolean) {
   const [providers, settings] = await Promise.all([
-    providerViews(d1, accountId),
-    aiSettings(d1, accountId),
+    providerViews(d1, spaceId),
+    aiSettings(d1, spaceId),
   ]);
   return { canManage, providers, selection: settings.models } satisfies AiProvidersView;
 }
 
-/** The account, for a person who may change its AI settings, or the failure to return. */
+/** The Space, for a person who may change its AI settings, or the failure to return. */
 async function manager(c: Context<AppEnv>) {
   const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
   const found = await load(c, actor as Actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
+  if (!found) return fail(c, 404, "No such Space, or you do not have a current grant.");
   if (found.role !== "admin")
-    return fail(
-      c,
-      403,
-      "Only the account owner, organization owners, or site admins can change AI providers.",
-    );
-  return found.account;
+    return fail(c, 403, "Only Space administrators or Instance operators can change AI providers.");
+  return found.space;
 }
 
 async function json(c: Context<AppEnv>): Promise<Record<string, unknown> | null> {
@@ -75,8 +71,8 @@ async function json(c: Context<AppEnv>): Promise<Record<string, unknown> | null>
 }
 
 /** Roles whose current choice is one of `ids`, in words: "Fast and Task". */
-async function inUse(d1: D1Database, accountId: string, ids: (id: string) => boolean) {
-  const { models } = await aiSettings(d1, accountId);
+async function inUse(d1: D1Database, spaceId: string, ids: (id: string) => boolean) {
+  const { models } = await aiSettings(d1, spaceId);
   const roles = (Object.keys(ROLE_NAMES) as (keyof typeof ROLE_NAMES)[]).filter((role) =>
     ids(models[role]),
   );
@@ -87,8 +83,8 @@ aiProvidersApi.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
-  if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  return c.json(await view(c.env.DB, found.account.id, found.role === "admin" && !actor.agent));
+  if (!found) return fail(c, 404, "No such Space, or you do not have a current grant.");
+  return c.json(await view(c.env.DB, found.space.id, found.role === "admin" && !actor.agent));
 });
 
 aiProvidersApi.get("/:kind/catalog", async (c) => {
@@ -96,7 +92,8 @@ aiProvidersApi.get("/:kind/catalog", async (c) => {
   if (actor instanceof Response) return actor;
   const kind = kindOf(c);
   if (!kind) return fail(c, 404, "No such AI provider.");
-  if (!(await load(c, actor))) return fail(c, 404, "No such account, or you aren't a member.");
+  if (!(await load(c, actor)))
+    return fail(c, 404, "No such Space, or you do not have a current grant.");
   try {
     const catalog = await providerCatalog(kind);
     return c.json<AiProviderCatalogView>({ provider: kind, ...catalog });
@@ -106,8 +103,8 @@ aiProvidersApi.get("/:kind/catalog", async (c) => {
 });
 
 aiProvidersApi.put("/:kind", async (c) => {
-  const account = await manager(c);
-  if (account instanceof Response) return account;
+  const space = await manager(c);
+  if (space instanceof Response) return space;
   const kind = kindOf(c);
   if (!kind) return fail(c, 404, "No such AI provider.");
   const body = await json(c);
@@ -136,27 +133,27 @@ aiProvidersApi.put("/:kind", async (c) => {
   // Replacing a key keeps the row, so running work picks up the new key.
   await db(c.env.DB)
     .insertInto("ai_providers")
-    .values({ ...values, id: newProviderId(), account_id: account.id, kind })
-    .onConflict((oc) => oc.columns(["account_id", "kind"]).doUpdateSet(values))
+    .values({ ...values, id: newProviderId(), space_id: space.id, kind })
+    .onConflict((oc) => oc.columns(["space_id", "kind"]).doUpdateSet(values))
     .execute();
-  return c.json(await view(c.env.DB, account.id, true));
+  return c.json(await view(c.env.DB, space.id, true));
 });
 
 aiProvidersApi.delete("/:kind", async (c) => {
-  const account = await manager(c);
-  if (account instanceof Response) return account;
+  const space = await manager(c);
+  if (space instanceof Response) return space;
   const kind = kindOf(c);
   if (!kind) return fail(c, 404, "No such AI provider.");
   // One statement: a choice saved concurrently can't slip between check and delete.
   const deleted = await c.env.DB.prepare(
-    `DELETE FROM ai_providers WHERE account_id = ?1 AND kind = ?2 AND NOT EXISTS (
-       SELECT 1 FROM account_settings s WHERE s.account_id = ?1 AND (
+    `DELETE FROM ai_providers WHERE space_id = ?1 AND kind = ?2 AND NOT EXISTS (
+       SELECT 1 FROM space_settings s WHERE s.space_id = ?1 AND (
          s.ai_classification_model LIKE ?3 OR s.ai_fast_model LIKE ?3 OR s.ai_task_model LIKE ?3))`,
   )
-    .bind(account.id, kind, `${kind}:%`)
+    .bind(space.id, kind, `${kind}:%`)
     .run();
   if (!deleted.meta.changes) {
-    const roles = await inUse(c.env.DB, account.id, (id) => id.startsWith(`${kind}:`));
+    const roles = await inUse(c.env.DB, space.id, (id) => id.startsWith(`${kind}:`));
     if (roles)
       return fail(
         c,
@@ -165,27 +162,27 @@ aiProvidersApi.delete("/:kind", async (c) => {
       );
     return fail(c, 404, `${nameOf(kind)} isn't connected.`);
   }
-  return c.json(await view(c.env.DB, account.id, true));
+  return c.json(await view(c.env.DB, space.id, true));
 });
 
-async function connected(d1: D1Database, accountId: string, kind: AiProviderKind) {
+async function connected(d1: D1Database, spaceId: string, kind: AiProviderKind) {
   return db(d1)
     .selectFrom("ai_providers")
     .select("id")
-    .where("account_id", "=", accountId)
+    .where("space_id", "=", spaceId)
     .where("kind", "=", kind)
     .executeTakeFirst();
 }
 
 aiProvidersApi.post("/:kind/models", async (c) => {
-  const account = await manager(c);
-  if (account instanceof Response) return account;
+  const space = await manager(c);
+  if (space instanceof Response) return space;
   const kind = kindOf(c);
   if (!kind) return fail(c, 404, "No such AI provider.");
   const body = await json(c);
   if (!body || typeof body.model !== "string" || Object.keys(body).length !== 1)
     return fail(c, 400, "Send a JSON object with the provider's model id as model.");
-  const provider = await connected(c.env.DB, account.id, kind);
+  const provider = await connected(c.env.DB, space.id, kind);
   if (!provider) return fail(c, 409, `Connect ${nameOf(kind)} with an API key first.`);
   let catalog;
   try {
@@ -210,12 +207,12 @@ aiProvidersApi.post("/:kind/models", async (c) => {
     .values({ ...values, provider_id: provider.id, model: entry.model })
     .onConflict((oc) => oc.columns(["provider_id", "model"]).doUpdateSet(values))
     .execute();
-  return c.json(await view(c.env.DB, account.id, true));
+  return c.json(await view(c.env.DB, space.id, true));
 });
 
 aiProvidersApi.delete("/:kind/models", async (c) => {
-  const account = await manager(c);
-  if (account instanceof Response) return account;
+  const space = await manager(c);
+  if (space instanceof Response) return space;
   const kind = kindOf(c);
   if (!kind) return fail(c, 404, "No such AI provider.");
   const model = c.req.query("model");
@@ -224,32 +221,32 @@ aiProvidersApi.delete("/:kind/models", async (c) => {
   const deleted = await c.env.DB.prepare(
     `DELETE FROM ai_provider_models
      WHERE model = ?1 AND provider_id = (
-       SELECT id FROM ai_providers WHERE account_id = ?2 AND kind = ?3)
+       SELECT id FROM ai_providers WHERE space_id = ?2 AND kind = ?3)
      AND NOT EXISTS (
-       SELECT 1 FROM account_settings s WHERE s.account_id = ?2
+       SELECT 1 FROM space_settings s WHERE s.space_id = ?2
          AND ?4 IN (s.ai_classification_model, s.ai_fast_model, s.ai_task_model))`,
   )
-    .bind(model, account.id, kind, id)
+    .bind(model, space.id, kind, id)
     .run();
   if (!deleted.meta.changes) {
-    const roles = await inUse(c.env.DB, account.id, (selected) => selected === id);
+    const roles = await inUse(c.env.DB, space.id, (selected) => selected === id);
     if (roles)
       return fail(
         c,
         409,
         `${model} is in use for ${roles}. Choose another model in AI settings first.`,
       );
-    return fail(c, 404, `${model} isn't one of this account's ${nameOf(kind)} models.`);
+    return fail(c, 404, `${model} isn't one of this Space's ${nameOf(kind)} models.`);
   }
-  return c.json(await view(c.env.DB, account.id, true));
+  return c.json(await view(c.env.DB, space.id, true));
 });
 
 aiProvidersApi.post("/:kind/models/refresh", async (c) => {
-  const account = await manager(c);
-  if (account instanceof Response) return account;
+  const space = await manager(c);
+  if (space instanceof Response) return space;
   const kind = kindOf(c);
   if (!kind) return fail(c, 404, "No such AI provider.");
-  const provider = await connected(c.env.DB, account.id, kind);
+  const provider = await connected(c.env.DB, space.id, kind);
   if (!provider) return fail(c, 409, `Connect ${nameOf(kind)} with an API key first.`);
   let catalog;
   try {
@@ -284,5 +281,5 @@ aiProvidersApi.post("/:kind/models/refresh", async (c) => {
       : [];
   });
   await Promise.all(updates);
-  return c.json(await view(c.env.DB, account.id, true));
+  return c.json(await view(c.env.DB, space.id, true));
 });

@@ -19,7 +19,7 @@ export interface ContentsOptions {
 }
 const missing = () => RegistryError.notFound("Version content not found.");
 function downloadUrl(
-  owner: string,
+  space: string,
   format: string,
   name: string,
   version: string,
@@ -28,7 +28,7 @@ function downloadUrl(
 ): string {
   const params = new URLSearchParams({ version, id });
   if (manifest) params.set("manifest", manifest);
-  return `/api/packages/${[owner, format, name].map(encodeURIComponent).join("/")}/contents/download?${params.toString()}`;
+  return `/api/packages/${[space, format, name].map(encodeURIComponent).join("/")}/contents/download?${params.toString()}`;
 }
 async function jsonBlob(svc: Services, digest: string): Promise<Record<string, unknown>> {
   const blob = await getBlob(svc.db, digest);
@@ -253,12 +253,12 @@ async function npmCache(svc: Services, at: Located, version: string) {
 
 export async function packageContents(
   svc: Services,
-  owner: string,
+  space: string,
   format: string,
   name: string,
   options: ContentsOptions,
 ): Promise<PackageContents> {
-  const at = await locate(svc, owner, format, name);
+  const at = await locate(svc, space, format, name);
   if (!options.version) throw RegistryError.badRequest("Select a version.");
   const offset = Math.max(0, Math.trunc(options.offset ?? 0));
   const limit = Math.max(1, Math.min(200, Math.trunc(options.limit ?? 100)));
@@ -290,7 +290,7 @@ export async function packageContents(
       entry.size = blob.size;
       entry.checksums = { sha256: blob.digest.replace(/^sha256:/, "") };
       entry.downloadUrl = downloadUrl(
-        owner,
+        space,
         format,
         name,
         options.version,
@@ -331,7 +331,7 @@ export async function packageContents(
       digest: f.digest,
       contentType: f.content_type,
       metadata: { label: f.label },
-      downloadUrl: downloadUrl(owner, format, name, options.version, f.name),
+      downloadUrl: downloadUrl(space, format, name, options.version, f.name),
     }));
   } else if (format === "npm") {
     const { cache, metadata } = await npmCache(svc, at, options.version);
@@ -362,7 +362,7 @@ export async function packageContents(
       size: f.kind === "directory" ? null : f.size,
       digest: f.digest,
       downloadUrl:
-        f.kind === "directory" ? null : downloadUrl(owner, format, name, options.version, f.path),
+        f.kind === "directory" ? null : downloadUrl(space, format, name, options.version, f.path),
     }));
     const manifest = await svc.db
       .selectFrom("archive_members")
@@ -405,7 +405,7 @@ export async function packageContents(
             kind: "file",
             size: blob.size,
             digest,
-            downloadUrl: downloadUrl(owner, format, name, options.version, "formula"),
+            downloadUrl: downloadUrl(space, format, name, options.version, "formula"),
           },
         ];
     } else {
@@ -432,7 +432,7 @@ export async function packageContents(
           digest: f.digest,
           contentType: f.content_type,
           metadata: parseJson(f.metadata, {}),
-          downloadUrl: downloadUrl(owner, format, name, options.version, f.id),
+          downloadUrl: downloadUrl(space, format, name, options.version, f.id),
         })),
       ];
     }
@@ -452,13 +452,13 @@ export async function packageContents(
 
 export async function downloadPackageContent(
   svc: Services,
-  owner: string,
+  space: string,
   format: string,
   name: string,
   options: ContentsOptions,
   id: string,
 ): Promise<Response> {
-  const at = await locate(svc, owner, format, name);
+  const at = await locate(svc, space, format, name);
   if (!options.version || !id) throw missing();
   let digest: string;
   let filename: string;

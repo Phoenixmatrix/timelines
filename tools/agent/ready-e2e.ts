@@ -337,10 +337,10 @@ const browserScenarios: readonly ScenarioName[] = [
 ];
 
 // Audited route-module witnesses, not a dependency graph or a CSS ownership map.
-// appRoutes mounts both account/site exports from each module. Usage's journey
-// covers settings navigation, denied access and site→account; retention's journey
-// also traverses UsageCosts before its settings link and category deep link.
-// DataRetention's account/site, denial and cleanup links are all in that journey.
+// appRoutes mounts the Space/person/Instance exports from each module. Usage's
+// journey covers settings navigation, denied access and Instance→Space; retention's
+// journey also traverses UsageCosts before its settings link and category deep link.
+// DataRetention's Space/person/Instance, denial and cleanup links are all in that journey.
 // Only appRoutes imports these modules. Their shared imports (SettingsPage, ui,
 // API/session, report/retention views), palette, router and assets stay broad.
 const routeScenarios: Readonly<Record<string, readonly ScenarioName[]>> = {

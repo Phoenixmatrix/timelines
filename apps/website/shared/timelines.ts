@@ -1,11 +1,12 @@
-// Timelines (TIMELINES-RESEARCH.md, "A timeline, concretely"): an
-// account-wide line of work with a bookmark `timeline/<slug>` in each
-// repository it touches. The records and their events live in the account's
-// tracker, next to the issues and leases later steps change with them.
+// Timelines (TIMELINES-RESEARCH.md, "A timeline, concretely"): a
+// Space-wide line of work with an owned source in each repository it touches.
+// The records and their events live in the Space's tracker, next to the issues
+// and leases later steps change with them.
 
 import type { KnowledgePageSet } from "./api.ts";
 import type { CodeSource, SourceSnapshot, SourceDependency } from "./code-source.ts";
 import type { DoneIn, Issue } from "./tracker.ts";
+import type { WorkAuthority } from "./ci.ts";
 
 export type TimelinePolicy = "auto" | "approval";
 export const TIMELINE_POLICIES: readonly TimelinePolicy[] = ["auto", "approval"];
@@ -30,7 +31,7 @@ export type TimelineStatus =
 /** Stable repository identity. Stored labels are historical; live API views resolve names by ID. */
 export interface TimelineRepo {
   id: string;
-  owner: string;
+  space: string;
   name: string;
   /** The branch holding the timeline's work: `timeline/<slug>`. */
   bookmark: string;
@@ -42,7 +43,7 @@ export interface TimelineRepo {
 
 export interface Timeline {
   id: string;
-  /** Unique in the account and never changed: the bookmark is named after it. */
+  /** Unique in the Space and never changed: the bookmark is named after it. */
   slug: string;
   name: string;
   policy: TimelinePolicy;
@@ -177,7 +178,7 @@ export type LandingOutcome =
  */
 export interface CheckpointRepo {
   id: string;
-  owner: string;
+  space: string;
   name: string;
   /** The tip of the timeline's bookmark. */
   commit: string;
@@ -287,7 +288,7 @@ export interface CheckpointList {
 }
 
 /**
- * POST /api/tracker/:owner/timelines/:slug/checkpoints/:ref/revive: the
+ * POST /api/tracker/:space/timelines/:slug/checkpoints/:ref/revive: the
  * checkpoint, and per repository the preview run started (its number) or
  * why none was (its ci.yml doesn't opt in, say).
  */
@@ -296,14 +297,14 @@ export interface PreviewRevival {
   runs: ({ repoId: string; number: number } | { repoId: string; skipped: string })[];
 }
 
-/** POST /api/tracker/:owner/timelines/:slug/checkpoints. */
+/** POST /api/tracker/:space/timelines/:slug/checkpoints. */
 export interface CreateCheckpoint {
   summary?: string;
 }
 
 export interface TimelineList {
   timelines: Timeline[];
-  /** With `?stalled=true`: the account's idle period the list was cut with. */
+  /** With `?stalled=true`: the Space's idle period the list was cut with. */
   idleDays?: number;
 }
 
@@ -353,7 +354,7 @@ export interface CreateTimeline {
   /** `main` (the default) or another timeline's slug. */
   parent?: string;
   /**
-   * `owner/name`, or `{ repo, commit }` to fork at a commit other than the
+   * `space/name`, or `{ repo, commit }` to fork at a commit other than the
    * parent's tip. Defaults to the parent timeline's repositories.
    */
   repos?: (string | { repo: string; commit?: string })[];
@@ -390,7 +391,7 @@ export type LandingState =
 /** One repository of a landing. */
 export interface LandingRepo {
   id: string;
-  owner: string;
+  space: string;
   name: string;
   /** The checkpoint's commit. */
   commit: string;
@@ -435,6 +436,8 @@ export interface Landing {
   trigger: "auto" | "approval" | "request";
   /** Who queued it: main's moves and the timeline's events are theirs. */
   requestedBy: { actorId: string; accountableId: string; agentId: string | null };
+  /** Immutable initiating scope; re-authorized before each new external effect. */
+  authority: WorkAuthority;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -454,7 +457,7 @@ export function landingSlugOf(branch: string): string | null {
   return match ? match[1]! : null;
 }
 
-/** POST /api/tracker/:owner/timelines/:slug/land: queued, or why not. */
+/** POST /api/tracker/:space/timelines/:slug/land: queued, or why not. */
 export interface LandResult {
   landing: Landing;
   /** False when a landing of this checkpoint was already under way. */
@@ -472,7 +475,7 @@ export function timelineSlugOf(ref: string): string | null {
   return match ? match[1]! : null;
 }
 
-/** Days without a push before a timeline counts as idle, unless the account says otherwise. */
+/** Days without a push before a timeline counts as idle, unless the Space says otherwise. */
 export const DEFAULT_IDLE_DAYS = 7;
 const DAY = 24 * 60 * 60 * 1000;
 

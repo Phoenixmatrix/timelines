@@ -72,7 +72,7 @@ export async function chronicleScenario(t: ChronicleE2E): Promise<void> {
     t.secret,
     "POST",
     {
-      account: owner,
+      space: owner,
       team: t.team ?? "CHRON",
       issues: 300,
       days: 30,

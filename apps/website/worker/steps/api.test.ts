@@ -8,9 +8,11 @@ import { jobRoute } from "../deployments/job.ts";
 import { stepArtifacts } from "../retention/cleanups/steps.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { fakeDurableState } from "../testing/durable-state.ts";
-import { StepFeed } from "./feed.ts";
+import { issueToken } from "../api/tokens.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import { captureFeedAccess, StepFeed } from "./feed.ts";
 import { steps } from "./api.ts";
 import { fakeHistory } from "../testing/history.ts";
 import { Timing } from "../timing.ts";
@@ -21,7 +23,14 @@ import { sha256 } from "../api/bytes.ts";
 beforeEach(() => {
   vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
 });
-afterEach(() => vi.unstubAllGlobals());
+const closers: (() => void)[] = [];
+/** Work a feed object kept going past its reply (a reader's stream), awaited before closing. */
+const background: Promise<unknown>[] = [];
+afterEach(async () => {
+  vi.unstubAllGlobals();
+  await Promise.allSettled(background.splice(0));
+  for (const close of closers.splice(0)) close();
+});
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -42,13 +51,34 @@ const cid: Actor = { id: "cid", slug: "cid", displayName: "Cid", isSiteAdmin: fa
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-function setup(visibility: "public" | "private" = "private") {
-  const sqlite = migratedDatabase();
+async function setup(visibility: "public" | "private" = "private") {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  closers.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'), ('cid', 'user', 'cid', 'Cid');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "ann-org",
+      slug: "ann-org",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "ann",
+    },
+    space: { id: "ann", slug: "ann", displayName: "General" },
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "ann",
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'ann', 'app', '${visibility}', 'steps-${crypto.randomUUID()}', 'https://a');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('repo', 'ben', 'write');
   `);
@@ -56,26 +86,40 @@ function setup(visibility: "public" | "private" = "private") {
   const feeds = new Map<string, StepFeed>();
   const git = fakeHistory();
   const files = new FakeR2Bucket();
-  const env = {
-    DB: d1(sqlite),
+  Object.assign(env, {
     ARTIFACTS: git.artifacts,
     STEP_ARTIFACTS: files,
     STEP_FEED: {
       getByName: (name: string) => {
-        if (!feeds.has(name))
-          feeds.set(name, new StepFeed(fakeDurableState().ctx as never, {} as Env));
+        if (!feeds.has(name)) {
+          const { ctx } = fakeDurableState({ name });
+          Object.assign(ctx, { waitUntil: (work: Promise<unknown>) => background.push(work) });
+          feeds.set(name, new StepFeed(ctx as never, env));
+        }
         return feeds.get(name)!;
       },
     },
-  } as unknown as Env;
-  let actor: Actor | null = annsAgent;
+  });
+  const actors = new Map<Actor, Actor>();
+  for (const original of [ann, annsAgent, ben, cid]) {
+    const token = await issueToken(
+      env.DB,
+      original.id,
+      "steps",
+      "write",
+      undefined,
+      original.agent?.id,
+    );
+    actors.set(original, { ...original, credential: { kind: "token", id: token.id } });
+  }
+  let actor: Actor | null = actors.get(annsAgent)!;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("actor", actor);
     c.set("timing", new Timing());
     await next();
   });
-  app.route("/api/repos/:owner/:name/steps", steps);
+  app.route("/api/repos/:space/:name/steps", steps);
   const pending: Promise<unknown>[] = [];
   const context = {
     waitUntil: (work: Promise<unknown>) => pending.push(work),
@@ -95,9 +139,13 @@ function setup(visibility: "public" | "private" = "private") {
   /** A running CI job of `repo` (run `runId`, commit oid(1)) and its credential. */
   const jobFor = async (jobId: string, runId: string, repoId = "repo", name = "visuals") => {
     const number = Number(sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()!.n) + 1;
+    // Started by ann: the job acts on her current work authority.
+    const authority = await captureWorkAuthority(env, repoId, actors.get(ann)!);
     sqlite.exec(`
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step)
-        VALUES ('${runId}', '${repoId}', ${number}, '${oid(1)}', 'timeline/search', 'manual', 'running', 1);
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status, step,
+          space_id, migration_epoch, authority)
+        VALUES ('${runId}', '${repoId}', ${number}, '${oid(1)}', 'timeline/search', 'manual', 'ann',
+          'running', 1, '${authority.spaceId}', ${authority.migrationEpoch}, '${JSON.stringify(authority)}');
       INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
         VALUES ('${jobId}', '${runId}', '${repoId}', '${name}', '{}', 'running', 'sandbox');
     `);
@@ -129,8 +177,9 @@ function setup(visibility: "public" | "private" = "private") {
         sourceId: "canonical",
       }),
     feeds,
+    feedAccess: () => captureFeedAccess(env, "repo", "search", actor),
     as: (next: Actor | null) => {
-      actor = next;
+      actor = next ? (actors.get(next) ?? next) : null;
     },
     call,
     upload: (step: Partial<StepUpload>) => call("", { method: "POST", body: JSON.stringify(step) }),
@@ -157,7 +206,7 @@ const step = (n: number, over: Partial<StepUpload> = {}): StepUpload => ({
 
 describe("step context", () => {
   test("single successful remote context inspection records only an existing commit, never a batch", async () => {
-    const s = setup();
+    const s = await setup();
     const first = s.git.commit({ files: { a: "a\n" } });
     const second = s.git.commit({ parents: [first], files: { a: "b\n" } });
     await s.upload(step(1, { commitOid: first }));
@@ -181,7 +230,7 @@ describe("step context", () => {
   });
 
   test("single commit inspection records existing commits even without uploaded context", async () => {
-    const s = setup();
+    const s = await setup();
     const commit = s.git.commit({ files: { a: "a\n" } });
     const missing = oid(99);
     const absent = await s.call(`?commits=${missing}`);
@@ -198,7 +247,7 @@ describe("step context", () => {
   test.each(["lookup", "close", "lookup and close"] as const)(
     "auxiliary object %s failure preserves context without recording presence",
     async (failure) => {
-      const s = setup();
+      const s = await setup();
       const commit = s.git.commit({ files: { a: "a\n" } });
       await s.upload(step(1, { commitOid: commit }));
       s.as(ann);
@@ -231,7 +280,7 @@ describe("step context", () => {
   );
 
   test("a feed that fails never fails the upload or the reads (S11)", async () => {
-    const s = setup();
+    const s = await setup();
     s.feeds.set("repo:search", {
       publish: async () => {
         throw new Error("feed down");
@@ -250,13 +299,14 @@ describe("step context", () => {
   });
 
   test("a new timeline step goes out on its live feed, read by whoever can read the repo (CORE-239)", async () => {
-    const s = setup();
-    await s.upload(step(1));
+    const s = await setup();
+    expect((await s.upload(step(1))).status).toBe(201);
     // A retry doesn't go out twice; a step outside a timeline doesn't at all.
     await s.upload(step(1));
     await s.upload(step(2, { timeline: undefined }));
+    expect(s.feeds.has("repo:search")).toBe(true);
     const feed = s.feeds.get("repo:search")!;
-    const records = await feed.since(0);
+    const records = await feed.since(await s.feedAccess(), 0);
     expect(records.map((r) => [r.seq, r.summary, r.repo, r.timeline])).toEqual([
       [1, "Step 1", "ann/app", "search"],
     ]);
@@ -284,7 +334,7 @@ describe("step context", () => {
   });
 
   test("a step carries its step runs' artifacts, newest first (CORE-235)", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     const summary = (status: string) =>
       JSON.stringify({
@@ -320,7 +370,7 @@ describe("step context", () => {
   });
 
   test("an agent uploads a step; it reads back with its context and author", async () => {
-    const s = setup();
+    const s = await setup();
     const made = await s.upload(step(1));
     expect(made.status).toBe(201);
     const body = (await made.json()) as Step;
@@ -348,7 +398,7 @@ describe("step context", () => {
   });
 
   test("is verified when a push has shown its commit as that change", async () => {
-    const s = setup();
+    const s = await setup();
     s.sqlite.exec(`
       INSERT INTO ref_updates (repo_id, ref, new_oid, actor_id) VALUES ('repo', 'refs/heads/timeline/search', '${oid(2)}', 'ann');
       INSERT INTO change_refs (repo_id, change_id, ref, first_commit_oid, first_update_id, last_commit_oid)
@@ -362,7 +412,7 @@ describe("step context", () => {
   });
 
   test("retained exact source membership verifies overwritten versions without change-ref endpoints", async () => {
-    const s = setup();
+    const s = await setup();
     const original = step(2);
     expect(((await (await s.upload(original)).json()) as Step).verified).toBe(false);
     s.sqlite
@@ -396,7 +446,7 @@ describe("step context", () => {
   });
 
   test("retries replace the author's own record; nobody else can overwrite it", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     const again = await s.upload(step(1, { why: "Better reason." }));
     expect(again.status).toBe(200);
@@ -406,7 +456,7 @@ describe("step context", () => {
   });
 
   test("checks its input and bounds", async () => {
-    const s = setup();
+    const s = await setup();
     expect((await s.upload(step(1, { changeId: "NOT A CHANGE" }))).status).toBe(400);
     expect((await s.upload(step(1, { commitOid: "abc" }))).status).toBe(400);
     expect((await s.upload(step(1, { committedAt: "yesterday" }))).status).toBe(400);
@@ -432,14 +482,14 @@ describe("step context", () => {
   });
 
   test("readers read, only writers upload, outsiders see nothing", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     s.as(cid);
     expect((await s.call("")).status).toBe(404);
     expect((await s.call("/change0001")).status).toBe(404);
     expect((await s.upload(step(2))).status).toBe(404);
 
-    const open = setup("public");
+    const open = await setup("public");
     await open.upload(step(1));
     open.as(cid);
     expect(((await (await open.call("")).json()) as StepPage).steps).toHaveLength(1);
@@ -449,7 +499,7 @@ describe("step context", () => {
   });
 
   test("lists newest first, filters by timeline, issue and commits, and pages without repeats", async () => {
-    const s = setup();
+    const s = await setup();
     for (let n = 1; n <= 7; n++)
       await s.upload(step(n, n > 5 ? { timeline: "other", issue: "CORE-8" } : {}));
     const all: string[] = [];
@@ -482,7 +532,7 @@ describe("step context", () => {
   });
 
   test("keeps every version of an amended change", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     await s.upload(
       step(1, {
@@ -500,7 +550,7 @@ describe("step context", () => {
   });
 
   test("admins delete a step's context, leaving the step; it can't be re-uploaded", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     s.as(ben);
     expect((await s.call(`/change0001/${oid(1)}`, { method: "DELETE" })).status).toBe(403);
@@ -513,16 +563,16 @@ describe("step context", () => {
   });
 
   test("deleting a step makes its live feed forget it, before the answer (CORE-399)", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     await s.upload(step(2));
     // No timeline, no feed.
     await s.upload(step(3, { timeline: undefined }));
     const feed = s.feeds.get("repo:search")!;
-    expect((await feed.since(0)).map((r) => r.seq)).toEqual([1, 2]);
+    expect((await feed.since(await s.feedAccess(), 0)).map((r) => r.seq)).toEqual([1, 2]);
     s.as(ann);
     expect((await s.call(`/change0001/${oid(1)}`, { method: "DELETE" })).status).toBe(204);
-    expect((await feed.since(0)).map((r) => r.summary)).toEqual(["Step 2"]);
+    expect((await feed.since(await s.feedAccess(), 0)).map((r) => r.summary)).toEqual(["Step 2"]);
     expect(await feed.removals()).toEqual([
       { repo: "ann/app", changeId: "change0001", commitOid: oid(1) },
     ]);
@@ -548,7 +598,7 @@ describe("step context", () => {
   });
 
   test("a feed that fails never fails the deletion; the next reader's connection heals it", async () => {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     const feed = s.feeds.get("repo:search")!;
     const forget = vi.spyOn(feed, "forget").mockRejectedValueOnce(new Error("feed down"));
@@ -563,7 +613,7 @@ describe("step context", () => {
     } finally {
       errors.mockRestore();
     }
-    expect((await feed.since(0)).map((r) => r.summary)).toEqual(["Step 1"]);
+    expect((await feed.since(await s.feedAccess(), 0)).map((r) => r.summary)).toEqual(["Step 1"]);
     // The next connection asks D1 which steps were deleted, and the feed forgets them.
     s.as(ben);
     const live = await s.call("/live?timeline=search");
@@ -573,7 +623,7 @@ describe("step context", () => {
       text += new TextDecoder().decode((await reader.read()).value);
     await reader.cancel();
     expect(text).not.toContain("Step 1");
-    expect(await feed.since(0)).toEqual([]);
+    expect(await feed.since(await s.feedAccess(), 0)).toEqual([]);
     expect(forget).toHaveBeenCalledTimes(2);
     // Once forgotten, a connection doesn't tell anyone again.
     await (await s.call("/live?timeline=search")).body!.cancel();
@@ -588,7 +638,7 @@ const bearer = (secret: string) => ({ authorization: `Bearer ${secret}` });
 
 describe("step artifacts (CORE-383)", () => {
   async function ready() {
-    const s = setup();
+    const s = await setup();
     await s.upload(step(1));
     const secret = await s.jobFor("job1", "run1");
     s.as(null);
@@ -654,7 +704,7 @@ describe("step artifacts (CORE-383)", () => {
     s.as(null);
     // Another repository's job.
     s.sqlite.exec(`
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('repo2', 'ann', 'other', 'private', 'steps-${crypto.randomUUID()}', 'https://a');
     `);
     const stranger = await s.jobFor("job2", "run2", "repo2");
@@ -809,7 +859,7 @@ describe("step artifacts (CORE-383)", () => {
       { kind: "screenshot" }
     >;
     s.sqlite.exec(`
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
         VALUES ('repo2', 'ann', 'other', 'public', 'steps-${crypto.randomUUID()}', 'https://a');
     `);
     const res = await s.other(`/artifacts/${encodeURIComponent(stored.id)}`);
@@ -847,7 +897,7 @@ describe("step artifacts (CORE-383)", () => {
       now: new Date("2026-10-12T00:00:00.000Z"),
       limit: 100,
       thresholds: { days: 90 },
-      target: { scope: "account", accountId: "ann" },
+      target: { kind: "space", id: "ann" },
     } as unknown as Parameters<typeof stepArtifacts.select>[0];
     const selected = await stepArtifacts.select(ctx, null);
     expect(selected.items.map((i) => i.id)).toEqual(["run1:screenshot:b", "run1:screenshot:c"]);

@@ -22,6 +22,12 @@ const BROWSER_MEMORY_RESERVE = 3 * 2 ** 30;
 /** A test's statuses in Vitest's JSON report once it ran (`pending`: it didn't). */
 const OUTCOMES = new Set(["passed", "failed", "skipped", "todo"]);
 
+/**
+ * In CI a run stops at its first failed test, and the other project's run
+ * stops with it: a failing gate answers in minutes, not after the whole suite.
+ */
+const FAIL_FAST = process.env.CI === "true";
+
 /** The parts of Vitest's JSON report this reads. */
 export interface JsonReport {
   testResults?: {
@@ -34,12 +40,15 @@ export interface JsonReport {
 /**
  * The browser files to run again after a run that failed: those it didn't
  * finish, when the browser crashed and no assertion failed for a reason of
- * its own. Null when the failure isn't a crash, or isn't only one.
+ * its own. Null when the failure isn't a crash, or isn't only one. After a
+ * bail, Vitest marks the tests it cut short as skipped: then a skip isn't an
+ * outcome either.
  */
 export function abandoned(
   report: JsonReport | null,
   output: string,
   browserFiles: string[],
+  bailed = false,
 ): string[] | null {
   if (!CRASH.test(output)) return null;
   // Every error outside a test must be the crash itself.
@@ -63,7 +72,9 @@ export function abandoned(
         (file) =>
           file.status !== "failed" &&
           (file.assertionResults ?? []).length > 0 &&
-          (file.assertionResults ?? []).every((test) => OUTCOMES.has(test.status)),
+          (file.assertionResults ?? []).every(
+            (test) => OUTCOMES.has(test.status) && !(bailed && test.status === "skipped"),
+          ),
       )
       .map((file) => resolve(file.name)),
   );
@@ -84,11 +95,30 @@ export function selectedBrowserFiles(
   return null;
 }
 
-async function vp(
-  args: string[],
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<{ code: number; output: string }> {
-  const child = spawn("vp", args, { env, stdio: ["inherit", "pipe", "pipe"] });
+/** A running `vp`, and how to stop it with everything it started. */
+interface Running {
+  done: Promise<{ code: number; output: string }>;
+  stop: () => void;
+  /** Whether stop() ended it. */
+  stopped: () => boolean;
+}
+
+/** Process groups still running, stopped with this script when CI cancels it. */
+const groups = new Set<() => void>();
+if (FAIL_FAST)
+  for (const signal of ["SIGINT", "SIGTERM"] as const)
+    process.once(signal, () => {
+      for (const stop of groups) stop();
+      process.exit(1);
+    });
+
+function vp(args: string[], env: NodeJS.ProcessEnv = process.env): Running {
+  // Its own process group when failing fast, so stopping it reaches Vitest's workers.
+  const child = spawn("vp", args, {
+    env,
+    stdio: ["inherit", "pipe", "pipe"],
+    detached: FAIL_FAST,
+  });
   let output = "";
   const tee = (to: NodeJS.WriteStream) => (chunk: Buffer) => {
     to.write(chunk);
@@ -96,35 +126,67 @@ async function vp(
   };
   child.stdout.on("data", tee(process.stdout));
   child.stderr.on("data", tee(process.stderr));
-  const code = await new Promise<number>((done, fail) => {
+  const signalGroup = (signal: NodeJS.Signals) => {
+    if (child.pid === undefined) return;
+    try {
+      process.kill(FAIL_FAST ? -child.pid : child.pid, signal);
+    } catch {
+      // Already gone.
+    }
+  };
+  let stopped = false;
+  const done = new Promise<number>((resolve, fail) => {
     child.once("error", fail);
-    child.once("close", (exit, signal) => done(exit ?? (signal ? 1 : 0)));
+    child.once("close", (exit, signal) => resolve(exit ?? (signal ? 1 : 0)));
+    // A stopped run's leftover descendants can hold its output open: once vp
+    // itself has exited, don't wait on them for long.
+    child.once("exit", (exit, signal) => {
+      if (stopped) setTimeout(() => resolve(exit ?? (signal ? 1 : 0)), 5_000).unref();
+    });
+  }).then((code) => {
+    if (stopped) signalGroup("SIGKILL");
+    return { code, output };
   });
-  return { code, output };
+  const stop = () => {
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+    stopped = true;
+    signalGroup("SIGTERM");
+    // Whatever ignores SIGTERM (a browser run shutting down) is killed outright.
+    setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) signalGroup("SIGKILL");
+    }, 10_000).unref();
+  };
+  groups.add(stop);
+  void done.finally(() => groups.delete(stop)).catch(() => {});
+  return { done, stop, stopped: () => stopped };
 }
 
 const log = (event: Record<string, unknown>) => console.error(JSON.stringify(event));
 
 /** A JSON-reporting run of `filters`, its report read back (null when unreadable). */
-async function run(filters: string[], reportPath: string, env?: NodeJS.ProcessEnv) {
-  const result = await vp(
+function run(filters: string[], reportPath: string, env?: NodeJS.ProcessEnv) {
+  const running = vp(
     [
       "test",
       "run",
       "--reporter=default",
       "--reporter=json",
       `--outputFile.json=${reportPath}`,
+      ...(FAIL_FAST ? ["--bail=1"] : []),
       ...filters,
     ],
     env,
   );
-  const report =
-    result.code === 0
-      ? null
-      : await readFile(reportPath, "utf8")
-          .then((text) => JSON.parse(text) as JsonReport)
-          .catch(() => null);
-  return { ...result, report };
+  const done = running.done.then(async (result) => {
+    const report =
+      result.code === 0
+        ? null
+        : await readFile(reportPath, "utf8")
+            .then((text) => JSON.parse(text) as JsonReport)
+            .catch(() => null);
+    return { ...result, report };
+  });
+  return { done, stop: running.stop, stopped: running.stopped };
 }
 
 /** After a crash that abandoned browser files, run those once more, one at a time. */
@@ -132,7 +194,7 @@ async function retryAbandoned(
   first: { code: number; output: string; report: JsonReport | null },
   browserFiles: string[],
 ): Promise<number> {
-  const rerun = abandoned(first.report, first.output, browserFiles);
+  const rerun = abandoned(first.report, first.output, browserFiles, FAIL_FAST);
   if (!rerun?.length) return first.code;
   log({
     event: "website-tests.crashed",
@@ -140,7 +202,7 @@ async function retryAbandoned(
     rerun: rerun.length,
     note: "Chromium died under memory pressure (CORE-306); running the browser files it abandoned once more, one at a time.",
   });
-  const second = await vp(["test", "run", "--project", "browser", "--maxWorkers=1", ...rerun]);
+  const second = await vp(["test", "run", "--project", "browser", "--maxWorkers=1", ...rerun]).done;
   if (second.code !== 0 && CRASH.test(second.output))
     log({
       event: "website-tests.crashed-again",
@@ -167,15 +229,33 @@ async function main(): Promise<number> {
         ...process.env,
         GITMATRIX_TEST_MEMORY_RESERVE_BYTES: String(BROWSER_MEMORY_RESERVE),
       };
+      const unitRun = run(["--project", "unit"], join(scratch, "unit.json"), unitEnv);
+      const browserRun = run(["--project", "browser"], join(scratch, "browser.json"));
+      // A browser crash isn't a failure yet: its abandoned files run again below.
       const [unit, browser] = await Promise.all([
-        run(["--project", "unit"], join(scratch, "unit.json"), unitEnv),
-        run(["--project", "browser"], join(scratch, "browser.json")),
+        unitRun.done.then((result) => {
+          if (FAIL_FAST && result.code !== 0) browserRun.stop();
+          return result;
+        }),
+        browserRun.done.then((result) => {
+          if (
+            FAIL_FAST &&
+            result.code !== 0 &&
+            abandoned(result.report, result.output, inventory, FAIL_FAST) === null
+          )
+            unitRun.stop();
+          return result;
+        }),
       ]);
-      const browserCode = browser.code === 0 ? 0 : await retryAbandoned(browser, inventory);
+      // A browser run stopped for unit's failure has nothing worth rerunning.
+      const browserCode =
+        browser.code === 0 || browserRun.stopped()
+          ? browser.code
+          : await retryAbandoned(browser, inventory);
       return unit.code || browserCode;
     }
     const browserFiles = selectedBrowserFiles(filters, inventory);
-    const first = await run(filters, join(scratch, "report.json"));
+    const first = await run(filters, join(scratch, "report.json")).done;
     // Unknown filters still run unchanged and return their real failure.
     if (first.code === 0 || browserFiles === null) return first.code;
     return await retryAbandoned(first, browserFiles);

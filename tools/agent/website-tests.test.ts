@@ -67,6 +67,27 @@ await test("a test that failed because the browser died is rerun, not counted as
   assert.deepEqual(abandoned(report, crashed, files), files);
 });
 
+await test("after a bail, the tests it cut short (reported skipped) are rerun too", () => {
+  const report: JsonReport = {
+    testResults: [
+      {
+        name: "/w/src/a.browser.test.tsx",
+        status: "failed",
+        assertionResults: [{ status: "failed", failureMessages: ["Error: Target crashed"] }],
+      },
+      {
+        name: "/w/src/b.browser.test.tsx",
+        status: "passed",
+        assertionResults: [{ status: "passed" }, { status: "skipped" }],
+      },
+      passed("/w/src/c.browser.test.tsx"),
+    ],
+  };
+  assert.deepEqual(abandoned(report, crashed, files, true), files.slice(0, 2));
+  // Without a bail a skip is the test's own outcome.
+  assert.deepEqual(abandoned(report, crashed, files), files.slice(0, 1));
+});
+
 await test("a failed assertion is never retried, even alongside a crash", () => {
   const report: JsonReport = {
     testResults: [

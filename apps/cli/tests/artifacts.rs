@@ -181,6 +181,19 @@ impl Sandbox {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let registry = Registry::new();
+        registry.route(
+            "GET",
+            "/api/session",
+            Response::bytes(
+                &serde_json::to_vec(&json!({"viewer": {
+                    "id": "person-author",
+                    "slug": "author",
+                    "defaultSpaceId": "space-publisher",
+                    "spaces": [{"id": "space-publisher", "slug": "publisher"}]
+                }}))
+                .unwrap(),
+            ),
+        );
         fs::create_dir_all(root.path().join("home")).unwrap();
         fs::create_dir_all(root.path().join("config/gitmatrix")).unwrap();
         fs::write(
@@ -188,7 +201,7 @@ impl Sandbox {
             serde_json::to_vec(&json!({
                 "server": format!("http://{}", registry.address),
                 "token": TOKEN,
-                "user": "publisher"
+                "user": "author"
             }))
             .unwrap(),
         )
@@ -208,7 +221,6 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("PATH", "/usr/bin:/bin")
             .env("GM_AGENT", "1")
-            .env("GITMATRIX_OWNER", "publisher")
             .args(args)
             .output()
             .expect("gm runs")
@@ -267,7 +279,7 @@ fn authenticated_download_resolves_current_latest_and_requires_overwrite_opt_in(
         "pkg",
         "download",
         "tool/latest/nested/tool.bin",
-        "--owner",
+        "--space",
         "publisher",
     ];
     let result = s.ok(&args);
@@ -282,7 +294,7 @@ fn authenticated_download_resolves_current_latest_and_requires_overwrite_opt_in(
         "pkg",
         "download",
         "tool/latest/nested/tool.bin",
-        "-O",
+        "--space",
         "publisher",
         "--force",
     ]);
@@ -508,4 +520,42 @@ fn missing_auth_and_redirect_failures_never_replace_destination() {
     s.registry.route("GET", route, redirect);
     s.fails(&args);
     assert_eq!(fs::read(&destination).unwrap(), b"keep me");
+}
+
+#[test]
+fn inaccessible_default_space_does_not_fall_back_to_person_identity() {
+    let s = Sandbox::new();
+    s.registry.route(
+        "GET",
+        "/api/session",
+        Response::bytes(
+            &serde_json::to_vec(&json!({"viewer": {
+                "id": "person-author", "slug": "author",
+                "defaultSpaceId": "space-revoked",
+                "spaces": [{"id": "space-publisher", "slug": "publisher"}]
+            }}))
+            .unwrap(),
+        ),
+    );
+    for space in ["author", "publisher"] {
+        s.registry.route(
+            "GET",
+            &format!("/generic/{space}/tool/v1/tool"),
+            Response::bytes(b"must not choose another scope"),
+        );
+    }
+    let destination = s.path("absent/tool");
+    assert_eq!(
+        s.fails(&[
+            "pkg",
+            "download",
+            "tool/v1/tool",
+            "--dest",
+            text(&destination)
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+    assert!(!s.path("absent").exists());
 }

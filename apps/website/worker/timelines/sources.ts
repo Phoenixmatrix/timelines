@@ -1,6 +1,9 @@
 import type { Selectable } from "kysely";
 import type { CodeSource, SourceSnapshot } from "../../shared/code-source.ts";
 import type { TimelineRepo } from "../../shared/timelines.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
+import { resolveWorkAuthority, parseWorkAuthority } from "../ci/admission.ts";
+import type { Access } from "../tracker/store.ts";
 import type { RepoRow } from "../db.ts";
 import { db, type Database } from "../schema.ts";
 import { fail } from "../tracker/store.ts";
@@ -28,6 +31,7 @@ export interface InitializedWorkSource {
   logicalBase: SourceSnapshot;
 }
 export interface WorkSourceInput {
+  authority: WorkAuthority;
   timelineId: string;
   timelineSlug: string;
   base: SourceSnapshot;
@@ -43,10 +47,10 @@ export function canonicalSource(repo: Pick<RepoRow, "id" | "default_branch">): C
   };
 }
 export function workGitPath(
-  repo: { owner_slug: string; name: string },
+  repo: { space_slug: string; name: string },
   timelineSlug: string,
 ): string {
-  return `/${encodeURIComponent(repo.owner_slug)}/${encodeURIComponent(repo.name)}@${encodeURIComponent(timelineSlug)}.git`;
+  return `/${encodeURIComponent(repo.space_slug)}/${encodeURIComponent(repo.name)}@${encodeURIComponent(timelineSlug)}.git`;
 }
 export async function getWorkSource(
   env: Env,
@@ -69,15 +73,16 @@ export async function resolveSource(
   // must not resurrect a canonical tombstone.
   const live = await db(env.DB)
     .selectFrom("repos")
-    .select("id")
+    .select(["id", "space_id"])
     .where("id", "=", repo.id)
     .where("deleted_at", "is", null)
     .executeTakeFirst();
-  if (!live) fail("not_found", "Repository was deleted.", 404);
+  if (!live || live.space_id !== repo.space_id)
+    fail("not_found", "Repository is unavailable in this Space.", 404);
   if (!sourceId || sourceId === "canonical")
     return { repo: { ...repo, source_id: "canonical" }, source: canonicalSource(repo) };
   const owned = await getWorkSource(env, repo.id, sourceId);
-  if (!owned || owned.owner_id !== repo.owner_id) fail("not_found", "No such code source.", 404);
+  if (!owned || owned.space_id !== repo.space_id) fail("not_found", "No such code source.", 404);
   if (owned.state === "purging" || owned.state === "purged")
     fail("source_expired", "This code source has expired.", 410);
   if (
@@ -136,14 +141,21 @@ export const SOURCE_RETRY_DELAYS_MS = [500, 2000, 5000] as const;
  */
 export async function ensureWorkSource(
   env: Env,
+  access: Access,
   repo: RepoRow,
   input: WorkSourceInput,
   wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
 ): Promise<InitializedWorkSource> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const reply = await trackerObject(env, repo.owner_id).initializeWorkSource(repo, input);
+      await resolveWorkAuthority(env, input.authority, repo.id);
+      const reply = await trackerObject(env, repo.space_id).initializeWorkSource(
+        access,
+        repo,
+        input,
+      );
       if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+      await resolveWorkAuthority(env, input.authority, repo.id);
       return reply.value;
     } catch (error) {
       if (error instanceof TrackerError || !isTransientArtifactsError(error)) throw error;
@@ -165,24 +177,34 @@ export async function ensureWorkSource(
   }
 }
 
-/** Runs inside the account Tracker's single-flight initializer. */
+/** Runs inside the Space Tracker's single-flight initializer. */
 export async function initializeWorkSource(
   env: Env,
+  access: Access,
   repo: RepoRow,
   input: WorkSourceInput,
 ): Promise<InitializedWorkSource> {
-  const tracker = trackerObject(env, repo.owner_id);
+  const tracker = trackerObject(env, repo.space_id);
   const unwrap = <T>(reply: TrackerReply<T>): T => {
     if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
     return reply.value;
   };
-  let row = unwrap(await tracker.reserveWorkSource(repo, input));
+  let row = unwrap(await tracker.reserveWorkSource(access, repo, input));
+  // The durable reservation, not a retry's input, binds subsequent effects.
+  if (!row.authority)
+    fail("client_upgrade_required", "Source allocation has no initiating authority.", 409);
+  const authority = parseWorkAuthority(row.authority);
+  const authorize = async () => {
+    const current = await resolveWorkAuthority(env, authority, row.repo_id);
+    if (current.repo.space_id !== row.space_id || row.space_id !== repo.space_id)
+      fail("forbidden", "Source allocation Space does not match.", 403);
+  };
   const project = async () => {
     // An update of an existing reservation is allowed after tombstoning so
     // deletion can drain the creating phase. A new reservation is not.
     await env.DB.prepare(`INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,version,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,work_ref,initial_token_revoked,created_at,updated_at,archived_at,error,initial_source_id,initial_commit,initial_tree,initial_ref)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM repos WHERE id=? AND deleted_at IS NULL)
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,version,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,work_ref,initial_token_revoked,created_at,updated_at,archived_at,error,initial_source_id,initial_commit,initial_tree,initial_ref,authority)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM repos WHERE id=? AND deleted_at IS NULL)
       ON CONFLICT(source_id) DO UPDATE SET artifacts_name=excluded.artifacts_name,artifacts_remote=excluded.artifacts_remote,state=excluded.state,version=excluded.version,initial_token_revoked=excluded.initial_token_revoked,updated_at=excluded.updated_at,archived_at=excluded.archived_at,error=excluded.error
       WHERE timeline_work_sources.version <= excluded.version AND (timeline_work_sources.state NOT IN ('purging','purged') OR excluded.state=timeline_work_sources.state OR excluded.state='purged')`)
       .bind(
@@ -190,7 +212,7 @@ export async function initializeWorkSource(
         row.repo_id,
         row.timeline_id,
         row.timeline_slug,
-        row.owner_id,
+        row.space_id,
         row.artifacts_name,
         row.artifacts_remote,
         row.state,
@@ -210,6 +232,7 @@ export async function initializeWorkSource(
         row.initial_commit,
         row.initial_tree,
         row.initial_ref,
+        row.authority,
         repo.id,
       )
       .run();
@@ -249,6 +272,7 @@ export async function initializeWorkSource(
   if (row.state === "ready" || row.state === "archived")
     return { ...(await resolveSource(env, repo, row.source_id)), logicalBase };
   if (row.state === "reserved" || row.state === "failed") {
+    await authorize();
     const admitted = await env.DB.prepare(
       `UPDATE timeline_work_sources SET state='creating' WHERE source_id=? AND state IN ('reserved','failed') AND EXISTS(SELECT 1 FROM repos WHERE id=? AND deleted_at IS NULL) RETURNING source_id`,
     )
@@ -284,6 +308,7 @@ export async function initializeWorkSource(
     }
     let forked: ArtifactsCreateRepoResult;
     try {
+      await authorize();
       using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
       forked = await origin.fork(row.artifacts_name, { readOnly: false });
     } catch (error) {
@@ -293,6 +318,7 @@ export async function initializeWorkSource(
       if (!isDroppedConnection(error)) throw error;
       row = unwrap(await tracker.renameWorkSource(row.source_id, row.version));
       await project();
+      await authorize();
       using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
       forked = await origin.fork(row.artifacts_name, { readOnly: false });
     }
@@ -310,6 +336,7 @@ export async function initializeWorkSource(
   const refs = await lsRefs(env, row.artifacts_name, row.artifacts_remote!);
   const current = refs.find((ref) => ref.name === row.work_ref)?.oid ?? null;
   if (current !== row.initial_commit) {
+    await authorize();
     const [result] = await writeRefs(
       env,
       { artifacts_name: row.artifacts_name, artifacts_remote: row.artifacts_remote! },
@@ -362,6 +389,7 @@ export async function initializeWorkSource(
       .bind(row.repo_id, row.source_id, oid, row.allocation_operation_id, row.created_at)
       .run();
   }
+  await authorize();
   row = unwrap(
     await tracker.transitionWorkSource(row.source_id, row.version, "ready", row.artifacts_remote!),
   );

@@ -26,7 +26,7 @@ import { IssueTagsInline } from "../../components/Chips.tsx";
 const FACET_GROUPS: { key: keyof Facets; title: string }[] = [
   { key: "state", title: "State" },
   { key: "team", title: "Team" },
-  { key: "ws", title: "Workspace" },
+  { key: "project", title: "Project" },
   { key: "assignee", title: "Assignee" },
   { key: "type", title: "Type" },
   { key: "tag", title: "Tag" },

@@ -6,7 +6,7 @@ describe("page context", () => {
   test("a file with selected lines, an issue, a run", () => {
     const file = contextFor("/orbit/app/blob/main/src/a.ts", "#L3-L9", [
       {
-        params: { owner: "orbit", repo: "app", "*": "main/src/a.ts" },
+        params: { space: "orbit", repo: "app", "*": "main/src/a.ts" },
         data: { blob: { ref: "main", path: "src/a.ts" } },
       },
     ]);
@@ -16,7 +16,7 @@ describe("page context", () => {
     expect(issue).toMatchObject({ tracker: "orbit", issue: "CORE-25" });
     expect(suggestionsFor(issue)[0]).toContain("CORE-25");
     const run = contextFor("/orbit/app/ci/44", "", [
-      { params: { owner: "orbit", repo: "app", number: "44" }, data: null },
+      { params: { space: "orbit", repo: "app", number: "44" }, data: null },
     ]);
     expect(run).toMatchObject({ repo: "orbit/app", run: 44 });
     expect(contextLabel(contextFor("/", "", []))).toBeNull();

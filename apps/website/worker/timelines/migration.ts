@@ -1,13 +1,14 @@
 import type { Timeline, TimelineRepo } from "../../shared/timelines.ts";
 import type { SourceSnapshot, SourceDependency } from "../../shared/code-source.ts";
-import { selectRepos, type RepoRow } from "../db.ts";
+import type { RepoRow, Actor } from "../db.ts";
 import { lsRefs } from "../artifacts.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import type { TrackerReply } from "../tracker/object.ts";
-import { TrackerError } from "../tracker/store.ts";
+import { TrackerError, type Access } from "../tracker/store.ts";
 import { canonicalSource, ensureWorkSource } from "./sources.ts";
 import { writeRefs } from "./bookmarks.ts";
 import { pinSourceRoot } from "../retention/work-sources.ts";
+import { captureWorkAuthority, resolveWorkAuthority } from "../ci/admission.ts";
 
 interface FrozenRepo {
   entry: TimelineRepo;
@@ -24,15 +25,18 @@ function unwrap<T>(reply: TrackerReply<T>): T {
   if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
   return reply.value;
 }
-async function repository(env: Env, id: string): Promise<RepoRow> {
-  const row = await selectRepos(env.DB, "").where("r.id", "=", id).executeTakeFirst();
-  if (!row)
+async function repository(env: Env, access: Access, actor: Actor, id: string): Promise<RepoRow> {
+  const authority = await captureWorkAuthority(env, id, actor);
+  if (authority.spaceId !== access.spaceId || authority.migrationEpoch !== access.migrationEpoch)
     throw new TrackerError(
-      404,
-      "not_found",
-      "Migration repository was deleted; it cannot be resurrected.",
+      409,
+      "migration_epoch_mismatch",
+      "Refresh the Space before resuming source migration.",
     );
-  return row;
+  const { repo } = await resolveWorkAuthority(env, authority, id);
+  if (repo.deleted_at)
+    throw new TrackerError(404, "not_found", "Migration repository was deleted.");
+  return repo;
 }
 async function snapshot(
   env: Env,
@@ -64,29 +68,33 @@ async function snapshot(
 /** One finite, resumable cutover. There is never an active legacy write mode. */
 export async function migrateLegacyTimeline(
   env: Env,
-  ownerId: string,
+  access: Access,
+  actor: Actor,
   timelineId: string,
 ): Promise<Timeline> {
+  const ownerId = access.spaceId;
   const tracker = trackerObject(env, ownerId);
   let row = await env.DB.prepare(
-    "SELECT state, input, output FROM timeline_source_migrations WHERE owner_id = ? AND timeline_id = ?",
+    "SELECT state, input, output FROM timeline_source_migrations WHERE space_id = ? AND timeline_id = ?",
   )
     .bind(ownerId, timelineId)
     .first<MigrationRow>();
   if (!row) {
-    const current = unwrap(await tracker.timelineById(timelineId));
+    const current = unwrap(await tracker.timelineById(access, timelineId));
     if (current.repos.every((entry) => entry.source)) return current;
   }
-  if (row?.state === "cleaned") return unwrap(await tracker.timelineById(timelineId));
-  const timeline = unwrap(await tracker.beginLegacyMigration(timelineId));
+  if (row?.state === "cleaned") return unwrap(await tracker.timelineById(access, timelineId));
+  const timeline = unwrap(await tracker.beginLegacyMigration(access, timelineId));
   const ended = timeline.status === "landed" || timeline.status === "abandoned";
   if (!row) {
     const frozen: FrozenRepo[] = [];
     const parent =
-      !ended && timeline.parentId ? unwrap(await tracker.timelineById(timeline.parentId)) : null;
+      !ended && timeline.parentId
+        ? unwrap(await tracker.timelineById(access, timeline.parentId))
+        : null;
     for (const entry of timeline.repos) {
       if (entry.source) continue;
-      const repo = await repository(env, entry.id);
+      const repo = await repository(env, access, actor, entry.id);
       const ref = `refs/heads/${entry.bookmark}`;
       const baseOid = timeline.forkPoint.commits[entry.id];
       if (!baseOid)
@@ -137,12 +145,12 @@ export async function migrateLegacyTimeline(
     }
     const now = new Date().toISOString();
     await env.DB.prepare(`INSERT INTO timeline_source_migrations
-      (owner_id,timeline_id,state,input,created_at,updated_at) VALUES (?,?,'frozen',?,?,?)
-      ON CONFLICT(owner_id,timeline_id) DO NOTHING`)
+      (space_id,timeline_id,state,input,created_at,updated_at) VALUES (?,?,'frozen',?,?,?)
+      ON CONFLICT(space_id,timeline_id) DO NOTHING`)
       .bind(ownerId, timelineId, JSON.stringify(frozen), now, now)
       .run();
     row = await env.DB.prepare(
-      "SELECT state,input,output FROM timeline_source_migrations WHERE owner_id=? AND timeline_id=?",
+      "SELECT state,input,output FROM timeline_source_migrations WHERE space_id=? AND timeline_id=?",
     )
       .bind(ownerId, timelineId)
       .first<MigrationRow>();
@@ -153,11 +161,12 @@ export async function migrateLegacyTimeline(
   if (row.state === "frozen") {
     repos = [...timeline.repos];
     for (const input of frozen) {
-      const repo = await repository(env, input.entry.id);
+      const repo = await repository(env, access, actor, input.entry.id);
       const source = ended
         ? input.head
         : (
-            await ensureWorkSource(env, repo, {
+            await ensureWorkSource(env, access, repo, {
+              authority: await captureWorkAuthority(env, repo.id, actor),
               timelineId,
               timelineSlug: timeline.slug,
               base: input.base,
@@ -178,12 +187,12 @@ export async function migrateLegacyTimeline(
     }
     // The allocator roots the exact work head before ready. Only then publish routing.
     await env.DB.prepare(
-      "UPDATE timeline_source_migrations SET state='ready',output=?,updated_at=? WHERE owner_id=? AND timeline_id=? AND state='frozen'",
+      "UPDATE timeline_source_migrations SET state='ready',output=?,updated_at=? WHERE space_id=? AND timeline_id=? AND state='frozen'",
     )
       .bind(JSON.stringify(repos), new Date().toISOString(), ownerId, timelineId)
       .run();
   }
-  const migrated = unwrap(await tracker.completeLegacyMigration(timelineId, repos));
+  const migrated = unwrap(await tracker.completeLegacyMigration(access, timelineId, repos));
   if (!ended)
     for (const input of frozen) {
       const at = new Date().toISOString();
@@ -204,7 +213,7 @@ export async function migrateLegacyTimeline(
   // Never clean up ended historical refs. CAS cannot erase concurrently changed work.
   if (!ended)
     for (const input of frozen) {
-      const repo = await repository(env, input.entry.id);
+      const repo = await repository(env, access, actor, input.entry.id);
       const current = (await lsRefs(env, repo.artifacts_name, repo.artifacts_remote)).find(
         (candidate) => candidate.name === input.head.ref,
       )?.oid;
@@ -221,7 +230,7 @@ export async function migrateLegacyTimeline(
       if (!result[0]?.ok) throw new Error("Legacy ref cleanup did not complete; retry migration.");
     }
   await env.DB.prepare(
-    "UPDATE timeline_source_migrations SET state='cleaned',updated_at=? WHERE owner_id=? AND timeline_id=?",
+    "UPDATE timeline_source_migrations SET state='cleaned',updated_at=? WHERE space_id=? AND timeline_id=?",
   )
     .bind(new Date().toISOString(), ownerId, timelineId)
     .run();

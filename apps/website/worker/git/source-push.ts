@@ -8,6 +8,9 @@ import { TrackerError } from "../tracker/store.ts";
 import type { TrackerReply } from "../tracker/object.ts";
 import type { SourcePush, SourcePushRecovery } from "../tracker/timelines.ts";
 import { sourcePushFixtureBoundary } from "./source-push-fixture.ts";
+import { repoSpace, type Actor } from "../db.ts";
+import { captureWorkAuthority, resolveWorkAuthority } from "../ci/admission.ts";
+import { accessFor } from "../tracker/access.ts";
 
 type SourceRepo = {
   id: string;
@@ -75,12 +78,12 @@ export async function retainProgress(
 export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?: string) {
   const canonical = await db(env.DB)
     .selectFrom("repos")
-    .select("owner_id")
+    .select("space_id")
     .where("id", "=", repoId)
     .executeTakeFirst();
   if (!canonical) return [];
-  const tracker = trackerObject(env, canonical.owner_id);
-  const pending = await tracker.sourcePushes(repoId);
+  const tracker = trackerObject(env, canonical.space_id);
+  const pending = await tracker.sourcePushesForSettlement({ spaceId: canonical.space_id, repoId });
   if (!pending.ok) throw new Error(pending.error);
   const settled: string[] = [];
   // Tracker commits the outcome first. Repair the projection even when that
@@ -93,7 +96,12 @@ export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?:
     .where("state", "in", ["admitted", "ambiguous"]);
   if (sourceId) projected = projected.where("source_id", "=", sourceId);
   for (const row of await projected.execute()) {
-    const authoritative = await tracker.sourcePush(row.id, repoId, row.source_id);
+    const authoritative = await tracker.sourcePushForSettlement({
+      spaceId: canonical.space_id,
+      operationId: row.id,
+      repoId,
+      sourceId: row.source_id,
+    });
     if (!authoritative.ok) throw new Error(authoritative.error);
     if (authoritative.value.state !== "accepted" && authoritative.value.state !== "rejected")
       continue;
@@ -101,7 +109,10 @@ export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?:
     const result =
       proof?.outcome && proof.head
         ? await tracker.settleSourcePushRecovery(row.id, proof.outcome, proof.head)
-        : await tracker.finishSourcePush(row.id, authoritative.value.state);
+        : await tracker.finishSourcePushForSettlement(
+            { spaceId: canonical.space_id, repoId, sourceId: row.source_id, operationId: row.id },
+            authoritative.value.state,
+          );
     if (!result.ok) throw new Error(result.error);
     settled.push(row.id);
   }
@@ -117,7 +128,15 @@ export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?:
                 proof.outcome,
                 proof.head,
               )
-            : await tracker.finishSourcePush(operation.operationId, operation.state);
+            : await tracker.finishSourcePushForSettlement(
+                {
+                  spaceId: canonical.space_id,
+                  repoId,
+                  sourceId: operation.sourceId,
+                  operationId: operation.operationId,
+                },
+                operation.state,
+              );
         if (!result.ok) throw new Error(result.error);
         settled.push(operation.operationId);
       }
@@ -150,7 +169,15 @@ export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?:
       if (command.old) await retainProgress(env, repo, operation.operationId, command.old);
       if (command.new) await retainProgress(env, repo, operation.operationId, command.new);
     }
-    const result = await tracker.finishSourcePush(operation.operationId, "accepted");
+    const result = await tracker.finishSourcePushForSettlement(
+      {
+        spaceId: canonical.space_id,
+        repoId,
+        sourceId: operation.sourceId,
+        operationId: operation.operationId,
+      },
+      "accepted",
+    );
     if (!result.ok) throw new Error(result.error);
     settled.push(operation.operationId);
   }
@@ -188,16 +215,15 @@ function recoveryResult(operation: SourcePush & { state: string }) {
 /** Explicit recovery never treats the unchanged old ref as rejection proof. */
 export async function recoverSourcePush(
   env: Env,
-  canonical: { id: string; owner_id: string },
+  canonical: { id: string; space_id: string },
   sourceId: string,
   operationId: string,
-  actorId: string,
-  accountableId: string,
+  actor: Actor,
 ) {
-  const tracker = trackerObject(env, canonical.owner_id);
-  let operation = unwrapPush(await tracker.sourcePush(operationId, canonical.id, sourceId));
-  const readOperation = async () =>
-    unwrapPush(await tracker.sourcePush(operationId, canonical.id, sourceId));
+  const tracker = trackerObject(env, canonical.space_id);
+  const scope = { spaceId: canonical.space_id, operationId, repoId: canonical.id, sourceId };
+  let operation = unwrapPush(await tracker.sourcePushForSettlement(scope));
+  const readOperation = async () => unwrapPush(await tracker.sourcePushForSettlement(scope));
   const finish = async () => {
     if (operation.recovery?.outcome) {
       unwrapPush(
@@ -208,7 +234,7 @@ export async function recoverSourcePush(
         ),
       );
     } else if (operation.state === "accepted" || operation.state === "rejected") {
-      unwrapPush(await tracker.finishSourcePush(operationId, operation.state));
+      unwrapPush(await tracker.finishSourcePushForSettlement(scope, operation.state));
     }
     return recoveryResult(await readOperation());
   };
@@ -221,7 +247,7 @@ export async function recoverSourcePush(
   const source = await getWorkSource(env, canonical.id, sourceId);
   if (
     !source ||
-    source.owner_id !== canonical.owner_id ||
+    source.space_id !== canonical.space_id ||
     source.state !== "ready" ||
     !source.artifacts_remote ||
     source.timeline_id !== operation.timelineId
@@ -248,11 +274,12 @@ export async function recoverSourcePush(
   let head = await readHead();
   if (!operation.recovery && head === command.new) {
     await retainProgress(env, repo, operationId, command.new);
-    unwrapPush(await tracker.finishSourcePush(operationId, "accepted"));
+    unwrapPush(await tracker.finishSourcePushForSettlement(scope, "accepted"));
     operation = await readOperation();
     return finish();
   }
   if (!operation.recovery) {
+    const recoveryAuthority = await captureWorkAuthority(env, canonical.id, actor);
     if (!head || head !== command.old || command.old === command.new)
       throw new TrackerError(
         409,
@@ -278,30 +305,29 @@ export async function recoverSourcePush(
       message: `Fence interrupted source push ${operationId}\n\nRecovery: ${id}\n`,
     });
     const intent: SourcePushRecovery = {
+      authority: recoveryAuthority,
       id,
       base: head,
       tree: base.treeHash,
       commit: hashObject("commit", bytes),
       content: new TextDecoder().decode(bytes),
-      actorId,
-      accountableId,
+      actorId: actor.agent?.id ?? actor.id,
+      accountableId: actor.id,
       createdAt,
       priorState: operation.state,
     };
     // First persisted intent wins. Every contender must use the returned marker.
-    operation = unwrapPush(
-      await tracker.beginSourcePushRecovery(operationId, canonical.id, sourceId, intent),
+    const current = await resolveWorkAuthority(env, recoveryAuthority, canonical.id);
+    const access = await accessFor(
+      env,
+      repoSpace(current.repo),
+      actor.id,
+      actor.agent?.id ?? null,
+      false,
+      actor.credential,
     );
-    if (operation.state === "accepted" || operation.state === "rejected") return finish();
-  } else {
-    // Recheck lifecycle before replaying provider work, not just on first intent.
     operation = unwrapPush(
-      await tracker.beginSourcePushRecovery(
-        operationId,
-        canonical.id,
-        sourceId,
-        operation.recovery,
-      ),
+      await tracker.beginSourcePushRecovery(access, operationId, canonical.id, sourceId, intent),
     );
     if (operation.state === "accepted" || operation.state === "rejected") return finish();
   }
@@ -321,6 +347,7 @@ export async function recoverSourcePush(
       pack.set(chunk, offset);
       offset += chunk.length;
     }
+    await resolveWorkAuthority(env, recovery.authority, canonical.id);
     try {
       await writeRefs(
         env,

@@ -1,4 +1,4 @@
-// The one way to reach a Durable Object instance (CORE-197). `durableStub`
+// The way to reach a business Durable Object instance (CORE-197). `durableStub`
 // returns the stub and records the instance in the D1 registry (do_instances)
 // so it can be found and purged from outside later, even after whatever named
 // it is gone. Recording never blocks or fails the caller: it runs in the
@@ -8,8 +8,7 @@
 // `purgeInstance` and `retireInstance` are how anything (retention, repository
 // deletion) gets rid of an instance; never a hand-built stub.
 //
-// The conformance test (conformance.test.ts) fails when code outside
-// worker/durable/ calls getByName, idFromName or getAgentByName.
+// Independent cutover control stays outside this tenant lifecycle registry.
 
 import type { Assistant } from "../assistant/agent.ts";
 import type { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
@@ -21,7 +20,8 @@ import type { UploadDO } from "../../registry/do/upload-do.ts";
 import type { LoginDO } from "../../registry/do/login-do.ts";
 import { DURABLE_CLASSES, type DurableClass } from "./classes.ts";
 import type { Purgeable, PurgeReport, StorageReport } from "./contract.ts";
-import { recordPurge, recordRetiring, recordUse } from "./record.ts";
+import { recordPurge, recordRetiring, recordUse, resolveDurableOwner } from "./record.ts";
+import { withCutoverAdmission } from "./cutover-admission.ts";
 
 /** Each class's RPC type, for typed stubs. */
 export interface DurableTypes {
@@ -36,7 +36,9 @@ export interface DurableTypes {
 }
 
 export interface DurableOwner {
+  /** Genuine person hint only; never used for named content classes. */
   account?: string | null;
+  /** Stable app repository id for a sandbox not yet backed by its job/run row. */
   repo?: string | null;
 }
 
@@ -44,7 +46,7 @@ export interface DurableOwner {
 export const TOUCH_EVERY_MS = 60 * 60_000;
 /** Instances an isolate remembers recording before it starts over. */
 const MEMORY_LIMIT = 10_000;
-const recorded = new Map<string, number>();
+const recorded = new Map<string, { at: number; hint: string }>();
 
 function key(cls: DurableClass, name: string) {
   return `${cls}\u0000${name}`;
@@ -84,8 +86,8 @@ export function peekStub<C extends Exclude<DurableClass, "Assistant">>(
 }
 
 /**
- * The assistant, an Agents SDK agent, through getAgentByName (it sets the
- * agent's name before the first call), recorded like the others.
+ * The assistant facade uses the same named-instance/startup contract as the
+ * Agents SDK. Its admission precedes SDK construction and persistent recovery.
  */
 export async function durableAgent(
   env: Env,
@@ -98,10 +100,30 @@ export async function durableAgent(
 }
 
 async function agentStub(env: Env, name: string): Promise<DurableObjectStub<Assistant>> {
-  // Loaded on demand: the SDK imports the Workers runtime, which plain unit
-  // tests of everything else here don't have.
-  const { getAgentByName } = await import("agents");
-  return getAgentByName(durableNamespace(env, "Assistant"), name);
+  const stub = durableNamespace(env, "Assistant").getByName(name);
+  // Match getAgentByName's default startup retries (agents/agent-routing):
+  // only platform retryable failures, never overload/admission failures.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await stub.__unsafe_ensureInitialized();
+      return stub;
+    } catch (error) {
+      if (
+        attempt >= 3 ||
+        typeof error !== "object" ||
+        error === null ||
+        Reflect.get(error, "retryable") !== true ||
+        Reflect.get(error, "overloaded") === true
+      )
+        throw error;
+      const pause = Promise.withResolvers<void>();
+      setTimeout(
+        pause.resolve,
+        Math.floor(Math.random() * Math.min(800, 100 * 2 ** (attempt - 1))),
+      );
+      await pause.promise;
+    }
+  }
 }
 
 /** A stub that isn't a use: purging or sizing must not count as activity. */
@@ -121,22 +143,19 @@ export function touchInstance(
     const d1 = Reflect.get(env, "DB") as D1Database | undefined;
     if (!d1) return;
     const id = key(cls, name);
+    const hint = JSON.stringify([owner?.repo ?? null, owner?.account ?? null]);
     const now = Date.now();
     const last = recorded.get(id);
-    if (last !== undefined && now - last < TOUCH_EVERY_MS) return;
+    if (last !== undefined && last.hint === hint && now - last.at < TOUCH_EVERY_MS) return;
     if (recorded.size >= MEMORY_LIMIT) recorded.clear();
-    recorded.set(id, now);
-    const derived = DURABLE_CLASSES[cls].owner(name);
-    const row = {
-      class: cls,
-      name,
-      account: owner?.account ?? derived.account,
-      repo: owner?.repo ?? derived.repo,
-    };
+    recorded.set(id, { at: now, hint });
     const at = new Date(now).toISOString();
     const freshAfter = new Date(now - TOUCH_EVERY_MS).toISOString();
     background(
-      recordUse(d1, row, at, freshAfter).catch((error: unknown) => {
+      withCutoverAdmission(env, "durable-registry", async () => {
+        const resolved = await resolveDurableOwner(env, cls, name, owner);
+        await recordUse(d1, { class: cls, name, ...resolved }, at, freshAfter);
+      }).catch((error: unknown) => {
         recorded.delete(id);
         console.warn("Durable: recording an instance failed", cls, error);
       }),

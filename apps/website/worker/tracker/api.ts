@@ -1,6 +1,8 @@
 import { Hono, type Context } from "hono";
 import type { AppEnv } from "../auth.ts";
-import { findAccountBySlug, findRepo, roleFor, visibleRepos, type Actor } from "../db.ts";
+import { findRepo, roleFor, visibleRepos, type Actor } from "../db.ts";
+import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
+import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type {
   ApprovalAutomation,
@@ -12,7 +14,7 @@ import type {
   RequestSummary,
   TrackerList,
   TrackerView,
-  TrackerOwner,
+  TrackerSpace,
 } from "../../shared/tracker.ts";
 import {
   TrackerError,
@@ -30,7 +32,7 @@ import { autoApprovable } from "../../shared/tracker.ts";
 import { linkedWork } from "./work.ts";
 import {
   clearPreferences,
-  defaultOwner,
+  defaultSpace,
   parsePreferences,
   preferencesFor,
   savePreferences,
@@ -40,53 +42,47 @@ import { view as checkpointView, writableRepoIds } from "../timelines/checkpoint
 import { currentRepositoryNames } from "../timelines/names.ts";
 import type { AutoApproveScope } from "../timelines/auto-approve.ts";
 import type { RepoIssueSummary } from "../../shared/api.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 
 export const tracker = new Hono<AppEnv>();
 
-/** The trackers an actor can read: their own, and their organizations'. */
-export async function accessible(db: D1Database, actor: Actor): Promise<TrackerOwner[]> {
-  const rows = await gitmatrixDb(db)
-    .selectFrom("accounts as a")
-    .leftJoin("org_members as m", (join) =>
-      join.onRef("m.org_id", "=", "a.id").on("m.user_id", "=", actor.id),
-    )
-    .select(["a.id", "a.slug", "a.display_name", "m.role"])
-    .where((eb) =>
-      eb.or([
-        eb("a.id", "=", actor.id),
-        eb.and([eb("a.kind", "=", "org"), eb("m.user_id", "is not", null)]),
-      ]),
-    )
-    .orderBy("a.slug")
-    .execute();
-  return rows.map((row) => ({
-    id: row.id,
-    slug: row.slug,
-    displayName: row.display_name,
-    canAdmin: row.id === actor.id || row.role === "owner",
-  }));
+/** Explicit current Space grants only; Instance and Organization roles grant no Tracker access. */
+export async function accessible(db: D1Database, actor: Actor): Promise<TrackerSpace[]> {
+  const rows = await db
+    .prepare(`SELECT s.slug FROM spaces s
+    JOIN space_grants g ON g.space_id=s.id AND g.account_id=?
+    JOIN organization_members m ON m.organization_id=s.organization_id AND m.account_id=g.account_id
+    WHERE s.archived_at IS NULL ORDER BY s.slug`)
+    .bind(actor.id)
+    .all<{ slug: string }>();
+  const spaces: TrackerSpace[] = [];
+  for (const row of rows.results) {
+    const space = await findSpaceBySlug(db, row.slug);
+    if (!space) continue;
+    const access = await resolveSpaceAccess(db, actor, space.id);
+    if (access) spaces.push({ ...access.space, canAdmin: access.grant.role === "admin" });
+  }
+  return spaces;
 }
 export async function authorize(c: Context<AppEnv>, includeMembers = true): Promise<Access> {
+  if (c.req.header(CONTENT_CONTRACT_HEADER) !== String(CONTENT_CONTRACT_VERSION))
+    throw new TrackerError(
+      409,
+      "client_upgrade_required",
+      "Upgrade your client and send X-Gitmatrix-Content-Version: 4.",
+    );
   const actor = c.get("actor");
   if (!actor) throw new TrackerError(401, "unauthenticated", "Sign in to access trackers.");
-  const owner = await findAccountBySlug(c.env.DB, c.req.param("owner")!);
-  if (!owner) throw new TrackerError(404, "not_found", "Tracker account not found.");
-  let canAdmin = owner.id === actor.id;
-  if (!canAdmin) {
-    const membership =
-      owner.kind === "org"
-        ? await gitmatrixDb(c.env.DB)
-            .selectFrom("org_members")
-            .select("role")
-            .where("org_id", "=", owner.id)
-            .where("user_id", "=", actor.id)
-            .executeTakeFirst()
-        : null;
-    if (!membership)
-      throw new TrackerError(403, "forbidden", "Tracker access requires account membership.");
-    canAdmin = membership.role === "owner";
-  }
-  return accessFor(c.env.DB, owner, actor.id, actor.agent?.id ?? null, canAdmin, includeMembers);
+  const space = await findSpaceBySlug(c.env.DB, c.req.param("space")!);
+  if (!space) throw new TrackerError(404, "not_found", "Tracker Space not found.");
+  return accessFor(
+    c.env,
+    space,
+    actor.id,
+    actor.agent?.id ?? null,
+    includeMembers,
+    actor.credential,
+  );
 }
 /** `?timeline=<slug>`: a timeline's view instead of main's. */
 function timelineParam(c: Context<AppEnv>): string | undefined {
@@ -141,11 +137,11 @@ tracker.onError((error, c) => {
 tracker.get("/tracker", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
-  const [trackers, defaultOwnerId] = await Promise.all([
+  const [trackers, defaultSpaceId] = await Promise.all([
     accessible(c.env.DB, actor),
-    defaultOwner(c.env.DB, actor.id),
+    defaultSpace(c.env.DB, actor.id),
   ]);
-  return c.json<TrackerList>({ viewerId: actor.id, trackers, defaultOwnerId });
+  return c.json<TrackerList>({ viewerId: actor.id, trackers, defaultSpaceId });
 });
 /**
  * How many open requests wait on you, and on anyone, across every tracker you're
@@ -155,8 +151,16 @@ tracker.get("/requests/summary", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
   const summary: RequestSummary = { forYou: 0, open: 0 };
-  for (const owner of await accessible(c.env.DB, actor)) {
-    const result = await trackerObject(c.env, owner.id).openRequests();
+  for (const space of await accessible(c.env.DB, actor)) {
+    const access = await accessFor(
+      c.env,
+      space,
+      actor.id,
+      actor.agent?.id ?? null,
+      false,
+      actor.credential,
+    );
+    const result = await trackerObject(c.env, space.id).openRequests(access);
     if (!result.ok) return response(c, result);
     for (const { request } of result.value) {
       summary.open++;
@@ -172,21 +176,22 @@ tracker.get("/requests/summary", async (c) => {
  */
 async function needsYouItems(
   c: Context<AppEnv>,
-  owner: { id: string; slug: string; displayName: string },
+  space: TrackerSpace,
+  access: Access,
   items: OpenRequestItem[],
 ): Promise<OpenRequest[] | Response> {
-  const stub = trackerObject(c.env, owner.id);
+  const stub = trackerObject(c.env, space.id);
   // History shows a closed approval's answer, not its checkpoint.
   const pinned = items.flatMap(({ request }) =>
     request.checkpoint && request.status === "open" ? [request.checkpoint.id] : [],
   );
   const checkpoints = new Map<string, OpenRequest["checkpoint"]>();
   if (pinned.length) {
-    const states = await stub.checkpointStates(pinned);
+    const states = await stub.checkpointStates(access, pinned);
     if (!states.ok) return response(c, states);
     const current = await currentRepositoryNames(
       c.env.DB,
-      owner.id,
+      space.id,
       states.value.map(({ state }) => state.checkpoint),
     );
     for (const [index, { state, timeline }] of states.value.entries())
@@ -213,7 +218,7 @@ async function needsYouItems(
   return items.map((item) => {
     const checkpoint = item.request.checkpoint && checkpoints.get(item.request.checkpoint.id);
     return {
-      tracker: { slug: owner.slug, displayName: owner.displayName },
+      tracker: { slug: space.slug, displayName: space.displayName },
       ...item,
       ...(checkpoint ? { checkpoint } : {}),
       ...(checkpoint &&
@@ -224,6 +229,11 @@ async function needsYouItems(
         : {}),
     };
   });
+}
+
+/** Read access to one Space's tracker for a Needs you or agent-work listing. */
+function listingAccess(c: Context<AppEnv>, actor: Actor, space: TrackerSpace) {
+  return accessFor(c.env, space, actor.id, actor.agent?.id ?? null, false, actor.credential);
 }
 
 /** Names for the people and agents requests mention: "builder for Ann Lee" for an agent. */
@@ -268,10 +278,11 @@ tracker.get("/requests", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
   const requests: OpenRequest[] = [];
-  for (const owner of await accessible(c.env.DB, actor)) {
-    const result = await trackerObject(c.env, owner.id).neededRequests({ open: true });
+  for (const space of await accessible(c.env.DB, actor)) {
+    const access = await listingAccess(c, actor, space);
+    const result = await trackerObject(c.env, space.id).neededRequests(access, { open: true });
     if (!result.ok) return response(c, result);
-    const items = await needsYouItems(c, owner, result.value);
+    const items = await needsYouItems(c, space, access, result.value);
     if (items instanceof Response) return items;
     requests.push(...items);
   }
@@ -297,14 +308,15 @@ tracker.get("/requests/history", async (c) => {
   if (before !== null && (before.length > 200 || !before.includes("|")))
     throw new TrackerError(400, "invalid_input", "before is the last page's next.");
   const closed: OpenRequest[] = [];
-  for (const owner of await accessible(c.env.DB, actor)) {
-    const result = await trackerObject(c.env, owner.id).neededRequests({
+  for (const space of await accessible(c.env.DB, actor)) {
+    const access = await listingAccess(c, actor, space);
+    const result = await trackerObject(c.env, space.id).neededRequests(access, {
       open: false,
       before,
       limit: HISTORY_PAGE + 1,
     });
     if (!result.ok) return response(c, result);
-    const items = await needsYouItems(c, owner, result.value);
+    const items = await needsYouItems(c, space, access, result.value);
     if (items instanceof Response) return items;
     closed.push(...items);
   }
@@ -326,11 +338,16 @@ tracker.get("/agent-eligibility", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to see your agents' work." }, 401);
   const out: AgentEligibility = { trackers: [] };
-  for (const owner of await accessible(c.env.DB, actor)) {
-    const account = await findAccountBySlug(c.env.DB, owner.slug);
-    if (!account) continue;
-    const access = await accessFor(c.env.DB, account, actor.id, null, owner.canAdmin);
-    const result = await trackerObject(c.env, owner.id).snapshot(access);
+  for (const space of await accessible(c.env.DB, actor)) {
+    const access = await accessFor(
+      c.env,
+      space,
+      actor.id,
+      actor.agent?.id ?? null,
+      true,
+      actor.credential,
+    );
+    const result = await trackerObject(c.env, space.id).snapshot(access);
     if (!result.ok) return response(c, result);
     const agents = result.value.agents.filter(
       (agent) =>
@@ -339,7 +356,7 @@ tracker.get("/agent-eligibility", async (c) => {
         (!actor.agent || agent.id === actor.agent.id),
     );
     out.trackers.push({
-      tracker: { slug: owner.slug, displayName: owner.displayName },
+      tracker: { slug: space.slug, displayName: space.displayName },
       agents: agents.map((agent) => agentWork(result.value, agent.id)),
       tags: result.value.labels,
     });
@@ -375,7 +392,7 @@ tracker.get("/agent-work", async (c) => {
   }
   const only = c.req.query("tracker");
   const trackers = (await accessible(c.env.DB, actor)).filter(
-    (owner) => !only || owner.slug === only,
+    (space) => !only || space.slug === only,
   );
   if (only && !trackers.length)
     throw new TrackerError(404, "not_found", `You aren't in a tracker ${only}.`);
@@ -385,7 +402,9 @@ tracker.get("/agent-work", async (c) => {
     actorIds: actor.agent || wanted ? agents.map((agent) => agent.id) : null,
   };
   const results = await Promise.all(
-    trackers.map((owner) => trackerObject(c.env, owner.id).completedWork(filter)),
+    trackers.map(async (space) =>
+      trackerObject(c.env, space.id).completedWork(await listingAccess(c, actor, space), filter),
+    ),
   );
   const out: CompletedWorkList = {
     since,
@@ -396,8 +415,8 @@ tracker.get("/agent-work", async (c) => {
   };
   for (const [index, result] of results.entries()) {
     if (!result.ok) return response(c, result);
-    const owner = trackers[index]!;
-    const where = { slug: owner.slug, displayName: owner.displayName };
+    const space = trackers[index]!;
+    const where = { slug: space.slug, displayName: space.displayName };
     out.items.push(...result.value.items.map((item) => ({ tracker: where, ...item })));
     out.truncated ||= result.value.truncated;
   }
@@ -405,14 +424,14 @@ tracker.get("/agent-work", async (c) => {
   return c.json(out);
 });
 // A single authenticated browser request, without the repository list or a session preflight.
-tracker.get("/tracker/:owner/view", async (c) => {
+tracker.get("/tracker/:space/view", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
   const [view, trackers] = await Promise.all([
     authorize(c).then(async (access) => ({
-      result: await trackerObject(c.env, access.owner.id).snapshot(access, timelineParam(c)),
+      result: await trackerObject(c.env, access.space.id).snapshot(access, timelineParam(c)),
       // An agent sees its person's defaults: they're whose work it does.
-      preferences: await preferencesFor(c.env.DB, actor.id, access.owner.id),
+      preferences: await preferencesFor(c.env.DB, actor.id, access.space.id),
     })),
     accessible(c.env.DB, actor),
   ]);
@@ -424,13 +443,13 @@ tracker.get("/tracker/:owner/view", async (c) => {
   });
 });
 /** Your defaults for this tracker (CORE-119); an agent reads its person's. */
-tracker.get("/tracker/:owner/preferences", async (c) => {
+tracker.get("/tracker/:space/preferences", async (c) => {
   const access = await authorize(c, false);
   return c.json({
-    preferences: await preferencesFor(c.env.DB, c.get("actor")!.id, access.owner.id),
+    preferences: await preferencesFor(c.env.DB, c.get("actor")!.id, access.space.id),
   });
 });
-tracker.put("/tracker/:owner/preferences", async (c) => {
+tracker.put("/tracker/:space/preferences", async (c) => {
   const access = await authorize(c, false);
   const actor = c.get("actor")!;
   if (actor.agent)
@@ -440,12 +459,27 @@ tracker.put("/tracker/:owner/preferences", async (c) => {
       "Defaults are your person's to set; agents follow them.",
     );
   const parsed = parsePreferences(await body(c));
-  if (typeof parsed === "string") throw new TrackerError(400, "invalid_input", parsed);
+  if (typeof parsed === "string")
+    throw new TrackerError(
+      parsed.startsWith("client_upgrade_required:") ? 409 : 400,
+      parsed.startsWith("client_upgrade_required:") ? "client_upgrade_required" : "invalid_input",
+      parsed,
+    );
+  if (parsed.teamId !== null) {
+    const teams = await trackerObject(c.env, access.spaceId).teamDirectory(access);
+    if (!teams.ok) return response(c, teams);
+    if (!teams.value.some((team) => team.id === parsed.teamId))
+      throw new TrackerError(
+        400,
+        "invalid_input",
+        "Default Team must be active and belong to this Space.",
+      );
+  }
   return c.json({
-    preferences: await savePreferences(c.env.DB, actor.id, access.owner.id, parsed),
+    preferences: await savePreferences(c.env.DB, actor.id, access.space.id, parsed),
   });
 });
-tracker.delete("/tracker/:owner/preferences", async (c) => {
+tracker.delete("/tracker/:space/preferences", async (c) => {
   const access = await authorize(c, false);
   const actor = c.get("actor")!;
   if (actor.agent)
@@ -454,40 +488,89 @@ tracker.delete("/tracker/:owner/preferences", async (c) => {
       "forbidden",
       "Defaults are your person's to set; agents follow them.",
     );
-  await clearPreferences(c.env.DB, actor.id, access.owner.id);
+  await clearPreferences(c.env.DB, actor.id, access.space.id);
   return c.body(null, 204);
 });
-tracker.get("/tracker/:owner/snapshot", async (c) => {
+tracker.get("/tracker/:space/snapshot", async (c) => {
   const access = await authorize(c);
   return response(
     c,
-    await trackerObject(c.env, access.owner.id).snapshot(
+    await trackerObject(c.env, access.space.id).snapshot(
       access,
       timelineParam(c),
       c.req.query("timelines") === "1",
     ),
   );
 });
+tracker.get("/tracker/:space/authorization", async (c) => {
+  const access = await authorize(c, false);
+  return c.json({
+    contractVersion: 4,
+    spaceId: access.spaceId,
+    migrationEpoch: access.migrationEpoch,
+  });
+});
 /**
  * The tracker's tag catalog (CORE-271), with how many issues carry each tag:
  * what issue tags, agent tags and requirement `tag:` values are chosen from.
  */
-tracker.get("/tracker/:owner/tags", async (c) => {
+tracker.get("/tracker/:space/tags", async (c) => {
   const access = await authorize(c);
-  const catalog = await trackerObject(c.env, access.owner.id).tagCatalog();
+  const catalog = await trackerObject(c.env, access.space.id).tagCatalog(access);
   return response(c, catalog.ok ? { ...catalog, value: { tags: catalog.value } } : catalog);
 });
-tracker.get("/tracker/:owner/changes", async (c) => {
+tracker.get("/tracker/:space/teams", async (c) => {
+  const access = await authorize(c, false);
+  const result = await trackerObject(c.env, access.spaceId).teamDirectory(access);
+  return response(c, result.ok ? { ...result, value: { teams: result.value } } : result);
+});
+tracker.post("/tracker/:space/recover", async (c) => {
+  const access = await authorize(c, false);
+  const input = await body(c);
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new TrackerError(400, "invalid_input", "A legacy recovery request is required.");
+  const record = input as Record<string, unknown>;
+  if (
+    Object.keys(record).some(
+      (key) => !["sourceContractVersion", "sourceSpaceId", "actorId", "operations"].includes(key),
+    ) ||
+    record.sourceContractVersion !== 3 ||
+    record.sourceSpaceId !== access.spaceId ||
+    record.actorId !== access.actorId ||
+    !Array.isArray(record.operations) ||
+    record.operations.length > 100
+  )
+    throw new TrackerError(
+      409,
+      "export_required",
+      "Recovery must match the original person or agent, immutable Space and contract version 3; preserve and export unresolved intent.",
+    );
+  return response(
+    c,
+    await trackerObject(c.env, access.spaceId).recoverOperations(access, record.operations),
+  );
+});
+tracker.get("/tracker/:space/changes", async (c) => {
   // Members and agents aren't events: a replica asks for them (directory=1) to
   // learn of agents created and people added since its snapshot. Polling skips it.
   const directory = c.req.query("directory") === "1";
   const access = await authorize(c, directory);
+  if (
+    c.req.query("spaceId") !== access.spaceId ||
+    c.req.query("migrationEpoch") !== String(access.migrationEpoch)
+  )
+    throw new TrackerError(
+      409,
+      "migration_epoch_mismatch",
+      "Changes require the immutable spaceId and migrationEpoch from your current snapshot.",
+    );
   const after = c.req.query("after") ?? "0";
   const limit = c.req.query("limit") ?? "200";
   if (!/^\d+$/.test(after) || !/^\d+$/.test(limit))
     throw new TrackerError(400, "invalid_input", "after and limit must be integers.");
   // Timeline records and events only for replicas that know them (timelines=1).
-  const changes = await trackerObject(c.env, access.owner.id).changes(
+  const changes = await trackerObject(c.env, access.space.id).changes(
+    access,
     Number(after),
     Number(limit),
     c.req.query("timelines") === "1",
@@ -507,7 +590,7 @@ tracker.get("/tracker/:owner/changes", async (c) => {
       : changes,
   );
 });
-tracker.get("/tracker/:owner/issues/:issue/history", async (c) => {
+tracker.get("/tracker/:space/issues/:issue/history", async (c) => {
   const access = await authorize(c);
   const before = c.req.query("before");
   const limit = c.req.query("limit") ?? "50";
@@ -515,7 +598,7 @@ tracker.get("/tracker/:owner/issues/:issue/history", async (c) => {
     throw new TrackerError(400, "invalid_input", "before and limit must be integers.");
   return response(
     c,
-    await trackerObject(c.env, access.owner.id).history(
+    await trackerObject(c.env, access.space.id).history(
       access,
       c.req.param("issue"),
       before === undefined ? null : Number(before),
@@ -527,14 +610,14 @@ tracker.get("/tracker/:owner/issues/:issue/history", async (c) => {
  * The Chronicle (CORE-250): issues matching `q` as of `from`, with what
  * changed, who worked them and what happened until `to`. Paged by `cursor`.
  */
-tracker.get("/tracker/:owner/chronicle", async (c) => {
+tracker.get("/tracker/:space/chronicle", async (c) => {
   const access = await authorize(c);
   const limit = c.req.query("limit") ?? String(CHRONICLE_PAGE);
   if (!/^\d+$/.test(limit))
     throw new TrackerError(400, "invalid_input", "limit must be an integer.");
   return response(
     c,
-    await trackerObject(c.env, access.owner.id).chronicle(access, {
+    await trackerObject(c.env, access.space.id).chronicle(access, {
       from: c.req.query("from") ?? "",
       to: c.req.query("to") ?? new Date().toISOString(),
       query: c.req.query("q") ?? "",
@@ -545,13 +628,13 @@ tracker.get("/tracker/:owner/chronicle", async (c) => {
   );
 });
 /** What an issue's work produced (CORE-250): commits, work contexts, runs, previews, packages, timelines, release notes. */
-tracker.get("/tracker/:owner/issues/:issue/work", async (c) => {
+tracker.get("/tracker/:space/issues/:issue/work", async (c) => {
   const access = await authorize(c, false);
-  const work = await trackerObject(c.env, access.owner.id).issueWork(c.req.param("issue"));
+  const work = await trackerObject(c.env, access.space.id).issueWork(access, c.req.param("issue"));
   if (!work.ok) return response(c, work);
-  return c.json<LinkedWork>(await linkedWork(c.env, c.get("actor")!, access.owner, work.value));
+  return c.json<LinkedWork>(await linkedWork(c.env, c.get("actor")!, access.space, work.value));
 });
-tracker.post("/tracker/:owner/mutate", async (c) => {
+tracker.post("/tracker/:space/mutate", async (c) => {
   const access = await authorize(c);
   const source = c.req.header("X-Gitmatrix-Source");
   access.source = source === "web" || source === "cli" || source === "assistant" ? source : "api";
@@ -566,16 +649,24 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
       throw new TrackerError(
         403,
         "forbidden",
-        "Tracker administration requires account ownership.",
+        "Tracker administration requires an explicit Space admin grant.",
       );
-    access.repos = (await visibleRepos(c.env.DB, c.get("actor")))
+    access.repos = (await visibleRepos(c.env.DB, c.get("actor"), access.spaceId))
       .filter((repo) => repo.viewerRole === "admin")
-      .map((repo) => ({ id: repo.id, owner: repo.owner.slug, name: repo.name }));
+      .map((repo) => ({
+        id: repo.id,
+        spaceId: repo.space.id,
+        space: repo.space.slug,
+        name: repo.name,
+      }));
     const removals = request.mutations
       .filter((mutation) => mutation.kind === "subscription.remove")
       .map((mutation) => mutation.id);
     if (removals.length) {
-      const lookup = await trackerObject(c.env, access.owner.id).subscriptionRepoIds(removals);
+      const lookup = await trackerObject(c.env, access.space.id).subscriptionRepoIds(
+        access,
+        removals,
+      );
       if (!lookup.ok) return response(c, lookup);
       removedRepoIds = lookup.value;
       if (lookup.value.length) {
@@ -591,11 +682,17 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
   }
   // Approving a checkpoint needs write access to its repositories, which D1 knows.
   if (request.mutations.some((mutation) => mutation.kind === "request.answer"))
-    access.writableRepoIds = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
-  const result = await trackerObject(c.env, access.owner.id).mutate(access, request);
+    access.writableRepoIds = await writableRepoIds(c.env.DB, c.get("actor")!, access.space.id);
+  const result = await trackerObject(c.env, access.space.id).mutate(access, request);
   if (result.ok) {
     c.executionCtx.waitUntil(
-      refreshAfterTrackerMutation(c.env, access.owner.id, result.value, removedRepoIds),
+      refreshAfterTrackerMutation(
+        c.env,
+        access.space.id,
+        result.value,
+        removedRepoIds,
+        c.get("actor")!,
+      ),
     );
     // A person approved a checkpoint: an approval timeline lands it (CORE-77).
     const approved = new Set(
@@ -630,7 +727,7 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
         Promise.all([import("../timelines/auto-approve.ts"), import("../timelines/landing.ts")])
           .then(async ([{ maybeAutoApprove }, { settled }]) => {
             for (const scope of scopes)
-              await settled(c.env, (deps) => maybeAutoApprove(c.env, deps, access.owner.id, scope));
+              await settled(c.env, (deps) => maybeAutoApprove(c.env, deps, access.space.id, scope));
           })
           .catch((error) => console.error("Auto-approve: after a mutation", error)),
       );
@@ -638,58 +735,78 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
     if (slugs.size)
       c.executionCtx.waitUntil(
         import("../timelines/landing.ts").then(async ({ maybeLand, settled }) => {
-          for (const slug of slugs)
-            await settled(c.env, (deps) =>
-              maybeLand(c.env, deps, access.owner.id, slug, "approval", {
-                principalId: access.principalId,
-                agentId: null,
-              }),
+          for (const slug of slugs) {
+            const timeline = await trackerObject(c.env, access.spaceId).timeline(
+              access,
+              slug,
+              0,
+              1,
             );
+            if (!timeline.ok) throw new Error(timeline.error);
+            const repo = timeline.value.timeline.repos[0];
+            if (!repo) throw new Error("Approval timeline has no repository authority.");
+            const authority = await captureWorkAuthority(c.env, repo.id, c.get("actor")!);
+            await settled(c.env, (deps) =>
+              maybeLand(c.env, deps, access.space.id, slug, "approval", authority),
+            );
+          }
         }),
       );
   }
   return response(c, result);
 });
-tracker.get("/repos/:owner/:name/tracker", async (c) => {
+tracker.get("/repos/:space/:name/tracker", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
-  const repo = await findRepo(c.env.DB, actor, c.req.param("owner"), c.req.param("name"));
+  const repo = await findRepo(c.env.DB, actor, c.req.param("space"), c.req.param("name"));
   if (!repo || roleFor(repo, actor) === "none")
     return c.json({ error: "Repository not found." }, 404);
-  const workspaces: { trackerOwner: string; workspaceId: string; slug: string; name: string }[] =
-    [];
-  const owners = await accessible(c.env.DB, actor);
-  for (const owner of owners) {
-    const result = await trackerObject(c.env, owner.id).subscribedWorkspaces(repo.id);
+  const projects: { trackerSpace: string; projectId: string; slug: string; name: string }[] = [];
+  const spaces = await accessible(c.env.DB, actor);
+  for (const space of spaces) {
+    if (space.id !== repo.space_id) continue;
+    const access = await accessFor(
+      c.env,
+      space,
+      actor.id,
+      actor.agent?.id ?? null,
+      false,
+      actor.credential,
+    );
+    const result = await trackerObject(c.env, space.id).subscribedProjects(access, repo.id);
     if (!result.ok) return response(c, result);
-    for (const workspace of result.value)
-      workspaces.push({ trackerOwner: owner.slug, ...workspace });
+    for (const project of result.value) projects.push({ trackerSpace: space.slug, ...project });
   }
   return c.json({
-    workspaces,
+    projects,
     canManage:
       roleFor(repo, actor) === "admin" &&
-      owners.some((owner) => owner.slug === repo.owner_slug && owner.canAdmin),
+      spaces.some((space) => space.slug === repo.space_slug && space.canAdmin),
   });
 });
 
-tracker.get("/repos/:owner/:name/tracker/summary", async (c) => {
+tracker.get("/repos/:space/:name/tracker/summary", async (c) => {
   const actor = c.get("actor");
-  const repo = await findRepo(c.env.DB, actor, c.req.param("owner"), c.req.param("name"));
+  const repo = await findRepo(c.env.DB, actor, c.req.param("space"), c.req.param("name"));
   if (!repo || roleFor(repo, actor) === "none")
     return c.json({ error: "Repository not found." }, 404);
-  const summary: RepoIssueSummary = { ready: null, workspaces: 0 };
+  const summary: RepoIssueSummary = { ready: null, projects: 0 };
   if (!actor) return c.json(summary);
   const timeline = timelineParam(c);
-  for (const owner of await accessible(c.env.DB, actor)) {
-    // A timeline belongs to the repository owner; other subscribed trackers retain main's view.
-    const result = await trackerObject(c.env, owner.id).repoReadySummary(
-      repo.id,
-      owner.slug === repo.owner_slug ? timeline : undefined,
+  for (const space of await accessible(c.env.DB, actor)) {
+    if (space.id !== repo.space_id) continue;
+    const access = await accessFor(
+      c.env,
+      space,
+      actor.id,
+      actor.agent?.id ?? null,
+      false,
+      actor.credential,
     );
+    const result = await trackerObject(c.env, space.id).repoReadySummary(access, repo.id, timeline);
     if (!result.ok) return response(c, result);
-    if (!result.value.workspaces) continue;
-    summary.workspaces += result.value.workspaces;
+    if (!result.value.projects) continue;
+    summary.projects += result.value.projects;
     summary.ready = (summary.ready ?? 0) + result.value.ready;
   }
   return c.json(summary);

@@ -4,6 +4,9 @@
 
 import { Hono } from "hono";
 import { accounts } from "./api/accounts.ts";
+import { organizations } from "./api/organizations.ts";
+import { spaces } from "./api/spaces.ts";
+import { contentContractGate } from "./api/content-contract.ts";
 import { dev } from "./api/dev.ts";
 import { repos } from "./api/repos.ts";
 import { environments, environmentSettings } from "./api/environments.ts";
@@ -42,12 +45,20 @@ import { deployments } from "./deployments/api.ts";
 import { jobRoute } from "./deployments/job.ts";
 import { previewSettingsApi } from "./deployments/settings.ts";
 import { aiProvidersApi } from "./ai-providers/api.ts";
-import { aiSettingsApi, siteAiSettingsApi } from "./settings/ai.ts";
-import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./retention/api.ts";
+import { aiSettingsApi, personAiSettingsApi, siteAiSettingsApi } from "./settings/ai.ts";
+import {
+  spaceRetentionApi,
+  spaceRunsApi,
+  personRetentionApi,
+  personRunsApi,
+  instanceRetentionApi,
+} from "./retention/api.ts";
 import { pricesApi } from "./usage/prices-api.ts";
 import { queueApi } from "./merge-queue/index.ts";
-import { accountUsageApi, siteUsageApi } from "./usage/report-api.ts";
+import { spaceUsageApi, personUsageApi, instanceUsageApi } from "./usage/report-api.ts";
 import { TrackerError } from "./tracker/store.ts";
+import { spaceCutoverApi } from "./space-cutover/api.ts";
+import { cutoverControl } from "./durable/cutover-admission.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -104,35 +115,42 @@ api.use(async (c, next) => {
   );
   return next();
 });
-api.route("/accounts/:slug/settings/previews", previewSettingsApi);
-api.route("/accounts/:slug/settings/ai", aiSettingsApi);
-api.route("/accounts/:slug/ai-providers", aiProvidersApi);
-api.route("/accounts/:slug/settings/retention", accountRetentionApi);
-api.route("/accounts/:slug/retention/runs", accountRunsApi);
-api.route("/admin/retention", siteRetentionApi);
+api.route("/spaces/:space/settings/previews", previewSettingsApi);
+api.route("/spaces/:space/settings/ai", aiSettingsApi);
+api.route("/accounts/:person/settings/ai", personAiSettingsApi);
+api.route("/spaces/:space/ai-providers", aiProvidersApi);
+api.route("/spaces/:space/retention", spaceRetentionApi);
+api.route("/spaces/:space/retention/runs", spaceRunsApi);
+api.route("/accounts/:person/retention", personRetentionApi);
+api.route("/accounts/:person/retention/runs", personRunsApi);
+api.route("/admin/retention", instanceRetentionApi);
 api.route("/admin/ai", siteAiSettingsApi);
 api.route("/admin/environments", environmentSettings);
 api.route("/admin/accounts", adminAccounts);
 api.route("/environments", environments);
 api.route("/admin/prices", pricesApi);
-api.route("/accounts/:slug/usage", accountUsageApi);
-api.route("/admin/usage", siteUsageApi);
-api.route("/accounts/:owner/atlas", workspaceAtlas);
+api.route("/spaces/:space/usage", spaceUsageApi);
+api.route("/accounts/:slug/usage", personUsageApi);
+api.route("/admin/usage", instanceUsageApi);
+api.route("/spaces/:space/atlas", workspaceAtlas);
+api.route("/", avatars);
+api.route("/organizations", organizations);
+api.route("/spaces", spaces);
 api.route("/", accounts);
 api.route("/account/skills", personalSkillsApi);
-api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
-api.route("/tracker/:owner/timelines", timelines);
-api.route("/tracker/:owner/timeline-graph", timelineGraph);
+api.route("/tracker/:space/release-notes", trackerReleaseNotes);
+api.route("/tracker/:space/timelines", timelines);
+api.route("/tracker/:space/timeline-graph", timelineGraph);
 api.route("/", tracker);
-api.route("/repos/:owner/:name/knowledge", knowledge);
-api.route("/repos/:owner/:name/steps", steps);
-api.route("/repos/:owner/:name/atlas", atlas);
-api.route("/repos/:owner/:name/release-notes", releaseNotes);
-api.route("/repos/:owner/:name/ci", ci);
-api.route("/repos/:owner/:name/queue", queueApi);
-api.route("/repos/:owner/:name", refLog);
-api.route("/repos/:owner/:name", why);
-api.route("/repos/:owner/:name", deployments);
+api.route("/repos/:space/:name/knowledge", knowledge);
+api.route("/repos/:space/:name/steps", steps);
+api.route("/repos/:space/:name/atlas", atlas);
+api.route("/repos/:space/:name/release-notes", releaseNotes);
+api.route("/repos/:space/:name/ci", ci);
+api.route("/repos/:space/:name/queue", queueApi);
+api.route("/repos/:space/:name", refLog);
+api.route("/repos/:space/:name", why);
+api.route("/repos/:space/:name", deployments);
 api.route("/ci/runner", runner);
 api.route("/repos", repos);
 api.route("/repos", mirrors);
@@ -145,7 +163,6 @@ api.route("/dev", dev);
 api.route("/assistant", assistant);
 api.route("/search", search);
 api.route("/refs", refs);
-api.route("/", avatars);
 api.notFound((c) => c.json({ error: "Not found." }, 404));
 api.onError((error, c) => {
   if (error instanceof TrackerError)
@@ -165,6 +182,17 @@ api.onError((error, c) => {
 });
 
 export const app = new Hono<AppEnv>();
+// The operator journal is independent of the business stores it restores.
+app.route("/api/admin/space-cutover", spaceCutoverApi);
+app.use(async (c, next) => {
+  if (!(await cutoverControl(c.env).admission(4)).allowed)
+    return c.json(
+      { error: "Content is fenced for Organization/Space migration", code: "space_cutover_fenced" },
+      503,
+    );
+  await next();
+});
+app.use(contentContractGate);
 // Sign-in: emailed codes and device login (worker/better-auth.ts).
 app.on(["GET", "POST"], "/api/identity/*", async (c) =>
   (await createAuth(c.env, new URL(c.req.url).origin)).handler(c.req.raw),

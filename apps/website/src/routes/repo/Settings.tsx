@@ -33,7 +33,7 @@ import { forgetRepoData } from "../../lib/repoData.ts";
 import { useRepo } from "./RepoLayout.tsx";
 
 export async function settingsLoader({ request, params }: LoaderFunctionArgs) {
-  const base = `/repos/${params.owner}/${params.repo}`;
+  const base = `/repos/${params.space}/${params.repo}`;
   const [{ collaborators }, { users }, { mirror }] = await Promise.all([
     load<{ collaborators: Collaborator[] }>(`${base}/collaborators`, request),
     load<{ users: AccountSummary[] }>("/users", request),
@@ -43,11 +43,11 @@ export async function settingsLoader({ request, params }: LoaderFunctionArgs) {
 }
 
 export async function settingsAction({ request, params }: ActionFunctionArgs) {
-  const owner = params.owner ?? "";
+  const space = params.space ?? "";
   const name = params.repo ?? "";
-  const base = `/repos/${owner}/${name}`;
+  const base = `/repos/${space}/${name}`;
   const form = await request.formData();
-  forgetRepoData(owner, name);
+  forgetRepoData(space, name);
 
   switch (form.get("intent")) {
     case "update":
@@ -405,9 +405,9 @@ export function Settings() {
     if (actionData?.saved) toast.add({ title: "Settings saved" });
   }, [actionData, toast]);
 
-  const taken = new Set([...collaborators.map((c) => c.id), repo.owner.id]);
+  const taken = new Set(collaborators.map((c) => c.id));
   const candidates = users.filter((user) => !taken.has(user.id));
-  const fullName = `${repo.owner.slug}/${repo.name}`;
+  const fullName = `${repo.space.slug}/${repo.name}`;
 
   return (
     <div className="flex max-w-3xl flex-col gap-6">
@@ -435,10 +435,7 @@ export function Settings() {
                   value: "private",
                   title: "Private",
                   icon: <LockSimpleIcon weight="bold" aria-hidden />,
-                  description:
-                    repo.owner.kind === "org"
-                      ? `Only ${repo.owner.displayName} members and collaborators can see or clone it.`
-                      : "Only you and collaborators can see or clone it.",
+                  description: `Only people with repository access in ${repo.space.displayName}, explicit collaborators and Instance operators can see or clone it.`,
                 },
                 {
                   value: "public",
@@ -460,11 +457,7 @@ export function Settings() {
 
       <Card
         title="Collaborators"
-        description={
-          repo.owner.kind === "org"
-            ? `People added here get this role on top of what ${repo.owner.displayName} membership gives them.`
-            : "People you add here can read, push or manage this repository."
-        }
+        description="People added here receive access only to this repository, independently of Space grants."
       >
         <div className="mk-card-body">
           {collaborators.length > 0 ? (
@@ -480,7 +473,7 @@ export function Settings() {
         </div>
       </Card>
 
-      <MirrorCard initial={mirror} base={`/repos/${repo.owner.slug}/${repo.name}`} />
+      <MirrorCard initial={mirror} base={`/repos/${repo.space.slug}/${repo.name}`} />
 
       <Card
         title="Delete this repository"

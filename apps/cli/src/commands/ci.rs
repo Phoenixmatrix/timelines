@@ -1221,7 +1221,11 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
     // Remove credentials even if the final server report fails.
     std::fs::remove_dir_all(&dir)?;
     reporter.send(json!({ "done": { "status": status, "exitCode": code, "error": error } }))?;
-    Ok(status)
+    Ok(if reporter.cancelled {
+        "cancelled"
+    } else {
+        status
+    })
 }
 
 pub fn runner(ctx: &Ctx, args: &RunnerArgs) -> Result<Shown> {

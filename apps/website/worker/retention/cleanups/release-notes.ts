@@ -1,4 +1,4 @@
-// Release notes (category "release-notes", CORE-206): an account's release
+// Release notes (category "release-notes", CORE-206): an Space's release
 // notes released more than `days` before the run's moment, with their entries
 // and the issue mentions only they cited.
 //
@@ -26,7 +26,7 @@ interface Item {
 }
 
 /** Parameters: account id, cutoff. `r` is the release's note. */
-const MATCHES = `r.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
+const MATCHES = `r.repo_id IN (SELECT id FROM repos WHERE space_id = ?)
   AND r.released_at < ?
   AND EXISTS (SELECT 1 FROM release_notes n WHERE n.repo_id = r.repo_id
               AND (n.release LIKE '${DAILY_RELEASE_PREFIX}%') = (r.release LIKE '${DAILY_RELEASE_PREFIX}%')
@@ -49,10 +49,10 @@ const CHOSEN = `FROM release_notes r
     AND ${MATCHES}`;
 
 function scope(ctx: CleanupContext): [string, string] {
-  if (ctx.target.scope !== "account") throw new Error("release-notes is an account category.");
+  if (ctx.target.kind !== "space") throw new Error("release-notes is a Space category.");
   const days = ctx.thresholds.days;
   if (days === undefined) throw new Error("release-notes needs its days threshold.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days)];
+  return [ctx.target.id, daysBefore(ctx.now, days)];
 }
 
 export const releaseNotes: CategoryCleanup<Item> = {

@@ -1,6 +1,5 @@
-import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { afterEach, describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import {
   AI_LOG_BODIES_NOTE,
   AI_LOG_COMPONENTS,
@@ -12,48 +11,67 @@ import { aiGatewayOptions } from "../ai-gateway.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { previewSettings, previewSettingsApi } from "../deployments/settings.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import {
-  accountAiSnapshot,
+  spaceAiSnapshot,
   aiSettings,
   aiSettingsApi,
   knowledgeSchedule,
   repoAiSnapshot,
   siteAiSettingsApi,
+  personAiSettingsApi,
 } from "./ai.ts";
 
-const databases: DatabaseSync[] = [];
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+
+const fixtures: Array<() => void> = [];
 afterEach(() => {
-  for (const sqlite of databases.splice(0)) sqlite.close();
+  for (const close of fixtures.splice(0)) close();
 });
 
 async function setup(bindings: Record<string, string> = {}) {
-  const sqlite = migratedDatabase();
-  databases.push(sqlite);
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  fixtures.push(fresh.close);
   sqlite.exec(`
+    BEGIN;
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('owner', 'user', 'ann', 'Ann'), ('member', 'user', 'cat', 'Cat'),
-      ('outsider', 'user', 'bob', 'Bob'), ('admin', 'user', 'admin', 'Admin'),
-      ('org', 'org', 'orbit', 'Orbit');
+      ('outsider', 'user', 'bob', 'Bob'), ('admin', 'user', 'admin', 'Admin');
     UPDATE accounts SET is_site_admin = 1 WHERE id = 'admin';
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('org', 'owner', 'owner'), ('org', 'member', 'member');
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id) VALUES
+      ('company', 'company', 'Company', 'company', NULL, 'org'),
+      ('personal-org', 'ann-personal', 'Ann', 'personal', 'owner', 'owner');
+    INSERT INTO spaces (id, organization_id, slug, display_name) VALUES
+      ('org', 'company', 'orbit', 'Orbit'), ('other-space', 'company', 'other', 'Other'),
+      ('owner', 'personal-org', 'ann', 'Ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by) VALUES
+      ('company', 'owner', 'owner', 'fixture', 'owner'),
+      ('company', 'member', 'member', 'fixture', 'owner'),
+      ('company', 'outsider', 'owner', 'fixture', 'owner'),
+      ('personal-org', 'owner', 'owner', 'fixture', 'owner');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by) VALUES
+      ('org', 'company', 'owner', 'admin', 'write', 'write', 'fixture', 'owner'),
+      ('org', 'company', 'member', 'member', 'none', 'none', 'fixture', 'owner'),
+      ('owner', 'personal-org', 'owner', 'admin', 'write', 'write', 'fixture', 'owner');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agent', 'builder', 'owner');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('repo', 'org', 'app', 'private', 'a', 'https://a'),
       ('sibling', 'org', 'site', 'private', 'b', 'https://b'),
       ('personal', 'owner', 'mine', 'private', 'c', 'https://c');
+    COMMIT;
   `);
-  const env = { DB: d1(sqlite), ...bindings } as unknown as Env;
+  const env = { ...fresh.env, ...bindings } as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);
-  app.route("/api/accounts/:slug/settings/previews", previewSettingsApi);
+  app.route("/api/spaces/:space/settings/ai", aiSettingsApi);
+  app.route("/api/spaces/:space/settings/previews", previewSettingsApi);
   app.route("/api/admin/ai", siteAiSettingsApi);
+  app.route("/api/accounts/:person/settings/ai", personAiSettingsApi);
   const tokens = {
     owner: (await issueToken(env.DB, "owner", "owner", "write")).secret,
     member: (await issueToken(env.DB, "member", "member", "write")).secret,
@@ -67,9 +85,10 @@ async function setup(bindings: Record<string, string> = {}) {
     body?: unknown,
     owner = "orbit",
     resource = "ai",
+    namespace = "spaces",
   ) =>
     app.request(
-      `/api/accounts/${owner}/settings/${resource}`,
+      `/api/${namespace}/${owner}/settings/${resource}`,
       {
         method,
         headers: {
@@ -131,6 +150,19 @@ describe("account AI settings", () => {
       updatedBy: "admin",
     });
     expect((await aiSettings(t.env.DB, "org")).features.knowledge).toBe(true);
+  });
+
+  test("Organization ownership never grants Space policy access and revocation is immediate", async () => {
+    const t = await setup();
+    expect((await t.call(t.tokens.outsider)).status).toBe(404);
+    expect((await t.call(t.tokens.owner, "GET", undefined, "other")).status).toBe(404);
+    expect((await t.call(t.tokens.member)).status).toBe(200);
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id = 'org' AND account_id = 'member'");
+    expect((await t.call(t.tokens.member)).status).toBe(404);
+    t.sqlite.exec(
+      "DELETE FROM organization_members WHERE organization_id = 'company' AND account_id = 'owner'",
+    );
+    expect((await t.call(t.tokens.owner)).status).toBe(404);
   });
 
   test("settings resolve provider IDs for every repository owned by the account without rewriting snapshots", async () => {
@@ -222,7 +254,7 @@ describe("account AI settings", () => {
     const response = await t.call(t.tokens.owner, "PATCH", body);
     expect(response.status).toBe(400);
     expect(await response.json()).toHaveProperty("error");
-    expect(t.sqlite.prepare("SELECT count(*) AS count FROM account_settings").get()).toMatchObject({
+    expect(t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get()).toMatchObject({
       count: 0,
     });
   });
@@ -230,7 +262,7 @@ describe("account AI settings", () => {
   test("rejects malformed JSON and treats empty partial updates as no-ops", async () => {
     const t = await setup();
     const response = await t.app.request(
-      "/api/accounts/orbit/settings/ai",
+      "/api/spaces/orbit/settings/ai",
       {
         method: "PATCH",
         headers: { authorization: `Bearer ${t.tokens.owner}`, "content-type": "application/json" },
@@ -243,7 +275,7 @@ describe("account AI settings", () => {
     for (const body of [{}, { features: {}, models: {} }]) {
       expect((await t.call(t.tokens.owner, "PATCH", body)).status).toBe(200);
     }
-    expect(t.sqlite.prepare("SELECT count(*) AS count FROM account_settings").get()).toMatchObject({
+    expect(t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get()).toMatchObject({
       count: 0,
     });
   });
@@ -363,17 +395,15 @@ describe("account AI settings", () => {
       knowledgeUpdates: { quietMinutes: 7 },
     });
     expect((await aiSettings(t.env.DB, "owner")).releaseHighlights).toEqual({ intervalHours: 24 });
-    expect(await accountAiSnapshot(t.env.DB, "org")).toEqual(
-      await repoAiSnapshot(t.env.DB, "repo"),
-    );
-    expect(await accountAiSnapshot(t.env.DB, "owner")).toEqual(
+    expect(await spaceAiSnapshot(t.env.DB, "org")).toEqual(await repoAiSnapshot(t.env.DB, "repo"));
+    expect(await spaceAiSnapshot(t.env.DB, "owner")).toEqual(
       await repoAiSnapshot(t.env.DB, "personal"),
     );
-    const snapshot = await accountAiSnapshot(t.env.DB, "org");
+    const snapshot = await spaceAiSnapshot(t.env.DB, "org");
     await t.call(t.tokens.owner, "PATCH", { features: { releaseNotes: true } });
     expect(snapshot.features.releaseNotes).toBe(false);
-    expect((await accountAiSnapshot(t.env.DB, "org")).features.releaseNotes).toBe(true);
-    await expect(accountAiSnapshot(t.env.DB, "missing")).rejects.toThrow(/no such account/);
+    expect((await spaceAiSnapshot(t.env.DB, "org")).features.releaseNotes).toBe(true);
+    await expect(spaceAiSnapshot(t.env.DB, "missing")).rejects.toThrow(/no such active Space/);
   });
 
   test.each(
@@ -397,26 +427,26 @@ describe("account AI settings", () => {
     const response = await t.call(t.tokens.owner, "PATCH", { releaseHighlights });
     expect(response.status).toBe(400);
     expect(await response.json()).toHaveProperty("error");
-    expect(t.sqlite.prepare("SELECT count(*) AS count FROM account_settings").get()).toMatchObject({
+    expect(t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get()).toMatchObject({
       count: 0,
     });
   });
 
   test("stored account cadence and viewer-scoped highlight keys obey migration constraints", async () => {
     const t = await setup();
-    t.sqlite.exec("INSERT INTO account_settings (account_id) VALUES ('org')");
+    t.sqlite.exec("INSERT INTO space_settings (space_id) VALUES ('org')");
     expect((await aiSettings(t.env.DB, "org")).releaseHighlights).toEqual({ intervalHours: 24 });
     for (const hours of [0, 169]) {
       expect(() =>
         t.sqlite
           .prepare(
-            "UPDATE account_settings SET release_highlights_interval_hours = ? WHERE account_id = 'org'",
+            "UPDATE space_settings SET release_highlights_interval_hours = ? WHERE space_id = 'org'",
           )
           .run(hours),
       ).toThrow();
     }
     const insert = t.sqlite.prepare(
-      "INSERT INTO release_highlights (scope, scope_id, viewer_id, owner_account_id, source_hash, body, updated_at) VALUES ('repo', 'repo', ?, 'org', 'hash', '', '2026-10-11T00:00:00.000Z')",
+      "INSERT INTO release_highlights (scope, scope_id, viewer_id, space_id, source_hash, body, updated_at) VALUES ('repo', 'repo', ?, 'org', 'hash', '', '2026-10-11T00:00:00.000Z')",
     );
     insert.run("owner");
     insert.run("member");
@@ -502,7 +532,7 @@ describe("gateway body logging settings (CORE-290)", () => {
     t.sqlite.exec(
       "INSERT INTO agents (id, name, accountable_id) VALUES ('agent2', 'ops', 'admin')",
     );
-    const adminAgent = (await issueToken(t.env.DB, "admin", "agent2", "write", undefined, "agent"))
+    const adminAgent = (await issueToken(t.env.DB, "admin", "agent2", "write", undefined, "agent2"))
       .secret;
     expect(await (await t.site(adminAgent)).json()).toMatchObject({ canManage: false });
     expect((await t.site(adminAgent, "PATCH", { logBodies: { knowledge: true } })).status).toBe(
@@ -522,7 +552,7 @@ describe("gateway body logging settings (CORE-290)", () => {
     ]);
     // Calls see it at once in this isolate, for every account without an override.
     expect(
-      await aiGatewayOptions(t.env, "knowledge", { account: "org", feature: "knowledge" }),
+      await aiGatewayOptions(t.env, "knowledge", { spaceId: "org", feature: "knowledge" }),
     ).not.toHaveProperty("extraHeaders");
     // null goes back to the environment's default.
     const reset = (await (
@@ -534,7 +564,7 @@ describe("gateway body logging settings (CORE-290)", () => {
       effective: false,
     });
     expect(
-      (await aiGatewayOptions(t.env, "knowledge", { account: "org", feature: "knowledge" }))
+      (await aiGatewayOptions(t.env, "knowledge", { spaceId: "org", feature: "knowledge" }))
         .extraHeaders,
     ).toEqual({ "cf-aig-collect-log-payload": "false" });
   });
@@ -562,73 +592,100 @@ describe("gateway body logging settings (CORE-290)", () => {
     expect(t.sqlite.prepare("SELECT count(*) AS n FROM site_ai_log_bodies").get()).toEqual({
       n: 0,
     });
-    expect(t.sqlite.prepare("SELECT count(*) AS n FROM account_ai_log_bodies").get()).toEqual({
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM space_ai_log_bodies").get()).toEqual({
       n: 0,
     });
   });
 
-  test("account overrides: the account's administrators, and its calls follow them", async () => {
+  test("Space logging overrides only control content components", async () => {
     const t = await setup({ AI_LOG_BODIES: "on" });
     const initial = (await (await t.call(t.tokens.member)).json()) as AiSettingsView;
-    expect(initial.logBodies).toMatchObject({ environmentDefault: true, note: AI_LOG_BODIES_NOTE });
-    expect(initial.logBodies.components.every((e) => e.account === null && e.site)).toBe(true);
-    expect(effective(initial)).toEqual(all(true));
-
-    // Members, agents and outsiders can't; the owner, the org owner and site admins can.
+    expect(initial.logBodies.components.map((entry) => entry.component)).toEqual([
+      "knowledge",
+      "release-notes",
+      "merge-queue",
+    ]);
     expect(
-      (await t.call(t.tokens.member, "PATCH", { logBodies: { assistant: false } })).status,
-    ).toBe(403);
+      initial.logBodies.components.every((entry) => entry.space === null && entry.effective),
+    ).toBe(true);
+    for (const token of [t.tokens.member, t.tokens.agent])
+      expect((await t.call(token, "PATCH", { logBodies: { knowledge: false } })).status).toBe(403);
     expect(
-      (await t.call(t.tokens.agent, "PATCH", { logBodies: { assistant: false } })).status,
-    ).toBe(403);
-    expect(
-      (await t.call(t.tokens.outsider, "PATCH", { logBodies: { assistant: false } })).status,
+      (await t.call(t.tokens.outsider, "PATCH", { logBodies: { knowledge: false } })).status,
     ).toBe(404);
-    expect(t.sqlite.prepare("SELECT count(*) AS n FROM account_ai_log_bodies").get()).toEqual({
-      n: 0,
-    });
-
-    const off = await t.call(t.tokens.owner, "PATCH", { logBodies: { assistant: false } });
-    expect(off.status).toBe(200);
-    const view = (await off.json()) as AiSettingsView;
-    expect(view.logBodies.components.find((e) => e.component === "assistant")).toMatchObject({
-      site: true,
-      account: false,
-      effective: false,
-    });
     expect(
-      (await aiGatewayOptions(t.env, "assistant", { account: "org", feature: "assistant" }))
-        .extraHeaders,
-    ).toEqual({ "cf-aig-collect-log-payload": "false" });
-    // Only that account's calls: Ann's own still keep bodies.
+      (await t.call(t.tokens.owner, "PATCH", { logBodies: { assistant: false } })).status,
+    ).toBe(400);
     expect(
-      await aiGatewayOptions(t.env, "assistant", { account: "owner", feature: "assistant" }),
-    ).not.toHaveProperty("extraHeaders");
-
-    // The site turns it off everywhere; an account turns it back on for itself.
-    await t.site(t.tokens.admin, "PATCH", { logBodies: { avatars: false } });
-    expect(
-      (await t.call(t.tokens.admin, "PATCH", { logBodies: { avatars: true } }, "ann")).status,
+      (await t.call(t.tokens.owner, "PATCH", { logBodies: { knowledge: false } })).status,
     ).toBe(200);
     expect(
-      await aiGatewayOptions(t.env, "avatars", { account: "owner", feature: "avatars" }),
-    ).not.toHaveProperty("extraHeaders");
-    expect(
-      (await aiGatewayOptions(t.env, "avatars", { account: "org", feature: "avatars" }))
+      (await aiGatewayOptions(t.env, "knowledge", { spaceId: "org", feature: "knowledge" }))
         .extraHeaders,
     ).toEqual({ "cf-aig-collect-log-payload": "false" });
-
-    // null removes the override: back to the site's default. Other AI settings are untouched.
-    const back = (await (
-      await t.call(t.tokens.owner, "PATCH", { logBodies: { assistant: null } })
-    ).json()) as AiSettingsView;
-    expect(back.logBodies.components.find((e) => e.component === "assistant")).toMatchObject({
-      account: null,
-      effective: true,
+    expect(
+      await aiGatewayOptions(t.env, "knowledge", { spaceId: "owner", feature: "knowledge" }),
+    ).not.toHaveProperty("extraHeaders");
+    await t.call(t.tokens.owner, "PATCH", { logBodies: { knowledge: null } });
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM space_ai_log_bodies").get()).toEqual({
+      n: 0,
     });
-    expect(back.updatedAt).toBeNull();
+  });
+
+  test("personal logging remains self-only and cannot be controlled by a Space", async () => {
+    const t = await setup({ AI_LOG_BODIES: "on" });
+    const personal = (token: string, method = "GET", body?: unknown) =>
+      t.call(token, method, body, "ann", "ai", "accounts");
+    const initial = (await (await personal(t.tokens.owner)).json()) as SiteAiSettingsView;
+    expect(initial.logBodies.components.map((entry) => entry.component)).toEqual([
+      "assistant",
+      "assistant-titles",
+      "avatars",
+    ]);
+    expect(
+      initial.logBodies.components.every((entry) => entry.person === null && entry.effective),
+    ).toBe(true);
+    for (const token of [t.tokens.member, t.tokens.outsider, t.tokens.admin])
+      expect((await personal(token)).status).toBe(404);
+    expect(
+      (await personal(t.tokens.agent, "PATCH", { logBodies: { assistant: false } })).status,
+    ).toBe(403);
+    expect(
+      (await personal(t.tokens.owner, "PATCH", { logBodies: { knowledge: false } })).status,
+    ).toBe(400);
+    expect(
+      (await personal(t.tokens.owner, "PATCH", { features: { knowledge: false } })).status,
+    ).toBe(400);
+    expect(
+      (await personal(t.tokens.owner, "PATCH", { logBodies: { assistant: false } })).status,
+    ).toBe(200);
+    expect(
+      (await aiGatewayOptions(t.env, "assistant", { personId: "owner", feature: "assistant" }))
+        .extraHeaders,
+    ).toEqual({ "cf-aig-collect-log-payload": "false" });
+    expect(
+      await aiGatewayOptions(t.env, "assistant", { personId: "member", feature: "assistant" }),
+    ).not.toHaveProperty("extraHeaders");
+    await t.site(t.tokens.admin, "PATCH", { logBodies: { avatars: false } });
+    await personal(t.tokens.owner, "PATCH", { logBodies: { avatars: true } });
+    expect(
+      await aiGatewayOptions(t.env, "avatars", { personId: "owner", feature: "avatars" }),
+    ).not.toHaveProperty("extraHeaders");
+    expect(
+      (await aiGatewayOptions(t.env, "avatars", { personId: "member", feature: "avatars" }))
+        .extraHeaders,
+    ).toEqual({ "cf-aig-collect-log-payload": "false" });
+    const reset = (await (
+      await personal(t.tokens.owner, "PATCH", { logBodies: { assistant: null } })
+    ).json()) as SiteAiSettingsView;
+    expect(
+      reset.logBodies.components.find((entry) => entry.component === "assistant"),
+    ).toMatchObject({ person: null, effective: true });
     expect(
       t.sqlite.prepare("SELECT account_id, component, keep FROM account_ai_log_bodies").all(),
     ).toEqual([{ account_id: "owner", component: "avatars", keep: 1 }]);
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM space_ai_log_bodies").get()).toEqual({
+      n: 0,
+    });
   });
 });

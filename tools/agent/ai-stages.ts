@@ -26,10 +26,11 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join, matchesGlob } from "node:path";
+import { isAbsolute, join, matchesGlob } from "node:path";
 import { command, privateJson } from "./environment.ts";
 import { ATLAS_STAGES } from "./atlas-provider-e2e.ts";
 import { COPPER_FINCH_STAGES } from "./provider-e2e.ts";
+import { MAX_SOURCE_BYTES, MAX_SOURCE_FILE_BYTES, MAX_SOURCE_FILES } from "./remote-protocol.ts";
 
 export interface StageDefinition {
   id: string;
@@ -95,6 +96,8 @@ export interface Selection {
   base: string | null;
   changed: string[];
   fingerprints: Record<string, string>;
+  /** Committed Cloudflare source revision when no Git baseline is available. */
+  sourceSnapshot?: string;
 }
 
 export type Outcome = "passed" | "failed";
@@ -195,6 +198,66 @@ export async function fingerprints(
       return [id, hash.digest("hex")];
     }),
   );
+}
+
+/**
+ * A hosted snapshot has no diff baseline. Verify its committed manifest against
+ * disk and fingerprint the entire snapshot for every stage: any source change
+ * invalidates reuse rather than guessing which unlanded changes matter.
+ */
+export async function snapshotInputs(root: string, manifestPath: string) {
+  const manifest: unknown = JSON.parse(await readFile(manifestPath, "utf8"));
+  if (
+    !manifest ||
+    typeof manifest !== "object" ||
+    !("revision" in manifest) ||
+    typeof manifest.revision !== "string" ||
+    !/^[a-f0-9]{64}$/.test(manifest.revision) ||
+    !("files" in manifest) ||
+    !Array.isArray(manifest.files) ||
+    !manifest.files.length ||
+    manifest.files.length > MAX_SOURCE_FILES ||
+    createHash("sha256").update(JSON.stringify(manifest.files)).digest("hex") !== manifest.revision
+  )
+    throw new Error("Invalid committed remote source manifest");
+  const files: unknown[] = manifest.files;
+  const revision = manifest.revision;
+  const paths = new Set<string>();
+  let bytes = 0;
+  for (const file of files) {
+    if (
+      !file ||
+      typeof file !== "object" ||
+      !("path" in file) ||
+      typeof file.path !== "string" ||
+      isAbsolute(file.path) ||
+      file.path.split("/").some((part) => !part || part === "." || part === "..") ||
+      paths.has(file.path) ||
+      !("sha256" in file) ||
+      typeof file.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(file.sha256) ||
+      !("size" in file) ||
+      typeof file.size !== "number" ||
+      !Number.isSafeInteger(file.size) ||
+      file.size < 0 ||
+      file.size > MAX_SOURCE_FILE_BYTES ||
+      (bytes += file.size) > MAX_SOURCE_BYTES
+    )
+      throw new Error("Invalid committed remote source file");
+    paths.add(file.path);
+    const content = await readFile(join(root, file.path));
+    if (
+      content.length !== file.size ||
+      createHash("sha256").update(content).digest("hex") !== file.sha256
+    )
+      throw new Error(`Remote source differs from its committed snapshot: ${file.path}`);
+  }
+  return {
+    base: null,
+    changed: [...paths],
+    prints: Object.fromEntries(STAGE_IDS.map((id) => [id, revision])),
+    sourceSnapshot: revision,
+  };
 }
 
 /** Paths changed against the merge base with `base`: commits, the working tree and untracked files. */

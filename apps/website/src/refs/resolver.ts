@@ -29,7 +29,7 @@ let flushing: ReturnType<typeof setTimeout> | null = null;
 
 /** The cache key of a context: refs resolve differently on different pages. */
 export function contextKey(context: RefContext): string {
-  return `${context.owner ?? ""}/${context.repo ?? ""}#${context.tracker ?? ""}`;
+  return `${context.space ?? ""}/${context.repo ?? ""}#${context.tracker ?? ""}`;
 }
 
 /** TESTS ONLY: forget every answer (a new world is a new viewer). */

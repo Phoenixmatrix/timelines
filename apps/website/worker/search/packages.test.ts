@@ -52,7 +52,8 @@ async function search(token: string, params: Record<string, string>) {
   return { ...group, results: group.results as PackageResult[] };
 }
 
-const names = (results: PackageResult[]) => results.map((r) => `${r.owner}/${r.format}/${r.name}`);
+const names = (results: PackageResult[]) =>
+  results.map((r) => `${r.space.slug}/${r.format}/${r.name}`);
 
 beforeEach(async () => {
   h = await makeHarness();
@@ -68,7 +69,7 @@ beforeEach(async () => {
     testNpm: await feed({ key: "test", format: "npm", kind: "local", visibility: "private" }),
     // Another org's public feed.
     pubNpm: await feed({
-      owner: "pubco",
+      space: "pubco",
       key: "pubco",
       format: "npm",
       kind: "local",
@@ -114,7 +115,7 @@ describe("package search", () => {
   test("a qualified owner/name is exact and ranks first", async () => {
     h.grant("mia", "write");
     const { results } = await search(h.token("mia"), { q: "test/shared" });
-    expect(results.map((r) => [`${r.owner}/${r.format}/${r.name}`, r.match])).toEqual([
+    expect(results.map((r) => [`${r.space.slug}/${r.format}/${r.name}`, r.match])).toEqual([
       ["test/generic/shared", "exact"],
       ["test/npm/shared", "exact"],
     ]);
@@ -124,20 +125,41 @@ describe("package search", () => {
     h.grant("mia", "write");
     const token = h.token("mia");
     expect((await search(token, { q: "secret" })).results).toHaveLength(1);
-    h.gitmatrix.applySql(`DELETE FROM org_members WHERE user_id = 'acc_mia'`);
+    h.gitmatrix.applySql(`DELETE FROM organization_members WHERE account_id = 'acc_mia'`);
     expect((await search(token, { q: "secret" })).results).toEqual([]);
   });
 
-  test("a CI job reads its own owner's feeds, as the registry grants it", async () => {
-    const job = h.jobToken({ repo: "web" });
+  test("a CI job reads only feeds allowed by its current Space package grant", async () => {
+    const job = await h.jobToken({ repo: "web" });
     expect(names((await search(job.token, { q: "secret" })).results)).toEqual([
       "test/generic/secret-build",
     ]);
-    h.gitmatrix.applySql(
-      `INSERT OR IGNORE INTO accounts (id, kind, slug, display_name) VALUES ('acc_other', 'org', 'other', 'Other')`,
-    );
-    const elsewhere = h.jobToken({ repo: "app", owner: "acc_other" });
+    const elsewhere = await h.jobToken({ repo: "app", space: "acc_pubco" });
     expect((await search(elsewhere.token, { q: "secret" })).results).toEqual([]);
+  });
+
+  test("repository collaborators and Organization owners without grants cannot search private packages", async () => {
+    h.collaborate("collaborator");
+    expect((await search(h.token("collaborator"), { q: "secret" })).results).toEqual([]);
+    const token = h.token("company-owner");
+    h.gitmatrix.applySql(`INSERT INTO organization_members
+      (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org_test', 'acc_company-owner', 'owner', 'test-fixture', 'acc_company-owner')`);
+    expect((await search(token, { q: "secret" })).results).toEqual([]);
+  });
+
+  test("package read is independent of repository baseline and old cursors recheck revoked grants", async () => {
+    h.grant("reader", "read");
+    const token = h.token("reader");
+    for (let i = 0; i < 8; i++) addPackage("testGeneric", `private-lib-${i}`);
+    const first = await search(token, { q: "private-lib", limit: "2" });
+    expect(first.results).toHaveLength(2);
+    expect(first.cursor).not.toBeNull();
+    h.gitmatrix.applySql(`DELETE FROM space_grants WHERE account_id = 'acc_reader'`);
+    expect(
+      (await search(token, { q: "private-lib", limit: "2", cursor: first.cursor! })).results,
+    ).toEqual([]);
+    expect((await search(token, { q: "private-lib" })).results).toEqual([]);
   });
 
   test("pages within the shared bounds without crossing into unreadable feeds", async () => {

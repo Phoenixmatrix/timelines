@@ -8,7 +8,7 @@ import {
 } from "@gitmatrix/formats/info";
 import { z } from "zod";
 
-import { db as gitmatrixDb } from "../../worker/schema.ts";
+import { findSpaceBySlug } from "../../worker/spaces/access.ts";
 
 import { nowIso, parseJson, type DB } from "./db.ts";
 import { RegistryError } from "./errors.ts";
@@ -19,8 +19,8 @@ export interface Repository {
   id: string;
   key: string;
   format: FormatId;
-  /** gitmatrix account (user or org) that owns the feed. */
-  ownerId: string;
+  /** Immutable Space owning this feed. */
+  spaceId: string;
   kind: RepoKind;
   visibility: Visibility;
   description: string;
@@ -102,7 +102,7 @@ type Row = {
   id: string;
   key: string;
   format: string;
-  owner_id: string;
+  space_id: string | null;
   kind: RepoKind;
   visibility: Visibility;
   description: string;
@@ -114,11 +114,12 @@ type Row = {
 
 function fromRow(row: Row): Repository {
   if (!isFormatId(row.format)) throw new Error(`unknown format ${row.format}`);
+  if (!row.space_id) throw RegistryError.denied("Feed Space migration is not active");
   return {
     id: row.id,
     key: row.key,
     format: row.format,
-    ownerId: row.owner_id,
+    spaceId: row.space_id,
     kind: row.kind,
     visibility: row.visibility,
     description: row.description,
@@ -129,23 +130,12 @@ function fromRow(row: Row): Repository {
   };
 }
 
-const CACHE_TTL_MS = 10_000;
-const cache = new Map<string, { repo: Repository | null; until: number }>();
-
-export function invalidateRepoCache(format?: string, key?: string): void {
-  if (format && key) cache.delete(`${format}:${key}`);
-  else cache.clear();
-}
-
 /** Feed keys are unique per format: `orbit` is both orbit's npm and its docker registry. */
 export async function getRepoByKey(
   db: DB,
   format: FormatId,
   key: string,
 ): Promise<Repository | null> {
-  const cacheKey = `${format}:${key}`;
-  const hit = cache.get(cacheKey);
-  if (hit && hit.until > Date.now()) return hit.repo;
   const row = await db
     .selectFrom("repositories")
     .selectAll()
@@ -153,15 +143,12 @@ export async function getRepoByKey(
     .where("key", "=", key)
     .executeTakeFirst();
   const repo = row ? fromRow(row as Row) : null;
-  if (cache.size > 2_000) cache.clear();
-  cache.set(cacheKey, { repo, until: Date.now() + CACHE_TTL_MS });
   return repo;
 }
 
 /**
- * The feed for a request. An owner's own feed in any format (key = their
- * slug) exists from the moment it is first used: nobody provisions registries.
- * Remote and virtual feeds (`<owner>.<name>`) are created by their owner.
+ * The feed for a request. A Space's local feed in each format uses its immutable
+ * handle. Remote and virtual feeds use `<space>.<name>`.
  */
 export async function resolveFeed(
   services: { db: DB; env: Env },
@@ -171,12 +158,8 @@ export async function resolveFeed(
   const existing = await getRepoByKey(services.db, format, key);
   if (existing) return existing;
   if (!FORMATS[format].kinds.includes("local") || key.includes(".")) return null;
-  const owner = await gitmatrixDb(services.env.DB)
-    .selectFrom("accounts")
-    .select(["id", "slug"])
-    .where("slug", "=", key)
-    .executeTakeFirst();
-  if (!owner || owner.slug.toLowerCase() !== key) return null;
+  const space = await findSpaceBySlug(services.env.DB, key);
+  if (!space || space.archivedAt || space.slug.toLowerCase() !== key) return null;
   const now = nowIso();
   await services.db
     .insertInto("repositories")
@@ -184,7 +167,7 @@ export async function resolveFeed(
       id: ulid(),
       key,
       format,
-      owner_id: owner.id,
+      space_id: space.id,
       kind: "local",
       visibility: "private",
       description: "",
@@ -195,7 +178,6 @@ export async function resolveFeed(
     })
     .onConflict((oc) => oc.columns(["format", "key"]).doNothing())
     .execute();
-  invalidateRepoCache(format, key);
   return getRepoByKey(services.db, format, key);
 }
 
@@ -211,18 +193,18 @@ export async function getRepoById(db: DB, id: string): Promise<Repository | null
 export async function listRepos(
   db: DB,
   format?: FormatId,
-  ownerId?: string,
+  spaceId?: string,
 ): Promise<Repository[]> {
   let query = db.selectFrom("repositories").selectAll().orderBy("key");
   if (format) query = query.where("format", "=", format);
-  if (ownerId) query = query.where("owner_id", "=", ownerId);
+  if (spaceId) query = query.where("space_id", "=", spaceId);
   return (await query.execute()).map((row) => fromRow(row as Row));
 }
 
 export const CreateRepoInput = z.object({
   key: z.string(),
   format: z.string(),
-  ownerId: z.string(),
+  spaceId: z.string(),
   kind: z.enum(["local", "remote", "virtual"]),
   visibility: z.enum(["public", "internal", "private"]),
   description: z.string().max(500).default(""),
@@ -271,7 +253,7 @@ export async function createRepo(
   }
   if (!isFormatId(input.format)) throw RegistryError.badRequest(`Unknown format ${input.format}`);
   validateShape(input.format, input.kind, input.config);
-  if (await getRepoByKeyUncached(db, input.format, input.key)) {
+  if (await getRepoByKey(db, input.format, input.key)) {
     throw RegistryError.conflict(`Feed ${input.key} already exists`);
   }
   const now = nowIso();
@@ -282,7 +264,7 @@ export async function createRepo(
       id,
       key: input.key,
       format: input.format,
-      owner_id: input.ownerId,
+      space_id: input.spaceId,
       kind: input.kind,
       visibility: input.visibility,
       description: input.description,
@@ -293,17 +275,7 @@ export async function createRepo(
     })
     .execute();
   if (input.kind === "virtual") await setVirtualMembers(db, id, input.format, input.members);
-  invalidateRepoCache(input.format, input.key);
   return (await getRepoById(db, id))!;
-}
-
-async function getRepoByKeyUncached(
-  db: DB,
-  format: FormatId,
-  key: string,
-): Promise<Repository | null> {
-  invalidateRepoCache(format, key);
-  return getRepoByKey(db, format, key);
 }
 
 export const UpdateRepoInput = z.object({
@@ -349,13 +321,11 @@ export async function updateRepo(
   if (repo.kind === "virtual" && input.members) {
     await setVirtualMembers(db, repo.id, repo.format, input.members);
   }
-  invalidateRepoCache(repo.format, repo.key);
   return (await getRepoById(db, repo.id))!;
 }
 
 export async function deleteRepo(db: DB, repo: Repository): Promise<void> {
   await db.deleteFrom("repositories").where("id", "=", repo.id).execute();
-  invalidateRepoCache(repo.format, repo.key);
 }
 
 async function setVirtualMembers(
@@ -364,13 +334,17 @@ async function setVirtualMembers(
   format: FormatId,
   members: { key: string; include: string[]; exclude: string[] }[],
 ): Promise<void> {
+  const parent = await getRepoById(db, virtualId);
+  if (!parent) throw RegistryError.notFound("No virtual feed");
   const resolved: { id: string; include: string[]; exclude: string[] }[] = [];
   for (const member of members) {
-    const repo = await getRepoByKeyUncached(db, format, member.key);
+    const repo = await getRepoByKey(db, format, member.key);
     if (!repo) throw RegistryError.badRequest(`No repository ${member.key}`);
     if (repo.format !== format) throw RegistryError.badRequest(`${member.key} is not ${format}`);
     if (repo.kind === "virtual") throw RegistryError.badRequest("Virtual repositories cannot nest");
     if (repo.id === virtualId) throw RegistryError.badRequest("A repository cannot include itself");
+    if (repo.spaceId !== parent.spaceId)
+      throw RegistryError.badRequest("Virtual feed members must belong to the same Space");
     resolved.push({ id: repo.id, include: member.include, exclude: member.exclude });
   }
   await db.deleteFrom("virtual_members").where("virtual_id", "=", virtualId).execute();

@@ -2,17 +2,25 @@
 // status is locked here until the timeline lands, and the way to the
 // timeline's view of it, where it can be reopened.
 
-import { Link } from "react-router";
+import { Link, useLocation } from "react-router";
 import type { Issue, Snapshot } from "../../../shared/tracker.ts";
 import { link as LINK } from "../../components/ui.tsx";
 import { DoneInTimelineIcon } from "./ui.tsx";
 
 /** The issue in a timeline's view, and the timeline's own page. */
-export function doneInLinks(owner: string, key: string, slug: string) {
-  const base = `/tracker/${encodeURIComponent(owner)}`;
+export function doneInLinks(
+  space: string,
+  key: string,
+  slug: string,
+  context?: { search: string; hash: string },
+) {
+  const base = `/tracker/${encodeURIComponent(space)}`;
+  const query = new URLSearchParams(context?.search);
+  query.set("tl", slug);
+  const suffix = `?${query}${context?.hash ?? ""}`;
   return {
-    issue: `${base}/issues/${encodeURIComponent(key)}?tl=${encodeURIComponent(slug)}`,
-    timeline: `${base}/timelines?tl=${encodeURIComponent(slug)}`,
+    issue: `${base}/issues/${encodeURIComponent(key)}${suffix}`,
+    timeline: `${base}/timelines${suffix}`,
   };
 }
 
@@ -22,7 +30,8 @@ export function lockedIn(issue: Pick<Issue, "status" | "doneIn">): Issue["doneIn
 }
 
 /** Under the disabled status picker: why, and where to reopen it. */
-export function LockedStatusHint({ issue, owner }: { issue: Issue; owner: string }) {
+export function LockedStatusHint({ issue, space }: { issue: Issue; space: string }) {
+  const location = useLocation();
   const slug = lockedIn(issue)?.slug;
   if (issue.status !== "done_in_timeline") return null;
   return (
@@ -30,7 +39,7 @@ export function LockedStatusHint({ issue, owner }: { issue: Issue; owner: string
       Locked while it's done in timeline{" "}
       {slug ? <span className="mk-mono">{slug}</span> : "a timeline"}: it lands with the timeline.{" "}
       {slug && (
-        <Link className={LINK} to={doneInLinks(owner, issue.key, slug).issue}>
+        <Link className={LINK} to={doneInLinks(space, issue.key, slug, location).issue}>
           Reopen it there
         </Link>
       )}
@@ -44,11 +53,12 @@ export function DoneInTimelineCallout({
   snapshot,
 }: {
   issue: Issue;
-  snapshot: Pick<Snapshot, "owner" | "timeline">;
+  snapshot: Pick<Snapshot, "space" | "timeline">;
 }) {
+  const location = useLocation();
   if (!issue.doneIn) return null;
   const { slug } = issue.doneIn;
-  const links = doneInLinks(snapshot.owner.slug, issue.key, slug);
+  const links = doneInLinks(snapshot.space.slug, issue.key, slug, location);
   return (
     <div
       id="tracker-done-in-timeline"

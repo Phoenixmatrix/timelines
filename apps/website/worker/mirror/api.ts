@@ -8,8 +8,9 @@ import { db, nowIso } from "../schema.ts";
 import { unseal } from "../../registry/core/seal.ts";
 import { productionOnly } from "../preview.ts";
 import { MirrorError, normalizeMirrorUrl, sealMirrorToken, syncMirror } from "./sync.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
 
-/** `/api/repos/:owner/:name/mirror`: a repository's one-way mirror (admins only). */
+/** `/api/repos/:space/:name/mirror`: a repository's one-way mirror (admins only). */
 export const mirrors = new Hono<AppEnv>();
 
 /** Mirror pushes come from one system identity: the instance owner's account. */
@@ -48,13 +49,13 @@ async function current(env: Env, repoId: string): Promise<RepoMirror | null> {
   };
 }
 
-mirrors.get("/:owner/:name/mirror", async (c) => {
+mirrors.get("/:space/:name/mirror", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   return c.json({ mirror: await current(c.env, loaded.row.id) });
 });
 
-mirrors.put("/:owner/:name/mirror", async (c) => {
+mirrors.put("/:space/:name/mirror", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const body = await readJson<UpdateMirrorRequest>(c);
@@ -88,7 +89,7 @@ mirrors.put("/:owner/:name/mirror", async (c) => {
   return c.json({ mirror: await current(c.env, loaded.row.id) });
 });
 
-mirrors.delete("/:owner/:name/mirror", async (c) => {
+mirrors.delete("/:space/:name/mirror", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   await db(c.env.DB).deleteFrom("repo_mirrors").where("repo_id", "=", loaded.row.id).execute();
@@ -96,11 +97,12 @@ mirrors.delete("/:owner/:name/mirror", async (c) => {
 });
 
 /** Sync now and report how it went (pushes sync on their own, through the queue). */
-mirrors.post("/:owner/:name/mirror/sync", async (c) => {
+mirrors.post("/:space/:name/mirror/sync", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   try {
-    const result = await syncMirror(c.env, loaded.row.id);
+    const authority = await captureWorkAuthority(c.env, loaded.row.id, c.get("actor"));
+    const result = await syncMirror(c.env, loaded.row.id, authority);
     if (result.status === "skipped") return fail(c, 409, "This repository has no enabled mirror.");
     if (result.status === "busy")
       return fail(c, 409, "A sync is already running. Try again shortly.");
@@ -119,7 +121,7 @@ mirrors.post("/:owner/:name/mirror/sync", async (c) => {
  * Rename an existing GitHub backup through its configured mirror, not a second
  * source of Git writes. The remote ID fences stale names and accidental targets.
  */
-mirrors.post("/:owner/:name/mirror/rename", async (c) => {
+mirrors.post("/:space/:name/mirror/rename", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   if (!productionOnly(c.env, "mirror", "renaming a GitHub backup"))

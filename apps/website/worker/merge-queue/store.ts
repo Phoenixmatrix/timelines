@@ -3,9 +3,11 @@ import type { AiSnapshot } from "../../shared/ai.ts";
 import type { QueueEntry, QueueResolution } from "../../shared/merge-queue.ts";
 import type { Actor } from "../db.ts";
 import { batch, db, type Database } from "../schema.ts";
+import type { WorkAuthority } from "../../shared/ci.ts";
 
 export interface QueueState {
   entry: QueueEntry;
+  authority: WorkAuthority;
   actor: Pick<Actor, "id" | "agent">;
   snapshot: AiSnapshot;
   mergeSource: string;

@@ -23,7 +23,7 @@ const issue = (key: string, fields: Partial<Issue> = {}): Issue => ({
   priority: 2,
   assigneeId: null,
   parentId: null,
-  workspaceIds: [],
+  projectIds: [],
   labels: [],
   claim: null,
   ...fields,
@@ -40,11 +40,11 @@ const issues = [
   issue("CORE-7"),
 ];
 const snapshot = {
-  owner: { id: "o", slug: "priya", displayName: "Priya" },
+  space: { id: "o", slug: "priya", displayName: "Priya" },
   members: [],
   agents: [],
   teams: [],
-  workspaces: [],
+  projects: [],
   requests: [],
   links: [{ id: "l", fromId: "core-4", toId: "core-6", kind: "blocks" }],
   issues,

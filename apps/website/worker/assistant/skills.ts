@@ -33,7 +33,7 @@ export const BUILTIN: Builtin[] = [
 Paths are under /api; pass them to api_get (GET) or api_write (everything else) without the /api prefix. Responses are JSON; errors are {"error": "..."} with an HTTP status. You act as the person's assistant agent, with their permissions: a 403 means they can't do it either, so say so.
 
 ## Repositories (/repos)
-- GET /repos — repositories you can see. POST /repos {owner, name, description, visibility: "public"|"private", importFrom?} — create or import.
+- GET /repos — repositories you can see. POST /repos {spaceId, name, description, visibility: "public"|"private", importFrom?} — create or import into that immutable Space ID.
 - GET /repos/:o/:n — detail: default branch, branches, tags, clone URL, your role.
 - GET /repos/:o/:n/tree?ref=&path= — a folder. GET /repos/:o/:n/blob?ref=&path= — a file.
 - GET /repos/:o/:n/commits?ref=&page= — commits. GET /repos/:o/:n/history?ref=&entries=a,b — last commit touching each path.
@@ -48,7 +48,7 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
 - GET /wiki — table of contents. GET /wiki/page?slug= — a page.
 - GET /repos/:o/:n/release-notes/range?from=&to= — release notes between two refs.
 - GET /repos/:o/:n/release-notes — daily UTC committer-date code updates and optional tag snapshots. GET /repos/:o/:n/release-notes/release?name=day:YYYY-MM-DD (or a tag) — entries and introduction. Commits and tags are not deployment evidence.
-- GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects tagged releases. Filters include kind, team, repo, ws, type, tag (issue tags; label: is its old name), release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
+- GET /tracker/:space/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects tagged releases. Filters include kind, team, repo, project, type, tag, release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
 
 These are JSON API endpoints, not browser pages. Link people to the Releases pages in the navigation skill: browser routes use /releases, never /release-notes.
 
@@ -60,19 +60,19 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - GET /ci/secrets — names only. PUT /ci/secrets/:NAME {value} and DELETE — never ask for or repeat secret values in chat; for a credential, tell the person to set it themselves (Settings or gm secret set).
 
 ## Packages (/packages)
-- GET /packages/:owner — packages and feeds. GET /packages/:owner/:format/:name — one package; /publishes?q=&offset=&limit=; /contents.
-- POST /packages/:owner/:format/:name/actions {action: "tag"|"untag"|"deprecate"|"yank"|"delete", versions: [...], ...} — bulk version actions.
-- POST|PATCH|DELETE /packages/:owner/feeds[/:format/:key] — feeds and upstream proxies.
+- GET /packages/:space — packages and feeds. GET /packages/:space/:format/:name — one package; /publishes?q=&offset=&limit=; /contents.
+- POST /packages/:space/:format/:name/actions {action: "tag"|"untag"|"deprecate"|"yank"|"delete", versions: [...], ...} — bulk version actions.
+- POST|PATCH|DELETE /packages/:space/feeds[/:format/:key] — feeds and upstream proxies.
 
 ## Tracker (/tracker)
-- GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view. GET /tracker/:owner/tags — the tag catalog with counts {tags: [{name, issues, open}]}; issue tags (the issue field is "labels", its old name; writes accept "tags" too), agent tags and requirement tag: values come from it.
-- POST /tracker/:owner/mutate {operationId: uuid, mutations: [...]}: kinds team.create|update, workspace.create|update, issue.create {id: uuid, data: {teamId, title, ...}} | issue.update {id, expectedVersion, data} , link.add {id, data: {fromId, toId, kind}} | link.remove, comment.add {id, data: {issueId, body, kind}}, subscription.add|remove, request.answer|cancel. Prefer the dedicated issue tools; use this for teams, workspaces and bulk changes.
+- GET /tracker — Spaces whose trackers you can use. GET /tracker/:space/snapshot — teams, projects, issues, links, comments, requests, members, agents, contractVersion, spaceId and migrationEpoch. GET /tracker/:space/view — a lighter view. GET /tracker/:space/tags — tag catalog with counts.
+- POST /tracker/:space/mutate {contractVersion:4, spaceId, migrationEpoch, operationId: uuid, mutations: [...]}: use exact scope/epoch from a fresh snapshot. Kinds team.create|update, project.create|update, issue.create {id: uuid, data: {teamId, projectIds?, title, ...}} | issue.update {id, expectedVersion, data}, link.add {id, data: {fromId, toId, kind}} | link.remove, comment.add {id, data: {issueId, body, kind}}, subscription.add|remove, request.answer|cancel. Prefer dedicated issue tools; use this for Teams, Projects and bulk changes.
 - GET /requests — open requests waiting on the person ("Needs you").
-- GET /agent-work?since=14d[&agent=<name>][&tracker=<owner>] — issues the person's agents finished lately, across trackers: {agents, trackers, items: [{tracker, issue, completion {actorId, accountableId, agent, at}, timeline, evidence}]}. Issue queries also take done-by:me|mine|<agent> and done:14d.
+- GET /agent-work?since=14d[&agent=<name>][&tracker=<space>] — issues the person's agents finished lately, across trackers: {agents, trackers, items: [{tracker, issue, completion {actorId, accountableId, agent, at}, timeline, evidence}]}. Issue queries also take done-by:me|mine|<agent> and done:14d.
 - Claims, leases and handoffs (issue.claim, renew, complete…) belong to agents doing the work with gm, not to this chat.
 
 ## People
-- GET /session — who you act for. GET /users?q= — find people. GET /accounts/:slug — an account or organization.`,
+- GET /session — who you act for. GET /users?q= — find people. GET /accounts/:slug — person profile. GET /organizations and /spaces — explicit directory/context; Organization membership grants no private content rights.`,
   },
   {
     name: "tracker",
@@ -81,7 +81,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
       "How the Timelines tracker works and how to plan with it: teams, statuses, priorities, PRDs and sub-issues, blockers, claims, requests to people.",
     body: `# The tracker
 
-- Trackers belong to an account or organization (the owner), independent of repositories. Issues belong to a team (key like CORE) and get keys CORE-1, CORE-2…
+- Each tracker belongs to one Space, independent of repositories. Use explicit space inputs. Issues have exactly one Team (key like CORE), retain keys CORE-1, CORE-2, and may belong to multiple same-Space Projects. Project/repository associations grant no access.
 - Status: backlog, todo, in_progress, done, canceled; and done_in_timeline, which the tracker sets: finished in a timeline that hasn't landed (doneIn names it). It still blocks, isn't ready and its status can't be changed (reopen it in the timeline instead); landing makes it done, abandoning the timeline makes it todo again. Priority 0 (urgent) to 4 (none); 2 is normal. Types: task, bug, prd, chore, research, remediation.
 - Ready = todo, every blocker done, nobody holding a claim, no open sub-issues. find_issues with ready: true finds them.
 - Links: "A blocks B" (B can't start until A is done), related, duplicates. Parent/sub-issue is structure, not blocking.
@@ -94,7 +94,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - A PRD (type prd) is a plan, implemented through sub-issues. To break work down: create the sub-issues with parent set, then link blockers between them in execution order. Give each a crisp title and acceptance criteria.
 - Requests are questions/approvals/decisions/credentials an agent asked a person; they show on the Needs you page (/needs-you).
 - Write issue titles as outcomes ("Users can reset passwords"), not activities. Descriptions are Markdown.
-- Link every issue you mention: [CORE-25](/tracker/<owner>/issues/CORE-25).`,
+- Link every issue you mention: [CORE-25](/tracker/<space>/issues/CORE-25).`,
   },
   {
     name: "code",
@@ -104,7 +104,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
     body: `# Reading code
 
 1. Find before reading: search_code (meaning search over the knowledge graph and code passages) beats listing folders. Use list_files for structure, read_file with lines for the part that matters.
-2. Cite what you read with links to exact lines: [worker/app.ts:12-30](/<owner>/<repo>/blob/<ref>/worker/app.ts#L12-L30).
+2. Cite what you read with links to exact lines: [worker/app.ts:12-30](/<space>/<repo>/blob/<ref>/worker/app.ts#L12-L30).
 3. Quote only the few lines that carry the point, in fenced code blocks with the language.
 4. Say what you didn't check. Don't describe code you haven't read.
 5. For "what changed", use list_commits and semantic_changes; for "who/when", file_history via api_get /repos/:o/:n/history?entries=path.`,
@@ -120,7 +120,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - Explain a failure as: what failed (job, step, exit code), why (quote the 3-10 decisive log lines), and the likely fix (link the code involved).
 - Statuses: queued, running, succeeded, failed, cancelled, skipped. A job "skipped" as unchanged counts as passed.
 - Rerun only when the failure looks transient (network, timeouts, infrastructure) or the person asks; otherwise explain first.
-- Link runs: [run #44](/<owner>/<repo>/ci/44).`,
+- Link runs: [run #44](/<space>/<repo>/ci/44).`,
   },
   {
     name: "packages",
@@ -129,10 +129,10 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
       "Packages in the Timelines registry: formats, feeds, versions, tags, yanking and deprecating.",
     body: `# Packages
 
-- Formats include npm, pypi, oci (containers), cargo, go, maven, nuget, rubygems, apt, rpm, brew, generic and releases. Each account or organization publishes into its own feeds.
-- find_packages lists them; api_get /packages/:owner/:format/:name for one package and its versions (publishes?q= to search versions).
-- Version actions (tag, deprecate, yank, delete) go through api_write POST /packages/:owner/:format/:name/actions. Yank and delete can break installs: say so before proposing them.
-- Link packages: [name](/<owner>/-/packages/<format>/<name>).`,
+- Formats include npm, pypi, oci (containers), cargo, go, maven, nuget, rubygems, apt, rpm, brew, generic and releases. Each Space publishes into its own feeds.
+- find_packages lists them; api_get /packages/:space/:format/:name for one package and its versions (publishes?q= to search versions).
+- Version actions (tag, deprecate, yank, delete) go through api_write POST /packages/:space/:format/:name/actions. Yank and delete can break installs: say so before proposing them.
+- Link packages: [name](/<space>/-/packages/<format>/<name>).`,
   },
   {
     name: "knowledge",
@@ -143,21 +143,21 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 
 - Every push rebuilds a graph of the repository: files, symbols, components and concepts, each summarized, with links (defines, imports, contains, uses).
 - search_code searches it by meaning. read_wiki without a slug gives the table of contents; with one, the page. The wiki is generated from the graph and cites sources.
-- search_code also returns completionEvidence from the repository's subscribed workspaces, limited to trackers you may read. Search by issue key or distinctive words from the verification result; this is live recorded evidence, not generated wiki prose. Cite each note's URL, actorId and createdAt, and distinguish historical evidence from current issue status. For evidence alone, api_get /repos/:o/:n/knowledge/completion-evidence?q=KEY reads the same source without a model or build.
+- search_code also returns completionEvidence from the repository's subscribed Projects, limited to trackers you may currently read. Search by issue key or distinctive verification words; cite each original note's URL, actorId and createdAt. Historical evidence is not current issue status. For evidence alone, api_get /repos/:o/:n/knowledge/completion-evidence?q=KEY reads the same source without a model or build.
 - api_get /repos/:o/:n/knowledge/graph/node?id=... reads a node and its neighbours (ids look like file:path, sym:path#name, component:name).
 - Prefer the wiki overview for "what is this repository / how does X work at a high level"; read code for exact behaviour.
-- Link: [the wiki](/<owner>/<repo>/wiki), [the map](/<owner>/<repo>/knowledge?node=<id>).`,
+- Link: [the wiki](/<space>/<repo>/wiki), [the map](/<space>/<repo>/knowledge?node=<id>).`,
   },
   {
     name: "release-notes-writer",
     group: "knowledge",
     description:
-      "Writing custom, client-ready release notes (an announcement, changelog or customer email) from a repository's or organization's release notes.",
+      "Writing custom, client-ready release notes (an announcement, changelog or customer email) from a repository's or Space's release notes.",
     body: `# Writing release notes
 
 Fetch the notes first, with api_get, then write from them:
 - One release of a repository: GET /repos/:o/:n/release-notes lists releases (daily updates are named @day:YYYY-MM-DD, tags by tag name); GET /repos/:o/:n/release-notes/release?name=<name> returns its entries (add &timeline=<slug> to keep one timeline's landed work).
-- Many releases of an organization: GET /tracker/:owner/release-notes?q=<filter> (for example since:7d, release:v1.2, repo:app, type:feature, team:CORE).
+- Many releases of a Space: GET /tracker/:space/release-notes?q=<filter> (for example since:7d, release:v1.2, repo:app, type:feature, team:CORE).
 These return only what the person may read, so write from nothing else. If they return no entries, say so rather than inventing notes.
 
 ${WRITING_GUIDANCE}
@@ -171,12 +171,12 @@ Answer with the Markdown itself (a short lead-in is fine) so the person can copy
       "Timelines' pages and their paths: for links in answers and for opening pages with navigate.",
     body: `# Pages
 
-- Home / ; Issue tracker /tracker and /tracker/<owner> ; an issue /tracker/<owner>/issues/<KEY> ; Needs you /needs-you ; Agent work (what your agents finished lately; ?since=7d|14d|30d&agent=<name>&tracker=<owner>&type=<type>) /agent-work ; Packages /packages
-- Account or organization /<owner> ; its packages /<owner>/-/packages ; a package /<owner>/-/packages/<format>/<name>
-- Repository /<owner>/<repo> ; folder /<owner>/<repo>/tree/<ref>/<path> ; file /<owner>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<owner>/<repo>/commits/<ref> ; changes /<owner>/<repo>/changes ; CI /<owner>/<repo>/ci and /<owner>/<repo>/ci/<number> ; wiki /<owner>/<repo>/wiki/<slug> ; knowledge map /<owner>/<repo>/knowledge ; settings /<owner>/<repo>/settings
-- Repository release notes /<owner>/<repo>/releases ; a daily update or tag /<owner>/<repo>/releases/<name> (URL-encode the exact name returned by the release-notes API, including @day: for a daily update)
-- Tracker-wide release notes /tracker/<owner>/releases ; preserve feed filters with ?q=<URL-encoded query>. Do not use /release-notes in browser links: that suffix belongs to the JSON API.
-- Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites, /settings/usage?owner=<account> (usage & costs), /settings/site-usage (site admins), /settings/ai?owner=<account> (AI settings), /settings/site-ai (site AI settings, site admins) ; new repository /new
+- Home / ; Issue tracker /tracker and /tracker/<space> ; issue /tracker/<space>/issues/<KEY> ; Projects /tracker/<space>/projects ; Needs you /needs-you ; Agent work (what your agents finished lately; ?since=7d|14d|30d&agent=<name>&tracker=<space>&type=<type>) /agent-work ; Packages /packages
+- Person /accounts/<person> ; Organization /organizations/<organization> ; Space /<space> ; packages /<space>/-/packages ; package /<space>/-/packages/<format>/<name>
+- Repository /<space>/<repo> ; folder /<space>/<repo>/tree/<ref>/<path> ; file /<space>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<space>/<repo>/commits/<ref> ; changes /<space>/<repo>/changes ; CI /<space>/<repo>/ci and /<space>/<repo>/ci/<number> ; wiki /<space>/<repo>/wiki/<slug> ; knowledge map /<space>/<repo>/knowledge ; settings /<space>/<repo>/settings
+- Repository release notes /<space>/<repo>/releases ; daily update or tag /<space>/<repo>/releases/<name> (URL-encode exact API name, including @day:)
+- Tracker-wide release notes /tracker/<space>/releases ; preserve filters with ?q=<URL-encoded query>. Browser pages use /releases, not /release-notes.
+- Person settings /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites. New repository /<space>/-/repositories/new. Instance administration is separate from Organization and Space administration.
 
 Use navigate when the person asks to go somewhere or see something, or to show what you just made or found; it opens beside the chat. Otherwise just link.`,
   },
@@ -187,9 +187,9 @@ Use navigate when the person asks to go somewhere or see something, or to show w
       "Administering repositories: settings, visibility, collaborators and roles, GitHub mirrors, creating and importing.",
     body: `# Repository administration
 
-- Roles: read, write, admin; owners of an organization are admins of its repositories. Settings, collaborators, mirrors and deletion need admin.
+- Roles: read, write, admin. Organization ownership grants no repository access. Explicit Space/resource grants determine rights. Settings, collaborators, mirrors and deletion need repository admin.
 - Change settings with api_write PATCH /repos/:o/:n; collaborators with PUT/DELETE /repos/:o/:n/collaborators/:username; mirrors with /repos/:o/:n/mirror.
-- Create: api_write POST /repos {owner, name, description, visibility}. Import a public git URL with importFrom.
+- Create: api_write POST /repos {spaceId, name, description, visibility}. Resolve the immutable Space ID explicitly; never use a person ID as a default. Import a public git URL with importFrom.
 - Never delete a repository unless the person asked for exactly that in this conversation, and state that it can't be undone.`,
   },
   {
@@ -199,9 +199,9 @@ Use navigate when the person asks to go somewhere or see something, or to show w
     body: `# gm
 
 gm is jj-style version control plus the Timelines client. Every edit lives in a change; operations can be undone (gm undo).
-- gm clone owner/repo · gm status · gm commit -m "…" · gm push (gm push --sync when trunk moved) · gm sync · gm log
+- gm clone space/repo · gm status · gm commit -m "…" · gm push (gm push --sync when trunk moved) · gm sync · gm log
 - gm runs list / wait / logs --follow · gm secret set NAME
-- gm issue create "Title" --team CORE [--owner <tracker>] · gm issue next · claim · checkpoint · complete [--evidence TEXT] · gm request list/answer. Provide actual completion evidence when available; it is recommended, not required. gm issue show returns completionEvidence with original attribution.
+- gm issue create "Title" --team CORE [--space <space>] [--project <project>] · gm project · gm issue next · claim · checkpoint · complete [--evidence TEXT] · gm request list/answer. Provide actual completion evidence when available; gm issue show returns original attribution.
 - gm pkg upload/download/install · gm agent setup (configure a coding agent for a checkout)
 - gm ask "question" — ask this assistant from a terminal (read-only unless --write)
 - gm cli guide (the workflow), gm cli search "<task>", gm schema <command>
@@ -327,8 +327,8 @@ export function preloaded(groups: readonly string[], navigate: boolean): string[
  * API as the assistant (so a private repository's skills need access to it).
  */
 export function repositorySkills(api: CallApi, repo: string): SkillSource {
-  const [owner, name] = repo.split("/");
-  const base = `/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(name!)}`;
+  const [space, name] = repo.split("/");
+  const base = `/repos/${encodeURIComponent(space!)}/${encodeURIComponent(name!)}`;
   return {
     async list() {
       const tree = await api("GET", `${base}/tree?path=.agents/skills`);

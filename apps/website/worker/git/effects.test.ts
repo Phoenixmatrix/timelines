@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import type { DatabaseSync } from "node:sqlite";
 import type * as CiTrigger from "../ci/trigger.ts";
 import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import { queueCandidateBranch, queueSourceBranch } from "../../shared/merge-queue.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { captureWorkAuthority } from "../ci/admission.ts";
+import { issueToken } from "../api/tokens.ts";
 import { admitQueue, getQueue, type QueueState } from "../merge-queue/store.ts";
 import { progressQueue } from "../merge-queue/scheduler.ts";
 import { afterPush, type PushedRepo } from "./effects.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 // These observational consumers are not part of guaranteed notification delivery.
 // Queue main CI has its own persisted deployment state and scheduler regressions.
 vi.mock("../ci/trigger.ts", async (original) => ({
@@ -17,29 +18,21 @@ vi.mock("../ci/trigger.ts", async (original) => ({
 }));
 vi.mock("../timelines/activity.ts", () => ({ logPush: vi.fn(async () => {}) }));
 
-const databases: DatabaseSync[] = [];
+const controlClosers: Array<() => void> = [];
 afterEach(() => {
   vi.restoreAllMocks();
-  for (const database of databases.splice(0)) database.close();
+  for (const close of controlClosers.splice(0)) close();
 });
 
-function setup() {
-  const sqlite = migratedDatabase();
-  databases.push(sqlite);
-  sqlite.exec(`
-    INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
-    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
-      VALUES('repo','owner','app','private','a','https://a');
-    INSERT INTO account_settings(account_id,ai_knowledge,ai_release_notes)
-      VALUES('owner',1,1);
-    INSERT INTO repo_mirrors(repo_id,url,enabled,status)
-      VALUES('repo','https://mirror.example/app',1,'ok');
-  `);
+async function setup() {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite } = fresh;
+  controlClosers.push(fresh.close);
   const delivery = { fail: null as string | null };
   const sent: { type: string; repoId: string }[] = [];
   const knowledge = new Set<string>();
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     AI: {},
     JOBS: {
       async send(body: { type: string; repoId: string }) {
@@ -56,10 +49,34 @@ function setup() {
       }),
     },
   } as unknown as Env;
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner')",
+  );
+  await seedSpaceFixture(env.DB, {
+    organization: { id: "company", slug: "company", displayName: "Company", kind: "company" },
+    space: { id: "space", slug: "space", displayName: "Space" },
+    actorId: "owner",
+    members: [
+      {
+        accountId: "owner",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+  });
+  sqlite.exec(`
+    INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES('repo','space','app','private','a','https://a');
+    INSERT INTO space_settings(space_id,ai_knowledge,ai_release_notes) VALUES('space',1,1);
+    INSERT INTO repo_mirrors(repo_id,url,enabled,status) VALUES('repo','https://mirror.example/app',1,'ok');
+  `);
+  const token = await issueToken(env.DB, "owner", "push initiator", "write");
+  const actor = { id: "owner", credential: { kind: "token" as const, id: token.id } };
+  const authority = await captureWorkAuthority(env, "repo", actor);
   const repo: PushedRepo = {
     id: "repo",
-    owner_id: "owner",
-    owner_slug: "owner",
+    space_id: "space",
+    space_slug: "space",
     name: "app",
     default_branch: "main",
     artifacts_name: "a",
@@ -69,7 +86,7 @@ function setup() {
   const state: QueueState = {
     entry: {
       id: commit,
-      repo: { id: "repo", owner: "owner", name: "app" },
+      repo: { id: "repo", space: "space", name: "app" },
       commit,
       branch: "main",
       sourceBranch: queueSourceBranch(commit),
@@ -90,7 +107,8 @@ function setup() {
       createdAt: "2026-10-01T00:00:00.000Z",
       updatedAt: "2026-10-01T00:00:00.000Z",
     },
-    actor: { id: "owner" },
+    actor,
+    authority,
     snapshot: LEGACY_AI_SNAPSHOT,
     mergeSource: commit,
     combinedIds: [],
@@ -106,19 +124,19 @@ function setup() {
     remediationPending: false,
     history: [],
   };
-  return { sqlite, env, repo, delivery, sent, knowledge, state };
+  return { sqlite, env, repo, delivery, sent, knowledge, state, actor, authority };
 }
 
 test("work pushes do not mutate canonical push time or enqueue its mirror and release notes", async () => {
-  const f = setup();
+  const f = await setup();
   const pending: Promise<unknown>[] = [];
   afterPush(
     f.env,
     { ...f.repo, source_id: "work_a", artifacts_name: "work-physical", default_branch: "work" },
-    null,
+    f.actor,
     (work) => pending.push(work),
   );
-  await Promise.all(pending);
+  while (pending.length) await Promise.all(pending.splice(0));
   expect(f.sent).toEqual([]);
   expect(f.sqlite.prepare("SELECT pushed_at FROM repos WHERE id='repo'").get()).toEqual({
     pushed_at: null,
@@ -130,7 +148,7 @@ test("work pushes do not mutate canonical push time or enqueue its mirror and re
 describe("queued push notification delivery", () => {
   for (const failed of ["mirror", "release-notes", "knowledge"]) {
     test(`${failed} rejection retains the durable outbox until real consumer delivery recovers`, async () => {
-      const f = setup();
+      const f = await setup();
       vi.spyOn(console, "error").mockImplementation(() => {});
       await admitQueue(f.env.DB, f.state);
       f.delivery.fail = failed;
@@ -150,8 +168,12 @@ describe("queued push notification delivery", () => {
         effectsPending: false,
         entry: { status: "landed", deployStatus: "succeeded" },
       });
-      expect(f.sent).toContainEqual({ type: "mirror", repoId: "repo" });
-      expect(f.sent).toContainEqual({ type: "release-notes", repoId: "repo" });
+      expect(f.sent).toContainEqual({ type: "mirror", repoId: "repo", authority: f.authority });
+      expect(f.sent).toContainEqual({
+        type: "release-notes",
+        repoId: "repo",
+        authority: f.authority,
+      });
       expect(f.knowledge.has("repo")).toBe(true);
       // Retrying an outbox is at-least-once, while the consumers' durable state
       // remains one dirty release-note record and one pending mirror.
@@ -169,18 +191,19 @@ describe("queued push notification delivery", () => {
 
   for (const failed of ["mirror", "release-notes"]) {
     test(`ordinary push still treats ${failed} enqueue rejection as best-effort`, async () => {
-      const f = setup();
+      const f = await setup();
       vi.spyOn(console, "error").mockImplementation(() => {});
       f.delivery.fail = failed;
       const pending: Promise<unknown>[] = [];
-      afterPush(f.env, f.repo, { id: "owner" }, (work) => {
+      afterPush(f.env, f.repo, f.actor, (work) => {
         pending.push(work);
       });
-      await Promise.all(pending);
+      while (pending.length) await Promise.all(pending.splice(0));
       expect(f.sent.filter((message) => message.type === failed)).toEqual([]);
       expect(f.sent).toContainEqual({
         type: failed === "mirror" ? "release-notes" : "mirror",
         repoId: "repo",
+        authority: f.authority,
       });
       expect(f.knowledge.has("repo")).toBe(true);
     });

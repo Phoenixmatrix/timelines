@@ -14,7 +14,7 @@ export interface RepoSection {
 
 /** The sections this viewer can open, in tab order. */
 export function repoSections(repo: RepoDetail): RepoSection[] {
-  const base = repoPath(repo.owner.slug, repo.name);
+  const base = repoPath(repo.space.slug, repo.name);
   const section = (id: string, label: string, keywords: string[] = []): RepoSection => ({
     id,
     label,
@@ -36,7 +36,7 @@ export function repoSections(repo: RepoDetail): RepoSection[] {
             id: "commits",
             label: "Commits",
             to: commitsUrl(
-              repo.owner.slug,
+              repo.space.slug,
               repo.name,
               repo.source?.kind === "timeline-work"
                 ? repo.source.ref.replace(/^refs\/heads\//, "")

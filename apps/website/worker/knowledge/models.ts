@@ -9,6 +9,8 @@
 import { aiGatewayOptions, componentOf } from "../ai-gateway.ts";
 import { callProvider } from "../ai-providers/providers.ts";
 import { parseProviderModelRef, providerKey } from "../ai-providers/store.ts";
+import { isActorCredentialLive } from "../auth.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
 import { attribution, recordAiCall, tokensOf } from "../usage/ai.ts";
 import { modelFailureDiagnostic } from "./model-failure.ts";
 import { paidWorkGuard, PaidWorkStopped } from "./paid-work.ts";
@@ -51,7 +53,7 @@ type LooseAi = {
 };
 /**
  * How long a call may take, by the job it does rather than the model: since
- * accounts choose models (CORE-190), a long wiki page on the fast model still
+ * Spaces choose models (CORE-190), a long wiki page on the fast model still
  * gets the writing deadline. A call cut off by its deadline has usually been
  * billed by the provider anyway, and is asked again, so deadlines are for
  * hung calls, not slow ones.
@@ -112,8 +114,8 @@ const ai = (env: Env, job: Job, rateLimitRetries = RATE_LIMIT_RETRIES): LooseAi 
  * One attempt: refused once the work it belongs to has stopped (paid-work.ts),
  * aborted at its deadline or when the work stops, and metered either way: a
  * success with its tokens, anything else as a failed call. A model from the
- * account's own provider (CORE-294; `<provider>:<row>:<model>` in snapshots)
- * goes to that provider with the account's key instead of Workers AI.
+ * Space's own provider (CORE-294; `<provider>:<row>:<model>` in snapshots)
+ * goes to that provider with the Space's key instead of Workers AI.
  */
 async function once(env: Env, model: string, inputs: unknown, timeout: number): Promise<unknown> {
   const provider = parseProviderModelRef(model);
@@ -121,6 +123,23 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
   const guard = paidWorkGuard();
   await guard?.check();
   const work = await attribution(env);
+  const authorizeProvider = async (): Promise<string> => {
+    const authority = work.providerAuthority;
+    if (!authority) {
+      if (work.scope.kind === "space") return work.scope.id;
+      throw new Error("Provider model calls require an authorized Space resource.");
+    }
+    if (
+      (work.scope.kind === "person" && authority.actor.id !== work.scope.id) ||
+      (work.scope.kind === "space" && authority.spaceId !== work.scope.id) ||
+      work.scope.kind === "instance" ||
+      !(await isActorCredentialLive(env.DB, authority.actor)) ||
+      !(await resolveSpaceAccess(env.DB, authority.actor, authority.spaceId))
+    )
+      throw new Error("Provider Space authority is no longer valid.");
+    return authority.spaceId;
+  };
+  const providerSpaceId = provider || work.providerAuthority ? await authorizeProvider() : null;
   // Attribution can yield while the owning work is stopped.
   guard?.signal.throwIfAborted();
   const ms = Math.min(timeout, guard?.remaining() ?? Infinity);
@@ -141,7 +160,9 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
   let dispatched = false;
   try {
     const call = provider
-      ? providerKey(env, provider).then((key) => {
+      ? providerKey(env, provider, providerSpaceId!).then(async (key) => {
+          await authorizeProvider();
+          await guard?.check();
           controller.signal.throwIfAborted();
           dispatched = true;
           return callProvider(
@@ -153,7 +174,9 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
             controller.signal,
           );
         })
-      : aiGatewayOptions(env, componentOf(work.feature), work).then((gateway) => {
+      : aiGatewayOptions(env, componentOf(work.feature), work).then(async (gateway) => {
+          if (work.providerAuthority) await authorizeProvider();
+          await guard?.check();
           controller.signal.throwIfAborted();
           gateway.gateway.metadata.attempt = attempt;
           dispatched = true;
@@ -164,7 +187,7 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
         });
     // The race: a binding that ignores the signal still can't hold the caller.
     const result = await Promise.race([call, aborted]);
-    // Metering (CORE-207): the call's tokens, for the account whose work this is.
+    // Metering (CORE-207): attribute tokens to the explicit work scope.
     await recordAiCall(env, metered, tokensOf(result));
     return result;
   } catch (error) {
@@ -177,7 +200,9 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
               attempt,
               provider: provider?.kind ?? "workers-ai",
               model: metered,
-              ...work,
+              scopeKind: work.scope.kind,
+              scopeId: work.scope.id,
+              feature: work.feature,
               dispatched,
             },
             failure,

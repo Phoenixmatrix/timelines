@@ -5,13 +5,10 @@ const RANK: Record<RepoRole, number> = { none: 0, read: 1, write: 2, admin: 3 };
 /** Everything that decides one person's access to one repository. */
 export interface RepoAccessFacts {
   visibility: "public" | "private";
-  ownerId: string;
-  ownerKind: "user" | "org";
-  /** The role an org grants all of its members; null for user-owned repos. */
-  orgMemberRepoRole: "none" | "read" | "write" | null;
+  /** Already resolved against a live Organization membership and Space grant. */
+  spaceRole: "admin" | "member" | null;
+  repositoryRole: "none" | "read" | "write" | null;
   viewer: { id: string; isSiteAdmin: boolean } | null;
-  /** The viewer's membership in the owning org, if any. */
-  orgRole: "owner" | "member" | null;
   /** The viewer's explicit collaborator role on this repo, if any. */
   collaboratorRole: "read" | "write" | "admin" | null;
 }
@@ -32,11 +29,8 @@ export function repoRole(facts: RepoAccessFacts): RepoRole {
   const viewer = facts.viewer;
   if (viewer) {
     if (viewer.isSiteAdmin) grants.push("admin");
-    if (facts.ownerKind === "user" && facts.ownerId === viewer.id) grants.push("admin");
-    if (facts.ownerKind === "org" && facts.orgRole === "owner") grants.push("admin");
-    if (facts.ownerKind === "org" && facts.orgRole === "member") {
-      grants.push(facts.orgMemberRepoRole ?? "none");
-    }
+    if (facts.spaceRole === "admin") grants.push("admin");
+    if (facts.spaceRole === "member") grants.push(facts.repositoryRole ?? "none");
     if (facts.collaboratorRole) grants.push(facts.collaboratorRole);
   }
 

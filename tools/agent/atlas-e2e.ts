@@ -47,7 +47,7 @@ export async function atlasFixtureRepo(
 ) {
   const owner = "orbit";
   const name = `${prefix}-${randomUUID().slice(0, 8)}`;
-  await t.gm(["repo", "create", name, "--owner", owner, "--description", "Atlas E2E fixture"]);
+  await t.gm(["repo", "create", name, "--space", owner, "--description", "Atlas E2E fixture"]);
   const dir = join(t.work, name);
   await t.gm(["clone", `${owner}/${name}`, dir]);
   for (const file of atlasFixtureFiles(variant)) {
@@ -171,29 +171,34 @@ export async function atlasRevocationScenario(t: AtlasE2E & { readerToken: strin
   // sam isn't in orbit: only the collaboration lets him read it.
   await t.json(api, t.readerToken, "GET", undefined, [404]);
   await t.json(`${api}/collaborators/sam`, t.token, "PUT", { role: "read" });
-  const overview = await t.json<{ snapshot: { id: string }; catalogue: { next: string | null } }>(
-    `${api}/atlas/overview`,
+  const catalogue = await t.json<{ snapshot: { id: string }; next: string | null }>(
+    `${api}/atlas/catalogue?limit=1`,
     t.readerToken,
   );
+  assert(catalogue.next, "Revocation must replay a real, previously usable cursor");
+  const continuation = `/atlas/catalogue?limit=1&cursor=${encodeURIComponent(catalogue.next)}`;
+  const pinned = `/atlas/overview?snapshot=${encodeURIComponent(catalogue.snapshot.id)}`;
+  await t.json(`${api}${continuation}`, t.readerToken);
+  await t.json(`${api}${pinned}`, t.readerToken);
   await t.json(`${api}/atlas/detail?id=${encodeURIComponent(file)}`, t.readerToken);
   const removed = await fetch(`${t.ctx.origin}${api}/collaborators/sam`, {
     method: "DELETE",
-    headers: { authorization: `Bearer ${t.token}` },
+    headers: { "X-Gitmatrix-Content-Version": "4", authorization: `Bearer ${t.token}` },
   });
   assert.equal(removed.status, 204, "Removing the collaborator");
   const paths = [
-    `/atlas/regions?cursor=${encodeURIComponent(overview.catalogue.next ?? "")}`,
-    `/atlas/overview?snapshot=${encodeURIComponent(overview.snapshot.id)}`,
+    continuation,
+    pinned,
     `/atlas/detail?id=${encodeURIComponent(file)}`,
     `/atlas/catalogue?q=ledger`,
     "/knowledge/status",
   ];
   for (const path of paths) {
     const hidden = await fetch(`${t.ctx.origin}${api}${path}`, {
-      headers: { authorization: `Bearer ${t.readerToken}` },
+      headers: { "X-Gitmatrix-Content-Version": "4", authorization: `Bearer ${t.readerToken}` },
     });
     const missing = await fetch(`${t.ctx.origin}${ghost}${path}`, {
-      headers: { authorization: `Bearer ${t.readerToken}` },
+      headers: { "X-Gitmatrix-Content-Version": "4", authorization: `Bearer ${t.readerToken}` },
     });
     assert.equal(hidden.status, 404, path);
     assert.equal(await hidden.text(), await missing.text(), path);

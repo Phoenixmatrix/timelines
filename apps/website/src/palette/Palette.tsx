@@ -6,7 +6,6 @@ import { Dialog } from "@base-ui/react/dialog";
 import {
   ArrowRightIcon,
   BookOpenTextIcon,
-  BuildingsIcon,
   ChatCenteredDotsIcon,
   CheckCircleIcon,
   CircleDashedIcon,
@@ -51,7 +50,12 @@ import type { TrackerList } from "../../shared/tracker.ts";
 import { useAssistant } from "../assistant/state.tsx";
 import { dialogMotion, fadeMotion, Tip } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
-import { readRecent, type PlaceKind, type RecentPlace } from "../lib/recentPlaces.ts";
+import {
+  readRecent,
+  readRecentRecovery,
+  type PlaceKind,
+  type RecentPlace,
+} from "../lib/recentPlaces.ts";
 import {
   parseRef,
   resolveJump,
@@ -61,7 +65,7 @@ import {
   type ParsedRef,
 } from "../lib/resolveRefs.ts";
 import { useViewer } from "../lib/session.ts";
-import { scopeOwner } from "../lib/timelineScope.ts";
+import { scopeSpace } from "../lib/timelineScope.ts";
 import { refContextFromPath } from "../refs/context.ts";
 import {
   COMMAND_SOURCES,
@@ -174,7 +178,7 @@ const CATEGORY_LABEL: Record<SearchCategory, string> = {
   repositories: "Repositories",
   issues: "Issues",
   packages: "Packages",
-  accounts: "People and organizations",
+  accounts: "People",
   conversations: "Conversations",
 };
 
@@ -215,7 +219,7 @@ const CATEGORY_NOUN: Record<SearchCategory, string> = {
   repositories: "repositories",
   issues: "issues",
   packages: "packages",
-  accounts: "people and organizations",
+  accounts: "people",
   conversations: "conversations",
 };
 
@@ -260,7 +264,7 @@ function resultOption(result: SearchResult): Option {
     result.category === "repositories"
       ? result.subtitle
       : result.category === "issues"
-        ? `${result.subtitle} · ${result.tracker.slug}`
+        ? `${result.subtitle} · ${result.space.slug}`
         : result.category === "packages"
           ? result.subtitle
           : result.category === "accounts"
@@ -284,11 +288,7 @@ function resultOption(result: SearchResult): Option {
       ) : result.category === "packages" ? (
         <PackageIcon className={iconClass} aria-hidden />
       ) : result.category === "accounts" ? (
-        result.kind === "org" ? (
-          <BuildingsIcon className={iconClass} aria-hidden />
-        ) : (
-          <UserCircleIcon className={iconClass} aria-hidden />
-        )
+        <UserCircleIcon className={iconClass} aria-hidden />
       ) : (
         <ChatCenteredDotsIcon className={iconClass} aria-hidden />
       ),
@@ -311,7 +311,7 @@ function groupLabel(
 ) {
   const going = scope?.kind === "go";
   if (group === "repository" && context.repo) {
-    const name = `${context.repo.owner.slug}/${context.repo.name}`;
+    const name = `${context.repo.space.slug}/${context.repo.name}`;
     return going ? name : `In ${name}`;
   }
   if (group === "actions") return "Actions";
@@ -551,7 +551,7 @@ function Palette({
     pathname,
     repo,
     trackers: trackers?.trackers ?? null,
-    defaultTrackerId: trackers?.defaultOwnerId ?? null,
+    defaultTrackerId: trackers?.defaultSpaceId ?? null,
     query,
     search: location.search,
     hash: location.hash,
@@ -562,15 +562,19 @@ function Palette({
     () => (open ? readRecent(viewerId) : []),
     [open, viewerId],
   );
+  const recentRecovery = useMemo(
+    () => (open ? readRecentRecovery(viewerId) : null),
+    [open, viewerId],
+  );
 
   // The timelines of the tracker in view (else the one /tracker opens), once per opening.
   const defaultTracker =
-    trackers?.trackers.find((tracker) => tracker.id === trackers.defaultOwnerId)?.slug ?? null;
-  const timelineOwner = contextTracker(context)?.slug ?? defaultTracker;
+    trackers?.trackers.find((tracker) => tracker.id === trackers.defaultSpaceId)?.slug ?? null;
+  const timelineSpace = contextTracker(context)?.slug ?? defaultTracker;
   // Switching scopes the page in view, so it offers the timelines of the
-  // account the page is about (as the banner reads them), else the default's.
-  const switchOwner =
-    scopeOwner(pathname, location.search) ?? defaultTracker ?? trackers?.trackers[0]?.slug ?? null;
+  // Space the page is about (as the banner reads them), else the default's.
+  const switchSpace =
+    scopeSpace(pathname, location.search) ?? defaultTracker ?? trackers?.trackers[0]?.slug ?? null;
   const [timelines, setTimelines] = useState<JumpContext["timelines"]>([]);
   const [switchable, setSwitchable] = useState<NonNullable<PaletteContext["timelines"]>>([]);
   useEffect(() => {
@@ -578,8 +582,8 @@ function Palette({
     setSwitchable([]);
     if (!open || !viewer) return;
     const controller = new AbortController();
-    const read = (owner: string) =>
-      api<TimelineList>(`/tracker/${encodeURIComponent(owner)}/timelines`, {
+    const read = (space: string) =>
+      api<TimelineList>(`/tracker/${encodeURIComponent(space)}/timelines`, {
         signal: controller.signal,
       });
     // Open ones first: they're what a person switches to.
@@ -590,19 +594,19 @@ function Palette({
           .sort((a, b) => Number(ended(a)) - Number(ended(b)))
           .map((t) => ({ slug: t.slug, name: t.name, status: t.status, repos: t.repos })),
       );
-    if (timelineOwner)
-      read(timelineOwner).then(
+    if (timelineSpace)
+      read(timelineSpace).then(
         (list) => {
           setTimelines(
-            list.timelines.map((t) => ({ slug: t.slug, name: t.name, owner: timelineOwner })),
+            list.timelines.map((t) => ({ slug: t.slug, name: t.name, space: timelineSpace })),
           );
-          if (switchOwner === timelineOwner) offer(list);
+          if (switchSpace === timelineSpace) offer(list);
         },
         () => {},
       );
-    if (switchOwner && switchOwner !== timelineOwner) read(switchOwner).then(offer, () => {});
+    if (switchSpace && switchSpace !== timelineSpace) read(switchSpace).then(offer, () => {});
     return () => controller.abort();
-  }, [open, viewer, timelineOwner, switchOwner]);
+  }, [open, viewer, timelineSpace, switchSpace]);
 
   // Direct jumps: what a reference names, through the one resolver.
   const typed = query.trim().replace(/\s+/g, " ");
@@ -611,13 +615,13 @@ function Palette({
   const jumpContext: JumpContext = {
     here: { pathname, search: location.search, state: location.state as unknown },
     repo,
-    tracker: contextTracker(context)?.slug ?? repo?.owner.slug ?? null,
-    owner: refContextFromPath(pathname).owner ?? null,
+    tracker: contextTracker(context)?.slug ?? repo?.space.slug ?? null,
+    space: refContextFromPath(pathname).space ?? null,
     recentRepos: recents
       .filter((place) => place.kind === "repo")
       .map((place) => {
-        const [owner = "", name = ""] = place.title.split("/");
-        return { owner, name };
+        const [space = "", name = ""] = place.title.split("/");
+        return { space, name };
       }),
     timelines,
   };
@@ -747,7 +751,7 @@ function Palette({
                   activate: (env: PaletteEnv) =>
                     env.scope({
                       kind: "repo",
-                      owner: result.owner,
+                      space: result.space.slug,
                       name: result.name,
                       defaultBranch: result.defaultBranch,
                     }),
@@ -940,6 +944,18 @@ function Palette({
               />
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
+              {recentRecovery && (
+                <p className="m-0 px-2.5 py-3 text-body-sm text-ink-muted" role="status">
+                  Earlier recent places contain an unrecognized scope and have not been opened.{" "}
+                  <a
+                    className="text-ink underline"
+                    href={`data:application/json;charset=utf-8,${encodeURIComponent(recentRecovery)}`}
+                    download="gitmatrix-retained-recent-places.json"
+                  >
+                    Download retained recent places
+                  </a>
+                </p>
+              )}
               <div id={listId} role="listbox" aria-label="Results">
                 {(() => {
                   let index = 0;

@@ -234,7 +234,7 @@ function trackerUrl(href: string, children: ReactNode) {
   return <Link to={href}>{children}</Link>;
 }
 export const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
-  // Issue keys, tracker URLs, owner/repo and pkg@version link when they resolve (CORE-22).
+  // Issue keys, tracker URLs, space/repo and pkg@version link when they resolve (CORE-22).
   const refs = useRefMarkdown(trackerUrl);
   return (
     <div className={MARKDOWN}>

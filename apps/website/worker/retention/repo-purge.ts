@@ -6,13 +6,24 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { runPurge, type PurgeStep } from "./repo-deletion.ts";
+import { withWorkflowCutoverAdmission } from "../durable/cutover-admission.ts";
+import {
+  reportWorkflowRuntime,
+  type WorkflowRuntimeProbe,
+} from "../durable/cutover-workflow-runtime.ts";
 
 export interface RepoPurgeParams {
   repoId: string;
 }
 
-export class RepoPurge extends WorkflowEntrypoint<Env, RepoPurgeParams> {
-  async run(event: Readonly<WorkflowEvent<RepoPurgeParams>>, step: WorkflowStep) {
+export class RepoPurge extends WorkflowEntrypoint<Env, RepoPurgeParams | WorkflowRuntimeProbe> {
+  async run(
+    event: Readonly<WorkflowEvent<RepoPurgeParams | WorkflowRuntimeProbe>>,
+    step: WorkflowStep,
+  ) {
+    if ("cutoverRuntime" in event.payload)
+      return reportWorkflowRuntime(this.env, "REPO_PURGE", event, event.payload, step);
+    const { repoId } = event.payload;
     const steps: PurgeStep = {
       do: (name, config, work) =>
         step.do(
@@ -22,8 +33,13 @@ export class RepoPurge extends WorkflowEntrypoint<Env, RepoPurgeParams> {
         ) as Promise<never>,
       sleep: (name, duration) => step.sleep(name, duration as WorkflowSleepDuration),
     };
-    return runPurge(this.env, event.payload.repoId, steps, {
-      waitUntil: (work) => this.ctx.waitUntil(work),
-    });
+    return withWorkflowCutoverAdmission(
+      this.env,
+      "repo-purge",
+      event,
+      step,
+      "REPO_PURGE",
+      (waitUntil) => runPurge(this.env, repoId, steps, { waitUntil }),
+    );
   }
 }

@@ -1,14 +1,52 @@
-// The mention index's backfill (CORE-22): pushes index what they make
-// reachable, so only history pushed before the index existed is missing.
-// The hourly sweep reads, for a few repositories at a time, the most recent
-// commits on the default branch's first-parent line and indexes them, then
-// marks the repository done (commit_mention_backfills). Bounded per run and
-// per repository; a repository is read once, whether or not it had anything.
+// Durable, scoped mention backfill. Authenticated producers persist their real
+// WorkAuthority; the hourly sweep revalidates it before reading any history.
+// Unattributed legacy work and failed/revoked jobs remain explicitly blocked.
 
 import { RepoReader } from "../objects.ts";
 import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { indexMentions, trackerLookup, type IssueLookup, type MentionCommit } from "./index.ts";
+import { captureWorkAuthority, parseWorkAuthority, resolveWorkAuthority } from "../ci/admission.ts";
+import type { Actor } from "../db.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
+
+/** Resume incomplete history without requiring another push. */
+export async function resumeMentionBackfill(
+  env: Env,
+  repoId: string,
+  actor: Pick<Actor, "id" | "agent" | "credential">,
+): Promise<void> {
+  const authority = await captureWorkAuthority(env, repoId, actor);
+  const current = await resolveWorkAuthority(env, authority, repoId);
+  if (
+    current.repo.deleted_at ||
+    !(await resolveSpaceAccess(env.DB, current.actor, authority.spaceId))
+  )
+    throw new Error("mention_space_access_required");
+  const k = db(env.DB);
+  const completed = await k
+    .selectFrom("commit_mention_backfills")
+    .select("repo_id")
+    .where("repo_id", "=", repoId)
+    .executeTakeFirst();
+  if (completed) return;
+  await k
+    .insertInto("mention_backfill_jobs")
+    .values({
+      repo_id: repoId,
+      authority: JSON.stringify(authority),
+      state: "pending",
+      error: null,
+    })
+    .onConflict((oc) =>
+      oc.column("repo_id").doUpdateSet({
+        authority: JSON.stringify(authority),
+        state: "pending",
+        error: null,
+      }),
+    )
+    .execute();
+}
 
 export const BACKFILL_LIMITS = {
   /** Repositories read per run. */
@@ -63,19 +101,21 @@ export interface BackfillResult {
   failed: number;
 }
 
-/** Index recent history for repositories not yet backfilled, most recently pushed first. */
+/** Consume bounded pending work; failures remain blocked until explicitly resumed. */
 export async function backfillMentions(
   env: Env,
   read: HistoryReader,
-  lookup: IssueLookup = trackerLookup(env),
+  lookup?: IssueLookup,
   limits = BACKFILL_LIMITS,
 ): Promise<BackfillResult> {
   const k = db(env.DB);
   const repos = await k
-    .selectFrom("repos as r")
-    .select(["r.id", "r.artifacts_name", "r.artifacts_remote"])
+    .selectFrom("mention_backfill_jobs as j")
+    .innerJoin("repos as r", "r.id", "j.repo_id")
+    .select(["r.id", "r.artifacts_name", "r.artifacts_remote", "j.authority"])
+    .where("j.state", "=", "pending")
+    .where("j.authority", "is not", null)
     .where("r.deleted_at", "is", null)
-    .where("r.pushed_at", "is not", null)
     .where((eb) =>
       eb.not(
         eb.exists(
@@ -94,22 +134,48 @@ export async function backfillMentions(
     let commits = 0;
     let note: string | null = null;
     try {
+      const authority = parseWorkAuthority(repo.authority);
+      const current = await resolveWorkAuthority(env, authority, repo.id);
+      if (!(await resolveSpaceAccess(env.DB, current.actor, authority.spaceId)))
+        throw new Error("mention_space_access_required");
       const history = await read(repo, limits.commits);
       commits = history.length;
-      const indexed = await indexMentions(env.DB, repo.id, history, lookup);
+      const refreshed = await resolveWorkAuthority(env, authority, repo.id);
+      if (!(await resolveSpaceAccess(env.DB, refreshed.actor, authority.spaceId)))
+        throw new Error("mention_space_access_required");
+      const indexed = await indexMentions(
+        env.DB,
+        repo.id,
+        history,
+        lookup ?? trackerLookup(env, repo.id, authority),
+      );
       result.linked += indexed.linked;
       result.ambiguous += indexed.ambiguous;
     } catch (error) {
-      // Marked done anyway: one broken repository mustn't hold up the rest.
+      // Do not mark failed or revoked work completed; preserve its explicit state.
       result.failed++;
       note = error instanceof Error ? error.message.slice(0, 500) : "read failed";
       console.error("Mentions: backfilling a repository failed", { repo: repo.id, error });
     }
-    await k
-      .insertInto("commit_mention_backfills")
-      .values({ repo_id: repo.id, commits, note })
-      .onConflict((oc) => oc.doNothing())
-      .execute();
+    if (note === null) {
+      await k
+        .insertInto("commit_mention_backfills")
+        .values({ repo_id: repo.id, commits, note: null })
+        .onConflict((oc) => oc.doNothing())
+        .execute();
+      await k
+        .deleteFrom("mention_backfill_jobs")
+        .where("repo_id", "=", repo.id)
+        .where("authority", "=", repo.authority)
+        .execute();
+    } else {
+      await k
+        .updateTable("mention_backfill_jobs")
+        .set({ state: "blocked", error: note })
+        .where("repo_id", "=", repo.id)
+        .where("authority", "=", repo.authority)
+        .execute();
+    }
     result.repos++;
   }
   return result;

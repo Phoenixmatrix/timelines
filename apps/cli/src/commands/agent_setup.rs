@@ -31,8 +31,9 @@ pub struct Options {
     pub model: Option<String>,
     pub tags: Vec<String>,
     pub drop_tags: Vec<String>,
-    pub owner: Option<String>,
+    pub space: Option<String>,
     pub team: Option<String>,
+    pub project: Option<String>,
     pub under: Option<String>,
     pub ttl: Option<u32>,
     pub intervention: Option<profile::InterventionMode>,
@@ -68,15 +69,19 @@ fn plan(root: &Path, path: &str, content: String, local: bool) -> Planned {
 /// "matrixorg, team CORE": the tracker and scope agents work in.
 fn scope(project: &Project, local: &Local) -> String {
     let pick = |mine: &Option<String>, shared: &Option<String>| mine.clone().or(shared.clone());
-    let owner = pick(&local.scope.owner, &project.tracker.owner)
+    let space = pick(&local.scope.space, &project.tracker.space)
         .unwrap_or_else(|| "this repository's tracker".into());
-    match (
+    let context = match (
         pick(&local.scope.under, &project.tracker.under),
         pick(&local.scope.team, &project.tracker.team),
     ) {
-        (Some(under), _) => format!("{owner}, under {under}"),
-        (None, Some(team)) => format!("{owner}, team {team}"),
-        _ => owner,
+        (Some(under), _) => format!("{space}, under {under}"),
+        (None, Some(team)) => format!("{space}, team {team}"),
+        _ => space,
+    };
+    match pick(&local.scope.project, &project.tracker.project) {
+        Some(project) => format!("{context}, project {project}"),
+        None => context,
     }
 }
 
@@ -132,8 +137,8 @@ pub fn upsert_section(text: &str, section: &str) -> String {
     format!("{}\n\n{block}\n", text.trim_end())
 }
 
-/// The owner in origin's URL: https://host/OWNER/name(.git) or host:OWNER/name.
-fn origin_owner(root: &Path) -> Option<String> {
+/// The Space in origin's URL: https://host/SPACE/name(.git) or host:SPACE/name.
+fn origin_space(root: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -189,7 +194,7 @@ const PROJECT_HEADER: &str = "\
 # graph-work skill current, and records each checkout's agent (name, harness,
 # model, tags) in .gitmatrix/agent.local.yml, which isn't committed.
 #
-# tracker:       owner, and the default scope for `gm issue next`:
+# tracker:       space, and the default scope for `gm issue next`:
 #                team: CORE, or under: CORE-4 for one project
 # ttl:           seconds per lease (renew before it ends)
 # intervention: autonomous (new setups) or harness (keep the harness's behavior)
@@ -207,8 +212,9 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
 
     // A new project file takes the scope flags; afterwards they're this checkout's.
     if creating_project {
-        project.tracker.owner = o.owner.clone().or_else(|| origin_owner(&root));
+        project.tracker.space = o.space.clone().or_else(|| origin_space(&root));
         project.tracker.team = o.team.clone();
+        project.tracker.project = o.project.clone();
         project.tracker.under = o.under.clone();
         project.ttl = o.ttl;
         project.intervention = Some(
@@ -221,8 +227,9 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
                 *slot = flag.clone();
             }
         };
-        set(&mut local.scope.owner, &o.owner);
+        set(&mut local.scope.space, &o.space);
         set(&mut local.scope.team, &o.team);
+        set(&mut local.scope.project, &o.project);
         set(&mut local.scope.under, &o.under);
         if o.ttl.is_some() {
             local.ttl = o.ttl;
@@ -420,8 +427,8 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     let tag_check = if o.no_identity {
         Value::Null
     } else {
-        let owner = local.scope.owner.clone().or(project.tracker.owner.clone());
-        super::agents::tag_check(&Config::load(), owner.as_deref(), &local.tags)
+        let space = local.scope.space.clone().or(project.tracker.space.clone());
+        super::agents::tag_check(&Config::load(), space.as_deref(), &local.tags)
     };
     let value = json!({
         "dryRun": ctx.dry_run,
@@ -860,7 +867,7 @@ mod tests {
             argv: String::new(),
         };
         let mut options = Options {
-            owner: Some("orbit".into()),
+            space: Some("orbit".into()),
             harness: Some("codex".into()),
             no_identity: true,
             ..Default::default()

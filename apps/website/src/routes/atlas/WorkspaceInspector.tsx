@@ -49,12 +49,12 @@ const STATE_LABEL: Record<AtlasLinkState, string> = {
 export type RepoNames = ReadonlyMap<string, string>;
 
 /** A source file at an indexed commit, linked to that commit (never a branch). */
-function FileAt({ owner, names, file }: { owner: string; names: RepoNames; file: AtlasFileRef }) {
+function FileAt({ space, names, file }: { space: string; names: RepoNames; file: AtlasFileRef }) {
   const repo = names.get(file.repoId);
   if (!repo) return <span className="font-mono">{file.path}</span>;
   return (
     <Link
-      to={blobUrl(owner, repo, file.commit, file.path, file.sourceId ?? "canonical")}
+      to={blobUrl(space, repo, file.commit, file.path, file.sourceId ?? "canonical")}
       className="min-w-0 truncate font-mono text-ink-muted hover:text-ink pointer-coarse:py-2.5"
       title={`${repo}/${file.path} at ${short(file.commit)}`}
     >
@@ -204,7 +204,7 @@ export function CrossLinks({
           {current.items.map((link) => (
             <CrossLinkRow
               key={`${link.src}|${link.dst}|${link.package?.name ?? ""}`}
-              owner={workspace.owner}
+              space={workspace.space}
               names={names}
               link={link}
               direction={direction}
@@ -239,13 +239,13 @@ export function CrossLinks({
 }
 
 function CrossLinkRow({
-  owner,
+  space,
   names,
   link,
   direction,
   onPick,
 }: {
-  owner: string;
+  space: string;
   names: RepoNames;
   link: AtlasCrossLink;
   direction: AtlasDirection;
@@ -339,13 +339,13 @@ function CrossLinkRow({
           <ul className="m-0 flex list-none flex-col gap-0.5 p-0 pl-2 text-micro">
             {evidence.importers.files.map((f) => (
               <li key={`${f.repoId}|${f.path}`} className="flex min-w-0">
-                <FileAt owner={owner} names={names} file={f} />
+                <FileAt space={space} names={names} file={f} />
               </li>
             ))}
           </ul>
           {evidence.manifest && (
             <span className="flex min-w-0 flex-wrap items-baseline gap-x-1 text-micro text-ink-faint">
-              Nearest manifest: <FileAt owner={owner} names={names} file={evidence.manifest} />
+              Nearest manifest: <FileAt space={space} names={names} file={evidence.manifest} />
               <span>(located by path; the Atlas doesn't read it)</span>
             </span>
           )}

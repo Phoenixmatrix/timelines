@@ -9,14 +9,14 @@ This page takes you from nothing to a change on trunk with a green CI run. It us
 
 ## Get access
 
-Timelines is invite-only for now. A site administrator invites your email address, and you sign in to the web app at [timelinesapp.fward.dev](https://timelinesapp.fward.dev) with a one-time code sent to that address. Whoever invites you also gives you access to `gm`, which is published as a package of the `matrixorg` account.
+Timelines is invite-only for now. An Instance administrator invites your email address, and you sign in to the web app at [timelinesapp.fward.dev](https://timelinesapp.fward.dev) with a one-time code sent to that address. Your Account is your person identity. Organizations contain Spaces, and each Space owns its repositories, Tracker, Projects, packages and content settings. Organization membership or ownership alone does not grant private content access: ask for an explicit Space grant. A repository collaborator grant covers only that repository.
 
 ## Get gm
 
 `gm` is a single binary, published for Linux on x86-64 and ARM64 (glibc 2.36 or newer).
 
 1. In the web app, create a personal access token under [Settings, Access tokens](https://timelinesapp.fward.dev/settings/tokens).
-2. Open the `gm` package under Packages. Its page shows the latest version and the `curl` command that downloads it with your token.
+2. Open the `gm` package under Packages in the `matrixorg` Space. Your inviter must give you package access there. Its page shows the latest version and the `curl` command that downloads it with your token. Verify the downloaded artifact against its published SHA-256 checksum.
 3. Make the downloaded file executable and put it on your `PATH`, for example in `~/.local/bin`:
 
 ```sh
@@ -24,13 +24,19 @@ chmod +x gm && mv gm ~/.local/bin/gm
 gm --version
 ```
 
-From then on, `gm` updates itself. `gm pkg install` downloads the binary for your platform, verifies its SHA-256 checksum and replaces the installed one, even while it runs:
+Once you have a compatible CLI and have signed in below, `gm` can update itself. `gm pkg install` downloads the binary for your platform, verifies its SHA-256 checksum and replaces the installed one, even while it runs:
 
 ```sh
-gm pkg install gm --owner matrixorg --force
+gm pkg install gm --space matrixorg --force
 ```
 
 gm does not edit your shell configuration; add its directory to `PATH` yourself.
+
+### Upgrading across the v4 content cutover
+
+The Space/Project commands on this page require the v4 content-contract CLI and a compatible server. An old CLI may neither recognize `--space` nor access the v4 content API; changing its flags is not an upgrade. Wait for the coordinated v4 server activation and CLI release publication, then download the released binary through the package page above rather than invoking the old CLI's package commands. Verify its published checksum and release provenance before replacing the installed binary. Do not install an unreleased feature build into your shared `PATH`.
+
+For an existing checkout, `apps/cli/README.md` has the checksum-verified `installGm` bootstrap procedure using `tools/preview/preview.ts` from the exact released `main` source. It uses a temporary compatible client, checks the published version against the released `apps/cli` tree ID, and pins that version for installation. Preserve legacy Tracker replicas and queued work; follow [offline recovery](/docs/concepts/issue-graph/#offline) before replaying them. These instructions describe the coordinated upgrade, not a claim that the cutover has been approved or deployed.
 
 ## Sign in
 
@@ -50,17 +56,17 @@ Credentials live in `~/.config/gitmatrix/gm.json`. The `GM_SERVER` and `GM_TOKEN
 
 ## Create or clone a repository
 
-Create a repository on the server. It is private unless you pass `--public`, and `--import` copies an existing public git repository:
+Create a repository in a Space where you have an explicit grant permitting creation. `--space` is required and takes the globally unique Space handle, not an Account handle or Organization slug. The repository is private unless you pass `--public`, and `--import` copies an existing public git repository:
 
 ```sh
-gm repo create demo
-gm repo create engine --owner orbit --import https://github.com/lukeed/clsx
+gm repo create demo --space orbit
+gm repo create engine --space orbit --import https://github.com/lukeed/clsx
 ```
 
-Clone it. Use your own account or organization name as the owner:
+Clone it with the canonical `<space>/<repo>` locator. Here `orbit` is the Space handle:
 
 ```sh
-gm clone <owner>/demo
+gm clone orbit/demo
 cd demo
 ```
 

@@ -54,7 +54,7 @@ const WORK: LinkedWork = {
   issue: { id: "orb-1", key: "ORB-1", title: "Index the docs", status: "done" },
   commits: [
     {
-      repo: { id: "r-app", owner: "orbit", name: "app" },
+      repo: { id: "r-app", space: "orbit", name: "app" },
       oid: "a".repeat(40),
       changeId: null,
       summary: "Build the docs index",
@@ -104,7 +104,7 @@ test("lists what my agents finished, filters it, and loads an issue's work only 
           ]
         : LIST.items,
   }));
-  server.on("GET", "/api/tracker/:owner/issues/:issue/work", WORK);
+  server.on("GET", "/api/tracker/:space/issues/:issue/work", WORK);
   const app = renderApp("/agent-work");
 
   await expect.element(page.getByRole("heading", { name: "Agent work", level: 1 })).toBeVisible();

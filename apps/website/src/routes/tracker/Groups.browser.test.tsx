@@ -2,6 +2,7 @@
 // in-progress work leads under one column header, sorting reorders inside
 // each group, a group folds away (and j/k skips it), and the list goes flat
 // on request or when the filter leaves one group.
+// Sorting and query context survive inspector navigation and browser history.
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
@@ -34,7 +35,7 @@ test("progress groups: work underway first, sorted inside, foldable, and flat on
     { kind: "issue.claim", id: "taken", data: { agent: "laptop" } },
   ]);
   localStorage.setItem("gitmatrix:tracker-shortcuts", "true");
-  const app = renderApp("/tracker/orbit?q=team%3Agrp+is%3Aopen");
+  const app = renderApp("/tracker/orbit?q=team%3Agrp+is%3Aopen#issue-list");
 
   const table = page.getByRole("table", { name: "Issues" });
   const titles = async () =>
@@ -81,8 +82,15 @@ test("progress groups: work underway first, sorted inside, foldable, and flat on
     (document.activeElement as HTMLElement | null)?.blur();
     await press(key);
   };
-  const opened = (key: string) =>
-    expect.element(page.getByRole("complementary", { name: `Issue ${key}` })).toBeVisible();
+  const context = () => {
+    expect(app.url().searchParams.get("sort")).toBe("priority");
+    expect(app.url().searchParams.get("q")).toBe("team:grp is:open");
+    expect(app.url().hash).toBe("#issue-list");
+  };
+  const opened = async (key: string) => {
+    await expect.element(page.getByRole("complementary", { name: `Issue ${key}` })).toBeVisible();
+    context();
+  };
   await shortcut("j");
   await opened("GRP-4");
   await shortcut("j");
@@ -91,10 +99,12 @@ test("progress groups: work underway first, sorted inside, foldable, and flat on
   await opened("GRP-2");
   await shortcut("Escape");
   await app.waitForUrl((url) => !url.pathname.includes("/issues/"));
+  context();
 
   // Flat on request: no group rows, and the priority sort runs across everything.
   await userEvent.click(page.getByRole("button", { name: "Group", exact: true }));
   await app.waitForUrl((url) => url.searchParams.get("group") === "none");
+  context();
   await expect.element(group(/^In progress/)).not.toBeInTheDocument();
   await expect
     .poll(titles)
@@ -106,6 +116,23 @@ test("progress groups: work underway first, sorted inside, foldable, and flat on
     ]);
   await userEvent.click(page.getByRole("button", { name: "Group", exact: true }));
   await app.waitForUrl((url) => !url.searchParams.has("group"));
+  context();
+  // Grouping replaces the current entry, but inspector navigation pushes:
+  // Back restores the selected issue, Forward restores the list and its sort.
+  await app.back();
+  await opened("GRP-2");
+  await app.forward();
+  await app.waitForUrl((url) => !url.pathname.includes("/issues/"));
+  context();
+  // A toolbar action immediately after Forward must not restore the inspector
+  // from the previous render's pathname.
+  await userEvent.click(page.getByRole("button", { name: "Group", exact: true }));
+  await app.waitForUrl((url) => url.searchParams.get("group") === "none");
+  expect(app.url().pathname).toBe("/tracker/orbit");
+  await expect
+    .element(page.getByRole("complementary", { name: "Issue GRP-2" }))
+    .not.toBeInTheDocument();
+  context();
 
   // A filter that leaves one group needs no group row.
   await app.navigate("/tracker/orbit?q=team%3Agrp+is%3Aclaimed");
@@ -131,6 +158,10 @@ test("progress groups: the group being read stays pinned under the header until 
   const table = page.getByRole("table", { name: "Issues" });
   await expect.element(table.getByRole("button", { name: /^Up next 40/ })).toBeVisible();
   const pane = table.element() as HTMLElement;
+  // Organization/Space controls must leave the entire scroll pane on screen.
+  await expect
+    .poll(() => pane.getBoundingClientRect().bottom)
+    .toBeLessThanOrEqual(window.innerHeight);
   const pinned = () => pane.querySelector<HTMLElement>(":scope > [aria-hidden]");
   const scrollTo = async (top: number) => {
     pane.scrollTop = top;

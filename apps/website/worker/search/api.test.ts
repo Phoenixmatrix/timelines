@@ -5,9 +5,12 @@ import type { SearchGroup, SearchResponse } from "../../shared/search.ts";
 import { SEARCH_LIMITS } from "../../shared/search.ts";
 import type { AppEnv } from "../auth.ts";
 import { readableRepo, roleFor, selectRepos, type Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { PROVIDERS, type AnySearchProvider, type SearchProvider } from "./providers.ts";
 import { searchApi } from "./api.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
+const closers: Array<() => void> = [];
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann Lee", isSiteAdmin: false };
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben Ito", isSiteAdmin: false };
@@ -18,18 +21,35 @@ const D1_PROVIDERS = PROVIDERS.filter(
   (provider) => provider.category !== "issues" && provider.category !== "packages",
 );
 
-function setup(providers: readonly AnySearchProvider[] = D1_PROVIDERS) {
-  const sqlite = migratedDatabase();
+async function setup(providers: readonly AnySearchProvider[] = D1_PROVIDERS) {
+  const fresh = await createFreshSpaceTestEnvironment();
+  const { sqlite, env } = fresh;
+  closers.push(fresh.close);
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
-      ('ann', 'user', 'ann', 'Ann Lee', NULL), ('ben', 'user', 'ben', 'Ben Ito', NULL),
-      ('root', 'user', 'root', 'Root', NULL),
-      ('orbit', 'org', 'orbit', 'Orbit Labs', 'read'),
-      ('vault', 'org', 'vault', 'Vault', 'none');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'member'), ('vault', 'ann', 'member'), ('vault', 'ben', 'owner');
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES
+      ('ann', 'user', 'ann', 'Ann Lee'), ('ben', 'user', 'ben', 'Ben Ito'),
+      ('root', 'user', 'root', 'Root');
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, default_space_id) VALUES
+      ('org-ann', 'org-ann', 'Ann', 'company', 'ann'),
+      ('org-ben', 'org-ben', 'Ben', 'company', 'ben'),
+      ('org-orbit', 'org-orbit', 'Orbit Labs', 'company', 'orbit'),
+      ('org-vault', 'org-vault', 'Vault', 'company', 'vault');
+    INSERT INTO spaces (id, organization_id, slug, display_name) VALUES
+      ('ann', 'org-ann', 'ann', 'Ann'), ('ben', 'org-ben', 'ben', 'Ben'),
+      ('orbit', 'org-orbit', 'orbit', 'Orbit Labs'), ('vault', 'org-vault', 'vault', 'Vault');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by) VALUES
+      ('org-ann', 'ann', 'owner', 'test', 'ann'), ('org-ben', 'ben', 'owner', 'test', 'ben'),
+      ('org-orbit', 'ann', 'member', 'test', 'ann'), ('org-vault', 'ann', 'member', 'test', 'ann'),
+      ('org-vault', 'ben', 'owner', 'test', 'ben');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by) VALUES
+      ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test', 'ann'),
+      ('ben', 'org-ben', 'ben', 'admin', 'write', 'write', 'test', 'ben'),
+      ('orbit', 'org-orbit', 'ann', 'member', 'read', 'read', 'test', 'ann'),
+      ('vault', 'org-vault', 'ann', 'member', 'none', 'read', 'test', 'ann'),
+      ('vault', 'org-vault', 'ben', 'admin', 'write', 'write', 'test', 'ben');
+    COMMIT;
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
   let actor: Actor | null = ann;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -67,7 +87,7 @@ function repo(
   const id = `repo-${++repoCount}`;
   sqlite
     .prepare(
-      `INSERT INTO repos (id, owner_id, name, description, visibility, artifacts_name, artifacts_remote, pushed_at)
+      `INSERT INTO repos (id, space_id, name, description, visibility, artifacts_name, artifacts_remote, pushed_at)
        VALUES (?, ?, ?, ?, ?, ?, '', ?)`,
     )
     .run(id, owner, name, description, visibility, id, pushedAt);
@@ -88,17 +108,20 @@ function group(response: SearchResponse, category: string) {
 
 const titles = (g: SearchGroup) => (g.status === "ok" ? g.results.map((r) => r.title) : []);
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  for (const close of closers.splice(0)) close();
+});
 
 describe("global search", () => {
   test("requires a signed-in viewer", async () => {
-    const { call, as } = setup();
+    const { call, as } = await setup();
     as(null);
     expect((await call({ q: "orbit" })).status).toBe(401);
   });
 
   test("returns typed groups with canonical destinations, in category order", async () => {
-    const { sqlite, search } = setup();
+    const { sqlite, search } = await setup();
     repo(sqlite, "orbit", "engine", { description: "The orbit engine" });
     chat(sqlite, "chat-engine-1", "ann", "Why is the engine slow?", "2026-10-01T00:00:00.000Z");
     const response = await search({ q: "orbit engine" });
@@ -118,25 +141,26 @@ describe("global search", () => {
         // "orbit/engine" reads as the words "orbit engine".
         match: "word",
         target: { kind: "path", path: "/orbit/engine" },
-        owner: "orbit",
+        space: expect.objectContaining({ id: "orbit", slug: "orbit", organizationId: "org-orbit" }),
         name: "engine",
         visibility: "public",
         defaultBranch: "main",
       },
     ]);
 
-    const people = await search({ q: "orbit" });
+    expect(group(await search({ q: "orbit" }), "accounts").results).toEqual([]);
+    const people = await search({ q: "ann" });
     expect(group(people, "accounts").results).toEqual([
       {
         category: "accounts",
-        id: "accounts:orbit",
-        title: "Orbit Labs",
-        subtitle: "orbit",
+        id: "accounts:ann",
+        title: "Ann Lee",
+        subtitle: "ann",
         breadcrumb: [],
         match: "exact",
-        target: { kind: "path", path: "/orbit" },
-        kind: "org",
-        slug: "orbit",
+        target: { kind: "path", path: "/accounts/ann" },
+        kind: "user",
+        slug: "ann",
       },
     ]);
 
@@ -165,7 +189,7 @@ describe("global search", () => {
   });
 
   test("ranks exact identifiers over prefixes, words and descriptions, then by recency and ID", async () => {
-    const { sqlite, search } = setup();
+    const { sqlite, search } = await setup();
     repo(sqlite, "ann", "notes", { description: "has an engine inside", pushedAt: "2026-09-30" });
     repo(sqlite, "ann", "rocket-engine", { pushedAt: "2026-09-29" });
     repo(sqlite, "ann", "engine-tools", { pushedAt: "2026-09-01" });
@@ -189,7 +213,7 @@ describe("global search", () => {
   });
 
   test("never shows a repository the viewer can't read, and honors revocation", async () => {
-    const { sqlite, search, as } = setup();
+    const { sqlite, search, as } = await setup();
     const secret = repo(sqlite, "ben", "secret-plans", {
       visibility: "private",
       description: "secret",
@@ -210,7 +234,7 @@ describe("global search", () => {
     sqlite.exec(`DELETE FROM repo_collaborators WHERE user_id = 'ann'`);
     expect(await visible()).toEqual(["orbit/secret-orbit"]);
 
-    // Ben owns his repo and the vault org; admins read everything.
+    // Ben has explicit admin grants for his Space and vault; operators read everything.
     as(ben);
     expect(await visible()).toEqual(["ben/secret-plans", "vault/secret-vault"]);
     as(admin);
@@ -218,13 +242,13 @@ describe("global search", () => {
   });
 
   test("authorizes repositories in SQL exactly as permissions.ts does", async () => {
-    const { sqlite, env } = setup();
+    const { sqlite, env } = await setup();
     for (const owner of ["ann", "ben", "orbit", "vault"])
       for (const visibility of ["public", "private"])
         repo(sqlite, owner, `r-${visibility}`, { visibility });
     sqlite.exec(`
       INSERT INTO repo_collaborators (repo_id, user_id, role)
-        SELECT id, 'ben', 'write' FROM repos WHERE owner_id = 'orbit' AND visibility = 'private';
+        SELECT id, 'ben', 'write' FROM repos WHERE space_id = 'orbit' AND visibility = 'private';
     `);
     for (const viewer of [ann, ben, admin]) {
       const rows = await selectRepos(env.DB, viewer.id).execute();
@@ -238,8 +262,34 @@ describe("global search", () => {
     }
   });
 
+  test("old cursors and Organization ownership never retain revoked repository access", async () => {
+    const { sqlite, search, as } = await setup();
+    for (let i = 0; i < 6; i++) repo(sqlite, "ben", `private-${i}`, { visibility: "private" });
+    as(ben);
+    const first = group(
+      await search({ q: "private", categories: "repositories", limit: "2" }),
+      "repositories",
+    );
+    expect(first.cursor).not.toBeNull();
+    sqlite.exec(`DELETE FROM space_grants WHERE space_id = 'ben' AND account_id = 'ben'`);
+    expect(
+      group(
+        await search({
+          q: "private",
+          categories: "repositories",
+          limit: "2",
+          cursor: first.cursor!,
+        }),
+        "repositories",
+      ).results,
+    ).toEqual([]);
+    expect(
+      group(await search({ q: "private", categories: "repositories" }), "repositories").results,
+    ).toEqual([]);
+  });
+
   test("searches only the viewer's own conversation titles, all of them", async () => {
-    const { sqlite, search } = setup();
+    const { sqlite, search } = await setup();
     // More than the chat directory's 200; the oldest still matches.
     sqlite.exec("BEGIN");
     for (let i = 0; i < 250; i++)
@@ -259,7 +309,7 @@ describe("global search", () => {
   });
 
   test("rejects empty, oversized and malformed queries", async () => {
-    const { call } = setup();
+    const { call } = await setup();
     for (const params of [
       {},
       { q: "   " },
@@ -277,7 +327,7 @@ describe("global search", () => {
   });
 
   test("matches LIKE wildcards literally", async () => {
-    const { sqlite, search } = setup();
+    const { sqlite, search } = await setup();
     repo(sqlite, "ann", "plain");
     repo(sqlite, "ann", "100_percent", { description: "100% done" });
     for (const q of ["%", "_", "\\"])
@@ -288,7 +338,7 @@ describe("global search", () => {
   });
 
   test("pages with cursors bound to their query, up to the documented depth", async () => {
-    const { sqlite, search, call } = setup();
+    const { sqlite, search, call } = await setup();
     sqlite.exec("BEGIN");
     for (let i = 0; i < 130; i++) {
       const slug = `bulk-${String(i).padStart(3, "0")}`;
@@ -312,6 +362,15 @@ describe("global search", () => {
     expect(new Set(seen).size).toBe(seen.length);
     expect(seen[0]).toBe("accounts:bulk-000");
     expect(last).toMatchObject({ cursor: null, truncated: true });
+    expect(
+      (
+        await call({
+          q: "bulk",
+          categories: "accounts",
+          cursor: btoa(JSON.stringify({ v: 1, c: "accounts", q: "bulk", o: 20 })),
+        })
+      ).status,
+    ).toBe(400);
 
     // A cursor only resumes the query and category that issued it.
     const first = group(await search({ q: "bulk", categories: "accounts" }), "accounts");
@@ -336,7 +395,7 @@ describe("global search", () => {
       search: () => new Promise(() => {}),
     };
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const { sqlite, search } = setup([D1_PROVIDERS[0]!, failing, slow]);
+    const { sqlite, search } = await setup([D1_PROVIDERS[0]!, failing, slow]);
     repo(sqlite, "orbit", "engine");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const pending = search({ q: "engine" });
@@ -347,7 +406,7 @@ describe("global search", () => {
       {
         category: "accounts",
         status: "unavailable",
-        error: "Couldn't search people and organizations right now.",
+        error: "Couldn't search people right now.",
       },
       {
         category: "conversations",
@@ -361,7 +420,7 @@ describe("global search", () => {
   });
 
   test("is never stored by a shared cache", async () => {
-    const { call } = setup();
+    const { call } = await setup();
     expect((await call({ q: "orbit" })).headers.get("cache-control")).toBe("private, no-store");
   });
 });

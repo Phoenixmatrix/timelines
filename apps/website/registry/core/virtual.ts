@@ -38,18 +38,9 @@ export function isPinned(repo: Repository, name: string): boolean {
   return matchesAny(name, repo.config.pinnedNamespaces ?? []);
 }
 
-const memberCache = new Map<string, { members: VirtualMember[]; until: number }>();
-
 export async function members(services: Services, repo: Repository): Promise<VirtualMember[]> {
-  const hit = memberCache.get(repo.id);
-  if (hit && hit.until > Date.now()) return hit.members;
   const list = await virtualMembers(services.db, repo.id);
-  memberCache.set(repo.id, { members: list, until: Date.now() + 10_000 });
-  return list;
-}
-
-export function invalidateMembers(): void {
-  memberCache.clear();
+  return list.filter((member) => member.repo.spaceId === repo.spaceId);
 }
 
 /**

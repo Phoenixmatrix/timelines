@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, globSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import {
   refusal,
   reusableStages,
   selectStages,
+  snapshotInputs,
   type RunRecord,
 } from "./ai-stages.ts";
 
@@ -200,6 +202,55 @@ function record(overrides: Partial<RunRecord>): RunRecord {
     ...overrides,
   };
 }
+
+await test("hosted snapshots invalidate all reused stages and reject unsynchronized source", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-snapshot-"));
+  const manifestPath = join(home, "manifest.json");
+  const path = "source.ts";
+  const commit = async (content: string) => {
+    await writeFile(join(home, path), content);
+    const files = [
+      {
+        path,
+        size: Buffer.byteLength(content),
+        sha256: createHash("sha256").update(content).digest("hex"),
+        mode: 0o644,
+      },
+    ];
+    const revision = createHash("sha256").update(JSON.stringify(files)).digest("hex");
+    await writeFile(manifestPath, JSON.stringify({ revision, files }));
+  };
+  try {
+    await commit("first");
+    const first = await snapshotInputs(home, manifestPath);
+    const previous = record({
+      base: first.base,
+      fingerprints: first.prints,
+      outcomes: Object.fromEntries(STAGE_IDS.map((id) => [id, "passed"])),
+    });
+    assert.deepEqual([...reusableStages([previous], null, first.prints)], STAGE_IDS);
+    await writeFile(join(home, path), "uncommitted remote edit");
+    await assert.rejects(snapshotInputs(home, manifestPath), /differs from its committed snapshot/);
+    await commit("second");
+    const second = await snapshotInputs(home, manifestPath);
+    assert.deepEqual([...reusableStages([previous], null, second.prints)], []);
+    const full = selectStages({
+      changed: second.changed,
+      all: true,
+      base: second.base,
+      fingerprints: second.prints,
+    });
+    assert.deepEqual(full.stages, STAGE_IDS);
+    assert(refusal([previous], full), "A changed snapshot must not bypass the failure cooldown");
+    await writeFile(manifestPath, JSON.stringify({ revision: second.sourceSnapshot, files: [] }));
+    await assert.rejects(
+      snapshotInputs(home, manifestPath),
+      /Invalid committed remote source manifest/,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 await test("--resume skips only stages that passed with the same base and inputs", async () => {
   const home = await mkdtemp(join(tmpdir(), "gitmatrix-stages-"));

@@ -44,6 +44,7 @@ import {
 } from "./graph.ts";
 import { runBatched, type Statement } from "./util.ts";
 import { dropTimelineRegrouping, storeTimelineRegrouping } from "../atlas/timelineGrouping.ts";
+import { paidWorkGuard } from "./paid-work.ts";
 
 /** Commits read looking for the merge base before comparing trees directly. */
 export const MAX_HISTORY_READS = 2000;
@@ -480,6 +481,7 @@ export async function storeOverlay(
     .where("ref", "=", ref)
     .executeTakeFirst();
   // Point at the new changes, then drop the old ones: readers never see half.
+  await paidWorkGuard()?.check();
   const pointed = await k
     .insertInto("kg_overlays")
     .values({
@@ -597,19 +599,24 @@ export function endReason(
 
 /**
  * Whether the timeline behind a bookmark has landed or been abandoned, from
- * its record in the account's tracker; null when it goes on, has no record,
+ * its record in the Space's tracker; null when it goes on, has no record,
  * or the tracker can't be reached.
  */
 export async function timelineEnd(
   env: Env,
-  ownerId: string,
+  spaceId: string,
+  repoId: string,
   ref: string,
 ): Promise<"landed" | "abandoned" | null> {
   const slug = timelineSlugOf(ref);
   if (!slug) return null;
   try {
-    const reply = await trackerObject(env, ownerId).timeline(slug, 0, 1);
-    return reply.ok ? endReason(reply.value.timeline.status) : null;
+    const reply = await trackerObject(env, spaceId).timelineLifecycle({
+      spaceId,
+      repoId,
+      timelineSlug: slug,
+    });
+    return reply.ok ? endReason(reply.value?.status) : null;
   } catch (error) {
     console.warn("Knowledge: looking up a timeline failed", { slug, error });
     return null;

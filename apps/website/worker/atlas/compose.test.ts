@@ -1,9 +1,6 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type {
   AtlasCrossLink,
   AtlasWorkspaceComposition,
@@ -11,7 +8,8 @@ import type {
 } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { clearCompositionCache, compose, PublisherIndex } from "./compose.ts";
 import {
   beginRepoProjection,
@@ -26,7 +24,14 @@ import { recordPublishedPackages, type RecordedPackage } from "./publishers.ts";
 import { workspaceAtlas } from "./workspace.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -36,16 +41,10 @@ const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: fa
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
 
 /** The registry's own database, from its migrations. */
-function registryDatabase() {
-  const sqlite = new DatabaseSync(":memory:");
-  const dir = fileURLToPath(new URL("../../registry/migrations/", import.meta.url).href);
-  for (const file of readdirSync(dir)
-    .filter((f) => f.endsWith(".sql"))
-    .sort())
-    sqlite.exec(readFileSync(join(dir, file), "utf8"));
+function registryDatabase(sqlite: DatabaseSync) {
   const now = "2026-10-01T00:00:00.000Z";
   sqlite.exec(`
-    INSERT INTO repositories (id, key, format, owner_id, kind, visibility, created_at, updated_at) VALUES
+    INSERT INTO repositories (id, key, format, space_id, kind, visibility, created_at, updated_at) VALUES
       ('feed_npm', 'ann', 'npm', 'ann', 'local', 'private', '${now}', '${now}');
     INSERT INTO packages (id, repo_id, name, normalized_name, created_at, updated_at) VALUES
       ('p_core', 'feed_npm', '@ann/billing-core', '@ann/billing-core', '${now}', '${now}'),
@@ -64,12 +63,26 @@ function registryDatabase() {
   return sqlite;
 }
 
-function database(visibility: "public" | "private" = "private") {
-  const sqlite = migratedDatabase();
+async function database(visibility: "public" | "private" = "private") {
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_app', 'ann', 'app', '${visibility}', 'a1', ''),
       ('r_core', 'ann', 'core', '${visibility}', 'a2', ''),
       ('r_docs', 'ann', 'docs', '${visibility}', 'a3', '');
@@ -77,7 +90,7 @@ function database(visibility: "public" | "private" = "private") {
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES
       ('r_app', 'ben', 'read'), ('r_docs', 'ben', 'read');
   `);
-  return sqlite;
+  return fresh;
 }
 
 function node(sqlite: DatabaseSync, repo: string, id: string, kind: string, name = id) {
@@ -188,10 +201,12 @@ async function build(env: Env, repo: string, commit: string) {
 }
 
 async function world({ visibility = "private" as "public" | "private" } = {}) {
-  const sqlite = database(visibility);
-  const registry = registryDatabase();
+  const fresh = await database(visibility);
+  const { sqlite } = fresh;
+  const registry = registryDatabase(fresh.registry);
   seed(sqlite);
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     REGISTRY_DB: d1(registry),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
@@ -208,8 +223,8 @@ async function world({ visibility = "private" as "public" | "private" } = {}) {
     c.set("actor", actor);
     await next();
   });
-  hono.route("/api/accounts/:owner/atlas", workspaceAtlas);
-  const call = (path: string) => hono.request(`/api/accounts/ann/atlas/${path}`, {}, env);
+  hono.route("/api/spaces/:space/atlas", workspaceAtlas);
+  const call = (path: string) => hono.request(`/api/spaces/ann/atlas/${path}`, {}, env);
   const capOf = async (repo: string, anchor: string) => {
     const row = sqlite
       .prepare(
@@ -485,6 +500,34 @@ describe("Atlas cross-repository composition", () => {
     // other publisher of @ann/shared, isn't selected).
     w.as(ann);
     expect((await w.get<AtlasWorkspaceComposition>("composition?repos=app,core")).resolved).toBe(2);
+  });
+
+  test("repository collaboration never supplies a package grant, and package revocation invalidates warm compositions", async () => {
+    const w = await world({ visibility: "public" });
+    w.as(ben);
+    const path = "composition?repos=app,core,docs";
+    const denied = await w.text(path);
+    expect((await w.get<AtlasWorkspaceComposition>(path)).resolved).toBe(0);
+    expect(denied).not.toContain("c0ffee");
+    w.sqlite.exec(`
+      INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+        VALUES ('org-ann', 'ben', 'member', 'test-fixture', 'ann');
+      INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+        VALUES ('ann', 'org-ann', 'ben', 'member', 'none', 'read', 'test-fixture', 'ann');
+      INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+        VALUES ('audit-ben-package', 'org-ann', 'ann', 'ann', 'space.grant', 'ben', '{"packageRole":"read"}');
+    `);
+    expect((await w.get<AtlasWorkspaceComposition>(path)).resolved).toBeGreaterThan(0);
+    expect((await w.get<AtlasWorkspaceComposition>(path)).resolved).toBeGreaterThan(0);
+    w.sqlite.exec(
+      `UPDATE space_grants SET package_role = 'none' WHERE space_id = 'ann' AND account_id = 'ben'`,
+    );
+    for (const cold of [false, true]) {
+      if (cold) clearCompositionCache();
+      const after = await w.get<AtlasWorkspaceComposition>(path);
+      expect(after.resolved).toBe(0);
+      expect(JSON.stringify(after)).not.toContain("c0ffee");
+    }
   });
 
   test("a denied repository leaves every result byte-identical to a selection without it", async () => {

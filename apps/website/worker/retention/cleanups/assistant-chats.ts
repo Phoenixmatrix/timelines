@@ -41,11 +41,11 @@ const MATCHES = `c.user_id = ?1 AND (c.updated_at < ?2 OR (?3 > 0 AND (
     AND (n.updated_at > c.updated_at OR (n.updated_at = c.updated_at AND n.id > c.id))) >= ?3))`;
 
 function scope(ctx: CleanupContext): [string, string, number] {
-  if (ctx.target.scope !== "account") throw new Error("assistant-chats is an account category.");
+  if (ctx.target.kind !== "person") throw new Error("assistant-chats is a person category.");
   const { days, maxPerUser } = ctx.thresholds;
   if (days === undefined || maxPerUser === undefined)
     throw new Error("assistant-chats needs its days and maxPerUser thresholds.");
-  return [ctx.target.accountId, daysBefore(ctx.now, days), maxPerUser];
+  return [ctx.target.id, daysBefore(ctx.now, days), maxPerUser];
 }
 
 /** Put a chat's row back as it was (a turn may have recreated it meanwhile). */

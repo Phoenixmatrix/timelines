@@ -13,6 +13,7 @@ const GiB = 2 ** 30;
 test("requirements: edit them in the inspector and see eligibility per agent", async () => {
   const server = await TestServer.start({ world: true });
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
@@ -103,13 +104,14 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
   await expect.element(work).toMatchTextContent(/eligible for 1 of 2 open issues/);
   await expect.element(work).toMatchTextContent(/ENG-1 needs at least 64GiB of memory/);
   await expect
-    .element(work.getByRole("link", { name: "Orbit Labs" }))
+    .element(work.getByRole("link", { name: "General", exact: true }))
     .toHaveAttribute("href", `/tracker/orbit?q=${encodeURIComponent("is:open eligible:designer")}`);
 });
 
 test("tags: one catalog for issues, agents and requirements, with label: as an alias (CORE-271)", async () => {
   const server = await TestServer.start({ world: true });
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
@@ -204,6 +206,7 @@ test("tags: one catalog for issues, agents and requirements, with label: as an a
 test("requirements: set at creation, from the issue's tags, and tightening a claim asks first (CORE-272)", async () => {
   const server = await TestServer.start({ world: true });
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
@@ -233,6 +236,7 @@ test("requirements: set at creation, from the issue's tags, and tightening a cla
   });
   // The agent holds it.
   await server.callAsAgent(agent.id, "POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [{ kind: "issue.claim", id: "board", data: { agent: "laptop" } }],
   });
@@ -276,7 +280,7 @@ test("requirements: set at creation, from the issue's tags, and tightening a cla
       /If it fits this work: gm agent setup --tag frontend; gm agent setup --tag web/,
     );
 
-  // Tightening further, the tracker owner releases the claim.
+  // Tightening further, the tracker space releases the claim.
   await userEvent.click(page.getByRole("button", { name: "Remove tag:web" }));
   await expect
     .element(page.getByRole("list", { name: "Requirements" }))
@@ -333,10 +337,10 @@ test("requirements: set at creation, from the issue's tags, and tightening a cla
   // Settings > Agents: what designer can take now.
   await app.navigate("/settings/agents");
   await expect
-    .element(page.getByRole("list", { name: "What designer can take in Orbit Labs" }))
+    .element(page.getByRole("list", { name: "What designer can take in General" }))
     .toMatchTextContent(/ENG-2Tidy the empty state/);
   // Released and unassigned, ENG-1 is what it can't take, and why.
   await expect
-    .element(page.getByRole("list", { name: "What designer can't take in Orbit Labs" }))
+    .element(page.getByRole("list", { name: "What designer can't take in General" }))
     .toMatchTextContent(/ENG-1 needs tag frontend .*needs at least 64GiB of memory/);
 });

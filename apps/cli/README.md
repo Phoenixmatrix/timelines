@@ -6,7 +6,7 @@ discoverable commands, structured errors. It uses a change-based workflow like
 no pull requests.
 
 ```bash
-pnpm run install-bin            # cargo install: puts `gm` in ~/.cargo/bin
+# Start with the published CLI; see installation and bootstrap below.
 gm auth login --persona jun     # dev sign-in; or --token gmx_…
 gm clone orbit/engine && cd engine
 # edit files…
@@ -56,7 +56,7 @@ gm queue wait <returned-id> --deploy --timeout 600
 
 Queue IDs are the full 40-hex source commit IDs. After an uncertain network
 outcome, inspect that deterministic ID before retrying; preserve local work and
-do not assume the source landed. `gm queue` commands accept `-R owner/name`.
+do not assume the source landed. `gm queue` commands accept `-R space/name`.
 `wait` fails on failure, cancellation or timeout; `--deploy` additionally waits
 for the final main pipeline, including coverage by a later run. A landed entry
 alone is not deployment proof. `gm queue cancel <id>` cancels pending work
@@ -118,7 +118,7 @@ direct-push recovery are not permission to bypass timeline approvals.
 
 `gm semantic list` reads the repository's individual syntax-change feed without
 replacing `gm diff`, `gm show`, or ordinary Git history. It uses the current
-repository, or `--repo owner/name` from anywhere:
+repository, or `--repo space/name` from anywhere:
 
 ```bash
 gm semantic list --ref main --limit 30
@@ -164,19 +164,19 @@ gm release notes v1.2.0 -R orbit/engine
 gm release notes day:2026-10-02 --internal -o json
 ```
 
-`gm release feed` reads a tracker account's daily code updates across repositories,
+`gm release feed` reads a Space's daily code updates across repositories,
 latest commit first. Tagged releases (Git tags) are excluded by default to avoid
 counting the same changes twice; use `kind:tag` or a positive `release:v1.2.0`
 filter to select them. `release:day:2026-10-02` selects a UTC day. `--team KEY`
 narrows the feed to one team; other filters include `type:fix repo:engine
 since:30d`, `-tag:docs` (issue tags; `label:` is the old spelling), and search
-words. The account comes from `--owner`, else `gm tracker use`.
+words. The Space comes from `--space`, else `gm tracker use`.
 Internal entries are left out unless you pass `--internal` or a `type:` filter.
 
 ```sh
-gm release feed --owner orbit --team CORE since:2w
+gm release feed --space orbit --team CORE since:2w
 gm release feed type:fix -o json
-gm release feed kind:tag --owner orbit
+gm release feed kind:tag --space orbit
 ```
 
 Entries about issues from trackers you can't read are omitted, and so is any
@@ -225,7 +225,7 @@ previews: tearing one down marks it `expired`.
 In a preview run (CORE-79), `GITMATRIX_TIMELINE` and `GITMATRIX_CHECKPOINT`
 name the timeline and checkpoint, so `gm deploy record --url "$URL"` files the
 preview under them; a revival's record is marked rebuilt. A timeline preview's
-expiry follows the org's retention unless `--expires` pins one. `gm deploy list`
+expiry follows the Space's retention unless `--expires` pins one. `gm deploy list`
 shows `(rebuilt)` on revived previews.
 
 ```sh
@@ -241,17 +241,17 @@ for the API.
 
 ## Distributed issue tracker
 
-Tracker commands work anywhere, without `gm init` or a Git repository. Accounts and
-organizations own trackers; each issue belongs to one team and any number of
-cross-team workspaces. Repository subscriptions are associations, not permissions.
+Tracker commands work anywhere, without `gm init` or a Git repository. Organizations
+contain Spaces; each Space owns a tracker. Each issue belongs to one same-Space Team
+and any number of cross-team Projects. Repository subscriptions grant no permissions.
 
 ```bash
 gm tracker list
 gm tracker use orbit
 gm team create ENG --name Engineering
-gm workspace create launch --name Launch
+gm project create launch --name Launch
 gm issue create 'Search redesign' --team ENG --type prd \
-  --description-file design.md --acceptance-file acceptance.md --workspace launch --tag ux --tag frontend
+  --description-file design.md --acceptance-file acceptance.md --project launch --tag ux --tag frontend
 gm issue ready --limit 10
 gm issue ready --type remediation --all-teams
 gm issue show ENG-1 --limit 20
@@ -260,11 +260,11 @@ gm issue tags                            # the tracker's tag catalog, with count
 gm issue link ENG-1 ENG-2 --kind blocks  # FROM blocks TO
 gm issue checkpoint ENG-1 '@checkpoint.md'
 gm issue evidence ENG-1 'Verified search with the integration smoke'
-gm workspace subscribe launch --repo REPOSITORY_ID
+gm project subscribe launch --repo REPOSITORY_ID
 gm tracker changes --after 0 --limit 100
 ```
 
-Use `--owner orbit` to override the saved tracker. `gm schema issue update` and
+Use `--space orbit` to override the saved tracker. `gm schema issue update` and
 `gm schema issue batch` describe inputs; JSON patch relationship fields use canonical
 IDs, not display keys. `null` clears nullable fields. Description/acceptance file flags
 accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` or `-`.
@@ -272,6 +272,33 @@ accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` 
 an authoritative permission, graph or lease validation. Changing the status or parent
 of an issue whose lease gm kept (its own or an ancestor's) goes online with that lease's
 token, never through the offline outbox. Tracker changes are **not** reversed by `gm undo`.
+
+The saved selector is `tracker.space`, bound to the server's immutable Space ID.
+`tracker.owner`, `--owner`, `gm workspace`, `--workspace`, `workspaceIds` and
+`workspace:` filters are not aliases. Confirm the operator-approved Space mapping,
+select it with `gm tracker use SPACE`, and change agent YAML `tracker.owner`/
+`scope.owner` to `space` and `workspace` to `project`. Invalid YAML scope is rejected
+before commands can fall back to a broader default. Use `projectIds` in JSON patches
+and `project:` in content queries. Person identity and local checkout/worktree names
+are unchanged. Organization administration alone grants no private Space access.
+
+Content JSON requests negotiate `X-Gitmatrix-Content-Version: 4`; replicas and
+mutations bind the immutable Space ID and migration epoch. A fenced legacy replica
+is never silently replayed. Keep its original file and export it for reconciliation:
+
+```bash
+gm tracker export /private/old/orbit.sqlite --destination /private/recovery.sqlite
+```
+
+Export makes a lossless SQLite logical copy, including unknown tables and original
+queued bodies, without selecting a tracker. Keep the original file. Normal use of
+a new v4 replica is fenced when v3 data exists: run online
+`gm tracker recover /private/old/orbit.sqlite --space orbit`. Conversion requires
+server proof of committed v3 receipts and verifies person/agent, server and immutable
+Space; absent or expired proof returns `export_required`, never automatic replay.
+The destination retains proof before opening, and the original stays read-only.
+Credential-rotation recovery within v4 also requires the exact migration epoch and
+preserves ordered batches and operation IDs without deleting the source.
 
 Tag issues by the expertise their scope requires, using repeated `--tag` flags
 (`--label` is the old spelling and still works). Tags come from the tracker's
@@ -342,7 +369,7 @@ runtime, minMemory, minCpus}` (or null), recorded in its history like any field;
 - Tightening requirements on a claimed issue is never silent. When the new ones
   no longer allow the agent holding it, gm prints who it is, its session and
   what it misses (`claimEffect`), keeps the claim and the issue records that;
-  `--release-claim` releases it instead (tracker owners and the agent's
+  `--release-claim` releases it instead (Space admins and the agent's
   accountable person). `--require-issue-tags` adds a `tag:` term for each of
   the issue's tags.
 - `gm issue next` also names the requirements that kept the most ready issues
@@ -350,8 +377,8 @@ runtime, minMemory, minCpus}` (or null), recorded in its history like any field;
   meet them, when the agent really fits that work.
 - An agent that never published capabilities meets no requirement: run
   `gm agent setup` (with `--tag`, `--model`) in its checkout.
-- People bypass capability requirements, not pickup policy. A person who owns
-  the tracker, or the agent's accountable human, can assign despite a capability
+- People bypass capability requirements, not pickup policy. A Space admin,
+  or the agent's accountable human, can assign despite a capability
   mismatch; pickup still applies and the issue shows `assigneeMismatch`.
 - `gm issue show` prints the requirements (`requiresText`) and whether the
   acting identity is eligible (`eligibility`).
@@ -374,8 +401,8 @@ the cached attribution until that refresh. Recovering an older credential replic
 also schedules a snapshot refresh.
 
 ```bash
-gm issue history ENG-1 --owner orbit --limit 50
-gm issue history ENG-1 --owner orbit --before 120 --limit 100 --json
+gm issue history ENG-1 --space orbit --limit 50
+gm issue history ENG-1 --space orbit --before 120 --limit 100 --json
 gm schema issue history
 ```
 
@@ -464,7 +491,7 @@ discards only that batch. Later operations stay queued and may themselves requir
 resolution. No automatic last-writer-wins or dependent-edit deletion occurs.
 
 Replicas live under `$XDG_DATA_HOME/gitmatrix/tracker` (default
-`~/.local/share/gitmatrix/tracker`), partitioned by server, credential and owner,
+`~/.local/share/gitmatrix/tracker`), partitioned by server, credential and Space,
 with directory mode 0700 and database/lock mode 0600 on Unix. The verified account
 ID is pinned before replay, including SSH reauthentication. No auth or lease token
 is stored in the tracker database. A rotated token deliberately selects a fresh
@@ -477,8 +504,8 @@ gm tracker recover /private/old-partition/orbit.sqlite
 gm tracker sync
 ```
 
-Recovery verifies the same server, authenticated account and owner, requires an empty
-destination outbox, and atomically moves the original requests/IDs and snapshot.
+Recovery verifies the same server, authenticated person/agent and immutable Space,
+requires an empty destination outbox, and preserves original operation IDs.
 It never silently imports another identity's work. `tracker status` reports the
 partition parent directory to locate retained replicas. Separate `XDG_DATA_HOME`
 directories provide independent offline replicas for testing or multiple agents.
@@ -614,7 +641,7 @@ gm agent setup --check                           # exit 4 if instructions or ski
   `gitmatrix-graph-work` skill where the harness loads skills (`.agents/skills`,
   plus `.claude/skills` for Claude Code). Text outside the markers is untouched.
 - **Configuration.** `.gitmatrix/agents.yml` is shared and committed: tracker
-  `owner`, default scope (`team` or `under`), lease `ttl`, human `intervention`
+  `space`, default scope (`team`, `project` or `under`), lease `ttl`, human `intervention`
   mode, and `instructions` (`file`, and how work `ship`s).
   `.gitmatrix/agent.local.yml` (git-ignored) is this checkout's agent: name,
   harness, model, tags, scope and intervention overrides.
@@ -629,7 +656,7 @@ gm agent setup --check                           # exit 4 if instructions or ski
   and `GM_TOKEN` always wins. Run by the agent, it refreshes its own profile.
   `--no-identity` writes only the files.
 - **Defaults.** `gm issue next` and `claim` take the session name, scope and
-  lease length from these files, and the tracker owner when none is selected.
+  lease length from these files, and the tracker Space when none is selected.
   `next` only picks issues whose requirements the agent's published profile
   meets (see "Requirements").
 - **Your default team.** When neither a flag nor these files name a team,
@@ -744,7 +771,7 @@ Prompts should include what was tried, the blocker and impact, alternatives
 with tradeoffs, a recommendation, and the specific human action needed.
 Registered agents' requests appear in their accountable person's **Needs you**
 panel by default; `--route-to MEMBER` deliberately routes elsewhere. Use
-`--kind approval` for permission and `--kind credential --secret owner/repo:NAME`
+`--kind approval` for permission and `--kind credential --secret space/repo:NAME`
 for secrets; never put credential values in a prompt or answer.
 
 The request parks a held lease without releasing it or requiring renewal.
@@ -767,7 +794,7 @@ gm agent detect                          # Local metadata; no server or login
 gm agent configure search-agent --model MODEL --tag rust --tag linux \
   --skill 'review=Review Rust changes'
 gm agent show search-agent
-gm agent list --owner orbit              # Profiles visible to this tracker
+gm agent list --space orbit              # Profiles visible to this tracker
 # With the agent's own write token in GM_TOKEN:
 gm agent configure                      # Refresh its own profile
 gm agent show
@@ -866,7 +893,7 @@ ids live in a `change-id` commit header, the same one jj uses.
 
 A timeline is a separate line of work that lands on main later, automatically
 (`auto`) or after a person approves a checkpoint (`approval`)
-([current server contract](../website/README.md#timelines)). The account-wide
+([current server contract](../website/README.md#timelines)). The Space-wide
 tracker record owns one work repository per canonical repository, shared by its
 agents: opaque `work_<id>`, physical `refs/heads/work`. `timeline/<slug>` is still
 a logical overlay/environment label. Work uses canonical permissions, but its
@@ -884,12 +911,12 @@ gm timeline use main                            # back to main
 - **`start <slug>`** forks one through the API: from main, or from another
   timeline with `--from <slug>`. `--name`, `--policy auto|approval`,
   `--experimental` (a marker for timelines not expected to land) and
-  `--repo owner/name` (repeatable; default this checkout's repository, or the
+  `--repo space/name` (repeatable; default this checkout's repository, or the
   parent timeline's) shape it. The server reserves and forks exact source
   snapshots, then binds this checkout as by `use` (`--no-use` skips binding).
 - **`use <slug>`** records `timeline: <slug>` in `.gitmatrix/agent.local.yml`,
   which `gm worktree add` copies. It validates the owned source, fetches through
-  `/<owner>/<repo>@<slug>.git`, and moves `@` onto its work head unless already
+  `/<space>/<repo>@<slug>.git`, and moves `@` onto its work head unless already
   based there. A successful fetch pins the immutable source ID under
   `gitmatrix.source-<slug>`; the friendly URL never replaces source identity.
   `use main` explicitly unbinds and selects canonical main; work elsewhere stays
@@ -916,7 +943,7 @@ gm timeline use main                            # back to main
 - **`list`**, **`show [<slug>]`** read the records and events (fork, merge,
   checkpoint, approval, landing, abandon); `*` and `current` mark this
   checkout's timeline. `list --stalled` shows open timelines with no push for
-  the account's idle period (7 days unless the account changes it), leaving
+  the Space's idle period (7 days unless the Space changes it), leaving
   experimental ones out: stalling is expected of them.
 - **`update [<slug>]`** (or **`flag`**) renames it (`--name`) or sets and clears
   the experimental flag (`--experimental`, `--no-experimental`). The flag marks
@@ -944,10 +971,10 @@ gm timeline use main                            # back to main
   A stopped partial landing requires `--resolve accept-partial-and-abandon`
   with the same version/note; it preserves successful receipts and abandons the
   timeline. Resolution does not itself convert: run plain `migrate` afterward.
-- **`pushes [OPERATION] [--timeline SLUG] [--repo OWNER/NAME]`** lists pending
+- **`pushes [OPERATION] [--timeline SLUG] [--repo SPACE/NAME]`** lists pending
   writes for the timeline's exact owned source, or inspects one retained operation,
   including its terminal outcome, original commands, attribution and recovery audit.
-- **`recover-push OPERATION [--timeline SLUG] [--repo OWNER/NAME]`** recovers
+- **`recover-push OPERATION [--timeline SLUG] [--repo SPACE/NAME]`** recovers
   that exact interrupted write; retry the same ID after a lost response. Selection
   defaults to the current timeline binding and canonical checkout origin; explicit
   selection also works outside a checkout and never changes bindings. The server
@@ -976,8 +1003,8 @@ Both durations and enablement are configurable in Data retention, independently
 of Tracker detail, published wiki and preview expiry. Live dependencies and
 unacknowledged consumers delay deletion. A purged source returns explicit expiry.
 
-`--owner` picks the tracker account; by default it's `.gitmatrix/agents.yml`'s,
-else origin's owner. Every command takes `--dry-run` and prints JSON for agents.
+`--space` picks the tracker Space; by default it's `.gitmatrix/agents.yml`'s,
+else origin's Space. Every command takes `--dry-run` and prints JSON for agents.
 `GM_TIMELINE=<slug>` works in a timeline for one command, over the binding
 (`GM_TIMELINE=main` for main); `profile::timeline()` is what other commands
 read to know the timeline they act in. Tracker commands (`gm issue …`) default
@@ -1126,14 +1153,16 @@ and [cleanup and cost bounds](../../README.md#cleanup-and-cost-bounds).
 ## Automatic AI settings
 
 ```bash
-gm settings ai show --owner orbit
-gm settings ai set --owner orbit --knowledge off
-gm settings ai set --owner orbit --wiki on --atlas on --release-notes off
-gm settings ai set --owner orbit --classification clef \
+gm settings ai show --space orbit
+gm settings ai set --space orbit --knowledge off
+gm settings ai set --space orbit --wiki on --atlas on --release-notes off
+gm settings ai set --space orbit --classification clef \
   --fast gemma-4-26b-a4b-it --task glm-5.3-flash
-gm settings ai set --owner orbit --task gemma-4-26b-a4b-it --dry-run
-gm settings ai set --owner orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60
-gm settings ai set --owner orbit --log-bodies assistant=off --log-bodies avatars=default
+gm settings ai set --space orbit --task gemma-4-26b-a4b-it --dry-run
+gm settings ai set --space orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60
+gm settings ai set --space orbit --log-bodies knowledge=off
+gm settings ai show --person jun
+gm settings ai set --person jun --log-bodies assistant=off --log-bodies avatars=default
 gm settings ai show --site
 gm settings ai set --site --log-bodies on
 ```
@@ -1142,47 +1171,51 @@ gm settings ai set --site --log-bodies on
 time and tokens; "Keep AI request and response bodies in gateway logs" also keeps
 what was sent and returned. It is set per component (`knowledge`, `assistant`,
 `assistant-titles`, `avatars`, `release-notes`, `merge-queue`): `--log-bodies
-on|off|default` sets every component, `COMPONENT=on|off|default` one (repeatable,
-later values win). An account's choice applies to that account's calls; `default`
-follows the site. `--site` (site administrators, people only) sets the site default
-and takes only `--log-bodies`; there `default` follows the environment (deployed:
-off; development and agent environments: on). `show` lists each component's site
-value, the account's override and the effective value, with this note: while on,
+on|off|default` sets every component in the selected scope; `COMPONENT=on|off|default`
+sets one (repeatable, later values win). Space components are `knowledge`,
+`release-notes` and `merge-queue`. Personal components are `assistant`,
+`assistant-titles` and `avatars`; `--person PERSON` is self-only and takes only
+`--log-bodies`. `--space`, `--person` and `--site` are mutually exclusive, and
+cross-scope components are rejected. `default` follows Instance policy.
+`--site` (human Instance operators) sets defaults for all components and takes only
+`--log-bodies`; its `default` follows the environment (deployed: off; development
+and agent environments: on). `show` lists scope overrides and effective values.
+While body logging is on,
 prompts and replies, including repository code and assistant conversations, are
 kept in Cloudflare's AI Gateway logs, readable by the Cloudflare account's
 dashboard users, and deleted oldest-first. Changes reach new model calls within a
 minute.
 
-These are account-wide settings, not repository settings. Omit `--owner` to use
-the authenticated person's own account; the current repository's owner is never
-inferred. `show` includes the curated catalog, prices, release dates, permissions
+These are Space-wide settings, not repository settings. Select a Space with
+`--space` or the saved tracker context; there is no Account ownership fallback.
+`show` includes the curated catalog, prices, release dates, permissions
 and save provenance. `set` requires at least one option and changes only supplied
 fields. Feature values are `on|off`; Classification accepts `clef` or a
-`typesafe:<model>` the account added in **Settings → AI providers**; Fast and
+`typesafe:<model>` added to the Space in **Settings → AI providers**; Fast and
 Task allow `glm-5.3-flash|gemma-4-26b-a4b-it` or an added `openrouter:<model>`
 (for example `--fast openrouter:google/gemini-3-flash`). The server refuses a
-provider model the account hasn't added. Defaults are all features on, Clef,
+provider model the Space hasn't added. Defaults are all features on, Clef,
 and GLM 5.3 Flash for both generation roles. `--knowledge-quiet-minutes` and
 `--knowledge-max-wait-minutes` (0-1440, defaults 10 and 30) say when pushes to a
 repository's default branch update its Knowledge: once they pause that long, and
 never later than the longest wait after the first pending push.
 
-Only human account owners, organization owners and site admins can save; members
-can inspect and agent credentials cannot write. Knowledge off also prevents new
+Only authorized human Space admins and separate Instance operators can save;
+members can inspect and agent credentials cannot write. Knowledge off also prevents new
 Wiki and Atlas AI work; Atlas's structural projection is separate from its paid
 descriptions. Agent chat and interactive search are unaffected.
 
 Changes apply to newly admitted jobs. Running jobs and their retries retain their
 policy; old content and cached output remain readable. Saving does not trigger a
 rebuild, and enabling a feature resumes it on normal triggers or explicit requests.
-`--dry-run` with an explicit owner prints the PATCH request without network access.
-Settings mutations are not part of `gm undo`. The equivalent web page is
-`/settings/ai?owner=orbit`.
+`--dry-run` with an explicit Space prints the PATCH request without network access.
+Settings mutations are not part of `gm undo`. Space policy is separate from
+personal profile preferences and Instance infrastructure.
 
 ## Data retention
 
 ```bash
-gm retention show --owner orbit                  # categories, switches, thresholds, last run
+gm retention show --space orbit                  # categories, switches, thresholds, last run
 gm retention set ci-logs --enable --threshold days=14
 gm retention set ci-runs --reset keepLatest      # inherit the site-wide default again
 gm retention set timeline-work-sources --threshold landedDays=30 --threshold abandonedDays=90
@@ -1195,15 +1228,21 @@ gm retention show --site                         # site categories and site-wide
 The same policies, cleanup runs and history as the Data retention settings
 pages. Policy categories are opt-in except `timeline-work-sources`, enabled by
 default at 30 days landed / 90 days abandoned; active categories always run.
-Scheduled cleanups apply the effective policy. Omit `--owner` for the signed-in
-person's own account; `--site` covers site categories and site-wide defaults
-(site administrators).
+Scheduled cleanups apply the effective policy. `--space` selects Space content;
+`--site` covers Instance categories and defaults for authorized operators.
+With no scope selector, retention uses the signed-in person's authorized default
+Space, not the saved `tracker.space` selection. Personal retention remains a
+distinct person scope.
+Use `gm retention show --person PERSON` for your own personal retention (including
+chats). `--person`, `--space` and `--site` are mutually exclusive; a Space grant
+does not authorize another person's history.
 `--inherit` and `--reset <key>` remove this level's value so it inherits again.
 `run` takes any categories with a cleanup, enabled or not, and per-run overrides
 (`--threshold category.key=value`). With `--dry-run` the server previews the run
 without deleting; a real run requires `--yes`. `run` waits for the result unless
-`--no-wait` (exit 4 when it fails). Only account owners (people, not agents) and
-site administrators change settings or start runs; nothing here is part of
+`--no-wait` (exit 4 when it fails). Authorized humans administer their selected
+scope: Space admins for Space content, the person for their own personal history,
+and separate Instance operators for Instance policy. Nothing here is part of
 `gm undo`.
 
 ## Built for agents, like `cf`
@@ -1271,7 +1310,7 @@ not numbers in progress counters or repository URLs. An interrupted pack transfe
 |             |                                                                                                                                           |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Inspect     | `status`, `log`, `show`, `diff`, `file show`, `file list`                                                                                 |
-| Semantics   | `semantic list [--repo owner/name] [--ref ref] [--cursor cursor] [--path path] [--kind kind] [--language language] [--limit N]`           |
+| Semantics   | `semantic list [--repo space/name] [--ref ref] [--cursor cursor] [--path path] [--kind kind] [--language language] [--limit N]`           |
 | Change      | `commit`, `describe`, `new`, `squash`, `split`, `edit`, `abandon`, `restore`                                                              |
 | Restructure | `rebase`, `backout` (revert), `duplicate` (cherry-pick)                                                                                   |
 | History     | `undo`, `op log`, `op restore`                                                                                                            |
@@ -1439,11 +1478,15 @@ too, and `gitmatrix.sshCommand` sets the ssh for gm without touching git.
 ## Downloading artifacts and installing Unix CLIs
 
 ```sh
-gm pkg download gm/latest/linux-x86_64/gm --owner orbit --dest ./gm
-gm pkg install gm --owner orbit
-gm pkg install gm --owner orbit --force
-gm pkg install gm --owner orbit --version <apps/cli-tree-id> --bin-dir ./bin
+gm pkg download gm/latest/linux-x86_64/gm --space matrixorg --dest ./gm
+gm pkg install gm --space matrixorg
+gm pkg install gm --space matrixorg --force
+gm pkg install gm --space matrixorg --version <apps/cli-tree-id> --bin-dir ./disposable-bin
 ```
+
+Package selection uses `--space`, then `GITMATRIX_SPACE`, then the current
+repository's Space, then the signed-in person's authorized default Space.
+It does not use `tracker.space` or infer content ownership from an Account handle.
 
 `download` accepts `<name>/<version>/<path>` in the generic registry. Its default
 destination is the artifact's basename. `install` defaults to
@@ -1477,20 +1520,73 @@ upload starts; reruns fill missing artifacts without replacing published ones.
 The native binary uploads both architectures.
 
 On a Raspberry Pi running 64-bit Raspberry Pi OS Bookworm or newer, use
-`gm pkg install gm --owner matrixorg` (add `--force` to update). It automatically
+`gm pkg install gm --space matrixorg` (add `--force` to update). It automatically
 selects the ARM64 binary. The release requires glibc 2.36 or newer; it does not
-run on a 32-bit Raspberry Pi OS or musl-based Linux. To bootstrap without `gm`,
-build from source with `vp run cli#build`, then use the resulting release binary.
+run on a 32-bit Raspberry Pi OS or musl-based Linux.
 For manual cross-builds, install `gcc-aarch64-linux-gnu` and `libc6-dev-arm64-cross`,
 run `rustup target add aarch64-unknown-linux-gnu`, and set
 `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc` and
 `CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc` when building with
 `cargo build --locked --release --manifest-path apps/cli/Cargo.toml --target aarch64-unknown-linux-gnu`.
 
-To bootstrap from an older `gm` without these commands, use
-`./apps/cli/target/release/gm pkg install gm --owner orbit` after a local release
-build. For feature validation, always pass an external disposable `--bin-dir`
-instead of replacing a shared/global binary.
+### Bootstrapping across the v4 cutover
+
+An old installed CLI may neither parse `--space` nor access the v4 content API.
+Do not run its package commands or change back to removed `--owner` arguments to
+upgrade. First wait for the v4 CLI's `main` deployment and release publication to
+succeed; use the pipeline's web view if the old CLI cannot query runs.
+
+On Linux x86-64 or ARM64, use the existing `installGm` helper exported by
+`tools/preview/preview.ts` from that exact released `main` checkout. It downloads
+the latest published artifact and verifies `x-checksum-sha256`; no Cargo build,
+installed `gm`, dependency installation or preview deployment is needed.
+Use the repository-supported Node runtime with TypeScript imports. Provide the
+release server as `GITMATRIX_URL`, the publishing Space as `GITMATRIX_SPACE`
+(`matrixorg` here), and authorized registry credentials as `GITMATRIX_TOKEN`
+through the environment, never in committed files or command-line literals.
+
+Run this import-only invocation on the machine whose shared CLI needs updating:
+
+```sh
+GM_BOOTSTRAP="$(node --input-type=module <<'JS'
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { installGm } from "./tools/preview/preview.ts";
+if (process.platform !== "linux" || !["x64", "arm64"].includes(process.arch))
+  throw new Error("This released bootstrap supports Linux x86-64 and ARM64 only.");
+const directory = await mkdtemp(join(tmpdir(), "gm-bootstrap-"));
+const env = { ...process.env, GITMATRIX_PREVIEW_GM: undefined };
+console.log(await installGm(env, directory));
+JS
+)"
+GM_SERVER="$GITMATRIX_URL" GM_TOKEN="$GITMATRIX_TOKEN" "$GM_BOOTSTRAP" pkg install gm --space matrixorg --force --dry-run
+git rev-parse origin/main:apps/cli
+```
+
+`GITMATRIX_PREVIEW_GM` is deliberately cleared: it would bypass the download and
+checksum verification. The helper writes only into the new temporary directory;
+importing it does not run preview creation or teardown. It selects `latest`, not
+a caller-pinned version. Require the dry-run's version to match the released
+`main` CLI tree ID above, then pin that observed ID for the atomic shared install:
+
+```sh
+GM_SERVER="$GITMATRIX_URL" GM_TOKEN="$GITMATRIX_TOKEN" "$GM_BOOTSTRAP" pkg install gm --space matrixorg --version <released-apps/cli-tree-id> --force
+```
+
+Both the temporary client and package install verify the published SHA-256.
+Remove only the temporary file/directory created by this invocation afterward.
+Never copy a feature build into a shared bin directory. A remote runtime's
+home/bin directory is not the host's shared install; run this lightweight
+download on the intended machine. `gm --version` is not the source-tree release
+ID. Preserve legacy tracker replicas/outboxes and follow the export/recovery
+instructions above. Feature validation must use an external disposable
+`--bin-dir`, never the shared install.
+
+This path requires the released v4 helper source, supported Node and Linux
+architecture, and authorized registry access. It is not an installer for macOS,
+32-bit Raspberry Pi OS or musl-based Linux. If those prerequisites are missing,
+report them rather than substituting an unverified download or feature binary.
 
 ## Layout
 

@@ -1,17 +1,32 @@
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { authenticate } from "../registry/core/auth/authenticate.ts";
+import {
+  issueRegistryToken,
+  resetRegistryTokenKeys,
+} from "../registry/core/auth/registry-token.ts";
 import { createAuth, linkAccount, mayJoin, recordFailure } from "./better-auth.ts";
 import { issueToken } from "./api/tokens.ts";
 import { authHygiene } from "./retention/cleanups/auth-hygiene.ts";
 import { advanceRun, createRun, getRun } from "./retention/runs.ts";
-import { d1, migratedDatabase } from "./testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "./testing/spaces.ts";
+import { cutoverControl } from "./durable/cutover-admission.ts";
+import type { RetentionAuthority } from "./retention/runs.ts";
 
-function setup({ org }: { org?: string } = {}) {
-  const sqlite = migratedDatabase();
+vi.mock("cloudflare:workers", () => import("./testing/runtime.ts"));
+
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const close of cleanups.splice(0)) close();
+});
+
+async function setup({ org }: { org?: string } = {}) {
+  const fresh = await createFreshSpaceTestEnvironment();
+  cleanups.push(fresh.close);
+  const { sqlite } = fresh;
   const sent: { to: string; text: string }[] = [];
   const failures = new Map<string, number>();
   const env = {
-    DB: d1(sqlite),
+    ...fresh.env,
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
     PUBLIC_URL: "http://gitmatrix.test",
     OWNER_EMAIL: "Owner@Example.com",
@@ -65,7 +80,7 @@ async function signIn(env: Env, sent: { to: string; text: string }[], email: str
 
 describe("invite-only email sign-in", () => {
   test("only the owner, invited addresses and existing users may join", async () => {
-    const { env, sqlite } = setup();
+    const { env, sqlite } = await setup();
     expect(await mayJoin(env, " OWNER@example.com ")).toBe(true);
     expect(await mayJoin(env, "stranger@example.com")).toBe(false);
     sqlite.exec("INSERT INTO auth_invites (email) VALUES ('friend@example.com')");
@@ -73,7 +88,7 @@ describe("invite-only email sign-in", () => {
   });
 
   test("an uninvited address gets the same answer and no email", async () => {
-    const { env, sent, rows } = setup();
+    const { env, sent, rows } = await setup();
     const response = await (
       await createAuth(env)
     ).handler(
@@ -87,8 +102,8 @@ describe("invite-only email sign-in", () => {
     expect(rows("SELECT * FROM auth_users")).toHaveLength(0);
   });
 
-  test("the owner's first sign-in creates a superuser account and their org", async () => {
-    const { env, sent, rows } = setup({ org: "matrixorg" });
+  test("the owner's first sign-in creates a person, personal Space and configured company", async () => {
+    const { env, sent, rows } = await setup({ org: "matrixorg" });
     const response = await signIn(env, sent, "owner@example.com");
     expect(response.status).toBe(200);
     expect(sent[0]?.to).toBe("owner@example.com");
@@ -102,18 +117,39 @@ describe("invite-only email sign-in", () => {
       email: "owner@example.com",
       is_site_admin: 1,
     });
-    const [org] = rows("SELECT id, kind FROM accounts WHERE slug = 'matrixorg'");
-    expect(org?.kind).toBe("org");
-    expect(
-      rows(
-        `SELECT role FROM org_members WHERE org_id = '${String(org!.id)}' AND user_id = '${userId}'`,
-      ),
-    ).toEqual([{ role: "owner" }]);
+    expect(rows("SELECT id FROM accounts WHERE kind = 'org'")).toEqual([]);
+    const [personal] = rows(`SELECT * FROM organizations WHERE personal_account_id = '${userId}'`);
+    expect(personal).toMatchObject({ kind: "personal", slug: "owner" });
+    const [org] = rows("SELECT * FROM organizations WHERE slug = 'matrixorg'");
+    expect(org?.kind).toBe("company");
+    for (const tenant of [personal!, org!]) {
+      expect(
+        rows(
+          `SELECT organization_id, archived_at FROM spaces WHERE id = '${String(tenant.default_space_id)}'`,
+        ),
+      ).toEqual([{ organization_id: tenant.id, archived_at: null }]);
+      expect(
+        rows(
+          `SELECT role FROM organization_members WHERE organization_id = '${String(tenant.id)}' AND account_id = '${userId}'`,
+        ),
+      ).toEqual([{ role: "owner" }]);
+      expect(
+        rows(
+          `SELECT role, repository_role, package_role FROM space_grants WHERE space_id = '${String(tenant.default_space_id)}' AND account_id = '${userId}'`,
+        ),
+      ).toEqual([{ role: "admin", repository_role: "write", package_role: "write" }]);
+      expect(
+        rows(
+          `SELECT actor_id, action FROM space_audit WHERE organization_id = '${String(tenant.id)}'`,
+        ),
+      ).toEqual([{ actor_id: userId, action: "organization.bootstrap" }]);
+      expect(tenant.default_space_id).not.toBe(userId);
+    }
     expect(response.headers.get("set-cookie")).toContain("gm.session_token");
   });
 
   test("an invited person joins as a regular user with a free slug, using the invite up", async () => {
-    const { env, sent, rows, sqlite } = setup();
+    const { env, sent, rows, sqlite } = await setup();
     sqlite.exec(
       "INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_taken', 'user', 'friend', 'Someone else')",
     );
@@ -128,18 +164,77 @@ describe("invite-only email sign-in", () => {
   });
 
   test("linking is idempotent for an account that already exists", async () => {
-    const { env, rows, sqlite } = setup();
+    const { env, rows, sqlite } = await setup();
     sqlite.exec(
       "INSERT INTO accounts (id, kind, slug, display_name, email, is_site_admin) VALUES ('acc_fward', 'user', 'fward', 'F', 'owner@example.com', 1)",
     );
     await linkAccount(env, { id: "acc_fward", email: "owner@example.com", name: "F" });
     expect(rows("SELECT id FROM accounts WHERE kind = 'user'")).toEqual([{ id: "acc_fward" }]);
   });
+
+  test("a failed grant rolls back person, tenants and invite consumption together", async () => {
+    const { env, rows, sqlite } = await setup({ org: "matrixorg" });
+    sqlite.exec(`INSERT INTO auth_invites (email) VALUES ('owner@example.com');
+      CREATE TRIGGER reject_bootstrap BEFORE INSERT ON space_grants
+      BEGIN SELECT RAISE(ABORT, 'grant failed'); END;`);
+    await expect(
+      linkAccount(env, { id: "acc_retry", email: "owner@example.com", name: "Owner" }),
+    ).rejects.toThrow("grant failed");
+    for (const table of [
+      "accounts",
+      "organizations",
+      "spaces",
+      "organization_members",
+      "space_grants",
+      "space_audit",
+    ])
+      expect(rows(`SELECT * FROM ${table}`)).toEqual([]);
+    expect(rows("SELECT email FROM auth_invites")).toEqual([{ email: "owner@example.com" }]);
+    sqlite.exec("DROP TRIGGER reject_bootstrap");
+    await linkAccount(env, { id: "acc_retry", email: "owner@example.com", name: "Owner" });
+    expect(rows("SELECT id FROM accounts")).toEqual([{ id: "acc_retry" }]);
+    expect(rows("SELECT * FROM organizations")).toHaveLength(2);
+  });
+
+  test("sign-in does not recreate a revoked explicit personal grant", async () => {
+    const { env, rows, sqlite } = await setup();
+    const user = { id: "acc_person", email: "owner@example.com", name: "Owner" };
+    await linkAccount(env, user);
+    sqlite.exec("DELETE FROM space_grants");
+    await linkAccount(env, user);
+    expect(rows("SELECT * FROM space_grants")).toEqual([]);
+    expect(rows("SELECT * FROM space_audit")).toHaveLength(1);
+  });
+
+  test("personal handles avoid an existing Space without treating it as identity", async () => {
+    const { env, rows, sqlite } = await setup();
+    await linkAccount(env, { id: "acc_other", email: "other@example.com", name: "Other" });
+    sqlite.exec("UPDATE accounts SET slug = 'renamed' WHERE id = 'acc_other'");
+    await linkAccount(env, { id: "acc_new", email: "other@elsewhere.example", name: "New" });
+    expect(rows("SELECT slug FROM accounts WHERE id = 'acc_new'")).toEqual([{ slug: "other-2" }]);
+  });
+
+  test("a later session retries an auth-only signup without replacing the person ID", async () => {
+    const { env, sent, rows, sqlite } = await setup();
+    sqlite.exec(`CREATE TRIGGER reject_bootstrap BEFORE INSERT ON space_grants
+      BEGIN SELECT RAISE(ABORT, 'grant failed'); END;`);
+    expect((await signIn(env, sent, "owner@example.com")).status).not.toBe(200);
+    expect(rows("SELECT * FROM accounts")).toEqual([]);
+    expect(rows("SELECT * FROM auth_sessions")).toEqual([]);
+    const [authUser] = rows("SELECT id FROM auth_users");
+    expect(authUser?.id).toMatch(/^acc_/);
+    sqlite.exec("DROP TRIGGER reject_bootstrap");
+    expect((await signIn(env, sent, "owner@example.com")).status).toBe(200);
+    expect(rows("SELECT id FROM accounts")).toEqual([{ id: authUser!.id }]);
+    expect(rows("SELECT personal_account_id FROM organizations")).toEqual([
+      { personal_account_id: authUser!.id },
+    ]);
+  });
 });
 
 describe("failure lockout", () => {
   test("crossing the limiter locks the key out, and locked keys are refused", async () => {
-    const { env, sent, rows } = setup();
+    const { env, sent, rows } = await setup();
     await signIn(env, sent, "owner@example.com");
     const auth = await createAuth(env);
     const wrong = () =>
@@ -156,7 +251,7 @@ describe("failure lockout", () => {
   });
 
   test("recordFailure only locks keys the limiter refuses", async () => {
-    const { env, rows } = setup();
+    const { env, rows } = await setup();
     for (let n = 0; n < 3; n++) await recordFailure(env, ["ip:1"]);
     expect(rows("SELECT * FROM auth_lockouts")).toHaveLength(0);
     await recordFailure(env, ["ip:1"]);
@@ -166,7 +261,7 @@ describe("failure lockout", () => {
 
 describe("the registry and an email sign-in", () => {
   test("the sign-in cookie alone identifies the user to the registry", async () => {
-    const { env, sent, rows } = setup();
+    const { env, sent, rows } = await setup();
     const response = await signIn(env, sent, "owner@example.com");
     const cookie = response.headers
       .getSetCookie()
@@ -181,21 +276,47 @@ describe("the registry and an email sign-in", () => {
       via: "session",
       isSiteAdmin: true,
     });
-    // A cookie that isn't a live session is just a signed-out visitor.
-    expect(
-      await authenticate(env, new Headers({ cookie: "gm.session_token=forged.value" })),
-    ).toMatchObject({ kind: "anonymous" });
+    // Supplied but invalid credentials never silently become anonymous.
+    await expect(
+      authenticate(env, new Headers({ cookie: "gm.session_token=forged.value" })),
+    ).rejects.toMatchObject({ status: 401 });
+  });
+
+  test("revoking a real session revokes its cookie and previously issued registry JWT", async () => {
+    const { env, sent, sqlite } = await setup();
+    env.REGISTRY_KEK = btoa("k".repeat(32));
+    resetRegistryTokenKeys();
+    const response = await signIn(env, sent, "owner@example.com");
+    expect(response.status).toBe(200);
+    const cookie = response.headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0]!)
+      .find((value) => value.startsWith("gm.session_token="))!;
+    const actor = await authenticate(env, new Headers({ cookie }));
+    expect(actor.credential?.kind).toBe("session");
+    const issued = await issueRegistryToken(env, actor, [], "gitmatrix.test");
+    const headers = new Headers({ authorization: `Bearer ${issued.token}` });
+    expect(await authenticate(env, headers)).toMatchObject({
+      subject: actor.subject,
+      via: "registry",
+    });
+    sqlite
+      .prepare("DELETE FROM auth_sessions WHERE id = ?")
+      .run(actor.credential?.kind === "session" ? actor.credential.id : "");
+    await expect(authenticate(env, headers)).rejects.toMatchObject({ status: 401 });
+    await expect(authenticate(env, new Headers({ cookie }))).rejects.toMatchObject({ status: 401 });
   });
 });
 
 describe("auth hygiene (CORE-206)", () => {
   const DAY = 86_400_000;
   /** A manual site run of "auth-hygiene" to the end, in batches of two. */
-  async function hygiene(env: Env, dryRun: boolean, now: Date) {
+  async function hygiene(env: Env, dryRun: boolean, now: Date, authority: RetentionAuthority) {
     const id = await createRun(env.DB, {
-      target: { scope: "site" },
+      target: { kind: "instance", id: "" },
       trigger: "manual",
-      actorId: null,
+      actorId: authority.id,
+      authority,
       dryRun,
       categories: [{ id: "auth-hygiene", thresholds: { days: 7 } }],
       now,
@@ -209,13 +330,13 @@ describe("auth hygiene (CORE-206)", () => {
           void seen.push(...(items as { table: number; key: string }[]).map((i) => i.key)),
       })) === "more"
     );
-    const run = (await getRun(env.DB, { scope: "site" }, id))!;
+    const run = (await getRun(env.DB, { kind: "instance", id: "" }, id))!;
     expect(run.status).toBe("succeeded");
     return { seen: seen.sort(), items: run.items, bytes: run.bytes };
   }
 
   test("removes only what ended over 7 days ago; sign-in and tokens keep working", async () => {
-    const { env, sent, rows, sqlite } = setup();
+    const { env, sent, rows, sqlite } = await setup();
     const now = new Date();
     const at = (days: number) => new Date(now.getTime() + days * DAY).toISOString();
     // A real sign-in: a live session, and the code it used.
@@ -250,14 +371,28 @@ describe("auth hygiene (CORE-206)", () => {
         ('tok_old', '${userId}', 'old', 'read', 'h_old', 'aaaa', '${at(-100)}'),
         ('tok_week', '${userId}', 'week', 'read', 'h_week', 'bbbb', '${at(-6)}');
     `);
+    const person = sqlite
+      .prepare("SELECT slug, display_name FROM accounts WHERE id = ?")
+      .get(userId) as {
+      slug: string;
+      display_name: string;
+    };
+    const authority: RetentionAuthority = {
+      id: userId,
+      slug: person.slug,
+      displayName: person.display_name,
+      isSiteAdmin: true,
+      credential: { kind: "token", id: live.id },
+      migrationEpoch: (await cutoverControl(env).admission(4)).epoch,
+    };
     const old = ["d_old", "ip:old", "n_old", "s_old", "tok_old", "v_old"];
 
-    const dry = await hygiene(env, true, now);
+    const dry = await hygiene(env, true, now, authority);
     expect(dry.seen).toEqual(old);
     expect(dry.items).toBe(6);
-    const real = await hygiene(env, false, now);
+    const real = await hygiene(env, false, now, authority);
     expect(real).toEqual(dry);
-    expect(await hygiene(env, false, now)).toEqual({ seen: [], items: 0, bytes: 0 });
+    expect(await hygiene(env, false, now, authority)).toEqual({ seen: [], items: 0, bytes: 0 });
     expect(rows("SELECT id FROM auth_sessions WHERE id IN ('s_old', 's_recent')")).toEqual([
       { id: "s_recent" },
     ]);
@@ -280,14 +415,14 @@ describe("auth hygiene (CORE-206)", () => {
   });
 
   test("selects nothing still valid at any threshold", async () => {
-    const { env, sqlite } = setup();
+    const { env, sqlite } = await setup();
     const now = new Date();
     sqlite.exec(`
       INSERT INTO auth_lockouts (key, until) VALUES ('ip:a', '${new Date(now.getTime() + 60_000).toISOString()}');
     `);
     const ctx = {
       env,
-      target: { scope: "site" } as const,
+      target: { kind: "instance", id: "" } as const,
       thresholds: { days: 1 },
       now,
       limit: 100,

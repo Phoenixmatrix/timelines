@@ -1,8 +1,4 @@
-// Data retention (CORE-210): an account's page for its administrators, and the
-// site's (site categories and site-wide defaults) for site administrators.
-// Both read the retention API (worker/retention/api.ts); the page itself is
-// RetentionView.
-
+// Retention policy and cleanup are scoped independently to a Space, person, or Instance.
 import { redirect, useLoaderData, useNavigation, useSearchParams } from "react-router";
 import type { RetentionRunPage, RetentionSettings } from "../../shared/retention.ts";
 import { RetentionView } from "../components/RetentionView.tsx";
@@ -11,74 +7,109 @@ import { FormError, SelectField } from "../components/ui.tsx";
 import { api, ApiError, load } from "../lib/api.ts";
 import { requireViewer } from "../lib/session.ts";
 
-const accountPaths = (owner: string) => ({
-  settings: `/accounts/${encodeURIComponent(owner)}/settings/retention`,
-  runs: `/accounts/${encodeURIComponent(owner)}/retention/runs`,
-});
-const SITE_PATHS = { settings: "/admin/retention", runs: "/admin/retention/runs" };
+const INSTANCE_PATHS = { settings: "/admin/retention", runs: "/admin/retention/runs" };
 
 export async function retentionLoader({ request }: { request: Request }) {
   const viewer = await requireViewer(request);
-  const url = new URL(request.url);
-  const owner = url.searchParams.get("owner");
-  if (!owner) throw redirect(`/settings/retention?owner=${encodeURIComponent(viewer.slug)}`);
-  const accounts: { slug: string; displayName: string }[] = [
-    { slug: viewer.slug, displayName: viewer.displayName },
-    ...viewer.canCreateIn.filter((a) => a.slug !== viewer.slug),
+  const params = new URL(request.url).searchParams;
+  const space = params.get("space");
+  const person = params.get("person");
+  if (params.has("owner") || (space && person))
+    throw new Response("Choose a Space or your personal retention, not an ambiguous scope.", {
+      status: 400,
+    });
+  if (!space && !person) {
+    params.set("person", viewer.slug);
+    throw redirect(`/settings/retention?${params}`);
+  }
+  if (person && person !== viewer.slug)
+    throw new Response("Personal retention is only available to that person.", { status: 403 });
+  const subject = space ?? person!;
+  const scope = space ? "space" : "person";
+  const base = `/${space ? "spaces" : "accounts"}/${encodeURIComponent(subject)}/retention`;
+  const paths = { settings: base, runs: `${base}/runs` };
+  const options = [
+    { value: `person:${viewer.slug}`, label: `Personal / ${viewer.displayName} (@${viewer.slug})` },
+    ...viewer.spaces.map((entry) => ({
+      value: `space:${entry.slug}`,
+      label: `${entry.organization.displayName} / ${entry.displayName} (@${entry.slug})`,
+    })),
   ];
-  const preselect = url.searchParams.get("cleanup");
-  const paths = accountPaths(owner);
+  const selected = `${scope}:${subject}`;
+  if (!options.some((entry) => entry.value === selected))
+    options.push({ value: selected, label: `Space / @${subject}` });
+  const preselect = params.get("cleanup");
   try {
     const [settings, runs] = await Promise.all([
       api<RetentionSettings>(paths.settings, { signal: request.signal }),
       api<RetentionRunPage>(paths.runs, { signal: request.signal }),
     ]);
-    return { owner, accounts, settings, runs, preselect, error: "" };
+    return {
+      space,
+      subject,
+      scope,
+      selected,
+      options,
+      paths,
+      settings,
+      runs,
+      preselect,
+      error: "",
+    };
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
-    return { owner, accounts, settings: null, runs: null, preselect, error: error.message };
+    return {
+      space,
+      subject,
+      scope,
+      selected,
+      options,
+      paths,
+      settings: null,
+      runs: null,
+      preselect,
+      error: error.message,
+    };
   }
 }
-
-const INTRO =
-  "Choose what Timelines deletes and when. Nothing is deleted until you turn a category on or run a cleanup yourself, and each category says what it never deletes.";
 
 export function DataRetention() {
   const data = useLoaderData<typeof retentionLoader>();
   const [, setParams] = useSearchParams();
   const navigation = useNavigation();
-  const options = data.accounts.map((a) => ({
-    value: a.slug,
-    label: `${a.displayName} (@${a.slug})`,
-  }));
-  if (!options.some((o) => o.value === data.owner))
-    options.push({ value: data.owner, label: `@${data.owner}` });
   return (
-    <SettingsPage owner={data.owner} wide>
+    <SettingsPage space={data.space ?? undefined} wide>
       <h1 className="m-0 text-headline">Data retention</h1>
-      <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">{INTRO}</p>
+      <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
+        Choose what Timelines deletes and when. Nothing is deleted until you turn a category on or
+        run a cleanup yourself, and each category says what it never deletes.
+      </p>
       <div className="mt-6 flex max-w-md flex-col gap-1 text-field-label">
-        Account
+        Retention scope
         <SelectField
-          ariaLabel="Account for data retention"
-          value={data.owner}
-          options={options}
-          onChange={(owner) => setParams({ owner })}
+          ariaLabel="Scope for data retention"
+          value={data.selected}
+          options={data.options}
+          onChange={(value) => {
+            const separator = value.indexOf(":");
+            setParams({ [value.slice(0, separator)]: value.slice(separator + 1) });
+          }}
           className="w-full"
         />
       </div>
       <p role="status" className="mt-2 mb-0 text-body-sm text-ink-muted">
         {navigation.state !== "idle"
           ? "Loading data retention…"
-          : `Data retention for @${data.owner}`}
+          : `${data.scope === "space" ? "Space" : "Personal"} retention for @${data.subject}`}
       </p>
       {data.settings && data.runs ? (
         <RetentionView
-          key={data.owner}
+          key={data.selected}
           initial={data.settings}
           initialRuns={data.runs}
-          paths={accountPaths(data.owner)}
+          paths={data.paths}
           preselect={data.preselect}
+          usageHref={`/settings/usage?${data.scope}=${encodeURIComponent(data.subject)}`}
         />
       ) : (
         <div className="mt-6">
@@ -93,8 +124,8 @@ export async function siteRetentionLoader({ request }: { request: Request }) {
   const viewer = await requireViewer(request);
   if (!viewer.isSiteAdmin) throw redirect("/");
   const [settings, runs] = await Promise.all([
-    load<RetentionSettings>(SITE_PATHS.settings, request),
-    load<RetentionRunPage>(SITE_PATHS.runs, request),
+    load<RetentionSettings>(INSTANCE_PATHS.settings, request),
+    load<RetentionRunPage>(INSTANCE_PATHS.runs, request),
   ]);
   return { settings, runs, preselect: new URL(request.url).searchParams.get("cleanup") };
 }
@@ -103,16 +134,17 @@ export function SiteRetention() {
   const data = useLoaderData<typeof siteRetentionLoader>();
   return (
     <SettingsPage wide>
-      <h1 className="m-0 text-headline">Site data retention</h1>
+      <h1 className="m-0 text-headline">Instance data retention</h1>
       <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
-        Retention for data no account owns, and the defaults every account starts from. Nothing is
+        Retention for Instance infrastructure and the defaults for Spaces and people. Nothing is
         deleted until a category is on or you run a cleanup yourself.
       </p>
       <RetentionView
         initial={data.settings}
         initialRuns={data.runs}
-        paths={SITE_PATHS}
+        paths={INSTANCE_PATHS}
         preselect={data.preselect}
+        usageHref="/settings/site-usage"
       />
     </SettingsPage>
   );

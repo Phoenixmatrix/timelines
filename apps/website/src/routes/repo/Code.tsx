@@ -41,19 +41,19 @@ import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
 export async function codeLoader({ request, params }: LoaderFunctionArgs) {
-  const owner = params.owner ?? "";
+  const space = params.space ?? "";
   const name = params.repo ?? "";
   const at = params["*"] ?? "";
-  const source = await requestSource(owner, name, request);
+  const source = await requestSource(space, name, request);
   // In a timeline's scope (?tl=) the repository opens on the timeline's
   // bookmark when it has one; a path that names a branch keeps it.
   const scope = at ? null : scopeOf(new URL(request.url).search);
   // Otherwise the tree and the repo detail load in parallel; the server splits
   // the branch from the path, so neither waits for the other.
   const [repo, tree] = await Promise.all([
-    routeData(repoData.detail(owner, name, source)),
+    routeData(repoData.detail(space, name, source)),
     (scope
-      ? repoData.detail(owner, name, source).then((detail) => {
+      ? repoData.detail(space, name, source).then((detail) => {
           const bookmark = bookmarkIn(detail, scope);
           if (!bookmark && source)
             throw new ApiError(
@@ -64,7 +64,7 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
         })
       : Promise.resolve(at)
     )
-      .then((path) => repoData.tree(owner, name, path, source))
+      .then((path) => repoData.tree(space, name, path, source))
       .catch((error: unknown) => error),
   ]);
   if (!repo.head || repo.state !== "ready") return { tree: null, about: null };
@@ -76,10 +76,10 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   const about = Promise.all([
     source && source !== "canonical"
       ? Promise.resolve(null)
-      : repoData.graphNode(owner, name, "repo").catch(() => null),
-    repoData.ciRuns(owner, name, source).catch(() => null),
+      : repoData.graphNode(space, name, "repo").catch(() => null),
+    repoData.ciRuns(space, name, source).catch(() => null),
     api<RepoIssueSummary>(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/tracker/summary?${new URLSearchParams({ timeline: scopeOf(new URL(request.url).search) ?? "main" })}`,
+      `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}/tracker/summary?${new URLSearchParams({ timeline: scopeOf(new URL(request.url).search) ?? "main" })}`,
       { signal: request.signal },
     ).catch(() => null),
   ]).then(([knowledge, ci, issues]) => ({ knowledge, ci, issues }));
@@ -138,8 +138,8 @@ function EntryRow({
   const Icon = ICONS[entry.type];
   const to =
     entry.type === "tree"
-      ? treeUrl(repo.owner.slug, repo.name, refName, entry.path, repo.source?.sourceId)
-      : blobUrl(repo.owner.slug, repo.name, refName, entry.path, repo.source?.sourceId);
+      ? treeUrl(repo.space.slug, repo.name, refName, entry.path, repo.source?.sourceId)
+      : blobUrl(repo.space.slug, repo.name, refName, entry.path, repo.source?.sourceId);
   const label = (
     <>
       <Icon
@@ -151,7 +151,7 @@ function EntryRow({
     </>
   );
   const history = commitsUrl(
-    repo.owner.slug,
+    repo.space.slug,
     repo.name,
     refName,
     entry.path,
@@ -183,7 +183,7 @@ function EntryRow({
               repo.source && repo.source.sourceId !== "canonical" ? (
                 <Link
                   to={treeUrl(
-                    repo.owner.slug,
+                    repo.space.slug,
                     repo.name,
                     change.latest.oid,
                     "",
@@ -196,7 +196,7 @@ function EntryRow({
                 </Link>
               ) : (
                 <CommitLink
-                  owner={repo.owner.slug}
+                  space={repo.space.slug}
                   name={repo.name}
                   sha={change.latest.oid}
                   className="text-ink-muted no-underline hover:text-ink hover:underline"
@@ -298,7 +298,7 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
         <Link
           className="mk-btn mk-btn--sm no-underline"
           to={commitsUrl(
-            repo.owner.slug,
+            repo.space.slug,
             repo.name,
             tree.commit.oid,
             tree.path,
@@ -313,7 +313,7 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
           <li>
             <PrefetchLink
               to={treeUrl(
-                repo.owner.slug,
+                repo.space.slug,
                 repo.name,
                 tree.ref,
                 tree.path.split("/").slice(0, -1).join("/"),
@@ -402,7 +402,7 @@ export function Code() {
           view="tree"
           commit={tree.commit.oid}
           onSwitch={(ref) =>
-            navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path, repo.source?.sourceId))
+            navigate(treeUrl(repo.space.slug, repo.name, ref, tree.path, repo.source?.sourceId))
           }
         />
 

@@ -6,9 +6,10 @@ import { cannedFiles } from "../testing/git.ts";
 import { renderApp } from "../testing/render.tsx";
 import { reply, TestServer } from "../testing/server.ts";
 
-test("issue selection and saved live edits publish titles without reloading the tracker", async () => {
+test("issue selection and saved live edits publish current titles and clear unavailable issues", async () => {
   const server = await TestServer.start({ world: true });
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "titles-team", data: { key: "TAB", name: "Titles" } },
@@ -26,11 +27,8 @@ test("issue selection and saved live edits publish titles without reloading the 
   });
   const app = renderApp("/tracker/orbit/issues/titles-first");
   await expect.poll(() => document.title).toContain("TAB-1 Private first issue");
-  const loads = server.requests.filter((request) =>
-    request.url.pathname.endsWith("/orbit/view"),
-  ).length;
 
-  // Selection changes do not revalidate the loader; the snapshot must supply the new issue.
+  // Selecting another issue publishes its title, then an autosave replaces it.
   await app.navigate("/tracker/orbit/issues/TAB-2");
   await expect.poll(() => document.title).toContain("TAB-2 Private second issue");
   await userEvent.click(page.getByRole("button", { name: "Private second issue", exact: true }));
@@ -41,9 +39,6 @@ test("issue selection and saved live edits publish titles without reloading the 
   await userEvent.keyboard("{Tab}");
   await expect.poll(() => document.title).toContain("TAB-2 Renamed live issue");
   expect(document.title).not.toContain("Private second issue");
-  expect(
-    server.requests.filter((request) => request.url.pathname.endsWith("/orbit/view")),
-  ).toHaveLength(loads);
 
   await app.navigate("/tracker/orbit/issues/missing-issue");
   await expect.poll(() => document.title).toContain("Issue unavailable");

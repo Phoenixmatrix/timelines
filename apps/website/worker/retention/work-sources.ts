@@ -7,7 +7,7 @@ import { reconcileExpiredKnowledge } from "../knowledge/source-claims.ts";
 interface ClaimedSource {
   source_id: string;
   artifacts_name: string;
-  owner_id: string;
+  space_id: string;
   version: number;
 }
 
@@ -27,7 +27,7 @@ export async function pinSourceRoot(env: Env, root: SourceRoot): Promise<void> {
     SELECT s.repo_id, s.source_id, ?3, ?4, ?5, ?6 FROM timeline_work_sources s
     JOIN repos r ON r.id = s.repo_id
     WHERE s.repo_id = ?1 AND s.source_id = ?2 AND s.state IN ('ready', 'archived')
-      AND r.deleted_at IS NULL
+      AND r.deleted_at IS NULL AND r.space_id = s.space_id
       AND (s.expiry_requested_at IS NULL OR EXISTS (
         SELECT 1 FROM timeline_source_roots existing
         WHERE existing.repo_id=s.repo_id AND existing.source_id=s.source_id
@@ -61,7 +61,7 @@ export async function releaseSourceRoots(
 
 /** Provider deletion is retried from purging; inventory is never removed first. */
 async function deleteClaimedSource(env: Env, source: ClaimedSource): Promise<void> {
-  const tracker = trackerObject(env, source.owner_id);
+  const tracker = trackerObject(env, source.space_id);
   const current = await tracker.getWorkSource(source.source_id);
   if (!current.ok) throw new Error(current.error);
   if (
@@ -69,7 +69,8 @@ async function deleteClaimedSource(env: Env, source: ClaimedSource): Promise<voi
       (await env.DB.prepare("SELECT repo_id FROM timeline_work_sources WHERE source_id=?")
         .bind(source.source_id)
         .first<string>("repo_id")) ||
-    current.value.artifacts_name !== source.artifacts_name
+    current.value.artifacts_name !== source.artifacts_name ||
+    current.value.space_id !== source.space_id
   )
     throw new Error("Source inventory ownership mismatch.");
   const claim =
@@ -116,59 +117,66 @@ export interface SourceExpiryCutoffs {
 /** Dedicated work-Git policy; Tracker metadata and preview expiry never select bytes. */
 export async function expireArchivedSources(
   env: Env,
-  ownerId: string,
+  spaceId: string,
   cutoffs: SourceExpiryCutoffs,
   timelineIds: string[],
 ): Promise<void> {
   if (!timelineIds.length) return;
   const ids = JSON.stringify(timelineIds);
+  const mismatch = await env.DB.prepare(`SELECT s.source_id FROM timeline_work_sources s
+    LEFT JOIN repos r ON r.id=s.repo_id
+    WHERE s.space_id=? AND s.timeline_id IN (SELECT value FROM json_each(?))
+      AND (r.id IS NULL OR r.space_id!=s.space_id) LIMIT 1`)
+    .bind(spaceId, ids)
+    .first();
+  if (mismatch) throw new Error("Source repository Space ownership mismatch.");
   // Reconcile older inventories only from authoritative end evidence. Missing
   // evidence is not abandonment, and never licenses deletion.
   const legacy =
     await env.DB.prepare(`SELECT source_id,repo_id,timeline_id FROM timeline_work_sources
-    WHERE owner_id=? AND timeline_id IN (SELECT value FROM json_each(?))
+    WHERE space_id=? AND timeline_id IN (SELECT value FROM json_each(?))
       AND state='archived' AND archive_disposition IS NULL`)
-      .bind(ownerId, ids)
+      .bind(spaceId, ids)
       .all<{ source_id: string; repo_id: string; timeline_id: string }>();
   for (const source of legacy.results) {
-    const reply = await trackerObject(env, ownerId).getWorkSource(source.source_id);
+    const reply = await trackerObject(env, spaceId).getWorkSource(source.source_id);
     if (!reply.ok) throw new Error(reply.error);
     const row = reply.value;
     if (
       row.repo_id !== source.repo_id ||
       row.timeline_id !== source.timeline_id ||
-      row.owner_id !== ownerId
+      row.space_id !== spaceId
     )
       throw new Error("Source archive ownership mismatch.");
     if (!row.archive_disposition || !row.archived_at) continue;
     await env.DB.prepare(`UPDATE timeline_work_sources SET archive_disposition=?,archived_at=?
-      WHERE source_id=? AND owner_id=? AND state='archived' AND archive_disposition IS NULL`)
-      .bind(row.archive_disposition, row.archived_at, row.source_id, ownerId)
+      WHERE source_id=? AND space_id=? AND state='archived' AND archive_disposition IS NULL`)
+      .bind(row.archive_disposition, row.archived_at, row.source_id, spaceId)
       .run();
   }
   // Fence the exact policy-expired group before attempting any reconciliation.
   // Outstanding operations and consumers delay deletion, never this admission fence.
   await env.DB.prepare(`UPDATE timeline_work_sources AS s
     SET expiry_requested_at=COALESCE(expiry_requested_at, ?1)
-    WHERE s.owner_id=?2 AND s.timeline_id IN (SELECT value FROM json_each(?3))
+    WHERE s.space_id=?2 AND s.timeline_id IN (SELECT value FROM json_each(?3))
       AND s.state='archived'
       AND s.archived_at < CASE s.archive_disposition WHEN 'landed' THEN ?4 WHEN 'abandoned' THEN ?5 END
       AND s.source_id!='canonical'
       AND NOT EXISTS (SELECT 1 FROM repos r WHERE r.id=s.repo_id AND r.artifacts_name=s.artifacts_name)
       AND NOT EXISTS (SELECT 1 FROM timeline_work_sources other
         WHERE other.timeline_id=s.timeline_id AND (
-          other.owner_id!=?2 OR (other.state NOT IN ('purged','purging') AND
+          other.space_id!=?2 OR (other.state NOT IN ('purged','purging') AND
             (other.state!='archived' OR other.archived_at IS NULL OR other.archive_disposition IS NULL
               OR other.archived_at >= CASE other.archive_disposition WHEN 'landed' THEN ?4 WHEN 'abandoned' THEN ?5 END))))`)
-    .bind(new Date().toISOString(), ownerId, ids, cutoffs.landed, cutoffs.abandoned)
+    .bind(new Date().toISOString(), spaceId, ids, cutoffs.landed, cutoffs.abandoned)
     .run();
-  await reconcileExpiredKnowledge(env, ownerId, timelineIds);
+  await reconcileExpiredKnowledge(env, spaceId, timelineIds);
   const pending = await env.DB.prepare(`SELECT DISTINCT o.repo_id
     FROM source_operations o JOIN timeline_work_sources s
       ON s.repo_id=o.repo_id AND s.source_id=o.source_id
-    WHERE s.owner_id=? AND s.timeline_id IN (SELECT value FROM json_each(?))
+    WHERE s.space_id=? AND s.timeline_id IN (SELECT value FROM json_each(?))
       AND o.state IN ('admitted','ambiguous')`)
-    .bind(ownerId, ids)
+    .bind(spaceId, ids)
     .all<{ repo_id: string }>();
   for (const repo of pending.results) {
     await reconcileSourcePushes(env, repo.repo_id);
@@ -181,10 +189,10 @@ export async function expireArchivedSources(
   const claimed = await env.DB.batch<ClaimedSource>([
     env.DB.prepare(`WITH RECURSIVE eligible(timeline_id) AS (
       SELECT DISTINCT s.timeline_id FROM timeline_work_sources s
-      WHERE s.owner_id=?1 AND s.timeline_id IN (SELECT value FROM json_each(?2))
+      WHERE s.space_id=?1 AND s.timeline_id IN (SELECT value FROM json_each(?2))
         AND NOT EXISTS (SELECT 1 FROM timeline_work_sources other
           WHERE other.timeline_id=s.timeline_id AND (
-            other.owner_id!=?1 OR (other.state NOT IN ('purged','purging') AND
+            other.space_id!=?1 OR (other.state NOT IN ('purged','purging') AND
               (other.state!='archived' OR other.archived_at IS NULL OR other.archive_disposition IS NULL
                 OR other.archived_at >= CASE other.archive_disposition WHEN 'landed' THEN ?3 WHEN 'abandoned' THEN ?4 END
                 OR other.expiry_requested_at IS NULL))))
@@ -205,14 +213,14 @@ export async function expireArchivedSources(
     DELETE FROM timeline_source_roots WHERE consumer_kind='dependency'
       AND consumer_id IN (SELECT timeline_id FROM eligible)
       AND consumer_id NOT IN (SELECT timeline_id FROM protected)`).bind(
-      ownerId,
+      spaceId,
       ids,
       cutoffs.landed,
       cutoffs.abandoned,
     ),
     env.DB.prepare(`UPDATE timeline_work_sources AS s
       SET state = 'purging', updated_at = ?1
-      WHERE owner_id = ?2 AND timeline_id IN (SELECT value FROM json_each(?3))
+      WHERE space_id = ?2 AND timeline_id IN (SELECT value FROM json_each(?3))
         AND ((state = 'archived' AND expiry_requested_at IS NOT NULL
           AND archived_at < CASE archive_disposition WHEN 'landed' THEN ?4 WHEN 'abandoned' THEN ?5 END)
           OR state = 'purging')
@@ -221,9 +229,9 @@ export async function expireArchivedSources(
         AND NOT EXISTS (SELECT 1 FROM timeline_source_roots p WHERE p.source_id = s.source_id)
         AND NOT EXISTS (SELECT 1 FROM source_operations o WHERE o.repo_id = s.repo_id
           AND o.source_id = s.source_id AND o.state IN ('admitted','ambiguous'))
-      RETURNING source_id, artifacts_name, owner_id, version`).bind(
+      RETURNING source_id, artifacts_name, space_id, version`).bind(
       new Date().toISOString(),
-      ownerId,
+      spaceId,
       ids,
       cutoffs.landed,
       cutoffs.abandoned,
@@ -260,12 +268,12 @@ export async function drainDeletedRepoSources(env: Env, repoId: string): Promise
     .first();
   if (busy)
     throw new Error("Repository source operations are still draining; reconcile before purge.");
-  const creating = await env.DB.prepare(`SELECT source_id,owner_id FROM timeline_work_sources
+  const creating = await env.DB.prepare(`SELECT source_id,space_id FROM timeline_work_sources
     WHERE repo_id = ? AND state = 'creating'`)
     .bind(repoId)
-    .all<{ source_id: string; owner_id: string }>();
+    .all<{ source_id: string; space_id: string }>();
   for (const source of creating.results) {
-    const settled = await trackerObject(env, source.owner_id).reconcileDeletedSource(
+    const settled = await trackerObject(env, source.space_id).reconcileDeletedSource(
       source.source_id,
     );
     if (!settled.ok || settled.value.state === "creating")
@@ -273,7 +281,7 @@ export async function drainDeletedRepoSources(env: Env, repoId: string): Promise
   }
   const { results } =
     await env.DB.prepare(`UPDATE timeline_work_sources SET state = 'purging', updated_at = ?
-    WHERE repo_id = ? AND state != 'purged' RETURNING source_id, artifacts_name, owner_id, version`)
+    WHERE repo_id = ? AND state != 'purged' RETURNING source_id, artifacts_name, space_id, version`)
       .bind(new Date().toISOString(), repoId)
       .all<ClaimedSource>();
   for (const source of results) await deleteClaimedSource(env, source);

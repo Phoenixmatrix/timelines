@@ -19,7 +19,7 @@ const LABELS: Record<SearchCategory, string> = {
   repositories: "repositories",
   issues: "issues",
   packages: "packages",
-  accounts: "people and organizations",
+  accounts: "people",
   conversations: "conversations",
 };
 

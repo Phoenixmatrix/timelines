@@ -96,15 +96,15 @@ test("verified reuse links to the executed producer without inventing execution 
     configError: null,
     jobs: [reused, skipped],
   };
-  server.on("GET", "/api/repos/:owner/:name/ci/runs/:number", ({ params }): CiRunDetail =>
+  server.on("GET", "/api/repos/:space/:name/ci/runs/:number", ({ params }): CiRunDetail =>
     params.number === "41"
       ? { ...run, id: "candidate-run", number: 41, jobs: [skipped, producer] }
       : run,
   );
   server.on("GET", "/api/packages/-/published", () => ({ rows: [] }));
-  server.on("GET", "/api/repos/:owner/:name/deployments", () => ({ deployments: [], next: null }));
+  server.on("GET", "/api/repos/:space/:name/deployments", () => ({ deployments: [], next: null }));
   const logRequests: string[] = [];
-  server.on("GET", "/api/repos/:owner/:name/ci/jobs/:job/logs", ({ params }) => {
+  server.on("GET", "/api/repos/:space/:name/ci/jobs/:job/logs", ({ params }) => {
     logRequests.push(params.job!);
     return {
       chunks:

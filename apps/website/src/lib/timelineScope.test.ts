@@ -5,7 +5,7 @@ import {
   carryScope,
   scopeLinks,
   scopeOf,
-  scopeOwner,
+  scopeSpace,
   scopeRedirect,
   switchScope,
   timelineScopeMiddleware,
@@ -24,18 +24,20 @@ describe("the timeline scope", () => {
   });
 
   test("links carry the current scope unless they name one", () => {
-    expect(carryScope("/orbit/engine/ci", "search")).toBe("/orbit/engine/ci?tl=search");
-    expect(carryScope("/tracker/orbit?q=is%3Aopen#top", "search")).toBe(
+    expect(carryScope("/orbit/engine/ci", "search", "orbit")).toBe("/orbit/engine/ci?tl=search");
+    expect(carryScope("/tracker/orbit?q=is%3Aopen#top", "search", "orbit")).toBe(
       "/tracker/orbit?q=is%3Aopen&tl=search#top",
     );
-    expect(carryScope("/tracker/orbit?tl=main", "search")).toBe("/tracker/orbit?tl=main");
-    expect(carryScope("/tracker/orbit?tl=other", "search")).toBe("/tracker/orbit?tl=other");
-    expect(carryScope("/orbit/engine", null)).toBe("/orbit/engine");
+    expect(carryScope("/tracker/orbit?tl=main", "search", "orbit")).toBe("/tracker/orbit?tl=main");
+    expect(carryScope("/tracker/orbit?tl=other", "search", "orbit")).toBe(
+      "/tracker/orbit?tl=other",
+    );
+    expect(carryScope("/orbit/engine", null, "orbit")).toBe("/orbit/engine");
     // Downloads and other hosts aren't pages.
-    expect(carryScope("/api/repos/orbit/engine/archive", "search")).toBe(
+    expect(carryScope("/api/repos/orbit/engine/archive", "search", "orbit")).toBe(
       "/api/repos/orbit/engine/archive",
     );
-    expect(carryScope("https://example.com/", "search")).toBe("https://example.com/");
+    expect(carryScope("https://example.com/", "search", "orbit")).toBe("https://example.com/");
   });
 
   test("leaving a timeline names main, so it isn't carried back", () => {
@@ -45,13 +47,35 @@ describe("the timeline scope", () => {
 
   test("pushes keep the scope; back, forward and reloads keep what the URL says", () => {
     const target = { pathname: "/orbit/engine/ci", search: "" };
-    expect(scopeRedirect(target, { search: "?tl=search" })).toEqual({
+    expect(scopeRedirect(target, { pathname: "/tracker/orbit", search: "?tl=search" })).toEqual({
       to: "/orbit/engine/ci?tl=search",
       replace: false,
     });
     expect(scopeRedirect(target, null)).toBeNull();
-    expect(scopeRedirect(target, { search: "?tl=main" })).toBeNull();
-    expect(scopeRedirect({ ...target, search: "?tl=main" }, { search: "?tl=search" })).toBeNull();
+    expect(scopeRedirect(target, { pathname: "/tracker/orbit", search: "?tl=main" })).toBeNull();
+    expect(
+      scopeRedirect(
+        { ...target, search: "?tl=main" },
+        { pathname: "/tracker/orbit", search: "?tl=search" },
+      ),
+    ).toBeNull();
+  });
+
+  test("Space changes never inherit a different Space's timeline", () => {
+    const from = { pathname: "/tracker/orbit", search: "?tl=search" };
+    for (const pathname of [
+      "/other",
+      "/other/engine",
+      "/tracker/other",
+      "/organizations/company",
+      "/accounts/marco",
+    ]) {
+      expect(scopeRedirect({ pathname, search: "" }, from)).toBeNull();
+      expect(carryScope(pathname, "search", "orbit")).toBe(pathname);
+    }
+    expect(carryScope("/other/engine?tl=review&source=work_other#L4", "search", "orbit")).toBe(
+      "/other/engine?tl=review&source=work_other#L4",
+    );
   });
 
   test("the Knowledge tab's old ?timeline= becomes ?tl=", () => {
@@ -71,17 +95,17 @@ describe("the timeline scope", () => {
     expect(scopeRedirect({ pathname: "/orbit/engine", search: "?timeline=x" }, null)).toBeNull();
   });
 
-  test("the account a page is about", () => {
-    expect(scopeOwner("/tracker/orbit/timelines")).toBe("orbit");
-    expect(scopeOwner("/tracker")).toBeNull();
-    expect(scopeOwner("/orbit/engine/tree/main/src")).toBe("orbit");
-    expect(scopeOwner("/orbit/-/packages/npm/web")).toBe("orbit");
-    expect(scopeOwner("/orbit")).toBe("orbit");
-    expect(scopeOwner("/settings/preferences", "?tracker=orbit")).toBe("orbit");
+  test("the Space a page is about", () => {
+    expect(scopeSpace("/tracker/orbit/timelines")).toBe("orbit");
+    expect(scopeSpace("/tracker")).toBeNull();
+    expect(scopeSpace("/orbit/engine/tree/main/src")).toBe("orbit");
+    expect(scopeSpace("/orbit/-/packages/npm/web")).toBe("orbit");
+    expect(scopeSpace("/orbit")).toBe("orbit");
+    expect(scopeSpace("/settings/preferences", "?tracker=orbit")).toBe("orbit");
     for (const page of ["ai", "retention", "usage", "tokens", "preferences"])
-      expect(scopeOwner(`/settings/${page}`, "?owner=orbit")).toBe("orbit");
-    expect(scopeOwner("/settings/preferences", "?owner=orbit&tracker=marco")).toBe("orbit");
-    expect(scopeOwner("/settings/ai", "?tracker=orbit")).toBeNull();
+      expect(scopeSpace(`/settings/${page}`, "?space=orbit")).toBe("orbit");
+    expect(scopeSpace("/settings/preferences", "?space=orbit&tracker=marco")).toBe("orbit");
+    expect(scopeSpace("/settings/ai", "?tracker=orbit")).toBeNull();
     for (const page of [
       "/",
       "/highlights",
@@ -89,11 +113,13 @@ describe("the timeline scope", () => {
       "/packages",
       "/settings/tokens",
       "/new",
+      "/accounts/marco",
+      "/organizations/orbit",
       "/timelines",
       "/release-notes",
       "/-/go/CORE-1",
     ])
-      expect(scopeOwner(page)).toBeNull();
+      expect(scopeSpace(page)).toBeNull();
   });
 
   test("switching follows code refs to the new timeline's bookmark, or main's", () => {
@@ -188,8 +214,8 @@ describe("the router carries the scope", () => {
       middleware: [timelineScopeMiddleware],
       loader: () => null,
       children: [
-        { path: "tracker/:owner", ...page },
-        { path: ":owner/:repo/*", ...page },
+        { path: "tracker/:space", ...page },
+        { path: ":space/:repo/*", ...page },
       ],
     },
   ];

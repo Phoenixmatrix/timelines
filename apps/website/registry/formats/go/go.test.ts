@@ -1,7 +1,6 @@
 import { strToU8, zipSync } from "@gitmatrix/formats/archive";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { invalidateMembers } from "../../core/virtual.ts";
 import { basic, makeHarness, type Harness } from "../../testing/harness.ts";
 
 function moduleZip(module: string, version: string, files: Record<string, string>): Uint8Array {
@@ -172,7 +171,6 @@ describe("go remote and virtual repositories", () => {
   const MEMBERS = [{ key: "proxy" }, { key: "golocal" }];
 
   beforeEach(async () => {
-    invalidateMembers();
     hits.length = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -286,7 +284,7 @@ describe("go remote and virtual repositories", () => {
         members: MEMBERS,
       }),
     });
-    invalidateMembers();
+
     const zip = moduleZip("golang.org/x/text", "v0.15.0-fork.1", {
       "go.mod": "module golang.org/x/text\n",
     });

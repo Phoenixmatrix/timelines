@@ -25,10 +25,10 @@ export function useRefreshWhile(pending: boolean) {
 }
 
 /** Where a timeline page opens: the wiki, scoped to the timeline, at this set. */
-export function timelinePageUrl(owner: string, name: string, set: KnowledgePageSet, slug: string) {
+export function timelinePageUrl(space: string, name: string, set: KnowledgePageSet, slug: string) {
   return withScope(
     sourceUrl(
-      `${repoPath(owner, name, "wiki", slug)}?set=${encodeURIComponent(set.key)}`,
+      `${repoPath(space, name, "wiki", slug)}?set=${encodeURIComponent(set.key)}`,
       set.sourceId,
     ),
     set.timeline,
@@ -44,11 +44,11 @@ export function setLabel(set: Pick<KnowledgePageSet, "checkpoint" | "commit">): 
 
 export function PageSetSummary({
   set,
-  owner,
+  space,
   name,
 }: {
   set: KnowledgePageSet;
-  owner: string;
+  space: string;
   name: string;
 }) {
   if (pagesPending(set))
@@ -78,10 +78,10 @@ export function PageSetSummary({
           <li key={page.slug} className="flex flex-col gap-0.5 text-body-sm">
             <span className="flex flex-wrap items-baseline gap-x-2">
               {page.outcome === "written" ? (
-                <Link to={timelinePageUrl(owner, name, set, page.slug)}>{page.title}</Link>
+                <Link to={timelinePageUrl(space, name, set, page.slug)}>{page.title}</Link>
               ) : (
                 <Link
-                  to={withScope(repoPath(owner, name, "wiki", page.slug), null)}
+                  to={withScope(repoPath(space, name, "wiki", page.slug), null)}
                   className="text-ink-muted"
                 >
                   {page.title}

@@ -23,16 +23,16 @@ import { useViewer } from "../../lib/session.ts";
 import { CommitPanel } from "./CommitPanel.tsx";
 
 export async function repoLoader({ params, request }: LoaderFunctionArgs) {
-  const owner = params.owner ?? "";
+  const space = params.space ?? "";
   const name = params.repo ?? "";
   const pathname = new URL(request.url).pathname;
-  const releases = repoPath(owner, name, "releases");
+  const releases = repoPath(space, name, "releases");
   // Landed notes outlive their work source; the layout must not read that source either.
   const source =
     pathname === releases || pathname.startsWith(`${releases}/`)
       ? null
-      : await requestSource(owner, name, request);
-  return routeData(repoData.detail(owner, name, source, true));
+      : await requestSource(space, name, request);
+  return routeData(repoData.detail(space, name, source, true));
 }
 
 /**
@@ -49,7 +49,7 @@ export function repoShouldRevalidate({
 }: ShouldRevalidateFunctionArgs) {
   if (formMethod || currentUrl.href === nextUrl.href) return defaultShouldRevalidate;
   return (
-    currentParams.owner !== nextParams.owner ||
+    currentParams.space !== nextParams.space ||
     currentParams.repo !== nextParams.repo ||
     currentUrl.searchParams.get("source") !== nextUrl.searchParams.get("source") ||
     currentUrl.searchParams.get("tl") !== nextUrl.searchParams.get("tl")
@@ -140,10 +140,10 @@ function ClonePopover({ repo }: { repo: RepoDetail }) {
 export function RepoLayout() {
   const repo = useLoaderData<typeof repoLoader>();
   const revalidator = useRevalidator();
-  const base = repoPath(repo.owner.slug, repo.name);
+  const base = repoPath(repo.space.slug, repo.name);
   useRememberPlace({
     kind: "repo",
-    title: `${repo.owner.slug}/${repo.name}`,
+    title: `${repo.space.slug}/${repo.name}`,
     detail: repo.description,
     to: base,
   });
@@ -155,10 +155,10 @@ export function RepoLayout() {
         <div className="min-w-0">
           <h1 className="m-0 flex flex-wrap items-baseline gap-x-2 text-headline">
             <Link
-              to={`/${repo.owner.slug}`}
+              to={`/${repo.space.slug}`}
               className="font-normal text-ink-muted no-underline hover:text-ink"
             >
-              {repo.owner.slug}
+              {repo.space.slug}
             </Link>
             <span className="font-normal text-ink-faint">/</span>
             <Link to={sourceUrl(base, repo.source?.sourceId)} className="text-ink no-underline">
@@ -206,7 +206,7 @@ export function RepoLayout() {
             type="button"
             className="mk-btn mk-btn--sm"
             onClick={() => {
-              forgetRepoData(repo.owner.slug, repo.name);
+              forgetRepoData(repo.space.slug, repo.name);
               void revalidator.revalidate();
             }}
             disabled={revalidator.state !== "idle"}

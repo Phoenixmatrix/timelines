@@ -466,16 +466,16 @@ function emptyFixture(directory: string): { ctx: HarnessContext; fixtures: SeedM
       artifacts: join(directory, "artifacts"),
     },
     fixtures: {
-      version: 1,
+      version: 4,
       origin,
       readToken: "",
       tokens: { priya: "", marco: "", jun: "", sam: "" },
       repos: [
-        { owner: "orbit", name: "engine", visibility: "private" },
-        { owner: "sam", name: "private", visibility: "private" },
-        { owner: "orbit", name: "public", visibility: "public" },
+        { space: "orbit", name: "engine", visibility: "private" },
+        { space: "sam", name: "private", visibility: "private" },
+        { space: "orbit", name: "public", visibility: "public" },
       ],
-      tracker: { owner: "orbit", team: "", ready: "", blocked: "", blocker: "" },
+      tracker: { space: "orbit", team: "", ready: "", blocked: "", blocker: "" },
     },
   };
 }

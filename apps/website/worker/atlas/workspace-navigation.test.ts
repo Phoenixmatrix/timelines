@@ -3,20 +3,17 @@
 // the other's billing imports, browsed through the page's own client and
 // session the way WorkspaceAtlas.tsx does. Finds the capability spanning both,
 // drills to files, cites sources at each repository's immutable commit, and
-// proves every read is a bounded /api/accounts/:owner/atlas page, with every
+// proves every read is a bounded /api/spaces/:space/atlas page, with every
 // model, index and search binding wired to fail if touched.
 
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { ATLAS_FIXTURE_PACKAGE } from "../../shared/atlasFixture.ts";
 import type { AtlasEvidence } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { atlasWorkspaceApi, workspaceReader } from "../../src/lib/atlas.ts";
 import { FocusResolver, type Focus } from "../../src/routes/repo/atlasNavigation.ts";
 import {
@@ -29,7 +26,14 @@ import { publishAtlasFixture, registerFixturePackage, writeAtlasFixtureGraph } f
 import { workspaceAtlas } from "./workspace.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -55,28 +59,32 @@ function forbidden(name: string, touched: string[]) {
   );
 }
 
-function registryDatabase() {
-  const sqlite = new DatabaseSync(":memory:");
-  const dir = fileURLToPath(new URL("../../registry/migrations/", import.meta.url).href);
-  for (const file of readdirSync(dir)
-    .filter((f) => f.endsWith(".sql"))
-    .sort())
-    sqlite.exec(readFileSync(join(dir, file), "utf8"));
-  return sqlite;
-}
-
 async function setup() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_ledger', 'ann', 'ledger', 'private', 'art-1', ''),
       ('r_shop', 'ann', 'shop', 'private', 'art-2', '');
   `);
   const touched: string[] = [];
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
-    REGISTRY_DB: d1(registryDatabase()),
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
     AI: forbidden("AI", touched),
     VECTORS: forbidden("VECTORS", touched),
@@ -103,7 +111,7 @@ async function setup() {
     c.set("actor", ann);
     await next();
   });
-  app.route("/api/accounts/:owner/atlas", workspaceAtlas);
+  app.route("/api/spaces/:space/atlas", workspaceAtlas);
   const requests: URL[] = [];
   vi.stubGlobal("fetch", async (input: string, init?: RequestInit) => {
     requests.push(new URL(String(input), "http://atlas.test"));
@@ -115,7 +123,7 @@ async function setup() {
 describe("the workspace Atlas's navigation", () => {
   test("a capability spanning two repositories, drilled to files and cited at immutable commits", async () => {
     const s = await setup();
-    const workspace = { owner: "ann", repos: ["shop", "ledger"] };
+    const workspace = { space: "ann", repos: ["shop", "ledger"] };
     const states: WorkspaceState[] = [];
     const session = new WorkspaceSession(workspace, atlasWorkspaceApi, (state) =>
       states.push(state),
@@ -218,7 +226,7 @@ describe("the workspace Atlas's navigation", () => {
     // Every read was a bounded page of the workspace API; nothing else ran.
     for (const url of s.requests) {
       expect(url.pathname).toMatch(
-        /^\/api\/accounts\/ann\/atlas\/(overview|composition|links|children|ancestors|evidence)$/,
+        /^\/api\/spaces\/ann\/atlas\/(overview|composition|links|children|ancestors|evidence)$/,
       );
       expect(Number(url.searchParams.get("limit") ?? 0)).toBeLessThanOrEqual(100);
     }

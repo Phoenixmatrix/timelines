@@ -1,7 +1,7 @@
-// Timelines, under a tracker account (/api/tracker/:owner/timelines):
+// Timelines, under a tracker Space (/api/tracker/:space/timelines):
 //   GET    /                  every timeline, newest first (?status= to filter;
 //                             ?stalled=true for open ones without a push for the
-//                             account's idle period, experimental ones left out)
+//                             Space's idle period, experimental ones left out)
 //   POST   /                  fork an owned work source per repository, pinned
 //                             to main or another timeline's exact snapshot
 //   GET    /:slug             the timeline and its events (?after=&limit= to page)
@@ -72,6 +72,7 @@ import {
 import type { SourceSnapshot } from "../../shared/code-source.ts";
 import type { TimelineRepo } from "../../shared/timelines.ts";
 import { migrateLegacyTimeline } from "./migration.ts";
+import { captureWorkAuthority, WorkAuthorizationError } from "../ci/admission.ts";
 import { currentRepositoryNames } from "./names.ts";
 
 /** Repositories one timeline may touch. */
@@ -81,8 +82,8 @@ const OID = /^[0-9a-f]{40}$/;
 type BookmarkRepo = Pick<
   RepoRow,
   | "id"
-  | "owner_id"
-  | "owner_slug"
+  | "space_id"
+  | "space_slug"
   | "name"
   | "default_branch"
   | "artifacts_name"
@@ -94,6 +95,15 @@ export const timelines = new Hono<AppEnv>();
 timelines.onError((error, c) => {
   if (error instanceof TrackerError)
     return c.json({ error: error.message, code: error.code }, error.status);
+  if (error instanceof WorkAuthorizationError)
+    return c.json({ error: error.message, code: error.code }, error.status);
+  if (error.message === "migration_epoch_mismatch")
+    return c.json(
+      { error: "The Space migration epoch changed; refresh before retrying.", code: error.message },
+      409,
+    );
+  if (error.message === "space_cutover_fenced")
+    return c.json({ error: "Space work is fenced during cutover.", code: error.message }, 503);
   throw error;
 });
 
@@ -127,14 +137,15 @@ timelines.get("/", async (c) => {
   if (stalled !== undefined && stalled !== "true" && stalled !== "false")
     fail("invalid_input", "stalled must be true or false.");
   const list = unwrap(
-    await trackerObject(c.env, access.owner.id).listTimelines(
+    await trackerObject(c.env, access.space.id).listTimelines(
+      access,
       status === undefined ? undefined : timelineStatus(status),
     ),
   );
-  const current = await currentRepositoryNames(c.env.DB, access.owner.id, list);
+  const current = await currentRepositoryNames(c.env.DB, access.space.id, list);
   if (stalled !== "true") return c.json<TimelineList>({ timelines: current });
   // Stalling is expected of experimental timelines: isStalled leaves them out.
-  const { idleDays } = await previewSettings(c.env.DB, access.owner.id);
+  const { idleDays } = await previewSettings(c.env.DB, access.space.id);
   const now = Date.now();
   return c.json<TimelineList>({
     timelines: current.filter((timeline) => isStalled(timeline, now, idleDays)),
@@ -155,8 +166,10 @@ timelines.post("/", async (c) => {
     fail("invalid_input", "experimental must be true or false.");
   const parentSlug =
     data.parent === undefined || data.parent === "main" ? null : timelineSlug(data.parent);
-  const tracker = trackerObject(c.env, access.owner.id);
-  const parent = parentSlug ? unwrap(await tracker.timeline(parentSlug, 0, 1)).timeline : null;
+  const tracker = trackerObject(c.env, access.space.id);
+  const parent = parentSlug
+    ? unwrap(await tracker.timeline(access, parentSlug, 0, 1)).timeline
+    : null;
   // Parent snapshots retain their original labels; resolve current URLs by the
   // stable IDs so a rename (or reuse of the old name) cannot change fork identity.
   const inherited =
@@ -172,37 +185,37 @@ timelines.post("/", async (c) => {
   if (data.repos === undefined && parent && inherited.length !== parent.repos.length)
     fail("not_found", "A parent repository no longer exists.", 404);
 
-  // The repositories, by default the parent's: each the account's own, and writable.
+  // The repositories, by default the parent's: each in this Space, and writable.
   const requested =
     data.repos === undefined
-      ? inherited.map((repo) => ({ repo: `${repo.owner_slug}/${repo.name}` }))
+      ? inherited.map((repo) => ({ repo: `${repo.space_slug}/${repo.name}` }))
       : Array.isArray(data.repos)
         ? data.repos.map((entry) => (typeof entry === "string" ? { repo: entry } : entry))
-        : fail("invalid_input", "repos must be a list of owner/name.");
+        : fail("invalid_input", "repos must be a list of space/name.");
   if (!requested.length)
-    fail("invalid_input", "Name the repositories the timeline touches (repos: [owner/name]).");
+    fail("invalid_input", "Name the repositories the timeline touches (repos: [space/name]).");
   if (requested.length > MAX_REPOS)
     fail("invalid_input", `A timeline touches at most ${MAX_REPOS} repositories.`);
   const repos = new Map<string, { row: RepoRow; commit: string | null }>();
   for (const entry of requested) {
-    if (!entry || typeof entry !== "object") fail("invalid_input", "repos must be owner/name.");
+    if (!entry || typeof entry !== "object") fail("invalid_input", "repos must be space/name.");
     const { repo: fullName, commit, ...rest } = entry as Record<string, unknown>;
     if (Object.keys(rest).length) fail("invalid_input", "A repository is { repo, commit }.");
     const [owner, name, extra] = text(fullName, "repo").split("/");
     if (!owner || !name || extra !== undefined)
-      fail("invalid_input", "A repository is owner/name.");
+      fail("invalid_input", "A repository is space/name.");
     const row =
       data.repos === undefined
-        ? inherited.find((repo) => repo.owner_slug === owner && repo.name === name)
+        ? inherited.find((repo) => repo.space_slug === owner && repo.name === name)
         : await findRepo(c.env.DB, actor, owner, name);
     const role = row ? roleFor(row, actor) : "none";
     if (!row || !atLeast(role, "read")) fail("not_found", `No repository ${owner}/${name}.`, 404);
     if (!atLeast(role, "write"))
       fail("forbidden", `Forking a timeline needs write access to ${owner}/${name}.`, 403);
-    if (row.owner_id !== access.owner.id)
+    if (row.space_id !== access.space.id)
       fail(
         "invalid_input",
-        `${owner}/${name} belongs to another account; a timeline touches its own account's repositories.`,
+        `${owner}/${name} belongs to another Space; a timeline touches only its own Space's repositories.`,
       );
     const at = commit === undefined ? null : text(commit, "commit", 40);
     if (at !== null && !OID.test(at))
@@ -223,16 +236,22 @@ timelines.post("/", async (c) => {
       : { repo: row, source: canonicalSource(row) };
     const refs = await lsRefs(c.env, origin.repo.artifacts_name, origin.repo.artifacts_remote);
     const tip = commit ?? refs.find((ref) => ref.name === origin.source.ref)?.oid;
-    if (!tip) fail("no_commits", `${row.owner_slug}/${row.name} has no commit to fork.`, 409);
+    if (!tip) fail("no_commits", `${row.space_slug}/${row.name} has no commit to fork.`, 409);
     using artifacts = await c.env.ARTIFACTS.get(origin.repo.artifacts_name);
     const pinned = await artifacts.readCommit(tip);
     if (!pinned) fail("not_found", `No commit ${tip} in the requested source.`, 404);
     const base: SourceSnapshot = { ...origin.source, commit: tip, tree: pinned.treeHash };
-    const owned = await ensureWorkSource(c.env, row, { timelineId, timelineSlug: slug, base });
+    const authority = await captureWorkAuthority(c.env, row.id, actor);
+    const owned = await ensureWorkSource(c.env, access, row, {
+      timelineId,
+      timelineSlug: slug,
+      base,
+      authority,
+    });
     commits[row.id] = owned.logicalBase.commit;
     entries.push({
       id: row.id,
-      owner: row.owner_slug,
+      space: row.space_slug,
       name: row.name,
       bookmark: "work",
       source: owned.source,
@@ -253,8 +272,8 @@ timelines.post("/", async (c) => {
       commits,
     }),
   );
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [timeline]);
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [timeline]);
   return c.json<TimelineChange>({ timeline: current!, bookmarks: created }, 201);
 });
 
@@ -265,60 +284,61 @@ timelines.get("/:slug", async (c) => {
   if (!/^\d+$/.test(after) || !/^\d+$/.test(limit))
     fail("invalid_input", "after and limit must be integers.");
   const detail = unwrap(
-    await trackerObject(c.env, access.owner.id).timeline(
+    await trackerObject(c.env, access.space.id).timeline(
+      access,
       c.req.param("slug"),
       Number(after),
       Number(limit),
     ),
   );
-  noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [detail.timeline]);
+  noteAgentPresence(c, presenceTarget(access.space.id, detail.timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [detail.timeline]);
   return c.json<TimelineDetail>({ ...detail, timeline: current! });
 });
 
 timelines.get("/:slug/presence", async (c) => {
   const access = await authorize(c, false);
   const { timeline } = unwrap(
-    await trackerObject(c.env, access.owner.id).timeline(c.req.param("slug"), 0, 1),
+    await trackerObject(c.env, access.space.id).timeline(access, c.req.param("slug"), 0, 1),
   );
-  return c.json(await readAgentPresence(c.env.DB, presenceTarget(access.owner.id, timeline.id)));
+  return c.json(await readAgentPresence(c.env.DB, presenceTarget(access.space.id, timeline.id)));
 });
 
 timelines.patch("/:slug", async (c) => {
   const access = await authorize(c, false);
   const { expectedVersion, ...data } = await input(c, ["name", "experimental", "expectedVersion"]);
   const timeline = unwrap(
-    await trackerObject(c.env, access.owner.id).updateTimeline(
+    await trackerObject(c.env, access.space.id).updateTimeline(
+      access,
       c.req.param("slug"),
       data,
       expectedVersion,
-      access,
     ),
   );
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [timeline]);
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [timeline]);
   return c.json<Timeline>(current!);
 });
 
 timelines.post("/:slug/migrate", async (c) => {
   const access = await authorize(c, true);
   const detail = unwrap(
-    await trackerObject(c.env, access.owner.id).timeline(c.req.param("slug"), 0, 1),
+    await trackerObject(c.env, access.space.id).timeline(access, c.req.param("slug"), 0, 1),
   );
-  const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
+  const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.space.id);
   if (detail.timeline.repos.some((repo) => !writable.includes(repo.id)))
     fail("forbidden", "Migration needs write access to every repository.", 403);
-  const result = await migrateLegacyTimeline(c.env, access.owner.id, detail.timeline.id);
-  noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result]);
+  const result = await migrateLegacyTimeline(c.env, access, c.get("actor")!, detail.timeline.id);
+  noteAgentPresence(c, presenceTarget(access.space.id, detail.timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [result]);
   return c.json(current!);
 });
 
 timelines.post("/:slug/migration/resolve", async (c) => {
   const access = await authorize(c, true);
-  const tracker = trackerObject(c.env, access.owner.id);
-  const detail = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1));
-  const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
+  const tracker = trackerObject(c.env, access.space.id);
+  const detail = unwrap(await tracker.timeline(access, c.req.param("slug"), 0, 1));
+  const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.space.id);
   if (detail.timeline.repos.some((repo) => !writable.includes(repo.id)))
     fail("forbidden", "Resolution needs write access to every repository.", 403);
   const data = await input(c, ["expectedVersion", "action", "note"]);
@@ -327,7 +347,7 @@ timelines.post("/:slug/migration/resolve", async (c) => {
     (data.action !== "cancel-unadvanced" && data.action !== "accept-partial-and-abandon")
   )
     fail("invalid_input", "Name the landing version and explicit resolution action.");
-  const landing = unwrap(await tracker.landing(detail.timeline.slug));
+  const landing = unwrap(await tracker.landing(access, detail.timeline.slug));
   if (!landing) fail("not_found", "No legacy landing to resolve.", 404);
   const runs = landing.repos
     .flatMap((repo) => [repo.mergeRun?.id, repo.gateRun?.id])
@@ -348,21 +368,22 @@ timelines.post("/:slug/migration/resolve", async (c) => {
   }
   const result = unwrap(
     await tracker.resolveLegacyLanding(
+      access,
       detail.timeline.id,
       data.expectedVersion as number,
       data.action,
       text(data.note, "note"),
     ),
   );
-  noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result]);
+  noteAgentPresence(c, presenceTarget(access.space.id, detail.timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [result]);
   return c.json(current!);
 });
 
 timelines.post("/:slug/abandon", async (c) => {
   const access = await authorize(c, false);
   const actor = c.get("actor")!;
-  const tracker = trackerObject(c.env, access.owner.id);
+  const tracker = trackerObject(c.env, access.space.id);
   const cancellation = unwrap(await tracker.cancelReservedCreation(access, c.req.param("slug")));
   if (cancellation) return c.json<TimelineCreationCancellation>({ ...cancellation, bookmarks: [] });
   const timeline = unwrap(await tracker.mayAbandonTimeline(access, c.req.param("slug")));
@@ -406,27 +427,27 @@ timelines.post("/:slug/abandon", async (c) => {
     }
     bookmarks.push({ repoId: entry.id, ref: entry.source.ref, ok: true });
   }
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result.timeline]);
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [result.timeline]);
   return c.json<TimelineChange>({ timeline: current!, bookmarks });
 });
 
 timelines.get("/:slug/checkpoints", async (c) => {
   const access = await authorize(c, false);
-  const tracker = trackerObject(c.env, access.owner.id);
+  const tracker = trackerObject(c.env, access.space.id);
   const slug = c.req.param("slug");
   const [states, detail] = await Promise.all([
-    tracker.checkpoints(slug),
-    tracker.timeline(slug, 0, 1),
+    tracker.checkpoints(access, slug),
+    tracker.timeline(access, slug, 0, 1),
   ]);
   const timeline = unwrap(detail).timeline;
   const checkpoints = await Promise.all(
     unwrap(states).map((state) => view(c.env, state, timeline)),
   );
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
   const current = await currentRepositoryNames(
     c.env.DB,
-    access.owner.id,
+    access.space.id,
     checkpoints.map((checkpoint) => checkpoint.checkpoint),
   );
   return c.json<CheckpointList>({
@@ -439,18 +460,18 @@ timelines.get("/:slug/checkpoints", async (c) => {
 
 timelines.get("/:slug/checkpoints/:ref", async (c) => {
   const access = await authorize(c, false);
-  const tracker = trackerObject(c.env, access.owner.id);
+  const tracker = trackerObject(c.env, access.space.id);
   const slug = c.req.param("slug");
   const ref = c.req.param("ref");
   if (ref.length > 100) fail("invalid_input", "A checkpoint is its id or number.");
   const [state, detail] = await Promise.all([
-    tracker.checkpoint(slug, ref),
-    tracker.timeline(slug, 0, 1),
+    tracker.checkpoint(access, slug, ref),
+    tracker.timeline(access, slug, 0, 1),
   ]);
   const timeline = unwrap(detail).timeline;
   const checkpoint = await view(c.env, unwrap(state), timeline);
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [
     checkpoint.checkpoint,
   ]);
   return c.json<CheckpointView>({ ...checkpoint, checkpoint: current! });
@@ -462,8 +483,8 @@ timelines.post("/:slug/checkpoints", async (c) => {
   const data = await input(c, ["summary", "syncMain"]);
   if (data.syncMain !== undefined && typeof data.syncMain !== "boolean")
     fail("invalid_input", "syncMain must be a boolean.");
-  const tracker = trackerObject(c.env, access.owner.id);
-  const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
+  const tracker = trackerObject(c.env, access.space.id);
+  const timeline = unwrap(await tracker.timeline(access, c.req.param("slug"), 0, 1)).timeline;
   if (timeline.status === "landed" || timeline.status === "abandoned")
     fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
   const repos = await measure(c.env, actor, timeline, data.syncMain === true);
@@ -472,9 +493,12 @@ timelines.post("/:slug/checkpoints", async (c) => {
   );
   // The preview contract: each repository that opts in builds this checkpoint.
   const waitUntil = (work: Promise<unknown>) => c.executionCtx.waitUntil(work);
-  waitUntil(previewCheckpoint(c.env, state.checkpoint, timeline, actor, waitUntil));
+  const firstRepo = state.checkpoint.repos[0];
+  if (!firstRepo) fail("invalid_input", "A checkpoint must contain a repository.");
+  const authority = await captureWorkAuthority(c.env, firstRepo.id, actor);
+  waitUntil(previewCheckpoint(c.env, state.checkpoint, timeline, actor, waitUntil, authority));
   // The timeline's wiki pages (CORE-84), queued after the answer too.
-  waitUntil(requestCheckpointPages(c.env, state.checkpoint, timeline.slug, actor.id));
+  waitUntil(requestCheckpointPages(c.env, state.checkpoint, timeline.slug, actor.id, authority));
   // Its full CI and knowledge overlays now, not after the quiet period (CORE-238).
   for (const repo of state.checkpoint.repos) {
     const bookmark = timelineBookmark(timeline.slug);
@@ -490,7 +514,7 @@ timelines.post("/:slug/checkpoints", async (c) => {
       ).catch((error) => console.error("CI: releasing the checkpoint's run failed", error)),
     );
     waitUntil(
-      overlayNow(c.env, repo.id, [`refs/heads/${bookmark}`]).catch((error) =>
+      overlayNow(c.env, repo.id, [`refs/heads/${bookmark}`], authority).catch((error) =>
         console.error("Knowledge: the checkpoint's overlay failed to start", error),
       ),
     );
@@ -498,11 +522,13 @@ timelines.post("/:slug/checkpoints", async (c) => {
   // Green already? An auto timeline lands it (CORE-77).
   if (timeline.policy === "auto")
     waitUntil(
-      settled(c.env, (deps) => maybeLand(c.env, deps, access.owner.id, timeline.slug, "auto")),
+      settled(c.env, (deps) =>
+        maybeLand(c.env, deps, access.space.id, timeline.slug, "auto", authority),
+      ),
     );
   const checkpoint = await view(c.env, state, timeline);
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [
     checkpoint.checkpoint,
   ]);
   return c.json<CheckpointView>({ ...checkpoint, checkpoint: current! }, 201);
@@ -511,24 +537,32 @@ timelines.post("/:slug/checkpoints", async (c) => {
 timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
   const access = await authorize(c, false);
   const actor = c.get("actor")!;
-  const tracker = trackerObject(c.env, access.owner.id);
+  const tracker = trackerObject(c.env, access.space.id);
   const slug = c.req.param("slug");
   const ref = c.req.param("ref");
   if (ref.length > 100) fail("invalid_input", "A checkpoint is its id or number.");
   const [found, detail] = await Promise.all([
-    tracker.checkpoint(slug, ref),
-    tracker.timeline(slug, 0, 1),
+    tracker.checkpoint(access, slug, ref),
+    tracker.timeline(access, slug, 0, 1),
   ]);
   const state = unwrap(found);
   const timeline = unwrap(detail).timeline;
   // Starting runs needs write access to every repository, as checkpoints do.
   await mayWriteAll(c.env, actor, state.checkpoint);
-  const runs = await reviveCheckpoint(c.env, state.checkpoint, timeline, actor, (work) =>
-    c.executionCtx.waitUntil(work),
+  const firstRepo = state.checkpoint.repos[0];
+  if (!firstRepo) fail("invalid_input", "A checkpoint must contain a repository.");
+  const authority = await captureWorkAuthority(c.env, firstRepo.id, actor);
+  const runs = await reviveCheckpoint(
+    c.env,
+    state.checkpoint,
+    timeline,
+    actor,
+    (work) => c.executionCtx.waitUntil(work),
+    authority,
   );
   const checkpoint = await view(c.env, state, timeline);
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [
     checkpoint.checkpoint,
   ]);
   return c.json<PreviewRevival>(
@@ -540,34 +574,35 @@ timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
 timelines.post("/:slug/land", async (c) => {
   const access = await authorize(c, true);
   const actor = c.get("actor")!;
-  const tracker = trackerObject(c.env, access.owner.id);
-  const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
+  const tracker = trackerObject(c.env, access.space.id);
+  const timeline = unwrap(await tracker.timeline(access, c.req.param("slug"), 0, 1)).timeline;
   // Landing moves main: it needs write access to every repository it lands in.
-  const writable = await writableRepoIds(c.env.DB, actor, access.owner.id);
+  const writable = await writableRepoIds(c.env.DB, actor, access.space.id);
   for (const repo of timeline.repos)
     if (!writable.includes(repo.id))
-      fail("forbidden", `Landing needs write access to ${repo.owner}/${repo.name}.`, 403);
+      fail("forbidden", `Landing needs write access to ${repo.space}/${repo.name}.`, 403);
   const result = await requestLanding(
     c.env,
     workerDeps(c.env, (work) => c.executionCtx.waitUntil(work)),
     access,
     timeline.slug,
     "request",
+    actor,
   );
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result.landing]);
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.space.id, [result.landing]);
   return c.json<LandResult>({ ...result, landing: current! }, result.queued ? 202 : 200);
 });
 
 timelines.get("/:slug/landing", async (c) => {
   const access = await authorize(c, false);
-  const tracker = trackerObject(c.env, access.owner.id);
-  const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
-  const landing = unwrap(await tracker.landing(timeline.slug));
-  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  const tracker = trackerObject(c.env, access.space.id);
+  const timeline = unwrap(await tracker.timeline(access, c.req.param("slug"), 0, 1)).timeline;
+  const landing = unwrap(await tracker.landing(access, timeline.slug));
+  noteAgentPresence(c, presenceTarget(access.space.id, timeline.id));
   const [current] = await currentRepositoryNames(
     c.env.DB,
-    access.owner.id,
+    access.space.id,
     landing ? [landing] : [],
   );
   return c.json<{ landing: Landing | null }>({ landing: current ?? null });

@@ -25,6 +25,10 @@
 // - Never select current state or anything a retained record refers to; say
 //   what the category never deletes in its registry entry (`never`).
 // - Do bounded work per call (one batch); the engine loops.
+// - Migration operation identity/digest/result evidence is outside ordinary
+//   retention. No category may remove it while supported replay relies on it.
+// - Manual run batches require the initiating credential and current target
+//   authority; scheduled policy runs are separate service work.
 //
 // A dry run calls only `select`, page after page; a run calls `select` then
 // `remove` for each page. Both are recorded the same way.
@@ -33,7 +37,7 @@ import type { RetentionTarget } from "./policies.ts";
 
 export interface CleanupContext {
   env: Env;
-  /** Whose data: one account's (account categories) or the site's. */
+  /** Explicit content, private person, or Instance infrastructure scope. */
   target: RetentionTarget;
   /** The category's effective thresholds for this run, every key present. */
   thresholds: Record<string, number>;

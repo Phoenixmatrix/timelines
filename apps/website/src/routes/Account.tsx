@@ -1,146 +1,48 @@
-import { Card, link } from "../components/ui.tsx";
-import { useState } from "react";
-import { ImageSquareIcon } from "@phosphor-icons/react";
-import { PictureEditor } from "./AvatarEditor.tsx";
 import { Link, useLoaderData, type LoaderFunctionArgs } from "react-router";
 import type { AccountPage } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { Monogram } from "../components/Monogram.tsx";
-import { RepoList } from "../components/RepoList.tsx";
+import { link } from "../components/ui.tsx";
 import { load } from "../lib/api.ts";
-import { packagesPath } from "../lib/packages.ts";
+import { useViewer } from "../lib/session.ts";
 
 export async function accountLoader({ request, params }: LoaderFunctionArgs) {
-  return load<AccountPage>(`/accounts/${params.owner}`, request);
+  return load<AccountPage>(`/accounts/${encodeURIComponent(params.person!)}`, request);
 }
 
 export function Account() {
   const account = useLoaderData<typeof accountLoader>();
-  const isOrg = account.kind === "org";
-  const [editingIcon, setEditingIcon] = useState(false);
-
+  const viewer = useViewer();
   return (
     <Page>
       <header className="flex items-center gap-4">
-        <Monogram
-          name={account.displayName}
-          shape={isOrg ? "place" : "person"}
-          size="lg"
-          src={account.avatarUrl}
-        />
+        <Monogram name={account.displayName} shape="person" size="lg" src={account.avatarUrl} />
         <div className="min-w-0">
           <h1 className="m-0 text-headline">
             <bdi>{account.displayName}</bdi>
           </h1>
-          <p className="m-0 text-ink-muted">
-            @{account.slug}
-            {isOrg && " · Organization"}
-          </p>
+          <p className="m-0 text-ink-muted">@{account.slug} · Person</p>
         </div>
-        {account.viewerCanManage && (
-          <button
-            type="button"
-            className="mk-btn mk-btn--ghost mk-btn--sm ml-auto"
-            aria-expanded={editingIcon}
-            onClick={() => setEditingIcon((open) => !open)}
-          >
-            <ImageSquareIcon className="size-4" aria-hidden />
-            {editingIcon ? "Done" : "Change icon"}
-          </button>
+        {viewer?.id === account.id && (
+          <Link to="/settings/profile" className={`${link} ml-auto`}>
+            Edit profile
+          </Link>
         )}
       </header>
-      {account.viewerCanManage && editingIcon && (
-        <Card title="Icon" className="mt-6 max-w-xl">
-          <PictureEditor
-            target={{
-              endpoint: `/accounts/${encodeURIComponent(account.slug)}/avatar`,
-              name: account.displayName,
-              avatarUrl: account.avatarUrl,
-              shape: "place",
-              noun: "icon",
-              intro: "Shown wherever the organization appears. Only its owners can change it.",
-            }}
-          />
-        </Card>
-      )}
       {account.bio && (
-        <p className="mt-4 mb-0 max-w-[48ch] text-ink-muted" dir="auto">
+        <p className="mt-4 mb-0 max-w-[65ch] text-ink-muted" dir="auto">
           {account.bio}
         </p>
       )}
-      {account.teams !== null && (
-        <section className="mt-6" aria-label="Tracker">
-          <Link
-            to={`/tracker/${encodeURIComponent(account.slug)}`}
-            className={`${link} font-semibold`}
-          >
-            Issues
-          </Link>
-          {account.teams.length > 0 ? (
-            <ul
-              className="m-0 mt-2 flex list-none flex-wrap gap-x-4 gap-y-2 p-0"
-              aria-label="Teams"
-            >
-              {account.teams.map((team) => (
-                <li key={team.id}>
-                  <Link
-                    to={`/tracker/${encodeURIComponent(account.slug)}?${new URLSearchParams({ q: `is:open team:${team.key.toLowerCase()}` })}`}
-                    className={`${link} inline-flex min-h-11 items-center gap-2`}
-                  >
-                    <span className="font-mono text-mono">{team.key}</span>
-                    <bdi>{team.name}</bdi>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="mt-2 mb-0 text-body-sm text-ink-muted">No active teams yet.</p>
-          )}
-        </section>
+      <p className="mt-8 text-ink-muted">
+        Repositories and work belong to Spaces. This profile identifies the person behind their
+        contributions.
+      </p>
+      {viewer?.id === account.id && (
+        <Link to="/organizations" className={link}>
+          Your Organizations and Spaces
+        </Link>
       )}
-
-      <div className="mt-8 grid gap-6 md:grid-cols-[1fr_15rem]">
-        <section>
-          <div className="mb-3 flex items-baseline justify-between gap-3">
-            <h2 className="m-0 text-title">Repositories</h2>
-            <span className="flex gap-4">
-              {/* The Atlas across repositories you pick (CORE-172). */}
-              <Link to={`/${account.slug}/-/atlas`} className={`${link} text-body-sm`}>
-                Knowledge
-              </Link>
-              <Link to={packagesPath(account.slug)} className={`${link} text-body-sm`}>
-                Packages
-              </Link>
-            </span>
-          </div>
-          <RepoList repos={account.repos} showOwner={false} empty="No repositories you can see." />
-        </section>
-        {isOrg && (
-          <section>
-            <h2 className="mt-0 mb-3 text-title">People</h2>
-            <ul className="m-0 flex list-none flex-col gap-1 p-0">
-              {account.members.map((member) => (
-                <li key={member.id}>
-                  <Link
-                    to={`/${member.slug}`}
-                    className="flex items-center gap-3 rounded-control px-2 py-1.5 text-ink no-underline hover:bg-pane"
-                  >
-                    <Monogram name={member.displayName} size="sm" src={member.avatarUrl} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-semibold">
-                        <bdi>{member.displayName}</bdi>
-                      </span>
-                      <span className="block text-micro text-ink-faint">
-                        {member.role === "owner" ? "Owner" : "Member"}
-                      </span>
-                    </span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-      </div>
     </Page>
   );
 }

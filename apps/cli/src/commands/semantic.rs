@@ -42,13 +42,13 @@ pub(crate) fn encode_into(out: &mut String, value: &str) {
 fn request_path(repo: &str, args: &SemanticListArgs) -> Result<String> {
     let (owner, name) = repo
         .split_once('/')
-        .ok_or_else(|| GmError::usage("Name the repository with --repo owner/name."))?;
+        .ok_or_else(|| GmError::usage("Name the repository with --repo space/name."))?;
     if [owner, name]
         .iter()
         .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('/'))
     {
         return Err(GmError::usage(
-            "Name the repository with --repo owner/name.",
+            "Name the repository with --repo space/name.",
         ));
     }
     let mut path = String::from("/repos/");

@@ -15,14 +15,14 @@ export function cannedFiles(server: TestServer, head: string, files = ["README.m
     parents: [],
   };
   const at = (url: URL) => url.searchParams.get("at") || "main";
-  server.on("GET", "/api/repos/:owner/:name/tree", ({ url }): TreeResponse => ({
+  server.on("GET", "/api/repos/:space/:name/tree", ({ url }): TreeResponse => ({
     ref: at(url),
     path: "",
     commit,
     entries: files.map((path) => ({ name: path, path, type: "blob", oid: head })),
     readme: null,
   }));
-  server.on("GET", "/api/repos/:owner/:name/history", ({ url }): HistoryPage => ({
+  server.on("GET", "/api/repos/:space/:name/history", ({ url }): HistoryPage => ({
     ref: at(url),
     head,
     path: "",

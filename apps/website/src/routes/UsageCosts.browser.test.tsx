@@ -1,13 +1,65 @@
-// Usage & costs by person, agent and timeline (CORE-222), in a real browser:
+// Usage & costs: Space, person and Instance reports stay separate scopes, and
+// a report's costs by person, agent and timeline (CORE-222), in a real browser:
 // who spent what, each agent with the person it works for, timelines as a
 // second view, and what can't be attributed with the reason why; empty lists
 // say so, and the section fits a phone.
 
 import { expect, test } from "vite-plus/test";
-import { page } from "vite-plus/test/browser";
+import { page, userEvent } from "vite-plus/test/browser";
 import type { AttributedSpend, UsageAttribution, UsageReport } from "../../shared/usage.ts";
 import { renderApp } from "../testing/render.tsx";
 import { TestServer } from "../testing/server.ts";
+
+test("personal usage stays separate from the person's granted Spaces", async () => {
+  const server = await TestServer.start({ world: true, persona: "marco" });
+  const app = renderApp("/settings/usage?person=marco");
+  await expect
+    .element(page.getByRole("heading", { name: "Usage & costs", level: 1 }))
+    .toBeVisible();
+  await expect
+    .element(page.getByRole("link", { name: "Personal usage & costs", exact: true }).first())
+    .toHaveAttribute("aria-current", "page");
+  const report = await server.call<UsageReport>("GET", "/api/accounts/marco/usage");
+  expect(report.scope).toBe("person");
+  expect(report.subject?.slug).toBe("marco");
+  expect(report.subjects).toBeNull();
+  expect(report.knowledgeUpdates).toBeNull();
+  await userEvent.click(page.getByRole("combobox", { name: "Scope for usage and costs" }));
+  await userEvent.click(
+    page.getByRole("option", { name: "Orbit Labs / General (@orbit)", exact: true }),
+  );
+  await app.waitForUrl(
+    (url) => url.searchParams.get("space") === "orbit" && !url.searchParams.has("person"),
+  );
+  await expect
+    .element(page.getByRole("link", { name: "Space usage & costs", exact: true }).first())
+    .toHaveAttribute("aria-current", "page");
+  const spaceReport = await server.call<UsageReport>("GET", "/api/spaces/orbit/usage");
+  expect(spaceReport.scope).toBe("space");
+  expect(spaceReport.subject?.slug).toBe("orbit");
+  expect(spaceReport.subjects).toBeNull();
+});
+
+test("Instance operator authority alone does not grant a Space usage report", async () => {
+  const server = await TestServer.start({ world: true, persona: "priya" });
+  const report = await server.call<UsageReport>("GET", "/api/admin/usage");
+  expect(report.scope).toBe("instance");
+  expect(report.subject).toBeNull();
+  renderApp("/settings/usage?space=orbit");
+  await expect.element(page.getByRole("alert")).toBeVisible();
+  await expect(server.call("GET", "/api/spaces/orbit/usage")).rejects.toThrow(
+    /GET \/api\/spaces\/orbit\/usage: 404/,
+  );
+});
+
+test("a Space member cannot administer Space usage", async () => {
+  const server = await TestServer.start({ world: true, persona: "jun" });
+  renderApp("/settings/usage?space=orbit");
+  await expect.element(page.getByRole("alert")).toBeVisible();
+  await expect(server.call("GET", "/api/spaces/orbit/usage")).rejects.toThrow(
+    /GET \/api\/spaces\/orbit\/usage: 403/,
+  );
+});
 
 const spend = (over: Partial<AttributedSpend> & Pick<AttributedSpend, "id" | "name">) => ({
   accountable: null,
@@ -68,7 +120,7 @@ const ATTRIBUTION: UsageAttribution = {
       label: "Storage",
       costUsd: 5,
       reason:
-        "Repositories, databases, search indexes and files belong to the account, whoever wrote them.",
+        "Repositories, databases, search indexes and files belong to the Space, whoever wrote them.",
     },
     {
       id: "ai-builds",
@@ -82,8 +134,8 @@ const ATTRIBUTION: UsageAttribution = {
 
 function report(attribution: UsageAttribution): UsageReport {
   return {
-    scope: "account",
-    account: { slug: "orbit", displayName: "Orbit" },
+    scope: "space",
+    subject: { id: "spc_orbit", slug: "orbit", displayName: "Orbit Labs / General" },
     asOf: "2026-10-20",
     window: { from: "2026-09-20", to: "2026-10-19", daysMeasured: 30 },
     collectedAt: "2026-10-20T05:00:00.000Z",
@@ -97,7 +149,7 @@ function report(attribution: UsageAttribution): UsageReport {
       measured: true,
     })),
     catalog: { version: 1, sources: [] },
-    accounts: null,
+    subjects: null,
     notes: [],
     attribution,
   };
@@ -107,15 +159,15 @@ const section = () => page.getByRole("region", { name: "By person, agent and tim
 const group = (name: string) => section().getByRole("group", { name, exact: true });
 
 test("costs by person, agent and timeline, and what isn't attributed and why", async () => {
-  const server = await TestServer.start({ world: true });
-  server.on("GET", "/api/accounts/:slug/usage", report(ATTRIBUTION));
-  renderApp("/settings/usage?owner=orbit");
+  const server = await TestServer.start({ world: true, persona: "marco" });
+  server.on("GET", "/api/spaces/:slug/usage", report(ATTRIBUTION));
+  renderApp("/settings/usage?space=orbit");
 
   await expect.element(section()).toBeVisible();
   await expect
     .element(
       section().getByText(
-        "People and agents account for $1.50 of the $2.00 spent on CI and AI in this window (75%). The rest, and storage, belong to the account as a whole: see Not attributed.",
+        "People and agents account for $1.50 of the $2.00 spent on CI and AI in this window (75%). The rest, and storage, belong to the Space as a whole: see Not attributed.",
       ),
     )
     .toBeVisible();
@@ -145,7 +197,7 @@ test("costs by person, agent and timeline, and what isn't attributed and why", a
   await text(unattributed, "Storage");
   await text(
     unattributed,
-    "Repositories, databases, search indexes and files belong to the account, whoever wrote them.",
+    "Repositories, databases, search indexes and files belong to the Space, whoever wrote them.",
   );
   await text(unattributed, "$5.00 a month");
   await text(unattributed, "Knowledge and wiki builds");
@@ -153,13 +205,13 @@ test("costs by person, agent and timeline, and what isn't attributed and why", a
 });
 
 test("empty lists say so, and the section fits a phone", async () => {
-  const server = await TestServer.start({ world: true });
-  server.on("GET", "/api/accounts/:slug/usage", {
+  const server = await TestServer.start({ world: true, persona: "marco" });
+  server.on("GET", "/api/spaces/:slug/usage", {
     ...report({ ...ATTRIBUTION, agents: [], timelines: [], attributedUsd: 1, activityUsd: 1.5 }),
     window: { from: "2026-09-20", to: "2026-10-19", daysMeasured: 10 },
   });
   await page.viewport(390, 844);
-  renderApp("/settings/usage?owner=orbit");
+  renderApp("/settings/usage?space=orbit");
   await expect
     .element(group("Agents").getByText("No CI or AI was started by an agent in this window."))
     .toBeVisible();

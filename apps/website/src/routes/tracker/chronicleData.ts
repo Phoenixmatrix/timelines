@@ -27,7 +27,7 @@ export interface Loaded {
 }
 
 export function useChronicle(
-  owner: string,
+  space: string,
   query: string,
   window: { from: number; to: number },
   now: number,
@@ -68,7 +68,7 @@ export function useChronicle(
           });
           if (cursor) params.set("cursor", cursor);
           const page: Chronicle = await api<Chronicle>(
-            `/tracker/${encodeURIComponent(owner)}/chronicle?${params}`,
+            `/tracker/${encodeURIComponent(space)}/chronicle?${params}`,
             { signal: controller.signal },
           );
           first ??= page;
@@ -106,6 +106,6 @@ export function useChronicle(
     };
     // The key holds what matters; the window's values ride along with it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, owner]);
+  }, [key, space]);
   return { data, loading: loading || key !== null, error };
 }

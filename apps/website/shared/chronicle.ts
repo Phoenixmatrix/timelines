@@ -2,8 +2,8 @@
 // "as of"; a claimed stretch of work is a "work span". The server
 // reconstructs both from the Tracker's event log (worker/tracker/chronicle.ts):
 //
-//   GET /api/tracker/:owner/chronicle?from&to[&q][&cursor][&limit][&quiet=1]
-//   GET /api/tracker/:owner/issues/:issue/work
+//   GET /api/tracker/:space/chronicle?from&to[&q][&cursor][&limit][&quiet=1]
+//   GET /api/tracker/:space/issues/:issue/work
 //
 // Everything here is pure, shared by the Worker, the web view and the tests.
 
@@ -36,7 +36,7 @@ export interface ChronicleSegment extends ChronicleState {
  * How a work span ended:
  * - `release`: its holder let go; `complete`: its holder completed the issue;
  * - `revoke`: the holder of a lease above took it back;
- * - `takeover`: a tracker owner claimed it over the holder;
+ * - `takeover`: a Space admin claimed it over the holder;
  * - `handoff`: someone accepted the holder's offer;
  * - `ended`: someone else ended it (a forced release, or an edit that cleared it);
  * - `expiry`: it ran out without a renewal (nothing is recorded then: the
@@ -193,7 +193,7 @@ export interface ChronicleDensity {
   counts: number[];
 }
 
-/** GET /api/tracker/:owner/chronicle */
+/** GET /api/tracker/:space/chronicle */
 export interface Chronicle {
   from: string;
   to: string;
@@ -366,10 +366,10 @@ export function actorText(actors: Record<string, AuditActor>, id: string | null)
 
 // ── Linked work ─────────────────────────────────────────────────────────────
 
-/** A repository, by its current owner and name. */
+/** A repository, by its immutable Space handle and current name. */
 export interface WorkRepo {
   id: string;
-  owner: string;
+  space: string;
   name: string;
 }
 
@@ -447,8 +447,8 @@ export interface WorkPackage {
   format: string;
   name: string;
   version: string;
-  /** The account whose registry it's in. */
-  owner: string;
+  /** The immutable Space handle of its registry. */
+  space: string;
   commit: string;
   repo: WorkRepo;
   at: string;
@@ -513,7 +513,7 @@ export interface WorkMention {
   ref: string | null;
   pushedAt: string;
   /**
-   * Opens the commit panel: `/<owner>/<repo>?commit=<oid>`, with `source=<id>`
+   * Opens the commit panel: `/<space>/<repo>?commit=<oid>`, with `source=<id>`
    * for a commit in a timeline's work source (CORE-296).
    */
   href: string;
@@ -521,7 +521,7 @@ export interface WorkMention {
   packages: WorkPackage[];
 }
 
-/** GET /api/tracker/:owner/issues/:issue/work: what the issue's work produced, newest first. */
+/** GET /api/tracker/:space/issues/:issue/work: what the issue's work produced, newest first. */
 export interface LinkedWork {
   issue: { id: string; key: string; title: string; status: IssueStatus };
   commits: WorkCommit[];

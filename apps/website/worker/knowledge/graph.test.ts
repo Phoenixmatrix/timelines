@@ -1,7 +1,10 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { FileAnalysis } from "./analyze.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { applyGraph, buildGraph, conceptKey, planComponents } from "./graph.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 
 const analysis = (over: Partial<FileAnalysis>): FileAnalysis => ({
   language: "typescript",
@@ -77,10 +80,15 @@ test("buildGraph links files, symbols, packages, concepts and components", () =>
 });
 
 test("applyGraph moves the graph version only when the stored graph changes", async () => {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id,slug,display_name,kind,default_space_id) VALUES ('org','org','Org','company','acc');
+    INSERT INTO spaces (id,organization_id,slug,display_name) VALUES ('acc','org','org','Org');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
   `);
   const version = () =>

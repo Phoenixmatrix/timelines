@@ -1,4 +1,4 @@
-// The artifact store's management side, in gitmatrix's terms: an owner's
+// The artifact store's management side, in gitmatrix's terms: a Space's
 // packages and feeds, a package's console, its sources, housekeeping,
 // proxies and virtual feeds, and what a commit or CI run published.
 
@@ -11,7 +11,7 @@ import type {
   CreateFeedRequest,
   FeedSummary,
   NpmLoginRequest,
-  OwnerPackages,
+  SpacePackages,
   PackageAccess,
   PackageDetail,
   PackageSource,
@@ -22,8 +22,10 @@ import type {
   UpdateFeedRequest,
 } from "../../shared/packages.ts";
 import { issueToken } from "../../worker/api/tokens.ts";
-import { avatarUrl } from "../../worker/avatars/api.ts";
-import { db as gitmatrixDb } from "../../worker/schema.ts";
+import type { SpaceSummary } from "../../shared/spaces.ts";
+import { findSpaceBySlug } from "../../worker/spaces/access.ts";
+import { readableRepo, selectRepos } from "../../worker/db.ts";
+import { currentPerson } from "../core/auth/authenticate.ts";
 import { purgeInstance } from "../../worker/durable/registry.ts";
 import type { AccessControl } from "../core/acl.ts";
 import { loginObject, type Services } from "../core/context.ts";
@@ -48,33 +50,15 @@ import { completeNpmLogin } from "../formats/npm/login.ts";
 import { matchingVersions, queryPublishes, type Directory, type Scope } from "./query.ts";
 import { actionsFor, applyToVersions } from "./versions.ts";
 
-interface Owner {
-  id: string;
-  slug: string;
-  displayName: string;
-  kind: "user" | "org";
-  avatarUrl: string | null;
+async function findSpace(services: Services, slug: string): Promise<SpaceSummary> {
+  const space = await findSpaceBySlug(services.env.DB, slug);
+  if (!space || space.archivedAt) throw RegistryError.notFound(`No Space ${slug}.`);
+  return space;
 }
 
-async function findOwner(services: Services, slug: string): Promise<Owner> {
-  const row = await gitmatrixDb(services.env.DB)
-    .selectFrom("accounts")
-    .select(["id", "slug", "display_name", "kind", "avatar_key"])
-    .where("slug", "=", slug)
-    .executeTakeFirst();
-  if (!row) throw RegistryError.notFound(`No account ${slug}.`);
-  return {
-    id: row.id,
-    slug: row.slug,
-    displayName: row.display_name,
-    kind: row.kind,
-    avatarUrl: avatarUrl(row.avatar_key),
-  };
-}
-
-async function ownerAccess(access: AccessControl, ownerId: string): Promise<PackageAccess | null> {
+async function spaceAccess(access: AccessControl, spaceId: string): Promise<PackageAccess | null> {
   if (await access.isAdmin()) return "admin";
-  return access.roleForOwner(ownerId);
+  return access.roleForSpace(spaceId);
 }
 
 async function feedAccess(access: AccessControl, feed: Repository): Promise<PackageAccess | null> {
@@ -85,33 +69,30 @@ async function feedAccess(access: AccessControl, feed: Repository): Promise<Pack
 }
 
 /** gitmatrix repositories, as the console's query and sources name them. */
-export function directory(services: Services, owner: { slug: string }): Directory {
+export function directory(services: Services, space: { slug: string }): Directory {
   const names = new Map<string, string>();
   return {
     async repoIds(value) {
-      const [ownerSlug, name] = value.includes("/") ? value.split("/", 2) : [owner.slug, value];
-      const results = await gitmatrixDb(services.env.DB)
-        .selectFrom("repos as r")
-        .innerJoin("accounts as o", "o.id", "r.owner_id")
-        .select("r.id")
-        .where("o.slug", "=", ownerSlug ?? "")
+      const [spaceSlug, name] = value.includes("/") ? value.split("/", 2) : [space.slug, value];
+      if (spaceSlug !== space.slug) return [];
+      const person = await currentPerson(services.env.DB, (await services.access()).actor);
+      const results = await selectRepos(services.env.DB, person?.id ?? "")
+        .where("s.slug", "=", space.slug)
         .where("r.name", "=", name ?? "")
-        .where("r.deleted_at", "is", null)
+        .where(readableRepo(person))
         .execute();
       return results.map((r) => r.id);
     },
     async repoNames(ids) {
       const missing = ids.filter((id) => !names.has(id));
+      const person = await currentPerson(services.env.DB, (await services.access()).actor);
       for (let i = 0; i < missing.length; i += 90) {
-        const chunk = missing.slice(i, i + 90);
-        const results = await gitmatrixDb(services.env.DB)
-          .selectFrom("repos as r")
-          .innerJoin("accounts as o", "o.id", "r.owner_id")
-          .select(["r.id", "r.name", "o.slug"])
-          .where("r.id", "in", chunk)
-          .where("r.deleted_at", "is", null)
+        const results = await selectRepos(services.env.DB, person?.id ?? "")
+          .where("s.slug", "=", space.slug)
+          .where("r.id", "in", missing.slice(i, i + 90))
+          .where(readableRepo(person))
           .execute();
-        for (const row of results) names.set(row.id, `${row.slug}/${row.name}`);
+        for (const row of results) names.set(row.id, `${row.space_slug}/${row.name}`);
       }
       return new Map(ids.filter((id) => names.has(id)).map((id) => [id, names.get(id)!]));
     },
@@ -155,7 +136,7 @@ const HOUR = 3_600_000;
 async function packageSummaries(
   services: Services,
   feeds: Repository[],
-  owner: { slug: string },
+  space: { slug: string },
   only?: string[],
 ): Promise<PackageSummary[]> {
   const local = feeds.filter((f) => f.kind === "local");
@@ -229,7 +210,7 @@ async function packageSummaries(
       if (h >= 0 && h < 24) series[h] = (series[h] ?? 0) + Number(row.n);
       spark.set(row.package_id, series);
     }
-    const names = await directory(services, owner).repoNames([
+    const names = await directory(services, space).repoNames([
       ...new Set(granted.map((g) => g.git_repo_id)),
     ]);
     for (const g of granted) {
@@ -258,29 +239,29 @@ async function packageSummaries(
     .sort((a, b) => (b.lastPublishedAt ?? "").localeCompare(a.lastPublishedAt ?? ""));
 }
 
-async function visibleFeeds(services: Services, ownerId: string): Promise<Repository[]> {
+async function visibleFeeds(services: Services, spaceId: string): Promise<Repository[]> {
   const access = await services.access();
-  const feeds = await listRepos(services.db, undefined, ownerId);
+  const feeds = await listRepos(services.db, undefined, spaceId);
   const visible: Repository[] = [];
   for (const feed of feeds) if (await access.can(feed, "read")) visible.push(feed);
   return visible;
 }
 
-export async function ownerPackages(services: Services, slug: string): Promise<OwnerPackages> {
-  const owner = await findOwner(services, slug);
+export async function spacePackages(services: Services, slug: string): Promise<SpacePackages> {
+  const space = await findSpace(services, slug);
   const access = await services.access();
-  const feeds = await visibleFeeds(services, owner.id);
+  const feeds = await visibleFeeds(services, space.id);
   return {
-    owner,
-    access: await ownerAccess(access, owner.id),
+    space,
+    access: await spaceAccess(access, space.id),
     registryUrl: services.baseUrl,
-    packages: await packageSummaries(services, feeds, owner),
+    packages: await packageSummaries(services, feeds, space),
     feeds: await feedSummaries(services, feeds),
   };
 }
 
 export interface Located {
-  owner: Owner;
+  space: SpaceSummary;
   feed: Repository;
   pkg: PackageRow;
   access: PackageAccess;
@@ -293,12 +274,12 @@ export async function locate(
   name: string,
 ): Promise<Located> {
   if (!isFormatId(format)) throw RegistryError.notFound(`Unknown format ${format}.`);
-  const owner = await findOwner(services, slug);
-  const feed = await getRepoByKey(services.db, format, owner.slug.toLowerCase());
+  const space = await findSpace(services, slug);
+  const feed = await getRepoByKey(services.db, format, space.slug.toLowerCase());
   const access = await services.access();
-  const level = feed ? await feedAccess(access, feed) : null;
+  const level = feed?.spaceId === space.id ? await feedAccess(access, feed) : null;
   const missing = RegistryError.notFound(
-    `${owner.slug} has no ${FORMATS[format].label} package ${name}.`,
+    `${space.slug} has no ${FORMATS[format].label} package ${name}.`,
   );
   if (!feed || !level) {
     if (feed && access.actor.kind === "anonymous") throw RegistryError.unauthorized();
@@ -320,7 +301,7 @@ export async function locate(
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-  return { owner, feed, pkg, access: level };
+  return { space, feed, pkg, access: level };
 }
 
 export async function packageDetail(
@@ -329,9 +310,9 @@ export async function packageDetail(
   format: string,
   name: string,
 ): Promise<PackageDetail> {
-  const { owner, feed, pkg, access } = await locate(services, slug, format, name);
+  const { space, feed, pkg, access } = await locate(services, slug, format, name);
   const [[summary], [feedSummary], tags, totals, sources] = await Promise.all([
-    packageSummaries(services, [feed], owner, [pkg.id]),
+    packageSummaries(services, [feed], space, [pkg.id]),
     feedSummaries(services, [feed]),
     services.db
       .selectFrom("dist_tags")
@@ -349,12 +330,12 @@ export async function packageDetail(
       ])
       .where("package_id", "=", pkg.id)
       .executeTakeFirst(),
-    packageSources(services, owner, pkg.id),
+    packageSources(services, space, pkg.id),
   ]);
   return {
     package: summary!,
     feed: feedSummary!,
-    owner,
+    space,
     registryUrl: services.baseUrl,
     access,
     tags: Object.fromEntries(tags.map((t) => [t.tag, t.version])),
@@ -373,7 +354,7 @@ export async function packageDetail(
 
 async function packageSources(
   services: Services,
-  owner: { slug: string },
+  space: { slug: string },
   packageId: string,
 ): Promise<PackageSource[]> {
   const [granted, usage] = await Promise.all([
@@ -395,7 +376,7 @@ async function packageSources(
       .groupBy("git_repo_id")
       .execute(),
   ]);
-  const names = await directory(services, owner).repoNames(granted.map((g) => g.git_repo_id));
+  const names = await directory(services, space).repoNames(granted.map((g) => g.git_repo_id));
   const used = new Map(usage.map((u) => [u.git_repo_id, u]));
   return granted.map((g) => ({
     repoId: g.git_repo_id,
@@ -414,8 +395,8 @@ export async function packagePublishes(
   name: string,
   options: { query: string; offset: number; limit: number },
 ): Promise<PublishPage> {
-  const { owner, feed, pkg } = await locate(services, slug, format, name);
-  return queryPublishes(services.db, scopeOf(feed, pkg), directory(services, owner), options);
+  const { space, feed, pkg } = await locate(services, slug, format, name);
+  return queryPublishes(services.db, scopeOf(feed, pkg), directory(services, space), options);
 }
 
 function scopeOf(feed: Repository, pkg: PackageRow): Scope {
@@ -431,12 +412,12 @@ export async function bulkAction(
   name: string,
   request: BulkActionRequest,
 ): Promise<BulkActionResult> {
-  const { owner, feed, pkg } = await locate(services, slug, format, name);
+  const { space, feed, pkg } = await locate(services, slug, format, name);
   const access = await services.access();
   if (request.action === "delete") await access.require(feed, "delete");
   else {
     await access.require(feed, "write");
-    // Changing a package is publishing it: its sources' writers, or owner admins.
+    // Package source associations never bypass current feed or repository rights.
     await authorizePublish(services.db, { id: pkg.id, name: pkg.name, repoId: feed.id });
     if (request.action === "tag" && request.tag === "latest") requireMovesLatest(access.actor);
   }
@@ -449,7 +430,7 @@ export async function bulkAction(
     const matched = await matchingVersions(
       services.db,
       scopeOf(feed, pkg),
-      directory(services, owner),
+      directory(services, space),
       request.query,
       BULK_LIMIT,
     );
@@ -472,10 +453,10 @@ export async function grantSource(
   name: string,
   repo: string,
 ): Promise<PackageSource[]> {
-  const { owner, feed, pkg } = await locate(services, slug, format, name);
+  const { space, feed, pkg } = await locate(services, slug, format, name);
   const access = await services.access();
   await access.require(feed, "admin");
-  const ids = await directory(services, owner).repoIds(repo);
+  const ids = await directory(services, space).repoIds(repo);
   if (ids.length !== 1) throw RegistryError.notFound(`No repository ${repo}.`);
   await services.db
     .insertInto("package_sources")
@@ -492,7 +473,7 @@ export async function grantSource(
     target: pkg.name,
     detail: { repo },
   });
-  return packageSources(services, owner, pkg.id);
+  return packageSources(services, space, pkg.id);
 }
 
 export async function revokeSource(
@@ -502,7 +483,7 @@ export async function revokeSource(
   name: string,
   repoId: string,
 ): Promise<PackageSource[]> {
-  const { owner, feed, pkg } = await locate(services, slug, format, name);
+  const { space, feed, pkg } = await locate(services, slug, format, name);
   const access = await services.access();
   await access.require(feed, "admin");
   await services.db
@@ -515,19 +496,19 @@ export async function revokeSource(
     target: pkg.name,
     detail: { repoId },
   });
-  return packageSources(services, owner, pkg.id);
+  return packageSources(services, space, pkg.id);
 }
 
-// ── Feeds: the owner's registries, proxies and virtual feeds ──────────────
+// ── Feeds: the Space's registries, proxies and virtual feeds ──────────────
 
-async function requireOwnerAdmin(services: Services, owner: Owner): Promise<AccessControl> {
+async function requireSpaceAdmin(services: Services, space: SpaceSummary): Promise<AccessControl> {
   const access = await services.access();
   if (access.actor.kind === "anonymous") throw RegistryError.unauthorized();
   if (
-    (await ownerAccess(access, owner.id)) !== "admin" ||
+    (await spaceAccess(access, space.id)) !== "admin" ||
     !access.actor.scopes.has("packages:admin")
   ) {
-    throw RegistryError.denied(`Only ${owner.slug}'s admins manage its feeds.`);
+    throw RegistryError.denied(`Only ${space.slug}'s admins manage its feeds.`);
   }
   return access;
 }
@@ -539,16 +520,16 @@ export async function createFeed(
   slug: string,
   request: CreateFeedRequest,
 ): Promise<FeedSummary> {
-  const owner = await findOwner(services, slug);
-  const access = await requireOwnerAdmin(services, owner);
+  const space = await findSpace(services, slug);
+  const access = await requireSpaceAdmin(services, space);
   if (!FEED_NAME.test(request.name ?? "")) {
     throw RegistryError.badRequest("Feed names are lowercase letters, digits, '-' and '_'.");
   }
-  const key = `${owner.slug.toLowerCase()}.${request.name}`;
+  const key = `${space.slug.toLowerCase()}.${request.name}`;
   const input = await sealConfig(services.env, {
     key,
     format: request.format,
-    ownerId: owner.id,
+    spaceId: space.id,
     kind: request.kind,
     visibility: request.visibility ?? "private",
     description: request.description ?? "",
@@ -571,10 +552,10 @@ export async function createFeed(
   return (await feedSummaries(services, [feed]))[0]!;
 }
 
-async function ownedFeed(services: Services, owner: Owner, format: string, key: string) {
+async function spaceFeed(services: Services, space: SpaceSummary, format: string, key: string) {
   if (!isFormatId(format)) throw RegistryError.notFound(`Unknown format ${format}.`);
   const feed = await getRepoByKey(services.db, format as FormatId, key);
-  if (!feed || feed.ownerId !== owner.id) throw RegistryError.notFound(`No feed ${key}.`);
+  if (!feed || feed.spaceId !== space.id) throw RegistryError.notFound(`No feed ${key}.`);
   return feed;
 }
 
@@ -585,9 +566,9 @@ export async function updateFeed(
   key: string,
   request: UpdateFeedRequest,
 ): Promise<FeedSummary> {
-  const owner = await findOwner(services, slug);
-  const access = await requireOwnerAdmin(services, owner);
-  const feed = await ownedFeed(services, owner, format, key);
+  const space = await findSpace(services, slug);
+  const access = await requireSpaceAdmin(services, space);
+  const feed = await spaceFeed(services, space, format, key);
   const config: Record<string, unknown> = { ...feed.config };
   if (request.retention) {
     const retention = Object.fromEntries(
@@ -622,11 +603,11 @@ export async function removeFeed(
   format: string,
   key: string,
 ): Promise<void> {
-  const owner = await findOwner(services, slug);
-  const access = await requireOwnerAdmin(services, owner);
-  const feed = await ownedFeed(services, owner, format, key);
+  const space = await findSpace(services, slug);
+  const access = await requireSpaceAdmin(services, space);
+  const feed = await spaceFeed(services, space, format, key);
   if (feed.kind === "local") {
-    throw RegistryError.badRequest("An owner's own registry stays; delete its packages instead.");
+    throw RegistryError.badRequest("A Space's own registry stays; delete its packages instead.");
   }
   await deleteRepo(services.db, feed);
   await audit(services.db, access.actor, "feed.delete", { target: key });
@@ -644,8 +625,10 @@ export async function published(
   repo: string,
   where: { commit?: string; run?: number },
 ): Promise<Published> {
-  const [ownerSlug] = repo.split("/");
-  const ids = await directory(services, { slug: ownerSlug ?? "" }).repoIds(repo);
+  const [spaceSlug] = repo.split("/");
+  const space = await findSpaceBySlug(services.env.DB, spaceSlug ?? "");
+  if (!space || space.archivedAt) return { rows: [] };
+  const ids = await directory(services, { slug: spaceSlug ?? "" }).repoIds(repo);
   if (ids.length !== 1) return { rows: [] };
   let query = services.db
     .selectFrom("publishes as x")
@@ -665,7 +648,10 @@ export async function published(
   for (const row of rows) {
     if (!feeds.has(row.feed_id)) {
       const feed = await getRepoById(services.db, row.feed_id);
-      feeds.set(row.feed_id, feed && (await access.can(feed, "read")) ? feed : null);
+      feeds.set(
+        row.feed_id,
+        feed?.spaceId === space.id && (await access.can(feed, "read")) ? feed : null,
+      );
     }
     const feed = feeds.get(row.feed_id);
     if (!feed) continue;
@@ -735,9 +721,10 @@ export async function approveNpmLogin(services: Services, publicId: string): Pro
 // ── A repository's packages: what it is a source of, or has published ─────
 
 export async function repoPackages(services: Services, repo: string): Promise<PackageSummary[]> {
-  const [ownerSlug] = repo.split("/");
-  const owner = { slug: ownerSlug ?? "" };
-  const ids = await directory(services, owner).repoIds(repo);
+  const [spaceSlug] = repo.split("/");
+  const space = await findSpaceBySlug(services.env.DB, spaceSlug ?? "");
+  if (!space || space.archivedAt) return [];
+  const ids = await directory(services, space).repoIds(repo);
   if (ids.length !== 1) return [];
   const repoId = ids[0]!;
   const rows = await services.db
@@ -767,12 +754,12 @@ export async function repoPackages(services: Services, repo: string): Promise<Pa
   const feeds: Repository[] = [];
   for (const feedId of new Set(rows.map((r) => r.repo_id))) {
     const feed = await getRepoById(services.db, feedId);
-    if (feed && (await access.can(feed, "read"))) feeds.push(feed);
+    if (feed?.spaceId === space.id && (await access.can(feed, "read"))) feeds.push(feed);
   }
   return packageSummaries(
     services,
     feeds,
-    owner,
+    space,
     rows.map((r) => r.id),
   );
 }

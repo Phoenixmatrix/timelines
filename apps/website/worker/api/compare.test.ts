@@ -7,14 +7,14 @@ import { forgetObjectMemory } from "../objects.ts";
 import type { RepoRefs } from "../artifacts.ts";
 import { issueToken } from "./tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { fakeHistory } from "../testing/history.ts";
 import { Timing } from "../timing.ts";
 import { repos } from "./repos.ts";
 
 // Branch tips by Artifacts name: the git endpoint the reader would list refs from.
 const tips = new Map<string, Record<string, string>>();
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {}, WorkflowEntrypoint: class {} }));
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 vi.mock("../artifacts.ts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../artifacts.ts")>()),
   listRefs: async (_env: Env, name: string): Promise<RepoRefs> => ({
@@ -36,18 +36,38 @@ beforeEach(() => {
     throw new Error("no network in tests");
   });
 });
-afterEach(() => vi.unstubAllGlobals());
+const closers: { close(): void }[] = [];
+afterEach(() => {
+  vi.unstubAllGlobals();
+  for (const closer of closers.splice(0)) closer.close();
+});
 
 async function setup(visibility = "private") {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  closers.push(fresh);
+  const { sqlite } = fresh;
   const id = crypto.randomUUID();
   const mainName = `cmp-${id}`;
   const workName = `cmp-work-${id}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob'), ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ann', 'owner');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      ('ann', 'user', 'ann', 'Ann'), ('bob', 'user', 'bob', 'Bob');
+  `);
+  // Ann reads orbit's repositories through her explicit Space grant; Bob has none.
+  await seedSpaceFixture(fresh.env.DB, {
+    organization: { id: "org_orbit", slug: "orbit-org", displayName: "Orbit", kind: "company" },
+    space: { id: "orbit", slug: "orbit", displayName: "General" },
+    members: [
+      {
+        accountId: "ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "ann",
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('app', 'orbit', 'app', '${visibility}', '${mainName}', 'https://app');
   `);
   // Canonical and the timeline's work source are separate repositories.
@@ -58,26 +78,24 @@ async function setup(visibility = "private") {
     canonical: { readCommit: 0, readTree: 0, readBlob: 0 },
     work: { readCommit: 0, readTree: 0, readBlob: 0 },
   };
-  const env = {
-    DB: d1(sqlite),
-    ARTIFACTS: {
-      get: async (name: string) => {
-        const side = name === workName ? "work" : "canonical";
-        const repo = (await (side === "work" ? work : canonical).artifacts.get()) as Record<
-          string,
-          unknown
-        >;
-        for (const method of ["readCommit", "readTree", "readBlob"] as const) {
-          const original = repo[method] as (oid: string) => Promise<unknown>;
-          repo[method] = (oid: string) => {
-            reads[side][method]++;
-            return original(oid);
-          };
-        }
-        return repo;
-      },
+  const env = fresh.env;
+  Reflect.set(env, "ARTIFACTS", {
+    get: async (name: string) => {
+      const side = name === workName ? "work" : "canonical";
+      const repo = (await (side === "work" ? work : canonical).artifacts.get()) as Record<
+        string,
+        unknown
+      >;
+      for (const method of ["readCommit", "readTree", "readBlob"] as const) {
+        const original = repo[method] as (oid: string) => Promise<unknown>;
+        repo[method] = (oid: string) => {
+          reads[side][method]++;
+          return original(oid);
+        };
+      }
+      return repo;
     },
-  } as unknown as Env;
+  });
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
@@ -117,7 +135,7 @@ async function setup(visibility = "private") {
   };
   const workSource = (forkCommit: string) =>
     sqlite.exec(`INSERT INTO timeline_work_sources
-      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+      (source_id,repo_id,timeline_id,timeline_slug,space_id,artifacts_name,artifacts_remote,state,
        allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
        initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
       VALUES('work','app','timeline','test','orbit','${workName}','https://work','ready',

@@ -2,6 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
 import { promisify } from "node:util";
 
 // Deploy what changed on main since the deployed Worker versions, from CI.
@@ -49,6 +50,34 @@ const MIGRATIONS = [
   },
 ] as const;
 
+/** Tenant ownership transformation is an operator protocol, never a migration
+ * that runs while the preceding Worker still admits legacy business writes. */
+export function assertOrdinaryOwnershipMigration(filename: string, source: string): void {
+  if (filename < "20261011171726") return;
+  const sql = source.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, "");
+  const ownership =
+    "(?:accounts|org_members|repos|repositories|organizations|spaces|organization_members|space_grants|account_settings|ai_providers)";
+  const destructive = new RegExp(
+    `\\b(?:DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?[\\"\`\\[]?${ownership}\\b|ALTER\\s+TABLE\\s+[\\"\`\\[]?${ownership}\\b[^;]*\\b(?:RENAME|DROP)\\b)`,
+    "i",
+  );
+  if (destructive.test(sql))
+    throw new Error(
+      `${filename}: ownership rename/drop requires the approved fenced operator cutover, not ordinary deploy`,
+    );
+  // Additive preparation may define integrity triggers on the new directory,
+  // but must never backfill live ownership as a side effect of ordinary deploy.
+  const statements = sql.replace(/CREATE\s+TRIGGER\b[\s\S]*?\bEND\s*;/gi, "");
+  const mutation = new RegExp(
+    `\\b(?:UPDATE\\s+|DELETE\\s+FROM\\s+|INSERT\\s+(?:OR\\s+\\w+\\s+)?INTO\\s+)[\\"\`\\[]?${ownership}\\b`,
+    "i",
+  );
+  if (mutation.test(statements))
+    throw new Error(
+      `${filename}: ownership data import requires an exact approved manifest and independent fence`,
+    );
+}
+
 export interface Plan {
   /** The Worker's code, assets or dependencies changed. */
   worker: boolean;
@@ -71,14 +100,19 @@ function inert(path: string): boolean {
 /** What a set of changed paths (relative to the repository root) needs deployed. */
 export function plan(changed: string[]): Plan {
   const migrations = MIGRATIONS.filter((m) => changed.some((path) => path.startsWith(m.prefix)));
-  const image = changed.some((path) => path.startsWith("apps/website/ci/"));
-  const worker = changed.some(
-    (path) =>
-      !inert(path) &&
-      !path.startsWith("apps/website/ci/") &&
-      !MIGRATIONS.some((m) => path.startsWith(m.prefix)) &&
-      (path.startsWith("apps/website/") || path.startsWith("packages/") || shared(path)),
+  const preparesCutover = changed.some((path) =>
+    /(?:organization_space_prepare|space_ownership_prepare)\.sql$/.test(path),
   );
+  const image = changed.some((path) => path.startsWith("apps/website/ci/"));
+  const worker =
+    preparesCutover ||
+    changed.some(
+      (path) =>
+        !inert(path) &&
+        !path.startsWith("apps/website/ci/") &&
+        !MIGRATIONS.some((m) => path.startsWith(m.prefix)) &&
+        (path.startsWith("apps/website/") || path.startsWith("packages/") || shared(path)),
+    );
   return { worker, image, migrations };
 }
 
@@ -521,6 +555,19 @@ function deployWebsite(
     }),
   );
 
+  // Validate ALL prospective ownership migrations before applying either D1.
+  // Preparation remains additive; mapping/import runs only through the journal
+  // after this tagged fence-aware Worker and every consumer are deployed/drained.
+  for (const migration of todo.migrations) {
+    for (const filename of readdirSync(join(website, migration.dir)).filter((name) =>
+      name.endsWith(".sql"),
+    )) {
+      assertOrdinaryOwnershipMigration(
+        filename,
+        readFileSync(join(website, migration.dir, filename), "utf8"),
+      );
+    }
+  }
   if (planOnly) return { deployed: false, previous };
 
   for (const migration of todo.migrations) {
@@ -534,7 +581,7 @@ function deployWebsite(
       cf,
       ["deploy", "--tag", head, "--message", subject.slice(0, 100), "--containers-rollout", "none"],
       website,
-      { GITMATRIX_CI_IMAGE: current.image },
+      { GITMATRIX_CI_IMAGE: current.image, GITMATRIX_CUTOVER_CHECKPOINT: head },
     );
     console.log(JSON.stringify({ event: "deploy.worker", head }));
   }

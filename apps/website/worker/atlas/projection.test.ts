@@ -1,6 +1,9 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+
+vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
 import { GROUPING_VERSION } from "./grouping.ts";
 import {
   beginRepoProjection,
@@ -22,11 +25,24 @@ import {
 
 const scope = repoScope("r1");
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const { sqlite, close } = await createFreshSpaceTestEnvironment();
+  onTestFinished(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('r1', 'ann', 'engine', 'private', 'art-r1', '');
   `);
   return { sqlite, db: d1(sqlite) };
@@ -121,7 +137,7 @@ const rows = (sqlite: DatabaseSync, table: string, where = "") =>
 
 describe("Atlas projections", () => {
   test("a work source cannot replace a published canonical projection", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     await project(db, "canonical-tip");
     const before = await currentSnapshot(db, scope);
@@ -148,7 +164,7 @@ describe("Atlas projections", () => {
   });
 
   test("project the graph into one primary tree with deduplicated counts", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     const { seq, snapshotId } = await project(db, "c1");
 
@@ -198,7 +214,7 @@ describe("Atlas projections", () => {
   });
 
   test("a published snapshot keeps reading what it published, and unchanged rows are stored once", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     const first = await project(db, "c1");
 
@@ -243,7 +259,7 @@ describe("Atlas projections", () => {
   });
 
   test("an interrupted projection never becomes current and is rolled back by the next", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     const published = await project(db, "c1");
 
@@ -268,7 +284,7 @@ describe("Atlas projections", () => {
   });
 
   test("a retried batch converges on the same rows", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     await project(db, "c1");
     node(sqlite, "file:src/a.ts", "file", "a.ts", "src/a.ts", "Retried", { blob: "b7" });
@@ -288,7 +304,7 @@ describe("Atlas projections", () => {
   });
 
   test("a failed projection rolls back and leaves the published one current", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     const published = await project(db, "c1");
     node(sqlite, "file:src/a.ts", "file", "a.ts", "src/a.ts", "Doomed", { blob: "b8" });
@@ -304,7 +320,7 @@ describe("Atlas projections", () => {
   });
 
   test("large graphs project in bounded, resumable batches", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     node(sqlite, "repo", "repository", "engine", null);
     node(sqlite, "component:big", "component", "Big", null);
     edge(sqlite, "repo", "component:big", "contains");
@@ -351,7 +367,7 @@ describe("Atlas projections", () => {
   }, 30_000); // Thousands of rows: seconds on a loaded 4-core host (CORE-247).
 
   test("deleting the repository deletes its projections", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     seedGraph(sqlite);
     await project(db, "c1");
     expect(rows(sqlite, "atlas_entities")).toBeGreaterThan(0);
@@ -367,7 +383,7 @@ describe("Atlas projections", () => {
   });
 
   test("capabilities group files across directories, with their evidence", async () => {
-    const { sqlite, db } = setup();
+    const { sqlite, db } = await setup();
     node(sqlite, "repo", "repository", "shop", null);
     for (const dir of ["src", "src/billing", "web", "ops", "misc"])
       node(sqlite, `dir:${dir}`, "directory", dir, dir);

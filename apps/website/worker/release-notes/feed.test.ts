@@ -1,7 +1,15 @@
 import { describe, expect, test } from "vite-plus/test";
 import { parseReleaseQuery, parseReleaseWhen } from "../../shared/release-notes.ts";
 import { buildFeed, releaseFeed, type FeedRow } from "./feed.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import {
+  releaseActor,
+  releaseEnvironment,
+  seedReleasePerson,
+  seedReleaseSpace,
+} from "./test-support.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
+import { authorizeReceipts, contentProbe, contentReceipt } from "../assistant/provenance.ts";
+import type { CallApi } from "../assistant/internal.ts";
 
 let next = 0;
 function row(overrides: Partial<FeedRow> & { subject: string }): FeedRow {
@@ -9,21 +17,21 @@ function row(overrides: Partial<FeedRow> & { subject: string }): FeedRow {
   return {
     id: `id-${next++}`,
     repo_id: "engine",
-    repo_owner: "orbit",
+    repo_space: "orbit",
     repo_name: "engine",
     release: "@day:2026-09-20",
     kind: issue ? "issue" : "commit",
     category: "feature",
     title: "A change",
     summary: "It changed.",
-    tracker_owner_id: issue ? "orbit" : null,
+    tracker_space_id: issue ? "orbit" : null,
     issue_id: issue ? "issue-id" : null,
     issue_key: issue ? overrides.subject.split(":")[2]! : null,
     team_id: issue ? "team-eng" : null,
     team_key: issue ? "ENG" : null,
     issue_type: issue ? "task" : null,
     labels: "[]",
-    workspace_ids: "[]",
+    project_ids: "[]",
     commits: '["c1"]',
     changes: "[]",
     shipped_at: "2026-09-10T00:00:00.000Z",
@@ -44,7 +52,7 @@ const rows = (): FeedRow[] => [
     subject: "issue:orbit:ENG-1",
     title: "Faster search",
     labels: '["web"]',
-    workspace_ids: '["ws-platform"]',
+    project_ids: '["ws-platform"]',
     shipped_at: "2026-09-20T00:00:00.000Z",
   }),
   // The same issue has an independent code update in the website.
@@ -56,7 +64,7 @@ const rows = (): FeedRow[] => [
     title: "Faster search (draft)",
     commits: '["w1"]',
     labels: '["web"]',
-    workspace_ids: '["ws-platform"]',
+    project_ids: '["ws-platform"]',
     shipped_at: "2026-09-20T00:00:00.000Z",
   }),
   row({
@@ -74,7 +82,7 @@ const rows = (): FeedRow[] => [
     shipped_at: "2026-08-01T00:00:00.000Z",
   }),
   // From a tracker the viewer can't read, and from a repository they can't see.
-  row({ subject: "issue:secret:SEC-1", tracker_owner_id: "secret", title: "Secret work" }),
+  row({ subject: "issue:secret:SEC-1", tracker_space_id: "secret", title: "Secret work" }),
   row({ subject: "commit:p1", repo_id: "private", repo_name: "private", title: "Private repo" }),
 ];
 
@@ -82,7 +90,7 @@ const feed = (q: string) =>
   buildFeed(rows(), {
     trackers: new Map([["orbit", "orbit"]]),
     visibleRepoIds: new Set(["engine", "website"]),
-    workspaces: new Map([["ws-platform", "platform"]]),
+    projects: new Map([["ws-platform", "platform"]]),
     // OPS is unknown here: its facet falls back to the key.
     teams: new Map([["ENG", "Engineering"]]),
     query: parseReleaseQuery(q),
@@ -91,6 +99,10 @@ const feed = (q: string) =>
   });
 
 describe("release feed query", () => {
+  test("obsolete workspace filters fail closed instead of widening the feed", () => {
+    for (const query of ["ws:platform", "-workspace:platform"])
+      expect(() => parseReleaseQuery(query)).toThrow("client_upgrade_required");
+  });
   test("parses filters, aliases, negation, quoting and daily selectors", () => {
     expect(
       parseReleaseQuery(
@@ -138,7 +150,7 @@ describe("release feed", () => {
         {
           trackers,
           visibleRepoIds: new Set(["engine"]),
-          workspaces: new Map(),
+          projects: new Map(),
           teams: new Map(),
           query: parseReleaseQuery(q),
           now: Date.parse("2026-10-01T00:00:00Z"),
@@ -180,14 +192,14 @@ describe("release feed", () => {
       ...landed,
       id: "secret",
       kind: "issue" as const,
-      tracker_owner_id: "secret",
+      tracker_space_id: "secret",
     };
     const privateRepo = { ...landed, id: "private", repo_id: "private" };
     const selected = (timeline?: string, q = "") =>
       buildFeed([other, unlanded, secret, privateRepo, landed, tagged], {
         trackers: new Map([["orbit", "orbit"]]),
         visibleRepoIds: new Set(["engine"]),
-        workspaces: new Map(),
+        projects: new Map(),
         teams: new Map(),
         query: parseReleaseQuery(q),
         timeline,
@@ -232,10 +244,10 @@ describe("release feed", () => {
       ["orbit/engine", 3],
       ["orbit/website", 1],
     ]);
-    expect(all.facets.workspaces).toEqual([{ value: "platform", label: "platform", count: 2 }]);
+    expect(all.facets.projects).toEqual([{ value: "platform", label: "platform", count: 2 }]);
   });
 
-  test("filters by team, repository, workspace, type, tag, release, dates and words", () => {
+  test("filters by team, repository, Project, type, tag, release, dates and words", () => {
     const titles = (q: string) => feed(q).entries.map((e) => e.title);
     expect(titles("team:ops")).toEqual(["Fix deploy rollback"]);
     expect(titles("-team:eng type:fix")).toEqual(["Fix deploy rollback"]);
@@ -245,9 +257,12 @@ describe("release feed", () => {
       "Fix deploy rollback",
       "Faster search",
     ]);
-    expect(titles("ws:platform tag:web")).toEqual(["Faster search", "Faster search (draft)"]);
+    expect(titles("project:platform tag:web")).toEqual(["Faster search", "Faster search (draft)"]);
     // label: is the old spelling of tag: (CORE-271), and the facet keeps its old name too.
-    expect(titles("ws:platform label:web")).toEqual(["Faster search", "Faster search (draft)"]);
+    expect(titles("project:platform label:web")).toEqual([
+      "Faster search",
+      "Faster search (draft)",
+    ]);
     expect(titles("-label:web")).toEqual(titles("-tag:web"));
     expect(feed("").facets.labels).toEqual(feed("").facets.tags);
     expect(titles("release:day:2026-09-21")).toEqual(["Faster search (draft)"]);
@@ -264,7 +279,7 @@ describe("release feed", () => {
     const capped = buildFeed(rows(), {
       trackers: new Map([["orbit", "orbit"]]),
       visibleRepoIds: new Set(["engine", "website"]),
-      workspaces: new Map(),
+      projects: new Map(),
       teams: new Map(),
       query: parseReleaseQuery(""),
       now: 0,
@@ -280,14 +295,14 @@ describe("release feed", () => {
     const secret = row({
       subject: "issue:secret:SEC-1",
       release: "v1",
-      tracker_owner_id: "secret",
+      tracker_space_id: "secret",
     });
     const privateRepo = row({ subject: "commit:p1", release: "v1", repo_id: "private" });
     const selected = (q: string) =>
       buildFeed([daily, tagged, secret, privateRepo], {
         trackers: new Map([["orbit", "orbit"]]),
         visibleRepoIds: new Set(["engine"]),
-        workspaces: new Map(),
+        projects: new Map(),
         teams: new Map(),
         query: parseReleaseQuery(q),
         now: 0,
@@ -306,20 +321,71 @@ describe("release feed", () => {
     expect(selected("tag:v1")).toEqual(["tagged"]);
     expect(selected("tag:day:2026-09-20")).toEqual([daily.id]);
   });
-  test("tracker reads lazily upgrade only accessible related repositories and conceal stale rows", async () => {
-    const sqlite = migratedDatabase();
+  test("retained tracker feeds cannot keep private repository content after collaborator revocation", async () => {
+    const { sqlite, env } = await releaseEnvironment();
+    seedReleasePerson(sqlite, "reader");
+    await seedReleaseSpace(sqlite, "orbit", "reader");
     sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES
-        ('ann', 'user', 'ann', 'Ann'), ('orbit', 'org', 'orbit', 'Orbit'),
-        ('other', 'org', 'other', 'Other');
-      UPDATE accounts SET member_repo_role = 'read' WHERE id = 'orbit';
-      INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ann', 'member');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+      UPDATE space_grants SET role='member',repository_role='none',package_role='none';
+      INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+        VALUES('repo','orbit','app','private','artifact','https://artifact');
+      INSERT INTO repo_collaborators(repo_id,user_id,role) VALUES('repo','reader','read');
+      INSERT INTO tracker_repo_subscriptions(tracker_space_id,repo_id) VALUES('orbit','repo');
+      INSERT INTO release_note_state(repo_id,status,format_version) VALUES('repo','ready',1);
+      INSERT INTO release_notes(repo_id,release,to_oid,released_at,updated_at,format_version)
+        VALUES('repo','@day:2026-09-20','commit','2026-09-20','2026-09-20',1);
+      INSERT INTO release_note_entries
+        (id,repo_id,release,subject,kind,category,title,summary,inputs_hash,shipped_at,updated_at)
+        VALUES('entry','repo','@day:2026-09-20','commit:private','commit','feature',
+          'Private repository change','Private summary','hash','2026-09-20','2026-09-20');
+    `);
+    env.TRACKER = {
+      getByName: () => ({
+        projectSlugs: async () => ({ ok: true, value: [] }),
+        teamNames: async () => ({ ok: true, value: [] }),
+      }),
+    } as unknown as Env["TRACKER"];
+    const actor = releaseActor("reader");
+    const api: CallApi = async (_method, path) => {
+      if (path.endsWith("/authorization")) {
+        if (!(await resolveSpaceAccess(env.DB, actor, "orbit")))
+          return { status: 404, ok: false, body: null };
+        return {
+          status: 200,
+          ok: true,
+          body: { contractVersion: 4, spaceId: "orbit", migrationEpoch: 0 },
+        };
+      }
+      return { status: 200, ok: true, body: await releaseFeed(env, actor, "orbit", "") };
+    };
+    expect(
+      (await releaseFeed(env, actor, "orbit", "")).entries.map((entry) => entry.title),
+    ).toEqual(["Private repository change"]);
+    const probe = contentProbe("GET", "/tracker/orbit/release-notes")!;
+    const observed = await api("GET", probe.path);
+    const receipt = await contentReceipt(api, probe);
+    sqlite.exec("DELETE FROM repo_collaborators WHERE repo_id='repo' AND user_id='reader'");
+    expect((await resolveSpaceAccess(env.DB, actor, "orbit"))?.spaceId).toBe("orbit");
+    expect((await releaseFeed(env, actor, "orbit", "")).entries).toEqual([]);
+    await expect(authorizeReceipts(api, [receipt])).rejects.toThrow("current source access");
+    // Revocation between a tool read and receipt persistence must not bind the
+    // private bytes already returned to a later, now-empty authorized projection.
+    const raced = await contentReceipt(api, probe, observed);
+    await expect(authorizeReceipts(api, [raced])).rejects.toThrow("current source access");
+  });
+  test("tracker reads lazily upgrade only accessible related repositories and conceal stale rows", async () => {
+    const { sqlite, env } = await releaseEnvironment();
+    seedReleasePerson(sqlite, "ann");
+    seedReleasePerson(sqlite, "other-person");
+    await seedReleaseSpace(sqlite, "orbit", "ann");
+    await seedReleaseSpace(sqlite, "other", "other-person");
+    sqlite.exec(`
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
         ('owned', 'orbit', 'app', 'private', 'a', 'https://a'),
         ('public', 'other', 'public', 'public', 'b', 'https://b'),
         ('private', 'other', 'private', 'private', 'c', 'https://c');
-      INSERT INTO tracker_repo_subscriptions (tracker_owner_id, repo_id) VALUES
-        ('orbit', 'public'), ('orbit', 'private');
+      INSERT INTO tracker_repo_subscriptions (tracker_space_id, repo_id) VALUES
+        ('orbit', 'owned');
       INSERT INTO release_note_state (repo_id, status) VALUES ('owned', 'ready');
       INSERT INTO release_notes (repo_id, release, to_oid, released_at, updated_at) VALUES
         ('owned', '@day:2026-09-20', 'c1', '2026-09-20', '2026-09-20'),
@@ -330,29 +396,23 @@ describe("release feed", () => {
         ('tag', 'owned', 'v1', 'commit:c1', 'commit', 'feature', 'Feature', 'Change', 'h', '2026-09-20', '2026-09-20');
     `);
     const sent: unknown[] = [];
-    const env = {
-      DB: d1(sqlite),
-      AI: {},
-      JOBS: { send: async (body: unknown) => void sent.push(body) },
-      TRACKER: {
-        getByName: () => ({
-          workspaceSlugs: async () => ({ ok: true, value: [] }),
-          teamNames: async () => ({ ok: true, value: [] }),
-        }),
-      },
-    } as unknown as Env;
-    const actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
+    env.AI = {} as NonNullable<Env["AI"]>;
+    env.JOBS = { send: async (body: unknown) => void sent.push(body) } as unknown as Env["JOBS"];
+    env.TRACKER = {
+      getByName: () => ({
+        projectSlugs: async () => ({ ok: true, value: [] }),
+        teamNames: async () => ({ ok: true, value: [] }),
+      }),
+    } as unknown as Env["TRACKER"];
+    const actor = releaseActor("ann");
     await expect(releaseFeed(env, null, "orbit", "")).rejects.toMatchObject({ status: 401 });
     expect(sent).toEqual([]);
     expect((await releaseFeed(env, actor, "orbit", "")).entries).toEqual([]);
     expect(sent).toEqual(
-      expect.arrayContaining([
-        { type: "release-notes", repoId: "owned" },
-        { type: "release-notes", repoId: "public" },
-      ]),
+      expect.arrayContaining([expect.objectContaining({ type: "release-notes", repoId: "owned" })]),
     );
     await releaseFeed(env, actor, "orbit", "");
-    expect(sent).toHaveLength(2);
+    expect(sent).toHaveLength(1);
     sqlite.exec(`UPDATE release_note_state SET format_version = 1, dirty = 0, status = 'ready' WHERE repo_id = 'owned';
       UPDATE release_notes SET format_version = 1;`);
     expect((await releaseFeed(env, actor, "orbit", "")).entries.map((e) => e.id)).toEqual(["day"]);

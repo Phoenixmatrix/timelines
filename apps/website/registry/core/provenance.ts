@@ -5,7 +5,7 @@
 //                     granted to publish them). Once a package has sources, only
 //                     their CI jobs and people with write on them may publish;
 //                     a CI job publishing a package with no sources claims it
-//                     for its repository. Owner admins can always publish.
+//                     for its repository. Explicit Space admins can publish.
 //   recordPublish     after: one row in `publishes` per version, file, tag or
 //                     asset, with repository, commit, branch, run and actor.
 //                     That stream is each package's history and what the
@@ -19,8 +19,10 @@
 // Catalog formats reach both through catalog.ts; OCI, releases and generic,
 // which keep their own tables, call them where they publish.
 
-import { atLeast, repoRole } from "../../worker/permissions.ts";
-import { db as gitmatrixDb, type DB as GitmatrixDB } from "../../worker/schema.ts";
+import { atLeast } from "../../worker/permissions.ts";
+import { roleFor, selectRepos } from "../../worker/db.ts";
+import { currentPerson } from "./auth/authenticate.ts";
+import { db as gitmatrixDb } from "../../worker/schema.ts";
 import { actorLabel, principalOf, type Actor } from "./auth/actor.ts";
 import { currentServices } from "./context.ts";
 import { nowIso, type DB } from "./db.ts";
@@ -76,79 +78,28 @@ async function feedOf(db: DB, repoId: string): Promise<Repository | null> {
   return getRepoById(db, repoId);
 }
 
-/** gitmatrix `owner/name` for repository ids, for messages. */
-async function repoNames(gitmatrix: GitmatrixDB, ids: string[]): Promise<Map<string, string>> {
-  if (ids.length === 0) return new Map();
-  const results = await gitmatrix
-    .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
-    .select(["r.id", "r.name", "o.slug"])
-    .where("r.id", "in", ids)
-    .where("r.deleted_at", "is", null)
-    .execute();
-  return new Map(results.map((r) => [r.id, `${r.slug}/${r.name}`]));
-}
-
 /** Whether a person has write on at least one of these repositories. */
-async function writesAny(
-  gitmatrix: GitmatrixDB,
-  actor: Actor,
-  repoIds: string[],
-): Promise<boolean> {
+async function writesAny(d1: D1Database, actor: Actor, repoIds: string[]): Promise<boolean> {
   if (actor.kind !== "user" || !actor.subject || repoIds.length === 0) return false;
-  const userId = actor.subject;
-  const results = await gitmatrix
-    .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
-    .select((eb) => [
-      "r.visibility",
-      "r.owner_id",
-      "o.kind as owner_kind",
-      "o.member_repo_role",
-      eb
-        .selectFrom("org_members as m")
-        .select("m.role")
-        .whereRef("m.org_id", "=", "r.owner_id")
-        .where("m.user_id", "=", userId)
-        .as("org_role"),
-      eb
-        .selectFrom("repo_collaborators as c")
-        .select("c.role")
-        .whereRef("c.repo_id", "=", "r.id")
-        .where("c.user_id", "=", userId)
-        .as("collaborator_role"),
-    ])
-    .where("r.id", "in", repoIds)
-    .where("r.deleted_at", "is", null)
-    .execute();
-  return results.some((row) =>
-    atLeast(
-      repoRole({
-        visibility: row.visibility,
-        ownerId: row.owner_id,
-        ownerKind: row.owner_kind,
-        orgMemberRepoRole: row.member_repo_role,
-        viewer: { id: actor.subject as string, isSiteAdmin: actor.isSiteAdmin === true },
-        orgRole: row.org_role,
-        collaboratorRole: row.collaborator_role,
-      }),
-      "write",
-    ),
-  );
+  const person = await currentPerson(d1, actor);
+  if (!person) return false;
+  const results = await selectRepos(d1, person.id).where("r.id", "in", repoIds).execute();
+  return results.some((row) => atLeast(roleFor(row, person), "write"));
 }
 
 /**
- * Throws `denied` unless the current caller may publish `pkg`. No request in
- * scope (queue jobs, cron, Durable Object maintenance) means the system, which
- * may. Only local feeds are gated: caching from an upstream isn't publishing.
+ * Throws `denied` unless the current caller may publish `pkg`. Background
+ * maintenance is not a publishing principal. Upstream cache fills are not
+ * local package publications.
  */
 export async function authorizePublish(db: DB, pkg: PackageRef): Promise<void> {
   const services = currentServices();
-  if (!services) return;
   const feed = await feedOf(db, pkg.repoId);
-  if (!feed || feed.kind !== "local") return;
+  if (!feed) throw RegistryError.notFound("No package feed");
+  if (feed.kind !== "local") return;
+  if (!services) throw RegistryError.denied("Publishing requires current request authorization");
   const access = await services.access();
-  if (await access.isAdmin()) return;
+  await access.require(feed, "write");
   const actor = access.actor;
 
   const sources = (
@@ -158,11 +109,25 @@ export async function authorizePublish(db: DB, pkg: PackageRef): Promise<void> {
       .where("package_id", "=", pkg.id)
       .execute()
   ).map((r) => r.git_repo_id);
+  if (sources.length) {
+    const valid = await gitmatrixDb(services.env.DB)
+      .selectFrom("repos")
+      .select("id")
+      .where("id", "in", sources)
+      .where("space_id", "=", feed.spaceId)
+      .where("deleted_at", "is", null)
+      .execute();
+    if (valid.length !== sources.length)
+      throw RegistryError.denied("Package sources must be live repositories in this Space");
+  }
+  if (await access.isAdmin()) return;
 
   if (actor.kind === "job" && actor.job) {
     const job = actor.job;
+    if (job.spaceId !== feed.spaceId)
+      throw RegistryError.denied("Package source belongs to a different Space");
     if (sources.includes(job.repoId)) return;
-    if (sources.length === 0 && job.ownerId === feed.ownerId) {
+    if (sources.length === 0) {
       // First CI publish: the package now remembers this repository.
       await db
         .insertInto("package_sources")
@@ -176,31 +141,21 @@ export async function authorizePublish(db: DB, pkg: PackageRef): Promise<void> {
         .execute();
       return;
     }
-    const names = await repoNames(gitmatrixDb(services.env.DB), sources);
     throw RegistryError.denied(
-      `${job.repo} is not a source of ${pkg.name}` +
-        (sources.length
-          ? `; it is published from ${sources.map((id) => names.get(id) ?? id).join(", ")}.`
-          : ".") +
-        " An owner admin can add it as a source in the package's settings.",
+      `${job.repo} is not an authorized source of ${pkg.name}. A Space admin can manage package sources.`,
     );
   }
 
   if (actor.kind === "user") {
-    const role = await access.roleForOwner(feed.ownerId);
+    const role = await access.roleForSpace(feed.spaceId);
     if (role === "admin") return;
     if (
-      sources.length === 0
-        ? role === "write"
-        : await writesAny(gitmatrixDb(services.env.DB), actor, sources)
+      sources.length === 0 ? role === "write" : await writesAny(services.env.DB, actor, sources)
     ) {
       return;
     }
-    const names = await repoNames(gitmatrixDb(services.env.DB), sources);
     throw RegistryError.denied(
-      sources.length
-        ? `${pkg.name} is published from ${sources.map((id) => names.get(id) ?? id).join(", ")}; you need write access to one of them.`
-        : `You need write access to publish ${pkg.name}.`,
+      `Publishing ${pkg.name} requires package write and write access to an authorized source.`,
     );
   }
   throw RegistryError.unauthorized();

@@ -16,7 +16,7 @@ import { repoPath } from "../lib/refs.ts";
 
 /** Viewer-specific prose must never be reused from a browser or intermediary cache. */
 export async function highlightsLoader({ request, params }: LoaderFunctionArgs) {
-  const path = `/tracker/${encodeURIComponent(params.owner!)}/release-notes/highlights`;
+  const path = `/tracker/${encodeURIComponent(params.space!)}/release-notes/highlights`;
   const headers = { "Cache-Control": "private, no-store" };
   try {
     const highlights = await api<ReleaseHighlights>(path, {
@@ -56,10 +56,10 @@ export function Highlights() {
     return () => clearInterval(timer);
   }, [pending, pathname]);
 
-  const owner = highlights.owner;
-  const scopeName = owner.displayName;
+  const space = highlights.space;
+  const scopeName = space.displayName;
   usePageTitle(`Highlights · ${scopeName}`);
-  const detailsPath = `/tracker/${encodeURIComponent(owner.slug)}/releases`;
+  const detailsPath = `/tracker/${encodeURIComponent(space.slug)}/releases`;
   const ready = highlights.status.state === "ready" && Boolean(highlights.body?.trim());
   const stateMessage =
     highlights.status.state === "disabled"
@@ -78,7 +78,7 @@ export function Highlights() {
         aria-label="Highlights breadcrumbs"
         className="mb-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-body-sm text-ink-muted"
       >
-        <Link to={`/tracker/${encodeURIComponent(owner.slug)}`}>{scopeName}</Link>
+        <Link to={`/tracker/${encodeURIComponent(space.slug)}`}>{scopeName}</Link>
         <span aria-hidden>/</span>
         <Link to={detailsPath}>Release notes</Link>
         <span aria-hidden>/</span>
@@ -88,9 +88,8 @@ export function Highlights() {
         <h1 className="m-0 text-headline">Highlights</h1>
         <p className="mt-2 mb-0 break-words text-title text-ink">{scopeName}</p>
         <p className="mt-2 mb-0 text-body-sm text-ink-muted">
-          A short overview of the past week's daily code updates in this organization, not
-          deployments. Highlights refresh on the configured schedule after this page is first
-          opened.
+          A short overview of the past week's daily code updates in this Space, not deployments.
+          Highlights refresh on the configured schedule after this page is first opened.
         </p>
       </header>
       {ready ? (
@@ -140,18 +139,18 @@ export function Highlights() {
           </p>
           <ul className="m-0 list-none p-0">
             {highlights.notes.map((note) => (
-              <li key={`${note.repo.owner}/${note.repo.name}/${note.release}`}>
+              <li key={`${note.repo.space}/${note.repo.name}/${note.release}`}>
                 <Link
                   className="inline-flex min-h-11 items-center gap-2 py-2 text-body-sm"
                   to={repoPath(
-                    note.repo.owner,
+                    note.repo.space,
                     note.repo.name,
                     "releases",
                     encodeURIComponent(note.release),
                   )}
                 >
                   <span className="break-all">
-                    {note.repo.owner}/{note.repo.name}
+                    {note.repo.space}/{note.repo.name}
                   </span>
                   <span className="shrink-0">{releaseLabel(note.release)}</span>
                 </Link>

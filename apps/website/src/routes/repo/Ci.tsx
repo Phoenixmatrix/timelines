@@ -43,19 +43,19 @@ import type { RefKind } from "../../../shared/refs.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
 
 const SETUP_STEP = -1;
-const base = (owner?: string, name?: string) => `/repos/${owner}/${name}/ci`;
+const base = (space?: string, name?: string) => `/repos/${space}/${name}/ci`;
 
 /** Older pages never change; the strip reads them once per page. */
 const olderPages = new Map<string, Promise<CiRunSummary[]>>();
 
 export async function ciLoader({ request, params }: LoaderFunctionArgs) {
-  const path = base(params.owner, params.repo);
-  const source = await requestSource(params.owner ?? "", params.repo ?? "", request);
+  const path = base(params.space, params.repo);
+  const source = await requestSource(params.space ?? "", params.repo ?? "", request);
   // In a timeline's scope (?tl=), the runs on its bookmark, where the repository has one.
   const scope = scopeOf(new URL(request.url).search);
   const ref = scope
     ? (bookmarkIn(
-        await routeData(repoData.detail(params.owner ?? "", params.repo ?? "", source)),
+        await routeData(repoData.detail(params.space ?? "", params.repo ?? "", source)),
         scope,
       ) ?? (source ? scopeBookmark(scope) : null))
     : null;
@@ -81,7 +81,7 @@ export async function ciLoader({ request, params }: LoaderFunctionArgs) {
 }
 
 export async function ciRunLoader({ request, params }: LoaderFunctionArgs) {
-  const repo = `${params.owner}/${params.repo}`;
+  const repo = `${params.space}/${params.repo}`;
   // What the run published is extra: the run page never fails on it.
   const published = api<Published>(
     `/packages/-/published?repo=${encodeURIComponent(repo)}&run=${params.number}`,
@@ -89,7 +89,7 @@ export async function ciRunLoader({ request, params }: LoaderFunctionArgs) {
   ).catch(() => ({ rows: [] }) as Published);
   const run = await load<CiRunDetail>(
     sourceUrl(
-      `${base(params.owner, params.repo)}/runs/${params.number}`,
+      `${base(params.space, params.repo)}/runs/${params.number}`,
       new URL(request.url).searchParams.get("source") ?? undefined,
     ),
     request,
@@ -142,9 +142,9 @@ function PublishedPanel({ rows }: { rows: Published["rows"] }) {
 
 export async function ciAction({ request, params }: ActionFunctionArgs) {
   const form = await request.formData();
-  const root = base(params.owner, params.repo);
+  const root = base(params.space, params.repo);
   const intent = field(form, "intent");
-  const source = await requestSource(params.owner ?? "", params.repo ?? "", request);
+  const source = await requestSource(params.space ?? "", params.repo ?? "", request);
   const result = await attempt(async () => {
     if (intent === "cancel") {
       await api(`${root}/runs/${field(form, "number")}/cancel`, { method: "POST" });
@@ -159,7 +159,7 @@ export async function ciAction({ request, params }: ActionFunctionArgs) {
   });
   if ("error" in result) return result;
   return redirect(
-    sourceUrl(repoPath(params.owner ?? "", params.repo ?? "", "ci", String(result.number)), source),
+    sourceUrl(repoPath(params.space ?? "", params.repo ?? "", "ci", String(result.number)), source),
   );
 }
 
@@ -252,9 +252,9 @@ function RunBy({ run }: { run: CiRunSummary }) {
   );
 }
 
-/** A timeline's page in the tracker that holds the repository's timelines (its owner's). */
-const timelineUrl = (owner: string, slug: string) =>
-  `/tracker/${encodeURIComponent(owner)}/timelines?tl=${encodeURIComponent(slug)}`;
+/** A timeline's page in the tracker that holds the repository's timelines (its space's). */
+const timelineUrl = (space: string, slug: string) =>
+  `/tracker/${encodeURIComponent(space)}/timelines?tl=${encodeURIComponent(slug)}`;
 
 /** A preview run (CORE-79): what it does, and for whom when someone asked. */
 const previewLabel = (preview: NonNullable<CiRunSummary["preview"]>) =>
@@ -278,7 +278,7 @@ function RunRow({ run }: { run: CiRunSummary }) {
   return (
     <li>
       <PrefetchLink
-        to={repoPath(repo.owner.slug, repo.name, "ci", String(run.number))}
+        to={repoPath(repo.space.slug, repo.name, "ci", String(run.number))}
         className={`${RUN_GRID} min-h-11 py-2 text-body-sm text-ink no-underline transition-colors hover:bg-raised @2xl:h-11 @2xl:py-0`}
       >
         <CiStatusIcon status={run.status} />
@@ -420,7 +420,7 @@ function HealthStrip({ runs }: { runs: CiRunSummary[] }) {
         {shown.map((run) => (
           <li key={run.id} className="flex h-full min-w-0 flex-1 basis-0">
             <PrefetchLink
-              to={repoPath(repo.owner.slug, repo.name, "ci", String(run.number))}
+              to={repoPath(repo.space.slug, repo.name, "ci", String(run.number))}
               aria-label={`Run ${run.number}: ${ciLabel(run.status)}${run.startedAt ? `, ${duration(run.startedAt, run.finishedAt)}` : ""}`}
               className="flex h-full w-full items-end rounded-t-[4px] transition-colors hover:bg-raised focus-visible:bg-raised"
               onPointerEnter={() => setHover(run)}
@@ -528,7 +528,7 @@ function clean(text: string): string {
 }
 
 /** A job's log, fetched incrementally while the job runs. (JobPanel is keyed by job.) */
-function useJobLog(owner: string, name: string, job: CiJob) {
+function useJobLog(space: string, name: string, job: CiJob) {
   const [log, setLog] = useState({ byStep: new Map<number, string>(), next: 0, done: false });
   const active = isActive(job.status);
 
@@ -540,7 +540,7 @@ function useJobLog(owner: string, name: string, job: CiJob) {
       async () => {
         try {
           const page = await api<CiLogs>(
-            `/repos/${owner}/${name}/ci/jobs/${job.id}/logs?after=${log.next}`,
+            `/repos/${space}/${name}/ci/jobs/${job.id}/logs?after=${log.next}`,
           );
           if (stopped) return;
           setLog((current) => {
@@ -561,7 +561,7 @@ function useJobLog(owner: string, name: string, job: CiJob) {
       stopped = true;
       clearTimeout(timer);
     };
-  }, [owner, name, job.id, job.verifiedBy, job.logsRemovedAt, log, active]);
+  }, [space, name, job.id, job.verifiedBy, job.logsRemovedAt, log, active]);
 
   return log;
 }
@@ -632,7 +632,7 @@ function StepLog({
 
 function JobPanel({ job }: { job: CiJob }) {
   const repo = useRepo();
-  const log = useJobLog(repo.owner.slug, repo.name, job);
+  const log = useJobLog(repo.space.slug, repo.name, job);
   const setup = log.byStep.get(SETUP_STEP) ?? "";
   const verification = job.verifiedBy;
   return (
@@ -660,7 +660,7 @@ function JobPanel({ job }: { job: CiJob }) {
           <p className="m-0">
             Verified by{" "}
             <Link
-              to={`${repoPath(repo.owner.slug, repo.name, "ci", String(verification.runNumber))}?job=${encodeURIComponent(verification.jobId)}`}
+              to={`${repoPath(repo.space.slug, repo.name, "ci", String(verification.runNumber))}?job=${encodeURIComponent(verification.jobId)}`}
               className="text-ink underline hover:text-signal"
             >
               run #{verification.runNumber}, producer job
@@ -734,8 +734,8 @@ export function CiRun() {
   useRememberPlace({
     kind: "run",
     title: `#${run.number} ${run.title}`,
-    detail: `CI run in ${repo.owner.slug}/${repo.name}`,
-    to: repoPath(repo.owner.slug, repo.name, "ci", String(run.number)),
+    detail: `CI run in ${repo.space.slug}/${repo.name}`,
+    to: repoPath(repo.space.slug, repo.name, "ci", String(run.number)),
   });
 
   const chosen =
@@ -751,7 +751,7 @@ export function CiRun() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <Link
-            to={repoPath(repo.owner.slug, repo.name, "ci")}
+            to={repoPath(repo.space.slug, repo.name, "ci")}
             className="text-body-sm text-ink-muted no-underline hover:text-ink"
           >
             ← All runs
@@ -759,7 +759,7 @@ export function CiRun() {
           <h2 className="m-0 mt-1 flex items-center gap-2 text-title-lg">
             <CiStatusIcon status={run.status} className="size-6" />
             <span className="truncate" dir="auto">
-              {/* Issue keys, hashes and owner/repo link when they resolve (CORE-22). */}
+              {/* Issue keys, hashes and space/repo link when they resolve (CORE-22). */}
               {run.title ? <LinkedText text={run.title} /> : "(no message)"}
             </span>
             <span className="font-normal text-ink-faint">#{run.number}</span>
@@ -767,7 +767,7 @@ export function CiRun() {
           <div className="mt-1 flex flex-wrap items-center gap-x-2 text-body-sm text-ink-faint">
             {run.coveredBy ? (
               <PrefetchLink
-                to={repoPath(repo.owner.slug, repo.name, "ci", String(run.coveredBy))}
+                to={repoPath(repo.space.slug, repo.name, "ci", String(run.coveredBy))}
                 className="text-ink-muted hover:text-ink"
               >
                 {runLabel(run)}
@@ -792,7 +792,7 @@ export function CiRun() {
                     <>
                       {" of "}
                       <Link
-                        to={timelineUrl(repo.owner.slug, run.preview.timeline)}
+                        to={timelineUrl(repo.space.slug, run.preview.timeline)}
                         className="text-ink-muted no-underline hover:text-ink"
                       >
                         {run.preview.timeline}
@@ -815,7 +815,7 @@ export function CiRun() {
                     <>
                       {" of "}
                       <Link
-                        to={timelineUrl(repo.owner.slug, run.landing.timeline)}
+                        to={timelineUrl(repo.space.slug, run.landing.timeline)}
                         className="text-ink-muted no-underline hover:text-ink"
                       >
                         {run.landing.timeline}
@@ -847,7 +847,7 @@ export function CiRun() {
             )}
             <span>·</span>
             <Link
-              to={commitsUrl(repo.owner.slug, repo.name, run.ref, "", run.sourceId ?? undefined)}
+              to={commitsUrl(repo.space.slug, repo.name, run.ref, "", run.sourceId ?? undefined)}
               className="inline-flex items-center gap-1 text-ink-muted no-underline hover:text-ink"
               title={`Commits on ${run.ref}`}
             >
@@ -857,7 +857,7 @@ export function CiRun() {
             {/* The commit panel reads canonical history; a work source's commit opens in its own source. */}
             {run.sourceId && run.sourceId !== "canonical" ? (
               <PrefetchLink
-                to={treeUrl(repo.owner.slug, repo.name, run.commit, "", run.sourceId)}
+                to={treeUrl(repo.space.slug, repo.name, run.commit, "", run.sourceId)}
                 className="mk-chip mk-chip--tag mk-mono h-6 no-underline"
                 title="Browse files at this commit"
               >
@@ -865,7 +865,7 @@ export function CiRun() {
               </PrefetchLink>
             ) : (
               <CommitLink
-                owner={repo.owner.slug}
+                space={repo.space.slug}
                 name={repo.name}
                 sha={run.commit}
                 className="mk-chip mk-chip--tag mk-mono h-6 no-underline"
@@ -879,7 +879,7 @@ export function CiRun() {
         {canRun && (active || !run.queueId) && (
           <Form
             method="post"
-            action={repoPath(repo.owner.slug, repo.name, "ci")}
+            action={repoPath(repo.space.slug, repo.name, "ci")}
             className="flex gap-2"
           >
             <input type="hidden" name="number" value={run.number} />
@@ -911,7 +911,7 @@ export function CiRun() {
       </div>
       <RecentAgents
         endpoint={sourceUrl(
-          `${base(repo.owner.slug, repo.name)}/runs/${run.number}/presence`,
+          `${base(repo.space.slug, repo.name)}/runs/${run.number}/presence`,
           run.sourceId,
         )}
       />
@@ -919,11 +919,11 @@ export function CiRun() {
         <p className="m-0 text-body-sm text-ink-muted">
           Queue-owned runs cannot be re-run here. Inspect{" "}
           <code className="mk-mono break-all">
-            gm queue show {run.queueId} -R {repo.owner.slug}/{repo.name}
+            gm queue show {run.queueId} -R {repo.space.slug}/{repo.name}
           </code>
           ; for a failed or cancelled queue entry, use{" "}
           <code className="mk-mono break-all">
-            gm queue retry {run.queueId} -R {repo.owner.slug}/{repo.name}
+            gm queue retry {run.queueId} -R {repo.space.slug}/{repo.name}
           </code>
           .
         </p>
@@ -975,7 +975,7 @@ export function CiRun() {
           {chosen && <JobPanel key={chosen.id} job={chosen} />}
         </div>
       )}
-      <DeploymentsPanel deployments={run.deployments} owner={repo.owner.slug} name={repo.name} />
+      <DeploymentsPanel deployments={run.deployments} space={repo.space.slug} name={repo.name} />
       <PublishedPanel rows={run.published} />
       {active && run.jobs.some((j) => j.status === "queued" && j.runner === "local") && (
         <RunnerHint runner="local" waiting />

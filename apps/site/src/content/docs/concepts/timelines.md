@@ -34,7 +34,7 @@ gm timeline use main                            # go back to main
 
 - `--policy auto|approval`: how it lands. `auto` lands when its gates pass; `approval` lands after a person approves a checkpoint.
 - `--name`: a readable name (default: the slug).
-- `--repo owner/name`: the repositories it touches, repeatable. A timeline can span several repositories of one account.
+- `--repo space/name`: the repositories it touches, repeatable, using the globally unique Space handle. A timeline can span several repositories, but all must belong to the same Space as its Tracker.
 - `--experimental`: marks it as not expected to land. The marker restricts nothing.
 - `--no-use`: create it without binding this checkout.
 
@@ -49,7 +49,7 @@ gm commit -m "Rank by recency"
 gm push                          # to the timeline, never main
 ```
 
-Each timeline keeps its own work repository per canonical repository, shared by its agents, so work-in-progress commits never enter the canonical repository, even when the timeline lands. Plain git reaches it at `/<owner>/<repo>@<slug>.git`.
+Each timeline keeps its own work repository per canonical repository, shared by its agents, so work-in-progress commits never enter the canonical repository, even when the timeline lands. Plain git reaches it at `/<space>/<repo>@<slug>.git`, using the Space handle.
 
 To bring main into the timeline, merge it. Do this only when a person asks:
 
@@ -132,7 +132,7 @@ gm timeline update search-v2 --experimental
 gm timeline abandon search-v2
 ```
 
-Abandoning ends writes and archives the work read-only. Only the timeline's accountable person or the agent that started it may abandon it. Ended timelines stay readable; by default their work repositories expire 30 days after landing or 90 days after abandonment, which account administrators can change under Data retention.
+Abandoning ends writes and archives the work read-only. Only the timeline's accountable person or the agent that started it may abandon it. Ended timelines stay readable; by default their work repositories expire 30 days after landing or 90 days after abandonment. Explicit Space admins can change these defaults under the Space's Data retention settings; Organization ownership alone does not grant that permission.
 
 In the web app, a timeline switcher scopes every page (code, CI, tracker, knowledge, wiki) to main plus the selected timeline, and the timeline graph shows forks, merges and landings.
 

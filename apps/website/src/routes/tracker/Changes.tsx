@@ -109,13 +109,13 @@ export function landedMerge(
 export function compareUrl(repo: TimelineRepo, request: CompareRequest): string {
   if (request.landed)
     return sourceUrl(
-      `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/commits/${request.landed}/diff`,
+      `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}/commits/${request.landed}/diff`,
       repo.source?.sourceId,
     );
   const query = new URLSearchParams({ head: request.head });
   if (request.base) query.set("base", request.base);
   return sourceUrl(
-    `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/compare?${query}`,
+    `/repos/${encodeURIComponent(repo.space)}/${encodeURIComponent(repo.name)}/compare?${query}`,
     repo.source?.sourceId,
   );
 }
@@ -153,7 +153,7 @@ function plan(
   if (!checkpoints.some((view) => view.checkpoint.number === mode.number))
     return { problem: `This timeline has no checkpoint #${mode.number}.` };
   if (!at)
-    return { problem: `Checkpoint #${mode.number} doesn't include ${repo.owner}/${repo.name}.` };
+    return { problem: `Checkpoint #${mode.number} doesn't include ${repo.space}/${repo.name}.` };
   if (mode.kind === "since") return { base: at, head };
   return { base: commitAt(mode.number - 1), head: at };
 }
@@ -227,7 +227,7 @@ export function useCompares(
 }
 
 /** The timeline's checkpoints, for the modes that start from one. */
-function useCheckpoints(owner: string, slug: string, version: number) {
+function useCheckpoints(space: string, slug: string, version: number) {
   const [state, setState] = useState<{
     list: CheckpointView[] | null;
     error: string | null;
@@ -235,7 +235,7 @@ function useCheckpoints(owner: string, slug: string, version: number) {
   useEffect(() => {
     const abort = new AbortController();
     api<CheckpointList>(
-      `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(slug)}/checkpoints`,
+      `/tracker/${encodeURIComponent(space)}/timelines/${encodeURIComponent(slug)}/checkpoints`,
       { signal: abort.signal },
     )
       .then((loaded) =>
@@ -252,7 +252,7 @@ function useCheckpoints(owner: string, slug: string, version: number) {
           });
       });
     return () => abort.abort();
-  }, [owner, slug, version]);
+  }, [space, slug, version]);
   return state;
 }
 
@@ -272,14 +272,14 @@ function Stat({ diff }: { diff: CompareDiff }) {
 export function Changes() {
   const detail = useLoaderData() as TimelineDetail;
   const { timeline, events } = detail;
-  const owner = useParams().owner ?? "";
+  const space = useParams().space ?? "";
   const [params, setParams] = useLiveSearchParams();
   const mode = modeOf(params);
   const repo =
-    timeline.repos.find((r) => `${r.owner}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
-  const repoKey = repo ? `${repo.owner}/${repo.name}` : "";
+    timeline.repos.find((r) => `${r.space}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
+  const repoKey = repo ? `${repo.space}/${repo.name}` : "";
   const [version, setVersion] = useState(0);
-  const checkpoints = useCheckpoints(owner, timeline.slug, version);
+  const checkpoints = useCheckpoints(space, timeline.slug, version);
 
   const planned = useMemo(
     () =>
@@ -304,7 +304,7 @@ export function Changes() {
     if (timeline.repos.length > 1 && repoKey) next.set("repo", repoKey);
     for (const [name, value] of Object.entries(changes)) if (value) next.set(name, value);
     const search = next.size ? `?${next}` : "";
-    return `${timelinePageUrl(owner, timeline.slug, "changes")}${search}`;
+    return `${timelinePageUrl(space, timeline.slug, "changes")}${search}`;
   };
   const setFile = (path: string) =>
     setParams(
@@ -320,7 +320,7 @@ export function Changes() {
     <main className="mx-auto max-w-[110rem] px-4 py-4">
       <h1 className="m-0 mb-3 text-title-lg [overflow-wrap:anywhere]">{timeline.name}</h1>
       <TimelineNav
-        owner={owner}
+        space={space}
         slug={timeline.slug}
         current="changes"
         query={{ repo: timeline.repos.length > 1 ? repoKey : null }}
@@ -337,7 +337,7 @@ export function Changes() {
               planned={planned}
               href={(r) => {
                 const next = new URLSearchParams(params);
-                next.set("repo", `${r.owner}/${r.name}`);
+                next.set("repo", `${r.space}/${r.name}`);
                 next.delete("file");
                 return `?${next}`;
               }}
@@ -387,7 +387,7 @@ function RepoSwitcher({
       <p className="m-0 mb-2 text-body-sm text-ink-muted">
         Showing{" "}
         <strong className="mk-mono font-semibold text-ink">
-          {selected.owner}/{selected.name}
+          {selected.space}/{selected.name}
         </strong>{" "}
         · {others} more {others === 1 ? "repository" : "repositories"}
       </p>
@@ -404,7 +404,7 @@ function RepoSwitcher({
                 className={`flex min-h-11 flex-col justify-center rounded-control px-3 py-1.5 text-body-sm no-underline ${current ? "bg-signal-wash text-ink" : "bg-pane text-ink-muted hover:bg-raised hover:text-ink"}`}
               >
                 <span className="mk-mono font-semibold">
-                  {r.owner}/{r.name}
+                  {r.space}/{r.name}
                 </span>
                 <span className="text-micro text-ink-faint">
                   {result?.state === "ok" ? (
@@ -564,12 +564,12 @@ function fallbacks(detail: TimelineDetail, repo: TimelineRepo): { to: string; la
   );
   if (landing?.kind === "merge")
     out.push({
-      to: commitPanelUrl(repo.owner, repo.name, landing.commit),
+      to: commitPanelUrl(repo.space, repo.name, landing.commit),
       label: `The landing commit on main (${shortOid(landing.commit)})`,
     });
   out.push({
     to: commitsUrl(
-      repo.owner,
+      repo.space,
       repo.name,
       workHead(timeline, events, repo),
       "",
@@ -602,7 +602,7 @@ function Body({
   onRetry: () => void;
 }) {
   const { timeline } = detail;
-  const owner = useParams().owner ?? "";
+  const space = useParams().space ?? "";
   const sourceId = repo.source?.sourceId;
   const alternatives = (
     <ul className="m-0 mt-2 list-none p-0 text-body-sm">
@@ -620,7 +620,7 @@ function Body({
   if (!result)
     return (
       <p className="m-0 text-body-sm text-ink-faint" role="status">
-        Comparing {repo.owner}/{repo.name}…
+        Comparing {repo.space}/{repo.name}…
       </p>
     );
   if (result.state === "error") {
@@ -638,7 +638,7 @@ function Body({
       return (
         <div className="rounded-pane bg-pane p-4" role="note">
           <p className="m-0 text-body-sm">
-            This timeline is {timeline.status}, and its work in {repo.owner}/{repo.name} is no
+            This timeline is {timeline.status}, and its work in {repo.space}/{repo.name} is no
             longer there to compare.
           </p>
           {alternatives}
@@ -663,19 +663,19 @@ function Body({
       <div className="rounded-pane bg-pane p-4">
         <p className="m-0 text-body-sm text-ink-muted">
           {result.landed
-            ? `Landing brought no file changes onto main in ${repo.owner}/${repo.name}.`
+            ? `Landing brought no file changes onto main in ${repo.space}/${repo.name}.`
             : mode.kind === "all"
               ? "No changes compared with main yet."
               : mode.kind === "checkpoint"
-                ? `Checkpoint #${mode.number} changed nothing in ${repo.owner}/${repo.name}.`
-                : `Nothing has changed in ${repo.owner}/${repo.name} since checkpoint #${mode.number}.`}
+                ? `Checkpoint #${mode.number} changed nothing in ${repo.space}/${repo.name}.`
+                : `Nothing has changed in ${repo.space}/${repo.name} since checkpoint #${mode.number}.`}
         </p>
         {alternatives}
       </div>
     );
   const storyLink = (step?: string) =>
-    timelinePageUrl(owner, timeline.slug, "story", {
-      repo: detail.timeline.repos.length > 1 ? `${repo.owner}/${repo.name}` : null,
+    timelinePageUrl(space, timeline.slug, "story", {
+      repo: detail.timeline.repos.length > 1 ? `${repo.space}/${repo.name}` : null,
       step,
     });
   return (
@@ -727,8 +727,8 @@ function Body({
                 </time>
                 <Link
                   className="mk-mono text-micro text-ink-faint no-underline hover:underline"
-                  to={sourceUrl(commitPanelUrl(repo.owner, repo.name, commit.oid), sourceId)}
-                  title={`Open commit ${shortOid(commit.oid)} in ${repo.owner}/${repo.name}`}
+                  to={sourceUrl(commitPanelUrl(repo.space, repo.name, commit.oid), sourceId)}
+                  title={`Open commit ${shortOid(commit.oid)} in ${repo.space}/${repo.name}`}
                 >
                   {shortOid(commit.oid)}
                 </Link>
@@ -746,7 +746,7 @@ function Body({
         // A deleted file lives on where the comparison started.
         blobHref={(path) =>
           blobUrl(
-            repo.owner,
+            repo.space,
             repo.name,
             diff.files.find((f) => f.path === path)?.status === "deleted" ? diff.from : diff.head,
             path,

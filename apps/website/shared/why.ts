@@ -6,7 +6,7 @@
 // context; compact source admission and checkpoints use exact source/OID
 // membership, never equality of change ids.
 //
-// GET /api/repos/:owner/:name/why serves it to the web app and to `gm why`.
+// GET /api/repos/:space/:name/why serves it to the web app and to `gm why`.
 
 import type { Step } from "./steps.ts";
 import type { RefUpdate, SourceLineage } from "./api.ts";
@@ -120,7 +120,7 @@ export interface WhyIssue {
   key: string;
   title: string;
   status: IssueStatus;
-  trackerOwner: string;
+  trackerSpace: string;
   /** `commit`: a commit of the change cites its key. `timeline`: the timeline worked on it. */
   source: "commit" | "timeline";
 }
@@ -220,13 +220,13 @@ export interface WhyChain {
 
 export interface WhyResponse {
   source?: CodeSource;
-  repo: { owner: string; name: string; defaultBranch: string };
+  repo: { space: string; name: string; defaultBranch: string };
   /**
-   * The tracker of the repository's owner, which holds its timelines,
+   * The tracker of the repository's Space, which holds its timelines,
    * checkpoints and approvals. Callers who can't read it get the git half of
    * the chain (blame, commits, refs, landing) and no tracker records.
    */
-  tracker: { owner: string; readable: boolean };
+  tracker: { space: string; readable: boolean };
   /** Null when the caller named commits instead of lines. */
   blame: WhyBlame | null;
   /** One per distinct commit, in the order of the first line each explains. */

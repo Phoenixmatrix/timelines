@@ -17,12 +17,15 @@ import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { timelineKnowledgeSource } from "../knowledge/sources.ts";
 import { repoAiSnapshot } from "../settings/ai.ts";
 import { aiWork } from "../usage/ai.ts";
-import { findAccountBySlug } from "../db.ts";
-import { accessFor } from "../tracker/access.ts";
+import { findAccountBySlug, findUserById } from "../db.ts";
+import { findSpaceById, findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
+import { fixtureAccess } from "./dev-fixture-access.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
+import { CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import { durableAgent, instanceStorage } from "../durable/registry.ts";
-import { collectUsage } from "../usage/collect.ts";
+import { collectUsage, USAGE_CURSOR } from "../usage/collect.ts";
 import { advanceRun, createRun, getRun, retentionCron } from "../retention/runs.ts";
 import { SYSTEM_ACTOR } from "../../registry/core/auth/system.ts";
 import { Services } from "../../registry/core/context.ts";
@@ -46,7 +49,7 @@ import { sweepReleaseHighlights } from "../release-notes/highlights.ts";
 // DEVELOPMENT ONLY: empty, named repositories exercising the persona permissions.
 // The harness populates their bounded, pinned contents through the real CLI.
 interface Sample {
-  owner: string;
+  spaceId: string;
   name: string;
   visibility: "public" | "private";
   description: string;
@@ -55,7 +58,7 @@ interface Sample {
 
 const SAMPLES: Sample[] = [
   {
-    owner: "acc_orbit",
+    spaceId: "acc_orbit",
     name: "engine",
     visibility: "private",
     description: "Small private engine fixture.",
@@ -65,26 +68,33 @@ const SAMPLES: Sample[] = [
     ],
   },
   {
-    owner: "acc_orbit",
+    spaceId: "acc_orbit",
     name: "website",
     visibility: "public",
     description: "The Orbit Labs website.",
     collaborators: [],
   },
   {
-    owner: "acc_marco",
+    spaceId: "acc_marco",
     name: "hello-world",
     visibility: "public",
     description: "My first repository.",
     collaborators: [],
   },
   {
-    owner: "acc_sam",
+    spaceId: "acc_sam",
     name: "notes",
     visibility: "private",
     description: "Private scratch notes.",
     collaborators: [],
   },
+  ...["space_orbit_research", "space_nova", "space_nova_research"].map((spaceId): Sample => ({
+    spaceId,
+    name: "boundary-private",
+    visibility: "private",
+    description: "Private two-Organization/two-Space isolation fixture.",
+    collaborators: [],
+  })),
 ];
 
 export const dev = new Hono<AppEnv>();
@@ -155,7 +165,7 @@ dev.post("/release-highlights-fixtures", async (c) => {
     !actor ||
     !repo ||
     !/^provider-[a-f0-9]{10}$/.test(repo.name) ||
-    repo.owner_id !== "acc_orbit"
+    repo.space_id !== "acc_orbit"
   )
     return fail(c, 403, "Only the owned Copper Finch fixture is allowed.");
   const rows = k
@@ -163,7 +173,7 @@ dev.post("/release-highlights-fixtures", async (c) => {
     .selectAll()
     .where("viewer_id", "=", actor.id)
     .where((eb) =>
-      eb.or([eb.and([eb("scope", "=", "tracker"), eb("scope_id", "=", repo.owner_id)])]),
+      eb.or([eb.and([eb("scope", "=", "tracker"), eb("scope_id", "=", repo.space_id)])]),
     );
   // The fixture's real daily note is dated long ago, outside the 7-day window.
   // "recent" and "stale" copy it to today and to ten days ago, so the proof can
@@ -269,7 +279,7 @@ dev.post("/release-highlights-fixtures", async (c) => {
         .execute();
     await sweepReleaseHighlights(c.env, {
       scope: "tracker",
-      scopeId: repo.owner_id,
+      scopeId: repo.space_id,
       viewerId: actor.id,
     });
   } else if (input.action !== "inspect") {
@@ -283,8 +293,14 @@ dev.post("/release-highlights-fixtures", async (c) => {
       .selectAll()
       // Highlights meter as their own feature (CORE-359), apart from release-note writing.
       .where("feature", "=", "release_highlights")
-      .where("account_id", "in", [actor.id, repo.owner_id, "acc_sam"])
-      .orderBy("account_id")
+      .where((eb) =>
+        eb.or([
+          eb.and([eb("scope_kind", "=", "space"), eb("scope_id", "=", repo.space_id)]),
+          eb.and([eb("scope_kind", "=", "person"), eb("scope_id", "in", [actor.id, "acc_sam"])]),
+        ]),
+      )
+      .orderBy("scope_kind")
+      .orderBy("scope_id")
       .orderBy("model")
       .execute(),
   });
@@ -298,18 +314,18 @@ dev.post("/durable", async (c) => {
 });
 
 // Usage metering in the real runtime (CORE-207): run today's collection
-// from the start to the end, then return one account's figures.
+// from the start to the end, then return one explicit Space/person/Instance scope.
 dev.post("/usage", async (c) => {
-  const { account } = await readJson<{ account: string }>(c);
-  const found = account ? await findAccountBySlug(c.env.DB, account) : null;
-  if (!found) return fail(c, 404, "No such account.");
-  await c.env.DB.prepare("DELETE FROM job_cursors WHERE name = 'usage:collect'").run();
+  const { target } = await readJson<{ target: RetentionTarget }>(c);
+  if (!target || !(await validFixtureTarget(c.env.DB, target)))
+    return fail(c, 400, "An existing explicit scope target is required.");
+  await c.env.DB.prepare("DELETE FROM job_cursors WHERE name = ?").bind(USAGE_CURSOR).run();
   let runs = 0;
   for (let done = false; !done && runs < 50; runs++) done = (await collectUsage(c.env)).done;
   const { results } = await c.env.DB.prepare(
-    "SELECT day, construct, item, metric, kind, quantity, estimated, method FROM usage_snapshots WHERE account_id = ? ORDER BY day, construct, item, metric",
+    "SELECT day, construct, item, metric, kind, quantity, estimated, method FROM usage_snapshots WHERE scope_kind = ? AND scope_id = ? ORDER BY day, construct, item, metric",
   )
-    .bind(found.id)
+    .bind(target.kind, target.id)
     .all();
   return c.json({ runs, figures: results });
 });
@@ -319,12 +335,13 @@ dev.post("/usage", async (c) => {
 dev.get("/ai-usage", async (c) => {
   const since = c.req.query("since") ?? new Date().toISOString().slice(0, 10);
   const { results } = await c.env.DB.prepare(
-    `SELECT u.account_id, a.slug, u.feature, u.model, SUM(u.calls) AS calls,
+    `SELECT u.scope_kind, u.scope_id, COALESCE(s.slug, a.slug) AS slug, u.feature, u.model, SUM(u.calls) AS calls,
             SUM(u.failed_calls) AS failed, SUM(u.input_tokens) AS input,
             SUM(u.output_tokens) AS output, SUM(u.total_tokens) AS total
-     FROM ai_usage u LEFT JOIN accounts a ON a.id = u.account_id
-     WHERE u.day >= ?1 GROUP BY u.account_id, u.feature, u.model
-     ORDER BY u.account_id, u.feature, u.model`,
+     FROM ai_usage u LEFT JOIN spaces s ON u.scope_kind = 'space' AND s.id = u.scope_id
+       LEFT JOIN accounts a ON u.scope_kind = 'person' AND a.id = u.scope_id
+     WHERE u.day >= ?1 GROUP BY u.scope_kind, u.scope_id, u.feature, u.model
+     ORDER BY u.scope_kind, u.scope_id, u.feature, u.model`,
   )
     .bind(since)
     .all();
@@ -333,7 +350,7 @@ dev.get("/ai-usage", async (c) => {
 
 // Retention runs in the real runtime with a moment `daysAhead` days from now
 // (CORE-203), so E2E can age what it just made: run to the end, synchronously.
-// With `account`, that account's categories; without, the site's. With `gc`,
+// Each run targets one explicit Space, person or Instance. With `gc`,
 // the registry's garbage collection then runs at the same moment (CORE-205).
 // The hourly retention cron in the real runtime (CORE-210): which scheduled
 // runs it starts, and with which categories, so E2E can show a disabled
@@ -343,25 +360,38 @@ dev.post("/retention-cron", async (c) => {
   const runs = await Promise.all(
     result.scheduled.map((id) =>
       c.env.DB.prepare(
-        `SELECT r.id, a.slug AS account, json_group_array(c.category) AS categories
-         FROM cleanup_runs r LEFT JOIN accounts a ON a.id = r.account_id
+        `SELECT r.id, r.scope_kind, r.scope_id, json_group_array(c.category) AS categories
+         FROM cleanup_runs r
          JOIN cleanup_run_categories c ON c.run_id = r.id WHERE r.id = ? GROUP BY r.id`,
       )
         .bind(id)
-        .first<{ id: number; account: string | null; categories: string }>(),
+        .first<{
+          id: number;
+          scope_kind: RetentionTarget["kind"];
+          scope_id: string;
+          categories: string;
+        }>(),
     ),
   );
   return c.json({
     scheduled: runs.flatMap((r) =>
-      r ? [{ id: r.id, account: r.account, categories: JSON.parse(r.categories) as string[] }] : [],
+      r
+        ? [
+            {
+              id: r.id,
+              target: { kind: r.scope_kind, id: r.scope_id },
+              categories: JSON.parse(r.categories) as string[],
+            },
+          ]
+        : [],
     ),
     restarted: result.restarted,
   });
 });
 
 dev.post("/retention", async (c) => {
-  const { account, categories, daysAhead, dryRun, gc } = await readJson<{
-    account?: string;
+  const { target, categories, daysAhead, dryRun, gc } = await readJson<{
+    target: RetentionTarget;
     categories?: Record<string, Record<string, number>>;
     daysAhead?: number;
     dryRun?: boolean;
@@ -369,16 +399,14 @@ dev.post("/retention", async (c) => {
   }>(c);
   if (typeof daysAhead !== "number" || !Number.isFinite(daysAhead) || !categories)
     return fail(c, 400, "daysAhead and categories are required.");
-  let target: RetentionTarget = { scope: "site" };
-  if (account) {
-    const found = await findAccountBySlug(c.env.DB, account);
-    if (!found) return fail(c, 404, "No such account.");
-    target = { scope: "account", accountId: found.id };
-  }
+  if (!target || !(await validFixtureTarget(c.env.DB, target)))
+    return fail(c, 400, "An existing explicit scope target is required.");
   const now = new Date(Date.now() + daysAhead * 86_400_000);
+  // This time-travel fixture is authorized by the environment capability, not a
+  // person's credential. Manual runs use the scoped retention/runs API instead.
   const id = await createRun(c.env.DB, {
     target,
-    trigger: "manual",
+    trigger: "schedule",
     actorId: null,
     dryRun: dryRun === true,
     categories: Object.entries(categories).map(([category, thresholds]) => ({
@@ -405,18 +433,18 @@ dev.post("/retention", async (c) => {
 // CI retention in the real runtime (CORE-200): move runs (with their jobs and
 // steps) back in time so the retention categories see them as old.
 dev.post("/ci-age", async (c) => {
-  const { owner, name, numbers, days } = await readJson<{
-    owner: string;
+  const { space, name, numbers, days } = await readJson<{
+    space: string;
     name: string;
     numbers: number[];
     days: number;
   }>(c);
-  const account = owner ? await findAccountBySlug(c.env.DB, owner) : null;
+  const account = space ? await findSpaceBySlug(c.env.DB, space) : null;
   const repo = account
     ? await db(c.env.DB)
         .selectFrom("repos")
         .select("id")
-        .where("owner_id", "=", account.id)
+        .where("space_id", "=", account.id)
         .where("name", "=", name ?? "")
         .executeTakeFirst()
     : undefined;
@@ -532,7 +560,17 @@ dev.post("/assistant-chat", async (c) => {
     )
       .bind(id, found.id, title, at)
       .run();
-    await (await durableAgent(c.env, "Assistant", name)).transcript();
+    const actor = await findUserById(c.env.DB, found.id);
+    if (!actor) return fail(c, 404, "Fixture person missing.");
+    const token = await issueToken(c.env.DB, actor.id, "assistant-fixture", "write", {
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    });
+    await (
+      await durableAgent(c.env, "Assistant", name)
+    ).transcript({
+      ...actor,
+      credential: { kind: "token", id: token.id },
+    });
     for (let i = 0; i < 40 && !(await instance()); i++)
       await new Promise((resolve) => setTimeout(resolve, 50));
     return c.json({
@@ -587,17 +625,19 @@ dev.post("/auth-expired", async (c) => {
 });
 
 dev.get("/environment", async (c) => {
+  const admission = await cutoverControl(c.env).admission(CONTENT_CONTRACT_VERSION);
   const accounts = await db(c.env.DB)
     .selectFrom("accounts")
     .select("id")
-    .where("id", "in", ["acc_priya", "acc_marco", "acc_jun", "acc_sam", "acc_orbit"])
+    .where("id", "in", ["acc_priya", "acc_marco", "acc_jun", "acc_sam", "acc_fward"])
     .execute();
-  const repos = await db(c.env.DB).selectFrom("repos").select(["owner_id", "name"]).execute();
+  const repos = await db(c.env.DB).selectFrom("repos").select(["space_id", "name"]).execute();
   return c.json({
     id: Reflect.get(c.env, "AGENT_ID") ?? null,
-    ready: accounts.length === 5,
+    ready: admission.allowed,
+    personas: accounts.length === 5,
     fixtures: SAMPLES.every((sample) =>
-      repos.some((repo) => repo.owner_id === sample.owner && repo.name === sample.name),
+      repos.some((repo) => repo.space_id === sample.spaceId && repo.name === sample.name),
     ),
   });
 });
@@ -621,12 +661,16 @@ dev.post("/clef", async (c) => {
   const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
   const owned = await db(c.env.DB)
-    .selectFrom("repos")
-    .select("id")
-    .where("id", "=", repo)
-    .where("owner_id", "=", actor.id)
+    .selectFrom("repos as r")
+    .innerJoin("spaces as s", "s.id", "r.space_id")
+    .innerJoin("organizations as o", "o.id", "s.organization_id")
+    .select(["r.id", "r.space_id"])
+    .where("r.id", "=", repo)
+    .where("o.kind", "=", "personal")
+    .where("o.personal_account_id", "=", actor.id)
     .executeTakeFirst();
-  if (!owned) return fail(c, 404, "No owned personal repository.");
+  if (!owned || !(await resolveSpaceAccess(c.env.DB, actor, owned.space_id)))
+    return fail(c, 404, "No granted personal repository.");
   const policy = await repoAiSnapshot(c.env.DB, owned.id);
   const answers = await aiWork({ feature: "knowledge", repo: owned.id }, () =>
     decide(c.env, state, questions, {
@@ -658,53 +702,52 @@ dev.post("/tokens", async (c) => {
  */
 dev.post("/chronicle", async (c) => {
   const body = await readJson<{
-    account: string;
+    space: string;
     team: string;
     issues?: number;
     days?: number;
     seed?: number;
     link?: { repo: string; commit: string };
   }>(c);
-  const account = body.account;
+  const spaceSlug = body.space;
   const teamKey = body.team;
   if (
-    typeof account !== "string" ||
+    typeof spaceSlug !== "string" ||
     typeof teamKey !== "string" ||
     !/^[A-Z][A-Z0-9]{1,5}$/.test(teamKey)
   )
-    return fail(c, 400, "account and a new team key (2–6 capitals) are required.");
-  const owner = await findAccountBySlug(c.env.DB, account);
-  if (!owner) return fail(c, 404, "No such account.");
+    return fail(c, 400, "space and a new team key (2–6 capitals) are required.");
+  const space = await findSpaceBySlug(c.env.DB, spaceSlug);
+  if (!space) return fail(c, 404, "No such Space.");
   const issues = Math.min(2000, Math.max(1, Math.trunc(body.issues ?? 300)));
   const days = Math.min(365, Math.max(1, Math.trunc(body.days ?? 30)));
   const k = db(c.env.DB);
-  const members =
-    owner.kind === "user"
-      ? [{ id: owner.id, admin: true }]
-      : (
-          await k
-            .selectFrom("org_members")
-            .select(["user_id", "role"])
-            .where("org_id", "=", owner.id)
-            .orderBy("role", "desc")
-            .orderBy("user_id")
-            .execute()
-        )
-          .map((m) => ({ id: m.user_id, admin: m.role === "owner" }))
-          .sort((a, b) => Number(b.admin) - Number(a.admin));
+  const members = (
+    await k
+      .selectFrom("space_grants as g")
+      .innerJoin("organization_members as m", (join) =>
+        join
+          .onRef("m.organization_id", "=", "g.organization_id")
+          .onRef("m.account_id", "=", "g.account_id"),
+      )
+      .select(["g.account_id", "g.role"])
+      .where("g.space_id", "=", space.id)
+      .orderBy("g.account_id")
+      .execute()
+  )
+    .map((m) => ({ id: m.account_id, admin: m.role === "admin" }))
+    .sort((a, b) => Number(b.admin) - Number(a.admin));
   const lead = members[0];
-  if (!lead) return fail(c, 400, "The account has no members.");
-  const agentId = `agt_chronicle_${owner.id}`;
+  if (!lead) return fail(c, 400, "The Space has no granted members.");
+  const agentId = `agt_chronicle_${space.id}`;
   await k
     .insertInto("agents")
     .values({ id: agentId, name: "builder", accountable_id: lead.id })
     .onConflict((oc) => oc.column("id").doNothing())
     .execute();
-  const people = await Promise.all(
-    members.map((m) => accessFor(c.env.DB, owner, m.id, null, m.admin)),
-  );
-  const agents = [await accessFor(c.env.DB, owner, lead.id, agentId, lead.admin)];
-  const result = await trackerObject(c.env, owner.id).chronicleFixture(people, agents, {
+  const people = await Promise.all(members.map((m) => fixtureAccess(c.env, space, m.id)));
+  const agents = [await fixtureAccess(c.env, space, lead.id, agentId)];
+  const result = await trackerObject(c.env, space.id).chronicleFixture(people, agents, {
     issues,
     days,
     end: Date.now() - 10 * 60_000,
@@ -716,17 +759,22 @@ dev.post("/chronicle", async (c) => {
     const [repoOwner, repoName] = body.link.repo.split("/");
     const repo = await k
       .selectFrom("repos as r")
-      .innerJoin("accounts as a", "a.id", "r.owner_id")
+      .innerJoin("spaces as a", "a.id", "r.space_id")
       .select("r.id")
       .where("a.slug", "=", repoOwner ?? "")
+      .where("r.space_id", "=", space.id)
       .where("r.name", "=", repoName ?? "")
       .executeTakeFirst();
     if (!repo || !/^[0-9a-f]{40}$/.test(body.link.commit))
-      return fail(c, 400, "link needs a repository owner/name and a 40-character commit.");
+      return fail(
+        c,
+        400,
+        "link needs a same-Space repository space/name and a 40-character commit.",
+      );
     const show = result.showcase;
     const committedAt = new Date(Date.parse(show.claimedAt) + 45 * 60_000).toISOString();
     const release = `@day:${show.completedAt.slice(0, 10)}`;
-    const team = await trackerObject(c.env, owner.id).issuesByKey([show.key]);
+    const team = await trackerObject(c.env, space.id).issuesByKey(people[0]!, [show.key]);
     const shipped = team.ok ? team.value[0] : undefined;
     await batch(c.env.DB, [
       k
@@ -779,7 +827,7 @@ dev.post("/chronicle", async (c) => {
           category: "feature",
           title: `${show.key} shipped`,
           summary: "The showcase issue's release-note entry (development fixture).",
-          tracker_owner_id: owner.id,
+          tracker_space_id: space.id,
           issue_id: show.id,
           issue_key: show.key,
           team_id: shipped?.team.id ?? null,
@@ -804,7 +852,7 @@ dev.post("/seed", async (c) => {
     let row = await db(c.env.DB)
       .selectFrom("repos")
       .select("id")
-      .where("owner_id", "=", sample.owner)
+      .where("space_id", "=", sample.spaceId)
       .where("name", "=", sample.name)
       .executeTakeFirst();
     if (!row) {
@@ -819,7 +867,7 @@ dev.post("/seed", async (c) => {
           .insertInto("repos")
           .values({
             id,
-            owner_id: sample.owner,
+            space_id: sample.spaceId,
             name: sample.name,
             description: sample.description,
             visibility: sample.visibility,
@@ -836,7 +884,7 @@ dev.post("/seed", async (c) => {
         row = await db(c.env.DB)
           .selectFrom("repos")
           .select("id")
-          .where("owner_id", "=", sample.owner)
+          .where("space_id", "=", sample.spaceId)
           .where("name", "=", sample.name)
           .executeTakeFirst();
         if (!row) throw error;
@@ -870,12 +918,13 @@ dev.post("/seed", async (c) => {
  * `land` (with publish) also records the build as finished at `commit`, as
  * the Knowledge build does last, so an open page's status poll sees a build
  * land and reads the route again; `queue` makes the repository's build
- * pending again (CORE-187).
+ * pending again (CORE-187). `inspect` reads accounting through the running
+ * D1 binding, never a second SQLite runtime competing with active builds.
  */
 dev.post("/atlas", async (c) => {
   const body = await readJson<{
     repo: string;
-    action: "publish" | "expire" | "overlay" | "end" | "queue";
+    action: "publish" | "expire" | "overlay" | "end" | "queue" | "inspect";
     land?: boolean;
     commit?: string;
     base?: string;
@@ -886,16 +935,25 @@ dev.post("/atlas", async (c) => {
     publishes?: string;
   }>(c);
   const [owner, name] = (body.repo ?? "").split("/");
-  const account = owner ? await findAccountBySlug(c.env.DB, owner) : null;
+  const account = owner ? await findSpaceBySlug(c.env.DB, owner) : null;
   const repo = account
     ? await db(c.env.DB)
         .selectFrom("repos")
         .select(["id", "name"])
-        .where("owner_id", "=", account.id)
+        .where("space_id", "=", account.id)
         .where("name", "=", name ?? "")
         .executeTakeFirst()
     : undefined;
   if (!repo) return fail(c, 404, "No such repository.");
+  if (body.action === "inspect") {
+    const [spend, builds] = await c.env.DB.batch<Record<string, unknown>>([
+      c.env.DB.prepare(
+        "SELECT repo_id, run_id, purpose, model, status, input_tokens, output_tokens, cost_micro_usd FROM atlas_spend WHERE repo_id = ? ORDER BY created_at",
+      ).bind(repo.id),
+      c.env.DB.prepare("SELECT COUNT(*) AS n FROM kg_builds WHERE repo_id = ?").bind(repo.id),
+    ]);
+    return c.json({ spend: spend!.results, builds: Number(builds!.results[0]!.n) });
+  }
   if (body.action === "expire") return c.json(await expireAtlasPriors(c.env.DB, repo.id));
   if (body.action === "queue") {
     await queueAtlasFixtureBuild(c.env.DB, repo.id);
@@ -951,7 +1009,7 @@ async function devRepoId(env: Env, repo: string): Promise<string | null> {
   if (!repo.includes("/")) return repo;
   const [owner, name] = repo.split("/");
   const live = await env.DB.prepare(
-    "SELECT r.id FROM repos r JOIN accounts o ON o.id = r.owner_id WHERE o.slug = ? AND r.name = ?",
+    "SELECT r.id FROM repos r JOIN spaces s ON s.id = r.space_id WHERE s.slug = ? AND r.name = ?",
   )
     .bind(owner, name)
     .first<string>("id");
@@ -963,4 +1021,20 @@ async function devRepoId(env: Env, repo: string): Promise<string | null> {
       .bind(repo)
       .first<string>("repo_id")) ?? null
   );
+}
+
+async function validFixtureTarget(
+  d1: D1Database,
+  target: RetentionTarget | undefined,
+): Promise<boolean> {
+  if (!target || typeof target.id !== "string") return false;
+  if (target.kind === "instance") return target.id === "";
+  if (target.kind === "space") return (await findSpaceById(d1, target.id)) !== null;
+  if (target.kind !== "person") return false;
+  return !!(await db(d1)
+    .selectFrom("accounts")
+    .select("id")
+    .where("id", "=", target.id)
+    .where("kind", "=", "user")
+    .executeTakeFirst());
 }

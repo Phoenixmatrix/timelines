@@ -10,12 +10,12 @@ import { accessible } from "../tracker/api.ts";
 import { FeedError, releaseFeed } from "./feed.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
-import { landedTimelines, ownerTimelines } from "./timelines.ts";
+import { landedTimelines, spaceTimelines } from "./timelines.ts";
 import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
 import { issuesFrom } from "./trackers.ts";
 import { ensureReleaseNotes } from "./queue.ts";
 import { compactReleaseInputs } from "./compact.ts";
-import { findAccountBySlug } from "../db.ts";
+import { findSpaceBySlug } from "../spaces/access.ts";
 import { readReleaseHighlights } from "./highlights.ts";
 import { composeRepoNotes, composeTrackerNotes } from "./compose.ts";
 
@@ -56,7 +56,7 @@ export async function linkedIssues(
   keys: string[],
 ): Promise<LinkedIssue[]> {
   if (!actor || !keys.length) return [];
-  return issuesFrom(env, await accessible(env.DB, actor), repo.id, keys);
+  return issuesFrom(env, await accessible(env.DB, actor), repo.id, keys, actor);
 }
 
 /**
@@ -149,7 +149,7 @@ releaseNotes.get("/range", async (c) => {
             row.id,
             refs.headBranch,
             merges,
-            ownerTimelines(c.env, row.owner_id),
+            spaceTimelines(c.env, row.space_id, c.get("actor")),
           )
         ).values(),
         ...[...compact.values()].map((input) => input.timeline),
@@ -167,7 +167,7 @@ releaseNotes.get("/", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   c.header("cache-control", "private, no-store");
-  await ensureReleaseNotes(c.env, loaded.row.id);
+  await ensureReleaseNotes(c.env, loaded.row.id, c.get("actor"));
   const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
   return c.json(
     await releaseIndex(
@@ -185,7 +185,7 @@ releaseNotes.get("/release", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   c.header("cache-control", "private, no-store");
-  await ensureReleaseNotes(c.env, loaded.row.id);
+  await ensureReleaseNotes(c.env, loaded.row.id, c.get("actor"));
   const name = releaseName(c.req.query("name") ?? "");
   const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
   const body = await releaseNotesFor(
@@ -199,7 +199,7 @@ releaseNotes.get("/release", async (c) => {
   return c.json(body);
 });
 
-/** A tracker account's release feed: `?q=` is ANDed with `?timeline=` scope. */
+/** A tracker Space's release feed: `?q=` is ANDed with `?timeline=` scope. */
 export const trackerReleaseNotes = new Hono<AppEnv>();
 trackerReleaseNotes.get("/", async (c) => {
   c.header("cache-control", "private, no-store");
@@ -208,7 +208,7 @@ trackerReleaseNotes.get("/", async (c) => {
       await releaseFeed(
         c.env,
         c.get("actor"),
-        c.req.param("owner") ?? "",
+        c.req.param("space") ?? "",
         c.req.query("q") ?? "",
         c.req.query("timeline"),
       ),
@@ -224,16 +224,16 @@ trackerReleaseNotes.get("/highlights", async (c) => {
   const actor = c.get("actor");
   if (!actor || actor.agent)
     return c.json({ error: "Sign in as a person to read highlights." }, 401);
-  const owner = await findAccountBySlug(c.env.DB, c.req.param("owner") ?? "");
-  if (!owner) return c.json({ error: "Tracker account not found." }, 404);
+  const space = await findSpaceBySlug(c.env.DB, c.req.param("space") ?? "");
+  if (!space) return c.json({ error: "Tracker Space not found." }, 404);
   try {
     return c.json(
       await readReleaseHighlights(c.env, actor, {
         type: "release-highlights",
         scope: "tracker",
-        scopeId: owner.id,
+        scopeId: space.id,
         viewerId: actor.id,
-        ownerAccountId: owner.id,
+        spaceId: space.id,
       }),
     );
   } catch (error) {

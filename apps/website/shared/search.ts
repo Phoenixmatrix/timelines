@@ -4,6 +4,7 @@
 
 import type { FormatId } from "./packages.ts";
 import type { Issue, IssueStatus } from "./tracker.ts";
+import type { SpaceSummary } from "./spaces.ts";
 
 /**
  * What can be found. Each category has one server-side provider
@@ -44,7 +45,7 @@ export const SEARCH_LIMITS = {
 /**
  * How a result matched, strongest first. Results within a category are
  * ordered by this, then by the category's own tie-breaks (recency, name, ID).
- * - `exact`: an identifier equals the query (`owner/name`, a slug, a title);
+ * - `exact`: an identifier equals the query (`space/name`, a slug, a title);
  * - `prefix`: a name or title starts with it;
  * - `word`: a word inside a name or title starts with it;
  * - `contains`: every word appears somewhere, e.g. in a description.
@@ -68,7 +69,7 @@ interface ResultBase {
 
 export interface RepositoryResult extends ResultBase {
   category: "repositories";
-  owner: string;
+  space: SpaceSummary;
   name: string;
   visibility: "public" | "private";
   /** Where code links point, e.g. a code passage found in this repository. */
@@ -78,8 +79,8 @@ export interface RepositoryResult extends ResultBase {
 export interface IssueResult extends ResultBase {
   category: "issues";
   key: string;
-  /** The tracker it's in: keys repeat across trackers, so this tells them apart. */
-  tracker: { slug: string; displayName: string };
+  /** The Space it's in: issue keys repeat across Spaces. */
+  space: SpaceSummary;
   status: IssueStatus;
   priority: Issue["priority"];
   updatedAt: string;
@@ -87,15 +88,15 @@ export interface IssueResult extends ResultBase {
 
 export interface PackageResult extends ResultBase {
   category: "packages";
-  /** Owner, format and name together identify a package: the same name repeats across them. */
-  owner: string;
+  /** Space, format and name together identify a package: the same name repeats across them. */
+  space: SpaceSummary;
   format: FormatId;
   name: string;
 }
 
 export interface AccountResult extends ResultBase {
   category: "accounts";
-  kind: "user" | "org";
+  kind: "user";
   slug: string;
 }
 

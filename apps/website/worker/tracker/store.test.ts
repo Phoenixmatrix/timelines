@@ -1,4 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import {
   readiness,
@@ -7,21 +6,31 @@ import {
   type Issue,
   type Mutation,
 } from "../../shared/tracker.ts";
-import { RESUME_WINDOW_SECONDS, TrackerStore, type Access, type SqlDatabase } from "./store.ts";
-import { trackerSql, transactional } from "../testing/tracker.ts";
+import { RESUME_WINDOW_SECONDS, TrackerStore, type Access } from "./store.ts";
+import { freshTrackerStorage } from "../testing/tracker.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 
-const databases: DatabaseSync[] = [];
+const databases: { close(): void }[] = [];
 afterEach(() => {
   for (const db of databases) db.close();
   databases.length = 0;
 });
-function fixture() {
-  const db = new DatabaseSync(":memory:");
-  databases.push(db);
-  const sql: SqlDatabase = trackerSql(db);
+async function fixture(spaceId = "org") {
+  const storage = await freshTrackerStorage(spaceId, [
+    {
+      accountId: "alice",
+      role: "owner",
+      grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+    },
+    {
+      accountId: "bob",
+      role: "member",
+      grant: { role: "member", repositoryRole: "read", packageRole: "read" },
+    },
+  ]);
+  databases.push(storage);
+  const { db, sql, transactionSync: transaction, scope, space } = storage;
   let now = Date.parse("2026-10-01T00:00:00Z");
-  const transaction = transactional(db);
   const store = new TrackerStore(sql, transaction, () => now);
   const access: Access = {
     actorId: "alice",
@@ -36,20 +45,23 @@ function fixture() {
         revokedAt: null,
       },
     ],
-    owner: { id: "org", slug: "org", displayName: "Org" },
+    agentId: null,
+    ...scope,
+    authorizationVersion: space.authorizationVersion,
+    space,
     canAdmin: true,
     members: [
       { id: "alice", slug: "alice", displayName: "Alice" },
       { id: "bob", slug: "bob", displayName: "Bob" },
     ],
-    repos: [{ id: "repo", owner: "org", name: "private" }],
+    repos: [{ id: "repo", spaceId, space: spaceId, name: "private" }],
   };
   let operation = 0;
   const mutate = (...mutations: Mutation[]) =>
-    store.mutate(access, { operationId: `operation-${++operation}`, mutations });
+    store.mutate(access, { ...scope, operationId: `operation-${++operation}`, mutations });
   mutate(
     { kind: "team.create", id: "team", data: { key: "ENG", name: "Engineering" } },
-    { kind: "workspace.create", id: "workspace", data: { slug: "platform", name: "Platform" } },
+    { kind: "project.create", id: "project", data: { slug: "platform", name: "Platform" } },
   );
   const issue = (id: string) =>
     mutate({ kind: "issue.create", id, data: { teamId: "team", title: id } });
@@ -66,13 +78,240 @@ function fixture() {
   };
 }
 
+describe("Space contract and atomic receipts", () => {
+  test("snapshots, changes and mutation results carry the exact numeric scope", async () => {
+    const f = await fixture();
+    const scope = { contractVersion: 4, spaceId: "org", migrationEpoch: 0 };
+    expect(f.store.snapshot(f.access)).toMatchObject({ ...scope, space: f.access.space });
+    expect(f.store.changes(f.access, 0, 100)).toMatchObject(scope);
+    expect(f.issue("scoped")).toMatchObject(scope);
+  });
+
+  test("persisted Space scope rejects foreign and stale Access before reads or receipt replay", async () => {
+    const f = await fixture();
+    const request = {
+      contractVersion: 4,
+      spaceId: "org",
+      migrationEpoch: 0,
+      operationId: "access-replay",
+      mutations: [
+        { kind: "issue.create", id: "scoped", data: { teamId: "team", title: "Scoped" } },
+      ],
+    };
+    const committed = f.store.mutate(f.access, request);
+    const before = f.store.snapshot(f.access);
+    const invalid: { access: Access; code: string }[] = [
+      {
+        access: {
+          ...f.access,
+          spaceId: "other-space",
+          space: { ...f.access.space, id: "other-space" },
+        },
+        code: "space_mismatch",
+      },
+      {
+        access: { ...f.access, space: { ...f.access.space, id: "other-space" } },
+        code: "space_mismatch",
+      },
+      { access: { ...f.access, migrationEpoch: 1 }, code: "migration_epoch_mismatch" },
+    ];
+    for (const { access, code } of invalid) {
+      expect(() => f.store.snapshot(access)).toThrow(expect.objectContaining({ code }));
+      expect(() => f.store.changes(access, 0, 100)).toThrow(expect.objectContaining({ code }));
+      expect(() => f.store.history(access, "scoped", null, 10)).toThrow(
+        expect.objectContaining({ code }),
+      );
+      expect(() => f.store.mutate(access, request)).toThrow(expect.objectContaining({ code }));
+    }
+    expect(f.store.snapshot(f.access)).toEqual(before);
+    expect(f.store.mutate(f.access, request)).toEqual(committed);
+  });
+
+  test.each(["team", "project"] as const)(
+    "foreign %s references roll back the whole batch",
+    async (entity) => {
+      const local = await fixture();
+      const foreign = await fixture("other-space");
+      foreign.mutate(
+        { kind: "team.create", id: "foreign-team", data: { key: "EXT", name: "External" } },
+        {
+          kind: "project.create",
+          id: "foreign-project",
+          data: { slug: "external", name: "External" },
+        },
+      );
+      const before = local.store.snapshot(local.access);
+      const request = {
+        contractVersion: 4,
+        spaceId: "org",
+        migrationEpoch: 0,
+        operationId: `foreign-${entity}`,
+        mutations: [
+          { kind: "issue.create", id: "first", data: { teamId: "team", title: "First" } },
+          {
+            kind: "issue.create",
+            id: "foreign",
+            data: {
+              teamId: entity === "team" ? "foreign-team" : "team",
+              projectIds: entity === "project" ? ["foreign-project"] : [],
+              title: "Foreign reference",
+            },
+          },
+        ],
+      };
+      expect(() => local.store.mutate(local.access, request)).toThrow();
+      expect(local.store.snapshot(local.access)).toEqual(before);
+      expect(
+        local.db.prepare("SELECT id FROM receipts WHERE id = ?").all(request.operationId),
+      ).toEqual([]);
+      local.issue("next");
+      expect(
+        local.store.snapshot(local.access).issues.find((issue) => issue.id === "next")?.key,
+      ).toBe("ENG-1");
+      expect(foreign.store.snapshot(foreign.access).issues).toEqual([]);
+    },
+  );
+
+  test("missing and stale contracts fail before writing a receipt or consuming an issue key", async () => {
+    const f = await fixture();
+    const before = f.store.snapshot(f.access);
+    const request = {
+      contractVersion: 4,
+      spaceId: "org",
+      migrationEpoch: 0,
+      operationId: "scope-retry",
+      mutations: [
+        { kind: "issue.create", id: "scoped", data: { teamId: "team", title: "Scoped" } },
+      ],
+    };
+    const invalid = [
+      { contractVersion: undefined, code: "client_upgrade_required" },
+      { contractVersion: 3, code: "client_upgrade_required" },
+      { migrationEpoch: undefined, code: "migration_epoch_mismatch" },
+      { migrationEpoch: "1", code: "migration_epoch_mismatch" },
+      { migrationEpoch: 1, code: "migration_epoch_mismatch" },
+      { spaceId: "other-space", code: "space_mismatch" },
+    ];
+    for (const { code, ...scope } of invalid) {
+      expect(() => f.store.mutate(f.access, { ...request, ...scope })).toThrow(
+        expect.objectContaining({ code }),
+      );
+      expect(f.store.snapshot(f.access)).toEqual(before);
+      expect(f.db.prepare("SELECT id FROM receipts WHERE id = ?").all(request.operationId)).toEqual(
+        [],
+      );
+      expect(
+        f.db
+          .prepare("SELECT id FROM space_migration_receipt_proof WHERE id = ?")
+          .all(request.operationId),
+      ).toEqual([]);
+    }
+    const committed = f.store.mutate(f.access, request);
+    expect(f.store.snapshot(f.access).issues.find((issue) => issue.id === "scoped")?.key).toBe(
+      "ENG-1",
+    );
+    expect(f.store.mutate(f.access, request)).toEqual(committed);
+  });
+
+  test("a cross-Space repository rolls back every mutation and permits a corrected retry", async () => {
+    const f = await fixture();
+    f.access.repos.push({
+      id: "foreign-repo",
+      spaceId: "other-space",
+      space: "other",
+      name: "private",
+    });
+    const before = f.store.snapshot(f.access);
+    const request = {
+      contractVersion: 4,
+      spaceId: "org",
+      migrationEpoch: 0,
+      operationId: "atomic-space",
+      mutations: [
+        { kind: "issue.create", id: "atomic", data: { teamId: "team", title: "Atomic" } },
+        {
+          kind: "subscription.add",
+          id: "foreign-sub",
+          data: { projectId: "project", repoId: "foreign-repo" },
+        },
+      ],
+    };
+    expect(() => f.store.mutate(f.access, request)).toThrow(
+      expect.objectContaining({ code: "space_mismatch" }),
+    );
+    expect(f.store.snapshot(f.access)).toEqual(before);
+    expect(f.db.prepare("SELECT id FROM receipts WHERE id = ?").all(request.operationId)).toEqual(
+      [],
+    );
+    expect(
+      f.db
+        .prepare("SELECT id FROM space_migration_receipt_proof WHERE id = ?")
+        .all(request.operationId),
+    ).toEqual([]);
+    request.mutations[1] = {
+      kind: "subscription.add",
+      id: "local-sub",
+      data: { projectId: "project", repoId: "repo" },
+    };
+    f.store.mutate(f.access, request);
+    expect(f.store.snapshot(f.access).issues[0]?.key).toBe("ENG-1");
+    expect(f.store.snapshot(f.access).subscriptions).toEqual([
+      {
+        id: "local-sub",
+        projectId: "project",
+        repoId: "repo",
+        spaceId: "org",
+        space: "org",
+        name: "private",
+      },
+    ]);
+  });
+
+  test("retained operation proof prevents replay after receipts and issue content are pruned", async () => {
+    const f = await fixture();
+    const request = {
+      contractVersion: 4,
+      spaceId: "org",
+      migrationEpoch: 0,
+      operationId: "pruned-replay",
+      mutations: [
+        { kind: "issue.create", id: "pruned", data: { teamId: "team", title: "Pruned" } },
+      ],
+    };
+    const committed = f.store.mutate(f.access, request);
+    f.db.prepare("DELETE FROM receipts WHERE id = ?").run(request.operationId);
+    f.db.prepare("DELETE FROM issues WHERE id = ?").run("pruned");
+    f.db.prepare("DELETE FROM events WHERE json_extract(data, '$.entityId') = ?").run("pruned");
+    const before = f.store.snapshot(f.access);
+    const reopened = f.reopen();
+    expect(reopened.mutate(f.access, request)).toEqual(committed);
+    expect(reopened.snapshot(f.access)).toEqual(before);
+    expect(() =>
+      reopened.mutate({ ...f.access, actorId: "bob", principalId: "bob" }, request),
+    ).toThrow(expect.objectContaining({ code: "operation_conflict" }));
+    expect(() =>
+      reopened.mutate(f.access, {
+        ...request,
+        mutations: [{ ...request.mutations[0], data: { teamId: "team", title: "Changed" } }],
+      }),
+    ).toThrow(expect.objectContaining({ code: "operation_conflict" }));
+    f.issue("next");
+    expect(f.store.snapshot(f.access).issues.find((issue) => issue.id === "next")?.key).toBe(
+      "ENG-2",
+    );
+  });
+});
+
 describe("comment author snapshots", () => {
-  test("comments, checkpoints and evidence retain the authenticated agent after directory removal", () => {
-    const f = fixture();
+  test("comments, checkpoints and evidence retain the authenticated agent after directory removal", async () => {
+    const f = await fixture();
     f.issue("work");
     const result = f.store.mutate(
-      { ...f.access, actorId: "agt-bot" },
+      { ...f.access, actorId: "agt-bot", agentId: "agt-bot" },
       {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
         operationId: "agent-notes",
         mutations: (["comment", "checkpoint", "evidence"] as const).map((kind) => ({
           kind: "comment.add",
@@ -101,8 +340,8 @@ describe("comment author snapshots", () => {
     for (const comment of comments) expect(comment.actor).toEqual(actor);
   });
 
-  test("human comments stay human and clients cannot supply actor metadata", () => {
-    const f = fixture();
+  test("human comments stay human and clients cannot supply actor metadata", async () => {
+    const f = await fixture();
     f.issue("work");
     f.mutate({ kind: "comment.add", id: "human", data: { issueId: "work", body: "Hello" } });
     expect(f.store.snapshot(f.access).comments[0]).toMatchObject({
@@ -129,12 +368,12 @@ describe("comment author snapshots", () => {
 });
 
 describe("Knowledge completion evidence", () => {
-  test("an exact issue key cannot be evicted by newer prefix matches before the result limit", () => {
-    const f = fixture();
+  test("an exact issue key cannot be evicted by newer prefix matches before the result limit", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "subscription.add",
       id: "sub",
-      data: { workspaceId: "workspace", repoId: "repo" },
+      data: { projectId: "project", repoId: "repo" },
     });
     for (let number = 1; number <= 10; number++)
       f.mutate({
@@ -143,7 +382,7 @@ describe("Knowledge completion evidence", () => {
         data: {
           teamId: "team",
           title: `Work ${number}`,
-          workspaceIds: ["workspace"],
+          projectIds: ["project"],
         },
       });
     f.mutate({
@@ -178,17 +417,17 @@ describe("Knowledge completion evidence", () => {
     expect(result.map((note) => [note.id, note.issue.key])).toEqual([["exact-proof", "ENG-1"]]);
   });
 
-  test("reads original notes only in live subscribed workspaces, including reopened issues", () => {
-    const f = fixture();
+  test("reads original notes only in live subscribed projects, including reopened issues", async () => {
+    const f = await fixture();
     f.mutate(
-      { kind: "subscription.add", id: "sub", data: { workspaceId: "workspace", repoId: "repo" } },
+      { kind: "subscription.add", id: "sub", data: { projectId: "project", repoId: "repo" } },
       {
         kind: "issue.create",
         id: "work",
         data: {
           teamId: "team",
           title: "Verify parcels",
-          workspaceIds: ["workspace"],
+          projectIds: ["project"],
         },
       },
       {
@@ -209,7 +448,7 @@ describe("Knowledge completion evidence", () => {
           body: "modulus 65521 conversation",
         },
       },
-      { kind: "issue.create", id: "elsewhere", data: { teamId: "team", title: "Other workspace" } },
+      { kind: "issue.create", id: "elsewhere", data: { teamId: "team", title: "Other project" } },
       {
         kind: "comment.add",
         id: "private",
@@ -250,8 +489,8 @@ describe("Knowledge completion evidence", () => {
 });
 
 describe("optional completion evidence", () => {
-  test.each([undefined, "", " \n "])("completes without a fake note for %j", (evidence) => {
-    const f = fixture();
+  test.each([undefined, "", " \n "])("completes without a fake note for %j", async (evidence) => {
+    const f = await fixture();
     f.issue("work");
     const leaseToken = f.mutate({ kind: "issue.claim", id: "work", data: { agent: "worker" } })
       .results[0]!.leaseToken!;
@@ -259,10 +498,14 @@ describe("optional completion evidence", () => {
       f.mutate({
         kind: "issue.complete",
         id: "work",
-        data: { leaseToken: "forged", evidence },
+        data: { leaseToken: "forged", ...(evidence === undefined ? {} : { evidence }) },
       }),
     ).toThrow();
-    f.mutate({ kind: "issue.complete", id: "work", data: { leaseToken, evidence } });
+    f.mutate({
+      kind: "issue.complete",
+      id: "work",
+      data: { leaseToken, ...(evidence === undefined ? {} : { evidence }) },
+    });
     const snapshot = f.store.snapshot(f.access);
     expect(snapshot.issues.find((i) => i.id === "work")).toMatchObject({
       status: "done",
@@ -271,8 +514,8 @@ describe("optional completion evidence", () => {
     expect(snapshot.comments).toEqual([]);
   });
 
-  test("preserves historical evidence and attribution across completion, replay and reopening", () => {
-    const f = fixture();
+  test("preserves historical evidence and attribution across completion, replay and reopening", async () => {
+    const f = await fixture();
     f.issue("work");
     f.mutate({
       kind: "comment.add",
@@ -287,6 +530,9 @@ describe("optional completion evidence", () => {
     const leaseToken = f.mutate({ kind: "issue.claim", id: "work", data: { agent: "worker" } })
       .results[0]!.leaseToken!;
     const request = {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "finish-with-evidence",
       mutations: [
         {
@@ -322,8 +568,8 @@ describe("optional completion evidence", () => {
 });
 
 describe("durable tag definitions", () => {
-  test("registers exact labels, retaining unused definitions across restarts", () => {
-    const f = fixture();
+  test("registers exact labels, retaining unused definitions across restarts", async () => {
+    const f = await fixture();
     const long = "x".repeat(100);
     f.mutate({
       kind: "issue.create",
@@ -347,8 +593,8 @@ describe("durable tag definitions", () => {
     expect(saved.issues[0]!.labels).toEqual([]);
   });
 
-  test("accepts tags as the name of labels, keeps labels working, and refuses both disagreeing (CORE-271)", () => {
-    const f = fixture();
+  test("accepts tags as the name of labels, keeps labels working, and refuses both disagreeing (CORE-271)", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "issue.create",
       id: "tagged",
@@ -376,8 +622,8 @@ describe("durable tag definitions", () => {
     ).toThrow(/tags or labels/);
   });
 
-  test("the tag catalog counts the issues and open issues carrying each tag", () => {
-    const f = fixture();
+  test("the tag catalog counts the issues and open issues carrying each tag", async () => {
+    const f = await fixture();
     f.mutate(
       { kind: "issue.create", id: "one", data: { teamId: "team", title: "One", tags: ["ux"] } },
       {
@@ -395,8 +641,8 @@ describe("durable tag definitions", () => {
     ]);
   });
 
-  test("rolls back definitions when a later batch mutation fails", () => {
-    const f = fixture();
+  test("rolls back definitions when a later batch mutation fails", async () => {
+    const f = await fixture();
     expect(() =>
       f.mutate(
         {
@@ -429,8 +675,8 @@ describe("durable tag definitions", () => {
     expect(f.store.snapshot(f.access).labels).toEqual([]);
   });
 
-  test("backfills existing issue and historical definitions once without rewriting labels", () => {
-    const f = fixture();
+  test("backfills existing issue and historical definitions once without rewriting labels", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "issue.create",
       id: "tagged",
@@ -466,8 +712,8 @@ describe("trusted queue remediation", () => {
     repairModel: null,
     occurredAt: "2026-10-01T00:00:00.000Z",
   };
-  test("atomic evidence survives ambiguous replay without changing original ownership", () => {
-    const f = fixture();
+  test("atomic evidence survives ambiguous replay without changing original ownership", async () => {
+    const f = await fixture();
     f.issue("original");
     const held = f.mutate({ kind: "issue.claim", id: "original", data: { agent: "worker" } })
       .results[0]!;
@@ -516,8 +762,8 @@ describe("trusted queue remediation", () => {
     expect(f.store.snapshot(f.access).issues.find((i) => i.id === "original")!.status).toBe("done");
   });
 
-  test("a failed write rolls back originals, issue numbers, links, evidence and receipts", () => {
-    const f = fixture();
+  test("a failed write rolls back originals, issue numbers, links, evidence and receipts", async () => {
+    const f = await fixture();
     f.issue("original");
     const before = f.store.snapshot(f.access);
     f.db.exec(
@@ -530,8 +776,8 @@ describe("trusted queue remediation", () => {
     expect(f.store.recordQueueFailure(f.access, input).key).toBe("ENG-2");
   });
 
-  test("invalid failure evidence and missing originals leave no partial remediation", () => {
-    const f = fixture();
+  test("invalid failure evidence and missing originals leave no partial remediation", async () => {
+    const f = await fixture();
     f.issue("original");
     const before = f.store.snapshot(f.access);
     for (const invalid of [
@@ -558,8 +804,8 @@ describe("trusted queue remediation", () => {
     expect(f.store.snapshot(f.access)).toEqual(before);
   });
 
-  test("distinct attempts retain history and delayed callbacks cannot erase newer failure", () => {
-    const f = fixture();
+  test("distinct attempts retain history and delayed callbacks cannot erase newer failure", async () => {
+    const f = await fixture();
     f.issue("original");
     const input = { repoId: "repo", issueIds: ["original"], failure };
     const first = f.store.recordQueueFailure(f.access, input);
@@ -580,8 +826,8 @@ describe("trusted queue remediation", () => {
     expect(history.events.filter((e) => e.entityType === "comment")).toHaveLength(3);
   });
 
-  test("unlinked failures reuse MERGE and P0 next grants a fenced normal lease", () => {
-    const f = fixture();
+  test("unlinked failures reuse MERGE and P0 next grants a fenced normal lease", async () => {
+    const f = await fixture();
     f.issue("normal");
     const remediation = f.store.recordQueueFailure(f.access, {
       repoId: "repo",
@@ -615,8 +861,8 @@ describe("trusted queue remediation", () => {
     );
   });
 
-  test("read-only metadata cannot be forged and admission enforces main visibility and team scope", () => {
-    const f = fixture();
+  test("read-only metadata cannot be forged and admission enforces main visibility and team scope", async () => {
+    const f = await fixture();
     f.issue("original");
     expect(f.store.snapshot(f.access).issues[0]!.queueFailure).toBeUndefined();
     for (const mutation of [
@@ -636,8 +882,8 @@ describe("trusted queue remediation", () => {
     ).toThrow(/Only team members/);
   });
 
-  test("remediation obeys assignment, ancestor leases and active claim boundaries", () => {
-    const f = fixture();
+  test("remediation obeys assignment, ancestor leases and active claim boundaries", async () => {
+    const f = await fixture();
     const remediation = f.store.recordQueueFailure(f.access, {
       repoId: "repo",
       issueIds: [],
@@ -692,16 +938,19 @@ describe("trusted queue remediation", () => {
     );
   });
 
-  test("failure metadata stays global through timeline edits and landing", () => {
-    const f = fixture();
+  test("failure metadata stays global through timeline edits and landing", async () => {
+    const f = await fixture();
     f.issue("original");
     f.store.timelines.create(f.access, {
       slug: "work",
       parent: null,
-      repos: [{ id: "repo", owner: "org", name: "private" }],
+      repos: [{ id: "repo", space: "org", name: "private" }],
       commits: { repo: "b".repeat(40) },
     });
     f.store.mutate(f.access, {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "timeline-edit",
       timeline: "work",
       mutations: [
@@ -733,9 +982,10 @@ describe("trusted queue remediation", () => {
 });
 
 describe("ticket audit history", () => {
-  test("persists creator and authenticated agent identity, paginates without duplicates, and fences retries", () => {
-    const f = fixture();
+  test("persists creator and authenticated agent identity, paginates without duplicates, and fences retries", async () => {
+    const f = await fixture();
     f.access.actorId = "agt-bot";
+    f.access.agentId = "agt-bot";
     f.access.source = "cli";
     f.issue("ticket");
     const creator = {
@@ -746,6 +996,9 @@ describe("ticket audit history", () => {
     };
     expect(f.store.snapshot(f.access).issues[0]!.createdBy).toEqual(creator);
     const input = {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "edit-once",
       mutations: [
         { kind: "issue.update", id: "ticket", expectedVersion: 1, data: { title: "Changed" } },
@@ -794,8 +1047,8 @@ describe("ticket audit history", () => {
     ).toEqual(["issue.update", "issue.create"]);
   });
 
-  test("includes both link endpoints, former parents, requests, comments and completion effects without secrets", () => {
-    const f = fixture();
+  test("includes both link endpoints, former parents, requests, comments and completion effects without secrets", async () => {
+    const f = await fixture();
     for (const id of ["ticket", "other", "parent", "new-parent"]) f.issue(id);
     f.mutate({
       kind: "issue.update",
@@ -871,8 +1124,8 @@ describe("ticket audit history", () => {
     ).toEqual(["issue.update", "issue.create"]);
   });
 
-  test("backfills legacy creators and removed relationships without inventing old source metadata", () => {
-    const f = fixture();
+  test("backfills legacy creators and removed relationships without inventing old source metadata", async () => {
+    const f = await fixture();
     for (const id of ["ticket", "other", "parent"]) f.issue(id);
     f.mutate({
       kind: "issue.update",
@@ -889,8 +1142,8 @@ describe("ticket audit history", () => {
     f.mutate({ kind: "link.remove", id: "removed" });
     f.db
       .exec(`UPDATE events SET data = json_remove(data, '$.actor', '$.source', '$.before', '$.mutationKind', '$.entity.createdBy');
-      UPDATE issues SET data = json_remove(data, '$.createdBy');
-      DELETE FROM issue_events; DELETE FROM tracker_migrations;`);
+    UPDATE issues SET data = json_remove(data, '$.createdBy');
+    DELETE FROM issue_events; DELETE FROM tracker_migrations;`);
     const migrated = f.reopen();
     expect(
       migrated.snapshot(f.access).issues.find((issue) => issue.id === "ticket")!.createdBy,
@@ -916,7 +1169,7 @@ describe("ticket audit history", () => {
     ).toEqual(["issue.update", "issue.update", "issue.create"]);
     expect(f.reopen().history(f.access, "ticket", null, 100)).toEqual(history);
     f.db.exec(`DELETE FROM events WHERE json_extract(data, '$.kind') = 'issue.create';
-      UPDATE issues SET data = json_remove(data, '$.createdBy'); DELETE FROM tracker_migrations;`);
+    UPDATE issues SET data = json_remove(data, '$.createdBy'); DELETE FROM tracker_migrations;`);
     expect(
       f
         .reopen()
@@ -927,8 +1180,8 @@ describe("ticket audit history", () => {
 });
 
 describe("tracker SQLite authority", () => {
-  test("one claimant wins, expiry fences the old token, and completion persists evidence without leaking tokens", () => {
-    const f = fixture();
+  test("one claimant wins, expiry fences the old token, and completion persists evidence without leaking tokens", async () => {
+    const f = await fixture();
     f.issue("issue");
     const first = f.mutate({
       kind: "issue.claim",
@@ -963,11 +1216,11 @@ describe("tracker SQLite authority", () => {
       expect.objectContaining({ body: "Verified result", kind: "evidence", issueId: "issue" }),
     ]);
     expect(JSON.stringify(snapshot)).not.toContain(nextToken);
-    expect(JSON.stringify(f.store.changes(0, 500))).not.toContain(token);
-    expect(JSON.stringify(f.store.changes(0, 500))).not.toContain(nextToken);
+    expect(JSON.stringify(f.store.changes(f.access, 0, 500))).not.toContain(token);
+    expect(JSON.stringify(f.store.changes(f.access, 0, 500))).not.toContain(nextToken);
   });
-  test("blockers prevent claims and completion including canceled blockers", () => {
-    const f = fixture();
+  test("blockers prevent claims and completion including canceled blockers", async () => {
+    const f = await fixture();
     f.issue("blocker");
     f.issue("target");
     f.mutate({
@@ -999,8 +1252,8 @@ describe("tracker SQLite authority", () => {
     ).toThrow(/blockers/);
     expect(f.store.snapshot(f.access).comments).toEqual([]);
   });
-  test("closing preserves its reason in snapshots and history without completing work, and reopening clears it", () => {
-    const f = fixture();
+  test("closing preserves its reason in snapshots and history without completing work, and reopening clears it", async () => {
+    const f = await fixture();
     f.issue("blocker");
     f.issue("target");
     f.mutate({
@@ -1033,11 +1286,12 @@ describe("tracker SQLite authority", () => {
       version: 3,
     });
     expect(
-      f.store.changes(0, 500).events.find((event) => event.cursor === closed.cursor)?.entity,
+      f.store.changes(f.access, 0, 500).events.find((event) => event.cursor === closed.cursor)
+        ?.entity,
     ).toMatchObject({ status: "canceled", closeReason: "duplicate" });
   });
-  test("close reasons are required on cancellation, forbidden on open work, and validated atomically", () => {
-    const f = fixture();
+  test("close reasons are required on cancellation, forbidden on open work, and validated atomically", async () => {
+    const f = await fixture();
     f.issue("issue");
     const before = f.store.snapshot(f.access);
     for (const data of [
@@ -1048,6 +1302,9 @@ describe("tracker SQLite authority", () => {
     ]) {
       expect(() =>
         f.store.mutate(f.access, {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
           operationId: crypto.randomUUID(),
           mutations: [{ kind: "issue.update", id: "issue", expectedVersion: 1, data }],
         }),
@@ -1090,8 +1347,8 @@ describe("tracker SQLite authority", () => {
       closeReason: null,
     });
   });
-  test("historical cancellations stay editable without inventing a reason", () => {
-    const f = fixture();
+  test("historical cancellations stay editable without inventing a reason", async () => {
+    const f = await fixture();
     f.issue("legacy");
     f.db
       .prepare(
@@ -1117,8 +1374,8 @@ describe("tracker SQLite authority", () => {
     });
     expect(f.store.snapshot(f.access).issues[0]!.closeReason).toBe("cannot_reproduce");
   });
-  test("the timeline rule defaults to agent_decides, keeps a policy only when required, and validates atomically", () => {
-    const f = fixture();
+  test("the timeline rule defaults to agent_decides, keeps a policy only when required, and validates atomically", async () => {
+    const f = await fixture();
     f.issue("issue");
     const read = (id: string) =>
       f.store.snapshot(f.access).issues.find((issue) => issue.id === id)!;
@@ -1133,6 +1390,9 @@ describe("tracker SQLite authority", () => {
     ]) {
       expect(() =>
         f.store.mutate(f.access, {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
           operationId: crypto.randomUUID(),
           mutations: [{ kind: "issue.update", id: "issue", expectedVersion: 1, data } as Mutation],
         }),
@@ -1178,10 +1438,13 @@ describe("tracker SQLite authority", () => {
     expect(read("legacy")).toMatchObject({ timelineUse: "required" });
     expect(read("legacy").timelinePolicy).toBeUndefined();
   });
-  test("cyclic batches roll back entities, sequence numbers, events and receipts", () => {
-    const f = fixture();
+  test("cyclic batches roll back entities, sequence numbers, events and receipts", async () => {
+    const f = await fixture();
     const before = f.store.snapshot(f.access);
     const request = {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "cycle",
       mutations: [
         { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } },
@@ -1196,8 +1459,8 @@ describe("tracker SQLite authority", () => {
     f.store.mutate(f.access, request);
     expect(f.store.snapshot(f.access).issues.map((i) => i.key)).toEqual(["ENG-1", "ENG-2"]);
   });
-  test("parent hierarchy is acyclic and version conflicts preserve authoritative edits", () => {
-    const f = fixture();
+  test("parent hierarchy is acyclic and version conflicts preserve authoritative edits", async () => {
+    const f = await fixture();
     f.issue("a");
     f.issue("b");
     f.mutate({
@@ -1229,10 +1492,13 @@ describe("tracker SQLite authority", () => {
       "Authoritative",
     );
   });
-  test("operation replay is exact and actor-bound without duplicate comments", () => {
-    const f = fixture();
+  test("operation replay is exact and actor-bound without duplicate comments", async () => {
+    const f = await fixture();
     f.issue("a");
     const request = {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "replay",
       mutations: [
         {
@@ -1258,8 +1524,8 @@ describe("tracker SQLite authority", () => {
       }),
     ).toThrow(/payload/);
   });
-  test("team members and assignees must be account members; team restrictions enforce writes", () => {
-    const f = fixture();
+  test("team members and assignees must be Space members; team restrictions enforce writes", async () => {
+    const f = await fixture();
     expect(() =>
       f.mutate({
         kind: "team.update",
@@ -1267,7 +1533,7 @@ describe("tracker SQLite authority", () => {
         expectedVersion: 1,
         data: { memberIds: ["outsider"] },
       }),
-    ).toThrow(/account member/);
+    ).toThrow(/Space member/);
     f.mutate({
       kind: "team.update",
       id: "team",
@@ -1285,6 +1551,9 @@ describe("tracker SQLite authority", () => {
       f.store.mutate(
         { ...f.access, actorId: "bob", principalId: "bob", canAdmin: false },
         {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
           operationId: "bob-create",
           mutations: [{ kind: "issue.create", id: "bad", data: { teamId: "team", title: "Bad" } }],
         },
@@ -1294,16 +1563,19 @@ describe("tracker SQLite authority", () => {
       f.store.mutate(
         { ...f.access, canAdmin: false },
         {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
           operationId: "member-admin",
           mutations: [
-            { kind: "workspace.create", id: "other", data: { slug: "other", name: "Other" } },
+            { kind: "project.create", id: "other", data: { slug: "other", name: "Other" } },
           ],
         },
       ),
-    ).toThrow(/ownership/);
+    ).toThrow(/Space admin/);
   });
-  test("team edits retain an assigned agent through its accountable member but cannot remove that member", () => {
-    const f = fixture();
+  test("team edits retain an assigned agent through its accountable member but cannot remove that member", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "team.update",
       id: "team",
@@ -1312,8 +1584,11 @@ describe("tracker SQLite authority", () => {
     });
     f.issue("work");
     f.store.mutate(
-      { ...f.access, actorId: "agt-bot" },
+      { ...f.access, actorId: "agt-bot", agentId: "agt-bot" },
       {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
         operationId: "agent-claim",
         mutations: [{ kind: "issue.claim", id: "work", data: { agent: "session" } }],
       },
@@ -1345,29 +1620,41 @@ describe("tracker SQLite authority", () => {
     ).toThrow(expect.objectContaining({ code: "invalid_member", status: 409 }));
     expect(f.reopen().snapshot(f.access)).toEqual(saved);
   });
-  test("repository administration is required for both subscription directions; archive prevents new associations", () => {
-    const f = fixture();
+  test("repository administration is required for both subscription directions; archive prevents new associations", async () => {
+    const f = await fixture();
     const subscription: Mutation = {
       kind: "subscription.add",
       id: "sub",
-      data: { workspaceId: "workspace", repoId: "repo" },
+      data: { projectId: "project", repoId: "repo" },
     };
     expect(() =>
       f.store.mutate(
         { ...f.access, repos: [] },
-        { operationId: "unauthorized", mutations: [subscription] },
+        {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
+          operationId: "unauthorized",
+          mutations: [subscription],
+        },
       ),
     ).toThrow(/Repository administration/);
     f.mutate(subscription);
     expect(() =>
       f.store.mutate(
         { ...f.access, repos: [] },
-        { operationId: "remove", mutations: [{ kind: "subscription.remove", id: "sub" }] },
+        {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
+          operationId: "remove",
+          mutations: [{ kind: "subscription.remove", id: "sub" }],
+        },
       ),
     ).toThrow(/Repository administration/);
     f.mutate({
-      kind: "workspace.update",
-      id: "workspace",
+      kind: "project.update",
+      id: "project",
       expectedVersion: 1,
       data: { archived: true },
     });
@@ -1375,28 +1662,38 @@ describe("tracker SQLite authority", () => {
       f.mutate({
         kind: "issue.create",
         id: "bad",
-        data: { teamId: "team", title: "Bad", workspaceIds: ["workspace"] },
+        data: { teamId: "team", title: "Bad", projectIds: ["project"] },
       }),
     ).toThrow(/archived/);
     expect(() =>
       f.mutate({
         kind: "subscription.add",
         id: "sub2",
-        data: { workspaceId: "workspace", repoId: "repo" },
+        data: { projectId: "project", repoId: "repo" },
       }),
     ).toThrow(/archived/);
     expect(f.store.snapshot(f.access).subscriptions).toEqual([
-      { id: "sub", workspaceId: "workspace", repoId: "repo", owner: "org", name: "private" },
+      {
+        id: "sub",
+        projectId: "project",
+        repoId: "repo",
+        spaceId: "org",
+        space: "org",
+        name: "private",
+      },
     ]);
   });
-  test("only tracker admins may remove confirmed deleted-repository subscriptions", () => {
-    const f = fixture();
+  test("only tracker admins may remove confirmed deleted-repository subscriptions", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "subscription.add",
       id: "orphan",
-      data: { workspaceId: "workspace", repoId: "repo" },
+      data: { projectId: "project", repoId: "repo" },
     });
     const request = {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "remove-orphan",
       mutations: [{ kind: "subscription.remove", id: "orphan" } satisfies Mutation],
     };
@@ -1413,7 +1710,7 @@ describe("tracker SQLite authority", () => {
         },
         request,
       ),
-    ).toThrow(/ownership/);
+    ).toThrow(/Space admin/);
     f.store.mutate({ ...f.access, repos: [], deletedRepoIds: ["repo"] }, request);
     expect(f.store.snapshot(f.access).subscriptions).toEqual([]);
     expect(() =>
@@ -1424,56 +1721,59 @@ describe("tracker SQLite authority", () => {
           deletedRepoIds: ["repo"],
         },
         {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
           operationId: "cannot-readd",
           mutations: [
             {
               kind: "subscription.add",
               id: "new-sub",
-              data: { workspaceId: "workspace", repoId: "repo" },
+              data: { projectId: "project", repoId: "repo" },
             },
           ],
         },
       ),
     ).toThrow(/Repository administration/);
   });
-  test("repo associations only return that repo's live workspaces across owning teams", () => {
-    const f = fixture();
-    f.access.repos.push({ id: "another-repo", owner: "other", name: "other" });
+  test("repo associations only return that repo's live projects within the Space", async () => {
+    const f = await fixture();
+    f.access.repos.push({ id: "another-repo", spaceId: "org", space: "org", name: "other" });
     f.mutate(
-      { kind: "workspace.create", id: "other-workspace", data: { slug: "other", name: "Other" } },
-      { kind: "subscription.add", id: "sub", data: { workspaceId: "workspace", repoId: "repo" } },
+      { kind: "project.create", id: "other-project", data: { slug: "other", name: "Other" } },
+      { kind: "subscription.add", id: "sub", data: { projectId: "project", repoId: "repo" } },
       {
         kind: "subscription.add",
         id: "other-sub",
-        data: { workspaceId: "other-workspace", repoId: "another-repo" },
+        data: { projectId: "other-project", repoId: "another-repo" },
       },
     );
-    expect(f.store.subscribedWorkspaces("repo")).toEqual([
-      { workspaceId: "workspace", slug: "platform", name: "Platform" },
+    expect(f.store.subscribedProjects("repo")).toEqual([
+      { projectId: "project", slug: "platform", name: "Platform" },
     ]);
-    expect(f.store.subscribedWorkspaces("unrelated-repo")).toEqual([]);
+    expect(f.store.subscribedProjects("unrelated-repo")).toEqual([]);
     f.mutate({
-      kind: "workspace.update",
-      id: "workspace",
+      kind: "project.update",
+      id: "project",
       expectedVersion: 1,
       data: { archived: true },
     });
-    expect(f.store.subscribedWorkspaces("repo")).toEqual([]);
-    expect(f.store.subscribedWorkspaces("another-repo")).toEqual([
-      { workspaceId: "other-workspace", slug: "other", name: "Other" },
+    expect(f.store.subscribedProjects("repo")).toEqual([]);
+    expect(f.store.subscribedProjects("another-repo")).toEqual([
+      { projectId: "other-project", slug: "other", name: "Other" },
     ]);
   });
-  test("repository ready summaries deduplicate workspace membership and use canonical readiness", () => {
-    const f = fixture();
-    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 0, workspaces: 0 });
+  test("repository ready summaries deduplicate project membership and use canonical readiness", async () => {
+    const f = await fixture();
+    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 0, projects: 0 });
     f.mutate(
-      { kind: "workspace.create", id: "second", data: { slug: "second", name: "Second" } },
+      { kind: "project.create", id: "second", data: { slug: "second", name: "Second" } },
       {
         kind: "subscription.add",
         id: "sub-one",
-        data: { workspaceId: "workspace", repoId: "repo" },
+        data: { projectId: "project", repoId: "repo" },
       },
-      { kind: "subscription.add", id: "sub-two", data: { workspaceId: "second", repoId: "repo" } },
+      { kind: "subscription.add", id: "sub-two", data: { projectId: "second", repoId: "repo" } },
       {
         kind: "issue.create",
         id: "ready",
@@ -1481,7 +1781,7 @@ describe("tracker SQLite authority", () => {
           teamId: "team",
           title: "Ready",
           status: "todo",
-          workspaceIds: ["workspace", "second"],
+          projectIds: ["project", "second"],
         },
       },
       {
@@ -1497,13 +1797,13 @@ describe("tracker SQLite authority", () => {
           title: "Human",
           status: "todo",
           pickup: "human_only",
-          workspaceIds: ["workspace"],
+          projectIds: ["project"],
         },
       },
       {
         kind: "issue.create",
         id: "blocked",
-        data: { teamId: "team", title: "Blocked", status: "todo", workspaceIds: ["workspace"] },
+        data: { teamId: "team", title: "Blocked", status: "todo", projectIds: ["project"] },
       },
       {
         kind: "link.add",
@@ -1511,24 +1811,24 @@ describe("tracker SQLite authority", () => {
         data: { kind: "blocks", fromId: "outside", toId: "blocked" },
       },
     );
-    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 1, workspaces: 2 });
+    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 1, projects: 2 });
     f.mutate({
       kind: "issue.update",
       id: "ready",
       expectedVersion: 1,
       data: { pickup: "not_ready" },
     });
-    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 0, workspaces: 2 });
-    expect(f.store.repoReadySummary("unrelated")).toEqual({ ready: 0, workspaces: 0 });
+    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 0, projects: 2 });
+    expect(f.store.repoReadySummary("unrelated")).toEqual({ ready: 0, projects: 0 });
   });
-  test("team navigation excludes archived teams and returns no issue content", () => {
-    const f = fixture();
+  test("team navigation excludes archived teams and returns no issue content", async () => {
+    const f = await fixture();
     expect(f.store.teamDirectory()).toEqual([{ id: "team", key: "ENG", name: "Engineering" }]);
     f.mutate({ kind: "team.update", id: "team", expectedVersion: 1, data: { archived: true } });
     expect(f.store.teamDirectory()).toEqual([]);
   });
-  test("malformed optional fields and content/cardinality limits reject without partial writes", () => {
-    const f = fixture();
+  test("malformed optional fields and content/cardinality limits reject without partial writes", async () => {
+    const f = await fixture();
     f.issue("issue");
     const before = f.store.snapshot(f.access);
     const invalid = [
@@ -1545,30 +1845,42 @@ describe("tracker SQLite authority", () => {
         kind: "issue.update",
         id: "issue",
         expectedVersion: 1,
-        data: { workspaceIds: ["missing"] },
+        data: { projectIds: ["missing"] },
       },
       { kind: "issue.update", id: "issue", expectedVersion: 1, data: { surprise: true } },
       { kind: "comment.add", id: "comment", data: { issueId: "issue", body: "Body", kind: null } },
     ];
     for (const mutation of invalid) {
       expect(() =>
-        f.store.mutate(f.access, { operationId: "invalid", mutations: [mutation] }),
+        f.store.mutate(f.access, {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
+          operationId: "invalid",
+          mutations: [mutation],
+        }),
       ).toThrow();
       expect(f.store.snapshot(f.access)).toEqual(before);
     }
     expect(() =>
-      f.store.mutate(f.access, { operationId: "too-many", mutations: Array(101).fill(invalid[0]) }),
+      f.store.mutate(f.access, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
+        operationId: "too-many",
+        mutations: Array(101).fill(invalid[0]),
+      }),
     ).toThrow(/1–100/);
   });
-  test("pagination cursors stop at included events, and final batch readiness cannot be bypassed", () => {
-    const f = fixture();
+  test("pagination cursors stop at included events, and final batch readiness cannot be bypassed", async () => {
+    const f = await fixture();
     f.issue("a");
     f.issue("b");
-    const first = f.store.changes(0, 2);
+    const first = f.store.changes(f.access, 0, 2);
     expect(first.events.map((e) => e.cursor)).toEqual([1, 2]);
     expect(first.cursor).toBe(2);
     expect(first.hasMore).toBe(true);
-    const second = f.store.changes(first.cursor, 2);
+    const second = f.store.changes(f.access, first.cursor, 2);
     expect(second.events.map((e) => e.cursor)).toEqual([3, 4]);
     expect(second.hasMore).toBe(false);
     expect(() =>
@@ -1583,8 +1895,8 @@ describe("tracker SQLite authority", () => {
 });
 
 describe("graph readiness", () => {
-  function graph() {
-    const f = fixture();
+  async function graph() {
+    const f = await fixture();
     for (const id of ["project", "a", "b"]) f.issue(id);
     const version = (id: string) =>
       (f.store.snapshot(f.access).issues.find((i) => i.id === id) as Issue).version;
@@ -1611,8 +1923,8 @@ describe("graph readiness", () => {
     return { ...f, version, state, claim };
   }
 
-  test("a parent with open sub-issues is a container, not work, but can be claimed to take its subtree", () => {
-    const g = graph();
+  test("a parent with open sub-issues is a container, not work, but can be claimed to take its subtree", async () => {
+    const g = await graph();
     expect([g.state("project"), g.state("a"), g.state("b")]).toEqual([
       "container",
       "ready",
@@ -1622,8 +1934,8 @@ describe("graph readiness", () => {
     expect([g.state("a"), g.state("b")]).toEqual(["leased_above", "leased_above"]);
   });
 
-  test("another agent can't claim or change status or parent inside a leased subtree", () => {
-    const g = graph();
+  test("another agent can't claim or change status or parent inside a leased subtree", async () => {
+    const g = await graph();
     const token = g.claim("project", "lead");
     expect(() => g.claim("a", "other")).toThrow(
       /ENG-1 is leased by lead, and its lease covers ENG-2/,
@@ -1671,8 +1983,8 @@ describe("graph readiness", () => {
     g.claim("b", "other");
   });
 
-  test("text edits under an ancestor lease preserve attribution, versions, replay and the lease", () => {
-    const g = graph();
+  test("text edits under an ancestor lease preserve attribution, versions, replay and the lease", async () => {
+    const g = await graph();
     g.claim("project", "lead");
     const before = g.store.snapshot(g.access);
     const parent = before.issues.find((issue) => issue.id === "project")!;
@@ -1685,6 +1997,9 @@ describe("graph readiness", () => {
       source: "web",
     };
     const request = {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "text-under-lease",
       mutations: [
         {
@@ -1727,6 +2042,9 @@ describe("graph readiness", () => {
     });
     expect(() =>
       g.store.mutate(access, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
         operationId: "nonmember-text-edit",
         mutations: [
           {
@@ -1739,8 +2057,8 @@ describe("graph readiness", () => {
     ).toThrow(/Only team members/);
   });
 
-  test("later batch transitions see ancestor leases introduced by an earlier parent change", () => {
-    const g = graph();
+  test("later batch transitions see ancestor leases introduced by an earlier parent change", async () => {
+    const g = await graph();
     const token = g.claim("project", "lead");
     g.issue("branch");
     g.issue("child");
@@ -1788,16 +2106,16 @@ describe("graph readiness", () => {
     expect(after.issues.find((issue) => issue.id === "a")?.status).toBe("in_progress");
   });
 
-  test("an expired lease no longer covers its subtree", () => {
-    const g = graph();
+  test("an expired lease no longer covers its subtree", async () => {
+    const g = await graph();
     g.claim("project", "lead", 30);
     expect(g.state("a")).toBe("leased_above");
     g.advance(30_000);
     expect(g.state("a")).toBe("ready");
   });
 
-  test("a parent can't be completed or set done while a sub-issue is open; canceled ones don't count", () => {
-    const g = graph();
+  test("a parent can't be completed or set done while a sub-issue is open; canceled ones don't count", async () => {
+    const g = await graph();
     const token = g.claim("project", "lead");
     expect(() =>
       g.mutate({
@@ -1824,7 +2142,7 @@ describe("graph readiness", () => {
       data: { leaseToken: token, evidence: "All done" },
     });
 
-    const h = graph();
+    const h = await graph();
     expect(() =>
       h.mutate({
         kind: "issue.update",
@@ -1835,8 +2153,8 @@ describe("graph readiness", () => {
     ).toThrow(/Close its sub-issues first/);
   });
 
-  test("blocker cycles are rejected", () => {
-    const g = graph();
+  test("blocker cycles are rejected", async () => {
+    const g = await graph();
     g.mutate({ kind: "link.add", id: "l1", data: { fromId: "a", toId: "b", kind: "blocks" } });
     expect(g.state("b")).toBe("blocked");
     expect(() =>
@@ -1846,8 +2164,8 @@ describe("graph readiness", () => {
 });
 
 describe("agents", () => {
-  test("an agent's actions are attributed to it, with its human answerable and its human's access", () => {
-    const f = fixture();
+  test("an agent's actions are attributed to it, with its human answerable and its human's access", async () => {
+    const f = await fixture();
     f.issue("work");
     // Team restricted to alice: her agent still gets in through her membership.
     f.mutate({
@@ -1856,8 +2174,16 @@ describe("agents", () => {
       expectedVersion: 1,
       data: { memberIds: ["alice"] },
     });
-    const asAgent: Access = { ...f.access, actorId: "agt-bot", principalId: "alice" };
+    const asAgent: Access = {
+      ...f.access,
+      actorId: "agt-bot",
+      agentId: "agt-bot",
+      principalId: "alice",
+    };
     const claimed = f.store.mutate(asAgent, {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "agent-claim",
       mutations: [{ kind: "issue.claim", id: "work", data: { agent: "session-1" } }],
     });
@@ -1882,30 +2208,33 @@ describe("agents", () => {
     ).toEqual(["bot for alice"]);
   });
 
-  test.each(["bob", "agt-bot"])("claiming preserves the existing assignee %s", (assigneeId) => {
-    const f = fixture();
-    f.mutate({
-      kind: "issue.create",
-      id: "assigned",
-      data: { teamId: "team", title: "Already assigned", assigneeId },
-    });
-    const claimed = f.mutate({ kind: "issue.claim", id: "assigned", data: { agent: "session" } });
-    expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
-      assigneeId,
-      claim: { actorId: "alice" },
-    });
-    f.mutate({
-      kind: "issue.renew",
-      id: "assigned",
-      data: { leaseToken: String(claimed.results[0]!.leaseToken) },
-    });
-    expect(f.store.snapshot(f.access).issues[0]!.assigneeId).toBe(assigneeId);
-  });
+  test.each(["bob", "agt-bot"])(
+    "claiming preserves the existing assignee %s",
+    async (assigneeId) => {
+      const f = await fixture();
+      f.mutate({
+        kind: "issue.create",
+        id: "assigned",
+        data: { teamId: "team", title: "Already assigned", assigneeId },
+      });
+      const claimed = f.mutate({ kind: "issue.claim", id: "assigned", data: { agent: "session" } });
+      expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+        assigneeId,
+        claim: { actorId: "alice" },
+      });
+      f.mutate({
+        kind: "issue.renew",
+        id: "assigned",
+        data: { leaseToken: String(claimed.results[0]!.leaseToken) },
+      });
+      expect(f.store.snapshot(f.access).issues[0]!.assigneeId).toBe(assigneeId);
+    },
+  );
 
   test.each(["alice", "agt-bot"])(
     "an admin claim cannot assign %s outside the restricted team",
-    (actorId) => {
-      const f = fixture();
+    async (actorId) => {
+      const f = await fixture();
       f.mutate({
         kind: "team.update",
         id: "team",
@@ -1914,6 +2243,7 @@ describe("agents", () => {
       });
       f.issue("work");
       f.access.actorId = actorId;
+      f.access.agentId = actorId.startsWith("agt-") ? actorId : null;
       expect(() =>
         f.mutate({ kind: "issue.claim", id: "work", data: { agent: "outside-team" } }),
       ).toThrow(expect.objectContaining({ code: "invalid_member", status: 400 }));
@@ -1937,8 +2267,8 @@ describe("agents", () => {
     },
   );
 
-  test("an out-of-team admin can claim a valid assigned issue without breaking later edits", () => {
-    const f = fixture();
+  test("an out-of-team admin can claim a valid assigned issue without breaking later edits", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "team.update",
       id: "team",
@@ -1965,8 +2295,8 @@ describe("agents", () => {
     });
   });
 
-  test("next cannot autoassign an out-of-team admin's delegated agent", () => {
-    const f = fixture();
+  test("next cannot autoassign an out-of-team admin's delegated agent", async () => {
+    const f = await fixture();
     f.mutate({
       kind: "team.update",
       id: "team",
@@ -1988,10 +2318,11 @@ describe("agents", () => {
     });
   });
 
-  test("assignment and claim roll back together when a later mutation fails", () => {
-    const f = fixture();
+  test("assignment and claim roll back together when a later mutation fails", async () => {
+    const f = await fixture();
     f.issue("work");
     f.access.actorId = "agt-bot";
+    f.access.agentId = "agt-bot";
     expect(() =>
       f.mutate(
         { kind: "issue.claim", id: "work", data: { agent: "session" } },
@@ -2006,8 +2337,8 @@ describe("agents", () => {
     });
   });
 
-  test("an agent can be assigned when its human could be; unknown agents can't", () => {
-    const f = fixture();
+  test("an agent can be assigned when its human could be; unknown agents can't", async () => {
+    const f = await fixture();
     f.issue("work");
     f.mutate({
       kind: "issue.update",
@@ -2023,18 +2354,21 @@ describe("agents", () => {
         expectedVersion: 2,
         data: { assigneeId: "agt-stranger" },
       }),
-    ).toThrow(/not a current account member/);
+    ).toThrow(/not a current Space member/);
   });
 });
 
 describe("issue.next", () => {
-  function board() {
-    const f = fixture();
+  async function board() {
+    const f = await fixture();
     const make = (id: string, data: Record<string, unknown> = {}) =>
       f.mutate({ kind: "issue.create", id, data: { teamId: "team", title: id, ...data } });
     let n = 0;
     const next = (data: Record<string, unknown> = {}, operationId = `next-${++n}`) =>
       f.store.mutate(f.access, {
+        contractVersion: 4,
+        spaceId: f.access.spaceId,
+        migrationEpoch: f.access.migrationEpoch,
         operationId,
         mutations: [
           { kind: "issue.next", id: `pick-${operationId}`, data: { agent: "walker", ...data } },
@@ -2043,8 +2377,8 @@ describe("issue.next", () => {
     return { ...f, make, next };
   }
 
-  test("takes the highest priority, then whatever unblocks the most work, then the oldest", () => {
-    const b = board();
+  test("takes the highest priority, then whatever unblocks the most work, then the oldest", async () => {
+    const b = await board();
     b.make("old", { priority: 2 });
     b.advance(1000);
     b.make("leaf", { priority: 2 });
@@ -2062,8 +2396,8 @@ describe("issue.next", () => {
     expect(b.next().key).toBe("ENG-2");
   });
 
-  test("skips containers, PRDs, blocked work and other people's assignments, and stays in scope", () => {
-    const b = board();
+  test("skips containers, PRDs, blocked work and other people's assignments, and stays in scope", async () => {
+    const b = await board();
     b.make("project");
     b.make("child", { parentId: "project" });
     b.make("prd", { type: "prd" });
@@ -2075,16 +2409,16 @@ describe("issue.next", () => {
       id: "l1",
       data: { fromId: "blocker", toId: "blocked", kind: "blocks" },
     });
-    b.make("tagged", { workspaceIds: ["workspace"] });
-    expect(b.next({ workspaceId: "workspace" })).toMatchObject({ issueId: "tagged" });
+    b.make("tagged", { projectIds: ["project"] });
+    expect(b.next({ projectId: "project" })).toMatchObject({ issueId: "tagged" });
     expect(b.next({ underId: "project" })).toMatchObject({ issueId: "child" });
     // Everything left is a container, a PRD, someone else's, blocked or in the backlog.
     expect(b.next().issueId).toBeUndefined();
     expect(b.next({ teamId: "team" }).leaseToken).toBeUndefined();
   });
 
-  test("claims atomically: two callers never get the same issue, and a retry returns the same claim", () => {
-    const b = board();
+  test("claims atomically: two callers never get the same issue, and a retry returns the same claim", async () => {
+    const b = await board();
     b.make("a");
     b.make("b");
     const first = b.next({}, "op-1");
@@ -2111,11 +2445,14 @@ describe("issue.next", () => {
 });
 
 describe("taking over a claim", () => {
-  test("an owner, as themselves, takes over a live claim; the holder's token stops working", () => {
-    const f = fixture();
+  test("a Space admin, as themselves, takes over a live claim; the holder's token stops working", async () => {
+    const f = await fixture();
     f.issue("issue");
-    const holder: Access = { ...f.access, actorId: "agt-bot" };
+    const holder: Access = { ...f.access, actorId: "agt-bot", agentId: "agt-bot" };
     const held = f.store.mutate(holder, {
+      contractVersion: 4 as const,
+      spaceId: "org",
+      migrationEpoch: 0,
       operationId: "held",
       mutations: [
         { kind: "issue.claim", id: "issue", data: { agent: "lost-session", ttlSeconds: 86400 } },
@@ -2126,17 +2463,23 @@ describe("taking over a claim", () => {
       f.store.mutate(
         { ...f.access, canAdmin: false },
         {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
           operationId: "member",
           mutations: [{ kind: "issue.claim", id: "issue", data: { agent: "x", force: true } }],
         },
       ),
-    ).toThrow(/tracker owner/);
+    ).toThrow(/Space admin/);
     expect(() =>
       f.store.mutate(holder, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
         operationId: "agent",
         mutations: [{ kind: "issue.claim", id: "issue", data: { agent: "x", force: true } }],
       }),
-    ).toThrow(/tracker owner/);
+    ).toThrow(/Space admin/);
     // Without force it's still busy.
     expect(() => f.mutate({ kind: "issue.claim", id: "issue", data: { agent: "x" } })).toThrow(
       /active claim/,
@@ -2160,6 +2503,9 @@ describe("taking over a claim", () => {
     );
     expect(() =>
       f.store.mutate(holder, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
         operationId: "old",
         mutations: [
           {
@@ -2192,8 +2538,8 @@ describe("taking over a claim", () => {
 });
 
 describe("delegated leases", () => {
-  function tree() {
-    const f = fixture();
+  async function tree() {
+    const f = await fixture();
     const make = (id: string, parentId?: string) =>
       f.mutate({
         kind: "issue.create",
@@ -2204,10 +2550,16 @@ describe("delegated leases", () => {
     make("child", "project");
     make("grandchild", "child");
     make("sibling", "project");
-    const asBot: Access = { ...f.access, actorId: "agt-bot" };
+    const asBot: Access = { ...f.access, actorId: "agt-bot", agentId: "agt-bot" };
     let n = 0;
     const as = (access: Access, ...mutations: Mutation[]) =>
-      f.store.mutate(access, { operationId: `d-${++n}`, mutations });
+      f.store.mutate(access, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
+        operationId: `d-${++n}`,
+        mutations,
+      });
     const version = (id: string) =>
       f.store.snapshot(f.access).issues.find((i) => i.id === id)!.version;
     const claimOf = (id: string) =>
@@ -2219,8 +2571,8 @@ describe("delegated leases", () => {
     return { ...f, asBot, as, version, claimOf, lead };
   }
 
-  test("the subtree's holder delegates a child to one of its own agents, who works it with its own token", () => {
-    const t = tree();
+  test("the subtree's holder delegates a child to one of its own agents, who works it with its own token", async () => {
+    const t = await tree();
     const delegated = t.mutate({
       kind: "issue.claim",
       id: "child",
@@ -2266,8 +2618,8 @@ describe("delegated leases", () => {
     });
   });
 
-  test("delegation needs the covering lease's token, and only to yourself or your own agents", () => {
-    const t = tree();
+  test("delegation needs the covering lease's token, and only to yourself or your own agents", async () => {
+    const t = await tree();
     expect(() =>
       t.mutate({ kind: "issue.claim", id: "child", data: { agent: "x", underToken: "wrong" } }),
     ).toThrow(/doesn't hold ENG-1's lease/);
@@ -2286,8 +2638,8 @@ describe("delegated leases", () => {
     expect(t.claimOf("sibling")).toMatchObject({ actorId: "alice", delegatedFrom: "project" });
   });
 
-  test("any lease above a claim can revoke it, which fences its token; others can't", () => {
-    const t = tree();
+  test("any lease above a claim can revoke it, which fences its token; others can't", async () => {
+    const t = await tree();
     const childToken = String(
       t.mutate({
         kind: "issue.claim",
@@ -2315,8 +2667,8 @@ describe("delegated leases", () => {
     expect(t.claimOf("child")).toBeNull();
   });
 
-  test("next picks inside your own leased subtree only with its token", () => {
-    const t = tree();
+  test("next picks inside your own leased subtree only with its token", async () => {
+    const t = await tree();
     const pick = (data: Record<string, unknown>) =>
       t.mutate({
         kind: "issue.next",
@@ -2334,13 +2686,19 @@ describe("delegated leases", () => {
 });
 
 describe("waiting on a person", () => {
-  function waiting() {
-    const f = fixture();
+  async function waiting() {
+    const f = await fixture();
     f.issue("work");
-    const bot: Access = { ...f.access, actorId: "agt-bot" };
+    const bot: Access = { ...f.access, actorId: "agt-bot", agentId: "agt-bot" };
     let n = 0;
     const as = (access: Access, ...mutations: Mutation[]) =>
-      f.store.mutate(access, { operationId: `w-${++n}`, mutations });
+      f.store.mutate(access, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
+        operationId: `w-${++n}`,
+        mutations,
+      });
     const issue = () => f.store.snapshot(f.access).issues.find((i) => i.id === "work")!;
     const request = (id: string) =>
       f.store.snapshot(f.access).requests.find((r) => r.id === id) as HumanRequest;
@@ -2356,8 +2714,8 @@ describe("waiting on a person", () => {
     return { ...f, bot, as, issue, request, state, token };
   }
 
-  test("asking with the lease parks it: the issue waits, in progress, and the lease outlives its ttl", () => {
-    const w = waiting();
+  test("asking with the lease parks it: the issue waits, in progress, and the lease outlives its ttl", async () => {
+    const w = await waiting();
     w.as(w.bot, {
       kind: "request.open",
       id: "q1",
@@ -2373,8 +2731,8 @@ describe("waiting on a person", () => {
     );
   });
 
-  test("a person answers, the lease unparks for its holder to resume with a fresh token", () => {
-    const w = waiting();
+  test("a person answers, the lease unparks for its holder to resume with a fresh token", async () => {
+    const w = await waiting();
     w.as(w.bot, {
       kind: "request.open",
       id: "q1",
@@ -2409,8 +2767,8 @@ describe("waiting on a person", () => {
     });
   });
 
-  test("if the holder doesn't come back within the window, anyone can take the work", () => {
-    const w = waiting();
+  test("if the holder doesn't come back within the window, anyone can take the work", async () => {
+    const w = await waiting();
     w.as(w.bot, {
       kind: "request.open",
       id: "q1",
@@ -2422,8 +2780,8 @@ describe("waiting on a person", () => {
     w.mutate({ kind: "issue.claim", id: "work", data: { agent: "someone" } });
   });
 
-  test("each kind takes its own answer, and credentials are recorded only as where they went", () => {
-    const w = waiting();
+  test("each kind takes its own answer, and credentials are recorded only as where they went", async () => {
+    const w = await waiting();
     w.as(
       w.bot,
       {
@@ -2473,8 +2831,8 @@ describe("waiting on a person", () => {
     ).toThrow(/at least two choices/);
   });
 
-  test("only the asker cancels; requests can be routed to another member, not an outsider", () => {
-    const w = waiting();
+  test("only the asker cancels; requests can be routed to another member, not an outsider", async () => {
+    const w = await waiting();
     w.as(w.bot, {
       kind: "request.open",
       id: "q",
@@ -2487,11 +2845,17 @@ describe("waiting on a person", () => {
         id: "q2",
         data: { issueId: "work", kind: "question", prompt: "?", routeTo: "outsider" },
       }),
-    ).toThrow(/not a current account member/);
+    ).toThrow(/not a current Space member/);
     expect(() =>
       w.store.mutate(
         { ...w.access, actorId: "bob", principalId: "bob", canAdmin: false },
-        { operationId: "bob-cancel", mutations: [{ kind: "request.cancel", id: "q" }] },
+        {
+          contractVersion: 4 as const,
+          spaceId: "org",
+          migrationEpoch: 0,
+          operationId: "bob-cancel",
+          mutations: [{ kind: "request.cancel", id: "q" }],
+        },
       ),
     ).toThrow(/Only whoever asked/);
     w.as(w.bot, { kind: "request.cancel", id: "q" });
@@ -2501,14 +2865,20 @@ describe("waiting on a person", () => {
 });
 
 describe("handoff", () => {
-  function handoff() {
-    const f = fixture();
+  async function handoff() {
+    const f = await fixture();
     f.issue("work");
-    const bot: Access = { ...f.access, actorId: "agt-bot" };
+    const bot: Access = { ...f.access, actorId: "agt-bot", agentId: "agt-bot" };
     const bob: Access = { ...f.access, actorId: "bob", principalId: "bob" };
     let n = 0;
     const as = (access: Access, ...mutations: Mutation[]) =>
-      f.store.mutate(access, { operationId: `h-${++n}`, mutations });
+      f.store.mutate(access, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
+        operationId: `h-${++n}`,
+        mutations,
+      });
     const issue = () => f.store.snapshot(f.access).issues.find((i) => i.id === "work")!;
     const giver = String(
       as(bot, { kind: "issue.claim", id: "work", data: { agent: "first" } }).results[0]!.leaseToken,
@@ -2521,8 +2891,8 @@ describe("handoff", () => {
     return { ...f, bot, bob, as, issue, giver, offer };
   }
 
-  test("accepting moves the lease and its accountability; the giver's token stops at that moment", () => {
-    const h = handoff();
+  test("accepting moves the lease and its accountability; the giver's token stops at that moment", async () => {
+    const h = await handoff();
     const code = h.offer();
     expect(code.startsWith("ENG-1.")).toBe(true);
     expect(h.issue().handoff).toMatchObject({ to: null });
@@ -2553,8 +2923,8 @@ describe("handoff", () => {
     });
   });
 
-  test("withdrawn, expired and someone else's offers can't be accepted", () => {
-    const h = handoff();
+  test("withdrawn, expired and someone else's offers can't be accepted", async () => {
+    const h = await handoff();
     const withdrawn = h.offer();
     h.as(h.bot, { kind: "issue.withdraw", id: "work", data: { leaseToken: h.giver } });
     expect(() =>
@@ -2571,8 +2941,8 @@ describe("handoff", () => {
     );
   });
 
-  test("an offer dies with the lease it was made under", () => {
-    const h = handoff();
+  test("an offer dies with the lease it was made under", async () => {
+    const h = await handoff();
     const code = h.offer();
     h.as(h.bot, { kind: "issue.release", id: "work", data: { leaseToken: h.giver } });
     expect(h.issue().handoff).toBeNull();
@@ -2583,8 +2953,8 @@ describe("handoff", () => {
 });
 
 describe("escalating repeated failures", () => {
-  function attempts(limit?: number) {
-    const f = fixture();
+  async function attempts(limit?: number) {
+    const f = await fixture();
     if (limit !== undefined)
       f.mutate({
         kind: "team.update",
@@ -2593,10 +2963,16 @@ describe("escalating repeated failures", () => {
         data: { attemptLimit: limit },
       });
     f.issue("flaky");
-    const bot: Access = { ...f.access, actorId: "agt-bot" };
+    const bot: Access = { ...f.access, actorId: "agt-bot", agentId: "agt-bot" };
     let n = 0;
     const as = (access: Access, ...mutations: Mutation[]) =>
-      f.store.mutate(access, { operationId: `e-${++n}`, mutations });
+      f.store.mutate(access, {
+        contractVersion: 4 as const,
+        spaceId: "org",
+        migrationEpoch: 0,
+        operationId: `e-${++n}`,
+        mutations,
+      });
     const issue = () => f.store.snapshot(f.access).issues.find((i) => i.id === "flaky")!;
     const open = () =>
       f.store
@@ -2617,8 +2993,8 @@ describe("escalating repeated failures", () => {
     return { ...f, bot, as, issue, open, fail };
   }
 
-  test("the third failed attempt asks the accountable person, with the latest checkpoints, and leaves ready", () => {
-    const e = attempts();
+  test("the third failed attempt asks the accountable person, with the latest checkpoints, and leaves ready", async () => {
+    const e = await attempts();
     e.fail("Tried the cache");
     e.fail("Tried a retry loop");
     expect(e.issue().attempts).toBe(2);
@@ -2642,11 +3018,14 @@ describe("escalating repeated failures", () => {
     e.as(e.bot, { kind: "issue.claim", id: "flaky", data: { agent: "again" } });
   });
 
-  test("a team can ask sooner, or never", () => {
-    const soon = attempts(1);
+  test("a team can ask after its first failed attempt", async () => {
+    const soon = await attempts(1);
     soon.fail("Once");
     expect(soon.open()).toHaveLength(1);
-    const never = attempts(0);
+  });
+
+  test("a team can disable repeated-failure escalation", async () => {
+    const never = await attempts(0);
     for (const note of ["1", "2", "3", "4"]) never.fail(note);
     expect(never.issue().attempts).toBe(4);
     expect(never.open()).toHaveLength(0);
@@ -2654,8 +3033,8 @@ describe("escalating repeated failures", () => {
 });
 
 describe("shipped issues for release notes", () => {
-  function shipping() {
-    const f = fixture();
+  async function shipping() {
+    const f = await fixture();
     const version = (id: string) =>
       f.store.snapshot(f.access).issues.find((issue) => issue.id === id)!.version;
     const status = (id: string, value: Issue["status"]) =>
@@ -2691,8 +3070,8 @@ describe("shipped issues for release notes", () => {
     return f;
   }
 
-  test("look up by key with team, completion time and evidence; unknown keys are skipped", () => {
-    const f = shipping();
+  test("look up by key with team, completion time and evidence; unknown keys are skipped", async () => {
+    const f = await shipping();
     const found = f.store.issuesByKey(["ENG-3", "ENG-1", "ENG-2", "ENG-4", "UTF-8"]);
     const byKey = Object.fromEntries(found.map((issue) => [issue.key, issue]));
     expect(Object.keys(byKey).sort()).toEqual(["ENG-1", "ENG-2", "ENG-3", "ENG-4"]);
@@ -2714,8 +3093,8 @@ describe("shipped issues for release notes", () => {
     expect(f.store.issuesByKey([])).toEqual([]);
   });
 
-  test("a release naming hundreds of keys looks them up in one statement (CORE-310)", () => {
-    const f = shipping();
+  test("a release naming hundreds of keys looks them up in one statement (CORE-310)", async () => {
+    const f = await shipping();
     // More than a Durable Object's 100 bound variables: each key must not bind one.
     const many = [
       ...Array.from({ length: 497 }, (_, i) => `ZED-${i + 1}`),
@@ -2733,8 +3112,8 @@ describe("shipped issues for release notes", () => {
     expect(refs.map((issue) => issue.key).sort()).toEqual(["ENG-1", "ENG-2", "ENG-4"]);
   });
 
-  test("completed in a window counts the latest completion of issues still done", () => {
-    const f = shipping();
+  test("completed in a window counts the latest completion of issues still done", async () => {
+    const f = await shipping();
     const keys = (since: string, until: string) =>
       f.store.completedBetween(since, until, 100).map((issue) => issue.key);
     expect(keys("2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z")).toEqual(["ENG-1", "ENG-3"]);

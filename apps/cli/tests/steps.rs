@@ -88,7 +88,7 @@ impl Api {
                     "kind": "timeline-work", "ref": "refs/heads/work"});
                 if method == "GET" && path.starts_with("/api/tracker/orbit/timelines/search?") {
                     let text = json!({"timeline": {"id": "tl_search", "slug": "search", "status": "active",
-                        "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "bookmark": "work", "source": source}]},
+                        "repos": [{"id": "r1", "space": "orbit", "name": "engine", "bookmark": "work", "source": source}]},
                         "events": [], "next": null}).to_string();
                     let _ = write!(
                         stream,

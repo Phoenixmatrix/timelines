@@ -1,4 +1,4 @@
-// The Atlas read API (CORE-160), mounted at /api/repos/:owner/:name/atlas.
+// The Atlas read API (CORE-160), mounted at /api/repos/:space/:name/atlas.
 //
 //   GET /overview[?snapshot=]                      the root and the ≤12 largest top-level
 //                                                  regions, the imports between them,
@@ -66,6 +66,7 @@ import {
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
 import type { RepoRow } from "../db.ts";
+import { cutoverControl } from "../durable/cutover-admission.ts";
 import { overlayRef } from "../knowledge/overlay.ts";
 import {
   cursorSecret,
@@ -255,7 +256,21 @@ async function pin<K>(
   const d1 = c.env.DB;
   const scope = repoScope(loaded.row.id);
   const secret = await cursorSecret(c.env);
-  const binding: CursorBinding = { route, scope, filters, principal: principalOf(c) };
+  const admission = await cutoverControl(c.env).admission(4);
+  if (!admission.allowed)
+    return c.json(
+      {
+        error: "Content is fenced for Space migration. Retry after activation.",
+        code: "space_cutover_fenced",
+      },
+      503,
+    );
+  const binding: CursorBinding = {
+    route,
+    scope: `${scope}:space:${loaded.row.space_id}:authorization:${loaded.row.space_authorization_version}:epoch:${admission.epoch}`,
+    filters,
+    principal: principalOf(c),
+  };
   const requested = (options.snapshot ?? c.req.query("snapshot")) || null;
   const side = options.side ? { side: options.side } : {};
   const restart = async (code: AtlasErrorCode, status: ContentfulStatusCode, error: string) =>

@@ -9,6 +9,28 @@ import { D1Dialect } from "kysely-d1";
  * live in gitmatrix's database (DB), not here.
  */
 export interface Database {
+  _space_cutover_fence: {
+    id: 1;
+    run_id: string | null;
+    migration_epoch: number | null;
+    manifest_digest: string | null;
+    authority_token: Generated<string>;
+    fenced: Generated<number>;
+    bypass: Generated<number>;
+  };
+  registry_space_migrations: {
+    legacy_owner_id: string;
+    space_id: string;
+    organization_id: string;
+    space_slug: string;
+    run_id: string;
+    migration_epoch: number;
+    manifest_digest: string;
+    contract_version: 4;
+    before_digest: string;
+    after_digest: string;
+    migrated_at: string;
+  };
   archive_caches: {
     id: string;
     repo_id: string;
@@ -29,7 +51,7 @@ export interface Database {
     id: string;
     key: string;
     format: string;
-    owner_id: string;
+    space_id: string;
     kind: "local" | "remote" | "virtual";
     visibility: "public" | "internal" | "private";
     description: Generated<string>;

@@ -4,7 +4,7 @@
 
 use super::Ctx;
 use crate::model::Json;
-use crate::output::{GmError, Result, exit};
+use crate::output::{GmError, Result};
 use crate::remote::{self, Acting, Config};
 use clap::{Args, Subcommand};
 use serde_json::{Map, Value, json};
@@ -188,14 +188,17 @@ fn environment_settings(ctx: &Ctx, command: &EnvironmentCommand) -> Result<Json>
 pub enum AiCommand {
     /// Show policy, published model catalog, gateway body logging and your management permission
     Show {
-        /// Account slug; defaults to the signed-in person, never the repository owner.
-        #[arg(long, value_parser = account_slug, conflicts_with = "site")]
-        owner: Option<String>,
+        /// Space handle; defaults to your authorized personal default Space.
+        #[arg(long, value_parser = space_slug, conflicts_with_all = ["site", "person"])]
+        space: Option<String>,
+        /// Personal assistant/avatar logging for this person (self-only).
+        #[arg(long, value_parser = space_slug, conflicts_with = "site")]
+        person: Option<String>,
         /// The site's defaults instead (site administrators).
         #[arg(long)]
         site: bool,
     },
-    /// Change future jobs only; human account/org owner or site admin required
+    /// Change future jobs only; Space admin or site admin required
     Set(Box<AiSetArgs>),
 }
 
@@ -206,9 +209,15 @@ pub enum AiCommand {
     "knowledge_quiet_minutes", "knowledge_max_wait_minutes", "log_bodies"
 ])))]
 pub struct AiSetArgs {
-    /// Account slug; defaults to the signed-in person, never the repository owner.
-    #[arg(long, value_parser = account_slug, conflicts_with = "site")]
-    owner: Option<String>,
+    /// Space handle; defaults to your authorized personal default Space.
+    #[arg(long, value_parser = space_slug, conflicts_with_all = ["site", "person"])]
+    space: Option<String>,
+    /// Personal assistant/avatar body logging (self-only); only --log-bodies applies.
+    #[arg(long, value_parser = space_slug, conflicts_with_all = [
+        "site", "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task",
+        "knowledge_quiet_minutes", "knowledge_max_wait_minutes"
+    ])]
+    person: Option<String>,
     /// Set the site's defaults (site administrators); only --log-bodies applies.
     #[arg(long, conflicts_with_all = [
         "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task",
@@ -245,7 +254,7 @@ pub struct AiSetArgs {
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1440))]
     knowledge_max_wait_minutes: Option<u32>,
     /// Keep AI request and response bodies in gateway logs: on|off|default for every
-    /// component, or COMPONENT=on|off|default (repeatable). default follows the site
+    /// component in this scope, or COMPONENT=on|off|default (repeatable). default follows the site
     /// (with --site: the environment). While on, prompts and replies, including
     /// repository code and assistant conversations, are kept in Cloudflare's AI Gateway
     /// logs, readable in the Cloudflare dashboard, and deleted oldest-first.
@@ -286,19 +295,19 @@ fn log_bodies_choice(value: &str) -> std::result::Result<(Option<String>, Option
     Ok((component, choice))
 }
 
-fn account_slug(value: &str) -> std::result::Result<String, String> {
+fn space_slug(value: &str) -> std::result::Result<String, String> {
     if value.is_empty()
         || !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err("Use an account slug, not a repository or URL.".into());
+        return Err("Use a Space handle, not a repository or URL.".into());
     }
     Ok(value.to_string())
 }
 
-/// A curated model id, or `<provider>:<model>` from the account's own provider
-/// (CORE-294); the server checks the account actually added that model.
+/// A curated model id, or `<provider>:<model>` from the Space's own provider
+/// (CORE-294); the server checks the Space actually added that model.
 fn model_choice(
     value: &str,
     curated: &[&str],
@@ -333,6 +342,12 @@ fn generation_model(value: &str) -> std::result::Result<String, String> {
 }
 
 impl AiSetArgs {
+    fn allows_log_component(&self, component: &str) -> bool {
+        self.site
+            || matches!(component, "assistant" | "assistant-titles" | "avatars")
+                == self.person.is_some()
+    }
+
     fn patch(&self) -> Value {
         let mut features = Map::new();
         for (key, value) in [
@@ -383,7 +398,10 @@ impl AiSetArgs {
                     log_bodies.insert(component.clone(), value);
                 }
                 None => {
-                    for component in LOG_COMPONENTS {
+                    for component in LOG_COMPONENTS
+                        .into_iter()
+                        .filter(|c| self.allows_log_component(c))
+                    {
                         log_bodies.insert(component.into(), value.clone());
                     }
                 }
@@ -405,9 +423,24 @@ pub fn run(ctx: &Ctx, command: &SettingsCommand) -> Result<Json> {
         SettingsCommand::Ai(command) => command,
         SettingsCommand::Environments(command) => return environment_settings(ctx, command),
     };
-    let (explicit, site, patch) = match command {
-        AiCommand::Show { owner, site } => (owner, *site, None),
-        AiCommand::Set(args) => (&args.owner, args.site, Some(args.patch())),
+    let (explicit, person, site, patch) = match command {
+        AiCommand::Show {
+            space,
+            person,
+            site,
+        } => (space, person, *site, None),
+        AiCommand::Set(args) => {
+            if let Some((Some(component), _)) = args.log_bodies.iter().find(|(component, _)| {
+                component
+                    .as_deref()
+                    .is_some_and(|c| !args.allows_log_component(c))
+            }) {
+                return Err(GmError::usage(format!(
+                    "{component} body logging belongs to a different scope; use --person for assistant/avatar logging or --space for content logging."
+                )));
+            }
+            (&args.space, &args.person, args.site, Some(args.patch()))
+        }
     };
     if site {
         let path = "/admin/ai";
@@ -426,27 +459,34 @@ pub fn run(ctx: &Ctx, command: &SettingsCommand) -> Result<Json> {
             patch.as_ref(),
         )?));
     }
-    let owner = match explicit {
-        Some(owner) => owner.clone(),
-        None => {
-            let session = remote::api(&config, "GET", "/session", None)?;
-            session["viewer"]["slug"]
-                .as_str()
-                .ok_or_else(|| {
-                    GmError::new("unauthenticated", "Sign in to manage account AI settings.")
-                        .hint("Run `gm auth login`, or pass --owner <account>.")
-                        .exit(exit::AUTH)
-                })?
-                .to_string()
+    if let Some(person) = person {
+        let path = format!("/accounts/{person}/settings/ai");
+        if ctx.dry_run
+            && let Some(patch) = &patch
+        {
+            return Ok(Json(json!({
+                "dry_run": true, "person": person, "method": "PATCH", "path": path,
+                "request": patch
+            })));
         }
+        return Ok(Json(remote::api(
+            &config,
+            if patch.is_some() { "PATCH" } else { "GET" },
+            &path,
+            patch.as_ref(),
+        )?));
+    }
+    let space = match explicit {
+        Some(space) => space.clone(),
+        None => remote::default_space(&config)?,
     };
-    account_slug(&owner).map_err(GmError::usage)?;
-    let path = format!("/accounts/{owner}/settings/ai");
+    space_slug(&space).map_err(GmError::usage)?;
+    let path = format!("/spaces/{space}/settings/ai");
     if ctx.dry_run
         && let Some(patch) = &patch
     {
         return Ok(Json(json!({
-            "dry_run": true, "owner": owner, "method": "PATCH", "path": path,
+            "dry_run": true, "space": space, "method": "PATCH", "path": path,
             "request": patch
         })));
     }
@@ -607,13 +647,14 @@ mod tests {
 
     #[test]
     fn log_bodies_for_every_component_or_one() {
-        let args = parse_set(&["--log-bodies", "on"]);
+        let args = parse_set(&["--site", "--log-bodies", "on"]);
         let all: Map<String, Value> = LOG_COMPONENTS
             .iter()
             .map(|c| (c.to_string(), json!(true)))
             .collect();
         assert_eq!(args.patch(), json!({"logBodies": all}));
         let args = parse_set(&[
+            "--site",
             "--log-bodies",
             "off",
             "--log-bodies",
@@ -631,6 +672,42 @@ mod tests {
             args.patch(),
             json!({"features": {"releaseNotes": true}, "logBodies": {"merge-queue": false}})
         );
+    }
+
+    #[test]
+    fn body_logging_expands_only_within_selected_scope() {
+        let content = parse_set(&["--space", "engineering", "--log-bodies", "on"]);
+        assert_eq!(
+            content.patch()["logBodies"],
+            json!({
+                "knowledge": true, "release-notes": true, "merge-queue": true
+            })
+        );
+        assert!(!content.allows_log_component("assistant"));
+        let person = parse_set(&["--person", "francois", "--log-bodies", "off"]);
+        assert_eq!(
+            person.patch()["logBodies"],
+            json!({
+                "assistant": false, "assistant-titles": false, "avatars": false
+            })
+        );
+        assert!(!person.allows_log_component("knowledge"));
+        for flags in [
+            vec![
+                "--person",
+                "francois",
+                "--space",
+                "engineering",
+                "--log-bodies",
+                "on",
+            ],
+            vec!["--person", "francois", "--site", "--log-bodies", "on"],
+            vec!["--person", "francois", "--knowledge", "on"],
+        ] {
+            let mut argv = vec!["gm", "settings", "ai", "set"];
+            argv.extend(flags);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
     }
 
     #[test]
@@ -670,16 +747,16 @@ mod tests {
         assert!(args.site);
         assert_eq!(args.patch()["logBodies"]["release-notes"], json!(true));
         let parsed = Cli::try_parse_from(["gm", "settings", "ai", "show", "--site"]).unwrap();
-        let Some(Command::Settings(SettingsCommand::Ai(AiCommand::Show { site, owner }))) =
+        let Some(Command::Settings(SettingsCommand::Ai(AiCommand::Show { site, space, .. }))) =
             parsed.command
         else {
             panic!("expected settings ai show");
         };
-        assert!(site && owner.is_none());
+        assert!(site && space.is_none());
         for flags in [
             vec!["--site"],
             vec!["--site", "--knowledge", "off"],
-            vec!["--site", "--log-bodies", "on", "--owner", "orbit"],
+            vec!["--site", "--log-bodies", "on", "--space", "orbit"],
             vec![
                 "--site",
                 "--log-bodies",
@@ -693,7 +770,7 @@ mod tests {
             assert!(Cli::try_parse_from(&argv).is_err(), "accepted {argv:?}");
         }
         assert!(
-            Cli::try_parse_from(["gm", "settings", "ai", "show", "--site", "--owner", "x"])
+            Cli::try_parse_from(["gm", "settings", "ai", "show", "--site", "--space", "x"])
                 .is_err()
         );
     }
@@ -702,7 +779,7 @@ mod tests {
     fn invalid_or_empty_updates_fail_at_parse_time() {
         for flags in [
             vec![],
-            vec!["--owner", "orbit"],
+            vec!["--space", "orbit"],
             vec!["--dry-run"],
             vec!["--knowledge", "false"],
             vec!["--wiki", "ON"],
@@ -713,8 +790,8 @@ mod tests {
             vec!["--fast", "typesafe:jev-latest"],
             vec!["--classification", "openrouter:anthropic/claude-sonnet-5"],
             vec!["--task", "openrouter:"],
-            vec!["--release-notes", "off", "--owner", "orbit/repo"],
-            vec!["--wiki", "on", "--owner", ""],
+            vec!["--release-notes", "off", "--space", "orbit/repo"],
+            vec!["--wiki", "on", "--space", ""],
             vec!["--indexing", "off"],
             vec!["--knowledge-quiet-minutes", "1441"],
             vec!["--knowledge-max-wait-minutes", "-1"],

@@ -8,6 +8,7 @@ test("absolute issue links in descriptions and comments navigate without replaci
   const destination = "/tracker/orbit/issues/ENG-2?from=markdown#details";
   const absolute = `${location.origin}${destination}`;
   await server.call("POST", "/api/tracker/orbit/mutate", {
+    ...(await server.trackerContract("orbit")),
     operationId: crypto.randomUUID(),
     mutations: [
       {

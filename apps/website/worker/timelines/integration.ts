@@ -209,7 +209,14 @@ export async function recordIntent(
   const existing = await receiptFor(env, landing.id, repo.id);
   if (existing && existing.status !== "intent") return existing;
   const owned = await getWorkSource(env, repo.id, source.sourceId);
-  if (!owned || owned.state !== "ready") throw new Error("Source is not available for landing");
+  if (
+    !owned ||
+    owned.state !== "ready" ||
+    source.repoId !== repo.id ||
+    owned.space_id !== landing.authority?.spaceId ||
+    owned.timeline_id !== landing.timelineId
+  )
+    throw new Error("Source is not available in this landing's immutable Space.");
   using artifacts = await env.ARTIFACTS.get(owned.artifacts_name);
   const readCommit = metadata.reader(owned.artifacts_name, artifacts);
   const commit = await readCommit(source.commit);
@@ -285,7 +292,10 @@ export async function completeReceipts(env: Env, landingId: string) {
 export async function reconcileLandingOperations(env: Env, repoId: string): Promise<void> {
   const pending = await env.DB.prepare(`SELECT r.* FROM source_integration_receipts r
     JOIN source_operations o ON o.id='landing:' || r.landing_id || ':' || r.repo_id
-    WHERE r.repo_id=? AND o.kind='landing' AND o.state IN ('admitted','ambiguous')`)
+    JOIN repos p ON p.id=r.repo_id AND p.space_id=o.space_id
+    JOIN timeline_work_sources w ON w.source_id=r.source_id AND w.repo_id=p.id AND w.space_id=p.space_id
+    WHERE r.repo_id=? AND o.repo_id=r.repo_id AND o.source_id=r.source_id
+      AND o.kind='landing' AND o.state IN ('admitted','ambiguous')`)
     .bind(repoId)
     .all<IntegrationReceipt>();
   if (!pending.results.length) return;

@@ -14,7 +14,7 @@ import { setLabel } from "../../components/TimelinePages.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
 export async function wikiLoader({ request, params }: LoaderFunctionArgs) {
-  const base = `/repos/${params.owner}/${params.repo}/knowledge`;
+  const base = `/repos/${params.space}/${params.repo}/knowledge`;
   const slug = params["*"] || "overview";
   // Scoped to a timeline: its own version of the page, where it wrote one
   // (CORE-84), from `set` or its newest set that has it.
@@ -43,14 +43,14 @@ export async function wikiLoader({ request, params }: LoaderFunctionArgs) {
 /** Which version of the page this is, when the timeline has its own. */
 function TimelineNote({
   page,
-  owner,
+  space,
   name,
 }: {
   page: KnowledgeTimelinePage;
-  owner: string;
+  space: string;
   name: string;
 }) {
-  const main = withScope(repoPath(owner, name, "wiki", page.slug), null);
+  const main = withScope(repoPath(space, name, "wiki", page.slug), null);
   return (
     <p className="m-0 mb-4 rounded-plate border border-line-soft bg-raised px-3 py-2 text-body-sm text-ink-muted">
       {page.outcome === "written" ? (
@@ -69,7 +69,7 @@ function TimelineNote({
   );
 }
 
-function Sidebar({ catalog, owner, name }: { catalog: WikiCatalog; owner: string; name: string }) {
+function Sidebar({ catalog, space, name }: { catalog: WikiCatalog; space: string; name: string }) {
   const [filter, setFilter] = useState("");
   const term = filter.trim().toLowerCase();
   const sections = new Map<string, WikiCatalog["pages"]>();
@@ -102,7 +102,7 @@ function Sidebar({ catalog, owner, name }: { catalog: WikiCatalog; owner: string
             {pages.map((page) => (
               <li key={page.slug}>
                 <NavLink
-                  to={repoPath(owner, name, "wiki", page.slug)}
+                  to={repoPath(space, name, "wiki", page.slug)}
                   end
                   className="block truncate rounded-plate px-2.5 py-1.5 text-body-sm text-ink-muted no-underline hover:bg-pane hover:text-ink aria-[current=page]:bg-raised aria-[current=page]:font-semibold aria-[current=page]:text-ink"
                 >
@@ -123,13 +123,13 @@ const diagramTitle = (page: WikiPage) =>
 /** On this page (from xl), the files the page was written from, and when. */
 function PageRail({
   page,
-  owner,
+  space,
   name,
   sourceId,
   sourceLocations,
 }: {
   page: WikiPage;
-  owner: string;
+  space: string;
   name: string;
   sourceId: string;
   sourceLocations?: KnowledgeTimelinePage["sourceLocations"];
@@ -165,7 +165,7 @@ function PageRail({
                 <FileRow
                   key={path}
                   to={blobUrl(
-                    owner,
+                    space,
                     name,
                     location?.commit ?? page.generatedIn,
                     path,
@@ -193,7 +193,7 @@ export function Wiki() {
   const page: WikiPage | null = timelinePage?.outcome === "written" ? timelinePage : mainPage;
   const sourceId = timelinePage?.outcome === "written" ? timelinePage.sourceId : "canonical";
   const repo = useRepo();
-  const status = useKnowledgeStatus(repo.owner.slug, repo.name, catalog.status);
+  const status = useKnowledgeStatus(repo.space.slug, repo.name, catalog.status);
   const { hash } = useLocation();
 
   // The page renders after its loader, so the browser's own jump to #heading
@@ -216,7 +216,7 @@ export function Wiki() {
               : "The first version is on its way."}
           </span>
         </div>
-        <KnowledgeStatusPill status={status} repo={{ owner: repo.owner.slug, name: repo.name }} />
+        <KnowledgeStatusPill status={status} repo={{ space: repo.space.slug, name: repo.name }} />
       </div>
     );
   }
@@ -224,7 +224,7 @@ export function Wiki() {
   return (
     <div className="grid gap-x-8 gap-y-8 md:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,46rem)_minmax(15rem,19rem)] xl:gap-x-12">
       <aside className="md:row-span-3 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start md:overflow-y-auto">
-        <Sidebar catalog={catalog} owner={repo.owner.slug} name={repo.name} />
+        <Sidebar catalog={catalog} space={repo.space.slug} name={repo.name} />
       </aside>
       <article className="min-w-0 md:col-start-2 [&_h2]:scroll-mt-6 [&_h3]:scroll-mt-6">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -233,7 +233,7 @@ export function Wiki() {
             {page?.nodeId && (
               <Link
                 className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
-                to={`${repoPath(repo.owner.slug, repo.name, "knowledge")}?select=${encodeURIComponent(page.nodeId)}`}
+                to={`${repoPath(repo.space.slug, repo.name, "knowledge")}?select=${encodeURIComponent(page.nodeId)}`}
               >
                 <MapTrifoldIcon weight="bold" aria-hidden />
                 Show on the map
@@ -241,17 +241,17 @@ export function Wiki() {
             )}
             <KnowledgeStatusPill
               status={status}
-              repo={{ owner: repo.owner.slug, name: repo.name }}
+              repo={{ space: repo.space.slug, name: repo.name }}
             />
           </div>
         </div>
         {timelinePage && (
-          <TimelineNote page={timelinePage} owner={repo.owner.slug} name={repo.name} />
+          <TimelineNote page={timelinePage} space={repo.space.slug} name={repo.name} />
         )}
         {page ? (
           <Markdown
             text={page.body}
-            owner={repo.owner.slug}
+            space={repo.space.slug}
             name={repo.name}
             refName={page.generatedIn}
             sourceId={sourceId}
@@ -276,7 +276,7 @@ export function Wiki() {
         >
           <PageRail
             page={page}
-            owner={repo.owner.slug}
+            space={repo.space.slug}
             name={repo.name}
             sourceId={sourceId}
             sourceLocations={timelinePage?.sourceLocations}

@@ -1,35 +1,68 @@
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { ChangeHistory, RefUpdateList } from "../../shared/api.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import type { PackCommit } from "../git/pack.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { refLog } from "./api.ts";
 import { recordRefs } from "./record.ts";
 
 // loadRepo's module reaches the knowledge coordinator, a Durable Object.
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    public ctx: unknown;
+    public env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
+const closers: (() => void)[] = [];
+afterEach(() => {
+  for (const close of closers.splice(0)) close();
+});
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  closers.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('acc_ann', 'user', 'ann', 'Ann'), ('acc_bob', 'user', 'bob', 'Bob');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'acc_ann');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+  `);
+  await seedSpaceFixture(env.DB, {
+    organization: {
+      id: "ann-org",
+      slug: "ann-org",
+      displayName: "Ann",
+      kind: "personal",
+      personalAccountId: "acc_ann",
+    },
+    space: { id: "acc_ann", slug: "ann", displayName: "General" },
+    members: [
+      {
+        accountId: "acc_ann",
+        role: "owner",
+        grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+      },
+    ],
+    actorId: "acc_ann",
+  });
+  sqlite.exec(`
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote)
       VALUES ('repo', 'acc_ann', 'app', 'private', 'a', 'https://a');
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/repos/:owner/:name", refLog);
+  app.route("/api/repos/:space/:name", refLog);
   const ann = (await issueToken(env.DB, "acc_ann", "laptop", "read")).secret;
   const bob = (await issueToken(env.DB, "acc_bob", "laptop", "read")).secret;
   const get = (token: string, path: string) =>

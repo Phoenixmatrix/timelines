@@ -62,7 +62,7 @@ restricting pickup. Policy is global across timelines, not a branch-local overri
 6. **Handle human input** using the current claim's `intervention` policy (below).
    When using durable requests, `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`
    parks your lease. Never put a secret in a prompt; use a credential request
-   with `--secret owner/repo:NAME`. Read the responses with
+   with `--secret space/repo:NAME`. Read the responses with
    `gm request list --issue <issue> --status all`; once all are resolved,
    `gm issue resume <issue>` takes the lease back up.
 7. **Submit, monitor, then finish.** Ship first (Keep Claude/Codex/OMP and authoritative source edits local. Follow README.md's Agent-first development workflow. Execution selection is --execution, then GITMATRIX_AGENT_EXECUTION, then .gitmatrix/development.json, then local. When cloudflare is selected, use `node tools/agent/entry.ts` for setup/up, sync, scoped gm, checks, logs, debug and artifacts; use its `run -- <argv>` for remote vp/Cargo/browser work, never run heavy tooling on the host or silently fall back to local. Do not sync secrets, credential files or generated output back into authoritative source. Cloud mode explicitly trusts its disposable runtime with the current validated cf access token; the refresh credential stays local. AI remains opt-in. Sync the authoritative source workspace. In local mode, run `vp install`, inspect `vp run ready --dry-run`, then run `vp run ready`. In cloud mode, use `node tools/agent/entry.ts setup` for remote installation, sync source, inspect `node tools/agent/entry.ts check --dry-run`, then run `node tools/agent/entry.ts check`. These are the automatically selective required gate. Do not routinely add blanket check/test/build runs, `vp run agent test` or `--all`; use `--all` only when comprehensive verification is deliberately required. Local selection covers all unlanded committed, staged, unstaged and untracked work against the merge base with local `origin/main` and does not fetch. Use `--base` only for the actual integration branch, never to hide work. Accept automatic full fallback for broad or unknown changes, including remote source snapshots without Git metadata. Preserve required real consumer smoke checks, explicit AI verification and deployment-boundary checks in `AGENTS.md`; see `README.md#completion-gate` for coverage. Then follow the queue or timeline shipping workflow below from the authoritative local worktree and verify actual landing and required CI/deployment before completing the issue. Destroy the owned cloud environment when finished; stop is not resource cleanup.); independent main work
@@ -299,7 +299,7 @@ People and other agents follow them live and read them later.
   tokens directly.
 - Don't take a PRD (`type: prd`) as work: implement its sub-issues, and complete
   the PRD once they're done.
-- `gm agent list --owner <owner>` shows the tracker's agents with their
+- `gm agent list --space <space>` shows the tracker's agents with their
   advisory profiles (harness, model, environment, tags, skills), to pick whom to
   delegate to. Profiles are self-reported: treat them as hints, not proof.
 

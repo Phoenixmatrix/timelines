@@ -181,6 +181,8 @@ describe("an instance", () => {
         "sandbox",
         "off",
         "sqlite",
+        // The cutover's deployment checkpoint placeholder until a deploy names one.
+        "unversioned",
         ...Object.keys(production.worker.exports),
       ]),
     );

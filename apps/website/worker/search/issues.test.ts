@@ -1,47 +1,73 @@
 import { Hono } from "hono";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { IssueResult, SearchResponse } from "../../shared/search.ts";
 import { SEARCH_LIMITS } from "../../shared/search.ts";
 import type { Issue, IssueCloseReason, Mutation } from "../../shared/tracker.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
 import { trackerSql, transactional } from "../testing/tracker.ts";
 import { TrackerStore, type Access } from "../tracker/store.ts";
 import { searchApi } from "./api.ts";
 import { PROVIDERS } from "./providers.ts";
 import { parseQuery, type SearchQuery } from "./query.ts";
+import { fakeDurableState, fakeDurableObjectId } from "../testing/durable-state.ts";
+import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
+import { findSpaceById } from "../spaces/access.ts";
+import { issueToken } from "../api/tokens.ts";
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const issuesOnly = PROVIDERS.filter((provider) => provider.category === "issues");
 
 const databases: DatabaseSync[] = [];
+const cleanups: (() => void)[] = [];
 afterEach(() => {
   for (const db of databases) db.close();
   databases.length = 0;
+  for (const close of cleanups.splice(0)) close();
   vi.restoreAllMocks();
 });
+interface TestTracker {
+  store: TrackerStore;
+  add(data: {
+    title: string;
+    description?: string;
+    status?: Issue["status"];
+    priority?: Issue["priority"];
+    closeReason?: IssueCloseReason;
+  }): string;
+}
 
-/** A real TrackerStore for one owner, with a team ENG and a way to add issues. */
-function trackerFor(owner: { id: string; slug: string }) {
-  const db = new DatabaseSync(":memory:");
+/** A real TrackerStore for one Space, with a team ENG and a way to add issues. */
+async function trackerFor(env: Env, owner: { id: string; slug: string }) {
+  const { db, ctx } = fakeDurableState({ name: owner.id });
   databases.push(db);
+  const scope = await initializeFreshTrackerSpace(env, ctx, owner.id);
   let now = Date.parse("2026-10-01T00:00:00Z");
   const store = new TrackerStore(trackerSql(db), transactional(db), () => now);
-  const identity = { id: owner.id, slug: owner.slug, displayName: owner.slug };
+  const identity = (await findSpaceById(env.DB, owner.id))!;
   const access: Access = {
     actorId: "ann",
     principalId: "ann",
     agents: [],
-    owner: identity,
+    space: identity,
+    agentId: null,
+    ...scope,
+    authorizationVersion: 1,
     canAdmin: true,
     members: [{ id: "ann", slug: "ann", displayName: "Ann" }],
     repos: [],
   };
   let operation = 0;
   const mutate = (...mutations: Mutation[]) =>
-    store.mutate(access, { operationId: `${owner.id}-${++operation}`, mutations });
+    store.mutate(access, {
+      contractVersion: 4,
+      spaceId: identity.id,
+      migrationEpoch: scope.migrationEpoch,
+      operationId: `${owner.id}-${++operation}`,
+      mutations,
+    });
   mutate({ kind: "team.create", id: "team", data: { key: "ENG", name: "Engineering" } });
   let n = 0;
   return {
@@ -68,30 +94,52 @@ function query(text: string): SearchQuery {
   return parsed;
 }
 
-function setup() {
-  const sqlite = migratedDatabase();
+async function setup() {
+  const { sqlite, env, close } = await createFreshSpaceTestEnvironment();
+  cleanups.push(close);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
-      ('orbit', 'org', 'orbit', 'Orbit'), ('vault', 'org', 'vault', 'Vault');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'member'), ('vault', 'ben', 'owner');
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
   `);
-  const trackers = new Map<string, ReturnType<typeof trackerFor>>();
+  const token = await issueToken(env.DB, "ann", "search", "read");
+  const identity: Actor = { ...ann, credential: { kind: "token", id: token.id } };
+  Reflect.set(env, "TRACKER", { idFromName: fakeDurableObjectId });
+  const trackers = new Map<string, TestTracker>();
+  const seed = async (id: string, accountId = "ann") => {
+    await seedSpaceFixture(env.DB, {
+      organization: { id: `org-${id}`, slug: `org-${id}`, displayName: id, kind: "company" },
+      space: { id, slug: id, displayName: id },
+      members: [
+        {
+          accountId,
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "none", packageRole: "none" },
+        },
+      ],
+      actorId: accountId,
+    });
+    trackers.set(id, await trackerFor(env, { id, slug: id }));
+  };
+  await seed("ann");
+  await seed("orbit");
+  await seed("vault", "ben");
   const failing = new Set<string>();
   const tracker = (id: string) => {
-    let found = trackers.get(id);
-    if (!found) trackers.set(id, (found = trackerFor({ id, slug: id })));
+    const found = trackers.get(id);
+    if (!found) throw new Error(`Missing fixture Tracker ${id}`);
     return found;
   };
   const getByName = vi.fn((id: string) => ({
-    searchIssues: async (q: SearchQuery, limit: number) => {
+    searchIssues: async (access: Access, q: SearchQuery, limit: number) => {
+      expect(access.spaceId).toBe(id);
+      expect(access.principalId).toBe("ann");
+      expect(access.contractVersion).toBe(4);
       if (failing.has(id)) throw new Error("Durable Object reset");
       return { ok: true, value: tracker(id).store.searchIssues(q, limit) };
     },
   }));
-  const env = { DB: d1(sqlite), TRACKER: { getByName } } as unknown as Env;
-  let actor: Actor = ann;
+  env.TRACKER = { idFromName: fakeDurableObjectId, getByName } as unknown as Env["TRACKER"];
+  let actor: Actor = identity;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("actor", actor);
@@ -102,11 +150,12 @@ function setup() {
     app.request(`/api/search?${new URLSearchParams(params).toString()}`, {}, env);
   return {
     sqlite,
+    seed,
     tracker,
     failing,
     getByName,
     as: (next: Actor) => {
-      actor = next;
+      actor = next.id === identity.id ? { ...identity, ...next } : next;
     },
     call,
     search: async (params: Record<string, string>) => {
@@ -120,8 +169,8 @@ function setup() {
 }
 
 describe("tracker issue search", () => {
-  test("ranks exact keys, then titles, then descriptions, open and closed alike", () => {
-    const t = trackerFor({ id: "orbit", slug: "orbit" });
+  test("ranks exact keys, then titles, then descriptions, open and closed alike", async () => {
+    const t = (await setup()).tracker("orbit");
     t.add({ title: "Login is slow", description: "Profile the token check" }); // ENG-1
     t.add({ title: "Token refresh", status: "done" }); // ENG-2
     t.add({ title: "Refactor the token cache", status: "canceled", closeReason: "obsolete" }); // ENG-3
@@ -139,8 +188,8 @@ describe("tracker issue search", () => {
     expect(found("%")).toEqual([]);
   });
 
-  test("breaks ties by priority, then most recently updated", () => {
-    const t = trackerFor({ id: "orbit", slug: "orbit" });
+  test("breaks ties by priority, then most recently updated", async () => {
+    const t = (await setup()).tracker("orbit");
     t.add({ title: "Deploy fails", priority: 3 });
     t.add({ title: "Deploy flakes", priority: 1 });
     t.add({ title: "Deploy docs", priority: 1 });
@@ -152,14 +201,14 @@ describe("tracker issue search", () => {
   });
 
   test("searches every tracker the viewer belongs to, with distinct breadcrumbs for equal keys", async () => {
-    const s = setup();
+    const s = await setup();
     s.tracker("ann").add({ title: "Personal budget" });
     s.tracker("orbit").add({ title: "Orbit budget review", status: "done" });
     s.tracker("vault").add({ title: "Vault budget secrets" });
     const { results, incomplete } = await s.search({ q: "budget" });
     expect(incomplete).toBeNull();
     expect(
-      results.map((r) => [r.key, r.tracker.slug, r.status, r.breadcrumb, r.target, r.id]),
+      results.map((r) => [r.key, r.space.slug, r.status, r.breadcrumb, r.target, r.id]),
     ).toEqual([
       [
         "ENG-1",
@@ -184,11 +233,11 @@ describe("tracker issue search", () => {
   });
 
   test("an exact key outranks text matches in other trackers", async () => {
-    const s = setup();
+    const s = await setup();
     s.tracker("ann").add({ title: "Mentions orbit ENG-1 in passing" });
     s.tracker("orbit").add({ title: "The real one" });
     const { results } = await s.search({ q: "ENG-1" });
-    expect(results.map((r) => [r.tracker.slug, r.title, r.match])).toEqual([
+    expect(results.map((r) => [r.space.slug, r.title, r.match])).toEqual([
       ["ann", "Mentions orbit ENG-1 in passing", "exact"],
       ["orbit", "The real one", "exact"],
     ]);
@@ -197,15 +246,39 @@ describe("tracker issue search", () => {
   });
 
   test("losing membership removes a tracker's issues at once", async () => {
-    const s = setup();
+    const s = await setup();
     s.tracker("orbit").add({ title: "Orbit roadmap" });
     expect((await s.search({ q: "roadmap" })).results).toHaveLength(1);
-    s.sqlite.exec(`DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ann'`);
+    s.sqlite.exec(
+      `DELETE FROM organization_members WHERE organization_id = 'org-orbit' AND account_id = 'ann'`,
+    );
     expect((await s.search({ q: "roadmap" })).results).toEqual([]);
   });
 
+  test("Organization ownership, matching person IDs, and Instance power do not replace a Space grant", async () => {
+    const s = await setup();
+    s.tracker("ann").add({ title: "Hidden personal plan" });
+    s.tracker("orbit").add({ title: "Hidden company plan" });
+    s.sqlite.exec(`DELETE FROM space_grants WHERE account_id = 'ann'`);
+    s.as({ ...ann, isSiteAdmin: true });
+    expect((await s.search({ q: "hidden" })).results).toEqual([]);
+    expect(s.getByName).not.toHaveBeenCalled();
+  });
+
+  test("a continuation cursor cannot retain revoked Tracker visibility", async () => {
+    const s = await setup();
+    for (let i = 0; i < 5; i++) s.tracker("orbit").add({ title: `Private plan ${i}` });
+    const first = await s.search({ q: "private", limit: "2" });
+    expect(first.cursor).not.toBeNull();
+    s.sqlite.exec(`DELETE FROM space_grants WHERE space_id = 'orbit' AND account_id = 'ann'`);
+    expect((await s.search({ q: "private", limit: "2", cursor: first.cursor! })).results).toEqual(
+      [],
+    );
+    expect((await s.search({ q: "private" })).results).toEqual([]);
+  });
+
   test("pages across trackers without duplicates", async () => {
-    const s = setup();
+    const s = await setup();
     for (let i = 0; i < 7; i++) s.tracker("ann").add({ title: `Release ${i}` });
     for (let i = 0; i < 6; i++) s.tracker("orbit").add({ title: `Release orbit ${i}` });
     const seen: string[] = [];
@@ -223,12 +296,12 @@ describe("tracker issue search", () => {
 
   test("reports failed trackers as incomplete, and all failing as unavailable", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const s = setup();
+    const s = await setup();
     s.tracker("ann").add({ title: "Budget" });
     s.tracker("orbit").add({ title: "Budget" });
     s.failing.add("orbit");
     const partial = await s.search({ q: "budget" });
-    expect(partial.results.map((r) => r.tracker.slug)).toEqual(["ann"]);
+    expect(partial.results.map((r) => r.space.slug)).toEqual(["ann"]);
     expect(partial.incomplete).toBe("Couldn't search orbit.");
 
     s.failing.add("ann");
@@ -241,21 +314,13 @@ describe("tracker issue search", () => {
   });
 
   test("reads a bounded number of trackers and says so", async () => {
-    const s = setup();
+    const s = await setup();
     const many = SEARCH_LIMITS.trackers + 3;
     const rows = Array.from({ length: many }, (_, i) => `org${String(i).padStart(2, "0")}`);
-    s.sqlite.exec(
-      rows
-        .map(
-          (id) =>
-            `INSERT INTO accounts (id, kind, slug, display_name) VALUES ('${id}', 'org', '${id}', '${id}');
-             INSERT INTO org_members (org_id, user_id, role) VALUES ('${id}', 'ann', 'member');`,
-        )
-        .join("\n"),
-    );
+    for (const id of rows) await s.seed(id);
     const page = await s.search({ q: "anything" });
     expect(s.getByName).toHaveBeenCalledTimes(SEARCH_LIMITS.trackers);
-    // Ann's own tracker is always among them.
+    // Stable Space-slug ordering includes ann without any matching-ID privilege.
     expect(s.getByName.mock.calls.map(([id]) => id)).toContain("ann");
     expect(page.incomplete).toBe(
       `Searched ${SEARCH_LIMITS.trackers} of your ${many + 2} trackers.`,

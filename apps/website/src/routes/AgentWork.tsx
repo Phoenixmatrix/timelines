@@ -299,7 +299,7 @@ function WorkRow({
         </button>
       </div>
       <div id={panel} hidden={!open} className="pl-7">
-        {open && <LinkedWorkPanel owner={tracker.slug} issueId={issue.id} issueKey={issue.key} />}
+        {open && <LinkedWorkPanel space={tracker.slug} issueId={issue.id} issueKey={issue.key} />}
       </div>
     </li>
   );

@@ -1,4 +1,4 @@
-// A timeline across a workspace (CORE-186): GET /api/accounts/:owner/atlas/timeline
+// A timeline across a workspace (CORE-186): GET /api/spaces/:space/atlas/timeline
 // against real D1 projections of three repositories, through the browser
 // client. Each repository's part is its own: one with the timeline (placed in
 // its own snapshot, ids namespaced, its regrouping read), one without it
@@ -7,12 +7,13 @@
 // caller can't read is never mentioned; nothing is computed by reading.
 
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { onTestFinished, afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AtlasWorkspaceTimeline } from "../../shared/atlas.ts";
 import { atlasErrorOf, atlasWorkspaceApi } from "../../src/lib/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Timing } from "../timing.ts";
 import {
@@ -23,7 +24,14 @@ import {
 import { workspaceAtlas } from "./workspace.ts";
 
 vi.mock("cloudflare:workers", () => ({
-  DurableObject: class {},
+  DurableObject: class {
+    ctx: DurableObjectState;
+    env: Env;
+    constructor(ctx: DurableObjectState, env: Env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
   WorkflowEntrypoint: class {},
 }));
 
@@ -39,17 +47,31 @@ const TIP = "7".repeat(40);
 let names = 0;
 
 async function setup() {
-  const sqlite = migratedDatabase();
+  const fresh = await createFreshSpaceTestEnvironment();
+  onTestFinished(fresh.close);
+  const { sqlite } = fresh;
   const n = ++names;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, personal_account_id, default_space_id)
+      VALUES ('org-ann', 'personal-ann', 'ann', 'personal', 'ann', 'ann');
+    INSERT INTO spaces (id, organization_id, slug, display_name)
+      VALUES ('ann', 'org-ann', 'ann', 'ann');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by)
+      VALUES ('org-ann', 'ann', 'owner', 'test-fixture', 'ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+      VALUES ('ann', 'org-ann', 'ann', 'admin', 'write', 'write', 'test-fixture', 'ann');
+    INSERT INTO space_audit (id, organization_id, space_id, actor_id, action, subject_id, detail)
+      VALUES ('audit-ann', 'org-ann', 'ann', 'ann', 'space.grant', 'ann', '{"origin":"test-fixture"}');
+    COMMIT;
+    INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'public', 'ws-shop-${n}', 'https://shop'),
       ('r2', 'ann', 'docs', 'public', 'ws-docs-${n}', 'https://docs'),
       ('r3', 'ann', 'notes', 'private', 'ws-notes-${n}', 'https://notes');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('r3', 'ben', 'read');
-    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, space_id,
       artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
       fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
       initial_token_revoked, created_at, updated_at)
@@ -73,6 +95,7 @@ async function setup() {
     `ws-notes-work-${n}`,
   );
   const env = {
+    ...fresh.env,
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
@@ -84,7 +107,7 @@ async function setup() {
     c.set("timing", new Timing());
     await next();
   });
-  app.route("/api/accounts/:owner/atlas", workspaceAtlas);
+  app.route("/api/spaces/:space/atlas", workspaceAtlas);
   const executionCtx = { waitUntil() {}, passThroughOnException() {}, props: {} };
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
     const href = input instanceof Request ? input.url : String(input);
@@ -114,7 +137,7 @@ async function setup() {
   };
 }
 
-const workspace = { owner: "ann", repos: ["shop", "docs", "notes"] };
+const workspace = { space: "ann", repos: ["shop", "docs", "notes"] };
 
 async function all(request: Parameters<typeof atlasWorkspaceApi.timeline>[2] = {}) {
   const pages: AtlasWorkspaceTimeline[] = [];
@@ -229,7 +252,7 @@ describe("A timeline across a workspace", () => {
     s.as(ben);
     const his = await atlasWorkspaceApi.timeline(workspace, "timeline/plan");
     const without = await atlasWorkspaceApi.timeline(
-      { owner: "ann", repos: ["shop", "notes"] },
+      { space: "ann", repos: ["shop", "notes"] },
       "timeline/plan",
     );
     expect(his.repos.map((r) => r.name)).toEqual(["shop", "notes"]);

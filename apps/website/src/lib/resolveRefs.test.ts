@@ -12,7 +12,14 @@ import {
   withCommit,
 } from "./commitPanel.ts";
 import { resetRefResolutions } from "../refs/resolver.ts";
-import { RECENT_LIMIT, addRecent, readRecent, recentKey, rememberPlace } from "./recentPlaces.ts";
+import {
+  RECENT_LIMIT,
+  addRecent,
+  readRecent,
+  readRecentRecovery,
+  recentKey,
+  rememberPlace,
+} from "./recentPlaces.ts";
 import {
   confirmIssueKeys,
   issueKeysIn,
@@ -127,6 +134,47 @@ describe("recent places", () => {
     expect(addRecent([], { ...place(1), at: 1 })).toHaveLength(1);
   });
 
+  test("migrates legacy content places without losing timeline, source, filters or anchors", () => {
+    const storage = memory();
+    const original = JSON.stringify([
+      {
+        kind: "issue",
+        title: "ENG-1",
+        detail: "Saved work",
+        at: 42,
+        to: "/tracker/orbit/issues/ENG-1?tl=search&source=work_1&q=ws%3A%22web+app%22+-workspace%3Aold+%22literal+ws%3Ax%22#evidence-2",
+      },
+      { ...place(1), at: 41 },
+    ]);
+    storage.setItem("gitmatrix:recent-places:acc_1", original);
+    const migrated = readRecent("acc_1", storage);
+    expect(migrated.map(({ title, detail, at }) => ({ title, detail, at }))).toEqual([
+      { title: "ENG-1", detail: "Saved work", at: 42 },
+      { title: "orbit/r1", detail: "", at: 41 },
+    ]);
+    const url = new URL(migrated[0]!.to, "https://gm.test");
+    expect(url.pathname).toBe("/tracker/orbit/issues/ENG-1");
+    expect(url.searchParams.get("tl")).toBe("search");
+    expect(url.searchParams.get("source")).toBe("work_1");
+    expect(url.searchParams.get("q")).toBe('project:"web app" -project:old "literal ws:x"');
+    expect(url.hash).toBe("#evidence-2");
+    expect(migrated[1]!.to).toBe("/orbit/r1");
+    expect(storage.getItem("gitmatrix:recent-places:acc_1")).toBe(original);
+    expect(readRecentRecovery("acc_1", storage)).toBeNull();
+    expect(readRecent("acc_1", storage)).toEqual(migrated);
+  });
+
+  test("unknown legacy schemas are fenced and retained for explicit recovery", () => {
+    const storage = memory();
+    const original = JSON.stringify([{ ...place(1), at: 1, to: "/accounts/marco" }]);
+    storage.setItem("gitmatrix:recent-places:acc_1", original);
+    expect(readRecent("acc_1", storage)).toEqual([]);
+    expect(storage.getItem(recentKey("acc_1"))).toBeNull();
+    expect(readRecentRecovery("acc_1", storage)).toBe(original);
+    rememberPlace("acc_1", place(2), storage);
+    expect(readRecentRecovery("acc_1", storage)).toBe(original);
+  });
+
   test("broken or hostile storage reads as nothing and never throws", () => {
     const storage = memory();
     storage.setItem(recentKey("acc_1"), "{not json");
@@ -160,18 +208,18 @@ describe("resolveJump through the reference resolver (POST /api/refs/resolve)", 
   const signal = new AbortController().signal;
   const context: JumpContext = {
     here: { pathname: "/orbit/engine/ci", search: "", state: null },
-    repo: { owner: { slug: "orbit" } as never, name: "engine" },
+    repo: { space: { slug: "orbit" } as never, name: "engine" },
     tracker: "orbit",
-    owner: "orbit",
+    space: "orbit",
     recentRepos: [],
-    timelines: [{ slug: "fast-search", name: "Fast search", owner: "orbit" }],
+    timelines: [{ slug: "fast-search", name: "Fast search", space: "orbit" }],
   };
   const sha = "abc1234".padEnd(40, "0");
   const commit = (repo: string) => ({
     kind: "commit",
     path: `/orbit/${repo}?commit=${sha}`,
     label: "",
-    owner: "orbit",
+    space: "orbit",
     repo,
     sha,
   });
@@ -214,7 +262,7 @@ describe("resolveJump through the reference resolver (POST /api/refs/resolve)", 
       "/tracker/orbit/issues/i1",
       "/tracker/ann/issues/i1",
     ]);
-    expect(asked).toEqual([{ owner: "orbit", repo: "engine", tracker: "orbit" }]);
+    expect(asked).toEqual([{ space: "orbit", repo: "engine", tracker: "orbit" }]);
   });
 
   test("a SHA in a repository opens its full hash over the page, one Back step deep", async () => {
@@ -239,8 +287,8 @@ describe("resolveJump through the reference resolver (POST /api/refs/resolve)", 
         here: { pathname: "/tracker/orbit", search: "", state: null },
         repo: null,
         recentRepos: [
-          { owner: "orbit", name: "engine" },
-          { owner: "orbit", name: "website" },
+          { space: "orbit", name: "engine" },
+          { space: "orbit", name: "website" },
         ],
       },
       signal,
@@ -272,7 +320,7 @@ describe("resolveJump through the reference resolver (POST /api/refs/resolve)", 
     );
     const found = await confirmIssueKeys(
       ["CORE-22", "WEB-1", "OPS-8"],
-      { owner: "orbit", name: "engine" },
+      { space: "orbit", name: "engine" },
       signal,
     );
     expect([...found.keys()]).toEqual(["CORE-22"]);

@@ -5,22 +5,25 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { UsageLine, UsageReport } from "../../shared/usage.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { priceTimeline } from "./prices.ts";
 import {
-  accountUsageReport,
+  spaceUsageReport,
+  personUsageReport,
   addDays,
   buildReport,
   collected,
   reportCsv,
-  siteUsageReport,
+  instanceUsageReport,
   type SnapshotRow,
 } from "./report.ts";
-import { accountUsageApi, siteUsageApi } from "./report-api.ts";
+import { spaceUsageApi, personUsageApi, instanceUsageApi } from "./report-api.ts";
 
 const FLASH = "@cf/zai-org/glm-5.3-flash";
 const EMBED = "@cf/qwen/qwen3-embedding-0.6b";
@@ -101,8 +104,8 @@ describe("costs", () => {
     const asOf = "2026-10-20";
     // As ai_usage records chat models: the total counts the input and output tokens too.
     const report = buildReport({
-      scope: "account",
-      account: { slug: "orbit", displayName: "Orbit" },
+      scope: "space",
+      subject: { id: "acc_org", slug: "orbit", displayName: "Orbit" },
       rows: collections(asOf, 30, (day) => [
         ...STORAGE(day),
         activity(addDays(day, -1), "workers_ai", FLASH, "input_tokens", 2e6 / 30),
@@ -130,8 +133,8 @@ describe("costs", () => {
   test("equal usage × catalog prices, in the prices' units", async () => {
     const asOf = "2026-10-20";
     const report = buildReport({
-      scope: "account",
-      account: { slug: "orbit", displayName: "Orbit" },
+      scope: "space",
+      subject: { id: "acc_org", slug: "orbit", displayName: "Orbit" },
       rows: collections(asOf, 30, (day) => [...STORAGE(day), ...ACTIVITY(day)]),
       asOf,
       timeline: await timeline(),
@@ -199,8 +202,8 @@ describe("costs", () => {
   test("estimated figures are labelled; measured ones aren't", async () => {
     const asOf = "2026-10-20";
     const report = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows: collections(asOf, 30, STORAGE),
       asOf,
       timeline: await timeline(),
@@ -216,8 +219,8 @@ describe("costs", () => {
   test("before billing starts, a price is shown with its start and kept out of totals", async () => {
     const asOf = "2026-10-10";
     const report = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows: STORAGE(asOf),
       asOf,
       timeline: await timeline(),
@@ -232,8 +235,8 @@ describe("costs", () => {
   test("activity measured on fewer days is extrapolated to 30 and labelled", async () => {
     const asOf = "2026-10-20";
     const report = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows: collections(asOf, 10, (day) => [...STORAGE(day), ...ACTIVITY(day)]),
       asOf,
       timeline: await timeline(),
@@ -260,8 +263,8 @@ describe("costs", () => {
       activity("2026-10-19", "workers_ai", FLASH, "output_tokens", 1e6),
     ];
     const report = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows,
       asOf,
       timeline: await timeline(),
@@ -285,8 +288,8 @@ describe("costs", () => {
       storage(asOf, "durable_objects", "Assistant", "bytes", 1e6),
     ];
     const account = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows,
       asOf,
       timeline: await timeline(),
@@ -302,12 +305,22 @@ describe("costs", () => {
       "closed-issues",
       "tracker-activity",
     ]);
-    expect(ids(account, "durable_objects", "Assistant")).toEqual(["assistant-chats"]);
+    expect(ids(account, "durable_objects", "Assistant")).toEqual([]);
+    const person = buildReport({
+      scope: "person",
+      subject: null,
+      rows,
+      asOf,
+      timeline: await timeline(),
+      version: 1,
+    });
+    expect(ids(person, "durable_objects", "Assistant")).toEqual(["assistant-chats"]);
+    expect(ids(person, "durable_objects", "Tracker")).toEqual([]);
     // The registry proxy cache is site data: only the site page links it.
     expect(ids(account, "r2", "registry_blobs")).toEqual([]);
     const site = buildReport({
-      scope: "site",
-      account: null,
+      scope: "instance",
+      subject: null,
       rows,
       asOf,
       timeline: await timeline(),
@@ -319,8 +332,8 @@ describe("costs", () => {
   test("CSV has one row per figure with its price and monthly cost", async () => {
     const asOf = "2026-10-20";
     const report = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows: [
         storage(asOf, "d1", "ci-logs", "rows", 5),
         storage(asOf, "d1", "ci-logs", "bytes", 2e9),
@@ -341,8 +354,8 @@ describe("costs", () => {
 
   test("no collection yet says so", async () => {
     const report = buildReport({
-      scope: "account",
-      account: null,
+      scope: "space",
+      subject: null,
       rows: [],
       asOf: null,
       timeline: await timeline(),
@@ -354,40 +367,53 @@ describe("costs", () => {
 });
 
 describe("which day a report describes", () => {
-  test("a day counts once its collection finished for the account", () => {
-    expect(collected(null, "2026-10-20", "acc_b")).toBe(true);
-    expect(collected({ day: "2026-10-21", account: "", done: false }, "2026-10-20", "acc_b")).toBe(
-      true,
-    );
+  test("completion uses scope kind and ID, never a shared bare ID", () => {
+    const scope = { kind: "space", id: "acc_b" } as const;
+    expect(collected(null, "2026-10-20", scope)).toBe(true);
+    expect(collected({ day: "2026-10-21", scope, done: false }, "2026-10-20", scope)).toBe(true);
     expect(
-      collected({ day: "2026-10-20", account: "acc_c", done: false }, "2026-10-20", "acc_b"),
+      collected(
+        { day: "2026-10-20", scope: { kind: "space", id: "acc_c" }, done: false },
+        "2026-10-20",
+        scope,
+      ),
     ).toBe(true);
+    expect(collected({ day: "2026-10-20", scope, done: false }, "2026-10-20", scope)).toBe(false);
     expect(
-      collected({ day: "2026-10-20", account: "acc_b", done: false }, "2026-10-20", "acc_b"),
+      collected(
+        { day: "2026-10-20", scope: { kind: "space", id: "acc_a" }, done: false },
+        "2026-10-20",
+        scope,
+      ),
     ).toBe(false);
     expect(
-      collected({ day: "2026-10-20", account: "acc_a", done: false }, "2026-10-20", "acc_b"),
-    ).toBe(false);
-    expect(
-      collected({ day: "2026-10-20", account: "acc_z", done: false }, "2026-10-20", null),
-    ).toBe(false);
-    expect(collected({ day: "2026-10-20", account: "acc_z", done: true }, "2026-10-20", null)).toBe(
-      true,
-    );
+      collected({ day: "2026-10-20", scope, done: false }, "2026-10-20", {
+        kind: "person",
+        id: scope.id,
+      }),
+    ).toBe(true);
+    expect(collected({ day: "2026-10-20", scope, done: false }, "2026-10-20", null)).toBe(false);
+    expect(collected({ day: "2026-10-20", scope, done: true }, "2026-10-20", null)).toBe(true);
   });
 });
 
 // ---- against the database and through the API -------------------------------------
 
-function insert(sqlite: DatabaseSync, account: string, rows: SnapshotRow[]) {
+function insert(
+  sqlite: DatabaseSync,
+  kind: "space" | "person" | "instance",
+  id: string,
+  rows: SnapshotRow[],
+) {
   const statement = sqlite.prepare(
-    `INSERT INTO usage_snapshots (day, account_id, construct, item, metric, kind, quantity, estimated, method, collected_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO usage_snapshots (day, scope_kind, scope_id, construct, item, metric, kind, quantity, estimated, method, collected_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const r of rows)
     statement.run(
       r.day,
-      account,
+      kind,
+      id,
       r.construct,
       r.item,
       r.metric,
@@ -399,47 +425,70 @@ function insert(sqlite: DatabaseSync, account: string, rows: SnapshotRow[]) {
     );
 }
 
+const fixtureCleanup: (() => void)[] = [];
+afterEach(() => {
+  for (const close of fixtureCleanup.splice(0).reverse()) close();
+});
+
 async function setup() {
   const sqlite = migratedDatabase();
+  const registry = migratedRegistryDatabase();
+  const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
+  fixtureCleanup.push(
+    () => sqlite.close(),
+    () => registry.close(),
+  );
+  const control = installCutoverTestControl(env);
+  fixtureCleanup.push(control.close);
+  await initializeFreshSpaceInstallation(env);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name, is_site_admin) VALUES
       ('acc_ann', 'user', 'ann', 'Ann', 0), ('acc_bob', 'user', 'bob', 'Bob', 0),
       ('acc_cat', 'user', 'cat', 'Cat', 0), ('acc_root', 'user', 'root', 'Root', 1);
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role)
-      VALUES ('acc_org', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('acc_org', 'acc_ann', 'owner'), ('acc_org', 'acc_cat', 'member');
+    BEGIN;
+    INSERT INTO organizations (id, slug, display_name, kind, default_space_id)
+      VALUES ('org_orbit', 'orbit-company', 'Orbit Company', 'company', 'acc_org');
+    INSERT INTO spaces (id, organization_id, slug, display_name) VALUES
+      ('acc_org', 'org_orbit', 'orbit', 'Orbit'), ('acc_bob', 'org_orbit', 'bob-content', 'Bob content');
+    INSERT INTO organization_members (organization_id, account_id, role, origin, granted_by) VALUES
+      ('org_orbit', 'acc_ann', 'owner', 'test', 'acc_ann'),
+      ('org_orbit', 'acc_cat', 'member', 'test', 'acc_ann'),
+      ('org_orbit', 'acc_bob', 'owner', 'test', 'acc_ann');
+    INSERT INTO space_grants (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by) VALUES
+      ('acc_org', 'org_orbit', 'acc_ann', 'admin', 'none', 'none', 'test', 'acc_ann'),
+      ('acc_org', 'org_orbit', 'acc_cat', 'member', 'none', 'none', 'test', 'acc_ann');
+    COMMIT;
   `);
   const day = "2026-10-20";
   const yesterday = "2026-10-19";
   // Orbit: yesterday complete; today's collection is still on Orbit.
-  insert(sqlite, "acc_org", [
+  insert(sqlite, "space", "acc_org", [
     ...STORAGE(yesterday),
     ...ACTIVITY(yesterday),
     storage(day, "d1", "ci-logs", "bytes", 1e9),
   ]);
-  insert(sqlite, "acc_bob", [
+  insert(sqlite, "space", "acc_bob", [
     storage(yesterday, "r2", "registry_blobs", "bytes", 20e9),
     storage(day, "r2", "registry_blobs", "bytes", 20e9),
   ]);
   // The site's own: every registry blob once (Orbit's and Bob's overlap).
-  insert(sqlite, "", [
+  insert(sqlite, "instance", "", [
     storage(yesterday, "r2", "registry_blobs_all", "bytes", 30e9),
     storage(day, "r2", "registry_blobs_all", "bytes", 30e9),
     storage(day, "d1", "analysis-caches", "bytes", 2e9),
   ]);
   sqlite.exec(
-    `INSERT INTO job_cursors (name, cursor, updated_at) VALUES ('usage:collect', '{"day":"${day}","account":"acc_org","step":3,"page":null,"done":false}', '${day}T03:00:00Z')`,
+    `INSERT INTO job_cursors (name, cursor, updated_at) VALUES ('usage:collect:v4', '{"day":"${day}","scope":{"kind":"space","id":"acc_org"},"step":3,"page":null,"done":false}', '${day}T03:00:00Z')`,
   );
-  const env = { DB: d1(sqlite) } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     const credential = await tokenCredential(c);
     c.set("actor", credential.kind === "token" ? credential.actor : null);
     return next();
   });
-  app.route("/api/accounts/:slug/usage", accountUsageApi);
-  app.route("/api/admin/usage", siteUsageApi);
+  app.route("/api/spaces/:space/usage", spaceUsageApi);
+  app.route("/api/accounts/:slug/usage", personUsageApi);
+  app.route("/api/admin/usage", instanceUsageApi);
   const token = async (user: string) =>
     (await issueToken(env.DB, user, `t-${Math.random()}`, "read")).secret;
   const tokens = {
@@ -471,20 +520,20 @@ async function setup() {
 describe("reports from the database", () => {
   test("an account's report uses its latest complete day", async () => {
     const t = await setup();
-    const orbit = await accountUsageReport(t.env.DB, {
+    const orbit = await spaceUsageReport(t.env.DB, {
       id: "acc_org",
       slug: "orbit",
-      display_name: "Orbit",
+      displayName: "Orbit",
     });
     // Today's collection is still on Orbit: yesterday is its latest complete day.
     expect(orbit.asOf).toBe("2026-10-19");
     expect(orbit.notes.join(" ")).toContain("still running");
     expect(lineOf(orbit, "d1", "ci-logs").monthlyUsd).toBeCloseTo(1.875, 10);
     // Bob comes before Orbit's id: his today is complete.
-    const bob = await accountUsageReport(t.env.DB, {
+    const bob = await spaceUsageReport(t.env.DB, {
       id: "acc_bob",
-      slug: "bob",
-      display_name: "Bob",
+      slug: "bob-content",
+      displayName: "Bob content",
     });
     expect(bob.asOf).toBe("2026-10-20");
     expect(bob.monthlyUsd).toBeCloseTo(0.3, 10);
@@ -492,57 +541,139 @@ describe("reports from the database", () => {
 
   test("the site sums accounts, counts shared blobs once and totals each account", async () => {
     const t = await setup();
-    const site = await siteUsageReport(t.env.DB);
+    const site = await instanceUsageReport(t.env.DB);
     // The site's collection hasn't finished today.
     expect(site.asOf).toBe("2026-10-19");
     const r2 = site.constructs.find((c) => c.construct === "r2")!;
     expect(r2.lines.map((l) => l.item)).toEqual(["registry_blobs_all"]);
     expect(r2.monthlyUsd).toBeCloseTo(30 * 0.015, 10);
-    expect(site.accounts).toEqual([
+    expect(site.subjects).toEqual([
       // One day of activity measured, extrapolated to 30.
       {
+        scope: "space",
+        id: "acc_org",
         slug: "orbit",
         displayName: "Orbit",
         monthlyUsd: expect.closeTo(1.875 + 0.75 + 0.2 + 0.3 + 0.1 + 2 + 0.8 + 0.12 + CI_USD, 8),
       },
-      { slug: "bob", displayName: "Bob", monthlyUsd: expect.closeTo(0.3, 10) },
+      {
+        scope: "space",
+        id: "acc_bob",
+        slug: "bob-content",
+        displayName: "Bob content",
+        monthlyUsd: expect.closeTo(0.3, 10),
+      },
     ]);
   });
 });
 
-describe("the API", () => {
-  test("an account's administrators see its report; members are refused; others get 404", async () => {
+describe("distinct attribution identities", () => {
+  test("equal person and Space IDs neither merge totals nor expose content through self usage", async () => {
     const t = await setup();
-    const ok = await t.call(t.tokens.ann, "/api/accounts/orbit/usage");
+    insert(t.sqlite, "person", "acc_bob", [
+      storage("2026-10-19", "durable_objects", "Assistant", "bytes", 1e9),
+      storage("2026-10-20", "durable_objects", "Assistant", "bytes", 1e9),
+    ]);
+    const person = await personUsageReport(t.env.DB, {
+      id: "acc_bob",
+      slug: "bob",
+      displayName: "Bob",
+    });
+    expect(person.scope).toBe("person");
+    expect(person.monthlyUsd).toBeCloseTo(0.2, 10);
+    expect(person.knowledgeUpdates).toBeNull();
+    expect(person.constructs.map((c) => c.construct)).toEqual(["durable_objects"]);
+    const instance = await instanceUsageReport(t.env.DB);
+    expect(instance.subjects?.filter((s) => s.id === "acc_bob")).toEqual([
+      {
+        scope: "space",
+        id: "acc_bob",
+        slug: "bob-content",
+        displayName: "Bob content",
+        monthlyUsd: expect.closeTo(0.3, 10),
+      },
+      {
+        scope: "person",
+        id: "acc_bob",
+        slug: "bob",
+        displayName: "Bob",
+        monthlyUsd: expect.closeTo(0.2, 10),
+      },
+    ]);
+    const self = await t.call(t.tokens.bob, "/api/accounts/bob/usage");
+    expect((self.json as UsageReport).monthlyUsd).toBeCloseTo(0.2, 10);
+    expect((await t.call(t.tokens.bob, "/api/spaces/bob-content/usage")).status).toBe(404);
+  });
+});
+
+describe("the API", () => {
+  test("Space admins only; Organization ownership and Instance power confer no content access", async () => {
+    const t = await setup();
+    const ok = await t.call(t.tokens.ann, "/api/spaces/orbit/usage");
     expect(ok.status).toBe(200);
-    expect((ok.json as UsageReport).account).toEqual({ slug: "orbit", displayName: "Orbit" });
-    expect((await t.call(t.tokens.root, "/api/accounts/orbit/usage")).status).toBe(200);
+    expect((ok.json as UsageReport).subject).toEqual({
+      id: "acc_org",
+      slug: "orbit",
+      displayName: "Orbit",
+    });
+    expect((await t.call(t.tokens.root, "/api/spaces/orbit/usage")).status).toBe(404);
     expect((await t.call(t.tokens.bob, "/api/accounts/bob/usage")).status).toBe(200);
-    expect((await t.call(t.tokens.cat, "/api/accounts/orbit/usage")).status).toBe(403);
-    expect((await t.call(t.tokens.bob, "/api/accounts/orbit/usage")).status).toBe(404);
+    expect((await t.call(t.tokens.cat, "/api/spaces/orbit/usage")).status).toBe(403);
+    expect((await t.call(t.tokens.bob, "/api/spaces/orbit/usage")).status).toBe(404);
     expect((await t.call(t.tokens.ann, "/api/accounts/bob/usage")).status).toBe(404);
-    expect((await t.call(t.tokens.ann, "/api/accounts/nobody/usage")).status).toBe(404);
-    expect((await t.call(null, "/api/accounts/orbit/usage")).status).toBe(401);
+    expect((await t.call(t.tokens.root, "/api/accounts/bob/usage")).status).toBe(404);
+    expect((await t.call(t.tokens.ann, "/api/spaces/nobody/usage")).status).toBe(404);
+    expect((await t.call(null, "/api/spaces/orbit/usage")).status).toBe(401);
+  });
+
+  test("grant and membership revocation apply to the next JSON and CSV request", async () => {
+    const t = await setup();
+    expect((await t.call(t.tokens.ann, "/api/spaces/orbit/usage")).status).toBe(200);
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id='acc_org' AND account_id='acc_ann'");
+    expect((await t.call(t.tokens.ann, "/api/spaces/orbit/usage")).status).toBe(404);
+    expect((await t.call(t.tokens.ann, "/api/spaces/orbit/usage?format=csv")).status).toBe(404);
+    t.sqlite
+      .exec(`INSERT INTO space_grants (space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by)
+      VALUES ('acc_org','org_orbit','acc_ann','admin','none','none','test','acc_ann')`);
+    expect((await t.call(t.tokens.ann, "/api/spaces/orbit/usage")).status).toBe(200);
+    t.sqlite.exec(
+      "DELETE FROM organization_members WHERE organization_id='org_orbit' AND account_id='acc_ann'",
+    );
+    expect((await t.call(t.tokens.ann, "/api/spaces/orbit/usage")).status).toBe(404);
+  });
+
+  test("revoked accountable agents cannot retain Space report access", async () => {
+    const t = await setup();
+    t.sqlite.exec(
+      "INSERT INTO agents (id,name,accountable_id) VALUES ('report-agent','Reports','acc_ann')",
+    );
+    const token = (
+      await issueToken(t.env.DB, "acc_ann", "report-agent", "read", undefined, "report-agent")
+    ).secret;
+    expect((await t.call(token, "/api/spaces/orbit/usage")).status).toBe(200);
+    t.sqlite.exec("UPDATE agents SET revoked_at=CURRENT_TIMESTAMP WHERE id='report-agent'");
+    expect((await t.call(token, "/api/spaces/orbit/usage")).status).toBe(401);
+    expect((await t.call(token, "/api/spaces/orbit/usage?format=csv")).status).toBe(401);
   });
 
   test("only site administrators see the site's report", async () => {
     const t = await setup();
     const site = await t.call(t.tokens.root, "/api/admin/usage");
     expect(site.status).toBe(200);
-    expect((site.json as UsageReport).scope).toBe("site");
+    expect((site.json as UsageReport).scope).toBe("instance");
     expect((await t.call(t.tokens.ann, "/api/admin/usage")).status).toBe(403);
     expect((await t.call(null, "/api/admin/usage")).status).toBe(401);
   });
 
   test("CSV export", async () => {
     const t = await setup();
-    const csv = await t.call(t.tokens.ann, "/api/accounts/orbit/usage?format=csv");
+    const csv = await t.call(t.tokens.ann, "/api/spaces/orbit/usage?format=csv");
     expect(csv.status).toBe(200);
     expect(csv.type).toBe("text/csv; charset=utf-8");
     expect(csv.disposition).toBe('attachment; filename="orbit-usage-2026-10-19.csv"');
     expect(csv.text.split("\n")[0]).toMatch(/^construct,item,label,/);
     expect(csv.text).toContain("d1,ci-logs,CI logs,storage,bytes,2500000000,no,");
-    expect((await t.call(t.tokens.cat, "/api/accounts/orbit/usage?format=csv")).status).toBe(403);
+    expect((await t.call(t.tokens.cat, "/api/spaces/orbit/usage?format=csv")).status).toBe(403);
     const site = await t.call(t.tokens.root, "/api/admin/usage?format=csv");
     expect(site.text).toContain("r2,registry_blobs_all,");
   });

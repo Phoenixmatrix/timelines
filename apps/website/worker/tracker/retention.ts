@@ -354,6 +354,9 @@ export function removeClosedIssues(
   sql.exec("DELETE FROM leases WHERE issue_id IN (SELECT value FROM json_each(?))", list);
   sql.exec("DELETE FROM offers WHERE issue_id IN (SELECT value FROM json_each(?))", list);
   // Idempotency receipts that carry them (their results hold whole entities).
+  // space_migration_receipt_proof and space_migration_checkpoint/records are
+  // retained independently: supported pre-cutover replay still relies on the
+  // original actor, request digest and result after ordinary receipts expire.
   const gone = JSON.stringify(entities.flatMap(([, , entityIds]) => entityIds));
   sql.exec(
     `DELETE FROM receipts WHERE EXISTS (
@@ -404,7 +407,7 @@ const PRUNABLE_EVENT = `json_extract(e.data, '$.createdAt') < ?
       WHEN 'comment' THEN EXISTS (SELECT 1 FROM comments x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'request' THEN EXISTS (SELECT 1 FROM requests x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'team' THEN EXISTS (SELECT 1 FROM teams x WHERE x.id = json_extract(e.data, '$.entityId'))
-      WHEN 'workspace' THEN EXISTS (SELECT 1 FROM workspaces x WHERE x.id = json_extract(e.data, '$.entityId'))
+      WHEN 'project' THEN EXISTS (SELECT 1 FROM projects x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'subscription' THEN EXISTS (SELECT 1 FROM subscriptions x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'automation' THEN EXISTS (SELECT 1 FROM approval_automation x WHERE x.person_id = json_extract(e.data, '$.entityId'))
       WHEN 'timeline' THEN EXISTS (SELECT 1 FROM timelines x WHERE x.id = json_extract(e.data, '$.entityId'))

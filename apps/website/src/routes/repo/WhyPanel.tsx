@@ -22,7 +22,7 @@ const slide =
 
 /** The request a selection makes: lines of a file at the commit the page shows. */
 export function whyPath(
-  owner: string,
+  space: string,
   name: string,
   path: string,
   rev: string,
@@ -32,7 +32,7 @@ export function whyPath(
 ) {
   const line = start === end ? `${start}` : `${start}-${end}`;
   return sourceUrl(
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/why?path=${encodeURIComponent(path)}&line=${line}&rev=${encodeURIComponent(rev)}`,
+    `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}/why?path=${encodeURIComponent(path)}&line=${line}&rev=${encodeURIComponent(rev)}`,
     sourceId,
   );
 }
@@ -69,7 +69,7 @@ export function WhyPanel({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const request = whyPath(repo.owner.slug, repo.name, path, rev, start, end, repo.source?.sourceId);
+  const request = whyPath(repo.space.slug, repo.name, path, rev, start, end, repo.source?.sourceId);
   const [state, setState] = useState<{
     request: string;
     result?: WhyResponse;
@@ -142,7 +142,7 @@ function WhyResult({
     <div className="flex flex-col gap-6">
       {!result.tracker.readable && (
         <p className="m-0 rounded-plate bg-sunken px-3 py-2 text-body-sm text-ink-muted">
-          You can't read {result.tracker.owner}'s tracker, so its timelines, checkpoints and
+          You can't read {result.tracker.space}'s tracker, so its timelines, checkpoints and
           approvals aren't shown.
         </p>
       )}
@@ -265,8 +265,8 @@ function Chain({
   path: string;
   onLeave: () => void;
 }) {
-  const { owner, name, defaultBranch } = result.repo;
-  const tracker = result.tracker.owner;
+  const { space, name, defaultBranch } = result.repo;
+  const tracker = result.tracker.space;
   const timelineUrl = (slug: string) =>
     `/tracker/${encodeURIComponent(tracker)}/timelines?tl=${encodeURIComponent(slug)}`;
   const who = (id: string | null) => {
@@ -300,7 +300,7 @@ function Chain({
                 ·{" "}
                 <CommitLink
                   className={`${link} mk-mono`}
-                  owner={owner}
+                  space={space}
                   name={name}
                   sha={commit.oid}
                   onClick={onLeave}
@@ -313,7 +313,7 @@ function Chain({
                 <Link
                   className={link}
                   to={blobUrl(
-                    owner,
+                    space,
                     name,
                     commit.oid,
                     path,
@@ -325,7 +325,7 @@ function Chain({
                 <Link
                   className={link}
                   to={commitsUrl(
-                    owner,
+                    space,
                     name,
                     commit.oid,
                     "",
@@ -406,7 +406,7 @@ function Chain({
               <span key={issue.key} className="flex flex-wrap items-baseline gap-x-2">
                 <Link
                   className={link}
-                  to={`/tracker/${encodeURIComponent(issue.trackerOwner)}/issues/${encodeURIComponent(issue.id)}`}
+                  to={`/tracker/${encodeURIComponent(issue.trackerSpace)}/issues/${encodeURIComponent(issue.id)}`}
                 >
                   {issue.key}
                 </Link>
@@ -527,7 +527,7 @@ function Chain({
                 <Link
                   className={link}
                   to={treeUrl(
-                    owner,
+                    space,
                     name,
                     chain.lineage.integration.canonical.commit,
                     "",
@@ -539,7 +539,7 @@ function Chain({
                 <Link
                   className={link}
                   to={commitsUrl(
-                    owner,
+                    space,
                     name,
                     chain.lineage.integration.source.commit,
                     "",
@@ -571,7 +571,7 @@ function Chain({
             <StepContext
               chain={chain}
               tracker={tracker}
-              repo={`${owner}/${name}`}
+              repo={`${space}/${name}`}
               onLeave={onLeave}
             />
           </Step>
