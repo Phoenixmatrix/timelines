@@ -198,6 +198,18 @@ export interface Collaborator extends AccountSummary {
 }
 
 /** An address allowed to create an account (sign-up is invite only). */
+/** A person's account as a site admin sees it on the Accounts page (CORE-404). */
+export interface PasswordAccount {
+  username: string;
+  displayName: string;
+  email: string;
+  /** False for accounts an admin created: nobody confirmed the address. */
+  emailVerified: boolean;
+  /** Whether the account can sign in with a password. */
+  hasPassword: boolean;
+  createdAt: string;
+}
+
 export interface Invite {
   email: string;
   /** Slug of the admin who invited them. */

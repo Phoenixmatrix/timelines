@@ -44,7 +44,9 @@ import { timelineGraph } from "../timelines/graph.ts";
 import { resolveSource } from "../timelines/sources.ts";
 import { Timing } from "../timing.ts";
 import { tracker } from "../tracker/api.ts";
+import { adminAccounts } from "../api/admin-accounts.ts";
 import { agents } from "../api/agents.ts";
+import { createAuth } from "../better-auth.ts";
 import { Tracker } from "../tracker/object.ts";
 import { fakeProviders, isProviderUrl } from "./ai-providers.ts";
 import { d1, migratedDatabase } from "./d1.ts";
@@ -136,6 +138,8 @@ function createWorld(persona: Persona): string {
     REGISTRY_DB: d1(registryDatabase()),
     DEV_MODE: "true",
     BETTER_AUTH_SECRET: "browser-tests-browser-tests-browser-tests",
+    // Password sign-in counts failures here; nothing is ever locked out.
+    AUTH_FAILURES: { limit: async () => ({ success: true }) },
     // Seals AI provider keys (CORE-294).
     REGISTRY_KEK: btoa("browser-tests-sealing-key-32-bytes"),
     // Tokens and the commits pushed; no trees or blobs.
@@ -229,6 +233,12 @@ app.use(async (c, next) => {
   } else c.set("actor", persona ? await findUserById(c.env.DB, `acc_${persona}`) : null);
   await next();
 });
+// Sign-in (password accounts, CORE-404). A session it starts doesn't change
+// who the world acts as: that stays the persona.
+app.on(["GET", "POST"], "/api/identity/*", async (c) =>
+  (await createAuth(c.env, new URL(c.req.url).origin)).handler(c.req.raw),
+);
+app.route("/api/admin/accounts", adminAccounts);
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
 app.route("/api/agents", agents);
 app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);

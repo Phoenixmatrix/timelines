@@ -1,5 +1,6 @@
-// Real sign-in, with Better Auth: an emailed one-time code for people, and the
-// device authorization flow (RFC 8628) for `gm auth login`.
+// Real sign-in, with Better Auth: an emailed one-time code for people, a
+// password for accounts a site admin created (worker/api/admin-accounts.ts),
+// and the device authorization flow (RFC 8628) for `gm auth login`.
 //
 // A Better Auth user's id is the Gitmatrix account id ("acc_…"), created
 // together with the accounts row on first sign-in, so a session resolves
@@ -8,7 +9,9 @@
 // Sign-up is by invitation: a code is only sent to an existing user, the
 // instance owner (OWNER_EMAIL) or an address an admin invited, and anyone else
 // gets the same "check your email" answer so addresses can't be probed.
-// Failed codes and device approvals count against the email and the client IP
+// Nobody signs themselves up with a password: an admin sets it. People sign
+// in with their username or email and it.
+// Failed codes, passwords and device approvals count against the email and the client IP
 // through the AUTH_FAILURES rate limiter; crossing it locks the key out for
 // LOCKOUT_MS (auth_lockouts).
 
@@ -25,17 +28,58 @@ import { db } from "./schema.ts";
 export const GM_CLIENT_ID = "gm";
 const LOCKOUT_MS = 15 * 60_000;
 
+export const MIN_PASSWORD = 12;
+export const MAX_PASSWORD = 128;
+
 const normalize = (email: string) => email.trim().toLowerCase();
 
-/** Whether an email may receive a code: an existing user, the owner, or invited. */
+/** Who a sign-in names: the email Better Auth looks up, and the key its failures count against. */
+interface SignInIdentity {
+  email: string;
+  key: string;
+}
+
+/**
+ * Who a password sign-in names: an email as given, or a username's. An unknown
+ * username looks up an address no one has, so it fails exactly like a wrong
+ * password; its failures count against the username itself (`user:`), a key
+ * no email can reach, so lockouts don't tell known usernames apart either.
+ */
+async function signInIdentity(env: Env, identifier: string): Promise<SignInIdentity> {
+  const name = normalize(identifier);
+  if (name.includes("@")) return { email: name, key: `email:${name}` };
+  const user = await db(env.DB)
+    .selectFrom("accounts as a")
+    .innerJoin("auth_users as u", "u.id", "a.id")
+    .select("u.email")
+    .where("a.slug", "=", name)
+    .where("a.kind", "=", "user")
+    .executeTakeFirst();
+  if (user) return { email: normalize(user.email), key: `email:${normalize(user.email)}` };
+  return {
+    email: `${name.replace(/[^a-z0-9-]/g, "") || "user"}@users.invalid`,
+    key: `user:${name}`,
+  };
+}
+
+/**
+ * Whether an email may receive a code: an existing user, the owner, or invited.
+ * Not an account a site admin made with a password and an email nobody has
+ * proven (worker/api/admin-accounts.ts): the address may be made up, or
+ * someone else's, and a code sent there would hand them the account (and
+ * Better Auth would drop the password on that first unproven sign-in).
+ */
 export async function mayJoin(env: Env, email: string): Promise<boolean> {
   const address = normalize(email);
   if (address === normalize(env.OWNER_EMAIL)) return true;
   const [user, invite] = await Promise.all([
     db(env.DB)
-      .selectFrom("auth_users")
-      .select("id")
-      .where("email", "=", address)
+      .selectFrom("auth_users as u")
+      .leftJoin("auth_accounts as p", (join) =>
+        join.onRef("p.userId", "=", "u.id").on("p.providerId", "=", "credential"),
+      )
+      .select(["u.id", "u.emailVerified", "p.id as credential"])
+      .where("u.email", "=", address)
       .executeTakeFirst(),
     db(env.DB)
       .selectFrom("auth_invites")
@@ -43,7 +87,8 @@ export async function mayJoin(env: Env, email: string): Promise<boolean> {
       .where("email", "=", address)
       .executeTakeFirst(),
   ]);
-  return Boolean(user || invite);
+  if (user) return Boolean(user.emailVerified) || !user.credential;
+  return Boolean(invite);
 }
 
 /** A slug from the email's local part, made unique against accounts and reserved names. */
@@ -123,10 +168,10 @@ export async function linkAccount(env: Env, user: { id: string; email: string; n
   }
 }
 
-/** Keys a failure counts against: the email (when known) and the client IP. */
-function failureKeys(request: Request | undefined, email?: string): string[] {
+/** Keys a failure counts against: who it names (when known) and the client IP. */
+function failureKeys(request: Request | undefined, key?: string): string[] {
   const ip = request?.headers.get("cf-connecting-ip");
-  return [...(email ? [`email:${normalize(email)}`] : []), ...(ip ? [`ip:${ip}`] : [])];
+  return [...(key ? [key] : []), ...(ip ? [`ip:${ip}`] : [])];
 }
 
 async function lockedOut(env: Env, keys: string[]): Promise<boolean> {
@@ -154,8 +199,51 @@ export async function recordFailure(env: Env, keys: string[]) {
   }
 }
 
-/** Sign-in paths whose failures count: wrong codes and wrong device codes. */
-const GUARDED = new Set(["/sign-in/email-otp", "/device", "/device/approve", "/device/deny"]);
+/** Sign-in paths whose failures count: wrong codes, passwords and device codes. */
+const GUARDED = new Set([
+  "/sign-in/email-otp",
+  "/sign-in/email",
+  "/device",
+  "/device/approve",
+  "/device/deny",
+]);
+
+/** Who a guarded request names, with a password sign-in's username resolved. */
+async function requestIdentity(
+  env: Env,
+  path: string,
+  body: unknown,
+): Promise<SignInIdentity | undefined> {
+  const email = (body as { email?: unknown } | undefined)?.email;
+  if (typeof email !== "string") return undefined;
+  if (path === "/sign-in/email") return signInIdentity(env, email);
+  return { email, key: `email:${normalize(email)}` };
+}
+
+/**
+ * Who each guarded request named, as the before hook resolved it: the after
+ * hook sees the body that hook rewrote (an unknown username's made-up address),
+ * so it reuses this rather than resolving again.
+ */
+const identities = new WeakMap<Request, SignInIdentity>();
+
+/**
+ * Better Auth routes nobody here uses, all ways to set a password or change or
+ * prove an email outside an admin: passwords are set by site admins
+ * (worker/api/admin-accounts.ts) and changed with /change-password.
+ */
+const DISABLED_PATHS = [
+  "/email-otp/request-password-reset",
+  "/email-otp/reset-password",
+  "/forget-password/email-otp",
+  "/request-password-reset",
+  "/reset-password",
+  "/email-otp/request-email-change",
+  "/email-otp/change-email",
+  "/email-otp/verify-email",
+  "/send-verification-email",
+  "/verify-email",
+];
 
 /** Email a sign-in code. A preview sends none: its people are the seeded personas. */
 export async function sendCode(env: Env, email: string, otp: string) {
@@ -183,6 +271,7 @@ export function authOptions(env: Env, secret: string, origin?: string) {
     // /api/auth/ssh is SSH-key sign-in for gm; Better Auth lives beside it.
     basePath: "/api/identity",
     trustedOrigins: baseURL ? [baseURL] : [],
+    disabledPaths: DISABLED_PATHS,
     user: { modelName: "auth_users" },
     session: {
       modelName: "auth_sessions",
@@ -191,6 +280,14 @@ export function authOptions(env: Env, secret: string, origin?: string) {
     },
     account: { modelName: "auth_accounts" },
     verification: { modelName: "auth_verifications" },
+    emailAndPassword: {
+      enabled: true,
+      // Invite only: site admins create password accounts, nobody else.
+      disableSignUp: true,
+      minPasswordLength: MIN_PASSWORD,
+      maxPasswordLength: MAX_PASSWORD,
+      revokeSessionsOnPasswordReset: true,
+    },
     // Failures are limited by AUTH_FAILURES; Better Auth's own limiter keeps
     // in-memory state, which a Worker can't share between isolates.
     rateLimit: { enabled: false },
@@ -237,19 +334,38 @@ export function authOptions(env: Env, secret: string, origin?: string) {
     },
     hooks: {
       before: createAuthMiddleware(async (ctx) => {
+        // Codes only sign in: none reset a password or verify an address.
+        if (ctx.path === "/email-otp/send-verification-otp" && ctx.body?.type !== "sign-in")
+          throw new APIError("BAD_REQUEST", { message: "Only sign-in codes are sent." });
         if (!GUARDED.has(ctx.path)) return;
-        const email = typeof ctx.body?.email === "string" ? ctx.body.email : undefined;
-        if (await lockedOut(env, failureKeys(ctx.request, email)))
+        const identity = await requestIdentity(env, ctx.path, ctx.body);
+        if (identity && ctx.request) identities.set(ctx.request, identity);
+        if (await lockedOut(env, failureKeys(ctx.request, identity?.key)))
           throw new APIError("TOO_MANY_REQUESTS", {
             message: "Too many failed attempts. Try again in 15 minutes.",
           });
+        // No code was sent to an address that may not join (see mayJoin):
+        // refuse a guessed one like any wrong code.
+        if (
+          ctx.path === "/sign-in/email-otp" &&
+          identity &&
+          !(await mayJoin(env, identity.email))
+        ) {
+          await recordFailure(env, failureKeys(ctx.request, identity.key));
+          throw APIError.from("BAD_REQUEST", { code: "INVALID_OTP", message: "Invalid OTP" });
+        }
+        // A password sign-in may name a username; Better Auth wants the email.
+        if (ctx.path === "/sign-in/email" && identity)
+          return { context: { body: { ...ctx.body, email: identity.email } } };
       }),
       after: createAuthMiddleware(async (ctx) => {
         if (!GUARDED.has(ctx.path)) return;
         const returned = ctx.context.returned;
         if (!(returned instanceof APIError)) return;
-        const email = typeof ctx.body?.email === "string" ? ctx.body.email : undefined;
-        await recordFailure(env, failureKeys(ctx.request, email));
+        const identity =
+          (ctx.request && identities.get(ctx.request)) ??
+          (await requestIdentity(env, ctx.path, ctx.body));
+        await recordFailure(env, failureKeys(ctx.request, identity?.key));
       }),
     },
   } satisfies BetterAuthOptions;

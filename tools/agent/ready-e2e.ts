@@ -43,6 +43,7 @@ export const e2eScenarioNames = [
   "repository-deletion-purges-everything-and-resumes",
   "assistant-chats-expire",
   "auth-hygiene-keeps-sign-in-and-tokens-working",
+  "password-accounts-admin-create-sign-in-and-reset",
   "push-log-retention-and-unreachable-git",
   "browser-personas-persisted-product-state",
   "browser-atlas-smoke",
@@ -124,6 +125,7 @@ export const prerequisites: Readonly<Record<ScenarioName, readonly ScenarioName[
   "repository-deletion-purges-everything-and-resumes": [],
   "assistant-chats-expire": [],
   "auth-hygiene-keeps-sign-in-and-tokens-working": [],
+  "password-accounts-admin-create-sign-in-and-reset": [],
   "push-log-retention-and-unreachable-git": [],
   // Browser asserts the completed issue's note, successful CI run and package 2.0.0.
   "browser-personas-persisted-product-state": [
@@ -287,6 +289,7 @@ export const scenarioAreas: Readonly<Record<ScenarioName, readonly E2EArea[]>> =
   ],
   "assistant-chats-expire": ["retention", "assistant", "durable"],
   "auth-hygiene-keeps-sign-in-and-tokens-working": ["gm", "auth", "retention"],
+  "password-accounts-admin-create-sign-in-and-reset": ["gm", "auth"],
   "push-log-retention-and-unreachable-git": ["git-transport", "retention", "usage"],
   "browser-personas-persisted-product-state": ["tracker", "ci", "packages", "repos"],
   "browser-atlas-smoke": ["gm", "atlas"],
@@ -325,6 +328,7 @@ const browserScenarios: readonly ScenarioName[] = [
   "tracker-retention-removes-closed-issues-and-replicas-converge",
   "assistant-chats-expire",
   "auth-hygiene-keeps-sign-in-and-tokens-working",
+  "password-accounts-admin-create-sign-in-and-reset",
   "browser-personas-persisted-product-state",
   "browser-atlas-smoke",
   "browser-timeline-scope-round-trip",
@@ -345,6 +349,8 @@ const routeScenarios: Readonly<Record<string, readonly ScenarioName[]>> = {
     "browser-data-retention-account-and-site",
   ],
   "apps/website/src/routes/DataRetention.tsx": ["browser-data-retention-account-and-site"],
+  // Creates an account and sets a new password, then signs in with each.
+  "apps/website/src/routes/Accounts.tsx": ["password-accounts-admin-create-sign-in-and-reset"],
 };
 
 /** A changed path's E2E consumers: areas, specific scenarios and the mirror stage. */
@@ -450,7 +456,7 @@ const rules: readonly (readonly [RegExp, E2ETarget | typeof AGENTS_FULL])[] = [
   [worker("(?:better-auth|ssh|preview|preview-gate)\\.ts$"), { areas: ["auth"] }],
   [worker("api/repos\\.ts$"), { areas: ["repos", "sources"] }],
   [worker("api/(?:agents|personal-skills|environments)\\.ts$"), { areas: ["agents"] }],
-  [worker("api/(?:tokens|invites|ssh)\\.ts$"), { areas: ["auth"] }],
+  [worker("api/(?:tokens|invites|ssh|admin-accounts)\\.ts$"), { areas: ["auth"] }],
   [worker("api/accounts\\.ts$"), { areas: ["accounts", "auth"] }],
   [worker("api/bytes\\.ts$"), { areas: ["accounts", "steps"] }],
   // Fixture endpoints of particular journeys (landing and legacy sources are main-only).

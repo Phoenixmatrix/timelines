@@ -51,6 +51,7 @@ const labels: Record<string, string> = {
   "settings/retention": "Data retention",
   "settings/site-retention": "Site data retention",
   "settings/invites": "Invites",
+  "settings/accounts": "Accounts",
   "settings/ssh-keys": "SSH keys",
   "cli-auth/npm/:id": "Authorize npm",
   "tracker/:owner": "Issues",

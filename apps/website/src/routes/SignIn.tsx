@@ -9,7 +9,7 @@ import {
   useNavigation,
   useSearchParams,
 } from "react-router";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { Persona, RepoSummary, SessionResponse, Viewer } from "../../shared/api.ts";
 import { AuthFrame, CodeCells, Ledger, Step } from "../components/AuthFrame.tsx";
 import { Monogram } from "../components/Monogram.tsx";
@@ -34,6 +34,8 @@ function safeNext(next: string | null): string {
 
 type SignInResult =
   | { step: "code"; email: string; sentAt: string; error?: string }
+  | { step: "password"; identifier: string; error: string }
+  | { step: "signed-in"; identifier: string; signedInAt: string; name: string; next: string }
   | { step: "done"; email: string; sentAt: string; signedInAt: string; name: string; next: string }
   | { error: string; email?: string };
 
@@ -70,6 +72,33 @@ export async function signInAction({ request }: { request: Request }) {
     if (sent && typeof sent === "object" && "error" in sent)
       return { error: String(sent.error), email } satisfies SignInResult;
     return { step: "code", email, sentAt: new Date().toISOString() } satisfies SignInResult;
+  }
+  if (intent === "password") {
+    const identifier = field(form, "identifier").trim();
+    try {
+      await api("/identity/sign-in/email", {
+        method: "POST",
+        json: { email: identifier, password: field(form, "password") },
+      });
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      return {
+        step: "password",
+        identifier,
+        error:
+          error.status === 429
+            ? error.message
+            : "That username or password isn't right. Ask your admin if you've forgotten it.",
+      } satisfies SignInResult;
+    }
+    const { viewer } = await api<SessionResponse>("/session");
+    return {
+      step: "signed-in",
+      identifier,
+      signedInAt: new Date().toISOString(),
+      name: viewer?.displayName ?? identifier,
+      next: safeNext(url.searchParams.get("next")),
+    } satisfies SignInResult;
   }
   if (intent === "verify") {
     const email = field(form, "email");
@@ -110,7 +139,10 @@ function EmailLedger() {
   const [params] = useSearchParams();
   const busy = navigation.state !== "idle" ? navigation.formData?.get("intent") : null;
   const action = `/signin?${params.toString()}`;
-  const sent = result && "step" in result ? result : null;
+  const sent =
+    result && "step" in result && (result.step === "code" || result.step === "done")
+      ? result
+      : null;
   const signedIn = sent?.step === "done" ? sent : null;
   const navigate = useNavigate();
   useEffect(() => {
@@ -206,6 +238,100 @@ function EmailLedger() {
         last
       />
     </Ledger>
+  );
+}
+
+/** A password an admin set (CORE-404), by username or email. */
+function PasswordLedger() {
+  const result = useActionData<SignInResult | undefined>();
+  const navigation = useNavigation();
+  const [params] = useSearchParams();
+  const busy = navigation.state !== "idle" && navigation.formData?.get("intent") === "password";
+  const failed = result && "step" in result && result.step === "password" ? result : null;
+  const signedIn = result && "step" in result && result.step === "signed-in" ? result : null;
+  const passwordRef = useRef<HTMLInputElement>(null);
+  // A wrong password is cleared for the next try; the username stays.
+  useEffect(() => {
+    if (!failed || !passwordRef.current) return;
+    passwordRef.current.value = "";
+    passwordRef.current.focus();
+  }, [failed]);
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!signedIn) return;
+    const timer = setTimeout(() => void navigate(signedIn.next), 900);
+    return () => clearTimeout(timer);
+  }, [signedIn, navigate]);
+
+  return (
+    <Ledger label="Sign-in steps">
+      <Step
+        state={signedIn ? "done" : "active"}
+        title="Password"
+        value={signedIn?.identifier}
+        time={signedIn?.signedInAt}
+      >
+        <Form method="post" action={`/signin?${params.toString()}`} className="flex flex-col gap-3">
+          <input type="hidden" name="intent" value="password" />
+          <input
+            className="mk-input"
+            name="identifier"
+            aria-label="Username or email"
+            placeholder="Username or email"
+            autoComplete="username"
+            autoCapitalize="none"
+            spellCheck={false}
+            defaultValue={failed?.identifier}
+            required
+            autoFocus
+          />
+          <input
+            className="mk-input"
+            type="password"
+            name="password"
+            ref={passwordRef}
+            aria-label="Password"
+            placeholder="Password"
+            autoComplete="current-password"
+            aria-invalid={failed ? true : undefined}
+            aria-describedby={failed ? "password-error" : undefined}
+            required
+          />
+          {failed && (
+            <p id="password-error" role="alert" className="mk-error m-0">
+              {failed.error}
+            </p>
+          )}
+          <div>
+            <button className="mk-btn mk-btn--primary" disabled={busy}>
+              {busy ? "Signing in…" : "Sign in"}
+            </button>
+          </div>
+        </Form>
+      </Step>
+      <Step
+        state={signedIn ? "done" : "waiting"}
+        title="Signed in"
+        value={signedIn ? `as ${signedIn.name}` : undefined}
+        time={signedIn?.signedInAt}
+        last
+      />
+    </Ledger>
+  );
+}
+
+/** Switch between an emailed code and a password, keeping where to go next. */
+function MethodSwitch({ password }: { password: boolean }) {
+  const [params] = useSearchParams();
+  const next = new URLSearchParams(params);
+  if (password) next.delete("with");
+  else next.set("with", "password");
+  return (
+    <p className="mt-6 mb-0 text-body-sm">
+      <Link to={`/signin?${next.toString()}`} className="text-ink-muted hover:text-ink">
+        {password ? "Email me a code instead" : "Sign in with a password"}
+      </Link>
+    </p>
   );
 }
 
@@ -313,6 +439,7 @@ export function SignIn() {
   const viewer = useViewer();
   const [params] = useSearchParams();
   const actionData = useActionData<SignInResult | undefined>();
+  const password = params.get("with") === "password";
 
   return (
     <AuthFrame
@@ -326,12 +453,17 @@ export function SignIn() {
     >
       <h1 className="m-0 text-headline">Sign in</h1>
       <p className="mt-2 mb-0 max-w-[48ch] text-ink-muted">
-        Timelines is invite only. We'll email you a one-time code; there's no password to remember.
+        {password
+          ? "Timelines is invite only. Use the username or email and the password your admin gave you."
+          : "Timelines is invite only. We'll email you a one-time code; there's no password to remember."}
       </p>
       {viewer && !params.has("switch") && !actionData ? (
         <SignedInLedger viewer={viewer} />
       ) : (
-        <EmailLedger />
+        <>
+          {password ? <PasswordLedger /> : <EmailLedger />}
+          <MethodSwitch password={password} />
+        </>
       )}
       {personas.length > 0 && <Personas personas={personas} hasRepos={hasRepos} />}
     </AuthFrame>

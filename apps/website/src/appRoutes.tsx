@@ -42,6 +42,7 @@ import { SemanticChanges } from "./routes/repo/SemanticChanges.tsx";
 import { SignIn, signInAction, signInLoader } from "./routes/SignIn.tsx";
 import { Device, deviceAction, deviceLoader } from "./routes/Device.tsx";
 import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
+import { Accounts, accountsAction, accountsLoader } from "./routes/Accounts.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { Preferences, preferencesLoader } from "./routes/Preferences.tsx";
 import { AiProviders, aiProvidersLoader } from "./routes/AiProviders.tsx";
@@ -252,6 +253,12 @@ export const routes: RouteObject[] = withPageTitles([
             path: "settings/site-retention",
             loader: siteRetentionLoader,
             Component: SiteRetention,
+          },
+          {
+            path: "settings/accounts",
+            loader: accountsLoader,
+            action: accountsAction,
+            Component: Accounts,
           },
           {
             path: "settings/invites",

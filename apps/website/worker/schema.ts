@@ -152,6 +152,14 @@ export interface Database {
     createdAt: string;
     updatedAt: string;
   };
+  auth_accounts: {
+    id: string;
+    userId: string;
+    /** "credential" holds a password (worker/api/admin-accounts.ts). */
+    providerId: string;
+    /** Better Auth's scrypt hash; null for other providers. */
+    password: string | null;
+  };
   auth_invites: {
     email: string;
     invited_by: string | null;

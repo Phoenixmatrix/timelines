@@ -523,6 +523,9 @@ pub enum AuthCommand {
     /// SSH keys registered for signing in (`gm auth login --ssh`)
     #[command(subcommand)]
     SshKey(SshKeyCommand),
+    /// Password accounts a site admin creates (site admins, as a person)
+    #[command(subcommand)]
+    Account(AccountCommand),
     /// Git credential helper: lets plain git use your gm sign-in, SSH keys included
     GitCredential {
         /// What git asks for: get, store or erase.
@@ -532,6 +535,39 @@ pub enum AuthCommand {
     Status,
     /// Forget the stored token
     Logout,
+}
+
+#[derive(Subcommand)]
+pub enum AccountCommand {
+    /// List password accounts
+    List,
+    /// Create a password account; without --password-stdin a password is generated and shown once
+    Create {
+        /// Username (lowercase letters, digits and dashes).
+        #[arg(long)]
+        username: String,
+        /// Email address; they can sign in with it too.
+        #[arg(long)]
+        email: String,
+        /// Display name (default: the username).
+        #[arg(long)]
+        name: Option<String>,
+        /// Read the password (12-128 characters) from stdin instead of generating one.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Set a new password for an account; its sessions end
+    Password {
+        /// The account's username.
+        username: String,
+        /// Read the password (12-128 characters) from stdin instead of generating one.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Also revoke the account's access tokens (gm, agents, CI). Browser
+        /// sessions always end.
+        #[arg(long)]
+        revoke_tokens: bool,
+    },
 }
 
 #[derive(Subcommand)]

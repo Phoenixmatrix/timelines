@@ -183,6 +183,7 @@ await test("representative paths select their areas' journeys", () => {
       "tracker-retention-removes-closed-issues-and-replicas-converge",
       "assistant-chats-expire",
       "auth-hygiene-keeps-sign-in-and-tokens-working",
+      "password-accounts-admin-create-sign-in-and-reset",
       "browser-personas-persisted-product-state",
       "browser-atlas-smoke",
       "browser-timeline-scope-round-trip",

@@ -1,10 +1,10 @@
 //! Commands for the Timelines server itself: sign-in, repositories, raw API.
 
 use super::Ctx;
-use crate::cli::{AuthCommand, MirrorCommand, RepoCommand};
+use crate::cli::{AccountCommand, AuthCommand, MirrorCommand, RepoCommand};
 use crate::model::Json;
 use crate::output::{GmError, Result, exit};
-use crate::remote::{self, Config};
+use crate::remote::{self, Acting, Config};
 use serde_json::{Value, json};
 use std::io::Read;
 
@@ -64,6 +64,7 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
             finish_token_login(config, secret, "token")
         }
         AuthCommand::SshKey(command) => ssh_key(ctx, &config, command),
+        AuthCommand::Account(command) => account(ctx, command),
         AuthCommand::GitCredential { .. } => unreachable!("handled in main"),
         AuthCommand::Status => {
             if config.token()?.is_none() && !config.uses_ssh() {
@@ -111,6 +112,89 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
             ))
         }
     }
+}
+
+const PASSWORD_ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PASSWORD_NOTE: &str = "Shown once: give it to them over a private channel. They can sign in with their username or email.";
+
+/// 24 characters from an alphabet without look-alikes, drawn from the OS RNG.
+fn generate_password() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..24)
+        .map(|_| PASSWORD_ALPHABET[rng.random_range(0..PASSWORD_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// One trailing newline (LF or CRLF) is the pipe's, not the password's.
+fn trim_stdin_password(raw: &str) -> &str {
+    let raw = raw.strip_suffix('\n').unwrap_or(raw);
+    raw.strip_suffix('\r').unwrap_or(raw)
+}
+
+/// The password to set and whether gm generated it (and so must show it).
+fn account_password(from_stdin: bool) -> Result<(String, bool)> {
+    if !from_stdin {
+        return Ok((generate_password(), true));
+    }
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+    let password = trim_stdin_password(&raw);
+    if password.is_empty() {
+        return Err(GmError::usage(
+            "--password-stdin read nothing; pipe the password in.",
+        ));
+    }
+    Ok((password.to_string(), false))
+}
+
+/// Password accounts: site admins only, always as the person, never the agent.
+fn account(ctx: &Ctx, command: &AccountCommand) -> Result<Json> {
+    let mut config = Config::load();
+    config.acting = Acting::Person;
+    let (method, path, mut body, generated) = match command {
+        AccountCommand::List => {
+            return Ok(Json(remote::api(&config, "GET", "/admin/accounts", None)?));
+        }
+        AccountCommand::Create {
+            username,
+            email,
+            name,
+            password_stdin,
+        } => {
+            let (password, generated) = account_password(*password_stdin)?;
+            let mut body = json!({ "username": username, "email": email, "password": password });
+            if let Some(name) = name {
+                body["displayName"] = json!(name);
+            }
+            ("POST", "/admin/accounts".to_string(), body, generated)
+        }
+        AccountCommand::Password {
+            username,
+            password_stdin,
+            revoke_tokens,
+        } => {
+            let (password, generated) = account_password(*password_stdin)?;
+            (
+                "PUT",
+                format!("/admin/accounts/{}/password", super::pkg::encode(username)),
+                json!({ "password": password, "revokeTokens": revoke_tokens }),
+                generated,
+            )
+        }
+    };
+    if ctx.dry_run {
+        body["password"] = json!("<redacted>");
+        return Ok(Json(
+            json!({ "dry_run": true, "method": method, "path": path, "request": body }),
+        ));
+    }
+    let mut out = remote::api(&config, method, &path, Some(&body))?;
+    if generated {
+        out["password"] = body["password"].take();
+        out["note"] = json!(PASSWORD_NOTE);
+    }
+    Ok(Json(out))
 }
 
 /// Save a personal access token as the sign-in, after checking the server takes it.
@@ -597,5 +681,62 @@ fn mirror(ctx: &Ctx, config: &Config, command: &MirrorCommand) -> Result<Json> {
             remote::api(config, "DELETE", &format!("/repos/{repo}/mirror"), None)?;
             Ok(Json(json!({ "removed": repo })))
         }
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    #[test]
+    fn generated_passwords_are_24_unambiguous_characters() {
+        let a = generate_password();
+        assert_eq!(a.len(), 24);
+        assert!(a.bytes().all(|b| PASSWORD_ALPHABET.contains(&b)));
+        assert!(!a.contains(['0', 'O', '1', 'l', 'I']));
+        assert_ne!(a, generate_password());
+    }
+
+    #[test]
+    fn stdin_passwords_lose_one_trailing_newline_only() {
+        assert_eq!(trim_stdin_password("secret-pass\n"), "secret-pass");
+        assert_eq!(trim_stdin_password("secret-pass\r\n"), "secret-pass");
+        assert_eq!(trim_stdin_password("secret-pass\n\n"), "secret-pass\n");
+        assert_eq!(trim_stdin_password(" spaced \n"), " spaced ");
+        assert_eq!(trim_stdin_password("\n"), "");
+    }
+
+    #[test]
+    fn account_commands_parse() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "gm",
+            "auth",
+            "account",
+            "create",
+            "--username",
+            "ada",
+            "--email",
+            "a@b.co",
+            "--name",
+            "Ada",
+            "--password-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth(AuthCommand::Account(
+                AccountCommand::Create {
+                    password_stdin: true,
+                    ..
+                }
+            )))
+        ));
+        assert!(
+            Cli::try_parse_from(["gm", "auth", "account", "create", "--username", "ada"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["gm", "auth", "account", "password", "ada"]).is_ok());
+        assert!(Cli::try_parse_from(["gm", "auth", "account", "list"]).is_ok());
     }
 }

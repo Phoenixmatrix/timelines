@@ -17,6 +17,24 @@ gm push --queue                 # explicitly submit for merge/gates; not landed 
 `gm cli guide` prints the whole workflow in one page; it is written to be pasted
 into an AGENTS.md.
 
+## Password accounts
+
+A human site admin can give someone a username and password with
+`gm auth account` (agent tokens are refused):
+
+```bash
+gm auth account list
+gm auth account create --username ada --email ada@example.com --name "Ada Lovelace"
+gm auth account password ada            # reset; ends their browser sessions
+gm auth account password ada --revoke-tokens   # and their access tokens
+```
+
+Passwords never go on the command line. Without `--password-stdin` gm generates
+a 24-character one and prints it once as `password`; give it to them over a
+private channel. With `--password-stdin` gm reads it from stdin (12-128
+characters) and never prints it. They sign in with their username or email.
+`--dry-run` shows the request with the password redacted.
+
 ## Queued pushes
 
 `gm push --queue [--issue KEY_OR_ID ...]` stages the selected commit and admits

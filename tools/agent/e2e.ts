@@ -4349,6 +4349,75 @@ export async function runE2E(
     record({ written: Object.keys(written), dry: dry.items, removed: removed.items });
   });
 
+  await scenario("password-accounts-admin-create-sign-in-and-reset", async () => {
+    // CORE-404, in the real runtime: a site admin's gm creates an account with
+    // a made-up, never-verified email and a generated password; the person
+    // signs in with their username in a browser; a new password ends that
+    // session; and no one else may create an account.
+    const username = `pw-${randomUUID().slice(0, 8)}`;
+    const email = `${username}@example.invalid`;
+    type Created = { account: { username: string; emailVerified: boolean }; password: string };
+    const created = JSON.parse(
+      await gm(
+        ["auth", "account", "create", "--username", username, "--email", email, "--name", "Demo"],
+        "priya",
+      ),
+    ) as Created;
+    secrets.add(created.password);
+    assert.equal(created.account.username, username);
+    assert.equal(created.account.emailVerified, false);
+    assert.equal(created.password.length, 24);
+    await gm(
+      ["auth", "account", "create", "--username", `${username}-x`, "--email", `x-${email}`],
+      "marco",
+      work,
+      /site admins/,
+    );
+    const listed = JSON.parse(await gm(["auth", "account", "list"], "priya")) as {
+      accounts: { username: string; hasPassword: boolean }[];
+    };
+    assert(listed.accounts.some((a) => a.username === username && a.hasPassword));
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      const signIn = async (password: string) => {
+        await page.goto("/signin?with=password");
+        await page.getByLabel("Username or email").fill(username);
+        await page.getByLabel("Password").fill(password);
+        await page.getByRole("button", { name: "Sign in" }).click();
+      };
+      await signIn("not the password at all");
+      await expect(page.getByRole("alert")).toContainText("That username or password isn't right");
+      await signIn(created.password);
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      const session = async () =>
+        (await (await page.request.get("/api/session")).json()) as {
+          viewer: { slug: string } | null;
+        };
+      assert.equal((await session()).viewer?.slug, username);
+
+      const reset = JSON.parse(await gm(["auth", "account", "password", username], "priya")) as {
+        sessionsRevoked: number;
+        password: string;
+      };
+      secrets.add(reset.password);
+      assert.equal(reset.sessionsRevoked, 1);
+      assert.equal((await session()).viewer, null, "A new password ends the session");
+      await signIn(created.password);
+      await expect(page.getByRole("alert")).toBeVisible();
+      await signIn(reset.password);
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      assert.equal((await session()).viewer?.slug, username);
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+    record({ username, sessionsRevoked: 1 });
+  });
+
   await scenario("push-log-retention-and-unreachable-git", async () => {
     // CORE-202 with real Artifacts, in jun's own account (the cleanup is
     // per account): a deleted branch leaves a commit no ref reaches.

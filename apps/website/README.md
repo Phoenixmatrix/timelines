@@ -237,6 +237,23 @@ anyone else gets the same "check your email" answer. Failed codes and device
 approvals count against the email and the IP through the `AUTH_FAILURES`
 rate-limit binding; past the limit the key is locked out for 15 minutes.
 
+**Password accounts** (CORE-404) are the one way in without an invitation. A
+site admin, as a person (agent tokens are refused), creates one at
+`/settings/accounts` or with `gm auth account create`: a username, an email
+that is never verified (a made-up one is fine for demos; the owner's is
+refused) and a password of 12 to 128 characters. The person signs in at
+`/signin?with=password` with their username or email. Wrong passwords count
+against the same limiter; an unknown username fails exactly like a wrong
+password and is locked out under its own `user:` key, so neither reveals which
+usernames exist. No sign-in code is ever sent to an address nobody proved
+(`mayJoin`): it may be someone else's, and that code would hand them the
+account. Nobody sets their own password except with `/change-password` while
+signed in: password sign-up is off (`disableSignUp`) and Better Auth's reset,
+email-change and email-verification routes are disabled (`DISABLED_PATHS`). An
+admin can set a new password on any account with an email
+(`gm auth account password`); that ends its browser sessions, and with
+`--revoke-tokens` (a checkbox on the page) its access tokens too.
+
 - **Locally**, codes print in the dev server's log (the Email Service binding
   only simulates delivery), and hello@fward.me is the seeded superuser `fward`,
   reachable by email code or as a persona.
@@ -726,6 +743,7 @@ never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 | `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)                           |
 | `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                                 |
 | `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                                      |
+| `GET\|POST /api/admin/accounts`, `PUT /api/admin/accounts/:username/password`             | Password accounts: create, list, set a new password (site admins, as a person) |
 
 ### Renaming a repository in place
 

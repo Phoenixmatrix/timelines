@@ -10,6 +10,7 @@ import {
   RobotIcon,
   SlidersHorizontalIcon,
   UserCircleIcon,
+  UserPlusIcon,
   UsersThreeIcon,
   type Icon,
 } from "@phosphor-icons/react";
@@ -93,6 +94,11 @@ export function SettingsPage({
                 label: "Invitations",
                 to: `/settings/invites${accountQuery}`,
                 icon: EnvelopeSimpleIcon,
+              },
+              {
+                label: "Accounts",
+                to: `/settings/accounts${accountQuery}`,
+                icon: UserPlusIcon,
               },
               {
                 label: "Site AI settings",
