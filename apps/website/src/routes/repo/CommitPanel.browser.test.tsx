@@ -4,12 +4,15 @@
 // cited issues linked only when they resolve, CI, packages, deployments and
 // files); Escape closes it back to the page; a SHA link opens it in place
 // and closing goes Back; parents open in the panel; a short hash resolves;
-// bad hashes say so; and it fits a phone. The in-memory repositories have no
-// git objects or CI, so commits, runs, publishes, deployments and the why
-// chain are canned; issues come from the real tracker and search.
+// bad hashes say so; and it fits a phone. Deployment presence is lazy and
+// source-scoped even for records outside CI, independently of commit presence.
+// The in-memory repositories have no git objects or CI, so commits, runs,
+// publishes, deployments and the why chain are canned; issues come from the real tracker and search.
 
-import { expect, test } from "vite-plus/test";
+import { act } from "react";
+import { expect, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
+import type { AgentPresence } from "../../../shared/agent-presence.ts";
 import type { CiRunList, CiRunSummary, RepoDetail } from "../../../shared/api.ts";
 import type { Deployment, DeploymentList } from "../../../shared/deployments.ts";
 import type { CommitDiff } from "../../../shared/diff.ts";
@@ -391,6 +394,120 @@ test("on a work source's page it reads the commit from that source (CORE-296)", 
   expect(read(`/commits/${head}/diff`)).toContain("work_1");
   await expect.poll(() => read("/why")).toContain("work_1");
   await expect.poll(() => read("/ci")).toContain("work_1");
+});
+
+test("non-CI deployment observers are lazy, source-scoped and poll only the expanded row", async () => {
+  const { server, head } = await world();
+  const now = new Date().toISOString();
+  const deployments: Deployment[] = [41, 42].map((id) => ({
+    id,
+    sourceId: `source_${id}`,
+    environment: `external-${id}`,
+    timeline: null,
+    timelineId: null,
+    checkpoint: null,
+    commit: head,
+    url: `https://deploy-${id}.example.dev`,
+    status: "active",
+    run: null,
+    job: null,
+    actor: "marco",
+    agent: null,
+    expiresAt: null,
+    expiryPinned: false,
+    revived: false,
+    rebuiltFrom: null,
+    tornDownAt: null,
+    teardownRun: null,
+    createdAt: now,
+    updatedAt: now,
+  }));
+  server.on("GET", "/api/repos/:owner/:name/deployments", () => ({ deployments, next: null }));
+  const presence = (name: string): AgentPresence => ({
+    agents: [
+      {
+        id: name,
+        name,
+        accountable: { slug: "marco", displayName: "Marco" },
+        lastSeenAt: now,
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      },
+    ],
+    asOf: now,
+    windowSeconds: 600,
+    truncated: false,
+  });
+  server.on("GET", "/api/repos/:owner/:name/commits/:oid/presence", () =>
+    presence("commit observer"),
+  );
+  server.on("GET", "/api/repos/:owner/:name/deployments/:id/presence", ({ params }) =>
+    presence(`deployment observer ${params.id}`),
+  );
+  const mark = server.requests.length;
+  const reads = (resource: string) =>
+    server
+      .since(mark, `/api/repos/orbit/engine/${resource}`)
+      .filter((request) => request.url.pathname.endsWith("/presence"));
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  try {
+    renderApp(`/orbit/engine?commit=${head}`);
+    const dialog = panel(head);
+    const section = dialog.getByRole("region", { name: /Deployments and previews/ });
+    const toggles = section.getByRole("button", { name: "Agents seen recently" });
+    await expect.element(toggles.first()).toBeVisible();
+    await expect.element(dialog.getByText("commit observer", { exact: true })).toBeVisible();
+    await expect
+      .element(section.getByRole("link", { name: "deploy-41.example.dev" }))
+      .toHaveAttribute("href", "https://deploy-41.example.dev");
+    expect(section.getByRole("link", { name: /run #/ }).elements()).toHaveLength(0);
+    expect(reads("deployments")).toHaveLength(0);
+
+    await userEvent.click(toggles.first());
+    await expect
+      .element(section.getByText("deployment observer 41", { exact: true }))
+      .toBeVisible();
+    expect(
+      reads("deployments").map((request) => [
+        request.url.pathname,
+        request.url.searchParams.get("source"),
+      ]),
+    ).toEqual([["/api/repos/orbit/engine/deployments/41/presence", "source_41"]]);
+    await userEvent.click(toggles.last());
+    await expect
+      .element(section.getByText("deployment observer 42", { exact: true }))
+      .toBeVisible();
+    await expect
+      .element(section.getByText("deployment observer 41", { exact: true }))
+      .not.toBeInTheDocument();
+    await expect.element(toggles.first()).toHaveAttribute("aria-expanded", "false");
+    await expect.element(toggles.last()).toHaveAttribute("aria-expanded", "true");
+    expect(reads("deployments/42")[0]?.url.searchParams.get("source")).toBe("source_42");
+
+    const firstCount = reads("deployments/41").length;
+    const secondCount = reads("deployments/42").length;
+    const commitCount = reads("commits").length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    await expect.poll(() => reads("deployments/42").length).toBeGreaterThan(secondCount);
+    await expect.poll(() => reads("commits").length).toBeGreaterThan(commitCount);
+    expect(reads("deployments/41")).toHaveLength(firstCount);
+
+    await userEvent.click(toggles.last());
+    await expect
+      .element(section.getByText("deployment observer 42", { exact: true }))
+      .not.toBeInTheDocument();
+    const collapsedCount = reads("deployments").length;
+    const ongoingCommitCount = reads("commits").length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    await expect.poll(() => reads("commits").length).toBeGreaterThan(ongoingCommitCount);
+    expect(reads("deployments")).toHaveLength(collapsedCount);
+    await expect.element(dialog.getByText("commit observer", { exact: true })).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("a SHA link opens it in place, parents open inside, and closing goes Back to the page", async () => {

@@ -6,6 +6,7 @@ import type {
   ClassificationModel,
   GenerationModel,
 } from "../shared/ai.ts";
+import type { AgentPresenceTarget } from "../shared/agent-presence.ts";
 import type { QueueStatus } from "../shared/merge-queue.ts";
 
 /**
@@ -227,6 +228,15 @@ export interface Database {
     revoked_at: string | null;
     capabilities: Generated<string | null>;
     capabilities_updated_at: Generated<string | null>;
+  };
+  agent_presence: {
+    id: Generated<number>;
+    target_kind: AgentPresenceTarget["kind"];
+    scope_id: string;
+    resource_id: string;
+    source_id: string;
+    agent_id: string;
+    last_seen_at: string;
   };
   tracker_preferences: {
     user_id: string;

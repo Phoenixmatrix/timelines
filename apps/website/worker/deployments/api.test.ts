@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { describe, expect, test, vi } from "vite-plus/test";
+import type { AgentPresence } from "../../shared/agent-presence.ts";
 import {
   branchEnvironment,
   type Deployment,
@@ -75,6 +76,7 @@ async function setup() {
     ended: await mintJobToken(env.DB, "job4", 30),
   };
   const call = async (token: string, method: string, path: string, body?: unknown) => {
+    const pending: Promise<unknown>[] = [];
     const response = await app.request(
       path,
       {
@@ -83,7 +85,15 @@ async function setup() {
         body: body === undefined ? undefined : JSON.stringify(body),
       },
       env,
+      {
+        waitUntil: (work: Promise<unknown>) => {
+          pending.push(work);
+        },
+        passThroughOnException() {},
+        props: {},
+      } as ExecutionContext,
     );
+    await Promise.all(pending);
     return { status: response.status, json: (await response.json()) as never };
   };
   return { call, tokens, sqlite, env };
@@ -473,5 +483,59 @@ describe("preview settings", () => {
     const path = "/api/accounts/bob/settings/previews";
     expect((await t.call(t.tokens.bob, "PATCH", path, { endedDays: 5 })).status).toBe(200);
     expect((await t.call(t.tokens.ann, "GET", path)).status).toBe(404);
+  });
+});
+
+describe("deployment recent presence", () => {
+  test("job attribution is not presence; successful agent reads and changes coalesce without reader heartbeats", async () => {
+    const t = await setup();
+    try {
+      const created = await t.call(t.tokens.deploy, "POST", "/api/repos/orbit/app/deployments", {
+        url: "https://app.example.com",
+      });
+      expect(created.status).toBe(201);
+      const resource = `/api/repos/orbit/app/deployments/${(created.json as Deployment).id}`;
+      const agents = async () =>
+        ((await t.call(t.tokens.ann, "GET", `${resource}/presence`)).json as AgentPresence).agents;
+      expect(await agents()).toEqual([]);
+      await t.call(t.tokens.agent, "GET", `${resource}/presence`);
+      await t.call(t.tokens.agent, "GET", "/api/repos/orbit/app/deployments");
+      expect(await agents()).toEqual([]);
+      expect((await t.call(t.tokens.agent, "GET", `${resource}?source=other`)).status).toBe(404);
+      expect((await t.call(t.tokens.agent, "PATCH", resource, { url: "not a url" })).status).toBe(
+        400,
+      );
+      expect(await agents()).toEqual([]);
+      expect((await t.call(t.tokens.agent, "GET", resource)).status).toBe(200);
+      expect(await agents()).toMatchObject([{ id: "agt_builder", name: "builder" }]);
+      expect((await t.call(t.tokens.agent, "PATCH", resource, { status: "sleeping" })).status).toBe(
+        200,
+      );
+      const before = await agents();
+      expect(before).toHaveLength(1);
+      await t.call(t.tokens.agent, "GET", `${resource}/presence`);
+      expect(await agents()).toEqual(before);
+      expect((await t.call(t.tokens.ann, "GET", `${resource}/presence?source=other`)).status).toBe(
+        404,
+      );
+      expect((await t.call(t.tokens.bob, "GET", `${resource}/presence`)).status).toBe(404);
+      expect(
+        (await t.call(t.tokens.ann, "GET", resource.replace("/app/", "/site/") + "/presence"))
+          .status,
+      ).toBe(404);
+      const second = await t.call(t.tokens.agent, "POST", "/api/repos/orbit/app/deployments", {
+        commit: oid(7),
+        url: "https://second.example.com",
+      });
+      expect(second.status).toBe(201);
+      const secondPresence = await t.call(
+        t.tokens.ann,
+        "GET",
+        `/api/repos/orbit/app/deployments/${(second.json as Deployment).id}/presence`,
+      );
+      expect((secondPresence.json as AgentPresence).agents).toMatchObject([{ id: "agt_builder" }]);
+    } finally {
+      t.sqlite.close();
+    }
   });
 });

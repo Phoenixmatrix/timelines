@@ -50,6 +50,7 @@ import { LandingPanel } from "./Landing.tsx";
 import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { LiveNow } from "./LiveNow.tsx";
 import { PersonLink } from "../../components/PersonLink.tsx";
+import { RecentAgents } from "../../components/RecentAgents.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -670,7 +671,7 @@ function TimelineDetails({
         <dd className="m-0">{actorLink(timeline.accountableId)}</dd>
         {timeline.agentIds.length > 0 && (
           <>
-            <dt className="text-ink-faint">Agents</dt>
+            <dt className="text-ink-faint">Agent participants</dt>
             <dd className="m-0">{timeline.agentIds.map(actor).join(", ")}</dd>
           </>
         )}
@@ -683,6 +684,11 @@ function TimelineDetails({
           )}
         </dd>
       </dl>
+      <div className="mt-4">
+        <RecentAgents
+          endpoint={`/tracker/${encodeURIComponent(data.owner.slug)}/timelines/${encodeURIComponent(timeline.slug)}/presence`}
+        />
+      </div>
 
       {timeline.status !== "landed" && timeline.status !== "abandoned" && (
         <ExperimentalSwitch owner={data.owner.slug} timeline={timeline} onChange={onChange} />

@@ -8,6 +8,7 @@ import type { Deployment, DeploymentList, DeploymentStatus } from "../../shared/
 import { api } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
 import { sourceUrl } from "../lib/refs.ts";
+import { RecentAgents } from "./RecentAgents.tsx";
 
 export const DEPLOYMENT_LABEL: Record<DeploymentStatus, string> = {
   active: "Active",
@@ -43,7 +44,16 @@ function Address({ deployment }: { deployment: Deployment }) {
 }
 
 /** Everything a CI run recorded as deployed, newest first. */
-export function DeploymentsPanel({ deployments }: { deployments: Deployment[] }) {
+export function DeploymentsPanel({
+  deployments,
+  owner,
+  name,
+}: {
+  deployments: Deployment[];
+  owner: string;
+  name: string;
+}) {
+  const [expanded, setExpanded] = useState<number | null>(null);
   if (deployments.length === 0) return null;
   return (
     <section aria-labelledby="ci-deployments" className="overflow-hidden rounded-pane bg-pane">
@@ -82,6 +92,25 @@ export function DeploymentsPanel({ deployments }: { deployments: Deployment[] })
                 </span>
               )}
             </span>
+            <button
+              type="button"
+              className="mk-btn mk-btn--sm mk-btn--ghost"
+              aria-expanded={expanded === deployment.id}
+              aria-controls={`deployment-presence-${deployment.id}`}
+              onClick={() => setExpanded(expanded === deployment.id ? null : deployment.id)}
+            >
+              Agents seen recently
+            </button>
+            <div id={`deployment-presence-${deployment.id}`} className="w-full">
+              {expanded === deployment.id && (
+                <RecentAgents
+                  endpoint={sourceUrl(
+                    `/repos/${owner}/${name}/deployments/${deployment.id}/presence`,
+                    deployment.sourceId,
+                  )}
+                />
+              )}
+            </div>
           </li>
         ))}
       </ul>

@@ -126,6 +126,32 @@ Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
 Locator text with an apostrophe is safer as a RegExp. Restore what a test
 changes in the page (viewport, theme, emulated media) in a `finally`.
 
+## Recent agent presence
+
+CI run details, commit panels, selected timelines, and deployment disclosures
+show **Agents seen recently** (CORE-41). This is separate from who authored,
+pushed, started, or historically participated in the resource: an agent
+inspecting someone else's work can appear too.
+
+Successful authenticated agent interactions refresh a ten-minute observation.
+Presence reads do not refresh it. The UI checks every 30 seconds while visible,
+removes expired observations even when refresh fails, and says explicitly that
+this is approximate—not proof that an agent remains online or is editing.
+Deployment presence loads only when expanded.
+
+The read-only endpoints are `/repos/:owner/:name/ci/runs/:number/presence`,
+`/repos/:owner/:name/deployments/:id/presence`,
+`/repos/:owner/:name/commits/:oid/presence`, and
+`/tracker/:owner/timelines/:slug/presence`, all under `/api`. Existing resource
+permissions apply; repository observations are isolated by code source.
+Revoked agents are omitted. D1 retains only the latest observation per
+agent/resource/source, returns at most 30 recent agents, and incrementally
+reclaims expired rows. No request contents, tokens, or append-only access log are kept.
+
+Local/offline operations such as ordinary `gm show` cannot be observed.
+Successful remote single-commit context reads count for an existing commit even
+when no context was recorded; enumerating a list does not mark every item as visited.
+
 ## Commit panel
 
 There is no commit page (CORE-22): any repository page with `?commit=<sha>`

@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { describe, expect, test, vi } from "vite-plus/test";
 import type { CiLogs, CiRunDetail, CiRunList } from "../../shared/api.ts";
+import type { AgentPresence } from "../../shared/agent-presence.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
@@ -15,6 +16,8 @@ async function setup() {
   const sqlite = migratedDatabase();
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_ann', 'user', 'ann', 'Ann');
+    INSERT INTO agents (id, name, accountable_id) VALUES ('agt_monitor', 'monitor', 'acc_ann');
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_bob', 'user', 'bob', 'Bob');
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('repo', 'acc_ann', 'app', 'private', 'a', 'https://a');
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
@@ -36,15 +39,27 @@ async function setup() {
   });
   app.route("/api/repos/:owner/:name/ci", ci);
   const { secret } = await issueToken(env.DB, "acc_ann", "t", "read");
-  const get = async (path: string) => {
+  const agent = (await issueToken(env.DB, "acc_ann", "monitor", "read", undefined, "agt_monitor"))
+    .secret;
+  const outsider = (await issueToken(env.DB, "acc_bob", "outsider", "read")).secret;
+  const get = async (path: string, token = secret) => {
+    const pending: Promise<unknown>[] = [];
     const response = await app.request(
       path,
-      { headers: { authorization: `Bearer ${secret}` } },
+      { headers: { authorization: `Bearer ${token}` } },
       env,
+      {
+        waitUntil: (work: Promise<unknown>) => {
+          pending.push(work);
+        },
+        passThroughOnException() {},
+        props: {},
+      } as ExecutionContext,
     );
+    await Promise.all(pending);
     return { status: response.status, json: (await response.json()) as CiRunList };
   };
-  return Object.assign(get, { sqlite });
+  return Object.assign(get, { sqlite, agent, outsider });
 }
 
 describe("CI runs list", () => {
@@ -152,5 +167,38 @@ describe("after retention (CORE-200)", () => {
     expect(gone).toEqual({ status: 404, json: { error: "Run #2 was removed by retention." } });
     const never = await get("/api/repos/ann/app/ci/runs/9");
     expect(never).toEqual({ status: 404, json: { error: "No such run." } });
+  });
+});
+
+describe("CI recent presence", () => {
+  test("only successful resource reads count; logs resolve the run and presence reads never renew", async () => {
+    const get = await setup();
+    try {
+      const presence = "/api/repos/ann/app/ci/runs/1/presence";
+      const agents = async () => ((await get(presence)).json as unknown as AgentPresence).agents;
+      await get(presence, get.agent);
+      await get("/api/repos/ann/app/ci", get.agent);
+      expect(await agents()).toEqual([]);
+      expect((await get("/api/repos/ann/app/ci/runs/1?source=other", get.agent)).status).toBe(404);
+      expect((await get("/api/repos/ann/app/ci/runs/99", get.agent)).status).toBe(404);
+      expect(await agents()).toEqual([]);
+      expect((await get("/api/repos/ann/app/ci/runs/1", get.agent)).status).toBe(200);
+      expect(await agents()).toMatchObject([{ id: "agt_monitor", name: "monitor" }]);
+      get.sqlite.exec(`INSERT INTO ci_jobs(id,run_id,repo_id,name,spec,status,runner)
+        VALUES('observed','run1','repo','build','{"needs":[]}','succeeded','sandbox')`);
+      expect(
+        (await get("/api/repos/ann/app/ci/jobs/observed/logs?source=other", get.agent)).status,
+      ).toBe(404);
+      expect((await get("/api/repos/ann/app/ci/jobs/observed/logs", get.agent)).status).toBe(200);
+      const before = await agents();
+      expect(before).toHaveLength(1);
+      await get(presence, get.agent);
+      expect(await agents()).toEqual(before);
+      expect((await get(`${presence}?source=other`)).status).toBe(404);
+      expect((await get(presence, get.outsider)).status).toBe(404);
+      expect((await get("/api/repos/ann/missing/ci/runs/1/presence")).status).toBe(404);
+    } finally {
+      get.sqlite.close();
+    }
   });
 });

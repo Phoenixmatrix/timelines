@@ -23,6 +23,7 @@ import {
 import type { CiJob, CiLogs, CiRunDetail, CiRunList, CiRunSummary } from "../../../shared/api.ts";
 import { CiStatusIcon, ciLabel, duration, isActive, runLabel } from "../../components/CiStatus.tsx";
 import { DeploymentsPanel } from "../../components/Deployments.tsx";
+import { RecentAgents } from "../../components/RecentAgents.tsx";
 import type { DeploymentList } from "../../../shared/deployments.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { FormError } from "../../components/ui.tsx";
@@ -86,15 +87,18 @@ export async function ciRunLoader({ request, params }: LoaderFunctionArgs) {
     `/packages/-/published?repo=${encodeURIComponent(repo)}&run=${params.number}`,
     { signal: request.signal },
   ).catch(() => ({ rows: [] }) as Published);
-  // So are its deployments.
-  const deployments = api<DeploymentList>(
-    `/repos/${repo}/deployments?run=${params.number}&limit=100`,
-    { signal: request.signal },
-  ).catch(() => ({ deployments: [], next: null }) as DeploymentList);
   const run = await load<CiRunDetail>(
-    `${base(params.owner, params.repo)}/runs/${params.number}`,
+    sourceUrl(
+      `${base(params.owner, params.repo)}/runs/${params.number}`,
+      new URL(request.url).searchParams.get("source") ?? undefined,
+    ),
     request,
   );
+  // So are its deployments.
+  const deployments = api<DeploymentList>(
+    sourceUrl(`/repos/${repo}/deployments?run=${params.number}&limit=100`, run.sourceId),
+    { signal: request.signal },
+  ).catch(() => ({ deployments: [], next: null }) as DeploymentList);
   return {
     ...run,
     published: (await published).rows,
@@ -905,6 +909,12 @@ export function CiRun() {
           </Form>
         )}
       </div>
+      <RecentAgents
+        endpoint={sourceUrl(
+          `${base(repo.owner.slug, repo.name)}/runs/${run.number}/presence`,
+          run.sourceId,
+        )}
+      />
       {canRun && !active && run.queueId && (
         <p className="m-0 text-body-sm text-ink-muted">
           Queue-owned runs cannot be re-run here. Inspect{" "}
@@ -965,7 +975,7 @@ export function CiRun() {
           {chosen && <JobPanel key={chosen.id} job={chosen} />}
         </div>
       )}
-      <DeploymentsPanel deployments={run.deployments} />
+      <DeploymentsPanel deployments={run.deployments} owner={repo.owner.slug} name={repo.name} />
       <PublishedPanel rows={run.published} />
       {active && run.jobs.some((j) => j.status === "queued" && j.runner === "local") && (
         <RunnerHint runner="local" waiting />

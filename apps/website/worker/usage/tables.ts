@@ -208,6 +208,7 @@ export const TABLE_GROUPS: TableGroup[] = [
       ai_provider_models: "provider_id IN (SELECT id FROM ai_providers WHERE account_id = ?1)",
       org_members: "org_id = ?1",
       agents: "accountable_id = ?1",
+      agent_presence: "agent_id IN (SELECT id FROM agents WHERE accountable_id = ?1)",
       access_tokens: "user_id = ?1",
       ssh_keys: "user_id = ?1",
       avatar_generations: "user_id = ?1",

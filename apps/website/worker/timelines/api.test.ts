@@ -152,6 +152,139 @@ async function setup(missingRepoError?: (name: string) => Error) {
   return { sqlite, git, app, lib, call, raw, work, env, trackers, contexts };
 }
 
+describe("recent timeline presence", () => {
+  afterEach(() => vi.useRealTimers());
+
+  test("a reader need not participate, and presence polling never renews or creates presence", async () => {
+    const t = await setup();
+    const created = await t.call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    expect(created.status).toBe(201);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = Date.now();
+    expect((await t.call("bot", "GET", "/search/presence")).body.agents).toEqual([]);
+    expect((await t.call("bot", "GET", "")).status).toBe(200);
+    expect((await t.call("ben", "GET", "/search/presence")).body.agents).toEqual([]);
+
+    const detail = await t.call("bot", "GET", "/search");
+    expect(detail.status).toBe(200);
+    expect(detail.body.timeline.agentIds).toEqual([]);
+    const first = await t.call("cat", "GET", "/search/presence");
+    expect(first.status).toBe(200);
+    expect(first.body.agents).toMatchObject([
+      { id: "agt_bot", name: "bot", accountable: { slug: "ben", displayName: "Ben" } },
+    ]);
+    const seen = first.body.agents[0].lastSeenAt;
+
+    vi.setSystemTime(now + 60_000);
+    expect((await t.call("bot", "GET", "/search/presence")).body.agents[0].lastSeenAt).toBe(seen);
+    expect((await t.call("bot", "GET", "/search")).status).toBe(200);
+    const renewed = (await t.call("cat", "GET", "/search/presence")).body.agents;
+    expect(renewed).toHaveLength(1);
+    expect(renewed[0].lastSeenAt).not.toBe(seen);
+    vi.setSystemTime(now + 11 * 60_000 + 1);
+    expect((await t.call("bot", "GET", "/search/presence")).body.agents).toEqual([]);
+  });
+
+  test("denied and missing resources and rejected mutations neither expose nor capture presence", async () => {
+    const t = await setup();
+    expect((await t.call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] })).status).toBe(
+      201,
+    );
+    expect((await t.call("dan", "GET", "/search/presence")).status).toBe(403);
+    expect((await t.call("bot", "GET", "/missing/presence")).status).toBe(404);
+    expect((await t.call("bot", "GET", "/missing")).status).toBe(404);
+    expect((await t.call("bot", "GET", "/search?limit=bad")).status).toBe(400);
+    expect((await t.call("bot", "GET", "/search/checkpoints/99")).status).toBe(404);
+    expect((await t.call("bot", "PATCH", "/search", { name: "" })).status).toBe(400);
+    expect((await t.call("bot", "POST", "/search/land")).status).toBe(409);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
+
+    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    expect((await t.call("bot", "GET", "/search")).status).toBe(403);
+    expect((await t.call("bot", "GET", "/search/presence")).status).toBe(403);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
+  });
+
+  test.each(["/search/checkpoints", "/search/checkpoints/1", "/search/landing"])(
+    "successful specific read %s records its timeline only",
+    async (path) => {
+      const t = await setup();
+      expect(
+        (
+          await t.call("ben", "POST", "", {
+            slug: "search",
+            repos: ["orbit/app"],
+            policy: "approval",
+          })
+        ).status,
+      ).toBe(201);
+      expect(
+        (await t.call("ben", "POST", "", { slug: "other", repos: ["orbit/app"] })).status,
+      ).toBe(201);
+      t.work().commits.add(oid(9));
+      t.work().refs.set("refs/heads/work", oid(9));
+      expect((await t.call("ben", "POST", "/search/checkpoints", {})).status).toBe(201);
+      expect((await t.call("bot", "GET", path)).status).toBe(200);
+      expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+        { id: "agt_bot" },
+      ]);
+      expect((await t.call("cat", "GET", "/other/presence")).body.agents).toEqual([]);
+    },
+  );
+
+  test("historical participants expire while successful lifecycle actions refresh recent presence", async () => {
+    const t = await setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = Date.now();
+    const created = await t.call("bot", "POST", "", {
+      slug: "search",
+      repos: ["orbit/app"],
+      policy: "approval",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.timeline.agentIds).toEqual(["agt_bot"]);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+      { id: "agt_bot" },
+    ]);
+    vi.setSystemTime(now + 11 * 60_000);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
+    expect((await t.call("cat", "GET", "/search")).body.timeline.agentIds).toEqual(["agt_bot"]);
+    expect((await t.call("bot", "PATCH", "/search", { name: "New name" })).status).toBe(200);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+      { id: "agt_bot" },
+    ]);
+    vi.setSystemTime(now + 22 * 60_000);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
+    t.work().commits.add(oid(9));
+    t.work().refs.set("refs/heads/work", oid(9));
+    expect((await t.call("bot", "POST", "/search/checkpoints", {})).status).toBe(201);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+      { id: "agt_bot" },
+    ]);
+    vi.setSystemTime(now + 33 * 60_000);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
+    expect((await t.call("bot", "POST", "/search/abandon")).status).toBe(200);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+      { id: "agt_bot" },
+    ]);
+  });
+
+  test("revoking an agent removes it from recent presence without changing historical participants", async () => {
+    const t = await setup();
+    expect((await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] })).status).toBe(
+      201,
+    );
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+      { id: "agt_bot" },
+    ]);
+    t.sqlite
+      .prepare("UPDATE agents SET revoked_at = ? WHERE id = 'agt_bot'")
+      .run(new Date().toISOString());
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
+    expect((await t.call("cat", "GET", "/search")).body.timeline.agentIds).toEqual(["agt_bot"]);
+  });
+});
+
 describe("forking", () => {
   test("allocates isolated owned sources at main's tip without modifying canonical refs", async () => {
     const t = await setup();

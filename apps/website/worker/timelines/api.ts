@@ -5,6 +5,7 @@
 //   POST   /                  fork an owned work source per repository, pinned
 //                             to main or another timeline's exact snapshot
 //   GET    /:slug             the timeline and its events (?after=&limit= to page)
+//   GET    /:slug/presence    recently interacting agents (does not renew presence)
 //   PATCH  /:slug             rename it, or set or clear its experimental flag
 //   POST   /:slug/abandon     archive work, or cancel/drain a reserved creation
 //   GET    /:slug/checkpoints       its checkpoints, newest first, each with its
@@ -28,6 +29,8 @@
 
 import { Hono, type Context } from "hono";
 import type { AppEnv } from "../auth.ts";
+import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
+import type { AgentPresenceTarget } from "../../shared/agent-presence.ts";
 import { lsRefs } from "../artifacts.ts";
 import { findRepo, roleFor, selectRepos, type RepoRow } from "../db.ts";
 import { atLeast } from "../permissions.ts";
@@ -96,6 +99,10 @@ timelines.onError((error, c) => {
 function unwrap<T>(reply: TrackerReply<T>): T {
   if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
   return reply.value;
+}
+
+function presenceTarget(scopeId: string, resourceId: string): AgentPresenceTarget {
+  return { kind: "timeline", scopeId, resourceId, sourceId: "canonical" };
 }
 
 async function input(c: Context<AppEnv>, allowed: string[]): Promise<Record<string, unknown>> {
@@ -227,6 +234,7 @@ timelines.post("/", async (c) => {
       commits,
     }),
   );
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
   return c.json<TimelineChange>({ timeline, bookmarks: created }, 201);
 });
 
@@ -236,30 +244,38 @@ timelines.get("/:slug", async (c) => {
   const limit = c.req.query("limit") ?? "200";
   if (!/^\d+$/.test(after) || !/^\d+$/.test(limit))
     fail("invalid_input", "after and limit must be integers.");
-  return c.json<TimelineDetail>(
-    unwrap(
-      await trackerObject(c.env, access.owner.id).timeline(
-        c.req.param("slug"),
-        Number(after),
-        Number(limit),
-      ),
+  const detail = unwrap(
+    await trackerObject(c.env, access.owner.id).timeline(
+      c.req.param("slug"),
+      Number(after),
+      Number(limit),
     ),
   );
+  noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
+  return c.json<TimelineDetail>(detail);
+});
+
+timelines.get("/:slug/presence", async (c) => {
+  const access = await authorize(c, false);
+  const { timeline } = unwrap(
+    await trackerObject(c.env, access.owner.id).timeline(c.req.param("slug"), 0, 1),
+  );
+  return c.json(await readAgentPresence(c.env.DB, presenceTarget(access.owner.id, timeline.id)));
 });
 
 timelines.patch("/:slug", async (c) => {
   const access = await authorize(c, false);
   const { expectedVersion, ...data } = await input(c, ["name", "experimental", "expectedVersion"]);
-  return c.json<Timeline>(
-    unwrap(
-      await trackerObject(c.env, access.owner.id).updateTimeline(
-        c.req.param("slug"),
-        data,
-        expectedVersion,
-        access,
-      ),
+  const timeline = unwrap(
+    await trackerObject(c.env, access.owner.id).updateTimeline(
+      c.req.param("slug"),
+      data,
+      expectedVersion,
+      access,
     ),
   );
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  return c.json<Timeline>(timeline);
 });
 
 timelines.post("/:slug/migrate", async (c) => {
@@ -270,7 +286,9 @@ timelines.post("/:slug/migrate", async (c) => {
   const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
   if (detail.timeline.repos.some((repo) => !writable.includes(repo.id)))
     fail("forbidden", "Migration needs write access to every repository.", 403);
-  return c.json(await migrateLegacyTimeline(c.env, access.owner.id, detail.timeline.id));
+  const result = await migrateLegacyTimeline(c.env, access.owner.id, detail.timeline.id);
+  noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
+  return c.json(result);
 });
 
 timelines.post("/:slug/migration/resolve", async (c) => {
@@ -305,16 +323,16 @@ timelines.post("/:slug/migration/resolve", async (c) => {
         409,
       );
   }
-  return c.json(
-    unwrap(
-      await tracker.resolveLegacyLanding(
-        detail.timeline.id,
-        data.expectedVersion as number,
-        data.action,
-        text(data.note, "note"),
-      ),
+  const result = unwrap(
+    await tracker.resolveLegacyLanding(
+      detail.timeline.id,
+      data.expectedVersion as number,
+      data.action,
+      text(data.note, "note"),
     ),
   );
+  noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
+  return c.json(result);
 });
 
 timelines.post("/:slug/abandon", async (c) => {
@@ -364,6 +382,7 @@ timelines.post("/:slug/abandon", async (c) => {
     }
     bookmarks.push({ repoId: entry.id, ref: entry.source.ref, ok: true });
   }
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
   return c.json<TimelineChange>({ timeline: result.timeline, bookmarks });
 });
 
@@ -376,9 +395,11 @@ timelines.get("/:slug/checkpoints", async (c) => {
     tracker.timeline(slug, 0, 1),
   ]);
   const timeline = unwrap(detail).timeline;
-  return c.json<CheckpointList>({
-    checkpoints: await Promise.all(unwrap(states).map((state) => view(c.env, state, timeline))),
-  });
+  const checkpoints = await Promise.all(
+    unwrap(states).map((state) => view(c.env, state, timeline)),
+  );
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  return c.json<CheckpointList>({ checkpoints });
 });
 
 timelines.get("/:slug/checkpoints/:ref", async (c) => {
@@ -391,7 +412,10 @@ timelines.get("/:slug/checkpoints/:ref", async (c) => {
     tracker.checkpoint(slug, ref),
     tracker.timeline(slug, 0, 1),
   ]);
-  return c.json<CheckpointView>(await view(c.env, unwrap(state), unwrap(detail).timeline));
+  const timeline = unwrap(detail).timeline;
+  const checkpoint = await view(c.env, unwrap(state), timeline);
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  return c.json<CheckpointView>(checkpoint);
 });
 
 timelines.post("/:slug/checkpoints", async (c) => {
@@ -436,7 +460,9 @@ timelines.post("/:slug/checkpoints", async (c) => {
     waitUntil(
       settled(c.env, (deps) => maybeLand(c.env, deps, access.owner.id, timeline.slug, "auto")),
     );
-  return c.json<CheckpointView>(await view(c.env, state, timeline), 201);
+  const checkpoint = await view(c.env, state, timeline);
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  return c.json<CheckpointView>(checkpoint, 201);
 });
 
 timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
@@ -457,8 +483,10 @@ timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
   const runs = await reviveCheckpoint(c.env, state.checkpoint, timeline, actor, (work) =>
     c.executionCtx.waitUntil(work),
   );
+  const checkpoint = await view(c.env, state, timeline);
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
   return c.json<PreviewRevival>(
-    { checkpoint: await view(c.env, state, timeline), runs },
+    { checkpoint, runs },
     runs.some((run) => "number" in run) ? 201 : 200,
   );
 });
@@ -480,11 +508,15 @@ timelines.post("/:slug/land", async (c) => {
     timeline.slug,
     "request",
   );
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
   return c.json<LandResult>(result, result.queued ? 202 : 200);
 });
 
 timelines.get("/:slug/landing", async (c) => {
   const access = await authorize(c, false);
-  const landing = unwrap(await trackerObject(c.env, access.owner.id).landing(c.req.param("slug")));
+  const tracker = trackerObject(c.env, access.owner.id);
+  const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
+  const landing = unwrap(await tracker.landing(timeline.slug));
+  noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
   return c.json<{ landing: Landing | null }>({ landing });
 });

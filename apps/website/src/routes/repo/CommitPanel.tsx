@@ -28,6 +28,7 @@ import type { StepAuthor, StepPage } from "../../../shared/steps.ts";
 import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
 import { CiStatusIcon, runLabel } from "../../components/CiStatus.tsx";
 import { DEPLOYMENT_LABEL } from "../../components/Deployments.tsx";
+import { RecentAgents } from "../../components/RecentAgents.tsx";
 import { fadeMotion, link, Tip } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import {
@@ -203,7 +204,7 @@ function CommitBody({
     ready && inSource(`${base}/deployments?commit=${ready}&limit=20`),
   );
   const why = useApi<WhyResponse>(ready && inSource(`${base}/why?commit=${ready}`));
-  const steps = useApi<StepPage>(ready && `${base}/steps?commits=${ready}&limit=1`);
+  const steps = useApi<StepPage>(ready && inSource(`${base}/steps?commits=${ready}&limit=1`));
 
   const summary =
     diff.state === "done"
@@ -279,6 +280,7 @@ function CommitBody({
         ) : (
           <div className="flex flex-col gap-6">
             <Message repo={repo} oid={ready} summary={summary} steps={steps} chain={chain} />
+            <RecentAgents endpoint={inSource(`${base}/commits/${ready}/presence`)} />
             <Landing
               repo={repo}
               why={why}
@@ -773,6 +775,7 @@ function Deployments({
   repo: RepoDetail;
   deployments: Loaded<DeploymentList>;
 }) {
+  const [expanded, setExpanded] = useState<number | null>(null);
   const rows: Deployment[] = deployments.state === "done" ? deployments.value.deployments : [];
   return (
     <Section id="commit-deployments" title="Deployments and previews" count={rows.length}>
@@ -821,6 +824,27 @@ function Deployments({
                     >
                       {timeAgo(deployment.createdAt)}
                     </time>
+                    <button
+                      type="button"
+                      className="mk-btn mk-btn--sm mk-btn--ghost max-sm:min-h-11"
+                      aria-expanded={expanded === deployment.id}
+                      aria-controls={`commit-deployment-presence-${deployment.id}`}
+                      onClick={() =>
+                        setExpanded((current) => (current === deployment.id ? null : deployment.id))
+                      }
+                    >
+                      Agents seen recently
+                    </button>
+                    <div id={`commit-deployment-presence-${deployment.id}`} className="w-full">
+                      {expanded === deployment.id && (
+                        <RecentAgents
+                          endpoint={sourceUrl(
+                            `/repos/${repo.owner.slug}/${repo.name}/deployments/${deployment.id}/presence`,
+                            deployment.sourceId,
+                          )}
+                        />
+                      )}
+                    </div>
                   </li>
                 );
               })}

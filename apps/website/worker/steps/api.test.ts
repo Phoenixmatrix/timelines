@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { Step, StepPage, StepUpload, StepVersions } from "../../shared/steps.ts";
 import { STEP_LIMITS } from "../../shared/steps.ts";
 import type { AppEnv } from "../auth.ts";
@@ -8,6 +8,15 @@ import { d1, migratedDatabase } from "../testing/d1.ts";
 import { fakeDurableState } from "../testing/durable-state.ts";
 import { StepFeed } from "./feed.ts";
 import { steps } from "./api.ts";
+import { fakeHistory } from "../testing/history.ts";
+import { Timing } from "../timing.ts";
+import { readAgentPresence } from "../agent-presence.ts";
+import { RepoReader } from "../objects.ts";
+
+beforeEach(() => {
+  vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+});
+afterEach(() => vi.unstubAllGlobals());
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -35,13 +44,15 @@ function setup(visibility: "public" | "private" = "private") {
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'), ('cid', 'user', 'cid', 'Cid');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_builder', 'builder', 'ann');
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
-      VALUES ('repo', 'ann', 'app', '${visibility}', 'a', 'https://a');
+      VALUES ('repo', 'ann', 'app', '${visibility}', 'steps-${crypto.randomUUID()}', 'https://a');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('repo', 'ben', 'write');
   `);
   // Live feeds (CORE-239), real objects over fake storage, by name.
   const feeds = new Map<string, StepFeed>();
+  const git = fakeHistory();
   const env = {
     DB: d1(sqlite),
+    ARTIFACTS: git.artifacts,
     STEP_FEED: {
       getByName: (name: string) => {
         if (!feeds.has(name))
@@ -54,13 +65,36 @@ function setup(visibility: "public" | "private" = "private") {
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("actor", actor);
+    c.set("timing", new Timing());
     await next();
   });
   app.route("/api/repos/:owner/:name/steps", steps);
-  const call = (path: string, init?: RequestInit) =>
-    app.request(`/api/repos/ann/app/steps${path}`, init, env);
+  const pending: Promise<unknown>[] = [];
+  const context = {
+    waitUntil: (work: Promise<unknown>) => pending.push(work),
+    passThroughOnException: () => {},
+    props: {},
+  };
+  const call = async (path: string, init?: RequestInit) => {
+    const response = await app.request(
+      `/api/repos/ann/app/steps${path}`,
+      init,
+      env,
+      context as unknown as ExecutionContext,
+    );
+    while (pending.length) await Promise.all(pending.splice(0));
+    return response;
+  };
   return {
     sqlite,
+    git,
+    presence: (commit: string) =>
+      readAgentPresence(env.DB, {
+        kind: "commit",
+        scopeId: "repo",
+        resourceId: commit,
+        sourceId: "canonical",
+      }),
     feeds,
     as: (next: Actor | null) => {
       actor = next;
@@ -89,6 +123,80 @@ const step = (n: number, over: Partial<StepUpload> = {}): StepUpload => ({
 });
 
 describe("step context", () => {
+  test("single successful remote context inspection records only an existing commit, never a batch", async () => {
+    const s = setup();
+    const first = s.git.commit({ files: { a: "a\n" } });
+    const second = s.git.commit({ parents: [first], files: { a: "b\n" } });
+    await s.upload(step(1, { commitOid: first }));
+    await s.upload(step(2, { commitOid: second }));
+    await s.upload(step(3));
+    expect((await s.call(`?commits=${first},${second}`)).status).toBe(200);
+    expect((await s.presence(first)).agents).toEqual([]);
+    expect((await s.presence(second)).agents).toEqual([]);
+    expect((await s.call(`?commits=${oid(3)}`)).status).toBe(200);
+    expect((await s.presence(oid(3))).agents).toEqual([]);
+    expect((await s.call(`?commits=${first}&source=unknown`)).status).toBe(404);
+    s.as(cid);
+    expect((await s.call(`?commits=${first}`)).status).toBe(404);
+    s.as(ann);
+    expect((await s.call(`?commits=${first}`)).status).toBe(200);
+    expect((await s.presence(first)).agents).toEqual([]);
+    s.as(annsAgent);
+    expect((await s.call(`?commits=${first}`)).status).toBe(200);
+    expect((await s.presence(first)).agents.map((agent) => agent.id)).toEqual(["agt_builder"]);
+    expect((await s.presence(second)).agents).toEqual([]);
+  });
+
+  test("single commit inspection records existing commits even without uploaded context", async () => {
+    const s = setup();
+    const commit = s.git.commit({ files: { a: "a\n" } });
+    const missing = oid(99);
+    const absent = await s.call(`?commits=${missing}`);
+    expect(absent.status).toBe(200);
+    expect(await absent.json()).toEqual({ steps: [], cursor: null });
+    expect((await s.presence(missing)).agents).toEqual([]);
+
+    const response = await s.call(`?commits=${commit}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ steps: [], cursor: null });
+    expect((await s.presence(commit)).agents.map((agent) => agent.id)).toEqual(["agt_builder"]);
+  });
+
+  test.each(["lookup", "close", "lookup and close"] as const)(
+    "auxiliary object %s failure preserves context without recording presence",
+    async (failure) => {
+      const s = setup();
+      const commit = s.git.commit({ files: { a: "a\n" } });
+      await s.upload(step(1, { commitOid: commit }));
+      s.as(ann);
+      const original = await s.call(`?commits=${commit}`);
+      expect(original.status).toBe(200);
+      const body = await original.json();
+      s.as(annsAgent);
+
+      const lookup = vi.spyOn(RepoReader.prototype, "commit");
+      const close = vi.spyOn(RepoReader.prototype, "close");
+      const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+      if (failure !== "close")
+        lookup.mockRejectedValueOnce(new Error("sensitive provider lookup details"));
+      if (failure !== "lookup")
+        close.mockRejectedValueOnce(new Error("sensitive provider close details"));
+      try {
+        const response = await s.call(`?commits=${commit}`);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual(body);
+        expect(lookup).toHaveBeenCalledWith(commit);
+        expect(close).toHaveBeenCalledTimes(1);
+        expect((await s.presence(commit)).agents).toEqual([]);
+        expect(warnings.mock.calls).toEqual([["Recent agent presence could not be recorded."]]);
+      } finally {
+        lookup.mockRestore();
+        close.mockRestore();
+        warnings.mockRestore();
+      }
+    },
+  );
+
   test("a feed that fails never fails the upload or the reads (S11)", async () => {
     const s = setup();
     s.feeds.set("repo:search", {

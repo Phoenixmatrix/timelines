@@ -43,6 +43,7 @@ import { trackerObject } from "../tracker/stub.ts";
 import { jobCaller, jobSecret, type JobCaller } from "./job.ts";
 import { previewSettings } from "./settings.ts";
 import { resolveSource } from "../timelines/sources.ts";
+import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
 
 const PAGE = 50;
 const MAX_PAGE = 100;
@@ -156,6 +157,19 @@ async function reader(c: Context<AppEnv>): Promise<RepoRow | Response> {
   }
   const repo = await loadRepo(c);
   return repo instanceof Response ? repo : repo.row;
+}
+
+/** A source query narrows a stable record id; job credentials never cross sources. */
+async function recordSource(c: Context<AppEnv>, row: DeploymentRow): Promise<Response | null> {
+  if (c.req.query("source") !== undefined && c.req.query("source") !== row.source_id)
+    return fail(c, 404, "No such deployment.");
+  const secret = jobSecret(c.req.header("authorization"));
+  if (secret) {
+    const job = await jobCaller(c.env.DB, secret);
+    if (!job || job.repoId !== row.repo_id || job.sourceId !== row.source_id)
+      return fail(c, 403, "A job may read only its own source's deployments.");
+  }
+  return null;
 }
 
 async function body(c: Context<AppEnv>, allowed: string[]): Promise<Record<string, unknown>> {
@@ -400,6 +414,12 @@ deployments.post("/deployments", async (c) => {
     .returning("id")
     .executeTakeFirstOrThrow();
   const row = await findDeployment(kdb, who.repo.id, inserted.id);
+  noteAgentPresence(c, {
+    kind: "deployment",
+    scopeId: who.repo.id,
+    resourceId: String(inserted.id),
+    sourceId,
+  });
   return c.json<Deployment>(toDeployment(row!), 201);
 });
 
@@ -407,7 +427,34 @@ deployments.get("/deployments/:id{[0-9]+}", async (c) => {
   const repo = await reader(c);
   if (repo instanceof Response) return repo;
   const row = await findDeployment(db(c.env.DB), repo.id, Number(c.req.param("id")));
-  return row ? c.json<Deployment>(toDeployment(row)) : fail(c, 404, "No such deployment.");
+  if (!row) return fail(c, 404, "No such deployment.");
+  const denied = await recordSource(c, row);
+  if (denied) return denied;
+  noteAgentPresence(c, {
+    kind: "deployment",
+    scopeId: repo.id,
+    resourceId: String(row.id),
+    sourceId: row.source_id,
+  });
+  return c.json<Deployment>(toDeployment(row));
+});
+
+deployments.get("/deployments/:id{[0-9]+}/presence", async (c) => {
+  const repo = await reader(c);
+  if (repo instanceof Response) return repo;
+  const row = await findDeployment(db(c.env.DB), repo.id, Number(c.req.param("id")));
+  if (!row) return fail(c, 404, "No such deployment.");
+  const denied = await recordSource(c, row);
+  if (denied) return denied;
+  c.header("cache-control", "private, no-store");
+  return c.json(
+    await readAgentPresence(c.env.DB, {
+      kind: "deployment",
+      scopeId: repo.id,
+      resourceId: String(row.id),
+      sourceId: row.source_id,
+    }),
+  );
 });
 
 deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
@@ -418,6 +465,8 @@ deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
   const id = Number(c.req.param("id"));
   const existing = await findDeployment(kdb, who.repo.id, id);
   if (!existing) return fail(c, 404, "No such deployment.");
+  if (c.req.query("source") !== undefined && c.req.query("source") !== existing.source_id)
+    return fail(c, 404, "No such deployment.");
   if (who.kind === "job" && existing.source_id !== who.job.sourceId)
     return fail(c, 403, "A job may update only its own source's deployments.");
   const changes: {
@@ -444,6 +493,12 @@ deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
     .where("repo_id", "=", who.repo.id)
     .execute();
   const row = await findDeployment(kdb, who.repo.id, id);
+  noteAgentPresence(c, {
+    kind: "deployment",
+    scopeId: who.repo.id,
+    resourceId: String(id),
+    sourceId: existing.source_id,
+  });
   return c.json<Deployment>(toDeployment(row!));
 });
 

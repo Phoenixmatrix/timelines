@@ -13,6 +13,7 @@ import type {
   Visibility,
 } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
+import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
 import { isArtifactsError, newArtifactsName } from "../artifacts.ts";
 import { launchPurge, requestDeletion } from "../retention/repo-deletion.ts";
 import {
@@ -506,6 +507,30 @@ repos.get("/:owner/:name/history", async (c) => {
   }
 });
 
+repos.get("/:owner/:name/commits/:oid/presence", async (c) => {
+  const loaded = await loadSourceRepo(c);
+  if (loaded instanceof Response) return loaded;
+  const oid = c.req.param("oid");
+  if (!isCommitId(oid) || oid.length !== 40)
+    return fail(c, 400, "Give the full 40-character commit hash.");
+  const objects = reader(c, loaded.row);
+  try {
+    const commit = await objects.commit(oid);
+    if (!commit) return fail(c, 404, `No commit ${oid}.`);
+    c.header("cache-control", "private, no-store");
+    return c.json(
+      await readAgentPresence(c.env.DB, {
+        kind: "commit",
+        scopeId: loaded.canonical.id,
+        resourceId: commit.hash,
+        sourceId: loaded.source.sourceId,
+      }),
+    );
+  } finally {
+    await objects.close();
+  }
+});
+
 // One commit's diff against its first parent (CORE-234: a step's work).
 // Bounded: DIFF_LIMITS caps files listed, files patched, blob size and tree reads.
 repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
@@ -588,6 +613,12 @@ repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
       truncated: changes.length > listed.length,
     };
     cacheIfImmutable(c, oid);
+    noteAgentPresence(c, {
+      kind: "commit",
+      scopeId: loaded.canonical.id,
+      resourceId: commit.hash,
+      sourceId: loaded.source.sourceId,
+    });
     return c.json(body);
   } finally {
     await objects.close();

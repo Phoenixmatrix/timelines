@@ -45,6 +45,7 @@ import { startRun } from "./trigger.ts";
 import { landingSlugOf } from "../../shared/timelines.ts";
 import { resolveSource } from "../timelines/sources.ts";
 import { ciSource } from "./source.ts";
+import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
 
 const PAGE = 30;
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
@@ -139,6 +140,12 @@ ci.post("/runs", async (c) => {
     waitUntil: (work) => c.executionCtx.waitUntil(work),
   });
   if ("skipped" in started) return fail(c, 422, started.skipped);
+  noteAgentPresence(c, {
+    kind: "ci-run",
+    scopeId: repo.row.id,
+    resourceId: started.runId,
+    sourceId: source.repo.source_id,
+  });
   return c.json({ number: started.number }, 201);
 });
 
@@ -146,7 +153,7 @@ async function runDetail(
   d1: D1Database,
   repoId: string,
   number: number,
-): Promise<CiRunDetail | null> {
+): Promise<(CiRunDetail & { sourceId: string }) | null> {
   const kdb = db(d1);
   const row = await selectRuns(kdb)
     .where("r.repo_id", "=", repoId)
@@ -168,6 +175,7 @@ async function runDetail(
   const stepRows = steps!.results as InferResult<typeof stepsQuery>;
   return {
     ...toRun(row),
+    sourceId: row.source_id,
     configError: row.config_error,
     jobs: (jobs!.results as InferResult<typeof jobsQuery>).map((job) => ({
       id: job.id,
@@ -204,8 +212,40 @@ ci.get("/runs/:number{[0-9]+}", async (c) => {
   if (repo instanceof Response) return repo;
   const number = Number(c.req.param("number"));
   const run = await runDetail(c.env.DB, repo.row.id, number);
-  if (run) return c.json<CiRunDetail>(run);
+  if (run) {
+    if (c.req.query("source") !== undefined && c.req.query("source") !== run.sourceId)
+      return fail(c, 404, "No such run.");
+    noteAgentPresence(c, {
+      kind: "ci-run",
+      scopeId: repo.row.id,
+      resourceId: run.id,
+      sourceId: run.sourceId,
+    });
+    return c.json<CiRunDetail>(run);
+  }
   return fail(c, 404, await missingRun(c.env.DB, repo.row.id, number));
+});
+
+ci.get("/runs/:number{[0-9]+}/presence", async (c) => {
+  const repo = await loadRepo(c);
+  if (repo instanceof Response) return repo;
+  const run = await db(c.env.DB)
+    .selectFrom("ci_runs")
+    .select(["id", "source_id"])
+    .where("repo_id", "=", repo.row.id)
+    .where("number", "=", Number(c.req.param("number")))
+    .executeTakeFirst();
+  if (!run || (c.req.query("source") !== undefined && c.req.query("source") !== run.source_id))
+    return fail(c, 404, "No such run.");
+  c.header("cache-control", "private, no-store");
+  return c.json(
+    await readAgentPresence(c.env.DB, {
+      kind: "ci-run",
+      scopeId: repo.row.id,
+      resourceId: run.id,
+      sourceId: run.source_id,
+    }),
+  );
 });
 
 /**
@@ -229,15 +269,23 @@ ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   if (repo instanceof Response) return repo;
   const run = await db(c.env.DB)
     .selectFrom("ci_runs")
-    .select(["id", "status"])
+    .select(["id", "status", "source_id"])
     .where("repo_id", "=", repo.row.id)
     .where("number", "=", Number(c.req.param("number")))
     .executeTakeFirst();
   if (!run) return fail(c, 404, "No such run.");
+  if (c.req.query("source") !== undefined && c.req.query("source") !== run.source_id)
+    return fail(c, 404, "No such run.");
   if (run.status !== "queued" && run.status !== "running") {
     return fail(c, 409, `The run already ${run.status}.`);
   }
   await cancelRun(c.env, run.id);
+  noteAgentPresence(c, {
+    kind: "ci-run",
+    scopeId: repo.row.id,
+    resourceId: run.id,
+    sourceId: run.source_id,
+  });
   return c.json({ ok: true });
 });
 
@@ -247,6 +295,8 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
   const run = await db(c.env.DB)
     .selectFrom("ci_runs")
     .select([
+      "id",
+      "source_id",
       "commit_oid",
       "ref",
       "preview_action",
@@ -260,6 +310,8 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
     .where("number", "=", Number(c.req.param("number")))
     .executeTakeFirst();
   if (!run) return fail(c, 404, "No such run.");
+  if (c.req.query("source") !== undefined && c.req.query("source") !== run.source_id)
+    return fail(c, 404, "No such run.");
   if (run.queue_id)
     return fail(
       c,
@@ -277,7 +329,8 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
           rebuiltFrom: run.preview_rebuilt_from,
         }
       : undefined;
-  const started = await startRun(c.env, repo.row, {
+  const source = await resolveSource(c.env, repo.row, run.source_id);
+  const started = await startRun(c.env, source.repo, {
     branch: run.ref,
     commit: run.commit_oid,
     trigger: preview ? "preview" : "manual",
@@ -286,6 +339,19 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
     waitUntil: (work) => c.executionCtx.waitUntil(work),
   });
   if ("skipped" in started) return fail(c, 422, started.skipped);
+  noteAgentPresence(c, {
+    kind: "ci-run",
+    scopeId: repo.row.id,
+    resourceId: run.id,
+    sourceId: run.source_id,
+  });
+  if (started.runId !== run.id)
+    noteAgentPresence(c, {
+      kind: "ci-run",
+      scopeId: repo.row.id,
+      resourceId: started.runId,
+      sourceId: run.source_id,
+    });
   return c.json({ number: started.number }, 201);
 });
 
@@ -305,16 +371,26 @@ ci.get("/jobs/:job/logs", async (c) => {
     .orderBy("l.seq")
     .limit(500);
   const jobQuery = kdb
-    .selectFrom("ci_jobs")
-    .select(["status", "logs_removed_at"])
-    .where("id", "=", c.req.param("job"))
-    .where("repo_id", "=", repo.row.id);
+    .selectFrom("ci_jobs as j")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
+    .select(["j.status", "j.logs_removed_at", "r.id as run_id", "r.source_id"])
+    .where("j.id", "=", c.req.param("job"))
+    .where("j.repo_id", "=", repo.row.id)
+    .where("r.repo_id", "=", repo.row.id);
   const [chunks, job] = await batch(d1, [chunksQuery, jobQuery]);
   const found = (job!.results as InferResult<typeof jobQuery>)[0];
   if (!found) return fail(c, 404, "No such job.");
+  if (c.req.query("source") !== undefined && c.req.query("source") !== found.source_id)
+    return fail(c, 404, "No such job.");
   const status = found.status;
   const rows: CiLogs["chunks"] = chunks!.results as InferResult<typeof chunksQuery>;
   const done = !["pending", "queued", "running"].includes(status);
+  noteAgentPresence(c, {
+    kind: "ci-run",
+    scopeId: repo.row.id,
+    resourceId: found.run_id,
+    sourceId: found.source_id,
+  });
   return c.json<CiLogs>({
     chunks: rows,
     next: rows.at(-1)?.seq ?? after,

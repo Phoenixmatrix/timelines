@@ -33,7 +33,9 @@ import {
 } from "../../shared/steps.ts";
 import type { AppEnv } from "../auth.ts";
 import { fail, requireActor } from "../api/http.ts";
-import { loadRepo } from "../api/repos.ts";
+import { loadRepo, loadSourceRepo } from "../api/repos.ts";
+import { noteAgentPresence } from "../agent-presence.ts";
+import { RepoReader } from "../objects.ts";
 import { durableStub } from "../durable/registry.ts";
 import { avatarUrl } from "../avatars/api.ts";
 import { sqlNow } from "../db.ts";
@@ -487,7 +489,7 @@ function decodeCursor(cursor: string): [string, string, string] | null {
 }
 
 steps.get("/", async (c) => {
-  const loaded = await loadRepo(c, "read");
+  const loaded = await loadSourceRepo(c, "read");
   if (loaded instanceof Response) return loaded;
   const limitParam = c.req.query("limit");
   const limit = limitParam === undefined ? 50 : Number(limitParam);
@@ -537,6 +539,35 @@ steps.get("/", async (c) => {
     steps: await present(c, page),
     cursor: rows.length > limit ? encodeCursor(page[page.length - 1]!) : null,
   };
+  // A single remote context inspection (for example `gm show --context`)
+  // concerns one commit; batch log enumeration never visits every result.
+  if (c.get("actor")?.agent && commitsParam && COMMIT_OID.test(commitsParam)) {
+    try {
+      const objects = new RepoReader(
+        c.env,
+        loaded.row.artifacts_name,
+        loaded.row.artifacts_remote,
+        c.get("timing"),
+        (work) => c.executionCtx.waitUntil(work),
+        loaded.source.sourceId !== "canonical" ? loaded.source.ref : undefined,
+      );
+      let commit;
+      try {
+        commit = await objects.commit(commitsParam);
+      } finally {
+        await objects.close();
+      }
+      if (commit)
+        noteAgentPresence(c, {
+          kind: "commit",
+          scopeId: loaded.canonical.id,
+          resourceId: commit.hash,
+          sourceId: loaded.source.sourceId,
+        });
+    } catch {
+      console.warn("Recent agent presence could not be recorded.");
+    }
+  }
   return c.json(body);
 });
 
