@@ -4369,8 +4369,18 @@ export async function runE2E(
     const doomed = await git(["rev-parse", "HEAD"]);
     // The push log records a push after answering it, by comparing the refs
     // with the last it saw: let it see the branch before it goes.
-    const updates = async () =>
-      (await json<RefUpdateList>(`/api/repos/${owner}/${name}/ref-updates`, token)).updates;
+    let lastRecordedHistory = "";
+    const updates = async () => {
+      const current = (await json<RefUpdateList>(`/api/repos/${owner}/${name}/ref-updates`, token))
+        .updates;
+      const history = current.map(({ id, ref, old, new: next }) => ({ id, ref, old, new: next }));
+      const serialized = JSON.stringify(history);
+      if (serialized !== lastRecordedHistory) {
+        record({ pushLog: history });
+        lastRecordedHistory = serialized;
+      }
+      return current;
+    };
     await git(["push", remote, "doomed"]);
     await poll(updates, (list) => list.length === 2, "the push log's branch entry");
     await git(["push", remote, ":doomed"]);

@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "lib": ["ES2024", "ESNext.Disposable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "types": ["./.cloudflare/types/index.d.ts", "node"],
+    "skipLibCheck": true
+  },
+  "include": ["worker.ts", "cloudflare.config.ts", "runtime.mjs"]
+}

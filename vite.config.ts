@@ -38,11 +38,11 @@ export default defineConfig({
     cache: true,
     tasks: {
       agent: {
-        command: "node tools/agent/main.ts",
+        command: "node tools/agent/entry.ts",
         cache: false,
       },
       ready: {
-        command: "node tools/agent/main.ts check",
+        command: "node tools/agent/entry.ts check",
         cache: false,
       },
     },

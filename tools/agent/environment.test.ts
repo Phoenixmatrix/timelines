@@ -14,6 +14,8 @@ import {
   redact,
   context,
   loadEnvironment,
+  terminateProcessGroup,
+  unitTestEnvironment,
 } from "./environment.ts";
 import type { Environment } from "./environment.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
@@ -58,6 +60,77 @@ function runtime(env: Environment): Record<string, string> {
     XDG_DATA_HOME: `${env.dir}/data`,
   };
 }
+
+await test(
+  "shutdown waits for TERM-ignoring descendants after the launcher exits",
+  { timeout: 35_000 },
+  async (t) => {
+    // Real POSIX signals and /proc identity fencing require the real shutdown grace;
+    // advancing a JS clock cannot advance the independently scheduled child processes.
+    const processStart = async (pid: number) => {
+      try {
+        const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+        return stat
+          .slice(stat.lastIndexOf(")") + 2)
+          .trim()
+          .split(/\s+/)[19];
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return undefined;
+      }
+    };
+    const descendantProgram =
+      'process.on("SIGTERM", () => {}); require("node:net").createServer().listen(0, "127.0.0.1", () => process.send("ready"));';
+    const launcher = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const { spawn } = require("node:child_process");
+       const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantProgram)}], {
+         stdio: ["ignore", "ignore", "ignore", "ipc"],
+       });
+       child.once("message", () => process.send(child.pid));
+       process.on("SIGTERM", () => process.exit(0));`,
+      ],
+      { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] },
+    );
+    const pid = launcher.pid!;
+    const birth = await processStart(pid);
+    let descendant: number | undefined;
+    let descendantBirth: string | undefined;
+    t.after(async () => {
+      for (const [child, start] of [
+        [pid, birth],
+        [descendant, descendantBirth],
+      ] as const) {
+        if (!child || !start || (await processStart(child)) !== start) continue;
+        try {
+          process.kill(child, "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+      }
+    });
+    [descendant] = await once(launcher, "message", { signal: AbortSignal.timeout(5_000) });
+    assert.equal(typeof descendant, "number");
+    descendantBirth = await processStart(descendant!);
+    assert.ok(birth);
+    assert.ok(descendantBirth);
+    await terminateProcessGroup(pid, birth);
+    assert.equal(launcher.exitCode, 0);
+    const stat = await readFile(`/proc/${descendant}/stat`, "utf8").catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return "";
+      },
+    );
+    assert.ok(
+      (await processStart(descendant!)) !== descendantBirth ||
+        stat.split(") ")[1]?.startsWith("Z "),
+      "the owned descendant must be dead before shutdown completes",
+    );
+  },
+);
 
 await test("ownership rejects canonical, foreign and non-expiring environments", () => {
   const env = owned();
@@ -166,7 +239,13 @@ await test("setup provisions no AI resources unless --ai", async () => {
           "-e",
           `import {context, createEnvironment, listEnvironments} from ${JSON.stringify(module)}; const env = await createEnvironment(${JSON.stringify(root)}, false${ai === undefined ? "" : `, ${ai}`}); console.log(JSON.stringify({env, listed: await listEnvironments(), vars: (await context(env)).env}));`,
         ],
-        { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } },
+        {
+          env: {
+            ...unitTestEnvironment(process.env),
+            HOME: home,
+            PATH: `${bin}:${process.env.PATH}`,
+          },
+        },
       );
       const { env, listed, vars } = JSON.parse(output.trim().split("\n").at(-1)!) as {
         env: Environment;
@@ -282,7 +361,11 @@ await test("a stuck expired environment doesn't block creating another (CORE-292
       { mode: 0o700 },
     );
     const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
-    const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+    const childEnv = {
+      ...unitTestEnvironment(process.env),
+      HOME: home,
+      PATH: `${bin}:${process.env.PATH}`,
+    };
     // cleanupExpired itself still reports the failure...
     await assert.rejects(
       command(
@@ -351,7 +434,11 @@ for (const gateway of [undefined, "pending", "created"] as const)
         "-e",
         `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
       ];
-      const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+      const childEnv = {
+        ...unitTestEnvironment(process.env),
+        HOME: home,
+        PATH: `${bin}:${process.env.PATH}`,
+      };
       await assert.rejects(
         command(process.execPath, invocation, { env: childEnv }),
         /Cleanup incomplete/,
@@ -389,7 +476,7 @@ for (const gateway of [undefined, "pending", "created"] as const)
 await test("a crashed lock owner does not prevent the next cleanup", async () => {
   const home = await mkdtemp(join(tmpdir(), "gitmatrix-lock-"));
   const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
-  const env = { ...process.env, HOME: home };
+  const env = { ...unitTestEnvironment(process.env), HOME: home };
   const child = spawn(
     process.execPath,
     [
@@ -457,7 +544,13 @@ await test("redirected worktree state cannot block remote cleanup or delete fore
         "-e",
         `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
       ],
-      { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } },
+      {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH}`,
+        },
+      },
     );
     const deleted = JSON.parse(await readFile(journal, "utf8")) as Environment;
     assert.equal(deleted.status, "deleted");
@@ -501,7 +594,7 @@ await test("failed local cleanup stays retryable after remote resources have bee
       "-e",
       `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
     ];
-    const childEnv = { ...process.env, HOME: home, PATH: "/usr/bin:/bin" };
+    const childEnv = { ...unitTestEnvironment(process.env), HOME: home, PATH: "/usr/bin:/bin" };
     await assert.rejects(command(process.execPath, invocation, { env: childEnv }), /JSON/);
     assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleting");
     assert.equal(await readFile(credential, "utf8"), "owned credential");
@@ -563,7 +656,11 @@ await test("a namespace Cloudflare refuses to delete with no listable repos is o
     const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
     const run = (code: string) =>
       command(process.execPath, ["--input-type=module", "-e", code], {
-        env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH}`,
+        },
       });
     await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
     for (const journal of journals) {
@@ -633,7 +730,13 @@ console.log('[]');\n`,
           "-e",
           `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
         ],
-        { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } },
+        {
+          env: {
+            ...unitTestEnvironment(process.env),
+            HOME: home,
+            PATH: `${bin}:${process.env.PATH}`,
+          },
+        },
       );
       const listed = async () =>
         (await readFile(calls, "utf8"))

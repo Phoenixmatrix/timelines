@@ -1,0 +1,287 @@
+import { spawn } from "node:child_process";
+import { randomBytes, createHash } from "node:crypto";
+import { mkdir, readFile, readdir, realpath, rename, writeFile, lstat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+
+export type Execution = "local" | "cloudflare";
+export interface OwnedResources {
+  id: string;
+  account: string;
+  resources: Record<string, "pending" | "created" | "deleted" | "orphaned">;
+}
+export interface RemoteEnvironment {
+  version: 1;
+  id: string;
+  root: string;
+  account: string;
+  profile?: string;
+  origin?: string;
+  token: string;
+  previewToken: string;
+  created: number;
+  expires: number;
+  status: "provisioning" | "ready" | "stopped" | "deleting" | "deleted";
+  installed: boolean;
+  workerDeleted?: boolean;
+  containerApplicationId?: string;
+  teardownPhase?: "worker-delete";
+  resources: OwnedResources[];
+  lastProcess?: string;
+}
+export const remoteRegistry = join(homedir(), ".local", "state", "gitmatrix-agent", "remote");
+const sessionPattern = /^gmr-[a-f0-9]{24}$/;
+const accountPattern = /^[a-f0-9]{32}$/;
+
+export function selectExecution(
+  cli: string | undefined,
+  env: string | undefined,
+  config: unknown,
+  pinned?: Execution,
+): Execution {
+  for (const value of [cli, env, config]) {
+    if (value !== undefined && value !== "local" && value !== "cloudflare")
+      throw new Error("Execution must be local or cloudflare.");
+  }
+  const explicit = cli ?? env ?? config;
+  if (pinned && explicit !== undefined && explicit !== pinned)
+    throw new Error(
+      `This worktree owns a ${pinned} environment; destroy it before switching execution mode.`,
+    );
+  return (explicit ?? pinned ?? "local") as Execution;
+}
+
+export function validateOwnedResources(value: OwnedResources, account: string): void {
+  if (
+    !value ||
+    !/^gma-[a-z0-9]+-[a-f0-9]{12}$/.test(value.id) ||
+    value.account !== account ||
+    !value.resources ||
+    typeof value.resources !== "object"
+  )
+    throw new Error("Invalid remote resource ownership record.");
+  for (const [key, state] of Object.entries(value.resources)) {
+    if (
+      !["artifacts", "vectors", "search", "gateway"].includes(key) ||
+      !["pending", "created", "deleted", "orphaned"].includes(state)
+    )
+      throw new Error("Invalid remote resource ownership state.");
+  }
+}
+export function validateRemoteEnvironment(value: RemoteEnvironment): void {
+  if (
+    !value ||
+    value.version !== 1 ||
+    !sessionPattern.test(value.id) ||
+    !isAbsolute(value.root) ||
+    !accountPattern.test(value.account) ||
+    !/^[a-f0-9]{64}$/.test(value.token) ||
+    !/^[a-f0-9]{64}$/.test(value.previewToken) ||
+    !Number.isFinite(value.created) ||
+    !Number.isFinite(value.expires) ||
+    value.expires <= value.created ||
+    value.expires - value.created > 86_400_000 ||
+    !["provisioning", "ready", "stopped", "deleting", "deleted"].includes(value.status) ||
+    typeof value.installed !== "boolean" ||
+    (value.workerDeleted !== undefined && typeof value.workerDeleted !== "boolean") ||
+    (value.containerApplicationId !== undefined &&
+      !/^[a-f0-9]{32}$/.test(value.containerApplicationId)) ||
+    (value.teardownPhase !== undefined && value.teardownPhase !== "worker-delete") ||
+    (value.teardownPhase !== undefined && !["deleting", "deleted"].includes(value.status)) ||
+    !Array.isArray(value.resources)
+  )
+    throw new Error("Invalid remote environment ownership journal; refusing resource operations.");
+  if (value.origin) {
+    const url = new URL(value.origin);
+    if (
+      url.protocol !== "https:" ||
+      url.origin !== value.origin ||
+      !url.hostname.startsWith(`${value.id}.`) ||
+      !url.hostname.endsWith(".workers.dev")
+    )
+      throw new Error("Remote origin is not this environment's isolated workers.dev host.");
+  }
+  for (const resource of value.resources) validateOwnedResources(resource, value.account);
+  if (
+    value.teardownPhase === "worker-delete" &&
+    value.resources.some((owned) =>
+      Object.values(owned.resources).some((state) => state !== "deleted"),
+    )
+  )
+    throw new Error("Worker deletion requires completed owned resource cleanup.");
+}
+
+async function privateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const stat = await lstat(path);
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    (stat.mode & 0o077) !== 0 ||
+    (process.getuid && stat.uid !== process.getuid())
+  )
+    throw new Error(`Remote journal directory must be private and owned by this user: ${path}`);
+}
+export async function privateJson(path: string, value: unknown): Promise<void> {
+  await privateDirectory(dirname(path));
+  const temporary = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+  await writeFile(temporary, JSON.stringify(value) + "\n", { mode: 0o600, flag: "wx" });
+  await rename(temporary, path);
+}
+export async function inventory(): Promise<RemoteEnvironment[]> {
+  const directory = join(remoteRegistry, "environments");
+  const names = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const records: RemoteEnvironment[] = [];
+  for (const name of names.filter((name) => name.endsWith(".json"))) {
+    const path = join(directory, name);
+    const stat = await lstat(path);
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      (stat.mode & 0o077) !== 0 ||
+      (process.getuid && stat.uid !== process.getuid())
+    )
+      throw new Error("Unsafe remote ownership journal permissions.");
+    const record = JSON.parse(await readFile(path, "utf8")) as RemoteEnvironment;
+    validateRemoteEnvironment(record);
+    if (name !== `${record.id}.json`)
+      throw new Error("Remote ownership journal filename mismatch.");
+    records.push(record);
+  }
+  return records;
+}
+export async function currentRemote(root: string): Promise<RemoteEnvironment | undefined> {
+  return (await inventory()).find((record) => record.root === root && record.status !== "deleted");
+}
+export async function persistRemote(record: RemoteEnvironment): Promise<void> {
+  validateRemoteEnvironment(record);
+  await privateJson(join(remoteRegistry, "environments", `${record.id}.json`), record);
+}
+
+/** A failed first deployment retains its identity, secrets, quota slot and absolute deadline. */
+export async function ensureRemoteDeployment(
+  record: RemoteEnvironment,
+  deploy: (record: RemoteEnvironment) => Promise<void>,
+  now = Date.now(),
+): Promise<void> {
+  validateRemoteEnvironment(record);
+  if (record.expires <= now || record.status === "deleting" || record.status === "deleted")
+    throw new Error("Remote environment expired or deleting; destroy it before setup.");
+  if (record.origin) return;
+  if (record.status !== "provisioning" || record.installed || record.resources.length !== 0)
+    throw new Error("Remote deployment journal is incomplete; refusing to replace unknown state.");
+  await deploy(record);
+}
+
+/** Commit the last runtime-dependent cleanup before deleting its only endpoint. */
+export async function teardownRemote(
+  record: RemoteEnvironment,
+  actions: {
+    persist: (record: RemoteEnvironment) => Promise<void>;
+    collectOwnership: () => Promise<void>;
+    stop: () => Promise<void>;
+    removeResources: () => Promise<void>;
+    deleteWorker: () => Promise<void>;
+    deleteApplication: () => Promise<void>;
+  },
+): Promise<void> {
+  validateRemoteEnvironment(record);
+  record.status = "deleting";
+  await actions.persist(record);
+  if (record.teardownPhase !== "worker-delete") {
+    if (record.origin && !record.workerDeleted) {
+      // Failure is not evidence of absence: preserve the runtime and its journal.
+      await actions.collectOwnership();
+      await actions.stop();
+      await actions.collectOwnership();
+    }
+    await actions.removeResources();
+    record.teardownPhase = "worker-delete";
+    // Persist before cf: an interrupted successful delete must not need the Worker.
+    await actions.persist(record);
+  }
+  if (!record.workerDeleted) {
+    await actions.deleteWorker();
+    record.workerDeleted = true;
+    await actions.persist(record);
+  }
+  // Worker deletion leaves its separately billed Container application behind.
+  await actions.deleteApplication();
+  record.status = "deleted";
+  await actions.persist(record);
+}
+
+/** A kernel lock releases even on abrupt client exit, unlike PID-file locks. */
+export async function remoteLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+  await privateDirectory(remoteRegistry);
+  const path = join(remoteRegistry, `${createHash("sha256").update(key).digest("hex")}.lock`);
+  const child = spawn(
+    "flock",
+    [
+      "-w",
+      "300",
+      path,
+      process.execPath,
+      "-e",
+      'process.stdout.write("locked\\n");process.stdin.resume()',
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const exited = Promise.withResolvers<void>();
+  const locked = Promise.withResolvers<void>();
+  child.once("error", exited.reject);
+  child.once("exit", (code) =>
+    code === 0 ? exited.resolve() : exited.reject(new Error("Remote environment lock failed.")),
+  );
+  child.stdout.once("data", () => locked.resolve());
+  // Attach the rejection immediately, including errors before acquiring the lock.
+  void exited.promise.catch(() => {});
+  await Promise.race([
+    locked.promise,
+    exited.promise.then(() => {
+      throw new Error("Remote environment lock exited before acquisition.");
+    }),
+  ]);
+  try {
+    return await action();
+  } finally {
+    child.stdin.end();
+    await exited.promise;
+  }
+}
+export async function allocateRemote(
+  root: string,
+  account: string,
+  profile?: string,
+): Promise<RemoteEnvironment> {
+  root = await realpath(root);
+  return remoteLock("quota", async () => {
+    const records = await inventory();
+    if (records.some((record) => record.root === root && record.status !== "deleted"))
+      throw new Error("Remote environment already exists; use it or destroy it before setup.");
+    if (records.filter((record) => record.status !== "deleted").length >= 4)
+      throw new Error(
+        "Four remote environments already exist; destroy unused environments or cleanup --expired first.",
+      );
+    const created = Date.now();
+    const record: RemoteEnvironment = {
+      version: 1,
+      id: `gmr-${randomBytes(12).toString("hex")}`,
+      root,
+      account,
+      profile,
+      token: randomBytes(32).toString("hex"),
+      previewToken: randomBytes(32).toString("hex"),
+      created,
+      expires: created + 86_400_000,
+      status: "provisioning",
+      installed: false,
+      resources: [],
+    };
+    await persistRemote(record);
+    return record;
+  });
+}

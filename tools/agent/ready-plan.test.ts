@@ -21,6 +21,7 @@ const workspaces = [
   "apps/site",
   "tools/agent",
   "tools/preview",
+  "tools/remote",
   "packages/formats",
   "packages/testing",
   "packages/utils",
@@ -106,32 +107,23 @@ await test("ready options accept explicit flags and reject malformed or unknown 
     assert.throws(() => parseReadyOptions(args), Error, args.join(" "));
 });
 
-await test("coding-agent configuration runs only the mandatory check", async () => {
+await test("docs and coding-agent configuration retain mandatory checks", async () => {
   await fixture(async (root, _git, put) => {
+    assert.deepEqual(names(await readinessPlan(root, options)), ["remote-types", "check"]);
+    await put("README.md");
+    await put("apps/website/README.md");
     await put(".claude/settings.json", "{}\n");
     await put(".claude/agents/runner.md");
     await put(".claude/rules/delegation.md");
     await put(".claude/skills/gitmatrix-graph-work/SKILL.md");
     await put(".agents/skills/gitmatrix-graph-work/SKILL.md");
     const plan = await readinessPlan(root, options);
-    assert.deepEqual(names(plan), ["check"]);
-    assert.equal(plan.full, false);
-    assert.equal(plan.e2e, false);
-  });
-});
-
-await test("unchanged and allowlisted documentation run only mandatory checks", async () => {
-  await fixture(async (root, _git, put) => {
-    assert.deepEqual(names(await readinessPlan(root, options)), ["check"]);
-    await put("README.md");
-    await put("apps/website/README.md");
-    const plan = await readinessPlan(root, options);
-    assert.deepEqual(names(plan), ["check"]);
+    assert.deepEqual(names(plan), ["remote-types", "check"]);
     assert.equal(plan.full, false);
     assert.equal(plan.e2e, false);
     await rm(join(root, "apps/website/.cloudflare"), { recursive: true });
     const fresh = await readinessPlan(root, options);
-    assert.deepEqual(names(fresh), ["bindings", "check"]);
+    assert.deepEqual(names(fresh), ["bindings", "remote-types", "check"]);
     assert.deepEqual(fresh.gates[0], {
       name: "bindings",
       binary: "cf",
@@ -149,6 +141,7 @@ await test("website production changes propagate implicit TS consumers without R
     assert.equal(plan.e2e, true);
     assert.deepEqual(targets(plan), [
       "website#typecheck",
+      "@gitmatrix/remote#typecheck",
       "@gitmatrix/agent#typecheck",
       "@gitmatrix/agent#test",
       "@gitmatrix/preview#typecheck",
@@ -156,7 +149,8 @@ await test("website production changes propagate implicit TS consumers without R
       "website#test",
       "website#build",
     ]);
-    assert.deepEqual(names(plan).slice(0, 2), ["website-types", "check"]);
+    assert.ok(names(plan).indexOf("website-types") < names(plan).indexOf("check"));
+    assert.ok(names(plan).indexOf("remote-types") < names(plan).indexOf("check"));
   });
 });
 
@@ -169,14 +163,22 @@ await test("CLI changes select its whole Rust package and the site's gm referenc
       assert.equal(plan.e2e, true, path);
       assert.deepEqual(
         targets(plan),
-        ["cli#check", "cli#test", "cli#build", "site#typecheck", "site#test", "site#build"],
+        [
+          "@gitmatrix/remote#typecheck",
+          "cli#check",
+          "cli#test",
+          "cli#build",
+          "site#typecheck",
+          "site#test",
+          "site#build",
+        ],
         path,
       );
     });
   }
 });
 
-await test("public site changes select only the site, without E2E", async () => {
+await test("public site changes select site work and the mandatory remote contract, without E2E", async () => {
   for (const path of [
     "apps/site/src/pages/index.astro",
     "apps/site/src/content/docs/concepts/timelines.md",
@@ -186,7 +188,11 @@ await test("public site changes select only the site, without E2E", async () => 
       const plan = await readinessPlan(root, options);
       assert.equal(plan.full, false, path);
       assert.equal(plan.e2e, false, path);
-      assert.deepEqual(targets(plan), ["site#typecheck", "site#test", "site#build"], path);
+      assert.deepEqual(
+        targets(plan),
+        ["@gitmatrix/remote#typecheck", "site#typecheck", "site#test", "site#build"],
+        path,
+      );
     });
   }
 });
@@ -229,7 +235,8 @@ await test("manifest dependencies propagate formats and testing but keep utils i
       assert.ok(!targets(plan).some((target) => target.startsWith("cli#")));
       if (workspace === "testing")
         assert.ok(!targets(plan).some((target) => target.endsWith("#build")));
-      if (workspace === "utils") assert.deepEqual(targets(plan), expected);
+      if (workspace === "utils")
+        assert.deepEqual(targets(plan), ["@gitmatrix/remote#typecheck", ...expected]);
     });
   }
 });
@@ -267,7 +274,13 @@ await test("test-only changes select corresponding tests and types without build
     await fixture(async (root, _git, put) => {
       await put(path);
       const plan = await readinessPlan(root, options);
-      assert.deepEqual(targets(plan), expected, path);
+      assert.deepEqual(
+        targets(plan),
+        expected[0] === "website#typecheck"
+          ? [expected[0], "@gitmatrix/remote#typecheck", ...expected.slice(1)]
+          : ["@gitmatrix/remote#typecheck", ...expected],
+        path,
+      );
       assert.equal(plan.full, false, path);
       assert.equal(plan.e2e, false, path);
     });
@@ -278,9 +291,62 @@ await test("preview tooling stays isolated from production app and CLI", async (
   await fixture(async (root, _git, put) => {
     await put("tools/preview/preview.ts");
     const plan = await readinessPlan(root, options);
-    assert.deepEqual(targets(plan), ["@gitmatrix/preview#typecheck", "@gitmatrix/preview#test"]);
+    assert.deepEqual(targets(plan), [
+      "@gitmatrix/remote#typecheck",
+      "@gitmatrix/preview#typecheck",
+      "@gitmatrix/preview#test",
+    ]);
     assert.equal(plan.e2e, false);
   });
+});
+
+await test("remote test-only changes keep Worker coverage without live or production gates", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("tools/remote/worker.test.ts");
+    const plan = await readinessPlan(root, options);
+    assert.equal(plan.full, false);
+    assert.equal(plan.e2e, false);
+    assert.deepEqual(targets(plan), ["@gitmatrix/remote#typecheck"]);
+    assert.deepEqual(names(plan), ["remote-types", "check"]);
+  });
+});
+
+await test("remote protocol consumers participate in transitive workspace task selection", async () => {
+  await fixture(async (root, git, put) => {
+    const path = "tools/remote/package.json";
+    const manifest = JSON.parse(await readFile(join(root, path), "utf8"));
+    // Exercise selection of an available consumer task rather than only its mandatory typecheck.
+    manifest.scripts.test = "node --test";
+    await put(path, JSON.stringify(manifest));
+    await git(["add", path]);
+    await git(["commit", "-m", "remote test task"]);
+    await git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    await put("tools/agent/environment.test.ts");
+    const testOnly = await readinessPlan(root, options);
+    assert.ok(!targets(testOnly).includes("@gitmatrix/remote#test"));
+    await put("apps/website/src/routes/Home.tsx");
+    const production = await readinessPlan(root, options);
+    assert.equal(production.full, false);
+    assert.ok(targets(production).includes("@gitmatrix/remote#test"));
+    assert.equal(production.e2e, true);
+  });
+});
+
+await test("every narrow plan regenerates and checks remote bindings before root lint", async () => {
+  for (const path of ["README.md", "apps/cli/tests/remote.rs", "tools/remote/worker.test.ts"]) {
+    await fixture(async (root, _git, put) => {
+      await put(path);
+      for (const generated of [false, true]) {
+        if (generated) await put("tools/remote/.cloudflare/types/index.d.ts", "// generated\n");
+        const plan = await readinessPlan(root, options);
+        assert.equal(plan.full, false);
+        const remote = plan.gates.filter((gate) => gate.name === "remote-types");
+        assert.equal(remote.length, 1);
+        assert.deepEqual(remote[0].args, ["run", "--no-cache", "@gitmatrix/remote#typecheck"]);
+        assert.ok(plan.gates.indexOf(remote[0]) < names(plan).indexOf("check"));
+      }
+    });
+  }
 });
 
 await test("unknown/global paths, task manifests and shared harness changes fail closed", async () => {
@@ -297,6 +363,10 @@ await test("unknown/global paths, task manifests and shared harness changes fail
     "tools/agent/ready-plan.ts",
     "tools/agent/ready-e2e.ts",
     "tools/agent/e2e.ts",
+    "tools/agent/remote-protocol.ts",
+    "tools/remote/worker.ts",
+    "tools/remote/cloudflare.config.ts",
+    "tools/remote/package.json",
     "apps/website/package.json",
   ]) {
     await fixture(async (root, _git, put) => {
@@ -308,18 +378,18 @@ await test("unknown/global paths, task manifests and shared harness changes fail
         plan.reasons.some((reason) => reason.includes(path)),
         path,
       );
-      assert.deepEqual(names(plan), [
-        "website-types",
-        "check",
-        "cli-check",
-        "types",
-        "preview-types",
-        "formats-types",
-        "testing-types",
-        "site-types",
-        "tests",
-        "build",
-      ]);
+      for (const target of [
+        "website#typecheck",
+        "@gitmatrix/agent#typecheck",
+        "@gitmatrix/preview#typecheck",
+        "@gitmatrix/remote#typecheck",
+        "@gitmatrix/formats#typecheck",
+        "@gitmatrix/testing#typecheck",
+        "site#typecheck",
+        "cli#check",
+      ])
+        assert.ok(targets(plan).includes(target), target);
+      assert.ok(names(plan).indexOf("remote-types") < names(plan).indexOf("check"));
       assert.deepEqual(plan.gates.at(-2)?.args, [
         "run",
         "-r",
@@ -349,8 +419,19 @@ await test("content-only audited stylesheets retain every website gate and E2E",
       );
       await rm(join(root, "apps/website/.cloudflare"), { recursive: true });
       const plan = await readinessPlan(root, options);
-      assert.deepEqual(names(plan), ["website-types", "check", "website-tests", "website-build"]);
-      assert.deepEqual(targets(plan), ["website#typecheck", "website#test", "website#build"]);
+      assert.deepEqual(names(plan), [
+        "website-types",
+        "remote-types",
+        "check",
+        "website-tests",
+        "website-build",
+      ]);
+      assert.deepEqual(targets(plan), [
+        "website#typecheck",
+        "@gitmatrix/remote#typecheck",
+        "website#test",
+        "website#build",
+      ]);
       assert.equal(plan.e2e, true);
     });
   }
@@ -409,7 +490,9 @@ await test("full and website profiles generate bindings exactly once before thei
     await put("apps/website/worker/index.test.ts");
     for (const all of [false, true]) {
       const plan = await readinessPlan(root, { ...options, all });
-      assert.deepEqual(names(plan).slice(0, 2), ["website-types", "check"]);
+      assert.ok(names(plan).indexOf("website-types") < names(plan).indexOf("check"));
+      assert.ok(names(plan).indexOf("remote-types") < names(plan).indexOf("check"));
+      assert.equal(names(plan).filter((name) => name === "remote-types").length, 1);
       assert.equal(names(plan).filter((name) => name === "website-types").length, 1);
       assert.ok(!names(plan).includes("bindings"));
     }
@@ -471,7 +554,7 @@ await test("Git discovery preserves committed, staged, unstaged, deleted, rename
         .map((name) => prefix + name)
         .sort(),
     );
-    assert.deepEqual(targets(plan), ["utils#test", "utils#build"]);
+    assert.deepEqual(targets(plan), ["@gitmatrix/remote#typecheck", "utils#test", "utils#build"]);
   });
 });
 

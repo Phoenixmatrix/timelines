@@ -607,6 +607,18 @@ importers:
         specifier: 'catalog:'
         version: 7.0.2
 
+  tools/remote:
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.19.0
+      cf:
+        specifier: 'catalog:'
+        version: 1.0.0-beta.7(patch_hash=e8114ba3de4870ba725619e95a949e6998ba9e96794c5ad04d5a0a3ff19b3e4f)(@types/node@24.19.0)
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+
 packages:
 
   '@ai-sdk/gateway@4.0.103':

@@ -206,8 +206,13 @@ export default defineConfig(({ mode, isPreview }) => {
         CI_VERSION: bindings.versionMetadata(),
         // Local runners start on demand: the CI Workflow pings the dev server,
         // which runs `gm runner --once` per queued job (vite/ci-runners.ts).
-        ...(runner === "local" && dev && publicUrl
-          ? { CI_DISPATCH_URL: bindings.text(`${publicUrl}/__gitmatrix/ci/dispatch`) }
+        // Internal dispatch stays on loopback, not the authenticated browser preview.
+        ...(runner === "local" && dev
+          ? {
+              CI_DISPATCH_URL: bindings.text(
+                `http://${local.host}:${local.port}/__gitmatrix/ci/dispatch`,
+              ),
+            }
           : {}),
         ...(dev && env.GITMATRIX_AGENT_ID
           ? { AGENT_ID: bindings.text(env.GITMATRIX_AGENT_ID) }

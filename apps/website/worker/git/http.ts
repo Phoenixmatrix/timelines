@@ -212,17 +212,35 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
       );
     }
     if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
-      if (!(await sourceOnly))
-        afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
-      else {
-        invalidateRefs(repo.artifacts_name);
-        // Staging skips CI/AI/preview work, not provenance. Finish this bounded
-        // metadata read before the CLI uploads context for the staged commits.
-        await recordPush(c.env, repo, actor).catch((error) =>
-          console.error("Queue source push log: recording failed", errorDetails(error)),
-        );
-      }
+      const finishPush = async () => {
+        if (!(await sourceOnly))
+          afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
+        else {
+          invalidateRefs(repo.artifacts_name);
+          // Staging skips CI/AI/preview work, not provenance. Finish this bounded
+          // metadata read before the CLI uploads context for the staged commits.
+          await recordPush(c.env, repo, actor).catch((error) =>
+            console.error("Queue source push log: recording failed", errorDetails(error)),
+          );
+        }
+      };
       if (pack) c.executionCtx.waitUntil(recordPushedBytes(c.env, repo.id, pack.done));
+      if (upstream.body) {
+        // Headers can precede the ref transaction. Keep the response streaming,
+        // but hold its final EOF until source-stage provenance has been recorded.
+        const { readable, writable } = new TransformStream<Uint8Array>();
+        c.executionCtx.waitUntil(
+          upstream.body.pipeTo(writable, { preventClose: true }).then(async () => {
+            try {
+              await finishPush();
+            } finally {
+              await writable.close();
+            }
+          }),
+        );
+        return respond(upstream, readable);
+      }
+      await finishPush();
     }
   }
   return respond(upstream);
@@ -569,14 +587,14 @@ async function forward(
   return upstream;
 }
 
-function respond(upstream: Response | { refused: Response }) {
+function respond(upstream: Response | { refused: Response }, body?: ReadableStream<Uint8Array>) {
   if (!(upstream instanceof Response)) return upstream.refused;
   const responseHeaders = new Headers();
   for (const header of FORWARDED_RESPONSE_HEADERS) {
     const value = upstream.headers.get(header);
     if (value) responseHeaders.set(header, value);
   }
-  return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
+  return new Response(body ?? upstream.body, { status: upstream.status, headers: responseHeaders });
 }
 
 /**

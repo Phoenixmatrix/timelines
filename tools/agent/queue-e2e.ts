@@ -9,6 +9,7 @@ import type { CiRunDetail, CiRunList, RepoDetail } from "../../apps/website/shar
 import type { DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { StepPage, StepVersions } from "../../apps/website/shared/steps.ts";
+import { redact } from "./environment.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 export type QueueGm = (
@@ -98,9 +99,13 @@ export async function queueFixture(
             GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
           },
         },
-        (error, stdout) =>
+        (error, stdout, stderr) =>
           error
-            ? reject(new Error(`Queue fixture git ${args[0]} failed (${error.code})`))
+            ? reject(
+                new Error(
+                  `Queue fixture git ${args[0]} failed (${error.code}):\n${redact(stderr.replaceAll(token, "[REDACTED]")).slice(-6000)}`,
+                ),
+              )
             : resolve(raw ? stdout : stdout.trim()),
       );
     });

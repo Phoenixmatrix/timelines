@@ -46,9 +46,13 @@ jobs:
     instance: standard-4
     timeout_minutes: 15
     steps:
-      # Locally the checkout is already installed and typed.
+      # Locally the checkout is already installed and the website is typed.
       - name: Install
         run: '[ -n "${GITMATRIX_LOCAL:-}" ] || { pnpm install --frozen-lockfile && vp run website#cf-typegen; }'
+      # Also runs locally: the remote Worker's generated bindings must precede vp check.
+      # Typegen mode is offline and does not provision a remote session or container.
+      - name: Remote Worker types and compile contract
+        run: vp run --no-cache @gitmatrix/remote#typecheck
       - name: Format, lint, type check
         run: vp check
 
@@ -80,9 +84,12 @@ jobs:
       # Binding types are generated (and gitignored); type-aware lint needs them.
       - name: Generate Worker types
         run: vp run website#cf-typegen
+      - name: Remote Worker types and compile contract
+        run: vp run --no-cache @gitmatrix/remote#typecheck
       - name: Format, lint, type check
         run: vp check
-      - name: All application and harness type contracts
+      # Remote types were checked above so root lint can consume their generated bindings.
+      - name: Application and remaining harness type contracts
         run: >-
           vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
           && vp run --no-cache @gitmatrix/preview#typecheck && vp run --no-cache site#typecheck

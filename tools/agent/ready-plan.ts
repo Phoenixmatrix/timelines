@@ -46,6 +46,7 @@ const WORKSPACES = [
   "apps/cli",
   "tools/agent",
   "tools/preview",
+  "tools/remote",
   "apps/website",
   "apps/site",
   "packages/formats",
@@ -80,6 +81,7 @@ const task = (name: string, target: string) => gate(name, ["run", "--no-cache", 
 function fullGates(): ReadyPlan["gates"] {
   return [
     task("website-types", "website#typecheck"),
+    task("remote-types", "@gitmatrix/remote#typecheck"),
     gate("check", ["check"]),
     task("cli-check", "cli#check"),
     task("types", "@gitmatrix/agent#typecheck"),
@@ -228,6 +230,8 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
       return full(`Workspace task/dependency configuration changed: ${path}`);
     if (workspace === "tools/agent" && !testOnly(path))
       return full(`Shared harness lifecycle or readiness implementation changed: ${path}`);
+    if (workspace === "tools/remote" && !testOnly(path))
+      return full(`Shared remote execution backend changed: ${path}`);
     affected.add(workspace);
     if (!testOnly(path) && workspace !== "packages/testing") production.add(workspace);
   }
@@ -275,6 +279,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     dependencies.get("tools/preview")!.add("apps/website");
   }
   dependencies.get("tools/preview")!.add("tools/agent");
+  dependencies.get("tools/remote")!.add("tools/agent");
   // The site's gm reference is checked against gm's manifest (apps/cli/src/meta.rs).
   dependencies.get("apps/site")!.add("apps/cli");
   const propagate = (selected: Set<Workspace>) => {
@@ -312,6 +317,9 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     plan.gates.push(bindings());
     plan.reasons.push("Generate missing bindings required by root type-aware vp check.");
   }
+  // Root type-aware lint includes the remote Worker even for otherwise narrow changes.
+  // Its typecheck generates credential-free bindings before checking the Worker contract.
+  plan.gates.push(task("remote-types", "@gitmatrix/remote#typecheck"));
   if (stylesheetOnly)
     plan.reasons.push(
       "Content-only audited stylesheets: retain whole website tests/build/types and frontend E2E; omit unrelated implicit agent/preview consumers.",
@@ -321,6 +329,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     "apps/cli": "cli",
     "tools/agent": "agent",
     "tools/preview": "preview",
+    "tools/remote": "remote",
     "apps/website": "website",
     "apps/site": "site",
     "packages/formats": "formats",
@@ -332,7 +341,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     const manifest = manifests.get(workspace)!;
     const label = labels[workspace];
     if (workspace === "apps/cli") plan.gates.push(task("cli-check", "cli#check"));
-    if (manifest.scripts?.typecheck && workspace !== "apps/website")
+    if (manifest.scripts?.typecheck && workspace !== "apps/website" && workspace !== "tools/remote")
       plan.gates.push(
         task(
           workspace === "tools/agent" ? "types" : `${label}-types`,
@@ -347,7 +356,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   plan.reasons.push(
     affected.size
       ? `Check/test affected workspaces and transitive consumers: ${[...affected].join(", ")}.`
-      : "No executable changes: only the mandatory root check (and missing bindings).",
+      : "No executable changes: only mandatory root/remote checks (and missing bindings).",
     production.size
       ? `Build affected production workspaces where a build task exists: ${[...production].join(", ")}.`
       : "Skip builds: only documentation, tests or shared test helpers changed.",

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { copyFile, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -19,6 +19,8 @@ import {
   redact,
   registryLock,
   stopEnvironment,
+  terminateProcessGroup,
+  unitTestEnvironment,
   validateEnvironment,
 } from "./environment.ts";
 import type { Environment } from "./environment.ts";
@@ -194,6 +196,7 @@ async function identity(env: Environment): Promise<boolean> {
 async function start(
   env: Environment,
   ctx: HarnessContext,
+  lifecycle?: { assertRunning(): void; spawned(child: ChildProcess): void },
 ): Promise<{ owned: boolean; exited: Promise<number | null> }> {
   if (await identity(env)) return { owned: false, exited: Promise.resolve(0) };
   if (env.server)
@@ -212,12 +215,14 @@ async function start(
     if (process.env[xdg!] === undefined) delete serverEnv[xdg!];
     else serverEnv[xdg!] = process.env[xdg!];
   }
+  lifecycle?.assertRunning();
   const child = spawn("vp", ["dev"], {
     cwd: website,
     env: serverEnv,
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  lifecycle?.spawned(child);
   let spawnError: Error | undefined;
   child.once("error", (error) => {
     spawnError = error;
@@ -234,6 +239,7 @@ async function start(
   await markServer(env, child.pid);
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
+    lifecycle?.assertRunning();
     if (spawnError) throw spawnError;
     if (child.exitCode !== null || child.signalCode !== null)
       throw new Error(`Vite exited before readiness. See ${ctx.artifacts}/server.log`);
@@ -245,6 +251,13 @@ async function start(
           origin: env.origin,
           ai: aiEnabled(env),
           log: join(ctx.artifacts, "server.log"),
+          ...(ctx.env.GITMATRIX_REMOTE_ORIGIN
+            ? {
+                publicOrigin: ctx.env.GITMATRIX_REMOTE_ORIGIN,
+                inspector: `${ctx.env.GITMATRIX_REMOTE_ORIGIN}/__remote/ports/9229/json`,
+                sourceRoot: root,
+              }
+            : {}),
         }),
       );
       return { owned: true, exited };
@@ -259,18 +272,21 @@ interface EnvironmentSupervisor {
   close(): Promise<void>;
 }
 
-function superviseEnvironment(env: Environment): EnvironmentSupervisor {
+function superviseEnvironment(
+  env: Environment,
+  stopOwned: () => Promise<void> = () => stopEnvironment(env),
+): EnvironmentSupervisor {
   let interrupted = false;
   let stopping: Promise<void> | undefined;
   let stopFailure: unknown;
   const stop = () => {
     interrupted = true;
-    stopping ??= stopEnvironment(env).catch((error: unknown) => {
+    stopping ??= stopOwned().catch((error: unknown) => {
       stopFailure = error;
     });
   };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
   const expiry = setTimeout(stop, Math.max(1, env.expires - Date.now()));
   return {
     assertRunning() {
@@ -278,9 +294,9 @@ function superviseEnvironment(env: Environment): EnvironmentSupervisor {
     },
     async close() {
       clearTimeout(expiry);
+      await stopping;
       process.off("SIGINT", stop);
       process.off("SIGTERM", stop);
-      await stopping;
       if (stopFailure) throw stopFailure;
     },
   };
@@ -605,6 +621,9 @@ async function gates(options: ReadyOptions): Promise<void> {
         try {
           return await command(binary, commandArgs, {
             cwd: cwd === "website" ? website : root,
+            ...(name === "tests" || name.endsWith("-tests")
+              ? { env: unitTestEnvironment(process.env) }
+              : {}),
             timeout: 1_800_000,
             log: join(directory, `${name}.log`),
           });
@@ -693,18 +712,60 @@ try {
     if (operation === "up") {
       if (args.length) {
         if (args.length !== 1 || args[0] !== "--sandbox") throw new Error("Use up [--sandbox].");
+        if (process.env.GITMATRIX_REMOTE_HOSTED === "1")
+          throw new Error(
+            "Hosted CI runs inside the Cloudflare container; --sandbox requires local Docker and is not supported.",
+          );
         await command("docker", ["info"], { cwd: root });
         ctx.env.GITMATRIX_CI_RUNNER = "sandbox";
       }
-      const handle = await start(env, ctx);
-      if (!handle.owned) throw new Error("Environment already running; use status for its origin.");
-      const supervisor = superviseEnvironment(env);
-      try {
-        const code = await handle.exited;
-        if (code && code !== 143) process.exitCode = code;
-      } finally {
-        await supervisor.close();
-        await stopEnvironment(env);
+      if (process.env.GITMATRIX_REMOTE_HOSTED === "1") {
+        // Install handlers before startup yields, but never stop a server this
+        // invocation merely discovered. A signal during markServer is retried
+        // by finally after the ownership record has finished persisting.
+        let ownedChild: ChildProcess | undefined;
+        let cleanup = Promise.resolve();
+        const stopOwned = () => {
+          cleanup = cleanup.then(async () => {
+            if (!ownedChild?.pid) return;
+            if (env.server?.pid === ownedChild.pid) await stopEnvironment(env);
+            else if (ownedChild.exitCode === null && ownedChild.signalCode === null)
+              await terminateProcessGroup(ownedChild.pid);
+          });
+          return cleanup;
+        };
+        const supervisor = superviseEnvironment(env, stopOwned);
+        try {
+          const handle = await start(env, ctx, {
+            assertRunning: () => supervisor.assertRunning(),
+            spawned: (child) => {
+              ownedChild = child;
+            },
+          });
+          supervisor.assertRunning();
+          if (!handle.owned)
+            throw new Error("Environment already running; use status for its origin.");
+          const code = await handle.exited;
+          if (code && code !== 143) process.exitCode = code;
+        } finally {
+          try {
+            await stopOwned();
+          } finally {
+            await supervisor.close();
+          }
+        }
+      } else {
+        const handle = await start(env, ctx);
+        if (!handle.owned)
+          throw new Error("Environment already running; use status for its origin.");
+        const supervisor = superviseEnvironment(env);
+        try {
+          const code = await handle.exited;
+          if (code && code !== 143) process.exitCode = code;
+        } finally {
+          await supervisor.close();
+          await stopEnvironment(env);
+        }
       }
     } else if (operation === "stop") await stopEnvironment(env);
     else if (operation === "seed") {
@@ -715,13 +776,12 @@ try {
       const binary = operation === "gm" ? ctx.gm : args.shift();
       if (!binary) throw new Error("Missing command.");
       if (!(await identity(env))) throw new Error("Scoped server is not ready; run agent up.");
-      console.log(
-        await command(binary, args, {
-          cwd: operation === "gm" ? ctx.work : root,
-          env: ctx.env,
-          timeout: 1_800_000,
-        }),
-      );
+      const output = await command(binary, args, {
+        cwd: operation === "gm" ? ctx.work : root,
+        env: ctx.env,
+        timeout: 1_800_000,
+      });
+      console.log(process.env.GITMATRIX_REMOTE_HOSTED === "1" ? redact(output) : output);
     } else if (operation === "inspect") {
       const database = args.shift() ?? "db";
       if (!["db", "registry"].includes(database))

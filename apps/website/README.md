@@ -323,6 +323,11 @@ is missing, it never starts a new production deployment of the old candidate.
 It follows the current main's real push pipeline only with Git ancestry proof;
 missing newer-main CI stays pending for bounded recovery before an honest
 infrastructure failure, and unrelated main history fails without inventing coverage.
+
+Canonical push observers start only after the provider's receive-pack response
+finishes, not on its initial headers. Responses remain streamed with backpressure;
+source staging holds the final client EOF until its bounded provenance read ends.
+
 Source staging refs do not start ordinary CI, knowledge or preview work. They do
 record push provenance before returning, so subsequently uploaded step context is
 verified against the staged commit without waiting for landing. Queue

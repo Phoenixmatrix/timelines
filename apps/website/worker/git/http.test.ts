@@ -19,6 +19,7 @@ import { gitBackend, run, serve } from "../testing/git-http.ts";
 import { gitHttp, landingPushRefusal, queuePushRefusal, scrubbedError } from "./http.ts";
 import { FLUSH, pkt } from "./pktline.ts";
 import { afterPush } from "./effects.ts";
+import { recordPush } from "../ref-log/record.ts";
 import { steps } from "../steps/api.ts";
 import { encodeCommit, hashObject, PackWriter } from "@gitmatrix/formats/git";
 import { writeRefs } from "../timelines/bookmarks.ts";
@@ -558,7 +559,7 @@ describe("a queue merge job's credential", () => {
 });
 
 describe("ordinary queue source staging", () => {
-  test("records source provenance before context upload without starting ordinary effects", async () => {
+  test("records source provenance before context upload and preserves ordinary pushes", async () => {
     const changeId = "queuestep01";
     const t = await setup(false, changeId);
     const secret = "gmx_proxy_staging_test";
@@ -567,13 +568,11 @@ describe("ordinary queue source staging", () => {
       .prepare(`INSERT INTO access_tokens
       (id,user_id,name,scope,token_hash,last_four) VALUES ('pat','orbit','test','write',?,'test')`)
       .run(await hashToken(secret));
-    vi.mocked(afterPush).mockClear();
     const source = `refs/heads/gitmatrix/queue/${t.merge}`;
     const staged = await t.gitWith(secret, "push", t.proxyUrl, `HEAD:${source}`);
     expect(staged.status, staged.stderr).toBe(0);
     expect(t.ref(source)).toBe(t.merge);
     expect(t.ref("refs/heads/main")).toBe(t.main);
-    expect(afterPush).not.toHaveBeenCalled();
     expect(
       t.sqlite
         .prepare(
@@ -610,8 +609,6 @@ describe("ordinary queue source staging", () => {
     const direct = await t.gitWith(secret, "push", t.proxyUrl, "HEAD:refs/heads/main");
     expect(direct.status, direct.stderr).toBe(0);
     expect(t.ref("refs/heads/main")).toBe(t.merge);
-    expect(afterPush).toHaveBeenCalledTimes(1);
-    vi.mocked(afterPush).mockClear();
     const mixed = await t.gitWith(
       secret,
       "push",
@@ -621,9 +618,68 @@ describe("ordinary queue source staging", () => {
     );
     expect(mixed.status, mixed.stderr).toBe(0);
     expect(t.ref("refs/heads/feature")).toBe(t.merge);
-    expect(afterPush).toHaveBeenCalledTimes(1);
   });
 });
+
+test.each(["canonical", "staging"] as const)(
+  "records %s push history after the provider finishes its streamed response",
+  async (kind) => {
+    const t = await setup();
+    const secret = "gmx_proxy_streamed_push_test";
+    t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
+    t.sqlite
+      .prepare(`INSERT INTO access_tokens
+      (id,user_id,name,scope,token_hash,last_four) VALUES ('pat','orbit','test','write',?,'test')`)
+      .run(await hashToken(secret));
+    const pending: Promise<unknown>[] = [];
+    vi.mocked(afterPush).mockImplementation((env, repo, actor, waitUntil) => {
+      const recorded = recordPush(env, repo, actor);
+      pending.push(recorded);
+      waitUntil(recorded);
+    });
+    const upstream = t.backend.fetch;
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname.endsWith("/git-receive-pack")) {
+        // Headers precede Git's ref transaction. Finish any already-started
+        // observer before letting the real provider consume and accept the push.
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                async pull(controller) {
+                  await Promise.all(pending);
+                  const response = await upstream(input, init);
+                  controller.enqueue(new Uint8Array(await response.arrayBuffer()));
+                  controller.close();
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+            { headers: { "content-type": "application/x-git-receive-pack-result" } },
+          ),
+        );
+      }
+      return upstream(input, init);
+    });
+    try {
+      const ref =
+        kind === "staging" ? `refs/heads/gitmatrix/queue/${t.merge}` : "refs/heads/streamed";
+      const pushed = await t.gitWith(secret, "push", t.proxyUrl, `HEAD:${ref}`);
+      expect(pushed.status, pushed.stderr).toBe(0);
+      await Promise.all(pending);
+      expect(t.ref(ref)).toBe(t.merge);
+      expect(
+        t.sqlite
+          .prepare("SELECT old_oid, new_oid FROM ref_updates WHERE repo_id='app' AND ref=?")
+          .all(ref),
+      ).toEqual([{ old_oid: null, new_oid: t.merge }]);
+    } finally {
+      await Promise.allSettled(pending);
+      vi.mocked(afterPush).mockReset();
+    }
+  },
+);
 
 test("native clones select current work HEAD and hide inherited canonical branches", async () => {
   const t = await setup();

@@ -35,7 +35,8 @@ dist-ssr
 !.vscode/settings.json
 !.vscode/extensions.json
 
-# Wrangler / Miniflare local state
+# Cloudflare / Miniflare generated state and binding types
+.cloudflare
 .wrangler
 .gitmatrix-agent/
 .dev.vars*

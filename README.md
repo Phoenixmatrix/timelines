@@ -177,7 +177,35 @@ Use one **source worktree and isolated environment per agent**. Never test produ
 mutations against the canonical development server on port 5180, and never install
 a feature worktree's `gm` over the shared binary.
 
-### Prerequisites
+### Choose where tools execute
+
+Claude Code, Codex and OMP stay on your computer, editing the local source
+worktree. **Local execution remains the default.** The optional `cloudflare`
+backend moves dependency installation, app processes, builds, checks, scoped
+`gm` and browser tests into a disposable Cloudflare container; it does not move
+the agent or make the remote filesystem authoritative.
+
+Selection, highest priority first:
+
+1. `--execution local` or `--execution cloudflare` on the agent entry command.
+2. `GITMATRIX_AGENT_EXECUTION=local|cloudflare`.
+3. `.gitmatrix/development.json`, for example `{"execution":"cloudflare"}`.
+4. `local`.
+
+An existing remote environment pins the worktree to its backend. Destroy it
+before switching; an explicit conflicting choice is an error. Cloud failures
+never silently run expensive commands locally. The dependency-light entry
+`node tools/agent/entry.ts` selects the backend before loading the local harness;
+cloud users do not need a local `vp install`, Rust toolchain or Chromium.
+`vp run agent` and `vp run ready` use the same selector when Vite+ is installed.
+
+The local instructions below apply when local execution is selected. To choose
+it deliberately, use `node tools/agent/entry.ts --execution local setup` (with
+the local prerequisites installed). For cloud mode use the
+[Cloudflare workflow](#optional-cloudflare-workflow), including remote command
+paths rather than host-side `vp`, Cargo or browser automation.
+
+### Local prerequisites
 
 - Linux (including WSL2) with a running **user systemd** manager and `flock`.
 - Vite+, Node 24+, the Rust toolchain, Git and curl. `vp install` selects pinned
@@ -199,7 +227,7 @@ a feature worktree's `gm` over the shared binary.
 Cloudflare operations use **`cf`, never Wrangler**. Remote services incur charges;
 see [cleanup and cost bounds](#cleanup-and-cost-bounds) before provisioning.
 
-### Create, run and inspect
+### Local create, run and inspect
 
 ```bash
 # In the source workspace; gm snapshots the current working copy.
@@ -271,6 +299,227 @@ Cookies are host-scoped, not port-scoped: separate ports alone do not isolate
 browser sessions. The dev persona UI and token/seed endpoints are disabled outside
 development; harness dev endpoints additionally require an environment capability.
 
+### Optional Cloudflare workflow
+
+Use a separate local worktree per agent, just as in local mode. The Linux/WSL2
+host needs Node 24+, Git, a running user-systemd manager and an authenticated
+**`cf` CLI**. Install Node and `cf` outside the checkout so cleanup survives
+worktree removal. No Docker, local image build, Cargo or browser dependencies
+are needed on the host. Your Cloudflare account must support Workers,
+Durable Objects and Containers and permit the existing CI image to be used.
+The harness deploys a small per-worktree control Worker using a digest-pinned
+prebuilt CI image. Missing account permissions or image access are errors,
+not reasons to install and run the heavy toolchain locally.
+
+Use your existing `cf auth login` session. If it exposes multiple accounts,
+select `CLOUDFLARE_ACCOUNT_ID`. There is no separate development API token to
+maintain by default. **Choosing cloud mode authorizes remote execution with
+your current validated `cf` access token**: trusted code and dependencies in
+that disposable container can use its Cloudflare permissions until it expires.
+Use a development account and run only code you trust. The client validates
+auth for remote commands and transfers only the access token and necessary
+allowlisted runtime values over the authenticated control channel. The OAuth
+refresh credential, credential file and broad host environment stay local;
+never copy them into the container or source tree. Connected clients let `cf`
+renew its session locally and publish the current access token. If `cf` cannot
+renew a revoked or invalid session, repair the login locally rather than
+embedding a secret in source.
+
+#### Setup, edit, run and reconnect
+
+From the local source worktree, choose cloud mode for the terminal session:
+
+```bash
+export GITMATRIX_AGENT_EXECUTION=cloudflare
+node tools/agent/entry.ts setup
+node tools/agent/entry.ts up
+```
+
+`setup` deploys the environment, synchronizes source, installs dependencies
+remotely and runs the existing real harness setup there (build, bindings,
+migrations and seed). Add `--ai` only when that capability is required.
+`up` starts the remote app and prints its authenticated preview launch URL.
+Keep it connected while editing locally for incremental source updates and
+app logs. Open the printed URL, not a guessed workers.dev path or local port.
+Cloud mode does not accept `up --sandbox`: its tools already execute remotely.
+CI runners and their authenticated dispatcher use the app's loopback origin
+inside the Container, not the browser-preview URL.
+
+In another local terminal, select the same backend and worktree:
+
+```bash
+export GITMATRIX_AGENT_EXECUTION=cloudflare
+node tools/agent/entry.ts status
+node tools/agent/entry.ts sync
+node tools/agent/entry.ts run -- vp check
+node tools/agent/entry.ts run -- vp run -r --concurrency-limit 1 build
+node tools/agent/entry.ts check
+node tools/agent/entry.ts test
+node tools/agent/entry.ts gm -- auth status
+node tools/agent/entry.ts inspect db 'SELECT slug, kind FROM accounts ORDER BY slug'
+```
+
+`run -- <argv>` executes directly in the synchronized remote workspace,
+without requiring the app to be running; it is the path for targeted package
+tests, Cargo builds and browser tooling. `exec -- <argv>` uses the harness's
+scoped client environment. `gm -- ...` uses its disposable remote client
+workspace and scoped credentials, never the source worktree or shared `gm`.
+Use local `gm` only for authoritative source work such as commits and pushes.
+Do not run bare local `vp check`, `cargo`, browser tests or dependency installs
+to work around a failed remote command.
+
+Hosted commands set `GITMATRIX_CONTAINER_IMAGES=skip`, matching the existing
+non-deploy CI build gate. They compile and package the real application without
+invoking nested Docker or building/publishing the CI container image. Publish
+from the authoritative source checkout through the normal `gm` workflow, not
+from downloaded development build output.
+
+`check` (also `vp run ready` when installed locally and cloud mode is selected)
+uses `--all` coverage because local Git history is not uploaded. Explicit paid
+`test-ai` likewise uses all stages unless stages are supplied explicitly;
+it is never implied by selecting cloud mode. Inspect the actual command
+outcomes and evidence rather than treating successful synchronization or
+process creation as a passing check.
+
+After losing the terminal connection, reconnect from the same worktree:
+
+```bash
+node tools/agent/entry.ts status
+node tools/agent/entry.ts logs
+node tools/agent/entry.ts logs <process-id>
+node tools/agent/entry.ts up
+```
+
+Use the process IDs reported by the client/status; reconnect to logs rather
+than launching a second copy of a long build. Exit status is recorded remotely,
+not inferred from a disconnected client. Foreground heavy work is serialized;
+app/debug processes have separate lifetimes. Foreground log followers and the
+`up` watcher revalidate local `cf` auth and publish refreshed access tokens under
+the same worktree lock as source updates and command launches. Credential
+publication is a workspace mutation too: without this serialization it can
+collide with a source update and fail with HTTP 409. Mutation conflicts and
+authentication failures remain errors, not retries or local fallbacks.
+The watcher can restart the app after token rotation or reconnect, briefly
+interrupting preview/inspector connections. Source watching pauses during a
+foreground build/check so that it uses a stable snapshot; subsequent local
+edits sync afterward.
+
+Within one container lifetime, process identities come from stable log entries,
+not atomically replaced status filenames. Named status/log/stop operations read
+the exact record, so status refresh cannot hide a running command from source
+or concurrency guards. Stop still waits for owned descendants to exit.
+
+Cloudflare HTML 404 routing-propagation responses receive bounded retries
+(at most six attempts within 30 seconds and the environment's expiry).
+Source uploads replay a bounded stream from the same validated local file,
+without buffering a whole file. Application errors and authentication failures
+remain errors; reconnecting to logs never reruns the remote command.
+
+For interactive debugging, keep the app up and run:
+
+```bash
+node tools/agent/entry.ts debug
+```
+
+Use the printed loopback inspector endpoint in your local debugger. The client
+proxies authenticated inspector traffic; do not publish the inspector or give
+the browser control credentials. Map remote `/workspace/repo` to this local
+worktree for source breakpoints. Keep the proxy terminal open while attached.
+Browser automation and browser test execution still belong in the remote
+container; a local browser/debugger is only the interactive client.
+
+Retrieve a specific reported artifact into an explicit external destination
+before teardown, for example:
+
+```bash
+node tools/agent/entry.ts artifacts apps/cli/target/debug/gm /tmp/gitmatrix-feature-gm
+node tools/agent/entry.ts stop
+# To resume after stopping, repeat setup, then up.
+node tools/agent/entry.ts destroy
+node tools/agent/entry.ts cleanup --expired
+```
+
+Use a fresh destination outside the source worktree, never a shared/global
+binary location. For gate logs/screenshots, use a relative path under
+`.gitmatrix-agent/artifacts` or `.gitmatrix-agent/runs/<run-id>/artifacts`.
+Failed E2E runs retain their artifacts and bounded, redacted fixture Git
+diagnostics; inspect them before rerunning. Treat retrieved logs and browser
+traces as private.
+Destroy the cloud environment before selecting `--execution local`.
+
+#### Source authority and synchronization
+
+Edit, review, commit and publish from the **local worktree**. No commit or push
+is needed to exercise an edit remotely. Source synchronization includes
+tracked and nonignored untracked files, uncommitted changes, binary content,
+executable modes, additions, deletions and renames. Content hashes determine
+changes, not modification times. Heavy commands synchronize before execution;
+the connected `up` client also watches the local source.
+Framework route filenames such as Astro's `[...slug].astro` are preserved;
+filename query parameters are separate from control-route validation.
+
+Synchronization deliberately excludes Git internals, dependency trees, build
+output, `.gitmatrix-agent`, `.cloudflare`, `.env*`, `.dev.vars*`, key/credential
+files, `.gitmatrix/agent.local.yml`, sockets and symlinks. Do not rely on an
+ignored local file appearing remotely. Safe tracked repository configuration
+such as `.gitmatrix/ci.yml` and `.gitmatrix/agents.yml` is source, not secret
+runtime state. Files must fit the synchronization size limits (64 MiB per
+file). An interrupted sync must complete before commands can use the new
+snapshot.
+
+The remote checkout has its own tooling Git repository, not your `.git`.
+Readiness therefore runs conservatively with full coverage rather than
+pretending the remote checkout knows your local merge base. Remote-generated
+types, caches, dependencies and logs remain remote. There is no reverse
+source sync: request an artifact explicitly into a disposable destination
+outside the source worktree, and inspect it before deliberately incorporating
+any result. Never copy remote state or a container's `gm` over shared tools.
+
+#### Cloud lifecycle and cost bounds
+
+Each worktree gets its own Worker, container, journal and unique preview
+origin; app traffic never targets canonical port 5180 or a sibling's
+environment. Preview authorization uses a short-lived one-use launch ticket
+exchanged for a secure cookie, separate from the control credential.
+Inspector access requires control authentication, not a preview cookie.
+Use a fresh browser context per environment/persona even with isolated origins.
+
+The repository pins one `standard-4` container per Worker (4 vCPU, 12 GiB RAM,
+20 GB disk); the local remote-environment journal limits provisioning to four
+live environments. These are repository policy limits, not account-wide
+quotas. The environment has an absolute maximum lifetime of 24 hours, with no
+silent renewal. A Durable Object alarm enforces compute expiry even if the host
+agent disconnects. The hosted runtime installs no systemd service; remote
+setup instead installs the host's hourly `gitmatrix-remote-cleanup.timer`
+before provisioning. Its Node-only cleanup code lives outside worktrees in
+`~/.local/state/gitmatrix-agent/remote-janitor`, uses local `cf` auth without
+putting tokens in service units, and survives source-worktree removal.
+
+Container disk, dependencies, test data and process logs are **ephemeral**:
+stopping or recycling the container can discard them. Retrieve needed evidence
+before stopping; reconnect is not a backup or a promise of persistent disk.
+Restart requires source synchronization and installation again. Disconnecting
+a client is not a stop or a teardown; remote processes can keep running.
+
+Use `destroy` for owned app-resource, control Worker and Container application
+cleanup; `stop` alone is not cleanup. Partial deletion remains journaled for
+retry, so never delete the journal to hide a failed teardown. The host cleanup timer cannot run while its
+user manager is unavailable; provider deletion can also fail with revoked
+credentials or an unavailable provider. Reconnect with valid local `cf` auth
+and run `cleanup --expired`; inspect
+`journalctl --user -u gitmatrix-remote-cleanup.service` after failures.
+Do not delete unrelated resources
+by guessing a prefix.
+
+Running containers incur provisioned memory/disk charges as well as active CPU
+charges, including while waiting for edits. Stopping saves running-container
+compute charges but does not erase other resource costs. Workers, Durable
+Objects, egress and provisioned application services have their own billing.
+See [current Containers pricing](https://developers.cloudflare.com/containers/platform/pricing/)
+and set account billing alerts: profile, concurrency and expiry limits are
+**not a hard currency budget**. AI remains off unless explicitly requested;
+remote execution is not permission to run paid AI verification.
+
 ### Completion gate
 
 ```bash
@@ -287,11 +536,11 @@ staged, unstaged and untracked files. Renames include both old and new paths. It
 not fetch: sync the source workspace first. `--base` changes the integration baseline,
 not the requirement to verify all your unlanded work.
 
-The root formatting/lint/type-aware `vp check` always runs. When selected checks
-consume Worker bindings, `ready` generates them once before those consumer checks,
-rather than regenerating them for each workspace. Other uncached gates follow
-workspace dependencies, including the harness and preview tools' relative imports
-of website contracts:
+The root formatting/lint/type-aware `vp check` and remote Worker contract
+typecheck always run. The latter generates the credential-free remote bindings
+required by root lint. Website bindings are generated once before consumer checks.
+Other uncached gates follow workspace dependencies, including the harness and
+preview tools' relative imports of website contracts:
 
 | Change                                                                                         | Selected coverage                                                                                                             |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -301,7 +550,8 @@ of website contracts:
 | Shared formats                                                                                 | Package checks/tests plus dependent website/harness/preview coverage and E2E                                                  |
 | Shared test helpers                                                                            | Package and consumer checks/tests, without production builds or E2E                                                           |
 | Tests only                                                                                     | Their workspace's checks/tests; no builds or live E2E                                                                         |
-| Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                 | Root check only; Markdown runtime assets are not exempt                                                                       |
+| Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                 | Mandatory checks only; Markdown runtime assets are not exempt                                                                 |
+| Coding-agent Markdown instructions/skills and `.claude/settings.json`                          | Mandatory checks only; executable hooks and scripts are not exempt                                                            |
 | Global/task/dependency configuration, shared harness, unknown paths or failed change discovery | Full suite                                                                                                                    |
 
 Content-only edits to the three audited stylesheets
@@ -550,6 +800,9 @@ The measured non-AI E2E spent 41 seconds exercising scenarios, with mirror work
 overlapped. These are local verification measurements, not a new trunk CI run.
 
 ### Cleanup and cost bounds
+
+This section describes the **local backend's** cleanup service and limits.
+The cloud backend has its own [lifecycle and cost bounds](#cloud-lifecycle-and-cost-bounds).
 
 ```bash
 vp run agent stop                # stop app/runners; keep data until expiry

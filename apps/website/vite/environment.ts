@@ -23,6 +23,10 @@ export function developmentEnvironment(env: Environment) {
   }
   const host = agent ? "127.0.0.1" : "localhost";
   const publicUrl = env.GITMATRIX_PUBLIC_URL ?? `http://${host}:${port}`;
+  // Hosted commands without an agent context (build/typegen) retain canonical
+  // config; only the main scoped app has a public preview and inspector.
+  const hosted =
+    agent && env.GITMATRIX_REMOTE_HOSTED === "1" && env.GITMATRIX_REMOTE_ORIGIN !== undefined;
   const stateDir = env.GITMATRIX_STATE_DIR ?? ".wrangler/state";
   const runnerHomes = {
     XDG_CONFIG_HOME: env.GITMATRIX_RUNNER_CONFIG_HOME ?? env.XDG_CONFIG_HOME,
@@ -33,7 +37,20 @@ export function developmentEnvironment(env: Environment) {
     required("GITMATRIX_AGENT_ID");
     required("GITMATRIX_PORT");
     required("GITMATRIX_PUBLIC_URL");
-    if (port === 5180 || publicUrl !== `http://127.0.0.1:${port}`) {
+    if (hosted) {
+      const origin = new URL(required("GITMATRIX_REMOTE_ORIGIN"));
+      if (
+        port !== 5270 ||
+        origin.protocol !== "https:" ||
+        origin.origin !== env.GITMATRIX_REMOTE_ORIGIN ||
+        origin.username ||
+        origin.password ||
+        origin.hostname.includes("*") ||
+        origin.hostname.startsWith(".") ||
+        publicUrl !== origin.origin
+      )
+        throw new Error("Hosted agent requires port 5270 and its exact HTTPS preview origin.");
+    } else if (port === 5180 || publicUrl !== `http://127.0.0.1:${port}`) {
       throw new Error(
         "Agent mode requires a dedicated port and matching loopback GITMATRIX_PUBLIC_URL",
       );
@@ -89,5 +106,5 @@ export function developmentEnvironment(env: Environment) {
     if (!["local", "sandbox"].includes(env.GITMATRIX_CI_RUNNER ?? ""))
       throw new Error("Agent mode requires an explicit local or sandbox CI runner");
   }
-  return { agent, agentId, ai, port, host, publicUrl, stateDir, runnerHomes };
+  return { agent, agentId, ai, port, host, publicUrl, stateDir, runnerHomes, hosted };
 }

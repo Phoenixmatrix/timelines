@@ -54,7 +54,7 @@ export function ciRunners(): Plugin {
   }
   Object.assign(runnerEnv, local.runnerHomes);
   runnerEnv.HOME = local.agent ? runnerEnv.XDG_DATA_HOME : process.env.HOME;
-  runnerEnv.GM_SERVER = local.publicUrl;
+  runnerEnv.GM_SERVER = local.hosted ? `http://127.0.0.1:${local.port}` : local.publicUrl;
   const log = (message: string) =>
     server?.config.logger.info(`[ci] ${message}`, { timestamp: true });
   const warn = (message: string) =>

@@ -1,14 +1,33 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
-import { readFileSync } from "node:fs";
+import { readFileSync, watchFile, unwatchFile } from "node:fs";
+import { resolve } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import type { Plugin } from "vite-plus";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite-plus";
+import { defineConfig, normalizePath } from "vite-plus";
 import { browserCommands } from "./vite/browser-commands.ts";
 import { ciRunners } from "./vite/ci-runners.ts";
 import { DEV_AI_OPT_IN, developmentEnvironment } from "./vite/environment.ts";
 
 const local = developmentEnvironment(process.env);
+const credentialChannel =
+  process.env.GITMATRIX_REMOTE_HOSTED === "1"
+    ? process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE
+    : undefined;
+function refreshHostedCredentials(): void {
+  if (!credentialChannel) return;
+  const { env } = JSON.parse(readFileSync(credentialChannel, "utf8")) as {
+    env: { CLOUDFLARE_API_TOKEN: string; CLOUDFLARE_ACCOUNT_ID: string };
+  };
+  if (
+    typeof env?.CLOUDFLARE_API_TOKEN !== "string" ||
+    !env.CLOUDFLARE_API_TOKEN ||
+    env.CLOUDFLARE_ACCOUNT_ID !== process.env.CLOUDFLARE_ACCOUNT_ID
+  )
+    throw new Error("Hosted Cloudflare credential channel is invalid or changed accounts.");
+  process.env.CLOUDFLARE_API_TOKEN = env.CLOUDFLARE_API_TOKEN;
+}
+refreshHostedCredentials();
 // Only Vitest needs the browser provider: dev and build don't load Playwright.
 const browserProvider = process.env.VITEST
   ? (await import("vite-plus/test/browser-playwright")).playwright
@@ -37,10 +56,33 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    !!credentialChannel &&
+      ({
+        name: "gitmatrix-hosted-credentials",
+        apply: "serve",
+        configureServer(server) {
+          // cf's remote-binding auth hook reads process.env for each renewal.
+          const refresh = () => {
+            try {
+              refreshHostedCredentials();
+            } catch {
+              server.config.logger.error(
+                "Hosted Cloudflare credential refresh failed; stopping the app.",
+              );
+              void server.close();
+            }
+          };
+          watchFile(credentialChannel, { interval: 1_000, persistent: false }, refresh);
+          server.httpServer?.once("close", () => unwatchFile(credentialChannel, refresh));
+        },
+      } satisfies Plugin),
     // Before the Cloudflare plugin, so its dispatch path never reaches the Worker.
     !process.env.VITEST && ciRunners(),
     !process.env.VITEST &&
-      cloudflare({ persistState: { path: local.stateDir }, inspectorPort: false }),
+      cloudflare({
+        persistState: { path: local.stateDir },
+        inspectorPort: local.hosted ? 9229 : false,
+      }),
     // Say whether the dev server spends on AI: it's opt-in (CORE-284).
     !process.env.VITEST &&
       ({
@@ -59,7 +101,35 @@ export default defineConfig({
   // (`extends: true`) would inherit `strictPort` onto its browser server, which
   // starts at 63315 (`test.api`), so a second run elsewhere on this machine
   // failed to start instead of taking the next free port.
-  server: process.env.VITEST ? {} : { host: local.host, port: local.port, strictPort: true },
+  server: process.env.VITEST
+    ? {}
+    : {
+        host: local.hosted ? "0.0.0.0" : local.host,
+        port: local.port,
+        strictPort: true,
+        ...(local.hosted
+          ? {
+              allowedHosts: [new URL(local.publicUrl).hostname],
+              hmr: { protocol: "wss", host: new URL(local.publicUrl).hostname, clientPort: 443 },
+              fs: {
+                // deny replaces Vite's defaults: retain its env, key, package-auth and git
+                // rules before excluding capabilities from static, /@fs and raw imports.
+                deny: [
+                  ".env",
+                  ".env.*",
+                  "*.{crt,pem,key,p12,pfx,cer,der}",
+                  ".npmrc",
+                  ".yarnrc.yml",
+                  "**/.git/**",
+                  "**/.gitmatrix-agent/**",
+                  ...(credentialChannel
+                    ? [normalizePath(resolve(credentialChannel)).replace(/[?*[\]{}()!+@]/g, "\\$&")]
+                    : []),
+                ],
+              },
+            }
+          : {}),
+      },
   // Source highlighting and audit diffs load late; discover their dependencies
   // before navigation rather than restarting the page when the optimizer finds them.
   optimizeDeps: {

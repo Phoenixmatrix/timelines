@@ -111,10 +111,24 @@ function requireGateway(env: Environment): void {
     );
 }
 
+const hostedTokens = new Set<string>(
+  process.env.GITMATRIX_REMOTE_HOSTED === "1" && process.env.CLOUDFLARE_API_TOKEN
+    ? [process.env.CLOUDFLARE_API_TOKEN]
+    : [],
+);
 export function redact(text: string): string {
+  for (const token of hostedTokens) text = text.replaceAll(token, "[REDACTED]");
   return text
     .replace(/\b(?:gmx_|gmj_)[A-Za-z0-9_-]+/g, "[REDACTED]")
     .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]");
+}
+
+/** Unit fixtures must not inherit a live app identity or provider capability. */
+export function unitTestEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...source };
+  for (const key of Object.keys(env))
+    if (/^(GITMATRIX_|GM_|CLOUDFLARE_|CF_)/.test(key)) delete env[key];
+  return env;
 }
 
 export async function command(
@@ -128,6 +142,28 @@ export async function command(
   } = {},
 ): Promise<string> {
   const childEnv: NodeJS.ProcessEnv = { ...(options.env ?? process.env), NO_COLOR: "1" };
+  if (childEnv.GITMATRIX_REMOTE_HOSTED === "1") {
+    const channel = childEnv.GITMATRIX_REMOTE_CREDENTIALS_FILE;
+    if (channel) {
+      const { env: credentials } = JSON.parse(await readFile(channel, "utf8")) as {
+        env: { CLOUDFLARE_API_TOKEN: string; CLOUDFLARE_ACCOUNT_ID: string };
+      };
+      if (
+        typeof credentials?.CLOUDFLARE_API_TOKEN !== "string" ||
+        !credentials.CLOUDFLARE_API_TOKEN ||
+        !/^[a-f0-9]{32}$/.test(credentials.CLOUDFLARE_ACCOUNT_ID)
+      )
+        throw new Error("Hosted Cloudflare credential channel is invalid.");
+      if (
+        childEnv.CLOUDFLARE_ACCOUNT_ID &&
+        childEnv.CLOUDFLARE_ACCOUNT_ID !== credentials.CLOUDFLARE_ACCOUNT_ID
+      )
+        throw new Error("Hosted Cloudflare credential account changed.");
+      hostedTokens.add(credentials.CLOUDFLARE_API_TOKEN);
+      childEnv.CLOUDFLARE_API_TOKEN = credentials.CLOUDFLARE_API_TOKEN;
+      childEnv.CLOUDFLARE_ACCOUNT_ID = credentials.CLOUDFLARE_ACCOUNT_ID;
+    }
+  }
   delete childEnv.FORCE_COLOR;
   const result = await new Promise<{ code: number | null; output: string; stdout: string }>(
     (accept, reject) => {
@@ -234,6 +270,26 @@ async function persist(env: Environment): Promise<void> {
   }
   // Central journal survives worktree removal and is committed before local state.
   await privateJson(join(registry, "environments", `${env.id}.json`), env);
+  if (process.env.GITMATRIX_REMOTE_HOSTED === "1") {
+    // The external journal must commit before any provisioning call: container
+    // loss must never erase the only record of resources we may have created.
+    const environment = {
+      id: env.id,
+      account: env.account,
+      created: env.created,
+      expires: env.expires,
+      resources: env.resources,
+      status: env.status,
+      ai: aiEnabled(env),
+    };
+    const response = await fetch("http://127.0.0.1:8787/ownership", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ environment }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) throw new Error(`Remote ownership journal failed (${response.status}).`);
+  }
   if ((await realpath(env.root).catch(() => null)) === env.root) {
     try {
       await safeLocalDirectory(env);
@@ -364,6 +420,59 @@ async function deleteIfPresent(env: Environment, args: string[]): Promise<void> 
   }
 }
 
+/** Stop a fenced session, not just its launcher: vp may exit before Vite/workerd. */
+export async function terminateProcessGroup(pid: number, start?: string): Promise<void> {
+  const initial = await processStart(pid);
+  if (start !== undefined && initial !== start) return;
+  if (initial === null) return;
+  const births = new Map<string, string>([[String(pid), initial]]);
+  const running = async () => {
+    const leader = await processStart(pid);
+    if (leader !== null && leader !== initial)
+      throw new Error("Process group leader was replaced; refusing to signal it.");
+    const members: { pid: string; start: string; state: string }[] = [];
+    for (const entry of await readdir("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const stat = await readFile(`/proc/${entry}/stat`, "utf8").catch(() => null);
+      if (!stat) continue;
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (fields[2] === String(pid) && fields[3] === String(pid) && fields[19])
+        members.push({ pid: entry, start: fields[19], state: fields[0]! });
+    }
+    if (!members.length) return false;
+    if (!members.some((member) => births.get(member.pid) === member.start))
+      throw new Error("No fenced process group member remains; refusing to signal a reused group.");
+    // Capture descendants before TERM and extend only while an original birth
+    // identity anchors the session; a recycled PGID alone is not ownership.
+    for (const member of members) births.set(member.pid, member.start);
+    // Zombies retain the group identity but cannot execute or hold app ports.
+    return members.some((member) => member.state !== "Z");
+  };
+  const signal = (value: NodeJS.Signals) => {
+    try {
+      process.kill(-pid, value);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  };
+  if (!(await running())) return;
+  signal("SIGTERM");
+  const deadline = Date.now() + 20_000;
+  while (await running()) {
+    if (Date.now() >= deadline) {
+      signal("SIGKILL");
+      const killedDeadline = Date.now() + 5_000;
+      while (await running()) {
+        if (Date.now() >= killedDeadline)
+          throw new Error("Owned process group did not stop after SIGKILL; retaining its journal.");
+        await delay(100);
+      }
+      return;
+    }
+    await delay(100);
+  }
+}
+
 export async function stopEnvironment(env: Environment): Promise<void> {
   if (!env.server) return;
   const { pid, start } = env.server;
@@ -372,14 +481,7 @@ export async function stopEnvironment(env: Environment): Promise<void> {
     await persist(env);
     return;
   }
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-  }
-  const deadline = Date.now() + 20_000;
-  while ((await processStart(pid)) === start && Date.now() < deadline) await delay(100);
-  if ((await processStart(pid)) === start) process.kill(-pid, "SIGKILL");
+  await terminateProcessGroup(pid, start);
   delete env.server;
   await persist(env);
 }
@@ -630,7 +732,8 @@ export async function createEnvironment(
     const dir = ephemeral
       ? join(root, ".gitmatrix-agent", "runs", id)
       : join(root, ".gitmatrix-agent");
-    const port = await allocatePort();
+    const port =
+      process.env.GITMATRIX_REMOTE_HOSTED === "1" && !ephemeral ? 5270 : await allocatePort();
     const created = Date.now();
     const env: Environment = {
       version: 1,
@@ -784,12 +887,25 @@ export async function context(env: Environment): Promise<HarnessContext> {
     { mode: 0o600 },
   );
   const gm = join(env.root, "apps", "cli", "target", "debug", "gm");
+  const hosted = process.env.GITMATRIX_REMOTE_HOSTED === "1";
+  const preview = hosted && env.dir === join(env.root, ".gitmatrix-agent");
+  if (hosted) {
+    vars.GITMATRIX_REMOTE_HOSTED = "1";
+    vars.GITMATRIX_AGENT_EXECUTION = "local";
+    vars.GITMATRIX_REMOTE_CREDENTIALS_FILE = process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE;
+    if (preview) {
+      const origin = process.env.GITMATRIX_REMOTE_ORIGIN;
+      if (!origin || new URL(origin).protocol !== "https:" || new URL(origin).origin !== origin)
+        throw new Error("Hosted preview requires an exact HTTPS GITMATRIX_REMOTE_ORIGIN.");
+      vars.GITMATRIX_REMOTE_ORIGIN = origin;
+    }
+  }
   Object.assign(vars, {
     GITMATRIX_AGENT_ID: env.id,
     GITMATRIX_AGENT_SECRET: env.secret,
     GITMATRIX_CI_DISPATCH_SECRET: env.dispatchSecret,
     GITMATRIX_PORT: String(env.port),
-    GITMATRIX_PUBLIC_URL: env.origin,
+    GITMATRIX_PUBLIC_URL: preview ? vars.GITMATRIX_REMOTE_ORIGIN : env.origin,
     GITMATRIX_STATE_DIR: join(env.dir, "state"),
     GITMATRIX_ARTIFACTS_NAMESPACE: env.id,
     GITMATRIX_AGENT_AI: aiEnabled(env) ? "enabled" : "disabled",

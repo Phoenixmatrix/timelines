@@ -1,0 +1,15 @@
+{
+  "name": "@gitmatrix/remote",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf-typegen": "GITMATRIX_REMOTE_TYPEGEN=1 cf workers types",
+    "typecheck": "GITMATRIX_REMOTE_TYPEGEN=1 cf workers types && node ../agent/typecheck.ts -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "cf": "catalog:",
+    "typescript": "catalog:"
+  }
+}
