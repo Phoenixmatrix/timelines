@@ -143,6 +143,20 @@ the busy state and its elapsed-time bound; release it in `onTestFinished` too.
 Assert pause, no overlapping checks and manual recovery—not one request per
 timer tick, since busy revalidation deliberately skips ticks.
 
+**Screenshots for the step view (CORE-383).** `visual("Name")`
+(`src/testing/visual.ts`) saves the settled test page as `Name.png`, 1280×900,
+when `GITMATRIX_VISUALS_DIR` is set, and does nothing otherwise. Call it once
+per page-level test at a representative state, never in a loop. A name is
+letters, digits, spaces, `.`, `_` and `-` (80 at most); the same name on
+another commit is what the Story compares. CI's test job sets the directory and
+its last step, `node tools/visuals/upload.ts`, attaches the pictures to the
+commit's step, so a step opened in a timeline's Story shows them and what
+changed since the step before. The script also uploads `*.mmd` files as Mermaid
+diagrams. A failed upload warns and never fails CI. Screenshots mask `time`
+elements, but fixture ids and other volatile text still vary between runs, so
+the Story proves only "unchanged" (equal hash) and otherwise offers "Compare",
+never "changed".
+
 ## Recent agent presence
 
 CI run details, commit panels, selected timelines, and deployment disclosures
@@ -553,6 +567,33 @@ logo-style presets) and remove it, from **Change icon** on the organization's
 page (`viewerCanManage` on `AccountPage` shows the control). Icons show as
 squircles wherever the organization appears: its page, the rail, repository
 lists and package pages.
+
+## Step screenshots and diagrams
+
+A CI job can attach pictures and diagrams to the commit its run built (CORE-383),
+and a step then shows them (`artifacts` on `Step`, kind `screenshot` or
+`document`). Images live in the `STEP_ARTIFACTS` R2 bucket
+(`gitmatrix-step-artifacts`; a preview shares its one bucket) under
+`step-artifacts/<repo>/<run>/<sha256>.<ext>`, never meeting the registry's or
+avatars' keys. A job uploads with its own `$GITMATRIX_TOKEN` (the job
+credential, the only one these routes take; repo, commit and run come from it):
+
+```sh
+curl -X PUT --data-binary @home.png -H "authorization: Bearer $GITMATRIX_TOKEN" \
+  "$GITMATRIX_URL/api/repos/$GITMATRIX_REPOSITORY/steps/artifacts/screenshots/Home%20page"
+curl -X PUT -H "authorization: Bearer $GITMATRIX_TOKEN" \
+  -d '{"format":"mermaid","source":"graph TD; A-->B"}' \
+  "$GITMATRIX_URL/api/repos/$GITMATRIX_REPOSITORY/steps/artifacts/documents/Flow"
+```
+
+Names are 1-80 letters, digits, spaces, `.`, `_` or `-`. An image is PNG, JPEG
+or WebP by its bytes (never SVG, whatever the Content-Type) up to 2 MiB; a
+diagram is Mermaid source up to 50,000 characters, kept in the database. A run
+attaches 40 in all, and uploading a name again replaces it. People who can read
+the repository fetch an image from the `url` on its artifact
+(`GET .../steps/artifacts/<id>?v=<hash>`), served `nosniff` with a locked-down
+CSP and cached immutably. Retention's `step-artifacts` category and repository
+deletion remove the images with their rows.
 
 ## Personas (dev sign-in)
 

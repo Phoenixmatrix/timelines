@@ -6,6 +6,7 @@ import { focusOn, press, tap } from "../../testing/focus.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 import { timelineWorld } from "../../testing/timelines.ts";
+import { visual } from "../../testing/visual.ts";
 
 const graph = () => page.getByRole("region", { name: "Timeline graph" });
 const select = (name: string) => graph().getByRole("link", { name: `Select ${name}`, exact: true });
@@ -58,6 +59,7 @@ test("timeline rows select through native links, preserve parameters and restore
   await expect
     .element(page.getByRole("region", { name: "Live now" }).getByText("Timeline selection works"))
     .toBeVisible();
+  await visual("Timelines - graph");
   await focusOn(select("main"));
   await expect.element(select("main")).toHaveFocus();
   // Main is explicit so the app-wide scope carrier cannot restore Search.

@@ -5,6 +5,7 @@
 // the Workflow: the E2E scenarios repository-deletion-* and `agent test-ai`.
 
 import { Hono } from "hono";
+import { FakeR2Bucket } from "@gitmatrix/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
@@ -204,6 +205,8 @@ async function setup() {
   const purges = fakeWorkflow();
   const builds = fakeWorkflow();
   const ciRuns = fakeWorkflow();
+  // Step artifact images (CORE-383): more than one listing page for the doomed one.
+  const stepFiles = new FakeR2Bucket();
   let env!: Env;
   const knowledge = coordinators(() => env);
   env = {
@@ -212,6 +215,7 @@ async function setup() {
     VECTORS: vectors,
     SEARCH: search.binding,
     ARTIFACTS: artifacts,
+    STEP_ARTIFACTS: stepFiles,
     REPO_PURGE: purges,
     KNOWLEDGE_BUILD: builds,
     CI_RUN: ciRuns,
@@ -307,6 +311,9 @@ async function setup() {
   }
   await repository("r_doomed", "doomed");
   await repository("r_keep", "keep");
+  for (let n = 0; n < 1005; n++) await stepFiles.put(`step-artifacts/r_doomed/run/${n}.png`, "x");
+  await stepFiles.put("step-artifacts/r_keep/run/0.png", "x");
+  await stepFiles.put("step-artifacts/r_doomed2/run/0.png", "x");
 
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -332,6 +339,7 @@ async function setup() {
     vectors,
     search,
     artifacts,
+    stepFiles,
     purges,
     builds,
     ciRuns,
@@ -610,6 +618,12 @@ describe("repository deletion", () => {
     expect(left(await repoInventory(w.env, "r_doomed"))).toEqual(NOTHING_LEFT);
     // Nothing of the other repository was touched.
     expect(left(await repoInventory(w.env, "r_keep"))).toEqual(keepBefore);
+    // Its step artifact images went, in pages; another repository's (even one
+    // whose id starts the same) stayed.
+    expect([...w.stepFiles.objects.keys()].sort()).toEqual([
+      "step-artifacts/r_doomed2/run/0.png",
+      "step-artifacts/r_keep/run/0.png",
+    ]);
     expect(w.builds.instances.get("r_doomed-b2")?.status).toBe("terminated");
     expect(w.builds.instances.get("r_keep-b2")?.status).toBe("running");
     expect(w.ciRuns.instances.get("r_doomed-run2")?.status).toBe("terminated");
@@ -646,6 +660,7 @@ describe("repository deletion", () => {
       search: { deleted: 2, swept: 1, remaining: 0 },
       links: { spendDeleted: 1, spendDetached: 1, sources: 1, publishes: 1 },
       artifacts: { deleted: true },
+      stepFiles: 1005,
       rows: { repos: 1, ci_logs: 2, kg_nodes: 3, merge_queue: 2 },
     });
 

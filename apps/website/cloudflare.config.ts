@@ -285,6 +285,9 @@ export default defineConfig(({ mode, isPreview }) => {
         // preview shares its one bucket: avatar keys (avatars/, avatar-options/)
         // never meet the registry's (b/, c/, d/).
         AVATARS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-avatars" }),
+        // Screenshots CI jobs attach to a commit (CORE-383). A preview shares its
+        // one bucket: keys (step-artifacts/) never meet the registry's or avatars'.
+        STEP_ARTIFACTS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-step-artifacts" }),
         REGISTRY_REPO: bindings.durableObject({ worker: "gitmatrix", exportName: "RegistryRepo" }),
         REGISTRY_UPLOAD: bindings.durableObject({
           worker: "gitmatrix",

@@ -19,6 +19,7 @@ import { Hono, type Context } from "hono";
 import type { AvatarOptions } from "../../shared/api.ts";
 import { aiGatewayOptions } from "../ai-gateway.ts";
 import type { AppEnv } from "../auth.ts";
+import { readBounded, sha256 } from "../api/bytes.ts";
 import { fail, requirePerson } from "../api/http.ts";
 import { findAccountBySlug, findUserById, sqlNow, viewerFor, type Actor } from "../db.ts";
 import { db } from "../schema.ts";
@@ -108,45 +109,20 @@ export function imageType(bytes: Uint8Array): "image/png" | "image/jpeg" | "imag
   return null;
 }
 
-const EXTENSION = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" } as const;
+export const EXTENSION = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" } as const;
 
 /** The public URL for a stored picture key ("avatars/<user>/<hash>.<ext>"). */
 export function avatarUrl(key: string | null): string | null {
   return key ? `/api/${key}` : null;
 }
 
-/** The request body, counted as it streams; null (with a response sent) when too big. */
+/** The request body, counted as it streams; a response (400, 413) when it isn't a picture-sized body. */
 async function boundedBody(c: Context<AppEnv>): Promise<Uint8Array | Response> {
-  const reader = c.req.raw.body?.getReader();
-  if (!reader) return fail(c, 400, "Send the picture as the request body.");
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_AVATAR_BYTES) {
-        await reader.cancel();
-        return fail(c, 413, "Keep the picture under 256 KiB.");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
-}
-
-async function sha256(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const body = c.req.raw.body;
+  if (!body) return fail(c, 400, "Send the picture as the request body.");
+  return (
+    (await readBounded(body, MAX_AVATAR_BYTES)) ?? fail(c, 413, "Keep the picture under 256 KiB.")
+  );
 }
 
 /** Whose picture a request changes, and how to answer once it has. */

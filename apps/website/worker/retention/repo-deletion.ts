@@ -134,6 +134,8 @@ export interface Progress {
     publishes: number;
   };
   artifacts?: { deleted: boolean };
+  /** Step artifact images deleted from STEP_ARTIFACTS (CORE-383). */
+  stepFiles?: number;
   rows?: Record<string, number>;
   /**
    * A step being retried: which, its attempt, and the last failure (CORE-302),
@@ -1141,6 +1143,20 @@ async function artifactsPhase(env: Env, repoId: string, step: PurgeStep) {
   // Also cover a resumed purge and teardown consumers admitted after stop.
   await step.do("artifacts:ci-acknowledged", STEP, () => assertCiDrained(env, repoId, false));
   await step.do("artifacts:work-sources", STEP, () => drainDeletedRepoSources(env, repoId));
+  // Screenshots CI jobs attached to its commits. Each page is listed afresh
+  // (what's deleted is gone), so a resumed purge finds only what's left.
+  let files = 0;
+  for (let i = 0; ; i++) {
+    const page = await step.do(`artifacts:step-files:${i}`, STEP, () =>
+      deleteStepFiles(env, repoId),
+    );
+    files += page.deleted;
+    if (!page.more) break;
+  }
+  if (files)
+    await step.do("artifacts:step-files:done", STEP, () =>
+      saveProgress(env, repoId, { stepFiles: files }),
+    );
   await step.do("artifacts:delete", STEP, async () => {
     const row = await loadDeletion(env, repoId);
     const name = row?.artifacts_name;
@@ -1150,6 +1166,18 @@ async function artifactsPhase(env: Env, repoId: string, step: PurgeStep) {
     await env.ARTIFACTS.delete(name);
     await saveProgress(env, repoId, { artifacts: { deleted: true } });
   });
+}
+
+/** R2 lists and deletes up to 1000 keys at a time. */
+const FILES_PER_PAGE = 1000;
+
+async function deleteStepFiles(env: Env, repoId: string) {
+  const { objects, truncated } = await env.STEP_ARTIFACTS.list({
+    prefix: `step-artifacts/${repoId}/`,
+    limit: FILES_PER_PAGE,
+  });
+  if (objects.length) await env.STEP_ARTIFACTS.delete(objects.map((o) => o.key));
+  return { deleted: objects.length, more: truncated };
 }
 
 // rows: the biggest children in bounded batches, then the row and its cascade.

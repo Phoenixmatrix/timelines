@@ -74,7 +74,8 @@ api.use(async (c, next) => {
     c.req.path === "/api/dev" ||
     c.req.path.startsWith("/api/dev/") ||
     c.req.path === "/api/tokens/device" ||
-    // A CI job's credential reaches only its deployments, which check it.
+    // A CI job's credential reaches only its deployments and step artifact
+    // uploads, which check it.
     jobRoute(c) ||
     // The queue resolution endpoint validates only its current merge-job credential.
     (c.req.method === "POST" &&

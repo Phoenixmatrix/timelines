@@ -23,6 +23,7 @@ import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { sourceUrl } from "../../lib/refs.ts";
 import { readTrackerShortcuts } from "./preferences.ts";
+import { StepVisuals } from "./StepVisuals.tsx";
 
 /** The filters' "no filter" value. */
 const ALL = "*";
@@ -337,6 +338,9 @@ export function Story() {
               key={current.commit.oid}
               repo={repo}
               row={current}
+              earlier={rows
+                .slice(rows.findIndex((r) => r.commit.oid === current.commit.oid) + 1)
+                .flatMap((r) => (r.step ? [r.step] : []))}
               shortcuts={shortcuts}
               onPrevious={index > 0 ? () => open(shown[index - 1]) : null}
               onNext={index + 1 < shown.length ? () => open(shown[index + 1]) : null}
@@ -426,6 +430,7 @@ function StepRow({ row, active, onOpen }: { row: StoryRow; active: boolean; onOp
 function StepDetail({
   repo,
   row,
+  earlier,
   shortcuts,
   onPrevious,
   onNext,
@@ -433,6 +438,8 @@ function StepDetail({
 }: {
   repo: TimelineRepo;
   row: StoryRow;
+  /** Steps before this one on the line, nearest first, to compare visuals with (CORE-383). */
+  earlier: Step[];
   shortcuts: boolean;
   onPrevious: (() => void) | null;
   onNext: (() => void) | null;
@@ -533,6 +540,7 @@ function StepDetail({
         <Diff base={base} oid={version} sourceId={repo.source?.sourceId} />
         <Context step={step} />
       </div>
+      <StepVisuals step={step} earlier={earlier} />
     </section>
   );
 }

@@ -99,6 +99,11 @@ jobs:
     verification: context-invariant-v1
     instance: standard-4
     timeout_minutes: 30
+    # The browser tests save a picture of the app at their key states here
+    # (src/testing/visual.ts); the last step attaches them to the commit's step
+    # for the Story's step view (CORE-383).
+    env:
+      GITMATRIX_VISUALS_DIR: /tmp/gitmatrix-visuals
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -119,7 +124,11 @@ jobs:
           fi
           pnpm --filter website exec playwright install --only-shell chromium
       - name: Tests (everything but gm, which the cli job tests)
-        run: vp run --filter '!cli' --concurrency-limit 1 --no-cache test
+        run: |
+          rm -rf "$GITMATRIX_VISUALS_DIR"
+          vp run --filter '!cli' --concurrency-limit 1 --no-cache test
+      - name: Upload screenshots for the step view
+        run: node tools/visuals/upload.ts
 
   build:
     verification: context-invariant-v1

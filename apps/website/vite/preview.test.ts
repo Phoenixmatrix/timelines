@@ -73,6 +73,7 @@ describe("cloudflare.config.ts in preview mode", () => {
     expect(worker.env.DB).toMatchObject({ type: "d1", id: resources.db });
     expect(worker.env.REGISTRY_DB).toMatchObject({ type: "d1", id: resources.registryDb });
     expect(worker.env.REGISTRY_BLOBS).toMatchObject({ name: resources.bucket });
+    expect(worker.env.STEP_ARTIFACTS).toMatchObject({ name: resources.bucket });
     expect(worker.env.ARTIFACTS).toMatchObject({ namespace: resources.artifacts });
     expect(worker.env.PREVIEW_MODE).toMatchObject({ value: "true" });
     expect(worker.env.AGENT_ID).toMatchObject({ value: resources.name });

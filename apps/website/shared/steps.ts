@@ -97,10 +97,43 @@ export interface StepTestSummary {
   jobs: StepJobResult[];
 }
 
+/** Raster formats a screenshot may be, recognized by signature, never SVG. */
+export type StepImageType = "image/png" | "image/jpeg" | "image/webp";
+
+/** A picture of the app a CI job took at this commit (CORE-383). */
+export interface StepScreenshot {
+  /** What it shows, unique within its run; the same name across commits compares. */
+  name: string;
+  contentType: StepImageType;
+  bytes: number;
+  /** Hex SHA-256 of the image: equal across commits means unchanged. */
+  sha256: string;
+  /** The CI job that uploaded it. */
+  job: string;
+}
+
+/** A diagram a CI job drew for this commit (CORE-383), kept inline. */
+export interface StepDocument {
+  name: string;
+  format: "mermaid";
+  source: string;
+  job: string;
+}
+
+/** Bounds on what a run may attach to its commit (CORE-383). */
+export const STEP_ARTIFACT_LIMITS = {
+  /** Screenshots and documents together, per run. */
+  perRun: 40,
+  imageBytes: 2 * 1024 * 1024,
+  documentChars: 50_000,
+  /** Letters, digits, space, dot, underscore, hyphen; 1-80, starting alphanumeric. */
+  name: /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$/,
+} as const;
+
 /**
  * Something a step run produced, attached to the step by commit. A test
- * summary carries its data inline; screenshots and documents (later) point at
- * a stored object.
+ * summary and a document carry their data inline; a screenshot points at a
+ * stored image (`url`, served to people who can read the repository).
  */
 export type StepArtifact = {
   id: string;
@@ -109,7 +142,8 @@ export type StepArtifact = {
   createdAt: string;
 } & (
   | { kind: "test-summary"; data: StepTestSummary }
-  | { kind: "screenshot" | "document"; data: Record<string, unknown>; url: string | null }
+  | { kind: "screenshot"; data: StepScreenshot; url: string }
+  | { kind: "document"; data: StepDocument }
 );
 
 /** GET /api/repos/:owner/:name/steps: a page of steps, newest first. */

@@ -5,6 +5,7 @@ import { commitId } from "../../testing/atlas.ts";
 import { cannedFiles } from "../../testing/git.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
+import { visual } from "../../testing/visual.ts";
 
 test("verified reuse links to the executed producer without inventing execution or fetching logs", async () => {
   const server = await TestServer.start({ world: true });
@@ -150,6 +151,7 @@ test("verified reuse links to the executed producer without inventing execution 
     .element(executed.getByText("Producer checks passed", { exact: false }))
     .toBeVisible();
   await expect.element(executed.getByText(/build-runner/)).toBeVisible();
+  await visual("CI run - job log");
   expect(logRequests).toContain(producer.id);
   expect(logRequests).not.toContain(reused.id);
 });

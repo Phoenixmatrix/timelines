@@ -27,6 +27,7 @@
 //   throw, and every test checks none was touched.
 
 import type { DatabaseSync } from "node:sqlite";
+import { FakeR2Bucket } from "@gitmatrix/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type {
   AtlasCrossLink,
@@ -213,6 +214,8 @@ async function world() {
       REGISTRY_DB: forbidden("REGISTRY_DB", touched),
       BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
       ARTIFACTS: { ...git.artifacts, delete: async () => {} },
+      // A deleted repository's step screenshots go with it (CORE-383).
+      STEP_ARTIFACTS: new FakeR2Bucket(),
       AI: forbidden("AI", touched),
       VECTORS: forbidden("VECTORS", touched),
       SEARCH: forbidden("SEARCH", touched),

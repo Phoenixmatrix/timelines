@@ -37,6 +37,7 @@ interface Commands {
     colorScheme?: "light" | "dark";
   }): Promise<void>;
   tap(selector: string): Promise<void>;
+  captureVisual(name: string): Promise<boolean>;
 }
 
 export const browserCommands = commands as unknown as Commands;

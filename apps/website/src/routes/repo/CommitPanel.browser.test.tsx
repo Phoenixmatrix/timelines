@@ -25,6 +25,7 @@ import { press } from "../../testing/focus.ts";
 import { cannedFiles } from "../../testing/git.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { reply, TestServer } from "../../testing/server.ts";
+import { visual } from "../../testing/visual.ts";
 
 const short = (oid: string) => oid.slice(0, 7);
 const panel = (oid: string) => page.getByRole("dialog", { name: `Commit ${short(oid)}` });
@@ -319,6 +320,7 @@ test("?commit= opens every section over the page; Escape closes back to it", asy
   // The change, its timeline and landing.
   await expect.element(dialog.getByText("kqvzmxyzwpnl")).toBeVisible();
   await expect.element(dialog.getByText(/Landed on/)).toBeVisible();
+  await visual("Commit panel");
   await expect
     .element(dialog.getByRole("link", { name: "Fast search" }))
     .toHaveAttribute("href", "/tracker/orbit/timelines?tl=fast-search");

@@ -1,7 +1,8 @@
 // A CI job's credential (gmj_…, worker/ci/registry.ts) on the JSON API. The
 // API otherwise takes only personal and agent tokens; a job may record and
 // update its own repository's deployments (`gm deploy record` in CI), as the
-// run: its commit and branch, and the person and agent who started it.
+// run: its commit and branch, and the person and agent who started it. It also
+// uploads the step artifacts (screenshots, diagrams) its run produced (CORE-383).
 
 import type { Context } from "hono";
 import type { AppEnv } from "../auth.ts";
@@ -12,9 +13,11 @@ export const JOB_TOKEN_PREFIX = "gmj_";
 
 /**
  * API paths a job's credential may call: its repository's deployments and
- * environments. (A landing's merge job also uses it for git: git/http.ts.)
+ * environments, and its step artifact uploads (no other steps route).
+ * (A landing's merge job also uses it for git: git/http.ts.)
  */
-const JOB_PATHS = /^\/api\/repos\/[^/]+\/[^/]+\/(?:deployments|environments)(?:\/|$)/;
+const JOB_PATHS =
+  /^\/api\/repos\/[^/]+\/[^/]+\/(?:(?:deployments|environments)(?:\/|$)|steps\/artifacts\/)/;
 
 export interface JobCaller {
   jobId: string;

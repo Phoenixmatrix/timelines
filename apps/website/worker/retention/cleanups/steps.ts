@@ -8,13 +8,16 @@
 // finds nothing. Deleted steps have no text to trim.
 //
 // "step-artifacts": what step runs produced (step_artifacts) more than `days`
-// after the run. The step and the run stay.
+// after the run. The step and the run stay. A screenshot's bytes are its stored
+// image plus its row; removing it deletes the image from STEP_ARTIFACTS unless
+// another artifact still shows it (CORE-383).
 //
 // Cursors: the last (repo, change, commit) key; the last artifact id.
 
 import { TRIMMED_TEXT } from "../../../shared/steps.ts";
 import type { CategoryCleanup, CleanupContext } from "../engine.ts";
 import { daysBefore } from "../engine.ts";
+import { deleteUnreferenced } from "../../steps/objects.ts";
 
 function scope(ctx: CleanupContext, id: string): [string, string] {
   if (ctx.target.scope !== "account") throw new Error(`${id} is an account category.`);
@@ -104,7 +107,9 @@ export const stepArtifacts: CategoryCleanup<ArtifactItem> = {
   async select(ctx, cursor) {
     const [account, cutoff] = scope(ctx, "step-artifacts");
     const { results } = await ctx.env.DB.prepare(
-      `SELECT a.id, length(CAST(a.data AS BLOB)) AS bytes FROM step_artifacts a
+      `SELECT a.id,
+              length(CAST(a.data AS BLOB)) + iif(json_valid(a.data), coalesce(json_extract(a.data, '$.bytes'), 0), 0) AS bytes
+       FROM step_artifacts a
        WHERE ${OLD_ARTIFACT} AND a.id > ? ORDER BY a.id LIMIT ?`,
     )
       .bind(account, cutoff, cursor ?? "", ctx.limit)
@@ -120,10 +125,25 @@ export const stepArtifacts: CategoryCleanup<ArtifactItem> = {
     const { results } = await ctx.env.DB.prepare(
       `DELETE FROM step_artifacts AS a
        WHERE a.id IN (SELECT value FROM json_each(?)) AND ${OLD_ARTIFACT}
-       RETURNING length(CAST(data AS BLOB)) AS bytes`,
+       RETURNING length(CAST(data AS BLOB)) + iif(json_valid(data), coalesce(json_extract(data, '$.bytes'), 0), 0) AS bytes,
+                 object_key`,
     )
       .bind(JSON.stringify(items.map((i) => i.id)), account, cutoff)
-      .all<{ bytes: number }>();
+      .all<{ bytes: number; object_key: string | null }>();
+    const keys = results.flatMap((r) => (r.object_key ? [r.object_key] : []));
+    // Rows go first (RETURNING hands back their keys in the same statement, so
+    // there is no window to select them separately). If R2 then fails, the
+    // images are orphaned: acceptable, because deleting the objects first
+    // would leave rows pointing at nothing, and throwing here would rerun a
+    // batch whose rows are already gone, wedging retention. The keys are logged.
+    if (keys.length)
+      try {
+        await deleteUnreferenced(ctx.env, keys);
+      } catch (error) {
+        console.warn(
+          `step-artifacts: ${keys.length} images left in the bucket (${String(error)}): ${keys.join(", ")}`,
+        );
+      }
     return { count: results.length, bytes: results.reduce((sum, r) => sum + r.bytes, 0) };
   },
 };

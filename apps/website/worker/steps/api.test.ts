@@ -1,7 +1,11 @@
 import { Hono } from "hono";
+import { FakeR2Bucket } from "@gitmatrix/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
-import type { Step, StepPage, StepUpload, StepVersions } from "../../shared/steps.ts";
-import { STEP_LIMITS } from "../../shared/steps.ts";
+import type { Step, StepArtifact, StepPage, StepUpload, StepVersions } from "../../shared/steps.ts";
+import { STEP_ARTIFACT_LIMITS, STEP_LIMITS } from "../../shared/steps.ts";
+import { hashToken } from "../auth.ts";
+import { jobRoute } from "../deployments/job.ts";
+import { stepArtifacts } from "../retention/cleanups/steps.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
@@ -12,6 +16,7 @@ import { fakeHistory } from "../testing/history.ts";
 import { Timing } from "../timing.ts";
 import { readAgentPresence } from "../agent-presence.ts";
 import { RepoReader } from "../objects.ts";
+import { sha256 } from "../api/bytes.ts";
 
 beforeEach(() => {
   vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
@@ -50,9 +55,11 @@ function setup(visibility: "public" | "private" = "private") {
   // Live feeds (CORE-239), real objects over fake storage, by name.
   const feeds = new Map<string, StepFeed>();
   const git = fakeHistory();
+  const files = new FakeR2Bucket();
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
+    STEP_ARTIFACTS: files,
     STEP_FEED: {
       getByName: (name: string) => {
         if (!feeds.has(name))
@@ -85,9 +92,35 @@ function setup(visibility: "public" | "private" = "private") {
     while (pending.length) await Promise.all(pending.splice(0));
     return response;
   };
+  /** A running CI job of `repo` (run `runId`, commit oid(1)) and its credential. */
+  const jobFor = async (jobId: string, runId: string, repoId = "repo", name = "visuals") => {
+    const number = Number(sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()!.n) + 1;
+    sqlite.exec(`
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step)
+        VALUES ('${runId}', '${repoId}', ${number}, '${oid(1)}', 'timeline/search', 'manual', 'running', 1);
+      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
+        VALUES ('${jobId}', '${runId}', '${repoId}', '${name}', '{}', 'running', 'sandbox');
+    `);
+    const secret = `gmj_${jobId}`;
+    sqlite
+      .prepare("INSERT INTO ci_job_tokens (token_hash, job_id, expires_at) VALUES (?, ?, ?)")
+      .run(await hashToken(secret), jobId, "2099-01-01T00:00:00.000Z");
+    return secret;
+  };
   return {
     sqlite,
     git,
+    files,
+    env,
+    jobFor,
+    /** A request to a second repository, ann/other. */
+    other: (path: string) =>
+      app.request(
+        `/api/repos/ann/other/steps${path}`,
+        {},
+        env,
+        context as unknown as ExecutionContext,
+      ),
     presence: (commit: string) =>
       readAgentPresence(env.DB, {
         kind: "commit",
@@ -269,7 +302,13 @@ describe("step context", () => {
         ('run2:test-summary', 'repo', '${oid(1)}', 'run2', 'test-summary', '${summary("succeeded")}', '2026-10-04T00:02:00.000Z');
     `);
     const page = (await (await s.call("")).json()) as StepPage;
-    expect(page.steps[0]!.artifacts.map((a) => [a.runNumber, a.kind, a.data.status])).toEqual([
+    expect(
+      page.steps[0]!.artifacts.map((a) => [
+        a.runNumber,
+        a.kind,
+        a.kind === "test-summary" ? a.data.status : undefined,
+      ]),
+    ).toEqual([
       [2, "test-summary", "succeeded"],
       [1, "test-summary", "failed"],
     ]);
@@ -471,5 +510,288 @@ describe("step context", () => {
     expect(kept).toMatchObject({ deleted: true, summary: "", context: { why: "", steering: [] } });
     s.as(annsAgent);
     expect((await s.upload(step(1))).status).toBe(410);
+  });
+});
+
+const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const PNG_TWO = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9]);
+const SVG = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+const bearer = (secret: string) => ({ authorization: `Bearer ${secret}` });
+
+describe("step artifacts (CORE-383)", () => {
+  async function ready() {
+    const s = setup();
+    await s.upload(step(1));
+    const secret = await s.jobFor("job1", "run1");
+    s.as(null);
+    const put = (secret: string | null, path: string, body: BodyInit | null, type?: string) =>
+      s.call(`/artifacts/${path}`, {
+        method: "PUT",
+        headers: { ...(secret ? bearer(secret) : {}), ...(type ? { "content-type": type } : {}) },
+        body,
+      });
+    return { s, secret, put };
+  }
+
+  test("a job uploads a screenshot and a diagram; the step lists them", async () => {
+    const { s, secret, put } = await ready();
+    const shot = await put(secret, "screenshots/Home page", PNG, "text/plain");
+    expect(shot.status).toBe(201);
+    const stored = (await shot.json()) as Extract<StepArtifact, { kind: "screenshot" }>;
+    expect(stored).toMatchObject({
+      id: "run1:screenshot:Home page",
+      runId: "run1",
+      kind: "screenshot",
+      data: { name: "Home page", contentType: "image/png", bytes: PNG.length, job: "visuals" },
+    });
+    expect(stored.data.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(stored.url).toBe(
+      `/api/repos/ann/app/steps/artifacts/run1%3Ascreenshot%3AHome%20page?v=${stored.data.sha256.slice(0, 16)}`,
+    );
+    expect([...s.files.objects.keys()]).toEqual([
+      `step-artifacts/repo/run1/${stored.data.sha256}.png`,
+    ]);
+
+    const doc = await put(
+      secret,
+      "documents/Flow",
+      JSON.stringify({ format: "mermaid", source: "graph TD; A-->B" }),
+    );
+    expect(doc.status).toBe(201);
+    expect(await doc.json()).toMatchObject({
+      id: "run1:document:Flow",
+      kind: "document",
+      data: { name: "Flow", format: "mermaid", source: "graph TD; A-->B", job: "visuals" },
+    });
+
+    s.as(ann);
+    const page = (await (await s.call("")).json()) as StepPage;
+    const artifacts = page.steps.find((x) => x.commitOid === oid(1))!.artifacts;
+    expect(artifacts.map((a) => [a.kind, a.id])).toEqual([
+      ["document", "run1:document:Flow"],
+      ["screenshot", "run1:screenshot:Home page"],
+    ]);
+    expect(artifacts.find((a) => a.kind === "screenshot")).toMatchObject({ url: stored.url });
+    expect(artifacts.find((a) => a.kind === "document")).not.toHaveProperty("url");
+  });
+
+  test("only a job's own credential uploads, only for its own repository", async () => {
+    const { s, secret, put } = await ready();
+    expect((await put(null, "screenshots/a", PNG)).status).toBe(401);
+    expect((await put("gmj_unknown", "screenshots/a", PNG)).status).toBe(401);
+    expect((await put("gm_personal_token", "screenshots/a", PNG)).status).toBe(401);
+    // A person (with write access) is not a job.
+    s.as(ann);
+    expect((await put(null, "screenshots/a", PNG)).status).toBe(401);
+    s.as(null);
+    // Another repository's job.
+    s.sqlite.exec(`
+      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+        VALUES ('repo2', 'ann', 'other', 'private', 'steps-${crypto.randomUUID()}', 'https://a');
+    `);
+    const stranger = await s.jobFor("job2", "run2", "repo2");
+    expect((await put(stranger, "screenshots/a", PNG)).status).toBe(403);
+    // An ended job.
+    s.sqlite.exec("UPDATE ci_jobs SET status = 'succeeded' WHERE id = 'job1'");
+    expect((await put(secret, "screenshots/a", PNG)).status).toBe(401);
+    expect(s.files.objects.size).toBe(0);
+  });
+
+  test("a job's credential reaches artifact uploads and no other steps route", async () => {
+    const route = (path: string) =>
+      jobRoute({
+        req: { header: () => "Bearer gmj_x", path },
+      } as unknown as Parameters<typeof jobRoute>[0]);
+    const base = "/api/repos/ann/app/steps";
+    expect(route(`${base}/artifacts/screenshots/home`)).toBe(true);
+    expect(route(`${base}/artifacts/documents/flow`)).toBe(true);
+    for (const other of ["", "/live", "/change0001", "/change0001/" + oid(1), "/artifactsx/a"])
+      expect(route(base + other)).toBe(false);
+    // Past the middleware, a job (no actor) can't use the person routes either.
+    const { s, secret } = await ready();
+    expect((await s.call("", { headers: bearer(secret) })).status).toBe(404);
+    expect(
+      (await s.call("", { method: "POST", headers: bearer(secret), body: JSON.stringify(step(2)) }))
+        .status,
+    ).toBe(401);
+  });
+
+  test("names are checked; only PNG, JPEG and WebP bytes are accepted", async () => {
+    const { s, secret, put } = await ready();
+    expect((await put(secret, "screenshots/.hidden", PNG)).status).toBe(400);
+    expect((await put(secret, `screenshots/${"x".repeat(81)}`, PNG)).status).toBe(400);
+    expect((await put(secret, "screenshots/a%2Fb", PNG)).status).toBe(400);
+    expect((await put(secret, "documents/.hidden", "{}")).status).toBe(400);
+    expect((await put(secret, "screenshots/ok name", SVG, "image/png")).status).toBe(415);
+    expect((await put(secret, "screenshots/ok name", new Uint8Array(), "image/png")).status).toBe(
+      415,
+    );
+    expect(
+      (await put(secret, "screenshots/ok name", Uint8Array.from([0xff, 0xd8, 0xff, 1]))).status,
+    ).toBe(201);
+    expect(
+      (await put(secret, "screenshots/webp", new TextEncoder().encode("RIFF\0\0\0\0WEBPVP8 ")))
+        .status,
+    ).toBe(201);
+    const big = new Uint8Array(STEP_ARTIFACT_LIMITS.imageBytes + 1);
+    big.set(PNG);
+    expect((await put(secret, "screenshots/big", big)).status).toBe(413);
+    expect(s.sqlite.prepare("SELECT COUNT(*) AS n FROM step_artifacts").get()!.n).toBe(2);
+  });
+
+  test("a diagram is JSON with mermaid source within the limit", async () => {
+    const { put, secret } = await ready();
+    const doc = (body: unknown) => put(secret, "documents/d", JSON.stringify(body));
+    expect((await put(secret, "documents/d", "not json")).status).toBe(400);
+    expect((await doc({ format: "dot", source: "digraph {}" })).status).toBe(400);
+    expect((await doc({ format: "mermaid", source: "  " })).status).toBe(400);
+    expect((await doc({ format: "mermaid" })).status).toBe(400);
+    expect(
+      (
+        await doc({
+          format: "mermaid",
+          source: "a".repeat(STEP_ARTIFACT_LIMITS.documentChars + 1),
+        })
+      ).status,
+    ).toBe(413);
+    expect((await doc({ format: "mermaid", source: "graph TD; A-->B" })).status).toBe(201);
+  });
+
+  test("re-uploading a name replaces it and its old image; a shared image stays", async () => {
+    const { s, secret, put } = await ready();
+    const first = (await (await put(secret, "screenshots/home", PNG)).json()) as Extract<
+      StepArtifact,
+      { kind: "screenshot" }
+    >;
+    // The same picture under a second name shares the object.
+    await put(secret, "screenshots/copy", PNG);
+    expect(s.files.objects.size).toBe(1);
+    const again = await put(secret, "screenshots/home", PNG_TWO);
+    expect(again.status).toBe(200);
+    const second = (await again.json()) as Extract<StepArtifact, { kind: "screenshot" }>;
+    expect(second.data.sha256).not.toBe(first.data.sha256);
+    expect(
+      s.sqlite.prepare("SELECT COUNT(*) AS n FROM step_artifacts WHERE kind = 'screenshot'").get()!
+        .n,
+    ).toBe(2);
+    // "copy" still shows the old image, so it stays; replace it and it goes.
+    expect(s.files.objects.size).toBe(2);
+    await put(secret, "screenshots/copy", PNG_TWO);
+    expect([...s.files.objects.keys()]).toEqual([
+      `step-artifacts/repo/run1/${second.data.sha256}.png`,
+    ]);
+    // Uploading the same bytes again keeps the object.
+    expect((await put(secret, "screenshots/home", PNG_TWO)).status).toBe(200);
+    expect(s.files.objects.size).toBe(1);
+  });
+
+  test("a run attaches a bounded number, though replacing one is always allowed", async () => {
+    const { s, secret, put } = await ready();
+    for (let n = 0; n < STEP_ARTIFACT_LIMITS.perRun; n++)
+      expect(
+        (await put(secret, `documents/d${n}`, JSON.stringify({ format: "mermaid", source: "a" })))
+          .status,
+      ).toBe(201);
+    expect((await put(secret, "screenshots/one-too-many", PNG)).status).toBe(409);
+    expect(
+      (await put(secret, "documents/d0", JSON.stringify({ format: "mermaid", source: "b" })))
+        .status,
+    ).toBe(200);
+    // The test summary doesn't count, and another run starts fresh.
+    const next = await s.jobFor("job3", "run3");
+    expect((await put(next, "screenshots/fresh", PNG)).status).toBe(201);
+  });
+
+  test("readers fetch the image with hardened headers; others can't see it", async () => {
+    const { s, secret, put } = await ready();
+    const stored = (await (await put(secret, "screenshots/Home page", PNG)).json()) as Extract<
+      StepArtifact,
+      { kind: "screenshot" }
+    >;
+    const path = stored.url.slice("/api/repos/ann/app/steps".length);
+    s.as(ben);
+    const res = await s.call(path);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("default-src 'none'; sandbox");
+    expect(res.headers.get("cache-control")).toBe("private, max-age=31536000, immutable");
+    // Without the current hash in the link, the bytes may have been replaced.
+    const bare = await s.call(path.split("?")[0]!);
+    expect(bare.headers.get("cache-control")).toBe("private, no-cache");
+    const stale = await s.call(`${path.split("?")[0]}?v=0000000000000000`);
+    expect(stale.headers.get("cache-control")).toBe("private, no-cache");
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(PNG);
+    // A document has no image; an unknown id is missing; a stranger can't tell it exists.
+    await put(secret, "documents/Flow", JSON.stringify({ format: "mermaid", source: "a" }));
+    expect((await s.call(`/artifacts/${encodeURIComponent("run1:document:Flow")}`)).status).toBe(
+      404,
+    );
+    expect((await s.call("/artifacts/nope")).status).toBe(404);
+    s.as(cid);
+    expect((await s.call(path)).status).toBe(404);
+    s.as(null);
+    expect((await s.call(path)).status).toBe(404);
+  });
+
+  test("an image is served only through its own repository", async () => {
+    const { s, secret, put } = await ready();
+    const stored = (await (await put(secret, "screenshots/a", PNG)).json()) as Extract<
+      StepArtifact,
+      { kind: "screenshot" }
+    >;
+    s.sqlite.exec(`
+      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+        VALUES ('repo2', 'ann', 'other', 'public', 'steps-${crypto.randomUUID()}', 'https://a');
+    `);
+    const res = await s.other(`/artifacts/${encodeURIComponent(stored.id)}`);
+    expect(res.status).toBe(404);
+  });
+
+  test("an artifact whose data isn't the expected shape is skipped, not fatal", async () => {
+    const { s } = await ready();
+    s.as(ann);
+    s.sqlite.exec(`
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step)
+        VALUES ('runx', 'repo', 9, '${oid(1)}', 'timeline/search', 'manual', 'succeeded', 1);
+      INSERT INTO step_artifacts (id, repo_id, commit_oid, run_id, kind, data, created_at) VALUES
+        ('runx:screenshot:bad', 'repo', '${oid(1)}', 'runx', 'screenshot', '{"name":1}', '2026-10-04T00:01:00.000Z'),
+        ('runx:document:bad', 'repo', '${oid(1)}', 'runx', 'document', 'not json', '2026-10-04T00:02:00.000Z');
+    `);
+    const page = (await (await s.call("")).json()) as StepPage;
+    expect(page.steps[0]!.artifacts).toEqual([]);
+  });
+
+  test("retention removes a screenshot's image with its row, unless another row shows it", async () => {
+    const { s, secret, put } = await ready();
+    await put(secret, "screenshots/a", PNG);
+    await put(secret, "screenshots/b", PNG);
+    await put(secret, "screenshots/c", PNG_TWO);
+    s.sqlite.exec(
+      "UPDATE step_artifacts SET created_at = '2020-01-01T00:00:00.000Z' WHERE id LIKE '%:screenshot:_'",
+    );
+    // Only "b" and "c" are old enough to remove below.
+    s.sqlite.exec(
+      "UPDATE step_artifacts SET created_at = '2099-01-01T00:00:00.000Z' WHERE id LIKE '%:screenshot:a'",
+    );
+    const ctx = {
+      env: s.env,
+      now: new Date("2026-10-12T00:00:00.000Z"),
+      limit: 100,
+      thresholds: { days: 90 },
+      target: { scope: "account", accountId: "ann" },
+    } as unknown as Parameters<typeof stepArtifacts.select>[0];
+    const selected = await stepArtifacts.select(ctx, null);
+    expect(selected.items.map((i) => i.id)).toEqual(["run1:screenshot:b", "run1:screenshot:c"]);
+    expect(selected.bytes).toBeGreaterThan(PNG.length + PNG_TWO.length);
+    const removed = await stepArtifacts.remove(ctx, selected.items);
+    expect(removed.count).toBe(2);
+    // "a" still shows the shared PNG; the other image went.
+    expect([...s.files.objects.keys()]).toEqual([
+      `step-artifacts/repo/run1/${await sha256(PNG)}.png`,
+    ]);
+    expect(s.files.objects.has(`step-artifacts/repo/run1/${await sha256(PNG_TWO)}.png`)).toBe(
+      false,
+    );
   });
 });

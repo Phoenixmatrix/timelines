@@ -56,7 +56,8 @@ export function Mermaid({ code }: { code: string }) {
   return (
     <div
       className="overflow-x-auto rounded-control bg-sunken p-4 [&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-w-full"
-      // Mermaid's strict security level sanitizes labels; diagrams come from our own graph.
+      // Sources include wiki graphs and diagrams CI jobs upload for the step view; both
+      // render at Mermaid's strict security level, which sanitizes labels.
       dangerouslySetInnerHTML={{ __html: svg }}
     />
   );

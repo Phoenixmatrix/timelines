@@ -9,11 +9,18 @@ import { expect, onTestFinished, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { CommitSummary, HistoryPage } from "../../../shared/api.ts";
 import type { CommitDiff } from "../../../shared/diff.ts";
-import type { StepUpload } from "../../../shared/steps.ts";
+import type {
+  Step,
+  StepArtifact,
+  StepPage,
+  StepUpload,
+  StepVersions,
+} from "../../../shared/steps.ts";
 import type { TimelineDetail } from "../../../shared/timelines.ts";
 import { commitId, settled, sidewaysOverflow } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { reply, TestServer } from "../../testing/server.ts";
+import { visual } from "../../testing/visual.ts";
 
 test("story: steps in order, context beside the diff, keys, filters, versions, phone", async () => {
   let shortcuts = false;
@@ -194,6 +201,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   const diff = step.getByRole("region", { name: "Diff" });
   await expect.element(diff).toMatchTextContent(/src\/rank\.ts/);
   await expect.element(diff.getByText("+byRecency()")).toBeVisible();
+  await visual("Timeline story - step open");
   const commitLink = step.getByRole("link", { name: rank.slice(0, 7), exact: true });
   const commitUrl = new URL(commitLink.element().getAttribute("href")!, location.origin);
   expect(commitUrl.searchParams.get("source")).toBe(source.sourceId);
@@ -438,4 +446,162 @@ test("ended Story keeps owned work separate from historical canonical merge pare
     expect(new URL(href, location.origin).searchParams.get("source")).toBe(source.sourceId);
     app.unmount();
   }
+});
+
+test("a step's screenshots and diagram, compared with the step before (CORE-383)", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.repo("orbit", "engine");
+  const fork = commitId();
+  await server.push("orbit/engine", "main", fork);
+  const slug = "visuals";
+  await server.call("POST", "/api/tracker/orbit/timelines", {
+    slug,
+    name: "Visuals",
+    repos: ["orbit/engine"],
+  });
+  const detail = await server.call<TimelineDetail>("GET", `/api/tracker/orbit/timelines/${slug}`);
+  const source = detail.timeline.repos[0]!.source!;
+  const [latest, middle, first] = [commitId(), commitId(), commitId()];
+  const at = (n: number) => 1_790_000_000 + n * 60;
+  const line = [
+    [latest, "Tidy the settings", 3, middle],
+    [middle, "Redraw the board", 2, first],
+    [first, "Add the board", 1, fork],
+  ] as const;
+  server.on("GET", "/api/repos/:owner/:name/history", ({ url }): HistoryPage => {
+    expect(url.searchParams.get("source")).toBe(source.sourceId);
+    return {
+      ref: "work",
+      head: latest,
+      path: "",
+      scanned: line.length,
+      next: null,
+      commits: line.map(([oid, message, n, parent]) => ({
+        oid,
+        message,
+        authorName: "Marco",
+        authorEmail: "marco@example.com",
+        authoredAt: at(n),
+        parents: [parent],
+      })),
+      entries: {},
+    };
+  });
+  server.on("GET", "/api/repos/:owner/:name/commits/:oid/diff", ({ params }): CommitDiff => ({
+    oid: params.oid!,
+    parents: [],
+    message: "",
+    authorName: "Marco",
+    authoredAt: 0,
+    truncated: false,
+    files: [],
+  }));
+  for (const [oid, message, n] of line)
+    await server.call("POST", "/api/repos/orbit/engine/steps", {
+      changeId: `${oid.slice(0, 12)}change`,
+      commitOid: oid,
+      summary: message,
+      committedAt: new Date(at(n) * 1000).toISOString(),
+      timeline: slug,
+    } satisfies Partial<StepUpload>);
+
+  // Tiny images; the fragment tells them apart.
+  const png =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  let runs = 0;
+  const shot = (name: string, sha256: string, run = ++runs): StepArtifact => ({
+    id: `${name}-${sha256}-${run}`,
+    runId: `run-${run}`,
+    runNumber: run,
+    createdAt: new Date(at(run) * 1000).toISOString(),
+    kind: "screenshot",
+    data: { name, contentType: "image/png", bytes: 68, sha256, job: "test" },
+    url: `${png}#${name}-${sha256}`,
+  });
+  const diagram: StepArtifact = {
+    id: "diagram",
+    runId: "run-9",
+    runNumber: 9,
+    createdAt: new Date(at(3) * 1000).toISOString(),
+    kind: "document",
+    data: {
+      name: "Architecture",
+      format: "mermaid",
+      source: "graph TD; Browser-->Worker; Worker-->D1;",
+      job: "test",
+    },
+  };
+  // Newest first, as the API returns them: the older run's Board is shadowed.
+  const artifacts: Record<string, StepArtifact[]> = {
+    [latest]: [],
+    [middle]: [
+      shot("Home", "same", 5),
+      shot("Board", "after", 5),
+      shot("Settings", "fresh", 5),
+      diagram,
+      shot("Board", "stale", 4),
+    ],
+    [first]: [shot("Home", "same", 1), shot("Board", "before", 1)],
+  };
+  const withArtifacts = (step: Step): Step => ({ ...step, artifacts: artifacts[step.commitOid]! });
+  server.on("GET", "/api/repos/:owner/:name/steps", async ({ url }): Promise<StepPage> => {
+    const page = await server.call<StepPage>("GET", `/api/repos/orbit/engine/steps${url.search}`);
+    return { ...page, steps: page.steps.map(withArtifacts) };
+  });
+  server.on("GET", "/api/repos/:owner/:name/steps/:changeId", async ({ params }) => {
+    const versions = await server.call<StepVersions>(
+      "GET",
+      `/api/repos/orbit/engine/steps/${params.changeId}`,
+    );
+    return { ...versions, versions: versions.versions.map(withArtifacts) };
+  });
+
+  const app = renderApp(`/tracker/orbit/timelines/${slug}/story?step=${middle}`);
+  const visuals = page.getByRole("region", { name: "Visuals" });
+  const thumb = (name: string) => visuals.getByRole("button", { name: `Enlarge ${name}` });
+  const caption = (name: string) => visuals.getByRole("listitem").filter({ hasText: name });
+  await expect.element(visuals.getByRole("img", { name: "Home" })).toBeVisible();
+  // One thumbnail per name (the newest run's), against the step before.
+  expect(visuals.getByRole("listitem").elements()).toHaveLength(3);
+  await expect.element(caption("Home")).toMatchTextContent(/Unchanged/);
+  await expect.element(caption("Board")).toMatchTextContent(/Compare/);
+  await expect.element(caption("Settings")).toMatchTextContent(/New/);
+  await expect
+    .element(visuals.getByRole("img", { name: "Board" }))
+    .toHaveAttribute("src", `${png}#Board-after`);
+  await expect.element(visuals.getByText("Architecture", { exact: true })).toBeVisible();
+  await expect.poll(() => visuals.element().querySelector("svg")).not.toBeNull();
+
+  // Enlarged: Before and After swap the picture; Escape closes it and only it.
+  await thumb("Board").click();
+  const dialog = page.getByRole("dialog", { name: "Board" });
+  await expect.element(dialog).toBeVisible();
+  const picture = dialog.getByRole("img");
+  await expect.element(picture).toHaveAttribute("src", `${png}#Board-after`);
+  const after = dialog.getByRole("button", { name: "After" });
+  const before = dialog.getByRole("button", { name: "Before" });
+  await expect.element(after).toHaveAttribute("aria-pressed", "true");
+  await before.click();
+  await expect.element(before).toHaveAttribute("aria-pressed", "true");
+  await expect.element(picture).toHaveAttribute("src", `${png}#Board-before`);
+  await expect
+    .element(dialog.getByRole("link", { name: "Open full size" }))
+    .toHaveAttribute("href", `${png}#Board-before`);
+  await userEvent.keyboard("{Escape}");
+  await expect.element(dialog).not.toBeInTheDocument();
+  expect(app.url().searchParams.get("step")).toBe(middle);
+  await expect.element(thumb("Board")).toHaveFocus();
+  // Unchanged and new pictures have nothing to compare.
+  await thumb("Home").click();
+  await expect.element(page.getByRole("dialog", { name: "Home" })).toBeVisible();
+  expect(page.getByRole("button", { name: "Before" }).elements()).toHaveLength(0);
+  await userEvent.keyboard("{Escape}");
+
+  // The first step has nothing before it: everything is new. The newest has no visuals at all.
+  await app.navigate(`/tracker/orbit/timelines/${slug}/story?step=${first}`);
+  await expect.element(caption("Board")).toMatchTextContent(/New/);
+  await expect.element(caption("Home")).toMatchTextContent(/New/);
+  await app.navigate(`/tracker/orbit/timelines/${slug}/story?step=${latest}`);
+  await expect.element(page.getByRole("region", { name: "Step" })).toBeVisible();
+  await expect.element(visuals).not.toBeInTheDocument();
 });

@@ -8,6 +8,7 @@ import { page, userEvent } from "vite-plus/test/browser";
 import { press } from "../../testing/focus.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
+import { visual } from "../../testing/visual.ts";
 import { mutate } from "../../testing/timelines.ts";
 
 test("progress groups: work underway first, sorted inside, foldable, and flat on request", async () => {
@@ -57,6 +58,7 @@ test("progress groups: work underway first, sorted inside, foldable, and flat on
       "Write the release notes",
       "Someday tidy-up",
     ]);
+  await visual("Issue list - progress groups");
 
   // Priority sorts inside each group; claimed work still leads.
   await userEvent.click(table.getByRole("button", { name: "P", exact: true }));

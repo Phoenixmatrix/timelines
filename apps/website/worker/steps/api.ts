@@ -6,6 +6,9 @@
 //   GET    /api/repos/:owner/:name/steps?timeline=&issue=&commits=&cursor=&limit=   newest first
 //   GET    /api/repos/:owner/:name/steps/:changeId             every version of a change
 //   DELETE /api/repos/:owner/:name/steps/:changeId/:commitOid  delete or redact (admins)
+//   PUT    /api/repos/:owner/:name/steps/artifacts/screenshots/<name>  a CI job's image (CORE-383)
+//   PUT    /api/repos/:owner/:name/steps/artifacts/documents/<name>    a CI job's diagram
+//   GET    /api/repos/:owner/:name/steps/artifacts/:id        a stored screenshot (readers)
 //
 // A step is verified once a push has shown Gitmatrix its commit (here, at
 // upload, or later in worker/ref-log/record.ts); until then it's reported as
@@ -16,6 +19,7 @@ import { Hono, type Context } from "hono";
 import type { Selectable } from "kysely";
 import {
   EMPTY_CONTEXT,
+  STEP_ARTIFACT_LIMITS,
   STEP_LIMITS,
   type ContextEntry,
   type ContextSource,
@@ -23,6 +27,9 @@ import {
   type StepArtifact,
   type StepAuthor,
   type StepContextBody,
+  type StepDocument,
+  type StepImageType,
+  type StepScreenshot,
   type StepFeedRecord,
   STEP_FEED_DAYS,
   type StepPage,
@@ -32,14 +39,18 @@ import {
   type StepVersions,
 } from "../../shared/steps.ts";
 import type { AppEnv } from "../auth.ts";
+import { readBounded, sha256 } from "../api/bytes.ts";
 import { fail, requireActor } from "../api/http.ts";
 import { loadRepo, loadSourceRepo } from "../api/repos.ts";
 import { noteAgentPresence } from "../agent-presence.ts";
 import { RepoReader } from "../objects.ts";
 import { durableStub } from "../durable/registry.ts";
-import { avatarUrl } from "../avatars/api.ts";
-import { sqlNow } from "../db.ts";
-import { db, type Database } from "../schema.ts";
+import { avatarUrl, EXTENSION, imageType } from "../avatars/api.ts";
+import { jobCaller, jobSecret, type JobCaller } from "../deployments/job.ts";
+import { findRepo, sqlNow, type RepoRow } from "../db.ts";
+import { db, nowIso, type Database } from "../schema.ts";
+import { deleteUnreferenced } from "./objects.ts";
+import { resolveSource } from "../timelines/sources.ts";
 
 export const steps = new Hono<AppEnv>();
 
@@ -180,12 +191,72 @@ async function present(c: Context<AppEnv>, rows: Row[]) {
   }));
 }
 
+/** Where a repository's step routes live, for links in what they return. */
+async function stepsPath(d1: D1Database, repoId: string): Promise<string | null> {
+  const row = await db(d1)
+    .selectFrom("repos as r")
+    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .select(["o.slug", "r.name"])
+    .where("r.id", "=", repoId)
+    .executeTakeFirst();
+  return row ? `/api/repos/${row.slug}/${row.name}/steps` : null;
+}
+
+const IMAGE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/webp"];
+
+/** The stored screenshot's data when it has the shape we wrote; null otherwise. */
+function screenshotData(value: unknown): StepScreenshot | null {
+  const d = value as Partial<StepScreenshot> | null;
+  return d &&
+    typeof d.name === "string" &&
+    IMAGE_TYPES.includes(d.contentType as string) &&
+    typeof d.bytes === "number" &&
+    typeof d.sha256 === "string" &&
+    typeof d.job === "string"
+    ? (d as StepScreenshot)
+    : null;
+}
+
+function documentData(value: unknown): StepDocument | null {
+  const d = value as Partial<StepDocument> | null;
+  return d &&
+    typeof d.name === "string" &&
+    d.format === "mermaid" &&
+    typeof d.source === "string" &&
+    typeof d.job === "string"
+    ? (d as StepDocument)
+    : null;
+}
+
+/** A screenshot's link: the content hash in the query busts caches when it changes. */
+const screenshotUrl = (base: string, id: string, data: StepScreenshot) =>
+  `${base}/artifacts/${encodeURIComponent(id)}?v=${data.sha256.slice(0, 16)}`;
+
+/** One stored artifact as the API shows it; null when its data isn't the shape we wrote. */
+function toArtifact(
+  common: Pick<StepArtifact, "id" | "runId" | "runNumber" | "createdAt">,
+  kind: "test-summary" | "screenshot" | "document",
+  data: unknown,
+  base: string | null,
+): StepArtifact | null {
+  if (kind === "test-summary") return { ...common, kind, data: data as StepTestSummary };
+  if (kind === "screenshot") {
+    const shot = screenshotData(data);
+    return shot && base
+      ? { ...common, kind, data: shot, url: screenshotUrl(base, common.id, shot) }
+      : null;
+  }
+  const document = documentData(data);
+  return document ? { ...common, kind, data: document } : null;
+}
+
 /** Step runs' artifacts for these steps' commits, newest first (CORE-235). */
 async function artifactsOf(d1: D1Database, rows: Row[]): Promise<Map<string, StepArtifact[]>> {
   const out = new Map<string, StepArtifact[]>();
   const repoId = rows[0]?.repo_id;
   if (!repoId) return out;
   const commits = [...new Set(rows.map((r) => r.commit_oid))];
+  let base: string | null | undefined;
   for (let i = 0; i < commits.length; i += ROWS_PER_QUERY) {
     const found = await db(d1)
       .selectFrom("step_artifacts as a")
@@ -196,23 +267,20 @@ async function artifactsOf(d1: D1Database, rows: Row[]): Promise<Map<string, Ste
       .orderBy("a.created_at", "desc")
       .execute();
     for (const row of found) {
-      let data: Record<string, unknown> = {};
+      let data: unknown = {};
       try {
-        data = JSON.parse(row.data) as Record<string, unknown>;
+        data = JSON.parse(row.data);
       } catch {
-        // Keep the artifact; its data is unreadable.
+        // Keep a test summary; its data is unreadable.
       }
-      const base = {
-        id: row.id,
-        runId: row.run_id,
-        runNumber: row.number,
-        createdAt: row.created_at,
-      };
-      const artifact: StepArtifact =
-        row.kind === "test-summary"
-          ? { ...base, kind: "test-summary", data: data as unknown as StepTestSummary }
-          : { ...base, kind: row.kind, data, url: null };
-      out.set(row.commit_oid, [...(out.get(row.commit_oid) ?? []), artifact]);
+      if (row.kind === "screenshot") base ??= await stepsPath(d1, repoId);
+      const artifact = toArtifact(
+        { id: row.id, runId: row.run_id, runNumber: row.number, createdAt: row.created_at },
+        row.kind,
+        data,
+        base ?? null,
+      );
+      if (artifact) out.set(row.commit_oid, [...(out.get(row.commit_oid) ?? []), artifact]);
     }
   }
   return out;
@@ -471,6 +539,209 @@ steps.get("/live", async (c) => {
     new Request("https://step-feed/subscribe", { headers }),
   );
   return new Response(response.body, response);
+});
+
+// Step artifacts (CORE-383): what a CI job attaches to its run's commit.
+
+/** The CI job behind the request's credential, for its own repository only. */
+async function artifactJob(
+  c: Context<AppEnv>,
+): Promise<{ repo: RepoRow; job: JobCaller } | Response> {
+  const secret = jobSecret(c.req.header("authorization"));
+  if (!secret)
+    return fail(c, 401, "Only a CI job uploads step artifacts, with its own credential.");
+  const job = await jobCaller(c.env.DB, secret);
+  if (!job) return fail(c, 401, "The CI job's credential is invalid, or the job has ended.");
+  const repo = await findRepo(
+    c.env.DB,
+    null,
+    c.req.param("owner") ?? "",
+    c.req.param("name") ?? "",
+  );
+  if (!repo || repo.id !== job.repoId)
+    return fail(c, 403, "A CI job uploads artifacts for its own repository only.");
+  if (job.sourceId !== "canonical") await resolveSource(c.env, repo, job.sourceId);
+  return { repo, job };
+}
+
+/**
+ * Stores one artifact row for the job's run, replacing the run's earlier
+ * upload of the same name. Respond as the step lists would show it.
+ */
+async function putArtifact(
+  c: Context<AppEnv>,
+  caller: { repo: RepoRow; job: JobCaller },
+  kind: "screenshot" | "document",
+  name: string,
+  data: StepScreenshot | StepDocument,
+  store?: { key: string; bytes: Uint8Array; type: StepImageType },
+) {
+  const { repo, job } = caller;
+  const kdb = db(c.env.DB);
+  const id = `${job.runId}:${kind}:${name}`;
+  const existing = await kdb
+    .selectFrom("step_artifacts")
+    .select("object_key")
+    .where("id", "=", id)
+    .executeTakeFirst();
+  if (!existing) {
+    const { n } = await kdb
+      .selectFrom("step_artifacts")
+      .select((eb) => eb.fn.countAll<number>().as("n"))
+      .where("run_id", "=", job.runId)
+      .where("kind", "in", ["screenshot", "document"])
+      .executeTakeFirstOrThrow();
+    if (Number(n) >= STEP_ARTIFACT_LIMITS.perRun)
+      return fail(
+        c,
+        409,
+        `A run attaches up to ${STEP_ARTIFACT_LIMITS.perRun} screenshots and documents.`,
+      );
+  }
+  if (store)
+    await c.env.STEP_ARTIFACTS.put(store.key, store.bytes, {
+      httpMetadata: { contentType: store.type },
+    });
+  const values = {
+    kind,
+    data: JSON.stringify(data),
+    object_key: store?.key ?? null,
+    created_at: nowIso(),
+  };
+  try {
+    await kdb
+      .insertInto("step_artifacts")
+      .values({ id, repo_id: repo.id, commit_oid: job.commit, run_id: job.runId, ...values })
+      .onConflict((oc) =>
+        oc.column("id").doUpdateSet({
+          data: values.data,
+          object_key: values.object_key,
+          created_at: values.created_at,
+        }),
+      )
+      .execute();
+  } catch (error) {
+    // Don't leave the just-put image behind with no row to find it by.
+    if (store)
+      await deleteUnreferenced(c.env, [store.key]).catch((e) =>
+        console.warn(`step artifact ${store.key} left after a failed save: ${String(e)}`),
+      );
+    throw error;
+  }
+  // A replacement that stored a different image frees the old one, unless
+  // another artifact (the same picture under another name) still shows it.
+  // The upload has succeeded by now, so a failure here is only a leftover.
+  const old = existing?.object_key;
+  if (old && old !== store?.key)
+    await deleteUnreferenced(c.env, [old]).catch((e) =>
+      console.warn(`step artifact ${old} left after a replacement: ${String(e)}`),
+    );
+  const artifact = toArtifact(
+    { id, runId: job.runId, runNumber: job.runNumber, createdAt: values.created_at },
+    kind,
+    data,
+    `/api/repos/${repo.owner_slug}/${repo.name}/steps`,
+  );
+  return c.json(artifact, existing ? 200 : 201);
+}
+
+function artifactName(c: Context<AppEnv>): string | Response {
+  // Not `:name`, which is the repository's.
+  const name = c.req.param("artifact") ?? "";
+  return STEP_ARTIFACT_LIMITS.name.test(name)
+    ? name
+    : fail(
+        c,
+        400,
+        "name is 1-80 letters, digits, spaces, dots, underscores or hyphens, starting with a letter or digit.",
+      );
+}
+
+steps.put("/artifacts/screenshots/:artifact", async (c) => {
+  const caller = await artifactJob(c);
+  if (caller instanceof Response) return caller;
+  const name = artifactName(c);
+  if (name instanceof Response) return name;
+  const body = c.req.raw.body;
+  if (!body) return fail(c, 400, "Send the image as the request body.");
+  const bytes = await readBounded(body, STEP_ARTIFACT_LIMITS.imageBytes);
+  if (!bytes) return fail(c, 413, "Keep a screenshot under 2 MiB.");
+  // The bytes decide the type; the request's Content-Type is never trusted, and SVG never matches.
+  const type = imageType(bytes);
+  if (!type) return fail(c, 415, "Send a PNG, JPEG or WebP image.");
+  const hash = await sha256(bytes);
+  const data: StepScreenshot = {
+    name,
+    contentType: type,
+    bytes: bytes.byteLength,
+    sha256: hash,
+    job: caller.job.jobName,
+  };
+  const key = `step-artifacts/${caller.repo.id}/${caller.job.runId}/${hash}.${EXTENSION[type]}`;
+  return putArtifact(c, caller, "screenshot", name, data, { key, bytes, type });
+});
+
+steps.put("/artifacts/documents/:artifact", async (c) => {
+  const caller = await artifactJob(c);
+  if (caller instanceof Response) return caller;
+  const name = artifactName(c);
+  if (name instanceof Response) return name;
+  const body = c.req.raw.body;
+  if (!body) return fail(c, 400, "Send the diagram as JSON.");
+  // Characters take up to four bytes in UTF-8, plus the JSON around the source.
+  const raw = await readBounded(body, STEP_ARTIFACT_LIMITS.documentChars * 4 + 1024);
+  if (!raw) return fail(c, 413, "Keep a diagram under 50,000 characters.");
+  let upload: { format?: unknown; source?: unknown };
+  try {
+    upload = JSON.parse(new TextDecoder().decode(raw)) as typeof upload;
+  } catch {
+    return fail(c, 400, "Send the diagram as JSON.");
+  }
+  if (upload?.format !== "mermaid") return fail(c, 400, 'format is "mermaid".');
+  if (typeof upload.source !== "string" || !upload.source.trim())
+    return fail(c, 400, "source is the diagram's text.");
+  if (upload.source.length > STEP_ARTIFACT_LIMITS.documentChars)
+    return fail(c, 413, "Keep a diagram under 50,000 characters.");
+  const data: StepDocument = {
+    name,
+    format: "mermaid",
+    source: upload.source,
+    job: caller.job.jobName,
+  };
+  return putArtifact(c, caller, "document", name, data);
+});
+
+steps.get("/artifacts/:id", async (c) => {
+  const loaded = await loadRepo(c, "read");
+  if (loaded instanceof Response) return loaded;
+  const row = await db(c.env.DB)
+    .selectFrom("step_artifacts")
+    .select(["kind", "data", "object_key"])
+    .where("id", "=", c.req.param("id") ?? "")
+    .where("repo_id", "=", loaded.row.id)
+    .executeTakeFirst();
+  let data: StepScreenshot | null = null;
+  try {
+    data = row ? screenshotData(JSON.parse(row.data)) : null;
+  } catch {
+    data = null;
+  }
+  const object =
+    row?.kind === "screenshot" && row.object_key && data
+      ? await c.env.STEP_ARTIFACTS.get(row.object_key)
+      : null;
+  if (!object || !data) return fail(c, 404, "No such screenshot.");
+  // Only a link carrying this image's hash (?v=, as artifactsOf writes it) may be
+  // cached for good; the same id replaced by another upload serves new bytes.
+  const current = c.req.query("v") === data.sha256.slice(0, 16);
+  return new Response(object.body, {
+    headers: {
+      "content-type": data.contentType,
+      "cache-control": current ? "private, max-age=31536000, immutable" : "private, no-cache",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'none'; sandbox",
+    },
+  });
 });
 
 /** Opaque paging: the last step's (committedAt, changeId, commitOid). */

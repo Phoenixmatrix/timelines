@@ -4,8 +4,11 @@
 // (worker/testing/browser-api.ts, real Worker routes over node:sqlite),
 // media emulation, and touch.
 
+import { mkdir, writeFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
+import { join } from "node:path";
 import type { BrowserCommand } from "vite-plus/test/node";
+import { STEP_ARTIFACT_LIMITS } from "../shared/steps.ts";
 
 /** What the in-memory API module exports; loaded by Node itself, not bundled into the config. */
 interface BrowserApiModule {
@@ -63,4 +66,33 @@ const tap: BrowserCommand<[selector: string]> = async (ctx, selector) => {
   await (await ctx.frame()).locator(selector).tap();
 };
 
-export const browserCommands = { gmWorld, gmServe, emulateMedia, tap };
+/**
+ * A picture of the rendered test page (CORE-383), written to
+ * $GITMATRIX_VISUALS_DIR/<name>.png for CI to attach to the commit's step.
+ * Returns false, doing nothing, when that directory isn't set. The name obeys
+ * the step artifact rules, so a bad one fails the test that wrote it, but a
+ * screenshot that can't be taken never does.
+ */
+const captureVisual: BrowserCommand<[name: string]> = async (ctx, name) => {
+  if (!STEP_ARTIFACT_LIMITS.name.test(name))
+    throw new Error(`visual("${name}"): a name is letters, digits, spaces, . _ - (80 at most)`);
+  const dir = process.env.GITMATRIX_VISUALS_DIR;
+  if (!dir) return false;
+  if (!("iframe" in ctx)) throw new Error("captureVisual needs the Playwright provider");
+  try {
+    // The test page is an iframe at the configured viewport; shoot just that.
+    // Times ("3 minutes ago") are masked: they differ between runs of the same UI.
+    const frame = await ctx.frame();
+    const png = await ctx.iframe
+      .owner()
+      .screenshot({ animations: "disabled", caret: "hide", mask: [frame.locator("time")] });
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${name}.png`), png);
+    return true;
+  } catch (error) {
+    console.warn(`visual("${name}") was not captured: ${String(error)}`);
+    return false;
+  }
+};
+
+export const browserCommands = { gmWorld, gmServe, emulateMedia, tap, captureVisual };

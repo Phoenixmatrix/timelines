@@ -16,6 +16,7 @@ import { sidewaysOverflow } from "../../testing/atlas.ts";
 import { focused, focusOn, press } from "../../testing/focus.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
+import { visual } from "../../testing/visual.ts";
 import {
   askApproval,
   changes,
@@ -142,6 +143,7 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
   // The summary, as Markdown.
   await expect.element(card().getByText("ranked", { exact: true })).toBeVisible();
   await expect.element(card().getByText("Ranks by freshness")).toBeVisible();
+  await visual("Checkpoint - approval card");
 
   // Each repository: its work's commit (in its owned source, which canonical
   // history never has) onto main's, its changes, CI runs and previews.

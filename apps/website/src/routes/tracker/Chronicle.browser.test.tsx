@@ -3,6 +3,7 @@ import { page, userEvent } from "vite-plus/test/browser";
 import type { Snapshot } from "../../../shared/tracker.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
+import { visual } from "../../testing/visual.ts";
 import { mutate } from "../../testing/timelines.ts";
 import { focusOn, press } from "../../testing/focus.ts";
 
@@ -27,6 +28,7 @@ test("a truncated Chronicle row shows its whole title when hovered anywhere on t
   expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
   const tooltip = () => document.querySelector<HTMLElement>("[data-chronicle-tooltip]");
   expect(tooltip()).toBeNull();
+  await visual("Chronicle - issues");
   await title.hover();
   await expect.poll(() => tooltip()?.textContent).toContain(`ENG-1 ${LONG}`);
   // The tooltip wraps rather than truncating the title again.
