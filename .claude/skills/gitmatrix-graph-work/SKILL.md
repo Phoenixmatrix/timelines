@@ -64,6 +64,10 @@ restricting pickup. Policy is global across timelines, not a branch-local overri
    uses the explicit queue workflow below. Only after acceptance is shipped and
    verified, `gm issue complete <issue> --evidence 'Landed <commit>, queue <id>; gate run #N green; deployment/run #M verified; tests: …'`.
    Cite only evidence actually observed; omit deployment claims when not verified.
+   `--evidence` is optional and accepts literal text, `@file` or `-` for stdin.
+   Omitted or whitespace-only evidence creates no note, not a synthetic success claim.
+   `gm issue show` retains original completion evidence separately from recent activity,
+   including after reopening. Optional evidence does not waive acceptance, gates or approvals.
    Complete only what is shipped and verified. If abandoning active work,
    `gm issue release <issue>`: after the team's limit of releases, the issue asks
    your person what to try next. Do not release a lease parked on a human request.

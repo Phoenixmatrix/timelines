@@ -7,11 +7,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import {
-  ensureRemoteDeployment,
-  teardownRemote,
-  validateRemoteEnvironment,
-} from "./remote-environment.ts";
+import { teardownRemote, validateRemoteEnvironment } from "./remote-environment.ts";
 import type { RemoteEnvironment } from "./remote-environment.ts";
 import {
   authenticate,
@@ -158,43 +154,172 @@ await it("packages without node_modules and passes cf's real prebuilt upload con
   }
 });
 
-await it("retries only its own pending deployment without reallocating or extending expiry", async () => {
-  const record = fixture().read();
-  delete record.origin;
-  record.status = "provisioning";
-  record.installed = false;
-  record.resources = [];
-  const before = structuredClone(record);
-  await assert.rejects(
-    ensureRemoteDeployment(
-      record,
-      async () => {
+await it("retains quota admission across interrupted deployment and rejects a released reservation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "remote-admission-fixture-"));
+  try {
+    await exec(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `
+      import assert from "node:assert/strict";
+      import { ensureRemoteDeployment } from ${JSON.stringify(new URL("./remote-environment.ts", import.meta.url).href)};
+      const record = ${JSON.stringify(fixture().read())};
+      delete record.origin;
+      record.status = "provisioning";
+      record.installed = false;
+      record.resources = [];
+      record.quota = { authority: "https://quota.example", state: "pending" };
+      let admissions = 0;
+      globalThis.fetch = async (url, init) => {
+        assert.equal(url, "https://quota.example/api/environments/reservations");
+        assert.equal(new Headers(init.headers).get("authorization"), "Bearer quota-fixture");
+        admissions++;
+        return Response.json({ id: record.id, reserved: true });
+      };
+      await assert.rejects(ensureRemoteDeployment(record, async () => {
         throw new Error("deploy interrupted");
+      }, 2000), /deploy interrupted/);
+      assert.equal(record.quota.state, "reserved");
+      let deployments = 0;
+      const deploy = async (owned) => {
+        deployments++;
+        owned.origin = "https://" + owned.id + ".example.workers.dev";
+      };
+      await ensureRemoteDeployment(record, deploy, 2000);
+      await ensureRemoteDeployment(record, deploy, 2000);
+      assert.equal(deployments, 1);
+      assert.equal(admissions, 3);
+      assert.equal(record.expires, 86401000);
+      await assert.rejects(ensureRemoteDeployment({ ...record, expires: 2000 }, deploy, 2000), /expired/);
+      record.quota.state = "released";
+      await assert.rejects(ensureRemoteDeployment(record, deploy, 2000), /released/);
+      assert.equal(deployments, 1);
+    `,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: directory,
+          GITMATRIX_REMOTE_HOSTED: "1",
+          GITMATRIX_REMOTE_CREDENTIALS_FILE: "",
+          GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: "https://quota.example",
+          GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: "quota-fixture",
+        },
       },
-      2000,
-    ),
-  );
-  assert.deepEqual(record, before);
-  let deployments = 0;
-  const deploy = async (owned: RemoteEnvironment) => {
-    assert.equal(owned, record);
-    deployments++;
-    owned.origin = `https://${owned.id}.example.workers.dev`;
-  };
-  await ensureRemoteDeployment(record, deploy, 2000);
-  await ensureRemoteDeployment(record, deploy, 2000);
-  assert.equal(deployments, 1);
-  assert.equal(record.expires, before.expires);
-  assert.equal(record.token, before.token);
-  assert.equal(record.id, before.id);
-  await assert.rejects(
-    ensureRemoteDeployment({ ...before, expires: 2000 }, deploy, 2000),
-    /expired/,
-  );
-  await assert.rejects(
-    ensureRemoteDeployment({ ...before, status: "ready" }, deploy, 2000),
-    /unknown state/,
-  );
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+await it("requires legacy drainage, enforces global admission, and releases only after physical deletion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "remote-quota-fixture-"));
+  try {
+    await exec(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `
+      import assert from "node:assert/strict";
+      import { mkdir } from "node:fs/promises";
+      import { join } from "node:path";
+      import { allocateRemote, ensureRemoteAdmission, persistRemote, teardownRemote, inventory, remoteOutstanding, remoteQuotaAuthority } from ${JSON.stringify(new URL("./remote-environment.ts", import.meta.url).href)};
+      const root = process.env.HOME;
+      const legacy = ${JSON.stringify(fixture().read())};
+      legacy.root = join(root, "legacy");
+      legacy.created = Date.now();
+      legacy.expires = legacy.created + 60000;
+      legacy.resources = [];
+      await mkdir(legacy.root);
+      await persistRemote(legacy);
+      const slots = new Set();
+      let maximum = 1;
+      let physicalDeleted = false;
+      let ambiguous = true;
+      globalThis.fetch = async (url, init) => {
+        if (init.method === "POST") {
+          const { id, backend } = JSON.parse(init.body);
+          assert.equal(backend, "remote");
+          if (!slots.has(id) && slots.size >= maximum) return new Response(null, { status: 409 });
+          slots.add(id);
+          return Response.json({ id, reserved: true });
+        }
+        assert.equal(physicalDeleted, true, "quota cannot release before application deletion");
+        const id = url.split("/").at(-1);
+        slots.delete(id);
+        if (ambiguous) { ambiguous = false; throw new Error("release response lost"); }
+        return Response.json({ id, released: true });
+      };
+      await assert.rejects(allocateRemote(root, legacy.account), /Legacy remote resources/);
+      await assert.rejects(ensureRemoteAdmission(legacy), /Legacy remote resources/);
+      assert.equal(slots.size, 0, "migration never rewrites another root or re-admits its children");
+      assert.equal((await inventory())[0].quota, undefined);
+      await teardownRemote(legacy, {
+        persist: persistRemote, collectOwnership: async () => {}, stop: async () => {},
+        removeResources: async () => {}, deleteWorker: async () => {},
+        deleteApplication: async () => {},
+      });
+      maximum = 0;
+      await assert.rejects(allocateRemote(root, legacy.account), /refused POST/);
+      const denied = (await inventory()).find((item) => item.root === root);
+      assert.equal(denied.quota.state, "pending");
+      assert.equal(slots.size, 0);
+      maximum = 8;
+      await ensureRemoteAdmission(denied);
+      const staleChild = "gma-child-1123456789ab";
+      denied.resources.push({ id: staleChild, account: denied.account, expires: denied.expires,
+        quota: { authority: "https://quota.example", state: "reserved" }, resources: {} });
+      await persistRemote(denied);
+      await ensureRemoteAdmission(denied);
+      assert.equal(slots.has(staleChild), false, "a cached child reservation must not be recreated");
+      denied.resources[0].quota.state = "released";
+      await persistRemote(denied);
+      for (let i = 0; i < 5; i++) {
+        const path = join(root, "extra-" + i); await mkdir(path);
+        await allocateRemote(path, legacy.account);
+      }
+      assert.equal(slots.size, 6, "there is no unrelated fixed four remote ceiling");
+      const childId = "gma-child-0123456789ab";
+      slots.add(childId);
+      denied.resources.push({ id: childId, account: denied.account, expires: denied.expires,
+        quota: { authority: "https://quota.example", state: "reserved" }, resources: {} });
+      const actions = {
+        persist: persistRemote,
+        collectOwnership: async () => {},
+        stop: async () => {},
+        removeResources: async () => {},
+        deleteWorker: async () => {},
+        deleteApplication: async () => { physicalDeleted = true; },
+      };
+      await assert.rejects(teardownRemote(denied, actions), /refused DELETE/);
+      assert.equal(denied.status, "deleting");
+      assert.equal(remoteOutstanding(denied), true);
+      await teardownRemote(denied, actions);
+      assert.equal(denied.status, "deleted");
+      assert.equal(denied.quota.state, "released");
+      assert.equal(denied.resources[1].quota.state, "released");
+      assert.equal(slots.has(childId), false);
+      assert.equal(remoteOutstanding(denied), false);
+      await assert.rejects(remoteQuotaAuthority({ ...legacy, quota: { authority: "https://127.0.0.1", state: "reserved" } }), /loopback/);
+    `,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: directory,
+          GITMATRIX_REMOTE_HOSTED: "1",
+          GITMATRIX_REMOTE_CREDENTIALS_FILE: "",
+          GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: "https://quota.example",
+          GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: "quota-fixture",
+        },
+      },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 function fixture() {

@@ -79,7 +79,8 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent maintenance install|status|uninstall
   vp run agent prune-browsers [--dry-run] [--include-other-installs]
                                   Delete Playwright browser revisions no worktree or other live install uses
-24-hour hard lifetime; four live environments per user. Setup installs hourly user-systemd cleanup.
+24-hour hard lifetime; default limits: four installation-wide and four local per OS user/machine.
+Configure the shared quota authority before setup. Setup installs hourly user-systemd cleanup.
 Canonical source publication uses ordinary gm outside 'agent gm'. Never point test commands at port 5180.
 `;
 

@@ -12,6 +12,7 @@ import {
 } from "./remote-environment.ts";
 import type { RemoteEnvironment } from "./remote-environment.ts";
 import { commandExit, credentialFile, remoteRequest } from "./remote.ts";
+import { unitTestEnvironment } from "./environment.ts";
 
 function environment(): RemoteEnvironment {
   return {
@@ -157,6 +158,11 @@ await it("serializes log follower credentials with concurrent source mutations",
       `#!/bin/sh\n[ "$1 $2" = "auth whoami" ] || exit 1\nprintf '%s\\n' '${JSON.stringify(identity)}'\n`,
       { mode: 0o700 },
     );
+    await writeFile(
+      join(directory, "gm"),
+      '#!/bin/sh\n[ "$1 $2 $3" = "auth git-credential get" ] || exit 1\n[ -z "$GM_TOKEN$GITMATRIX_TOKEN" ] || exit 2\n[ "$GM_SERVER" = "https://quota.example" ] || exit 3\ncat >/dev/null\nprintf \'password=quota-fixture\\n\'\n',
+      { mode: 0o700 },
+    );
     await promisify(execFile)(
       process.execPath,
       [
@@ -174,6 +180,7 @@ await it("serializes log follower credentials with concurrent source mutations",
         record.root = process.env.HOME;
         record.created = Date.now();
         record.expires = record.created + 60_000;
+        record.quota = { authority: "https://quota.example", state: "reserved" };
         await persistRemote(record);
         const lockPath = join(remoteRegistry, createHash("sha256").update(record.root).digest("hex") + ".lock");
         const request = remoteRequest(record);
@@ -237,10 +244,13 @@ await it("serializes log follower credentials with concurrent source mutations",
       ],
       {
         env: {
-          ...process.env,
+          ...unitTestEnvironment(process.env),
           HOME: directory,
           PATH: `${directory}:${process.env.PATH}`,
           CLOUDFLARE_API_TOKEN: "fixture-access-token",
+          GM_SERVER: "https://product.example",
+          GM_TOKEN: "fixture-product-token",
+          GITMATRIX_TOKEN: "fixture-second-product-token",
         },
         timeout: 15_000,
       },
@@ -417,11 +427,44 @@ await it("discovers live commands independently of replaced state entries and re
           const completed = (await request("/processes/after")).value;
           assert.equal(completed.status, "succeeded");
           assert.equal(completed.exitCode, 0);
+          const oldQuota = "old-quota-credential-for-log-regression";
+          const newQuota = "new-quota-credential-for-log-regression";
+          const credentials = (token) => request("/credentials", { env: {
+            CLOUDFLARE_API_TOKEN: "cloud-credential-for-log-regression",
+            CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
+            GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: "https://quota.example",
+            GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: token,
+          } });
+          assert.equal((await credentials(oldQuota)).status, 200);
+          const disclose = [
+            'import fs from "node:fs";',
+            'const old = process.env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN;',
+            'process.stdout.write(old.slice(0, 9));',
+            'const watcher = fs.watch(' + JSON.stringify(directory) + ', () => {',
+            'if (!fs.existsSync(' + JSON.stringify(marker("rotate")) + ')) return;',
+            'watcher.close(); process.stdout.write(old.slice(9) + "\\\\npublic marker\\\\n");',
+            'console.error(JSON.parse(fs.readFileSync(process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE, "utf8")).env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN); });',
+            'fs.writeFileSync(' + JSON.stringify(marker("half-secret")) + ', "");',
+          ].join("\\n");
+          assert.equal((await command("secret-log", disclose)).status, 200);
+          await waitFor("half-secret");
+          assert.equal((await credentials(newQuota)).status, 200);
+          fs.writeFileSync(marker("rotate"), "");
+          await until(state + "/processes", () => record("secret-log").status !== "running");
+          const persisted = fs.readFileSync(state + "/processes/secret-log.log", "utf8");
+          assert.equal(persisted.includes(oldQuota), false);
+          assert.equal(persisted.includes(newQuota), false);
+          assert.match(persisted, /public marker/);
+          assert.equal(persisted.split("[redacted]").length - 1, 2);
+          await close();
+          await start();
+          assert.equal((await request("/processes/secret-log/logs")).value.text, persisted);
         } finally {
           fs.writeFileSync(marker("release"), "");
           fs.writeFileSync(marker("release-stop"), "");
+          fs.writeFileSync(marker("rotate"), "");
           discovery = "omit-state";
-          for (const id of ["first", "tree", "second", "after", "pending"]) {
+          for (const id of ["first", "tree", "second", "after", "pending", "secret-log"]) {
             await request("/processes/" + id + "/stop", {});
           }
           await close();

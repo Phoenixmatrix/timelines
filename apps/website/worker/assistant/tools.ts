@@ -307,11 +307,19 @@ export function buildTools(context: ToolContext) {
   const knowledge = {
     search_code: tool({
       description:
-        "Search a repository by meaning: matching files, symbols and components from the knowledge graph, plus the most relevant code passages. Start here to find where something is implemented.",
+        "Search a repository by meaning: files, symbols, components and code passages, plus live completion evidence from readable subscribed trackers. For evidence use an issue key or distinctive words from the result; cite its URL and attribution rather than treating issue status as proof.",
       inputSchema: z.object({ repo: REPO, query: z.string().min(2) }),
       execute: async ({ repo, query }) => {
-        const r = await api("GET", `${repoApi(repo)}/knowledge/search?q=${enc(query)}`);
-        return r.ok ? compact(r.body, { strings: 1200, items: 12 }) : failed(r);
+        const [code, evidence] = await Promise.all([
+          api("GET", `${repoApi(repo)}/knowledge/search?q=${enc(query)}`),
+          api("GET", `${repoApi(repo)}/knowledge/completion-evidence?q=${enc(query)}`),
+        ]);
+        return {
+          ...(code.ok
+            ? (compact(code.body, { strings: 1200, items: 12 }) as object)
+            : failed(code)),
+          completionEvidence: evidence.ok ? evidence.body : failed(evidence),
+        };
       },
     }),
     read_wiki: tool({
@@ -427,7 +435,7 @@ export function buildTools(context: ToolContext) {
     }),
     show_issue: tool({
       description:
-        "Everything about one issue. Returns {key, title, status, priority, team, description, acceptance, queueFailure: read-only system failure evidence or null, parent, children: [string], blockedBy: [string], blocks: [key], related: [string], comments: [{kind, by, at, body}], url}.",
+        "Everything about one issue. Returns issue fields, queueFailure, relationships, completionEvidence: all original evidence notes with id, actorId, createdAt, body and citeable URL (independent of the recent activity limit), comments: recent other notes, url. Historical evidence remains visible after reopening; status alone is not proof of verification.",
       inputSchema: z.object({ owner: OWNER, key: KEY }),
       execute: async ({ owner, key }) => {
         const snap = await snapshot(owner);
@@ -454,8 +462,14 @@ export function buildTools(context: ToolContext) {
           related: snap.links
             .filter((l) => l.kind !== "blocks" && (l.fromId === issue.id || l.toId === issue.id))
             .map((l) => `${l.kind} ${keyOf(l.fromId === issue.id ? l.toId : l.fromId)}`),
+          completionEvidence: snap.comments
+            .filter((c) => c.issueId === issue.id && c.kind === "evidence")
+            .map((c) => ({
+              ...c,
+              url: `/tracker/${enc(owner)}/issues/${issue.key}#evidence-${enc(c.id)}`,
+            })),
           comments: snap.comments
-            .filter((c) => c.issueId === issue.id)
+            .filter((c) => c.issueId === issue.id && c.kind !== "evidence")
             .slice(-20)
             .map((c) => ({
               kind: c.kind,

@@ -159,7 +159,7 @@ export const AI_LOG_COMPONENTS: readonly {
 
 /** The plain retention note shown wherever this setting is. */
 export const AI_LOG_BODIES_NOTE =
-  "While this is on, prompts and replies, including repository code and assistant conversations, are kept in Cloudflare's AI Gateway logs. Anyone with access to the Cloudflare account's dashboard can read them, and the gateway deletes the oldest logs first once it reaches its log limit.";
+  "While this is on, prompts and replies, including repository code and assistant conversations, may be stored in Cloudflare's AI Gateway logs and read by people with access to those logs. Storage is subject to Cloudflare's limits: accounts whose first gateway predates September 24, 2026 use Legacy Logs (10 MB per log; oversized logs are not stored). Legacy logs remain until deleted; at capacity the gateway can stop saving or delete the oldest logs, depending on its configuration. Newer customers use Workers Logs (256 KB per log; oversized logs are truncated; retention is 3 days on Free or 7 days on Paid). Turning this off does not delete bodies already stored.";
 
 /** One component's body logging: the site default, and an account's override. */
 export interface AiLogBodiesEntry {

@@ -75,7 +75,7 @@ import {
 } from "./concepts.ts";
 import { syncSearchFiles, syncSearchPages, syncVectors } from "./indexes.ts";
 import { DEFINER, synthesize } from "./synthesize.ts";
-import { buildAiUsage, meterBuildCall, type ModelUsage } from "./meter.ts";
+import { buildAiUsage, finalBuildStats, meterBuildCall, type ModelUsage } from "./meter.ts";
 import { coordinator } from "./coordinator.ts";
 import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay.ts";
 import { runPageSet } from "./pages.ts";
@@ -626,13 +626,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       );
 
       // With definitions written, related pairs of kept concepts get a second
-      // look; any merge it finds regroups concepts and defines the new group.
-      // With definitions written, related pairs of kept concepts get a second
       // look; any answer can regroup concepts, which defines the new groups and
       // brings new pairs to review. Rounds go on until nothing is left to ask,
       // so a build leaves the concept model settled and the next update asks
       // only about what its push changed (CORE-286).
-      const review = { asked: 0, newMerges: 0, rounds: 0 };
+      const review = { newMerges: 0, rounds: 0 };
       for (let round = 0; round < REVIEW_ROUNDS; round++) {
         const stats = await progress(round ? `review-${round}` : "review", "synthesize", () =>
           this.#withReader(row, async (reader) => {
@@ -663,8 +661,9 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
               return { draft, graph: buildGraph(row.full_name, files, analyses, syntheses, model) };
             };
             const { graph } = await graphWith(await loadConceptModel(env.DB, repoId));
-            const stats = await reviewConcepts(env, models, repoId, graph);
-            // New answers can regroup concepts; without any, the model is as settled.
+            const stats = await reviewConcepts(env, models, repoId, graph, { id: buildId, round });
+            // Include answers persisted before a retry: they still need settling,
+            // even when this attempt found every pair in the review cache.
             if (stats.asked > 0) {
               await settleConcepts(env, models, repoId, files, analyses);
               const { draft } = await graphWith(await loadConceptModel(env.DB, repoId));
@@ -673,7 +672,6 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             return stats;
           }),
         );
-        review.asked += stats.asked;
         review.newMerges = stats.newMerges;
         review.rounds = round + 1;
         if (stats.asked === 0) break;
@@ -858,7 +856,6 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         graph: firstPass,
         conceptPairsAsked: pairsAsked,
         conceptSalienceAsked: conceptStats.askedSalience,
-        conceptReviewsAsked: review.asked,
         conceptReviewMerges: review.newMerges,
         conceptReviewRounds: review.rounds,
         pagesWritten: wiki.written,
@@ -1239,7 +1236,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         .set({
           status: "succeeded",
           phase: "done",
-          stats: patchStats({ ...stats, atlasSpend, aiUsage }),
+          stats: finalBuildStats({ ...stats, atlasSpend, aiUsage }),
           finished_at: nowIso(),
         })
         .where("id", "=", buildId)

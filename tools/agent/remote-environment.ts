@@ -3,11 +3,20 @@ import { randomBytes, createHash } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rename, writeFile, lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import {
+  parseEnvironmentLimits,
+  readEnvironmentLimits,
+  reserveQuota,
+  releaseQuota,
+} from "./quota.ts";
+import type { QuotaReservation } from "./quota.ts";
 
 export type Execution = "local" | "cloudflare";
 export interface OwnedResources {
   id: string;
   account: string;
+  expires?: number;
+  quota?: QuotaReservation;
   resources: Record<string, "pending" | "created" | "deleted" | "orphaned">;
 }
 export interface RemoteEnvironment {
@@ -27,6 +36,7 @@ export interface RemoteEnvironment {
   containerApplicationId?: string;
   teardownPhase?: "worker-delete";
   resources: OwnedResources[];
+  quota?: QuotaReservation;
   lastProcess?: string;
 }
 export const remoteRegistry = join(homedir(), ".local", "state", "gitmatrix-agent", "remote");
@@ -67,6 +77,44 @@ export function validateOwnedResources(value: OwnedResources, account: string): 
     )
       throw new Error("Invalid remote resource ownership state.");
   }
+  if (value.quota !== undefined) {
+    validateQuota(value.quota);
+    if (!Number.isFinite(value.expires)) throw new Error("Invalid child quota expiry.");
+  }
+}
+function validateQuota(quota: QuotaReservation): void {
+  if (!quota || typeof quota.authority !== "string")
+    throw new Error("Invalid remote quota authority.");
+  parseEnvironmentLimits({ maximum: 0, authority: quota.authority });
+  if (!["pending", "reserved", "released"].includes(quota.state))
+    throw new Error("Invalid remote quota reservation.");
+}
+
+export function remoteOutstanding(record: RemoteEnvironment): boolean {
+  return (
+    record.status !== "deleted" ||
+    (!!record.quota && record.quota.state !== "released") ||
+    record.resources.some((owned) => !!owned.quota && owned.quota.state !== "released")
+  );
+}
+
+export async function remoteQuotaAuthority(record?: RemoteEnvironment): Promise<string> {
+  const authority = record?.quota?.authority ?? (await readEnvironmentLimits()).authority;
+  if (!authority)
+    throw new Error("Configure the installation quota authority before remote setup.");
+  const url = new URL(authority);
+  if (
+    url.protocol !== "https:" ||
+    url.hostname === "localhost" ||
+    url.hostname.endsWith(".localhost") ||
+    url.hostname === "[::1]" ||
+    url.hostname.startsWith("127.") ||
+    url.hostname === "0.0.0.0"
+  )
+    throw new Error(
+      "Remote execution requires a hosted-reachable HTTPS quota authority; loopback authorities are unsupported.",
+    );
+  return authority;
 }
 export function validateRemoteEnvironment(value: RemoteEnvironment): void {
   if (
@@ -91,6 +139,7 @@ export function validateRemoteEnvironment(value: RemoteEnvironment): void {
     !Array.isArray(value.resources)
   )
     throw new Error("Invalid remote environment ownership journal; refusing resource operations.");
+  if (value.quota !== undefined) validateQuota(value.quota);
   if (value.origin) {
     const url = new URL(value.origin);
     if (
@@ -154,11 +203,36 @@ export async function inventory(): Promise<RemoteEnvironment[]> {
   return records;
 }
 export async function currentRemote(root: string): Promise<RemoteEnvironment | undefined> {
-  return (await inventory()).find((record) => record.root === root && record.status !== "deleted");
+  return (await inventory()).find((record) => record.root === root && remoteOutstanding(record));
 }
 export async function persistRemote(record: RemoteEnvironment): Promise<void> {
   validateRemoteEnvironment(record);
   await privateJson(join(remoteRegistry, "environments", `${record.id}.json`), record);
+}
+
+function unadmittedLegacyRemote(record: RemoteEnvironment): boolean {
+  return (
+    record.status !== "deleted" &&
+    (!record.quota ||
+      record.resources.some(
+        (owned) =>
+          !owned.quota && Object.values(owned.resources).some((state) => state !== "deleted"),
+      ))
+  );
+}
+
+/** The caller holds this root's lifecycle lock. Never rewrite another root's journal. */
+export async function ensureRemoteAdmission(record: RemoteEnvironment): Promise<void> {
+  await remoteQuotaAuthority(record);
+  if (unadmittedLegacyRemote(record))
+    throw new Error(
+      "Legacy remote resources have no installation admission record; destroy that environment on its owning host, then setup again.",
+    );
+  if (record.status === "deleted")
+    throw new Error("Remote quota cleanup remains pending; destroy or cleanup before setup.");
+  // Hosted children own their admission. A cached reserved child may already
+  // have released through its external journal; replaying POST would resurrect it.
+  await reserveQuota(record, "remote", persistRemote);
 }
 
 /** A failed first deployment retains its identity, secrets, quota slot and absolute deadline. */
@@ -170,6 +244,7 @@ export async function ensureRemoteDeployment(
   validateRemoteEnvironment(record);
   if (record.expires <= now || record.status === "deleting" || record.status === "deleted")
     throw new Error("Remote environment expired or deleting; destroy it before setup.");
+  await ensureRemoteAdmission(record);
   if (record.origin) return;
   if (record.status !== "provisioning" || record.installed || record.resources.length !== 0)
     throw new Error("Remote deployment journal is incomplete; refusing to replace unknown state.");
@@ -210,6 +285,21 @@ export async function teardownRemote(
   }
   // Worker deletion leaves its separately billed Container application behind.
   await actions.deleteApplication();
+  for (const owned of record.resources) {
+    if (!owned.quota) continue;
+    const owner = {
+      id: owned.id,
+      account: owned.account,
+      root: record.root,
+      expires: owned.expires!,
+      quota: owned.quota,
+    };
+    await releaseQuota(owner, async () => {
+      owned.quota = owner.quota;
+      await actions.persist(record);
+    });
+  }
+  await releaseQuota(record, actions.persist);
   record.status = "deleted";
   await actions.persist(record);
 }
@@ -260,11 +350,12 @@ export async function allocateRemote(
   root = await realpath(root);
   return remoteLock("quota", async () => {
     const records = await inventory();
-    if (records.some((record) => record.root === root && record.status !== "deleted"))
+    if (records.some((record) => record.root === root && remoteOutstanding(record)))
       throw new Error("Remote environment already exists; use it or destroy it before setup.");
-    if (records.filter((record) => record.status !== "deleted").length >= 4)
+    await remoteQuotaAuthority();
+    if (records.some(unadmittedLegacyRemote))
       throw new Error(
-        "Four remote environments already exist; destroy unused environments or cleanup --expired first.",
+        "Legacy remote resources have no installation admission record; destroy those environments on their owning hosts before allocating another.",
       );
     const created = Date.now();
     const record: RemoteEnvironment = {
@@ -282,6 +373,7 @@ export async function allocateRemote(
       resources: [],
     };
     await persistRemote(record);
+    await reserveQuota(record, "remote", persistRemote);
     return record;
   });
 }

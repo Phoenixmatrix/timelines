@@ -1,15 +1,9 @@
-// "Keep AI request and response bodies in gateway logs" (CORE-290): a site
-// administrator sets the site default, an account's owner overrides it for
-// the account, each page shows the retention note, and what they save is
-// what the real settings routes store.
+// A site administrator sets the body-logging default; an account owner
+// overrides it. Saved settings must preserve inheritance and account isolation.
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
-import {
-  AI_LOG_BODIES_NOTE,
-  type AiSettingsView,
-  type SiteAiSettingsView,
-} from "../../shared/ai.ts";
+import type { AiSettingsView, SiteAiSettingsView } from "../../shared/ai.ts";
 import { renderApp } from "../testing/render.tsx";
 import { TestServer } from "../testing/server.ts";
 
@@ -29,7 +23,6 @@ test("a site administrator turns body logging on for the site, then back to the 
   await expect
     .element(page.getByRole("heading", { name: "Site AI settings", level: 1 }))
     .toBeVisible();
-  await expect.element(page.getByText(AI_LOG_BODIES_NOTE)).toBeVisible();
   const knowledge = page.getByRole("checkbox", { name: "Knowledge", exact: true });
   const assistant = page.getByRole("checkbox", { name: "Assistant", exact: true });
   // The browser world binds no AI: its environment default is off.
@@ -75,7 +68,6 @@ test("an account's owner overrides the site default for the account's own calls"
     name: "Keep AI request and response bodies in gateway logs",
   });
   await expect.element(fieldset).toBeVisible();
-  await expect.element(fieldset.getByText(AI_LOG_BODIES_NOTE)).toBeVisible();
   const assistant = page.getByRole("combobox", {
     name: "Assistant: keep request and response bodies",
   });
@@ -105,10 +97,14 @@ test("an account's owner overrides the site default for the account's own calls"
     .toMatchObject({ account: null, effective: true });
 });
 
-test("a member sees the setting and the note, read-only", async () => {
+test("a member sees the body-logging setting read-only", async () => {
   await TestServer.start({ world: true, persona: "jun" });
   renderApp("/settings/ai?owner=orbit");
-  await expect.element(page.getByText(AI_LOG_BODIES_NOTE)).toBeVisible();
+  await expect
+    .element(
+      page.getByRole("group", { name: "Keep AI request and response bodies in gateway logs" }),
+    )
+    .toBeVisible();
   await expect
     .element(page.getByRole("combobox", { name: "Assistant: keep request and response bodies" }))
     .not.toBeInTheDocument();

@@ -79,10 +79,43 @@ async function isolated(body: string): Promise<void> {
         "-e",
         `
       import assert from 'node:assert/strict';
-      import { readFile } from 'node:fs/promises';
+      import { readFile, writeFile } from 'node:fs/promises';
       import { join } from 'node:path';
       import { command, context, markServer, registry, unitTestEnvironment } from ${JSON.stringify(new URL("./environment.ts", import.meta.url).href)};
       import { developmentEnvironment } from ${JSON.stringify(new URL("../../apps/website/vite/environment.ts", import.meta.url).href)};
+      import { readEnvironmentLimits, reserveQuota, releaseQuota } from ${JSON.stringify(new URL("./quota.ts", import.meta.url).href)};
+      // Explicit transport fixture only; API invariants use migrated SQLite tests.
+      async function quotaFixture() {
+        const credentials = { env: {
+          CLOUDFLARE_ACCOUNT_ID: 'a'.repeat(32),
+          CLOUDFLARE_API_TOKEN: 'fixture-cloudflare-capability',
+          GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: 'https://quota.example',
+          GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: 'fixture-quota-capability',
+        } };
+        await writeFile(process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE, JSON.stringify(credentials));
+        const reservations = new Map();
+        const published = new Map();
+        globalThis.fetch = async (url, options) => {
+          if (url === 'http://127.0.0.1:8787/ownership') {
+            const value = JSON.parse(options.body).environment;
+            published.set(value.id, value);
+            return new Response(null, { status: 204 });
+          }
+          assert.ok(url.startsWith('https://quota.example/api/environments/reservations'));
+          assert.equal(options.headers.authorization, 'Bearer fixture-quota-capability');
+          assert.equal(options.redirect, 'error');
+          if (options.method === 'POST') {
+            const value = JSON.parse(options.body);
+            assert.equal(published.get(value.id)?.quota?.state, 'pending');
+            reservations.set(value.id, value);
+            return Response.json({ reserved: true, id: value.id });
+          }
+          const id = url.split('/').at(-1);
+          reservations.delete(id);
+          return Response.json({ released: true, id });
+        };
+        return { reservations, published, credentials };
+      }
       const env = ${JSON.stringify(owned(root))};
       const preview = ${JSON.stringify(preview)};
       ${body}
@@ -198,6 +231,8 @@ await test("unit subprocesses cannot inherit hosted capabilities or reload the p
       CLOUDFLARE_ACCOUNT_ID: env.account,
       CF_API_TOKEN: 'fixture-legacy-cloudflare-capability',
       GM_TOKEN: 'fixture-gm-capability',
+      GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: 'https://quota.example',
+      GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: 'fixture-quota-capability',
       GM_SERVER: preview,
     };
     Object.assign(process.env, capabilities);
@@ -223,6 +258,7 @@ await test("unit subprocesses cannot inherit hosted capabilities or reload the p
 
 await test("hosted contexts preserve loopback consumers and isolate ephemeral previews", async () => {
   await isolated(`
+    const quota = await quotaFixture();
     const main = await context(env);
     assert.equal(main.origin, 'http://127.0.0.1:5270');
     assert.equal(main.env.GM_SERVER, main.origin);
@@ -232,10 +268,12 @@ await test("hosted contexts preserve loopback consumers and isolate ephemeral pr
     const runs = [];
     for (const [index, port] of [19231, 19232].entries()) {
       const id = 'gma-mga00000-' + (index ? '112345abcdef' : '212345abcdef');
-      const run = await context({ ...env, id, port,
+      const runRecord = { ...env, id, port,
         origin: 'http://127.0.0.1:' + port,
         dir: join(env.dir, 'runs', id),
-      });
+      };
+      delete runRecord.quota;
+      const run = await context(runRecord);
       const config = developmentEnvironment(run.env);
       assert.equal(run.origin, 'http://127.0.0.1:' + port);
       assert.equal(run.env.GM_SERVER, run.origin);
@@ -253,6 +291,85 @@ await test("hosted contexts preserve loopback consumers and isolate ephemeral pr
     assert.notEqual(runs[0].env.GITMATRIX_PORT, runs[1].env.GITMATRIX_PORT);
     assert.notEqual(runs[0].env.GITMATRIX_STATE_DIR, runs[1].env.GITMATRIX_STATE_DIR);
     assert.notEqual(runs[0].env.TMPDIR, runs[1].env.TMPDIR);
+    assert.equal(quota.reservations.size, 3, 'main and nested apps each consume global capacity');
+    for (const value of quota.published.values()) {
+      assert.equal(value.quota.state, 'reserved');
+      assert.equal(JSON.stringify(value).includes('fixture-quota-capability'), false);
+    }
+  `);
+});
+
+await test("hosted quota refreshes only the pinned authority and preserves ambiguous reservations", async () => {
+  await isolated(`
+    const fixture = await quotaFixture();
+    const snapshots = [];
+    const persist = async record => {
+      const snapshot = JSON.parse(JSON.stringify(record));
+      snapshots.push(snapshot);
+      fixture.published.set(record.id, snapshot);
+    };
+    process.env.GM_SERVER = 'https://product.example';
+    process.env.GM_TOKEN = 'fixture-product-capability';
+    const record = { id: 'gmr-' + 'a'.repeat(24), root: env.root,
+      account: env.account, expires: env.expires };
+    const transport = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      assert.equal(snapshots.at(-1).quota.state, 'pending');
+      await transport(url, options);
+      throw new Error('ambiguous network failure');
+    };
+    await assert.rejects(reserveQuota(record, 'remote', persist), /No admission fallback/);
+    assert.equal(record.quota.state, 'pending');
+    assert.equal(fixture.reservations.size, 1);
+    const renewed = fixture.credentials;
+    renewed.env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN = 'renewed-quota-capability';
+    await writeFile(process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE, JSON.stringify(renewed));
+    let calls = 0;
+    globalThis.fetch = async (url, options) => {
+      calls++;
+      assert.equal(url, 'https://quota.example/api/environments/reservations');
+      assert.equal(options.headers.authorization, 'Bearer renewed-quota-capability');
+      assert.equal(JSON.parse(options.body).backend, 'remote');
+      return Response.json({ id: record.id, reserved: true });
+    };
+    await reserveQuota(record, 'remote', persist);
+    assert.equal(record.quota.state, 'reserved');
+    assert.equal(calls, 1);
+    renewed.env.GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY = 'https://rotated.example';
+    await writeFile(process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE, JSON.stringify(renewed));
+    await assert.rejects(releaseQuota(record, persist), /pinned reservation/);
+    assert.equal(calls, 1, 'a rotated credential must never reach the old authority');
+    assert.equal(record.quota.authority, 'https://quota.example');
+    assert.equal(record.quota.state, 'reserved');
+    renewed.env.GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY = 'https://quota.example';
+    await writeFile(process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE, JSON.stringify(renewed));
+    for (const response of [{}, { id: 'wrong', released: true }, { id: record.id, released: false }]) {
+      globalThis.fetch = async () => Response.json(response);
+      await assert.rejects(releaseQuota(record, persist), /acknowledge/);
+      assert.equal(record.quota.state, 'reserved');
+    }
+    globalThis.fetch = async (url, options) => {
+      assert.equal(options.method, 'DELETE');
+      assert.equal(url, 'https://quota.example/api/environments/reservations/' + record.id);
+      return Response.json({ id: record.id, released: true });
+    };
+    await releaseQuota(record, persist);
+    assert.equal(snapshots.at(-1).quota.state, 'released');
+    await assert.rejects(reserveQuota(record, 'remote', persist), /cannot be reused/);
+    assert.ok(!JSON.stringify(snapshots).includes('capability'));
+  `);
+});
+
+await test("hosted quota cannot substitute product identity for a missing protected quota capability", async () => {
+  await isolated(`
+    process.env.GM_SERVER = 'https://product.example';
+    process.env.GM_TOKEN = 'fixture-product-capability';
+    await writeFile(process.env.GITMATRIX_REMOTE_CREDENTIALS_FILE, JSON.stringify({ env: {
+      CLOUDFLARE_ACCOUNT_ID: env.account, CLOUDFLARE_API_TOKEN: 'fixture-cloudflare-capability',
+    } }));
+    globalThis.fetch = async () => { throw new Error('quota RPC must not run'); };
+    await assert.rejects(readEnvironmentLimits(), /authority and token are required together/);
+    await assert.rejects(context(env), /authority and token are required together/);
   `);
 });
 

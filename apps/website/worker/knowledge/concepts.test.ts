@@ -4,10 +4,12 @@ import type { FileAnalysis } from "./analyze.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import {
   alignPairs,
+  ALIGNER,
   cluster,
   mutualNeighbours,
   pairKey,
   partOfLinks,
+  reviewConcepts,
   tokenCandidates,
   type ConceptModel,
   type Decision,
@@ -293,4 +295,74 @@ test("alignPairs decides what a newcomer changes in its neighbours' closest cand
   // Every pair with the newcomer is decided, the fifth too: what a full rebuild decides.
   expect(asked.length).toBe(5);
   expect(asked.every((p) => p.includes("Store\u0000") || p.endsWith("\u0000Store"))).toBe(true);
+});
+
+test("review totals survive partial retries, cached replay, later rounds and later builds", async () => {
+  const sqlite = migratedDatabase();
+  sqlite.exec(`
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
+    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
+    INSERT INTO kg_builds (id, repo_id, to_commit, status)
+      VALUES ('b1', 'repo', 'c1', 'running'), ('b2', 'repo', 'c2', 'running');
+    INSERT INTO kg_concepts (repo_id, key, canonical)
+      VALUES ('repo', 'alpha', 'alpha'), ('repo', 'beta', 'beta'), ('repo', 'gamma', 'gamma');
+  `);
+  for (const b of ["beta", "gamma"])
+    sqlite
+      .prepare(
+        "INSERT INTO kg_concept_pairs (repo_id, a, b, score, a_in_b, b_in_a, version) VALUES ('repo', 'alpha', ?, 1, 0, 0, ?)",
+      )
+      .run(b, ALIGNER);
+  let fail = true;
+  let calls = 0;
+  const env = {
+    DB: d1(sqlite),
+    AI: {
+      run: async (_model: string, input: { state: { entry_b: { name: string } } }) => {
+        calls++;
+        if (fail && input.state.entry_b.name === "Gamma") throw new Error("review interrupted");
+        return {
+          answers: { link: { type: "score", score: 1, probabilities: [0, 1, 0], confidence: 1 } },
+        };
+      },
+    },
+  } as unknown as Env;
+  const graph = buildGraph(
+    "org/app",
+    [{ path: "a.ts", blob: "a", mode: "100644" }],
+    new Map([["a", analysis(["Alpha", "Beta", "Gamma"])]]),
+    { components: new Map(), concepts: new Map() },
+  );
+  for (const node of graph.nodes)
+    if (node.kind === "concept") node.summary = `${node.name} definition`;
+  const run = (id: string, round: number) =>
+    reviewConcepts(env, LEGACY_AI_SNAPSHOT.models, "repo", graph, { id, round });
+  const total = (id: string) => {
+    const row = sqlite
+      .prepare(
+        "SELECT coalesce(json_extract(stats, '$.conceptReviewsAsked'), 0) n FROM kg_builds WHERE id = ?",
+      )
+      .get(id);
+    if (!row || typeof row.n !== "number") throw new Error("Missing review total");
+    return row.n;
+  };
+  await expect(run("b1", 0)).rejects.toThrow("review interrupted");
+  expect(total("b1")).toBe(1);
+  fail = false;
+  expect((await run("b1", 0)).asked).toBe(2);
+  expect(total("b1")).toBe(2);
+  const afterRetry = calls;
+  // A retry after all answers persisted must still request settling. A cached
+  // Workflow callback replay does even less work: it returns this same result.
+  expect((await run("b1", 0)).asked).toBe(2);
+  expect((await run("b1", 1)).asked).toBe(0);
+  expect((await run("b2", 0)).asked).toBe(0);
+  expect(calls).toBe(afterRetry);
+  expect(total("b1")).toBe(2);
+  expect(total("b2")).toBe(0);
+  graph.nodes.find((node) => node.id === "concept:alpha")!.summary = "Changed definition";
+  expect((await run("b1", 1)).asked).toBe(2);
+  expect(total("b1")).toBe(4);
+  expect(total("b2")).toBe(0);
 });

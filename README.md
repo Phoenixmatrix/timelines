@@ -227,6 +227,67 @@ paths rather than host-side `vp`, Cargo or browser automation.
 Cloudflare operations use **`cf`, never Wrangler**. Remote services incur charges;
 see [cleanup and cost bounds](#cleanup-and-cost-bounds) before provisioning.
 
+### Environment limits and quota authority
+
+Environment admission has two independent caps (CORE-300): **4 installation-wide**
+by default, shared across users, machines and both execution backends, and **4
+local application environments per OS user on one machine** by default, including
+ephemeral E2E runs. Each `gmr-` control environment and each `gma-` application or
+E2E environment consumes an installation slot: a normal Cloudflare setup uses
+**two slots**, one for its container controller and one for its hosted app.
+The local cap protects host capacity; raising it cannot override the installation
+cap. Admission reserves capacity atomically before provider provisioning.
+
+Before setup, explicitly choose the **same shared Gitmatrix authority on every
+host managing the installation**, and authenticate `gm` to it:
+
+```bash
+gm settings environments show --local
+gm settings environments set --local --max 4 --authority https://YOUR-GITMATRIX
+GM_SERVER=https://YOUR-GITMATRIX gm settings environments show --site
+# Installation changes require a signed-in human site administrator:
+GM_SERVER=https://YOUR-GITMATRIX gm settings environments set --site --max 4
+```
+
+`--local` reads/writes `~/.local/state/gitmatrix-agent/limits.json`; `set` accepts
+`--max`, `--authority`, or both. The authority must be an HTTP(S) origin without
+credentials, a path, query or fragment. `--site` addresses the current `gm` server,
+not an authority inferred from local settings; use `GM_SERVER` as above to target
+the pinned authority. Site settings require site-admin access, and changing them
+requires a **person**, not an agent credential. The local setting grants no site
+administration rights.
+
+Limits are integers from 0 through 2147483647. Zero pauses **new allocations**;
+lowering a cap below current usage does not evict existing environments.
+New local application allocations must satisfy both caps; Cloudflare control
+environments use the shared installation cap, not a separate hard-coded limit.
+Existing reservations can still be acknowledged and cleaned up.
+
+Each environment journal pins its authority before requesting a reservation.
+Changing the local authority does not migrate existing reservations or redirect
+their cleanup. Product-server selection, scoped test credentials and local fixture
+credentials never select the quota authority implicitly. Missing configuration,
+an unavailable quota API/schema (including a server without the API), rejected
+authentication, or an unacknowledged request **fails closed**: there is no offline,
+404 or local-count fallback. Deploy the quota API/schema on the chosen authority,
+restore the owning identity's access, and retry cleanup/setup; do not switch to
+another authority or remove journals to bypass a full or unreachable quota.
+
+On rollout, local setup adopts non-deleted legacy application journals from this
+user's local inventory before admitting another environment. Adoption itself needs
+capacity and access to the authority. Legacy Cloudflare environments or hosted
+children **without quota metadata must instead be destroyed on their owning host
+and recreated**; setup refuses to guess or re-admit cached child ownership.
+Drain or adopt old environments on **every owning host** before treating
+installation usage as complete: no machine can discover another offline
+machine's legacy inventory.
+
+Failed provisioning, interrupted cleanup and expired reservations conservatively
+retain installation capacity until owned resources are actually removed and the
+authority acknowledges release. An offline host or elapsed TTL alone never frees
+a reservation. See [cleanup and cost bounds](#cleanup-and-cost-bounds), including
+the distinction between local orphan retirement and installation capacity.
+
 ### Local create, run and inspect
 
 ```bash
@@ -317,13 +378,23 @@ maintain by default. **Choosing cloud mode authorizes remote execution with
 your current validated `cf` access token**: trusted code and dependencies in
 that disposable container can use its Cloudflare permissions until it expires.
 Use a development account and run only code you trust. The client validates
-auth for remote commands and transfers only the access token and necessary
-allowlisted runtime values over the authenticated control channel. The OAuth
-refresh credential, credential file and broad host environment stay local;
-never copy them into the container or source tree. Connected clients let `cf`
-renew its session locally and publish the current access token. If `cf` cannot
-renew a revoked or invalid session, repair the login locally rather than
-embedding a secret in source.
+auth for remote commands and transfers the access token and necessary allowlisted
+runtime values over the authenticated control channel. The channel also carries
+the pinned quota authority and an access token selected specifically for that
+authority through `gm`; inherited `GM_TOKEN` and `GITMATRIX_TOKEN` values are not
+forwarded as quota credentials. Cloudflare mode requires an HTTPS quota authority
+reachable from the hosted container, not a loopback development server.
+The OAuth refresh credential, credential file and broad host environment stay
+local; never copy them into the container or source tree. Connected clients renew
+credentials locally and publish the current access tokens. Repair revoked or
+invalid credentials locally rather than embedding a secret in source.
+
+The hosted runtime redacts known credential-channel values **before persisting
+command logs**, including values split across output chunks. Private redaction
+history retains rotated values across controller restarts within that ephemeral
+container, so a fresh log reader does not need old credentials to redact them.
+This is not a sanitizer for arbitrary application data; treat logs and artifacts
+as private.
 
 #### Setup, edit, run and reconnect
 
@@ -485,15 +556,16 @@ Inspector access requires control authentication, not a preview cookie.
 Use a fresh browser context per environment/persona even with isolated origins.
 
 The repository pins one `standard-4` container per Worker (4 vCPU, 12 GiB RAM,
-20 GB disk); the local remote-environment journal limits provisioning to four
-live environments. These are repository policy limits, not account-wide
-quotas. The environment has an absolute maximum lifetime of 24 hours, with no
-silent renewal. A Durable Object alarm enforces compute expiry even if the host
-agent disconnects. The hosted runtime installs no systemd service; remote
-setup instead installs the host's hourly `gitmatrix-remote-cleanup.timer`
-before provisioning. Its Node-only cleanup code lives outside worktrees in
-`~/.local/state/gitmatrix-agent/remote-janitor`, uses local `cf` auth without
-putting tokens in service units, and survives source-worktree removal.
+20 GB disk). Provisioning uses the [shared installation quota](#environment-limits-and-quota-authority),
+not a separate four-container counter. These are Gitmatrix policy limits, not
+Cloudflare account-wide quotas. The environment has an absolute maximum lifetime
+of 24 hours, with no silent renewal. A Durable Object alarm enforces compute
+expiry even if the host agent disconnects. The hosted runtime installs no systemd
+service; remote setup instead installs the host's hourly
+`gitmatrix-remote-cleanup.timer` before provisioning. Its Node-only cleanup code
+lives outside worktrees in `~/.local/state/gitmatrix-agent/remote-janitor`, uses
+local `cf` and authority-specific `gm` credentials without putting tokens in
+service units, and survives source-worktree removal.
 
 Container disk, dependencies, test data and process logs are **ephemeral**:
 stopping or recycling the container can discard them. Retrieve needed evidence
@@ -502,11 +574,14 @@ Restart requires source synchronization and installation again. Disconnecting
 a client is not a stop or a teardown; remote processes can keep running.
 
 Use `destroy` for owned app-resource, control Worker and Container application
-cleanup; `stop` alone is not cleanup. Partial deletion remains journaled for
-retry, so never delete the journal to hide a failed teardown. The host cleanup timer cannot run while its
-user manager is unavailable; provider deletion can also fail with revoked
-credentials or an unavailable provider. Reconnect with valid local `cf` auth
-and run `cleanup --expired`; inspect
+cleanup; `stop` alone is not cleanup. Child and parent quota reservations are
+released only after physical cleanup succeeds and the pinned authority
+acknowledges release. Partial deletion or ambiguous release remains journaled for
+retry, so never delete the journal to hide a failed teardown. The host cleanup
+timer cannot run while its user manager is unavailable; provider deletion or
+quota release can also fail with revoked credentials or an unavailable service.
+Reconnect with valid local `cf` and quota-authority `gm` access, run
+`cleanup --expired`, and inspect
 `journalctl --user -u gitmatrix-remote-cleanup.service` after failures.
 Do not delete unrelated resources
 by guessing a prefix.
@@ -732,22 +807,22 @@ failure it refuses a full run, and any rerun with nothing changed, unless
 `completion.json` and `ai-e2e.json` (`selection`, `stages`, `cost`) record which
 stages ran, why, their outcomes and the Gateway-logged spend.
 
-| Stage                                                | Verifies                                                                       |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview            |
-| `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search   |
-| `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps |
-| `avatars`                                            | Real avatar generation within its ten-call budget                              |
-| `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings        |
-| `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed           |
-| `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                        |
-| `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                      |
-| `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep    |
-| `queue`                                              | The merge queue's real conflict repair                                         |
-| `atlas-describe`                                     | The ledger's capabilities named and summarized with provenance; Knowledge tab  |
-| `atlas-workspace`                                    | A dependency resolved across repositories in the workspace Atlas               |
-| `atlas-reuse`                                        | Unchanged prose reused after a README push                                     |
-| `atlas-disabled`, `atlas-refused`, `atlas-exhausted` | The three degraded Atlas providers                                             |
+| Stage                                                | Verifies                                                                                           |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview                                |
+| `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search                       |
+| `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps                     |
+| `avatars`                                            | Real avatar generation within its ten-call budget                                                  |
+| `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings                            |
+| `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed                               |
+| `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                                            |
+| `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                                          |
+| `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep                        |
+| `queue`                                              | The merge queue's real conflict repair                                                             |
+| `atlas-describe`                                     | The ledger's capabilities named and summarized with provenance; Knowledge tab                      |
+| `atlas-workspace`                                    | A dependency resolved across repositories in the workspace Atlas                                   |
+| `atlas-reuse`                                        | Same-tree commit: cached prose and inference provenance, advanced source basis, no new Atlas calls |
+| `atlas-disabled`, `atlas-refused`, `atlas-exhausted` | The three degraded Atlas providers                                                                 |
 
 Every run provisions its own paid resources. Together, the stages verify the exact
 pushed commit, named graph relationships, generated wiki provenance/content, and
@@ -813,8 +888,8 @@ vp run agent maintenance status
 ```
 
 - Every environment has a **24-hour maximum lifetime**, with no silent renewal.
-  At most **four live environments per OS user** may be provisioned, including E2E
-  runs. Expired environments are swept before new provisioning.
+  Both configurable caps above include E2E runs. Expired environments are swept
+  before new provisioning, but expiry alone does not release installation capacity.
 - Setup requires and installs the hourly `gitmatrix-agent-cleanup.timer` user
   service, with persistent catch-up and up to five minutes of jitter. Its code and
   resource journal live outside worktrees in `~/.local/state/gitmatrix-agent`, so
@@ -825,8 +900,9 @@ vp run agent maintenance status
   retried; unrelated resources are never discovered and deleted by prefix alone.
   An Artifacts namespace Cloudflare refuses to delete ("Namespace is not empty")
   while listing no repositories is **orphaned**: `status` reports it with the
-  reason, it no longer counts toward the four, and every cleanup retries it; its
-  journal is kept.
+  reason, it no longer counts toward the **local** cap, and every cleanup retries
+  it; its journal and **installation reservation remain** until the namespace is
+  actually deleted. A failed quota release also remains journaled for retry.
   AI environments created before Gateway ownership was introduced must be destroyed
   and recreated with `setup --ai`; their legacy journals remain valid for cleanup.
 - Foreground apps stop at expiry. Process-group shutdown is PID-start-time fenced;

@@ -18,6 +18,7 @@ import {
   unitTestEnvironment,
 } from "./environment.ts";
 import type { Environment } from "./environment.ts";
+import { parseEnvironmentLimits } from "./quota.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
 
 function owned(root = "/tmp/agent-worktree"): Environment {
@@ -61,6 +62,66 @@ function runtime(env: Environment): Record<string, string> {
   };
 }
 
+// Unit transport fixture only; integration checks use the real gm and quota API.
+async function quotaFixture(home: string, maximum = 4): Promise<void> {
+  const directory = join(home, ".local/state/gitmatrix-agent");
+  await mkdir(directory, { recursive: true });
+  await mkdir(join(home, "bin"), { recursive: true });
+  await writeFile(
+    join(directory, "limits.json"),
+    JSON.stringify({
+      maximum: 4,
+      authority: "https://quota.example",
+    }),
+  );
+  await writeFile(
+    join(home, "bin", "gm"),
+    `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const path = ${JSON.stringify(join(home, "quota.json"))};
+const rows = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : {};
+if (process.env.GM_SERVER !== 'https://quota.example') throw new Error('wrong quota authority');
+if (process.env.GM_TOKEN || process.env.GITMATRIX_TOKEN) throw new Error('product credential reached quota transport');
+let acknowledgement;
+if (args[3] === 'POST') {
+  const body = JSON.parse(args[args.indexOf('--data') + 1]);
+  if (!rows[body.id] && Object.keys(rows).length >= ${maximum}) {
+    console.error('Installation environment limit reached'); process.exit(1);
+  }
+  rows[body.id] = body;
+  acknowledgement = { reserved: true, id: body.id };
+} else if (args[3] === 'DELETE') {
+  const id = args[4].split('/').at(-1);
+  delete rows[id];
+  acknowledgement = { released: true, id };
+} else throw new Error('unexpected quota method');
+fs.writeFileSync(path, JSON.stringify(rows));
+const overridePath = ${JSON.stringify(join(home, "quota-response.json"))};
+const overrides = fs.existsSync(overridePath) ? JSON.parse(fs.readFileSync(overridePath, 'utf8')) : {};
+process.stdout.write(Object.hasOwn(overrides, args[3])
+  ? overrides[args[3]].replaceAll('$ID', acknowledgement.id) : JSON.stringify(acknowledgement));
+`,
+    { mode: 0o700 },
+  );
+}
+
+await test("machine limits require whole bounded values and an explicit credential-free authority", () => {
+  assert.deepEqual(parseEnvironmentLimits({ maximum: 4 }), { maximum: 4, authority: undefined });
+  assert.equal(
+    parseEnvironmentLimits({ maximum: 0, authority: "https://quota.example" }).maximum,
+    0,
+  );
+  for (const maximum of [-1, 1.2, "4", null, 2147483648])
+    assert.throws(() => parseEnvironmentLimits({ maximum }), /maximum/);
+  for (const authority of [
+    "relative",
+    "https://token@quota.example",
+    "https://quota.example/path",
+    "https://quota.example/",
+  ])
+    assert.throws(() => parseEnvironmentLimits({ maximum: 4, authority }));
+});
 await test(
   "shutdown waits for TERM-ignoring descendants after the launcher exits",
   { timeout: 35_000 },
@@ -228,6 +289,7 @@ await test("setup provisions no AI resources unless --ai", async () => {
       `#!${process.execPath}\nconst args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} require('node:fs').appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); console.log('{}');\n`,
       { mode: 0o700 },
     );
+    await quotaFixture(home);
     const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
     const provision = async (root: string, ai: boolean | undefined) => {
       await mkdir(root, { recursive: true });
@@ -624,7 +686,7 @@ await test("legacy AI journals require recreation for use but remain valid for c
   }
 });
 
-await test("a namespace Cloudflare refuses to delete with no listable repos is orphaned, not held (CORE-302)", async () => {
+await test("empty namespace orphans free local slots but retain global reservations until deleted", async () => {
   const home = await mkdtemp(join(tmpdir(), "gitmatrix-orphan-"));
   try {
     const directory = join(home, ".local/state/gitmatrix-agent/environments");
@@ -639,6 +701,7 @@ await test("a namespace Cloudflare refuses to delete with no listable repos is o
       `#!${process.execPath}\nconst fs=require('node:fs'); const args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); if(args[0]==='artifacts'&&args[2]==='delete'&&fs.existsSync(${JSON.stringify(refuse)})){console.error('Namespace is not empty');process.exit(1)} console.log(args.includes('list')?'[]':'{}');\n`,
       { mode: 0o700 },
     );
+    await quotaFixture(home);
     // Every slot taken by an expired environment whose namespace won't go.
     const journals: string[] = [];
     for (let i = 0; i < 4; i++) {
@@ -670,17 +733,15 @@ await test("a namespace Cloudflare refuses to delete with no listable repos is o
       assert.equal(env.orphan?.namespace, env.id);
       assert.match(env.orphan?.reason ?? "", /not empty/);
     }
-    // Reported, but holding no slot: a fifth environment can be set up.
-    const output = await run(
-      `import {createEnvironment, listEnvironments} from ${JSON.stringify(module)}; const listed = await listEnvironments(); const env = await createEnvironment(${JSON.stringify(join(home, "worktree-0"))}); console.log(JSON.stringify({listed, env}));`,
+    // Legacy orphans are adopted before any new allocation; the global cap is
+    // still full even though none holds a local compute slot.
+    await assert.rejects(
+      run(
+        `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(join(home, "worktree-0"))});`,
+      ),
     );
-    const { listed, env } = JSON.parse(output.trim().split("\n").at(-1)!) as {
-      listed: { id: string; status: string; orphan?: { namespace: string } }[];
-      env: Environment;
-    };
-    assert.equal(listed.filter((e) => e.status === "orphaned" && e.orphan).length, 4);
-    assert.equal(env.status, "ready");
-    assert(!journals.includes(join(directory, `${env.id}.json`)));
+    const reservations = JSON.parse(await readFile(join(home, "quota.json"), "utf8"));
+    assert.equal(Object.keys(reservations).length, 4);
     // Once Cloudflare lets go, the next sweep finishes the deletion; journals stay.
     await rm(refuse);
     await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
@@ -690,6 +751,13 @@ await test("a namespace Cloudflare refuses to delete with no listable repos is o
       assert.equal(done.resources.artifacts, "deleted");
       assert.equal(done.orphan, undefined);
     }
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      0,
+    );
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(join(home, "worktree-0"))});`,
+    );
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -763,3 +831,262 @@ console.log('[]');\n`,
       await rm(home, { recursive: true, force: true });
     }
   });
+
+await test("machine admission, failed provisioning and failed release retain honest accounting", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-quota-"));
+  try {
+    await quotaFixture(home, 1);
+    const bin = join(home, "bin");
+    const calls = join(home, "calls");
+    const failCreate = join(home, "fail-create");
+    const failCleanup = join(home, "fail-cleanup");
+    await writeFile(calls, "");
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}
+const fs = require('node:fs'), args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
+if (args[0] === 'auth') {
+  console.log(JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] }));
+} else if ((args.includes('create') && fs.existsSync(${JSON.stringify(failCreate)})) ||
+           (args.includes('delete') && fs.existsSync(${JSON.stringify(failCleanup)}))) {
+  console.error('provider unavailable'); process.exit(1);
+} else console.log(args.includes('list') ? '[]' : '{}');
+`,
+      { mode: 0o700 },
+    );
+    const root = join(home, "worktree");
+    await mkdir(root);
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (code: string) =>
+      command(process.execPath, ["--input-type=module", "-e", code], {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH}`,
+          GM_SERVER: "https://product.example",
+          GM_TOKEN: "fixture-product-token",
+          GITMATRIX_TOKEN: "fixture-second-product-token",
+        },
+      });
+    const create = `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(root)});`;
+    const settings = join(home, ".local/state/gitmatrix-agent/limits.json");
+    await writeFile(settings, JSON.stringify({ maximum: 0, authority: "https://quota.example" }));
+    await assert.rejects(run(create), /Machine environment limit reached/);
+    assert.equal(await readFile(calls, "utf8"), "", "local denial precedes provider access");
+    await writeFile(settings, JSON.stringify({ maximum: 4 }));
+    await assert.rejects(run(create), /explicit shared quota authority/);
+    assert.equal(await readFile(calls, "utf8"), "", "missing authority cannot fail open");
+    await writeFile(settings, JSON.stringify({ maximum: 4, authority: "https://quota.example" }));
+    await writeFile(failCreate, "");
+    await writeFile(failCleanup, "");
+    await assert.rejects(run(create), /cleanup remains pending/);
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      1,
+    );
+    await rm(failCleanup);
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      0,
+    );
+    await rm(failCreate);
+    await run(create);
+    const journal = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    const gm = join(bin, "gm");
+    const transport = await readFile(gm, "utf8");
+    await writeFile(
+      gm,
+      `#!${process.execPath}\nconsole.error('authority unavailable'); process.exit(1);\n`,
+      { mode: 0o700 },
+    );
+    await assert.rejects(
+      run(
+        `import {destroyEnvironment, registryLock} from ${JSON.stringify(module)}; await registryLock(() => destroyEnvironment(${JSON.stringify(journal)}));`,
+      ),
+      /quota authority .* refused DELETE/,
+    );
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      1,
+    );
+    const pending = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    assert.equal(pending.status, "deleting");
+    assert.equal(pending.resources.artifacts, "deleted");
+    await writeFile(gm, transport, { mode: 0o700 });
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      0,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("concurrent worktrees share one per-machine admission lock", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-quota-concurrent-"));
+  try {
+    await quotaFixture(home);
+    await writeFile(
+      join(home, ".local/state/gitmatrix-agent/limits.json"),
+      JSON.stringify({
+        maximum: 1,
+        authority: "https://quota.example",
+      }),
+    );
+    await writeFile(
+      join(home, "bin/cf"),
+      `#!${process.execPath}
+console.log(process.argv[2] === 'auth'
+  ? JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] })
+  : '{}');
+`,
+      { mode: 0o700 },
+    );
+    const roots = [join(home, "a"), join(home, "b")];
+    await Promise.all(roots.map((root) => mkdir(root)));
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const attempts = await Promise.allSettled(
+      roots.map((root) =>
+        command(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(root)});`,
+          ],
+          {
+            env: {
+              ...unitTestEnvironment(process.env),
+              HOME: home,
+              PATH: `${join(home, "bin")}:${process.env.PATH}`,
+            },
+          },
+        ),
+      ),
+    );
+    assert.equal(attempts.filter((result) => result.status === "fulfilled").length, 1);
+    const refused = attempts.find((result) => result.status === "rejected");
+    assert(refused?.status === "rejected");
+    assert.match(String(refused.reason), /Machine environment limit reached/);
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      1,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("false-success quota responses cannot authorize provisioning or discard retryable cleanup", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-quota-ack-"));
+  try {
+    await quotaFixture(home);
+    const calls = join(home, "provider-calls");
+    await writeFile(calls, "");
+    await writeFile(
+      join(home, "bin/cf"),
+      `#!${process.execPath}
+const fs = require('node:fs'), args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
+console.log(args[0] === 'auth'
+  ? JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] })
+  : args.includes('list') ? '[]' : '{}');
+`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (code: string) =>
+      command(process.execPath, ["--input-type=module", "-e", code], {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${join(home, "bin")}:${process.env.PATH}`,
+        },
+      });
+    const overrides = join(home, "quota-response.json");
+    const invalid = [
+      "",
+      "<html>Sign in</html>",
+      "{}",
+      "null",
+      "[]",
+      '{"reserved":true,"released":true,"id":"wrong-environment"}',
+      '{"id":"$ID","reserved":false}',
+      '{"id":"$ID","reserved":"true"}',
+      '{"id":"$ID","unrelated":true}',
+      '{"reserved":true}',
+      '{"released":true}',
+    ];
+    for (let index = 0; index < invalid.length; index++) {
+      const root = join(home, `refused-${index}`);
+      await mkdir(root);
+      await writeFile(overrides, JSON.stringify({ POST: invalid[index] }));
+      await assert.rejects(
+        run(
+          `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(root)});`,
+        ),
+        /acknowledge/,
+      );
+    }
+    const operations = (await readFile(calls, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      operations.filter((args) => args.includes("create")).length,
+      0,
+      "exit-zero HTML, empty or unrelated JSON must never authorize provider creation",
+    );
+    await rm(overrides);
+    const root = join(home, "valid");
+    await mkdir(root);
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(root)});`,
+    );
+    const journalPath = join(root, ".gitmatrix-agent/environment.json");
+    const admitted = JSON.parse(await readFile(journalPath, "utf8")) as Environment;
+    assert.equal(
+      admitted.quota?.state,
+      "reserved",
+      "matching reserved:true acknowledgement admits",
+    );
+    for (const response of [
+      ...invalid,
+      JSON.stringify({ id: admitted.id, released: false }),
+      JSON.stringify({ id: admitted.id, reserved: true }),
+    ]) {
+      await writeFile(overrides, JSON.stringify({ DELETE: response }));
+      await assert.rejects(
+        run(
+          `import {destroyEnvironment, registryLock} from ${JSON.stringify(module)}; import {readFile} from 'node:fs/promises'; const env = JSON.parse(await readFile(${JSON.stringify(journalPath)}, 'utf8')); await registryLock(() => destroyEnvironment(env));`,
+        ),
+        /acknowledge/,
+      );
+      const pending = JSON.parse(await readFile(journalPath, "utf8")) as Environment;
+      assert.equal(pending.status, "deleting", "false success must preserve a retryable journal");
+      assert.equal(
+        pending.quota?.state,
+        "reserved",
+        "release requires its own matching acknowledgement",
+      );
+    }
+    await rm(overrides);
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    const released = JSON.parse(await readFile(journalPath, "utf8")) as Environment;
+    assert.equal(released.status, "deleted");
+    assert.equal(
+      released.quota?.state,
+      "released",
+      "matching released:true acknowledgement completes cleanup",
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

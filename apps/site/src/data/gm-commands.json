@@ -2273,7 +2273,8 @@
       ],
       "command": "gm issue complete",
       "examples": [
-        "gm issue complete ENG-1 --evidence '@verification.md'"
+        "gm issue complete ENG-1 --evidence '@verification.md'",
+        "gm issue complete ENG-1"
       ],
       "mutates": true,
       "options": [
@@ -2285,11 +2286,11 @@
           "required": false
         },
         {
-          "description": "",
+          "description": "Recommended, not required: verification results and links. '-' reads stdin; '@path' reads a file",
           "flag": false,
           "multiple": false,
           "name": "--evidence",
-          "required": true
+          "required": false
         },
         {
           "description": "Tracker account/organization slug; otherwise use saved tracker context",
@@ -2313,8 +2314,8 @@
           "required": false
         }
       ],
-      "summary": "Complete claimed work online with durable evidence and a valid fencing token",
-      "usage": "gm issue complete [OPTIONS] --evidence <EVIDENCE> <ISSUE>"
+      "summary": "Complete claimed work online with a valid fencing token. Include actual verification evidence when available",
+      "usage": "gm issue complete [OPTIONS] <ISSUE>"
     },
     {
       "arguments": [
@@ -4760,6 +4761,75 @@
       ],
       "summary": "Change future jobs only; human account/org owner or site admin required",
       "usage": "gm settings ai set [OPTIONS] <--knowledge <KNOWLEDGE>|--wiki <WIKI>|--atlas <ATLAS>|--release-notes <RELEASE_NOTES>|--classification <CLASSIFICATION>|--fast <FAST>|--task <TASK>|--knowledge-quiet-minutes <KNOWLEDGE_QUIET_MINUTES>|--knowledge-max-wait-minutes <KNOWLEDGE_MAX_WAIT_MINUTES>|--log-bodies <[COMPONENT=]on|off|default>>"
+    },
+    {
+      "arguments": [],
+      "command": "gm settings environments show",
+      "examples": [
+        "gm settings environments show --local",
+        "gm settings environments show --site"
+      ],
+      "mutates": false,
+      "options": [
+        {
+          "description": "This OS user's machine, shared across its worktrees",
+          "flag": true,
+          "multiple": false,
+          "name": "--local",
+          "required": false
+        },
+        {
+          "description": "The current gm server's installation-wide quota",
+          "flag": true,
+          "multiple": false,
+          "name": "--site",
+          "required": false
+        }
+      ],
+      "summary": "Show the local cap/authority, or the installation-wide quota with --site",
+      "usage": "gm settings environments show <--local|--site>"
+    },
+    {
+      "arguments": [],
+      "command": "gm settings environments set",
+      "examples": [
+        "gm settings environments set --local --max 2 --authority https://gitmatrix.example",
+        "gm settings environments set --site --max 8",
+        "gm settings environments set --local --max 0 --dry-run"
+      ],
+      "mutates": true,
+      "options": [
+        {
+          "description": "This OS user's machine, shared across its worktrees",
+          "flag": true,
+          "multiple": false,
+          "name": "--local",
+          "required": false
+        },
+        {
+          "description": "The current gm server's installation-wide quota",
+          "flag": true,
+          "multiple": false,
+          "name": "--site",
+          "required": false
+        },
+        {
+          "description": "Maximum live environments; 0 pauses new allocations. Default: 4",
+          "flag": false,
+          "multiple": false,
+          "name": "--max",
+          "required": false
+        },
+        {
+          "description": "Explicit shared Gitmatrix quota authority URL (--local only). Every host managing the same installation must use the same authority",
+          "flag": false,
+          "multiple": false,
+          "name": "--authority",
+          "required": false
+        }
+      ],
+      "summary": "Set the local cap/explicit quota authority, or the site maximum (human admin)",
+      "usage": "gm settings environments set [OPTIONS] <--local|--site>"
     },
     {
       "arguments": [

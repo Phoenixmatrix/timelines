@@ -1,3 +1,4 @@
+import type { Tool } from "ai";
 import { describe, expect, test } from "vite-plus/test";
 import { describeWrite, toolLabel } from "../../shared/assistant.ts";
 import { allowedPath } from "./internal.ts";
@@ -6,6 +7,67 @@ import { cleanStatus, progressPrompt, stepFromMessage } from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
 import { parseSkill } from "./skills.ts";
 import { buildTools, clip, compact } from "./tools.ts";
+
+describe("completion evidence consumers", () => {
+  const note = {
+    id: "proof",
+    issueId: "i",
+    kind: "evidence",
+    actorId: "original-agent",
+    createdAt: "2026-10-01T00:00:00Z",
+    body: "Verified modulus 65521 at abc123",
+  };
+  test("show_issue keeps original evidence separate from the recent activity limit", async () => {
+    const tools = buildTools({
+      api: async () => ({
+        ok: true,
+        status: 200,
+        body: {
+          issues: [
+            {
+              id: "i",
+              key: "ENG-1",
+              teamId: "t",
+              title: "Parcels",
+              status: "todo",
+              description: "",
+              acceptance: "",
+            },
+          ],
+          teams: [{ id: "t", key: "ENG" }],
+          links: [],
+          comments: [
+            note,
+            ...Array.from({ length: 25 }, (_, i) => ({
+              ...note,
+              id: `chat-${i}`,
+              kind: "comment",
+              body: "Later discussion",
+            })),
+          ],
+        },
+      }),
+      writes: false,
+      approve: false,
+      navigate: false,
+    });
+    const showIssue = tools.reads.show_issue as Tool<
+      { owner: string; key: string },
+      unknown,
+      unknown
+    >;
+    const result = await showIssue.execute!(
+      { owner: "orbit", key: "ENG-1" },
+      { toolCallId: "show", messages: [], context: undefined },
+    );
+    expect(result).toMatchObject({
+      status: "todo",
+      completionEvidence: [{ ...note, url: "/tracker/orbit/issues/ENG-1#evidence-proof" }],
+      comments: expect.any(Array),
+    });
+    expect(result).toHaveProperty("comments.length", 20);
+  });
+});
 
 describe("clef routing", () => {
   test("one call asks every question, within clef's limit", () => {

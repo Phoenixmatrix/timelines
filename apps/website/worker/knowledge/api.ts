@@ -7,6 +7,7 @@
 //   GET  /graph/export           the whole graph (nodes + edges), on explicit request only
 //   GET  /changes?build=         the change feed for a build (default: latest)
 //   GET  /search?q=              entities (Vectorize) + passages (AI Search)
+//   GET  /completion-evidence?q= live, attributable evidence from readable subscribed trackers
 //   GET  /wiki                   the catalog
 //   GET  /wiki/page?slug=        one page
 //   GET  /overlays               every timeline's graph diff against main, in brief,
@@ -53,6 +54,9 @@ import { timelineSlugOf } from "../../shared/timelines.ts";
 import { aiWork } from "../usage/ai.ts";
 import { liveTimelineSources, timelineKnowledgeSource, knowledgeRepo } from "./sources.ts";
 import { getWorkSource, resolveSource } from "../timelines/sources.ts";
+import { accessible } from "../tracker/api.ts";
+import { trackerObject } from "../tracker/stub.ts";
+import { parseQuery } from "../search/query.ts";
 
 export const knowledge = new Hono<AppEnv>();
 
@@ -380,6 +384,43 @@ knowledge.get("/changes", async (c) => {
       .execute(),
   ]);
   return c.json({ build: build ? toBuild(build) : null, changes });
+});
+
+knowledge.get("/completion-evidence", async (c) => {
+  const row = await repoOrFail(c);
+  if (row instanceof Response) return row;
+  const actor = c.get("actor");
+  if (!actor) return fail(c, 401, "Sign in to read completion evidence.");
+  const query = parseQuery(c.req.query("q"));
+  if (typeof query === "string") return fail(c, 400, query);
+  // Repository visibility never grants tracker access. Check membership first;
+  // the live tracker then restricts results to subscribed, unarchived workspaces.
+  const owners = await accessible(c.env.DB, actor);
+  const results = await Promise.all(
+    owners.map(async (owner) => {
+      const result = await trackerObject(c.env, owner.id).completionEvidence(row.id, query, 31);
+      if (!result.ok) throw new Error(`Completion evidence unavailable: ${result.error}`);
+      return result.value.map((note) => ({
+        ...note,
+        trackerOwner: owner.slug,
+        trackerOwnerId: owner.id,
+        url: `/tracker/${encodeURIComponent(owner.slug)}/issues/${encodeURIComponent(note.issue.key)}#evidence-${encodeURIComponent(note.id)}`,
+      }));
+    }),
+  );
+  const evidence = results
+    .flat()
+    .sort(
+      (a, b) =>
+        b.createdAt.localeCompare(a.createdAt) ||
+        a.trackerOwner.localeCompare(b.trackerOwner) ||
+        a.id.localeCompare(b.id),
+    );
+  return c.json({
+    query: query.text,
+    evidence: evidence.slice(0, 30),
+    truncated: evidence.length > 30,
+  });
 });
 
 knowledge.get("/search", async (c) => {

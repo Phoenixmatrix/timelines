@@ -17,12 +17,16 @@ import {
   validateRemoteEnvironment,
   teardownRemote,
   ensureRemoteDeployment,
+  remoteOutstanding,
+  remoteQuotaAuthority,
+  ensureRemoteAdmission,
 } from "./remote-environment.ts";
 import type { RemoteEnvironment, OwnedResources } from "./remote-environment.ts";
 import { syncSources, retrieveArtifact } from "./remote-sync.ts";
 import type { RemoteRequest } from "./remote-protocol.ts";
 import { writeRemoteBuild } from "./remote-build.ts";
 import { installRemoteMaintenance } from "./maintenance.ts";
+import { readEnvironmentLimits } from "./quota.ts";
 
 const secrets = new Set<string>();
 const help = `Cloudflare execution (local agents/source; remote tooling, no local app build)
@@ -36,7 +40,7 @@ check uses normal readiness selection; missing remote base history selects full 
 Requires Node 24+, git, flock and authenticated cf CLI only. No local install/build.
 Mode: --execution > GITMATRIX_AGENT_EXECUTION > .gitmatrix/development.json > local;
 existing ownership pins execution until destroy. Never falls back to local tools.
-One standard-4 container per worktree; four owned remote environments per user;
+One standard-4 container per worktree; installation-wide quota admission;
 24-hour absolute compute lifetime. Running containers, Worker/DO requests/storage,
 Artifacts and opt-in AI incur normal Cloudflare charges, even while disconnected.
 Stop discards the remote disk; setup reinstalls it. Destroy removes owned resources.
@@ -115,6 +119,58 @@ interface Credentials {
   token: string;
   account: string;
   expires?: number;
+}
+export async function quotaCredentials(
+  record?: RemoteEnvironment,
+): Promise<Record<string, string>> {
+  const authority = await remoteQuotaAuthority(record);
+  const url = new URL(authority);
+  const explicitToken = process.env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN;
+  const explicitAuthority = process.env.GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY;
+  if (explicitToken !== undefined || explicitAuthority !== undefined) {
+    if (
+      !explicitToken ||
+      explicitAuthority !== authority ||
+      (await readEnvironmentLimits()).authority !== authority
+    )
+      throw new Error("Quota credential authority does not match the selected reservation.");
+    secrets.add(explicitToken);
+    return {
+      GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: authority,
+      GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: explicitToken,
+    };
+  }
+  const quotaEnv: NodeJS.ProcessEnv = { ...process.env, GM_SERVER: authority };
+  delete quotaEnv.GM_TOKEN;
+  delete quotaEnv.GITMATRIX_TOKEN;
+  const child = spawn("gm", ["auth", "git-credential", "get"], {
+    cwd: record?.root,
+    env: quotaEnv,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (text: string) => {
+    output += text;
+  });
+  // Never surface credential-helper diagnostics or output.
+  child.stderr.resume();
+  const done = new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  child.stdin.end(`protocol=${url.protocol.slice(0, -1)}\nhost=${url.host}\n\n`);
+  const code = await done;
+  const token = /^password=(.+)$/m.exec(output)?.[1];
+  if (code !== 0 || !token)
+    throw new Error(
+      "gm auth git-credential did not provide a quota authority credential; sign in to the selected authority.",
+    );
+  secrets.add(token);
+  return {
+    GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY: authority,
+    GITMATRIX_ENVIRONMENT_QUOTA_TOKEN: token,
+  };
 }
 export function credentialFile(authSource: string): string | undefined {
   const match = /(?:OAuth token|API token) from (.+)$/.exec(authSource);
@@ -315,16 +371,35 @@ async function collectOwnership(record: RemoteEnvironment, request: RemoteReques
       id: item.id,
       account: item.account,
       resources: { ...item.resources },
+      ...(item.expires !== undefined ? { expires: item.expires } : {}),
+      ...(item.quota ? { quota: { ...item.quota } } : {}),
     };
     const index = record.resources.findIndex((old) => old.id === item.id);
+    const previous = record.resources[index];
+    if (previous?.quota) {
+      if (clean.quota && clean.quota.authority !== previous.quota.authority)
+        throw new Error("Remote child quota authority changed; refusing ownership replacement.");
+      if (!clean.quota || previous.quota.state === "released") {
+        clean.quota = { ...previous.quota };
+        clean.expires = previous.expires;
+      }
+    }
     if (index < 0) record.resources.push(clean);
     else record.resources[index] = clean;
   }
   await persistRemote(record);
 }
-async function publishCredentials(request: RemoteRequest, credentials: Credentials): Promise<void> {
+async function publishCredentials(
+  request: RemoteRequest,
+  credentials: Credentials,
+  record: RemoteEnvironment,
+): Promise<void> {
   await json(request, "/credentials", {
-    env: { CLOUDFLARE_API_TOKEN: credentials.token, CLOUDFLARE_ACCOUNT_ID: credentials.account },
+    env: {
+      CLOUDFLARE_API_TOKEN: credentials.token,
+      CLOUDFLARE_ACCOUNT_ID: credentials.account,
+      ...(await quotaCredentials(record)),
+    },
   });
 }
 async function launch(
@@ -334,7 +409,7 @@ async function launch(
   kind = "foreground",
 ): Promise<string> {
   const credentials = await authenticate(record);
-  await publishCredentials(request, credentials);
+  await publishCredentials(request, credentials, record);
   const id = randomBytes(16).toString("hex");
   await json(request, "/commands", {
     id,
@@ -408,7 +483,7 @@ async function follow(
       if (Date.now() >= nextAuth) {
         const refresh = async () => {
           const credentials = await authenticate(record);
-          await publishCredentials(request, credentials);
+          await publishCredentials(request, credentials, record);
           nextAuth = nextCredentialRefresh(credentials);
         };
         // Setup already owns this non-reentrant lock for the whole command.
@@ -755,7 +830,7 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
     }
     if (operation === "status") {
       for (const record of await inventory()) {
-        if (record.status === "deleted") continue;
+        if (!remoteOutstanding(record)) continue;
         let runtime: unknown;
         try {
           runtime = record.origin ? await json(remoteRequest(record), "/status") : undefined;
@@ -773,7 +848,8 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
               expires: new Date(record.expires).toISOString(),
               resources: record.resources,
               runtime,
-              limits: { profile: "standard-4", maxEnvironments: 4, lifetimeHours: 24 },
+              quota: record.quota,
+              limits: { profile: "standard-4", admission: "installation-wide", lifetimeHours: 24 },
               costs:
                 "Running container + Worker/DO + owned Artifacts and opt-in AI. Expiry stops compute; cleanup removes resources.",
             },
@@ -789,8 +865,10 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
       const failures: string[] = [];
       for (const record of await inventory())
         if (
-          record.status !== "deleted" &&
-          (record.expires <= Date.now() || record.status === "deleting")
+          remoteOutstanding(record) &&
+          (record.expires <= Date.now() ||
+            record.status === "deleting" ||
+            record.status === "deleted")
         ) {
           try {
             await remoteLock(record.root, () => destroy(record));
@@ -814,6 +892,7 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
       await remoteLock(root, async () => {
         let record = await currentRemote(root);
         const credentials = await authenticate(record);
+        await quotaCredentials(record);
         await installRemoteMaintenance(root);
         if (!record) {
           record = await allocateRemote(
@@ -826,7 +905,7 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
         const request = remoteRequest(record);
         if (record.status === "provisioning") await waitForRemoteDeployment(record, request);
         await json(request, "/start", {});
-        await publishCredentials(request, credentials);
+        await publishCredentials(request, credentials, record);
         await syncSources(root, request);
         const installation = await launch(record, request, ["vp", "install"]);
         const installCode = await follow(record, request, installation, true);
@@ -894,7 +973,8 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
     let id = "";
     await remoteLock(root, async () => {
       record = (await currentRemote(root))!;
-      await publishCredentials(request, credentials);
+      await ensureRemoteAdmission(record);
+      await publishCredentials(request, credentials, record);
       const synced = await syncSources(root, request);
       if (operation === "sync") {
         console.log(JSON.stringify({ event: "remote.synced", ...synced }));
@@ -978,7 +1058,7 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
           await collectOwnership(record, request);
           if (Date.now() >= nextAuth) {
             const refreshed = await authenticate(record);
-            await publishCredentials(request, refreshed);
+            await publishCredentials(request, refreshed, record);
             if (refreshed.token !== credentials.token) {
               await json(request, `/processes/${id}/stop`, {});
               write("", true);

@@ -178,6 +178,9 @@ Work is tracked in Gitmatrix: matrixorg, team CORE. The loop, in brief (the
    only to retry the same source after fixing the cause, not to upload new code.
    Complete original/remediation work only with actual landing and required CI/deploy
    evidence: `gm issue complete <issue> --evidence '…'`. Do not report admission as success.
+   The `--evidence` argument is optional; omitted or blank evidence creates no note.
+   Record only verification actually performed. Optional evidence never waives acceptance,
+   required gates or approvals.
    Abandoning active work? `gm issue release <issue>`. Keep parked request leases.
    Queue unavailable? Ordinary `gm push` remains an explicit recovery path;
    investigate uncertain admission first, never silently bypass gates or approvals.

@@ -102,8 +102,9 @@ pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
   (`worker/testing/browser-api.ts`, reached through the commands in
   `vite/browser-commands.ts`). Requests act as the world's persona (marco by
   default; `server.as()` switches, and `server.call(..., as)` acts as someone
-  else once). `server.requests` records every request, for "it read only
-  this" assertions.
+  else once). An explicit `null` persona means signed out; omitting the per-request
+  persona uses the world's current one. `server.requests` records every request,
+  for "it read only this" assertions.
 - A world's repositories (`server.repo()`) have refs (`server.push()`) and
   accept ref-only pushes, but no git objects: file listings and history are
   canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
@@ -468,10 +469,12 @@ its context is. Opening one shows the commit's diff beside its why,
 instructions, steering, challenges and tests, with the missing-hook note when
 a harness hook didn't record them. With character navigation enabled, `j` is
 Next (the next visible row) and `k` is Previous (the previous visible row),
-matching the visible buttons. Right/Down is Next and Left/Up is Previous even without the opt-in; Escape
-closes. Filters by agent and issue and the step itself live in the URL; an
-amended change offers its earlier versions. On a phone the list and the step
-take the screen in turn.
+matching the visible buttons. Right/Down is Next and Left/Up is Previous even
+without the opt-in; Escape closes. Clicks, keys and closing share the pending
+destination, so a key immediately after a click or close does not use the old
+render's selection. Filters by agent and issue and the step itself live in the
+URL; an amended change offers its earlier versions. On a phone the list and the
+step take the screen in turn.
 
 It reads `history` for the line, `steps?commits=` for the context in batches
 of 100, and the diff from `GET /api/repos/:o/:n/commits/:oid/diff`. History
@@ -1110,7 +1113,7 @@ read as `agent_decides`.
   above it, nothing waiting on a person, and pickup permitted for the acting identity
   (`readiness` in `shared/tracker.ts`, mirrored by gm). Exclusive claims require an online transaction. Renew,
   release and complete require the unexpired fencing token; completion also
-  records evidence, rechecks blockers and refuses parents with open sub-issues.
+  records supplied evidence when present, rechecks blockers and refuses parents with open sub-issues.
   Tokens never appear in public snapshots or event feeds.
   Granting a lease also assigns an unassigned issue to its holder's identity in
   the same transaction and audit event. Delegated claims use the receiving
@@ -1241,6 +1244,16 @@ read as `agent_decides`.
   Closed board lanes retain their counts and expand to show closed issues.
   Add subtasks from the parent without leaving it; only active workspaces are
   inherited. Checkpoints, claims, blockers and completion evidence remain distinct.
+- **Completion evidence** (CORE-126): issue detail has a dedicated section and
+  summary link at `#completion-evidence`, with a stable fragment target for every
+  original note at `#evidence-<comment-id>`. **Add completion evidence** records a durable
+  tracker comment with `kind: "evidence"`, not a second completion record.
+  Evidence is recommended but optional when completing; omitting it creates no
+  synthetic note and does not relax leases, blockers or approval requirements.
+  Original note IDs, authors, timestamps and bodies remain available after
+  reopening and independently of the bounded recent activity feed. A note
+  records what its author verified; neither its presence nor `done` is proof of
+  checks the author did not perform.
 - **Creator and audit:** issue details show **Created by** and the creation time
   without opening history. Expand **Audit history** for newest-first events,
   including comments, requests, relations and parent changes. Entries default to
@@ -1975,6 +1988,35 @@ the **Site AI settings** page (`/settings/site-ai`). Tables: `site_ai_log_bodies
 once-a-minute isolate cache.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
 
+**Body logging privacy and provider limits** (CORE-293). The shared notice in
+`shared/ai.ts` applies to both settings pages: enabling bodies may retain
+repository code, prompts, replies and assistant conversations, readable by
+people with access to the gateway's logs. Turning it off prevents body storage
+for subsequent calls using that policy; it does **not** erase bodies already
+stored. Metadata logging is separate from payload logging; see Cloudflare's
+[logging controls](https://developers.cloudflare.com/ai-gateway/observability/logging/).
+
+The applicable backend depends on the account's **first** gateway, not the
+creation date of the gateway handling this call. Under the
+[official AI Gateway limits](https://developers.cloudflare.com/ai-gateway/reference/limits/):
+
+- Accounts with a gateway created **before September 24, 2026** use
+  [Legacy Logs](https://developers.cloudflare.com/ai-gateway/observability/logging/legacy-logs/):
+  **10 MB per log**; oversized logs are not stored. Stored logs remain until
+  deleted. At the configured storage cap, collection either stops or deletes
+  the oldest logs, according to the gateway's policy.
+- Customers whose first gateway was created **on or after September 24, 2026**
+  use [Workers Logs limits and retention](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits):
+  **256 KB per log**; oversized logs are truncated, with **3 days on Free**
+  and **7 days on Paid** retention.
+
+These are stored-log limits, not model input limits or a promise that every
+body will be available. The October 9, 2026 production audit established Legacy
+Logs eligibility and found seven samples with both request and response bodies
+available. Its byte measurements were serialized `cf` output, **not original
+provider payload sizes**. It did not establish an observed failure threshold
+or reproduce a size-related logging failure.
+
 ### AI providers (CORE-294)
 
 An account can add models from its own providers, with its own API keys, on
@@ -2049,6 +2091,52 @@ retains build statistics and the structural graph before membership assertions;
 description citations must belong to the capability's actual primary members
 and retain their exact commit and blob provenance.
 
+The retained Gateway assertions inspect up to three successful logs per
+body-policy check. Every sampled enabled log must have **both** request and
+response bodies; the check waits for their availability rather than accepting
+one available sample in place of the others. Disabled samples must have neither
+body. Evidence stores availability/serialized-output sizes, not prompt or reply
+content; missing bodies are not assumed to prove a size limit.
+
+The `release-notes` stage also exercises the real completion-evidence consumer:
+it compares Knowledge's result with the original tracker comment, checks that a
+repository-only reader cannot retrieve tracker evidence, then asks the real
+assistant without putting the evidence body, receipt or URL in its prompt.
+Assertions require a completed answer quoting the original evidence and source
+anchor, and a successful persisted Knowledge tool receipt preserving the exact
+original evidence fields, issue status, tracker owner and source URL. Either
+`search_code` for this repository or `api_get` to its completion-evidence
+endpoint can supply that receipt; the model's tool choice is not the contract.
+These are gate requirements, not a claim of a successful run or a five-minute
+full-gate guarantee; use the run's retained outcomes and timings.
+
+### Live completion evidence (CORE-126)
+
+`GET /api/repos/:owner/:name/knowledge/completion-evidence?q=KEY` reads original
+tracker evidence directly, independently of graph/wiki indexing. It requires
+sign-in and repository read authorization, then restricts results to readable
+trackers and issues currently in an **unarchived workspace subscribed to this
+repository**. Repository access alone grants no tracker access. Removing the
+subscription or archiving the workspace removes that live source from results.
+
+A query shaped like an issue key (for example `CORE-126`) matches that key
+exactly, case-insensitively, rather than notes that happen to mention it.
+Other queries search issue keys, titles and evidence bodies. The response is
+`{query, evidence, truncated}`: at most 30 notes, newest first, with `truncated`
+indicating more matches. Each result retains the original comment fields
+(`id`, `issueId`, `kind`, `body`, `actorId`, `createdAt`), current issue context
+(`id`, `key`, `title`, `status`, `doneIn`), `trackerOwner`, `trackerOwnerId` and a
+`url` pointing to `/tracker/<owner>/issues/<key>#evidence-<comment-id>`.
+Evidence remains searchable after reopening; current status is context, not a
+rewrite of the original verification claim.
+
+The assistant's `search_code` combines normal code/wiki search with this live
+source in `completionEvidence`, preserving source anchors and attribution.
+There is no separately indexed, paid copy of tracker evidence and no need to
+wait for a Knowledge rebuild to retrieve a new note.
+
+### Build pipeline
+
 ```
 push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
                        main's pushes pending until they settle (10 min quiet, 30 min at most),
@@ -2103,6 +2191,15 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   (`update` or `full`, with `fullBecause`), `pushes` and `treesRead`. The usage
   report adds a **Knowledge updates** section: updates and full rebuilds over
   30 days, their calls, cost each and the costliest repositories.
+- **Retry-safe answered reviews** (CORE-288). A successful concept-review
+  answer is cached together with increments to `conceptReviewsAsked` (the
+  build's cumulative total) and `conceptReviewRoundsAsked` (per-round totals)
+  in one atomic commit. Replaying a cached answer does not increment either
+  counter. Final stats preserve the authoritative durable total rather than
+  overwriting it with a stale step snapshot, including when an earlier attempt
+  finishes late. These count recorded successful answers, not raw provider
+  attempts: actual calls, retries and failures remain separately metered in
+  `aiUsage`, including `failedCalls`. Historical counters are not backfilled.
 - **Analysis per content, not per commit.** Each file version (blob) is
   analyzed once: exact structure from regex extractors (imports, symbols,
   resolved file/package edges), its role from the Classification model, and a

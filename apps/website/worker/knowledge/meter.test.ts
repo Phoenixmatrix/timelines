@@ -3,9 +3,10 @@
 
 import { describe, expect, test } from "vite-plus/test";
 import type { CatalogPrice } from "../../shared/usage.ts";
+import { db as databaseQueries } from "../schema.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { knowledgeUpdateSpend } from "../usage/report.ts";
-import { buildAiUsage, meterBuildCall, priceUsage } from "./meter.ts";
+import { buildAiUsage, finalBuildStats, meterBuildCall, priceUsage } from "./meter.ts";
 
 const price = (metric: string, usdPerMillion: number): CatalogPrice =>
   ({
@@ -33,6 +34,73 @@ function database() {
 }
 
 describe("build metering", () => {
+  test("finalization preserves an old attempt's late answer rather than a retry snapshot", async () => {
+    const { sqlite, db } = database();
+    sqlite.exec(`
+      INSERT INTO kg_builds (id, repo_id, to_commit, status, stats)
+        VALUES ('b1', 'r1', 'c', 'running', '{"conceptReviewsAsked":1,"conceptReviewRoundsAsked":{"0":1}}'),
+               ('empty', 'r1', 'c', 'running', '{}');
+    `);
+    const retry = sqlite
+      .prepare(
+        "SELECT json_extract(stats, '$.conceptReviewsAsked') asked FROM kg_builds WHERE id = 'b1'",
+      )
+      .get();
+    if (!retry || typeof retry.asked !== "number") throw new Error("Missing retry snapshot");
+    // Provider success was already returned; metering held the old callback
+    // until after the retry read its round total.
+    const metering = Promise.withResolvers<void>();
+    const lateAnswer = metering.promise.then(() => {
+      sqlite.exec(`
+        INSERT INTO kg_concept_reviews (repo_id, a, b, score, inputs_hash)
+          VALUES ('r1', 'a', 'b', 1, 'late');
+        UPDATE kg_builds SET stats = json_set(stats,
+          '$.conceptReviewsAsked', json_extract(stats, '$.conceptReviewsAsked') + 1,
+          '$.conceptReviewRoundsAsked."0"', 2) WHERE id = 'b1';
+      `);
+    });
+    metering.resolve();
+    await lateAnswer;
+    await databaseQueries(db)
+      .updateTable("kg_builds")
+      .set({
+        status: "succeeded",
+        stats: finalBuildStats({ conceptReviewsAsked: retry.asked, conceptReviewRounds: 1 }),
+      })
+      .where("id", "=", "b1")
+      .execute();
+    expect(
+      sqlite
+        .prepare(`
+      SELECT json_extract(stats, '$.conceptReviewsAsked') total,
+             json_extract(stats, '$.conceptReviewRoundsAsked."0"') round_total,
+             json_extract(stats, '$.conceptReviewRounds') rounds
+      FROM kg_builds WHERE id = 'b1'
+    `)
+        .get(),
+    ).toMatchObject({ total: 2, round_total: 2, rounds: 1 });
+    // A zero-review build gets an explicit zero; replay leaves existing totals.
+    await databaseQueries(db)
+      .updateTable("kg_builds")
+      .set({ stats: finalBuildStats({}) })
+      .where("id", "in", ["b1", "empty"])
+      .execute();
+    expect(
+      sqlite
+        .prepare(
+          "SELECT json_extract(stats, '$.conceptReviewsAsked') total FROM kg_builds WHERE id = 'b1'",
+        )
+        .get(),
+    ).toMatchObject({ total: 2 });
+    expect(
+      sqlite
+        .prepare(
+          "SELECT json_extract(stats, '$.conceptReviewsAsked') total FROM kg_builds WHERE id = 'empty'",
+        )
+        .get(),
+    ).toMatchObject({ total: 0 });
+  });
+
   test("calls add up by model, concurrently, and are priced at list prices", async () => {
     const { sqlite, db } = database();
     sqlite.exec(

@@ -811,6 +811,58 @@ export class TrackerStore {
         .orderBy("slug"),
     );
   }
+  /** Live evidence for Knowledge, scoped to this repo's subscribed workspaces.
+   * Every member may read issues; the caller must authorize tracker membership.
+   */
+  completionEvidence(repoId: string, query: SearchQuery, limit = 30) {
+    const workspaces = this.subscribedWorkspaces(repoId).map((w) => w.workspaceId);
+    if (!workspaces.length) return [];
+    const columns = {
+      identifiers: [json<string>("i.data", "$.key")],
+      names: [json<string>("i.data", "$.title")],
+      searched: [
+        json<string>("i.data", "$.key"),
+        json<string>("i.data", "$.title"),
+        json<string>("c.data", "$.body"),
+      ],
+    };
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("comments as c")
+        .innerJoin("issues as i", (join) =>
+          join.on("i.id", "=", json<string>("c.data", "$.issueId")),
+        )
+        .select(["c.data as comment", "i.data as issue"])
+        .where(json("c.data", "$.kind"), "=", "evidence")
+        .where(raw<boolean>`EXISTS (
+          SELECT 1 FROM json_each(json_extract(i.data, '$.workspaceIds')) AS workspace
+          WHERE workspace.value IN (${raw.join(workspaces)})
+        )`)
+        .where(
+          /^[a-z][a-z0-9]{1,5}-\d+$/.test(query.lower)
+            ? raw<boolean>`lower(${json<string>("i.data", "$.key")}) = ${query.lower}`
+            : matches(columns, query),
+        )
+        .orderBy(json<string>("c.data", "$.createdAt"), "desc")
+        .orderBy("c.id")
+        .limit(Math.max(1, Math.min(100, limit))),
+    ).map((row) => {
+      const comment = JSON.parse(row.comment) as Comment;
+      const issue = JSON.parse(row.issue) as Issue;
+      return {
+        ...comment,
+        issue: {
+          id: issue.id,
+          key: issue.key,
+          title: issue.title,
+          status: issue.status,
+          doneIn: issue.doneIn,
+        },
+      };
+    });
+  }
+
   subscriptionRepoIds(subscriptionIds: string[]): string[] {
     if (!subscriptionIds.length) return [];
     return all(
@@ -3090,21 +3142,24 @@ export class TrackerStore {
               pickupAllowed(issue);
               unblocked(issue);
               childrenClosed(issue);
-              const body = text(data.evidence, "evidence", 131072);
-              const commentId = crypto.randomUUID();
-              emit(
-                "comment",
-                commentId,
-                {
-                  id: commentId,
-                  issueId: entityId,
-                  body,
-                  kind: "evidence",
-                  actorId: access.actorId,
-                  createdAt: now,
-                },
-                "comment.add",
-              );
+              const body =
+                data.evidence === undefined ? "" : text(data.evidence, "evidence", 131072, true);
+              if (body.trim()) {
+                const commentId = crypto.randomUUID();
+                emit(
+                  "comment",
+                  commentId,
+                  {
+                    id: commentId,
+                    issueId: entityId,
+                    body,
+                    kind: "evidence",
+                    actorId: access.actorId,
+                    createdAt: now,
+                  },
+                  "comment.add",
+                );
+              }
             }
             const released = issue.claim!;
             issue.status = kind === "issue.complete" ? "done" : "todo";

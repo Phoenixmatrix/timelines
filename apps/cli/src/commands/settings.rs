@@ -14,6 +14,174 @@ pub enum SettingsCommand {
     /// Automatic AI features and curated models for a person or organization
     #[command(subcommand)]
     Ai(AiCommand),
+    /// Installation-wide environment quota and this machine's memory limit
+    #[command(subcommand)]
+    Environments(EnvironmentCommand),
+}
+
+#[derive(Subcommand)]
+pub enum EnvironmentCommand {
+    /// Show the local cap/authority, or the installation-wide quota with --site
+    Show(EnvironmentScope),
+    /// Set the local cap/explicit quota authority, or the site maximum (human admin)
+    Set(EnvironmentSetArgs),
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+pub struct EnvironmentScope {
+    /// This OS user's machine, shared across its worktrees.
+    #[arg(long)]
+    local: bool,
+    /// The current gm server's installation-wide quota.
+    #[arg(long)]
+    site: bool,
+}
+
+#[derive(Args)]
+pub struct EnvironmentSetArgs {
+    #[command(flatten)]
+    scope: EnvironmentScope,
+    /// Maximum live environments; 0 pauses new allocations. Default: 4.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=2147483647))]
+    max: Option<u32>,
+    /// Explicit shared Gitmatrix quota authority URL (--local only). Every host
+    /// managing the same installation must use the same authority.
+    #[arg(long, requires = "local", conflicts_with = "site", value_parser = environment_authority)]
+    authority: Option<String>,
+}
+
+fn environment_authority(value: &str) -> std::result::Result<String, String> {
+    let uri: ureq::http::Uri = value
+        .parse()
+        .map_err(|_| "Use an absolute http(s) authority URL.")?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or("Use an absolute http(s) authority URL.")?;
+    let authority = uri
+        .authority()
+        .ok_or("Use an absolute http(s) authority URL.")?;
+    let host = authority.host().to_ascii_lowercase();
+    if !matches!(scheme, "http" | "https")
+        || host.is_empty()
+        || authority.as_str().contains('@')
+        || host.contains('*')
+        || uri.query().is_some()
+        || value.contains('#')
+        || uri.path() != "/"
+    {
+        return Err("Use an http(s) origin without credentials, path, query or fragment.".into());
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let port = authority.port_u16().unwrap_or(default_port);
+    let text = authority.as_str().to_ascii_lowercase();
+    if text != host && text != format!("{host}:{port}") {
+        return Err("Use a valid authority host and port.".into());
+    }
+    Ok(if port == default_port {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    })
+}
+
+fn environment_settings(ctx: &Ctx, command: &EnvironmentCommand) -> Result<Json> {
+    let (scope, maximum, authority) = match command {
+        EnvironmentCommand::Show(scope) => (scope, None, None),
+        EnvironmentCommand::Set(args) => {
+            if args.max.is_none() && args.authority.is_none() {
+                return Err(GmError::usage("Provide --max or --authority."));
+            }
+            (&args.scope, args.max, args.authority.as_ref())
+        }
+    };
+    if scope.site {
+        let mut config = Config::load();
+        config.acting = Acting::Person;
+        let patch = maximum.map(|maximum| json!({ "maximum": maximum }));
+        if ctx.dry_run
+            && let Some(patch) = &patch
+        {
+            return Ok(Json(json!({
+                "dry_run": true, "site": true, "method": "PATCH",
+                "path": "/admin/environments", "request": patch
+            })));
+        }
+        return Ok(Json(remote::api(
+            &config,
+            if patch.is_some() { "PATCH" } else { "GET" },
+            "/admin/environments",
+            patch.as_ref(),
+        )?));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        GmError::usage("HOME is required for the per-user machine environment limit.")
+    })?;
+    let directory = std::path::PathBuf::from(home).join(".local/state/gitmatrix-agent");
+    let path = directory.join("limits.json");
+    // Share the allocator's lock: concurrent partial updates cannot lose fields.
+    let _lock = if matches!(command, EnvironmentCommand::Set(_)) && !ctx.dry_run {
+        std::fs::create_dir_all(&directory)?;
+        let lock = std::fs::File::create(directory.join("registry.lock"))?;
+        lock.lock()?;
+        Some(lock)
+    } else {
+        None
+    };
+    let mut settings: Value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({ "maximum": 4 }),
+        Err(error) => return Err(error.into()),
+    };
+    if !settings.is_object()
+        || settings["maximum"].as_u64().is_none_or(|n| n > 2147483647)
+        || settings
+            .get("authority")
+            .is_some_and(|v| v.as_str().is_none_or(|s| environment_authority(s).is_err()))
+    {
+        return Err(GmError::usage(format!(
+            "Invalid environment limits in {}; repair the file before allocating environments.",
+            path.display()
+        )));
+    }
+    if let Some(maximum) = maximum {
+        settings["maximum"] = json!(maximum);
+    }
+    if let Some(authority) = authority {
+        settings["authority"] = json!(authority);
+    }
+    if matches!(command, EnvironmentCommand::Set(_)) {
+        if ctx.dry_run {
+            return Ok(Json(
+                json!({ "dry_run": true, "local": true, "settings": settings }),
+            ));
+        }
+        std::fs::create_dir_all(&directory)?;
+        let temporary = directory.join(format!("limits.{}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = options.open(&temporary)?;
+            file.write_all(serde_json::to_string_pretty(&settings)?.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
+    }
+    Ok(Json(json!({
+        "scope": "user-machine", "maximum": settings["maximum"],
+        "authority": settings.get("authority"), "path": path,
+        "note": "The local cap never overrides the shared installation quota. Configure the same explicit authority on every host; it must expose the environment quota API."
+    })))
 }
 
 #[derive(Subcommand)]
@@ -233,7 +401,10 @@ pub fn run(ctx: &Ctx, command: &SettingsCommand) -> Result<Json> {
     // Explicit environment tokens still win; only the backend grants authority.
     let mut config = Config::load();
     config.acting = Acting::Person;
-    let SettingsCommand::Ai(command) = command;
+    let command = match command {
+        SettingsCommand::Ai(command) => command,
+        SettingsCommand::Environments(command) => return environment_settings(ctx, command),
+    };
     let (explicit, site, patch) = match command {
         AiCommand::Show { owner, site } => (owner, *site, None),
         AiCommand::Set(args) => (&args.owner, args.site, Some(args.patch())),
@@ -292,6 +463,98 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn environment_limits_require_explicit_scope_and_safe_values() {
+        for argv in [
+            vec!["gm", "settings", "environments", "show", "--local"],
+            vec!["gm", "settings", "environments", "show", "--site"],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--local",
+                "--max",
+                "0",
+            ],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--site",
+                "--max",
+                "12",
+            ],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--local",
+                "--authority",
+                "https://gitmatrix.example",
+                "--max",
+                "8",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_ok(), "rejected {argv:?}");
+        }
+        for argv in [
+            vec!["gm", "settings", "environments", "show"],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "show",
+                "--local",
+                "--site",
+            ],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--site",
+                "--authority",
+                "https://gitmatrix.example",
+            ],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--local",
+                "--max",
+                "-1",
+            ],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--local",
+                "--max",
+                "2147483648",
+            ],
+            vec![
+                "gm",
+                "settings",
+                "environments",
+                "set",
+                "--local",
+                "--authority",
+                "https://token@gitmatrix.example",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_err(), "accepted {argv:?}");
+        }
+        assert_eq!(
+            environment_authority("http://127.0.0.1:19000/").unwrap(),
+            "http://127.0.0.1:19000"
+        );
+    }
 
     fn parse_set(flags: &[&str]) -> AiSetArgs {
         let mut argv = vec!["gm", "settings", "ai", "set"];

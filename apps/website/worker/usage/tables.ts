@@ -29,6 +29,13 @@ const PACKAGE =
 
 export const TABLE_GROUPS: TableGroup[] = [
   {
+    id: "environment-quota",
+    database: "db",
+    scope: "site",
+    label: "Installation environment limits and live reservations",
+    tables: { environment_limits: null, environment_reservations: null },
+  },
+  {
     id: "repositories",
     database: "db",
     scope: "account",

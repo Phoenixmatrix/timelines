@@ -4,6 +4,7 @@
 // when the build ends its totals and list-price cost land in its stats, and
 // the usage report adds them up per update.
 
+import { sql } from "kysely";
 import type { CatalogPrice } from "../../shared/usage.ts";
 import { priceOn, priceTimeline, utcDay } from "../usage/prices.ts";
 
@@ -28,6 +29,16 @@ export interface BuildAiUsage {
   byModel: Record<string, ModelUsage & { costUsd: number | null }>;
   /** Models with calls but no catalog price (their cost is left out of `costUsd`). */
   unpriced: string[];
+}
+
+/**
+ * Finish merges snapshots of other stats, but review accounting stays live:
+ * an earlier timed-out attempt can persist an answer after the retry returned.
+ * Read the authoritative total in the UPDATE itself, not in a prior SELECT.
+ */
+export function finalBuildStats(stats: Record<string, unknown>) {
+  return sql<string>`json_set(json_patch(stats, ${JSON.stringify(stats)}),
+    '$.conceptReviewsAsked', coalesce(json_extract(stats, '$.conceptReviewsAsked'), 0))`;
 }
 
 /** Add calls to a build's running usage. One statement, so concurrent calls add up. */

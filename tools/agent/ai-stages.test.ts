@@ -35,7 +35,11 @@ await test("changed paths select their stages and the stages those require", () 
     [["apps/website/worker/avatars/api.ts"], ["avatars"]],
     [["apps/website/src/routes/AvatarEditor.tsx"], ["avatars"]],
     [["apps/website/worker/merge-queue/ai.ts"], ["queue"]],
-    [["apps/website/worker/assistant/tools.ts"], ["knowledge", "search", "assistant"]],
+    [
+      ["apps/website/worker/assistant/tools.ts"],
+      ["knowledge", "search", "assistant", "knowledge-edit", "release-notes"],
+    ],
+    [["apps/website/worker/tracker/store.ts"], ["knowledge", "knowledge-edit", "release-notes"]],
     [
       ["apps/website/worker/release-notes/generate.ts"],
       ["knowledge", "knowledge-edit", "release-notes"],
@@ -70,7 +74,7 @@ await test("changed paths select their stages and the stages those require", () 
     [["apps/website/cloudflare.config.ts"], STAGE_IDS],
     [["pnpm-lock.yaml"], STAGE_IDS],
     // Nothing AI changed: nothing is provisioned or spent.
-    [["apps/cli/src/main.rs", "README.md", "apps/website/worker/tracker/store.ts"], []],
+    [["apps/cli/src/main.rs", "README.md"], []],
     [[], []],
   ];
   for (const [changed, expected] of examples)
@@ -95,6 +99,26 @@ await test("--all runs every stage, and --stage adds to what changed, never repl
   });
   assert.equal(selectStages({ changed: [] }).skipped.avatars, "no matching change");
   assert.throws(() => selectStages({ changed: [], requested: ["wiki"] }), /Unknown test-ai stage/);
+});
+
+await test("the gateway follow-up retains every consumer and fresh search prerequisites", () => {
+  const requested = ["knowledge", "assistant", "avatars", "repository-deletion", "queue"];
+  const expected = ["knowledge", "search", "assistant", "avatars", "repository-deletion", "queue"];
+  assert.deepEqual(selectStages({ changed: [], requested }).stages, expected);
+  assert.deepEqual(
+    selectStages({
+      changed: [],
+      requested,
+      reusable: new Set(["knowledge", "search"]),
+    }).stages,
+    expected,
+  );
+  // A narrow request never hides changes to the expensive consumers.
+  const changed = ["tools/agent/provider-e2e.ts"];
+  assert.deepEqual(
+    selectStages({ changed, requested }).stages,
+    STAGE_IDS.filter((id) => !id.startsWith("atlas")),
+  );
 });
 
 await test("no stage's own files can be skipped, and every mapped path exists", () => {

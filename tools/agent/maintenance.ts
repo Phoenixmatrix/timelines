@@ -34,13 +34,18 @@ export async function installMaintenance(): Promise<void> {
   const cfPath = (
     await command("which", ["cf"], { env: { ...process.env, PATH: stablePath } })
   ).trim();
-  for (const executable of [process.execPath, cfPath]) {
+  const gmPath = (
+    await command("which", ["gm"], { env: { ...process.env, PATH: stablePath } })
+  ).trim();
+  for (const executable of [process.execPath, cfPath, gmPath]) {
     if ((await realpath(executable)).startsWith(`${checkout}/`))
-      throw new Error("Scheduled cleanup requires Node and cf installed outside the worktree.");
+      throw new Error("Scheduled cleanup requires Node, cf and gm installed outside the worktree.");
   }
-  const temporary = join(registry, `environment.${process.pid}.ts`);
-  await copyFile(join(source, "environment.ts"), temporary);
-  await rename(temporary, join(registry, "environment.ts"));
+  for (const name of ["quota.ts", "heavy.ts", "environment.ts"]) {
+    const temporary = join(registry, `${name}.${process.pid}.tmp`);
+    await copyFile(join(source, name), temporary);
+    await rename(temporary, join(registry, name));
+  }
   await writeFile(
     join(registry, "janitor.ts"),
     'import { cleanupExpired } from "./environment.ts";\nawait cleanupExpired();\n',
@@ -92,9 +97,12 @@ export async function installRemoteMaintenance(root: string): Promise<void> {
       env: { ...process.env, PATH: stablePath },
     })
   ).trim();
-  for (const executable of [process.execPath, cfPath]) {
+  const gmPath = (
+    await command("which", ["gm"], { env: { ...process.env, PATH: stablePath } })
+  ).trim();
+  for (const executable of [process.execPath, cfPath, gmPath]) {
     if ((await realpath(executable)).startsWith(`${checkout}/`))
-      throw new Error("Scheduled cleanup requires Node and cf installed outside the worktree.");
+      throw new Error("Scheduled cleanup requires Node, cf and gm installed outside the worktree.");
   }
   const destination = join(registry, "remote-janitor", "tools", "agent");
   await mkdir(destination, { recursive: true, mode: 0o700 });
@@ -109,6 +117,7 @@ export async function installRemoteMaintenance(root: string): Promise<void> {
     "remote-protocol.ts",
     "maintenance.ts",
     "environment.ts",
+    "quota.ts",
     "heavy.ts",
     "types.ts",
     "../remote/cloudflare.config.ts",

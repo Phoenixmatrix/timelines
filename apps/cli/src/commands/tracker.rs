@@ -2209,6 +2209,16 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
             .cmp(&b["createdAt"].as_str())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
+    let completion_evidence: Vec<Value> = notes
+        .iter()
+        .filter(|note| note["kind"] == "evidence")
+        .map(|note| {
+            let mut evidence = (**note).clone();
+            evidence["actorDisplay"] =
+                json!(actor_name(snapshot, note["actorId"].as_str().unwrap_or("")));
+            evidence
+        })
+        .collect();
     let related: Vec<&Value> = snapshot["issues"]
         .as_array()
         .into_iter()
@@ -2222,7 +2232,7 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         .take(limit)
         .collect();
     Ok(Shown(
-        json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline,"timeline":snapshot["timeline"]}),
+        json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"completionEvidence":completion_evidence,"completionGuidance":"Include actual verification results and links with gm issue complete --evidence TEXT (or @path / -). Evidence is recommended, not required; omission records no evidence.","limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline,"timeline":snapshot["timeline"]}),
     ))
 }
 /// Who gm acts as here, for eligibility (CORE-32): a person, an agent (with its
@@ -2440,7 +2450,7 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
         "context": context,
         "timeline": snapshot["timeline"],
         "blockerEvidence": blocker_evidence,
-        "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete with evidence. gm kept the lease token for this identity, so those commands need no token.",
+        "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete --evidence with actual verification results and links. Evidence is recommended but optional; never invent a result when omitting it. gm kept the lease token for this identity, so those commands need no token.",
     });
     if skipped_count > 0 {
         out["skipped"] = skipped;
@@ -2810,7 +2820,11 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
                 let (token, kept_by) = lease_token(&r.config, &issue_id, lease)?;
                 holder = kept_by;
-                json!({"kind":"issue.complete","id":issue_id,"data":{"leaseToken":token,"evidence":input(evidence)?}})
+                let mut data = json!({"leaseToken":token});
+                if let Some(evidence) = evidence {
+                    data["evidence"] = json!(input(evidence)?);
+                }
+                json!({"kind":"issue.complete","id":issue_id,"data":data})
             }
         };
         locked_status(&snapshot, &mutation)?;
@@ -3221,6 +3235,53 @@ mod tests {
 
     fn snapshot() -> Value {
         json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"labels":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+    }
+    #[test]
+    fn completion_evidence_is_optional_input_and_not_hidden_by_recent_notes() {
+        use clap::Parser;
+        for args in [
+            vec!["gm", "issue", "complete", "ENG-1"],
+            vec![
+                "gm",
+                "issue",
+                "complete",
+                "ENG-1",
+                "--evidence",
+                "@results.txt",
+            ],
+            vec!["gm", "issue", "complete", "ENG-1", "--evidence", "-"],
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(args.clone()).unwrap();
+            let Some(crate::cli::Command::Issue(IssueArgs {
+                command: IssueCommand::Complete { evidence, .. },
+                ..
+            })) = parsed.command
+            else {
+                panic!("expected issue complete");
+            };
+            assert_eq!(evidence.as_deref(), args.get(5).copied());
+        }
+        let mut s = snapshot();
+        s["issues"] =
+            json!([{"id":"a","key":"ENG-1","title":"Parcels","status":"todo","parentId":null}]);
+        s["comments"] = json!([
+            {"id":"proof","issueId":"a","kind":"evidence","actorId":"alice","body":"Verified 65521","createdAt":"2026-10-01T00:00:00Z"},
+            {"id":"new","issueId":"a","kind":"comment","actorId":"bob","body":"Reopened","createdAt":"2026-10-02T00:00:00Z"}
+        ]);
+        let shown = context(&s, "ENG-1", 1, true).unwrap().0;
+        assert_eq!(shown["notes"][0]["id"], "new");
+        assert_eq!(shown["completionEvidence"][0]["id"], "proof");
+        assert_eq!(shown["completionEvidence"][0]["actorId"], "alice");
+        assert_eq!(shown["completionEvidence"][0]["body"], "Verified 65521");
+        assert_eq!(
+            shown["completionEvidence"][0]["createdAt"],
+            "2026-10-01T00:00:00Z"
+        );
+        s["comments"] = json!([]);
+        assert_eq!(
+            context(&s, "ENG-1", 1, true).unwrap().0["completionEvidence"],
+            json!([])
+        );
     }
     #[test]
     fn moving_a_leased_issue_uses_the_covering_kept_lease() {

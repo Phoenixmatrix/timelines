@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FocusEvent } from "react";
 import { CheckIcon } from "@phosphor-icons/react";
-import { Link, useBlocker } from "react-router";
+import { Link, useBlocker, useLocation } from "react-router";
 import {
   actorName,
   attribution,
@@ -293,6 +293,27 @@ export function IssueDetail({
   };
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
+  const completionEvidence = comments.filter((comment) => comment.kind === "evidence");
+  const activityNotes = comments.filter((comment) => comment.kind !== "evidence");
+  const { hash } = useLocation();
+  const evidenceAnchor = useMemo(() => {
+    try {
+      const id = decodeURIComponent(hash.slice(1));
+      return id === "completion-evidence" || id.startsWith("evidence-") ? id : null;
+    } catch {
+      return null;
+    }
+  }, [hash]);
+  const evidenceAnchorExists =
+    evidenceAnchor === "completion-evidence" ||
+    completionEvidence.some((comment) => `evidence-${comment.id}` === evidenceAnchor);
+  // Router links update history before the issue has rendered. Jump once per
+  // destination, not whenever background snapshots refresh its comments.
+  useEffect(() => {
+    if (!evidenceAnchor || !evidenceAnchorExists) return;
+    const target = document.getElementById(evidenceAnchor);
+    if (target && detailRef.current?.contains(target)) target.scrollIntoView();
+  }, [evidenceAnchor, evidenceAnchorExists, issue.id, snapshot.owner.id]);
   // The issue's own lease, or an ancestor's: either way only its holder changes the status.
   // A lease retained by a timeline (CORE-75) doesn't guard a reopen there.
   const covering =
@@ -1041,6 +1062,14 @@ export function IssueDetail({
               <dd className="m-0 min-w-0">{notReady}</dd>
             </>
           )}
+          <dt className="text-ink-faint">Completion evidence</dt>
+          <dd className="m-0 min-w-0">
+            <a className={LINK} href="#completion-evidence">
+              {completionEvidence.length
+                ? `${completionEvidence.length} recorded ${completionEvidence.length === 1 ? "note" : "notes"}`
+                : "Not recorded · add evidence"}
+            </a>
+          </dd>
           <dt className="text-ink-faint">Created by</dt>
           <dd className="m-0 min-w-0">
             <AuditIdentity actor={issue.createdBy} snapshot={snapshot} />
@@ -1693,6 +1722,55 @@ export function IssueDetail({
           headingClassName={HEADING}
         />
       </section>
+      <section id="completion-evidence" className={SECTION} aria-label="Evidence of completion">
+        <h3 className={HEADING}>Evidence of completion</h3>
+        <p className="mk-hint mt-0.5 mb-0 max-w-[48ch]">
+          Record what was verified, with links to results or commits. Recommended when completing
+          work, but optional. Earlier evidence stays visible when an issue is reopened.
+        </p>
+        {completionEvidence.length === 0 && (
+          <p className="mt-3 mb-0 text-body-sm text-ink-muted">No completion evidence recorded.</p>
+        )}
+        <ol className="m-0 mb-3 list-none p-0">
+          {completionEvidence.map((comment) => (
+            <li
+              key={comment.id}
+              id={`evidence-${comment.id}`}
+              className="border-b border-line-soft py-3"
+              data-kind="evidence"
+            >
+              <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="size-1.5 rounded-full bg-online" aria-hidden />
+                  Evidence
+                </span>
+                <Actor who={attribution(snapshot, comment.actorId)} link />
+                <time
+                  dateTime={comment.createdAt}
+                  title={new Date(comment.createdAt).toLocaleString()}
+                >
+                  {relativeTime(comment.createdAt, snapshot.serverTime)}
+                </time>
+              </header>
+              <MarkdownText text={comment.body} />
+            </li>
+          ))}
+        </ol>
+        <button
+          type="button"
+          className="mk-btn mk-btn--sm"
+          disabled={busy}
+          onClick={() => {
+            setKind("evidence");
+            setCommentError("");
+            detailRef.current
+              ?.querySelector<HTMLTextAreaElement>('[aria-label="Activity note"]')
+              ?.focus();
+          }}
+        >
+          Add completion evidence
+        </button>
+      </section>
       <AuditHistory
         key={`${snapshot.owner.id}:${issue.id}`}
         issueId={issue.id}
@@ -1703,11 +1781,11 @@ export function IssueDetail({
         <p className="mk-hint mt-0.5 mb-0 max-w-[48ch]">
           Leave decisions, a checkpoint for the next agent, or evidence of completion.
         </p>
-        {comments.length === 0 && (
+        {activityNotes.length === 0 && (
           <p className="mt-3 mb-0 text-body-sm text-ink-muted">No activity notes yet.</p>
         )}
         <ol className="m-0 mb-3 list-none p-0">
-          {comments.map((comment) => (
+          {activityNotes.map((comment) => (
             <li
               key={comment.id}
               className="border-b border-line-soft py-3"
@@ -1720,11 +1798,7 @@ export function IssueDetail({
                   className="[&>span:last-child]:font-semibold [&>span:last-child]:text-ink"
                 />
                 <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>
-                  {comment.kind === "checkpoint" ? (
-                    <ClaimIcon />
-                  ) : comment.kind === "evidence" ? (
-                    <span className="size-1.5 rounded-full bg-online" aria-hidden />
-                  ) : null}
+                  {comment.kind === "checkpoint" ? <ClaimIcon /> : null}
                   {comment.kind[0]!.toUpperCase() + comment.kind.slice(1)}
                 </span>
                 <time
@@ -1762,7 +1836,10 @@ export function IssueDetail({
               value={kind}
               options={["comment", "checkpoint", "evidence"].map((value) => ({
                 value,
-                label: value[0]!.toUpperCase() + value.slice(1),
+                label:
+                  value === "evidence"
+                    ? "Evidence of completion"
+                    : value[0]!.toUpperCase() + value.slice(1),
               }))}
               onChange={(value) => {
                 setKind(value as Comment["kind"]);
@@ -1782,11 +1859,15 @@ export function IssueDetail({
               setNotice("");
             }}
             required
-            placeholder="Add a note. Markdown supported."
+            placeholder={
+              kind === "evidence"
+                ? "What did you verify? Include actual results and links. Markdown supported."
+                : "Add a note. Markdown supported."
+            }
           />
           <FormError message={commentError} />
           <button className="mk-btn mk-btn--sm" disabled={busy || !body.trim()}>
-            Post {kind}
+            {kind === "evidence" ? "Save completion evidence" : `Post ${kind}`}
           </button>
         </form>
       </section>

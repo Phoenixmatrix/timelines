@@ -437,16 +437,27 @@ function AiSettingsForm({
           Keep AI request and response bodies in gateway logs
         </legend>
         <p className="mt-0 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
-          AI Gateway always logs each model call’s model, time and tokens. Choose, for this
-          account’s calls, whether it also keeps what was sent and returned. By default each part
-          follows the site’s setting. Changes reach new model calls within a minute, including
-          running work.
+          AI Gateway records model, time and token metadata when logging is available. Choose, for
+          this account’s calls, whether it also stores what was sent and returned, subject to
+          Cloudflare’s log limits. By default each part follows the site’s setting. Changes reach
+          new model calls within a minute, including running work.
         </p>
         <p
           className="mt-0 mb-4 max-w-[65ch] text-body-sm font-semibold text-ink"
           data-log-bodies-note
         >
           {saved.logBodies.note}
+        </p>
+        <p className="mt-0 mb-4 max-w-[65ch] text-body-sm text-ink-muted">
+          <a
+            href="https://developers.cloudflare.com/ai-gateway/reference/limits/"
+            className={link}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Cloudflare log limits
+            <span className="sr-only"> (opens in a new tab)</span>
+          </a>
         </p>
         <div className="flex flex-col gap-5">
           {saved.logBodies.components.map((entry) => {

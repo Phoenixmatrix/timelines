@@ -7,9 +7,15 @@ import { join, resolve, dirname, isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { HarnessContext } from "./types.ts";
 import { withFileLock } from "./heavy.ts";
+import {
+  parseEnvironmentLimits,
+  readEnvironmentLimits,
+  reserveQuota,
+  releaseQuota,
+} from "./quota.ts";
+import type { QuotaReservation } from "./quota.ts";
 
 const TTL = 24 * 60 * 60 * 1000;
-const MAX_ENVIRONMENTS = 4;
 const ID = /^gma-[a-z0-9]{8,10}-[a-f0-9]{12}$/;
 export const registry = join(homedir(), ".local", "state", "gitmatrix-agent");
 type Resource = "artifacts" | "vectors" | "search";
@@ -47,6 +53,8 @@ export interface Environment {
    * before the field derive it from their resources.
    */
   ai?: boolean;
+  /** Explicit installation authority, never derived from scoped product credentials. */
+  quota?: QuotaReservation;
 }
 
 /** Done with: nothing of it is live, so it holds none of the environment slots. */
@@ -99,6 +107,13 @@ export function validateEnvironment(value: Environment): void {
     throw new Error("Invalid resource ownership journal.");
   if (Object.hasOwn(value, "ai") && typeof value.ai !== "boolean")
     throw new Error("Invalid environment AI flag.");
+  if (Object.hasOwn(value, "quota")) {
+    if (!value.quota || typeof value.quota.authority !== "string")
+      throw new Error("Invalid pinned environment quota authority.");
+    parseEnvironmentLimits({ maximum: 4, authority: value.quota.authority });
+    if (!["pending", "reserved", "released"].includes(value.quota.state))
+      throw new Error("Invalid environment reservation journal.");
+  }
 }
 
 function requireGateway(env: Environment): void {
@@ -116,6 +131,8 @@ const hostedTokens = new Set<string>(
     ? [process.env.CLOUDFLARE_API_TOKEN]
     : [],
 );
+if (process.env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN)
+  hostedTokens.add(process.env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN);
 export function redact(text: string): string {
   for (const token of hostedTokens) text = text.replaceAll(token, "[REDACTED]");
   return text
@@ -146,7 +163,11 @@ export async function command(
     const channel = childEnv.GITMATRIX_REMOTE_CREDENTIALS_FILE;
     if (channel) {
       const { env: credentials } = JSON.parse(await readFile(channel, "utf8")) as {
-        env: { CLOUDFLARE_API_TOKEN: string; CLOUDFLARE_ACCOUNT_ID: string };
+        env: {
+          CLOUDFLARE_API_TOKEN: string;
+          CLOUDFLARE_ACCOUNT_ID: string;
+          GITMATRIX_ENVIRONMENT_QUOTA_TOKEN?: string;
+        };
       };
       if (
         typeof credentials?.CLOUDFLARE_API_TOKEN !== "string" ||
@@ -160,6 +181,8 @@ export async function command(
       )
         throw new Error("Hosted Cloudflare credential account changed.");
       hostedTokens.add(credentials.CLOUDFLARE_API_TOKEN);
+      if (credentials.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN)
+        hostedTokens.add(credentials.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN);
       childEnv.CLOUDFLARE_API_TOKEN = credentials.CLOUDFLARE_API_TOKEN;
       childEnv.CLOUDFLARE_ACCOUNT_ID = credentials.CLOUDFLARE_ACCOUNT_ID;
     }
@@ -281,6 +304,7 @@ async function persist(env: Environment): Promise<void> {
       resources: env.resources,
       status: env.status,
       ai: aiEnabled(env),
+      ...(env.quota ? { quota: env.quota } : {}),
     };
     const response = await fetch("http://127.0.0.1:8787/ownership", {
       method: "POST",
@@ -618,6 +642,9 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
     }
   }
   await rm(join(registry, "workspaces", env.id), { recursive: true, force: true });
+  // Empty namespace orphans stay counted globally until actual deletion. A
+  // transient release failure also retains a retryable deleting journal.
+  if (env.resources.artifacts !== "orphaned") await releaseQuota(env, persist);
   env.status = env.resources.artifacts === "orphaned" ? "orphaned" : "deleted";
   await persist(env);
   console.log(JSON.stringify({ event: `environment.${env.status}`, id: env.id }));
@@ -694,6 +721,15 @@ export async function createEnvironment(
   await sweepBeforeCreate();
   return registryLock(async () => {
     const existing = await inventory();
+    const limits = await readEnvironmentLimits();
+    if (!limits.authority)
+      throw new Error(
+        "Set an explicit shared quota authority before setup: gm settings environments set --local --authority https://YOUR-GITMATRIX. Upgrade/sign in to that authority; there is no offline or 404 fallback.",
+      );
+    // Adopt legacy journals before admitting anything new. Other hosts must do
+    // the same during rollout; a local journal cannot discover offline hosts.
+    for (const current of existing)
+      if (current.status !== "deleted") await reserveQuota(current, "local", persist);
     if (!ephemeral) {
       const current = existing.find(
         (e) => e.root === root && e.dir === join(root, ".gitmatrix-agent") && !retired(e),
@@ -709,9 +745,9 @@ export async function createEnvironment(
         return current;
       }
     }
-    if (existing.filter((e) => !retired(e)).length >= MAX_ENVIRONMENTS)
+    if (existing.filter((e) => !retired(e)).length >= limits.maximum)
       throw new Error(
-        `At most ${MAX_ENVIRONMENTS} live agent environments per user. Destroy unused environments first.`,
+        `Machine environment limit reached (${limits.maximum}). Destroy unused environments or use gm settings environments set --local --max N. Raising it cannot override the installation quota.`,
       );
     const profile = process.env.GITMATRIX_CF_PROFILE;
     const identity = JSON.parse(
@@ -759,6 +795,7 @@ export async function createEnvironment(
     };
     await persist(env);
     try {
+      await reserveQuota(env, "local", persist);
       await cf(env, ["artifacts", "namespaces", "create", "--namespace", id]);
       env.resources.artifacts = "created";
       await persist(env);
@@ -863,6 +900,18 @@ export async function createEnvironment(
 export async function context(env: Environment): Promise<HarnessContext> {
   validateEnvironment(env);
   requireGateway(env);
+  await registryLock(async () => {
+    const current = await recordAt(join(registry, "environments", `${env.id}.json`));
+    if (
+      (current && current.status !== "ready") ||
+      env.status !== "ready" ||
+      env.expires <= Date.now()
+    )
+      throw new Error("Environment is expired or being destroyed; run destroy then setup.");
+    // Re-read under the same lock as cleanup, never resurrect a released slot.
+    if (current?.quota) env.quota = current.quota;
+    await reserveQuota(env, "local", persist);
+  });
   await safeLocalDirectory(env);
   const vars: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(vars))

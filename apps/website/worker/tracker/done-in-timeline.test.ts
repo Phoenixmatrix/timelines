@@ -95,6 +95,43 @@ function setup() {
 }
 
 describe("done in a timeline", () => {
+  test("omitted completion evidence retains timeline fencing without creating a note", () => {
+    const t = setup();
+    const timeline = t.fork("optional-evidence");
+    const claim = t.mutate(timeline.slug, {
+      kind: "issue.claim",
+      id: "a",
+      data: { agent: "w" },
+    }).results[0]!;
+    t.mutate(timeline.slug, {
+      kind: "issue.complete",
+      id: "a",
+      data: { leaseToken: claim.leaseToken! },
+    });
+    expect(t.issue("a")).toMatchObject({
+      status: "done_in_timeline",
+      claim: { retainedIn: { id: timeline.id, slug: timeline.slug } },
+    });
+    expect(t.issue("a", timeline.slug).status).toBe("done");
+    expect(t.view(timeline.slug).comments).toEqual([]);
+    expect(() =>
+      t.mutate(undefined, {
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: t.issue("a").version,
+        data: { status: "todo" },
+      }),
+    ).toThrow();
+    t.mutate(timeline.slug, {
+      kind: "issue.update",
+      id: "a",
+      expectedVersion: t.issue("a", timeline.slug).version,
+      data: { status: "todo" },
+    });
+    expect(t.issue("a", timeline.slug).status).toBe("todo");
+    expect(t.view(timeline.slug).comments).toEqual([]);
+  });
+
   test("is done in its timeline, and done there everywhere else: blocking, not ready", () => {
     const t = setup();
     const search = t.fork("search");

@@ -88,7 +88,7 @@ export const ATLAS_STAGES = [
   },
   {
     id: "atlas-reuse",
-    covers: "A README push reuses unchanged prose and publishes within 30 s of the graph",
+    covers: "A same-tree commit reuses unchanged prose and publishes within 30 s of the graph",
     requires: ["atlas-describe"],
     paths: ATLAS_CORE,
   },
@@ -1171,11 +1171,36 @@ export async function runAtlasProviderE2E(
     if (want("atlas-reuse"))
       await step("atlas-reuse", ["atlas-reuse"], async () => {
         const previous = enabled.build;
-        await pushFiles(
-          ledger,
-          { "README.md": `${LEDGER["README.md"]}\nSee index.ts for the public API.\n` },
-          "Point the README at the public API",
+        const previousCommit = ledger.head;
+        const tree = await git(ledger.dir, ["rev-parse", "HEAD^{tree}"]);
+        const overview = await api<AtlasOverview>(`${atlasOf(ledger)}/overview`);
+        const beforeCapabilities = await Promise.all(
+          overview.regions
+            .filter((region) => region.kind === "capability")
+            .map(async (region) => ({
+              detail: await api<AtlasDetail>(
+                `${atlasOf(ledger)}/detail?id=${encodeURIComponent(region.id)}`,
+              ),
+              sources: await evidenceOf(ledger, region.id),
+            })),
         );
+        assert(beforeCapabilities.length >= 2);
+        // README is an input to the shared component synthesis, so editing it can
+        // legitimately invalidate every capability. A new commit of the identical
+        // tree isolates cache reuse from upstream model-generated input changes.
+        await git(ledger.dir, [
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Advance ledger provenance without changing description inputs",
+        ]);
+        await git(ledger.dir, ["push", "origin", "main"], fixtures.tokens[ledger.owner]);
+        ledger.head = await git(ledger.dir, ["rev-parse", "HEAD"]);
+        assert.notEqual(ledger.head, previousCommit);
+        assert.equal(await git(ledger.dir, ["rev-parse", "HEAD^"]), previousCommit);
+        assert.equal(await git(ledger.dir, ["rev-parse", "HEAD^{tree}"]), tree);
         const build = await built(ledger);
         // Retained beside enabledGraph: what any changed part's prose became.
         evidence.reuseGraph = await api(
@@ -1183,6 +1208,9 @@ export async function runAtlasProviderE2E(
           tokenOf(ledger),
         );
         const stats = build.stats as {
+          changedFiles: number;
+          removedFiles: number;
+          toAnalyze: number;
           atlasError?: string;
           atlasTimings?: {
             mode: string;
@@ -1196,32 +1224,79 @@ export async function runAtlasProviderE2E(
             inferred: number;
             current: number;
           };
-          atlasSpend?: { calls: number };
+          atlasSpend?: { calls: number; inputTokens: number; outputTokens: number; usd: number };
         };
         assert.equal(stats.atlasError, undefined);
         assert(stats.atlasTimings && stats.atlasDescribed && stats.atlasSpend);
+        assert.notEqual(build.id, previous.id);
+        assert.equal(stats.changedFiles, 0);
+        assert.equal(stats.removedFiles, 0);
+        assert.equal(stats.toAnalyze, 0);
+        const published = await api<AtlasOverview>(`${atlasOf(ledger)}/overview`);
+        assert.notEqual(published.snapshot.id, overview.snapshot.id);
+        assert(published.snapshot.seq > overview.snapshot.seq);
+        assert.deepEqual(
+          published.regions
+            .filter((region) => region.kind === "capability")
+            .map((region) => region.id)
+            .sort(),
+          beforeCapabilities.map(({ detail }) => detail.entity.id).sort(),
+        );
+        assert.deepEqual(published.snapshot.vector, [
+          { repoId: ledger.id, sourceId: "canonical", commit: ledger.head, buildId: build.id },
+        ]);
         const now: {
           id: string;
           name: string;
           sameInputs: boolean;
           reinferred: boolean;
+          inputsHash: string;
+          sources: AtlasEvidence[];
           /** Input parts whose hash differs, appeared or went: what made it change. */
           changedParts: string[];
           basis: AtlasInference["basis"];
         }[] = [];
-        for (const cap of [enabled.ledgerCap, enabled.currencyCap]) {
+        for (const { detail: beforeDetail, sources: beforeSources } of beforeCapabilities) {
+          const cap = beforeDetail.entity;
           const detail = await api<AtlasDetail>(
             `${atlasOf(ledger)}/detail?id=${encodeURIComponent(cap.id)}`,
           );
-          assert.equal(detail.snapshot.vector[0]?.commit, ledger.head);
+          assert.deepEqual(detail.snapshot.vector, [
+            { repoId: ledger.id, sourceId: "canonical", commit: ledger.head, buildId: build.id },
+          ]);
           const before = (cap.data.provenance as AtlasProvenance).inferred!;
           const after = (detail.entity.data.provenance as AtlasProvenance).inferred!;
           assert.deepEqual(detail.entity.summaryState, { status: "current" });
+          assert(before && after, "Current prose carries its inference provenance");
+          assert.equal(
+            after.inputsHash,
+            before.inputsHash,
+            `${cap.name} inputs changed for the same tree`,
+          );
+          assert.equal(detail.entity.name, cap.name);
+          assert.equal(detail.entity.summary, cap.summary);
+          assert.deepEqual(detail.entity.data.description, cap.data.description);
+          // Cached prose retains its exact original model, time, source blobs and
+          // inference basis; only the structural snapshot/evidence moves forward.
+          assert.deepEqual(after, before);
+          const sources = await evidenceOf(ledger, cap.id);
+          assert(beforeSources.items.length > 0);
+          assert.equal(sources.items.length, beforeSources.items.length);
+          for (const source of sources.items) {
+            const original = beforeSources.items.find(
+              (item) => item.path === source.path && item.via === source.via,
+            );
+            assert(original, `${source.path} was not in the previous capability evidence`);
+            assert.equal(original.commit, previousCommit);
+            assert.deepEqual(source, { ...original, commit: ledger.head });
+          }
           now.push({
             id: cap.id,
             name: detail.entity.name,
             sameInputs: before.inputsHash === after.inputsHash,
             reinferred: before.inferredAt !== after.inferredAt,
+            inputsHash: after.inputsHash,
+            sources: sources.items,
             changedParts: changedParts(before.inputParts, after.inputParts),
             basis: after.basis,
           });
@@ -1231,6 +1306,9 @@ export async function runAtlasProviderE2E(
           build: build.id,
           previousBuild: previous.id,
           commit: ledger.head,
+          previousCommit,
+          tree,
+          snapshot: published.snapshot,
           atlasTimings: stats.atlasTimings,
           atlasDescribed: stats.atlasDescribed,
           atlasSpend: stats.atlasSpend,
@@ -1239,12 +1317,16 @@ export async function runAtlasProviderE2E(
         // Identity holds across the push, and identical inputs reuse their prose.
         for (const c of now)
           if (c.sameInputs) assert(!c.reinferred, `${c.name} was inferred again`);
-        assert(
-          now.some((c) => c.sameInputs),
-          `A README edit changed every capability's inputs: ${now
-            .map((c) => `${c.name} (${c.changedParts.join(", ") || "parts not recorded"})`)
-            .join("; ")}`,
-        );
+        assert.equal(changed, 0, "An identical tree must preserve every capability's inputs");
+        assert.equal(stats.atlasDescribed.capabilities, beforeCapabilities.length);
+        assert.equal(stats.atlasDescribed.current, beforeCapabilities.length);
+        assert.equal(stats.atlasDescribed.cached, beforeCapabilities.length);
+        assert.equal(stats.atlasDescribed.inferred, 0);
+        assert.equal(stats.atlasSpend.calls, 0);
+        assert.equal(stats.atlasSpend.inputTokens, 0);
+        assert.equal(stats.atlasSpend.outputTokens, 0);
+        assert.equal(stats.atlasSpend.usd, 0);
+        assert.equal(stats.atlasTimings.modelCalls, 0);
         assert.equal(stats.atlasSpend.calls, stats.atlasDescribed.inferred);
         assert(stats.atlasDescribed.inferred <= changed, "Only changed inputs may be inferred");
         assert.equal(stats.atlasTimings.mode, "incremental");

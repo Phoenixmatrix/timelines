@@ -66,6 +66,199 @@ function fixture() {
   };
 }
 
+describe("Knowledge completion evidence", () => {
+  test("an exact issue key cannot be evicted by newer prefix matches before the result limit", () => {
+    const f = fixture();
+    f.mutate({
+      kind: "subscription.add",
+      id: "sub",
+      data: { workspaceId: "workspace", repoId: "repo" },
+    });
+    for (let number = 1; number <= 10; number++)
+      f.mutate({
+        kind: "issue.create",
+        id: `work-${number}`,
+        data: {
+          teamId: "team",
+          title: `Work ${number}`,
+          workspaceIds: ["workspace"],
+        },
+      });
+    f.mutate({
+      kind: "comment.add",
+      id: "exact-proof",
+      data: {
+        issueId: "work-1",
+        kind: "evidence",
+        body: "Original exact issue verification",
+      },
+    });
+    f.advance(1000);
+    for (let number = 0; number < 35; number++)
+      f.mutate({
+        kind: "comment.add",
+        id: `prefix-proof-${number}`,
+        data: {
+          issueId: "work-10",
+          kind: "evidence",
+          body: "Newer prefix issue verification",
+        },
+      });
+    const result = f.store.completionEvidence(
+      "repo",
+      {
+        text: "eng-1",
+        lower: "eng-1",
+        words: ["eng-1"],
+      },
+      31,
+    );
+    expect(result.map((note) => [note.id, note.issue.key])).toEqual([["exact-proof", "ENG-1"]]);
+  });
+
+  test("reads original notes only in live subscribed workspaces, including reopened issues", () => {
+    const f = fixture();
+    f.mutate(
+      { kind: "subscription.add", id: "sub", data: { workspaceId: "workspace", repoId: "repo" } },
+      {
+        kind: "issue.create",
+        id: "work",
+        data: {
+          teamId: "team",
+          title: "Verify parcels",
+          workspaceIds: ["workspace"],
+        },
+      },
+      {
+        kind: "comment.add",
+        id: "proof",
+        data: {
+          issueId: "work",
+          kind: "evidence",
+          body: "Checked modulus 65521 at abc123",
+        },
+      },
+      {
+        kind: "comment.add",
+        id: "chat",
+        data: {
+          issueId: "work",
+          kind: "comment",
+          body: "modulus 65521 conversation",
+        },
+      },
+      { kind: "issue.create", id: "elsewhere", data: { teamId: "team", title: "Other workspace" } },
+      {
+        kind: "comment.add",
+        id: "private",
+        data: {
+          issueId: "elsewhere",
+          kind: "evidence",
+          body: "modulus 65521 elsewhere",
+        },
+      },
+    );
+    const query = { text: "modulus 65521", lower: "modulus 65521", words: ["modulus", "65521"] };
+    const original = f.store.snapshot(f.access).comments.find((c) => c.id === "proof")!;
+    expect(f.store.completionEvidence("repo", query)).toEqual([
+      {
+        ...original,
+        issue: {
+          id: "work",
+          key: "ENG-1",
+          title: "Verify parcels",
+          status: "todo",
+          doneIn: undefined,
+        },
+      },
+    ]);
+    expect(f.store.completionEvidence("other-repo", query)).toEqual([]);
+    expect(
+      f.store.completionEvidence("repo", { text: "ENG-1", lower: "eng-1", words: ["eng-1"] }),
+    ).toHaveLength(1);
+    f.mutate({ kind: "issue.update", id: "work", expectedVersion: 1, data: { status: "done" } });
+    f.mutate({ kind: "issue.update", id: "work", expectedVersion: 2, data: { status: "todo" } });
+    expect(f.store.completionEvidence("repo", query)[0]).toMatchObject({
+      ...original,
+      issue: { status: "todo" },
+    });
+    f.mutate({ kind: "subscription.remove", id: "sub" });
+    expect(f.store.completionEvidence("repo", query)).toEqual([]);
+  });
+});
+
+describe("optional completion evidence", () => {
+  test.each([undefined, "", " \n "])("completes without a fake note for %j", (evidence) => {
+    const f = fixture();
+    f.issue("work");
+    const leaseToken = f.mutate({ kind: "issue.claim", id: "work", data: { agent: "worker" } })
+      .results[0]!.leaseToken!;
+    expect(() =>
+      f.mutate({
+        kind: "issue.complete",
+        id: "work",
+        data: { leaseToken: "forged", evidence },
+      }),
+    ).toThrow();
+    f.mutate({ kind: "issue.complete", id: "work", data: { leaseToken, evidence } });
+    const snapshot = f.store.snapshot(f.access);
+    expect(snapshot.issues.find((i) => i.id === "work")).toMatchObject({
+      status: "done",
+      claim: null,
+    });
+    expect(snapshot.comments).toEqual([]);
+  });
+
+  test("preserves historical evidence and attribution across completion, replay and reopening", () => {
+    const f = fixture();
+    f.issue("work");
+    f.mutate({
+      kind: "comment.add",
+      id: "historical",
+      data: {
+        issueId: "work",
+        kind: "evidence",
+        body: "Earlier verification",
+      },
+    });
+    const historical = f.store.snapshot(f.access).comments[0];
+    const leaseToken = f.mutate({ kind: "issue.claim", id: "work", data: { agent: "worker" } })
+      .results[0]!.leaseToken!;
+    const request = {
+      operationId: "finish-with-evidence",
+      mutations: [
+        {
+          kind: "issue.complete" as const,
+          id: "work",
+          data: {
+            leaseToken,
+            evidence: "Verified exact commit abc123",
+          },
+        },
+      ],
+    };
+    f.store.mutate(f.access, request);
+    f.store.mutate(f.access, request);
+    const snapshot = f.store.snapshot(f.access);
+    expect(snapshot.comments).toHaveLength(2);
+    expect(snapshot.comments).toContainEqual(historical);
+    expect(snapshot.comments.find((c) => c.id !== "historical")).toMatchObject({
+      issueId: "work",
+      kind: "evidence",
+      body: "Verified exact commit abc123",
+      actorId: "alice",
+      createdAt: snapshot.serverTime,
+    });
+    f.mutate({
+      kind: "issue.update",
+      id: "work",
+      expectedVersion: snapshot.issues.find((i) => i.id === "work")!.version,
+      data: { status: "todo" },
+    });
+    expect(f.reopen().snapshot(f.access).comments).toEqual(snapshot.comments);
+  });
+});
+
 describe("durable tag definitions", () => {
   test("registers exact labels, retaining unused definitions across restarts", () => {
     const f = fixture();

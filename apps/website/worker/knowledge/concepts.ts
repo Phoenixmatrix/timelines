@@ -28,7 +28,7 @@
 // the glossary framing with file paths (no summaries) ranked pairs best, and
 // merges at level 2 were all correct; see the README.
 
-import type { InferResult } from "kysely";
+import { sql, type InferResult } from "kysely";
 import type { AiModels } from "../../shared/ai.ts";
 import { batch, db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
@@ -728,7 +728,7 @@ const REVIEW_QUESTION: Record<string, ClefQuestion> = {
 
 export interface ReviewStats {
   candidates: number;
-  /** Pairs asked now; any answer can regroup concepts, so the build settles again only then. */
+  /** Answered pairs this round, including persisted answers from earlier step attempts. */
   asked: number;
   /** Reviewed pairs judged the same that are still separate groups. */
   newMerges: number;
@@ -743,6 +743,7 @@ export async function reviewConcepts(
   models: AiModels,
   repoId: string,
   graph: Pick<BuiltGraph, "nodes" | "conceptFiles">,
+  build: { id: string; round: number },
 ): Promise<ReviewStats> {
   const d1 = env.DB;
   const kept = new Map(
@@ -782,7 +783,7 @@ export async function reviewConcepts(
     ...kept.get(key),
     mentioned_in: (graph.conceptFiles.get(key) ?? []).slice(0, 4),
   });
-  let asked = 0;
+  const path = `$.conceptReviewRoundsAsked."${build.round}"`;
   // Each answer is saved as it arrives, so a retried step doesn't ask again.
   await pool([...candidates], CLEF_CONCURRENCY, async (pk) => {
     const [a, b] = splitPair(pk);
@@ -796,9 +797,8 @@ export async function reviewConcepts(
     );
     const link = answers.link;
     const score = link?.type === "score" ? link.score : 0;
-    asked++;
     reviews.set(pk, { a, b, score, inputs_hash: hash });
-    await db(d1)
+    const save = db(d1)
       .insertInto("kg_concept_reviews")
       .values({ repo_id: repoId, a, b, score, inputs_hash: hash })
       .onConflict((oc) =>
@@ -806,9 +806,29 @@ export async function reviewConcepts(
           score: eb.ref("excluded.score"),
           inputs_hash: eb.ref("excluded.inputs_hash"),
         })),
-      )
-      .execute();
+      );
+    // Cache and counters commit together: a retry neither loses an answer
+    // from its totals nor counts a cached answer twice. Failed model calls
+    // stay in aiUsage.failedCalls, not this successful-answer count.
+    await batch(d1, [
+      save,
+      db(d1)
+        .updateTable("kg_builds")
+        .set({
+          stats: sql<string>`json_set(stats,
+            '$.conceptReviewsAsked', coalesce(json_extract(stats, '$.conceptReviewsAsked'), 0) + 1,
+            ${path}, coalesce(json_extract(stats, ${path}), 0) + 1)`,
+        })
+        .where("id", "=", build.id)
+        .where("repo_id", "=", repoId),
+    ]);
   });
+  const { asked } = await db(d1)
+    .selectFrom("kg_builds")
+    .select(sql<number>`coalesce(json_extract(stats, ${path}), 0)`.as("asked"))
+    .where("id", "=", build.id)
+    .where("repo_id", "=", repoId)
+    .executeTakeFirstOrThrow();
   const newMerges = [...reviews.values()].filter(
     (r) => r.score >= SAME && (canonical.get(r.a) ?? r.a) !== (canonical.get(r.b) ?? r.b),
   ).length;

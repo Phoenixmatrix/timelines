@@ -72,9 +72,10 @@ lease, and work on independent, separately claimed work while it runs. Inspect
 queue state at work boundaries or the next invocation; do not busy-poll. Use a
 bounded wait when deliberately waiting to finish. `gm sync` later reconciles
 landed history; queue admission does not mark local commits immutable.
-Complete with honest commit, queue, CI and required deployment evidence only
-when the issue's actual acceptance is verified:
-`gm issue complete ENG-1 --evidence '…'`.
+Complete only when the issue's actual acceptance is verified. Include honest
+commit, queue, CI and required deployment evidence with
+`gm issue complete ENG-1 --evidence '…'`; the evidence argument is optional, not
+a waiver of verification, repository gates or approval requirements.
 
 Automatic failures create unassigned, top-level P0 `remediation` issues.
 Discover them with `gm issue ready --type remediation --all-teams`; use
@@ -498,6 +499,28 @@ gm issue checkpoint ENG-1 'Implementation complete; verifying edge cases'
 gm issue complete ENG-1 --evidence '@verification.md'
 # Or: gm issue release ENG-1
 ```
+
+`--evidence` is recommended, **not required** (CORE-126). It accepts literal text,
+`@path` to read a file, or `-` to read stdin:
+
+```bash
+gm issue complete ENG-1 --evidence 'Verified the changed consumer; CI run #42 passed'
+gm issue complete ENG-1 --evidence '@verification.md'
+gm issue complete ENG-1 --evidence - < verification.md
+gm issue complete ENG-1
+```
+
+Use only the form appropriate to your actual results. Omitting evidence, or
+supplying only whitespace, completes without inventing a note. This does not
+relax acceptance, lease fencing, repository gates or required human approvals.
+Prefer genuine verification results and links over generic assertions.
+
+`gm issue show ENG-1` exposes a dedicated **Completion evidence** section
+(`completionEvidence` in JSON), separate from bounded recent `notes`. Evidence
+keeps its original actor, timestamp and body even after newer comments push it
+out of recent notes, and remains available if the issue is reopened. Historical
+evidence is a record of what was verified then, not proof that reopened work is
+complete.
 
 Claim/renew/release/complete always require online access. Tokens appear only in
 claim/renew responses, never normal list/context/status output or SQLite. gm keeps
@@ -990,6 +1013,33 @@ canonical repository/change-ID/commit keys and author rules. Compact canonical
 landings link through integration receipts to the full WIP steps; `gm why` and
 release notes use that provenance rather than a second merge parent. Missing,
 ambiguous or expired source evidence is not guessed from matching change IDs.
+
+## Environment settings
+
+Discover the quota controls with `gm settings environments --help`. Both the
+installation-wide cap and this OS user's per-machine cap default to **4**;
+raising the local cap cannot override the installation cap.
+
+```bash
+gm settings environments show --local
+gm settings environments set --local --max 4 --authority https://YOUR-GITMATRIX
+GM_SERVER=https://YOUR-GITMATRIX gm settings environments show --site
+GM_SERVER=https://YOUR-GITMATRIX gm settings environments set --site --max 4
+```
+
+Choose exactly one scope: `--local` manages this user's machine settings across
+worktrees, while `--site` addresses the current `gm` server. Local `set` accepts
+`--max`, `--authority`, or both; site `set` takes `--max` and requires a signed-in
+**human site administrator**. Zero pauses new allocations; lowering a cap does
+not evict existing environments.
+
+Configure the same explicit authority on every participating host. Existing
+environments pin that authority; missing configuration/API/authentication fails
+closed, with no implicit selection from scoped credentials or offline fallback.
+For canonical configuration, legacy adoption/drain, failed/expired/orphan capacity
+and cleanup recovery boundaries, read
+[environment limits and quota authority](../../README.md#environment-limits-and-quota-authority)
+and [cleanup and cost bounds](../../README.md#cleanup-and-cost-bounds).
 
 ## Automatic AI settings
 

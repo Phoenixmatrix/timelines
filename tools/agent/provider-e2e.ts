@@ -14,6 +14,7 @@ import type {
 } from "../../apps/website/shared/assistant-skills.ts";
 import type { CodeSource, SourceSnapshot } from "../../apps/website/shared/code-source.ts";
 import type { Landing } from "../../apps/website/shared/timelines.ts";
+import type { Comment, MutationResult } from "../../apps/website/shared/tracker.ts";
 import type {
   ReleaseFeed,
   ReleaseNoteEntry,
@@ -110,11 +111,15 @@ export const COPPER_FINCH_STAGES = [
   {
     id: "release-notes",
     covers:
-      "Daily notes and their rollover, a named tag, a tracker issue's entry and the team feed",
+      "Daily notes and their rollover, a named tag, a tracker issue's entry and team feed; original completion evidence retrieved through Knowledge and a real assistant turn with tracker permissions",
     requires: ["knowledge-edit"],
     paths: [
       HARNESS,
       `${WORKER}/release-notes/**`,
+      `${WORKER}/assistant/tools.ts`,
+      `${WORKER}/tracker/store.ts`,
+      `${WORKER}/tracker/object.ts`,
+      `${SHARED}/tracker.ts`,
       `${WORKER}/git/effects.ts`,
       `${SHARED}/release-notes.ts`,
       `${SRC}/routes/repo/Releases.tsx`,
@@ -309,8 +314,9 @@ async function gatewayLogs(
 }
 
 /**
- * Whether one log kept its request and response bodies (CORE-290): their
- * sizes in bytes, or null where the gateway has none. Never their content.
+ * Whether one log kept its request and response bodies (CORE-290): cf's
+ * serialized output bytes, or null where the gateway has none. Never content
+ * or an estimate of the original provider payload size.
  */
 async function gatewayBodies(owned: Environment, id: string) {
   const size = async (which: "get-request" | "get-response") => {
@@ -335,7 +341,8 @@ async function gatewayBodies(owned: Environment, id: string) {
       throw new Error(`Gateway ${which} lookup failed for ${id}`);
     }
   };
-  return { request: await size("get-request"), response: await size("get-response") };
+  const [request, response] = await Promise.all([size("get-request"), size("get-response")]);
+  return { request, response };
 }
 
 /**
@@ -2061,6 +2068,7 @@ export async function runProviderE2E(
               id: "copper-issue",
               data: {
                 teamId: "copper-team",
+                workspaceIds: ["copper-ws"],
                 title: "Let receivers verify a batch of Copper Finch parcels",
                 description:
                   "Receivers check many parcels at once. Add copperFinchVerifyAll, which is true only when every parcel matches its expected checksum.",
@@ -2072,7 +2080,10 @@ export async function runProviderE2E(
           operationId: operation(),
           mutations: [{ kind: "issue.claim", id: "copper-issue", data: { agent: "provider-e2e" } }],
         });
-        await api(`/tracker/${owner}/mutate`, "POST", {
+        const completionBody =
+          `Verified Copper Finch build ${final}: Knowledge graph contains copperFinchChecksum in checksum.ts; ` +
+          `the generated overview explains checksum behavior. Verification receipt ${randomBytes(8).toString("hex")}.`;
+        const completed: MutationResult = await api(`/tracker/${owner}/mutate`, "POST", {
           operationId: operation(),
           mutations: [
             {
@@ -2080,11 +2091,142 @@ export async function runProviderE2E(
               id: "copper-issue",
               data: {
                 leaseToken: claim.results[0].leaseToken,
-                evidence: "copperFinchVerifyAll checks every parcel against its checksum.",
+                evidence: completionBody,
               },
             },
           ],
         });
+        enter("completion-evidence-consumers");
+        const original = completed.events.find(
+          (event) =>
+            event.entityType === "comment" && (event.entity as Comment)?.kind === "evidence",
+        )?.entity as Comment | undefined;
+        assert(original, "Completion must emit its original evidence comment");
+        assert.equal(original.body, completionBody);
+        const completionPath = `${base}/knowledge/completion-evidence?q=CF-1`;
+        const found = await api(completionPath);
+        const sourceUrl = `/tracker/${owner}/issues/CF-1#evidence-${original.id}`;
+        const note = found.evidence.find((entry: Comment) => entry.id === original.id);
+        assert(note, "Knowledge must return the actual completion comment");
+        for (const field of ["id", "issueId", "body", "actorId", "createdAt", "kind"] as const)
+          assert.equal(note[field], original[field], `Knowledge must preserve evidence ${field}`);
+        assert.equal(note.issue.key, "CF-1");
+        assert.equal(note.issue.status, "done");
+        assert.equal(note.trackerOwner, owner);
+        assert.equal(note.url, sourceUrl);
+        assert.equal(found.truncated, false);
+
+        // Sam can read this repository, but is not a member of Orbit's tracker.
+        await api(`${base}/collaborators/sam`, "PUT", { role: "read" });
+        const repoOnly = await fetch(`${ctx.origin}/api${completionPath}`, {
+          headers: { authorization: `Bearer ${fixtures.tokens.sam}` },
+          signal: AbortSignal.timeout(60_000),
+        });
+        assert.equal(repoOnly.status, 200, "A repository collaborator can reach Knowledge");
+        const restricted = await repoOnly.json();
+        assert.deepEqual(
+          restricted.evidence,
+          [],
+          "Repository access must not grant tracker evidence",
+        );
+        const removed = await fetch(`${ctx.origin}/api${base}/collaborators/sam`, {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+          signal: AbortSignal.timeout(60_000),
+        });
+        assert.equal(removed.status, 204, "Remove the temporary repository-only reader");
+
+        // Do not put the answer, receipt or URL in the prompt: only a real
+        // Knowledge tool result can supply those discriminating values.
+        const asked = await fetch(`${ctx.origin}/api/assistant/ask`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${fixtures.tokens[persona]}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            repo: `${owner}/${name}`,
+            question:
+              `Search Knowledge with query CF-1 in ${owner}/${name} for its recorded completion evidence. ` +
+              "Quote the complete original verification evidence verbatim, including its receipt, and cite its source URL.",
+          }),
+          signal: AbortSignal.timeout(180_000),
+        });
+        assert.equal(asked.status, 200, "The completion-evidence assistant turn must start");
+        const turn = (await asked.text())
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as { type: string; [key: string]: unknown });
+        const done = turn.find((event) => event.type === "done") as { answer: string } | undefined;
+        const chat = turn.find((event) => event.type === "chat") as { chatId: string } | undefined;
+        evidence.completionEvidence = { original, note, restricted, sourceUrl, turn };
+        assert(done && chat, "The real completion-evidence turn must finish and persist");
+        assert(
+          done.answer.includes(completionBody),
+          "The answer must quote the original verification evidence",
+        );
+        assert(
+          done.answer.includes(sourceUrl),
+          "The answer must cite the original evidence anchor",
+        );
+        type EvidenceResult = {
+          error?: unknown;
+          evidence?: (Comment & {
+            url: string;
+            trackerOwner: string;
+            issue: { key: string; status: string };
+          })[];
+        };
+        const messages: {
+          parts: {
+            type: string;
+            state?: string;
+            input?: { repo?: string; path?: string };
+            output?: EvidenceResult & { completionEvidence?: EvidenceResult };
+          }[];
+        }[] = await api(`/assistant/chats/${chat.chatId}/agent/get-messages`);
+        // Dedicated search nests the live Knowledge result; api_get returns it
+        // directly. Require a successful saved receipt from this repository's
+        // Knowledge endpoint, not a particular model-selected tool name.
+        const receipts = messages.flatMap((message) =>
+          message.parts.filter(
+            (part) =>
+              part.state === "output-available" &&
+              part.output &&
+              part.output.error === undefined &&
+              ((part.type === "tool-search_code" && part.input?.repo === `${owner}/${name}`) ||
+                (part.type === "tool-api_get" &&
+                  part.input?.path?.split("?")[0] === `${base}/knowledge/completion-evidence`)),
+          ),
+        );
+        evidence.completionEvidence = { original, note, restricted, sourceUrl, turn, receipts };
+        const retrieved = receipts
+          .flatMap((part) => {
+            const result =
+              part.type === "tool-search_code" ? part.output?.completionEvidence : part.output;
+            return result?.error === undefined && Array.isArray(result?.evidence)
+              ? result.evidence
+              : [];
+          })
+          .find((entry) => entry.id === original.id);
+        assert(
+          retrieved,
+          "A successful persisted Knowledge tool receipt must contain completion evidence",
+        );
+        for (const field of ["id", "issueId", "body", "actorId", "createdAt", "kind"] as const)
+          assert.equal(
+            retrieved[field],
+            original[field],
+            `Assistant tool must preserve evidence ${field}`,
+          );
+        assert.equal(retrieved.issue.key, "CF-1");
+        assert.equal(retrieved.issue.status, "done");
+        assert.equal(retrieved.trackerOwner, owner);
+        assert.equal(
+          retrieved.url,
+          sourceUrl,
+          "The persisted tool receipt must keep the source anchor",
+        );
       }
       if (want("release-notes") || want("overlays") || want("timeline-pages")) {
         // The commit citing CF-1: release notes assert its entry; the timelines fork around it.
@@ -3029,10 +3171,9 @@ export async function runProviderE2E(
             return successful.length >= requirement.minimum;
           });
           if (requirement.bodies !== undefined) {
-            // A few successful calls' bodies: kept, or not, as their settings
-            // say. Bodies can land a while after a log's metadata, so a kept
-            // one is waited for (any of the first few; a very large request
-            // may not be stored whole), and none may appear where they're off.
+            // Inspect a bounded sample, not every call in the run. Metadata
+            // may precede bodies, but every sampled enabled log must retain
+            // both bodies: missing bodies are not evidence of a size limit.
             const { logs } = await gatewayLogs(
               owned,
               String(evidence.startedAt),
@@ -3045,18 +3186,20 @@ export async function runProviderE2E(
             const deadline = Date.now() + 180_000;
             for (;;) {
               for (const log of inspected) seen[log.id] = await gatewayBodies(owned, log.id);
-              const kept = Object.values(seen).some((b) => b.request && b.response);
+              const kept = Object.values(seen).every((b) => b.request && b.response);
               if (!requirement.bodies || kept || Date.now() > deadline) break;
               await delay(10_000);
             }
             (gatewayEvidence[requirement.key] as Record<string, unknown>).bodies = {
               expected: requirement.bodies,
+              sampleLimit: 3,
+              byteMeasurement: "cf serialized output, not original provider payload",
               logs: seen,
             };
             if (requirement.bodies)
               assert(
-                Object.values(seen).some((b) => b.request && b.response),
-                `${requirement.key}: the Gateway logs must keep request and response bodies`,
+                Object.values(seen).every((b) => b.request && b.response),
+                `${requirement.key}: every sampled Gateway log must keep request and response bodies`,
               );
             else
               assert(
@@ -3183,6 +3326,17 @@ export async function runProviderE2E(
           before.durable.some((d) => d.class === "KnowledgeCoordinator" && !d.purgedAt),
           "The fixture's coordinator is registered",
         );
+        const planted = await dev<{
+          repoId: string;
+          artifactsName: string;
+          itemId: string | null;
+          vectorId: string | null;
+        }>("/repo-orphans", "POST", { action: "plant" });
+        deletionEvidence.planted = planted;
+        assert(planted.itemId && planted.vectorId, "An orphan was planted in each provider");
+        // CORE-291: let the orphan's asynchronous provider upserts settle
+        // during the fixture's killed/resumed purge, not afterward. The sweep
+        // still waits for Atlas below and every visibility assertion remains.
         const deleted = await fetch(`${ctx.origin}/api${base}`, {
           method: "DELETE",
           headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
@@ -3242,14 +3396,6 @@ export async function runProviderE2E(
         enter("repository-orphan-sweep");
         const atlasError = await atlas;
         if (atlasError) throw atlasError;
-        const planted = await dev<{
-          repoId: string;
-          artifactsName: string;
-          itemId: string | null;
-          vectorId: string | null;
-        }>("/repo-orphans", "POST", { action: "plant" });
-        deletionEvidence.planted = planted;
-        assert(planted.itemId && planted.vectorId, "An orphan was planted in each provider");
         // Vectorize applies upserts asynchronously: the orphan must be findable first.
         await waitFor("repository-orphan-planted", 300_000, async () => {
           const seen = await inventoryOf(planted.repoId).catch(() => null);

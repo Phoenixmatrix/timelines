@@ -220,19 +220,16 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   await expect
     .element(step.getByRole("button", { name: /Next/ }))
     .toHaveAttribute("aria-keyshortcuts", "j ArrowRight ArrowDown");
-  // Arrows and visible actions agree with the letter keys.
-  // A pointer action followed by a key before React commits must take two
-  // hops, not navigate again from the rendered (older) selection.
-  (step.getByRole("button", { name: /Previous/ }).element() as HTMLButtonElement).click();
+  // A click and key in one turn use the clicked destination before React
+  // renders it, rather than stepping from the previous selection.
+  step
+    .getByRole("button", { name: /Previous/ })
+    .element()
+    .dispatchEvent(new MouseEvent("click", { bubbles: true }));
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
   await app.waitForUrl((url) => url.searchParams.get("step") === merge);
-  await userEvent.keyboard("{ArrowDown}{ArrowDown}");
-  await app.waitForUrl((url) => url.searchParams.get("step") === plain);
-  await userEvent.click(step.getByRole("button", { name: /Previous/ }));
-  await app.waitForUrl((url) => url.searchParams.get("step") === rank);
+  await expect.element(context).toMatchTextContent(/Bring in main.s tokenizer/);
   await userEvent.keyboard("{ArrowDown}");
-  await app.waitForUrl((url) => url.searchParams.get("step") === plain);
-  await userEvent.keyboard("{ArrowUp}");
   await app.waitForUrl((url) => url.searchParams.get("step") === rank);
   await userEvent.click(step.getByRole("button", { name: /Next/ }));
   await app.waitForUrl((url) => url.searchParams.get("step") === plain);

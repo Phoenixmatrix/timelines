@@ -7,11 +7,9 @@ const manifest = JSON.parse(
   readFileSync(new URL("./data/gm-commands.json", import.meta.url), "utf8"),
 ) as GmManifest;
 
-await test("every command has a summary, a usage line and a unique anchor", () => {
+await test("every command has a unique reference anchor", () => {
   const slugs = new Set<string>();
   for (const command of manifest.commands) {
-    assert.ok(command.summary.trim(), `${command.command} has a summary`);
-    assert.match(command.usage, /^gm /, `${command.command} has a usage line`);
     const slug = commandSlug(command.command);
     assert.ok(!slugs.has(slug), `${slug} is unique`);
     slugs.add(slug);

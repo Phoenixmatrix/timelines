@@ -84,6 +84,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - Ready = todo, every blocker done, nobody holding a claim, no open sub-issues. find_issues with ready: true finds them.
 - Links: "A blocks B" (B can't start until A is done), related, duplicates. Parent/sub-issue is structure, not blocking.
 - A claim (lease) means an agent is working on it; only its holder changes its status. Don't change status on claimed issues.
+- Completion evidence is the original evidence note, not a done status. show_issue returns completionEvidence separately, including original author, time and a citeable URL. When completing work, provide actual checks/results and links via gm issue complete --evidence TEXT or comment_on_issue(kind: "evidence"). Validation is optional: if nothing was verified, omit evidence rather than inventing a passing result. Historical notes remain visible after reopening.
 - Queue failures create P0 remediation issues and read-only queueFailure evidence on the remediation and linked original issues: queueId, repo, commit, stage, kind, reason, runNumber, failedJobs, conflictPaths, classificationModel, repairModel and occurredAt. Never forge or edit these system fields. Monitor open remediation with type: remediation in find_issues; inspect issue detail and the actual CI run, not only the issue title.
 - For independent default-branch work, gm push --queue --issue KEY explicitly submits asynchronously: save the queue ID in a checkpoint and distinguish accepted, landed, and deployed. Check gm queue show ID or gm queue wait ID --deploy at work boundaries rather than busy polling. Continue independent work only while honoring existing claims; keep/renew the original lease or complete it with honest evidence under its acceptance criteria.
 - A failure does not grant ownership. Claim remediation through the normal online fenced gm issue claim/next protocol and require the returned lease token before changing status or repairing. Inspect conflict paths and run logs, push the fix, and complete only with actual recovery evidence. No ready result means stop or wait, not widen scope or steal a claim.
@@ -140,6 +141,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 
 - Every push rebuilds a graph of the repository: files, symbols, components and concepts, each summarized, with links (defines, imports, contains, uses).
 - search_code searches it by meaning. read_wiki without a slug gives the table of contents; with one, the page. The wiki is generated from the graph and cites sources.
+- search_code also returns completionEvidence from the repository's subscribed workspaces, limited to trackers you may read. Search by issue key or distinctive words from the verification result; this is live recorded evidence, not generated wiki prose. Cite each note's URL, actorId and createdAt, and distinguish historical evidence from current issue status. For evidence alone, api_get /repos/:o/:n/knowledge/completion-evidence?q=KEY reads the same source without a model or build.
 - api_get /repos/:o/:n/knowledge/graph/node?id=... reads a node and its neighbours (ids look like file:path, sym:path#name, component:name).
 - Prefer the wiki overview for "what is this repository / how does X work at a high level"; read code for exact behaviour.
 - Link: [the wiki](/<owner>/<repo>/wiki), [the map](/<owner>/<repo>/knowledge?node=<id>).`,
@@ -181,7 +183,7 @@ Use navigate when the person asks to go somewhere or see something, or to show w
 gm is jj-style version control plus the Gitmatrix client. Every edit lives in a change; operations can be undone (gm undo).
 - gm clone owner/repo · gm status · gm commit -m "…" · gm push (gm push --sync when trunk moved) · gm sync · gm log
 - gm runs list / wait / logs --follow · gm secret set NAME
-- gm issue create "Title" --team CORE [--owner <tracker>] · gm issue next · claim · checkpoint · complete --evidence · gm request list/answer
+- gm issue create "Title" --team CORE [--owner <tracker>] · gm issue next · claim · checkpoint · complete [--evidence TEXT] · gm request list/answer. Provide actual completion evidence when available; it is recommended, not required. gm issue show returns completionEvidence with original attribution.
 - gm pkg upload/download/install · gm agent setup (configure a coding agent for a checkout)
 - gm ask "question" — ask this assistant from a terminal (read-only unless --write)
 - gm cli guide (the workflow), gm cli search "<task>", gm schema <command>

@@ -492,12 +492,13 @@ pub enum IssueCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Complete claimed work online with durable evidence and a valid fencing token.
+    /// Complete claimed work online with a valid fencing token. Include actual verification evidence when available.
     Complete {
         #[command(flatten)]
         lease: Lease,
+        /// Recommended, not required: verification results and links. '-' reads stdin; '@path' reads a file.
         #[arg(long)]
-        evidence: String,
+        evidence: Option<String>,
     },
     /// Queue one atomic mutation array (max 100). Create referenced IDs before using them; '-' reads stdin, '@path' reads a file.
     Batch {

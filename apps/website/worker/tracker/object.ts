@@ -283,6 +283,9 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   subscribedWorkspaces(repoId: string) {
     return this.reply(() => this.store.subscribedWorkspaces(repoId));
   }
+  completionEvidence(repoId: string, query: SearchQuery, limit = 30) {
+    return this.reply(() => this.store.completionEvidence(repoId, query, limit));
+  }
   subscriptionRepoIds(subscriptionIds: string[]) {
     return this.reply(() => this.store.subscriptionRepoIds(subscriptionIds));
   }

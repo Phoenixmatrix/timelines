@@ -189,7 +189,7 @@ const app = new Hono<AppEnv>();
 app.use(async (c, next) => {
   c.set("timing", new Timing());
   const world = worldOf(c.req.header("x-browser-test-world") ?? "");
-  const persona = (c.req.header("x-browser-test-as") || world.persona) as Persona;
+  const persona = (c.req.header("x-browser-test-as") ?? world.persona) as Persona;
   // One of the world's agents, signed in as if with its token (its person's access).
   const agentId = c.req.header("x-browser-test-agent");
   if (agentId) {

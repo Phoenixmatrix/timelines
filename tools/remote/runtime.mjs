@@ -7,6 +7,7 @@ export const runtimeSource = String.raw`(async function runtime() {
   const crypto = await import("node:crypto");
   const { spawn } = await import("node:child_process");
   const { pipeline } = await import("node:stream/promises");
+  const { StringDecoder } = await import("node:string_decoder");
   const ROOT = "/workspace/repo";
   const STATE = "/workspace/.remote";
   const MAX_FILE = 64 * 1024 * 1024;
@@ -50,11 +51,22 @@ export const runtimeSource = String.raw`(async function runtime() {
   const allowedEnv = new Set(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CI", "NODE_ENV", "GITMATRIX_REMOTE_ORIGIN", "GITMATRIX_AGENT_ID", "GITMATRIX_AGENT_PORT", "GITMATRIX_DEV_AI", "GITMATRIX_DEV_EMAIL", "GITMATRIX_DEV_PASSWORD", "GITMATRIX_AI", "GITMATRIX_PUBLIC_URL", "GITMATRIX_CI_IMAGE", "GITMATRIX_CONTAINER_IMAGES", "RUST_LOG", "CARGO_BUILD_JOBS"]);
   allowedEnv.add("GITMATRIX_REMOTE_HOSTED");
   allowedEnv.add("GITMATRIX_AGENT_EXECUTION");
+  allowedEnv.add("GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY");
+  allowedEnv.add("GITMATRIX_ENVIRONMENT_QUOTA_TOKEN");
   const checkedEnv = (env = {}) => {
     if (!env || typeof env !== "object" || Array.isArray(env)) fail("Invalid environment");
     for (const [key, value] of Object.entries(env)) if (!allowedEnv.has(key) || typeof value !== "string" || value.length > 32768 || value.includes("\0")) fail("Environment key is not allowed: " + key);
     if (env.GITMATRIX_REMOTE_HOSTED !== undefined && env.GITMATRIX_REMOTE_HOSTED !== "1" || env.GITMATRIX_AGENT_EXECUTION !== undefined && env.GITMATRIX_AGENT_EXECUTION !== "local") fail("Hosted execution mode is fixed");
     return env;
+  };
+  // Keep rotation history private for this disposable runtime. Logs are scrubbed
+  // before persistence, so reconnecting clients need no historical credentials.
+  const redactionFile = STATE + "/redaction-secrets.json";
+  const secretValues = (env) => Object.entries(env).filter(([key, value]) => /TOKEN|SECRET|PASSWORD/.test(key) && typeof value === "string" && value).map(([, value]) => value);
+  const rememberSecrets = (env) => {
+    const values = new Set(exists(redactionFile) ? json(redactionFile) : []);
+    for (const value of secretValues(env)) values.add(value);
+    save(redactionFile, [...values]);
   };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const processInfo = (pid) => {
@@ -105,6 +117,34 @@ export const runtimeSource = String.raw`(async function runtime() {
     let reason;
     let finishing = false;
     let deadline;
+    let logsClosed = Promise.resolve();
+    const flushLogs = [];
+    const logWriter = () => {
+      const decoder = new StringDecoder("utf8");
+      let pending = "";
+      let revision;
+      let values = secretValues(spec.env);
+      const write = (chunk, done = false) => {
+        if (exists(redactionFile)) {
+          const stat = fs.statSync(redactionFile);
+          const next = stat.mtimeMs + ":" + stat.size;
+          if (next !== revision) { values = [...new Set([...values, ...json(redactionFile)])]; revision = next; }
+        }
+        pending += done ? decoder.end() : decoder.write(chunk);
+        for (const value of values) pending = pending.split(value).join("[redacted]");
+        let keep = 0;
+        if (!done) for (const value of values) {
+          for (let length = Math.min(value.length - 1, pending.length); length > keep; length--) {
+            if (pending.endsWith(value.slice(0, length))) { keep = length; break; }
+          }
+        }
+        const end = pending.length - keep;
+        if (end) fs.writeSync(log, pending.slice(0, end));
+        pending = pending.slice(end);
+      };
+      flushLogs.push(() => write(null, true));
+      return write;
+    };
     const capture = () => { record.owned = ownedProcesses(record); save(file, record); };
     stop = (cause) => {
       if (reason || finishing) return;
@@ -134,11 +174,17 @@ export const runtimeSource = String.raw`(async function runtime() {
         capture();
       }
       clearInterval(monitor);
+      await logsClosed;
+      for (const flush of flushLogs) flush();
       save(file, { ...record, status: reason === "cancelled" ? "stopped" : reason === "timeout" ? "failed" : code === 0 ? "succeeded" : "failed", exitCode: reason === "timeout" ? 124 : reason === "cancelled" ? 143 : code, finishedAt: Date.now() });
       fs.closeSync(log);
     };
     try {
-      child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env: spec.env, detached: true, stdio: ["ignore", log, log] });
+      child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env: spec.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      logsClosed = Promise.all([child.stdout, child.stderr].map((stream) => new Promise((resolve) => {
+        stream.on("data", logWriter());
+        stream.once("close", resolve);
+      })));
       record.pid = child.pid;
       record.pidStart = child.pid ? processInfo(child.pid)?.start : undefined;
       capture();
@@ -346,7 +392,9 @@ export const runtimeSource = String.raw`(async function runtime() {
       }
       if (route === "/credentials" && req.method === "POST") {
         const spec = await body(req, 65536); const env = checkedEnv(spec.env);
-        if (Object.keys(env).some((key) => !["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"].includes(key))) fail("Invalid credential channel");
+        if (Object.keys(env).some((key) => !["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY", "GITMATRIX_ENVIRONMENT_QUOTA_TOKEN"].includes(key))) fail("Invalid credential channel");
+        if (!env.GITMATRIX_ENVIRONMENT_QUOTA_AUTHORITY || !env.GITMATRIX_ENVIRONMENT_QUOTA_TOKEN) fail("Missing quota credential channel");
+        rememberSecrets(env);
         save(STATE + "/credentials.json", { env });
         return reply(res, { ok: true });
       }
@@ -367,6 +415,7 @@ export const runtimeSource = String.raw`(async function runtime() {
           if (spec.cwd !== ROOT && !spec.cwd.startsWith(ROOT + "/")) fail("Invalid working directory");
         }
         spec.env = { ...BASE, GITMATRIX_REMOTE_ORIGIN: process.env.REMOTE_ORIGIN, ...(exists(STATE + "/credentials.json") ? json(STATE + "/credentials.json").env : {}), ...checkedEnv(spec.env) };
+        rememberSecrets(spec.env);
         const remaining = Number(process.env.EXPIRES_AT) - Date.now();
         if (spec.timeoutMs !== undefined && (!Number.isSafeInteger(spec.timeoutMs) || spec.timeoutMs < 1 || spec.timeoutMs > 86400000)) fail("Invalid command timeout");
         spec.timeoutMs = Math.min(spec.timeoutMs ?? remaining, remaining);

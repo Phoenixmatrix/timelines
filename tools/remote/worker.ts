@@ -407,6 +407,31 @@ export class RemoteWorkspace extends DurableObject<Env> {
                 return error("Invalid owned resource", 400);
               resources[key] = value;
             }
+            let quota: { authority: string; state: string } | undefined;
+            if (environment.quota !== undefined) {
+              const value = environment.quota;
+              if (
+                !object(value) ||
+                typeof value.authority !== "string" ||
+                typeof value.state !== "string" ||
+                !["pending", "reserved", "released"].includes(value.state)
+              )
+                return error("Invalid quota ownership metadata", 400);
+              let origin: URL;
+              try {
+                origin = new URL(value.authority);
+              } catch {
+                return error("Invalid quota authority", 400);
+              }
+              if (
+                origin.protocol !== "https:" ||
+                origin.origin !== value.authority ||
+                origin.username ||
+                origin.password
+              )
+                return error("Invalid quota authority", 400);
+              quota = { authority: value.authority, state: value.state };
+            }
             await this.ctx.storage.put("ownership:" + environment.id, {
               id: environment.id,
               account: environment.account,
@@ -415,6 +440,7 @@ export class RemoteWorkspace extends DurableObject<Env> {
               resources,
               status: environment.status,
               ai: environment.ai,
+              ...(quota ? { quota } : {}),
             });
             return json({ ok: true });
           }

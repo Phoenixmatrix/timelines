@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { redirect, useLoaderData } from "react-router";
 import type { AiLogBodiesPatch, AiLogComponent, SiteAiSettingsView } from "../../shared/ai.ts";
 import { SettingsPage } from "../components/SettingsPage.tsx";
-import { FormError } from "../components/ui.tsx";
+import { FormError, link } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
 import { requireViewer } from "../lib/session.ts";
 
@@ -83,15 +83,26 @@ export function SiteAiSettings() {
               Keep AI request and response bodies in gateway logs
             </legend>
             <p className="mt-0 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
-              AI Gateway always logs each model call’s model, time and tokens. Choose whether it
-              also keeps what was sent and returned. Without a site choice, a part follows this
-              environment’s default ({environment}).
+              AI Gateway records model, time and token metadata when logging is available. Choose
+              whether it also stores what was sent and returned, subject to Cloudflare’s log limits.
+              Without a site choice, a part follows this environment’s default ({environment}).
             </p>
             <p
               className="mt-0 mb-4 max-w-[65ch] text-body-sm font-semibold text-ink"
               data-log-bodies-note
             >
               {saved.logBodies.note}
+            </p>
+            <p className="mt-0 mb-4 max-w-[65ch] text-body-sm text-ink-muted">
+              <a
+                href="https://developers.cloudflare.com/ai-gateway/reference/limits/"
+                className={link}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Cloudflare log limits
+                <span className="sr-only"> (opens in a new tab)</span>
+              </a>
             </p>
             {!saved.canManage && (
               <p className="mt-0 mb-4 text-body-sm font-semibold text-ink">

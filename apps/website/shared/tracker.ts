@@ -615,7 +615,7 @@ export type Mutation =
   | { kind: "issue.renew"; id: string; data: { leaseToken: string; ttlSeconds?: number } }
   /** Owners acting as themselves may end someone else's claim with force and no token. */
   | { kind: "issue.release"; id: string; data: { leaseToken?: string; force?: boolean } }
-  | { kind: "issue.complete"; id: string; data: { leaseToken: string; evidence: string } };
+  | { kind: "issue.complete"; id: string; data: { leaseToken: string; evidence?: string } };
 export interface MutationRequest {
   operationId: string;
   mutations: Mutation[];
