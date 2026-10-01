@@ -1,0 +1,767 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-01T21:51:09+00:00",
+  "title": "Design System: Gitmatrix",
+  "extensions": {
+    "colorMeta": {
+      "surface": {
+        "role": "neutral",
+        "displayName": "Warm Charcoal Surface",
+        "canonical": "oklch(0.235 0.007 70)",
+        "cssVar": "--surface",
+        "light": "oklch(0.965 0.005 75)",
+        "tonalRamp": [
+          "oklch(0.145 0.005 70)",
+          "oklch(0.175 0.006 70)",
+          "oklch(0.19 0.006 70)",
+          "oklch(0.205 0.006 70)",
+          "oklch(0.235 0.007 70)",
+          "oklch(0.275 0.008 70)",
+          "oklch(0.32 0.009 70)",
+          "oklch(0.945 0.008 80)"
+        ]
+      },
+      "sunken": {
+        "role": "neutral",
+        "displayName": "Sunken Well",
+        "canonical": "oklch(0.19 0.006 70)",
+        "cssVar": "--sunken",
+        "light": "oklch(0.945 0.006 75)",
+        "tonalRamp": [
+          "oklch(0.145 0.005 70)",
+          "oklch(0.175 0.006 70)",
+          "oklch(0.19 0.006 70)",
+          "oklch(0.205 0.006 70)",
+          "oklch(0.235 0.007 70)",
+          "oklch(0.275 0.008 70)",
+          "oklch(0.32 0.009 70)",
+          "oklch(0.945 0.008 80)"
+        ]
+      },
+      "rail": {
+        "role": "neutral",
+        "displayName": "Rail Charcoal",
+        "canonical": "oklch(0.175 0.006 70)",
+        "cssVar": "--rail",
+        "light": "oklch(0.995 0.002 75)",
+        "tonalRamp": [
+          "oklch(0.145 0.005 70)",
+          "oklch(0.175 0.006 70)",
+          "oklch(0.19 0.006 70)",
+          "oklch(0.205 0.006 70)",
+          "oklch(0.235 0.007 70)",
+          "oklch(0.275 0.008 70)",
+          "oklch(0.32 0.009 70)",
+          "oklch(0.945 0.008 80)"
+        ]
+      },
+      "pane": {
+        "role": "neutral",
+        "displayName": "Pane Charcoal",
+        "canonical": "oklch(0.205 0.006 70)",
+        "cssVar": "--pane",
+        "light": "oklch(0.985 0.003 75)",
+        "tonalRamp": [
+          "oklch(0.145 0.005 70)",
+          "oklch(0.175 0.006 70)",
+          "oklch(0.19 0.006 70)",
+          "oklch(0.205 0.006 70)",
+          "oklch(0.235 0.007 70)",
+          "oklch(0.275 0.008 70)",
+          "oklch(0.32 0.009 70)",
+          "oklch(0.945 0.008 80)"
+        ]
+      },
+      "raised": {
+        "role": "neutral",
+        "displayName": "Raised Charcoal",
+        "canonical": "oklch(0.275 0.008 70)",
+        "cssVar": "--raised",
+        "light": "oklch(0.925 0.008 75)",
+        "tonalRamp": [
+          "oklch(0.145 0.005 70)",
+          "oklch(0.175 0.006 70)",
+          "oklch(0.19 0.006 70)",
+          "oklch(0.205 0.006 70)",
+          "oklch(0.235 0.007 70)",
+          "oklch(0.275 0.008 70)",
+          "oklch(0.32 0.009 70)",
+          "oklch(0.945 0.008 80)"
+        ]
+      },
+      "pressed": {
+        "role": "neutral",
+        "displayName": "Pressed Charcoal",
+        "canonical": "oklch(0.32 0.009 70)",
+        "cssVar": "--pressed",
+        "light": "oklch(0.895 0.01 75)",
+        "tonalRamp": [
+          "oklch(0.145 0.005 70)",
+          "oklch(0.175 0.006 70)",
+          "oklch(0.19 0.006 70)",
+          "oklch(0.205 0.006 70)",
+          "oklch(0.235 0.007 70)",
+          "oklch(0.275 0.008 70)",
+          "oklch(0.32 0.009 70)",
+          "oklch(0.945 0.008 80)"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Line",
+        "canonical": "oklch(0.32 0.008 70)",
+        "cssVar": "--line",
+        "light": "oklch(0.8 0.012 75)",
+        "tonalRamp": [
+          "oklch(0.15 0.008 70)",
+          "oklch(0.26 0.008 70)",
+          "oklch(0.38 0.008 70)",
+          "oklch(0.50 0.008 70)",
+          "oklch(0.62 0.008 70)",
+          "oklch(0.74 0.008 70)",
+          "oklch(0.85 0.008 70)",
+          "oklch(0.95 0.008 70)"
+        ]
+      },
+      "line-soft": {
+        "role": "neutral",
+        "displayName": "Soft Hairline",
+        "canonical": "oklch(0.27 0.007 70)",
+        "cssVar": "--line-soft",
+        "light": "oklch(0.9 0.008 75)",
+        "tonalRamp": [
+          "oklch(0.15 0.007 70)",
+          "oklch(0.26 0.007 70)",
+          "oklch(0.38 0.007 70)",
+          "oklch(0.50 0.007 70)",
+          "oklch(0.62 0.007 70)",
+          "oklch(0.74 0.007 70)",
+          "oklch(0.85 0.007 70)",
+          "oklch(0.95 0.007 70)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Warm Ink",
+        "canonical": "oklch(0.945 0.008 80)",
+        "cssVar": "--ink",
+        "light": "oklch(0.235 0.015 65)",
+        "tonalRamp": [
+          "oklch(0.15 0.008 80)",
+          "oklch(0.26 0.008 80)",
+          "oklch(0.38 0.008 80)",
+          "oklch(0.50 0.008 80)",
+          "oklch(0.62 0.008 80)",
+          "oklch(0.74 0.008 80)",
+          "oklch(0.85 0.008 80)",
+          "oklch(0.95 0.008 80)"
+        ]
+      },
+      "ink-muted": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "oklch(0.76 0.012 75)",
+        "cssVar": "--ink-muted",
+        "light": "oklch(0.42 0.015 70)",
+        "tonalRamp": [
+          "oklch(0.15 0.012 75)",
+          "oklch(0.26 0.012 75)",
+          "oklch(0.38 0.012 75)",
+          "oklch(0.50 0.012 75)",
+          "oklch(0.62 0.012 75)",
+          "oklch(0.74 0.012 75)",
+          "oklch(0.85 0.012 75)",
+          "oklch(0.95 0.012 75)"
+        ]
+      },
+      "ink-faint": {
+        "role": "neutral",
+        "displayName": "Faint Ink",
+        "canonical": "oklch(0.64 0.012 75)",
+        "cssVar": "--ink-faint",
+        "light": "oklch(0.5 0.014 70)",
+        "tonalRamp": [
+          "oklch(0.15 0.012 75)",
+          "oklch(0.26 0.012 75)",
+          "oklch(0.38 0.012 75)",
+          "oklch(0.50 0.012 75)",
+          "oklch(0.62 0.012 75)",
+          "oklch(0.74 0.012 75)",
+          "oklch(0.85 0.012 75)",
+          "oklch(0.95 0.012 75)"
+        ]
+      },
+      "signal": {
+        "role": "primary",
+        "displayName": "Amber Signal",
+        "canonical": "oklch(0.81 0.145 76)",
+        "cssVar": "--signal",
+        "light": "oklch(0.77 0.155 72)",
+        "tonalRamp": [
+          "oklch(0.15 0.145 76)",
+          "oklch(0.26 0.145 76)",
+          "oklch(0.38 0.145 76)",
+          "oklch(0.50 0.145 76)",
+          "oklch(0.62 0.145 76)",
+          "oklch(0.74 0.145 76)",
+          "oklch(0.85 0.145 76)",
+          "oklch(0.95 0.145 76)"
+        ]
+      },
+      "signal-hover": {
+        "role": "primary",
+        "displayName": "Amber Hover",
+        "canonical": "oklch(0.85 0.13 80)",
+        "cssVar": "--signal-hover",
+        "light": "oklch(0.72 0.155 68)",
+        "tonalRamp": [
+          "oklch(0.15 0.13 80)",
+          "oklch(0.26 0.13 80)",
+          "oklch(0.38 0.13 80)",
+          "oklch(0.50 0.13 80)",
+          "oklch(0.62 0.13 80)",
+          "oklch(0.74 0.13 80)",
+          "oklch(0.85 0.13 80)",
+          "oklch(0.95 0.13 80)"
+        ]
+      },
+      "signal-ink": {
+        "role": "primary",
+        "displayName": "Signal Ink",
+        "canonical": "oklch(0.23 0.035 65)",
+        "cssVar": "--signal-ink",
+        "light": "oklch(0.2 0.03 65)",
+        "tonalRamp": [
+          "oklch(0.15 0.035 65)",
+          "oklch(0.26 0.035 65)",
+          "oklch(0.38 0.035 65)",
+          "oklch(0.50 0.035 65)",
+          "oklch(0.62 0.035 65)",
+          "oklch(0.74 0.035 65)",
+          "oklch(0.85 0.035 65)",
+          "oklch(0.95 0.035 65)"
+        ]
+      },
+      "signal-line": {
+        "role": "primary",
+        "displayName": "Signal Line",
+        "canonical": "oklch(0.81 0.145 76)",
+        "cssVar": "--signal-line",
+        "light": "oklch(0.58 0.145 62)",
+        "tonalRamp": [
+          "oklch(0.15 0.145 76)",
+          "oklch(0.26 0.145 76)",
+          "oklch(0.38 0.145 76)",
+          "oklch(0.50 0.145 76)",
+          "oklch(0.62 0.145 76)",
+          "oklch(0.74 0.145 76)",
+          "oklch(0.85 0.145 76)",
+          "oklch(0.95 0.145 76)"
+        ]
+      },
+      "signal-wash": {
+        "role": "primary",
+        "displayName": "Amber Wash",
+        "canonical": "oklch(0.81 0.145 76 / 0.14)",
+        "cssVar": "--signal-wash",
+        "light": "oklch(0.72 0.15 70 / 0.16)",
+        "tonalRamp": [
+          "oklch(0.15 0.145 76)",
+          "oklch(0.26 0.145 76)",
+          "oklch(0.38 0.145 76)",
+          "oklch(0.50 0.145 76)",
+          "oklch(0.62 0.145 76)",
+          "oklch(0.74 0.145 76)",
+          "oklch(0.85 0.145 76)",
+          "oklch(0.95 0.145 76)"
+        ]
+      },
+      "danger": {
+        "role": "secondary",
+        "displayName": "Ember Red",
+        "canonical": "oklch(0.54 0.19 25)",
+        "cssVar": "--danger",
+        "light": "oklch(0.52 0.19 25)",
+        "tonalRamp": [
+          "oklch(0.15 0.19 25)",
+          "oklch(0.26 0.19 25)",
+          "oklch(0.38 0.19 25)",
+          "oklch(0.50 0.19 25)",
+          "oklch(0.62 0.19 25)",
+          "oklch(0.74 0.19 25)",
+          "oklch(0.85 0.19 25)",
+          "oklch(0.95 0.19 25)"
+        ]
+      },
+      "danger-hover": {
+        "role": "secondary",
+        "displayName": "Ember Red Hover",
+        "canonical": "oklch(0.49 0.18 25)",
+        "cssVar": "--danger-hover",
+        "light": "oklch(0.47 0.18 25)",
+        "tonalRamp": [
+          "oklch(0.15 0.18 25)",
+          "oklch(0.26 0.18 25)",
+          "oklch(0.38 0.18 25)",
+          "oklch(0.50 0.18 25)",
+          "oklch(0.62 0.18 25)",
+          "oklch(0.74 0.18 25)",
+          "oklch(0.85 0.18 25)",
+          "oklch(0.95 0.18 25)"
+        ]
+      },
+      "danger-ink": {
+        "role": "secondary",
+        "displayName": "Danger Ink",
+        "canonical": "oklch(0.99 0 0)",
+        "cssVar": "--danger-ink",
+        "light": "oklch(0.99 0 0)",
+        "tonalRamp": [
+          "oklch(0.15 0.0 0)",
+          "oklch(0.26 0.0 0)",
+          "oklch(0.38 0.0 0)",
+          "oklch(0.50 0.0 0)",
+          "oklch(0.62 0.0 0)",
+          "oklch(0.74 0.0 0)",
+          "oklch(0.85 0.0 0)",
+          "oklch(0.95 0.0 0)"
+        ]
+      },
+      "danger-text": {
+        "role": "secondary",
+        "displayName": "Red Text",
+        "canonical": "oklch(0.72 0.16 25)",
+        "cssVar": "--danger-text",
+        "light": "oklch(0.5 0.18 25)",
+        "tonalRamp": [
+          "oklch(0.15 0.16 25)",
+          "oklch(0.26 0.16 25)",
+          "oklch(0.38 0.16 25)",
+          "oklch(0.50 0.16 25)",
+          "oklch(0.62 0.16 25)",
+          "oklch(0.74 0.16 25)",
+          "oklch(0.85 0.16 25)",
+          "oklch(0.95 0.16 25)"
+        ]
+      },
+      "danger-wash": {
+        "role": "secondary",
+        "displayName": "Red Wash",
+        "canonical": "oklch(0.64 0.19 25 / 0.16)",
+        "cssVar": "--danger-wash",
+        "light": "oklch(0.6 0.19 25 / 0.1)",
+        "tonalRamp": [
+          "oklch(0.15 0.19 25)",
+          "oklch(0.26 0.19 25)",
+          "oklch(0.38 0.19 25)",
+          "oklch(0.50 0.19 25)",
+          "oklch(0.62 0.19 25)",
+          "oklch(0.74 0.19 25)",
+          "oklch(0.85 0.19 25)",
+          "oklch(0.95 0.19 25)"
+        ]
+      },
+      "online": {
+        "role": "tertiary",
+        "displayName": "Online Green",
+        "canonical": "oklch(0.74 0.14 155)",
+        "cssVar": "--online",
+        "light": "oklch(0.58 0.14 155)",
+        "tonalRamp": [
+          "oklch(0.15 0.14 155)",
+          "oklch(0.26 0.14 155)",
+          "oklch(0.38 0.14 155)",
+          "oklch(0.50 0.14 155)",
+          "oklch(0.62 0.14 155)",
+          "oklch(0.74 0.14 155)",
+          "oklch(0.85 0.14 155)",
+          "oklch(0.95 0.14 155)"
+        ]
+      },
+      "backdrop": {
+        "role": "neutral",
+        "displayName": "Backdrop",
+        "canonical": "oklch(0.08 0.01 70 / 0.6)",
+        "cssVar": "--backdrop",
+        "light": "oklch(0.2 0.01 70 / 0.32)",
+        "tonalRamp": [
+          "oklch(0.15 0.01 70)",
+          "oklch(0.26 0.01 70)",
+          "oklch(0.38 0.01 70)",
+          "oklch(0.50 0.01 70)",
+          "oklch(0.62 0.01 70)",
+          "oklch(0.74 0.01 70)",
+          "oklch(0.85 0.01 70)",
+          "oklch(0.95 0.01 70)"
+        ]
+      },
+      "data-berry": {
+        "role": "tertiary",
+        "displayName": "Berry",
+        "canonical": "oklch(0.66 0.12 350)",
+        "cssVar": "--data-berry",
+        "light": "oklch(0.6 0.13 350)",
+        "tonalRamp": [
+          "oklch(0.15 0.12 350)",
+          "oklch(0.26 0.12 350)",
+          "oklch(0.38 0.12 350)",
+          "oklch(0.50 0.12 350)",
+          "oklch(0.62 0.12 350)",
+          "oklch(0.74 0.12 350)",
+          "oklch(0.85 0.12 350)",
+          "oklch(0.95 0.12 350)"
+        ]
+      },
+      "data-berry-wash": {
+        "role": "tertiary",
+        "displayName": "Berry Wash",
+        "canonical": "oklch(0.66 0.12 350 / 0.22)",
+        "cssVar": "--data-berry-wash",
+        "light": "oklch(0.6 0.13 350 / 0.2)",
+        "tonalRamp": [
+          "oklch(0.15 0.12 350)",
+          "oklch(0.26 0.12 350)",
+          "oklch(0.38 0.12 350)",
+          "oklch(0.50 0.12 350)",
+          "oklch(0.62 0.12 350)",
+          "oklch(0.74 0.12 350)",
+          "oklch(0.85 0.12 350)",
+          "oklch(0.95 0.12 350)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "The one page title: repository owner / name, package name."
+      },
+      "title-lg": {
+        "displayName": "Title Lg",
+        "purpose": "A single focused object inside a page: CI run title, knowledge node, standalone card, dialog title."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Section, pane, card and popover headings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default text, list-row primary lines (semibold), buttons (600), inputs."
+      },
+      "body-sm": {
+        "displayName": "Body Sm",
+        "purpose": "The workhorse: row metadata, table cells, captions, hints, errors, field labels."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Column headers and facet group titles, sentence case."
+      },
+      "micro": {
+        "displayName": "Micro",
+        "purpose": "Tags, row timestamps, axis labels, legends, counts."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Geist Mono: versions, hashes, commands, URLs, counts, logs; tabular figures."
+      }
+    },
+    "themes": {
+      "default": "dark",
+      "selector": "[data-theme=\"light\"] on <html> or any region; each colorMeta entry carries its light value",
+      "source": "apps/website/src/styles/tokens.css"
+    },
+    "monogram": {
+      "dark": {
+        "background": "oklch(0.36 0.05 var(--hue))",
+        "text": "oklch(0.92 0.04 var(--hue))"
+      },
+      "light": {
+        "background": "oklch(0.9 0.045 var(--hue))",
+        "text": "oklch(0.38 0.07 var(--hue))"
+      },
+      "hue": "hash of the name, 0-360 (components/Monogram.tsx)",
+      "shape": "circle for people, 30% squircle for orgs"
+    },
+    "shadows": [
+      {
+        "name": "float",
+        "value": "0 8px 24px -6px oklch(0.08 0.01 70 / 0.55), 0 2px 6px oklch(0.08 0.01 70 / 0.35)",
+        "light": "0 8px 24px -6px oklch(0.35 0.02 70 / 0.18), 0 2px 6px oklch(0.35 0.02 70 / 0.1)",
+        "purpose": "Popups, menus, popovers, toasts, dialogs, tooltips; paired with 0 0 0 1px var(--line-soft)."
+      },
+      {
+        "name": "dock",
+        "value": "0 10px 30px -8px oklch(0.05 0.01 70 / 0.7)",
+        "light": "0 10px 30px -8px oklch(0.35 0.02 70 / 0.24)",
+        "purpose": "The sticky bulk-selection bar; paired with the line-soft ring."
+      },
+      {
+        "name": "input-ring",
+        "value": "0 0 0 1px var(--line-soft)",
+        "purpose": "Inputs at rest (line on hover, 2px signal-line on focus); drawn as a shadow, not a border."
+      },
+      {
+        "name": "focus-ring",
+        "value": "outline: 2px solid var(--signal-line); outline-offset: 2px",
+        "purpose": "Global :focus-visible treatment inside .mk-root."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-expo",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Dialogs, toasts, enter-up, rise, facet bars, switch thumb."
+      },
+      {
+        "name": "state",
+        "value": "150ms",
+        "purpose": "Color and background transitions on controls; button press nudges 1px."
+      },
+      {
+        "name": "pop",
+        "value": "opacity + scale from 0.95, 150ms",
+        "purpose": "Popups, menus, selects, tooltips (popMotion)."
+      },
+      {
+        "name": "fade",
+        "value": "opacity, 200ms",
+        "purpose": "Dialog backdrops (fadeMotion)."
+      },
+      {
+        "name": "dialog",
+        "value": "opacity + scale from 0.97, 200ms, ease-expo",
+        "purpose": "Dialogs (dialogMotion)."
+      },
+      {
+        "name": "toast",
+        "value": "opacity + 12px slide, 250ms, ease-expo",
+        "purpose": "Toasts (toastMotion)."
+      },
+      {
+        "name": "enter-up",
+        "value": "translateY(6px) and opacity 0.4 to rest, 260ms, ease-expo",
+        "purpose": "New list rows and the selection bar (mk-enter-up)."
+      },
+      {
+        "name": "rise",
+        "value": "scaleY(0.2) and opacity 0 to rest, 420ms, ease-expo",
+        "purpose": "Publish-rate bars growing from the baseline (animate-rise)."
+      },
+      {
+        "name": "place",
+        "value": "200ms radius, color and pip scale",
+        "purpose": "Rail places on hover and current."
+      },
+      {
+        "name": "loading",
+        "value": "main column opacity 0.7",
+        "purpose": "Navigation in progress; no spinner."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "keep color, opacity and shadow transitions; drop movement",
+        "purpose": "prefers-reduced-motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px",
+        "purpose": "Below: 44px touch floor, horizontal rail, metadata hides."
+      },
+      {
+        "name": "md",
+        "value": "768px",
+        "purpose": "Below: wide tables re-flow into two-line rows (40px rows become 60px)."
+      },
+      {
+        "name": "lg",
+        "value": "1024px",
+        "purpose": "From: side columns (17rem sticky facet column), two-up panes."
+      }
+    ],
+    "layout": {
+      "rail": "72px",
+      "page": "max-w-4xl (56rem); wide max-w-6xl (72rem)",
+      "gutter": "16px phones, 32px from 640px",
+      "pagePadding": "28px vertical",
+      "rowPadding": "12px 16px",
+      "compactRow": "40px",
+      "proseMeasure": "48-72ch"
+    },
+    "stylingConvention": "Tailwind utilities on kit role names by default; mk-* kit classes for components (matrixkit.css in the components layer, vendored as is); custom CSS in app.css only for .gm-prose, scrollbar theming and the phone tag-chip override."
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one amber action on a view: Clone, New repository, Save changes.",
+      "html": "<button class=\"ds-btn ds-btn-primary\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 256 256\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M128 24a104 104 0 1 0 104 104A104.11 104.11 0 0 0 128 24Zm45.66 109.66-40 40a8 8 0 0 1-11.32 0l-40-40a8 8 0 0 1 11.32-11.32L120 148.69V88a8 8 0 0 1 16 0v60.69l26.34-26.35a8 8 0 0 1 11.32 11.32Z\"/></svg>Clone</button>",
+      "css": ".ds-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 16px;border:0;border-radius:8px;font-family:var(--font-sans);font-size:0.9375rem;font-weight:600;white-space:nowrap;cursor:pointer;transition:background-color 150ms,color 150ms,translate 150ms}.ds-btn:active{translate:0 1px}.ds-btn:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}.ds-btn-primary{background:var(--signal);color:var(--signal-ink)}.ds-btn-primary:hover{background:var(--signal-hover)}"
+    },
+    {
+      "name": "Default Button (small)",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Secondary actions in panes and toolbars: Check again, Tag, Deprecate.",
+      "html": "<button class=\"ds-btn-default\">Check again</button>",
+      "css": ".ds-btn-default{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border:0;border-radius:8px;background:var(--raised);color:var(--ink);font-family:var(--font-sans);font-size:0.8125rem;font-weight:600;cursor:pointer;transition:background-color 150ms,translate 150ms}.ds-btn-default:hover{background:var(--pressed)}.ds-btn-default:active{translate:0 1px}.ds-btn-default:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Low-stakes actions: Keep it, Select all, clearing a range.",
+      "html": "<button class=\"ds-btn-ghost\">Keep it</button>",
+      "css": ".ds-btn-ghost{display:inline-flex;align-items:center;height:40px;padding:0 16px;border:0;border-radius:8px;background:transparent;color:var(--ink-muted);font-family:var(--font-sans);font-size:0.9375rem;font-weight:600;cursor:pointer;transition:background-color 150ms,color 150ms}.ds-btn-ghost:hover{background:var(--raised);color:var(--ink)}.ds-btn-ghost:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Danger Ghost Button",
+      "kind": "button",
+      "refersTo": "button-danger-ghost",
+      "description": "Destructive actions outside a confirm dialog: Delete, Yank, Revoke.",
+      "html": "<button class=\"ds-btn-danger-ghost\">Delete</button>",
+      "css": ".ds-btn-danger-ghost{display:inline-flex;align-items:center;height:32px;padding:0 12px;border:0;border-radius:8px;background:transparent;color:var(--danger-text);font-family:var(--font-sans);font-size:0.8125rem;font-weight:600;cursor:pointer;transition:background-color 150ms}.ds-btn-danger-ghost:hover{background:var(--danger-wash)}.ds-btn-danger-ghost:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Query Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Sunken 44px field with a hairline ring; mono variant for queries, URLs and keys.",
+      "html": "<label class=\"ds-field\"><span class=\"ds-label\">Filter versions</span><input class=\"ds-input ds-input-code\" placeholder=\"source:web branch:main since:24h\"><span class=\"ds-hint\">Words match versions; - excludes.</span></label>",
+      "css": ".ds-field{display:flex;flex-direction:column;gap:6px;font-family:var(--font-sans)}.ds-label{font-size:0.8125rem;line-height:1.25rem;font-weight:600;color:var(--ink-muted)}.ds-hint{font-size:0.8125rem;line-height:1.25rem;color:var(--ink-faint)}.ds-input{height:44px;padding:0 14px;border:0;border-radius:8px;outline:none;background:var(--sunken);color:var(--ink);font:inherit;font-size:0.9375rem;box-shadow:0 0 0 1px var(--line-soft);transition:box-shadow 150ms,background-color 150ms}.ds-input::placeholder{color:var(--ink-faint)}.ds-input:hover{box-shadow:0 0 0 1px var(--line)}.ds-input:focus{background:var(--rail);box-shadow:0 0 0 2px var(--signal-line)}.ds-input-code{font-family:var(--font-mono);letter-spacing:0.02em}"
+    },
+    {
+      "name": "Filter Chips",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Saved views and format filters; pressed turns amber.",
+      "html": "<div class=\"ds-chips\"><button class=\"ds-chip\" aria-pressed=\"true\">Active</button><button class=\"ds-chip\" aria-pressed=\"false\">Last 24 hours</button><button class=\"ds-chip\" aria-pressed=\"false\">From main</button></div>",
+      "css": ".ds-chips{display:flex;flex-wrap:wrap;gap:8px}.ds-chip{display:inline-flex;align-items:center;height:28px;padding:0 12px;border:0;border-radius:9999px;background:var(--raised);color:var(--ink-muted);font-family:var(--font-sans);font-size:0.8125rem;cursor:pointer;transition:background-color 150ms,color 150ms}.ds-chip:hover{background:var(--pressed);color:var(--ink)}.ds-chip[aria-pressed=\"true\"]{background:var(--signal);color:var(--signal-ink);font-weight:600}.ds-chip:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Tags",
+      "kind": "chip",
+      "refersTo": "chip-tag",
+      "description": "20px non-interactive labels: visibility, role, format, status, short hashes.",
+      "html": "<span class=\"ds-tags\"><span class=\"ds-tag\">npm</span><span class=\"ds-tag\">Private</span><span class=\"ds-tag ds-mono\">33b0230</span></span>",
+      "css": ".ds-tags{display:inline-flex;gap:8px}.ds-tag{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:9999px;background:var(--raised);color:var(--ink-muted);font-family:var(--font-sans);font-size:0.6875rem}.ds-mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}"
+    },
+    {
+      "name": "List Pane",
+      "kind": "card",
+      "refersTo": "list-row",
+      "description": "The Pane List Rule: one pane, hairline rows, raised hover.",
+      "html": "<ul class=\"ds-pane\"><li><a class=\"ds-row\" href=\"#\"><span class=\"ds-row-main\"><strong>@orbit/web</strong><span class=\"ds-row-meta\"><span class=\"ds-mono ds-ink\">2.4.676-main.33b0230</span> · 18.2K versions</span></span><span class=\"ds-row-time\">32m ago</span></a></li><li><a class=\"ds-row\" href=\"#\"><span class=\"ds-row-main\"><strong>@orbit/engine</strong><span class=\"ds-row-meta\"><span class=\"ds-mono ds-ink\">0.9.12</span> · 412 versions</span></span><span class=\"ds-row-time\">2h ago</span></a></li></ul>",
+      "css": ".ds-pane{margin:0;padding:0;list-style:none;overflow:hidden;border-radius:12px;background:var(--pane);font-family:var(--font-sans)}.ds-pane>li+li{border-top:1px solid var(--line-soft)}.ds-row{display:flex;align-items:center;gap:16px;padding:12px 16px;color:var(--ink);text-decoration:none;transition:background-color 150ms}.ds-row:hover{background:var(--raised)}.ds-row:focus-visible{outline:2px solid var(--signal-line);outline-offset:-2px}.ds-row-main{flex:1;min-width:0;display:flex;flex-direction:column}.ds-row-main strong{font-weight:600;font-size:0.9375rem}.ds-row-meta{margin-top:2px;font-size:0.8125rem;color:var(--ink-muted)}.ds-ink{color:var(--ink)}.ds-mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}.ds-row-time{font-size:0.6875rem;color:var(--ink-faint)}"
+    },
+    {
+      "name": "Repository Tabs",
+      "kind": "nav",
+      "refersTo": "tab",
+      "description": "Underlined tab bar; the current tab is ink with an amber underline.",
+      "html": "<nav class=\"ds-tabs\"><a href=\"#\">Code</a><a href=\"#\">Commits</a><a href=\"#\">CI</a><a href=\"#\" aria-current=\"page\">Packages</a><a href=\"#\">Wiki</a><a href=\"#\">Knowledge</a></nav>",
+      "css": ".ds-tabs{display:flex;gap:20px;border-bottom:1px solid var(--line-soft);font-family:var(--font-sans)}.ds-tabs a{margin-bottom:-1px;padding:0 4px 10px;border-bottom:2px solid transparent;color:var(--ink-muted);font-weight:600;font-size:0.9375rem;text-decoration:none;transition:color 150ms}.ds-tabs a:hover{color:var(--ink)}.ds-tabs a[aria-current=\"page\"]{color:var(--ink);border-bottom-color:var(--signal-line)}.ds-tabs a:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Rail Place",
+      "kind": "nav",
+      "refersTo": "nav-place",
+      "description": "48px rail tile that tightens its radius and grows an amber pip when current.",
+      "html": "<nav class=\"ds-rail\"><a class=\"ds-place\" href=\"#\" aria-current=\"page\" aria-label=\"Home\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 256 256\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M224 115.55V208a16 16 0 0 1-16 16h-40a16 16 0 0 1-16-16v-40a8 8 0 0 0-8-8h-32a8 8 0 0 0-8 8v40a16 16 0 0 1-16 16H48a16 16 0 0 1-16-16v-92.45a16 16 0 0 1 5.17-11.78l80-75.48.11-.11a16 16 0 0 1 21.53 0 1.14 1.14 0 0 0 .11.11l80 75.48a16 16 0 0 1 5.08 11.78Z\"/></svg></a><a class=\"ds-place\" href=\"#\" aria-label=\"Access tokens\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 256 256\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" aria-hidden=\"true\"><circle cx=\"160\" cy=\"96\" r=\"56\"/><path d=\"M120 136 40 216M64 192l24 24\"/></svg></a></nav>",
+      "css": ".ds-rail{display:flex;flex-direction:column;align-items:center;gap:8px;width:72px;padding:12px 0;background:var(--rail)}.ds-place{position:relative;display:grid;place-items:center;width:48px;height:48px;border-radius:24px;background:var(--pane);color:var(--ink-muted);text-decoration:none;transition:border-radius 200ms,background-color 200ms,color 200ms}.ds-place:hover,.ds-place[aria-current=\"page\"]{border-radius:16px;background:var(--raised);color:var(--ink)}.ds-place::before{content:\"\";position:absolute;left:-12px;width:4px;height:36px;border-radius:0 9999px 9999px 0;background:var(--signal-line);scale:1 0.22;opacity:0;transition:scale 200ms,opacity 200ms}.ds-place:hover::before{scale:1 0.55;opacity:1}.ds-place[aria-current=\"page\"]::before{scale:1 1;opacity:1}.ds-place:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Info Strip",
+      "kind": "custom",
+      "refersTo": "strip",
+      "description": "Amber-wash notice with a dot and an action: still importing, no runner.",
+      "html": "<div class=\"ds-strip\"><span class=\"ds-strip-dot\"></span><span class=\"ds-strip-text\">Still importing. Large histories can take a minute.</span><button class=\"ds-strip-btn\">Check again</button></div>",
+      "css": ".ds-strip{display:flex;align-items:center;gap:12px;padding:8px 8px 8px 14px;border-radius:12px;background:var(--signal-wash);color:var(--ink);font-family:var(--font-sans);font-size:0.9375rem}.ds-strip-dot{width:8px;height:8px;border-radius:50%;background:var(--signal-line);flex:none}.ds-strip-text{flex:1;min-width:0}.ds-strip-btn{height:32px;padding:0 12px;border:0;border-radius:8px;background:var(--raised);color:var(--ink);font:inherit;font-size:0.8125rem;font-weight:600;cursor:pointer}.ds-strip-btn:hover{background:var(--pressed)}.ds-strip-btn:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Facet Count Bars",
+      "kind": "custom",
+      "refersTo": "facet",
+      "description": "Signature query-console facet: rows with a raised bar scaled to the count; pressed turns amber wash.",
+      "html": "<ul class=\"ds-facets\"><li><button class=\"ds-facet\" aria-pressed=\"true\"><span class=\"ds-facet-bar\" style=\"transform:scaleX(1)\"></span><span class=\"ds-facet-label\">Active</span><span class=\"ds-facet-count\">18.2K</span></button></li><li><button class=\"ds-facet\" aria-pressed=\"false\"><span class=\"ds-facet-bar\" style=\"transform:scaleX(0.48)\"></span><span class=\"ds-facet-label\">Deleted</span><span class=\"ds-facet-count\">8,840</span></button></li><li><button class=\"ds-facet\" aria-pressed=\"false\"><span class=\"ds-facet-bar\" style=\"transform:scaleX(0.03)\"></span><span class=\"ds-facet-label\">Yanked</span><span class=\"ds-facet-count\">452</span></button></li></ul>",
+      "css": ".ds-facets{margin:0;padding:0;list-style:none;width:17rem;font-family:var(--font-sans)}.ds-facet{position:relative;display:flex;align-items:center;gap:8px;width:100%;min-height:30px;padding:4px 8px;border:0;border-radius:6px;background:transparent;color:var(--ink);font:inherit;font-size:0.8125rem;text-align:left;cursor:pointer;overflow:hidden}.ds-facet:hover{background:var(--raised)}.ds-facet[aria-pressed=\"true\"]{font-weight:600}.ds-facet:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}.ds-facet-bar{position:absolute;inset:3px 0;transform-origin:left;border-radius:6px;background:var(--raised);opacity:0.7;transition:transform 300ms cubic-bezier(0.16, 1, 0.3, 1)}.ds-facet[aria-pressed=\"true\"] .ds-facet-bar{background:var(--signal-wash);opacity:1}.ds-facet-label{position:relative;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ds-facet-count{position:relative;font-family:var(--font-mono);font-size:0.75rem;color:var(--ink-muted);font-variant-numeric:tabular-nums}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Night Shift Console",
+    "overview": "Gitmatrix is read by people checking on work their agents did while they weren't looking: what landed, what CI said, what a commit published, what the knowledge graph now believes. The system is a dark, warm, quiet console for that review. Charcoal panes with a faint warm cast (hue 70) sit on a slightly lighter page; text is warm off-white in three strengths; one amber signal marks what is selected, current or the next thing to press. Everything else stays neutral, so a person scanning a long table sees the amber and nothing competing with it.\n\nDensity is that of a working tool, not a marketing page. Lists are single panes with hairline-divided rows; numbers line up in tabular figures; versions, hashes, commands and counts are set in Geist Mono and words in Figtree. The densest surface (the package console: query bar, saved views, publish-rate strip, virtualized version table, facet column) and the sparsest (a sign-in persona grid) are built from the same handful of pieces. MatrixKit Neo is the incumbent system, vendored from Claude Design as is; Gitmatrix composes it with Tailwind utilities and adds almost no CSS of its own.\n\nDark is the home theme (`data-theme=\"dark\"` on `<html>`); a light theme redefines every token under `data-theme=\"light\"` and is chosen from the account menu. Both themes share the same roles, so code names roles, never values.",
+    "keyCharacteristics": [
+      "Warm charcoal tonal stack; depth by tone, not borders or shadows.",
+      "One amber signal, for selection, current place and primary action only.",
+      "Figtree for words, Geist Mono for machine strings, tabular numerals wherever numbers align.",
+      "Panes of hairline-divided rows as the default container for anything listed.",
+      "Shadows only on what floats: popups, toasts, dialogs, the bulk-selection bar.",
+      "Tailwind utilities on the kit's role names; `mk-*` classes for kit components; CSS only where utilities can't reach.",
+      "Phones lift every control to a 44px touch floor."
+    ],
+    "rules": [
+      {
+        "name": "The One Amber Rule",
+        "body": "Amber means selected, current, or the primary action on the screen. Nothing decorative is amber, no status is amber (success is green, failure is red, waiting is faint ink), and a screen has at most one filled amber button.",
+        "section": "colors"
+      },
+      {
+        "name": "The Roles-Not-Values Rule",
+        "body": "Code names a role (`bg-pane`, `text-ink-faint`, `var(--signal-line)`), never an OKLCH literal and never a Tailwind palette color. The light theme only works because every surface is a role.",
+        "section": "colors"
+      },
+      {
+        "name": "The Chart-Hue Rule",
+        "body": "Data hues (berry, and teal and violet when they're needed) appear only inside charts and their legend keys, with a hatch or shape so the meaning survives without color.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mono-for-Machines Rule",
+        "body": "If a machine wrote it or will parse it (a version, hash, command, URL, path, query, exit code, run number), it is Geist Mono. If a person reads it as language, it is Figtree.",
+        "section": "typography"
+      },
+      {
+        "name": "The Lined-Up Numbers Rule",
+        "body": "Any number that sits in a column or updates in place uses tabular figures (`mk-tabular`, `tabular-nums`, or Geist Mono).",
+        "section": "typography"
+      },
+      {
+        "name": "The Sentence-Case Rule",
+        "body": "Headings, labels, column headers and buttons are sentence case. Nothing is set in uppercase with tracking.",
+        "section": "typography"
+      },
+      {
+        "name": "The Pane List Rule",
+        "body": "Anything listed (repositories, commits, runs, files, packages, versions, published artifacts) is one `pane` with `rounded-pane`, rows divided by `line-soft` hairlines, and `raised` on row hover. Not a stack of separate cards.",
+        "section": "layout"
+      },
+      {
+        "name": "The Float-Only Shadow Rule",
+        "body": "A shadow means \"this is above the page and will go away\". Cards, panes, tables and the rail never cast one.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** use Tailwind utilities on the kit's role names (`bg-pane`, `text-ink-faint`, `rounded-pane`, `text-body-sm`) and the `mk-*` component classes; reach for CSS only where utilities can't (rendered Markdown in `.gm-prose`, scrollbar theming, the phone override that keeps tags at 20px), and put it in `app.css`.",
+      "**Do** keep `matrixkit.css` and `tokens.css` vendored as is; adjust the kit from `app.css` or with utilities, which win because the kit is imported into the components layer.",
+      "**Do** list things in a single pane with `line-soft` hairline rows, 12px by 16px row padding and a `raised` hover.",
+      "**Do** reserve amber for the primary action, the current place and what is selected or brushed (The One Amber Rule).",
+      "**Do** set versions, hashes, commands, URLs and counts in Geist Mono, and use tabular figures for every number that lines up.",
+      "**Do** give every icon-only control a tooltip and an aria-label, and every input a visible label.",
+      "**Do** teach in empty states: say what will appear here and show the exact command or config that makes it appear.",
+      "**Do** keep controls at 44px on phones (the kit's phone rule) and re-flow wide tables into two-line rows under 768px rather than scrolling them sideways.",
+      "**Do** check both themes; anything built from roles will already work."
+    ],
+    "donts": [
+      "**Don't** use Tailwind's default palette or OKLCH literals in components; the default palette is deliberately reset away.",
+      "**Don't** put borders or shadows on panes, cards or tables; separate them by tone and spacing.",
+      "**Don't** put a shadow on anything that doesn't float (The Float-Only Shadow Rule).",
+      "**Don't** use amber to mean warning or status; failure is red, success is green, waiting is faint ink.",
+      "**Don't** use the data hues outside charts and their legend keys.",
+      "**Don't** stack separate cards for list items, or nest a card inside a card.",
+      "**Don't** set text in uppercase with letter-spacing, or add small labels above headings; headings stand on their own.",
+      "**Don't** step off the type scale with Tailwind's stock sizes (`text-xs`, `text-sm`); use `text-micro`, `text-body-sm` and the rest."
+    ]
+  }
+}

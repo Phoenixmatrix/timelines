@@ -94,10 +94,10 @@ const CELL = "flex min-w-0 items-center gap-1.5";
 const CELLS = {
   check: `${CELL} justify-center max-md:col-start-1 max-md:row-span-2 max-md:row-start-1`,
   version: `${CELL} max-md:col-[2/4] max-md:row-start-1`,
-  source: `${CELL} max-md:col-start-2 max-md:row-start-2 max-md:max-w-36 max-md:text-xs`,
+  source: `${CELL} max-md:col-start-2 max-md:row-start-2 max-md:max-w-36 max-md:text-mono`,
   commit: `${CELL} max-md:hidden`,
-  branch: `${CELL} text-ink-muted max-md:col-start-3 max-md:row-start-2 max-md:text-xs`,
-  run: `${CELL} justify-end text-ink-muted tabular-nums whitespace-nowrap max-md:col-start-4 max-md:row-start-2 max-md:text-xs`,
+  branch: `${CELL} text-ink-muted max-md:col-start-3 max-md:row-start-2 max-md:text-mono`,
+  run: `${CELL} justify-end text-ink-muted tabular-nums whitespace-nowrap max-md:col-start-4 max-md:row-start-2 max-md:text-mono`,
   age: `${CELL} justify-end text-ink-muted tabular-nums whitespace-nowrap max-md:col-start-4 max-md:row-start-1`,
 };
 const CHECKBOX = "m-0 size-4 cursor-pointer accent-signal";
@@ -163,7 +163,7 @@ function QueryBar({
           aria-hidden
         />
         <input
-          className="mk-input mk-input--code h-11 min-w-0 flex-1 pl-10 text-sm"
+          className="mk-input mk-input--code h-11 min-w-0 flex-1 pl-10 sm:text-body"
           value={draft}
           onChange={(e) => setDraft(e.currentTarget.value)}
           onKeyDown={(e) => {
