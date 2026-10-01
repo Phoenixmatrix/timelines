@@ -1,0 +1,234 @@
+@import "tailwindcss";
+@import "./tokens.css";
+/* The kit sits in the components layer so Tailwind utilities can still adjust it. */
+@import "./matrixkit.css" layer(components);
+
+/* MatrixKit roles as Tailwind utilities: bg-pane, text-ink-muted, rounded-control… */
+@theme inline {
+  --color-*: initial;
+  --color-stage: var(--stage);
+  --color-rail: var(--rail);
+  --color-sunken: var(--sunken);
+  --color-pane: var(--pane);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-pressed: var(--pressed);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-signal: var(--signal);
+  --color-signal-hover: var(--signal-hover);
+  --color-signal-ink: var(--signal-ink);
+  --color-signal-line: var(--signal-line);
+  --color-signal-wash: var(--signal-wash);
+  --color-danger: var(--danger);
+  --color-danger-ink: var(--danger-ink);
+  --color-danger-text: var(--danger-text);
+  --color-danger-wash: var(--danger-wash);
+  --color-online: var(--online);
+  --color-backdrop: var(--backdrop);
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  --text-display: 1.875rem;
+  --text-display--line-height: 2.25rem;
+  --text-display--letter-spacing: -0.02em;
+  --text-display--font-weight: 700;
+  --text-headline: 1.5rem;
+  --text-headline--line-height: 1.9rem;
+  --text-headline--letter-spacing: -0.015em;
+  --text-headline--font-weight: 700;
+  --text-title-lg: 1.25rem;
+  --text-title-lg--line-height: 1.65rem;
+  --text-title-lg--letter-spacing: -0.01em;
+  --text-title-lg--font-weight: 700;
+  --text-title: 1.0625rem;
+  --text-title--line-height: 1.5rem;
+  --text-title--font-weight: 700;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.45rem;
+  --text-body-sm: 0.8125rem;
+  --text-body-sm--line-height: 1.25rem;
+  --text-label: 0.75rem;
+  --text-label--line-height: 1.1rem;
+  --text-label--font-weight: 600;
+  --text-micro: 0.6875rem;
+  --text-micro--line-height: 1rem;
+  --text-mono: 0.75rem;
+  --text-mono--line-height: 1.1rem;
+}
+
+/* Same values as tokens.css, as literals so Tailwind can name utilities after them. */
+@theme {
+  --radius-plate: 6px;
+  --radius-control: 8px;
+  --radius-pane: 12px;
+  --radius-tile: 14px;
+  --radius-squircle: 30%;
+  --font-sans: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", monospace;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+}
+
+/* Links: ink with a signal-line underline that thickens on hover. */
+.mk-root .gm-link {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--signal-line);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+.mk-root .gm-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+/* Rendered READMEs: plain readable prose on the kit's type scale. */
+.gm-prose {
+  max-width: 72ch;
+  overflow-wrap: anywhere;
+}
+.gm-prose > :first-child {
+  margin-top: 0;
+}
+.gm-prose h1,
+.gm-prose h2,
+.gm-prose h3 {
+  margin: 1.5em 0 0.5em;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.gm-prose h1 {
+  font-size: 1.5rem;
+  line-height: 1.9rem;
+}
+.gm-prose h2 {
+  font-size: 1.25rem;
+  line-height: 1.65rem;
+}
+.gm-prose h3 {
+  font-size: 1.0625rem;
+  line-height: 1.5rem;
+}
+.gm-prose p,
+.gm-prose ul,
+.gm-prose ol,
+.gm-prose pre,
+.gm-prose blockquote {
+  margin: 0 0 1em;
+}
+.gm-prose ul,
+.gm-prose ol {
+  padding-left: 1.5em;
+}
+.gm-prose ul {
+  list-style: disc;
+}
+.gm-prose ol {
+  list-style: decimal;
+}
+.gm-prose a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--signal-line);
+  text-underline-offset: 0.2em;
+}
+.gm-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  padding: 1px 5px;
+  border-radius: var(--radius-plate);
+  background: var(--sunken);
+}
+.gm-prose pre {
+  padding: 12px 14px;
+  overflow-x: auto;
+  border-radius: var(--radius-control);
+  background: var(--sunken);
+}
+.gm-prose pre code {
+  padding: 0;
+  background: none;
+}
+.gm-prose blockquote {
+  padding-left: 12px;
+  border-left: 2px solid var(--line);
+  color: var(--ink-muted);
+}
+.gm-prose img {
+  max-width: 100%;
+}
+.gm-prose table {
+  border-collapse: collapse;
+  margin: 0 0 1em;
+}
+.gm-prose th,
+.gm-prose td {
+  padding: 4px 10px;
+  border: 1px solid var(--line-soft);
+}
+
+/* Motion from the kit: popups scale from 95% and fade in 150ms, dialogs from 97%
+   in 200ms on the expo ease, toasts slide 12px in 250ms. Base UI marks the
+   start and end of each transition with data attributes. */
+.gm-pop {
+  transform-origin: var(--transform-origin);
+  transition:
+    opacity 150ms,
+    scale 150ms;
+}
+.gm-pop[data-starting-style],
+.gm-pop[data-ending-style] {
+  opacity: 0;
+  scale: 0.95;
+}
+.gm-fade {
+  transition: opacity 200ms;
+}
+.gm-fade[data-starting-style],
+.gm-fade[data-ending-style] {
+  opacity: 0;
+}
+.gm-dialog {
+  transition:
+    opacity 200ms cubic-bezier(0.16, 1, 0.3, 1),
+    scale 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.gm-dialog[data-starting-style],
+.gm-dialog[data-ending-style] {
+  opacity: 0;
+  scale: 0.97;
+}
+.gm-toast {
+  transition:
+    opacity 250ms cubic-bezier(0.16, 1, 0.3, 1),
+    translate 250ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.gm-toast[data-starting-style],
+.gm-toast[data-ending-style] {
+  opacity: 0;
+  translate: 12px 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .gm-pop[data-starting-style],
+  .gm-pop[data-ending-style],
+  .gm-dialog[data-starting-style],
+  .gm-dialog[data-ending-style] {
+    scale: 1;
+  }
+  .gm-toast[data-starting-style],
+  .gm-toast[data-ending-style] {
+    translate: 0;
+  }
+}

@@ -1,0 +1,136 @@
+/*
+ * MatrixKit Neo tokens, generated from the design system's tokens.json
+ * (https://claude.ai/artifact/8fyZY8RS5h5Fma2uRTrojV). Dark is the home theme;
+ * light is chosen with data-theme="light" on <html> or any region.
+ */
+
+@font-face {
+  font-family: "Figtree Variable";
+  src: url("./fonts/Figtree-latin-wght-normal.woff2") format("woff2");
+  font-weight: 300 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Figtree Variable";
+  src: url("./fonts/Figtree-latin-wght-italic.woff2") format("woff2");
+  font-weight: 300 900;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono Variable";
+  src: url("./fonts/GeistMono-latin-wght-normal.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --space-hair: 4px;
+  --space-xs: 6px;
+  --space-sm: 8px;
+  --space-tile-gap: 10px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-section: 48px;
+  --radius-plate: 6px;
+  --radius-control: 8px;
+  --radius-pane: 12px;
+  --radius-tile: 14px;
+  --radius-squircle: 30%;
+  --radius-full: 9999px;
+  --size-control-sm: 32px;
+  --size-control: 40px;
+  --size-field: 44px;
+  --size-dock: 48px;
+  --size-rail: 72px;
+  --z-popup: 50;
+  --z-toast: 60;
+  --font-sans: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", monospace;
+}
+
+:root,
+[data-theme="dark"] {
+  --stage: oklch(0.145 0.005 70);
+  --rail: oklch(0.175 0.006 70);
+  --sunken: oklch(0.19 0.006 70);
+  --pane: oklch(0.205 0.006 70);
+  --surface: oklch(0.235 0.007 70);
+  --raised: oklch(0.275 0.008 70);
+  --pressed: oklch(0.32 0.009 70);
+  --line: oklch(0.32 0.008 70);
+  --line-soft: oklch(0.27 0.007 70);
+  --ink: oklch(0.945 0.008 80);
+  --ink-muted: oklch(0.76 0.012 75);
+  --ink-faint: oklch(0.64 0.012 75);
+  --signal: oklch(0.81 0.145 76);
+  --signal-hover: oklch(0.85 0.13 80);
+  --signal-ink: oklch(0.23 0.035 65);
+  --signal-line: var(--signal);
+  --signal-wash: oklch(0.81 0.145 76 / 0.14);
+  --danger: oklch(0.54 0.19 25);
+  --danger-hover: oklch(0.49 0.18 25);
+  --danger-ink: oklch(0.99 0 0);
+  --danger-text: oklch(0.72 0.16 25);
+  --danger-wash: oklch(0.64 0.19 25 / 0.16);
+  --danger-wash-strong: oklch(0.64 0.19 25 / 0.26);
+  --danger-line: oklch(0.64 0.19 25 / 0.25);
+  --scrim: oklch(0.12 0.005 70 / 0.78);
+  --scrim-strong: oklch(0.16 0.006 70 / 0.92);
+  --backdrop: oklch(0.08 0.01 70 / 0.6);
+  --screen: oklch(0.1 0.004 70);
+  --online: oklch(0.74 0.14 155);
+  --data-teal: oklch(0.78 0.1 200);
+  --data-teal-wash: oklch(0.78 0.1 200 / 0.18);
+  --data-violet: oklch(0.8 0.1 290);
+  --data-violet-wash: oklch(0.8 0.1 290 / 0.16);
+  --data-berry: oklch(0.66 0.12 350);
+  --data-berry-wash: oklch(0.66 0.12 350 / 0.22);
+  --shadow-float: 0 8px 24px -6px oklch(0.08 0.01 70 / 0.55), 0 2px 6px oklch(0.08 0.01 70 / 0.35);
+  --shadow-dock: 0 10px 30px -8px oklch(0.05 0.01 70 / 0.7);
+}
+
+[data-theme="light"] {
+  --stage: oklch(0.955 0.006 75);
+  --rail: oklch(0.995 0.002 75);
+  --sunken: oklch(0.945 0.006 75);
+  --pane: oklch(0.985 0.003 75);
+  --surface: oklch(0.965 0.005 75);
+  --raised: oklch(0.925 0.008 75);
+  --pressed: oklch(0.895 0.01 75);
+  --line: oklch(0.8 0.012 75);
+  --line-soft: oklch(0.9 0.008 75);
+  --ink: oklch(0.235 0.015 65);
+  --ink-muted: oklch(0.42 0.015 70);
+  --ink-faint: oklch(0.5 0.014 70);
+  --signal: oklch(0.77 0.155 72);
+  --signal-hover: oklch(0.72 0.155 68);
+  --signal-ink: oklch(0.2 0.03 65);
+  --signal-line: oklch(0.58 0.145 62);
+  --signal-wash: oklch(0.72 0.15 70 / 0.16);
+  --danger: oklch(0.52 0.19 25);
+  --danger-hover: oklch(0.47 0.18 25);
+  --danger-ink: oklch(0.99 0 0);
+  --danger-text: oklch(0.5 0.18 25);
+  --danger-wash: oklch(0.6 0.19 25 / 0.1);
+  --danger-wash-strong: oklch(0.6 0.19 25 / 0.18);
+  --danger-line: oklch(0.6 0.19 25 / 0.25);
+  --scrim: oklch(0.12 0.005 70 / 0.78);
+  --scrim-strong: oklch(0.16 0.006 70 / 0.92);
+  --backdrop: oklch(0.2 0.01 70 / 0.32);
+  --screen: oklch(0.1 0.004 70);
+  --online: oklch(0.58 0.14 155);
+  --data-teal: oklch(0.55 0.1 200);
+  --data-teal-wash: oklch(0.55 0.1 200 / 0.18);
+  --data-violet: oklch(0.45 0.14 290);
+  --data-violet-wash: oklch(0.45 0.14 290 / 0.16);
+  --data-berry: oklch(0.6 0.13 350);
+  --data-berry-wash: oklch(0.6 0.13 350 / 0.2);
+  --shadow-float: 0 8px 24px -6px oklch(0.35 0.02 70 / 0.18), 0 2px 6px oklch(0.35 0.02 70 / 0.1);
+  --shadow-dock: 0 10px 30px -8px oklch(0.35 0.02 70 / 0.24);
+}
