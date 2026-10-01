@@ -16,6 +16,7 @@ import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
 import { buildRegistry } from "../registry/app.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
+import { tracker } from "./tracker/api.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -50,6 +51,7 @@ api.use(async (c, next) => {
   return next();
 });
 api.route("/", accounts);
+api.route("/", tracker);
 api.route("/repos/:owner/:name/knowledge", knowledge);
 api.route("/repos/:owner/:name/ci", ci);
 api.route("/ci/runner", runner);
@@ -116,3 +118,4 @@ export { CiSandbox } from "./ci/sandbox.ts";
 export { RepoDO as RegistryRepo } from "../registry/do/repo-do.ts";
 export { UploadDO as RegistryUpload } from "../registry/do/upload-do.ts";
 export { LoginDO as RegistryLogin } from "../registry/do/login-do.ts";
+export { Tracker } from "./tracker/object.ts";

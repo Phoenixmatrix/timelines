@@ -3,7 +3,8 @@
 A git host on Cloudflare: one Worker serves the React app, a JSON API, and git's
 smart HTTP protocol. Repository contents live in
 [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/); accounts,
-permissions and tokens live in D1.
+permissions and tokens live in D1. Account-owned issue trackers live in SQLite
+Durable Objects, independent of repository history.
 
 ```
 git client ──Basic user:token──▶ Worker /:owner/:repo.git/*  ──Bearer art_…──▶ Artifacts git remote
@@ -14,17 +15,20 @@ browser    ──cookie──▶ Worker /api/*  ──env.ARTIFACTS──▶ log
 ## Run it
 
 ```bash
-pnpm install
-pnpm run db:migrate   # local D1: schema + dev personas
-vp dev                # http://localhost:5180
+vp install
+vp run db:migrate     # local D1: schema + dev personas
+cf dev                # http://localhost:5180; starts CI runners on demand
 ```
 
 Sign in with `cf auth login` (the account needs Artifacts and Workers AI). There
 is no local Artifacts, Workers AI, Vectorize or AI Search emulator, so dev uses
 the real services (`dev: { remote: true }` in `cloudflare.config.ts`); D1, the
-Durable Object and the Workflow run locally, with state in `.wrangler/state`
-(the Vite plugin's default, shared with `cf --persist-to`). `cf` 1.0.0-beta.7
-doesn't exit after local D1 commands; stop it once it prints its result.
+Durable Objects and Workflows run locally, with state explicitly persisted in
+`.wrangler/state` by `vite.config.ts` (shared with the migration script).
+The pinned Vite plugin v2 beta is required by `cf dev` and `cf build`; it reads
+`cloudflare.config.ts` directly, without the legacy `experimental.newConfig` option.
+`cf` 1.0.0-beta.7 doesn't exit after local D1 commands; stop it once it prints
+its result.
 
 On the persona screen, **Load samples** imports three small public GitHub repos
 and creates one empty repo.
@@ -133,6 +137,77 @@ curl -H "Authorization: Bearer $TOKEN" -X POST $H/api/repos \
 | `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                            |
 | `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                      |
 | `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                           |
+
+## Distributed issue tracker
+
+Open `/tracker` from the global navigation. Select an account, create a team,
+and capture a title-only issue. The workbench keeps the list, board or blocker
+graph beside the selected issue; phones navigate from the list into detail.
+Expand a ticket into a Markdown PRD, acceptance criteria, parent/child plan,
+dependencies and durable comments, agent checkpoints or evidence.
+
+- **Ownership:** a personal account or organization owns each tracker. An issue
+  has one team and zero or more cross-team workspaces. Team prefixes and workspace
+  slugs are permanent; archival preserves history.
+- **Repository subscriptions:** any number of repositories can subscribe to any
+  number of workspaces. The repository's **Issues** tab previews ready issues
+  only from trackers the viewer already belongs to. A subscription grants neither
+  tracker membership nor repository access. Managing one requires both tracker
+  ownership and repository administration. After a repository is deleted, its
+  tracker owner can remove the orphan association.
+- **Permissions:** account members can read the tracker. Owners administer teams,
+  workspaces and subscriptions. A nonempty team membership list restricts issue
+  writes and assignees; an empty list permits all current account members. A site
+  administrator is not automatically a member of every tracker.
+- **Graph:** `FROM blocks TO`; only `done` satisfies a blocker. Canceling a
+  prerequisite does not silently unblock its dependents. Parent hierarchy is
+  separate and does not imply blocking. Both blocker and parent cycles are rejected.
+- **Coordination:** ready work is unblocked, unclaimed `todo`, or an expired
+  claimed `in_progress` issue. Exclusive claims require an online transaction.
+  Renew, release and complete require the unexpired fencing token; completion
+  also records evidence and rechecks blockers. Tokens never appear in public
+  snapshots or event feeds.
+- **Distribution:** each account has one `TRACKER` SQLite Durable Object authority.
+  Atomic batches, actor/payload-bound operation receipts, version checks and an
+  ordered event cursor synchronize private CLI replicas. Lost acknowledgements
+  replay the same operation; conflicts preserve local intent for explicit
+  resolution. This is not Git-based issue storage. See the
+  [offline CLI and agent workflow](../cli/README.md#distributed-issue-tracker).
+- **Human workbench:** closed work is hidden by default; readiness, team and
+  workspace filters stay in the URL. Desktop collection/detail panes scroll
+  independently; mobile filters and account actions are disclosed on demand.
+  Closed board lanes retain their counts and expand to show closed issues.
+  Add subtasks from the parent without leaving it; only active workspaces are
+  inherited. Checkpoints, claims, blockers and completion evidence remain distinct.
+- **Browser conflicts:** drafts persist for the tab session. Review named fields,
+  choose individual remote values, then explicitly rebase; untouched remote
+  fields are retained. Labels and workspace membership compare as sets, so
+  reordering does not overwrite another person's changes. Errors remain beside
+  the failed action. An uncertain write freezes mutation fields and retries its
+  original operation ID; confirmation completes the original form without duplicates.
+- **Keyboard:** single-key shortcuts are off by default; enable or disable them
+  through **Shortcuts** in the account actions. The preference persists locally.
+  `c` or `n` focuses capture, `/` focuses search, `j`/`k` selects adjacent issues,
+  and `e` edits the selected issue. Shortcuts do not run while typing or interacting
+  with form controls. The enabled legend lists the available keys.
+
+| Route                                               | Contract                                                                                                |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `GET /api/tracker`                                  | Trackers accessible to the authenticated account                                                        |
+| `GET /api/tracker/:owner/snapshot`                  | Complete authorized replica snapshot and cursor                                                         |
+| `GET /api/tracker/:owner/changes?after=N&limit=200` | Ordered event page; resume from the returned cursor                                                     |
+| `POST /api/tracker/:owner/mutate`                   | `{operationId, mutations:[{kind,id,expectedVersion?,data?}]}`; 1–100 ordered operations, all or nothing |
+| `GET /api/repos/:owner/:name/tracker`               | Accessible subscribed workspaces for repository navigation                                              |
+
+Updates require the version last read; stale writes return `409 version_conflict`
+with current state. Issue IDs are stable client-generated identifiers; the authority
+assigns readable keys such as `ENG-42`. Mutation bodies are limited to 1 MiB.
+`shared/tracker.ts` defines the wire types; `gm schema issue batch` exposes the
+CLI contract. No new D1 migration is needed: the Durable Object initializes its
+own schema. Generate the new binding with `cf workers types`.
+
+These primitives support durable agent handoffs. An autonomous hours/days-long
+execution loop is not included.
 
 ## Knowledge graph and wiki
 
@@ -354,6 +429,9 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 - `registry/`: package registries (formats, catalog, ACL, provenance, Durable Objects,
   jobs); `registry/manage/`: the packages API behind the console, feeds and gm
 - `packages/formats` (repo root): IO-free protocol libraries for every package format
+- `worker/tracker/*`: account-level authority, transactional graph store and sync API
+- `shared/tracker.ts`: shared tracker entities, mutations and readiness semantics
+- `src/routes/tracker/*`: issue workbench, graph and tracker administration
 - `scripts/git-login.ts`: points the git CLI at Gitmatrix as a persona
 - `src/`: React Router (data mode), Base UI and Tailwind, styled with MatrixKit Neo
   (`src/styles/tokens.css` is generated from the design system's tokens;
@@ -365,7 +443,7 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
   returns 200, even if git rejected a ref inside the response.
 - READMEs render Markdown without raw HTML, so `<details>` and `<br>` show as text.
 - In testing, imports brought over the default branch only, without tags.
-- Owner slugs `signin`, `new`, `settings`, `api`, `cli-auth`, `-` and the registry prefixes
+- Owner slugs `signin`, `new`, `settings`, `tracker`, `api`, `cli-auth`, `-` and the registry prefixes
   collide with routes and should be reserved once accounts can be created.
 - Packages: the tag facet lives in the header's tag plates rather than the side
   column; retention can't yet keep a branch's builds longer than another's.

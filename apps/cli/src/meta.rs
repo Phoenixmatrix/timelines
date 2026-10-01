@@ -36,6 +36,37 @@ macro_rules! meta {
 }
 
 pub const COMMANDS: &[Meta] = &[
+    meta!("tracker list", git: "", kw: "accounts organizations issue trackers", mutates: false, out: Out::Other("{trackers:[{id,slug,displayName,canAdmin}]}"), ex: ["gm tracker list"]),
+    meta!("tracker use", git: "", kw: "select owner initialize offline replica account organization", mutates: true, out: Out::Other("{owner,identity,replica,cursor}"), ex: ["gm tracker use orbit"]),
+    meta!("tracker sync", git: "", kw: "offline replica outbox synchronize upload download cursor", mutates: true, out: Out::Other("{dryRun,cursor,pending}; conflicts stop ordered replay without dropping later edits"), ex: ["gm tracker sync"]),
+    meta!("tracker status", git: "", kw: "replica pending queue identity cache path", mutates: false, out: Out::Other("{owner,identity,cursor,operations,replica,credentialPartitions,credentialRotation}"), ex: ["gm tracker status --offline"]),
+    meta!("tracker conflicts", git: "", kw: "stale version collision local remote rejected edits", mutates: false, out: Out::Other("{operations,remote:Snapshot,local:Snapshot,resolution}"), ex: ["gm tracker conflicts"]),
+    meta!("tracker resolve", git: "", kw: "resolve conflict accept server reapply local explicit", mutates: true, out: Out::Other("{resolved,strategy,pending,next}"), ex: ["gm tracker resolve OPERATION --strategy reapply-local"]),
+    meta!("tracker recover", git: "", kw: "credential rotation token identity recover old replica outbox", mutates: true, out: Out::Other("{dryRun,recovered,source,replica,next}"), ex: ["gm tracker recover /private/old/orbit.sqlite --owner orbit"]),
+    meta!("tracker changes", git: "", kw: "events cursor incremental change feed", mutates: false, out: Out::Other("{events:[{cursor,operationId,actorId,kind,entityType,entityId,entity,createdAt}],cursor,hasMore,serverTime}"), ex: ["gm tracker changes --after 10 --limit 50"]),
+    meta!("team list", git: "", kw: "teams membership issue prefixes", mutates: false, out: Out::Other("{teams:[Team],offline,cursor}"), ex: ["gm team list"]),
+    meta!("team create", git: "", kw: "create team issue key prefix", mutates: true, out: Out::Other("{operationId,queued,entities:[Team],cursor}"), ex: ["gm team create ENG --name Engineering"]),
+    meta!("team update", git: "", kw: "team membership archive rename description", mutates: true, out: Out::Other("{operationId,queued,entities:[Team],cursor}"), ex: ["gm team update ENG --data '{\"name\":\"Platform\"}'"]),
+    meta!("workspace list", git: "", kw: "cross team workspace projects subscriptions", mutates: false, out: Out::Other("{workspaces:[Workspace],subscriptions:[Subscription],offline,cursor}"), ex: ["gm workspace list"]),
+    meta!("workspace create", git: "", kw: "project area cross team workspace create", mutates: true, out: Out::Other("{operationId,queued,entities:[Workspace],cursor}"), ex: ["gm workspace create launch --name Launch"]),
+    meta!("workspace update", git: "", kw: "workspace rename archive description", mutates: true, out: Out::Other("{operationId,queued,entities:[Workspace],cursor}"), ex: ["gm workspace update launch --data '{\"archived\":true}'"]),
+    meta!("workspace subscribe", git: "", kw: "repository workspace association subscription", mutates: true, out: Out::Other("{operationId,queued,entities:[Subscription],cursor}"), ex: ["gm workspace subscribe launch --repo REPO_ID"]),
+    meta!("workspace unsubscribe", git: "", kw: "remove repository workspace subscription", mutates: true, out: Out::Other("{operationId,queued,entities:[],cursor}"), ex: ["gm workspace unsubscribe SUBSCRIPTION_ID"]),
+    meta!("issue create", git: "", kw: "ticket task bug prd markdown acceptance offline stable id", mutates: true, out: Out::Other("{operationId,queued,entities:[Issue],cursor}; offline key is null until synchronized"), ex: ["gm issue create 'Ship search' --team ENG --type prd --description-file spec.md"]),
+    meta!("issue list", git: "", kw: "tickets issues filter search status team workspace bounded", mutates: false, out: Out::Other("{issues:[Issue],total,truncated,offline,readinessAdvisory,cursor,cachedAt,next}"), ex: ["gm issue list --workspace launch --limit 20"]),
+    meta!("issue ready", git: "", kw: "ready frontier agent unblocked available work dependency blockers", mutates: false, out: Out::Other("{issues:[Issue],total,truncated,offline,readinessAdvisory:true,cursor,cachedAt,next}; acquire an online claim before work"), ex: ["gm issue ready --limit 10"]),
+    meta!("issue show", git: "", kw: "bounded context ancestors parent prd blockers dependents checkpoint evidence", mutates: false, out: Out::Other("{issue,ancestors,links,relatedIssues,notes,limitPerSection,truncated,ready,readinessAdvisory,cursor,cachedAt,offline}"), ex: ["gm issue show ENG-1 --limit 20"]),
+    meta!("issue update", git: "", kw: "edit issue version optimistic status assignment acceptance labels", mutates: true, out: Out::Other("{operationId,queued,entities:[Issue],cursor}"), ex: ["gm issue update ENG-1 --data '{\"priority\":1}' --offline"]),
+    meta!("issue link", git: "", kw: "dependency blocker related duplicate directed graph", mutates: true, out: Out::Other("{operationId,queued,entities:[Link],cursor}"), ex: ["gm issue link ENG-1 ENG-2 --kind blocks"]),
+    meta!("issue unlink", git: "", kw: "remove dependency blocker relation", mutates: true, out: Out::Other("{operationId,queued,entities:[],cursor}"), ex: ["gm issue unlink LINK_ID"]),
+    meta!("issue comment", git: "", kw: "durable markdown comment discussion", mutates: true, out: Out::Other("{operationId,queued,entities:[Comment],cursor}"), ex: ["gm issue comment ENG-1 'Investigating the failing build'"]),
+    meta!("issue checkpoint", git: "", kw: "agent durable checkpoint progress decisions handoff resume", mutates: true, out: Out::Other("{operationId,queued,entities:[Comment],cursor}"), ex: ["gm issue checkpoint ENG-1 '@checkpoint.md'"]),
+    meta!("issue evidence", git: "", kw: "verification evidence proof durable test result", mutates: true, out: Out::Other("{operationId,queued,entities:[Comment],cursor}"), ex: ["gm issue evidence ENG-1 'Verified with integration smoke'"]),
+    meta!("issue batch", git: "", kw: "atomic graph dependency mutations offline batch json", mutates: true, out: Out::Other("{operationId,queued,entities:[Entity],cursor}; input array of {kind,id,expectedVersion?,data?}, max 100, canonical IDs"), ex: ["gm issue batch '@plan.json' --offline"]),
+    meta!("issue claim", git: "", kw: "exclusive online claim fence agent lease token", mutates: true, out: Out::Other("{cursor,events,results:[{id,leaseToken,expiresAt}],serverTime}; leaseToken is secret and is not cached"), ex: ["gm issue claim ENG-1 --agent build-agent"]),
+    meta!("issue renew", git: "", kw: "lease renew online fencing token expiration", mutates: true, out: Out::Other("{cursor,events,results,serverTime}; token may appear only in claim/renew responses"), ex: ["gm issue renew ENG-1 --ttl 900"]),
+    meta!("issue release", git: "", kw: "release exclusive fenced claim online", mutates: true, out: Out::Other("{cursor,events,results,serverTime}; lease token redacted"), ex: ["gm issue release ENG-1"]),
+    meta!("issue complete", git: "", kw: "finish issue online fencing evidence done", mutates: true, out: Out::Other("{cursor,events,results,serverTime}; lease token redacted"), ex: ["gm issue complete ENG-1 --evidence '@verification.md'"]),
     meta!("status", git: "git status", kw: "what changed working copy modified files uncommitted dirty state where am i", mutates: false, out: Out::Typed(schema_of::<model::Status>), ex: ["gm status"]),
     meta!("log", git: "git log --oneline --graph", kw: "history list changes commits recent graph unpushed", mutates: false, out: Out::Typed(schema_of::<model::Log>), ex: ["gm log", "gm log -r all -n 20", "gm log -r trunk..@"]),
     meta!("show", git: "git show", kw: "inspect view change commit details patch", mutates: false, out: Out::Typed(schema_of::<model::Diff>), ex: ["gm show", "gm show @- --stat"]),
@@ -188,7 +219,18 @@ fn param(arg: &clap::Arg) -> Param {
 
 /// Every leaf command, in definition order.
 pub fn manifest() -> Vec<Entry> {
-    fn walk(cmd: &clap::Command, prefix: &str, out: &mut Vec<Entry>) {
+    fn walk(cmd: &clap::Command, prefix: &str, inherited: &[&clap::Arg], out: &mut Vec<Entry>) {
+        let mut scoped = inherited.to_vec();
+        if !prefix.is_empty() {
+            for arg in cmd.get_arguments().filter(|arg| arg.is_global_set()) {
+                if !scoped
+                    .iter()
+                    .any(|previous| previous.get_id() == arg.get_id())
+                {
+                    scoped.push(arg);
+                }
+            }
+        }
         for sub in cmd.get_subcommands() {
             let path = if prefix.is_empty() {
                 sub.get_name().to_string()
@@ -196,20 +238,26 @@ pub fn manifest() -> Vec<Entry> {
                 format!("{prefix} {}", sub.get_name())
             };
             if sub.has_subcommands() {
-                walk(sub, &path, out);
+                walk(sub, &path, &scoped, out);
                 continue;
             }
             let meta = find(&path);
             let mut usage_cmd = sub.clone().bin_name(format!("gm {path}"));
+            let mut args: Vec<&clap::Arg> = sub
+                .get_arguments()
+                .filter(|arg| arg.get_id() != "help")
+                .collect();
+            for arg in &scoped {
+                if !args.iter().any(|own| own.get_id() == arg.get_id()) {
+                    usage_cmd = usage_cmd.arg((*arg).clone());
+                    args.push(arg);
+                }
+            }
             let usage = usage_cmd
                 .render_usage()
                 .to_string()
                 .trim_start_matches("Usage: ")
                 .to_string();
-            let args: Vec<&clap::Arg> = sub
-                .get_arguments()
-                .filter(|a| !a.is_global_set() && a.get_id() != "help")
-                .collect();
             out.push(Entry {
                 command: format!("gm {path}"),
                 summary: sub.get_about().map(|s| s.to_string()).unwrap_or_default(),
@@ -234,7 +282,7 @@ pub fn manifest() -> Vec<Entry> {
         }
     }
     let mut out = Vec::new();
-    walk(&crate::cli::Cli::command(), "", &mut out);
+    walk(&crate::cli::Cli::command(), "", &[], &mut out);
     out
 }
 
@@ -475,6 +523,23 @@ dependency installation yourself in the new checkout; do not copy node_modules.
 Removal refuses dirty/ignored files unless --force, and always refuses locks,
 the main checkout and your current checkout. Recorded gm history is archived;
 unsnapshotted edits and ignored files are discarded with --force.
+
+## Distributed tracker (no Git repository required)
+    gm tracker use orbit
+    gm team create ENG --name Engineering
+    gm issue create 'Fix search' --team ENG
+    gm issue ready --limit 10
+    gm issue show ENG-1 --limit 20
+    gm issue claim ENG-1 --agent my-agent
+    gm issue checkpoint ENG-1 'Implemented; next: verify'
+    gm issue complete ENG-1 --evidence 'Smoke verified'  # GM_LEASE_TOKEN required
+Explicit `--offline` queues durable SQLite edits; online commands never mask errors.
+`gm tracker sync` replays in order, retaining uncertain acknowledgements by operation ID.
+`gm tracker conflicts` preserves local/remote data; resolve the head explicitly using
+`gm tracker resolve OPERATION --strategy accept-server|reapply-local`.
+Offline readiness is advisory, never a lease. Lease operations require online access.
+Tracker writes are not restored by `gm undo`. `gm schema issue batch` describes atomic
+graph input. `gm tracker status` exposes private replica paths for credential recovery.
 
 ## CI
 Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,

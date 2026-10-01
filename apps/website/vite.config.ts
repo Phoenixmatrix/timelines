@@ -12,7 +12,7 @@ export default defineConfig({
     tailwindcss(),
     // Before the Cloudflare plugin, so its dispatch path never reaches the Worker.
     !process.env.VITEST && ciRunners(),
-    !process.env.VITEST && cloudflare({ experimental: { newConfig: true } }),
+    !process.env.VITEST && cloudflare({ persistState: { path: ".wrangler/state" } }),
   ],
   server: { port: 5180, strictPort: true },
   test: {

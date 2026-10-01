@@ -35,6 +35,14 @@ pub struct Global {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Offline replicas, ordered sync, conflicts and tracker selection (no Git repository needed)
+    Tracker(crate::tracker_cli::TrackerArgs),
+    /// Tracker teams, membership and immutable issue-key prefixes
+    Team(crate::tracker_cli::TeamArgs),
+    /// Cross-team tracker workspaces and repository subscriptions
+    Workspace(crate::tracker_cli::WorkspaceArgs),
+    /// Agent-first issues, PRDs, dependency graph, checkpoints and fenced claims
+    Issue(crate::tracker_cli::IssueArgs),
     /// Show the working-copy change, its files and where it sits relative to trunk
     #[command(visible_alias = "st")]
     Status,

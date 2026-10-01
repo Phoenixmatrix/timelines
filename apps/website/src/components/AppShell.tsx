@@ -2,6 +2,7 @@ import { popMotion } from "./ui.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
   HouseIcon,
+  ListChecksIcon,
   FingerprintIcon,
   KeyIcon,
   MoonIcon,
@@ -134,6 +135,13 @@ export function AppShell() {
         <Place to="/" label="Home" end>
           {(active) => <HouseIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
         </Place>
+        {viewer && (
+          <Place to="/tracker" label="Issue tracker">
+            {(active) => (
+              <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+            )}
+          </Place>
+        )}
         {viewer && (
           <Place to="/settings/tokens" label="Access tokens">
             {(active) => <KeyIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}

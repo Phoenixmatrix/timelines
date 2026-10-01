@@ -77,7 +77,7 @@ Do not explore gm by chaining --help calls. Instead:
   gm cli search \"<what you want>\"  top 5 matching commands as JSON
   gm schema <command...>           exact inputs and the JSON output shape
 Output is JSON whenever an agent or a pipe is detected. Errors are JSON on
-stderr with a stable `code` and a `hint`. Every mutating command takes --dry-run,
-and `gm undo` reverses the last operation.
+stderr with a stable `code` and a `hint`. Every mutating command takes --dry-run.
+`gm undo` restores local workspace operations, not tracker or remote changes.
 === END AGENTS ===
 ";

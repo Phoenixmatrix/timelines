@@ -7,6 +7,7 @@ mod output;
 mod remote;
 mod repo;
 mod ssh;
+mod tracker_cli;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::{BookmarkCommand, CliCommand, Command, FileCommand, OpCommand};
@@ -43,7 +44,9 @@ fn build_command(agent: bool) -> clap::Command {
                     }
                     if m.mutates {
                         extra.push_str("\nSupports --dry-run.\n");
-                        if m.path.starts_with("worktree ") {
+                        if ["tracker ", "team ", "workspace ", "issue "].iter().any(|p| m.path.starts_with(p)) {
+                            extra.push_str("Tracker changes are not reversed by `gm undo`; use an explicit versioned edit.\n");
+                        } else if m.path.starts_with("worktree ") {
                             extra.push_str(
                                 "Worktree creation/removal is not reversed by `gm undo`.\n",
                             );
@@ -114,6 +117,10 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Ok(())
     }
     match command {
+        Command::Tracker(a) => out(f, commands::tracker::tracker(ctx, &a)),
+        Command::Team(a) => out(f, commands::tracker::team(ctx, &a)),
+        Command::Workspace(a) => out(f, commands::tracker::workspace(ctx, &a)),
+        Command::Issue(a) => out(f, commands::tracker::issue(ctx, &a)),
         Command::Status => out(f, local::status(ctx)),
         Command::Log(a) => out(f, local::log(ctx, &a)),
         Command::Show(a) => out(f, local::show(ctx, &a)),

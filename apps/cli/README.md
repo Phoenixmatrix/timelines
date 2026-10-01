@@ -17,6 +17,131 @@ gm push --sync                  # rebase onto the latest trunk, then land on mai
 `gm cli guide` prints the whole workflow in one page; it is written to be pasted
 into an AGENTS.md.
 
+## Distributed issue tracker
+
+Tracker commands work anywhere, without `gm init` or a Git repository. Accounts and
+organizations own trackers; each issue belongs to one team and any number of
+cross-team workspaces. Repository subscriptions are associations, not permissions.
+
+```bash
+gm tracker list
+gm tracker use orbit
+gm team create ENG --name Engineering
+gm workspace create launch --name Launch
+gm issue create 'Search redesign' --team ENG --type prd \
+  --description-file design.md --acceptance-file acceptance.md --workspace launch
+gm issue ready --limit 10
+gm issue show ENG-1 --limit 20
+gm issue update ENG-1 --data '{"priority":1,"labels":["search"]}'
+gm issue link ENG-1 ENG-2 --kind blocks  # FROM blocks TO
+gm issue checkpoint ENG-1 '@checkpoint.md'
+gm issue evidence ENG-1 'Verified search with the integration smoke'
+gm workspace subscribe launch --repo REPOSITORY_ID
+gm tracker changes --after 0 --limit 100
+```
+
+Use `--owner orbit` to override the saved tracker. `gm schema issue update` and
+`gm schema issue batch` describe inputs; JSON patch relationship fields use canonical
+IDs, not display keys. `null` clears nullable fields. Description/acceptance file flags
+accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` or `-`.
+`--dry-run` previews intent without sending/enqueuing mutations. Local preview is not
+an authoritative permission, graph or lease validation. Tracker changes are **not**
+reversed by `gm undo`.
+
+### Offline replicas and explicit conflicts
+
+Initialize a replica online first. Offline mode is explicit: errors never silently
+turn into queued successes. Each mutation gets a stable operation ID and each new
+entity a stable random ID; issue keys are `null` until the server assigns a team
+number at sync. Use the returned canonical ID to edit or link a new offline issue.
+
+```bash
+gm issue create 'Reproduce timeout' --team ENG --offline
+gm issue update ISSUE_ID --data '{"description":"Reproduction steps…"}' --offline
+gm tracker status --offline
+gm tracker sync
+gm tracker conflicts
+gm tracker resolve OPERATION_ID --strategy reapply-local
+gm tracker sync
+```
+
+SQLite stores the confirmed snapshot and ordered durable outbox. A process lock
+serializes access, writes use full SQLite durability, and HTTP receipts are applied
+atomically with dequeue. Lost acknowledgements replay the **same request and ID**;
+they cannot be edited/resolved until the server definitively rejects them. Version
+conflicts stop replay. `conflicts` shows preserved local intent and remote snapshot.
+`reapply-local` explicitly rebases only the head batch; `accept-server` explicitly
+discards only that batch. Later operations stay queued and may themselves require
+resolution. No automatic last-writer-wins or dependent-edit deletion occurs.
+
+Replicas live under `$XDG_DATA_HOME/gitmatrix/tracker` (default
+`~/.local/share/gitmatrix/tracker`), partitioned by server, credential and owner,
+with directory mode 0700 and database/lock mode 0600 on Unix. The verified account
+ID is pinned before replay, including SSH reauthentication. No auth or lease token
+is stored in the tracker database. A rotated token deliberately selects a fresh
+partition: old edits remain intact. Before rotation, save `gm tracker status`'s
+`replica` path. After signing in again:
+
+```bash
+gm tracker use orbit
+gm tracker recover /private/old-partition/orbit.sqlite
+gm tracker sync
+```
+
+Recovery verifies the same server, authenticated account and owner, requires an empty
+destination outbox, and atomically moves the original requests/IDs and snapshot.
+It never silently imports another identity's work. `tracker status` reports the
+partition parent directory to locate retained replicas. Separate `XDG_DATA_HOME`
+directories provide independent offline replicas for testing or multiple agents.
+
+### Atomic graphs and fenced agents
+
+`gm issue batch '@plan.json'` accepts 1–100 contract mutations as one atomic batch.
+Assign canonical IDs yourself so later entries can refer to earlier creates:
+
+```json
+[
+  {
+    "kind": "issue.create",
+    "id": "plan-spec",
+    "data": { "teamId": "TEAM_ID", "title": "Specify search", "type": "prd" }
+  },
+  {
+    "kind": "issue.create",
+    "id": "plan-code",
+    "data": { "teamId": "TEAM_ID", "title": "Implement search", "parentId": "plan-spec" }
+  },
+  {
+    "kind": "link.add",
+    "id": "plan-edge",
+    "data": { "fromId": "plan-spec", "toId": "plan-code", "kind": "blocks" }
+  }
+]
+```
+
+The server rejects the entire batch for invalid references, authorization or cycles.
+Updates include `expectedVersion`; claim mutations are not allowed in the outbox.
+Ready means todo (or an expired claimed in-progress issue), no active claim, and
+every blocker **done**. Canceled blockers still block. Parent hierarchy does not
+implicitly block. `ready` and `show` provide cursor, cached timestamp, bounded
+sections and advisory readiness; only an online claim grants exclusive work.
+
+```bash
+gm issue claim ENG-1 --agent search-agent --ttl 900
+# Capture leaseToken securely from that response, then set GM_LEASE_TOKEN.
+gm issue renew ENG-1 --ttl 900
+gm issue checkpoint ENG-1 'Implementation complete; verifying edge cases'
+gm issue complete ENG-1 --evidence '@verification.md'
+# Or: gm issue release ENG-1
+```
+
+Claim/renew/release/complete always require online access. Tokens appear only in
+claim/renew responses, never normal list/context/status output or SQLite. Prefer
+`GM_LEASE_TOKEN` to a command-line argument that shell history/process listings may
+expose. Expired or superseded tokens are rejected even for the same human account.
+An ambiguous lease response is an error, not ownership: inspect the issue and do
+not start work without a received token.
+
 ## The model
 
 - **The working copy is a change (`@`).** Workspace commands snapshot the files

@@ -63,6 +63,7 @@ export default defineConfig(({ mode }) => {
       },
       env: {
         DB: bindings.d1({ name: "gitmatrix", id: "00000000000000000000000000000000" }),
+        TRACKER: bindings.durableObject({ worker: "gitmatrix", exportName: "Tracker" }),
         ARTIFACTS: bindings.artifacts({ namespace: "gitmatrix-dev", ...remote }),
         // Knowledge graph and wiki.
         AI: bindings.ai(remote),
@@ -122,6 +123,7 @@ export default defineConfig(({ mode }) => {
         triggers.scheduled({ schedule: "17 * * * *" }),
       ],
       exports: {
+        Tracker: exports.durableObject({ storage: "sqlite" }),
         KnowledgeCoordinator: exports.durableObject({ storage: "sqlite" }),
         KnowledgeBuild: exports.workflow({ name: "knowledge-build" }),
         CiRun: exports.workflow({ name: "ci-run" }),

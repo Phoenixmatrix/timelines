@@ -21,6 +21,13 @@ import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings
 import { SignIn, signInAction, signInLoader } from "./routes/SignIn.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
+import {
+  Tracker,
+  trackerLoader,
+  TrackerIndex,
+  trackerIndexLoader,
+} from "./routes/tracker/Tracker.tsx";
+import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
 
 export const router = createBrowserRouter([
   {
@@ -38,6 +45,26 @@ export const router = createBrowserRouter([
           { index: true, loader: homeLoader, Component: Home },
           { path: "signin", loader: signInLoader, action: signInAction, Component: SignIn },
           { path: "new", loader: newRepoLoader, action: newRepoAction, Component: NewRepo },
+          { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
+          {
+            path: "tracker/:owner",
+            loader: trackerLoader,
+            shouldRevalidate: ({
+              currentParams,
+              nextParams,
+              formMethod,
+              currentUrl,
+              nextUrl,
+              defaultShouldRevalidate,
+            }) =>
+              currentParams.owner !== nextParams.owner ||
+              formMethod ||
+              currentUrl.href === nextUrl.href
+                ? defaultShouldRevalidate
+                : false,
+            Component: Tracker,
+            children: [{ path: "issues/:issue" }],
+          },
           {
             path: "settings/tokens",
             loader: tokensLoader,
@@ -81,6 +108,7 @@ export const router = createBrowserRouter([
               { path: "commits/*", loader: commitsLoader, Component: Commits },
               { path: "wiki/*", loader: wikiLoader, Component: Wiki },
               { path: "knowledge", loader: knowledgeLoader, Component: Knowledge },
+              { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
               { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
               { path: "ci/:number", loader: ciRunLoader, Component: CiRun },
               { path: "packages", loader: repoPackagesLoader, Component: RepoPackages },

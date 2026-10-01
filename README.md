@@ -58,3 +58,15 @@ example files, when using `gm worktree add --include` or Claude Code's worktrees
 It deliberately excludes dependencies, build output and mutable local database
 state. Initialize local services in each checkout following the
 [website development instructions](apps/website/README.md).
+
+## Distributed issue tracker
+
+Gitmatrix includes an account-owned tracker independent of Git repositories:
+teams own issues, cross-team workspaces organize them, and repositories subscribe
+to workspaces without changing access permissions.
+
+Use `/tracker` for the human workbench, or `gm tracker use OWNER` followed by
+`gm issue ready` for agent work. The CLI supports private offline SQLite replicas,
+explicit conflict resolution, atomic dependency graphs and online fenced claims.
+See the [tracker architecture and API](apps/website/README.md#distributed-issue-tracker)
+and [CLI workflows](apps/cli/README.md#distributed-issue-tracker).

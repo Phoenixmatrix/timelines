@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-01T22:45:00Z",
+  "title": "Design System: Gitmatrix",
+  "extensions": {
+    "shadows": [
+      {
+        "name": "shadow-float",
+        "value": "var(--shadow-float)",
+        "purpose": "Existing soft offset elevation for menus and popovers; adapts to theme."
+      },
+      {
+        "name": "shadow-dock",
+        "value": "var(--shadow-dock)",
+        "purpose": "Existing dock elevation; ordinary work sections remain tonal."
+      }
+    ],
+    "motion": [
+      {
+        "name": "control-state",
+        "value": "150ms",
+        "purpose": "Shared button, field and chip state transitions."
+      },
+      {
+        "name": "place-state",
+        "value": "200ms",
+        "purpose": "Existing navigation-place shape and selection transitions."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "prefers-reduced-motion: reduce",
+        "purpose": "Keep state changes while removing movement."
+      }
+    ],
+    "breakpoints": [
+      { "name": "global-mobile-rail", "value": "640px" },
+      { "name": "tracker-single-pane", "value": "760px" },
+      { "name": "tracker-compact-desktop", "value": "1100px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary action",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Amber action using the incumbent control shape and focus treatment.",
+      "html": "<button class=\"ds-primary\">Save issue</button>",
+      "css": ".ds-primary{height:var(--size-control);padding:0 16px;border:0;border-radius:var(--radius-control);background:var(--signal);color:var(--signal-ink);font:600 .9375rem var(--font-sans);cursor:pointer;transition:background-color 150ms}.ds-primary:hover{background:var(--signal-hover)}.ds-primary:active{translate:0 1px}.ds-primary:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}.ds-primary:disabled{background:var(--raised);color:var(--ink-faint);cursor:not-allowed;translate:none}"
+    },
+    {
+      "name": "Secondary action",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Neutral raised control for ordinary actions.",
+      "html": "<button class=\"ds-secondary\">Refresh</button>",
+      "css": ".ds-secondary{height:var(--size-control);padding:0 16px;border:0;border-radius:var(--radius-control);background:var(--raised);color:var(--ink);font:600 .9375rem var(--font-sans);cursor:pointer;transition:background-color 150ms}.ds-secondary:hover{background:var(--pressed)}.ds-secondary:active{translate:0 1px}.ds-secondary:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}.ds-secondary:disabled{color:var(--ink-faint);cursor:not-allowed;translate:none}"
+    },
+    {
+      "name": "Text field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Recessed field with visible label and amber focus.",
+      "html": "<label class=\"ds-label\">Issue title<input class=\"ds-input\" placeholder=\"Capture an issue…\"></label>",
+      "css": ".ds-label{display:flex;flex-direction:column;gap:6px;color:var(--ink-muted);font:600 .8125rem/1.25rem var(--font-sans)}.ds-input{box-sizing:border-box;width:100%;height:var(--size-field);padding:0 14px;border:0;border-radius:var(--radius-control);background:var(--sunken);color:var(--ink);font:.9375rem var(--font-sans);box-shadow:0 0 0 1px var(--line-soft);caret-color:var(--signal-line)}.ds-input::placeholder{color:var(--ink-faint)}.ds-input:hover{box-shadow:0 0 0 1px var(--line)}.ds-input:focus-visible{background:var(--rail);outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Inert label",
+      "kind": "chip",
+      "description": "Compact metadata tag, deliberately not styled as a workspace link.",
+      "html": "<span class=\"ds-tag\">handoff</span>",
+      "css": ".ds-tag{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:var(--radius-full);background:var(--raised);color:var(--ink-muted);font:.6875rem var(--font-sans);cursor:default}"
+    },
+    {
+      "name": "Navigation place",
+      "kind": "nav",
+      "description": "Incumbent rounded rail link; selection is also exposed through aria-current.",
+      "html": "<a class=\"ds-place\" href=\"#tracker\" aria-label=\"Issue tracker\" aria-current=\"page\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><rect x=\"4\" y=\"3\" width=\"16\" height=\"18\" rx=\"2\"/><path d=\"M8 8h8M8 12h8M8 16h5\"/></svg></a>",
+      "css": ".ds-place{display:grid;place-items:center;width:var(--size-dock);height:var(--size-dock);border-radius:24px;background:var(--pane);color:var(--ink-muted);text-decoration:none;transition:border-radius 200ms,background-color 200ms,color 200ms}.ds-place:hover,.ds-place[aria-current=page]{border-radius:16px;background:var(--raised);color:var(--ink)}.ds-place:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}"
+    },
+    {
+      "name": "Selected issue row",
+      "kind": "custom",
+      "description": "Illustrative issue-row primitive, not a production record.",
+      "html": "<a class=\"ds-row\" href=\"#issue\" aria-current=\"true\"><span class=\"ds-key\">ENG-42 · Ready</span><strong>Review the handoff</strong><span class=\"ds-meta\">Unassigned · Engineering</span></a>",
+      "css": ".ds-row{display:block;padding:15px 18px;border-bottom:1px solid var(--line-soft);color:var(--ink);text-decoration:none;font:.9375rem/1.45 var(--font-sans);transition:background 160ms ease-out}.ds-row:hover{background:var(--surface)}.ds-row[aria-current=true]{background:var(--signal-wash);box-shadow:inset 0 0 0 1px var(--signal-line)}.ds-row strong{display:block;margin:6px 0;overflow-wrap:anywhere}.ds-key{font:.75rem var(--font-mono);color:var(--ink-muted)}.ds-meta{font-size:.75rem;color:var(--ink-faint)}.ds-row:focus-visible{outline:2px solid var(--signal-line);outline-offset:2px}@media(prefers-reduced-motion:reduce){.ds-row{transition:none}}"
+    }
+  ],
+  "narrative": {
+    "northStar": "MatrixKit Neo",
+    "overview": "Preserve the incumbent Gitmatrix identity: warm charcoal panes, Figtree text, Geist Mono identifiers and restrained amber actions. The product is a working environment for humans and agents, not a marketing dashboard. Hierarchy comes from readable content, tonal surfaces and explicit state.",
+    "keyCharacteristics": [
+      "Compact, readable engineering interfaces.",
+      "Tonal depth with amber selection and primary actions.",
+      "Persistent context and visible recovery from uncertainty."
+    ],
+    "rules": [
+      {
+        "name": "The State Meaning Rule",
+        "body": "Amber means action or selection, green means ready/evidence, violet means claim/checkpoint, and danger tokens mean blocked work or a conflict requiring attention.",
+        "section": "colors"
+      }
+    ],
+    "dos": [
+      "Do reuse semantic runtime tokens and existing component states.",
+      "Do preserve visible keyboard focus, readable labels and explicit disabled-action explanations.",
+      "Do keep long-form context readable and mobile controls reachable.",
+      "Do distinguish navigation, inert metadata and mutation actions."
+    ],
+    "donts": [
+      "Don't rebrand this extension or substitute a new visual world.",
+      "Don't use color alone to communicate ownership, readiness or conflict.",
+      "Don't hide uncertain writes or discard a draft to make the interface look successful.",
+      "Don't invent product claims, decorative charts or production demonstration records."
+    ]
+  }
+}
