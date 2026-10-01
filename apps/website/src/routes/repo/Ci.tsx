@@ -123,8 +123,9 @@ function RunnerHint({ runner, waiting }: { runner: CiRunList["runner"]; waiting:
     <div className="mk-strip">
       <span className="mk-strip-dot" />
       <span className="mk-strip-text">
-        This server runs CI on local runners. Jobs wait until one picks them up: run{" "}
-        <code className="mk-mono">gm runner</code> on your machine.
+        Jobs run on this machine: <code className="mk-mono">vp dev</code> starts a runner for each
+        one. If a job keeps waiting, check the dev server's log, or run{" "}
+        <code className="mk-mono">gm runner --once</code>.
       </span>
     </div>
   );

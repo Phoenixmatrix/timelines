@@ -17,7 +17,6 @@ browser    ──cookie──▶ Worker /api/*  ──env.ARTIFACTS──▶ log
 pnpm install
 pnpm run db:migrate   # local D1: schema + dev personas
 vp dev                # http://localhost:5180
-gm runner             # in another terminal: runs CI jobs (see CI/CD below)
 ```
 
 Sign in with `cf auth login` (the account needs Artifacts and Workers AI). There
@@ -232,14 +231,20 @@ push ─▶ git proxy ─▶ onPush: ci_refs diff (one run per moved branch) ─
 CiRun: jobs in dependency stages, in parallel within a stage, dependents of failures skipped
    CI_RUNNER=sandbox  step.do ─▶ CiSandbox (Durable Object + container, one per job):
                       start, clone from Artifacts, bash each step, stream logs, destroy
-   CI_RUNNER=local    job queued ─▶ step.waitForEvent ◀─ `gm runner` claims it over the API,
-                      runs the steps on your machine, streams logs, reports the end
+   CI_RUNNER=local    job queued ─▶ POST CI_DISPATCH_URL ─▶ vp dev starts `gm runner --once`
+                      ─▶ it claims the job over the API, runs the steps on your machine,
+                      streams logs, reports the end, exits ─▶ step.waitForEvent resumes
 ```
 
 - **Runners.** Deployed, jobs run in Cloudflare Sandbox containers (image
   `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git). Under `vp dev` they run on
-  this machine instead, so development doesn't start paid containers: keep
-  `gm runner` going next to the dev server. `GITMATRIX_CI_RUNNER=sandbox vp dev`
+  this machine instead, so development doesn't start paid containers, and
+  they come and go the same way: when the CI Workflow queues a job it pings
+  the dev server (`CI_DISPATCH_URL`), whose `vite/ci-runners.ts` plugin starts
+  `gm runner --once` processes until the queue is empty (4 at a time;
+  `GITMATRIX_CI_RUNNERS` changes it). Nothing has to be left running; jobs
+  queued while the dev server was down start when it comes back. Outside
+  `vp dev`, `gm runner` still works by hand. `GITMATRIX_CI_RUNNER=sandbox vp dev`
   runs the container path locally with Docker. The choice is made in
   `cloudflare.config.ts`, which attaches the container only when sandboxed.
 - **Both runners report the same way** (`worker/ci/jobs.ts`): batched log

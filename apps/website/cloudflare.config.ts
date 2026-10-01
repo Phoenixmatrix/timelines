@@ -79,6 +79,11 @@ export default defineConfig(({ mode }) => {
         }),
         // CI/CD.
         CI_RUNNER: bindings.text<Runner>(runner),
+        // Local runners start on demand: the CI Workflow pings the dev server,
+        // which runs `gm runner --once` per queued job (vite/ci-runners.ts).
+        ...(runner === "local" && dev && publicUrl
+          ? { CI_DISPATCH_URL: bindings.text(`${publicUrl}/__gitmatrix/ci/dispatch`) }
+          : {}),
         CI_RUN: bindings.workflow({ name: "ci-run", worker: "gitmatrix", exportName: "CiRun" }),
         CI_SANDBOX: bindings.durableObject({ worker: "gitmatrix", exportName: "CiSandbox" }),
         // Packages (registry/): its own catalog database and blob bucket, so its

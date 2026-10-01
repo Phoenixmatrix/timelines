@@ -6,6 +6,8 @@
 //            container, runs the steps, and returns when it is done.
 //   local    the job is queued for `gm runner` on a developer's machine; the
 //            Workflow sleeps in waitForEvent until the runner reports the end.
+//            Under `vp dev` a runner starts for it on demand (CI_DISPATCH_URL,
+//            vite/ci-runners.ts), like a Sandbox would.
 // Either way the job's state lives in D1, so the Workflow reads the outcome
 // from there.
 
@@ -29,6 +31,20 @@ interface PlannedJob {
 const DB_STEP = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" } } as const;
 /** How long a local job may wait for a runner, on top of its own timeout. */
 const QUEUE_GRACE_MINUTES = 60;
+
+/**
+ * Ask the development server to start a runner (best effort: a runner that is
+ * already polling, or `gm runner` by hand, takes the job just the same).
+ */
+async function dispatchLocalRunner(env: Env): Promise<void> {
+  const url = Reflect.get(env, "CI_DISPATCH_URL");
+  if (typeof url !== "string" || !url) return;
+  try {
+    await fetch(url, { method: "POST" });
+  } catch (error) {
+    console.warn("CI: couldn't reach the runner dispatcher", error);
+  }
+}
 
 export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
   async run(event: Readonly<WorkflowEvent<RunParams>>, step: WorkflowStep) {
@@ -136,6 +152,11 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
       return "queued" as const;
     });
     if (start !== "queued") return start;
+    if (job.runner === "local") {
+      await step.do(`dispatch:${job.name}`, async () => {
+        await dispatchLocalRunner(this.env);
+      });
+    }
 
     try {
       if (job.runner === "sandbox") {
@@ -160,7 +181,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     } catch (error) {
       const message =
         job.runner === "local"
-          ? "No runner finished this job in time. Start one with `gm runner`."
+          ? "No runner finished this job in time. Under `vp dev` runners start on their own; otherwise run `gm runner --once`."
           : `The sandbox failed: ${error instanceof Error ? error.message : String(error)}`;
       await step.do(`fail:${job.name}`, DB_STEP, async () => {
         await kdb

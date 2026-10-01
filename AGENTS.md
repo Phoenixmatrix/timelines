@@ -28,30 +28,32 @@ release. Add a tool name to select part of the graph. For example, run
 
 # Version control in this repo
 
-Two different jobs, two different tools:
+This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
 
-- **This project's source of truth is Gitmatrix; commit and push it with `git`.**
-  The `gitmatrix` remote (`orbit/gitmatrix` on the dev server) is where
-  changes land: `git push gitmatrix main`. Every push there runs the quality
-  gates in `.gitmatrix/ci.yml` (check, test, build) and is mirrored on to
-  GitHub (`origin`) as a backup, one way. Don't push to GitHub directly: the
-  mirror overwrites it. Use `gh` only to read GitHub. Don't run `gm init` in
-  this checkout and don't use `gm` to commit or push it.
-- **Before pushing, run the gates locally** (`vp check`, `vp test`, and
-  `vp run cli#check` for gm), then confirm the pushed run with
-  `gm runs wait -R orbit/gitmatrix`.
-- **Testing Gitmatrix itself: use `gm`** (`apps/cli`, installed with
-  `pnpm --filter cli run install-bin`). When exercising the product (cloning
+- **Commit and push this project with `gm`** (`apps/cli`, installed with
+  `pnpm --filter cli run install-bin`). `origin` is `orbit/gitmatrix` on the
+  dev server: `gm commit -m "…"`, then `gm push` (or `gm push --sync` when
+  trunk moved) lands it on `main`. Run `gm cli guide` once for the workflow,
+  and `gm cli search "<task>"` to find commands. Plain `git commit` still
+  works (gm adopts the commits), but never `git push`: gm pushes with the
+  right credentials and keeps its own view of trunk. Git shows a detached
+  HEAD here; that's gm's working copy, not a problem.
+- **GitHub is a backup, written only by the mirror.** Every push to
+  Gitmatrix is mirrored to GitHub (the `github` remote) one way. Don't push
+  there: the mirror overwrites it. Use `gh` only to read GitHub.
+- **Every push runs the quality gates** in `.gitmatrix/ci.yml` (check, test,
+  build). Run `vp check`, `vp test` and `vp run cli#check` first, then
+  `gm push && gm runs wait` to confirm the run.
+- **Testing Gitmatrix itself:** exercise the product (cloning
   Gitmatrix-hosted repos, committing, pushing, checking permissions as
-  different personas), drive it with `gm` against the local dev server
-  (`vp dev` in `apps/website`). Work in throwaway clones outside this
-  checkout, such as a temp directory. Run `gm cli guide` once for the workflow,
-  and `gm cli search "<task>"` to find commands.
-- **CI in development runs on this machine.** The dev server queues CI jobs
-  for local runners instead of starting Cloudflare Sandbox containers: keep
-  `gm runner` running alongside `vp dev`, or jobs wait. Use
-  `GITMATRIX_CI_RUNNER=sandbox vp dev` (needs Docker) only when changing the
-  sandbox runner itself.
+  different personas) with `gm` against the local dev server (`vp dev` in
+  `apps/website`), in throwaway clones outside this checkout, such as a temp
+  directory.
+- **CI in development runs on this machine, on demand.** `vp dev` starts a
+  runner for each queued job and it exits when the job is done, the way
+  Cloudflare Sandbox containers come and go once deployed; nothing needs to
+  stay running. Use `GITMATRIX_CI_RUNNER=sandbox vp dev` (needs Docker) only
+  when changing the sandbox runner itself.
 
 # Cloudflare tooling: use `cf`, not wrangler
 
