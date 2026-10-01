@@ -8,6 +8,7 @@
 // At most one build per repository is ever in flight.
 
 import { DurableObject } from "cloudflare:workers";
+import { db, nowIso } from "../schema.ts";
 
 /** Quiet period after the last push before building. */
 const DEBOUNCE_MS = 1_500;
@@ -98,15 +99,18 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
       } else if (!status || stale || ["errored", "terminated"].includes(status.status)) {
         // Crashed, vanished or hung: stop it, and retry once before giving up.
         if (stale) await instance?.terminate().catch(() => undefined);
-        await this.env.DB.prepare(
-          `UPDATE kg_builds SET status = 'failed', error = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-           WHERE id = ? AND status = 'running'`,
-        )
-          .bind(
-            stale ? "Build hung; stopped by the watchdog" : `Build ${status?.status ?? "vanished"}`,
-            state.running.buildId,
-          )
-          .run();
+        await db(this.env.DB)
+          .updateTable("kg_builds")
+          .set({
+            status: "failed",
+            error: stale
+              ? "Build hung; stopped by the watchdog"
+              : `Build ${status?.status ?? "vanished"}`,
+            finished_at: nowIso(),
+          })
+          .where("id", "=", state.running.buildId)
+          .where("status", "=", "running")
+          .execute();
         const reason = stale ? "hung" : (status?.status ?? "vanished");
         state.lastError = `Build ${reason}${status?.error?.message ? `: ${status.error.message}` : ""}`;
         if (state.retries < MAX_RETRIES) {

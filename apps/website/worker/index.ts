@@ -6,10 +6,14 @@ import { sshAuth, sshKeys } from "./api/ssh.ts";
 import { tokens } from "./api/tokens.ts";
 import { sessionActor, tokenCredential, type AppEnv } from "./auth.ts";
 import { isArtifactsError } from "./artifacts.ts";
+import { sqlNow } from "./db.ts";
 import { ci, runner } from "./ci/api.ts";
 import { gitHttp } from "./git/http.ts";
 import { knowledge } from "./knowledge/api.ts";
+import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
+import { buildRegistry } from "../registry/app.ts";
+import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -35,11 +39,11 @@ api.use(async (c, next) => {
   }
   c.set("actor", credential.actor);
   c.executionCtx.waitUntil(
-    c.env.DB.prepare(
-      "UPDATE access_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-    )
-      .bind(credential.tokenId)
-      .run(),
+    db(c.env.DB)
+      .updateTable("access_tokens")
+      .set({ last_used_at: sqlNow })
+      .where("id", "=", credential.tokenId)
+      .execute(),
   );
   return next();
 });
@@ -69,11 +73,34 @@ api.onError((error, c) => {
 });
 
 const app = new Hono<AppEnv>();
+// Package protocols (/v2, /npm/…, /pypi/…) and their REST extras
+// (/api/registry/…) come first; their middleware is scoped to those paths.
+app.route("/", buildRegistry() as unknown as Hono<AppEnv>);
 app.route("/api", api);
 app.route("/", gitHttp);
 
-export default app;
+export default {
+  fetch: app.fetch,
+  /** Registry work queued off the request path: index rebuilds, retention, GC. */
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      try {
+        await runJob(env, message.body);
+        message.ack();
+      } catch (error) {
+        console.error("Registry job failed", message.body, error);
+        message.retry();
+      }
+    }
+  },
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(scheduleSweeps(env));
+  },
+} satisfies ExportedHandler<Env, Job>;
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
 export { CiRun } from "./ci/workflow.ts";
 export { CiSandbox } from "./ci/sandbox.ts";
+export { RepoDO as RegistryRepo } from "../registry/do/repo-do.ts";
+export { UploadDO as RegistryUpload } from "../registry/do/upload-do.ts";
+export { LoginDO as RegistryLogin } from "../registry/do/login-do.ts";

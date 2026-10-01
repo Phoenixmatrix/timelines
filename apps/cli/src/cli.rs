@@ -107,6 +107,9 @@ pub enum Command {
     /// Secrets that CI jobs can read as environment variables
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Packages: npm, Docker, PyPI, Cargo… versions, provenance and housekeeping
+    #[command(subcommand, visible_alias = "packages")]
+    Pkg(PkgCommand),
     /// Call the Gitmatrix JSON API directly
     Api(ApiArgs),
     /// Discover commands: search, workflow guide, full manifest
@@ -586,4 +589,112 @@ pub struct SchemaArgs {
     /// Command path, e.g. `push` or `bookmark set`.
     #[arg(required = true)]
     pub command: Vec<String>,
+}
+
+/// A package is `<format>/<name>`: `npm/@orbit/web`, `oci/engine`, `pypi/orbit-sdk`.
+#[derive(Subcommand)]
+pub enum PkgCommand {
+    /// An owner's packages, most recently published first
+    List {
+        /// Owner (user or org). Default: this repository's owner, else you.
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// One package: latest version, tags, sources, counts and the install command
+    Show {
+        package: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// A package's publishes, newest first, filtered by a query
+    Versions {
+        package: String,
+        /// source:web branch:main status:active since:7d commit:ab12 run:42 by:jun tag:latest; words match versions; - excludes.
+        #[arg(short, long, default_value = "status:active")]
+        query: String,
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// Delete versions (owner admins); name them, or select them with --query
+    Delete(PkgAction),
+    /// Yank versions (Cargo, PyPI): still resolvable when pinned, never chosen
+    Yank(PkgAction),
+    /// Undo a yank or a deprecation
+    Restore(PkgAction),
+    /// Deprecate npm versions with a message
+    Deprecate(PkgAction),
+    /// Point a tag at a version (npm dist-tag, Docker tag)
+    Tag {
+        package: String,
+        version: String,
+        tag: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// Repositories allowed to publish a package
+    Sources {
+        package: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// Allow a repository (owner/name) to publish a package
+    Grant {
+        package: String,
+        repo: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// Stop a repository publishing a package
+    Revoke {
+        package: String,
+        repo: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// What a CI run or a commit published (default: the latest run)
+    Published {
+        /// Run number.
+        #[arg(long, conflicts_with = "commit")]
+        run: Option<i64>,
+        /// Full commit hash.
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Upload a file as a generic package: gm pkg upload dist/app.tgz app/1.4.0
+    Upload {
+        file: PathBuf,
+        /// <name>/<version>[/<path>]; the file name is used when no path is given.
+        target: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+    },
+    /// Configure npm, Docker, pip, Cargo… on this machine for an owner's registries
+    Setup {
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+        /// Also write it: npm (~/.npmrc) and docker (docker login).
+        #[arg(long, value_delimiter = ',')]
+        write: Vec<String>,
+    },
+}
+
+#[derive(Args)]
+pub struct PkgAction {
+    pub package: String,
+    /// Versions to act on.
+    pub versions: Vec<String>,
+    /// Everything this query matches instead (up to 1,000 per call).
+    #[arg(short, long, conflicts_with = "versions")]
+    pub query: Option<String>,
+    /// Why (shown to npm users on deprecation; recorded on yanks).
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(short = 'O', long)]
+    pub owner: Option<String>,
 }

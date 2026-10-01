@@ -1,0 +1,19 @@
+{
+  "name": "@gitmatrix/testing",
+  "version": "0.0.0",
+  "private": true,
+  "description": "In-memory fakes of D1 and R2 that enforce the platform's rules.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vp test run"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
 import { Monogram } from "../../components/Monogram.tsx";
-import { CopyField } from "../../components/ui.tsx";
+import { CopyField, link } from "../../components/ui.tsx";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { blobUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
@@ -97,7 +97,7 @@ function EmptyRepo({ repo }: { repo: RepoDetail }) {
       <p className="mk-card-desc max-w-[56ch]">
         This repository is empty. From an existing project, add it as a remote and push. Git asks
         for a password: use a{" "}
-        <Link to="/settings/tokens" className="gm-link">
+        <Link to="/settings/tokens" className={link}>
           personal access token
         </Link>
         {viewer ? <> with the username {viewer.slug}</> : null}.

@@ -5,6 +5,7 @@ import { newArtifactsName } from "../artifacts.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
+import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
 
@@ -83,7 +84,10 @@ dev.post("/tokens", async (c) => {
 });
 
 dev.post("/seed", async (c) => {
-  const existing = await c.env.DB.prepare("SELECT count(*) AS n FROM repos").first<{ n: number }>();
+  const existing = await db(c.env.DB)
+    .selectFrom("repos")
+    .select((eb) => eb.fn.countAll<number>().as("n"))
+    .executeTakeFirst();
   if (existing && existing.n > 0)
     return c.json({ error: "Sample repositories already exist." }, 409);
 
@@ -106,30 +110,28 @@ dev.post("/seed", async (c) => {
   const statements = created.flatMap(({ sample, artifactsName, repo }) => {
     const id = `repo_${crypto.randomUUID()}`;
     return [
-      c.env.DB.prepare(
-        `INSERT INTO repos (id, owner_id, name, description, visibility, default_branch,
-           artifacts_name, artifacts_remote, imported_from)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(
-        id,
-        sample.owner,
-        sample.name,
-        sample.description,
-        sample.visibility,
-        repo.defaultBranch || "main",
-        artifactsName,
-        repo.remote,
-        sample.importUrl,
-      ),
+      db(c.env.DB)
+        .insertInto("repos")
+        .values({
+          id,
+          owner_id: sample.owner,
+          name: sample.name,
+          description: sample.description,
+          visibility: sample.visibility,
+          default_branch: repo.defaultBranch || "main",
+          artifacts_name: artifactsName,
+          artifacts_remote: repo.remote,
+          imported_from: sample.importUrl,
+        }),
       ...sample.collaborators.map((collaborator) =>
-        c.env.DB.prepare(
-          "INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES (?, ?, ?)",
-        ).bind(id, collaborator.user, collaborator.role),
+        db(c.env.DB)
+          .insertInto("repo_collaborators")
+          .values({ repo_id: id, user_id: collaborator.user, role: collaborator.role }),
       ),
     ];
   });
-  await c.env.DB.batch(statements);
-  const { results } = await c.env.DB.prepare("SELECT id FROM repos").all<{ id: string }>();
+  await batch(c.env.DB, statements);
+  const results = await db(c.env.DB).selectFrom("repos").select("id").execute();
   c.executionCtx.waitUntil(Promise.all(results.map((r) => notifyKnowledge(c.env, r.id))));
   return c.json({ created: created.length }, 201);
 });

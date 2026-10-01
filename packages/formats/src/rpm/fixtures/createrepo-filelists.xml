@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="3">
+<package pkgid="6404b1028262aeaf3e083f08959969abea1301f7f5e8610492cf900b3d13d5db" name="basesystem" arch="noarch">
+  <version epoch="0" ver="11" rel="20.fc40"/>
+</package>
+<package pkgid="13bb4d6200770a7c3d5d7992d95f5095d7faf7918b0d98c0e1940636a38bce9b" name="which" arch="x86_64">
+  <version epoch="0" ver="2.21" rel="20.el8"/>
+  <file>/etc/profile.d/which2.csh</file>
+  <file>/etc/profile.d/which2.sh</file>
+  <file>/usr/bin/which</file>
+  <file type="dir">/usr/lib/.build-id</file>
+  <file type="dir">/usr/lib/.build-id/65</file>
+  <file>/usr/lib/.build-id/65/7c14aae0edf6eb2b0eb196293024ab1299ae64</file>
+  <file type="dir">/usr/share/doc/which</file>
+  <file>/usr/share/doc/which/AUTHORS</file>
+  <file>/usr/share/doc/which/EXAMPLES</file>
+  <file>/usr/share/doc/which/NEWS</file>
+  <file>/usr/share/doc/which/README</file>
+  <file>/usr/share/info/which.info.gz</file>
+  <file type="dir">/usr/share/licenses/which</file>
+  <file>/usr/share/licenses/which/COPYING</file>
+  <file>/usr/share/man/man1/which.1.gz</file>
+</package>
+<package pkgid="805a7a3b2b75051bac52f584a99d5ed601200687863f4c59eac535bc4d2756a6" name="which" arch="x86_64">
+  <version epoch="0" ver="2.23" rel="4.fc44"/>
+  <file>/etc/profile.d/which2.csh</file>
+  <file>/etc/profile.d/which2.sh</file>
+  <file>/usr/bin/which</file>
+  <file type="dir">/usr/lib/.build-id</file>
+  <file type="dir">/usr/lib/.build-id/2b</file>
+  <file>/usr/lib/.build-id/2b/10abca36ba30ac47a2b004a0f3ee631b458e4c</file>
+  <file type="dir">/usr/share/doc/which</file>
+  <file>/usr/share/doc/which/AUTHORS</file>
+  <file>/usr/share/doc/which/EXAMPLES</file>
+  <file>/usr/share/doc/which/NEWS</file>
+  <file>/usr/share/doc/which/README</file>
+  <file>/usr/share/info/which.info.gz</file>
+  <file type="dir">/usr/share/licenses/which</file>
+  <file>/usr/share/licenses/which/COPYING</file>
+  <file>/usr/share/man/man1/which.1.gz</file>
+</package>
+</filelists>

@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="3">
+<package type="rpm">
+  <name>basesystem</name>
+  <arch>noarch</arch>
+  <version epoch="0" ver="11" rel="20.fc40"/>
+  <checksum type="sha256" pkgid="YES">6404b1028262aeaf3e083f08959969abea1301f7f5e8610492cf900b3d13d5db</checksum>
+  <summary>The skeleton package which defines a simple Fedora system</summary>
+  <description>Basesystem defines the components of a basic Fedora system
+(for example, the package installation order to use during bootstrapping).
+Basesystem should be in every installation of a system, and it
+should never be removed. As the package has no content, it is Public Domain.</description>
+  <packager>Fedora Project</packager>
+  <url></url>
+  <time file="1790224889" build="1705968675"/>
+  <size package="7361" installed="0" archive="124"/>
+  <location href="basesystem-11-20.fc40.noarch.rpm"/>
+  <format>
+    <rpm:license>LicenseRef-Fedora-Public-Domain</rpm:license>
+    <rpm:vendor>Fedora Project</rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:buildhost>buildvm-x86-20.iad2.fedoraproject.org</rpm:buildhost>
+    <rpm:sourcerpm>basesystem-11-20.fc40.src.rpm</rpm:sourcerpm>
+    <rpm:header-range start="4504" end="7317"/>
+    <rpm:provides>
+      <rpm:entry name="basesystem" flags="EQ" epoch="0" ver="11" rel="20.fc40"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="filesystem" pre="1"/>
+      <rpm:entry name="setup" pre="1"/>
+    </rpm:requires>
+  </format>
+</package>
+<package type="rpm">
+  <name>which</name>
+  <arch>x86_64</arch>
+  <version epoch="0" ver="2.21" rel="20.el8"/>
+  <checksum type="sha256" pkgid="YES">13bb4d6200770a7c3d5d7992d95f5095d7faf7918b0d98c0e1940636a38bce9b</checksum>
+  <summary>Displays where a particular program in your path is located</summary>
+  <description>The which command shows the full pathname of a specified program, if
+the specified program is in your PATH.</description>
+  <packager>infrastructure@rockylinux.org</packager>
+  <url>https://savannah.gnu.org/projects/which/</url>
+  <time file="1790224889" build="1679502856"/>
+  <size package="49828" installed="83372" archive="85652"/>
+  <location href="which-2.21-20.el8.x86_64.rpm"/>
+  <format>
+    <rpm:license>GPLv3</rpm:license>
+    <rpm:vendor>Rocky</rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:buildhost>ord1-prod-x86build001.svc.aws.rockylinux.org</rpm:buildhost>
+    <rpm:sourcerpm>which-2.21-20.el8.src.rpm</rpm:sourcerpm>
+    <rpm:header-range start="4504" end="17428"/>
+    <rpm:provides>
+      <rpm:entry name="which" flags="EQ" epoch="0" ver="2.21" rel="20.el8"/>
+      <rpm:entry name="which(x86-64)" flags="EQ" epoch="0" ver="2.21" rel="20.el8"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="coreutils"/>
+      <rpm:entry name="rtld(GNU_HASH)"/>
+      <rpm:entry name="libc.so.6(GLIBC_2.14)(64bit)"/>
+    </rpm:requires>
+    <file>/etc/profile.d/which2.csh</file>
+    <file>/etc/profile.d/which2.sh</file>
+    <file>/usr/bin/which</file>
+  </format>
+</package>
+<package type="rpm">
+  <name>which</name>
+  <arch>x86_64</arch>
+  <version epoch="0" ver="2.23" rel="4.fc44"/>
+  <checksum type="sha256" pkgid="YES">805a7a3b2b75051bac52f584a99d5ed601200687863f4c59eac535bc4d2756a6</checksum>
+  <summary>Displays where a particular program in your path is located</summary>
+  <description>The which command shows the full pathname of a specified program, if
+the specified program is in your PATH.</description>
+  <packager>Fedora Project</packager>
+  <url>https://savannah.gnu.org/projects/which/</url>
+  <time file="1790224889" build="1768776901"/>
+  <size package="43209" installed="85352" archive="87608"/>
+  <location href="which-2.23-4.fc44.x86_64.rpm"/>
+  <format>
+    <rpm:license>GPL-3.0-only</rpm:license>
+    <rpm:vendor>Fedora Project</rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:buildhost>buildvm-x86-26.rdu3.fedoraproject.org</rpm:buildhost>
+    <rpm:sourcerpm>which-2.23-4.fc44.src.rpm</rpm:sourcerpm>
+    <rpm:header-range start="4504" end="10501"/>
+    <rpm:provides>
+      <rpm:entry name="which" flags="EQ" epoch="0" ver="2.23" rel="4.fc44"/>
+      <rpm:entry name="which(x86-64)" flags="EQ" epoch="0" ver="2.23" rel="4.fc44"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="coreutils"/>
+      <rpm:entry name="rtld(GNU_HASH)"/>
+      <rpm:entry name="libc.so.6(GLIBC_2.34)(64bit)"/>
+    </rpm:requires>
+    <file>/etc/profile.d/which2.csh</file>
+    <file>/etc/profile.d/which2.sh</file>
+    <file>/usr/bin/which</file>
+  </format>
+</package>
+</metadata>

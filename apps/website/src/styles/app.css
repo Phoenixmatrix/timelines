@@ -62,6 +62,14 @@
 
 /* Same values as tokens.css, as literals so Tailwind can name utilities after them. */
 @theme {
+  /* A bar growing from its baseline (the publish-rate strip). */
+  --animate-rise: rise 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  @keyframes rise {
+    from {
+      transform: scaleY(0.2);
+      opacity: 0;
+    }
+  }
   --radius-plate: 6px;
   --radius-control: 8px;
   --radius-pane: 12px;
@@ -80,18 +88,6 @@ body,
 body {
   margin: 0;
   background: var(--surface);
-}
-
-/* Links: ink with a signal-line underline that thickens on hover. */
-.mk-root .gm-link {
-  color: var(--ink);
-  text-decoration: underline;
-  text-decoration-color: var(--signal-line);
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.2em;
-}
-.mk-root .gm-link:hover {
-  text-decoration-thickness: 2px;
 }
 
 /* Rendered READMEs: plain readable prose on the kit's type scale. */
@@ -179,56 +175,29 @@ body {
   border: 1px solid var(--line-soft);
 }
 
-/* Motion from the kit: popups scale from 95% and fade in 150ms, dialogs from 97%
-   in 200ms on the expo ease, toasts slide 12px in 250ms. Base UI marks the
-   start and end of each transition with data attributes. */
-.gm-pop {
-  transform-origin: var(--transform-origin);
-  transition:
-    opacity 150ms,
-    scale 150ms;
+/* Things utilities can't reach. */
+
+/* Scrollbars are the browser's own surface; theme them from the palette. */
+.mk-root {
+  scrollbar-color: var(--line) transparent;
 }
-.gm-pop[data-starting-style],
-.gm-pop[data-ending-style] {
-  opacity: 0;
-  scale: 0.95;
+.mk-root ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
 }
-.gm-fade {
-  transition: opacity 200ms;
+.mk-root ::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 5px;
+  background: var(--line) padding-box;
 }
-.gm-fade[data-starting-style],
-.gm-fade[data-ending-style] {
-  opacity: 0;
+.mk-root ::-webkit-scrollbar-track {
+  background: transparent;
 }
-.gm-dialog {
-  transition:
-    opacity 200ms cubic-bezier(0.16, 1, 0.3, 1),
-    scale 200ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-.gm-dialog[data-starting-style],
-.gm-dialog[data-ending-style] {
-  opacity: 0;
-  scale: 0.97;
-}
-.gm-toast {
-  transition:
-    opacity 250ms cubic-bezier(0.16, 1, 0.3, 1),
-    translate 250ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-.gm-toast[data-starting-style],
-.gm-toast[data-ending-style] {
-  opacity: 0;
-  translate: 12px 0;
-}
-@media (prefers-reduced-motion: reduce) {
-  .gm-pop[data-starting-style],
-  .gm-pop[data-ending-style],
-  .gm-dialog[data-starting-style],
-  .gm-dialog[data-ending-style] {
-    scale: 1;
-  }
-  .gm-toast[data-starting-style],
-  .gm-toast[data-ending-style] {
-    translate: 0;
+
+/* The kit's phone rule lifts every chip to the 44px touch floor, and the
+   vendored stylesheet can't tell tags (labels, not controls) apart. */
+@media (max-width: 639.98px) {
+  .mk-root .mk-chip--tag {
+    height: 20px;
   }
 }

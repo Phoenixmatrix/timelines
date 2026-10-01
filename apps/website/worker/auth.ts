@@ -2,7 +2,8 @@ import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { TokenScope } from "../shared/api.ts";
 import type { Timing } from "./timing.ts";
-import { actorFromRow, findUserById, type AccountRow, type Actor } from "./db.ts";
+import { actorFromRow, findUserById, sqlNow, type Actor } from "./db.ts";
+import { db } from "./schema.ts";
 
 export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null; timing: Timing } };
 
@@ -83,13 +84,14 @@ export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredenti
   }
   if (!secret?.startsWith(TOKEN_PREFIX)) return { kind: "invalid" };
 
-  const row = await c.env.DB.prepare(
-    `SELECT t.id AS token_id, t.scope, a.* FROM access_tokens t
-     JOIN accounts a ON a.id = t.user_id
-     WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
-  )
-    .bind(await hashToken(secret))
-    .first<AccountRow & { token_id: string; scope: TokenScope }>();
+  const row = await db(c.env.DB)
+    .selectFrom("access_tokens as t")
+    .innerJoin("accounts as a", "a.id", "t.user_id")
+    .select(["t.id as token_id", "t.scope"])
+    .selectAll("a")
+    .where("t.token_hash", "=", await hashToken(secret))
+    .where((eb) => eb.or([eb("t.expires_at", "is", null), eb("t.expires_at", ">", sqlNow)]))
+    .executeTakeFirst();
   if (!row) return { kind: "invalid" };
   return { kind: "token", actor: actorFromRow(row), scope: row.scope, tokenId: row.token_id };
 }

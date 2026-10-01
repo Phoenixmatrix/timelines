@@ -1,14 +1,9 @@
 import { Hono } from "hono";
+import { sql } from "kysely";
 import type { AccountPage, Persona, SessionResponse } from "../../shared/api.ts";
 import { endSession, startPersonaSession, type AppEnv } from "../auth.ts";
-import {
-  accountSummary,
-  findAccountBySlug,
-  findUserById,
-  viewerFor,
-  visibleRepos,
-  type AccountRow,
-} from "../db.ts";
+import { accountSummary, findAccountBySlug, findUserById, viewerFor, visibleRepos } from "../db.ts";
+import { db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
 
 export const accounts = new Hono<AppEnv>();
@@ -35,9 +30,12 @@ accounts.delete("/session", (c) => {
 });
 
 accounts.get("/personas", async (c) => {
-  const { results } = await c.env.DB.prepare(
-    "SELECT * FROM accounts WHERE kind = 'user' ORDER BY rowid",
-  ).all<AccountRow>();
+  const results = await db(c.env.DB)
+    .selectFrom("accounts")
+    .selectAll()
+    .where("kind", "=", "user")
+    .orderBy(sql`rowid`)
+    .execute();
   const personas: Persona[] = results.map((row) => ({
     ...accountSummary(row),
     bio: row.bio,
@@ -47,9 +45,12 @@ accounts.get("/personas", async (c) => {
 });
 
 accounts.get("/users", async (c) => {
-  const { results } = await c.env.DB.prepare(
-    "SELECT * FROM accounts WHERE kind = 'user' ORDER BY slug",
-  ).all<AccountRow>();
+  const results = await db(c.env.DB)
+    .selectFrom("accounts")
+    .selectAll()
+    .where("kind", "=", "user")
+    .orderBy("slug")
+    .execute();
   return c.json({ users: results.map(accountSummary) });
 });
 
@@ -59,13 +60,16 @@ accounts.get("/accounts/:slug", async (c) => {
   const members =
     account.kind === "org"
       ? (
-          await c.env.DB.prepare(
-            `SELECT a.*, m.role FROM accounts a JOIN org_members m ON m.user_id = a.id
-             WHERE m.org_id = ? ORDER BY m.role DESC, a.slug`,
-          )
-            .bind(account.id)
-            .all<AccountRow & { role: "owner" | "member" }>()
-        ).results.map((row) => ({ ...accountSummary(row), role: row.role }))
+          await db(c.env.DB)
+            .selectFrom("accounts as a")
+            .innerJoin("org_members as m", "m.user_id", "a.id")
+            .selectAll("a")
+            .select("m.role")
+            .where("m.org_id", "=", account.id)
+            .orderBy("m.role", "desc")
+            .orderBy("a.slug")
+            .execute()
+        ).map((row) => ({ ...accountSummary(row), role: row.role }))
       : [];
   const page: AccountPage = {
     ...accountSummary(account),

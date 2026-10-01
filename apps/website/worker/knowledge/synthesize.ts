@@ -3,6 +3,7 @@
 // cached under a hash of exactly what it was written from, so a push only
 // re-synthesizes the components whose files actually changed meaning.
 
+import { db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import { ANALYZER } from "./analyze.ts";
 import type {
@@ -15,28 +16,33 @@ import type {
 import { chatJson } from "./models.ts";
 import { chunk, pool, sha256 } from "./util.ts";
 
-async function cached<T>(db: D1Database, key: string): Promise<T | null> {
-  const row = await db
-    .prepare("SELECT data FROM kg_synthesis WHERE key = ?")
-    .bind(key)
-    .first<{ data: string }>();
+async function cached<T>(d1: D1Database, key: string): Promise<T | null> {
+  const row = await db(d1)
+    .selectFrom("kg_synthesis")
+    .select("data")
+    .where("key", "=", key)
+    .executeTakeFirst();
   return row ? (JSON.parse(row.data) as T) : null;
 }
 
 async function remember(
-  db: D1Database,
+  d1: D1Database,
   key: string,
   value: unknown,
   model: string,
   tokens: number,
 ) {
-  await db
-    .prepare(
-      `INSERT INTO kg_synthesis (key, data, model, tokens) VALUES (?, ?, ?, ?)
-       ON CONFLICT (key) DO UPDATE SET data = excluded.data, model = excluded.model, tokens = excluded.tokens`,
+  await db(d1)
+    .insertInto("kg_synthesis")
+    .values({ key, data: JSON.stringify(value), model, tokens })
+    .onConflict((oc) =>
+      oc.column("key").doUpdateSet((eb) => ({
+        data: eb.ref("excluded.data"),
+        model: eb.ref("excluded.model"),
+        tokens: eb.ref("excluded.tokens"),
+      })),
     )
-    .bind(key, JSON.stringify(value), model, tokens)
-    .run();
+    .execute();
 }
 
 function fileBrief(path: string, a: FileAnalysis | undefined) {

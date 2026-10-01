@@ -11,6 +11,7 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { CiJobStatus } from "../../shared/api.ts";
+import { batch, db, nowIso } from "../schema.ts";
 import { stages, type JobSpec } from "./config.ts";
 import { doneEvent, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
@@ -28,37 +29,31 @@ interface PlannedJob {
 const DB_STEP = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" } } as const;
 /** How long a local job may wait for a runner, on top of its own timeout. */
 const QUEUE_GRACE_MINUTES = 60;
-const now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
   async run(event: Readonly<WorkflowEvent<RunParams>>, step: WorkflowStep) {
     const { runId } = event.payload;
-    const db = this.env.DB;
+    const kdb = db(this.env.DB);
 
     const jobs = await step.do("plan", DB_STEP, async () => {
-      await db
-        .prepare(
-          `UPDATE ci_runs SET status = 'running', started_at = ${now} WHERE id = ? AND status = 'queued'`,
-        )
-        .bind(runId)
-        .run();
-      const { results } = await db
-        .prepare("SELECT id, name, status, runner, spec FROM ci_jobs WHERE run_id = ?")
-        .bind(runId)
-        .all<{
-          id: string;
-          name: string;
-          status: CiJobStatus;
-          runner: "local" | "sandbox";
-          spec: string;
-        }>();
+      await kdb
+        .updateTable("ci_runs")
+        .set({ status: "running", started_at: nowIso() })
+        .where("id", "=", runId)
+        .where("status", "=", "queued")
+        .execute();
+      const results = await kdb
+        .selectFrom("ci_jobs")
+        .select(["id", "name", "status", "runner", "spec"])
+        .where("run_id", "=", runId)
+        .execute();
       return results.map((row): PlannedJob => {
         const spec = JSON.parse(row.spec) as StoredJob;
         return {
           id: row.id,
           name: row.name,
           status: row.status,
-          runner: row.runner,
+          runner: row.runner as PlannedJob["runner"],
           needs: spec.needs,
           timeoutMinutes: spec.timeoutMinutes,
         };
@@ -78,22 +73,21 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
 
     await step.do("finish", DB_STEP, async () => {
       const statuses = [...outcome.values()];
-      const run = await db
-        .prepare("SELECT status FROM ci_runs WHERE id = ?")
-        .bind(runId)
-        .first<string>("status");
+      const run = (
+        await kdb.selectFrom("ci_runs").select("status").where("id", "=", runId).executeTakeFirst()
+      )?.status;
       const status =
         run === "cancelled" || statuses.includes("cancelled")
           ? "cancelled"
           : statuses.includes("failed")
             ? "failed"
             : "succeeded";
-      await db
-        .prepare(
-          `UPDATE ci_runs SET status = ?, finished_at = ${now} WHERE id = ? AND status IN ('queued', 'running')`,
-        )
-        .bind(status, runId)
-        .run();
+      await kdb
+        .updateTable("ci_runs")
+        .set({ status, finished_at: nowIso() })
+        .where("id", "=", runId)
+        .where("status", "in", ["queued", "running"])
+        .execute();
       return status;
     });
   }
@@ -104,36 +98,41 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     job: PlannedJob,
     outcome: Map<string, CiJobStatus>,
   ): Promise<CiJobStatus> {
-    const db = this.env.DB;
+    const d1 = this.env.DB;
+    const kdb = db(d1);
     if (job.status !== "pending") return job.status;
 
     // Like GitHub Actions: a job runs only when everything it needs succeeded.
     const blocked = job.needs.find((need) => outcome.get(need) !== "succeeded");
     const start = await step.do(`start:${job.name}`, DB_STEP, async () => {
-      const run = await db
-        .prepare("SELECT status FROM ci_runs WHERE id = ?")
-        .bind(runId)
-        .first<string>("status");
+      const run = (
+        await kdb.selectFrom("ci_runs").select("status").where("id", "=", runId).executeTakeFirst()
+      )?.status;
       if (run === "cancelled") return "cancelled" as const;
       if (blocked) {
-        await db.batch([
-          db
-            .prepare(
-              `UPDATE ci_jobs SET status = 'skipped', error = ?, finished_at = ${now} WHERE id = ?`,
-            )
-            .bind(`Skipped because ${blocked} did not succeed.`, job.id),
-          db
-            .prepare(
-              "UPDATE ci_steps SET status = 'skipped' WHERE job_id = ? AND status = 'pending'",
-            )
-            .bind(job.id),
+        await batch(d1, [
+          kdb
+            .updateTable("ci_jobs")
+            .set({
+              status: "skipped",
+              error: `Skipped because ${blocked} did not succeed.`,
+              finished_at: nowIso(),
+            })
+            .where("id", "=", job.id),
+          kdb
+            .updateTable("ci_steps")
+            .set({ status: "skipped" })
+            .where("job_id", "=", job.id)
+            .where("status", "=", "pending"),
         ]);
         return "skipped" as const;
       }
-      await db
-        .prepare("UPDATE ci_jobs SET status = 'queued' WHERE id = ? AND status = 'pending'")
-        .bind(job.id)
-        .run();
+      await kdb
+        .updateTable("ci_jobs")
+        .set({ status: "queued" })
+        .where("id", "=", job.id)
+        .where("status", "=", "pending")
+        .execute();
       return "queued" as const;
     });
     if (start !== "queued") return start;
@@ -164,22 +163,22 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
           ? "No runner finished this job in time. Start one with `gm runner`."
           : `The sandbox failed: ${error instanceof Error ? error.message : String(error)}`;
       await step.do(`fail:${job.name}`, DB_STEP, async () => {
-        await db
-          .prepare(
-            `UPDATE ci_jobs SET status = 'failed', error = ?, finished_at = ${now}
-             WHERE id = ? AND status IN ('pending', 'queued', 'running')`,
-          )
-          .bind(message, job.id)
-          .run();
+        await kdb
+          .updateTable("ci_jobs")
+          .set({ status: "failed", error: message, finished_at: nowIso() })
+          .where("id", "=", job.id)
+          .where("status", "in", ["pending", "queued", "running"])
+          .execute();
       });
     }
 
     return step.do(`result:${job.name}`, DB_STEP, async () => {
-      const status = await db
-        .prepare("SELECT status FROM ci_jobs WHERE id = ?")
-        .bind(job.id)
-        .first<CiJobStatus>("status");
-      return status ?? "failed";
+      const row = await kdb
+        .selectFrom("ci_jobs")
+        .select("status")
+        .where("id", "=", job.id)
+        .executeTakeFirst();
+      return row?.status ?? "failed";
     });
   }
 }

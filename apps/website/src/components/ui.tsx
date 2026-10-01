@@ -12,6 +12,29 @@ import {
 import { useId, useState, type ReactElement, type ReactNode } from "react";
 import type { RepoRole, Visibility } from "../../shared/api.ts";
 
+/** Links in running text: ink, with a signal-line underline that thickens on hover. */
+export const link =
+  "text-ink underline decoration-signal-line decoration-1 underline-offset-[0.2em] hover:decoration-2";
+
+/** Links repeated down a table: a quiet underline that turns amber on hover. */
+export const quietLink =
+  "text-ink underline decoration-line underline-offset-[0.2em] hover:decoration-signal-line focus-visible:decoration-signal-line";
+
+// Motion from the kit. Base UI marks the start and end of each transition
+// with data attributes; reduced motion keeps the fades and drops the movement.
+/** Popups scale from 95% and fade in 150ms. */
+export const popMotion =
+  "origin-(--transform-origin) transition-[opacity,scale] duration-150 data-[starting-style]:scale-95 data-[starting-style]:opacity-0 data-[ending-style]:scale-95 data-[ending-style]:opacity-0 motion-reduce:scale-100!";
+/** Backdrops fade in 200ms. */
+export const fadeMotion =
+  "transition-opacity duration-200 data-[starting-style]:opacity-0 data-[ending-style]:opacity-0";
+/** Dialogs scale from 97% in 200ms on the expo ease. */
+export const dialogMotion =
+  "transition-[opacity,scale] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] data-[starting-style]:scale-[0.97] data-[starting-style]:opacity-0 data-[ending-style]:scale-[0.97] data-[ending-style]:opacity-0 motion-reduce:scale-100!";
+/** Toasts slide 12px in 250ms. */
+export const toastMotion =
+  "transition-[opacity,translate] duration-250 ease-[cubic-bezier(0.16,1,0.3,1)] data-[starting-style]:translate-x-3 data-[starting-style]:opacity-0 data-[ending-style]:translate-x-3 data-[ending-style]:opacity-0 motion-reduce:translate-x-0!";
+
 /** Every icon-only control gets a tooltip (and an aria-label on the control). */
 export function Tip({
   label,
@@ -27,7 +50,7 @@ export function Tip({
       <Tooltip.Trigger render={children} />
       <Tooltip.Portal>
         <Tooltip.Positioner side={side} sideOffset={8} className="z-[60]">
-          <Tooltip.Popup className="mk-tooltip gm-pop">{label}</Tooltip.Popup>
+          <Tooltip.Popup className={`mk-tooltip ${popMotion}`}>{label}</Tooltip.Popup>
         </Tooltip.Positioner>
       </Tooltip.Portal>
     </Tooltip.Root>
@@ -65,7 +88,7 @@ export function Toasts() {
     <Toast.Portal>
       <Toast.Viewport className="fixed top-16 right-4 z-[60] flex flex-col gap-2">
         {toasts.map((toast) => (
-          <Toast.Root key={toast.id} toast={toast} className="mk-toast gm-toast">
+          <Toast.Root key={toast.id} toast={toast} className={`mk-toast ${toastMotion}`}>
             <div className="mk-toast-body">
               <Toast.Title className="mk-toast-title" />
               <Toast.Description className="mk-toast-desc" />
@@ -154,7 +177,7 @@ export function SelectField({
       </Select.Trigger>
       <Select.Portal>
         <Select.Positioner sideOffset={6} alignItemWithTrigger={false} className="z-50">
-          <Select.Popup className="mk-popup gm-pop min-w-[var(--anchor-width)]">
+          <Select.Popup className={`mk-popup ${popMotion} min-w-[var(--anchor-width)]`}>
             <Select.List>
               {options.map((option) => (
                 <Select.Item
@@ -198,9 +221,9 @@ export function ConfirmDialog({
     <Dialog.Root>
       <Dialog.Trigger render={trigger} />
       <Dialog.Portal>
-        <Dialog.Backdrop className="mk-backdrop gm-fade" />
+        <Dialog.Backdrop className={`mk-backdrop ${fadeMotion}`} />
         <Dialog.Viewport className="fixed inset-0 z-50 grid place-items-center p-4">
-          <Dialog.Popup className="mk-dialog gm-dialog">
+          <Dialog.Popup className={`mk-dialog ${dialogMotion}`}>
             <Dialog.Title className="mk-dialog-title">{title}</Dialog.Title>
             <Dialog.Description className="mk-dialog-desc">{description}</Dialog.Description>
             <div className="mk-dialog-actions">

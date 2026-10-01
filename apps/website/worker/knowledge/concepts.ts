@@ -25,10 +25,12 @@
 // the glossary framing with file paths (no summaries) ranked pairs best, and
 // merges at level 2 were all correct; see the README.
 
+import type { InferResult } from "kysely";
+import { batch, db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import type { BuiltGraph, SnapshotFile } from "./graph.ts";
 import { decide, embed, type ClefQuestion } from "./models.ts";
-import { pool, runBatched, sha256, slug } from "./util.ts";
+import { pool, runBatched, sha256, slug, type Statement } from "./util.ts";
 
 export const ALIGNER = "a1";
 
@@ -329,35 +331,33 @@ const SALIENCE_QUESTION: Record<string, ClefQuestion> = {
   },
 };
 
-async function repoSummary(db: D1Database, repoId: string): Promise<string> {
-  const row = await db
-    .prepare("SELECT summary FROM kg_nodes WHERE repo_id = ? AND id = 'repo'")
-    .bind(repoId)
-    .first<{ summary: string }>();
+async function repoSummary(d1: D1Database, repoId: string): Promise<string> {
+  const row = await db(d1)
+    .selectFrom("kg_nodes")
+    .select("summary")
+    .where("repo_id", "=", repoId)
+    .where("id", "=", "repo")
+    .executeTakeFirst();
   return (row?.summary ?? "").slice(0, 400);
 }
 
 /** First-pass decisions, with review scores overriding theirs. */
-async function loadDecisions(db: D1Database, repoId: string): Promise<Map<string, Decision>> {
-  const [pairs, reviews] = await db.batch([
-    db
-      .prepare(
-        "SELECT a, b, score, a_in_b, b_in_a FROM kg_concept_pairs WHERE repo_id = ? AND version = ?",
-      )
-      .bind(repoId, ALIGNER),
-    db.prepare("SELECT a, b, score FROM kg_concept_reviews WHERE repo_id = ?").bind(repoId),
-  ]);
+async function loadDecisions(d1: D1Database, repoId: string): Promise<Map<string, Decision>> {
+  const pairsQuery = db(d1)
+    .selectFrom("kg_concept_pairs")
+    .select(["a", "b", "score", "a_in_b", "b_in_a"])
+    .where("repo_id", "=", repoId)
+    .where("version", "=", ALIGNER);
+  const reviewsQuery = db(d1)
+    .selectFrom("kg_concept_reviews")
+    .select(["a", "b", "score"])
+    .where("repo_id", "=", repoId);
+  const [pairs, reviews] = await batch(d1, [pairsQuery, reviewsQuery]);
   const out = new Map<string, Decision>();
-  for (const r of (pairs?.results ?? []) as {
-    a: string;
-    b: string;
-    score: number;
-    a_in_b: number;
-    b_in_a: number;
-  }[]) {
+  for (const r of (pairs?.results ?? []) as InferResult<typeof pairsQuery>) {
     out.set(pairKey(r.a, r.b), { score: r.score, aInB: r.a_in_b, bInA: r.b_in_a });
   }
-  for (const r of (reviews?.results ?? []) as { a: string; b: string; score: number }[]) {
+  for (const r of (reviews?.results ?? []) as InferResult<typeof reviewsQuery>) {
     const first = out.get(pairKey(r.a, r.b));
     out.set(pairKey(r.a, r.b), { score: r.score, aInB: first?.aInB ?? 0, bInA: first?.bInA ?? 0 });
   }
@@ -388,11 +388,11 @@ export async function alignPairs(
   const groups = collectConcepts(files, analyses);
   const names = new Map([...groups].map(([key, g]) => [key, displayName(g.names, key)]));
   const decided = await loadDecisions(env.DB, repoId);
-  const { results: knownRows } = await env.DB.prepare(
-    "SELECT key FROM kg_concepts WHERE repo_id = ?",
-  )
-    .bind(repoId)
-    .all<{ key: string }>();
+  const knownRows = await db(env.DB)
+    .selectFrom("kg_concepts")
+    .select("key")
+    .where("repo_id", "=", repoId)
+    .execute();
   const known = new Set(knownRows.map((r) => r.key));
   const fresh = [...names.keys()].filter((k) => !known.has(k));
 
@@ -419,7 +419,7 @@ export async function alignPairs(
     name: names.get(key),
     mentioned_in: [...(groups.get(key)?.files ?? [])].sort().slice(0, 4),
   });
-  let unsaved: D1PreparedStatement[] = [];
+  let unsaved: Statement[] = [];
   const save = async () => {
     const statements = unsaved;
     unsaved = [];
@@ -439,11 +439,25 @@ export async function alignPairs(
       return answer?.type === "noul" ? answer.noul : 0;
     };
     unsaved.push(
-      env.DB.prepare(
-        `INSERT INTO kg_concept_pairs (repo_id, a, b, version, score, a_in_b, b_in_a) VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (repo_id, a, b) DO UPDATE SET version = excluded.version, score = excluded.score,
-           a_in_b = excluded.a_in_b, b_in_a = excluded.b_in_a`,
-      ).bind(repoId, a, b, ALIGNER, score, p("a_in_b"), p("b_in_a")),
+      db(env.DB)
+        .insertInto("kg_concept_pairs")
+        .values({
+          repo_id: repoId,
+          a,
+          b,
+          version: ALIGNER,
+          score,
+          a_in_b: p("a_in_b"),
+          b_in_a: p("b_in_a"),
+        })
+        .onConflict((oc) =>
+          oc.columns(["repo_id", "a", "b"]).doUpdateSet((eb) => ({
+            version: eb.ref("excluded.version"),
+            score: eb.ref("excluded.score"),
+            a_in_b: eb.ref("excluded.a_in_b"),
+            b_in_a: eb.ref("excluded.b_in_a"),
+          })),
+        ),
     );
     if (unsaved.length >= 40) await save();
   });
@@ -477,27 +491,20 @@ export async function settleConcepts(
   files: SnapshotFile[],
   analyses: Map<string, FileAnalysis>,
 ): Promise<SettleStats> {
-  const db = env.DB;
+  const d1 = env.DB;
   const groups = collectConcepts(files, analyses);
   const keys = [...groups.keys()];
   const present = new Set(keys);
   const decisions = new Map(
-    [...(await loadDecisions(db, repoId))].filter(([pk]) =>
+    [...(await loadDecisions(d1, repoId))].filter(([pk]) =>
       splitPair(pk).every((k) => present.has(k)),
     ),
   );
-  const { results: rows } = await db
-    .prepare(
-      "SELECT key, canonical, recurring, salient, salience_hash FROM kg_concepts WHERE repo_id = ?",
-    )
-    .bind(repoId)
-    .all<{
-      key: string;
-      canonical: string;
-      recurring: number | null;
-      salient: number | null;
-      salience_hash: string | null;
-    }>();
+  const rows = await db(d1)
+    .selectFrom("kg_concepts")
+    .select(["key", "canonical", "recurring", "salient", "salience_hash"])
+    .where("repo_id", "=", repoId)
+    .execute();
   const previous = new Map(rows.map((r) => [r.key, r]));
   const canonical = cluster(
     keys,
@@ -519,7 +526,7 @@ export async function settleConcepts(
 
   // Salience: well-used groups stay; the rest ask clef, again only when the
   // group's names or files change.
-  const context = await repoSummary(db, repoId);
+  const context = await repoSummary(d1, repoId);
   const verdicts = new Map<string, { recurring: number | null; salient: boolean; hash: string }>();
   let asked = 0;
   await pool([...merged], CLEF_CONCURRENCY, async ([lead, group]) => {
@@ -556,38 +563,34 @@ export async function settleConcepts(
     verdicts.set(lead, { recurring, salient: recurring >= 0.5, hash });
   });
 
-  const statements: D1PreparedStatement[] = [
-    db.prepare("DELETE FROM kg_concepts WHERE repo_id = ?").bind(repoId),
-    db.prepare("DELETE FROM kg_concept_links WHERE repo_id = ?").bind(repoId),
+  const statements: Statement[] = [
+    db(d1).deleteFrom("kg_concepts").where("repo_id", "=", repoId),
+    db(d1).deleteFrom("kg_concept_links").where("repo_id", "=", repoId),
   ];
   for (const key of keys) {
     const lead = canonical.get(key) as string;
     const verdict = key === lead ? verdicts.get(lead) : undefined;
     statements.push(
-      db
-        .prepare(
-          "INSERT INTO kg_concepts (repo_id, key, canonical, recurring, salient, salience_hash) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          repoId,
+      db(d1)
+        .insertInto("kg_concepts")
+        .values({
+          repo_id: repoId,
           key,
-          lead,
-          verdict?.recurring ?? null,
-          verdict ? (verdict.salient ? 1 : 0) : null,
-          verdict?.hash ?? null,
-        ),
+          canonical: lead,
+          recurring: verdict?.recurring ?? null,
+          salient: verdict ? (verdict.salient ? 1 : 0) : null,
+          salience_hash: verdict?.hash ?? null,
+        }),
     );
   }
   for (const [narrower, broader] of links) {
     statements.push(
-      db
-        .prepare("INSERT INTO kg_concept_links (repo_id, narrower, broader) VALUES (?, ?, ?)")
-        .bind(repoId, narrower, broader),
+      db(d1).insertInto("kg_concept_links").values({ repo_id: repoId, narrower, broader }),
     );
   }
   // One transaction when it fits, so readers never see a half-written model.
-  if (statements.length <= 1000) await db.batch(statements);
-  else await runBatched(db, statements);
+  if (statements.length <= 1000) await batch(d1, statements);
+  else await runBatched(d1, statements);
 
   const salient = [...verdicts.values()].filter((v) => v.salient).length;
   return {
@@ -629,21 +632,24 @@ export async function reviewConcepts(
   repoId: string,
   graph: Pick<BuiltGraph, "nodes" | "conceptFiles">,
 ): Promise<ReviewStats> {
-  const db = env.DB;
+  const d1 = env.DB;
   const kept = new Map(
     graph.nodes
       .filter((n) => n.kind === "concept" && n.summary)
       .map((n) => [n.id.slice(8), { name: n.name, definition: n.summary }]),
   );
-  const { results: rows } = await db
-    .prepare("SELECT key, canonical FROM kg_concepts WHERE repo_id = ?")
-    .bind(repoId)
-    .all<{ key: string; canonical: string }>();
+  const rows = await db(d1)
+    .selectFrom("kg_concepts")
+    .select(["key", "canonical"])
+    .where("repo_id", "=", repoId)
+    .execute();
   const canonical = new Map(rows.map((r) => [r.key, r.canonical]));
-  const { results: first } = await db
-    .prepare("SELECT a, b, score FROM kg_concept_pairs WHERE repo_id = ? AND version = ?")
-    .bind(repoId, ALIGNER)
-    .all<{ a: string; b: string; score: number }>();
+  const first = await db(d1)
+    .selectFrom("kg_concept_pairs")
+    .select(["a", "b", "score"])
+    .where("repo_id", "=", repoId)
+    .where("version", "=", ALIGNER)
+    .execute();
   // Canonical pairs of kept concepts the first pass placed in between.
   const candidates = new Set<string>();
   for (const { a, b, score } of first) {
@@ -652,19 +658,20 @@ export async function reviewConcepts(
     const cb = canonical.get(b) ?? b;
     if (ca !== cb && kept.has(ca) && kept.has(cb)) candidates.add(pairKey(ca, cb));
   }
-  const { results: stored } = await db
-    .prepare("SELECT a, b, score, inputs_hash FROM kg_concept_reviews WHERE repo_id = ?")
-    .bind(repoId)
-    .all<{ a: string; b: string; score: number; inputs_hash: string }>();
+  const stored = await db(d1)
+    .selectFrom("kg_concept_reviews")
+    .select(["a", "b", "score", "inputs_hash"])
+    .where("repo_id", "=", repoId)
+    .execute();
   const reviews = new Map(stored.map((r) => [pairKey(r.a, r.b), r]));
 
-  const context = await repoSummary(db, repoId);
+  const context = await repoSummary(d1, repoId);
   const entry = (key: string) => ({
     ...kept.get(key),
     mentioned_in: (graph.conceptFiles.get(key) ?? []).slice(0, 4),
   });
   let asked = 0;
-  const statements: D1PreparedStatement[] = [];
+  const statements: Statement[] = [];
   await pool([...candidates], CLEF_CONCURRENCY, async (pk) => {
     const [a, b] = splitPair(pk);
     const hash = await sha256(`${ALIGNER}\u0000${JSON.stringify([kept.get(a), kept.get(b)])}`);
@@ -679,15 +686,18 @@ export async function reviewConcepts(
     asked++;
     reviews.set(pk, { a, b, score, inputs_hash: hash });
     statements.push(
-      db
-        .prepare(
-          `INSERT INTO kg_concept_reviews (repo_id, a, b, score, inputs_hash) VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT (repo_id, a, b) DO UPDATE SET score = excluded.score, inputs_hash = excluded.inputs_hash`,
-        )
-        .bind(repoId, a, b, score, hash),
+      db(d1)
+        .insertInto("kg_concept_reviews")
+        .values({ repo_id: repoId, a, b, score, inputs_hash: hash })
+        .onConflict((oc) =>
+          oc.columns(["repo_id", "a", "b"]).doUpdateSet((eb) => ({
+            score: eb.ref("excluded.score"),
+            inputs_hash: eb.ref("excluded.inputs_hash"),
+          })),
+        ),
     );
   });
-  await runBatched(db, statements);
+  await runBatched(d1, statements);
   const newMerges = [...reviews.values()].filter(
     (r) => r.score >= SAME && (canonical.get(r.a) ?? r.a) !== (canonical.get(r.b) ?? r.b),
   ).length;
@@ -695,27 +705,28 @@ export async function reviewConcepts(
 }
 
 /** The stored concept model (empty until a build has aligned concepts). */
-export async function loadConceptModel(db: D1Database, repoId: string): Promise<ConceptModel> {
-  const [concepts, links] = await db.batch([
-    db.prepare("SELECT key, canonical, salient FROM kg_concepts WHERE repo_id = ?").bind(repoId),
-    db.prepare("SELECT narrower, broader FROM kg_concept_links WHERE repo_id = ?").bind(repoId),
-  ]);
+export async function loadConceptModel(d1: D1Database, repoId: string): Promise<ConceptModel> {
+  const conceptsQuery = db(d1)
+    .selectFrom("kg_concepts")
+    .select(["key", "canonical", "salient"])
+    .where("repo_id", "=", repoId);
+  const linksQuery = db(d1)
+    .selectFrom("kg_concept_links")
+    .select(["narrower", "broader"])
+    .where("repo_id", "=", repoId);
+  const [concepts, links] = await batch(d1, [conceptsQuery, linksQuery]);
   const model: ConceptModel = {
     canonical: new Map(),
     salient: new Set(),
     trimmed: new Set(),
     partOf: [],
   };
-  for (const row of (concepts?.results ?? []) as {
-    key: string;
-    canonical: string;
-    salient: number | null;
-  }[]) {
+  for (const row of (concepts?.results ?? []) as InferResult<typeof conceptsQuery>) {
     if (row.key !== row.canonical) model.canonical.set(row.key, row.canonical);
     else if (row.salient === 1) model.salient.add(row.key);
     else if (row.salient === 0) model.trimmed.add(row.key);
   }
-  for (const row of (links?.results ?? []) as { narrower: string; broader: string }[]) {
+  for (const row of (links?.results ?? []) as InferResult<typeof linksQuery>) {
     model.partOf.push([row.narrower, row.broader]);
   }
   return model;

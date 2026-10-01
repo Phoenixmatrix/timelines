@@ -13,7 +13,7 @@ import {
 import type { RepoDetail } from "../../../shared/api.ts";
 import { Page } from "../../components/AppShell.tsx";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
-import { CopyField, RoleChip, VisibilityChip } from "../../components/ui.tsx";
+import { CopyField, RoleChip, VisibilityChip, link, popMotion } from "../../components/ui.tsx";
 import { forgetRepoData, repoData, routeData } from "../../lib/repoData.ts";
 import { commitsUrl, repoPath } from "../../lib/refs.ts";
 import { useViewer } from "../../lib/session.ts";
@@ -79,7 +79,7 @@ function ClonePopover({ repo }: { repo: RepoDetail }) {
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Positioner side="bottom" align="end" sideOffset={8} className="z-50">
-          <Popover.Popup className="mk-popup gm-pop w-[min(26rem,calc(100vw-2rem))] p-4">
+          <Popover.Popup className={`mk-popup ${popMotion} w-[min(26rem,calc(100vw-2rem))] p-4`}>
             <Popover.Title className="m-0 text-title">Clone over HTTPS</Popover.Title>
             <div className="mt-3">
               <CopyField value={repo.cloneUrl} label="Clone URL" />
@@ -89,7 +89,7 @@ function ClonePopover({ repo }: { repo: RepoDetail }) {
                 <>
                   When git asks, sign in as <strong className="text-ink">{viewer.slug}</strong> with
                   a{" "}
-                  <Link to="/settings/tokens" className="gm-link">
+                  <Link to="/settings/tokens" className={link}>
                     personal access token
                   </Link>{" "}
                   as the password.{" "}
@@ -182,6 +182,9 @@ export function RepoLayout() {
             )}
             <Tab to={`${base}/ci`} sections={[`${base}/ci`]}>
               CI
+            </Tab>
+            <Tab to={`${base}/packages`} sections={[`${base}/packages`]}>
+              Packages
             </Tab>
             <Tab to={`${base}/wiki`} sections={[`${base}/wiki`]}>
               Wiki

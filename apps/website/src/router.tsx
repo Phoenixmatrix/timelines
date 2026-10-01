@@ -10,6 +10,11 @@ import { ciAction, ciLoader, CiRun, CiRuns, ciRunLoader } from "./routes/repo/Ci
 import { Code, codeLoader } from "./routes/repo/Code.tsx";
 import { Commits, commitsLoader } from "./routes/repo/Commits.tsx";
 import { Knowledge, knowledgeLoader } from "./routes/repo/Knowledge.tsx";
+import { RepoPackages, repoPackagesLoader } from "./routes/repo/Packages.tsx";
+import { Feeds, feedsAction, feedsLoader } from "./routes/packages/Feeds.tsx";
+import { NpmLogin, npmLoginAction, npmLoginLoader } from "./routes/packages/NpmLogin.tsx";
+import { OwnerPackages, ownerPackagesLoader } from "./routes/packages/OwnerPackages.tsx";
+import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageConsole.tsx";
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
@@ -47,6 +52,23 @@ export const router = createBrowserRouter([
           },
           { path: ":owner", loader: accountLoader, Component: Account },
           {
+            path: ":owner/-/packages",
+            loader: ownerPackagesLoader,
+            Component: OwnerPackages,
+          },
+          {
+            path: ":owner/-/packages/:format/*",
+            loader: packageConsoleLoader,
+            Component: PackageConsole,
+          },
+          { path: ":owner/-/feeds", loader: feedsLoader, action: feedsAction, Component: Feeds },
+          {
+            path: "cli-auth/npm/:id",
+            loader: npmLoginLoader,
+            action: npmLoginAction,
+            Component: NpmLogin,
+          },
+          {
             id: "repo",
             path: ":owner/:repo",
             loader: repoLoader,
@@ -61,6 +83,7 @@ export const router = createBrowserRouter([
               { path: "knowledge", loader: knowledgeLoader, Component: Knowledge },
               { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
               { path: "ci/:number", loader: ciRunLoader, Component: CiRun },
+              { path: "packages", loader: repoPackagesLoader, Component: RepoPackages },
               {
                 path: "settings",
                 loader: settingsLoader,

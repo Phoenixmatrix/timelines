@@ -22,12 +22,12 @@ import {
   repoSummary,
   roleFor,
   visibleRepos,
-  type AccountRow,
   type RepoRow,
 } from "../db.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { isCommitId, RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
+import { db } from "../schema.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
 const REPO_NAME = /^(?!\.)[A-Za-z0-9._-]{1,100}$/;
@@ -143,23 +143,20 @@ repos.post("/", async (c) => {
   }
 
   try {
-    await c.env.DB.prepare(
-      `INSERT INTO repos (id, owner_id, name, description, visibility, default_branch,
-         artifacts_name, artifacts_remote, imported_from)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        `repo_${crypto.randomUUID()}`,
-        owner.id,
+    await db(c.env.DB)
+      .insertInto("repos")
+      .values({
+        id: `repo_${crypto.randomUUID()}`,
+        owner_id: owner.id,
         name,
         description,
         visibility,
-        created.defaultBranch || "main",
-        artifactsName,
-        created.remote,
-        importUrl,
-      )
-      .run();
+        default_branch: created.defaultBranch || "main",
+        artifacts_name: artifactsName,
+        artifacts_remote: created.remote,
+        imported_from: importUrl,
+      })
+      .execute();
   } catch (error) {
     // Lost a race for the same name: don't leave orphaned storage behind.
     c.executionCtx.waitUntil(c.env.ARTIFACTS.delete(artifactsName).then(() => undefined));
@@ -236,9 +233,11 @@ repos.get("/:owner/:name", async (c) => {
       // Imports keep the source's HEAD (often "master"); git is the source of truth.
       detail.defaultBranch = refs.headBranch;
       c.executionCtx.waitUntil(
-        c.env.DB.prepare("UPDATE repos SET default_branch = ? WHERE id = ?")
-          .bind(refs.headBranch, row.id)
-          .run(),
+        db(c.env.DB)
+          .updateTable("repos")
+          .set({ default_branch: refs.headBranch })
+          .where("id", "=", row.id)
+          .execute(),
       );
     }
   } catch (error) {
@@ -383,9 +382,11 @@ repos.patch("/:owner/:name", async (c) => {
     body.visibility === "public" || body.visibility === "private"
       ? body.visibility
       : row.visibility;
-  await c.env.DB.prepare("UPDATE repos SET description = ?, visibility = ? WHERE id = ?")
-    .bind(description, visibility, row.id)
-    .run();
+  await db(c.env.DB)
+    .updateTable("repos")
+    .set({ description, visibility })
+    .where("id", "=", row.id)
+    .execute();
   const updated = await findRepo(c.env.DB, c.get("actor"), row.owner_slug, row.name);
   return c.json(updated && repoSummary(updated, c.get("actor")));
 });
@@ -396,7 +397,7 @@ repos.delete("/:owner/:name", async (c) => {
   const { row } = loaded;
   // Remove the record first: a failed storage delete leaves an unreachable
   // orphan rather than a listed repository with no contents.
-  await c.env.DB.prepare("DELETE FROM repos WHERE id = ?").bind(row.id).run();
+  await db(c.env.DB).deleteFrom("repos").where("id", "=", row.id).execute();
   forgetUpstreamTokens(row.artifacts_name);
   c.executionCtx.waitUntil(
     c.env.ARTIFACTS.delete(row.artifacts_name).then(
@@ -410,12 +411,14 @@ repos.delete("/:owner/:name", async (c) => {
 repos.get("/:owner/:name/collaborators", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
-  const { results } = await c.env.DB.prepare(
-    `SELECT a.*, rc.role FROM repo_collaborators rc JOIN accounts a ON a.id = rc.user_id
-     WHERE rc.repo_id = ? ORDER BY a.slug`,
-  )
-    .bind(loaded.row.id)
-    .all<AccountRow & { role: CollaboratorRole }>();
+  const results = await db(c.env.DB)
+    .selectFrom("repo_collaborators as rc")
+    .innerJoin("accounts as a", "a.id", "rc.user_id")
+    .selectAll("a")
+    .select("rc.role")
+    .where("rc.repo_id", "=", loaded.row.id)
+    .orderBy("a.slug")
+    .execute();
   const collaborators: Collaborator[] = results.map((row) => ({
     ...accountSummary(row),
     role: row.role,
@@ -432,12 +435,13 @@ repos.put("/:owner/:name/collaborators/:username", async (c) => {
   }
   const user = await findAccountBySlug(c.env.DB, c.req.param("username"));
   if (!user || user.kind !== "user") return fail(c, 404, "No such user.");
-  await c.env.DB.prepare(
-    `INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES (?, ?, ?)
-     ON CONFLICT (repo_id, user_id) DO UPDATE SET role = excluded.role`,
-  )
-    .bind(loaded.row.id, user.id, role)
-    .run();
+  await db(c.env.DB)
+    .insertInto("repo_collaborators")
+    .values({ repo_id: loaded.row.id, user_id: user.id, role })
+    .onConflict((oc) =>
+      oc.columns(["repo_id", "user_id"]).doUpdateSet((eb) => ({ role: eb.ref("excluded.role") })),
+    )
+    .execute();
   const collaborator: Collaborator = { ...accountSummary(user), role };
   return c.json(collaborator);
 });
@@ -447,8 +451,10 @@ repos.delete("/:owner/:name/collaborators/:username", async (c) => {
   if (loaded instanceof Response) return loaded;
   const user = await findAccountBySlug(c.env.DB, c.req.param("username"));
   if (!user) return fail(c, 404, "No such user.");
-  await c.env.DB.prepare("DELETE FROM repo_collaborators WHERE repo_id = ? AND user_id = ?")
-    .bind(loaded.row.id, user.id)
-    .run();
+  await db(c.env.DB)
+    .deleteFrom("repo_collaborators")
+    .where("repo_id", "=", loaded.row.id)
+    .where("user_id", "=", user.id)
+    .execute();
   return c.body(null, 204);
 });

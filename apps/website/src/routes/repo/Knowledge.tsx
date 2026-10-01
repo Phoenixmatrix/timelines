@@ -1,3 +1,4 @@
+import { link } from "../../components/ui.tsx";
 import { MagnifyingGlassIcon } from "@phosphor-icons/react";
 import { Form, Link, useLoaderData, useNavigation, type LoaderFunctionArgs } from "react-router";
 import type {
@@ -142,7 +143,7 @@ function NodeView({ detail, status }: { detail: GraphNodeDetail; status: Knowled
         </div>
         {node.path && node.kind === "file" && (
           <Link
-            className="gm-link mk-mono mt-1 inline-block text-mono"
+            className={`${link} mk-mono mt-1 inline-block text-mono`}
             to={blobUrl(repo.owner.slug, repo.name, ref, node.path)}
           >
             {node.path}
@@ -150,7 +151,7 @@ function NodeView({ detail, status }: { detail: GraphNodeDetail; status: Knowled
         )}
         {node.path && node.kind === "symbol" && (
           <Link
-            className="gm-link mk-mono mt-1 inline-block text-mono"
+            className={`${link} mk-mono mt-1 inline-block text-mono`}
             to={nodeHref(repo.owner.slug, repo.name, `file:${node.path}`)}
           >
             {node.path}:{text(data.line)}
@@ -180,7 +181,7 @@ function NodeView({ detail, status }: { detail: GraphNodeDetail; status: Knowled
               {keyFiles.map((k) => (
                 <li key={k.path}>
                   <Link
-                    className="gm-link mk-mono text-mono"
+                    className={`${link} mk-mono text-mono`}
                     to={nodeHref(repo.owner.slug, repo.name, `file:${k.path}`)}
                   >
                     {k.path}

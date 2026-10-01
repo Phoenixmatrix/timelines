@@ -327,7 +327,11 @@ export interface CiSecretSummary {
   updatedAt: string;
 }
 
-/** What `gm runner` gets when it claims a job. */
+/**
+ * What `gm runner` gets when it claims a job. `env` may contain
+ * `${GITMATRIX_CONFIG}`: the runner writes `files` under a directory of its
+ * own and substitutes that directory's path.
+ */
 export interface CiClaimedJob {
   id: string;
   runId: string;
@@ -338,6 +342,8 @@ export interface CiClaimedJob {
   ref: string;
   timeoutMinutes: number;
   env: Record<string, string>;
+  /** Package tool configuration (npmrc, docker/config.json…), by relative path. */
+  files: Record<string, string>;
   steps: { position: number; name: string; run: string }[];
 }
 

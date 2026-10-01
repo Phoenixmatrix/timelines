@@ -15,6 +15,7 @@
 // Edge kinds: contains, defines, imports, depends_on, mentions, part_of
 // (narrower concept -> broader concept).
 
+import { db, nowIso } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import {
   collectConcepts,
@@ -24,7 +25,7 @@ import {
   type ConceptModel,
 } from "./concepts.ts";
 import { resolveImport } from "./extract.ts";
-import { chunk, runBatched, sha256 } from "./util.ts";
+import { runBatched, sha256, type Statement } from "./util.ts";
 
 export { conceptKey } from "./concepts.ts";
 
@@ -347,28 +348,31 @@ async function nodeHash(node: GraphNode): Promise<string> {
  * changed, add and drop edges, and record the change feed for the build.
  */
 export async function applyGraph(
-  db: D1Database,
+  d1: D1Database,
   repoId: string,
   buildId: string,
   commit: string,
   graph: BuiltGraph,
 ): Promise<GraphDiff> {
   const existing = new Map<string, { hash: string; kind: string }>();
-  const { results } = await db
-    .prepare("SELECT id, kind, content_hash FROM kg_nodes WHERE repo_id = ?")
-    .bind(repoId)
-    .all<{ id: string; kind: string; content_hash: string }>();
+  const results = await db(d1)
+    .selectFrom("kg_nodes")
+    .select(["id", "kind", "content_hash"])
+    .where("repo_id", "=", repoId)
+    .execute();
   for (const row of results) existing.set(row.id, { hash: row.content_hash, kind: row.kind });
 
   const diff: GraphDiff = { added: [], changed: [], removed: [] };
-  const statements: D1PreparedStatement[] = [];
+  const statements: Statement[] = [];
   const change = (id: string, kind: string, what: "added" | "changed" | "removed") =>
-    db
-      .prepare(
-        `INSERT INTO kg_changes (repo_id, build_id, node_id, kind, change) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (repo_id, build_id, node_id) DO UPDATE SET change = excluded.change`,
-      )
-      .bind(repoId, buildId, id, kind, what);
+    db(d1)
+      .insertInto("kg_changes")
+      .values({ repo_id: repoId, build_id: buildId, node_id: id, kind, change: what })
+      .onConflict((oc) =>
+        oc
+          .columns(["repo_id", "build_id", "node_id"])
+          .doUpdateSet((eb) => ({ change: eb.ref("excluded.change") })),
+      );
 
   const wanted = new Set<string>();
   for (const node of graph.nodes) {
@@ -377,24 +381,31 @@ export async function applyGraph(
     const before = existing.get(node.id);
     if (before?.hash === hash) continue;
     statements.push(
-      db
-        .prepare(
-          `INSERT INTO kg_nodes (repo_id, id, kind, name, path, summary, data, content_hash, changed_in, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-           ON CONFLICT (repo_id, id) DO UPDATE SET kind = excluded.kind, name = excluded.name, path = excluded.path,
-             summary = excluded.summary, data = excluded.data, content_hash = excluded.content_hash,
-             changed_in = excluded.changed_in, updated_at = excluded.updated_at`,
-        )
-        .bind(
-          repoId,
-          node.id,
-          node.kind,
-          node.name,
-          node.path,
-          node.summary,
-          JSON.stringify(node.data),
-          hash,
-          commit,
+      db(d1)
+        .insertInto("kg_nodes")
+        .values({
+          repo_id: repoId,
+          id: node.id,
+          kind: node.kind,
+          name: node.name,
+          path: node.path,
+          summary: node.summary,
+          data: JSON.stringify(node.data),
+          content_hash: hash,
+          changed_in: commit,
+          updated_at: nowIso(),
+        })
+        .onConflict((oc) =>
+          oc.columns(["repo_id", "id"]).doUpdateSet((eb) => ({
+            kind: eb.ref("excluded.kind"),
+            name: eb.ref("excluded.name"),
+            path: eb.ref("excluded.path"),
+            summary: eb.ref("excluded.summary"),
+            data: eb.ref("excluded.data"),
+            content_hash: eb.ref("excluded.content_hash"),
+            changed_in: eb.ref("excluded.changed_in"),
+            updated_at: eb.ref("excluded.updated_at"),
+          })),
         ),
     );
     const what = before ? "changed" : "added";
@@ -405,17 +416,18 @@ export async function applyGraph(
     if (wanted.has(id)) continue;
     diff.removed.push(id);
     statements.push(
-      db.prepare("DELETE FROM kg_nodes WHERE repo_id = ? AND id = ?").bind(repoId, id),
+      db(d1).deleteFrom("kg_nodes").where("repo_id", "=", repoId).where("id", "=", id),
     );
     statements.push(change(id, kind, "removed"));
   }
 
   // Edges: compare by (src, dst, kind) and weight.
-  const { results: oldEdges } = await db
-    .prepare("SELECT src, dst, kind, weight FROM kg_edges WHERE repo_id = ?")
-    .bind(repoId)
-    .all<GraphEdge>();
-  const key = (e: Pick<GraphEdge, "src" | "dst" | "kind">) =>
+  const oldEdges = await db(d1)
+    .selectFrom("kg_edges")
+    .select(["src", "dst", "kind", "weight"])
+    .where("repo_id", "=", repoId)
+    .execute();
+  const key = (e: { src: string; dst: string; kind: string }) =>
     `${e.src}\u0000${e.dst}\u0000${e.kind}`;
   const oldByKey = new Map(oldEdges.map((e) => [key(e), e]));
   const newKeys = new Set<string>();
@@ -423,59 +435,69 @@ export async function applyGraph(
     newKeys.add(key(edge));
     if (oldByKey.get(key(edge))?.weight === edge.weight) continue;
     statements.push(
-      db
-        .prepare(
-          `INSERT INTO kg_edges (repo_id, src, dst, kind, weight) VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT (repo_id, src, dst, kind) DO UPDATE SET weight = excluded.weight`,
-        )
-        .bind(repoId, edge.src, edge.dst, edge.kind, edge.weight),
+      db(d1)
+        .insertInto("kg_edges")
+        .values({
+          repo_id: repoId,
+          src: edge.src,
+          dst: edge.dst,
+          kind: edge.kind,
+          weight: edge.weight,
+        })
+        .onConflict((oc) =>
+          oc
+            .columns(["repo_id", "src", "dst", "kind"])
+            .doUpdateSet((eb) => ({ weight: eb.ref("excluded.weight") })),
+        ),
     );
   }
   for (const [k, edge] of oldByKey) {
     if (newKeys.has(k)) continue;
     statements.push(
-      db
-        .prepare("DELETE FROM kg_edges WHERE repo_id = ? AND src = ? AND dst = ? AND kind = ?")
-        .bind(repoId, edge.src, edge.dst, edge.kind),
+      db(d1)
+        .deleteFrom("kg_edges")
+        .where("repo_id", "=", repoId)
+        .where("src", "=", edge.src)
+        .where("dst", "=", edge.dst)
+        .where("kind", "=", edge.kind),
     );
   }
-  await runBatched(db, statements);
+  await runBatched(d1, statements);
   return diff;
 }
 
 /** Load the current snapshot's file list for a build or for the indexed commit. */
 export async function loadSnapshot(
-  db: D1Database,
+  d1: D1Database,
   repoId: string,
   snapshot: string,
 ): Promise<SnapshotFile[]> {
-  const { results } = await db
-    .prepare(
-      "SELECT path, blob_oid AS blob, mode FROM kg_files WHERE repo_id = ? AND snapshot = ? ORDER BY path",
-    )
-    .bind(repoId, snapshot)
-    .all<SnapshotFile>();
-  return results;
+  return db(d1)
+    .selectFrom("kg_files")
+    .select(["path", "blob_oid as blob", "mode"])
+    .where("repo_id", "=", repoId)
+    .where("snapshot", "=", snapshot)
+    .orderBy("path")
+    .execute();
 }
 
 export async function saveSnapshot(
-  db: D1Database,
+  d1: D1Database,
   repoId: string,
   snapshot: string,
   files: SnapshotFile[],
 ) {
-  await db
-    .prepare("DELETE FROM kg_files WHERE repo_id = ? AND snapshot = ?")
-    .bind(repoId, snapshot)
-    .run();
+  await db(d1)
+    .deleteFrom("kg_files")
+    .where("repo_id", "=", repoId)
+    .where("snapshot", "=", snapshot)
+    .execute();
   await runBatched(
-    db,
-    chunk(files, 1).map(([f]) =>
-      db
-        .prepare(
-          "INSERT INTO kg_files (repo_id, snapshot, path, blob_oid, mode) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(repoId, snapshot, f?.path, f?.blob, f?.mode),
+    d1,
+    files.map((f) =>
+      db(d1)
+        .insertInto("kg_files")
+        .values({ repo_id: repoId, snapshot, path: f.path, blob_oid: f.blob, mode: f.mode }),
     ),
   );
 }

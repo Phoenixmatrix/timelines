@@ -1,3 +1,4 @@
+import { link } from "./ui.tsx";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Link } from "react-router";
@@ -33,7 +34,7 @@ export function Markdown({
           a({ href = "", children }) {
             if (href.startsWith("wiki:")) {
               return (
-                <Link className="gm-link" to={repoPath(owner, name, "wiki", href.slice(5))}>
+                <Link className={link} to={repoPath(owner, name, "wiki", href.slice(5))}>
                   {children}
                 </Link>
               );
@@ -41,7 +42,7 @@ export function Markdown({
             if (/^[a-z]+:/i.test(href) || href.startsWith("#")) {
               return (
                 <a
-                  className="gm-link"
+                  className={link}
                   href={href}
                   target={href.startsWith("#") ? undefined : "_blank"}
                   rel="noreferrer"
@@ -52,7 +53,7 @@ export function Markdown({
             }
             const path = href.replace(/^\.?\//, "").replace(/#.*$/, "");
             return (
-              <Link className="gm-link" to={blobUrl(owner, name, refName, path)}>
+              <Link className={link} to={blobUrl(owner, name, refName, path)}>
                 {children}
               </Link>
             );

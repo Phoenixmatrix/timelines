@@ -1,5 +1,7 @@
 import type { AccountSummary, RepoRole, RepoSummary, Viewer, Visibility } from "../shared/api.ts";
+import { sql } from "kysely";
 import { repoRole } from "./permissions.ts";
+import { db } from "./schema.ts";
 
 /** A signed-in person, as the Worker sees them. */
 export interface Actor {
@@ -39,14 +41,35 @@ export interface RepoRow {
   collaborator_role: "read" | "write" | "admin" | null;
 }
 
-// ?1 is the viewer's account id ("" when signed out), so the per-viewer
-// columns come back null for anonymous requests.
-const REPO_SELECT = `
-  SELECT r.*, o.slug AS owner_slug, o.kind AS owner_kind, o.display_name AS owner_display_name,
-    o.member_repo_role,
-    (SELECT role FROM org_members m WHERE m.org_id = r.owner_id AND m.user_id = ?1) AS org_role,
-    (SELECT role FROM repo_collaborators c WHERE c.repo_id = r.id AND c.user_id = ?1) AS collaborator_role
-  FROM repos r JOIN accounts o ON o.id = r.owner_id`;
+/** The database's clock as an ISO timestamp, matching the columns' defaults. */
+export const sqlNow = sql<string>`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`;
+
+// The viewer's account id is "" when signed out, so the per-viewer columns
+// come back null for anonymous requests.
+function selectRepos(d1: D1Database, viewerId: string) {
+  return db(d1)
+    .selectFrom("repos as r")
+    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .selectAll("r")
+    .select((eb) => [
+      "o.slug as owner_slug",
+      "o.kind as owner_kind",
+      "o.display_name as owner_display_name",
+      "o.member_repo_role",
+      eb
+        .selectFrom("org_members as m")
+        .select("m.role")
+        .whereRef("m.org_id", "=", "r.owner_id")
+        .where("m.user_id", "=", viewerId)
+        .as("org_role"),
+      eb
+        .selectFrom("repo_collaborators as c")
+        .select("c.role")
+        .whereRef("c.repo_id", "=", "r.id")
+        .where("c.user_id", "=", viewerId)
+        .as("collaborator_role"),
+    ]);
+}
 
 export function accountSummary(row: AccountRow): AccountSummary {
   return { id: row.id, kind: row.kind, slug: row.slug, displayName: row.display_name };
@@ -61,16 +84,23 @@ export function actorFromRow(row: AccountRow): Actor {
   };
 }
 
-export async function findUserById(db: D1Database, id: string): Promise<Actor | null> {
-  const row = await db
-    .prepare("SELECT * FROM accounts WHERE id = ? AND kind = 'user'")
-    .bind(id)
-    .first<AccountRow>();
+export async function findUserById(d1: D1Database, id: string): Promise<Actor | null> {
+  const row = await db(d1)
+    .selectFrom("accounts")
+    .selectAll()
+    .where("id", "=", id)
+    .where("kind", "=", "user")
+    .executeTakeFirst();
   return row ? actorFromRow(row) : null;
 }
 
-export async function findAccountBySlug(db: D1Database, slug: string): Promise<AccountRow | null> {
-  return db.prepare("SELECT * FROM accounts WHERE slug = ?").bind(slug).first<AccountRow>();
+export async function findAccountBySlug(d1: D1Database, slug: string): Promise<AccountRow | null> {
+  const row = await db(d1)
+    .selectFrom("accounts")
+    .selectAll()
+    .where("slug", "=", slug)
+    .executeTakeFirst();
+  return row ?? null;
 }
 
 export function roleFor(row: RepoRow, actor: Actor | null): RepoRole {
@@ -106,43 +136,48 @@ export function repoSummary(row: RepoRow, actor: Actor | null): RepoSummary {
 }
 
 export async function findRepo(
-  db: D1Database,
+  d1: D1Database,
   actor: Actor | null,
   owner: string,
   name: string,
 ): Promise<RepoRow | null> {
-  return db
-    .prepare(`${REPO_SELECT} WHERE o.slug = ?2 AND r.name = ?3`)
-    .bind(actor?.id ?? "", owner, name)
-    .first<RepoRow>();
+  const row = await selectRepos(d1, actor?.id ?? "")
+    .where("o.slug", "=", owner)
+    .where("r.name", "=", name)
+    .executeTakeFirst();
+  return row ?? null;
 }
 
 /** Repositories the actor can read, most recently pushed first. */
 export async function visibleRepos(
-  db: D1Database,
+  d1: D1Database,
   actor: Actor | null,
   ownerId?: string,
 ): Promise<RepoSummary[]> {
-  const statement = ownerId
-    ? db.prepare(`${REPO_SELECT} WHERE r.owner_id = ?2`).bind(actor?.id ?? "", ownerId)
-    : db.prepare(REPO_SELECT).bind(actor?.id ?? "");
-  const { results } = await statement.all<RepoRow>();
+  let query = selectRepos(d1, actor?.id ?? "");
+  if (ownerId) query = query.where("r.owner_id", "=", ownerId);
+  const results: RepoRow[] = await query.execute();
   return results
     .map((row) => repoSummary(row, actor))
     .filter((repo) => repo.viewerRole !== "none")
     .sort((a, b) => (b.pushedAt ?? b.createdAt).localeCompare(a.pushedAt ?? a.createdAt));
 }
 
-export async function viewerFor(db: D1Database, actor: Actor): Promise<Viewer> {
-  const orgs = actor.isSiteAdmin
-    ? await db.prepare("SELECT * FROM accounts WHERE kind = 'org' ORDER BY slug").all<AccountRow>()
-    : await db
-        .prepare(
-          `SELECT a.* FROM accounts a JOIN org_members m ON m.org_id = a.id
-           WHERE m.user_id = ? ORDER BY a.slug`,
-        )
-        .bind(actor.id)
-        .all<AccountRow>();
+export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
+  const orgs: AccountRow[] = actor.isSiteAdmin
+    ? await db(d1)
+        .selectFrom("accounts")
+        .selectAll()
+        .where("kind", "=", "org")
+        .orderBy("slug")
+        .execute()
+    : await db(d1)
+        .selectFrom("accounts as a")
+        .innerJoin("org_members as m", "m.org_id", "a.id")
+        .selectAll("a")
+        .where("m.user_id", "=", actor.id)
+        .orderBy("a.slug")
+        .execute();
   const self: AccountSummary = {
     id: actor.id,
     kind: "user",
@@ -153,17 +188,19 @@ export async function viewerFor(db: D1Database, actor: Actor): Promise<Viewer> {
     ...self,
     kind: "user",
     isSiteAdmin: actor.isSiteAdmin,
-    canCreateIn: [self, ...orgs.results.map(accountSummary)],
+    canCreateIn: [self, ...orgs.map(accountSummary)],
   };
 }
 
 /** Who may create repositories under an owner: the user themselves, org members, site admins. */
-export async function canCreateIn(db: D1Database, actor: Actor, owner: AccountRow) {
+export async function canCreateIn(d1: D1Database, actor: Actor, owner: AccountRow) {
   if (actor.isSiteAdmin || owner.id === actor.id) return true;
   if (owner.kind !== "org") return false;
-  const membership = await db
-    .prepare("SELECT role FROM org_members WHERE org_id = ? AND user_id = ?")
-    .bind(owner.id, actor.id)
-    .first();
-  return membership !== null;
+  const membership = await db(d1)
+    .selectFrom("org_members")
+    .select("role")
+    .where("org_id", "=", owner.id)
+    .where("user_id", "=", actor.id)
+    .executeTakeFirst();
+  return membership !== undefined;
 }

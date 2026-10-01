@@ -13,6 +13,11 @@ export default defineConfig({
   ],
   server: { port: 5180, strictPort: true },
   test: {
-    include: ["worker/**/*.test.ts", "src/**/*.test.ts", "shared/**/*.test.ts"],
+    include: [
+      "worker/**/*.test.ts",
+      "registry/**/*.test.ts",
+      "src/**/*.test.ts",
+      "shared/**/*.test.ts",
+    ],
   },
 });

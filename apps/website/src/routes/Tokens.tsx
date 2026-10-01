@@ -4,7 +4,7 @@ import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } f
 import type { AccessToken, CreatedAccessToken } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { Segmented } from "../components/Choice.tsx";
-import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
+import { Card, ConfirmDialog, CopyField, FormError, TextField, link } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
@@ -45,7 +45,7 @@ export function Tokens() {
       <p className="mt-1.5 mb-0 max-w-[52ch] text-ink-muted">
         Git asks for a username and password over HTTPS. Use your username and a token as the
         password. Tokens act as you, limited to read or write. With gm you can sign in with an{" "}
-        <Link to="/settings/ssh-keys" className="gm-link">
+        <Link to="/settings/ssh-keys" className={link}>
           SSH key
         </Link>{" "}
         instead.

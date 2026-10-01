@@ -1,9 +1,11 @@
+import { link } from "../components/ui.tsx";
 import { Link, useLoaderData, type LoaderFunctionArgs } from "react-router";
 import type { AccountPage } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { Monogram } from "../components/Monogram.tsx";
 import { RepoList } from "../components/RepoList.tsx";
 import { load } from "../lib/api.ts";
+import { packagesPath } from "../lib/packages.ts";
 
 export async function accountLoader({ request, params }: LoaderFunctionArgs) {
   return load<AccountPage>(`/accounts/${params.owner}`, request);
@@ -35,7 +37,12 @@ export function Account() {
 
       <div className="mt-8 grid gap-6 md:grid-cols-[1fr_15rem]">
         <section>
-          <h2 className="mt-0 mb-3 text-title">Repositories</h2>
+          <div className="mb-3 flex items-baseline justify-between gap-3">
+            <h2 className="m-0 text-title">Repositories</h2>
+            <Link to={packagesPath(account.slug)} className={`${link} text-body-sm`}>
+              Packages
+            </Link>
+          </div>
           <RepoList repos={account.repos} showOwner={false} empty="No repositories you can see." />
         </section>
         {isOrg && (

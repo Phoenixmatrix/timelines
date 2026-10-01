@@ -16,7 +16,9 @@
 //   finish      promote the snapshot, record stats, tell the coordinator
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
+import { sql } from "kysely";
 import { invalidateRefs, RepoReader } from "../objects.ts";
+import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
 import {
@@ -62,40 +64,47 @@ const STEP = {
 } as const;
 const ANALYZE_BATCH = 32;
 
-async function repoRow(db: D1Database, repoId: string): Promise<RepoRow | null> {
-  return db
-    .prepare(
-      `SELECT r.id, r.artifacts_name, r.artifacts_remote, o.slug || '/' || r.name AS full_name
-       FROM repos r JOIN accounts o ON o.id = r.owner_id WHERE r.id = ?`,
-    )
-    .bind(repoId)
-    .first<RepoRow>();
+async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> {
+  const row = await db(d1)
+    .selectFrom("repos as r")
+    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .select(["r.id", "r.artifacts_name", "r.artifacts_remote", "o.slug", "r.name"])
+    .where("r.id", "=", repoId)
+    .executeTakeFirst();
+  if (!row) return null;
+  return {
+    id: row.id,
+    artifacts_name: row.artifacts_name,
+    artifacts_remote: row.artifacts_remote,
+    full_name: `${row.slug}/${row.name}`,
+  };
 }
 
+/** Merge `stats` into a build's stats JSON. */
+const patchStats = (stats: Record<string, unknown>) =>
+  sql<string>`json_patch(stats, ${JSON.stringify(stats)})`;
+
 async function setPhase(
-  db: D1Database,
+  d1: D1Database,
   buildId: string,
   phase: string,
   stats?: Record<string, unknown>,
 ) {
-  if (stats) {
-    await db
-      .prepare("UPDATE kg_builds SET phase = ?, stats = json_patch(stats, ?) WHERE id = ?")
-      .bind(phase, JSON.stringify(stats), buildId)
-      .run();
-  } else {
-    await db.prepare("UPDATE kg_builds SET phase = ? WHERE id = ?").bind(phase, buildId).run();
-  }
+  await db(d1)
+    .updateTable("kg_builds")
+    .set(stats ? { phase, stats: patchStats(stats) } : { phase })
+    .where("id", "=", buildId)
+    .execute();
 }
 
 /** Fallback meaning from the stored graph, used until new syntheses land. */
-async function storedSyntheses(db: D1Database, repoId: string): Promise<Syntheses> {
-  const { results } = await db
-    .prepare(
-      "SELECT id, kind, name, summary, data FROM kg_nodes WHERE repo_id = ? AND kind IN ('repository','component','concept')",
-    )
-    .bind(repoId)
-    .all<{ id: string; kind: string; name: string; summary: string; data: string }>();
+async function storedSyntheses(d1: D1Database, repoId: string): Promise<Syntheses> {
+  const results = await db(d1)
+    .selectFrom("kg_nodes")
+    .select(["id", "kind", "name", "summary", "data"])
+    .where("repo_id", "=", repoId)
+    .where("kind", "in", ["repository", "component", "concept"])
+    .execute();
   const out: Syntheses = { components: new Map(), concepts: new Map() };
   for (const row of results) {
     const data = JSON.parse(row.data) as Record<string, unknown>;
@@ -162,15 +171,23 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         if (!row) return null;
         invalidateRefs(row.artifacts_name);
         const refs = await this.#withReader(row, (reader) => reader.refs());
-        const state = await env.DB.prepare("SELECT indexed_commit FROM kg_state WHERE repo_id = ?")
-          .bind(repoId)
-          .first<{ indexed_commit: string | null }>();
-        await env.DB.prepare(
-          `INSERT INTO kg_builds (id, repo_id, from_commit, to_commit, status, phase) VALUES (?, ?, ?, ?, 'running', 'snapshot')
-           ON CONFLICT (id) DO NOTHING`,
-        )
-          .bind(buildId, repoId, state?.indexed_commit ?? null, refs.head ?? "")
-          .run();
+        const state = await db(env.DB)
+          .selectFrom("kg_state")
+          .select("indexed_commit")
+          .where("repo_id", "=", repoId)
+          .executeTakeFirst();
+        await db(env.DB)
+          .insertInto("kg_builds")
+          .values({
+            id: buildId,
+            repo_id: repoId,
+            from_commit: state?.indexed_commit ?? null,
+            to_commit: refs.head ?? "",
+            status: "running",
+            phase: "snapshot",
+          })
+          .onConflict((oc) => oc.column("id").doNothing())
+          .execute();
         return { row, head: refs.head, previous: state?.indexed_commit ?? null };
       });
       if (!start?.head) {
@@ -297,11 +314,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       // only the concepts a push introduced cost model calls.
       // Counted from what is stored, so calls made by a retried step count too.
       const decidedBefore = await step.do("align-start", STEP, async () => {
-        const row = await env.DB.prepare(
-          "SELECT COUNT(*) AS n FROM kg_concept_pairs WHERE repo_id = ?",
-        )
-          .bind(repoId)
-          .first<{ n: number }>();
+        const row = await db(env.DB)
+          .selectFrom("kg_concept_pairs")
+          .select((eb) => eb.fn.countAll<number>().as("n"))
+          .where("repo_id", "=", repoId)
+          .executeTakeFirst();
         return row?.n ?? 0;
       });
       let pairsAsked = 0;
@@ -449,11 +466,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             files.map((f) => f.blob),
           );
           const concepts = await loadConceptModel(env.DB, repoId);
-          const { results } = await env.DB.prepare(
-            "SELECT DISTINCT node_id, change FROM kg_changes WHERE repo_id = ? AND build_id = ?",
-          )
-            .bind(repoId, buildId)
-            .all<{ node_id: string; change: string }>();
+          const results = await db(env.DB)
+            .selectFrom("kg_changes")
+            .select(["node_id", "change"])
+            .distinct()
+            .where("repo_id", "=", repoId)
+            .where("build_id", "=", buildId)
+            .execute();
           const diff = {
             added: results.filter((r) => r.change === "added").map((r) => r.node_id),
             changed: results.filter((r) => r.change === "changed").map((r) => r.node_id),
@@ -522,11 +541,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             true,
           );
           const graph = buildGraph(row.full_name, files, analyses, syntheses, concepts);
-          const { results } = await env.DB.prepare(
-            "SELECT DISTINCT node_id FROM kg_changes WHERE repo_id = ? AND build_id = ?",
-          )
-            .bind(repoId, buildId)
-            .all<{ node_id: string }>();
+          const results = await db(env.DB)
+            .selectFrom("kg_changes")
+            .select("node_id")
+            .distinct()
+            .where("repo_id", "=", repoId)
+            .where("build_id", "=", buildId)
+            .execute();
           const stats = await updateWiki(
             env,
             reader,
@@ -539,11 +560,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             readme,
             new Set(results.map((r) => r.node_id)),
           );
-          const { results: pages } = await env.DB.prepare(
-            "SELECT slug, title, body, inputs_hash FROM wiki_pages WHERE repo_id = ?",
-          )
-            .bind(repoId)
-            .all<{ slug: string; title: string; body: string; inputs_hash: string }>();
+          const pages = await db(env.DB)
+            .selectFrom("wiki_pages")
+            .select(["slug", "title", "body", "inputs_hash"])
+            .where("repo_id", "=", repoId)
+            .execute();
           await syncSearchPages(env, repoId, head, pages);
           return stats;
         }),
@@ -564,11 +585,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await step.do("fail", async () => {
-        await env.DB.prepare(
-          "UPDATE kg_builds SET status = 'failed', error = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-        )
-          .bind(message.slice(0, 2000), buildId)
-          .run();
+        await db(env.DB)
+          .updateTable("kg_builds")
+          .set({ status: "failed", error: message.slice(0, 2000), finished_at: nowIso() })
+          .where("id", "=", buildId)
+          .execute();
         await coordinator(env, repoId).finished(buildId, false, message);
         return null;
       });
@@ -590,25 +611,39 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         const files = await loadSnapshot(env.DB, repoId, buildId);
         if (files.length) {
           await saveSnapshot(env.DB, repoId, "current", files);
-          await env.DB.prepare("DELETE FROM kg_files WHERE repo_id = ? AND snapshot = ?")
-            .bind(repoId, buildId)
-            .run();
+          await db(env.DB)
+            .deleteFrom("kg_files")
+            .where("repo_id", "=", repoId)
+            .where("snapshot", "=", buildId)
+            .execute();
         }
-        await env.DB.prepare(
-          `INSERT INTO kg_state (repo_id, indexed_commit, indexed_at, last_build_id)
-           VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)
-           ON CONFLICT (repo_id) DO UPDATE SET indexed_commit = excluded.indexed_commit,
-             indexed_at = excluded.indexed_at, last_build_id = excluded.last_build_id`,
-        )
-          .bind(repoId, head, buildId)
-          .run();
+        await db(env.DB)
+          .insertInto("kg_state")
+          .values({
+            repo_id: repoId,
+            indexed_commit: head,
+            indexed_at: nowIso(),
+            last_build_id: buildId,
+          })
+          .onConflict((oc) =>
+            oc.column("repo_id").doUpdateSet((eb) => ({
+              indexed_commit: eb.ref("excluded.indexed_commit"),
+              indexed_at: eb.ref("excluded.indexed_at"),
+              last_build_id: eb.ref("excluded.last_build_id"),
+            })),
+          )
+          .execute();
       }
-      await env.DB.prepare(
-        `UPDATE kg_builds SET status = 'succeeded', phase = 'done', stats = json_patch(stats, ?),
-           finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
-      )
-        .bind(JSON.stringify(stats), buildId)
-        .run();
+      await db(env.DB)
+        .updateTable("kg_builds")
+        .set({
+          status: "succeeded",
+          phase: "done",
+          stats: patchStats(stats),
+          finished_at: nowIso(),
+        })
+        .where("id", "=", buildId)
+        .execute();
       await coordinator(env, repoId).finished(buildId, true, null);
       return null;
     });

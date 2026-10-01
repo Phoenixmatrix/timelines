@@ -2,10 +2,11 @@ import { Hono, type Context } from "hono";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { onPush } from "../ci/trigger.ts";
-import { findRepo, roleFor } from "../db.ts";
+import { findRepo, roleFor, sqlNow } from "../db.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { invalidateRefs } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
+import { db } from "../schema.ts";
 
 // Git smart HTTP: https://git-scm.com/docs/http-protocol
 //   GET  /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
@@ -110,11 +111,11 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
 
   if (credential.kind === "token") {
     c.executionCtx.waitUntil(
-      c.env.DB.prepare(
-        "UPDATE access_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-      )
-        .bind(credential.tokenId)
-        .run(),
+      db(c.env.DB)
+        .updateTable("access_tokens")
+        .set({ last_used_at: sqlNow })
+        .where("id", "=", credential.tokenId)
+        .execute(),
     );
   }
   if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
@@ -126,11 +127,11 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
       ),
     );
     c.executionCtx.waitUntil(
-      c.env.DB.prepare(
-        "UPDATE repos SET pushed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-      )
-        .bind(repo.id)
-        .run(),
+      db(c.env.DB)
+        .updateTable("repos")
+        .set({ pushed_at: sqlNow })
+        .where("id", "=", repo.id)
+        .execute(),
     );
   }
 

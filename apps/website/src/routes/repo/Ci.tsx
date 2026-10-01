@@ -1,4 +1,10 @@
-import { ArrowClockwiseIcon, GitBranchIcon, PlayIcon, StopIcon } from "@phosphor-icons/react";
+import {
+  ArrowClockwiseIcon,
+  GitBranchIcon,
+  PackageIcon,
+  PlayIcon,
+  StopIcon,
+} from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import {
   Form,
@@ -17,7 +23,10 @@ import { CiStatusIcon, ciLabel, duration, isActive } from "../../components/CiSt
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { FormError } from "../../components/ui.tsx";
 import { api, attempt, field, load } from "../../lib/api.ts";
-import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
+import { bytes, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
+import { formatLabel, packagePath } from "../../lib/packages.ts";
+import { STATUS_LABEL } from "../packages/PackageConsole.tsx";
+import type { Published } from "../../../shared/packages.ts";
 import { repoPath, treeUrl } from "../../lib/refs.ts";
 import { useRepo } from "./RepoLayout.tsx";
 
@@ -29,7 +38,51 @@ export async function ciLoader({ request, params }: LoaderFunctionArgs) {
 }
 
 export async function ciRunLoader({ request, params }: LoaderFunctionArgs) {
-  return load<CiRunDetail>(`${base(params.owner, params.repo)}/runs/${params.number}`, request);
+  const repo = `${params.owner}/${params.repo}`;
+  // What the run published is extra: the run page never fails on it.
+  const published = api<Published>(
+    `/packages/-/published?repo=${encodeURIComponent(repo)}&run=${params.number}`,
+    { signal: request.signal },
+  ).catch(() => ({ rows: [] }) as Published);
+  const run = await load<CiRunDetail>(
+    `${base(params.owner, params.repo)}/runs/${params.number}`,
+    request,
+  );
+  return { ...run, published: (await published).rows };
+}
+
+/** Every package version the run published, linked to its console. */
+function PublishedPanel({ rows }: { rows: Published["rows"] }) {
+  if (rows.length === 0) return null;
+  return (
+    <section aria-labelledby="ci-published" className="overflow-hidden rounded-pane bg-pane">
+      <h3 id="ci-published" className="m-0 border-b border-line-soft px-4 py-3 text-title">
+        Published
+      </h3>
+      <ul className="m-0 list-none divide-y divide-line-soft p-0">
+        {rows.map((row) => (
+          <li key={row.id}>
+            <Link
+              to={`${packagePath(row.feed, row.format, row.package)}?q=${encodeURIComponent(`run:${row.runNumber} source:${row.repo}`)}`}
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-ink no-underline hover:bg-raised"
+            >
+              <PackageIcon weight="bold" className="text-ink-faint" aria-hidden />
+              <span className="font-semibold">{row.package}</span>
+              <span className="mk-mono text-body-sm">{row.version}</span>
+              <span className="mk-chip mk-chip--tag">{formatLabel(row.format)}</span>
+              {row.status !== "active" && (
+                <span className="mk-chip mk-chip--tag">{STATUS_LABEL[row.status]}</span>
+              )}
+              <span className="flex-1" />
+              <span className="text-micro text-ink-faint mk-tabular">
+                {row.size !== null ? bytes(row.size) : ""}
+              </span>
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 export async function ciAction({ request, params }: ActionFunctionArgs) {
@@ -475,6 +528,7 @@ export function CiRun() {
           {chosen && <JobPanel key={chosen.id} job={chosen} />}
         </div>
       )}
+      <PublishedPanel rows={run.published} />
       {active && run.jobs.some((j) => j.status === "queued" && j.runner === "local") && (
         <RunnerHint runner="local" waiting />
       )}

@@ -63,19 +63,20 @@ The design follows Cloudflare's agent-first `cf` CLI:
 
 ## Commands
 
-|             |                                                                                                      |
-| ----------- | ---------------------------------------------------------------------------------------------------- |
-| Inspect     | `status`, `log`, `show`, `diff`, `file show`, `file list`                                            |
-| Change      | `commit`, `describe`, `new`, `squash`, `split`, `edit`, `abandon`, `restore`                         |
-| Restructure | `rebase`, `backout` (revert), `duplicate` (cherry-pick)                                              |
-| History     | `undo`, `op log`, `op restore`                                                                       |
-| Bookmarks   | `bookmark list`, `bookmark set`, `bookmark delete [--remote]`                                        |
-| Remote      | `clone`, `init`, `fetch`, `sync` (pull), `push [--sync] [-b name]`                                   |
-| Worktrees   | `worktree add <path> [-r revision] [--include]`, `worktree list`, `worktree remove <path> [--force]` |
-| Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `api`                            |
-| SSH keys    | `auth ssh-key add/list/remove`, `auth git-credential` (git helper)                                   |
-| CI          | `runs list/show/logs/wait/start/cancel/rerun`, `runner`, `secret`                                    |
-| Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                                                  |
+|             |                                                                                                                                           |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Inspect     | `status`, `log`, `show`, `diff`, `file show`, `file list`                                                                                 |
+| Change      | `commit`, `describe`, `new`, `squash`, `split`, `edit`, `abandon`, `restore`                                                              |
+| Restructure | `rebase`, `backout` (revert), `duplicate` (cherry-pick)                                                                                   |
+| History     | `undo`, `op log`, `op restore`                                                                                                            |
+| Bookmarks   | `bookmark list`, `bookmark set`, `bookmark delete [--remote]`                                                                             |
+| Remote      | `clone`, `init`, `fetch`, `sync` (pull), `push [--sync] [-b name]`                                                                        |
+| Worktrees   | `worktree add <path> [-r revision] [--include]`, `worktree list`, `worktree remove <path> [--force]`                                      |
+| Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `api`                                                                 |
+| SSH keys    | `auth ssh-key add/list/remove`, `auth git-credential` (git helper)                                                                        |
+| CI          | `runs list/show/logs/wait/start/cancel/rerun`, `runner`, `secret`                                                                         |
+| Packages    | `pkg list/show/versions`, `pkg delete/yank/restore/deprecate/tag`, `pkg sources/grant/revoke`, `pkg published`, `pkg upload`, `pkg setup` |
+| Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                                                                                       |
 
 ## Worktrees
 
@@ -194,7 +195,8 @@ libgit2 (vendored, through `git2`) implements the change model. The `git` binary
 handles worktree lifecycle and ignored-file enumeration, plus fetch and push
 with the token passed through `GIT_CONFIG_*` so it never appears in `ps`.
 Credentials live in `~/.config/gitmatrix/gm.json`; `GM_SERVER` and `GM_TOKEN`
-override them.
+override them. Inside a CI job, `GITMATRIX_URL` and `GITMATRIX_TOKEN` are used
+when those aren't set, so `gm pkg upload` and `gm pkg published` act as the job.
 
 ## Develop
 

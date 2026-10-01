@@ -50,10 +50,11 @@ impl Config {
         Ok(())
     }
 
-    /// GM_SERVER beats the stored server, which beats the dev default.
+    /// GM_SERVER beats GITMATRIX_URL (set in CI jobs), the stored server and
+    /// the dev default.
     pub fn server(&self) -> String {
-        std::env::var("GM_SERVER")
-            .ok()
+        env("GM_SERVER")
+            .or_else(|| env("GITMATRIX_URL"))
             .or_else(|| self.server.clone())
             .unwrap_or_else(|| DEFAULT_SERVER.to_string())
             .trim_end_matches('/')
@@ -61,10 +62,7 @@ impl Config {
     }
 
     pub fn token(&self) -> Option<String> {
-        std::env::var("GM_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(|| self.token.clone())
+        env_token().or_else(|| self.token.clone())
     }
 
     pub fn uses_ssh(&self) -> bool {
@@ -76,13 +74,58 @@ impl Config {
 /// cached one is missing or ending), else the stored token. The flag says
 /// whether it came from SSH.
 pub fn credential(config: &Config) -> Result<(Option<String>, bool)> {
-    if let Some(token) = std::env::var("GM_TOKEN").ok().filter(|t| !t.is_empty()) {
+    if let Some(token) = env_token() {
         return Ok((Some(token), false));
     }
     if config.uses_ssh() {
         return Ok((Some(crate::ssh::session(config)?.token), true));
     }
     Ok((config.token.clone(), false))
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// GM_TOKEN, else GITMATRIX_TOKEN: inside a CI job, gm acts as the job.
+fn env_token() -> Option<String> {
+    env("GM_TOKEN").or_else(|| env("GITMATRIX_TOKEN"))
+}
+
+/// PUT raw bytes to a registry path (`/generic/<owner>/…`), as the signed-in user.
+pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
+    let (token, _) = credential(config)?;
+    let url = format!("{}{}", config.server(), path);
+    let mut req = agent().put(&url);
+    if let Some(t) = &token {
+        req = req.header("authorization", &format!("Bearer {t}"));
+    }
+    let mut response = req.send(&bytes[..]).map_err(|e| {
+        GmError::new(
+            "server_unreachable",
+            format!("Could not reach {}: {e}", config.server()),
+        )
+    })?;
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().unwrap_or_default();
+    let value: Value = serde_json::from_str(&text).unwrap_or(Value::String(text.clone()));
+    if (200..300).contains(&status) {
+        return Ok(value);
+    }
+    let message = value
+        .get("errors")
+        .and_then(|e| e.get(0))
+        .and_then(|e| e.get("message"))
+        .or_else(|| value.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or(text.trim())
+        .to_string();
+    Err(match status {
+        401 => GmError::new("unauthenticated", message).exit(exit::AUTH),
+        403 => GmError::new("forbidden", message).exit(exit::AUTH),
+        409 => GmError::new("conflict", message).exit(exit::CONFLICT),
+        _ => GmError::new("server_error", format!("HTTP {status}: {message}")),
+    })
 }
 
 fn agent() -> ureq::Agent {

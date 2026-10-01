@@ -4,7 +4,7 @@ import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } f
 import type { SshKey } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { Segmented } from "../components/Choice.tsx";
-import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
+import { Card, ConfirmDialog, CopyField, FormError, TextField, link } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
 import { requireViewer } from "../lib/session.ts";
@@ -48,7 +48,7 @@ export function SshKeys() {
         SSH agent, 1Password or <code className="mk-mono">~/.ssh</code>. Gitmatrix speaks HTTPS, so
         instead of an SSH connection gm signs a one-time challenge with your key and gets a session
         that lasts an hour. For plain git and scripts, there are{" "}
-        <Link to="/settings/tokens" className="gm-link">
+        <Link to="/settings/tokens" className={link}>
           access tokens
         </Link>
         .

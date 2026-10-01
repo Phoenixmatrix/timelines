@@ -89,6 +89,20 @@ pub const COMMANDS: &[Meta] = &[
     meta!("secret list", git: "", kw: "ci secrets environment variables credentials list", mutates: false, out: Out::Other("{secrets:[{name,updatedAt}]}"), ex: ["gm secret list"]),
     meta!("secret set", git: "", kw: "ci add secret token credential environment variable", mutates: true, out: Out::Other("{set}"), ex: ["gm secret set NPM_TOKEN --value xyz", "echo $TOKEN | gm secret set CLOUDFLARE_API_TOKEN"]),
     meta!("secret delete", git: "", kw: "ci remove secret", mutates: true, out: Out::Other("{deleted}"), ex: ["gm secret delete NPM_TOKEN"]),
+    meta!("pkg list", git: "", kw: "packages artifacts registry npm docker images crates wheels list published owner", mutates: false, out: Out::Other("OwnerPackages {owner,packages:[{format,name,latest,versions,publishes24h,sources}],feeds}"), ex: ["gm pkg list", "gm pkg list -O orbit"]),
+    meta!("pkg show", git: "", kw: "package details latest version tags sources install", mutates: false, out: Out::Other("PackageDetail {package,tags,sources,totals,actions}"), ex: ["gm pkg show npm/@orbit/web", "gm pkg show oci/engine"]),
+    meta!("pkg versions", git: "", kw: "package versions history query filter builds published from branch commit run what did ci publish", mutates: false, out: Out::Other("PublishPage {total,rows:[{version,status,repo,ref,commit,runNumber,at,tags}],facets,histogram}"), ex: ["gm pkg versions npm/@orbit/web", "gm pkg versions oci/engine -q \"branch:main since:24h\"", "gm pkg versions npm/@orbit/web -q \"commit:4f2a1b\""]),
+    meta!("pkg delete", git: "", kw: "delete unpublish remove package versions cleanup housekeeping prune old builds", mutates: true, out: Out::Other("{done,failed:[{version,error}],remaining}"), ex: ["gm pkg delete npm/@orbit/web 1.0.0-pr.12", "gm pkg delete oci/engine -q \"branch:feature/* since:90d\" --dry-run"]),
+    meta!("pkg yank", git: "", kw: "yank cargo pypi version bad release", mutates: true, out: Out::Other("{done,failed,remaining}"), ex: ["gm pkg yank cargo/orbit-core 0.4.1 --reason \"breaks serde\""]),
+    meta!("pkg restore", git: "", kw: "unyank undeprecate restore version", mutates: true, out: Out::Other("{done,failed,remaining}"), ex: ["gm pkg restore cargo/orbit-core 0.4.1"]),
+    meta!("pkg deprecate", git: "", kw: "npm deprecate version message", mutates: true, out: Out::Other("{done,failed,remaining}"), ex: ["gm pkg deprecate npm/@orbit/web 1.x --reason \"Use 2.x\""]),
+    meta!("pkg tag", git: "", kw: "dist-tag docker tag promote release stable latest", mutates: true, out: Out::Other("{done,failed}"), ex: ["gm pkg tag npm/@orbit/web 2.4.0 stable", "gm pkg tag oci/engine sha-4f2a1b7 prod"]),
+    meta!("pkg sources", git: "", kw: "package sources which repositories publish provenance", mutates: false, out: Out::Other("{sources:[{repo,publishes,lastPublishedAt}]}"), ex: ["gm pkg sources npm/@orbit/web"]),
+    meta!("pkg grant", git: "", kw: "allow repository publish package permission source ci", mutates: true, out: Out::Other("{sources}"), ex: ["gm pkg grant npm/@orbit/web orbit/website"]),
+    meta!("pkg revoke", git: "", kw: "remove repository publish permission source", mutates: true, out: Out::Other("{sources}"), ex: ["gm pkg revoke npm/@orbit/web orbit/website"]),
+    meta!("pkg published", git: "", kw: "what did this run commit build publish artifacts outputs ci", mutates: false, out: Out::Other("{rows:[{format,package,feed,version,status}]}"), ex: ["gm pkg published", "gm pkg published --run 42", "gm pkg published --commit $(git rev-parse HEAD)"]),
+    meta!("pkg upload", git: "", kw: "upload file artifact generic binary tarball release asset ci", mutates: true, out: Out::Other("{repo,path,downloadUri,size,checksums}"), ex: ["gm pkg upload dist/app.tgz app/1.4.0", "gm pkg upload build.zip app/$GITMATRIX_COMMIT/build.zip"]),
+    meta!("pkg setup", git: "", kw: "configure npm docker pip cargo registry login npmrc credentials machine", mutates: true, out: Out::Other("{owner,npmrc,docker,pip,cargo,goproxy,maven,helm,generic}"), ex: ["gm pkg setup", "gm pkg setup -O orbit --write npm,docker"]),
     meta!("api", git: "", kw: "raw http api request endpoint json", mutates: true, out: Out::Other("the API's JSON response"), ex: ["gm api GET /repos", "gm api POST /repos -d '{\"owner\":\"jun\",\"name\":\"x\",\"visibility\":\"private\"}'"]),
     meta!("cli search", git: "", kw: "find command help discover how do i", mutates: false, out: Out::Typed(schema_of::<Vec<Hit>>), ex: ["gm cli search \"undo my last commit\""]),
     meta!("cli guide", git: "", kw: "workflow guide tutorial how to use agents", mutates: false, out: Out::Other("markdown text"), ex: ["gm cli guide"]),
@@ -465,6 +479,18 @@ Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,
     gm runs logs --job test        # why it failed
 `gm runs list|show|start|cancel|rerun`, `gm secret set NAME`. Against the dev
 server, jobs run on your machine: keep `gm runner` going next to `vp dev`.
+
+## Packages
+CI jobs publish with their own credential: `npm publish`, `docker push
+$GITMATRIX_IMAGE_PREFIX/app:tag`, `twine upload`, `cargo publish --registry
+gitmatrix` and `gm pkg upload` need no setup, and each publish records its
+repository, branch, commit and run. Packages are `<format>/<name>`:
+    gm pkg list                                      # this owner's packages
+    gm pkg versions npm/@orbit/web -q "branch:main since:24h"
+    gm pkg published --run 42                        # what a run published
+    gm pkg delete oci/engine -q "branch:feature/* since:90d" --dry-run
+    gm pkg grant npm/@orbit/web orbit/website        # let a repo publish it
+    gm pkg setup --write npm,docker                  # this machine's tools
 
 ## Conflicts
 Rebases never stop halfway. A conflicted change gets conflict markers in its

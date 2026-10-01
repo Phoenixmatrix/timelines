@@ -1,3 +1,5 @@
+import { batch } from "../schema.ts";
+
 export async function sha256(text: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -27,10 +29,13 @@ export function chunk<T>(items: T[], size: number): T[][] {
   return out;
 }
 
+/** A compiled-on-demand query, as `batch` takes them. */
+export type Statement = Parameters<typeof batch>[1][number];
+
 /** Run D1 statements in batches small enough for one round trip each. */
-export async function runBatched(db: D1Database, statements: D1PreparedStatement[]) {
+export async function runBatched(d1: D1Database, statements: Statement[]) {
   for (const group of chunk(statements, 80)) {
-    if (group.length) await db.batch(group);
+    if (group.length) await batch(d1, group);
   }
 }
 

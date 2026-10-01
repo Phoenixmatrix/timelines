@@ -7,6 +7,7 @@
 // Both sync incrementally from the graph diff and blob versions.
 
 import type { RepoReader } from "../objects.ts";
+import { db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import type { GraphDiff, GraphNode, SnapshotFile } from "./graph.ts";
 import { embed } from "./models.ts";
@@ -74,11 +75,13 @@ interface SearchItemRow {
   version: string;
 }
 
-async function existingItems(db: D1Database, repoId: string, prefix: string) {
-  const { results } = await db
-    .prepare("SELECT key, item_id, version FROM kg_search_items WHERE repo_id = ? AND key LIKE ?")
-    .bind(repoId, `${prefix}%`)
-    .all<SearchItemRow>();
+async function existingItems(d1: D1Database, repoId: string, prefix: string) {
+  const results = await db(d1)
+    .selectFrom("kg_search_items")
+    .select(["key", "item_id", "version"])
+    .where("repo_id", "=", repoId)
+    .where("key", "like", `${prefix}%`)
+    .execute();
   return new Map(results.map((r) => [r.key, r]));
 }
 
@@ -96,21 +99,27 @@ async function upload(
   const info = await items.upload(itemName(repoId, key), body, {
     metadata: { repo: repoId, ...metadata },
   });
-  await env.DB.prepare(
-    `INSERT INTO kg_search_items (repo_id, key, item_id, version) VALUES (?, ?, ?, ?)
-     ON CONFLICT (repo_id, key) DO UPDATE SET item_id = excluded.item_id, version = excluded.version`,
-  )
-    .bind(repoId, key, info.id, version)
-    .run();
+  await db(env.DB)
+    .insertInto("kg_search_items")
+    .values({ repo_id: repoId, key, item_id: info.id, version })
+    .onConflict((oc) =>
+      oc.columns(["repo_id", "key"]).doUpdateSet((eb) => ({
+        item_id: eb.ref("excluded.item_id"),
+        version: eb.ref("excluded.version"),
+      })),
+    )
+    .execute();
 }
 
 async function forget(env: Env, repoId: string, row: SearchItemRow) {
   await env.SEARCH.get(SEARCH_INSTANCE)
     .items.delete(row.item_id)
     .catch(() => undefined);
-  await env.DB.prepare("DELETE FROM kg_search_items WHERE repo_id = ? AND key = ?")
-    .bind(repoId, row.key)
-    .run();
+  await db(env.DB)
+    .deleteFrom("kg_search_items")
+    .where("repo_id", "=", repoId)
+    .where("key", "=", row.key)
+    .execute();
 }
 
 /** Keep AI Search's copy of the repository's text files in step with the commit. */

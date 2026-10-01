@@ -252,6 +252,65 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
 API: `/api/repos/:o/:n/ci` (runs, run detail, logs with `?after=`, cancel,
 re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
 
+## Packages
+
+Every owner gets a package registry in each format the first time something is
+published to it: npm, Docker/OCI, PyPI, Maven, Cargo, Go, Helm, APT, RPM,
+Homebrew, generic files and releases. The engine (`registry/`,
+`packages/formats`) comes from artifatrix and runs in this same Worker on its
+own D1 database (`REGISTRY_DB`), R2 bucket (`REGISTRY_BLOBS`), Durable Objects
+and queue. Accounts and permissions stay in gitmatrix's `DB`.
+
+```
+npm / docker / pip / cargo … ──▶ /npm/<owner>/… /v2/<owner>/<image>/… /pypi/<owner>/…  (registry/app.ts)
+web app, gm                  ──▶ /api/packages/…   (registry/manage: console queries, housekeeping, feeds)
+every publish                ──▶ publishes: version, repository, branch, commit, CI run, actor
+```
+
+- **CI publishes natively.** A job gets a credential (`gmj_…`) bound to the job
+  and through it to its repository, commit and run. It ends with the job. Package
+  tools come set up with it: `npm publish`, `docker push
+$GITMATRIX_IMAGE_PREFIX/app:tag`, `twine upload`, `cargo publish --registry
+gitmatrix`, `mvn deploy` (server id `gitmatrix`), `helm push`, Go modules
+  through `GOPROXY`, and `gm pkg upload` for files (`worker/ci/registry.ts`).
+- **Packages remember their sources.** The first CI publish of a package claims
+  it for the job's repository. After that, only its sources' jobs and people
+  who can write to a source may publish it. Owner admins grant more
+  repositories, cross-owner ones included (`package_sources`). People without
+  write access to a source get a 403 naming the sources.
+- **Access follows the owner.**
+  - The owner and org owners are admins. Org members get read, or write when
+    the org gives members write. Collaborators who can write one of the
+    owner's repositories get write.
+  - Deleting versions takes admin, and CI jobs never delete.
+  - Feeds are private by default.
+  - Tokens: `gmx_` access tokens and SSH sessions, `gmj_` job tokens, Docker's
+    token flow, and the web session.
+- **The console.** `/:owner/-/packages/:format/:name` queries a package's
+  publish history:
+  - a query language (`source:web branch:main status:active since:7d
+commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
+  - facet counts, and a publish-rate strip you brush to zoom in;
+  - a virtualized table, built for tens of thousands of versions;
+  - bulk delete, yank, deprecate and tag, for a selection or everything a
+    query matches.
+
+  Repositories have a Packages tab, and CI runs list what they published.
+
+- **Feeds and proxies.** `/:owner/-/feeds` sets visibility and retention (keep
+  the newest N versions, or remove them after N days; tagged versions stay),
+  and adds proxies (`<owner>.<name>`, credentials sealed with `REGISTRY_KEK`)
+  and virtual feeds over several of them. An hourly cron sweeps retention, and
+  a GC deletes unreferenced blobs.
+- **npm login** works both ways: an access token as the password, or
+  `--auth-type=web`, which approves the login at `/cli-auth/npm/:id`.
+
+Deployed, set `GITMATRIX_PUBLIC_URL` (package indexes embed it) and the
+`REGISTRY_KEK` secret. Development uses a fixed public key. `pnpm run
+db:migrate` applies both databases' migrations. Account slugs must not take
+the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
+`helm`, `apt`, `rpm`, `brew`, `generic`, `releases`) or `-`.
+
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack)
@@ -260,6 +319,10 @@ re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
 - `worker/api/*`: JSON API (`dev.ts` mints persona tokens and seeds sample data)
 - `worker/knowledge/*`: knowledge graph pipeline, coordinator, workflow, API
 - `worker/ci/*`: CI config parser, push trigger, run Workflow, sandbox Durable Object, API
+  (`registry.ts`: job credentials and package-tool setup)
+- `registry/`: package registries (formats, catalog, ACL, provenance, Durable Objects,
+  jobs); `registry/manage/`: the packages API behind the console, feeds and gm
+- `packages/formats` (repo root): IO-free protocol libraries for every package format
 - `scripts/git-login.ts`: points the git CLI at Gitmatrix as a persona
 - `src/`: React Router (data mode), Base UI and Tailwind, styled with MatrixKit Neo
   (`src/styles/tokens.css` is generated from the design system's tokens;
@@ -271,4 +334,7 @@ re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
   returns 200, even if git rejected a ref inside the response.
 - READMEs render Markdown without raw HTML, so `<details>` and `<br>` show as text.
 - In testing, imports brought over the default branch only, without tags.
-- Owner slugs `signin`, `new`, `settings` and `api` collide with app routes and should be reserved.
+- Owner slugs `signin`, `new`, `settings`, `api`, `cli-auth`, `-` and the registry prefixes
+  collide with routes and should be reserved once accounts can be created.
+- Packages: the tag facet lives in the header's tag plates rather than the side
+  column; retention can't yet keep a branch's builds longer than another's.

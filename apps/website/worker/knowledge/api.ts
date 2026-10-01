@@ -11,6 +11,7 @@
 //   GET  /wiki/page?slug=        one page
 
 import { Hono, type Context } from "hono";
+import type { Selectable } from "kysely";
 import type {
   GraphLink,
   GraphNode,
@@ -27,6 +28,7 @@ import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
 import type { RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
+import { db, type Database } from "../schema.ts";
 import { coordinator, notifyKnowledge } from "./coordinator.ts";
 import { SEARCH_INSTANCE } from "./indexes.ts";
 import { embed } from "./models.ts";
@@ -35,19 +37,7 @@ export const knowledge = new Hono<AppEnv>();
 
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 
-interface BuildRow {
-  id: string;
-  from_commit: string | null;
-  to_commit: string;
-  status: KnowledgeBuild["status"];
-  phase: string;
-  stats: string;
-  error: string | null;
-  started_at: string;
-  finished_at: string | null;
-}
-
-const toBuild = (row: BuildRow): KnowledgeBuild => ({
+const toBuild = (row: Selectable<Database["kg_builds"]>): KnowledgeBuild => ({
   id: row.id,
   fromCommit: row.from_commit,
   toCommit: row.to_commit,
@@ -59,19 +49,13 @@ const toBuild = (row: BuildRow): KnowledgeBuild => ({
   finishedAt: row.finished_at,
 });
 
-interface NodeRow {
-  id: string;
-  kind: GraphNode["kind"];
-  name: string;
-  path: string | null;
-  summary: string;
-  data: string;
-  changed_in: string;
-}
+const NODE_COLUMNS = ["id", "kind", "name", "path", "summary", "data", "changed_in"] as const;
+
+type NodeRow = Pick<Selectable<Database["kg_nodes"]>, (typeof NODE_COLUMNS)[number]>;
 
 const toNode = (row: NodeRow): GraphNode => ({
   id: row.id,
-  kind: row.kind,
+  kind: row.kind as GraphNode["kind"],
   name: row.name,
   path: row.path,
   summary: row.summary,
@@ -80,7 +64,6 @@ const toNode = (row: NodeRow): GraphNode => ({
 });
 
 async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus> {
-  const db = c.env.DB;
   const reader = new RepoReader(
     c.env,
     row.artifacts_name,
@@ -89,23 +72,29 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
     (w) => c.executionCtx.waitUntil(w),
   );
   const [state, builds, counts, refs, coordination] = await Promise.all([
-    db
-      .prepare("SELECT indexed_commit, indexed_at FROM kg_state WHERE repo_id = ?")
-      .bind(row.id)
-      .first<{ indexed_commit: string; indexed_at: string }>(),
-    db
-      .prepare("SELECT * FROM kg_builds WHERE repo_id = ? ORDER BY started_at DESC LIMIT 5")
-      .bind(row.id)
-      .all<BuildRow>(),
-    db
-      .prepare("SELECT kind, count(*) AS n FROM kg_nodes WHERE repo_id = ? GROUP BY kind")
-      .bind(row.id)
-      .all<{ kind: string; n: number }>(),
+    db(c.env.DB)
+      .selectFrom("kg_state")
+      .select(["indexed_commit", "indexed_at"])
+      .where("repo_id", "=", row.id)
+      .executeTakeFirst(),
+    db(c.env.DB)
+      .selectFrom("kg_builds")
+      .selectAll()
+      .where("repo_id", "=", row.id)
+      .orderBy("started_at", "desc")
+      .limit(5)
+      .execute(),
+    db(c.env.DB)
+      .selectFrom("kg_nodes")
+      .select((eb) => ["kind", eb.fn.countAll<number>().as("n")])
+      .where("repo_id", "=", row.id)
+      .groupBy("kind")
+      .execute(),
     reader.refs().catch(() => null),
     coordinator(c.env, row.id).status(),
   ]);
   await reader.close();
-  const recent = builds.results.map(toBuild);
+  const recent = builds.map(toBuild);
   const current = recent.find((b) => b.status === "running") ?? null;
   const head = refs?.head ?? null;
   const indexed = state?.indexed_commit ?? null;
@@ -131,7 +120,7 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
             : "empty",
     current,
     recent,
-    counts: Object.fromEntries(counts.results.map((r) => [r.kind, r.n])),
+    counts: Object.fromEntries(counts.map((r) => [r.kind, r.n])),
   };
 }
 
@@ -159,22 +148,26 @@ knowledge.get("/graph", async (c) => {
   const kind = c.req.query("kind");
   const q = c.req.query("q")?.trim();
   const limit = Math.min(500, Number(c.req.query("limit") ?? "100") || 100);
-  const where = ["repo_id = ?"];
-  const binds: unknown[] = [row.id];
-  if (kind) {
-    where.push("kind = ?");
-    binds.push(kind);
-  }
+  let query = db(c.env.DB)
+    .selectFrom("kg_nodes")
+    .select(NODE_COLUMNS)
+    .where("repo_id", "=", row.id);
+  if (kind) query = query.where("kind", "=", kind);
   if (q) {
-    where.push("(name LIKE ? OR path LIKE ? OR summary LIKE ?)");
-    binds.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    query = query.where((eb) =>
+      eb.or([
+        eb("name", "like", `%${q}%`),
+        eb("path", "like", `%${q}%`),
+        eb("summary", "like", `%${q}%`),
+      ]),
+    );
   }
-  const { results } = await c.env.DB.prepare(
-    `SELECT id, kind, name, path, summary, data, changed_in FROM kg_nodes WHERE ${where.join(" AND ")}
-     ORDER BY kind, path, name LIMIT ?`,
-  )
-    .bind(...binds, limit)
-    .all<NodeRow>();
+  const results = await query
+    .orderBy("kind")
+    .orderBy("path")
+    .orderBy("name")
+    .limit(limit)
+    .execute();
   return c.json({ nodes: results.map(toNode) });
 });
 
@@ -182,25 +175,47 @@ knowledge.get("/graph/node", async (c) => {
   const row = await repoOrFail(c);
   if (row instanceof Response) return row;
   const id = c.req.query("id") ?? "";
-  const node = await c.env.DB.prepare(
-    "SELECT id, kind, name, path, summary, data, changed_in FROM kg_nodes WHERE repo_id = ? AND id = ?",
-  )
-    .bind(row.id, id)
-    .first<NodeRow>();
+  const node = await db(c.env.DB)
+    .selectFrom("kg_nodes")
+    .select(NODE_COLUMNS)
+    .where("repo_id", "=", row.id)
+    .where("id", "=", id)
+    .executeTakeFirst();
   if (!node) return fail(c, 404, "No such node.");
   const links = async (direction: "out" | "in") => {
-    const [self, other] = direction === "out" ? ["src", "dst"] : ["dst", "src"];
-    const { results } = await c.env.DB.prepare(
-      `SELECT e.kind AS edge_kind, e.weight, n.id, n.kind, n.name, n.path, n.summary
-       FROM kg_edges e JOIN kg_nodes n ON n.repo_id = e.repo_id AND n.id = e.${other}
-       WHERE e.repo_id = ? AND e.${self} = ? ORDER BY e.kind, e.weight DESC, n.name LIMIT 300`,
-    )
-      .bind(row.id, id)
-      .all<{ edge_kind: string; weight: number } & Omit<NodeRow, "data" | "changed_in">>();
+    const [self, other] =
+      direction === "out" ? (["src", "dst"] as const) : (["dst", "src"] as const);
+    const results = await db(c.env.DB)
+      .selectFrom("kg_edges as e")
+      .innerJoin("kg_nodes as n", (join) =>
+        join.onRef("n.repo_id", "=", "e.repo_id").onRef("n.id", "=", `e.${other}`),
+      )
+      .select([
+        "e.kind as edge_kind",
+        "e.weight",
+        "n.id",
+        "n.kind",
+        "n.name",
+        "n.path",
+        "n.summary",
+      ])
+      .where("e.repo_id", "=", row.id)
+      .where(`e.${self}`, "=", id)
+      .orderBy("e.kind")
+      .orderBy("e.weight", "desc")
+      .orderBy("n.name")
+      .limit(300)
+      .execute();
     return results.map((r): GraphLink => ({
       kind: r.edge_kind,
       weight: r.weight,
-      node: { id: r.id, kind: r.kind, name: r.name, path: r.path, summary: r.summary },
+      node: {
+        id: r.id,
+        kind: r.kind as GraphNode["kind"],
+        name: r.name,
+        path: r.path,
+        summary: r.summary,
+      },
     }));
   };
   const [outgoing, incoming] = await Promise.all([links("out"), links("in")]);
@@ -212,22 +227,26 @@ knowledge.get("/graph/export", async (c) => {
   const row = await repoOrFail(c);
   if (row instanceof Response) return row;
   const [nodes, edges, state] = await Promise.all([
-    c.env.DB.prepare(
-      "SELECT id, kind, name, path, summary, data, changed_in FROM kg_nodes WHERE repo_id = ?",
-    )
-      .bind(row.id)
-      .all<NodeRow>(),
-    c.env.DB.prepare("SELECT src, dst, kind, weight FROM kg_edges WHERE repo_id = ?")
-      .bind(row.id)
-      .all(),
-    c.env.DB.prepare("SELECT indexed_commit FROM kg_state WHERE repo_id = ?")
-      .bind(row.id)
-      .first<{ indexed_commit: string }>(),
+    db(c.env.DB)
+      .selectFrom("kg_nodes")
+      .select(NODE_COLUMNS)
+      .where("repo_id", "=", row.id)
+      .execute(),
+    db(c.env.DB)
+      .selectFrom("kg_edges")
+      .select(["src", "dst", "kind", "weight"])
+      .where("repo_id", "=", row.id)
+      .execute(),
+    db(c.env.DB)
+      .selectFrom("kg_state")
+      .select("indexed_commit")
+      .where("repo_id", "=", row.id)
+      .executeTakeFirst(),
   ]);
   return c.json({
     commit: state?.indexed_commit ?? null,
-    nodes: nodes.results.map(toNode),
-    edges: edges.results,
+    nodes: nodes.map(toNode),
+    edges,
   });
 });
 
@@ -237,24 +256,33 @@ knowledge.get("/changes", async (c) => {
   const buildId =
     c.req.query("build") ??
     (
-      await c.env.DB.prepare(
-        "SELECT id FROM kg_builds WHERE repo_id = ? AND status = 'succeeded' ORDER BY started_at DESC LIMIT 1",
-      )
-        .bind(row.id)
-        .first<{ id: string }>()
+      await db(c.env.DB)
+        .selectFrom("kg_builds")
+        .select("id")
+        .where("repo_id", "=", row.id)
+        .where("status", "=", "succeeded")
+        .orderBy("started_at", "desc")
+        .limit(1)
+        .executeTakeFirst()
     )?.id;
   if (!buildId) return c.json({ build: null, changes: [] });
   const [build, changes] = await Promise.all([
-    c.env.DB.prepare("SELECT * FROM kg_builds WHERE repo_id = ? AND id = ?")
-      .bind(row.id, buildId)
-      .first<BuildRow>(),
-    c.env.DB.prepare(
-      "SELECT node_id AS node, kind, change FROM kg_changes WHERE repo_id = ? AND build_id = ? ORDER BY kind, node_id",
-    )
-      .bind(row.id, buildId)
-      .all(),
+    db(c.env.DB)
+      .selectFrom("kg_builds")
+      .selectAll()
+      .where("repo_id", "=", row.id)
+      .where("id", "=", buildId)
+      .executeTakeFirst(),
+    db(c.env.DB)
+      .selectFrom("kg_changes")
+      .select(["node_id as node", "kind", "change"])
+      .where("repo_id", "=", row.id)
+      .where("build_id", "=", buildId)
+      .orderBy("kind")
+      .orderBy("node_id")
+      .execute(),
   ]);
-  return c.json({ build: build ? toBuild(build) : null, changes: changes.results });
+  return c.json({ build: build ? toBuild(build) : null, changes });
 });
 
 knowledge.get("/search", async (c) => {
@@ -273,15 +301,16 @@ knowledge.get("/search", async (c) => {
     });
     const ids = matches.matches.map((m) => text(m.metadata?.node));
     if (!ids.length) return [];
-    const { results } = await c.env.DB.prepare(
-      `SELECT id, kind, name, path, summary FROM kg_nodes WHERE repo_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
-    )
-      .bind(row.id, ...ids)
-      .all<Omit<NodeRow, "data" | "changed_in">>();
+    const results = await db(c.env.DB)
+      .selectFrom("kg_nodes")
+      .select(["id", "kind", "name", "path", "summary"])
+      .where("repo_id", "=", row.id)
+      .where("id", "in", ids)
+      .execute();
     const byId = new Map(results.map((r) => [r.id, r]));
     return matches.matches.flatMap((m) => {
       const node = byId.get(text(m.metadata?.node));
-      return node ? [{ ...node, score: m.score }] : [];
+      return node ? [{ ...node, kind: node.kind as GraphNode["kind"], score: m.score }] : [];
     });
   })();
 
@@ -311,14 +340,10 @@ knowledge.get("/search", async (c) => {
   return c.json(body);
 });
 
-interface PageRow {
-  slug: string;
-  title: string;
-  section: string;
-  position: number;
-  node_id: string | null;
-  updated_at: string;
-}
+type PageRow = Pick<
+  Selectable<Database["wiki_pages"]>,
+  "slug" | "title" | "section" | "position" | "node_id" | "updated_at"
+>;
 
 const toSummary = (r: PageRow): WikiPageSummary => ({
   slug: r.slug,
@@ -332,11 +357,12 @@ const toSummary = (r: PageRow): WikiPageSummary => ({
 knowledge.get("/wiki", async (c) => {
   const row = await repoOrFail(c);
   if (row instanceof Response) return row;
-  const { results } = await c.env.DB.prepare(
-    "SELECT slug, title, section, position, node_id, updated_at FROM wiki_pages WHERE repo_id = ? ORDER BY position",
-  )
-    .bind(row.id)
-    .all<PageRow>();
+  const results = await db(c.env.DB)
+    .selectFrom("wiki_pages")
+    .select(["slug", "title", "section", "position", "node_id", "updated_at"])
+    .where("repo_id", "=", row.id)
+    .orderBy("position")
+    .execute();
   const body: WikiCatalog = { pages: results.map(toSummary), status: await status(c, row) };
   return c.json(body);
 });
@@ -344,17 +370,12 @@ knowledge.get("/wiki", async (c) => {
 knowledge.get("/wiki/page", async (c) => {
   const row = await repoOrFail(c);
   if (row instanceof Response) return row;
-  const page = await c.env.DB.prepare("SELECT * FROM wiki_pages WHERE repo_id = ? AND slug = ?")
-    .bind(row.id, c.req.query("slug") ?? "overview")
-    .first<
-      PageRow & {
-        body: string;
-        diagram: string;
-        sources: string;
-        generated_in: string;
-        model: string | null;
-      }
-    >();
+  const page = await db(c.env.DB)
+    .selectFrom("wiki_pages")
+    .selectAll()
+    .where("repo_id", "=", row.id)
+    .where("slug", "=", c.req.query("slug") ?? "overview")
+    .executeTakeFirst();
   if (!page) return fail(c, 404, "No such page yet.");
   const body: WikiPage = {
     ...toSummary(page),

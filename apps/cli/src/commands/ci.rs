@@ -695,6 +695,9 @@ enum Ended {
     Cancelled,
 }
 
+/// Where the server's job `files` land; substituted into the job's `env`.
+const CONFIG_PLACEHOLDER: &str = "${GITMATRIX_CONFIG}";
+
 /// Run one script with bash, streaming combined output to the reporter.
 fn execute(
     reporter: &mut Reporter,
@@ -846,8 +849,27 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
             );
             return Ok(("failed", None, Some("Checkout failed.".into())));
         }
-        let empty = serde_json::Map::new();
-        let env = job["env"].as_object().unwrap_or(&empty);
+        // Package tools come preconfigured with the job's credential: their
+        // config files live beside the checkout, never in it.
+        let tools = dir.join("config");
+        for (path, content) in job["files"].as_object().into_iter().flatten() {
+            let file = tools.join(path);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&file, content.as_str().unwrap_or(""))?;
+        }
+        let tools = tools.to_string_lossy();
+        let env: serde_json::Map<String, Value> = job["env"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| {
+                let value = value.as_str().unwrap_or("").replace(CONFIG_PLACEHOLDER, &tools);
+                (key.clone(), Value::String(value))
+            })
+            .collect();
+        let env = &env;
         for step in job["steps"].as_array().into_iter().flatten() {
             let position = step["position"].as_i64().unwrap_or(0);
             if echo {

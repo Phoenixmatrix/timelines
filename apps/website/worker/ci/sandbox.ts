@@ -7,9 +7,13 @@
 import { DurableObject } from "cloudflare:workers";
 import type { CiClaimedJob } from "../../shared/api.ts";
 import { upstreamToken } from "../artifacts.ts";
+import { batch, db, nowIso } from "../schema.ts";
 import { jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
+import { mintJobToken, withConfigDir } from "./registry.ts";
 
 const WORKDIR = "/workspace/repo";
+/** Package tools' configuration (npmrc, docker/config.json…), outside the checkout. */
+const CONFIG_DIR = "/root/.gitmatrix-ci";
 const BASE_ENV = {
   HOME: "/root",
   PATH: "/usr/local/pnpm/bin:/usr/local/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -28,8 +32,8 @@ class Cancelled extends Error {}
 export class CiSandbox extends DurableObject<Env> {
   async run(jobId: string): Promise<void> {
     const container = this.ctx.container;
-    const db = this.env.DB;
-    const job = await loadJob(db, jobId);
+    const d1 = this.env.DB;
+    const job = await loadJob(d1, jobId);
     if (!job) throw new Error(`No CI job ${jobId}`);
     if (!container) {
       await report(this.env, jobId, {
@@ -41,22 +45,24 @@ export class CiSandbox extends DurableObject<Env> {
       return;
     }
     const spec = JSON.parse(job.spec) as StoredJob;
-    const payload = await jobPayload(db, job);
+    // Packages publish to the public URL the registry answers on.
+    const origin = String(Reflect.get(this.env, "PUBLIC_URL") || "http://localhost:5180");
+    const credential = await mintJobToken(d1, jobId, spec.timeoutMinutes);
+    const payload = await jobPayload(d1, job, { origin, token: credential });
 
     // A retried step starts over: claim (again) and clear the earlier attempt.
-    await db.batch([
-      db
-        .prepare(
-          `UPDATE ci_jobs SET status = 'running', claimed_by = 'sandbox',
-             started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status IN ('queued', 'running')`,
-        )
-        .bind(jobId),
-      db.prepare("DELETE FROM ci_logs WHERE job_id = ?").bind(jobId),
-      db
-        .prepare(
-          "UPDATE ci_steps SET status = 'pending', exit_code = NULL, started_at = NULL, finished_at = NULL WHERE job_id = ?",
-        )
-        .bind(jobId),
+    const kdb = db(d1);
+    await batch(d1, [
+      kdb
+        .updateTable("ci_jobs")
+        .set({ status: "running", claimed_by: "sandbox", started_at: nowIso() })
+        .where("id", "=", jobId)
+        .where("status", "in", ["queued", "running"]),
+      kdb.deleteFrom("ci_logs").where("job_id", "=", jobId),
+      kdb
+        .updateTable("ci_steps")
+        .set({ status: "pending", exit_code: null, started_at: null, finished_at: null })
+        .where("job_id", "=", jobId),
     ]);
 
     const deadline = Date.now() + spec.timeoutMinutes * 60_000;
@@ -105,7 +111,30 @@ export class CiSandbox extends DurableObject<Env> {
         return;
       }
 
-      await this.#steps(container, jobId, payload, deadline);
+      // Package tools come preconfigured with the job's credential.
+      const files = Object.entries(payload.files);
+      if (files.length) {
+        const write = files
+          .map((_, i) => `mkdir -p "$(dirname "$P${i}")" && printf '%s' "$C${i}" > "$P${i}"`)
+          .join(" && ");
+        const fileEnv = Object.fromEntries(
+          files.flatMap(([path, content], i) => [
+            [`P${i}`, `${CONFIG_DIR}/${path}`],
+            [`C${i}`, content],
+          ]),
+        );
+        await this.#exec(container, jobId, SETUP_STEP, write, {
+          cwd: "/",
+          env: { ...BASE_ENV, ...fileEnv },
+          deadline,
+        });
+      }
+      await this.#steps(
+        container,
+        jobId,
+        { ...payload, env: withConfigDir(payload.env, CONFIG_DIR) },
+        deadline,
+      );
     } catch (error) {
       const cancelled = error instanceof Cancelled;
       await report(this.env, jobId, {

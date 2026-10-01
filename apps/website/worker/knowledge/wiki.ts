@@ -7,10 +7,11 @@
 // if clef agrees the change makes the page out of date.
 
 import type { RepoReader } from "../objects.ts";
+import { db, nowIso } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import type { BuiltGraph, ComponentPlan, SnapshotFile, Syntheses } from "./graph.ts";
 import { chatText, decide, yes } from "./models.ts";
-import { pool, runBatched, sha256, slug } from "./util.ts";
+import { pool, runBatched, sha256, slug, type Statement } from "./util.ts";
 
 const WRITER = "w1";
 
@@ -349,14 +350,14 @@ export async function updateWiki(
 ): Promise<WikiStats> {
   const stats: WikiStats = { written: 0, kept: 0, unchanged: 0, removed: 0, tokens: 0 };
   const pages = planPages(graph, syntheses);
-  const { results: stored } = await env.DB.prepare(
-    "SELECT slug, title, body, inputs_hash FROM wiki_pages WHERE repo_id = ?",
-  )
-    .bind(repoId)
-    .all<{ slug: string; title: string; body: string; inputs_hash: string }>();
+  const stored = await db(env.DB)
+    .selectFrom("wiki_pages")
+    .select(["slug", "title", "body", "inputs_hash"])
+    .where("repo_id", "=", repoId)
+    .execute();
   const existing = new Map(stored.map((p) => [p.slug, p]));
 
-  const statements: D1PreparedStatement[] = [];
+  const statements: Statement[] = [];
   const save = (
     page: PlannedPage,
     body: string,
@@ -364,46 +365,55 @@ export async function updateWiki(
     model: string | null,
     sources: string[],
   ) =>
-    env.DB.prepare(
-      `INSERT INTO wiki_pages (repo_id, slug, title, section, position, node_id, body, diagram, sources, inputs_hash, generated_in, model, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-       ON CONFLICT (repo_id, slug) DO UPDATE SET title = excluded.title, section = excluded.section,
-         position = excluded.position, node_id = excluded.node_id, body = excluded.body, diagram = excluded.diagram,
-         sources = excluded.sources,
-         inputs_hash = excluded.inputs_hash, generated_in = excluded.generated_in, model = excluded.model,
-         updated_at = excluded.updated_at`,
-    ).bind(
-      repoId,
-      page.slug,
-      page.title,
-      page.section,
-      page.position,
-      page.nodeId,
-      body,
-      diagramFor(page, graph, syntheses),
-      JSON.stringify(sources),
-      hash,
-      commit,
-      model,
-    );
+    db(env.DB)
+      .insertInto("wiki_pages")
+      .values({
+        repo_id: repoId,
+        slug: page.slug,
+        title: page.title,
+        section: page.section,
+        position: page.position,
+        node_id: page.nodeId,
+        body,
+        diagram: diagramFor(page, graph, syntheses),
+        sources: JSON.stringify(sources),
+        inputs_hash: hash,
+        generated_in: commit,
+        model,
+        updated_at: nowIso(),
+      })
+      .onConflict((oc) =>
+        oc.columns(["repo_id", "slug"]).doUpdateSet((eb) => ({
+          title: eb.ref("excluded.title"),
+          section: eb.ref("excluded.section"),
+          position: eb.ref("excluded.position"),
+          node_id: eb.ref("excluded.node_id"),
+          body: eb.ref("excluded.body"),
+          diagram: eb.ref("excluded.diagram"),
+          sources: eb.ref("excluded.sources"),
+          inputs_hash: eb.ref("excluded.inputs_hash"),
+          generated_in: eb.ref("excluded.generated_in"),
+          model: eb.ref("excluded.model"),
+          updated_at: eb.ref("excluded.updated_at"),
+        })),
+      );
 
   // A page whose prose stays keeps its text, but its placement and diagram
   // always follow the current graph.
   const keep = (page: PlannedPage, hash: string, body: string) =>
-    env.DB.prepare(
-      `UPDATE wiki_pages SET inputs_hash = ?, title = ?, section = ?, position = ?, node_id = ?, body = ?, diagram = ?
-       WHERE repo_id = ? AND slug = ?`,
-    ).bind(
-      hash,
-      page.title,
-      page.section,
-      page.position,
-      page.nodeId,
-      stripTrailingDiagram(body),
-      diagramFor(page, graph, syntheses),
-      repoId,
-      page.slug,
-    );
+    db(env.DB)
+      .updateTable("wiki_pages")
+      .set({
+        inputs_hash: hash,
+        title: page.title,
+        section: page.section,
+        position: page.position,
+        node_id: page.nodeId,
+        body: stripTrailingDiagram(body),
+        diagram: diagramFor(page, graph, syntheses),
+      })
+      .where("repo_id", "=", repoId)
+      .where("slug", "=", page.slug);
 
   await pool(pages, 3, async (page) => {
     const inputs = await inputsFor(page, pages, graph, syntheses, files, analyses, reader, readme);
@@ -463,10 +473,10 @@ export async function updateWiki(
     if (wanted.has(slugName)) continue;
     stats.removed++;
     statements.push(
-      env.DB.prepare("DELETE FROM wiki_pages WHERE repo_id = ? AND slug = ?").bind(
-        repoId,
-        slugName,
-      ),
+      db(env.DB)
+        .deleteFrom("wiki_pages")
+        .where("repo_id", "=", repoId)
+        .where("slug", "=", slugName),
     );
   }
   await runBatched(env.DB, statements);

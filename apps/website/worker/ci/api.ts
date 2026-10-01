@@ -17,6 +17,7 @@
 //   POST   /jobs/:job              a CiJobReport → {cancelled}
 
 import { Hono } from "hono";
+import { sql, type InferResult } from "kysely";
 import type {
   CiClaimedJob,
   CiCommitStatuses,
@@ -27,7 +28,6 @@ import type {
   CiRunList,
   CiRunSummary,
   CiSecretSummary,
-  CiStep,
 } from "../../shared/api.ts";
 import { fail, readJson, requireActor } from "../api/http.ts";
 import { loadRepo } from "../api/repos.ts";
@@ -35,28 +35,22 @@ import type { AppEnv } from "../auth.ts";
 import { findRepo, roleFor } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
+import { batch, db, nowIso, type DB } from "../schema.ts";
 import { claim, jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
+import { mintJobToken } from "./registry.ts";
 import { startRun } from "./trigger.ts";
 
-interface RunRow {
-  id: string;
-  number: number;
-  commit_oid: string;
-  ref: string;
-  trigger: "push" | "manual";
-  title: string;
-  status: CiRunSummary["status"];
-  actor: string | null;
-  config_error: string | null;
-  created_at: string;
-  started_at: string | null;
-  finished_at: string | null;
-}
-
-const RUN_SELECT = `SELECT r.*, a.slug AS actor FROM ci_runs r LEFT JOIN accounts a ON a.id = r.actor_id`;
 const PAGE = 30;
-const now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
+
+const selectRuns = (kdb: DB) =>
+  kdb
+    .selectFrom("ci_runs as r")
+    .leftJoin("accounts as a", "a.id", "r.actor_id")
+    .selectAll("r")
+    .select("a.slug as actor");
+
+type RunRow = InferResult<ReturnType<typeof selectRuns>>[number];
 
 const toRun = (row: RunRow): CiRunSummary => ({
   id: row.id,
@@ -78,11 +72,12 @@ ci.get("/", async (c) => {
   const repo = await loadRepo(c);
   if (repo instanceof Response) return repo;
   const before = Number(c.req.query("before")) || Number.MAX_SAFE_INTEGER;
-  const { results } = await c.env.DB.prepare(
-    `${RUN_SELECT} WHERE r.repo_id = ? AND r.number < ? ORDER BY r.number DESC LIMIT ${PAGE}`,
-  )
-    .bind(repo.row.id, before)
-    .all<RunRow>();
+  const results = await selectRuns(db(c.env.DB))
+    .where("r.repo_id", "=", repo.row.id)
+    .where("r.number", "<", before)
+    .orderBy("r.number", "desc")
+    .limit(PAGE)
+    .execute();
   return c.json<CiRunList>({ runs: results.map(toRun), runner: c.env.CI_RUNNER });
 });
 
@@ -114,54 +109,38 @@ ci.post("/runs", async (c) => {
 });
 
 async function runDetail(
-  db: D1Database,
+  d1: D1Database,
   repoId: string,
   number: number,
 ): Promise<CiRunDetail | null> {
-  const row = await db
-    .prepare(`${RUN_SELECT} WHERE r.repo_id = ? AND r.number = ?`)
-    .bind(repoId, number)
-    .first<RunRow>();
+  const kdb = db(d1);
+  const row = await selectRuns(kdb)
+    .where("r.repo_id", "=", repoId)
+    .where("r.number", "=", number)
+    .executeTakeFirst();
   if (!row) return null;
-  const [jobs, steps] = await db.batch([
-    db.prepare("SELECT * FROM ci_jobs WHERE run_id = ? ORDER BY rowid").bind(row.id),
-    db
-      .prepare(
-        "SELECT s.* FROM ci_steps s JOIN ci_jobs j ON j.id = s.job_id WHERE j.run_id = ? ORDER BY s.position",
-      )
-      .bind(row.id),
-  ]);
-  type JobRow = {
-    id: string;
-    name: string;
-    spec: string;
-    status: CiJob["status"];
-    runner: CiJob["runner"];
-    claimed_by: string | null;
-    exit_code: number | null;
-    error: string | null;
-    started_at: string | null;
-    finished_at: string | null;
-  };
-  type StepRow = {
-    job_id: string;
-    position: number;
-    name: string;
-    status: CiStep["status"];
-    exit_code: number | null;
-    started_at: string | null;
-    finished_at: string | null;
-  };
-  const stepRows = steps!.results as StepRow[];
+  const jobsQuery = kdb
+    .selectFrom("ci_jobs")
+    .selectAll()
+    .where("run_id", "=", row.id)
+    .orderBy(sql`rowid`);
+  const stepsQuery = kdb
+    .selectFrom("ci_steps as s")
+    .innerJoin("ci_jobs as j", "j.id", "s.job_id")
+    .selectAll("s")
+    .where("j.run_id", "=", row.id)
+    .orderBy("s.position");
+  const [jobs, steps] = await batch(d1, [jobsQuery, stepsQuery]);
+  const stepRows = steps!.results as InferResult<typeof stepsQuery>;
   return {
     ...toRun(row),
     configError: row.config_error,
-    jobs: (jobs!.results as JobRow[]).map((job) => ({
+    jobs: (jobs!.results as InferResult<typeof jobsQuery>).map((job) => ({
       id: job.id,
       name: job.name,
       needs: (JSON.parse(job.spec) as StoredJob).needs,
       status: job.status,
-      runner: job.runner,
+      runner: job.runner as CiJob["runner"],
       claimedBy: job.claimed_by,
       exitCode: job.exit_code,
       error: job.error,
@@ -191,32 +170,35 @@ ci.get("/runs/:number{[0-9]+}", async (c) => {
 ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   const repo = await loadRepo(c, "write");
   if (repo instanceof Response) return repo;
-  const db = c.env.DB;
-  const run = await db
-    .prepare("SELECT id, status FROM ci_runs WHERE repo_id = ? AND number = ?")
-    .bind(repo.row.id, Number(c.req.param("number")))
-    .first<{ id: string; status: string }>();
+  const d1 = c.env.DB;
+  const kdb = db(d1);
+  const run = await kdb
+    .selectFrom("ci_runs")
+    .select(["id", "status"])
+    .where("repo_id", "=", repo.row.id)
+    .where("number", "=", Number(c.req.param("number")))
+    .executeTakeFirst();
   if (!run) return fail(c, 404, "No such run.");
   if (run.status !== "queued" && run.status !== "running") {
     return fail(c, 409, `The run already ${run.status}.`);
   }
   // Runners notice on their next report and stop; the Workflow stops now.
-  await db.batch([
-    db
-      .prepare(`UPDATE ci_runs SET status = 'cancelled', finished_at = ${now} WHERE id = ?`)
-      .bind(run.id),
-    db
-      .prepare(
-        `UPDATE ci_jobs SET status = 'cancelled', finished_at = ${now}
-         WHERE run_id = ? AND status IN ('pending', 'queued', 'running')`,
-      )
-      .bind(run.id),
-    db
-      .prepare(
-        `UPDATE ci_steps SET status = 'cancelled', finished_at = ${now}
-         WHERE job_id IN (SELECT id FROM ci_jobs WHERE run_id = ?) AND status IN ('pending', 'running')`,
-      )
-      .bind(run.id),
+  const now = nowIso();
+  await batch(d1, [
+    kdb
+      .updateTable("ci_runs")
+      .set({ status: "cancelled", finished_at: now })
+      .where("id", "=", run.id),
+    kdb
+      .updateTable("ci_jobs")
+      .set({ status: "cancelled", finished_at: now })
+      .where("run_id", "=", run.id)
+      .where("status", "in", ["pending", "queued", "running"]),
+    kdb
+      .updateTable("ci_steps")
+      .set({ status: "cancelled", finished_at: now })
+      .where("job_id", "in", kdb.selectFrom("ci_jobs").select("id").where("run_id", "=", run.id))
+      .where("status", "in", ["pending", "running"]),
   ]);
   const instance = await c.env.CI_RUN.get(run.id).catch(() => null);
   await instance?.terminate().catch(() => {});
@@ -226,11 +208,12 @@ ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
 ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
   const repo = await loadRepo(c, "write");
   if (repo instanceof Response) return repo;
-  const run = await c.env.DB.prepare(
-    "SELECT commit_oid, ref FROM ci_runs WHERE repo_id = ? AND number = ?",
-  )
-    .bind(repo.row.id, Number(c.req.param("number")))
-    .first<{ commit_oid: string; ref: string }>();
+  const run = await db(c.env.DB)
+    .selectFrom("ci_runs")
+    .select(["commit_oid", "ref"])
+    .where("repo_id", "=", repo.row.id)
+    .where("number", "=", Number(c.req.param("number")))
+    .executeTakeFirst();
   if (!run) return fail(c, 404, "No such run.");
   const started = await startRun(c.env, repo.row, {
     branch: run.ref,
@@ -247,21 +230,26 @@ ci.get("/jobs/:job/logs", async (c) => {
   const repo = await loadRepo(c);
   if (repo instanceof Response) return repo;
   const after = Number(c.req.query("after")) || 0;
-  const db = c.env.DB;
-  const [chunks, job] = await db.batch([
-    db
-      .prepare(
-        `SELECT l.seq, l.step, l.text FROM ci_logs l JOIN ci_jobs j ON j.id = l.job_id
-         WHERE l.job_id = ? AND j.repo_id = ? AND l.seq > ? ORDER BY l.seq LIMIT 500`,
-      )
-      .bind(c.req.param("job"), repo.row.id, after),
-    db
-      .prepare("SELECT status FROM ci_jobs WHERE id = ? AND repo_id = ?")
-      .bind(c.req.param("job"), repo.row.id),
-  ]);
-  const status = (job!.results[0] as { status: string } | undefined)?.status;
+  const d1 = c.env.DB;
+  const kdb = db(d1);
+  const chunksQuery = kdb
+    .selectFrom("ci_logs as l")
+    .innerJoin("ci_jobs as j", "j.id", "l.job_id")
+    .select(["l.seq", "l.step", "l.text"])
+    .where("l.job_id", "=", c.req.param("job"))
+    .where("j.repo_id", "=", repo.row.id)
+    .where("l.seq", ">", after)
+    .orderBy("l.seq")
+    .limit(500);
+  const jobQuery = kdb
+    .selectFrom("ci_jobs")
+    .select("status")
+    .where("id", "=", c.req.param("job"))
+    .where("repo_id", "=", repo.row.id);
+  const [chunks, job] = await batch(d1, [chunksQuery, jobQuery]);
+  const status = (job!.results as InferResult<typeof jobQuery>)[0]?.status;
   if (!status) return fail(c, 404, "No such job.");
-  const rows = chunks!.results as CiLogs["chunks"];
+  const rows: CiLogs["chunks"] = chunks!.results as InferResult<typeof chunksQuery>;
   const done = !["pending", "queued", "running"].includes(status);
   return c.json<CiLogs>({
     chunks: rows,
@@ -279,12 +267,13 @@ ci.get("/status", async (c) => {
     .filter((s) => /^[0-9a-f]{40}$/.test(s))
     .slice(0, 100);
   if (commits.length === 0) return c.json<CiCommitStatuses>({});
-  const { results } = await c.env.DB.prepare(
-    `SELECT commit_oid, status, number FROM ci_runs WHERE repo_id = ?
-       AND commit_oid IN (${commits.map(() => "?").join(",")}) ORDER BY number`,
-  )
-    .bind(repo.row.id, ...commits)
-    .all<{ commit_oid: string; status: CiRunSummary["status"]; number: number }>();
+  const results = await db(c.env.DB)
+    .selectFrom("ci_runs")
+    .select(["commit_oid", "status", "number"])
+    .where("repo_id", "=", repo.row.id)
+    .where("commit_oid", "in", commits)
+    .orderBy("number")
+    .execute();
   const out: CiCommitStatuses = {};
   // Ordered by number, so the latest run per commit wins.
   for (const row of results) out[row.commit_oid] = { status: row.status, number: row.number };
@@ -294,11 +283,12 @@ ci.get("/status", async (c) => {
 ci.get("/secrets", async (c) => {
   const repo = await loadRepo(c, "admin");
   if (repo instanceof Response) return repo;
-  const { results } = await c.env.DB.prepare(
-    "SELECT name, updated_at FROM ci_secrets WHERE repo_id = ? ORDER BY name",
-  )
-    .bind(repo.row.id)
-    .all<{ name: string; updated_at: string }>();
+  const results = await db(c.env.DB)
+    .selectFrom("ci_secrets")
+    .select(["name", "updated_at"])
+    .where("repo_id", "=", repo.row.id)
+    .orderBy("name")
+    .execute();
   return c.json<CiSecretSummary[]>(results.map((r) => ({ name: r.name, updatedAt: r.updated_at })));
 });
 
@@ -309,21 +299,27 @@ ci.put("/secrets/:secret", async (c) => {
   if (!SECRET_NAME.test(name)) return fail(c, 400, "Secret names use letters, digits and _.");
   const { value } = await readJson<{ value: string }>(c);
   if (typeof value !== "string" || !value) return fail(c, 400, "A secret needs a value.");
-  await c.env.DB.prepare(
-    `INSERT INTO ci_secrets (repo_id, name, value) VALUES (?, ?, ?)
-     ON CONFLICT (repo_id, name) DO UPDATE SET value = excluded.value, updated_at = ${now}`,
-  )
-    .bind(repo.row.id, name, value)
-    .run();
+  await db(c.env.DB)
+    .insertInto("ci_secrets")
+    .values({ repo_id: repo.row.id, name, value })
+    .onConflict((oc) =>
+      oc.columns(["repo_id", "name"]).doUpdateSet((eb) => ({
+        value: eb.ref("excluded.value"),
+        updated_at: nowIso(),
+      })),
+    )
+    .execute();
   return c.json({ ok: true });
 });
 
 ci.delete("/secrets/:secret", async (c) => {
   const repo = await loadRepo(c, "admin");
   if (repo instanceof Response) return repo;
-  await c.env.DB.prepare("DELETE FROM ci_secrets WHERE repo_id = ? AND name = ?")
-    .bind(repo.row.id, c.req.param("secret"))
-    .run();
+  await db(c.env.DB)
+    .deleteFrom("ci_secrets")
+    .where("repo_id", "=", repo.row.id)
+    .where("name", "=", c.req.param("secret"))
+    .execute();
   return c.json({ ok: true });
 });
 
@@ -333,12 +329,12 @@ export const runner = new Hono<AppEnv>();
 
 /** Whether the actor may run (and see the secrets of) jobs for a repo. */
 async function mayRun(
-  db: D1Database,
+  d1: D1Database,
   actor: NonNullable<AppEnv["Variables"]["actor"]>,
   repo: string,
 ) {
   const [owner, name] = repo.split("/");
-  const row = await findRepo(db, actor, owner ?? "", name ?? "");
+  const row = await findRepo(d1, actor, owner ?? "", name ?? "");
   return row !== null && atLeast(roleFor(row, actor), "write");
 }
 
@@ -347,12 +343,17 @@ runner.post("/claim", async (c) => {
   if (actor instanceof Response) return actor;
   const body = await readJson<{ name: string; repo: string }>(c);
   const runnerName = `${actor.slug}/${(body.name ?? "runner").slice(0, 60)}`;
-  const { results } = await c.env.DB.prepare(
-    `SELECT j.id, o.slug || '/' || p.name AS repo FROM ci_jobs j
-       JOIN repos p ON p.id = j.repo_id JOIN accounts o ON o.id = p.owner_id
-     WHERE j.runner = 'local' AND j.status = 'queued'
-     ORDER BY j.rowid LIMIT 50`,
-  ).all<{ id: string; repo: string }>();
+  const kdb = db(c.env.DB);
+  const results = await kdb
+    .selectFrom("ci_jobs as j")
+    .innerJoin("repos as p", "p.id", "j.repo_id")
+    .innerJoin("accounts as o", "o.id", "p.owner_id")
+    .select(["j.id", sql<string>`o.slug || '/' || p.name`.as("repo")])
+    .where("j.runner", "=", "local")
+    .where("j.status", "=", "queued")
+    .orderBy(sql`j.rowid`)
+    .limit(50)
+    .execute();
   const allowed = new Map<string, boolean>();
   for (const candidate of results) {
     if (body.repo && candidate.repo !== body.repo) continue;
@@ -363,13 +364,20 @@ runner.post("/claim", async (c) => {
     if (!(await claim(c.env.DB, candidate.id, runnerName))) continue;
     const job = await loadJob(c.env.DB, candidate.id);
     if (!job) continue;
-    await c.env.DB.prepare(
-      `UPDATE ci_runs SET status = 'running', started_at = COALESCE(started_at, ${now})
-       WHERE id = ? AND status = 'queued'`,
-    )
-      .bind(job.run_id)
-      .run();
-    return c.json<CiClaimedJob>(await jobPayload(c.env.DB, job));
+    await kdb
+      .updateTable("ci_runs")
+      .set((eb) => ({
+        status: "running",
+        started_at: eb.fn.coalesce("started_at", eb.val(nowIso())),
+      }))
+      .where("id", "=", job.run_id)
+      .where("status", "=", "queued")
+      .execute();
+    const spec = JSON.parse(job.spec) as StoredJob;
+    const token = await mintJobToken(c.env.DB, job.id, spec.timeoutMinutes);
+    return c.json<CiClaimedJob>(
+      await jobPayload(c.env.DB, job, { origin: new URL(c.req.url).origin, token }),
+    );
   }
   return c.body(null, 204);
 });

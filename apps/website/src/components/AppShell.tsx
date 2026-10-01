@@ -1,3 +1,4 @@
+import { popMotion } from "./ui.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
   HouseIcon,
@@ -60,7 +61,7 @@ function AccountMenu() {
       </Tip>
       <Menu.Portal>
         <Menu.Positioner side="right" align="end" sideOffset={12} className="z-50">
-          <Menu.Popup className="mk-popup gm-pop">
+          <Menu.Popup className={`mk-popup ${popMotion}`}>
             <div className="px-2.5 pt-2 pb-1.5">
               <div className="font-semibold">
                 <bdi>{viewer.displayName}</bdi>

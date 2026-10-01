@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { AccessToken, CreatedAccessToken, TokenScope } from "../../shared/api.ts";
 import { generateTokenSecret, hashToken, type AppEnv } from "../auth.ts";
+import { db } from "../schema.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
 interface TokenRow {
@@ -24,29 +25,27 @@ function toToken(row: TokenRow): AccessToken {
 }
 
 export async function issueToken(
-  db: D1Database,
+  d1: D1Database,
   userId: string,
   name: string,
   scope: TokenScope,
   session?: { expiresAt: string; sshKeyId: string },
 ): Promise<CreatedAccessToken> {
   const secret = generateTokenSecret();
-  const row = await db
-    .prepare(
-      `INSERT INTO access_tokens (id, user_id, name, scope, token_hash, last_four, expires_at, ssh_key_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-    )
-    .bind(
-      `tok_${crypto.randomUUID()}`,
-      userId,
+  const row = await db(d1)
+    .insertInto("access_tokens")
+    .values({
+      id: `tok_${crypto.randomUUID()}`,
+      user_id: userId,
       name,
       scope,
-      await hashToken(secret),
-      secret.slice(-4),
-      session?.expiresAt ?? null,
-      session?.sshKeyId ?? null,
-    )
-    .first<TokenRow>();
+      token_hash: await hashToken(secret),
+      last_four: secret.slice(-4),
+      expires_at: session?.expiresAt ?? null,
+      ssh_key_id: session?.sshKeyId ?? null,
+    })
+    .returningAll()
+    .executeTakeFirst();
   if (!row) throw new Error("The token could not be saved.");
   return { ...toToken(row), secret };
 }
@@ -56,12 +55,14 @@ export const tokens = new Hono<AppEnv>();
 tokens.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
-  const { results } = await c.env.DB.prepare(
+  const results = await db(c.env.DB)
+    .selectFrom("access_tokens")
+    .selectAll()
+    .where("user_id", "=", actor.id)
     // Sessions minted from SSH keys come and go; they're listed with the keys.
-    "SELECT * FROM access_tokens WHERE user_id = ? AND ssh_key_id IS NULL ORDER BY created_at DESC",
-  )
-    .bind(actor.id)
-    .all<TokenRow>();
+    .where("ssh_key_id", "is", null)
+    .orderBy("created_at", "desc")
+    .execute();
   return c.json({ tokens: results.map(toToken) });
 });
 
@@ -80,8 +81,10 @@ tokens.post("/", async (c) => {
 tokens.delete("/:id", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
-  const { meta } = await c.env.DB.prepare("DELETE FROM access_tokens WHERE id = ? AND user_id = ?")
-    .bind(c.req.param("id"), actor.id)
-    .run();
-  return meta.changes ? c.body(null, 204) : fail(c, 404, "No such token.");
+  const { numDeletedRows } = await db(c.env.DB)
+    .deleteFrom("access_tokens")
+    .where("id", "=", c.req.param("id"))
+    .where("user_id", "=", actor.id)
+    .executeTakeFirst();
+  return numDeletedRows ? c.body(null, 204) : fail(c, 404, "No such token.");
 });

@@ -1,0 +1,125 @@
+{
+  "title": "Choose the package page's structure",
+  "question": "Third hand, built for your steer: versions on every commit, tens of thousands a day. Feature parity with npm, Artifactory, Nexus and GitHub Packages is assumed; this picks the composition.",
+  "options": [
+    {
+      "id": "query-console",
+      "label": "Query console",
+      "kicker": "THE ROLL",
+      "lineage": "a log explorer's query bar and facets, pointed at versions",
+      "thesis": "Treat versions as data: one query over every version, facet counts beside it, bulk actions, built for tens of thousands a day.",
+      "palette": ["#1c1a18", "#262421", "#f0ede6", "#f0b44c", "#5fbf7a"],
+      "materials": [
+        "query bar",
+        "facet counts",
+        "publish-rate strip",
+        "virtualized table",
+        "saved views"
+      ],
+      "viewport": "Header and pull command; a query bar (source:orbit/web branch:main since:24h) with saved views like Released and Today; a publish-rate strip over a virtualized version table; facet counts (source, branch, status, tag) on the right; select rows to tag, yank or delete.",
+      "risk": "Cold at first glance unless the default views answer the common questions before anyone types.",
+      "wireframe": {
+        "cols": 12,
+        "rows": 10,
+        "regions": [
+          { "label": "package · format · pull command", "x": 0, "y": 0, "w": 12, "h": 1 },
+          {
+            "label": "query: source:… branch:… since:24h",
+            "x": 0,
+            "y": 1,
+            "w": 9,
+            "h": 1,
+            "accent": true
+          },
+          { "label": "saved views", "x": 9, "y": 1, "w": 3, "h": 1 },
+          { "label": "publish-rate strip", "x": 0, "y": 2, "w": 9, "h": 1 },
+          {
+            "label": "versions (virtualized): version · tags · source@commit · run · age",
+            "x": 0,
+            "y": 3,
+            "w": 9,
+            "h": 7,
+            "accent": true
+          },
+          { "label": "facets: source · branch · status · tag", "x": 9, "y": 2, "w": 3, "h": 8 }
+        ]
+      }
+    },
+    {
+      "id": "channels",
+      "label": "Channels",
+      "lineage": "release trains and build channels",
+      "thesis": "Separate noise from signal: per-commit builds flow into channels by branch or source, each a row with its cadence, latest build and tags.",
+      "palette": ["#1c1a18", "#262421", "#f0ede6", "#f0b44c", "#5fbf7a"],
+      "materials": [
+        "channel rows",
+        "cadence sparklines",
+        "released tags above",
+        "expandable build stream"
+      ],
+      "viewport": "Header and pull command; released tags float in a strip at the top; below, one row per channel (main, release/*, feature branches) with a cadence sparkline, builds today, latest version with its commit and CI status; expanding a row opens that channel's build stream.",
+      "risk": "Builds without branch information, like manual uploads, collect in one catch-all channel.",
+      "wireframe": {
+        "cols": 12,
+        "rows": 10,
+        "regions": [
+          { "label": "package · format · pull command", "x": 0, "y": 0, "w": 12, "h": 1 },
+          {
+            "label": "released tags: stable 2.4.0 · latest · next",
+            "x": 0,
+            "y": 1,
+            "w": 12,
+            "h": 1
+          },
+          {
+            "label": "channel: main · cadence · 1,204 today · latest@commit",
+            "x": 0,
+            "y": 2,
+            "w": 12,
+            "h": 2,
+            "accent": true
+          },
+          { "label": "channel: release/* · cadence · latest", "x": 0, "y": 4, "w": 12, "h": 2 },
+          { "label": "channel: feature branches (collapsed)", "x": 0, "y": 6, "w": 12, "h": 2 },
+          { "label": "expanded build stream", "x": 0, "y": 8, "w": 12, "h": 2 }
+        ]
+      }
+    },
+    {
+      "id": "retention-first",
+      "label": "Retention first",
+      "lineage": "a storage console that leads with policy",
+      "thesis": "At this volume the real question is what to keep: versions sorted into kept, recent and prunable, with storage and policy up front.",
+      "palette": ["#1c1a18", "#262421", "#f0ede6", "#f0b44c", "#d4483b"],
+      "materials": [
+        "segmented storage bar",
+        "editable retention rules",
+        "live sweep preview",
+        "bucketed version lists"
+      ],
+      "viewport": "Header; a storage bar split into kept (tagged or released), recent and prunable; retention rules beside a live preview of what the next sweep removes; version lists per bucket below.",
+      "risk": "Leads with housekeeping, the opposite of what most visits want, which is finding a version.",
+      "wireframe": {
+        "cols": 12,
+        "rows": 10,
+        "regions": [
+          { "label": "package · format · pull command", "x": 0, "y": 0, "w": 12, "h": 1 },
+          {
+            "label": "storage: kept · recent · prunable",
+            "x": 0,
+            "y": 1,
+            "w": 12,
+            "h": 1,
+            "accent": true
+          },
+          { "label": "retention rules", "x": 0, "y": 2, "w": 5, "h": 3 },
+          { "label": "next sweep preview", "x": 5, "y": 2, "w": 7, "h": 3 },
+          { "label": "versions by bucket", "x": 0, "y": 5, "w": 12, "h": 5 }
+        ]
+      }
+    }
+  ],
+  "reroll": true,
+  "steer": true,
+  "buildPath": { "value": "code" }
+}

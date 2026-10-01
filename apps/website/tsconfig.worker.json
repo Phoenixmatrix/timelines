@@ -2,7 +2,7 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "lib": ["ES2024", "ESNext.Disposable"],
-    "types": ["./.cloudflare/types/index.d.ts"]
+    "types": ["./.cloudflare/types/index.d.ts", "node"]
   },
-  "include": ["worker", "shared"]
+  "include": ["worker", "registry", "shared"]
 }
