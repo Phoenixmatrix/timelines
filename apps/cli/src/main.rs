@@ -10,7 +10,7 @@ mod ssh;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::{BookmarkCommand, CliCommand, Command, FileCommand, OpCommand};
-use commands::{Ctx, ci, local, network, server};
+use commands::{Ctx, ci, local, network, server, worktree};
 use output::{Format, GmError, Render, emit, emit_error, exit};
 
 /// Help text gets the git equivalent and examples from the manifest, and a
@@ -42,7 +42,14 @@ fn build_command(agent: bool) -> clap::Command {
                         }
                     }
                     if m.mutates {
-                        extra.push_str("\nSupports --dry-run. Undo with `gm undo`.\n");
+                        extra.push_str("\nSupports --dry-run.\n");
+                        if m.path.starts_with("worktree ") {
+                            extra.push_str(
+                                "Worktree creation/removal is not reversed by `gm undo`.\n",
+                            );
+                        } else {
+                            extra.push_str("Undo with `gm undo`.\n");
+                        }
                     }
                     extra.push_str(&format!("Output schema: gm schema {path}"));
                     sub = sub.after_help(extra);
@@ -138,6 +145,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::File(FileCommand::List { path, revision }) => {
             out(f, local::file_list(ctx, path.as_deref(), &revision))
         }
+        Command::Worktree(c) => out(f, worktree::run(ctx, &c)),
         Command::Init => out(f, local::init(ctx)),
         Command::Clone(a) => out(f, network::clone(ctx, &a)),
         Command::Fetch => out(f, network::fetch(ctx)),

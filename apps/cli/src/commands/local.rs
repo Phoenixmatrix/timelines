@@ -832,7 +832,7 @@ pub fn undo(ctx: &Ctx) -> Result<OpResult> {
             GmError::not_found("nothing_to_undo", "There is no operation left to undo.")
         })?;
     let op = ops[target].clone();
-    ws.restore_view(op.before.clone())?;
+    ws.restore_view(op.before.clone(), &op.after)?;
     let label = format!("undo {}", op.id);
     let edits_note = match &ws.snapshot_op {
         Some(snap) => format!(
@@ -945,7 +945,7 @@ pub fn op_restore(ctx: &Ctx, id: &str) -> Result<OpResult> {
                 )));
             }
         };
-        ws.restore_view(op.after.clone())?;
+        ws.restore_operation(op.after.clone())?;
         Ok(Outcome::new(
             format!(
                 "Restored the repository to just after `{}` ({}).",

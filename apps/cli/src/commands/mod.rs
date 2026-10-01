@@ -2,6 +2,8 @@ pub mod ci;
 pub mod local;
 pub mod network;
 pub mod server;
+pub mod worktree;
+mod worktree_include;
 
 use crate::model::{Change, ConflictReport, OpResult};
 use crate::output::{Format, Result};

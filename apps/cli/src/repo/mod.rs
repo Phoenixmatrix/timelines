@@ -51,9 +51,14 @@ pub struct Workspace {
     pub repo: Repository,
     store: Store,
     _lock: File,
+    _repository_lock: File,
     index: Index,
     pub view: View,
     before: View,
+    /// Shared refs observed under the repository lock, not the stale stored view.
+    git_bookmarks: std::collections::BTreeMap<String, String>,
+    /// Last persisted local observation, before opening imports sibling changes.
+    initial_bookmarks: std::collections::BTreeMap<String, String>,
     /// The tree the files on disk currently match.
     disk_tree: Oid,
     pub trunk: Option<Trunk>,
@@ -70,7 +75,24 @@ fn not_a_repo() -> GmError {
 impl Workspace {
     /// Open the workspace around `cwd`, take the lock and snapshot the working copy.
     pub fn open(cwd: &Path) -> Result<Workspace> {
+        Self::open_internal(cwd, false)
+    }
+
+    /// Read stored state without snapshotting files or persisting imported refs.
+    pub fn open_readonly(cwd: &Path) -> Result<Workspace> {
+        Self::open_internal(cwd, true)
+    }
+
+    /// All gm mutations take the shared lock before any worktree-local lock.
+    pub fn lock_repository(repo: &Repository) -> Result<File> {
+        let lock = File::create(repo.commondir().join("gm-workspace.lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
+    fn open_internal(cwd: &Path, readonly: bool) -> Result<Workspace> {
         let repo = Repository::discover(cwd).map_err(|_| not_a_repo())?;
+        let repository_lock = Self::lock_repository(&repo)?;
         if repo.workdir().is_none() {
             return Err(GmError::usage(
                 "gm needs a repository with a working directory.",
@@ -95,17 +117,27 @@ impl Workspace {
             repo,
             store,
             _lock: lock,
+            _repository_lock: repository_lock,
             index,
             before: view.clone(),
+            git_bookmarks: view.bookmarks.clone(),
+            initial_bookmarks: view.bookmarks.clone(),
             view,
             disk_tree,
             immutable_cache: Default::default(),
             snapshot_op: None,
         };
         ws.trunk = ws.find_trunk()?;
-        ws.import_git_changes()?;
-        ws.snapshot()?;
-        ws.snapshot_op = ws.finish("snapshot working copy")?;
+        if readonly {
+            ws.view.bookmarks = ws.git_bookmarks()?;
+            ws.git_bookmarks = ws.view.bookmarks.clone();
+            ws.before = ws.view.clone();
+        } else {
+            ws.retain_history()?;
+            ws.import_git_changes()?;
+            ws.snapshot()?;
+            ws.snapshot_op = ws.finish("snapshot working copy")?;
+        }
         Ok(ws)
     }
 
@@ -113,6 +145,12 @@ impl Workspace {
     /// holding whatever is on disk that HEAD doesn't have.
     pub fn init(cwd: &Path) -> Result<Workspace> {
         let repo = Repository::discover(cwd).map_err(|_| not_a_repo())?;
+        if repo.workdir().is_none() {
+            return Err(GmError::usage(
+                "gm needs a repository with a working directory.",
+            ));
+        }
+        let repository_lock = Self::lock_repository(&repo)?;
         let store = Store::new(repo.path());
         if store.exists() {
             return Err(
@@ -156,7 +194,9 @@ impl Workspace {
             bookmarks,
             ..Default::default()
         };
+        Self::retain_view(&repo, &view)?;
         store.save_view(&view)?;
+        drop(repository_lock);
         let ws = Workspace::open(cwd)?;
         ws.sync_git_head(true)?;
         Ok(ws)
@@ -462,14 +502,8 @@ impl Workspace {
     /// Bring git-side changes into the view: branches moved with plain git,
     /// and a HEAD that someone moved with `git commit` or `git checkout`.
     fn import_git_changes(&mut self) -> Result<()> {
-        let mut bookmarks = std::collections::BTreeMap::new();
-        for branch in self.repo.branches(Some(git2::BranchType::Local))? {
-            let (branch, _) = branch?;
-            if let (Some(name), Some(target)) = (branch.name()?, branch.get().target()) {
-                bookmarks.insert(name.to_string(), target.to_string());
-            }
-        }
-        self.view.bookmarks = bookmarks;
+        self.view.bookmarks = self.git_bookmarks()?;
+        self.git_bookmarks = self.view.bookmarks.clone();
 
         let wc = self.commit(self.wc())?;
         let expected = wc.parent_ids().next();
@@ -756,9 +790,75 @@ impl Workspace {
 
     // ---- committing the operation ---------------------------------------
 
-    /// Write the view to disk, refs and working directory, and log the
-    /// operation. Returns the operation id, or None if nothing changed.
+    fn git_bookmarks(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut bookmarks = std::collections::BTreeMap::new();
+        for branch in self.repo.branches(Some(git2::BranchType::Local))? {
+            let (branch, _) = branch?;
+            if let (Some(name), Some(target)) = (branch.name()?, branch.get().target()) {
+                bookmarks.insert(name.to_string(), target.to_string());
+            }
+        }
+        Ok(bookmarks)
+    }
+
+    /// Worktree-scoped anchors in the shared ref namespace: native git GC does
+    /// not reliably traverse another worktree's private refs.
+    pub fn retention_ref_prefix(repo: &Repository) -> Result<String> {
+        if !repo.is_worktree() {
+            return Ok("refs/gm/worktrees/main/keep/".to_string());
+        }
+        let name = repo.path().file_name().ok_or_else(|| {
+            GmError::usage("The linked worktree has no administrative directory name.")
+        })?;
+        // Encode ref-unsafe bytes (including '%' itself) without collisions.
+        let mut escaped = String::new();
+        for byte in name.as_encoded_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                escaped.push(*byte as char);
+            } else {
+                use std::fmt::Write;
+                write!(&mut escaped, "%{byte:02X}").expect("writing to a string");
+            }
+        }
+        Ok(format!("refs/gm/worktrees/linked/{escaped}/keep/"))
+    }
+
+    fn retain_view(repo: &Repository, view: &View) -> Result<()> {
+        let prefix = Self::retention_ref_prefix(repo)?;
+        for target in std::iter::once(&view.wc)
+            .chain(view.heads.iter())
+            .chain(view.bookmarks.values())
+        {
+            let name = format!("{prefix}{target}");
+            if repo.find_reference(&name).is_err() {
+                repo.reference(&name, Oid::from_str(target)?, false, "gm: retain history")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upgrade existing stores once; thereafter finish retains every new view.
+    fn retain_history(&self) -> Result<()> {
+        let marker = self.store.dir().join("reachability-shared-v1");
+        if !marker.exists() {
+            Self::retain_view(&self.repo, &self.view)?;
+            for op in self.store.ops()? {
+                Self::retain_view(&self.repo, &op.before)?;
+                Self::retain_view(&self.repo, &op.after)?;
+            }
+            std::fs::write(marker, b"")?;
+        }
+        Ok(())
+    }
+
+    /// Write the view, refs and working directory, and log the operation.
+    /// Returns the operation id, or None if nothing changed.
     pub fn finish(&mut self, command: &str) -> Result<Option<String>> {
+        Self::retain_view(&self.repo, &self.before)?;
+        Self::retain_view(&self.repo, &self.view)?;
+        if self.view != self.before {
+            self.write_bookmarks()?;
+        }
         let wc_tree = self.commit(self.wc())?.tree_id();
         if wc_tree != self.disk_tree {
             trees::checkout(&self.repo, &mut self.index, self.disk_tree, wc_tree)?;
@@ -767,7 +867,6 @@ impl Workspace {
         if self.view == self.before {
             return Ok(None);
         }
-        self.write_bookmarks()?;
         let before_parent = Oid::from_str(&self.before.wc)
             .ok()
             .and_then(|o| self.repo.find_commit(o).ok())
@@ -786,6 +885,7 @@ impl Workspace {
         };
         self.store.append_op(&op)?;
         self.before = self.view.clone();
+        self.git_bookmarks = self.view.bookmarks.clone();
         Ok(Some(op.id))
     }
 
@@ -795,29 +895,80 @@ impl Workspace {
     }
 
     fn write_bookmarks(&self) -> Result<()> {
-        let mut existing = HashMap::new();
-        for branch in self.repo.branches(Some(git2::BranchType::Local))? {
-            let (branch, _) = branch?;
-            if let (Some(name), Some(target)) = (branch.name()?, branch.get().target()) {
-                existing.insert(name.to_string(), target);
-            }
+        // Only write this operation's delta. Lock refs in sorted order and
+        // compare under those locks, so plain git cannot be silently overwritten.
+        let names: BTreeSet<_> = self
+            .git_bookmarks
+            .keys()
+            .chain(self.view.bookmarks.keys())
+            .filter(|name| self.git_bookmarks.get(*name) != self.view.bookmarks.get(*name))
+            .collect();
+        let mut transaction = self.repo.transaction()?;
+        for name in &names {
+            transaction.lock_ref(&format!("refs/heads/{name}"))?;
         }
-        for (name, target) in &self.view.bookmarks {
-            let oid = Oid::from_str(target)?;
-            if existing.get(name) != Some(&oid) {
-                self.repo.reference(
-                    &format!("refs/heads/{name}"),
-                    oid,
-                    true,
-                    "gm: move bookmark",
-                )?;
+        for name in &names {
+            let refname = format!("refs/heads/{name}");
+            let actual = match self.repo.find_reference(&refname) {
+                Ok(reference) => reference.target().map(|oid| oid.to_string()),
+                Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if actual.as_ref() != self.git_bookmarks.get(*name) {
+                return Err(GmError::new(
+                    "bookmark_changed",
+                    format!("Bookmark `{name}` changed outside this operation; retry."),
+                )
+                .exit(exit::CONFLICT));
             }
-        }
-        for name in existing.keys() {
-            if !self.view.bookmarks.contains_key(name)
-                && let Ok(mut reference) = self.repo.find_reference(&format!("refs/heads/{name}"))
+            if let Ok(branch) = self.repo.find_branch(name, git2::BranchType::Local)
+                && branch.is_head()
             {
-                reference.delete()?;
+                return Err(GmError::new(
+                    "bookmark_checked_out",
+                    format!("Bookmark `{name}` is checked out; detach it before moving it."),
+                )
+                .exit(exit::CONFLICT));
+            }
+            self.ensure_bookmark_not_checked_out(&refname)?;
+            match self.view.bookmarks.get(*name) {
+                Some(target) => transaction.set_target(
+                    &refname,
+                    Oid::from_str(target)?,
+                    None,
+                    "gm: move bookmark",
+                )?,
+                None => transaction.remove(&refname)?,
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn ensure_bookmark_not_checked_out(&self, refname: &str) -> Result<()> {
+        // HEAD is worktree-local. Inspect all administrative HEADs, including
+        // the main checkout when this Workspace belongs to a linked worktree.
+        let mut dirs = vec![self.repo.commondir().to_path_buf()];
+        let linked = self.repo.commondir().join("worktrees");
+        if linked.exists() {
+            for entry in std::fs::read_dir(linked)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        for dir in dirs {
+            let head = match std::fs::read_to_string(dir.join("HEAD")) {
+                Ok(head) => head,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if head.trim().strip_prefix("ref: ") == Some(refname) {
+                return Err(GmError::new("bookmark_checked_out",
+                    format!("Bookmark `{}` is checked out in a git worktree; detach it before moving it.",
+                        refname.trim_start_matches("refs/heads/")))
+                    .exit(exit::CONFLICT));
             }
         }
         Ok(())
@@ -842,8 +993,26 @@ impl Workspace {
         &self.store
     }
 
-    /// Replace the view wholesale (undo and op restore).
-    pub fn restore_view(&mut self, view: View) -> Result<()> {
+    /// Restore local state, reversing only uncontested bookmark changes.
+    pub fn restore_view(&mut self, view: View, expected: &View) -> Result<()> {
+        self.view = self.merge_restored_view(view, &expected.bookmarks)?;
+        self.immutable_cache.borrow_mut().clear();
+        Ok(())
+    }
+
+    /// Restore a historical local view without reverting refs changed elsewhere
+    /// since this worktree last observed them.
+    pub fn restore_operation(&mut self, view: View) -> Result<()> {
+        self.view = self.merge_restored_view(view, &self.initial_bookmarks)?;
+        self.immutable_cache.borrow_mut().clear();
+        Ok(())
+    }
+
+    fn merge_restored_view(
+        &self,
+        mut view: View,
+        expected: &std::collections::BTreeMap<String, String>,
+    ) -> Result<View> {
         // Objects can only go missing if git gc pruned them.
         self.repo
             .find_commit(Oid::from_str(&view.wc)?)
@@ -853,8 +1022,26 @@ impl Workspace {
                     "That operation's commits are no longer in the repository.",
                 )
             })?;
-        self.view = view;
-        self.immutable_cache.borrow_mut().clear();
-        Ok(())
+        let restored = view.bookmarks;
+        view.bookmarks = self.view.bookmarks.clone();
+        for name in restored
+            .keys()
+            .chain(expected.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            let target = restored.get(name);
+            let old = expected.get(name);
+            if target != old && self.view.bookmarks.get(name) == old {
+                match target {
+                    Some(oid) => {
+                        view.bookmarks.insert(name.clone(), oid.clone());
+                    }
+                    None => {
+                        view.bookmarks.remove(name);
+                    }
+                }
+            }
+        }
+        Ok(view)
     }
 }

@@ -79,6 +79,9 @@ pub enum Command {
     /// Read files at any revision without touching the working copy
     #[command(subcommand)]
     File(FileCommand),
+    /// Manage isolated working copies sharing this repository's objects and bookmarks
+    #[command(subcommand)]
+    Worktree(WorktreeCommand),
     /// Start using gm in the current git repository
     Init,
     /// Clone a Gitmatrix repository and set it up for gm
@@ -111,6 +114,31 @@ pub enum Command {
     Cli(CliCommand),
     /// Exact inputs and JSON output shape of a command
     Schema(SchemaArgs),
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// Create an initialized, detached worktree with its own working-copy change
+    Add {
+        /// Destination directory, relative to --cwd.
+        path: PathBuf,
+        /// Revision to build on; defaults to the current working-copy snapshot.
+        #[arg(short, long, default_value = "@")]
+        revision: String,
+        /// Copy ignored files matching the source checkout's .worktreeinclude.
+        #[arg(long)]
+        include: bool,
+    },
+    /// List the main checkout and linked worktrees, including non-gm worktrees
+    List,
+    /// Remove a linked worktree; its gm history is retained for recovery
+    Remove {
+        /// Worktree directory, relative to --cwd.
+        path: PathBuf,
+        /// Discard modified, untracked and ignored files; locked worktrees still refuse removal.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Args)]

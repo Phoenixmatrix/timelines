@@ -234,6 +234,8 @@ catalogs:
 overrides:
   vite@*: npm:@voidzero-dev/vite-plus-core@1.0.0-rc.0
 
+packageExtensionsChecksum: sha256-iNc6ICSBBqrl659PKZa+jBGWRIsFWZb9PmiqJ6jD59Y=
+
 importers:
 
   .:
@@ -251,7 +253,7 @@ importers:
         version: 1.8.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@phosphor-icons/react':
         specifier: 'catalog:'
-        version: 2.1.10(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        version: 2.1.10(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       diff:
         specifier: 'catalog:'
         version: 9.0.0
@@ -272,7 +274,7 @@ importers:
         version: 10.1.0(@types/react@19.3.0)(react@19.3.0)(supports-color@10.2.2)
       react-router:
         specifier: 'catalog:'
-        version: 8.4.0(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        version: 8.4.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       remark-gfm:
         specifier: 'catalog:'
         version: 4.0.1(supports-color@10.2.2)
@@ -1118,6 +1120,7 @@ packages:
     resolution: {integrity: sha512-vt8Tvq8GLjheAZZYa+YG/pW7HDbov8El/MANW8pOAz4eGxrwhnbfrQZq0Cp4q8zBEu8NIhHdnr+r8thnfRSNYA==}
     engines: {node: '>=10'}
     peerDependencies:
+      '@types/react': ^19
       react: '>= 16.8'
       react-dom: '>= 16.8'
 
@@ -2673,6 +2676,8 @@ packages:
     resolution: {integrity: sha512-JtydAkBvU9UTEe5qNC+POhu+ZBNM7rlKY2IegwXc7Idj7xfRG16x5RZrw3mju+XlqBxfvb2ky9P3jUp9WyWC1g==}
     engines: {node: '>=22.22.0'}
     peerDependencies:
+      '@types/react': ^19
+      '@types/react-dom': ^19
       react: '>=19.2.7'
       react-dom: '>=19.2.7'
     peerDependenciesMeta:
@@ -3493,8 +3498,9 @@ snapshots:
 
   '@oxlint/plugins@1.79.0': {}
 
-  '@phosphor-icons/react@2.1.10(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+  '@phosphor-icons/react@2.1.10(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
     dependencies:
+      '@types/react': 19.3.0
       react: 19.3.0
       react-dom: 19.3.0(react@19.3.0)
 
@@ -5344,9 +5350,11 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  react-router@8.4.0(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
+  react-router@8.4.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
     dependencies:
       '@remix-run/route-pattern': 0.22.1
+      '@types/react': 19.3.0
+      '@types/react-dom': 19.3.0(@types/react@19.3.0)
       cookie-es: 3.1.1
       react: 19.3.0
     optionalDependencies:

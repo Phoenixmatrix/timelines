@@ -1,9 +1,11 @@
 //! What gm remembers beside git's own refs, and the operation log that makes
 //! every command undoable.
 //!
-//! Lives in `.git/gm/`: `view.json` (the current view), `ops.jsonl` (one
-//! operation per line, newest last) and `index` (gm's stat cache for
-//! snapshotting the working copy).
+//! Lives in the worktree's git administrative directory under `gm/`:
+//! `view.json` (the current view), `ops.jsonl` (one operation per line,
+//! newest last) and `index` (gm's private stat cache). Shared branches are
+//! serialized by the common repository lock; shared refs under
+//! `refs/gm/worktrees/` retain each worktree's recorded views for native git GC.
 
 use super::super::output::Result;
 use serde::{Deserialize, Serialize};
@@ -12,7 +14,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Everything an operation can change. Restoring a view restores the repo.
+/// Local operation state plus the shared bookmarks observed at that time.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct View {
     /// The working-copy commit (`@`).

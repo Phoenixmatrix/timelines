@@ -59,6 +59,9 @@ pub const COMMANDS: &[Meta] = &[
     meta!("bookmark delete", git: "git branch -D / git push --delete", kw: "delete remove branch", mutates: true, out: OP, ex: ["gm bookmark delete feature-x", "gm bookmark delete feature-x --remote"]),
     meta!("file show", git: "git show <rev>:<path>", kw: "cat read print file contents at revision", mutates: false, out: Out::Typed(schema_of::<crate::commands::local::FileShow>), ex: ["gm file show src/main.rs -r trunk"]),
     meta!("file list", git: "git ls-tree -r --name-only", kw: "ls files tree list paths", mutates: false, out: Out::Typed(schema_of::<crate::commands::local::FileList>), ex: ["gm file list", "gm file list src -r trunk"]),
+    meta!("worktree add", git: "git worktree add --detach", kw: "parallel agent isolated checkout workspace create worktree include env ignored setup", mutates: true, out: Out::Typed(schema_of::<crate::commands::worktree::WorktreeResult>), ex: ["gm worktree add ../feature", "gm worktree add ../feature -r trunk --include"]),
+    meta!("worktree list", git: "git worktree list", kw: "worktrees workspaces checkouts list parallel", mutates: false, out: Out::Typed(schema_of::<crate::commands::worktree::WorktreeResult>), ex: ["gm worktree list"]),
+    meta!("worktree remove", git: "git worktree remove", kw: "worktree workspace checkout delete remove cleanup", mutates: true, out: Out::Typed(schema_of::<crate::commands::worktree::WorktreeResult>), ex: ["gm worktree remove ../feature", "gm worktree remove ../feature --force"]),
     meta!("init", git: "git init (then adopt)", kw: "initialize start adopt existing repository setup", mutates: true, out: OP, ex: ["gm init"]),
     meta!("clone", git: "git clone", kw: "download copy checkout repository get code", mutates: true, out: Out::Typed(schema_of::<crate::commands::network::Cloned>), ex: ["gm clone orbit/engine", "gm clone orbit/engine ./engine"]),
     meta!("fetch", git: "git fetch", kw: "download remote update refresh get latest", mutates: true, out: Out::Other("{trunk:{before,after}|null,updated_refs:[name]}"), ex: ["gm fetch"]),
@@ -401,15 +404,15 @@ pub const GUIDE: &str = r#"# gm: working with Gitmatrix
 gm is change-based (like jj), not commit-and-stage based (like git).
 
 ## The model
-- Your files are always in a change called `@` (the working copy). Every gm
-  command snapshots the files on disk into `@` first. There is no staging
+- Your files are always in a change called `@` (the working copy). Workspace
+  commands snapshot the files on disk into `@` first. There is no staging
   area and nothing is ever "uncommitted".
 - Every change has a **change id** (letters k-z, e.g. `kxmqvtyl`) that stays
   the same when the change is rewritten. Commit ids (hex) change on every
   rewrite. Prefer change ids when you refer to changes.
 - Rewriting a change automatically rebases everything on top of it.
-- Every command is an operation; `gm undo` reverses the last one (repeat to go
-  further back). Experiment freely.
+- Workspace changes are operations; `gm undo` reverses the last one (repeat
+  to go further back). Worktree creation/removal is not undoable.
 - `trunk` is the server's main line. Changes in trunk are immutable.
 - There are no pull requests. `gm push` lands your changes on trunk.
 
@@ -439,6 +442,21 @@ Ranges for `gm log -r`: `trunk..@`, `all`.
 - `gm rebase -d trunk` · `gm backout -r <rev>` (revert) · `gm duplicate <rev>` (cherry-pick)
 - `gm sync` (pull --rebase) · `gm push` (land on trunk) · `gm push -b name` (push a bookmark)
 - `gm undo` · `gm op log`
+
+## Worktrees
+    gm worktree add ../feature --include  # isolated @ on the current snapshot
+    gm worktree add ../clean -r trunk     # start from trunk instead
+    gm -C ../feature status
+    gm worktree list
+    gm worktree remove ../feature
+Each worktree has its own files, @ and undo log; objects and bookmarks are shared.
+`--include` copies ignored, untracked regular files matching the source root's
+`.worktreeinclude` (gitignore syntax). Symlinks/overwrites are rejected. Run
+dependency installation yourself in the new checkout; do not copy node_modules.
+`add --dry-run` previews the stored @ and include plan without snapshotting.
+Removal refuses dirty/ignored files unless --force, and always refuses locks,
+the main checkout and your current checkout. Recorded gm history is archived;
+unsnapshotted edits and ignored files are discarded with --force.
 
 ## CI
 Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,

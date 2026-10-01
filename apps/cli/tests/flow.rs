@@ -376,3 +376,126 @@ fn search_and_schema_describe_the_cli() {
     assert_eq!(schema["command"], "gm commit");
     assert!(schema["output"]["properties"]["working_copy"].is_object());
 }
+
+#[test]
+fn worktree_creation_snapshots_source_and_includes_only_when_requested() {
+    let s = Sandbox::new();
+    s.write(".gitignore", ".env\ncache/\n");
+    s.write(
+        ".worktreeinclude",
+        ".env\ncache/\n!cache/private\nREADME.md\n",
+    );
+    s.write(".env", "TOKEN=local\n");
+    s.write("cache/config", "ready\n");
+    s.write("cache/private", "do not copy\n");
+    s.write("pending.txt", "source edits\n");
+    let preview = s.ok(&["worktree", "add", "../preview", "--include", "--dry-run"]);
+    assert_eq!(preview["dry_run"], true);
+    assert!(!s.root.join("preview").exists());
+    let added = s.ok(&["worktree", "add", "../with spaces", "--include"]);
+    let target = s.root.join("with spaces");
+    assert_eq!(
+        fs::read_to_string(target.join("pending.txt")).unwrap(),
+        "source edits\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join(".env")).unwrap(),
+        "TOKEN=local\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("cache/config")).unwrap(),
+        "ready\n"
+    );
+    assert!(!target.join("cache/private").exists());
+    assert_eq!(
+        added["copied_files"],
+        serde_json::json!([".env", "cache/config"])
+    );
+    let status = s.ok(&["-C", target.to_str().unwrap(), "status"]);
+    assert_eq!(status["working_copy"]["empty"], true);
+    s.ok(&["worktree", "add", "../without"]);
+    assert!(!s.root.join("without/.env").exists());
+    let list = s.ok(&["-C", target.to_str().unwrap(), "worktree", "list"]);
+    let paths: Vec<_> = list["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["path"].as_str().unwrap(), w["current"].as_bool().unwrap()))
+        .collect();
+    assert!(paths.contains(&(target.to_str().unwrap(), true)));
+    assert!(paths.contains(&(s.work().to_str().unwrap(), false)));
+}
+
+#[test]
+fn worktree_removal_requires_consent_and_retains_snapshotted_history() {
+    let s = Sandbox::new();
+    s.ok(&["worktree", "add", "../side"]);
+    let side = s.root.join("side");
+    fs::write(side.join("only-here"), "keep in history\n").unwrap();
+    let side_path = side.to_str().unwrap();
+    let committed = s.ok(&["-C", side_path, "commit", "-m", "Side work"]);
+    let wc = committed["working_copy"]["commit_id"].as_str().unwrap();
+    fs::write(side.join("untracked"), "not snapshotted\n").unwrap();
+    assert_eq!(
+        s.err(&["worktree", "remove", "../side"]).1,
+        "worktree_dirty"
+    );
+    assert_eq!(
+        s.err(&["-C", side_path, "worktree", "remove", "."]).1,
+        "invalid_argument"
+    );
+    git(&s.work(), &["worktree", "lock", side_path]);
+    assert_eq!(
+        s.err(&["worktree", "remove", "../side", "--force"]).1,
+        "worktree_locked"
+    );
+    git(&s.work(), &["worktree", "unlock", side_path]);
+    s.ok(&["worktree", "remove", "../side", "--force", "--dry-run"]);
+    assert!(side.exists());
+    let removed = s.ok(&["worktree", "remove", "../side", "--force"]);
+    assert!(!side.exists());
+    let archive = Path::new(removed["recovery_path"].as_str().unwrap());
+    let view: Value =
+        serde_json::from_slice(&fs::read(archive.join("view.json")).unwrap()).unwrap();
+    assert!(view["wc"].as_str().unwrap().starts_with(wc));
+    git(&s.work(), &["reflog", "expire", "--expire=now", "--all"]);
+    git(&s.work(), &["gc", "--prune=now"]);
+    let repo = git2::Repository::open(s.work()).unwrap();
+    let saved = repo
+        .find_commit(git2::Oid::from_str(view["wc"].as_str().unwrap()).unwrap())
+        .unwrap();
+    let tree = saved.tree().unwrap();
+    let blob = repo
+        .find_blob(tree.get_name("only-here").unwrap().id())
+        .unwrap();
+    assert_eq!(blob.content(), b"keep in history\n");
+}
+
+#[test]
+fn worktree_add_failure_keeps_existing_files_and_dry_run_keeps_state() {
+    let s = Sandbox::new();
+    let before = fs::read(s.work().join(".git/gm/view.json")).unwrap();
+    s.write("pending", "not yet snapshotted\n");
+    s.ok(&["worktree", "add", "../preview", "-r", "trunk", "--dry-run"]);
+    assert_eq!(
+        fs::read(s.work().join(".git/gm/view.json")).unwrap(),
+        before
+    );
+    assert!(!s.root.join("preview").exists());
+    assert_eq!(
+        s.err(&["worktree", "add", "../invalid", "-r", "zzzzzzzz"])
+            .1,
+        "revision_not_found"
+    );
+    assert!(!s.root.join("invalid").exists());
+    fs::create_dir(s.root.join("occupied")).unwrap();
+    fs::write(s.root.join("occupied/keep"), "untouched\n").unwrap();
+    assert_eq!(
+        s.err(&["worktree", "add", "../occupied"]).1,
+        "directory_not_empty"
+    );
+    assert_eq!(
+        fs::read_to_string(s.root.join("occupied/keep")).unwrap(),
+        "untouched\n"
+    );
+}

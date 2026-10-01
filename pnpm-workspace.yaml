@@ -3,6 +3,19 @@ packages:
   - packages/*
   - tools/*
 
+virtualStoreType: global
+
+# These declarations import React types but omit the type peer dependencies.
+# A global store cannot fall back to a checkout's hoisted @types directory.
+packageExtensions:
+  "@phosphor-icons/react@2.1.10":
+    peerDependencies:
+      "@types/react": "^19"
+  "react-router@8.4.0":
+    peerDependencies:
+      "@types/react": "^19"
+      "@types/react-dom": "^19"
+
 catalogMode: prefer
 
 catalog:
