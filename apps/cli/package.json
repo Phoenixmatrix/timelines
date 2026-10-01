@@ -1,0 +1,12 @@
+{
+  "name": "cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "gm, the Gitmatrix CLI (Rust). Scripts wrap cargo so `vp run -r` covers it.",
+  "scripts": {
+    "build": "cargo build --release",
+    "test": "cargo test",
+    "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings",
+    "install-bin": "cargo install --path . --locked"
+  }
+}

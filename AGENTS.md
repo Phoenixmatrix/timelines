@@ -25,3 +25,19 @@ release. Add a tool name to select part of the graph. For example, run
 - [ ] If setup, runtime, or package-manager behavior looks wrong, run `vp env doctor` and include its output when asking for help.
 
 <!--VITE PLUS END-->
+
+# Version control in this repo
+
+Two different jobs, two different tools:
+
+- **Committing this project (the Gitmatrix source code) to GitHub: use `git` and `gh`.**
+  Commits, branches, pushes and pull requests for this repository go through
+  the standard git CLI and the GitHub CLI. Don't run `gm init` in this checkout
+  and don't use `gm` to commit or push it.
+- **Testing Gitmatrix itself: use `gm`** (`apps/cli`, installed with
+  `pnpm --filter cli run install-bin`). When exercising the product (cloning
+  Gitmatrix-hosted repos, committing, pushing, checking permissions as
+  different personas), drive it with `gm` against the local dev server
+  (`vp dev` in `apps/website`). Work in throwaway clones outside this
+  checkout, such as a temp directory. Run `gm cli guide` once for the workflow,
+  and `gm cli search "<task>"` to find commands.

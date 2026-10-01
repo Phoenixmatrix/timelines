@@ -1,0 +1,411 @@
+//! The command-line surface. Descriptions here feed `--help`, `gm cli search`
+//! and `gm schema`, so they are written for agents as much as for people.
+
+use crate::output::Format;
+use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "gm",
+    version,
+    about = "gm: the Gitmatrix CLI. Change-based version control for agents and people.",
+    long_about = None,
+    disable_help_subcommand = true,
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+    #[command(flatten)]
+    pub global: Global,
+}
+
+#[derive(Args, Clone)]
+pub struct Global {
+    /// Output format. Defaults to json for agents and pipes, text at a terminal.
+    #[arg(short = 'o', long, global = true, value_enum)]
+    pub output: Option<Format>,
+    /// Show what a mutating command would do without changing anything.
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+    /// Run as if gm was started in this directory.
+    #[arg(short = 'C', long = "cwd", global = true, value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Show the working-copy change, its files and where it sits relative to trunk
+    #[command(visible_alias = "st")]
+    Status,
+    /// List changes: your unpushed work and the trunk commit it builds on
+    Log(LogArgs),
+    /// Show one change: its description and diff
+    Show(ShowArgs),
+    /// Show the diff of a change (default: the working copy) or between two revisions
+    Diff(DiffArgs),
+    /// Set the description (commit message) of a change, by default the working copy
+    #[command(visible_alias = "desc")]
+    Describe(DescribeArgs),
+    /// Start a new empty change on top of one or more revisions (several = a merge)
+    New(NewArgs),
+    /// Describe the working-copy change and start a new one on top: the "save my work" step
+    #[command(visible_alias = "ci")]
+    Commit(CommitArgs),
+    /// Move a change's edits into another change (default: the working copy into its parent)
+    Squash(SquashArgs),
+    /// Split selected files out of a change into a new change before it
+    Split(SplitArgs),
+    /// Make an existing change the working copy, to keep editing it in place
+    Edit(EditArgs),
+    /// Drop changes; their descendants are rebased onto their parents
+    Abandon(AbandonArgs),
+    /// Discard edits: restore files from another revision (default: the parent)
+    Restore(RestoreArgs),
+    /// Move changes (and their descendants) onto another revision
+    Rebase(RebaseArgs),
+    /// Add a change that reverses another change, just below the working copy
+    Backout(BackoutArgs),
+    /// Copy a change (cherry-pick); by default insert the copy below the working copy
+    Duplicate(DuplicateArgs),
+    /// Undo the last operation; repeat to go further back
+    Undo,
+    /// Inspect or restore the operation log
+    #[command(subcommand)]
+    Op(OpCommand),
+    /// Named pointers to changes (git branches)
+    #[command(subcommand, visible_alias = "b")]
+    Bookmark(BookmarkCommand),
+    /// Read files at any revision without touching the working copy
+    #[command(subcommand)]
+    File(FileCommand),
+    /// Start using gm in the current git repository
+    Init,
+    /// Clone a Gitmatrix repository and set it up for gm
+    Clone(CloneArgs),
+    /// Download new commits from Gitmatrix without changing your changes
+    Fetch,
+    /// Fetch, then rebase your changes onto the new trunk
+    #[command(visible_alias = "pull")]
+    Sync,
+    /// Land changes on trunk (or a bookmark) on Gitmatrix. There are no pull requests.
+    Push(PushArgs),
+    /// Sign in to a Gitmatrix server
+    #[command(subcommand)]
+    Auth(AuthCommand),
+    /// Manage repositories on the Gitmatrix server
+    #[command(subcommand)]
+    Repo(RepoCommand),
+    /// Call the Gitmatrix JSON API directly
+    Api(ApiArgs),
+    /// Discover commands: search, workflow guide, full manifest
+    #[command(subcommand)]
+    Cli(CliCommand),
+    /// Exact inputs and JSON output shape of a command
+    Schema(SchemaArgs),
+}
+
+#[derive(Args)]
+pub struct LogArgs {
+    /// Revision or range: `@`, a change id, `A..B`, or `all`. Default: your mutable changes plus trunk.
+    #[arg(short, long)]
+    pub revisions: Option<String>,
+    /// Maximum number of changes.
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct ShowArgs {
+    /// Revision to show.
+    #[arg(default_value = "@")]
+    pub revision: String,
+    /// Only list files and line counts.
+    #[arg(long)]
+    pub stat: bool,
+}
+
+#[derive(Args)]
+pub struct DiffArgs {
+    /// Change to diff against its parent.
+    #[arg(short, long, conflicts_with_all = ["from", "to"])]
+    pub revision: Option<String>,
+    /// Diff from this revision (with --to).
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Diff to this revision (default `@`).
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Only list files and line counts.
+    #[arg(long)]
+    pub stat: bool,
+    /// Limit to these paths.
+    pub paths: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct DescribeArgs {
+    /// Change to describe.
+    #[arg(default_value = "@")]
+    pub revision: String,
+    /// The description. Several -m flags become paragraphs.
+    #[arg(short, long, required = true)]
+    pub message: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct NewArgs {
+    /// Parent revisions (default `@`). Two or more make a merge.
+    pub revisions: Vec<String>,
+    /// Description for the new change.
+    #[arg(short, long)]
+    pub message: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct CommitArgs {
+    /// Description for the change being committed (the current working copy).
+    #[arg(short, long, required = true)]
+    pub message: Vec<String>,
+    /// Commit only these paths; the rest stays in the new working copy.
+    pub paths: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct SquashArgs {
+    /// Change to take edits from.
+    #[arg(short, long, default_value = "@")]
+    pub revision: String,
+    /// Change to put them into (default: the parent of --revision).
+    #[arg(long, visible_alias = "to")]
+    pub into: Option<String>,
+    /// New description for the destination.
+    #[arg(short, long)]
+    pub message: Vec<String>,
+    /// Move only these paths.
+    pub paths: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct SplitArgs {
+    /// Change to split.
+    #[arg(short, long, default_value = "@")]
+    pub revision: String,
+    /// Description for the new change holding the selected paths.
+    #[arg(short, long, required = true)]
+    pub message: Vec<String>,
+    /// Paths to split out.
+    #[arg(required = true)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct EditArgs {
+    /// Change to edit.
+    pub revision: String,
+}
+
+#[derive(Args)]
+pub struct AbandonArgs {
+    /// Changes to drop (default `@`).
+    pub revisions: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    /// Take file contents from this revision (default: the parent of --into).
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Change to restore files in.
+    #[arg(long, visible_alias = "to", default_value = "@")]
+    pub into: String,
+    /// Paths to restore (default: everything).
+    pub paths: Vec<String>,
+}
+
+#[derive(Args)]
+#[group(id = "what", multiple = false)]
+pub struct RebaseArgs {
+    /// Rebase this change and its descendants.
+    #[arg(short, long, group = "what")]
+    pub source: Option<String>,
+    /// Rebase only this change; its descendants stay where they are.
+    #[arg(short, long, group = "what")]
+    pub revision: Option<String>,
+    /// Rebase the whole stack containing this change (default `@`).
+    #[arg(short, long, group = "what")]
+    pub branch: Option<String>,
+    /// Destination (default `trunk`).
+    #[arg(short, long, default_value = "trunk")]
+    pub destination: String,
+}
+
+#[derive(Args)]
+pub struct BackoutArgs {
+    /// Change to reverse.
+    #[arg(short, long)]
+    pub revision: String,
+}
+
+#[derive(Args)]
+pub struct DuplicateArgs {
+    /// Change to copy.
+    pub revision: String,
+    /// Put the copy on top of this revision instead of below the working copy.
+    #[arg(short, long)]
+    pub destination: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum OpCommand {
+    /// List recent operations, newest first
+    Log {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Put the repository back to how it was right after an operation
+    Restore {
+        /// Operation id from `gm op log`.
+        operation: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BookmarkCommand {
+    /// List local bookmarks and their remote counterparts
+    List,
+    /// Create or move a bookmark
+    Set {
+        name: String,
+        /// Revision to point at.
+        #[arg(short, long, default_value = "@")]
+        revision: String,
+    },
+    /// Delete a bookmark
+    Delete {
+        name: String,
+        /// Also delete it on the server.
+        #[arg(long)]
+        remote: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FileCommand {
+    /// Print a file's contents at a revision
+    Show {
+        path: String,
+        #[arg(short, long, default_value = "@")]
+        revision: String,
+    },
+    /// List files at a revision
+    List {
+        /// Only under this directory.
+        path: Option<String>,
+        #[arg(short, long, default_value = "@")]
+        revision: String,
+    },
+}
+
+#[derive(Args)]
+pub struct CloneArgs {
+    /// Repository as owner/name.
+    pub repository: String,
+    /// Directory to clone into (default: the repository name).
+    pub directory: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct PushArgs {
+    /// Change to push (default `@`, or `@-` when `@` is empty). Its ancestors go too.
+    #[arg(short, long)]
+    pub revision: Option<String>,
+    /// Push to this bookmark instead of trunk, creating or moving it.
+    #[arg(short, long)]
+    pub bookmark: Option<String>,
+    /// Fetch and rebase onto the latest trunk first.
+    #[arg(long)]
+    pub sync: bool,
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Sign in with a token, or as a dev persona (no secret needed in dev)
+    Login {
+        /// Dev persona to mint a token for (priya, marco, jun, sam).
+        #[arg(long, conflicts_with = "token")]
+        persona: Option<String>,
+        /// Existing personal access token (gmx_…).
+        #[arg(long)]
+        token: Option<String>,
+        /// Server URL.
+        #[arg(long, env = "GM_SERVER")]
+        server: Option<String>,
+    },
+    /// Show who you are signed in as
+    Status,
+    /// Forget the stored token
+    Logout,
+}
+
+#[derive(Subcommand)]
+pub enum RepoCommand {
+    /// List repositories you can read
+    List,
+    /// Create a repository, empty or imported from a public Git URL
+    Create {
+        /// Repository name.
+        name: String,
+        /// Owner (you, or an org you belong to). Default: you.
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// Make it public (default private).
+        #[arg(long)]
+        public: bool,
+        /// Import from this public https:// Git URL.
+        #[arg(long)]
+        import: Option<String>,
+    },
+    /// Show a repository with its branches (default: the current one)
+    View { repository: Option<String> },
+    /// Delete a repository on the server, permanently
+    Delete {
+        repository: String,
+        /// Required: confirms the deletion.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Args)]
+pub struct ApiArgs {
+    /// HTTP method.
+    pub method: String,
+    /// Path under /api, e.g. /repos.
+    pub path: String,
+    /// JSON request body.
+    #[arg(short, long)]
+    pub data: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum CliCommand {
+    /// Find commands by describing what you want to do
+    Search {
+        /// What you want to do, in plain words.
+        query: Vec<String>,
+    },
+    /// The gm workflow in one page, for agents and AGENTS.md
+    Guide,
+    /// Every command with its arguments, as JSON
+    Commands,
+}
+
+#[derive(Args)]
+pub struct SchemaArgs {
+    /// Command path, e.g. `push` or `bookmark set`.
+    #[arg(required = true)]
+    pub command: Vec<String>,
+}
