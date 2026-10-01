@@ -865,7 +865,10 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
             .into_iter()
             .flatten()
             .map(|(key, value)| {
-                let value = value.as_str().unwrap_or("").replace(CONFIG_PLACEHOLDER, &tools);
+                let value = value
+                    .as_str()
+                    .unwrap_or("")
+                    .replace(CONFIG_PLACEHOLDER, &tools);
                 (key.clone(), Value::String(value))
             })
             .collect();

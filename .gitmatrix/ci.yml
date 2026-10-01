@@ -1,8 +1,9 @@
-# CI for Gitmatrix, run by Gitmatrix (apps/website/worker/ci). Locally, start
-# `gm runner` next to `vp dev`; deployed, each job runs in a Cloudflare Sandbox.
+# CI for Gitmatrix, run by Gitmatrix (apps/website/worker/ci): the quality
+# gates every push must pass. Locally, start `gm runner` next to `vp dev`;
+# deployed, each job runs in a Cloudflare Sandbox. Gitmatrix is the source of
+# truth; GitHub is only a mirror (Settings → Mirror) and runs nothing.
 on:
-  push:
-    branches: [main]
+  push: {}
 
 jobs:
   check:
@@ -14,11 +15,16 @@ jobs:
         run: vp run website#cf-typegen
       - name: Format, lint, type check
         run: vp check
+      - name: Format and lint gm
+        run: vp run cli#check
 
   test:
+    timeout_minutes: 30
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
+      - name: Generate Worker types
+        run: vp run website#cf-typegen
       - name: Tests (web and gm)
         run: vp run -r test
 

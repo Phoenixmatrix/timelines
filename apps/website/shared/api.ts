@@ -353,3 +353,29 @@ export interface CiJobReport {
   steps?: { position: number; status: CiStepStatus; exitCode?: number | null }[];
   done?: { status: "succeeded" | "failed" | "cancelled"; exitCode?: number | null; error?: string };
 }
+
+/** A repository's one-way mirror to another git host (a GitHub backup). */
+export interface RepoMirror {
+  /** HTTPS clone URL of the target. */
+  url: string;
+  username: string;
+  /** The token is write-only; this says whether one is stored. */
+  hasToken: boolean;
+  enabled: boolean;
+  /** Delete target branches and tags that no longer exist here. */
+  prune: boolean;
+  status: "pending" | "syncing" | "ok" | "failed";
+  lastError: string | null;
+  lastAttemptAt: string | null;
+  lastSyncedAt: string | null;
+  lastSyncedCommit: string | null;
+}
+
+export interface UpdateMirrorRequest {
+  url?: string;
+  username?: string;
+  /** Omit to keep the stored token. */
+  token?: string;
+  enabled?: boolean;
+  prune?: boolean;
+}

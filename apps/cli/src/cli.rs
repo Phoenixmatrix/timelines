@@ -450,6 +450,51 @@ pub enum RepoCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Push every push on to another git host (a one-way backup, e.g. GitHub)
+    #[command(subcommand)]
+    Mirror(MirrorCommand),
+}
+
+#[derive(Subcommand)]
+pub enum MirrorCommand {
+    /// The repository's mirror and how its last sync went
+    Show {
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Create or change the mirror; the token comes from --token-stdin
+    Set {
+        /// HTTPS clone URL to push to, e.g. https://github.com/owner/name.git
+        url: Option<String>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+        /// Read a token with push access from stdin (kept if omitted).
+        #[arg(long)]
+        token_stdin: bool,
+        /// Username sent with the token (GitHub accepts any).
+        #[arg(long)]
+        username: Option<String>,
+        /// Also delete branches and tags on the target that are gone here.
+        #[arg(long, overrides_with = "no_prune")]
+        prune: bool,
+        #[arg(long)]
+        no_prune: bool,
+        /// Pause mirroring without forgetting the settings.
+        #[arg(long, overrides_with = "enable")]
+        disable: bool,
+        #[arg(long)]
+        enable: bool,
+    },
+    /// Sync now and wait for the result
+    Sync {
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Stop mirroring (the target keeps what it has)
+    Remove {
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

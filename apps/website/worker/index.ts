@@ -8,6 +8,8 @@ import { sessionActor, tokenCredential, type AppEnv } from "./auth.ts";
 import { isArtifactsError } from "./artifacts.ts";
 import { sqlNow } from "./db.ts";
 import { ci, runner } from "./ci/api.ts";
+import { mirrors } from "./mirror/api.ts";
+import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { gitHttp } from "./git/http.ts";
 import { knowledge } from "./knowledge/api.ts";
 import { db } from "./schema.ts";
@@ -52,6 +54,7 @@ api.route("/repos/:owner/:name/knowledge", knowledge);
 api.route("/repos/:owner/:name/ci", ci);
 api.route("/ci/runner", runner);
 api.route("/repos", repos);
+api.route("/repos", mirrors);
 api.route("/tokens", tokens);
 api.route("/ssh-keys", sshKeys);
 api.route("/auth/ssh", sshAuth);
@@ -81,9 +84,18 @@ app.route("/", gitHttp);
 
 export default {
   fetch: app.fetch,
-  /** Registry work queued off the request path: index rebuilds, retention, GC. */
+  /**
+   * Work queued off the request path: repository mirrors (gitmatrix-jobs),
+   * and registry index rebuilds, retention and GC (gitmatrix-registry-jobs).
+   */
   async queue(batch, env) {
-    for (const message of batch.messages) {
+    if (batch.queue === "gitmatrix-jobs") {
+      for (const message of batch.messages) {
+        await runMirrorJob(env, message as Message<MirrorJob>);
+      }
+      return;
+    }
+    for (const message of batch.messages as readonly Message<Job>[]) {
       try {
         await runJob(env, message.body);
         message.ack();
@@ -96,7 +108,7 @@ export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduleSweeps(env));
   },
-} satisfies ExportedHandler<Env, Job>;
+} satisfies ExportedHandler<Env, Job | MirrorJob>;
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
 export { CiRun } from "./ci/workflow.ts";

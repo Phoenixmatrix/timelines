@@ -30,10 +30,16 @@ release. Add a tool name to select part of the graph. For example, run
 
 Two different jobs, two different tools:
 
-- **Committing this project (the Gitmatrix source code) to GitHub: use `git` and `gh`.**
-  Commits, branches, pushes and pull requests for this repository go through
-  the standard git CLI and the GitHub CLI. Don't run `gm init` in this checkout
-  and don't use `gm` to commit or push it.
+- **This project's source of truth is Gitmatrix; commit and push it with `git`.**
+  The `gitmatrix` remote (`orbit/gitmatrix` on the dev server) is where
+  changes land: `git push gitmatrix main`. Every push there runs the quality
+  gates in `.gitmatrix/ci.yml` (check, test, build) and is mirrored on to
+  GitHub (`origin`) as a backup, one way. Don't push to GitHub directly: the
+  mirror overwrites it. Use `gh` only to read GitHub. Don't run `gm init` in
+  this checkout and don't use `gm` to commit or push it.
+- **Before pushing, run the gates locally** (`vp check`, `vp test`, and
+  `vp run cli#check` for gm), then confirm the pushed run with
+  `gm runs wait -R orbit/gitmatrix`.
 - **Testing Gitmatrix itself: use `gm`** (`apps/cli`, installed with
   `pnpm --filter cli run install-bin`). When exercising the product (cloning
   Gitmatrix-hosted repos, committing, pushing, checking permissions as

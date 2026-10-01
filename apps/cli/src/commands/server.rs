@@ -1,11 +1,12 @@
 //! Commands for the Gitmatrix server itself: sign-in, repositories, raw API.
 
 use super::Ctx;
-use crate::cli::{AuthCommand, RepoCommand};
+use crate::cli::{AuthCommand, MirrorCommand, RepoCommand};
 use crate::model::Json;
 use crate::output::{GmError, Result, exit};
 use crate::remote::{self, Config};
 use serde_json::{Value, json};
+use std::io::Read;
 
 pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
     let mut config = Config::load();
@@ -319,6 +320,7 @@ pub fn repo(ctx: &Ctx, command: &RepoCommand) -> Result<Json> {
             created["clone"] = json!(format!("gm clone {owner}/{name}"));
             Ok(Json(created))
         }
+        RepoCommand::Mirror(command) => mirror(ctx, &config, command),
         RepoCommand::View { repository } => {
             let repository = match repository {
                 Some(r) => r.clone(),
@@ -374,4 +376,90 @@ pub fn api(ctx: &Ctx, method: &str, path: &str, data: Option<&str>) -> Result<Js
         ));
     }
     Ok(Json(remote::api(&config, method, &path, body.as_ref())?))
+}
+
+fn mirror(ctx: &Ctx, config: &Config, command: &MirrorCommand) -> Result<Json> {
+    let repo_of = |repo: &Option<String>| match repo {
+        Some(r) => Ok(r.clone()),
+        None => current_repo(ctx),
+    };
+    match command {
+        MirrorCommand::Show { repo } => {
+            let repo = repo_of(repo)?;
+            Ok(Json(remote::api(
+                config,
+                "GET",
+                &format!("/repos/{repo}/mirror"),
+                None,
+            )?))
+        }
+        MirrorCommand::Set {
+            url,
+            repo,
+            token_stdin,
+            username,
+            prune,
+            no_prune,
+            disable,
+            enable,
+        } => {
+            let repo = repo_of(repo)?;
+            let mut body = serde_json::Map::new();
+            if let Some(url) = url {
+                body.insert("url".into(), json!(url));
+            }
+            if let Some(username) = username {
+                body.insert("username".into(), json!(username));
+            }
+            if *prune || *no_prune {
+                body.insert("prune".into(), json!(*prune));
+            }
+            if *disable || *enable {
+                body.insert("enabled".into(), json!(*enable));
+            }
+            if *token_stdin {
+                let mut token = String::new();
+                std::io::stdin().read_to_string(&mut token)?;
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err(GmError::usage(
+                        "--token-stdin read nothing; pipe the token in.",
+                    ));
+                }
+                body.insert("token".into(), json!(token));
+            }
+            if ctx.dry_run {
+                body.remove("token");
+                return Ok(Json(
+                    json!({ "dry_run": true, "repo": repo, "request": body }),
+                ));
+            }
+            Ok(Json(remote::api(
+                config,
+                "PUT",
+                &format!("/repos/{repo}/mirror"),
+                Some(&serde_json::Value::Object(body)),
+            )?))
+        }
+        MirrorCommand::Sync { repo } => {
+            let repo = repo_of(repo)?;
+            if ctx.dry_run {
+                return Ok(Json(json!({ "dry_run": true, "sync": repo })));
+            }
+            Ok(Json(remote::api(
+                config,
+                "POST",
+                &format!("/repos/{repo}/mirror/sync"),
+                None,
+            )?))
+        }
+        MirrorCommand::Remove { repo } => {
+            let repo = repo_of(repo)?;
+            if ctx.dry_run {
+                return Ok(Json(json!({ "dry_run": true, "remove": repo })));
+            }
+            remote::api(config, "DELETE", &format!("/repos/{repo}/mirror"), None)?;
+            Ok(Json(json!({ "removed": repo })))
+        }
+    }
 }

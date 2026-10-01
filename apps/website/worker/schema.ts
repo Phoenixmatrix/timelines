@@ -245,6 +245,22 @@ export interface Database {
     value: string;
     updated_at: Generated<string>;
   };
+  repo_mirrors: {
+    repo_id: string;
+    url: string;
+    username: Generated<string>;
+    token_sealed: string | null;
+    enabled: Generated<number>;
+    prune: Generated<number>;
+    status: Generated<"pending" | "syncing" | "ok" | "failed">;
+    last_error: string | null;
+    last_attempt_at: string | null;
+    last_synced_at: string | null;
+    last_synced_commit: string | null;
+    lease_until: string | null;
+    created_at: Generated<string>;
+    updated_at: Generated<string>;
+  };
   ci_job_tokens: {
     token_hash: string;
     job_id: string;

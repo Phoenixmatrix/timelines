@@ -311,6 +311,32 @@ db:migrate` applies both databases' migrations. Account slugs must not take
 the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
 `helm`, `apt`, `rpm`, `brew`, `generic`, `releases`) or `-`.
 
+## Mirrors
+
+A repository can mirror every push on to another git host: Settings → Mirror,
+`gm repo mirror set <url> --token-stdin`, or `PUT /api/repos/:o/:n/mirror`.
+Gitmatrix's own repository mirrors to GitHub this way, as a backup.
+
+```
+push ─▶ git proxy ─▶ queueMirror ─▶ JOBS queue (gitmatrix-jobs) ─▶ syncMirror
+syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
+            ─▶ fetch exactly the missing objects from Artifacts (v2 fetch, haves = target tips)
+            ─▶ stream that pack into the target's receive-pack ─▶ report-status
+```
+
+- **One way, and safe by default.** Branches and tags are pushed (force, so
+  rewinds follow); anything pushed to the target directly is overwritten.
+  Refs that disappear here stay on the target unless pruning is on, so a
+  backup never loses data on its own.
+- **Off the push path.** A push enqueues its repository; the consumer syncs
+  it and retries failures with exponential backoff. A lease in `repo_mirrors`
+  keeps one sync per repository at a time, and every sync converges on the
+  current refs, so duplicate or late messages are harmless. Status, the last
+  error and the last synced commit show in Settings and `gm repo mirror show`.
+- **No git binary.** Workers can't run git, so `worker/mirror/` speaks the
+  protocol: the pack streams from Artifacts to the target without buffering.
+- The token (push access on the target) is sealed with `REGISTRY_KEK`.
+
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack)

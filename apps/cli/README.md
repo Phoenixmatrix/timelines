@@ -72,7 +72,7 @@ The design follows Cloudflare's agent-first `cf` CLI:
 | Bookmarks   | `bookmark list`, `bookmark set`, `bookmark delete [--remote]`                                                                             |
 | Remote      | `clone`, `init`, `fetch`, `sync` (pull), `push [--sync] [-b name]`                                                                        |
 | Worktrees   | `worktree add <path> [-r revision] [--include]`, `worktree list`, `worktree remove <path> [--force]`                                      |
-| Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `api`                                                                 |
+| Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `repo mirror show/set/sync/remove`, `api`                             |
 | SSH keys    | `auth ssh-key add/list/remove`, `auth git-credential` (git helper)                                                                        |
 | CI          | `runs list/show/logs/wait/start/cancel/rerun`, `runner`, `secret`                                                                         |
 | Packages    | `pkg list/show/versions`, `pkg delete/yank/restore/deprecate/tag`, `pkg sources/grant/revoke`, `pkg published`, `pkg upload`, `pkg setup` |

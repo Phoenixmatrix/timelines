@@ -2,6 +2,7 @@ import { Hono, type Context } from "hono";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { onPush } from "../ci/trigger.ts";
+import { queueMirror } from "../mirror/queue.ts";
 import { findRepo, roleFor, sqlNow } from "../db.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { invalidateRefs } from "../objects.ts";
@@ -121,6 +122,9 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
     invalidateRefs(repo.artifacts_name);
     c.executionCtx.waitUntil(notifyKnowledge(c.env, repo.id));
+    c.executionCtx.waitUntil(
+      queueMirror(c.env, repo.id).catch((error) => console.error("Mirror: enqueue failed", error)),
+    );
     c.executionCtx.waitUntil(
       onPush(c.env, repo, actor?.id ?? null, (work) => c.executionCtx.waitUntil(work)).catch(
         (error) => console.error("CI: push trigger failed", error),

@@ -10,7 +10,12 @@ import {
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
-import type { AccountSummary, Collaborator, CollaboratorRole } from "../../../shared/api.ts";
+import type {
+  AccountSummary,
+  Collaborator,
+  CollaboratorRole,
+  RepoMirror,
+} from "../../../shared/api.ts";
 import { RadioCards } from "../../components/Choice.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
 import {
@@ -18,20 +23,23 @@ import {
   ConfirmDialog,
   FormError,
   SelectField,
+  TextField,
   Tip,
   useToast,
 } from "../../components/ui.tsx";
-import { api, attempt, field, load } from "../../lib/api.ts";
+import { api, ApiError, attempt, field, load } from "../../lib/api.ts";
+import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { forgetRepoData } from "../../lib/repoData.ts";
 import { useRepo } from "./RepoLayout.tsx";
 
 export async function settingsLoader({ request, params }: LoaderFunctionArgs) {
   const base = `/repos/${params.owner}/${params.repo}`;
-  const [{ collaborators }, { users }] = await Promise.all([
+  const [{ collaborators }, { users }, { mirror }] = await Promise.all([
     load<{ collaborators: Collaborator[] }>(`${base}/collaborators`, request),
     load<{ users: AccountSummary[] }>("/users", request),
+    load<{ mirror: RepoMirror | null }>(`${base}/mirror`, request),
   ]);
-  return { collaborators, users };
+  return { collaborators, users, mirror };
 }
 
 export async function settingsAction({ request, params }: ActionFunctionArgs) {
@@ -173,8 +181,199 @@ function AddCollaborator({ users }: { users: AccountSummary[] }) {
   );
 }
 
+function Switch({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      className="mk-switch"
+      onClick={() => onChange(!checked)}
+    />
+  );
+}
+
+/** Every push here is pushed on to another git host: a one-way backup. */
+function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: string }) {
+  const [mirror, setMirror] = useState(initial);
+  const [url, setUrl] = useState(initial?.url ?? "");
+  const [username, setUsername] = useState(initial?.username ?? "x-access-token");
+  const [token, setToken] = useState("");
+  const [enabled, setEnabled] = useState(initial?.enabled ?? true);
+  const [prune, setPrune] = useState(initial?.prune ?? false);
+  const [busy, setBusy] = useState<"save" | "sync" | "remove" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
+
+  const run = async (kind: "save" | "sync" | "remove", work: () => Promise<void>) => {
+    setBusy(kind);
+    setError(null);
+    try {
+      await work();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "That didn't work.");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const save = () =>
+    run("save", async () => {
+      const result = await api<{ mirror: RepoMirror }>(`${base}/mirror`, {
+        method: "PUT",
+        json: { url, username, enabled, prune, ...(token ? { token } : {}) },
+      });
+      setMirror(result.mirror);
+      setUrl(result.mirror.url);
+      setToken("");
+      toast.add({ title: "Mirror saved", description: "The next push syncs it; or sync now." });
+    });
+  const sync = () =>
+    run("sync", async () => {
+      try {
+        const result = await api<{ message: string; mirror: RepoMirror }>(`${base}/mirror/sync`, {
+          method: "POST",
+        });
+        setMirror(result.mirror);
+        toast.add({ title: result.message });
+      } finally {
+        const latest = await api<{ mirror: RepoMirror | null }>(`${base}/mirror`).catch(() => null);
+        if (latest) setMirror(latest.mirror);
+      }
+    });
+  const remove = () =>
+    run("remove", async () => {
+      await api(`${base}/mirror`, { method: "DELETE" });
+      setMirror(null);
+      setUrl("");
+      setToken("");
+      toast.add({ title: "Mirror removed", description: "The target keeps what it has." });
+    });
+
+  const status = !mirror
+    ? null
+    : mirror.status === "failed"
+      ? null
+      : mirror.lastSyncedAt
+        ? `Synced ${timeAgo(mirror.lastSyncedAt)}${
+            mirror.lastSyncedCommit ? ` at ${shortOid(mirror.lastSyncedCommit)}` : ""
+          }${mirror.status === "pending" || mirror.status === "syncing" ? "; a newer push is syncing" : ""}.`
+        : "Not synced yet. The next push syncs it.";
+
+  return (
+    <Card
+      title="Mirror"
+      description="Every push here is pushed on to another git host, so it always holds a backup. One way only: anything pushed there directly is overwritten."
+    >
+      <div className="mk-card-body">
+        <TextField
+          label="Push to"
+          type="url"
+          value={url}
+          onChange={(e) => setUrl(e.currentTarget.value)}
+          placeholder="https://github.com/owner/name.git"
+          autoComplete="off"
+        />
+        <div className="grid gap-5 sm:grid-cols-2">
+          <TextField
+            label="Username"
+            value={username}
+            onChange={(e) => setUsername(e.currentTarget.value)}
+            hint="GitHub accepts any name with a token."
+            autoComplete="off"
+          />
+          <TextField
+            label="Token"
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.currentTarget.value)}
+            placeholder={mirror?.hasToken ? "Stored; leave empty to keep it" : ""}
+            hint="Needs push access. Stored sealed, never shown again."
+            autoComplete="new-password"
+          />
+        </div>
+        <div className="flex flex-col gap-3">
+          <label className="flex items-center gap-3">
+            <Switch checked={enabled} onChange={setEnabled} label="Mirror every push" />
+            <span>Mirror every push</span>
+          </label>
+          <label className="flex items-start gap-3">
+            <Switch checked={prune} onChange={setPrune} label="Delete what's gone here" />
+            <span>
+              Delete what's gone here
+              <span className="block text-body-sm text-ink-faint">
+                Off: branches and tags deleted here stay on the target, so a backup never loses
+                anything.
+              </span>
+            </span>
+          </label>
+        </div>
+        {mirror?.status === "failed" && mirror.lastError ? (
+          <p className="mk-error m-0" role="alert">
+            Last sync failed{mirror.lastAttemptAt ? ` ${timeAgo(mirror.lastAttemptAt)}` : ""}:{" "}
+            {mirror.lastError}
+          </p>
+        ) : (
+          status && (
+            <p
+              className="m-0 text-body-sm text-ink-muted"
+              title={mirror?.lastSyncedAt ? fullDate(mirror.lastSyncedAt) : undefined}
+            >
+              {status}
+            </p>
+          )
+        )}
+        <FormError message={error} />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          {mirror && (
+            <ConfirmDialog
+              trigger={
+                <button type="button" className="mk-btn mk-btn--danger-ghost" disabled={!!busy}>
+                  Remove mirror…
+                </button>
+              }
+              title="Remove this mirror?"
+              description="Pushes stop going to the target. It keeps everything it already has."
+              confirmLabel="Remove mirror"
+              busy={busy === "remove"}
+              onConfirm={() => void remove()}
+            />
+          )}
+          <span className="flex-1" />
+          {mirror && (
+            <button
+              type="button"
+              className="mk-btn"
+              disabled={!!busy || !mirror.enabled}
+              onClick={() => void sync()}
+            >
+              {busy === "sync" ? "Syncing…" : "Sync now"}
+            </button>
+          )}
+          <button
+            type="button"
+            className="mk-btn"
+            disabled={!!busy || !url.trim() || (!token && !mirror?.hasToken)}
+            onClick={() => void save()}
+          >
+            {mirror ? "Save mirror" : "Add mirror"}
+          </button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 export function Settings() {
-  const { collaborators, users } = useLoaderData<typeof settingsLoader>();
+  const { collaborators, users, mirror } = useLoaderData<typeof settingsLoader>();
   const repo = useRepo();
   const actionData = useActionData<{ error?: string; saved?: boolean } | undefined>();
   const navigation = useNavigation();
@@ -260,6 +459,8 @@ export function Settings() {
           <AddCollaborator users={candidates} />
         </div>
       </Card>
+
+      <MirrorCard initial={mirror} base={`/repos/${repo.owner.slug}/${repo.name}`} />
 
       <Card
         title="Delete this repository"

@@ -309,7 +309,10 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
                 .find(|s| s["repo"].as_str() == Some(&wanted))
                 .and_then(|s| s["repoId"].as_str())
                 .ok_or_else(|| {
-                    GmError::not_found("not_a_source", format!("{wanted} isn't a source of {package}."))
+                    GmError::not_found(
+                        "not_a_source",
+                        format!("{wanted} isn't a source of {package}."),
+                    )
                 })?
                 .to_string();
             if ctx.dry_run {
@@ -403,7 +406,11 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
             }
             let path = format!(
                 "/generic/{owner}/{}",
-                parts.iter().map(|p| encode(p)).collect::<Vec<_>>().join("/")
+                parts
+                    .iter()
+                    .map(|p| encode(p))
+                    .collect::<Vec<_>>()
+                    .join("/")
             );
             let bytes = std::fs::read(file)?;
             if ctx.dry_run {
@@ -481,7 +488,10 @@ fn act(
                     ),
                     None,
                 )?;
-                format!("the versions among {} publishes matching `{q}`", page["total"])
+                format!(
+                    "the versions among {} publishes matching `{q}`",
+                    page["total"]
+                )
             }
             None => a.versions.join(", "),
         };
@@ -566,7 +576,10 @@ fn setup(ctx: &Ctx, config: &Config, o: &Option<String>, write: &[String]) -> Re
                     .map(|l| format!("{l}\n"))
                     .collect();
                 std::fs::write(&path, format!("{kept}{npmrc}"))?;
-                text.push_str(&format!("\nWrote the {owner} registry to {}.", path.display()));
+                text.push_str(&format!(
+                    "\nWrote the {owner} registry to {}.",
+                    path.display()
+                ));
             }
             "docker" => {
                 let mut child = Command::new("docker")
@@ -575,7 +588,9 @@ fn setup(ctx: &Ctx, config: &Config, o: &Option<String>, write: &[String]) -> Re
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .spawn()
-                    .map_err(|e| GmError::new("docker_missing", format!("Can't run docker: {e}")))?;
+                    .map_err(|e| {
+                        GmError::new("docker_missing", format!("Can't run docker: {e}"))
+                    })?;
                 child
                     .stdin
                     .take()

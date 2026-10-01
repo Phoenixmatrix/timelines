@@ -98,6 +98,8 @@ export default defineConfig(({ mode }) => {
           exportName: "RegistryLogin",
         }),
         REGISTRY_JOBS: bindings.queue({ name: "gitmatrix-registry-jobs" }),
+        // Repository work off the push path: mirrors to other git hosts.
+        JOBS: bindings.queue({ name: "gitmatrix-jobs" }),
         // Seals signing keys and upstream credentials, and seeds registry tokens.
         // Development uses a fixed public key; deployed, set the REGISTRY_KEK secret.
         ...(dev
@@ -109,6 +111,8 @@ export default defineConfig(({ mode }) => {
       },
       triggers: [
         triggers.queue({ name: "gitmatrix-registry-jobs", maxBatchSize: 10, maxRetries: 5 }),
+        // Mirror syncs back off exponentially (worker/mirror/queue.ts), up to ~2 hours.
+        triggers.queue({ name: "gitmatrix-jobs", maxBatchSize: 5, maxRetries: 12 }),
         // Package retention and garbage collection sweeps.
         triggers.scheduled({ schedule: "17 * * * *" }),
       ],
