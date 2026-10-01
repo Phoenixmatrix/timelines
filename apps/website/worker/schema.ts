@@ -270,16 +270,13 @@ export interface Database {
 
 export type DB = Kysely<Database>;
 
-const instances = new WeakMap<D1Database, DB>();
-
-/** Kysely over a D1 binding, one per binding (the dialect holds no connection state). */
+/**
+ * Kysely over a D1 binding. Built per call: it is cheap, and the runtime ties
+ * a binding's I/O to the request that made it, so an instance cached across
+ * requests fails with "Cannot perform I/O on behalf of a different request".
+ */
 export function db(d1: D1Database): DB {
-  let instance = instances.get(d1);
-  if (!instance) {
-    instance = new Kysely<Database>({ dialect: new D1Dialect({ database: d1 }) });
-    instances.set(d1, instance);
-  }
-  return instance;
+  return new Kysely<Database>({ dialect: new D1Dialect({ database: d1 }) });
 }
 
 /** SQLite's ISO timestamp, matching the columns' defaults. */
