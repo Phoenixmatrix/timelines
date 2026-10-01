@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { accounts } from "./api/accounts.ts";
 import { dev } from "./api/dev.ts";
 import { repos } from "./api/repos.ts";
+import { sshAuth, sshKeys } from "./api/ssh.ts";
 import { tokens } from "./api/tokens.ts";
 import { sessionActor, tokenCredential, type AppEnv } from "./auth.ts";
 import { isArtifactsError } from "./artifacts.ts";
@@ -48,6 +49,8 @@ api.route("/repos/:owner/:name/ci", ci);
 api.route("/ci/runner", runner);
 api.route("/repos", repos);
 api.route("/tokens", tokens);
+api.route("/ssh-keys", sshKeys);
+api.route("/auth/ssh", sshAuth);
 api.route("/dev", dev);
 api.notFound((c) => c.json({ error: "Not found." }, 404));
 api.onError((error, c) => {

@@ -1,6 +1,6 @@
 import { KeyIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
-import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
+import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { AccessToken, CreatedAccessToken } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { Segmented } from "../components/Choice.tsx";
@@ -44,7 +44,11 @@ export function Tokens() {
       <h1 className="m-0 text-headline">Access tokens</h1>
       <p className="mt-1.5 mb-0 max-w-[52ch] text-ink-muted">
         Git asks for a username and password over HTTPS. Use your username and a token as the
-        password. Tokens act as you, limited to read or write.
+        password. Tokens act as you, limited to read or write. With gm you can sign in with an{" "}
+        <Link to="/settings/ssh-keys" className="gm-link">
+          SSH key
+        </Link>{" "}
+        instead.
       </p>
 
       <div className="mt-8 flex flex-col gap-6">

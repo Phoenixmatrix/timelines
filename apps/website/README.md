@@ -66,6 +66,47 @@ Tokens are `read` (clone/fetch) or `write` (also push), and are stored as SHA-25
 hashes. The proxy checks the person's role and the token's scope, then streams
 the request to Artifacts with a short-lived repo token cached per isolate.
 
+## SSH keys over HTTPS
+
+Workers speak HTTP, not SSH, so `gm` signs in with SSH keys without an SSH
+connection: it proves it holds a registered key by signing a one-time
+challenge, then uses a short-lived token like any other.
+
+```
+gm ─ POST /api/auth/ssh/challenge {fingerprints} ─▶ first registered key offered + nonce
+gm ─ sign "gitmatrix-ssh-auth\n<origin>\n<nonce>\n<fingerprint>\n" (SSHSIG, namespace gitmatrix-auth)
+gm ─ POST /api/auth/ssh/token {nonce, signature} ─▶ 1-hour session token (git + API)
+```
+
+- **Keys** are registered under **SSH keys** in the web app or with
+  `gm auth ssh-key add` (Ed25519, ECDSA P-256/P-384, RSA ≥ 2048 with SHA-2), each
+  read or write. Removing a key ends its sessions.
+- **Signatures** are SSHSIG, the format of `ssh-keygen -Y sign` and git's SSH
+  commit signing, verified with WebCrypto (`worker/ssh.ts`, tested against
+  OpenSSH-made signatures). Nonces are single-use, expire in 2 minutes, and are
+  bound to the server's origin; gm refuses to sign anything else.
+- **gm finds keys like ssh**: the agent named by `IdentityAgent` in
+  `~/.ssh/config` (how 1Password's agent is set up), then `SSH_AUTH_SOCK`, then
+  `IdentityFile`s and `~/.ssh/id_*`. It signs through the agent, so 1Password's
+  approval prompt works as usual; key files with a passphrase prompt at a
+  terminal.
+- **…or like git, when git uses another ssh.** If `core.sshCommand` (or
+  `GIT_SSH_COMMAND`) names something other than plain `ssh`, e.g. `ssh.exe` in
+  WSL so Windows OpenSSH reaches 1Password, gm uses that ssh's `ssh-add -L` to
+  list keys (plus `user.signingKey`) and signs the way git signs commits: with
+  `gpg.ssh.program` when set (e.g. `op-ssh-sign-wsl`), else that ssh's
+  `ssh-keygen -Y sign`, given Windows paths. `gitmatrix.sshCommand` in git
+  config sets the ssh for gm alone. Sessions are cached in `~/.cache/gitmatrix/ssh-session.json` and
+  renewed with the key when they end.
+- **Plain git** can use the same sign-in through gm as a credential helper:
+  `git config --global credential.<server>.helper '!gm auth git-credential'`.
+
+```bash
+gm auth login --persona priya   # (dev) any sign-in, to register a key
+gm auth ssh-key add             # first key in your agent or ~/.ssh; --key to pick
+gm auth login --ssh             # from now on gm signs in with the key
+```
+
 ## Headless API
 
 Every `/api` route accepts `Authorization: Bearer gmx_…` in place of the browser's
@@ -214,6 +255,7 @@ re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack)
+- `worker/ssh.ts`, `worker/api/ssh.ts`: SSH public keys, SSHSIG verification, key sign-in
 - `worker/git/pktline.ts`: pkt-line codec and the `ls-refs` client used to list branches
 - `worker/api/*`: JSON API (`dev.ts` mints persona tokens and seeds sample data)
 - `worker/knowledge/*`: knowledge graph pipeline, coordinator, workflow, API

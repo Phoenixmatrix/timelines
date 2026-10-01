@@ -56,8 +56,8 @@ export type TokenCredential =
   | { kind: "token"; actor: Actor; scope: TokenScope; tokenId: string };
 
 /**
- * Resolve a personal access token from the Authorization header, for git and
- * for headless API use. Git sends `Basic user:token` after a 401 challenge; the
+ * Resolve a personal access token (or an SSH session token, until it expires)
+ * from the Authorization header, for git and for headless API use. Git sends `Basic user:token` after a 401 challenge; the
  * username is ignored and the token alone identifies the person. `Bearer token`
  * works too.
  */
@@ -85,7 +85,8 @@ export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredenti
 
   const row = await c.env.DB.prepare(
     `SELECT t.id AS token_id, t.scope, a.* FROM access_tokens t
-     JOIN accounts a ON a.id = t.user_id WHERE t.token_hash = ?`,
+     JOIN accounts a ON a.id = t.user_id
+     WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
   )
     .bind(await hashToken(secret))
     .first<AccountRow & { token_id: string; scope: TokenScope }>();

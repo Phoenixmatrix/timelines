@@ -64,7 +64,11 @@ pub const COMMANDS: &[Meta] = &[
     meta!("fetch", git: "git fetch", kw: "download remote update refresh get latest", mutates: true, out: Out::Other("{trunk:{before,after}|null,updated_refs:[name]}"), ex: ["gm fetch"]),
     meta!("sync", git: "git pull --rebase", kw: "pull update rebase onto latest trunk catch up refresh", mutates: true, out: OP, ex: ["gm sync"]),
     meta!("push", git: "git push", kw: "upload publish land ship merge deploy send pull request pr", mutates: true, out: Out::Typed(schema_of::<crate::commands::network::Pushed>), ex: ["gm push", "gm push --sync", "gm push -b feature-x"]),
-    meta!("auth login", git: "git credential approve", kw: "login sign in authenticate token persona credentials", mutates: true, out: Out::Other("{server,user:{slug,displayName},scope}"), ex: ["gm auth login --persona jun", "gm auth login --token gmx_..."]),
+    meta!("auth login", git: "git credential approve / ssh-add", kw: "login sign in authenticate token persona credentials ssh key agent 1password", mutates: true, out: Out::Other("{server,method,user:{slug},key?,scope?,sessionExpiresAt?}"), ex: ["gm auth login --ssh", "gm auth login --ssh --key ~/.ssh/id_ed25519", "gm auth login --persona jun", "gm auth login --token gmx_..."]),
+    meta!("auth ssh-key add", git: "(GitHub: Settings > SSH keys)", kw: "add register upload ssh public key agent 1password", mutates: true, out: Out::Other("SshKey {id,title,type,fingerprint,scope}"), ex: ["gm auth ssh-key add", "gm auth ssh-key add --key SHA256:abc... --title Laptop"]),
+    meta!("auth ssh-key list", git: "ssh-add -l", kw: "list ssh keys registered agent local fingerprints", mutates: false, out: Out::Other("{registered:[SshKey],local:[{fingerprint,type,comment,source,registered}],unreachableAgents}"), ex: ["gm auth ssh-key list"]),
+    meta!("auth ssh-key remove", git: "", kw: "remove delete unregister revoke ssh key", mutates: true, out: Out::Other("{removed}"), ex: ["gm auth ssh-key remove SHA256:abc..."]),
+    meta!("auth git-credential", git: "git credential-<helper>", kw: "git credential helper plain git https password ssh session", mutates: false, out: Out::Other("git credential lines (username=, password=) on stdout"), ex: ["git config --global credential.https://git.example.com.helper '!gm auth git-credential'"]),
     meta!("auth status", git: "", kw: "whoami who am i signed in user account", mutates: false, out: Out::Other("{server,user|null}"), ex: ["gm auth status"]),
     meta!("auth logout", git: "git credential reject", kw: "logout sign out forget token", mutates: true, out: Out::Other("{server,signed_out}"), ex: ["gm auth logout"]),
     meta!("repo list", git: "", kw: "repositories list remote server projects", mutates: false, out: Out::Other("{repos:[RepoSummary]}"), ex: ["gm repo list"]),
@@ -457,7 +461,9 @@ in `@` (or `gm edit <change>` first); the next gm command records the fix.
   trunk), 5 auth.
 - `gm cli search "<task>"` finds commands; `gm schema <command>` gives exact
   inputs and the output JSON Schema. Every mutating command takes `--dry-run`.
-- Sign in once: `gm auth login --persona <name>` (dev) or `--token gmx_…`.
+- Sign in once: `gm auth login --ssh` (an SSH key from your agent, 1Password
+  or ~/.ssh, registered with `gm auth ssh-key add`; in WSL it follows git's
+  `core.sshCommand`, e.g. ssh.exe), `--token gmx_…`, or `--persona <name>` in dev.
 "#;
 
 #[derive(Serialize)]

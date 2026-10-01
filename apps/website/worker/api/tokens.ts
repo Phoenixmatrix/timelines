@@ -28,12 +28,13 @@ export async function issueToken(
   userId: string,
   name: string,
   scope: TokenScope,
+  session?: { expiresAt: string; sshKeyId: string },
 ): Promise<CreatedAccessToken> {
   const secret = generateTokenSecret();
   const row = await db
     .prepare(
-      `INSERT INTO access_tokens (id, user_id, name, scope, token_hash, last_four)
-       VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
+      `INSERT INTO access_tokens (id, user_id, name, scope, token_hash, last_four, expires_at, ssh_key_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .bind(
       `tok_${crypto.randomUUID()}`,
@@ -42,6 +43,8 @@ export async function issueToken(
       scope,
       await hashToken(secret),
       secret.slice(-4),
+      session?.expiresAt ?? null,
+      session?.sshKeyId ?? null,
     )
     .first<TokenRow>();
   if (!row) throw new Error("The token could not be saved.");
@@ -54,7 +57,8 @@ tokens.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const { results } = await c.env.DB.prepare(
-    "SELECT * FROM access_tokens WHERE user_id = ? ORDER BY created_at DESC",
+    // Sessions minted from SSH keys come and go; they're listed with the keys.
+    "SELECT * FROM access_tokens WHERE user_id = ? AND ssh_key_id IS NULL ORDER BY created_at DESC",
   )
     .bind(actor.id)
     .all<TokenRow>();

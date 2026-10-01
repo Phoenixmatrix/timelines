@@ -6,6 +6,7 @@ mod model;
 mod output;
 mod remote;
 mod repo;
+mod ssh;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::{BookmarkCommand, CliCommand, Command, FileCommand, OpCommand};
@@ -142,6 +143,11 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Fetch => out(f, network::fetch(ctx)),
         Command::Sync => out(f, network::sync(ctx)),
         Command::Push(a) => out(f, network::push(ctx, &a)),
+        Command::Auth(cli::AuthCommand::GitCredential { operation }) => {
+            // Git reads this helper's stdout in its own key=value format.
+            server::git_credential(&operation);
+            Ok(())
+        }
         Command::Auth(c) => out(f, server::auth(ctx, &c)),
         Command::Repo(c) => out(f, server::repo(ctx, &c)),
         Command::Runs(c) => out(f, ci::runs(ctx, &c)),

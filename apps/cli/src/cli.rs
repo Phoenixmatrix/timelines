@@ -338,8 +338,14 @@ pub struct PushArgs {
 
 #[derive(Subcommand)]
 pub enum AuthCommand {
-    /// Sign in with a token, or as a dev persona (no secret needed in dev)
+    /// Sign in with an SSH key (agent, 1Password, ~/.ssh), a token, or a dev persona
     Login {
+        /// Sign in with an SSH key registered on the server, through your SSH agent or key files.
+        #[arg(long, conflicts_with_all = ["persona", "token"])]
+        ssh: bool,
+        /// With --ssh: the key to use (fingerprint, key file, or part of its comment).
+        #[arg(long, requires = "ssh")]
+        key: Option<String>,
         /// Dev persona to mint a token for (priya, marco, jun, sam).
         #[arg(long, conflicts_with = "token")]
         persona: Option<String>,
@@ -350,10 +356,38 @@ pub enum AuthCommand {
         #[arg(long, env = "GM_SERVER")]
         server: Option<String>,
     },
+    /// SSH keys registered for signing in (`gm auth login --ssh`)
+    #[command(subcommand)]
+    SshKey(SshKeyCommand),
+    /// Git credential helper: lets plain git use your gm sign-in, SSH keys included
+    GitCredential {
+        /// What git asks for: get, store or erase.
+        operation: String,
+    },
     /// Show who you are signed in as
     Status,
     /// Forget the stored token
     Logout,
+}
+
+#[derive(Subcommand)]
+pub enum SshKeyCommand {
+    /// Register a public key from your SSH agent or ~/.ssh (needs you signed in)
+    Add {
+        /// Which key: fingerprint, key file, or part of its comment (default: the first one found).
+        #[arg(long)]
+        key: Option<String>,
+        /// Name shown for the key (default: its comment).
+        #[arg(long)]
+        title: Option<String>,
+        /// Sessions from this key can clone and fetch but not push.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Keys registered on the server, and the keys gm can use on this machine
+    List,
+    /// Unregister a key (by id or fingerprint); its sessions end at once
+    Remove { key: String },
 }
 
 #[derive(Subcommand)]

@@ -119,6 +119,35 @@ export interface AccessToken {
   lastUsedAt: string | null;
 }
 
+/** A public key registered for SSH sign-in over HTTPS (gm). */
+export interface SshKey {
+  id: string;
+  title: string;
+  type: string;
+  fingerprint: string;
+  scope: TokenScope;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+/** Step one of SSH sign-in: sign `message` (SSHSIG, `namespace`) with the key. */
+export interface SshChallenge {
+  fingerprint: string;
+  nonce: string;
+  message: string;
+  namespace: string;
+  expiresAt: string;
+}
+
+/** Step two: a short-lived token that acts as the key's owner. */
+export interface SshSession {
+  token: string;
+  expiresAt: string;
+  scope: TokenScope;
+  user: AccountSummary;
+  key: { fingerprint: string; title: string };
+}
+
 export interface CreatedAccessToken extends AccessToken {
   /** Shown once, at creation. */
   secret: string;

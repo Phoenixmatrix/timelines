@@ -71,9 +71,27 @@ The design follows Cloudflare's agent-first `cf` CLI:
 | History     | `undo`, `op log`, `op restore`                                               |
 | Bookmarks   | `bookmark list`, `bookmark set`, `bookmark delete [--remote]`                |
 | Remote      | `clone`, `init`, `fetch`, `sync` (pull), `push [--sync] [-b name]`           |
-| Server      | `auth login/status/logout`, `repo list/create/view/delete`, `api`            |
+| Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `api`    |
+| SSH keys    | `auth ssh-key add/list/remove`, `auth git-credential` (git helper)           |
 | CI          | `runs list/show/logs/wait/start/cancel/rerun`, `runner`, `secret`            |
 | Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                          |
+
+## Signing in with SSH keys
+
+`gm auth login --ssh` signs in with an SSH key instead of a stored token, over
+HTTPS: gm signs a one-time challenge from the server (SSHSIG) and gets a
+one-hour session, renewed with the key when it runs out. Keys come from where
+ssh finds them: the `IdentityAgent` in `~/.ssh/config` (1Password and other
+agents), `SSH_AUTH_SOCK`, then key files (with a passphrase prompt at a
+terminal). Register a key with `gm auth ssh-key add`; `gm auth ssh-key list`
+shows what gm can see locally and what the server knows. See `src/ssh.rs`.
+
+When git is set up to use another ssh, gm follows git instead. In WSL with
+1Password on Windows that's `git config --global core.sshCommand ssh.exe`: gm
+lists keys with `ssh-add.exe -L` and signs with `ssh-keygen.exe -Y sign`
+(or `gpg.ssh.program`, e.g. `op-ssh-sign-wsl`, if you sign commits with it),
+so 1Password's prompt appears on Windows. `user.signingKey` counts as a key
+too, and `gitmatrix.sshCommand` sets the ssh for gm without touching git.
 
 ## Layout
 

@@ -1,6 +1,7 @@
 import { Menu } from "@base-ui/react/menu";
 import {
   HouseIcon,
+  FingerprintIcon,
   KeyIcon,
   MoonIcon,
   PlusIcon,
@@ -77,6 +78,10 @@ function AccountMenu() {
             <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/tokens" />}>
               <KeyIcon className="size-4" aria-hidden />
               Access tokens
+            </Menu.LinkItem>
+            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/ssh-keys" />}>
+              <FingerprintIcon className="size-4" aria-hidden />
+              SSH keys
             </Menu.LinkItem>
             <Menu.LinkItem className="mk-menu-item" render={<Link to="/signin" />}>
               <UserSwitchIcon className="size-4" aria-hidden />

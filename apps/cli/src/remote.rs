@@ -14,6 +14,12 @@ pub struct Config {
     pub server: Option<String>,
     pub token: Option<String>,
     pub user: Option<String>,
+    /// "ssh" to sign in with an SSH key for every session (see ssh.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// Fingerprint of the SSH key to use; any registered key when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<String>,
 }
 
 fn config_path() -> PathBuf {
@@ -60,6 +66,23 @@ impl Config {
             .filter(|t| !t.is_empty())
             .or_else(|| self.token.clone())
     }
+
+    pub fn uses_ssh(&self) -> bool {
+        self.auth.as_deref() == Some("ssh")
+    }
+}
+
+/// The token to send: GM_TOKEN, else an SSH session (signing in when the
+/// cached one is missing or ending), else the stored token. The flag says
+/// whether it came from SSH.
+pub fn credential(config: &Config) -> Result<(Option<String>, bool)> {
+    if let Some(token) = std::env::var("GM_TOKEN").ok().filter(|t| !t.is_empty()) {
+        return Ok((Some(token), false));
+    }
+    if config.uses_ssh() {
+        return Ok((Some(crate::ssh::session(config)?.token), true));
+    }
+    Ok((config.token.clone(), false))
 }
 
 fn agent() -> ureq::Agent {
@@ -71,10 +94,30 @@ fn agent() -> ureq::Agent {
 
 /// Call the JSON API. Non-2xx responses become errors carrying the server's message.
 pub fn api(config: &Config, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+    let (token, from_ssh) = credential(config)?;
+    match api_with(config, method, path, body, token.as_deref()) {
+        // The server ended the session early (key removed, server restarted):
+        // sign in with the key again, once.
+        Err(e) if from_ssh && e.code == "unauthenticated" => {
+            crate::ssh::forget();
+            let session = crate::ssh::session(config)?;
+            api_with(config, method, path, body, Some(&session.token))
+        }
+        other => other,
+    }
+}
+
+/// Call the JSON API with exactly this token (or none).
+pub fn api_with(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> Result<Value> {
     let url = format!("{}/api{}", config.server(), path);
     let agent = agent();
-    let token = config.token();
-    let auth = token.as_ref().map(|t| format!("Bearer {t}"));
+    let auth = token.map(|t| format!("Bearer {t}"));
     let unreachable = |e: ureq::Error| {
         GmError::new(
             "server_unreachable",
@@ -151,7 +194,7 @@ pub fn git(config: &Config, cwd: &Path, args: &[&str]) -> Result<std::process::O
         // gm handles auth itself; never block on a credential prompt.
         ("credential.interactive".into(), "false".into()),
     ];
-    if let Some(token) = config.token() {
+    if let Some(token) = credential(config)?.0 {
         entries.push((
             format!("http.{}/.extraHeader", config.server()),
             format!("Authorization: Bearer {token}"),

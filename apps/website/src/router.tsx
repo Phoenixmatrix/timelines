@@ -14,6 +14,7 @@ import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
 import { SignIn, signInAction, signInLoader } from "./routes/SignIn.tsx";
+import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
 
 export const router = createBrowserRouter([
@@ -37,6 +38,12 @@ export const router = createBrowserRouter([
             loader: tokensLoader,
             action: tokensAction,
             Component: Tokens,
+          },
+          {
+            path: "settings/ssh-keys",
+            loader: sshKeysLoader,
+            action: sshKeysAction,
+            Component: SshKeys,
           },
           { path: ":owner", loader: accountLoader, Component: Account },
           {
