@@ -1,9 +1,3 @@
-# Opt in with: gm worktree add ../feature --include
-# Match local environment files at any workspace depth; never copy dependencies
-# or mutable .wrangler state. Only gitignored, untracked files are eligible.
-.env
-.env.*
-!.env.example
-.dev.vars
-.dev.vars.*
-!.dev.vars.example
+# Deliberately empty: source worktrees must not inherit credentials or mutable state.
+# Run `vp install` and `vp run agent setup` in each worktree.
+# Never include .env*, .dev.vars*, .gitmatrix-agent, .wrangler, node_modules or binaries.

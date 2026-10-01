@@ -1,4 +1,5 @@
 import { bindings, defineConfig, defineContainer, exports, triggers } from "cf/config";
+import { developmentEnvironment } from "./vite/environment.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
 // (Artifacts, Workers AI, Vectorize, AI Search). D1, the Durable Object and
@@ -21,15 +22,17 @@ const ciSandbox = defineContainer({
 });
 
 export default defineConfig(({ mode }) => {
-  const runner: Runner =
-    // (Evaluated in Node; the Worker's tsconfig also sees this file, without Node types.)
-    ((globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env
-      .GITMATRIX_CI_RUNNER as Runner | undefined) ?? (mode === "development" ? "local" : "sandbox");
-  const sandboxed = runner === "sandbox";
+  // cf evaluates this in Node, while the Worker's tsconfig excludes Node globals.
+  const runtime = globalThis as typeof globalThis & {
+    process?: { env: Record<string, string | undefined> };
+  };
+  const env = runtime.process?.env ?? {};
   const dev = mode === "development";
-  const publicUrl =
-    (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env
-      .GITMATRIX_PUBLIC_URL ?? (dev ? "http://localhost:5180" : undefined);
+  const local = developmentEnvironment(env);
+  if (local.agent && !dev) throw new Error("Agent environments must never deploy");
+  const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
+  const sandboxed = runner === "sandbox";
+  const publicUrl = dev ? local.publicUrl : env.GITMATRIX_PUBLIC_URL;
   return {
     ...(sandboxed ? { containers: [ciSandbox] } : {}),
     worker: {
@@ -64,11 +67,22 @@ export default defineConfig(({ mode }) => {
       env: {
         DB: bindings.d1({ name: "gitmatrix", id: "00000000000000000000000000000000" }),
         TRACKER: bindings.durableObject({ worker: "gitmatrix", exportName: "Tracker" }),
-        ARTIFACTS: bindings.artifacts({ namespace: "gitmatrix-dev", ...remote }),
+        ARTIFACTS: bindings.artifacts({
+          namespace: dev ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev") : "gitmatrix-dev",
+          ...remote,
+        }),
         // Knowledge graph and wiki.
         AI: bindings.ai(remote),
-        VECTORS: bindings.vectorize({ name: "gitmatrix-knowledge", ...remote }),
-        SEARCH: bindings.aiSearchNamespace({ namespace: "gitmatrix", ...remote }),
+        VECTORS: bindings.vectorize({
+          name: dev
+            ? (env.GITMATRIX_VECTORIZE_INDEX ?? "gitmatrix-knowledge")
+            : "gitmatrix-knowledge",
+          ...remote,
+        }),
+        SEARCH: bindings.aiSearchNamespace({
+          namespace: dev ? (env.GITMATRIX_SEARCH_NAMESPACE ?? "gitmatrix") : "gitmatrix",
+          ...remote,
+        }),
         KNOWLEDGE_COORDINATOR: bindings.durableObject({
           worker: "gitmatrix",
           exportName: "KnowledgeCoordinator",
@@ -84,6 +98,15 @@ export default defineConfig(({ mode }) => {
         // which runs `gm runner --once` per queued job (vite/ci-runners.ts).
         ...(runner === "local" && dev && publicUrl
           ? { CI_DISPATCH_URL: bindings.text(`${publicUrl}/__gitmatrix/ci/dispatch`) }
+          : {}),
+        ...(dev && env.GITMATRIX_AGENT_ID
+          ? { AGENT_ID: bindings.text(env.GITMATRIX_AGENT_ID) }
+          : {}),
+        ...(dev && env.GITMATRIX_AGENT_SECRET
+          ? { AGENT_SECRET: bindings.text(env.GITMATRIX_AGENT_SECRET) }
+          : {}),
+        ...(dev && env.GITMATRIX_CI_DISPATCH_SECRET
+          ? { CI_DISPATCH_SECRET: bindings.text(env.GITMATRIX_CI_DISPATCH_SECRET) }
           : {}),
         CI_RUN: bindings.workflow({ name: "ci-run", worker: "gitmatrix", exportName: "CiRun" }),
         CI_SANDBOX: bindings.durableObject({ worker: "gitmatrix", exportName: "CiSandbox" }),

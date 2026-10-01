@@ -14,30 +14,41 @@ browser    ──cookie──▶ Worker /api/*  ──env.ARTIFACTS──▶ log
 
 ## Run it
 
+For agent development, start at the repository root and follow the
+[isolated agent workflow](../../README.md#agent-first-development):
+
 ```bash
 vp install
-vp run db:migrate     # local D1: schema + dev personas
-cf dev                # http://localhost:5180; starts CI runners on demand
+vp run agent setup
+vp run agent up
 ```
 
-Sign in with `cf auth login` (the account needs Artifacts and Workers AI). There
-is no local Artifacts, Workers AI, Vectorize or AI Search emulator, so dev uses
-the real services (`dev: { remote: true }` in `cloudflare.config.ts`); D1, the
-Durable Objects and Workflows run locally, with state explicitly persisted in
-`.wrangler/state` by `vite.config.ts` (shared with the migration script).
-The pinned Vite plugin v2 beta is required by `cf dev` and `cf build`; it reads
-`cloudflare.config.ts` directly, without the legacy `experimental.newConfig` option.
-`cf` 1.0.0-beta.7 doesn't exit after local D1 commands; stop it once it prints
-its result.
+Use the origin printed by `up`. Setup builds the worktree's CLI, installs and
+checks Chromium, provisions dedicated Artifacts/Vectorize/AI Search resources,
+migrates both local D1 databases, and seeds deterministic Git/tracker fixtures.
+Use `vp run agent inspect` for data, `vp run agent test` for real-service E2E,
+and `vp run agent destroy` when finished. Hourly cleanup and 24-hour expiry
+bound resource accumulation; see the root README for costs and failure recovery.
 
-On the persona screen, **Load samples** imports three small public GitHub repos
-and creates one empty repo.
+There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
+These bindings use real services; D1, Durable Objects and Workflows run locally
+under the environment's `.gitmatrix-agent` state directory. The pinned Vite
+plugin v2 reads `cloudflare.config.ts` directly. A pinned Miniflare lifecycle
+patch makes local `cf d1` commands exit normally; do not terminate them early
+after merely seeing output.
+
+The canonical source host remains a separate, owner-managed environment:
+from this directory, `vp run db:migrate` and `vp dev` use port 5180 and
+`.wrangler/state`. Feature agents must not reuse that state or test mutations
+against it. **Load samples** creates four small empty named repositories;
+the agent harness fills them through real `gm` commits, without GitHub imports.
 
 ## Personas (dev sign-in)
 
-Picking a persona sets a cookie holding the account id, with no secret. This is
-deliberately throwaway; real sign-in replaces the session half of
-`worker/auth.ts` and `migrations/0002_dev_personas.sql`.
+Picking a persona in development sets a cookie holding the account id. Production
+rejects persona cookies and dev sign-in/token/seed endpoints; this mechanism is
+not production authentication. Isolated environments require a private capability
+for headless bootstrap. Always use a separate browser context for each environment.
 
 | Persona    | Access                                                         |
 | ---------- | -------------------------------------------------------------- |
@@ -53,17 +64,18 @@ Repos you can't read return 404, never 403.
 
 ## Git over HTTPS
 
-One command points the git CLI at Gitmatrix as a persona, with no browser:
+From the source worktree, use its scoped client:
 
 ```bash
-pnpm run git:login priya          # or jun, sam, marco; add --read for a clone-only token
-git clone http://localhost:5180/orbit/engine.git
+vp run agent gm -- auth status
+vp run agent gm -- clone orbit/engine
 ```
 
-It mints a token through the dev API and stores it with git's `store` helper in
-`~/.config/gitmatrix/credentials`, scoped to `http://localhost:5180` in your global
-git config. Run it again to switch persona. From the browser instead, create a
-token under **Access tokens** and use it as the password.
+The clone belongs to the environment's external disposable workspace. Pass its
+printed path with `vp run agent gm -- -C <clone> ...` for subsequent commands.
+The harness keeps personal tokens and Git configuration out of the user's global
+credential store. Browser-created **Access tokens** remain usable as an HTTPS
+password by ordinary Git clients.
 
 Tokens are `read` (clone/fetch) or `write` (also push), and are stored as SHA-256
 hashes. The proxy checks the person's role and the token's scope, then streams
@@ -116,27 +128,28 @@ Every `/api` route accepts `Authorization: Bearer gmx_…` in place of the brows
 persona cookie; read-scoped tokens can only `GET`.
 
 ```bash
-H=http://localhost:5180
-TOKEN=$(curl -s -X POST $H/api/dev/tokens -d '{"persona":"jun"}' | jq -r .secret)
-curl -H "Authorization: Bearer $TOKEN" $H/api/repos
-curl -H "Authorization: Bearer $TOKEN" -X POST $H/api/repos \
-  -d '{"owner":"jun","name":"demo","visibility":"private"}'
+# From the source worktree, with agent up running:
+vp run agent gm -- repo list
 ```
 
-| Route                                                                                     | Does                                             |
-| ----------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a token for any persona (dev only, no auth) |
-| `POST /api/dev/seed`                                                                      | Load the sample repositories                     |
-| `GET /api/session`                                                                        | Who the token or cookie belongs to               |
-| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                  |
-| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                           |
-| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete    |
-| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README            |
-| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                    |
-| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                             |
-| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                            |
-| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                      |
-| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                           |
+For direct HTTP clients, use the environment's printed origin and a scoped token;
+never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
+`/api/dev/environment` require the harness capability in isolated environments.
+
+| Route                                                                                     | Does                                                           |
+| ----------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a dev token; capability required in isolated environments |
+| `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                 |
+| `GET /api/session`                                                                        | Who the token or cookie belongs to                             |
+| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                |
+| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                         |
+| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                  |
+| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                          |
+| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                                  |
+| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                                           |
+| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                          |
+| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                    |
+| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                                         |
 
 ## Distributed issue tracker
 

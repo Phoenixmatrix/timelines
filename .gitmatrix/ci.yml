@@ -1,7 +1,7 @@
-# CI for Gitmatrix, run by Gitmatrix (apps/website/worker/ci): the quality
-# gates every push must pass. Locally, start `gm runner` next to `vp dev`;
-# deployed, each job runs in a Cloudflare Sandbox. Gitmatrix is the source of
-# truth; GitHub is only a mirror (Settings → Mirror) and runs nothing.
+# Gitmatrix is the source of truth; GitHub is a mirror only.
+# Source CI runs on the trusted Linux development host with cf authentication
+# and user systemd. Vite starts local runners on demand. The live gate provisions
+# dedicated resources; its finally cleanup and the hourly janitor both apply.
 on:
   push: {}
 
@@ -17,6 +17,8 @@ jobs:
         run: vp check
       - name: Format and lint gm
         run: vp run cli#check
+      - name: All application and harness type contracts
+        run: vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
 
   test:
     timeout_minutes: 30
@@ -26,7 +28,7 @@ jobs:
       - name: Generate Worker types
         run: vp run website#cf-typegen
       - name: Tests (web and gm)
-        run: vp run -r test
+        run: vp run -r --no-cache test
 
   build:
     needs: [check, test]
@@ -37,3 +39,12 @@ jobs:
       # can fail to spawn native tools (spawn EBUSY).
       - name: Build
         run: vp run -r --no-cache build
+
+  e2e:
+    needs: [build]
+    timeout_minutes: 30
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Live isolated CLI, API, browser, CI and provider journeys
+        run: vp run agent test

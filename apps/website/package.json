@@ -8,7 +8,7 @@
     "build": "vp build",
     "preview": "vp preview",
     "test": "vp test",
-    "typecheck": "cf workers types && tsc -p tsconfig.app.json && tsc -p tsconfig.worker.json && tsc -p tsconfig.node.json",
+    "typecheck": "cf workers types && node ../../tools/agent/typecheck.ts -p tsconfig.app.json && node ../../tools/agent/typecheck.ts -p tsconfig.worker.json && node ../../tools/agent/typecheck.ts -p tsconfig.node.json",
     "cf-typegen": "cf workers types",
     "db:migrate": "cf d1 migrations apply 00000000000000000000000000000000 --local --persist-to .wrangler/state && cf d1 migrations apply 00000000000000000000000000000001 --local --persist-to .wrangler/state --dir registry/migrations",
     "deploy": "vp run build && cf deploy",

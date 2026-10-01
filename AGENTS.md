@@ -26,14 +26,40 @@ release. Add a tool name to select part of the graph. For example, run
 
 <!--VITE PLUS END-->
 
+# Required agent development workflow
+
+- Follow the root [agent-first workflow](README.md#agent-first-development).
+  Each agent uses its own source `gm worktree`, `vp install`, and
+  `vp run agent setup`; run the app with `vp run agent up`.
+- Use the printed isolated origin and `vp run agent gm -- ...` for product
+  testing. That wrapper uses this worktree's compiled binary, credentials and
+  external disposable workspace. Never test mutations on canonical port 5180,
+  copy another environment's state, or install a feature binary globally.
+- Use fresh browser contexts: cookies are not isolated by port. `agent seed`
+  reconciles fixtures; `agent reset` destroys and recreates them. Inspect data
+  with `agent inspect` or scoped tracker/issue commands.
+- Before completion, run **`vp run ready`**. It runs uncached static gates,
+  every workspace's tests/builds and fresh real CLI/API/browser/provider E2E.
+  Also exercise the specific changed consumer path. Missing providers, browser
+  dependencies or credentials are failures, not reasons to skip acceptance.
+- Keep the E2E artifacts and inspect failures before changing assertions.
+  The gate covers local Linux CI; Sandbox/deployment changes need their own
+  deployment-boundary smoke run.
+- Remote resources cost money. Setup installs hourly user-systemd cleanup;
+  environments expire after 24 hours, with four live environments per user.
+  Use `agent destroy` when finished, not merely `agent stop`. Check
+  `agent maintenance status`; never delete the central resource journal.
+- `.worktreeinclude` intentionally copies no secrets or local service state.
+  Agents and local runners share a trusted host, not a hostile-code sandbox.
+
 # Version control in this repo
 
 This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
 
-- **Commit and push this project with `gm`** (`apps/cli`, installed with
-  `pnpm --filter cli run install-bin`). `origin` is `orbit/gitmatrix` on the
-  dev server: `gm commit -m "…"`, then `gm push` (or `gm push --sync` when
-  trunk moved) lands it on `main`. Run `gm cli guide` once for the workflow,
+- **Commit and push this project with ordinary `gm`**, outside `agent gm`.
+  `origin` is `orbit/gitmatrix` on the canonical dev server:
+  `gm commit -m "…"`, then `gm push` (or `gm push --sync` when trunk moved)
+  lands it on `main`. Run `gm cli guide` once for the workflow,
   and `gm cli search "<task>"` to find commands. Plain `git commit` still
   works (gm adopts the commits), but never `git push`: gm pushes with the
   right credentials and keeps its own view of trunk. Git shows a detached
@@ -41,19 +67,17 @@ This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
 - **GitHub is a backup, written only by the mirror.** Every push to
   Gitmatrix is mirrored to GitHub (the `github` remote) one way. Don't push
   there: the mirror overwrites it. Use `gh` only to read GitHub.
-- **Every push runs the quality gates** in `.gitmatrix/ci.yml` (check, test,
-  build). Run `vp check`, `vp test` and `vp run cli#check` first, then
-  `gm push && gm runs wait` to confirm the run.
-- **Testing Gitmatrix itself:** exercise the product (cloning
-  Gitmatrix-hosted repos, committing, pushing, checking permissions as
-  different personas) with `gm` against the local dev server (`vp dev` in
-  `apps/website`), in throwaway clones outside this checkout, such as a temp
-  directory.
+- **Every push runs the quality gates** in `.gitmatrix/ci.yml`: check, test,
+  build and live E2E. Run `vp run ready` first, then
+  `gm push && gm runs wait` to confirm the source pipeline.
+- **Testing Gitmatrix itself:** use the scoped workflow above. Keep all product
+  clones outside this source checkout. `gm -C <clone>` selects a disposable
+  clone while `agent gm` keeps its server and credentials isolated.
 - **CI in development runs on this machine, on demand.** `vp dev` starts a
-  runner for each queued job and it exits when the job is done, the way
-  Cloudflare Sandbox containers come and go once deployed; nothing needs to
-  stay running. Use `GITMATRIX_CI_RUNNER=sandbox vp dev` (needs Docker) only
-  when changing the sandbox runner itself.
+  runner per queued job; it exits when done. The full source pipeline needs
+  the trusted Linux host's Cloudflare login and user-systemd manager.
+  `GITMATRIX_CI_RUNNER=sandbox vp dev` requires Docker and is a separate
+  deployment-boundary check, not a substitute for the local workflow.
 
 # Cloudflare tooling: use `cf`, not wrangler
 
@@ -62,8 +86,8 @@ D1 migrations, deploys, resource management (Artifacts, AI Search, Vectorize,
 Workers AI and so on). Don't run `wrangler` commands or add wrangler configs.
 
 - Worker configuration lives in `cloudflare.config.ts` (`cf/config`), not
-  `wrangler.jsonc`/`wrangler.toml`. The Vite plugin loads it with
-  `cloudflare({ experimental: { newConfig: true } })`.
+  `wrangler.jsonc`/`wrangler.toml`. The pinned Vite plugin v2 reads it directly
+  without the legacy `experimental.newConfig` option.
 - Generate binding types with `cf workers types` (writes `.cloudflare/types/`).
 - Find commands with `cf cli search "<task>"`, then `<command> --help` or
   `cf schema <command>`; don't crawl `--help` trees.

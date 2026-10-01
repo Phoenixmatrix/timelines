@@ -680,9 +680,9 @@ impl Reporter<'_> {
             .iter()
             .map(|p| p["text"].as_str().map_or(0, str::len))
             .sum();
-        if !self.pending.is_empty()
-            && (self.last_flush.elapsed() > Duration::from_secs(1) || size > 32 * 1024)
-        {
+        // Silent steps still poll cancellation, without paying for one request/sec.
+        let interval = Duration::from_secs(if self.pending.is_empty() { 5 } else { 1 });
+        if self.last_flush.elapsed() > interval || size > 32 * 1024 {
             self.send(json!({}))?;
         }
         Ok(())
@@ -697,6 +697,62 @@ enum Ended {
 
 /// Where the server's job `files` land; substituted into the job's `env`.
 const CONFIG_PLACEHOLDER: &str = "${GITMATRIX_CONFIG}";
+
+// Steps have their own process groups. The runner's parent cannot stop them by
+// signalling the runner group alone; serialize spawn with shutdown forwarding.
+static STEP_GROUP: parking_lot::Mutex<Option<u32>> = parking_lot::Mutex::new(None);
+
+fn stop_group(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([signal, "--", &format!("-{pid}")])
+        .status();
+}
+
+struct StepGroup;
+impl Drop for StepGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = STEP_GROUP.lock().take() {
+            // Also reap background descendants after bash exits or reporting fails.
+            stop_group(pid, "-KILL");
+        }
+    }
+}
+
+struct RunnerSignals {
+    handle: signal_hook::iterator::Handle,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunnerSignals {
+    fn start() -> std::io::Result<Self> {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
+        let handle = signals.handle();
+        let thread = std::thread::spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                let group = STEP_GROUP.lock();
+                if let Some(pid) = *group {
+                    stop_group(pid, "-KILL");
+                }
+                // The Vite parent also stops the runner group (checkout helpers).
+                std::process::exit(128 + signal);
+            }
+        });
+        Ok(Self {
+            handle,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for RunnerSignals {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// Run one script with bash, streaming combined output to the reporter.
 fn execute(
@@ -722,7 +778,11 @@ fn execute(
     for (key, value) in env {
         command.env(key, value.as_str().unwrap_or(""));
     }
+    let mut group = STEP_GROUP.lock();
     let mut child = command.spawn()?;
+    *group = Some(child.id());
+    let _group = StepGroup;
+    drop(group);
     drop(command);
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -735,29 +795,34 @@ fn execute(
             }
         }
     });
-    // Signal the whole process group (`--`, or procps reads `-<pgid>` as an option).
-    let kill = |signal: &str, pid: u32| {
-        let _ = Command::new("kill")
-            .args([signal, "--", &format!("-{pid}")])
-            .status();
-    };
+    let kill = |signal: &str, pid: u32| stop_group(pid, signal);
     let mut ended: Option<Ended> = None;
     let mut status = None;
+    let mut output_closed = false;
     let mut stopping: Option<Instant> = None;
-    loop {
-        match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                if echo {
-                    eprint!("{text}");
+    let exit_status = loop {
+        if output_closed {
+            // A disconnected receiver returns immediately; retain bounded polling.
+            std::thread::sleep(Duration::from_millis(250));
+        } else {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if echo {
+                        eprint!("{text}");
+                    }
+                    reporter.log(step, text);
                 }
-                reporter.log(step, text);
+                Err(mpsc::RecvTimeoutError::Disconnected) => output_closed = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if status.is_none() {
             status = child.try_wait()?;
+        }
+        // EOF and child exit are independent. Drain output and supervise until both.
+        if output_closed && let Some(status) = status {
+            break status;
         }
         reporter.tick()?;
         if ended.is_none() && reporter.cancelled {
@@ -776,13 +841,9 @@ fn execute(
             kill("-KILL", child.id());
             stopping = None;
         }
-    }
-    let _ = pump.join();
-    let status = match status {
-        Some(s) => s,
-        None => child.wait()?,
     };
-    Ok(ended.unwrap_or(Ended::Exit(status.code().unwrap_or(128))))
+    let _ = pump.join();
+    Ok(ended.unwrap_or(Ended::Exit(exit_status.code().unwrap_or(128))))
 }
 
 fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'static str> {
@@ -925,6 +986,7 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
 }
 
 pub fn runner(ctx: &Ctx, args: &RunnerArgs) -> Result<Shown> {
+    let _signals = RunnerSignals::start()?;
     let config = Config::load();
     if config.token().is_none() && !config.uses_ssh() {
         return Err(
@@ -1006,7 +1068,150 @@ pub fn runner(ctx: &Ctx, args: &RunnerArgs) -> Result<Shown> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{Config, Ended, Reporter, execute, strip_ansi};
+    use std::io::{BufRead, Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    // Each runner owns a process-global step group. A subprocess also prevents
+    // inherited GM credentials/server overrides from reaching the test server.
+    fn isolated(name: &str, body: fn()) {
+        if std::env::var("GITMATRIX_CI_TEST").ok().as_deref() == Some(name) {
+            body();
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("commands::ci::tests::{name}"),
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("GITMATRIX_CI_TEST", name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_script(config: &Config, script: &str, deadline: Instant, last_flush: Instant) -> Ended {
+        let directory = tempfile::tempdir().unwrap();
+        let mut reporter = Reporter {
+            config,
+            job: "test-job".into(),
+            pending: Vec::new(),
+            last_flush,
+            cancelled: false,
+        };
+        execute(
+            &mut reporter,
+            0,
+            script,
+            directory.path(),
+            &serde_json::Map::new(),
+            deadline,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn assert_cancelled(script: &str) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = Config {
+            server: Some(format!("http://{}", listener.local_addr().unwrap())),
+            ..Config::default()
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut input = std::io::BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(input.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':')
+                    && key.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            input.read_exact(&mut vec![0; length]).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"cancelled\":true}").unwrap();
+        });
+        let now = Instant::now();
+        let outcome = run_script(
+            &config,
+            script,
+            now + Duration::from_secs(30),
+            now - Duration::from_secs(6),
+        );
+        assert!(
+            matches!(outcome, Ended::Cancelled),
+            "silent step ignored server cancellation"
+        );
+        server.join().unwrap();
+    }
+
+    // Real pipes/processes are the boundary under test. The sleeps are finite
+    // fallbacks for a broken supervisor; successful tests interrupt them, not wait.
+    #[test]
+    fn closed_output_obeys_deadline() {
+        isolated("closed_output_obeys_deadline", || {
+            let config = Config {
+                server: Some("http://127.0.0.1:1".into()),
+                ..Config::default()
+            };
+            let now = Instant::now();
+            let outcome = run_script(&config, "exec >/dev/null 2>&1; exec sleep 3", now, now);
+            assert!(
+                matches!(outcome, Ended::TimedOut),
+                "output EOF discarded the deadline"
+            );
+        });
+    }
+
+    #[test]
+    fn closed_output_obeys_cancellation() {
+        isolated("closed_output_obeys_cancellation", || {
+            assert_cancelled("exec >/dev/null 2>&1; exec sleep 3");
+        });
+    }
+
+    #[test]
+    fn silent_open_output_obeys_cancellation() {
+        isolated("silent_open_output_obeys_cancellation", || {
+            assert_cancelled("exec sleep 3");
+        });
+    }
+
+    #[test]
+    fn closed_output_preserves_exit_status() {
+        isolated("closed_output_preserves_exit_status", || {
+            let config = Config {
+                server: Some("http://127.0.0.1:1".into()),
+                ..Config::default()
+            };
+            let now = Instant::now();
+            let outcome = run_script(
+                &config,
+                "exec >/dev/null 2>&1; exit 23",
+                now + Duration::from_secs(30),
+                now,
+            );
+            assert!(matches!(outcome, Ended::Exit(23)));
+        });
+    }
 
     #[test]
     fn strips_escape_sequences() {

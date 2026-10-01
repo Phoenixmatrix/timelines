@@ -12,11 +12,13 @@ export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null; timing: 
 const PERSONA_COOKIE = "gm_persona";
 
 export async function sessionActor(c: Context<AppEnv>): Promise<Actor | null> {
+  if (c.env.DEV_MODE !== "true") return null;
   const id = getCookie(c, PERSONA_COOKIE);
   return id ? findUserById(c.env.DB, id) : null;
 }
 
 export function startPersonaSession(c: Context<AppEnv>, accountId: string) {
+  if (c.env.DEV_MODE !== "true") throw new Error("Persona sessions are development-only");
   setCookie(c, PERSONA_COOKIE, accountId, {
     path: "/",
     httpOnly: true,

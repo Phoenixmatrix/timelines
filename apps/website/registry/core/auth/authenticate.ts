@@ -133,8 +133,12 @@ function unverifiedIssuer(token: string): string | null {
  */
 export async function authenticate(env: Env, headers: Headers): Promise<Actor> {
   const credential = extractCredential(headers);
+  if (!credential) {
+    return (
+      (env.DEV_MODE === "true" ? await fromCookie(gitmatrixDb(env.DB), headers) : null) ?? ANONYMOUS
+    );
+  }
   const db = gitmatrixDb(env.DB);
-  if (!credential) return (await fromCookie(db, headers)) ?? ANONYMOUS;
   const token = credential.token;
 
   if (token.startsWith(TOKEN_PREFIX)) {

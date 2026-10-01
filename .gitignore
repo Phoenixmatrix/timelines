@@ -37,6 +37,7 @@ dist-ssr
 
 # Wrangler / Miniflare local state
 .wrangler
+.gitmatrix-agent/
 .dev.vars*
 !.dev.vars.example
 

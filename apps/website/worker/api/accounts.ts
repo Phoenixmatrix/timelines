@@ -16,6 +16,7 @@ accounts.get("/session", async (c) => {
 
 // DEVELOPMENT ONLY: sign in as any persona by id. Replaced by real auth later.
 accounts.post("/session", async (c) => {
+  if (c.env.DEV_MODE !== "true") return fail(c, 404, "Not found.");
   const { accountId } = await readJson<{ accountId: string }>(c);
   const actor = accountId ? await findUserById(c.env.DB, accountId) : null;
   if (!actor) return fail(c, 404, "No such persona.");
@@ -30,6 +31,7 @@ accounts.delete("/session", (c) => {
 });
 
 accounts.get("/personas", async (c) => {
+  if (c.env.DEV_MODE !== "true") return fail(c, 404, "Not found.");
   const results = await db(c.env.DB)
     .selectFrom("accounts")
     .selectAll()

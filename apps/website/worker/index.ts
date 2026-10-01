@@ -31,6 +31,11 @@ api.use(async (c, next) => {
 // personal access token (`Authorization: Bearer gmx_…`). Read-scoped tokens
 // may only read.
 api.use(async (c, next) => {
+  // Dev endpoints authenticate their own environment secret, not a user PAT.
+  if (c.req.path === "/api/dev" || c.req.path.startsWith("/api/dev/")) {
+    c.set("actor", null);
+    return next();
+  }
   if (!c.req.header("authorization")) {
     c.set("actor", await sessionActor(c));
     return next();

@@ -1,0 +1,15 @@
+diff --git a/dist/src/index.js b/dist/src/index.js
+--- a/dist/src/index.js
++++ b/dist/src/index.js
+@@ -121016,6 +121016,11 @@
+    * @param item      base path of item/directory
+    */
+   _remove(directory, item, isDirectory3) {
++    // A pending file stat can finish after close(). Do not let its unlink
++    // callback call add(), which reopens the disposed registry watcher.
++    if (this.closed) {
++      return;
++    }
+     const path84 = sysPath2.join(directory, item);
+     const fullPath = sysPath2.resolve(path84);
+     isDirectory3 = isDirectory3 != null ? isDirectory3 : this._watched.has(path84) || this._watched.has(fullPath);

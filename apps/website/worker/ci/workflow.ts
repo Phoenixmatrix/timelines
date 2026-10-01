@@ -40,7 +40,14 @@ async function dispatchLocalRunner(env: Env): Promise<void> {
   const url = Reflect.get(env, "CI_DISPATCH_URL");
   if (typeof url !== "string" || !url) return;
   try {
-    await fetch(url, { method: "POST" });
+    const secret = Reflect.get(env, "CI_DISPATCH_SECRET");
+    const response = await fetch(url, {
+      method: "POST",
+      ...(typeof secret === "string" && secret
+        ? { headers: { authorization: `Bearer ${secret}` } }
+        : {}),
+    });
+    if (!response.ok) console.warn(`CI: runner dispatcher returned ${response.status}`);
   } catch (error) {
     console.warn("CI: couldn't reach the runner dispatcher", error);
   }

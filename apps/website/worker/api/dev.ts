@@ -1,23 +1,21 @@
+import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
 import type { TokenScope } from "../../shared/api.ts";
 import { newArtifactsName } from "../artifacts.ts";
-import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
 
-// DEVELOPMENT ONLY: sample repositories that put each persona's permissions to
-// work. Small public repos are imported; sam/notes starts empty to show the
-// first-push flow.
+// DEVELOPMENT ONLY: empty, named repositories exercising the persona permissions.
+// The harness populates their bounded, pinned contents through the real CLI.
 interface Sample {
   owner: string;
   name: string;
   visibility: "public" | "private";
   description: string;
-  importUrl: string | null;
   collaborators: { user: string; role: "read" | "write" | "admin" }[];
 }
 
@@ -26,8 +24,7 @@ const SAMPLES: Sample[] = [
     owner: "acc_orbit",
     name: "engine",
     visibility: "private",
-    description: "Tiny utility for constructing className strings.",
-    importUrl: "https://github.com/lukeed/clsx",
+    description: "Small private engine fixture.",
     collaborators: [
       { user: "acc_jun", role: "write" },
       { user: "acc_sam", role: "read" },
@@ -38,7 +35,6 @@ const SAMPLES: Sample[] = [
     name: "website",
     visibility: "public",
     description: "The Orbit Labs website.",
-    importUrl: "https://github.com/octocat/Spoon-Knife",
     collaborators: [],
   },
   {
@@ -46,7 +42,6 @@ const SAMPLES: Sample[] = [
     name: "hello-world",
     visibility: "public",
     description: "My first repository.",
-    importUrl: "https://github.com/octocat/Hello-World",
     collaborators: [],
   },
   {
@@ -54,12 +49,42 @@ const SAMPLES: Sample[] = [
     name: "notes",
     visibility: "private",
     description: "Private scratch notes.",
-    importUrl: null,
     collaborators: [],
   },
 ];
 
 export const dev = new Hono<AppEnv>();
+
+dev.use("*", async (c, next) => {
+  if (Reflect.get(c.env, "DEV_MODE") !== "true") return fail(c, 404, "Not found.");
+  const id = Reflect.get(c.env, "AGENT_ID");
+  if (id && ["/tokens", "/seed", "/environment"].some((path) => c.req.path.endsWith(path))) {
+    const secret = Reflect.get(c.env, "AGENT_SECRET");
+    const supplied = c.req.header("Authorization")?.replace(/^Bearer /, "");
+    if (typeof secret !== "string" || !secret || !supplied) return fail(c, 401, "Unauthorized.");
+    const expected = new TextEncoder().encode(secret);
+    const actual = new TextEncoder().encode(supplied);
+    if (expected.byteLength !== actual.byteLength || !timingSafeEqual(expected, actual))
+      return fail(c, 401, "Unauthorized.");
+  }
+  await next();
+});
+
+dev.get("/environment", async (c) => {
+  const accounts = await db(c.env.DB)
+    .selectFrom("accounts")
+    .select("id")
+    .where("id", "in", ["acc_priya", "acc_marco", "acc_jun", "acc_sam", "acc_orbit"])
+    .execute();
+  const repos = await db(c.env.DB).selectFrom("repos").select(["owner_id", "name"]).execute();
+  return c.json({
+    id: Reflect.get(c.env, "AGENT_ID") ?? null,
+    ready: accounts.length === 5,
+    fixtures: SAMPLES.every((sample) =>
+      repos.some((repo) => repo.owner_id === sample.owner && repo.name === sample.name),
+    ),
+  });
+});
 
 // Mint a token for any persona with no sign-in, so scripts can bootstrap:
 //   curl -X POST localhost:5180/api/dev/tokens -d '{"persona":"jun"}'
@@ -84,54 +109,60 @@ dev.post("/tokens", async (c) => {
 });
 
 dev.post("/seed", async (c) => {
-  const existing = await db(c.env.DB)
-    .selectFrom("repos")
-    .select((eb) => eb.fn.countAll<number>().as("n"))
-    .executeTakeFirst();
-  if (existing && existing.n > 0)
-    return c.json({ error: "Sample repositories already exist." }, 409);
-
-  const created = await Promise.all(
-    SAMPLES.map(async (sample) => {
+  let created = 0;
+  for (const sample of SAMPLES) {
+    let row = await db(c.env.DB)
+      .selectFrom("repos")
+      .select("id")
+      .where("owner_id", "=", sample.owner)
+      .where("name", "=", sample.name)
+      .executeTakeFirst();
+    if (!row) {
       const artifactsName = newArtifactsName();
-      const repo = sample.importUrl
-        ? await c.env.ARTIFACTS.import({
-            source: { url: sample.importUrl },
-            target: { name: artifactsName, opts: { description: sample.description } },
-          })
-        : await c.env.ARTIFACTS.create(artifactsName, {
+      const repo = await c.env.ARTIFACTS.create(artifactsName, {
+        description: sample.description,
+        setDefaultBranch: "main",
+      });
+      const id = `repo_${crypto.randomUUID()}`;
+      try {
+        await db(c.env.DB)
+          .insertInto("repos")
+          .values({
+            id,
+            owner_id: sample.owner,
+            name: sample.name,
             description: sample.description,
-            setDefaultBranch: "main",
-          });
-      return { sample, artifactsName, repo };
-    }),
-  );
-
-  const statements = created.flatMap(({ sample, artifactsName, repo }) => {
-    const id = `repo_${crypto.randomUUID()}`;
-    return [
-      db(c.env.DB)
-        .insertInto("repos")
-        .values({
-          id,
-          owner_id: sample.owner,
-          name: sample.name,
-          description: sample.description,
-          visibility: sample.visibility,
-          default_branch: repo.defaultBranch || "main",
-          artifacts_name: artifactsName,
-          artifacts_remote: repo.remote,
-          imported_from: sample.importUrl,
-        }),
-      ...sample.collaborators.map((collaborator) =>
-        db(c.env.DB)
-          .insertInto("repo_collaborators")
-          .values({ repo_id: id, user_id: collaborator.user, role: collaborator.role }),
-      ),
-    ];
-  });
-  await batch(c.env.DB, statements);
-  const results = await db(c.env.DB).selectFrom("repos").select("id").execute();
-  c.executionCtx.waitUntil(Promise.all(results.map((r) => notifyKnowledge(c.env, r.id))));
-  return c.json({ created: created.length }, 201);
+            visibility: sample.visibility,
+            default_branch: repo.defaultBranch || "main",
+            artifacts_name: artifactsName,
+            artifacts_remote: repo.remote,
+            imported_from: null,
+          })
+          .execute();
+        row = { id };
+        created++;
+      } catch (error) {
+        await c.env.ARTIFACTS.delete(artifactsName);
+        row = await db(c.env.DB)
+          .selectFrom("repos")
+          .select("id")
+          .where("owner_id", "=", sample.owner)
+          .where("name", "=", sample.name)
+          .executeTakeFirst();
+        if (!row) throw error;
+      }
+    }
+    if (sample.collaborators.length) {
+      await batch(
+        c.env.DB,
+        sample.collaborators.map((collaborator) =>
+          db(c.env.DB)
+            .insertInto("repo_collaborators")
+            .values({ repo_id: row.id, user_id: collaborator.user, role: collaborator.role })
+            .onConflict((oc) => oc.columns(["repo_id", "user_id"]).doNothing()),
+        ),
+      );
+    }
+  }
+  return c.json({ created }, created ? 201 : 200);
 });

@@ -16,5 +16,15 @@ export default defineConfig({
   },
   run: {
     cache: true,
+    tasks: {
+      agent: {
+        command: "node tools/agent/main.ts",
+        cache: false,
+      },
+      ready: {
+        command: "node tools/agent/main.ts check",
+        cache: false,
+      },
+    },
   },
 });
