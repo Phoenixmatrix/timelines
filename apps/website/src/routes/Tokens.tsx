@@ -42,7 +42,7 @@ export function Tokens() {
   return (
     <Page>
       <h1 className="m-0 text-headline">Access tokens</h1>
-      <p className="mt-1.5 mb-0 max-w-[52ch] text-ink-muted">
+      <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Git asks for a username and password over HTTPS. Use your username and a token as the
         password. Tokens act as you, limited to read or write. With gm you can sign in with an{" "}
         <Link to="/settings/ssh-keys" className={link}>

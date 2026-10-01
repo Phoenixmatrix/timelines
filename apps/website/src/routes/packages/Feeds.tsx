@@ -1,5 +1,5 @@
 import { TrashIcon } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Form,
   Link,
@@ -17,7 +17,13 @@ import type {
   OwnerPackages as OwnerPackagesData,
 } from "../../../shared/packages.ts";
 import { Page } from "../../components/AppShell.tsx";
-import { ConfirmDialog, FormError, SelectField, TextField } from "../../components/ui.tsx";
+import {
+  ConfirmDialog,
+  FormError,
+  SelectField,
+  TextField,
+  useToast,
+} from "../../components/ui.tsx";
 import { api, attempt, field, load } from "../../lib/api.ts";
 import { FORMATS, formatLabel, packagesPath, plural } from "../../lib/packages.ts";
 
@@ -103,7 +109,7 @@ function FeedRow({ feed, owner }: { feed: FeedSummary; owner: string }) {
         ? `Proxy and cache of ${feed.upstream}`
         : `Resolves from ${feed.members.join(", ") || "nothing yet"}, in that order`;
   return (
-    <li className="rounded-pane bg-pane p-4">
+    <li className="mk-card">
       <Form method="post" className="flex flex-col gap-4">
         <input type="hidden" name="key" value={feed.key} />
         <input type="hidden" name="format" value={feed.format} />
@@ -224,7 +230,7 @@ function NewFeed({ owner }: { owner: string }) {
   return (
     <section className="mk-card">
       <h2 className="mk-card-title">Add a proxy or virtual feed</h2>
-      <p className="mk-card-desc max-w-[62ch]">
+      <p className="mk-card-desc max-w-[48ch]">
         A proxy caches a public registry so builds never wait on it. A virtual feed puts several
         behind one URL: yours first, then the proxy.
       </p>
@@ -311,6 +317,10 @@ export function Feeds() {
   const data = useLoaderData<typeof feedsLoader>();
   const result = useActionData<typeof feedsAction>();
   const owner = data.owner.slug;
+  const toast = useToast();
+  useEffect(() => {
+    if (result && "ok" in result) toast.add({ title: result.ok });
+  }, [result, toast]);
   return (
     <Page>
       <nav aria-label="Breadcrumb" className="text-body-sm text-ink-muted">
@@ -323,7 +333,7 @@ export function Feeds() {
         </Link>
       </nav>
       <h1 className="m-0 mt-2 text-headline">Feeds and proxies</h1>
-      <p className="m-0 mt-1 max-w-[62ch] text-ink-muted">
+      <p className="m-0 mt-1 max-w-[48ch] text-ink-muted">
         Every format gets a registry for {owner} the first time something is published to it. Set
         who can install from each, how long versions stay, and add proxies of public registries.
       </p>
@@ -331,12 +341,6 @@ export function Feeds() {
         <div className="mt-4">
           <FormError message={result.error} />
         </div>
-      )}
-      {result && "ok" in result && (
-        <p className="mk-strip mt-4 mb-0" role="status">
-          <span className="mk-strip-dot" />
-          <span className="mk-strip-text">{result.ok}.</span>
-        </p>
       )}
       {data.access !== "admin" ? (
         <div className="mk-empty mt-6">Only {owner}'s admins manage its feeds.</div>
@@ -346,7 +350,7 @@ export function Feeds() {
           {data.feeds.length === 0 ? (
             <div className="mk-empty">None yet. Publish something, or add a proxy below.</div>
           ) : (
-            <ul className="m-0 flex list-none flex-col gap-3 p-0">
+            <ul className="m-0 flex list-none flex-col gap-6 p-0">
               {data.feeds.map((feed) => (
                 <FeedRow key={feed.id} feed={feed} owner={owner} />
               ))}

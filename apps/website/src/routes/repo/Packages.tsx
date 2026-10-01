@@ -22,7 +22,7 @@ export function RepoPackages() {
     return (
       <section className="mk-card">
         <h2 className="mk-card-title">Nothing published from {repo.name} yet</h2>
-        <p className="mk-card-desc max-w-[62ch]">
+        <p className="mk-card-desc max-w-[48ch]">
           A CI job that runs <code className="mk-mono">npm publish</code>,{" "}
           <code className="mk-mono">docker push</code>,{" "}
           <code className="mk-mono">twine upload</code> or{" "}

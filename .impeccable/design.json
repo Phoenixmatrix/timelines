@@ -486,13 +486,13 @@
         "name": "float",
         "value": "0 8px 24px -6px oklch(0.08 0.01 70 / 0.55), 0 2px 6px oklch(0.08 0.01 70 / 0.35)",
         "light": "0 8px 24px -6px oklch(0.35 0.02 70 / 0.18), 0 2px 6px oklch(0.35 0.02 70 / 0.1)",
-        "purpose": "Popups, menus, popovers, toasts, dialogs, tooltips; paired with 0 0 0 1px var(--line-soft)."
+        "purpose": "Popups, menus, popovers, toasts, dialogs, tooltips and the sticky bulk-selection bar; paired with 0 0 0 1px var(--line-soft)."
       },
       {
         "name": "dock",
         "value": "0 10px 30px -8px oklch(0.05 0.01 70 / 0.7)",
         "light": "0 10px 30px -8px oklch(0.35 0.02 70 / 0.24)",
-        "purpose": "The sticky bulk-selection bar; paired with the line-soft ring."
+        "purpose": "Kit-reserved for lifting a large framed composition off a marketing page; unused in the app (the floating selection bar takes float)."
       },
       {
         "name": "input-ring",
@@ -713,7 +713,7 @@
       },
       {
         "name": "The Chart-Hue Rule",
-        "body": "Data hues (berry, and teal and violet when they're needed) appear only inside charts and their legend keys, with a hatch or shape so the meaning survives without color.",
+        "body": "Data hues (teal, violet, berry, in that order; one per measure) appear only inside charts and their legend keys. They identify a measure and never judge it, and data is never drawn in amber.",
         "section": "colors"
       },
       {

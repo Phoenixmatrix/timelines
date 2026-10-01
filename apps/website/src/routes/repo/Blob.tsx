@@ -40,7 +40,7 @@ export function Blob() {
           </div>
         ) : (
           <div className="overflow-x-auto bg-sunken py-3">
-            <table className="w-full border-collapse font-mono text-[0.8125rem] leading-5">
+            <table className="w-full border-collapse font-mono text-body-sm leading-5">
               <tbody>
                 {lines.map((line, index) => (
                   <tr key={index}>

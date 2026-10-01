@@ -58,15 +58,7 @@ import {
   type QueryKey,
 } from "../../../shared/packages.ts";
 import { Page } from "../../components/AppShell.tsx";
-import {
-  ConfirmDialog,
-  CopyField,
-  link,
-  popMotion,
-  quietLink,
-  Tip,
-  useToast,
-} from "../../components/ui.tsx";
+import { ConfirmDialog, CopyField, link, popMotion, Tip, useToast } from "../../components/ui.tsx";
 import { ApiError, api } from "../../lib/api.ts";
 import { bytes, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import {
@@ -405,7 +397,7 @@ function RateStrip({
             <button
               key={i}
               type="button"
-              className="group/bar flex h-full min-w-0.5 flex-1 basis-0 cursor-pointer items-end rounded-[2px] border-0 bg-transparent p-0 transition-colors focus-visible:bg-signal-wash data-[brushed]:bg-signal-wash data-[empty]:cursor-default not-data-[empty]:hover:bg-signal-wash"
+              className="group/bar flex h-full min-w-0.5 flex-1 basis-0 cursor-pointer items-end rounded-t-[4px] border-0 bg-transparent p-0 transition-colors focus-visible:bg-raised data-[brushed]:bg-signal-wash data-[empty]:cursor-default not-data-[empty]:hover:bg-raised"
               data-empty={n === 0 || undefined}
               data-brushed={i >= lo && i <= hi ? "" : undefined}
               aria-label={`${bucketLabel(from.getTime(), ms)}: ${n} publishes. Show only these.`}
@@ -430,27 +422,21 @@ function RateStrip({
               }}
             >
               <span
-                className="flex min-h-0 w-full origin-bottom animate-rise flex-col overflow-hidden rounded-t-[2px] rounded-b-[1px] group-data-[empty]/bar:h-0.5! group-data-[empty]/bar:bg-line-soft motion-reduce:animate-none"
+                className="flex min-h-0 w-full origin-bottom animate-rise flex-col overflow-hidden rounded-t-[4px] group-data-[empty]/bar:h-0.5! group-data-[empty]/bar:bg-line-soft motion-reduce:animate-none"
                 style={{ height: `${(n / peak) * 100}%` }}
               >
                 {removed > 0 && (
-                  <span
-                    className="basis-0 bg-[repeating-linear-gradient(45deg,var(--data-berry)_0_1.5px,var(--data-berry-wash)_1.5px_4px)]"
-                    style={{ flexGrow: removed }}
-                  />
+                  <span className="basis-0 bg-data-berry" style={{ flexGrow: removed }} />
                 )}
                 {active > 0 && (
-                  <span
-                    className="basis-0 bg-ink-faint transition-colors group-hover/bar:bg-signal group-focus-visible/bar:bg-signal group-data-[brushed]/bar:bg-signal"
-                    style={{ flexGrow: active }}
-                  />
+                  <span className="basis-0 bg-data-teal" style={{ flexGrow: active }} />
                 )}
               </span>
             </button>
           );
         })}
       </div>
-      <div className="relative h-4 text-micro text-ink-faint tabular-nums" aria-hidden>
+      <div className="relative h-4 font-mono text-micro text-ink-faint tabular-nums" aria-hidden>
         {ticks.length ? (
           ticks.map((t) => (
             <span
@@ -468,11 +454,11 @@ function RateStrip({
       </div>
       <ul className="mk-legend text-micro">
         <li>
-          <span className="mk-key mk-key--bar bg-ink-faint" />
+          <span className="mk-key mk-key--bar mk-key--teal" />
           Active
         </li>
         <li>
-          <span className="mk-key mk-key--hatch mk-key--berry" />
+          <span className="mk-key mk-key--bar mk-key--berry" />
           Yanked, deprecated or deleted since
         </li>
       </ul>
@@ -592,13 +578,7 @@ function usePublishWindows(base: string, query: string, first: PublishPage) {
 
 function StatusChip({ status }: { status: PublishRow["status"] }) {
   if (status === "active") return null;
-  return (
-    <span
-      className={`mk-chip mk-chip--tag ${status === "deleted" ? "" : "bg-signal-wash text-ink"}`}
-    >
-      {STATUS_LABEL[status]}
-    </span>
-  );
+  return <span className="mk-chip mk-chip--tag">{STATUS_LABEL[status]}</span>;
 }
 
 function VersionRow({
@@ -643,26 +623,19 @@ function VersionRow({
         >
           {row.version}
         </span>
-        {row.tags.map((tag) => (
-          <button
-            key={tag}
-            type="button"
-            className="h-[18px] flex-none cursor-pointer rounded-full border-0 bg-signal-wash px-1.5 text-micro font-semibold text-ink hover:bg-signal hover:text-signal-ink"
-            onClick={() => onFilter("tag", tag)}
-            title={`Filter to tag:${tag}`}
-          >
+        {row.tags.slice(0, 3).map((tag) => (
+          <span key={tag} className="mk-chip mk-chip--tag flex-none">
             {tag}
-          </button>
+          </span>
         ))}
+        {row.tags.length > 3 && (
+          <span className="flex-none text-micro text-ink-faint">+{row.tags.length - 3}</span>
+        )}
         <StatusChip status={row.status} />
       </span>
       <span role="cell" className={CELLS.source}>
         {row.repo && repoOwner && repoName ? (
-          <Link
-            to={repoPath(repoOwner, repoName)}
-            className={`${quietLink} truncate`}
-            title={row.repo}
-          >
+          <Link to={repoPath(repoOwner, repoName)} className={`${link} truncate`} title={row.repo}>
             {repoOwner === owner ? repoName : row.repo}
           </Link>
         ) : (
@@ -701,10 +674,7 @@ function VersionRow({
       </span>
       <span role="cell" className={`${CELLS.run} font-mono`}>
         {row.runNumber !== null && repoOwner && repoName && (
-          <Link
-            to={repoPath(repoOwner, repoName, "ci", String(row.runNumber))}
-            className={quietLink}
-          >
+          <Link to={repoPath(repoOwner, repoName, "ci", String(row.runNumber))} className={link}>
             #{row.runNumber}
           </Link>
         )}
@@ -721,7 +691,7 @@ function SkeletonRow() {
     <div role="row" className={`${ROW} h-full text-body-sm`} aria-busy="true">
       <span role="cell" className={CELLS.check} />
       <span role="cell" className={CELLS.version}>
-        <span className="inline-block h-2.5 w-24 animate-pulse rounded-[5px] bg-raised" />
+        <span className="inline-block h-2.5 w-24 animate-pulse rounded-plate bg-raised" />
       </span>
     </div>
   );
@@ -1009,7 +979,7 @@ function SelectionBar({
     : plural(n, "version");
   return (
     <div
-      className="mk-enter-up sticky bottom-4 z-[5] flex flex-wrap items-center gap-2 rounded-pane bg-rail py-2 pr-2 pl-4 shadow-[var(--shadow-dock),0_0_0_1px_var(--line-soft)] motion-reduce:animate-none"
+      className="mk-enter-up sticky bottom-4 z-[5] flex flex-wrap items-center gap-2 rounded-pane bg-rail py-2 pr-2 pl-4 shadow-[var(--shadow-float),0_0_0_1px_var(--line-soft)] motion-reduce:animate-none"
       role="region"
       aria-label="Selected versions"
     >
@@ -1344,13 +1314,14 @@ export function PackageConsole() {
                 <li key={tag}>
                   <button
                     type="button"
-                    className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-control border-0 bg-pane px-2.5 text-body-sm text-ink-muted hover:bg-raised"
+                    className="mk-chip"
+                    aria-pressed={query.trim() === filterToken("tag", tag)}
                     onClick={() => onQuery(filterToken("tag", tag))}
                     title={`Show ${tag}`}
                   >
                     <TagIcon weight="bold" aria-hidden />
-                    <span>{tag}</span>
-                    <span className="mk-mono text-ink">{version}</span>
+                    {tag}
+                    <span className="mk-mono">{version}</span>
                   </button>
                 </li>
               ))}

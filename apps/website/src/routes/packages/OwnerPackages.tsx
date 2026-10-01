@@ -25,7 +25,7 @@ export function Activity({ spark, label }: { spark: number[]; label: string }) {
       {spark.map((n, i) => (
         <span
           key={i}
-          className="min-h-0.5 w-[3px] rounded-[1px] bg-ink-faint data-[zero]:bg-line-soft"
+          className="min-h-0.5 w-[3px] rounded-t-[4px] bg-data-teal data-[zero]:bg-line-soft"
           data-zero={n === 0 || undefined}
           style={{ height: `${(n / peak) * 100}%` }}
         />
@@ -123,7 +123,7 @@ export function OwnerPackages() {
       {data.packages.length === 0 ? (
         <section className="mk-card mt-8">
           <h2 className="mk-card-title">Nothing published yet</h2>
-          <p className="mk-card-desc max-w-[62ch]">
+          <p className="mk-card-desc max-w-[48ch]">
             CI jobs in {data.owner.slug}'s repositories publish here with nothing to configure: npm,
             docker, twine, cargo, mvn and helm come set up with the job's credential. From your
             machine, sign in with <code className="mk-mono">gm auth login</code> and run{" "}

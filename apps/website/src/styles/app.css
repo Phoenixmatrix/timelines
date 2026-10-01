@@ -28,6 +28,13 @@
   --color-danger-text: var(--danger-text);
   --color-danger-wash: var(--danger-wash);
   --color-online: var(--online);
+  /* Data hues: chart marks and their legend keys only (one per measure). */
+  --color-data-teal: var(--data-teal);
+  --color-data-teal-wash: var(--data-teal-wash);
+  --color-data-violet: var(--data-violet);
+  --color-data-violet-wash: var(--data-violet-wash);
+  --color-data-berry: var(--data-berry);
+  --color-data-berry-wash: var(--data-berry-wash);
   --color-backdrop: var(--backdrop);
   --color-transparent: transparent;
   --color-current: currentColor;

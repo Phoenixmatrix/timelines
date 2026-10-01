@@ -25,6 +25,8 @@ colors:
   danger-wash: "oklch(0.64 0.19 25 / 0.16)"
   online: "oklch(0.74 0.14 155)"
   backdrop: "oklch(0.08 0.01 70 / 0.6)"
+  data-teal: "oklch(0.78 0.1 200)"
+  data-teal-wash: "oklch(0.78 0.1 200 / 0.18)"
   data-berry: "oklch(0.66 0.12 350)"
   data-berry-wash: "oklch(0.66 0.12 350 / 0.22)"
 typography:
@@ -234,7 +236,7 @@ A near-monochrome warm charcoal palette with a single amber accent, a red reserv
 - **Amber Signal** (signal): primary buttons (Clone, Run, Create), pressed filter chips and saved views, the rail's current-place pip, the current repository tab's underline, the focus ring, text caret and selection highlight, the hover and brushed state of the publish-rate bars, and the switch's on state. Text on it is always **Signal Ink**, a dark warm brown, never white.
 - **Amber Hover** (signal-hover): the primary button's hover fill.
 - **Signal Line** (signal-line): the same amber as a line or mark: focus outlines, tab underlines, link underlines in running text, radio dots, select checks, running-CI spinners. In light it deepens to keep contrast against pale panes.
-- **Amber Wash** (signal-wash): a 14% amber tint for selected rows in the version table, pressed facet bars, info strips (`mk-strip`), dist-tag pills, and bar hover backgrounds. It marks "this is chosen" without shouting.
+- **Amber Wash** (signal-wash): a 14% amber tint for selected rows in the version table, pressed facet bars, the brushed span of the rate strip, and info strips (`mk-strip`, only for something that needs you now). It marks "this is chosen" without shouting. Never on tags, statuses or data marks.
 
 ### Secondary
 
@@ -243,8 +245,9 @@ A near-monochrome warm charcoal palette with a single amber accent, a red reserv
 
 ### Tertiary
 
-- **Online Green** (online): succeeded CI runs, a ready knowledge graph, a completed npm login. Status only; never a fill for controls.
-- **Berry** (data-berry, data-berry-wash): the hatched part of a publish-rate bar for versions yanked, deprecated or deleted since. The kit also defines teal and violet data hues for charts; Gitmatrix doesn't use them yet.
+- **Online Green** (online): succeeded CI runs, a ready knowledge graph, a completed npm login. Status only; never a fill for controls. This is a deliberate extension: the kit keeps `online` for a connection-is-live dot, and a git host needs pass/fail to read at a glance.
+- **Teal** (data-teal): the publishes measure: active publishes in the rate strip, and the 24-hour activity bars in package lists. One measure, one hue, everywhere it appears.
+- **Berry** (data-berry): the retired part of a rate-strip bar (versions yanked, deprecated or deleted since). Violet is free for the next measure.
 
 ### Neutral
 
@@ -256,7 +259,7 @@ A near-monochrome warm charcoal palette with a single amber accent, a red reserv
 - **Pressed** (pressed): default-button and chip hover, the switch track.
 - **Line** (line): the empty-state dashed border, blockquote rule, scrollbar thumb, link underline in tables, axis ticks.
 - **Line Soft** (line-soft): row dividers inside panes, the hairline ring on inputs and floating surfaces, the tab bar's baseline.
-- **Ink** (ink), **Ink Muted** (ink-muted), **Ink Faint** (ink-faint): primary text; secondary text, labels and inactive tabs; metadata, timestamps, placeholders, icons beside text and the neutral bars of the rate strip.
+- **Ink** (ink), **Ink Muted** (ink-muted), **Ink Faint** (ink-faint): primary text; secondary text, labels and inactive tabs; metadata, timestamps, placeholders, and icons beside text.
 - **Backdrop** (backdrop): the dimming layer behind dialogs.
 
 ### Named Rules
@@ -265,7 +268,7 @@ A near-monochrome warm charcoal palette with a single amber accent, a red reserv
 
 **The Roles-Not-Values Rule.** Code names a role (`bg-pane`, `text-ink-faint`, `var(--signal-line)`), never an OKLCH literal and never a Tailwind palette color. The light theme only works because every surface is a role.
 
-**The Chart-Hue Rule.** Data hues (berry, and teal and violet when they're needed) appear only inside charts and their legend keys, with a hatch or shape so the meaning survives without color.
+**The Chart-Hue Rule.** Data hues (teal, violet, berry, in that order; one per measure) appear only inside charts and their legend keys. They identify a measure and never judge it, and data is never drawn in amber: hover gets a `raised` backdrop, a brushed selection an amber wash behind the marks. Columns round 4px at the top; axis labels are faint mono micro; hatching is for estimates only.
 
 ## Typography
 
@@ -280,7 +283,7 @@ A near-monochrome warm charcoal palette with a single amber accent, a red reserv
 - **Headline** (700, 1.5rem/1.9rem, -0.015em): the one page title: the repository's `owner / name` (owner in normal weight and muted), the package name, "Packages", "Choose a persona".
 - **Title Large** (700, 1.25rem/1.65rem, -0.01em): a single focused object inside a page: a CI run's title, a knowledge node's name, a standalone card title such as the npm login confirmation. Dialog titles use the same size.
 - **Title** (700, 1.0625rem/1.5rem): section and pane headings ("Runs", "Published", "Narrow it down", job names), card titles and popover titles.
-- **Body** (400, 0.9375rem/1.45rem): default text, list-row primary lines (set semibold), buttons (600) and inputs. Running prose is held to 48 to 72ch (`max-w-[62ch]` is the common card-description measure; rendered Markdown caps at 72ch).
+- **Body** (400, 0.9375rem/1.45rem): default text, list-row primary lines (set semibold), buttons (600) and inputs. Explanatory copy caps at 48ch (`max-w-[48ch]`, the kit's 28 to 48ch); rendered Markdown caps at 72ch).
 - **Body Small** (400, 0.8125rem/1.25rem): the workhorse: row metadata, table cells, captions, hints, form errors, field labels (600), descriptions. It is the most used size in the app by a wide margin.
 - **Label** (600, 0.75rem/1.1rem): column headers and facet group titles, in sentence case and ink-muted or ink-faint.
 - **Micro** (400, 0.6875rem/1rem): tags, timestamps at the end of rows, axis labels, legend text, publish counts.
@@ -319,7 +322,7 @@ Gitmatrix is flat. Depth is carried by the tonal stack: sunken wells below the p
 ### Shadow Vocabulary
 
 - **Float** (`box-shadow: var(--shadow-float), 0 0 0 1px var(--line-soft)`; `--shadow-float` is `0 8px 24px -6px` plus `0 2px 6px` in a dark warm tint): popups, select lists, menus, popovers, toasts, dialogs, tooltips (without the ring).
-- **Dock** (`box-shadow: var(--shadow-dock), 0 0 0 1px var(--line-soft)`; `0 10px 30px -8px`): the sticky bulk-selection bar at the foot of the version table.
+- **Dock** (`--shadow-dock`): reserved by the kit for lifting a large framed composition off a marketing page. The app doesn't use it; the sticky bulk-selection bar floats, so it takes the float shadow and ring.
 
 ### Named Rules
 
@@ -348,7 +351,7 @@ The kit's classes (`mk-btn`, `mk-input`, `mk-chip`, `mk-card`, `mk-popup`…) ar
 ### Chips
 
 - **Filter chip:** 28px pill, raised fill, muted body-small text; pressed state (`aria-pressed`) turns amber with signal-ink semibold text. Saved views and format filters are rows of these.
-- **Tag:** a 20px non-interactive pill in micro text for labels: visibility, role, package format, status, short commit hashes (with mono). Tags stay 20px on phones (the one override `app.css` makes to the kit). Dist-tag pills in the version table are an 18px amber-wash variant that filters on click.
+- **Tag:** a 20px non-interactive pill in micro text for labels: visibility, role, package format, status, short commit hashes (with mono). Tags stay 20px on phones (the one override `app.css` makes to the kit). Tags are read-only: at most three, then a faint "+N" (dist-tags in the version table). To filter by a tag, the package header shows each tag as a filter chip.
 
 ### Cards / Containers
 
@@ -357,7 +360,7 @@ The kit's classes (`mk-btn`, `mk-input`, `mk-chip`, `mk-card`, `mk-popup`…) ar
 - **Shadow Strategy:** none (see Elevation & Depth).
 - **Border:** none; inner sections are split by `line-soft` hairlines with a title row (`px-4 py-3`, title size).
 - **Internal Padding:** 20px for `mk-card` (title, description, then a 20px-gap body); 16px horizontal for list panes.
-- **Empty states:** either a card that teaches the next step (title, a 62ch description naming the command, often a sunken code block with the exact snippet), or the dashed `mk-empty` box for "no results match".
+- **Empty states:** either a card that teaches the next step (title, a 48ch description naming the command, often a sunken code block with the exact snippet), or the dashed `mk-empty` box for "no results match".
 - **Strip:** a 12px-radius amber-wash bar with an amber dot, for in-progress notices with an action on the right (still importing, no CI runner, seed personas).
 
 ### Inputs / Fields
@@ -373,7 +376,7 @@ The kit's classes (`mk-btn`, `mk-input`, `mk-chip`, `mk-card`, `mk-popup`…) ar
 - **Rail:** 72px column on the rail tone. Places are 48px tiles (pane, muted icon at 22px) with a tooltip to the right; hover and current tighten the radius and lift to raised, and a 4px amber pip grows on the left edge (hidden on phones). Organizations appear as squircle monograms; the account sits at the foot as a circular monogram that opens a menu (profile, tokens, SSH keys, switch persona, theme radio, sign out). Under 640px the rail is a horizontal top bar.
 - **Repository tabs:** semibold muted text with a 2px transparent bottom border on a `line-soft` baseline; the current tab turns ink with a signal-line underline. A tab stays current for all of its sub-pages.
 - **Breadcrumbs:** body-small muted links separated by a faint slash.
-- **Links:** in running text, ink with a 1px signal-line underline that thickens to 2px on hover (`link`); repeated down a table, ink with a quiet `line` underline that turns amber on hover or focus (`quietLink`). Links that are whole rows or titles carry no underline and change tone instead.
+- **Links:** in running text, ink with a 1px signal-line underline that thickens to 2px on hover (`link`); the same style in tables; there is no second link style. Links that are whole rows or titles carry no underline and change tone instead.
 
 ### Monograms
 
@@ -389,7 +392,7 @@ State changes are 150ms color transitions. Popups scale from 95% and fade in 150
 
 ### Query console (signature component)
 
-The package version explorer: a mono query bar with filter help, a row of saved-view chips, the publish-rate strip (a pane of flat bars in faint ink with berry hatching for retired versions, turning amber on hover; dragging across bars scopes the query to that time range), a virtualized version table in one pane (sticky label-size header, 40px rows, amber-wash selected rows, tags and commit hashes as chips, branch and source as filter links), and a sticky facet column of count bars (raised bars scaled to the largest count, amber wash when pressed). Selecting rows raises a docked bar for bulk tag, deprecate, yank and delete. It is the reference for any future "lots of machine-made records" view: CI runs and commits should grow toward it, not away from it.
+The package version explorer: a mono query bar with filter help, a row of saved-view chips, the publish-rate strip (a pane of teal columns with berry for retired versions, a raised backdrop on hover and an amber wash behind a brushed span; dragging across bars scopes the query to that time range), a virtualized version table in one pane (sticky label-size header, 40px rows, amber-wash selected rows, read-only tags and commit-hash chips, source and run as links, branch as a filter), and a sticky facet column of count bars (raised bars scaled to the largest count, amber wash when pressed). The header shows dist-tags as filter chips. Selecting rows raises a floating bar for bulk tag, deprecate, yank and delete. It is the reference for any future "lots of machine-made records" view: CI runs and commits should grow toward it, not away from it.
 
 ## Do's and Don'ts
 

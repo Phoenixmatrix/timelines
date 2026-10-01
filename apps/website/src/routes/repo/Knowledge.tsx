@@ -264,7 +264,7 @@ function SearchResults({ search }: { search: KnowledgeSearchResults }) {
                   </span>
                   <span className="mk-mono truncate text-mono">{p.path}</span>
                 </Link>
-                <pre className="m-0 max-h-40 overflow-hidden px-4 py-2 font-mono text-[0.75rem] leading-5 whitespace-pre-wrap text-ink-muted">
+                <pre className="m-0 max-h-40 overflow-hidden px-4 py-2 font-mono text-mono leading-5 whitespace-pre-wrap text-ink-muted">
                   {p.text.slice(0, 600)}
                 </pre>
               </li>

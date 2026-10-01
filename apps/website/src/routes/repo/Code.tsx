@@ -94,7 +94,7 @@ function EmptyRepo({ repo }: { repo: RepoDetail }) {
   return (
     <section className="mk-card">
       <h2 className="mk-card-title">Push your first commit</h2>
-      <p className="mk-card-desc max-w-[56ch]">
+      <p className="mk-card-desc max-w-[48ch]">
         This repository is empty. From an existing project, add it as a remote and push. Git asks
         for a password: use a{" "}
         <Link to="/settings/tokens" className={link}>

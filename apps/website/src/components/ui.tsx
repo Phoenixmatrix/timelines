@@ -16,10 +16,6 @@ import type { RepoRole, Visibility } from "../../shared/api.ts";
 export const link =
   "text-ink underline decoration-signal-line decoration-1 underline-offset-[0.2em] hover:decoration-2";
 
-/** Links repeated down a table: a quiet underline that turns amber on hover. */
-export const quietLink =
-  "text-ink underline decoration-line underline-offset-[0.2em] hover:decoration-signal-line focus-visible:decoration-signal-line";
-
 // Motion from the kit. Base UI marks the start and end of each transition
 // with data attributes; reduced motion keeps the fades and drops the movement.
 /** Popups scale from 95% and fade in 150ms. */
