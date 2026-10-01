@@ -1,7 +1,10 @@
 import { Hono, type Context } from "hono";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
+import { onPush } from "../ci/trigger.ts";
 import { findRepo, roleFor } from "../db.ts";
+import { notifyKnowledge } from "../knowledge/coordinator.ts";
+import { invalidateRefs } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 
 // Git smart HTTP: https://git-scm.com/docs/http-protocol
@@ -115,6 +118,13 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     );
   }
   if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
+    invalidateRefs(repo.artifacts_name);
+    c.executionCtx.waitUntil(notifyKnowledge(c.env, repo.id));
+    c.executionCtx.waitUntil(
+      onPush(c.env, repo, actor?.id ?? null, (work) => c.executionCtx.waitUntil(work)).catch(
+        (error) => console.error("CI: push trigger failed", error),
+      ),
+    );
     c.executionCtx.waitUntil(
       c.env.DB.prepare(
         "UPDATE repos SET pushed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",

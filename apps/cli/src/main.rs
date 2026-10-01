@@ -9,7 +9,7 @@ mod repo;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::{BookmarkCommand, CliCommand, Command, FileCommand, OpCommand};
-use commands::{Ctx, local, network, server};
+use commands::{Ctx, ci, local, network, server};
 use output::{Format, GmError, Render, emit, emit_error, exit};
 
 /// Help text gets the git equivalent and examples from the manifest, and a
@@ -144,6 +144,9 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Push(a) => out(f, network::push(ctx, &a)),
         Command::Auth(c) => out(f, server::auth(ctx, &c)),
         Command::Repo(c) => out(f, server::repo(ctx, &c)),
+        Command::Runs(c) => out(f, ci::runs(ctx, &c)),
+        Command::Runner(a) => out(f, ci::runner(ctx, &a)),
+        Command::Secret(c) => out(f, ci::secret(ctx, &c)),
         Command::Api(a) => out(f, server::api(ctx, &a.method, &a.path, a.data.as_deref())),
         Command::Cli(CliCommand::Search { query }) => {
             let query = query.join(" ");

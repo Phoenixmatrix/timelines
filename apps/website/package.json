@@ -8,21 +8,25 @@
     "build": "vp build",
     "preview": "vp preview",
     "test": "vp test",
-    "typecheck": "tsc -p tsconfig.app.json && tsc -p tsconfig.worker.json && tsc -p tsconfig.node.json",
-    "cf-typegen": "wrangler types",
-    "db:migrate": "wrangler d1 migrations apply gitmatrix --local",
-    "deploy": "vp run build && wrangler deploy",
-    "git:login": "node scripts/git-login.ts"
+    "typecheck": "cf workers types && tsc -p tsconfig.app.json && tsc -p tsconfig.worker.json && tsc -p tsconfig.node.json",
+    "cf-typegen": "cf workers types",
+    "db:migrate": "cf d1 migrations apply 00000000000000000000000000000000 --local --persist-to .wrangler/state",
+    "deploy": "vp run build && cf deploy",
+    "git:login": "node scripts/git-login.ts",
+    "db:pending": "cf d1 migrations list 00000000000000000000000000000000 --local --persist-to .wrangler/state"
   },
   "dependencies": {
     "@base-ui/react": "catalog:",
     "@phosphor-icons/react": "catalog:",
+    "diff": "catalog:",
     "hono": "catalog:",
+    "mermaid": "catalog:",
     "react": "catalog:",
     "react-dom": "catalog:",
     "react-markdown": "catalog:",
     "react-router": "catalog:",
-    "remark-gfm": "catalog:"
+    "remark-gfm": "catalog:",
+    "yaml": "catalog:"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "catalog:",
@@ -31,6 +35,7 @@
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:",
     "@vitejs/plugin-react": "catalog:",
+    "cf": "catalog:",
     "tailwindcss": "catalog:",
     "typescript": "^7.0.2",
     "vite": "catalog:",

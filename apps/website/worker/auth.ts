@@ -1,9 +1,10 @@
 import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { TokenScope } from "../shared/api.ts";
+import type { Timing } from "./timing.ts";
 import { actorFromRow, findUserById, type AccountRow, type Actor } from "./db.ts";
 
-export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null } };
+export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null; timing: Timing } };
 
 // DEVELOPMENT ONLY. Picking a persona sets this cookie to their account id, with
 // no secret involved. Real sign-in replaces this module's session half.

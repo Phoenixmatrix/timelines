@@ -5,24 +5,26 @@ import { Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react
 import type { RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
 import { Monogram } from "../../components/Monogram.tsx";
 import { CopyField } from "../../components/ui.tsx";
-import { load, loadRepo } from "../../lib/api.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
-import { blobUrl, splitRefAndPath, treeUrl } from "../../lib/refs.ts";
+import { blobUrl, treeUrl } from "../../lib/refs.ts";
+import { repoData, routeData } from "../../lib/repoData.ts";
+import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { useViewer } from "../../lib/session.ts";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
-export async function codeLoader({ request, params }: LoaderFunctionArgs) {
+export async function codeLoader({ params }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
   const name = params.repo ?? "";
-  const repo = await loadRepo(owner, name, request);
-  if (!repo.head) return { tree: null };
-  const { ref, path } = params["*"]
-    ? splitRefAndPath(params["*"], repo)
-    : { ref: repo.defaultBranch, path: "" };
-  const query = new URLSearchParams({ ref, path });
-  const tree = await load<TreeResponse>(`/repos/${owner}/${name}/tree?${query}`, request);
-  return { tree };
+  // The tree and the repo detail load in parallel; the server splits the
+  // branch from the path, so neither waits for the other.
+  const [repo, tree] = await Promise.all([
+    routeData(repoData.detail(owner, name)),
+    repoData.tree(owner, name, params["*"] ?? "").catch((error: unknown) => error),
+  ]);
+  if (!repo.head || repo.state !== "ready") return { tree: null };
+  if (tree instanceof Error || !tree) return { tree: await routeData(Promise.reject(tree)) };
+  return { tree: tree as TreeResponse };
 }
 
 const ICONS = {
@@ -64,12 +66,12 @@ function EntryRow({
           {label}
         </span>
       ) : (
-        <Link
+        <PrefetchLink
           to={to}
           className="flex h-10 items-center gap-3 px-4 text-ink no-underline transition-colors hover:bg-raised"
         >
           {label}
-        </Link>
+        </PrefetchLink>
       )}
     </li>
   );
@@ -149,7 +151,7 @@ export function Code() {
         <ul className="m-0 list-none divide-y divide-line-soft p-0">
           {tree.path && (
             <li>
-              <Link
+              <PrefetchLink
                 to={treeUrl(
                   repo.owner.slug,
                   repo.name,
@@ -161,7 +163,7 @@ export function Code() {
               >
                 <FolderSimpleIcon className="size-4" aria-hidden />
                 ..
-              </Link>
+              </PrefetchLink>
             </li>
           )}
           {tree.entries.map((entry) => (

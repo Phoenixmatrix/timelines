@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
 import type { TokenScope } from "../../shared/api.ts";
 import { newArtifactsName } from "../artifacts.ts";
+import { notifyKnowledge } from "../knowledge/coordinator.ts";
+import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { fail, readJson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
@@ -60,6 +62,17 @@ export const dev = new Hono<AppEnv>();
 
 // Mint a token for any persona with no sign-in, so scripts can bootstrap:
 //   curl -X POST localhost:5180/api/dev/tokens -d '{"persona":"jun"}'
+// A clef playground: ask typed questions about any state, to tune the
+// questions the knowledge pipeline asks.
+dev.post("/clef", async (c) => {
+  const { state, questions } = await readJson<{
+    state: unknown;
+    questions: Record<string, ClefQuestion>;
+  }>(c);
+  if (!state || !questions) return fail(c, 400, "Send {state, questions}.");
+  return c.json(await decide(c.env, state, questions));
+});
+
 dev.post("/tokens", async (c) => {
   const body = await readJson<{ persona: string; name: string; scope: TokenScope }>(c);
   const persona = body.persona ? await findAccountBySlug(c.env.DB, body.persona) : null;
@@ -116,5 +129,7 @@ dev.post("/seed", async (c) => {
     ];
   });
   await c.env.DB.batch(statements);
+  const { results } = await c.env.DB.prepare("SELECT id FROM repos").all<{ id: string }>();
+  c.executionCtx.waitUntil(Promise.all(results.map((r) => notifyKnowledge(c.env, r.id))));
   return c.json({ created: created.length }, 201);
 });

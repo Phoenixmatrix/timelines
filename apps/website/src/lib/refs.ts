@@ -1,23 +1,3 @@
-import type { RepoDetail } from "../../shared/api.ts";
-
-/**
- * Split "/tree/<ref>/<path>" when the ref itself may contain slashes
- * ("jun/feature/src/index.js"): the longest known branch or tag that prefixes
- * the splat wins, then a full commit id, then the first segment.
- */
-export function splitRefAndPath(
-  splat: string,
-  repo: Pick<RepoDetail, "branches" | "tags">,
-): { ref: string; path: string } {
-  const trimmed = splat.replace(/^\/+|\/+$/g, "");
-  const names = [...repo.branches, ...repo.tags]
-    .map((ref) => ref.shortName)
-    .sort((a, b) => b.length - a.length);
-  const known = names.find((name) => trimmed === name || trimmed.startsWith(`${name}/`));
-  const ref = known ?? trimmed.split("/")[0] ?? "";
-  return { ref, path: trimmed.slice(ref.length).replace(/^\/+/, "") };
-}
-
 /** Encode each segment of a path for use in a URL, keeping the slashes. */
 export function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");

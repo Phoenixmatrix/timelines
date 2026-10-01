@@ -72,6 +72,7 @@ The design follows Cloudflare's agent-first `cf` CLI:
 | Bookmarks   | `bookmark list`, `bookmark set`, `bookmark delete [--remote]`                |
 | Remote      | `clone`, `init`, `fetch`, `sync` (pull), `push [--sync] [-b name]`           |
 | Server      | `auth login/status/logout`, `repo list/create/view/delete`, `api`            |
+| CI          | `runs list/show/logs/wait/start/cancel/rerun`, `runner`, `secret`            |
 | Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                          |
 
 ## Layout

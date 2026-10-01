@@ -8,16 +8,34 @@ import {
   useRevalidator,
   useRouteLoaderData,
   type LoaderFunctionArgs,
+  type ShouldRevalidateFunctionArgs,
 } from "react-router";
 import type { RepoDetail } from "../../../shared/api.ts";
 import { Page } from "../../components/AppShell.tsx";
+import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { CopyField, RoleChip, VisibilityChip } from "../../components/ui.tsx";
-import { loadRepo } from "../../lib/api.ts";
+import { forgetRepoData, repoData, routeData } from "../../lib/repoData.ts";
 import { commitsUrl, repoPath } from "../../lib/refs.ts";
 import { useViewer } from "../../lib/session.ts";
 
-export async function repoLoader({ request, params }: LoaderFunctionArgs) {
-  return loadRepo(params.owner ?? "", params.repo ?? "", request);
+export async function repoLoader({ params }: LoaderFunctionArgs) {
+  return routeData(repoData.detail(params.owner ?? "", params.repo ?? ""));
+}
+
+/**
+ * Moving around inside one repository doesn't refetch its branches; entering
+ * it, submitting a form or an explicit revalidation does.
+ */
+export function repoShouldRevalidate({
+  currentParams,
+  nextParams,
+  currentUrl,
+  nextUrl,
+  formMethod,
+  defaultShouldRevalidate,
+}: ShouldRevalidateFunctionArgs) {
+  if (formMethod || currentUrl.href === nextUrl.href) return defaultShouldRevalidate;
+  return currentParams.owner !== nextParams.owner || currentParams.repo !== nextParams.repo;
 }
 
 export function useRepo(): RepoDetail {
@@ -39,13 +57,13 @@ function Tab({
     section === "" ? pathname === to : pathname.startsWith(section),
   );
   return (
-    <Link
+    <PrefetchLink
       to={to}
       aria-current={current ? "page" : undefined}
-      className="-mb-px border-b-2 border-transparent px-1 pb-2.5 font-semibold text-ink-muted no-underline transition-colors hover:text-ink aria-[current=page]:border-signal-line aria-[current=page]:text-ink"
+      className="-mb-px shrink-0 border-b-2 border-transparent px-1 pb-2.5 font-semibold text-ink-muted no-underline transition-colors hover:text-ink aria-[current=page]:border-signal-line aria-[current=page]:text-ink"
     >
       {children}
-    </Link>
+    </PrefetchLink>
   );
 }
 
@@ -135,7 +153,10 @@ export function RepoLayout() {
           <button
             type="button"
             className="mk-btn mk-btn--sm"
-            onClick={() => revalidator.revalidate()}
+            onClick={() => {
+              forgetRepoData(repo.owner.slug, repo.name);
+              void revalidator.revalidate();
+            }}
             disabled={revalidator.state !== "idle"}
           >
             <ArrowClockwiseIcon weight="bold" aria-hidden />
@@ -144,7 +165,10 @@ export function RepoLayout() {
         </div>
       ) : (
         <>
-          <nav aria-label="Repository" className="mt-6 flex gap-5 border-b border-line-soft">
+          <nav
+            aria-label="Repository"
+            className="mt-6 flex gap-5 overflow-x-auto border-b border-line-soft [scrollbar-width:none]"
+          >
             <Tab to={base} sections={["", `${base}/tree/`, `${base}/blob/`]}>
               Code
             </Tab>
@@ -156,6 +180,15 @@ export function RepoLayout() {
                 Commits
               </Tab>
             )}
+            <Tab to={`${base}/ci`} sections={[`${base}/ci`]}>
+              CI
+            </Tab>
+            <Tab to={`${base}/wiki`} sections={[`${base}/wiki`]}>
+              Wiki
+            </Tab>
+            <Tab to={`${base}/knowledge`} sections={[`${base}/knowledge`]}>
+              Knowledge
+            </Tab>
             {repo.viewerRole === "admin" && (
               <Tab to={`${base}/settings`} sections={[`${base}/settings`]}>
                 Settings

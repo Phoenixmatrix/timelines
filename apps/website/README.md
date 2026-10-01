@@ -17,11 +17,15 @@ browser    ──cookie──▶ Worker /api/*  ──env.ARTIFACTS──▶ log
 pnpm install
 pnpm run db:migrate   # local D1: schema + dev personas
 vp dev                # http://localhost:5180
+gm runner             # in another terminal: runs CI jobs (see CI/CD below)
 ```
 
-`wrangler login` must have the `artifacts` scope. There is no local Artifacts
-emulator, so dev uses the real `gitmatrix-dev` namespace (`remote: true` in
-`wrangler.jsonc`); D1 stays local.
+Sign in with `cf auth login` (the account needs Artifacts and Workers AI). There
+is no local Artifacts, Workers AI, Vectorize or AI Search emulator, so dev uses
+the real services (`dev: { remote: true }` in `cloudflare.config.ts`); D1, the
+Durable Object and the Workflow run locally, with state in `.wrangler/state`
+(the Vite plugin's default, shared with `cf --persist-to`). `cf` 1.0.0-beta.7
+doesn't exit after local D1 commands; stop it once it prints its result.
 
 On the persona screen, **Load samples** imports three small public GitHub repos
 and creates one empty repo.
@@ -90,11 +94,130 @@ curl -H "Authorization: Bearer $TOKEN" -X POST $H/api/repos \
 | `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                      |
 | `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                           |
 
+## Knowledge graph and wiki
+
+Every repository has a knowledge graph that stays current as it changes; the
+wiki is one consumer of it (the Knowledge tab and `/api/repos/:o/:n/knowledge/*`
+are others). Inspired by OpenDeepWiki, rebuilt around the graph and around
+real-time incremental updates on Cloudflare.
+
+```
+push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
+                       debounce 1.5s (max 8s), one build in flight, rebuild if dirty
+                     ─▶ KnowledgeBuild (Workflow, durable retried steps)
+   snapshot ─▶ analyze ─▶ graph ─▶ align ─▶ concepts ─▶ synthesize ─▶ review ─▶ graph-final ─▶ index ─▶ wiki ─▶ finish
+                 │           │        │          │            │                         │        │
+   kg_blob_analysis  kg_nodes/edges kg_concept_pairs kg_concepts  kg_synthesis   Vectorize + AI Search  wiki_pages
+   (by blob id)      kg_changes feed (clef, by pair) (groups,     (by inputs hash) (entities / passages) (inputs hash +
+                                                      links, trim)                                         clef gate)
+```
+
+- **Analysis per content, not per commit.** Each file version (blob) is
+  analyzed once: exact structure from regex extractors (imports, symbols,
+  resolved file/package edges), its role from `clef`, and a semantic card from
+  `glm-5.3-flash`. An edit `clef` judges cosmetic reuses the previous card.
+- **The graph** (repo, directories, files, symbols, packages, concepts,
+  components) is rebuilt from cached analyses on every build and diffed, so
+  ids are stable and each build leaves a change feed (`kg_changes`).
+  Components are size-bounded directory clusters; their summaries, the
+  repository overview and concept definitions come from `qwen3.8-27b`, cached
+  by a hash of their inputs.
+- **Retrieval:** Vectorize holds one embedding per entity
+  (`qwen3-embedding-0.6b`); AI Search holds source files and wiki pages for
+  hybrid keyword + semantic passage search with reranking.
+- **Concepts are aligned and trimmed with `clef`** (`worker/knowledge/concepts.ts`),
+  after the entity-alignment recipe: candidate pairs come from shared uncommon
+  words and mutual nearest neighbours by name embedding; `clef` scores each
+  pair 0 different / 1 related but separate / 2 the same ("should a glossary
+  list these as one entry?"), plus which is part of the other. Level-2 pairs
+  merge under a stable canonical key (never chaining into a group with a
+  concept judged different); clear level-1 directions become `part_of` edges.
+  Then each group is asked whether a newcomer would look it up in the glossary
+  (3+ files always stay); the rest become `topics` on their files. Once kept
+  concepts have definitions, their related pairs are asked again with the
+  definitions (`review`), which settles many that names alone left in between.
+  Decisions are stored, so a push only asks about the concepts it introduced.
+  The wording was picked on hand-labelled samples from this repo: the glossary
+  framing with file paths ranked pairs best (AUC 0.94 vs 0.85 for the recipe's
+  wording; file summaries made it worse) with all level-2 merges correct; the
+  glossary question separated keep/trim at AUC 0.88; with definitions, the
+  review recovered half the duplicates names missed. On this repo: 410 concept
+  names → 118 concepts (34 names merged into others, 258 groups trimmed to topics), all defined,
+  15 part-of links; the glossary went from 60 to 118 entries. First alignment
+  ~1,300 `clef` calls (~6 min); a rebuild with nothing new asks none.
+- **The wiki** catalog comes from the graph. A page is rewritten only when its
+  inputs change _and_ `clef` judges the change makes it out of date; diagrams
+  are drawn from the graph on every build, never by a model.
+- **Latency** on this repo: a 2-file push updates the graph in ~14s, summaries
+  in ~40s, search in ~60s and the affected wiki page in ~90s. A first build of
+  ~100 files takes ~13 minutes (mostly writing every page once).
+- **Robustness:** model calls have deadlines and back off on Workers AI rate
+  limits; a failed file is retried next build; the coordinator's watchdog
+  stops a hung build and retries it once.
+
+Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
+`{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
+`gitmatrix-knowledge`, AI Search namespace `gitmatrix` / instance `knowledge`.
+
+## CI/CD
+
+Repositories declare a pipeline in `.gitmatrix/ci.yml`; every push that moves
+a matching branch starts a run (also: the Run button, `gm runs start`, re-runs).
+
+```yaml
+on:
+  push:
+    branches: [main, "release/*"] # globs; omit for every branch
+env: { CI_MODE: strict }
+jobs:
+  test:
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - run: vp test
+  deploy:
+    needs: [test] # runs only if test succeeded
+    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger, commit
+    secrets: [CLOUDFLARE_API_TOKEN] # `gm secret set`, masked in logs
+    timeout_minutes: 15 # default 20
+    instance: standard-2 # sandbox size (default standard-1)
+    steps:
+      - run: cf deploy
+```
+
+```
+push ─▶ git proxy ─▶ onPush: ci_refs diff (one run per moved branch) ─▶ ci_runs/jobs/steps (D1)
+                                                                     ─▶ CiRun (Workflow, one per run)
+CiRun: jobs in dependency stages, in parallel within a stage, dependents of failures skipped
+   CI_RUNNER=sandbox  step.do ─▶ CiSandbox (Durable Object + container, one per job):
+                      start, clone from Artifacts, bash each step, stream logs, destroy
+   CI_RUNNER=local    job queued ─▶ step.waitForEvent ◀─ `gm runner` claims it over the API,
+                      runs the steps on your machine, streams logs, reports the end
+```
+
+- **Runners.** Deployed, jobs run in Cloudflare Sandbox containers (image
+  `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git). Under `vp dev` they run on
+  this machine instead, so development doesn't start paid containers: keep
+  `gm runner` going next to the dev server. `GITMATRIX_CI_RUNNER=sandbox vp dev`
+  runs the container path locally with Docker. The choice is made in
+  `cloudflare.config.ts`, which attaches the container only when sandboxed.
+- **Both runners report the same way** (`worker/ci/jobs.ts`): batched log
+  chunks, step transitions, the end. Secret values are masked server-side; a
+  cancelled job is told so in the reply to its next report and kills its
+  process group.
+- **Agents** push, then `gm runs wait`: it blocks on the commit's run and exits
+  non-zero with the failing job named; `gm runs logs --job <name>` has the output.
+
+API: `/api/repos/:o/:n/ci` (runs, run detail, logs with `?after=`, cancel,
+re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
+
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack)
 - `worker/git/pktline.ts`: pkt-line codec and the `ls-refs` client used to list branches
 - `worker/api/*`: JSON API (`dev.ts` mints persona tokens and seeds sample data)
+- `worker/knowledge/*`: knowledge graph pipeline, coordinator, workflow, API
+- `worker/ci/*`: CI config parser, push trigger, run Workflow, sandbox Durable Object, API
 - `scripts/git-login.ts`: points the git CLI at Gitmatrix as a persona
 - `src/`: React Router (data mode), Base UI and Tailwind, styled with MatrixKit Neo
   (`src/styles/tokens.css` is generated from the design system's tokens;

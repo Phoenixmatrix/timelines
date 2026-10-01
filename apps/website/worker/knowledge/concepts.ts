@@ -1,0 +1,722 @@
+// Concept alignment and trimming. File analyses name concepts independently,
+// so one idea shows up under many names ("D1 Database", "Cloudflare D1") and
+// most names are details of a single file. clef cleans that up, following the
+// entity-alignment recipe (block candidates cheaply, ask one typed question
+// per pair, route by the nearest level, no fitted thresholds):
+//
+//   pairs    candidate pairs come from shared uncommon words and mutual
+//            nearest neighbours by name embedding; clef places each pair on
+//            0 different / 1 related but separate / 2 the same, plus which one
+//            is a part or kind of the other
+//   merge    pairs at level 2 merge into groups under a stable canonical key,
+//            never chaining into a group that holds a concept judged different
+//   link     level-1 pairs with a clear direction become narrower → broader
+//   trim     each group is asked whether a newcomer would look it up in the
+//            glossary; groups mentioned by 3+ files always stay. Trimmed
+//            names live on as file topics instead of graph nodes.
+//   review   once kept concepts have definitions, related pairs of them are
+//            asked again with the definitions, which settles many that names
+//            alone left in between; a "same" there merges them too.
+//
+// Every decision is stored, so after the first build a push only asks about
+// the concepts it introduced.
+//
+// Question wording was chosen on hand-labelled samples from this repository:
+// the glossary framing with file paths (no summaries) ranked pairs best, and
+// merges at level 2 were all correct; see the README.
+
+import type { FileAnalysis } from "./analyze.ts";
+import type { BuiltGraph, SnapshotFile } from "./graph.ts";
+import { decide, embed, type ClefQuestion } from "./models.ts";
+import { pool, runBatched, sha256, slug } from "./util.ts";
+
+export const ALIGNER = "a1";
+
+/** Nearest level 2 (score ≥ 1.5): the same concept. */
+const SAME = 1.5;
+/** Nearest level 0 (score ≤ 0.5): different concepts. */
+const DIFFERENT = 0.5;
+/** A clear direction for a related pair: likely one way, unlikely the other. */
+const DIRECTION_YES = 0.75;
+const DIRECTION_NO = 0.25;
+/** Concepts mentioned by this many files are glossary-worthy without asking. */
+const WELL_USED = 3;
+/** Above this many concepts, skip the O(n²) embedding comparison. */
+const MAX_EMBEDDED = 1200;
+const NEIGHBOURS = 3;
+const CLEF_CONCURRENCY = 6;
+
+export interface ConceptModel {
+  /** Concept key -> canonical key, for keys that merged into another. */
+  canonical: Map<string, string>;
+  /** Canonical keys clef judged glossary-worthy. */
+  salient: Set<string>;
+  /** Canonical keys judged not to be; they become file topics. */
+  trimmed: Set<string>;
+  /** [narrower, broader] canonical keys. */
+  partOf: [string, string][];
+}
+
+export const EMPTY_CONCEPT_MODEL: ConceptModel = {
+  canonical: new Map(),
+  salient: new Set(),
+  trimmed: new Set(),
+  partOf: [],
+};
+
+export interface Decision {
+  score: number;
+  aInB: number;
+  bInA: number;
+}
+
+export interface ConceptGroup {
+  /** Every spelling seen, with how many files used it. */
+  names: Map<string, number>;
+  files: string[];
+}
+
+export function singular(word: string): string {
+  if (word.length <= 3 || word.endsWith("ss") || word.endsWith("us") || word.endsWith("is"))
+    return word;
+  if (word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+  if (/(s|x|z|ch|sh)es$/.test(word)) return word.slice(0, -2);
+  return word.endsWith("s") ? word.slice(0, -1) : word;
+}
+
+/** Normalized concept key: case, punctuation and simple plurals don't split concepts. */
+export function conceptKey(name: string): string {
+  return slug(name.toLowerCase().split(/\s+/).map(singular).join(" "));
+}
+
+export const pairKey = (a: string, b: string) => (a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`);
+const splitPair = (key: string) => key.split("\u0000") as [string, string];
+
+/**
+ * The most used spelling; on a tie, one that spells the group's own key
+ * (so a merged concept is named after its canonical key), then alphabetical.
+ */
+export function displayName(names: Map<string, number>, key?: string): string {
+  const own = (name: string) => (key !== undefined && conceptKey(name) === key ? 1 : 0);
+  return (
+    [...names].sort(
+      (a, b) => b[1] - a[1] || own(b[0]) - own(a[0]) || a[0].localeCompare(b[0]),
+    )[0]?.[0] ?? ""
+  );
+}
+
+/** Concept key -> its spellings and the files that mention it. */
+export function collectConcepts(
+  files: SnapshotFile[],
+  analyses: Map<string, FileAnalysis>,
+): Map<string, ConceptGroup> {
+  const out = new Map<string, ConceptGroup>();
+  for (const file of files) {
+    const analysis = analyses.get(file.blob);
+    if (!analysis || analysis.skipped) continue;
+    for (const name of analysis.concepts) {
+      const key = conceptKey(name);
+      if (!key) continue;
+      const group: ConceptGroup = out.get(key) ?? { names: new Map(), files: [] };
+      group.names.set(name, (group.names.get(name) ?? 0) + 1);
+      if (!group.files.includes(file.path)) group.files.push(file.path);
+      out.set(key, group);
+    }
+  }
+  return out;
+}
+
+// ---- candidate pairs ----------------------------------------------------------
+
+const STOP = new Set([
+  "the",
+  "and",
+  "of",
+  "a",
+  "an",
+  "to",
+  "for",
+  "in",
+  "with",
+  "as",
+  "on",
+  "by",
+  "vs",
+  "via",
+]);
+
+function tokens(name: string): Set<string> {
+  return new Set(
+    name
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t && !STOP.has(t))
+      .map(singular),
+  );
+}
+
+/**
+ * Pairs sharing an uncommon word with enough overlap, or where one name's
+ * words are a subset of the other's.
+ */
+export function tokenCandidates(names: Map<string, string>): [string, string][] {
+  const tok = new Map([...names].map(([key, name]) => [key, tokens(name)]));
+  const index = new Map<string, string[]>();
+  for (const [key, set] of tok) for (const t of set) index.set(t, [...(index.get(t) ?? []), key]);
+  const rare = Math.max(8, Math.round(names.size * 0.03));
+  const seen = new Set<string>();
+  const out: [string, string][] = [];
+  for (const keys of index.values()) {
+    for (let i = 0; i < keys.length; i++) {
+      for (let j = i + 1; j < keys.length; j++) {
+        const a = keys[i] as string;
+        const b = keys[j] as string;
+        const pk = pairKey(a, b);
+        if (seen.has(pk)) continue;
+        seen.add(pk);
+        const ta = tok.get(a) as Set<string>;
+        const tb = tok.get(b) as Set<string>;
+        const shared = [...ta].filter((t) => tb.has(t));
+        const jaccard = shared.length / new Set([...ta, ...tb]).size;
+        const rareShared = shared.some((t) => (index.get(t)?.length ?? 0) <= rare);
+        const subset = [...ta].every((t) => tb.has(t)) || [...tb].every((t) => ta.has(t));
+        if ((rareShared && jaccard >= 0.25) || subset) out.push(splitPair(pk));
+      }
+    }
+  }
+  return out;
+}
+
+/** Pairs that are each other's nearest neighbours by embedding (no threshold to tune). */
+export function mutualNeighbours(
+  keys: string[],
+  vectors: number[][],
+  k = NEIGHBOURS,
+): [string, string][] {
+  const dims = vectors[0]?.length ?? 0;
+  const unit = vectors.map((v) => {
+    const norm = Math.hypot(...v) || 1;
+    return Float32Array.from(v, (x) => x / norm);
+  });
+  const top: number[][] = unit.map((a, i) => {
+    const best: [number, number][] = [];
+    for (let j = 0; j < unit.length; j++) {
+      if (j === i) continue;
+      const b = unit[j] as Float32Array;
+      let dot = 0;
+      for (let d = 0; d < dims; d++) dot += (a[d] as number) * (b[d] as number);
+      if (best.length < k || dot > (best[best.length - 1] as [number, number])[1]) {
+        best.push([j, dot]);
+        best.sort((x, y) => y[1] - x[1]);
+        if (best.length > k) best.pop();
+      }
+    }
+    return best.map(([j]) => j);
+  });
+  const out: [string, string][] = [];
+  top.forEach((neighbours, i) => {
+    for (const j of neighbours) {
+      if (j > i && top[j]?.includes(i)) out.push([keys[i] as string, keys[j] as string]);
+    }
+  });
+  return out;
+}
+
+// ---- grouping -----------------------------------------------------------------
+
+/**
+ * Merge keys that clef judged the same into groups and pick each group's
+ * canonical key. A group never absorbs another if any pair across them was
+ * judged different, so A≡B and B≡C can't drag in a C that differs from A.
+ * The canonical key stays put across builds: the key most of the group already
+ * pointed to, then the most mentioned, then the shortest.
+ */
+export function cluster(
+  keys: string[],
+  fileCounts: Map<string, number>,
+  decisions: Map<string, Decision>,
+  previous: Map<string, string>,
+): Map<string, string> {
+  const rootOf = new Map(keys.map((k) => [k, k]));
+  const members = new Map(keys.map((k) => [k, [k]]));
+  const same = [...decisions]
+    .filter(([, d]) => d.score >= SAME)
+    .sort((x, y) => y[1].score - x[1].score);
+  for (const [pk] of same) {
+    const [a, b] = splitPair(pk);
+    const ra = rootOf.get(a);
+    const rb = rootOf.get(b);
+    if (!ra || !rb || ra === rb) continue;
+    const groupA = members.get(ra) as string[];
+    const groupB = members.get(rb) as string[];
+    const conflict = groupA.some((x) =>
+      groupB.some((y) => (decisions.get(pairKey(x, y))?.score ?? SAME) <= DIFFERENT),
+    );
+    if (conflict) continue;
+    for (const y of groupB) rootOf.set(y, ra);
+    groupA.push(...groupB);
+    members.delete(rb);
+  }
+
+  const canonical = new Map<string, string>();
+  for (const group of members.values()) {
+    const votes = new Map<string, number>();
+    for (const k of group) {
+      const before = previous.get(k);
+      if (before && group.includes(before)) votes.set(before, (votes.get(before) ?? 0) + 1);
+    }
+    const lead = [...group].sort(
+      (x, y) =>
+        (votes.get(y) ?? 0) - (votes.get(x) ?? 0) ||
+        (fileCounts.get(y) ?? 0) - (fileCounts.get(x) ?? 0) ||
+        x.length - y.length ||
+        x.localeCompare(y),
+    )[0] as string;
+    for (const k of group) canonical.set(k, lead);
+  }
+  return canonical;
+}
+
+/** Narrower → broader links from related pairs with a clear direction. */
+export function partOfLinks(
+  decisions: Map<string, Decision>,
+  canonical: Map<string, string>,
+): [string, string][] {
+  const out = new Map<string, [string, string]>();
+  for (const [pk, d] of decisions) {
+    if (d.score >= SAME || d.score <= DIFFERENT) continue;
+    const [a, b] = splitPair(pk);
+    let link: [string, string] | null = null;
+    if (d.aInB >= DIRECTION_YES && d.bInA < DIRECTION_NO) link = [a, b];
+    else if (d.bInA >= DIRECTION_YES && d.aInB < DIRECTION_NO) link = [b, a];
+    if (!link) continue;
+    const narrower = canonical.get(link[0]);
+    const broader = canonical.get(link[1]);
+    if (!narrower || !broader || narrower === broader) continue;
+    out.set(`${narrower}\u0000${broader}`, [narrower, broader]);
+  }
+  // A pair of groups linked both ways is a tie, not a hierarchy.
+  return [...out.values()].filter(([n, b]) => !out.has(`${b}\u0000${n}`));
+}
+
+// ---- clef -----------------------------------------------------------------------
+
+const PAIR_QUESTIONS: Record<string, ClefQuestion> = {
+  link: {
+    type: "score",
+    instructions: "In a glossary for this repository, should these two concepts be one entry?",
+    criteria: [
+      "Different ideas: each needs its own entry.",
+      "Related ideas that need separate entries: one is a part, a kind or an aspect of the other.",
+      "One idea: the names are different wordings, abbreviations, or more or less specific phrasings of the same thing.",
+    ],
+  },
+  a_in_b: {
+    type: "noul",
+    instructions: "Is entity_a a more specific kind, part or aspect of entity_b?",
+  },
+  b_in_a: {
+    type: "noul",
+    instructions: "Is entity_b a more specific kind, part or aspect of entity_a?",
+  },
+};
+
+const SALIENCE_QUESTION: Record<string, ClefQuestion> = {
+  glossary: {
+    type: "noul",
+    instructions:
+      "Would a newcomer to this repository look this concept up in its glossary? Yes for ideas specific to how this project works, and for the platforms, services and tools it is built on; no for generic programming terms and details of a single file.",
+  },
+};
+
+async function repoSummary(db: D1Database, repoId: string): Promise<string> {
+  const row = await db
+    .prepare("SELECT summary FROM kg_nodes WHERE repo_id = ? AND id = 'repo'")
+    .bind(repoId)
+    .first<{ summary: string }>();
+  return (row?.summary ?? "").slice(0, 400);
+}
+
+/** First-pass decisions, with review scores overriding theirs. */
+async function loadDecisions(db: D1Database, repoId: string): Promise<Map<string, Decision>> {
+  const [pairs, reviews] = await db.batch([
+    db
+      .prepare(
+        "SELECT a, b, score, a_in_b, b_in_a FROM kg_concept_pairs WHERE repo_id = ? AND version = ?",
+      )
+      .bind(repoId, ALIGNER),
+    db.prepare("SELECT a, b, score FROM kg_concept_reviews WHERE repo_id = ?").bind(repoId),
+  ]);
+  const out = new Map<string, Decision>();
+  for (const r of (pairs?.results ?? []) as {
+    a: string;
+    b: string;
+    score: number;
+    a_in_b: number;
+    b_in_a: number;
+  }[]) {
+    out.set(pairKey(r.a, r.b), { score: r.score, aInB: r.a_in_b, bInA: r.b_in_a });
+  }
+  for (const r of (reviews?.results ?? []) as { a: string; b: string; score: number }[]) {
+    const first = out.get(pairKey(r.a, r.b));
+    out.set(pairKey(r.a, r.b), { score: r.score, aInB: first?.aInB ?? 0, bInA: first?.bInA ?? 0 });
+  }
+  return out;
+}
+
+export interface AlignStats {
+  concepts: number;
+  candidates: number;
+  asked: number;
+  /** Decisions stored once this call is done. */
+  decided: number;
+  remaining: number;
+}
+
+/**
+ * Ask clef about candidate pairs that have no stored decision, up to `budget`
+ * per call (one Workflow step); call again while `remaining` > 0. Decisions
+ * are saved as they arrive, so a retried step resumes where it stopped.
+ */
+export async function alignPairs(
+  env: Env,
+  repoId: string,
+  files: SnapshotFile[],
+  analyses: Map<string, FileAnalysis>,
+  budget = 600,
+): Promise<AlignStats> {
+  const groups = collectConcepts(files, analyses);
+  const names = new Map([...groups].map(([key, g]) => [key, displayName(g.names, key)]));
+  const decided = await loadDecisions(env.DB, repoId);
+  const { results: knownRows } = await env.DB.prepare(
+    "SELECT key FROM kg_concepts WHERE repo_id = ?",
+  )
+    .bind(repoId)
+    .all<{ key: string }>();
+  const known = new Set(knownRows.map((r) => r.key));
+  const fresh = [...names.keys()].filter((k) => !known.has(k));
+
+  const candidates = new Map<string, [string, string]>();
+  for (const [a, b] of tokenCandidates(names)) candidates.set(pairKey(a, b), [a, b]);
+  // Embeddings find synonyms with no word in common; they are only worth
+  // computing when there are new concepts to place.
+  if (fresh.length && names.size <= MAX_EMBEDDED) {
+    const keys = [...names.keys()];
+    const vectors = await embed(
+      env,
+      keys.map((k) => names.get(k) as string),
+    );
+    const freshSet = new Set(fresh);
+    for (const [a, b] of mutualNeighbours(keys, vectors)) {
+      if (freshSet.has(a) || freshSet.has(b)) candidates.set(pairKey(a, b), [a, b]);
+    }
+  }
+
+  const pending = [...candidates].filter(([pk]) => !decided.has(pk));
+  const batch = pending.slice(0, budget);
+  const context = await repoSummary(env.DB, repoId);
+  const entity = (key: string) => ({
+    name: names.get(key),
+    mentioned_in: [...(groups.get(key)?.files ?? [])].sort().slice(0, 4),
+  });
+  let unsaved: D1PreparedStatement[] = [];
+  const save = async () => {
+    const statements = unsaved;
+    unsaved = [];
+    await runBatched(env.DB, statements);
+  };
+  await pool(batch, CLEF_CONCURRENCY, async ([, [x, y]]) => {
+    const [a, b] = x < y ? [x, y] : [y, x];
+    const answers = await decide(
+      env,
+      { repository: context, entity_a: entity(a), entity_b: entity(b) },
+      PAIR_QUESTIONS,
+    );
+    const link = answers.link;
+    const score = link?.type === "score" ? link.score : 0;
+    const p = (name: string) => {
+      const answer = answers[name];
+      return answer?.type === "noul" ? answer.noul : 0;
+    };
+    unsaved.push(
+      env.DB.prepare(
+        `INSERT INTO kg_concept_pairs (repo_id, a, b, version, score, a_in_b, b_in_a) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (repo_id, a, b) DO UPDATE SET version = excluded.version, score = excluded.score,
+           a_in_b = excluded.a_in_b, b_in_a = excluded.b_in_a`,
+      ).bind(repoId, a, b, ALIGNER, score, p("a_in_b"), p("b_in_a")),
+    );
+    if (unsaved.length >= 40) await save();
+  });
+  await save();
+  return {
+    concepts: names.size,
+    candidates: candidates.size,
+    asked: batch.length,
+    decided: decided.size + batch.length,
+    remaining: pending.length - batch.length,
+  };
+}
+
+export interface SettleStats {
+  concepts: number;
+  groups: number;
+  merged: number;
+  salient: number;
+  trimmed: number;
+  links: number;
+  askedSalience: number;
+}
+
+/**
+ * Turn the stored pair decisions into the concept model: groups, canonical
+ * keys, narrower/broader links, and which groups are glossary-worthy.
+ */
+export async function settleConcepts(
+  env: Env,
+  repoId: string,
+  files: SnapshotFile[],
+  analyses: Map<string, FileAnalysis>,
+): Promise<SettleStats> {
+  const db = env.DB;
+  const groups = collectConcepts(files, analyses);
+  const keys = [...groups.keys()];
+  const present = new Set(keys);
+  const decisions = new Map(
+    [...(await loadDecisions(db, repoId))].filter(([pk]) =>
+      splitPair(pk).every((k) => present.has(k)),
+    ),
+  );
+  const { results: rows } = await db
+    .prepare(
+      "SELECT key, canonical, recurring, salient, salience_hash FROM kg_concepts WHERE repo_id = ?",
+    )
+    .bind(repoId)
+    .all<{
+      key: string;
+      canonical: string;
+      recurring: number | null;
+      salient: number | null;
+      salience_hash: string | null;
+    }>();
+  const previous = new Map(rows.map((r) => [r.key, r]));
+  const canonical = cluster(
+    keys,
+    new Map([...groups].map(([k, g]) => [k, g.files.length])),
+    decisions,
+    new Map(rows.map((r) => [r.key, r.canonical])),
+  );
+  const links = partOfLinks(decisions, canonical);
+
+  // Merge each group's spellings and files under its canonical key.
+  const merged = new Map<string, ConceptGroup>();
+  for (const [key, group] of groups) {
+    const lead = canonical.get(key) as string;
+    const target = merged.get(lead) ?? { names: new Map<string, number>(), files: [] };
+    for (const [name, n] of group.names) target.names.set(name, (target.names.get(name) ?? 0) + n);
+    for (const path of group.files) if (!target.files.includes(path)) target.files.push(path);
+    merged.set(lead, target);
+  }
+
+  // Salience: well-used groups stay; the rest ask clef, again only when the
+  // group's names or files change.
+  const context = await repoSummary(db, repoId);
+  const verdicts = new Map<string, { recurring: number | null; salient: boolean; hash: string }>();
+  let asked = 0;
+  await pool([...merged], CLEF_CONCURRENCY, async ([lead, group]) => {
+    if (group.files.length >= WELL_USED) {
+      verdicts.set(lead, { recurring: null, salient: true, hash: "" });
+      return;
+    }
+    const name = displayName(group.names, lead);
+    const aliases = [...group.names.keys()].filter((n) => n !== name).sort();
+    const paths = [...group.files].sort();
+    const hash = await sha256(
+      `${ALIGNER}\u0000${name}\u0000${aliases.join("|")}\u0000${paths.join("|")}`,
+    );
+    const before = previous.get(lead);
+    if (before?.salience_hash === hash && before.recurring !== null) {
+      verdicts.set(lead, { recurring: before.recurring, salient: before.recurring >= 0.5, hash });
+      return;
+    }
+    const answers = await decide(
+      env,
+      {
+        repository: context,
+        concept: {
+          name,
+          ...(aliases.length ? { also_called: aliases.slice(0, 6) } : {}),
+          mentioned_in: paths.slice(0, 6),
+        },
+      },
+      SALIENCE_QUESTION,
+    );
+    const answer = answers.glossary;
+    const recurring = answer?.type === "noul" ? answer.noul : 0;
+    asked++;
+    verdicts.set(lead, { recurring, salient: recurring >= 0.5, hash });
+  });
+
+  const statements: D1PreparedStatement[] = [
+    db.prepare("DELETE FROM kg_concepts WHERE repo_id = ?").bind(repoId),
+    db.prepare("DELETE FROM kg_concept_links WHERE repo_id = ?").bind(repoId),
+  ];
+  for (const key of keys) {
+    const lead = canonical.get(key) as string;
+    const verdict = key === lead ? verdicts.get(lead) : undefined;
+    statements.push(
+      db
+        .prepare(
+          "INSERT INTO kg_concepts (repo_id, key, canonical, recurring, salient, salience_hash) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(
+          repoId,
+          key,
+          lead,
+          verdict?.recurring ?? null,
+          verdict ? (verdict.salient ? 1 : 0) : null,
+          verdict?.hash ?? null,
+        ),
+    );
+  }
+  for (const [narrower, broader] of links) {
+    statements.push(
+      db
+        .prepare("INSERT INTO kg_concept_links (repo_id, narrower, broader) VALUES (?, ?, ?)")
+        .bind(repoId, narrower, broader),
+    );
+  }
+  // One transaction when it fits, so readers never see a half-written model.
+  if (statements.length <= 1000) await db.batch(statements);
+  else await runBatched(db, statements);
+
+  const salient = [...verdicts.values()].filter((v) => v.salient).length;
+  return {
+    concepts: keys.length,
+    groups: merged.size,
+    merged: keys.length - merged.size,
+    salient,
+    trimmed: merged.size - salient,
+    links: links.length,
+    askedSalience: asked,
+  };
+}
+
+const REVIEW_QUESTION: Record<string, ClefQuestion> = {
+  link: {
+    type: "score",
+    instructions: "In a glossary for this repository, should these two entries be one entry?",
+    criteria: [
+      "Different ideas: each needs its own entry.",
+      "Related ideas that need separate entries: one is a part, a kind or an aspect of the other.",
+      "One idea: the definitions describe the same thing, even if worded differently or more or less specifically.",
+    ],
+  },
+};
+
+export interface ReviewStats {
+  candidates: number;
+  asked: number;
+  /** Reviewed pairs judged the same that are still separate groups. */
+  newMerges: number;
+}
+
+/**
+ * Second opinion on related pairs of kept concepts, now that they have
+ * definitions. Reads the graph built with the current model and syntheses.
+ */
+export async function reviewConcepts(
+  env: Env,
+  repoId: string,
+  graph: Pick<BuiltGraph, "nodes" | "conceptFiles">,
+): Promise<ReviewStats> {
+  const db = env.DB;
+  const kept = new Map(
+    graph.nodes
+      .filter((n) => n.kind === "concept" && n.summary)
+      .map((n) => [n.id.slice(8), { name: n.name, definition: n.summary }]),
+  );
+  const { results: rows } = await db
+    .prepare("SELECT key, canonical FROM kg_concepts WHERE repo_id = ?")
+    .bind(repoId)
+    .all<{ key: string; canonical: string }>();
+  const canonical = new Map(rows.map((r) => [r.key, r.canonical]));
+  const { results: first } = await db
+    .prepare("SELECT a, b, score FROM kg_concept_pairs WHERE repo_id = ? AND version = ?")
+    .bind(repoId, ALIGNER)
+    .all<{ a: string; b: string; score: number }>();
+  // Canonical pairs of kept concepts the first pass placed in between.
+  const candidates = new Set<string>();
+  for (const { a, b, score } of first) {
+    if (score <= DIFFERENT || score >= SAME) continue;
+    const ca = canonical.get(a) ?? a;
+    const cb = canonical.get(b) ?? b;
+    if (ca !== cb && kept.has(ca) && kept.has(cb)) candidates.add(pairKey(ca, cb));
+  }
+  const { results: stored } = await db
+    .prepare("SELECT a, b, score, inputs_hash FROM kg_concept_reviews WHERE repo_id = ?")
+    .bind(repoId)
+    .all<{ a: string; b: string; score: number; inputs_hash: string }>();
+  const reviews = new Map(stored.map((r) => [pairKey(r.a, r.b), r]));
+
+  const context = await repoSummary(db, repoId);
+  const entry = (key: string) => ({
+    ...kept.get(key),
+    mentioned_in: (graph.conceptFiles.get(key) ?? []).slice(0, 4),
+  });
+  let asked = 0;
+  const statements: D1PreparedStatement[] = [];
+  await pool([...candidates], CLEF_CONCURRENCY, async (pk) => {
+    const [a, b] = splitPair(pk);
+    const hash = await sha256(`${ALIGNER}\u0000${JSON.stringify([kept.get(a), kept.get(b)])}`);
+    if (reviews.get(pk)?.inputs_hash === hash) return;
+    const answers = await decide(
+      env,
+      { repository: context, entry_a: entry(a), entry_b: entry(b) },
+      REVIEW_QUESTION,
+    );
+    const link = answers.link;
+    const score = link?.type === "score" ? link.score : 0;
+    asked++;
+    reviews.set(pk, { a, b, score, inputs_hash: hash });
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO kg_concept_reviews (repo_id, a, b, score, inputs_hash) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (repo_id, a, b) DO UPDATE SET score = excluded.score, inputs_hash = excluded.inputs_hash`,
+        )
+        .bind(repoId, a, b, score, hash),
+    );
+  });
+  await runBatched(db, statements);
+  const newMerges = [...reviews.values()].filter(
+    (r) => r.score >= SAME && (canonical.get(r.a) ?? r.a) !== (canonical.get(r.b) ?? r.b),
+  ).length;
+  return { candidates: candidates.size, asked, newMerges };
+}
+
+/** The stored concept model (empty until a build has aligned concepts). */
+export async function loadConceptModel(db: D1Database, repoId: string): Promise<ConceptModel> {
+  const [concepts, links] = await db.batch([
+    db.prepare("SELECT key, canonical, salient FROM kg_concepts WHERE repo_id = ?").bind(repoId),
+    db.prepare("SELECT narrower, broader FROM kg_concept_links WHERE repo_id = ?").bind(repoId),
+  ]);
+  const model: ConceptModel = {
+    canonical: new Map(),
+    salient: new Set(),
+    trimmed: new Set(),
+    partOf: [],
+  };
+  for (const row of (concepts?.results ?? []) as {
+    key: string;
+    canonical: string;
+    salient: number | null;
+  }[]) {
+    if (row.key !== row.canonical) model.canonical.set(row.key, row.canonical);
+    else if (row.salient === 1) model.salient.add(row.key);
+    else if (row.salient === 0) model.trimmed.add(row.key);
+  }
+  for (const row of (links?.results ?? []) as { narrower: string; broader: string }[]) {
+    model.partOf.push([row.narrower, row.broader]);
+  }
+  return model;
+}

@@ -1,5 +1,5 @@
 import { GitBranchIcon, TagIcon } from "@phosphor-icons/react";
-import { Link } from "react-router";
+import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import type { RepoDetail } from "../../../shared/api.ts";
 import { SelectField } from "../../components/ui.tsx";
 import { encodePath, repoPath } from "../../lib/refs.ts";
@@ -46,12 +46,12 @@ export function RefBar({
       </div>
       {view !== "commits" && (
         <nav aria-label="Path" className="flex min-w-0 flex-wrap items-center gap-1 text-body">
-          <Link
+          <PrefetchLink
             to={repoPath(repo.owner.slug, repo.name, "tree", encodePath(refName))}
             className="font-semibold text-ink-muted no-underline hover:text-ink"
           >
             {repo.name}
-          </Link>
+          </PrefetchLink>
           {segments.map((segment, index) => {
             const last = index === segments.length - 1;
             const to = repoPath(
@@ -69,9 +69,9 @@ export function RefBar({
                     {segment}
                   </span>
                 ) : (
-                  <Link to={to} className="text-ink-muted no-underline hover:text-ink">
+                  <PrefetchLink to={to} className="text-ink-muted no-underline hover:text-ink">
                     {segment}
-                  </Link>
+                  </PrefetchLink>
                 )}
               </span>
             );

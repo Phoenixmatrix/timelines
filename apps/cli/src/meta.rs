@@ -71,6 +71,17 @@ pub const COMMANDS: &[Meta] = &[
     meta!("repo create", git: "", kw: "new repository create remote server import", mutates: true, out: Out::Other("RepoSummary"), ex: ["gm repo create demo", "gm repo create engine --owner orbit --import https://github.com/lukeed/clsx"]),
     meta!("repo view", git: "git remote show origin", kw: "repository info details branches clone url", mutates: false, out: Out::Other("RepoDetail"), ex: ["gm repo view", "gm repo view orbit/engine"]),
     meta!("repo delete", git: "", kw: "delete remove repository server", mutates: true, out: Out::Other("{deleted}"), ex: ["gm repo delete jun/demo --yes"]),
+    meta!("runs list", git: "", kw: "ci cd pipeline builds checks runs status list recent tests", mutates: false, out: Out::Other("{runs:[CiRunSummary],runner}"), ex: ["gm runs list", "gm runs list -R orbit/engine"]),
+    meta!("runs show", git: "", kw: "ci run details jobs steps status result build", mutates: false, out: Out::Other("CiRunDetail {number,status,commit,ref,jobs:[{name,status,steps}]}"), ex: ["gm runs show", "gm runs show 12"]),
+    meta!("runs logs", git: "", kw: "ci output logs build failure why did it fail test output", mutates: false, out: Out::Other("{run,jobs:[{job,status,done,log}]}"), ex: ["gm runs logs", "gm runs logs 12 --job test", "gm runs logs 12 -f"]),
+    meta!("runs wait", git: "", kw: "ci wait block until build finishes tests pass green check result after push", mutates: false, out: Out::Other("CiRunDetail; exits 4 (code run_failed) when the run fails"), ex: ["gm runs wait", "gm push && gm runs wait", "gm runs wait 12", "gm runs wait --commit @-"]),
+    meta!("runs start", git: "", kw: "ci trigger start run build manually dispatch", mutates: true, out: Out::Other("{number}"), ex: ["gm runs start", "gm runs start --ref feature-x"]),
+    meta!("runs cancel", git: "", kw: "ci cancel stop abort run build", mutates: true, out: Out::Other("{cancelled}"), ex: ["gm runs cancel 12"]),
+    meta!("runs rerun", git: "", kw: "ci retry rerun again restart build flaky", mutates: true, out: Out::Other("{number}"), ex: ["gm runs rerun 12"]),
+    meta!("runner", git: "", kw: "ci runner agent worker execute jobs locally self-hosted run pipelines dev", mutates: false, out: Out::Other("{jobs:[{repo,run,job,status}]} (one JSON line per job while running)"), ex: ["gm runner", "gm runner --once", "gm runner -R orbit/engine -v"]),
+    meta!("secret list", git: "", kw: "ci secrets environment variables credentials list", mutates: false, out: Out::Other("{secrets:[{name,updatedAt}]}"), ex: ["gm secret list"]),
+    meta!("secret set", git: "", kw: "ci add secret token credential environment variable", mutates: true, out: Out::Other("{set}"), ex: ["gm secret set NPM_TOKEN --value xyz", "echo $TOKEN | gm secret set CLOUDFLARE_API_TOKEN"]),
+    meta!("secret delete", git: "", kw: "ci remove secret", mutates: true, out: Out::Other("{deleted}"), ex: ["gm secret delete NPM_TOKEN"]),
     meta!("api", git: "", kw: "raw http api request endpoint json", mutates: true, out: Out::Other("the API's JSON response"), ex: ["gm api GET /repos", "gm api POST /repos -d '{\"owner\":\"jun\",\"name\":\"x\",\"visibility\":\"private\"}'"]),
     meta!("cli search", git: "", kw: "find command help discover how do i", mutates: false, out: Out::Typed(schema_of::<Vec<Hit>>), ex: ["gm cli search \"undo my last commit\""]),
     meta!("cli guide", git: "", kw: "workflow guide tutorial how to use agents", mutates: false, out: Out::Other("markdown text"), ex: ["gm cli guide"]),
@@ -424,6 +435,14 @@ Ranges for `gm log -r`: `trunk..@`, `all`.
 - `gm rebase -d trunk` · `gm backout -r <rev>` (revert) · `gm duplicate <rev>` (cherry-pick)
 - `gm sync` (pull --rebase) · `gm push` (land on trunk) · `gm push -b name` (push a bookmark)
 - `gm undo` · `gm op log`
+
+## CI
+Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,
+`secrets`). Check your work landed green:
+    gm push && gm runs wait        # blocks; exit 0 = passed, 4 = failed
+    gm runs logs --job test        # why it failed
+`gm runs list|show|start|cancel|rerun`, `gm secret set NAME`. Against the dev
+server, jobs run on your machine: keep `gm runner` going next to `vp dev`.
 
 ## Conflicts
 Rebases never stop halfway. A conflicted change gets conflict markers in its

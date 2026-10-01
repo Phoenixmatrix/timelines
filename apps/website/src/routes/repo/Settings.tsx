@@ -21,7 +21,8 @@ import {
   Tip,
   useToast,
 } from "../../components/ui.tsx";
-import { api, attempt, field, forgetRepo, load } from "../../lib/api.ts";
+import { api, attempt, field, load } from "../../lib/api.ts";
+import { forgetRepoData } from "../../lib/repoData.ts";
 import { useRepo } from "./RepoLayout.tsx";
 
 export async function settingsLoader({ request, params }: LoaderFunctionArgs) {
@@ -38,7 +39,7 @@ export async function settingsAction({ request, params }: ActionFunctionArgs) {
   const name = params.repo ?? "";
   const base = `/repos/${owner}/${name}`;
   const form = await request.formData();
-  forgetRepo(owner, name);
+  forgetRepoData(owner, name);
 
   switch (form.get("intent")) {
     case "update":

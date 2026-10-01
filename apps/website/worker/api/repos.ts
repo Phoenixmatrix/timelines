@@ -13,12 +13,7 @@ import type {
   Visibility,
 } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
-import {
-  forgetUpstreamTokens,
-  isArtifactsError,
-  listRefs,
-  newArtifactsName,
-} from "../artifacts.ts";
+import { forgetUpstreamTokens, isArtifactsError, newArtifactsName } from "../artifacts.ts";
 import {
   accountSummary,
   canCreateIn,
@@ -30,6 +25,8 @@ import {
   type AccountRow,
   type RepoRow,
 } from "../db.ts";
+import { notifyKnowledge } from "../knowledge/coordinator.ts";
+import { isCommitId, RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
@@ -41,7 +38,7 @@ const COMMITS_PER_PAGE = 30;
 export const repos = new Hono<AppEnv>();
 
 /** Load a repo the actor can see, or the response to send instead. */
-async function loadRepo(
+export async function loadRepo(
   c: Context<AppEnv>,
   needed: RepoRole = "read",
 ): Promise<{ row: RepoRow; role: RepoRole } | Response> {
@@ -170,8 +167,45 @@ repos.post("/", async (c) => {
   }
 
   const row = await findRepo(c.env.DB, actor, owner.slug, name);
+  if (row) c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
   return c.json(row && repoSummary(row, actor), 201);
 });
+
+/** Open a cached object reader for a repo; always closed by the caller. */
+function reader(c: Context<AppEnv>, row: RepoRow): RepoReader {
+  return new RepoReader(c.env, row.artifacts_name, row.artifacts_remote, c.get("timing"), (work) =>
+    c.executionCtx.waitUntil(work),
+  );
+}
+
+/** Responses addressed by commit id never change, so browsers may keep them. */
+function cacheIfImmutable(c: Context<AppEnv>, ref: string) {
+  if (isCommitId(ref)) {
+    c.header("cache-control", "private, max-age=31536000, immutable");
+    c.header("vary", "Cookie, Authorization");
+  }
+}
+
+/**
+ * What a read request points at: `?at=<branch>/<path>` (a URL tail, split on
+ * the server so the page doesn't have to load the branch list first), or
+ * `?ref=&path=`. With neither, the repository's HEAD.
+ */
+async function resolveTarget(
+  c: Context<AppEnv>,
+  objects: RepoReader,
+  row: RepoRow,
+): Promise<{ ref: string; path: string } | Response> {
+  const at = c.req.query("at");
+  const raw = at
+    ? await objects.split(at)
+    : { ref: c.req.query("ref") || "", path: c.req.query("path") ?? "" };
+  const path = cleanPath(raw.path);
+  if (path === null) return fail(c, 400, "Invalid path.");
+  if (raw.ref) return { ref: raw.ref, path };
+  const refs = await objects.refs();
+  return { ref: refs.headBranch ?? row.default_branch, path };
+}
 
 repos.get("/:owner/:name", async (c) => {
   const loaded = await loadRepo(c);
@@ -186,9 +220,16 @@ repos.get("/:owner/:name", async (c) => {
     branches: [],
     tags: [],
   };
+  const objects = reader(c, row);
   try {
-    const refs = await listRefs(c.env, row.artifacts_name, row.artifacts_remote);
+    const refs = await objects.refs();
     detail.head = refs.head;
+    if (refs.head) {
+      const warmer = reader(c, row);
+      c.executionCtx.waitUntil(
+        warmer.warm(refs.head, COMMITS_PER_PAGE + 1).finally(() => warmer.close()),
+      );
+    }
     detail.branches = refs.branches;
     detail.tags = refs.tags;
     if (refs.headBranch && refs.headBranch !== row.default_branch) {
@@ -215,6 +256,8 @@ repos.get("/:owner/:name", async (c) => {
       }
     }
     throw error;
+  } finally {
+    await objects.close();
   }
   return c.json(detail);
 });
@@ -223,97 +266,111 @@ repos.get("/:owner/:name/tree", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
-  const ref = c.req.query("ref") || row.default_branch;
-  const path = cleanPath(c.req.query("path"));
-  if (path === null) return fail(c, 400, "Invalid path.");
+  const objects = reader(c, row);
+  try {
+    const target = await resolveTarget(c, objects, row);
+    if (target instanceof Response) return target;
+    const { ref, path } = target;
+    const oid = await objects.resolve(ref);
+    const commit = oid ? await objects.commit(oid) : null;
+    if (!commit) return fail(c, 404, `No branch, tag or commit named ${ref}.`);
+    const treeHash = await objects.treeAt(commit.treeHash, path);
+    if (!treeHash) return fail(c, 404, `No folder at ${path} on ${ref}.`);
 
-  using repo = await c.env.ARTIFACTS.get(row.artifacts_name);
-  const [commit] = await repo.log({ ref, limit: 1 });
-  if (!commit) return fail(c, 404, `No branch, tag or commit named ${ref}.`);
+    const entries: TreeEntry[] = ((await objects.tree(treeHash)) ?? [])
+      .map((entry) => ({
+        name: entry.name,
+        path: path ? `${path}/${entry.name}` : entry.name,
+        type: entry.type,
+        oid: entry.hash,
+      }))
+      .sort((a, b) =>
+        a.type === "tree" && b.type !== "tree"
+          ? -1
+          : b.type === "tree" && a.type !== "tree"
+            ? 1
+            : a.name.localeCompare(b.name),
+      );
 
-  let treeHash = commit.treeHash;
-  for (const segment of path ? path.split("/") : []) {
-    const entries = (await repo.readTree(treeHash)) ?? [];
-    const next = entries.find((entry) => entry.name === segment && entry.type === "tree");
-    if (!next) return fail(c, 404, `No folder at ${path} on ${ref}.`);
-    treeHash = next.hash;
-  }
-
-  const entries: TreeEntry[] = ((await repo.readTree(treeHash)) ?? [])
-    .map((entry) => ({
-      name: entry.name,
-      path: path ? `${path}/${entry.name}` : entry.name,
-      type: entry.type,
-      oid: entry.hash,
-    }))
-    .sort((a, b) =>
-      a.type === "tree" && b.type !== "tree"
-        ? -1
-        : b.type === "tree" && a.type !== "tree"
-          ? 1
-          : a.name.localeCompare(b.name),
+    let readme: TreeResponse["readme"] = null;
+    const readmeEntry = entries.find(
+      (entry) => entry.type === "blob" && /^readme(\.(md|markdown|txt))?$/i.test(entry.name),
     );
-
-  let readme: TreeResponse["readme"] = null;
-  const readmeEntry = entries.find(
-    (entry) => entry.type === "blob" && /^readme(\.(md|markdown|txt))?$/i.test(entry.name),
-  );
-  if (readmeEntry) {
-    const blob = await repo.readBlob(readmeEntry.oid);
-    if (blob && blob.size <= MAX_README_BYTES) {
-      readme = { name: readmeEntry.name, text: await blob.text() };
+    if (readmeEntry) {
+      const blob = await objects.blob(readmeEntry.oid);
+      if (blob && blob.size <= MAX_README_BYTES) {
+        readme = { name: readmeEntry.name, text: new TextDecoder().decode(blob.bytes) };
+      }
     }
-  }
 
-  const body: TreeResponse = { ref, path, commit: toCommit(commit), entries, readme };
-  return c.json(body);
+    cacheIfImmutable(c, ref);
+    const body: TreeResponse = { ref, path, commit: toCommit(commit), entries, readme };
+    return c.json(body);
+  } finally {
+    await objects.close();
+  }
 });
 
 repos.get("/:owner/:name/blob", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
-  const ref = c.req.query("ref") || row.default_branch;
-  const path = cleanPath(c.req.query("path"));
-  if (!path) return fail(c, 400, "Invalid path.");
+  const objects = reader(c, row);
+  try {
+    const target = await resolveTarget(c, objects, row);
+    if (target instanceof Response) return target;
+    const { ref, path } = target;
+    if (!path) return fail(c, 400, "Invalid path.");
+    const oid = await objects.resolve(ref);
+    const commit = oid ? await objects.commit(oid) : null;
+    if (!commit) return fail(c, 404, `No branch, tag or commit named ${ref}.`);
+    const entry = await objects.entryAt(commit.treeHash, path);
+    const blob = entry && entry.type !== "tree" ? await objects.blob(entry.hash) : null;
+    if (!blob) return fail(c, 404, `No file at ${path} on ${ref}.`);
 
-  using repo = await c.env.ARTIFACTS.get(row.artifacts_name);
-  const blob = await repo.readFile({ ref, path });
-  if (!blob) return fail(c, 404, `No file at ${path} on ${ref}.`);
-
-  const head = new Uint8Array(await blob.slice(0, MAX_TEXT_BYTES).arrayBuffer());
-  const binary = looksBinary(head);
-  const body: BlobResponse = {
-    ref,
-    path,
-    size: blob.size,
-    contentType: blob.type,
-    binary,
-    text: binary ? null : new TextDecoder().decode(head),
-    truncated: !binary && blob.size > MAX_TEXT_BYTES,
-  };
-  return c.json(body);
+    const head = blob.bytes.subarray(0, MAX_TEXT_BYTES);
+    const binary = looksBinary(head);
+    cacheIfImmutable(c, ref);
+    const body: BlobResponse = {
+      ref,
+      path,
+      size: blob.size,
+      contentType: binary ? "application/octet-stream" : "text/plain; charset=utf-8",
+      binary,
+      text: binary ? null : new TextDecoder().decode(head),
+      truncated: !binary && blob.size > MAX_TEXT_BYTES,
+    };
+    return c.json(body);
+  } finally {
+    await objects.close();
+  }
 });
 
 repos.get("/:owner/:name/commits", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
-  const ref = c.req.query("ref") || row.default_branch;
   const page = Math.max(1, Number.parseInt(c.req.query("page") ?? "1", 10) || 1);
 
-  using repo = await c.env.ARTIFACTS.get(row.artifacts_name);
-  const commits = await repo.log({
-    ref,
-    limit: COMMITS_PER_PAGE + 1,
-    offset: (page - 1) * COMMITS_PER_PAGE,
-  });
-  const body: CommitsResponse = {
-    ref,
-    commits: commits.slice(0, COMMITS_PER_PAGE).map(toCommit),
-    hasMore: commits.length > COMMITS_PER_PAGE,
-  };
-  return c.json(body);
+  const objects = reader(c, row);
+  try {
+    const target = await resolveTarget(c, objects, row);
+    if (target instanceof Response) return target;
+    const { ref } = target;
+    const oid = await objects.resolve(ref);
+    const commits = oid
+      ? await objects.log(oid, COMMITS_PER_PAGE + 1, (page - 1) * COMMITS_PER_PAGE)
+      : [];
+    cacheIfImmutable(c, ref);
+    const body: CommitsResponse = {
+      ref,
+      commits: commits.slice(0, COMMITS_PER_PAGE).map(toCommit),
+      hasMore: commits.length > COMMITS_PER_PAGE,
+    };
+    return c.json(body);
+  } finally {
+    await objects.close();
+  }
 });
 
 repos.patch("/:owner/:name", async (c) => {

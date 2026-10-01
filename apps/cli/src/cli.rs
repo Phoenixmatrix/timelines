@@ -96,6 +96,14 @@ pub enum Command {
     /// Manage repositories on the Gitmatrix server
     #[command(subcommand)]
     Repo(RepoCommand),
+    /// CI/CD runs of .gitmatrix/ci.yml: list, inspect, read logs, wait for a result
+    #[command(subcommand)]
+    Runs(RunsCommand),
+    /// Run queued CI jobs on this machine (how CI runs against the dev server)
+    Runner(RunnerArgs),
+    /// Secrets that CI jobs can read as environment variables
+    #[command(subcommand)]
+    Secret(SecretCommand),
     /// Call the Gitmatrix JSON API directly
     Api(ApiArgs),
     /// Discover commands: search, workflow guide, full manifest
@@ -376,6 +384,114 @@ pub enum RepoCommand {
         /// Required: confirms the deletion.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RunsCommand {
+    /// Recent runs, newest first
+    List {
+        /// Repository as owner/name (default: this repository's origin).
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// One run with its jobs and steps (default: the latest run)
+    Show {
+        number: Option<i64>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Output of a run's jobs (default: the latest run, every job)
+    Logs {
+        number: Option<i64>,
+        /// Only this job.
+        #[arg(short, long)]
+        job: Option<String>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+        /// Keep streaming until the jobs finish (text output).
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Block until a run finishes; exits 0 only if it succeeded. Default: the run for trunk.
+    Wait {
+        /// Run number. Default: the newest run for --commit.
+        number: Option<i64>,
+        /// Revision or commit hash whose run to wait for (default `trunk`).
+        #[arg(short, long, conflicts_with = "number")]
+        commit: Option<String>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Start a run of a branch by hand
+    Start {
+        /// Branch (default: the repository's default branch).
+        #[arg(long)]
+        r#ref: Option<String>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Cancel a queued or running run
+    Cancel {
+        number: i64,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Run the same commit again
+    Rerun {
+        number: i64,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Args)]
+pub struct RunnerArgs {
+    /// Only take jobs from this repository (owner/name).
+    #[arg(short = 'R', long)]
+    pub repo: Option<String>,
+    /// Name shown on the jobs this runner takes (default: the host name).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Take at most one job, then exit (exits right away when none is queued).
+    #[arg(long)]
+    pub once: bool,
+    /// Seconds between polls for work.
+    #[arg(long, default_value_t = 2)]
+    pub poll: u64,
+    /// Where jobs check out code (default: ~/.cache/gitmatrix/runner).
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+    /// Echo job output here as well as to the server.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+#[derive(Subcommand)]
+pub enum SecretCommand {
+    /// Secret names (values are never shown)
+    List {
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Create or replace a secret; the value comes from --value or stdin
+    Set {
+        name: String,
+        #[arg(long)]
+        value: Option<String>,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Remove a secret
+    Delete {
+        name: String,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
     },
 }
 

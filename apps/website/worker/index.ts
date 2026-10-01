@@ -5,9 +5,19 @@ import { repos } from "./api/repos.ts";
 import { tokens } from "./api/tokens.ts";
 import { sessionActor, tokenCredential, type AppEnv } from "./auth.ts";
 import { isArtifactsError } from "./artifacts.ts";
+import { ci, runner } from "./ci/api.ts";
 import { gitHttp } from "./git/http.ts";
+import { knowledge } from "./knowledge/api.ts";
+import { Timing } from "./timing.ts";
 
 const api = new Hono<AppEnv>();
+
+api.use(async (c, next) => {
+  const timing = new Timing();
+  c.set("timing", timing);
+  await next();
+  c.res.headers.set("server-timing", timing.header());
+});
 
 // Browsers authenticate with the persona cookie; scripts and CLIs send a
 // personal access token (`Authorization: Bearer gmx_…`). Read-scoped tokens
@@ -33,6 +43,9 @@ api.use(async (c, next) => {
   return next();
 });
 api.route("/", accounts);
+api.route("/repos/:owner/:name/knowledge", knowledge);
+api.route("/repos/:owner/:name/ci", ci);
+api.route("/ci/runner", runner);
 api.route("/repos", repos);
 api.route("/tokens", tokens);
 api.route("/dev", dev);
@@ -57,3 +70,7 @@ app.route("/api", api);
 app.route("/", gitHttp);
 
 export default app;
+export { KnowledgeBuild } from "./knowledge/build.ts";
+export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
+export { CiRun } from "./ci/workflow.ts";
+export { CiSandbox } from "./ci/sandbox.ts";

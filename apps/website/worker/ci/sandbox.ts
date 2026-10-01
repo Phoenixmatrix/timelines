@@ -1,0 +1,230 @@
+// Running a CI job on Cloudflare Sandbox. One Durable Object per job owns one
+// container (ctx.container, image from ci/Dockerfile): start it, clone the
+// commit straight from Artifacts with a short-lived read token, run each step
+// with bash, stream output into D1, then destroy the container so nothing
+// idles on the bill.
+
+import { DurableObject } from "cloudflare:workers";
+import type { CiClaimedJob } from "../../shared/api.ts";
+import { upstreamToken } from "../artifacts.ts";
+import { jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
+
+const WORKDIR = "/workspace/repo";
+const BASE_ENV = {
+  HOME: "/root",
+  PATH: "/usr/local/pnpm/bin:/usr/local/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  RUSTUP_HOME: "/usr/local/rustup",
+  CARGO_HOME: "/usr/local/cargo",
+  PNPM_HOME: "/usr/local/pnpm",
+};
+const FLUSH_MS = 1000;
+const FLUSH_BYTES = 16 * 1024;
+const READY_TIMEOUT_MS = 90_000;
+/** Log lines before step 0 (start-up and checkout) are filed under this step. */
+export const SETUP_STEP = -1;
+
+class Cancelled extends Error {}
+
+export class CiSandbox extends DurableObject<Env> {
+  async run(jobId: string): Promise<void> {
+    const container = this.ctx.container;
+    const db = this.env.DB;
+    const job = await loadJob(db, jobId);
+    if (!job) throw new Error(`No CI job ${jobId}`);
+    if (!container) {
+      await report(this.env, jobId, {
+        done: {
+          status: "failed",
+          error: "No sandbox container is configured for this deployment.",
+        },
+      });
+      return;
+    }
+    const spec = JSON.parse(job.spec) as StoredJob;
+    const payload = await jobPayload(db, job);
+
+    // A retried step starts over: claim (again) and clear the earlier attempt.
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE ci_jobs SET status = 'running', claimed_by = 'sandbox',
+             started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status IN ('queued', 'running')`,
+        )
+        .bind(jobId),
+      db.prepare("DELETE FROM ci_logs WHERE job_id = ?").bind(jobId),
+      db
+        .prepare(
+          "UPDATE ci_steps SET status = 'pending', exit_code = NULL, started_at = NULL, finished_at = NULL WHERE job_id = ?",
+        )
+        .bind(jobId),
+    ]);
+
+    const deadline = Date.now() + spec.timeoutMinutes * 60_000;
+    try {
+      const say = (text: string) => report(this.env, jobId, { logs: [{ step: SETUP_STEP, text }] });
+      await say(`Starting a ${spec.instance} sandbox (image ${spec.image})…\n`);
+      if (!container.running) {
+        container.start({
+          image: container.images[spec.image] ?? container.images.default!,
+          instance: spec.instance,
+          enableInternet: true,
+          env: BASE_ENV,
+        });
+      }
+      await this.#ready(container);
+
+      await say(`Checking out ${payload.ref} at ${payload.commit.slice(0, 12)}…\n`);
+      const token = await upstreamToken(this.env, job.artifacts_name, "read");
+      const gitEnv = {
+        ...BASE_ENV,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.extraHeader",
+        GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+        GIT_TERMINAL_PROMPT: "0",
+      };
+      const checkout = [
+        `git clone --quiet --depth 50 --single-branch --branch "$BRANCH" "$REMOTE" ${WORKDIR}`,
+        `cd ${WORKDIR}`,
+        `git checkout --quiet "$COMMIT" 2>/dev/null || { git fetch --quiet --depth 1 origin "$COMMIT" && git checkout --quiet "$COMMIT"; }`,
+        `git log -1 --format='%h %s'`,
+      ].join(" && ");
+      const code = await this.#exec(container, jobId, SETUP_STEP, checkout, {
+        cwd: "/",
+        env: {
+          ...gitEnv,
+          BRANCH: payload.ref,
+          REMOTE: job.artifacts_remote,
+          COMMIT: payload.commit,
+        },
+        deadline,
+      });
+      if (code !== 0) {
+        await report(this.env, jobId, {
+          done: { status: "failed", exitCode: code, error: "Checkout failed." },
+        });
+        return;
+      }
+
+      await this.#steps(container, jobId, payload, deadline);
+    } catch (error) {
+      const cancelled = error instanceof Cancelled;
+      await report(this.env, jobId, {
+        done: cancelled
+          ? { status: "cancelled" }
+          : { status: "failed", error: error instanceof Error ? error.message : String(error) },
+      });
+      if (!cancelled) throw error;
+    } finally {
+      await container.destroy().catch(() => {});
+    }
+  }
+
+  async #steps(container: Container, jobId: string, job: CiClaimedJob, deadline: number) {
+    for (const step of job.steps) {
+      const { cancelled } = await report(this.env, jobId, {
+        steps: [{ position: step.position, status: "running" }],
+      });
+      if (cancelled) throw new Cancelled();
+      const code = await this.#exec(container, jobId, step.position, step.run, {
+        cwd: WORKDIR,
+        env: { ...BASE_ENV, ...job.env },
+        deadline,
+      });
+      const ok = code === 0;
+      await report(this.env, jobId, {
+        steps: [{ position: step.position, status: ok ? "succeeded" : "failed", exitCode: code }],
+      });
+      if (!ok) {
+        await report(this.env, jobId, {
+          done: {
+            status: "failed",
+            exitCode: code,
+            error: code === 124 ? "The job timed out." : `${step.name} exited with ${code}.`,
+          },
+        });
+        return;
+      }
+    }
+    await report(this.env, jobId, { done: { status: "succeeded", exitCode: 0 } });
+  }
+
+  /** Wait until the container accepts exec. */
+  async #ready(container: Container) {
+    const until = Date.now() + READY_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const probe = await container.exec(["true"]);
+        if ((await probe.exitCode) === 0) return;
+      } catch (error) {
+        if (Date.now() > until) throw new Error(`The sandbox did not start: ${String(error)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  /**
+   * Run a bash script, streaming combined output into the job's log. Returns
+   * the exit code (124 on timeout). Throws Cancelled if the run was cancelled.
+   */
+  async #exec(
+    container: Container,
+    jobId: string,
+    step: number,
+    script: string,
+    options: { cwd: string; env: Record<string, string>; deadline: number },
+  ): Promise<number> {
+    const process = await container.exec(["/bin/bash", "-eo", "pipefail", "-c", script], {
+      cwd: options.cwd,
+      env: options.env,
+      stdout: "pipe",
+      stderr: "combined",
+    });
+    let buffer = "";
+    let cancelled = false;
+    let timedOut = false;
+    let flushing: Promise<void> = Promise.resolve();
+    const flush = () => {
+      if (!buffer) return flushing;
+      const text = buffer;
+      buffer = "";
+      flushing = flushing.then(async () => {
+        const result = await report(this.env, jobId, { logs: [{ step, text }] });
+        if (result.cancelled && !cancelled) {
+          cancelled = true;
+          process.kill();
+        }
+      });
+      return flushing;
+    };
+    const timer = setInterval(() => void flush(), FLUSH_MS);
+    const timeout = setTimeout(
+      () => {
+        timedOut = true;
+        buffer += `\n[gitmatrix] Timed out; stopping.\n`;
+        process.kill();
+      },
+      Math.max(0, options.deadline - Date.now()),
+    );
+    try {
+      const decoder = new TextDecoder();
+      for await (const chunk of process.stdout ?? []) {
+        buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+        if (buffer.length >= FLUSH_BYTES) void flush();
+      }
+      buffer += decoder.decode();
+      const code = await process.exitCode;
+      await flush();
+      if (cancelled) throw new Cancelled();
+      return timedOut ? 124 : code;
+    } finally {
+      clearInterval(timer);
+      clearTimeout(timeout);
+    }
+  }
+}
+
+/** The sandbox for one job. */
+export function sandbox(env: Env, jobId: string): DurableObjectStub<CiSandbox> {
+  // The config names the class by string, so its binding type can't infer it.
+  return (env.CI_SANDBOX as unknown as DurableObjectNamespace<CiSandbox>).getByName(jobId);
+}

@@ -41,3 +41,23 @@ Two different jobs, two different tools:
   (`vp dev` in `apps/website`). Work in throwaway clones outside this
   checkout, such as a temp directory. Run `gm cli guide` once for the workflow,
   and `gm cli search "<task>"` to find commands.
+- **CI in development runs on this machine.** The dev server queues CI jobs
+  for local runners instead of starting Cloudflare Sandbox containers: keep
+  `gm runner` running alongside `vp dev`, or jobs wait. Use
+  `GITMATRIX_CI_RUNNER=sandbox vp dev` (needs Docker) only when changing the
+  sandbox runner itself.
+
+# Cloudflare tooling: use `cf`, not wrangler
+
+The `cf` CLI supersedes wrangler for everything in this repo: types,
+D1 migrations, deploys, resource management (Artifacts, AI Search, Vectorize,
+Workers AI and so on). Don't run `wrangler` commands or add wrangler configs.
+
+- Worker configuration lives in `cloudflare.config.ts` (`cf/config`), not
+  `wrangler.jsonc`/`wrangler.toml`. The Vite plugin loads it with
+  `cloudflare({ experimental: { newConfig: true } })`.
+- Generate binding types with `cf workers types` (writes `.cloudflare/types/`).
+- Find commands with `cf cli search "<task>"`, then `<command> --help` or
+  `cf schema <command>`; don't crawl `--help` trees.
+- The `wrangler` package stays installed only because `@cloudflare/vite-plugin`
+  depends on it.

@@ -1,0 +1,340 @@
+// Reading git objects through the Artifacts binding, cached.
+//
+// Commits, trees and blobs are immutable by hash, and so is a page of history
+// counted from a given commit, so they are cached forever: first in this
+// isolate's memory, then in the Workers Cache API (shared by every isolate in
+// the colo). Only branch and tag names are mutable; they resolve through a
+// short-lived ref cache that pushes through the proxy invalidate.
+
+import { listRefs, type RepoRefs } from "./artifacts.ts";
+import type { Timing } from "./timing.ts";
+
+const MEMORY_BUDGET = 64 * 1024 * 1024;
+/** Refs are served from cache this long without asking Artifacts… */
+const REFS_FRESH_MS = 5_000;
+/** …and up to this long while a background refresh runs. Pushes through the
+ * proxy invalidate them immediately either way. */
+const REFS_STALE_MS = 10 * 60_000;
+const CACHE_ORIGIN = "https://objects.gitmatrix.internal";
+
+const memory = new Map<string, { value: unknown; size: number }>();
+let memoryUsed = 0;
+
+function remember(key: string, value: unknown, size: number) {
+  if (size > MEMORY_BUDGET / 8) return;
+  memory.delete(key);
+  memory.set(key, { value, size });
+  memoryUsed += size;
+  // Map iteration order is insertion order: the oldest entries go first.
+  for (const [oldKey, entry] of memory) {
+    if (memoryUsed <= MEMORY_BUDGET) break;
+    memory.delete(oldKey);
+    memoryUsed -= entry.size;
+  }
+}
+
+function recall<T>(key: string): T | undefined {
+  const entry = memory.get(key);
+  if (!entry) return undefined;
+  // Refresh recency.
+  memory.delete(key);
+  memory.set(key, entry);
+  return entry.value as T;
+}
+
+const refsCache = new Map<string, { at: number; refs: Promise<RepoRefs> }>();
+/** Loads in flight, so a page and the background warm-up never fetch twice. */
+const inflight = new Map<string, Promise<unknown>>();
+/** Heads already warmed in this isolate. */
+const warmed = new Set<string>();
+const WARM_MAX_BLOBS = 400;
+const WARM_MAX_BYTES = 8 * 1024 * 1024;
+const WARM_CONCURRENCY = 16;
+
+/** Forget cached refs for a repo, e.g. after a push went through the proxy. */
+export function invalidateRefs(artifactsName: string) {
+  refsCache.delete(artifactsName);
+}
+
+export interface BlobData {
+  size: number;
+  bytes: Uint8Array;
+}
+
+const HEX40 = /^[0-9a-f]{40}$/;
+
+export function isCommitId(ref: string): boolean {
+  return HEX40.test(ref);
+}
+
+export class RepoReader {
+  #stub: Promise<ArtifactsRepo> | undefined;
+  private env: Env;
+  private artifactsName: string;
+  private remote: string;
+  private timing: Timing;
+  private waitUntil: (work: Promise<unknown>) => void;
+
+  constructor(
+    env: Env,
+    artifactsName: string,
+    remote: string,
+    timing: Timing,
+    waitUntil: (work: Promise<unknown>) => void,
+  ) {
+    this.env = env;
+    this.artifactsName = artifactsName;
+    this.remote = remote;
+    this.timing = timing;
+    this.waitUntil = waitUntil;
+  }
+
+  /** The binding stub, fetched only when something misses the cache. */
+  #repo(): Promise<ArtifactsRepo> {
+    this.#stub ??= this.timing.measure("artifacts-get", this.env.ARTIFACTS.get(this.artifactsName));
+    return this.#stub;
+  }
+
+  /** Release the binding stub, if one was opened. */
+  async close() {
+    const stub = await this.#stub?.catch(() => null);
+    stub?.[Symbol.dispose]();
+  }
+
+  async #cached<T>(
+    kind: string,
+    id: string,
+    load: () => Promise<T>,
+    encode: (value: T) => { body: BodyInit; size: number },
+    decode: (response: Response) => Promise<T>,
+  ): Promise<T> {
+    const key = `${this.artifactsName}/${kind}/${id}`;
+    const hit = recall<T>(key);
+    if (hit !== undefined) {
+      this.timing.count(`${kind}-memory`);
+      return hit;
+    }
+    const pending = inflight.get(key) as Promise<T> | undefined;
+    if (pending) {
+      this.timing.count(`${kind}-shared`);
+      return pending;
+    }
+    const work = (async () => {
+      const url = `${CACHE_ORIGIN}/${key}`;
+      const cache = caches.default;
+      const stored = await cache.match(url);
+      if (stored) {
+        this.timing.count(`${kind}-cache`);
+        const value = await decode(stored);
+        remember(key, value, encode(value).size);
+        return value;
+      }
+      const value = await this.timing.measure(kind, load());
+      const { body, size } = encode(value);
+      remember(key, value, size);
+      await cache.put(
+        url,
+        new Response(body, { headers: { "cache-control": "public, max-age=31536000, immutable" } }),
+      );
+      return value;
+    })();
+    inflight.set(key, work);
+    try {
+      return await work;
+    } finally {
+      inflight.delete(key);
+    }
+  }
+
+  /** Seed the cache with a value obtained some other way. */
+  #seed(kind: string, id: string, value: unknown) {
+    const key = `${this.artifactsName}/${kind}/${id}`;
+    if (recall(key) === undefined) remember(key, value, JSON.stringify(value).length * 2);
+  }
+
+  #json<T>(kind: string, id: string, load: () => Promise<T>): Promise<T> {
+    return this.#cached(
+      kind,
+      id,
+      load,
+      (value) => {
+        const body = JSON.stringify(value);
+        return { body, size: body.length * 2 };
+      },
+      (response) => response.json() as Promise<T>,
+    );
+  }
+
+  commit(oid: string): Promise<ArtifactsCommitMetadata | null> {
+    return this.#json("commit", oid, async () => (await this.#repo()).readCommit(oid));
+  }
+
+  tree(oid: string): Promise<ArtifactsTreeEntry[] | null> {
+    return this.#json("tree", oid, async () => (await this.#repo()).readTree(oid));
+  }
+
+  /** A page of first-parent history counted from a commit: immutable too. */
+  async log(oid: string, limit: number, offset: number): Promise<ArtifactsCommitMetadata[]> {
+    const commits = await this.#json(`log`, `${oid}-${limit}-${offset}`, async () =>
+      (await this.#repo()).log({ ref: oid, limit, offset }),
+    );
+    // History pages carry full commit metadata: opening any of them is free.
+    for (const commit of commits) this.#seed("commit", commit.hash, commit);
+    return commits;
+  }
+
+  blob(oid: string): Promise<BlobData | null> {
+    return this.#cached<BlobData | null>(
+      "blob",
+      oid,
+      async () => {
+        const blob = await (await this.#repo()).readBlob(oid);
+        return blob ? { size: blob.size, bytes: new Uint8Array(await blob.arrayBuffer()) } : null;
+      },
+      (value) => ({ body: value ? value.bytes : "", size: value?.size ?? 0 }),
+      async (response) => {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        return { size: bytes.length, bytes };
+      },
+    );
+  }
+
+  /** Branch and tag tips: cached, and refreshed in the background once stale. */
+  refs(): Promise<RepoRefs> {
+    const cached = refsCache.get(this.artifactsName);
+    const age = cached ? Date.now() - cached.at : Infinity;
+    if (cached && age < REFS_FRESH_MS) {
+      this.timing.count("refs-memory");
+      return cached.refs;
+    }
+    const refresh = () => {
+      const refs = listRefs(this.env, this.artifactsName, this.remote);
+      refs.then(
+        () => refsCache.set(this.artifactsName, { at: Date.now(), refs }),
+        () => refsCache.delete(this.artifactsName),
+      );
+      return refs;
+    };
+    if (cached && age < REFS_STALE_MS) {
+      this.timing.count("refs-stale");
+      // Mark it fresh now so concurrent requests don't all refresh at once.
+      refsCache.set(this.artifactsName, { at: Date.now(), refs: cached.refs });
+      this.waitUntil(refresh().catch(() => undefined));
+      return cached.refs;
+    }
+    const refs = this.timing.measure("ls-refs", refresh());
+    refsCache.set(this.artifactsName, { at: Date.now(), refs });
+    return refs;
+  }
+
+  /** A branch, tag or commit id, as a commit id. */
+  async resolve(ref: string): Promise<string | null> {
+    if (isCommitId(ref)) return ref;
+    const refs = await this.refs();
+    if (ref === "HEAD") return refs.head;
+    const match =
+      refs.branches.find((b) => b.shortName === ref || b.name === ref) ??
+      refs.tags.find((t) => t.shortName === ref || t.name === ref);
+    return match?.oid ?? null;
+  }
+
+  /**
+   * Split a URL tail like `jun/feature/src/app.ts` into a ref and a path: the
+   * longest branch or tag that prefixes it wins, then a commit id, then the
+   * first segment.
+   */
+  async split(spec: string): Promise<{ ref: string; path: string }> {
+    const refs = await this.refs();
+    return splitRefPath(
+      spec,
+      [...refs.branches, ...refs.tags].map((r) => r.shortName),
+    );
+  }
+
+  /**
+   * Load everything a visitor is likely to open next at `head`: every tree,
+   * the smaller files and the first page of history. Repos here are small, so
+   * after this, browsing is served from memory.
+   */
+  async warm(head: string, logPage: number): Promise<void> {
+    const key = `${this.artifactsName}@${head}`;
+    if (warmed.has(key)) return;
+    warmed.add(key);
+    try {
+      const commit = await this.commit(head);
+      if (!commit) return;
+      const history = this.log(head, logPage, 0);
+      const blobs: string[] = [];
+      let level = [commit.treeHash];
+      while (level.length) {
+        const trees = await pool(level, WARM_CONCURRENCY, (oid) => this.tree(oid));
+        level = [];
+        for (const entries of trees) {
+          for (const entry of entries ?? []) {
+            if (entry.type === "tree") level.push(entry.hash);
+            else if (entry.type === "blob" || entry.type === "exec") blobs.push(entry.hash);
+          }
+        }
+      }
+      let bytes = 0;
+      await pool(blobs.slice(0, WARM_MAX_BLOBS), WARM_CONCURRENCY, async (oid) => {
+        if (bytes > WARM_MAX_BYTES) return;
+        const blob = await this.blob(oid);
+        bytes += blob?.size ?? 0;
+      });
+      await history;
+    } catch (error) {
+      warmed.delete(key);
+      console.warn("warm-up failed", this.artifactsName, error);
+    }
+  }
+
+  /** The tree id at `path` inside a commit's root tree, or null. */
+  async treeAt(rootTree: string, path: string): Promise<string | null> {
+    let current = rootTree;
+    for (const segment of path ? path.split("/") : []) {
+      const entries = (await this.tree(current)) ?? [];
+      const next = entries.find((entry) => entry.name === segment && entry.type === "tree");
+      if (!next) return null;
+      current = next.hash;
+    }
+    return current;
+  }
+
+  /** The blob entry at `path` inside a commit's root tree, or null. */
+  async entryAt(rootTree: string, path: string): Promise<ArtifactsTreeEntry | null> {
+    const slash = path.lastIndexOf("/");
+    const dir = await this.treeAt(rootTree, slash === -1 ? "" : path.slice(0, slash));
+    if (!dir) return null;
+    const name = path.slice(slash + 1);
+    return ((await this.tree(dir)) ?? []).find((entry) => entry.name === name) ?? null;
+  }
+}
+
+/** Run `work` over `items` with at most `limit` in flight. */
+async function pool<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = Array.from({ length: items.length });
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await work(items[index] as T);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+/**
+ * Split a URL tail into a ref and a path, given the repo's branch and tag
+ * names: the longest name that prefixes it wins, then a commit id, then the
+ * first segment.
+ */
+export function splitRefPath(spec: string, names: string[]): { ref: string; path: string } {
+  const trimmed = spec.replace(/^\/+|\/+$/g, "");
+  const known = [...names]
+    .sort((a, b) => b.length - a.length)
+    .find((name) => trimmed === name || trimmed.startsWith(`${name}/`));
+  const ref = known ?? trimmed.split("/")[0] ?? "";
+  return { ref, path: trimmed.slice(ref.length).replace(/^\/+/, "") };
+}

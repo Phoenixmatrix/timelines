@@ -1,0 +1,33 @@
+# CI for Gitmatrix, run by Gitmatrix (apps/website/worker/ci). Locally, start
+# `gm runner` next to `vp dev`; deployed, each job runs in a Cloudflare Sandbox.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      # Binding types are generated (and gitignored); type-aware lint needs them.
+      - name: Generate Worker types
+        run: vp run website#cf-typegen
+      - name: Format, lint, type check
+        run: vp check
+
+  test:
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Tests (web and gm)
+        run: vp run -r test
+
+  build:
+    needs: [check, test]
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      # Fresh clones gain nothing from the task cache, and its file tracking
+      # can fail to spawn native tools (spawn EBUSY).
+      - name: Build
+        run: vp run -r --no-cache build

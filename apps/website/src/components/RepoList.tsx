@@ -1,4 +1,4 @@
-import { Link } from "react-router";
+import { PrefetchLink } from "./PrefetchLink.tsx";
 import type { RepoSummary } from "../../shared/api.ts";
 import { timeAgo } from "../lib/format.ts";
 import { Monogram } from "./Monogram.tsx";
@@ -18,7 +18,7 @@ export function RepoList({
     <ul className="m-0 list-none divide-y divide-line-soft overflow-hidden rounded-pane bg-pane p-0">
       {repos.map((repo) => (
         <li key={repo.id} className="mk-enter-up">
-          <Link
+          <PrefetchLink
             to={`/${repo.owner.slug}/${repo.name}`}
             className="flex items-start gap-3 px-4 py-3.5 text-ink no-underline transition-colors hover:bg-raised"
           >
@@ -49,7 +49,7 @@ export function RepoList({
                 ? `Pushed ${timeAgo(repo.pushedAt)}`
                 : `Created ${timeAgo(repo.createdAt)}`}
             </span>
-          </Link>
+          </PrefetchLink>
         </li>
       ))}
     </ul>

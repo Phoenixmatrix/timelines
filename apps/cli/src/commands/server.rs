@@ -90,7 +90,7 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
 }
 
 /// owner/name of the repository in the current directory, from its origin URL.
-fn current_repo(ctx: &Ctx) -> Result<String> {
+pub(crate) fn current_repo(ctx: &Ctx) -> Result<String> {
     let repo = git2::Repository::discover(&ctx.cwd)
         .map_err(|_| GmError::usage("Name a repository: owner/name."))?;
     let url = repo

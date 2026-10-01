@@ -135,3 +135,186 @@ export interface CreateRepoRequest {
 export interface ApiError {
   error: string;
 }
+
+// ---- Knowledge graph and wiki ------------------------------------------------
+
+export interface KnowledgeBuild {
+  id: string;
+  fromCommit: string | null;
+  toCommit: string;
+  status: "running" | "succeeded" | "failed";
+  phase: string;
+  stats: Record<string, unknown>;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export interface KnowledgeStatus {
+  /** The commit the graph and wiki describe; null before the first build. */
+  indexedCommit: string | null;
+  indexedAt: string | null;
+  /** The repository's current HEAD, to compare with `indexedCommit`. */
+  head: string | null;
+  state: "empty" | "up-to-date" | "queued" | "building" | "failed";
+  current: KnowledgeBuild | null;
+  recent: KnowledgeBuild[];
+  counts: Record<string, number>;
+}
+
+export interface GraphNode {
+  id: string;
+  kind: "repository" | "directory" | "file" | "symbol" | "package" | "concept" | "component";
+  name: string;
+  path: string | null;
+  summary: string;
+  data: Record<string, unknown>;
+  changedIn: string;
+}
+
+export interface GraphLink {
+  kind: string;
+  weight: number;
+  node: Pick<GraphNode, "id" | "kind" | "name" | "path" | "summary">;
+}
+
+export interface GraphNodeDetail {
+  node: GraphNode;
+  outgoing: GraphLink[];
+  incoming: GraphLink[];
+}
+
+export interface KnowledgeSearchResults {
+  query: string;
+  /** Graph entities closest in meaning to the query (Vectorize). */
+  entities: (Pick<GraphNode, "id" | "kind" | "name" | "path" | "summary"> & { score: number })[];
+  /** Matching passages from source files and wiki pages (AI Search, hybrid). */
+  passages: { kind: "code" | "wiki"; path: string; text: string; score: number }[];
+}
+
+export interface WikiPageSummary {
+  slug: string;
+  title: string;
+  section: string;
+  position: number;
+  nodeId: string | null;
+  updatedAt: string;
+}
+
+export interface WikiCatalog {
+  pages: WikiPageSummary[];
+  status: KnowledgeStatus;
+}
+
+export interface WikiPage extends WikiPageSummary {
+  body: string;
+  /** Mermaid source drawn from the graph, or "". */
+  diagram: string;
+  sources: string[];
+  generatedIn: string;
+  model: string | null;
+}
+
+// ---- CI/CD ------------------------------------------------------------------
+
+export type CiRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type CiJobStatus =
+  | "pending"
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+export type CiStepStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "cancelled";
+export type CiRunner = "local" | "sandbox";
+
+export interface CiRunSummary {
+  id: string;
+  number: number;
+  commit: string;
+  /** Branch name, without refs/heads/. */
+  ref: string;
+  trigger: "push" | "manual";
+  title: string;
+  status: CiRunStatus;
+  actor: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface CiRunList {
+  runs: CiRunSummary[];
+  runner: CiRunner;
+}
+
+export interface CiStep {
+  position: number;
+  name: string;
+  status: CiStepStatus;
+  exitCode: number | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface CiJob {
+  id: string;
+  name: string;
+  needs: string[];
+  status: CiJobStatus;
+  runner: CiRunner;
+  claimedBy: string | null;
+  exitCode: number | null;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  steps: CiStep[];
+}
+
+export interface CiRunDetail extends CiRunSummary {
+  configError: string | null;
+  jobs: CiJob[];
+}
+
+export interface CiLogChunk {
+  seq: number;
+  step: number;
+  text: string;
+}
+
+export interface CiLogs {
+  chunks: CiLogChunk[];
+  /** Pass back as `after` to fetch only newer output. */
+  next: number;
+  done: boolean;
+}
+
+/** Latest run per commit, for status dots in history. */
+export type CiCommitStatuses = Record<string, { status: CiRunStatus; number: number }>;
+
+export interface CiSecretSummary {
+  name: string;
+  updatedAt: string;
+}
+
+/** What `gm runner` gets when it claims a job. */
+export interface CiClaimedJob {
+  id: string;
+  runId: string;
+  runNumber: number;
+  name: string;
+  repo: string;
+  commit: string;
+  ref: string;
+  timeoutMinutes: number;
+  env: Record<string, string>;
+  steps: { position: number; name: string; run: string }[];
+}
+
+/** One report from a runner: new output, step changes, and maybe the end. */
+export interface CiJobReport {
+  logs?: { step: number; text: string }[];
+  steps?: { position: number; status: CiStepStatus; exitCode?: number | null }[];
+  done?: { status: "succeeded" | "failed" | "cancelled"; exitCode?: number | null; error?: string };
+}

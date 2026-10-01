@@ -1,18 +1,12 @@
 import { useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
-import type { BlobResponse } from "../../../shared/api.ts";
-import { load, loadRepo } from "../../lib/api.ts";
+import { repoData, routeData } from "../../lib/repoData.ts";
 import { bytes } from "../../lib/format.ts";
-import { blobUrl, splitRefAndPath } from "../../lib/refs.ts";
+import { blobUrl } from "../../lib/refs.ts";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
-export async function blobLoader({ request, params }: LoaderFunctionArgs) {
-  const owner = params.owner ?? "";
-  const name = params.repo ?? "";
-  const repo = await loadRepo(owner, name, request);
-  const { ref, path } = splitRefAndPath(params["*"] ?? "", repo);
-  const query = new URLSearchParams({ ref, path });
-  return load<BlobResponse>(`/repos/${owner}/${name}/blob?${query}`, request);
+export async function blobLoader({ params }: LoaderFunctionArgs) {
+  return routeData(repoData.blob(params.owner ?? "", params.repo ?? "", params["*"] ?? ""));
 }
 
 export function Blob() {

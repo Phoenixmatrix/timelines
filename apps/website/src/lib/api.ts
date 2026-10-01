@@ -1,5 +1,4 @@
 import { data } from "react-router";
-import type { RepoDetail } from "../../shared/api.ts";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -52,22 +51,4 @@ export async function attempt<T>(run: () => Promise<T>): Promise<T | { error: st
     if (error instanceof ApiError) return { error: error.message };
     throw error;
   }
-}
-
-// The repo layout and its child routes load in parallel and both need the
-// repo's refs; share one request between them.
-const repoRequests = new Map<string, { at: number; promise: Promise<RepoDetail> }>();
-
-export function loadRepo(owner: string, name: string, request: Request): Promise<RepoDetail> {
-  const key = `${owner}/${name}`.toLowerCase();
-  const cached = repoRequests.get(key);
-  if (cached && Date.now() - cached.at < 2000) return cached.promise;
-  const promise = load<RepoDetail>(`/repos/${owner}/${name}`, request);
-  repoRequests.set(key, { at: Date.now(), promise });
-  promise.catch(() => repoRequests.delete(key));
-  return promise;
-}
-
-export function forgetRepo(owner: string, name: string) {
-  repoRequests.delete(`${owner}/${name}`.toLowerCase());
 }
