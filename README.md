@@ -223,8 +223,9 @@ visibility deadline fail honestly. Normal interactive `agent setup` remains AI-e
 
 Build completion acknowledges uploads, not search visibility. The AI gate observes
 the fixture item’s own AI Search indexing status before making at most six
-retrieval calls, with increasing waits totaling up to five minutes. A ten-minute
-overall deadline bounds indexing and retrieval together. The exact entity and
+retrieval calls. A ten-minute overall deadline bounds indexing and retrieval
+together; the last probe reserves 30 seconds for its request near that deadline
+so Vectorize gets the remaining visibility window too. The exact entity and
 source passage must appear in the same response. `indexVisibilitySummary` in
 `ai-e2e.json` records the item key/ID/status, observations, elapsed wait and missing
 invariants, including when a completed item never becomes retrievable.

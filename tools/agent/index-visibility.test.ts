@@ -100,7 +100,7 @@ await test("completed indexing does not pass without the exact consumer passage"
         passages: [{ ...visible.passages[0], path: "README.md" }],
       }),
     }),
-    /after 300000ms.*retrieval attempts exhausted.*missing: AI Search source passage/,
+    /after 570000ms.*retrieval attempts exhausted.*missing: AI Search source passage/,
   );
   assert.equal(report.attempts.length, 6);
   assert.deepEqual(report.missing, ["AI Search source passage"]);
@@ -187,4 +187,19 @@ await test("transport errors stay failures and do not leak raw diagnostics", asy
     },
   );
   assert.equal(report.outcome, "failed");
+});
+
+await test("reserves the final retrieval for late Vectorize visibility without extra calls", async () => {
+  const timer = clock();
+  const report = {} as VisibilityReport;
+  await waitForIndexVisibility({
+    target,
+    report,
+    ...timer,
+    item: async () => indexed,
+    search: async () => (timer.now() < 500_000 ? { ...visible, entities: [] } : visible),
+  });
+  assert.equal(report.outcome, "passed");
+  assert.equal(report.elapsedMs, 570_000);
+  assert.equal(report.attempts.length, 6);
 });

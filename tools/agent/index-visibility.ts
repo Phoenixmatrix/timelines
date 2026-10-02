@@ -92,8 +92,11 @@ export async function waitForIndexVisibility({
         fail("provider reported a terminal indexing failure");
       await pause(pollMs);
     }
-    for (const wait of retrievalDelays) {
-      await pause(wait);
+    for (const [index, wait] of retrievalDelays.entries()) {
+      // Reserve the last bounded call for the end of the shared visibility
+      // window; Vectorize can lag even after AI Search reports completion.
+      const finalProbe = index > 0 && index === retrievalDelays.length - 1;
+      await pause(finalProbe ? Math.max(0, remaining() - 30_000) : wait);
       const result = await search(remaining());
       const entityFound = result.entities.some(
         (entity) => entity.id === target.symbolId || entity.id === target.fileId,
