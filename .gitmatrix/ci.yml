@@ -6,13 +6,20 @@
 # oxlint's allocator failed before linting and the test container was lost.
 # On main, a deploy job then ships only what changed (see the job below).
 #
+# Fewer runs without slower answers (CORE-23): gm's Rust work is its own `cli`
+# job, skipped on pushes that leave apps/cli as it was when the job last passed.
+# With 4 runs in flight on a branch, further pushes wait in one held run that
+# covers them all (`gm runs wait` follows it), and a commit already in flight
+# isn't run twice.
+#
 # Non-AI E2E is too expensive to run per push. It runs only on local runners
 # (the trusted Linux host, with cf authentication and user systemd), where
 # `vp run ready` gates work before it lands; `instance` is ignored there. The
 # live gate provisions dedicated resources; its finally cleanup and the hourly
 # janitor both apply.
 on:
-  push: {}
+  push:
+    coalesce_after: 4
 
 # Four independent jobs must not each launch 24 compiler workers on this host.
 # Leave CPU capacity for JavaScript tests and the live server during cold builds.
@@ -30,8 +37,6 @@ jobs:
         run: vp run website#cf-typegen
       - name: Format, lint, type check
         run: vp check
-      - name: Format and lint gm
-        run: vp run cli#check
       - name: All application and harness type contracts
         run: vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
 
@@ -43,8 +48,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Generate Worker types
         run: vp run website#cf-typegen
-      - name: Tests (web and gm)
-        run: vp run -r --concurrency-limit 1 --no-cache test
+      - name: Tests (everything but gm, which the cli job tests)
+        run: vp run --filter '!cli' --concurrency-limit 1 --no-cache test
 
   build:
     instance: standard-4
@@ -56,8 +61,21 @@ jobs:
         run: pnpm install --frozen-lockfile
       # Fresh clones gain nothing from the task cache, and its file tracking
       # can fail to spawn native tools (spawn EBUSY).
-      - name: Build
-        run: vp run -r --concurrency-limit 1 --no-cache build
+      - name: Build (gm's release build runs when deploy publishes a new version)
+        run: vp run --filter '!cli' --concurrency-limit 1 --no-cache build
+
+  # gm, the Rust CLI: skipped while apps/cli is unchanged since it last passed,
+  # and then counts as passed for deploy.
+  cli:
+    instance: standard-4
+    paths: [apps/cli]
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Format and lint gm
+        run: vp run --no-cache cli#check
+      - name: Test gm
+        run: vp run --no-cache cli#test
 
   e2e:
     if: runner == "local"
@@ -73,7 +91,7 @@ jobs:
   # migrations, then the Worker. A changed CI image fails the job after the
   # rest has shipped; deploy it from a machine with Docker (`vp run deploy`).
   deploy:
-    needs: [check, test, build]
+    needs: [check, test, build, cli]
     if: branch == "main" && runner == "sandbox"
     # One deploy at a time, and a waiting deploy gives way to a newer push's: a
     # burst of pushes deploys once, from the newest commit.

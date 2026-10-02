@@ -437,7 +437,7 @@ fn wait(
     let progress = ctx.format == crate::output::Format::Text || std::io::stderr().is_terminal();
     // Find the run: by number, or the newest run for a commit (default: trunk),
     // which may take a moment to appear after a push.
-    let number = match number {
+    let mut number = match number {
         Some(n) => n,
         None => {
             let spec = commit.unwrap_or("trunk");
@@ -458,7 +458,8 @@ fn wait(
                             None,
                         )?;
                         if let Some(n) = statuses[&sha]["number"].as_i64() {
-                            break n;
+                            // Coalesced under load: a newer run tests this commit too.
+                            break statuses[&sha]["coveredBy"].as_i64().unwrap_or(n);
                         }
                         if started.elapsed() > Duration::from_secs(30) || Instant::now() > deadline
                         {
@@ -478,6 +479,21 @@ fn wait(
     let mut seen: HashMap<String, String> = HashMap::new();
     loop {
         let run = run_detail(config, repo, number)?;
+        // A held run covered by a newer one: its verdict is the newer run's.
+        if let Some(covering) = run["coveredBy"].as_i64() {
+            if progress {
+                eprintln!(
+                    "#{number} is covered by #{covering}, which tests a newer commit; following it."
+                );
+            }
+            number = covering;
+            seen.clear();
+            continue;
+        }
+        if progress && !run["heldAt"].is_null() && seen.is_empty() {
+            eprintln!("#{number} is waiting for a slot: enough runs are in flight on its branch.");
+            seen.insert(String::new(), "held".into());
+        }
         if progress {
             for job in run["jobs"].as_array().into_iter().flatten() {
                 let (name, status) = (s(job, "name").to_string(), s(job, "status").to_string());

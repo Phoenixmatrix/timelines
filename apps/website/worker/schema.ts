@@ -247,6 +247,10 @@ export interface Database {
     created_at: Generated<string>;
     started_at: string | null;
     finished_at: string | null;
+    /** Set while the run waits for runs in flight on its branch (coalescing). */
+    held_at: Generated<string | null>;
+    /** The run (by number) that covered this one's commit instead of running it. */
+    covered_by: Generated<number | null>;
   };
   ci_jobs: {
     id: string;

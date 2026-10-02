@@ -24,6 +24,17 @@ export function ciLabel(status: Status): string {
   return LABEL[status];
 }
 
+/** A run's state for people: held runs wait for a slot; covered ones point at their run. */
+export function runLabel(run: {
+  status: Status;
+  heldAt?: string | null;
+  coveredBy?: number | null;
+}): string {
+  if (run.coveredBy) return `Covered by #${run.coveredBy}`;
+  if (run.heldAt && run.status === "queued") return "Waiting for a slot";
+  return LABEL[run.status];
+}
+
 export function isActive(status: Status): boolean {
   return status === "queued" || status === "pending" || status === "running";
 }

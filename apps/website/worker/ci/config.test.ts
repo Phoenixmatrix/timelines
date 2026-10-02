@@ -91,7 +91,10 @@ test("this repository's pipeline is set up to run in Sandbox containers", () => 
   expect(job("build").env.GITMATRIX_CONTAINER_IMAGES).toBe("skip");
   // Deploys run once the gates pass, only on main and only in production.
   const deploy = job("deploy");
-  expect([...deploy.needs].sort()).toEqual(["build", "check", "test"]);
+  expect([...deploy.needs].sort()).toEqual(["build", "check", "cli", "test"]);
+  // gm's Rust work is skipped on pushes that leave apps/cli unchanged.
+  expect(job("cli").paths).toEqual(["apps/cli"]);
+  expect(pipeline.coalesceAfter).toBe(4);
   expect(deploy.secrets).toEqual(["CLOUDFLARE_API_TOKEN"]);
   expect(deploy.concurrency).toBe("production");
   const at = (branch: string, runner: "local" | "sandbox") =>

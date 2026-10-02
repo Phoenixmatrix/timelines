@@ -16,6 +16,7 @@ import {
   parsePipeline,
   type Pipeline,
 } from "./config.ts";
+import { activeRun, anyHeld, inFlight, lastPassed, releaseHeld, UNCHANGED } from "./coalesce.ts";
 import type { StoredJob } from "./jobs.ts";
 
 export interface CiRepo {
@@ -50,6 +51,11 @@ async function pipelineAt(
   }
 }
 
+/** Start a recorded run's Workflow. */
+export async function startWorkflow(env: Env, runId: string) {
+  await env.CI_RUN.create({ id: runId, params: { runId } satisfies RunParams });
+}
+
 /** Record a run and its jobs, then start its Workflow. Returns the run id. */
 export async function startRun(
   env: Env,
@@ -70,6 +76,9 @@ export async function startRun(
     options.waitUntil,
   );
   try {
+    // A run of this commit already in flight on the branch answers for it.
+    const existing = await activeRun(env.DB, repo.id, options.branch, options.commit);
+    if (existing) return { runId: existing.id, number: existing.number };
     const found = await pipelineAt(reader, options.commit);
     if (!found) return { skipped: `No ${CONFIG_PATH} at ${options.commit.slice(0, 12)}.` };
     const { pipeline, error, title } = found;
@@ -124,9 +133,11 @@ export async function startRun(
             .where("repo_id", "=", repo.id),
         ),
     ];
+    const tree = (await reader.commit(options.commit))?.treeHash;
     for (const job of pipeline?.jobs ?? []) {
       const jobId = crypto.randomUUID().replaceAll("-", "");
-      const run = job.if === null || evaluate(job.if, context);
+      let run = job.if === null || evaluate(job.if, context);
+      let unchanged: string | null = null;
       const spec: StoredJob = {
         needs: job.needs,
         if: job.if,
@@ -137,7 +148,34 @@ export async function startRun(
         timeoutMinutes: job.timeoutMinutes,
         steps: job.steps,
         concurrency: job.concurrency ?? null,
+        paths: job.paths ?? [],
       };
+      // On a push, a job whose paths match the last commit it passed on is skipped.
+      if (run && options.trigger === "push" && spec.paths?.length && tree) {
+        const base = await lastPassed(
+          env.DB,
+          repo.id,
+          options.branch,
+          job.name,
+          JSON.stringify(spec),
+        );
+        const baseTree = base && (await reader.commit(base.commit))?.treeHash;
+        if (base && baseTree) {
+          const same = await Promise.all(
+            spec.paths.map(async (path) => {
+              const [before, after] = await Promise.all([
+                reader.entryAt(baseTree, path),
+                reader.entryAt(tree, path),
+              ]);
+              return (before?.hash ?? null) === (after?.hash ?? null);
+            }),
+          );
+          if (same.every(Boolean)) {
+            run = false;
+            unchanged = `${UNCHANGED}${base.number}: ${spec.paths.join(", ")} matches.`;
+          }
+        }
+      }
       statements.push(
         kdb.insertInto("ci_jobs").values({
           id: jobId,
@@ -147,6 +185,7 @@ export async function startRun(
           spec: JSON.stringify(spec),
           status: run ? "pending" : "skipped",
           runner: env.CI_RUNNER,
+          ...(unchanged ? { error: unchanged } : {}),
         }),
         ...job.steps.map((step, position) =>
           kdb.insertInto("ci_steps").values({
@@ -159,9 +198,31 @@ export async function startRun(
       );
     }
     await batch(env.DB, statements);
+    // Under load, a push waits in a held run: when a run on its branch finishes,
+    // the newest held run starts and covers the older ones.
+    const limit = pipeline?.coalesceAfter;
+    if (!error && limit && options.trigger === "push") {
+      const busy = await inFlight(env.DB, repo.id, options.branch, runId);
+      if (busy >= limit || (await anyHeld(env.DB, repo.id, options.branch, runId))) {
+        await kdb
+          .updateTable("ci_runs")
+          .set({ held_at: nowIso() })
+          .where("id", "=", runId)
+          .execute();
+        // Held runs from before can start now if there's room (say a run got stuck).
+        if (busy < limit)
+          await releaseHeld(env.DB, repo.id, options.branch, (id) => startWorkflow(env, id));
+        const held = await kdb
+          .selectFrom("ci_runs")
+          .select("number")
+          .where("id", "=", runId)
+          .executeTakeFirst();
+        return { runId, number: held?.number ?? 0 };
+      }
+    }
     if (!error) {
       try {
-        await env.CI_RUN.create({ id: runId, params: { runId } satisfies RunParams });
+        await startWorkflow(env, runId);
       } catch (cause) {
         // Without its Workflow nothing would ever move the run on: fail it now.
         await kdb

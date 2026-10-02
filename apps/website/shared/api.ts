@@ -314,6 +314,10 @@ export interface CiRunSummary {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /** Set while the run waits for runs in flight on its branch (coalescing). */
+  heldAt: string | null;
+  /** The run that covered this one's commit instead of running it. */
+  coveredBy: number | null;
 }
 
 export interface CiRunList {
@@ -363,7 +367,10 @@ export interface CiLogs {
 }
 
 /** Latest run per commit, for status dots in history. */
-export type CiCommitStatuses = Record<string, { status: CiRunStatus; number: number }>;
+export type CiCommitStatuses = Record<
+  string,
+  { status: CiRunStatus; number: number; coveredBy: number | null }
+>;
 
 export interface CiSecretSummary {
   name: string;

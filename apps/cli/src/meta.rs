@@ -584,6 +584,10 @@ Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,
     gm runs logs --job test        # why it failed
 `gm runs list|show|start|cancel|rerun`, `gm secret set NAME`. Against the dev
 server, jobs run on your machine: keep `gm runner` going next to `vp dev`.
+Under load a push may share a run with later pushes (it's "covered" by the newer
+run); `gm runs wait` follows the covering run, so its verdict includes your commit.
+Starting a commit that's already running returns that run; jobs with `paths:` skip
+themselves when those paths are unchanged since they last passed.
 
 ## Packages
 CI jobs publish with their own credential: `npm publish`, `docker push

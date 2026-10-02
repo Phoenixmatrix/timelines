@@ -3,6 +3,7 @@
 //   on:
 //     push:
 //       branches: [main, "release/*"]   # globs; omit to run on every branch
+//       coalesce_after: 4   # with 4 runs in flight on a branch, later pushes share one run
 //   env:
 //     CI: "true"
 //   jobs:
@@ -19,6 +20,7 @@
 //       image: default          # sandbox image (see cloudflare.config.ts)
 //       instance: standard-1    # sandbox size
 //       concurrency: production  # one at a time per repo; superseded runs skip it
+//       paths: [apps/cli]        # pushes skip it while these are unchanged since it last passed
 //       steps:
 //         - run: cf deploy
 
@@ -48,10 +50,18 @@ export interface JobSpec {
    * skipped once a newer run on its branch has its own (e.g. deploys).
    */
   concurrency?: string | null;
+  /**
+   * Files or directories (no globs) the job depends on. On a push, a job whose
+   * paths are identical to the last commit it passed on the branch is skipped as
+   * unchanged, and counts as passed for the jobs that need it.
+   */
+  paths?: string[];
 }
 
 export interface Pipeline {
   branches: string[] | null;
+  /** Runs in flight on a branch before further pushes coalesce into one held run. */
+  coalesceAfter: number | null;
   env: Record<string, string>;
   jobs: JobSpec[];
 }
@@ -110,6 +120,12 @@ export function parsePipeline(source: string): Pipeline {
   const push = record(on.push, "on.push");
   const branches =
     push.branches === undefined ? null : stringList(push.branches, "on.push.branches");
+  let coalesceAfter: number | null = null;
+  if (push.coalesce_after !== undefined) {
+    coalesceAfter = Number(push.coalesce_after);
+    if (!Number.isInteger(coalesceAfter) || coalesceAfter < 1 || coalesceAfter > 50)
+      throw new ConfigError("on.push.coalesce_after must be a whole number from 1 to 50.");
+  }
   const env = stringMap(root.env, "env");
 
   const jobsRaw = record(root.jobs, "jobs");
@@ -147,6 +163,14 @@ export function parsePipeline(source: string): Pipeline {
       (typeof job.concurrency !== "string" || !NAME.test(job.concurrency))
     )
       throw new ConfigError(`jobs.${name}.concurrency must be a name like "production".`);
+    const paths = stringList(job.paths, `jobs.${name}.paths`).map((path) => {
+      const clean = path.replace(/\/+$/, "");
+      if (!clean || clean.startsWith("/") || /[*?[\]]|(^|\/)\.\.?(\/|$)/.test(clean))
+        throw new ConfigError(
+          `jobs.${name}.paths lists files or directories in the repository, like apps/cli (no globs).`,
+        );
+      return clean;
+    });
     return {
       name,
       needs: stringList(job.needs, `jobs.${name}.needs`),
@@ -158,6 +182,7 @@ export function parsePipeline(source: string): Pipeline {
       timeoutMinutes: timeout,
       steps,
       concurrency: (job.concurrency as string | undefined) ?? null,
+      paths,
     };
   });
 
@@ -171,7 +196,7 @@ export function parsePipeline(source: string): Pipeline {
     if (job.if) evaluate(job.if, { branch: "", trigger: "push", commit: "", runner: "local" });
   }
   stages(jobs);
-  return { branches, env, jobs };
+  return { branches, coalesceAfter, env, jobs };
 }
 
 /** Jobs grouped into stages: each stage only needs jobs from earlier stages. */

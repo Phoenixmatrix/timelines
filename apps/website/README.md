@@ -97,6 +97,16 @@ CI Durable Objects and Workflows of runs in flight: their jobs start over in a
 fresh sandbox (an attempt in progress is joined, a leftover container replaced,
 a start that doesn't take is retried), with three retries per job.
 
+**Fewer runs (CORE-23, `worker/ci/coalesce.ts`).** Starting a commit that already
+has a run in flight on its branch returns that run. A job can declare `paths:`
+(files or directories): on a push, it's skipped as unchanged when those paths
+have the same git object ids as the last commit it passed on (with the same
+spec), and the skip counts as a pass for jobs that need it; gm's Rust work is a
+`cli` job with `paths: [apps/cli]`. With `on.push.coalesce_after: N` runs in
+flight on a branch, a push's run is held; when one finishes, the newest held run
+starts and covers the older ones (`covered_by`), and `gm runs wait` follows the
+covering run.
+
 ## Personas (dev sign-in)
 
 Development data (the personas below, Orbit Labs, the owner account) lives in

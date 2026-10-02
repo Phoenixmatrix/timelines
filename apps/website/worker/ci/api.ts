@@ -64,6 +64,8 @@ const toRun = (row: RunRow): CiRunSummary => ({
   createdAt: row.created_at,
   startedAt: row.started_at,
   finishedAt: row.finished_at,
+  heldAt: row.held_at,
+  coveredBy: row.covered_by,
 });
 
 export const ci = new Hono<AppEnv>();
@@ -269,14 +271,15 @@ ci.get("/status", async (c) => {
   if (commits.length === 0) return c.json<CiCommitStatuses>({});
   const results = await db(c.env.DB)
     .selectFrom("ci_runs")
-    .select(["commit_oid", "status", "number"])
+    .select(["commit_oid", "status", "number", "covered_by"])
     .where("repo_id", "=", repo.row.id)
     .where("commit_oid", "in", commits)
     .orderBy("number")
     .execute();
   const out: CiCommitStatuses = {};
   // Ordered by number, so the latest run per commit wins.
-  for (const row of results) out[row.commit_oid] = { status: row.status, number: row.number };
+  for (const row of results)
+    out[row.commit_oid] = { status: row.status, number: row.number, coveredBy: row.covered_by };
   return c.json(out);
 });
 

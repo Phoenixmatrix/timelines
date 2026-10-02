@@ -14,11 +14,12 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { CiJobStatus } from "../../shared/api.ts";
 import { batch, db, nowIso } from "../schema.ts";
+import { releaseHeld, UNCHANGED } from "./coalesce.ts";
 import { concurrencyGate } from "./concurrency.ts";
 import { stages, type JobSpec } from "./config.ts";
 import { doneEvent, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
-import type { RunParams } from "./trigger.ts";
+import { startWorkflow, type RunParams } from "./trigger.ts";
 
 interface PlannedJob {
   id: string;
@@ -28,6 +29,8 @@ interface PlannedJob {
   needs: string[];
   timeoutMinutes: number;
   concurrency: string | null;
+  /** Skipped because its paths match the last commit it passed: it counts as passed. */
+  unchanged: boolean;
 }
 
 const DB_STEP = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" } } as const;
@@ -72,7 +75,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .execute();
       const results = await kdb
         .selectFrom("ci_jobs")
-        .select(["id", "name", "status", "runner", "spec"])
+        .select(["id", "name", "status", "runner", "spec", "error"])
         .where("run_id", "=", runId)
         .execute();
       return results.map((row): PlannedJob => {
@@ -85,6 +88,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
           needs: spec.needs,
           timeoutMinutes: spec.timeoutMinutes,
           concurrency: spec.concurrency ?? null,
+          unchanged: row.status === "skipped" && (row.error ?? "").startsWith(UNCHANGED),
         };
       });
     });
@@ -118,6 +122,16 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .where("status", "in", ["queued", "running"])
         .execute();
       return status;
+    });
+
+    // A slot on the branch is free: the newest held run starts, covering older ones.
+    await step.do("release", DB_STEP, async () => {
+      const run = await kdb
+        .selectFrom("ci_runs")
+        .select(["repo_id", "ref"])
+        .where("id", "=", runId)
+        .executeTakeFirstOrThrow();
+      return releaseHeld(this.env.DB, run.repo_id, run.ref, (id) => startWorkflow(this.env, id));
     });
   }
 
@@ -170,7 +184,8 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
   ): Promise<CiJobStatus> {
     const d1 = this.env.DB;
     const kdb = db(d1);
-    if (job.status !== "pending") return job.status;
+    // A job skipped as unchanged stands in for a pass, so what needs it still runs.
+    if (job.status !== "pending") return job.unchanged ? "succeeded" : job.status;
 
     // Like GitHub Actions: a job runs only when everything it needs succeeded.
     const blocked = job.needs.find((need) => outcome.get(need) !== "succeeded");

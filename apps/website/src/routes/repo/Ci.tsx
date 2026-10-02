@@ -20,7 +20,7 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import type { CiJob, CiLogs, CiRunDetail, CiRunList, CiRunSummary } from "../../../shared/api.ts";
-import { CiStatusIcon, ciLabel, duration, isActive } from "../../components/CiStatus.tsx";
+import { CiStatusIcon, ciLabel, duration, isActive, runLabel } from "../../components/CiStatus.tsx";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { FormError } from "../../components/ui.tsx";
 import { api, attempt, field, load } from "../../lib/api.ts";
@@ -216,6 +216,7 @@ function RunRow({ run }: { run: CiRunSummary }) {
           <span className="block truncate text-micro text-ink-faint @2xl:hidden">
             <span className="font-mono">#{run.number}</span> · {run.ref}
             {run.startedAt && ` · ${duration(run.startedAt, run.finishedAt)}`}
+            {(run.coveredBy || run.heldAt) && ` · ${runLabel(run).toLowerCase()}`}
           </span>
         </span>
         <span className={`truncate text-ink-faint ${WIDE}`}>
@@ -620,7 +621,24 @@ export function CiRun() {
             <span className="font-normal text-ink-faint">#{run.number}</span>
           </h2>
           <div className="mt-1 flex flex-wrap items-center gap-x-2 text-body-sm text-ink-faint">
-            <span>{ciLabel(run.status)}</span>
+            {run.coveredBy ? (
+              <PrefetchLink
+                to={repoPath(repo.owner.slug, repo.name, "ci", String(run.coveredBy))}
+                className="text-ink-muted hover:text-ink"
+              >
+                {runLabel(run)}
+              </PrefetchLink>
+            ) : (
+              <span
+                title={
+                  run.heldAt
+                    ? "Enough runs are in flight on this branch; this one starts when one finishes, covering any pushes that wait with it."
+                    : undefined
+                }
+              >
+                {runLabel(run)}
+              </span>
+            )}
             <span>·</span>
             <span>
               {run.trigger === "manual" ? "Started by" : "Pushed by"} {run.actor ?? "someone"}{" "}
