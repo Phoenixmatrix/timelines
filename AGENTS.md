@@ -40,14 +40,17 @@ release. Add a tool name to select part of the graph. For example, run
   with `agent inspect` or scoped tracker/issue commands.
 - Before completion, run **`vp run ready`**. It runs uncached static gates,
   every workspace's tests/builds and fresh real CLI/API/browser/mirror E2E,
-  without AI inference or AI resource provisioning. For changes to knowledge,
+  without AI inference or AI resource provisioning. E2E runs **only here**:
+  server CI skips it (too expensive per push), so `ready` is the only place
+  it runs before code lands. For changes to knowledge,
   wiki, embeddings or AI Search, follow
   `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run
   `vp run agent test-ai`. Also exercise the specific changed consumer path.
   Missing required services, browser dependencies or credentials are failures.
 - Keep the E2E artifacts and inspect failures before changing assertions.
-  The gate covers local Linux CI; Sandbox/deployment changes need their own
-  deployment-boundary smoke run.
+  Sandbox/deployment changes (`apps/website/ci/`, `worker/ci/sandbox.ts`,
+  `cloudflare.config.ts`) need their own deployment-boundary check: push and
+  watch the production run with `gm runs wait`.
 - Remote resources cost money. Setup installs hourly user-systemd cleanup;
   environments expire after 24 hours, with four live environments per user.
   Use `agent destroy` when finished, not merely `agent stop`. Check
@@ -60,7 +63,8 @@ release. Add a tool name to select part of the graph. For example, run
 This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
 
 - **Commit and push this project with ordinary `gm`**, outside `agent gm`.
-  `origin` is `orbit/gitmatrix` on the canonical dev server:
+  `origin` is `matrixorg/gitmatrix` on production
+  (`https://gitmatrix.fward.dev`), and plain `gm` defaults to that server:
   `gm commit -m "…"`, then `gm push` (or `gm push --sync` when trunk moved)
   lands it on `main`. Run `gm cli guide` once for the workflow,
   and `gm cli search "<task>"` to find commands. Plain `git commit` still
@@ -70,18 +74,19 @@ This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
 - **GitHub is a backup, written only by the mirror.** Every push to
   Gitmatrix is mirrored to GitHub (the `github` remote) one way. Don't push
   there: the mirror overwrites it. Use `gh` only to read GitHub.
-- **Every push runs the quality gates** in `.gitmatrix/ci.yml`: check, test,
-  build and non-AI live E2E. All four run independently and must pass.
-  Real AI checks are explicit, not automatic. Run `vp run ready` first, then
-  `gm push && gm runs wait` to confirm the source pipeline.
+- **Every push runs the quality gates** in `.gitmatrix/ci.yml` on production,
+  in Cloudflare Sandbox containers: check, test and build, independently;
+  all must pass. E2E is local-only (`if: runner == "local"`), so run
+  `vp run ready` first, then `gm push && gm runs wait` to confirm the
+  pipeline. Real AI checks are explicit, never automatic.
 - **Testing Gitmatrix itself:** use the scoped workflow above. Keep all product
   clones outside this source checkout. `gm -C <clone>` selects a disposable
   clone while `agent gm` keeps its server and credentials isolated.
-- **CI in development runs on this machine, on demand.** `vp dev` starts a
-  runner per queued job; it exits when done. The full source pipeline needs
-  the trusted Linux host's Cloudflare login and user-systemd manager.
-  `GITMATRIX_CI_RUNNER=sandbox vp dev` requires Docker and is a separate
-  deployment-boundary check, not a substitute for the local workflow.
+- **CI on a local server runs on this machine, on demand.** `vp dev` starts a
+  runner per queued job; it exits when done. There the pipeline also runs E2E,
+  which needs the trusted Linux host's Cloudflare login and user-systemd
+  manager. `GITMATRIX_CI_RUNNER=sandbox vp dev` requires Docker and tries the
+  Sandbox path locally; it is not a substitute for watching a production run.
 
 # Cloudflare tooling: use `cf`, not wrangler
 

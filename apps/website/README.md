@@ -490,10 +490,11 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   write only sanitized reports there. The harness retains allowlisted JSON, not
   credentials, raw logs or browser storage. Setup logs print cache/evidence paths.
   Checkout credentials are deleted before terminal reporting, on success or failure.
-- **This repository's pipeline.** Check, test, build and non-AI E2E start
-  independently; all four must pass. No job consumes another's artifacts, and
-  keeping them in one stage avoids a scheduler barrier. Real AI verification is
-  an explicit agent command.
+- **This repository's pipeline.** Check, test and build start independently on
+  `standard-4` Sandboxes; all must pass. Non-AI E2E runs only where
+  `runner == "local"` (it is too expensive per push), so `vp run ready` is its
+  gate. No job consumes another's artifacts, and keeping them in one stage avoids
+  a scheduler barrier. Real AI verification is an explicit agent command.
 - **Both runners report the same way** (`worker/ci/jobs.ts`): batched log
   chunks, step transitions, the end. Secret values are masked server-side; a
   cancelled job is told so in the reply to its next report and kills its

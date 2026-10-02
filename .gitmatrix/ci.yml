@@ -1,15 +1,15 @@
 # Gitmatrix is the source of truth; GitHub is a mirror only.
-# Source CI runs on the trusted Linux development host with cf authentication
-# and user systemd. Vite starts local runners on demand. The live gate provisions
-# dedicated resources; its finally cleanup and the hourly janitor both apply.
-# All four jobs are required, but exchange no artifacts. Keep them in one stage
-# so the stage-based scheduler never serializes build behind independent E2E.
-#
-# Deployed, each job runs in a Cloudflare Sandbox container (runner "sandbox").
+# Pushes to production run check, test and build, each in its own Cloudflare
+# Sandbox container (runner "sandbox"). They exchange no artifacts; keep them in
+# one stage so the stage-based scheduler never serializes one behind another.
 # Those get standard-4 (4 vCPU, 12 GiB): on the default standard-1 (4 GiB),
 # oxlint's allocator failed before linting and the test container was lost.
-# E2E needs this host's cf login and user systemd, so it runs on local runners
-# only; `instance` is ignored there.
+#
+# Non-AI E2E is too expensive to run per push. It runs only on local runners
+# (the trusted Linux host, with cf authentication and user systemd), where
+# `vp run ready` gates work before it lands; `instance` is ignored there. The
+# live gate provisions dedicated resources; its finally cleanup and the hourly
+# janitor both apply.
 on:
   push: {}
 

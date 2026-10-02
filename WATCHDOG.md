@@ -71,6 +71,7 @@ to `apps/website/` unless explicitly rooted elsewhere.
   replay/conflict cases, actual `gm` flows, or browser interaction as applicable.
   Follow `vp run ready`; AI capability changes additionally require the repo's
   `gitmatrix-ai-verification` skill and explicit `vp run agent test-ai`, not
-  automatic AI CI. After an authorized push, `gm runs wait` verifies server CI.
+  automatic AI CI. Server CI runs check, test and build only; E2E is local
+  (`vp run ready`). After an authorized push, `gm runs wait` verifies server CI.
   Report blocked checks honestly; compilation, mocked forwarding, or a queued
   job is not runtime proof.

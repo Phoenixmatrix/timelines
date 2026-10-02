@@ -181,8 +181,10 @@ Before calling work complete: run `ready`, exercise the specific changed consume
 path, inspect the evidence, update affected contracts/docs, and stop or destroy
 unneeded environments. Publish source changes with ordinary `gm commit` / `gm push`
 **outside** the scoped `agent gm` wrapper, then check `gm runs wait`.
-`.gitmatrix/ci.yml` starts check, test, build and non-AI E2E independently; all four
-must pass. They exchange no artifacts, so no dependency-stage barrier is needed.
+`.gitmatrix/ci.yml` starts check, test and build independently on production's
+Cloudflare Sandbox containers; all must pass. Non-AI E2E is too expensive per push,
+so it runs only on local runners (`if: runner == "local"`): `ready` is where it gates
+your work. The jobs exchange no artifacts, so no dependency-stage barrier is needed.
 The canonical development server runs one CI job at a time by default;
 `GITMATRIX_CI_RUNNERS` overrides this when the server starts. Isolated agent
 environments keep two slots for their fixture jobs. No running server needs to
@@ -192,7 +194,7 @@ Every Vitest pool is capped at two workers. `.cargo/config.toml` defaults Cargo 
 four compiler workers for local commands, and source CI explicitly uses the same
 limit. Manual recursive commands can use `vp run -r --concurrency-limit 1 build`
 or `vp run -r --concurrency-limit 1 test` to keep the same memory budget.
-It runs on the trusted Linux CI host with Cloudflare login and user-systemd
+Locally, E2E runs on the trusted Linux host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.
 
