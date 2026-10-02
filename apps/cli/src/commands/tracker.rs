@@ -220,15 +220,28 @@ impl Replica {
             }
             return self.set("snapshot", &serde_json::to_string(&snapshot)?);
         }
+        // The first page also brings the current members and agents: they are
+        // not events, so the snapshot alone would never learn of new ones.
+        let mut directory = true;
         loop {
             let mut snapshot = self.snapshot()?;
             let before = snapshot["cursor"].as_u64().unwrap_or(0);
             let feed = remote::api(
                 &self.config,
                 "GET",
-                &self.path(&format!("changes?after={before}&limit=200")),
+                &self.path(&format!(
+                    "changes?after={before}&limit=200{}",
+                    if directory { "&directory=1" } else { "" }
+                )),
                 None,
             )?;
+            if std::mem::take(&mut directory) {
+                for key in ["members", "agents", "canAdmin"] {
+                    if !feed[key].is_null() {
+                        snapshot[key] = feed[key].clone();
+                    }
+                }
+            }
             let events = feed["events"].as_array().ok_or_else(|| {
                 GmError::new("protocol_error", "Invalid tracker changes response.")
             })?;

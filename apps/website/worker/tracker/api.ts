@@ -224,14 +224,28 @@ tracker.get("/tracker/:owner/snapshot", async (c) => {
   return response(c, await trackerObject(c.env, access.owner.id).snapshot(access));
 });
 tracker.get("/tracker/:owner/changes", async (c) => {
-  const access = await authorize(c, false);
+  // Members and agents aren't events: a replica asks for them (directory=1) to
+  // learn of agents created and people added since its snapshot. Polling skips it.
+  const directory = c.req.query("directory") === "1";
+  const access = await authorize(c, directory);
   const after = c.req.query("after") ?? "0";
   const limit = c.req.query("limit") ?? "200";
   if (!/^\d+$/.test(after) || !/^\d+$/.test(limit))
     throw new TrackerError(400, "invalid_input", "after and limit must be integers.");
+  const changes = await trackerObject(c.env, access.owner.id).changes(Number(after), Number(limit));
   return response(
     c,
-    await trackerObject(c.env, access.owner.id).changes(Number(after), Number(limit)),
+    directory && changes.ok
+      ? {
+          ...changes,
+          value: {
+            ...changes.value,
+            members: access.members,
+            agents: access.agents,
+            canAdmin: access.canAdmin,
+          },
+        }
+      : changes,
   );
 });
 tracker.post("/tracker/:owner/mutate", async (c) => {

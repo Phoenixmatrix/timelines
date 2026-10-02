@@ -557,6 +557,69 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
+  await scenario("tracker-handoff-to-an-agent-created-after-sync", async () => {
+    // marco's replica predates this agent: the handoff must still find it by name.
+    const owner = fixtures.tracker.owner;
+    const issue = fixtures.tracker.blocker;
+    await gm(["tracker", "sync", "--owner", owner], "marco");
+    const name = `late-${randomUUID().slice(0, 8)}`;
+    const { agent } = await json<{ agent: Agent }>(
+      "/api/agents",
+      ownerToken,
+      "POST",
+      { name },
+      [201],
+    );
+    const token = await json<CreatedAccessToken>(
+      `/api/agents/${agent.id}/tokens`,
+      ownerToken,
+      "POST",
+      { scope: "write" },
+      [201],
+    );
+    secrets.add(token.secret);
+    const claimed = JSON.parse(
+      await gm(["issue", "claim", issue, "--owner", owner, "--agent", "e2e-handoff"], "marco"),
+    ) as { results: { leaseToken: string }[] };
+    const lease = claimed.results[0]?.leaseToken;
+    assert(lease, "Claim must return a fencing token");
+    secrets.add(lease);
+    const offered = JSON.parse(
+      await gm(
+        ["issue", "handoff", issue, "--owner", owner, "--to", name],
+        "marco",
+        work,
+        undefined,
+        {
+          GM_LEASE_TOKEN: lease,
+        },
+      ),
+    ) as { results: { offerCode: string }[] };
+    const code = offered.results[0]?.offerCode;
+    assert(code, "Handoff must return a single-use code");
+    secrets.add(code);
+    const accepted = JSON.parse(
+      await gm(["issue", "accept", code, "--owner", owner], "marco", work, undefined, {
+        GM_TOKEN: token.secret,
+      }),
+    ) as { results: { leaseToken: string }[] };
+    const handed = accepted.results[0]?.leaseToken;
+    assert(handed, "Accepting must return the agent's fencing token");
+    secrets.add(handed);
+    const shown = JSON.parse(
+      await gm(["issue", "show", issue, "--owner", owner], "marco", work, undefined, {
+        GM_TOKEN: token.secret,
+      }),
+    ) as { issue: { claim: { actorId: string } } };
+    assert.equal(shown.issue.claim.actorId, agent.id, "The agent now holds the lease");
+    await gm(["issue", "release", issue, "--owner", owner], "marco", work, undefined, {
+      GM_TOKEN: token.secret,
+      GM_LEASE_TOKEN: handed,
+    });
+    await gm(["agent", "revoke", agent.id]);
+    record({ agent: name, holder: shown.issue.claim.actorId });
+  });
+
   await scenario("package-upload-download-and-write-boundary", async () => {
     const file = join(work, "artifact.txt");
     await writeFile(file, bytes);

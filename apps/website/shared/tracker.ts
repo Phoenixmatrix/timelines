@@ -343,6 +343,10 @@ export interface Changes {
   cursor: number;
   hasMore: boolean;
   serverTime: string;
+  /** With `directory=1`: who can act here now, for replicas to refresh. */
+  members?: Snapshot["members"];
+  agents?: Snapshot["agents"];
+  canAdmin?: boolean;
 }
 /** Who an actor id names: a member, or an agent with the human accountable for it. */
 export function actorOf(
