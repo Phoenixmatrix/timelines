@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 // Version by the last CLI-source change, not every website/docs push. Full history
 // matters: a shallow boundary otherwise looks like it introduced every file.
@@ -42,7 +42,10 @@ function publish(): void {
     process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : process.arch;
   const platform = `${os}-${arch}`;
   const target = `gm/${version}/${platform}/gm`;
-  const gm = resolve(process.argv[2] ?? "apps/cli/target/release/gm");
+  // The CI runner's managed compiler cache moves Cargo's output via CARGO_TARGET_DIR.
+  const gm = resolve(
+    process.argv[2] ?? join(process.env.CARGO_TARGET_DIR ?? "apps/cli/target", "release/gm"),
+  );
   try {
     run(gm, [
       "pkg",
