@@ -25,9 +25,11 @@ The final `e2e.complete` event prints the local evidence directory. Inspect:
 
 - `completion.json`: mode, overall success, environment ID, requested resource selection, cleanup state, failed lifecycle stages.
 - `timings.json`: elapsed milliseconds and pass/fail for prepare, provision, migrate, start, seed, scenarios, shutdown and cleanup (executed stages only).
-- `ai-e2e.json`: unique fixture repository, observed build status/commit, graph file/symbol membership, generated overview body/model/commit, exact entity and passage results, API observations and per-stage timings. `knowledge-build` and `index-visibility` are separate timings.
+- `ai-e2e.json`: unique fixture repository, observed build status/commit, graph file/symbol membership, generated overview body/model/commit, exact entity and passage results, API observations and per-stage timings. `knowledge-build` and `index-visibility` are separate timings. `indexVisibility` records each retrieval attempt's elapsed time and separate `entityFound` / `passageFound` outcomes.
 
 The Copper Finch fixture must produce a successful build of its pushed commit; a `checksum.ts` file linked to `copperFinchChecksum`; a generated overview explaining checksum behavior at that commit; and both the matching Vectorize entity and an AI Search code passage containing the fixture function and modulus. These are real assertions, not a non-empty-result check. A provider failure, missing wiki, graph mismatch or index-visibility deadline fails the command. Build timeout means inspect build status/phase; search timeout after a successful build means inspect indexing/visibility and the separate entity/passage evidence. Do not turn a provider outage into a pass.
+
+Build completion does not imply immediate provider search visibility. The visibility check keeps at most six paid retrieval calls, with waits of 20, 40, 60, 80 and 100 seconds (five minutes total). Both exact-result assertions must pass in the same response; the longer wait does not accept missing entities or passages.
 
 For retained CI evidence, set `GITMATRIX_CI_ARTIFACTS_DIR` to a private absolute job-specific directory outside the disposable checkout. Only allowlisted sanitized JSON reports are retained there, including failures. Never upload raw server/build logs, credentials, environment journals, browser storage or screenshots. Local logs remain available in the owned artifact directory for diagnosis.
 

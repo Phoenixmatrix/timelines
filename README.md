@@ -218,6 +218,12 @@ matching Vectorize entities plus AI Search source passages. Assertions check sou
 facts, not exact generated wording. Missing providers or an expired visibility
 deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
 
+Build completion acknowledges uploads, not search visibility. The AI gate keeps
+at most six retrieval calls, with increasing waits totaling up to five minutes,
+and requires the exact entity and source passage in the same response.
+`ai-e2e.json` records each attempt's elapsed time and separate entity/passage
+visibility so a delayed index is distinguishable from a failed build.
+
 ### Fast edit loop
 
 Keep `vp run agent up` running and reuse its environment while editing. Use targeted

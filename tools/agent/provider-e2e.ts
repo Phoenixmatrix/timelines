@@ -411,26 +411,41 @@ export async function runProviderE2E(
       assert(page.model, "Wiki must record its real generation model");
       evidence.wiki = page;
       enter("index-visibility");
-      // At most six real embedding + hybrid retrieval calls while provider indexes settle.
+      // Uploads finish before provider indexes are searchable. Keep six paid
+      // retrieval calls, spread over a five-minute window rather than spending
+      // them all during initial indexing (20 + 40 + 60 + 80 + 100 seconds).
+      const attempts: {
+        attempt: number;
+        elapsedMs: number;
+        entityFound: boolean;
+        passageFound: boolean;
+      }[] = [];
+      evidence.indexVisibility = attempts;
       let found = false;
       for (let attempt = 1; attempt <= 6; attempt++) {
         const result = await api(
           `${base}/knowledge/search?q=${encodeURIComponent("Copper Finch copperFinchChecksum parcel checksum modulo 65521")}`,
         );
         evidence.search = result;
-        found =
-          result.entities.some(
-            (entity: { id: string }) => entity.id === symbol.id || entity.id === file.id,
-          ) &&
-          result.passages.some(
-            (passage: { kind: string; path: string; text: string }) =>
-              passage.kind === "code" &&
-              passage.path === "checksum.ts" &&
-              passage.text.includes("copperFinchChecksum") &&
-              passage.text.includes("65521"),
-          );
+        const entityFound = result.entities.some(
+          (entity: { id: string }) => entity.id === symbol.id || entity.id === file.id,
+        );
+        const passageFound = result.passages.some(
+          (passage: { kind: string; path: string; text: string }) =>
+            passage.kind === "code" &&
+            passage.path === "checksum.ts" &&
+            passage.text.includes("copperFinchChecksum") &&
+            passage.text.includes("65521"),
+        );
+        attempts.push({
+          attempt,
+          elapsedMs: Date.now() - stageStarted,
+          entityFound,
+          passageFound,
+        });
+        found = entityFound && passageFound;
         if (found) break;
-        if (attempt < 6) await delay(20_000);
+        if (attempt < 6) await delay(20_000 * attempt);
       }
       assert(
         found,
