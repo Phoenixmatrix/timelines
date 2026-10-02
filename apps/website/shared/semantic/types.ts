@@ -1,4 +1,4 @@
-import type { Tree } from "@lezer/common";
+import type { Parser, Tree } from "@lezer/common";
 
 export type SemanticLanguage =
   | "typescript"
@@ -60,6 +60,7 @@ export interface ParsedDocument {
 export interface LanguageAdapter {
   language: SemanticLanguage;
   extensions: readonly string[];
+  parser: Parser;
   parse(source: string): ParsedDocument;
 }
 

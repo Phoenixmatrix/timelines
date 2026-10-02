@@ -1,4 +1,5 @@
-import { analyzeFile, ANALYSIS_VERSION, MAX_SOURCE_BYTES } from "../../shared/semantic/index.ts";
+import { analyzeFile, ANALYSIS_VERSION } from "../../shared/semantic/index.ts";
+import { MAX_SOURCE_BYTES } from "../../shared/semantic/limits.ts";
 import type {
   FileAnalysis,
   SemanticFeedEntry,

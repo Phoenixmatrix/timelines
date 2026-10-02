@@ -227,6 +227,17 @@ Go, Markdown, XML, JSON, HTML and CSS:
   types, cross-file symbol identity, macro expansion, runtime effects or inferred
   author intent. Parent and child changes can both appear.
 
+The repository file view uses those same grammars and the Changes tab's shared
+token renderer in both themes. Source appears immediately as selectable plain
+text; a dedicated Web Worker applies syntax colors without parsing on the UI
+thread. Line numbers, `#L` links and the knowledge rail remain unchanged.
+Highlighting is limited to 256 KiB of UTF-8 source. Unknown extensions,
+truncated/oversized files and unavailable or failed workers retain plain text;
+binary files retain the existing not-shown notice. Navigation cancels the worker,
+stale results cannot color another file, and a five-second watchdog terminates
+unfinished worker loading/parsing. The worker uses only the syntax tree, not
+semantic fact extraction.
+
 ### API and pagination
 
 `GET /api/repos/:owner/:name/semantic` returns the versioned
@@ -261,8 +272,10 @@ cancel another request's cached read.
 ### Extending the adapters
 
 1. Implement `LanguageAdapter` in `shared/semantic/types.ts`: declare the language
-   and extensions, then parse source into a Lezer tree, `SyntaxFact[]` and
-   diagnostics. Register the adapter in `shared/semantic/index.ts`.
+   and extensions, expose its `parser: Parser` for syntax-only highlighting, and
+   implement `parse()` to produce a Lezer tree, `SyntaxFact[]` and diagnostics.
+   Register the adapter in `shared/semantic/index.ts`; the file viewer discovers
+   its extensions automatically.
 2. Give each fact a stable scope-local key and actual UTF-16 source offsets.
    Normalize insignificant syntax without changing strings or meaningful text.
    Use `signature` for declaration headers; supply `shape` only when conservative

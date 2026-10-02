@@ -1,6 +1,7 @@
 import { classHighlighter, highlightTree } from "@lezer/highlight";
 import { documentAdapters } from "./documents.ts";
 import { programmingAdapters } from "./programming.ts";
+import { MAX_SOURCE_BYTES } from "./limits.ts";
 import type {
   FileAnalysis,
   ParsedDocument,
@@ -11,7 +12,6 @@ import type {
 } from "./types.ts";
 
 export const ANALYSIS_VERSION = 1;
-export const MAX_SOURCE_BYTES = 256 * 1024;
 const MAX_FACTS = 10_000;
 const MAX_EXCERPT = 8_000;
 export const languageAdapters = [...programmingAdapters, ...documentAdapters];

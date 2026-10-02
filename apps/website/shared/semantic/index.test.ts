@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
-import { analyzeFile, MAX_SOURCE_BYTES } from "./index.ts";
+import { analyzeFile } from "./index.ts";
+import { MAX_SOURCE_BYTES } from "./limits.ts";
 
 describe("semantic analysis coverage boundaries", () => {
   it("does not invent syntax changes for unsupported or binary content", () => {

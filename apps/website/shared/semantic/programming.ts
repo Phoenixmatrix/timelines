@@ -180,6 +180,7 @@ function adapter(
   return {
     language,
     extensions,
+    parser,
     parse(source) {
       const tree = parser.parse(source);
       const facts: SyntaxFact[] = [];

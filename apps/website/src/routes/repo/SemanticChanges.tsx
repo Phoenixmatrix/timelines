@@ -1,10 +1,11 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { Form, Link, useSearchParams } from "react-router";
 import type {
   SemanticFeedResponse,
   SemanticLanguage,
   SemanticSource,
 } from "../../../shared/semantic/types.ts";
+import { HighlightedSource } from "../../components/HighlightedSource.tsx";
 import { link } from "../../components/ui.tsx";
 import { api } from "../../lib/api.ts";
 import { firstLine, fullDate, shortOid } from "../../lib/format.ts";
@@ -44,53 +45,6 @@ const kinds = [
   ),
   "symbol.signature_changed",
 ];
-const tokenColors: Record<string, string> = {
-  "tok-keyword": "text-data-violet",
-  "tok-string": "text-online",
-  "tok-string2": "text-online",
-  "tok-number": "text-signal",
-  "tok-bool": "text-signal",
-  "tok-null": "text-signal",
-  "tok-comment": "text-ink-faint",
-  "tok-typeName": "text-data-violet",
-  "tok-className": "text-data-violet",
-  "tok-tagName": "text-data-violet",
-  "tok-propertyName": "text-signal",
-  "tok-attributeName": "text-signal",
-  "tok-heading": "text-signal font-semibold",
-  "tok-link": "text-signal underline",
-  "tok-invalid": "text-danger-text",
-};
-
-/** Render only text and allowlisted styles, never server-provided markup. */
-function highlighted(source: SemanticSource): ReactNode[] {
-  const parts: ReactNode[] = [];
-  let position = 0;
-  for (const token of source.tokens) {
-    if (
-      !Number.isInteger(token.from) ||
-      !Number.isInteger(token.to) ||
-      token.from < position ||
-      token.to <= token.from ||
-      token.to > source.text.length
-    )
-      continue;
-    if (token.from > position) parts.push(source.text.slice(position, token.from));
-    const className = token.className
-      .split(/\s+/)
-      .map((name) => tokenColors[name] ?? "")
-      .filter(Boolean)
-      .join(" ");
-    parts.push(
-      <span key={`${token.from}:${token.to}`} className={className || undefined}>
-        {source.text.slice(token.from, token.to)}
-      </span>,
-    );
-    position = token.to;
-  }
-  parts.push(source.text.slice(position));
-  return parts;
-}
 
 function sourceLink(value: string | null, base: string): string | null {
   return value?.startsWith(`${base}/`) && !/[\\\r\n]/.test(value) ? value : null;
@@ -127,7 +81,9 @@ function Excerpt({
             tabIndex={0}
             aria-label={`${label} source excerpt`}
           >
-            <code>{highlighted(source)}</code>
+            <code>
+              <HighlightedSource text={source.text} tokens={source.tokens} />
+            </code>
           </pre>
           {source.truncated && (
             <p className="m-0 px-3 pb-3 text-body-sm text-ink-muted">

@@ -9,12 +9,14 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import type { BlobResponse, GraphNodeDetail, RepoDetail } from "../../../shared/api.ts";
+import { HighlightedSource } from "../../components/HighlightedSource.tsx";
 import { FileRow, RailSection, railClass } from "../../components/Rail.tsx";
 import { link } from "../../components/ui.tsx";
 import { bytes } from "../../lib/format.ts";
 import { findDefinitions } from "../../lib/outline.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
+import { useSourceHighlight } from "../../lib/useSourceHighlight.ts";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
@@ -36,6 +38,7 @@ export function Blob() {
   const navigate = useNavigate();
   const { hash } = useLocation();
   const lines = useMemo(() => blob.text?.replace(/\n$/, "").split("\n") ?? [], [blob.text]);
+  const highlights = useSourceHighlight(blob);
   const fileName = blob.path.split("/").pop();
 
   // The code renders after the loader, so the browser's own jump to #L123 on
@@ -87,7 +90,13 @@ export function Blob() {
                           {index + 1}
                         </a>
                       </td>
-                      <td className="pr-4 whitespace-pre">{line || " "}</td>
+                      <td className="pr-4 whitespace-pre">
+                        {highlights?.[index] ? (
+                          <HighlightedSource text={line || " "} tokens={highlights[index]} />
+                        ) : (
+                          line || " "
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
