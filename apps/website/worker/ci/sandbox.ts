@@ -117,7 +117,9 @@ export class CiSandbox extends DurableObject<Env> {
       const checkout = [
         // A container that outlived an earlier attempt still has its checkout.
         `rm -rf ${WORKDIR}`,
-        `git clone --quiet --depth 50 --single-branch --branch "$BRANCH" "$REMOTE" ${WORKDIR}`,
+        // Full history: steps that version by history (the gm and deploy steps) can't
+        // unshallow later, because the checkout's credentials end with this command.
+        `git clone --quiet --single-branch --branch "$BRANCH" "$REMOTE" ${WORKDIR}`,
         `cd ${WORKDIR}`,
         `git checkout --quiet "$COMMIT" 2>/dev/null || { git fetch --quiet --depth 1 origin "$COMMIT" && git checkout --quiet "$COMMIT"; }`,
         `git log -1 --format='%h %s'`,

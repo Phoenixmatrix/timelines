@@ -31,8 +31,15 @@ async function publish(): Promise<void> {
       timeout: 120_000,
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
+  // CI clones full history; an older shallow checkout can't always fetch more.
   if (run("git", ["rev-parse", "--is-shallow-repository"]) === "true") {
-    run("git", ["fetch", "--quiet", "--unshallow", "origin"]);
+    try {
+      run("git", ["fetch", "--quiet", "--unshallow", "origin"]);
+    } catch {
+      console.warn(
+        "Couldn't fetch full history; versioning gm from the commits this checkout has.",
+      );
+    }
   }
   const version = run("git", ["log", "-1", "--format=%H", "HEAD", "--", "apps/cli"]);
   if (!/^[a-f0-9]{40}$/.test(version)) throw new Error("No CLI source commit found.");
