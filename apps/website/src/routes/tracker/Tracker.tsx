@@ -770,7 +770,7 @@ function Workbench({ data }: { data: TrackerView }) {
                 />
                 <input
                   ref={queryRef}
-                  className="mk-input mk-input--code h-10 min-w-0 flex-1 pl-9 sm:text-body-sm"
+                  className={`mk-input mk-input--code h-12 min-w-0 flex-1 pl-9 sm:h-10 sm:text-body-sm ${draft !== query ? "pr-28" : "pr-12"}`}
                   aria-label="Filter issues"
                   aria-keyshortcuts={shortcuts ? "/" : undefined}
                   aria-invalid={parsedUnknown.length ? "true" : undefined}
@@ -787,14 +787,32 @@ function Workbench({ data }: { data: TrackerView }) {
                     if (event.key === "Escape") setDraft(query);
                   }}
                 />
-                {draft !== query && (
-                  <button
-                    type="submit"
-                    className="mk-btn mk-btn--sm mk-btn--primary absolute right-1"
-                  >
-                    Run
-                  </button>
-                )}
+                <div className="absolute right-1 flex items-center gap-1">
+                  {(draft.length > 0 || query.length > 0) && (
+                    <Tip label="Clear search">
+                      <button
+                        type="button"
+                        className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm min-h-11 min-w-11 sm:min-h-0 sm:min-w-0"
+                        aria-label="Clear search"
+                        onClick={() => {
+                          setDraft("");
+                          setQuery("");
+                          queryRef.current?.focus();
+                        }}
+                      >
+                        <XIcon weight="bold" aria-hidden />
+                      </button>
+                    </Tip>
+                  )}
+                  {draft !== query && (
+                    <button
+                      type="submit"
+                      className="mk-btn mk-btn--sm mk-btn--primary min-h-11 sm:min-h-0"
+                    >
+                      Run
+                    </button>
+                  )}
+                </div>
               </form>
               <div className="mk-segmented" role="radiogroup" aria-label="View">
                 {(Object.keys(VIEW_LABEL) as View[]).map((v) => (

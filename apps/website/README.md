@@ -392,6 +392,11 @@ phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
 acceptance criteria, parent/child plan, dependencies and durable comments, agent
 checkpoints or evidence.
 
+The search bar's **Clear search** (×) button clears both typed text and applied
+query filters immediately, shows all issues, and returns focus to the input.
+It preserves the selected layout and sort, and the empty query survives reload.
+The button disappears when both the input and applied query are empty.
+
 Use **Close issue** when work will not be completed. Choose Duplicate, Not planned,
 No longer needed, Cannot reproduce, or Other, then **Confirm close**. This saves
 the issue as `canceled`, not `done`; the selected reason stays visible after reload.
