@@ -124,15 +124,8 @@ function deploy(planOnly: boolean): void {
     console.log(JSON.stringify({ event: "deploy.skipped", reason: "not-main" }));
     return;
   }
-  // CI clones full history. A shallow checkout that can't fetch more still works:
-  // a deployed commit missing from it just means deploying everything.
-  if (run("git", ["rev-parse", "--is-shallow-repository"]) === "true") {
-    try {
-      run("git", ["fetch", "--quiet", "--unshallow", "origin"]);
-    } catch {
-      console.warn("Couldn't fetch full history; diffing within this checkout's commits.");
-    }
-  }
+  // CI's checkout is shallow (the last 50 commits), and the deployed commit is
+  // almost always among them; if it isn't, knownCommit fails and everything deploys.
   const head = run("git", ["rev-parse", "HEAD"]);
   const current = deployed();
   if (current.tag === head) {

@@ -365,7 +365,7 @@ too, and `gitmatrix.sshCommand` sets the ssh for gm without touching git.
 gm pkg download gm/latest/linux-x86_64/gm --owner orbit --dest ./gm
 gm pkg install gm --owner orbit
 gm pkg install gm --owner orbit --force
-gm pkg install gm --owner orbit --version <cli-source-commit> --bin-dir ./bin
+gm pkg install gm --owner orbit --version <apps/cli-tree-id> --bin-dir ./bin
 ```
 
 `download` accepts `<name>/<version>/<path>` in the generic registry. Its default
@@ -382,15 +382,17 @@ a running `gm` binary. Symlinks and nonregular destinations are refused.
 `--dry-run` checks remote metadata without creating files or directories.
 Add the bin directory to `PATH` yourself; no shell configuration is edited.
 
-The hosted `orbit/gitmatrix` pipeline publishes native release binaries as
-`gm/<last-commit-touching-apps/cli>/<os>-<arch>/gm`. The version changes only when
-the CLI source subtree changes; unrelated pushes and reruns reuse the existing
-artifact. CI unshallows its checkout before finding that commit so older source
-changes are not mistaken for a shallow-history boundary. Publication runs only
-on `main`, after check/test and a successful build, using the job credential and
-the already-built release binary. The current Linux host publishes
-`linux-x86_64`; the installer supports Unix naming, but does not cross-build or
-make a native binary compatible with a different OS, architecture, or libc.
+The `matrixorg/gitmatrix` pipeline on gitmatrix.fward.dev publishes native release
+binaries as `gm/<apps/cli tree id>/<os>-<arch>/gm`: the git tree id of the CLI's
+source (`git rev-parse HEAD:apps/cli`, `Cargo.lock` included). The same source
+always has the same version, so unrelated pushes and reruns reuse the existing
+artifact, and finding it needs only the checked-out commit, not history. Each
+publish records the commit and CI run it came from. Publication runs in the
+`deploy` job on `main`, after check, test and build pass; it asks the registry
+first and builds the release binary only when that version is missing. The CI
+host publishes `linux-x86_64`; the installer supports Unix naming, but does not
+cross-build or make a native binary compatible with a different OS,
+architecture, or libc.
 
 To bootstrap from an older `gm` without these commands, use
 `./apps/cli/target/release/gm pkg install gm --owner orbit` after a local release

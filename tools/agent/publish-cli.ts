@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 
-// Version by the last CLI-source change, not every website/docs push. Full history
-// matters: a shallow boundary otherwise looks like it introduced every file.
+// Version by the CLI source itself: the git tree id of apps/cli (Cargo.lock
+// included). The same source always has the same id, so pushes that don't touch
+// it reuse the published binary, and finding it needs only the checked-out
+// commit, not history. The source commit is recorded by the publish itself
+// (CI publishes carry their repository, branch, commit and run).
 async function publish(): Promise<void> {
   if (process.env.GITMATRIX_BRANCH !== "main") {
     console.log(JSON.stringify({ event: "cli.publish.skipped", reason: "not-main" }));
@@ -31,18 +34,8 @@ async function publish(): Promise<void> {
       timeout: 120_000,
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
-  // CI clones full history; an older shallow checkout can't always fetch more.
-  if (run("git", ["rev-parse", "--is-shallow-repository"]) === "true") {
-    try {
-      run("git", ["fetch", "--quiet", "--unshallow", "origin"]);
-    } catch {
-      console.warn(
-        "Couldn't fetch full history; versioning gm from the commits this checkout has.",
-      );
-    }
-  }
-  const version = run("git", ["log", "-1", "--format=%H", "HEAD", "--", "apps/cli"]);
-  if (!/^[a-f0-9]{40}$/.test(version)) throw new Error("No CLI source commit found.");
+  const version = run("git", ["rev-parse", "HEAD:apps/cli"]);
+  if (!/^[a-f0-9]{40}$/.test(version)) throw new Error("No apps/cli tree at HEAD.");
   const os = process.platform === "darwin" ? "macos" : process.platform;
   if (process.platform === "win32") throw new Error("CLI artifacts currently support Unix only.");
   const arch =
