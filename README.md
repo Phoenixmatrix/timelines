@@ -221,9 +221,13 @@ optional named tags and non-duplicated daily tracker feeds. Assertions check
 source facts, not exact generated wording. Missing providers or an expired
 visibility deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
 
-Build completion acknowledges uploads, not search visibility. The AI gate keeps
-at most six retrieval calls, with increasing waits totaling up to five minutes,
-and requires the exact entity and source passage in the same response.
+Build completion acknowledges uploads, not search visibility. The AI gate observes
+the fixture item’s own AI Search indexing status before making at most six
+retrieval calls, with increasing waits totaling up to five minutes. A ten-minute
+overall deadline bounds indexing and retrieval together. The exact entity and
+source passage must appear in the same response. `indexVisibilitySummary` in
+`ai-e2e.json` records the item key/ID/status, observations, elapsed wait and missing
+invariants, including when a completed item never becomes retrievable.
 `ai-e2e.json` records each attempt's elapsed time and separate entity/passage
 visibility so a delayed index is distinguishable from a failed build.
 

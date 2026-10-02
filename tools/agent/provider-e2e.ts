@@ -11,6 +11,8 @@ import type {
   ReleaseNotesIndex,
   ReleaseNotesRelease,
 } from "../../apps/website/shared/release-notes.ts";
+import { waitForIndexVisibility, type VisibilityReport } from "./index-visibility.ts";
+import { searchItemStatus } from "./search-item-status.ts";
 
 // Real git http-backend provides the target; all state belongs to this invocation.
 interface MirrorTarget {
@@ -203,7 +205,13 @@ export async function runProviderE2E(
         },
       );
     });
-  const api = async (path: string, method = "GET", body?: unknown, expected = 200) => {
+  const api = async (
+    path: string,
+    method = "GET",
+    body?: unknown,
+    expected = 200,
+    timeoutMs = 120_000,
+  ) => {
     const response = await fetch(`${ctx.origin}/api${path}`, {
       method,
       headers: {
@@ -211,7 +219,7 @@ export async function runProviderE2E(
         "content-type": "application/json",
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     events.push({ stage, method, path, status: response.status });
     assert.equal(
@@ -416,46 +424,33 @@ export async function runProviderE2E(
       assert(page.model, "Wiki must record its real generation model");
       evidence.wiki = page;
       enter("index-visibility");
-      // Uploads finish before provider indexes are searchable. Keep six paid
-      // retrieval calls, spread over a five-minute window rather than spending
-      // them all during initial indexing (20 + 40 + 60 + 80 + 100 seconds).
-      const attempts: {
-        attempt: number;
-        elapsedMs: number;
-        entityFound: boolean;
-        passageFound: boolean;
-      }[] = [];
-      evidence.indexVisibility = attempts;
-      let found = false;
-      for (let attempt = 1; attempt <= 6; attempt++) {
-        const result = await api(
-          `${base}/knowledge/search?q=${encodeURIComponent("Copper Finch copperFinchChecksum parcel checksum modulo 65521")}`,
-        );
-        evidence.search = result;
-        const entityFound = result.entities.some(
-          (entity: { id: string }) => entity.id === symbol.id || entity.id === file.id,
-        );
-        const passageFound = result.passages.some(
-          (passage: { kind: string; path: string; text: string }) =>
-            passage.kind === "code" &&
-            passage.path === "checksum.ts" &&
-            passage.text.includes("copperFinchChecksum") &&
-            passage.text.includes("65521"),
-        );
-        attempts.push({
-          attempt,
-          elapsedMs: Date.now() - stageStarted,
-          entityFound,
-          passageFound,
-        });
-        found = entityFound && passageFound;
-        if (found) break;
-        if (attempt < 6) await delay(20_000 * attempt);
-      }
-      assert(
-        found,
-        "Vectorize entity and AI Search source passage invariants were not both visible",
-      );
+      const fixtureRepo = await api(base);
+      const visibility = {} as VisibilityReport;
+      evidence.indexVisibilitySummary = visibility;
+      await waitForIndexVisibility({
+        target: {
+          repo: `${owner}/${name}`,
+          key: `${fixtureRepo.id}/file:checksum.ts.md`,
+          path: "checksum.ts",
+          symbolId: symbol.id,
+          fileId: file.id,
+        },
+        item: await searchItemStatus(ctx, `${fixtureRepo.id}/file:checksum.ts.md`),
+        search: async (remainingMs) => {
+          const result = await api(
+            `${base}/knowledge/search?q=${encodeURIComponent("Copper Finch copperFinchChecksum parcel checksum modulo 65521")}`,
+            "GET",
+            undefined,
+            200,
+            Math.min(120_000, remainingMs),
+          );
+          evidence.search = result;
+          return result;
+        },
+        report: visibility,
+      }).finally(() => {
+        evidence.indexVisibility = visibility.attempts;
+      });
       enter("assistant");
       // The assistant (CORE-25/26): one real turn through clef routing, the
       // orchestrator model and its tools, answered from the indexed fixture.
