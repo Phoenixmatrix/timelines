@@ -3,6 +3,8 @@
 
 use serde::Serialize;
 
+pub mod capabilities;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Harness {
     pub id: &'static str,
@@ -39,6 +41,11 @@ pub fn detect() -> Option<Harness> {
     }
     type Check = (fn() -> bool, &'static str, &'static str);
     let checks: &[Check] = &[
+        (
+            || set("PI_SESSION_FILE").is_some() && set("PI_TOOL_BRIDGE_SESSION").is_some(),
+            "pi",
+            "Pi",
+        ),
         (|| equals("CLAUDECODE", "1"), "claude-code", "Claude Code"),
         (|| set("CODEX_THREAD_ID").is_some(), "codex", "OpenAI Codex"),
         (

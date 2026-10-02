@@ -29,6 +29,22 @@ export interface AgentRef {
   name: string;
 }
 
+/** Self-reported advisory metadata, never an authorization or scheduling policy. */
+export interface AgentCapabilities {
+  version: 1;
+  harness: string | null;
+  model: string | null;
+  environment: {
+    os: string;
+    arch: string;
+    runtime: "host" | "container" | "vm" | "wsl" | "cloudflare-worker" | "unknown";
+    cpuCount: number | null;
+    memoryBytes: number | null;
+  };
+  tags: string[];
+  skills: { name: string; description: string; source: "detected" | "declared" }[];
+}
+
 /** An identity that works on its own, with a human accountable for it. */
 export interface Agent extends AgentRef {
   description: string;
@@ -36,6 +52,8 @@ export interface Agent extends AgentRef {
   accountable: AccountSummary;
   createdAt: string;
   revokedAt: string | null;
+  capabilities: AgentCapabilities | null;
+  capabilitiesUpdatedAt: string | null;
   /** Tokens it can sign in with. */
   tokens: AccessToken[];
 }

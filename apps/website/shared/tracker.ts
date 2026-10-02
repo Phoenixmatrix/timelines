@@ -1,3 +1,5 @@
+import type { AgentCapabilities } from "./api.ts";
+
 export interface TrackerIdentity {
   id: string;
   slug: string;
@@ -19,6 +21,9 @@ export interface TrackerAgent {
   id: string;
   name: string;
   accountable: TrackerIdentity;
+  capabilities: AgentCapabilities | null;
+  capabilitiesUpdatedAt: string | null;
+  revokedAt: string | null;
 }
 export interface TrackerOwner extends TrackerIdentity {
   canAdmin: boolean;

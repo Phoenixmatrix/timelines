@@ -658,8 +658,24 @@ pub enum SecretCommand {
 
 #[derive(Subcommand)]
 pub enum AgentCommand {
-    /// Your agents, with their tokens
-    List,
+    /// Your agents and advisory capabilities, optionally from an owner's tracker
+    List {
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Detect local advisory capabilities without network access
+    Detect {
+        #[command(flatten)]
+        capabilities: CapabilityArgs,
+    },
+    /// Create or refresh a named owned agent, or the authenticated agent itself
+    Configure {
+        name: Option<String>,
+        #[command(flatten)]
+        capabilities: CapabilityArgs,
+    },
+    /// Show a named owned agent, or the authenticated agent itself
+    Show { name: Option<String> },
     /// Create an agent accountable to you
     Create {
         /// Lowercase letters, digits and hyphens, e.g. builder
@@ -683,6 +699,37 @@ pub enum AgentCommand {
         /// The agent's name or id
         name: String,
     },
+}
+
+#[derive(Args, Debug, Default)]
+pub struct CapabilityArgs {
+    /// Explicit harness identifier (otherwise detected)
+    #[arg(long, conflicts_with = "clear_harness")]
+    pub harness: Option<String>,
+    #[arg(long)]
+    pub clear_harness: bool,
+    /// Explicit model identifier; never inferred from harness
+    #[arg(long, conflicts_with = "clear_model")]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub clear_model: bool,
+    /// Override detected runtime classification
+    #[arg(long, value_parser = ["host", "container", "vm", "wsl", "cloudflare-worker", "unknown"])]
+    pub runtime: Option<String>,
+    /// Replace tags with this repeatable set
+    #[arg(long = "tag", conflicts_with = "clear_tags")]
+    pub tags: Vec<String>,
+    #[arg(long)]
+    pub clear_tags: bool,
+    /// Replace declared skills with NAME or NAME=DESCRIPTION (repeatable)
+    #[arg(long = "skill", conflicts_with = "clear_skills")]
+    pub skills: Vec<String>,
+    /// Remove declared skills; detected skills are still refreshed
+    #[arg(long)]
+    pub clear_skills: bool,
+    /// Additional directory containing skill directories or a SKILL.md
+    #[arg(long = "skill-dir")]
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 #[derive(Args)]

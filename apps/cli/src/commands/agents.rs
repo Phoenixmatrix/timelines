@@ -2,6 +2,7 @@
 //! for it. `gm agent token` mints a token the agent signs in with (GM_TOKEN).
 
 use super::Ctx;
+use crate::agent::capabilities::{self, AgentCapabilities};
 use crate::cli::AgentCommand;
 use crate::output::{GmError, Render, Result};
 use crate::remote::{self, Config};
@@ -30,22 +31,100 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
 
+fn terminal(value: &str) -> String {
+    let mut safe = String::new();
+    for character in value.chars() {
+        if character.is_control()
+            || matches!(character, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
 /// "builder (for Ann Lee)": an agent and the person answerable for it.
 fn line(agent: &Value) -> String {
     let revoked = if agent["revokedAt"].is_null() {
         String::new()
     } else {
-        format!("  revoked {}", s(agent, "revokedAt"))
+        format!("  revoked {}", terminal(s(agent, "revokedAt")))
     };
-    let tokens = agent["tokens"].as_array().map_or(0, Vec::len);
+    // Tracker discovery deliberately omits credential metadata.
+    let tokens = agent["tokens"]
+        .as_array()
+        .map(|tokens| {
+            format!(
+                "  {} token{}",
+                tokens.len(),
+                if tokens.len() == 1 { "" } else { "s" }
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{} (for {})  {} token{}{}",
-        s(agent, "name"),
-        s(&agent["accountable"], "displayName"),
+        "{} (for {}){}{}{}",
+        terminal(s(agent, "name")),
+        terminal(s(&agent["accountable"], "displayName")),
         tokens,
-        if tokens == 1 { "" } else { "s" },
-        revoked
+        revoked,
+        summary(&agent["capabilities"])
     )
+}
+
+fn summary(profile: &Value) -> String {
+    if profile.is_null() {
+        return "  capabilities unknown".into();
+    }
+    let tags = profile["tags"]
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .filter_map(Value::as_str)
+                .map(terminal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let skills = profile["skills"]
+        .as_array()
+        .map(|skills| {
+            skills
+                .iter()
+                .filter_map(|s| s["name"].as_str())
+                .map(terminal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    format!(
+        "\n  harness: {}  model: {}  environment: {}/{}/{}\n  cpus: {}  memory: {}\n  tags: {}  skills: {}",
+        terminal(profile["harness"].as_str().unwrap_or("unknown")),
+        terminal(profile["model"].as_str().unwrap_or("unknown")),
+        terminal(s(&profile["environment"], "os")),
+        terminal(s(&profile["environment"], "arch")),
+        terminal(s(&profile["environment"], "runtime")),
+        profile["environment"]["cpuCount"]
+            .as_u64()
+            .map_or_else(|| "unknown".into(), |n| n.to_string()),
+        profile["environment"]["memoryBytes"]
+            .as_u64()
+            .map_or_else(|| "unknown".into(), |n| format!("{n} bytes")),
+        if tags.is_empty() { "none" } else { &tags },
+        if skills.is_empty() { "none" } else { &skills },
+    )
+}
+
+fn shown_agent(value: Value) -> Shown {
+    Shown {
+        text: line(&value["agent"]),
+        value,
+    }
+}
+
+fn self_agent(config: &Config) -> Result<Value> {
+    Ok(remote::api(config, "GET", "/agents/self", None)?["agent"].clone())
 }
 
 fn agents(config: &Config) -> Result<Vec<Value>> {
@@ -76,8 +155,93 @@ fn find(config: &Config, name: &str) -> Result<Value> {
 pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
     let config = Config::load();
     match command {
-        AgentCommand::List => {
-            let list = agents(&config)?;
+        AgentCommand::Detect { capabilities: args } => {
+            let value = serde_json::to_value(capabilities::detect(args, None, &ctx.cwd)?)?;
+            Ok(Shown {
+                text: summary(&value).trim().into(),
+                value,
+            })
+        }
+        AgentCommand::Show { name } => {
+            let agent = match name {
+                Some(name) => find(&config, name)?,
+                None => self_agent(&config)?,
+            };
+            Ok(shown_agent(json!({ "agent": agent })))
+        }
+        AgentCommand::Configure {
+            name,
+            capabilities: args,
+        } => {
+            let existing = match name {
+                Some(name) => agents(&config)?
+                    .into_iter()
+                    .find(|a| a["name"] == *name || a["id"] == *name),
+                None => Some(self_agent(&config)?),
+            };
+            if existing.as_ref().is_some_and(|a| !a["revokedAt"].is_null()) {
+                return Err(GmError::new(
+                    "revoked",
+                    "This agent was revoked; create a new identity.",
+                ));
+            }
+            let previous: Option<AgentCapabilities> = existing
+                .as_ref()
+                .filter(|a| !a["capabilities"].is_null())
+                .map(|a| serde_json::from_value(a["capabilities"].clone()))
+                .transpose()?;
+            let report = capabilities::detect(args, previous.as_ref(), &ctx.cwd)?;
+            let (method, path, body) = match &existing {
+                Some(agent) => (
+                    "PUT",
+                    if name.is_none() {
+                        "/agents/self/capabilities".into()
+                    } else {
+                        format!("/agents/{}/capabilities", s(agent, "id"))
+                    },
+                    serde_json::to_value(report)?,
+                ),
+                None => (
+                    "POST",
+                    "/agents".into(),
+                    json!({ "name": name, "capabilities": report }),
+                ),
+            };
+            if ctx.dry_run {
+                return Ok(Shown {
+                    text: format!(
+                        "Would {method} {path}\n{}",
+                        serde_json::to_string_pretty(&body)?
+                    ),
+                    value: json!({ "dry_run": true, "method": method, "path": path, "request": body }),
+                });
+            }
+            Ok(shown_agent(remote::api(
+                &config,
+                method,
+                &path,
+                Some(&body),
+            )?))
+        }
+        AgentCommand::List { owner } => {
+            let list = if let Some(owner) = owner {
+                if owner.is_empty()
+                    || !owner
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return Err(GmError::usage(
+                        "Owner must be an account slug (letters, numbers, '-' or '_').",
+                    ));
+                }
+                let snapshot =
+                    remote::api(&config, "GET", &format!("/tracker/{owner}/snapshot"), None)?;
+                snapshot["agents"].as_array().cloned().ok_or_else(|| {
+                    GmError::new("protocol_error", "Tracker snapshot has no agents array.")
+                })?
+            } else {
+                agents(&config)?
+            };
             let text = if list.is_empty() {
                 "No agents yet. Create one with `gm agent create <name>`.".into()
             } else {
@@ -151,6 +315,47 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
                 text: format!("Revoked {name}; its tokens stopped working."),
                 value: json!({ "revoked": agent["id"] }),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn untrusted_profile_text_cannot_control_the_terminal() {
+        let profile = serde_json::json!({
+            "harness": "\u{1b}[2J", "model": "model\nforged",
+            "environment": { "os": "linux", "arch": "x86_64", "runtime": "unknown" },
+            "tags": ["rust\rforged"], "skills": [{ "name": "\u{202e}skill", "description": "not displayed\nmultiline" }]
+        });
+        let text = super::summary(&profile);
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\r'));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("model\\nforged"));
+        assert!(text.contains("\\u{1b}[2J"));
+        assert!(!text.contains("multiline"));
+    }
+
+    #[test]
+    fn ambiguous_declarations_and_invalid_runtime_are_rejected() {
+        for args in [
+            vec!["gm", "agent", "configure", "--tag", "rust", "--clear-tags"],
+            vec![
+                "gm",
+                "agent",
+                "configure",
+                "--skill",
+                "review",
+                "--clear-skills",
+            ],
+            vec!["gm", "agent", "detect", "--model", "model", "--clear-model"],
+            vec!["gm", "agent", "detect", "--runtime", "guessed"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 }

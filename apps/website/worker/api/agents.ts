@@ -1,17 +1,92 @@
-// Agents: identities that work on their own, each with a human accountable for
-// it. A person manages their agents and mints their tokens here; an agent
-// signed in with its own token can't manage agents or credentials.
+// People manage agent identities and credentials. Agents may read and report
+// their own advisory capability profile, but cannot manage other identities.
 
 import { Hono, type Context } from "hono";
-import type { Agent, CreatedAccessToken, TokenScope } from "../../shared/api.ts";
+import { z } from "zod";
+import type { Agent, AgentCapabilities, CreatedAccessToken, TokenScope } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import { accountSummary } from "../db.ts";
 import { db, nowIso } from "../schema.ts";
-import { fail, readJson, requirePerson } from "./http.ts";
+import { fail, readJson, requireActor, requirePerson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
 
 /** Lowercase letters, digits and single hyphens, like usernames. */
 const NAME = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}$/;
+
+const capabilitiesSchema = z
+  .object({
+    version: z.literal(1),
+    harness: z.string().max(120).trim().nullable(),
+    model: z.string().max(120).trim().nullable(),
+    environment: z
+      .object({
+        os: z.string().max(64).trim().min(1),
+        arch: z.string().max(64).trim().min(1),
+        runtime: z.enum(["host", "container", "vm", "wsl", "cloudflare-worker", "unknown"]),
+        cpuCount: z.number().int().positive().max(65536).nullable(),
+        memoryBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+      })
+      .strict(),
+    tags: z.array(z.string().max(64).trim().min(1)).max(64),
+    skills: z
+      .array(
+        z
+          .object({
+            name: z.string().max(128).trim().min(1),
+            description: z.string().max(512).trim(),
+            source: z.enum(["detected", "declared"]),
+          })
+          .strict(),
+      )
+      .max(256),
+  })
+  .strict();
+
+function canonicalCapabilities(profile: AgentCapabilities): AgentCapabilities {
+  return {
+    ...profile,
+    tags: [...new Set(profile.tags)].sort(),
+    skills: [
+      ...new Map(
+        profile.skills.map((skill) => [
+          JSON.stringify([skill.name, skill.source, skill.description]),
+          skill,
+        ]),
+      ).values(),
+    ].sort(
+      (a, b) =>
+        a.name.localeCompare(b.name) ||
+        a.source.localeCompare(b.source) ||
+        a.description.localeCompare(b.description),
+    ),
+  };
+}
+
+/** Count actual bytes, including chunked requests; never buffer an unbounded body. */
+async function profileJson(c: Context<AppEnv>): Promise<unknown> {
+  const reader = c.req.raw.body?.getReader();
+  if (!reader) return fail(c, 400, "Send a JSON object.");
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+  let size = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 256 * 1024) {
+        await reader.cancel();
+        return fail(c, 413, "Keep the profile request under 256 KiB.");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } catch {
+    return fail(c, 400, "Send valid JSON.");
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 export const agents = new Hono<AppEnv>();
 
@@ -40,6 +115,8 @@ async function listAgents(d1: D1Database, accountableId: string): Promise<Agent[
     accountable: accountSummary(human),
     createdAt: row.created_at,
     revokedAt: row.revoked_at,
+    capabilities: row.capabilities === null ? null : JSON.parse(row.capabilities),
+    capabilitiesUpdatedAt: row.capabilities_updated_at,
     tokens: tokens
       .filter((t) => t.agent_id === row.id)
       .map((t) => ({
@@ -62,8 +139,19 @@ agents.get("/", async (c) => {
 agents.post("/", async (c) => {
   const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
-  const body = await readJson<{ name: string; description: string }>(c);
-  const name = body.name?.trim() ?? "";
+  const raw = await profileJson(c);
+  if (raw instanceof Response) return raw;
+  const parsed = z
+    .object({
+      name: z.string(),
+      description: z.string().optional(),
+      capabilities: capabilitiesSchema.optional(),
+    })
+    .strict()
+    .safeParse(raw);
+  if (!parsed.success) return fail(c, 400, "Invalid agent profile.");
+  const body = parsed.data;
+  const name = body.name.trim();
   if (!NAME.test(name))
     return fail(c, 400, "Name it with 1 to 39 lowercase letters, digits or single hyphens.");
   const description = body.description?.trim() ?? "";
@@ -78,10 +166,62 @@ agents.post("/", async (c) => {
   const id = `agt_${crypto.randomUUID()}`;
   await db(c.env.DB)
     .insertInto("agents")
-    .values({ id, name, accountable_id: actor.id, description, revoked_at: null })
+    .values({
+      id,
+      name,
+      accountable_id: actor.id,
+      description,
+      revoked_at: null,
+      capabilities: body.capabilities
+        ? JSON.stringify(canonicalCapabilities(body.capabilities))
+        : null,
+      capabilities_updated_at: body.capabilities ? nowIso() : null,
+    })
     .execute();
   const agent = (await listAgents(c.env.DB, actor.id)).find((a) => a.id === id)!;
   return c.json({ agent }, 201);
+});
+
+/** A person may inspect their agents; an agent may inspect/report only itself. */
+async function profileAgent(c: Context<AppEnv>) {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  const requested = c.req.param("id");
+  if (requested === "self" && !actor.agent)
+    return fail(c, 403, "Sign in with an agent token to use self.");
+  const id = requested === "self" ? actor.agent!.id : requested;
+  if (actor.agent && id !== actor.agent.id)
+    return fail(c, 403, "Agents can only access their own profile.");
+  const agent = (await listAgents(c.env.DB, actor.id)).find((row) => row.id === id);
+  return agent ?? fail(c, 404, "No such agent.");
+}
+
+agents.get("/:id", async (c) => {
+  const agent = await profileAgent(c);
+  return agent instanceof Response ? agent : c.json({ agent });
+});
+
+agents.put("/:id/capabilities", async (c) => {
+  const agent = await profileAgent(c);
+  if (agent instanceof Response) return agent;
+  if (agent.revokedAt) return fail(c, 409, `${agent.name} was revoked.`);
+  const raw = await profileJson(c);
+  if (raw instanceof Response) return raw;
+  const parsed = capabilitiesSchema.safeParse(raw);
+  if (!parsed.success) return fail(c, 400, "Invalid agent capabilities.");
+  const capabilities = canonicalCapabilities(parsed.data);
+  const capabilitiesUpdatedAt = nowIso();
+  const result = await db(c.env.DB)
+    .updateTable("agents")
+    .set({
+      capabilities: JSON.stringify(capabilities),
+      capabilities_updated_at: capabilitiesUpdatedAt,
+    })
+    .where("id", "=", agent.id)
+    .where("revoked_at", "is", null)
+    .executeTakeFirst();
+  if (!result.numUpdatedRows) return fail(c, 409, `${agent.name} was revoked.`);
+  return c.json({ agent: { ...agent, capabilities, capabilitiesUpdatedAt } });
 });
 
 /** The person's own, unrevoked agent, or an error response. */

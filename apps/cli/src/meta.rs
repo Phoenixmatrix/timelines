@@ -134,8 +134,11 @@ pub const COMMANDS: &[Meta] = &[
     meta!("runner", git: "", kw: "ci runner agent worker execute jobs locally self-hosted run pipelines dev", mutates: false, out: Out::Other("{jobs:[{repo,run,job,status}]} (one JSON line per job while running)"), ex: ["gm runner", "gm runner --once", "gm runner -R orbit/engine -v"]),
     meta!("secret list", git: "", kw: "ci secrets environment variables credentials list", mutates: false, out: Out::Other("{secrets:[{name,updatedAt}]}"), ex: ["gm secret list"]),
     meta!("secret set", git: "", kw: "ci add secret token credential environment variable", mutates: true, out: Out::Other("{set}"), ex: ["gm secret set NPM_TOKEN --value xyz", "echo $TOKEN | gm secret set CLOUDFLARE_API_TOKEN"]),
-    meta!("agent list", git: "", kw: "agents identities accountable bots list", mutates: false, out: Out::Other("{agents:[{id,name,description,accountable,createdAt,revokedAt,tokens}]}"), ex: ["gm agent list"]),
-    meta!("agent create", git: "", kw: "create agent identity bot accountable", mutates: true, out: Out::Other("{agent:{id,name,description,accountable,createdAt,revokedAt,tokens}}"), ex: ["gm agent create builder --description \"Works the CORE graph\""]),
+    meta!("agent list", git: "", kw: "agents identities accountable bots list capabilities selection owner", mutates: false, out: Out::Other("{agents:[{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}]}"), ex: ["gm agent list", "gm agent list --owner orbit"]),
+    meta!("agent detect", git: "", kw: "agent local capabilities environment harness model skills tags detect", mutates: false, out: Out::Other("{version:1,harness,model,environment:{os,arch,runtime,cpuCount,memoryBytes},tags,skills:[{name,description,source}]}"), ex: ["gm agent detect", "gm agent detect --model explicit-model --tag rust"]),
+    meta!("agent configure", git: "", kw: "agent create update refresh configure profile capabilities model harness skills tags", mutates: true, out: Out::Other("{agent:{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}}"), ex: ["gm agent configure builder --tag rust --skill review", "gm agent configure", "gm agent configure builder --clear-model --clear-tags --clear-skills --dry-run"]),
+    meta!("agent show", git: "", kw: "agent self profile capabilities model harness skills tags show", mutates: false, out: Out::Other("{agent:{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}}"), ex: ["gm agent show builder", "gm agent show"]),
+    meta!("agent create", git: "", kw: "create agent identity bot accountable", mutates: true, out: Out::Other("{agent:{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}}"), ex: ["gm agent create builder --description \"Works the CORE graph\""]),
     meta!("agent token", git: "", kw: "agent token credential GM_TOKEN sign in mint", mutates: true, out: Out::Other("{agent,token:{id,name,scope,lastFour,secret}}; secret is shown once"), ex: ["gm agent token builder"]),
     meta!("agent revoke", git: "", kw: "revoke disable agent tokens", mutates: true, out: Out::Other("{revoked}"), ex: ["gm agent revoke builder"]),
     meta!("secret delete", git: "", kw: "ci remove secret", mutates: true, out: Out::Other("{deleted}"), ex: ["gm secret delete NPM_TOKEN"]),
@@ -561,6 +564,17 @@ graph input. `gm tracker status` exposes private replica paths for credential re
 ## Working through a graph (agents)
 An agent has its own identity, accountable to a person: `gm agent create builder`,
 then `gm agent token builder`, and the agent runs with that token as GM_TOKEN.
+    gm agent detect                  # local only, no account or checkout needed
+    gm agent configure builder --tag rust --model explicit-model
+    gm agent show builder
+    gm agent list --owner orbit       # advisory profiles for selecting workers
+With an agent token, omit NAME for `configure`/`show` to use its own identity.
+Configure refreshes detected environment, harness and skills; it preserves
+model, tags and declared skills unless supplied replacements or --clear-model,
+--clear-tags, --clear-skills. --skill NAME[=DESCRIPTION] declares a skill;
+--skill-dir DIR adds bounded local metadata discovery. --dry-run previews the
+request without writing. These reports are self-reported advice, never proof
+of tool availability or authorization; configuring never selects a claim identity.
     gm issue next --agent builder --under CORE-4   # pick + claim atomically; token once
     gm issue checkpoint CORE-5 'Done X; next Y'    # as you go; renew before expiry
     gm issue ask CORE-5 --kind question --prompt 'Which region?'  # GM_LEASE_TOKEN parks

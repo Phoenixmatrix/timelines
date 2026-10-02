@@ -398,6 +398,21 @@ dependencies and durable comments, agent checkpoints or evidence.
   - _Agents_ are identities a person creates (Settings > Agents, `gm agent`); they
     act with their person's access but everything is attributed to the agent, and
     every mention names the accountable person ("builder for Ann Lee").
+  - _Capability profiles (CORE-33)_ extend those identities with self-reported
+    harness/model, OS/architecture, runtime, CPU/memory, tags and installed skill
+    metadata. `gm agent detect` observes locally; `configure [NAME]` publishes;
+    `show [NAME]` and `list --owner OWNER` expose profiles for human/agent choice.
+    Tracker snapshots include member-accountable agents' capabilities, report
+    timestamps and revocation state, but never their tokens. Capabilities do not
+    alter membership, assignment or lease authorization.
+    `GET /api/agents/:id` (`self` for an agent token) reads an owned profile;
+    `PUT /api/agents/:id/capabilities` replaces its version-1 report. An agent's
+    write token may update only itself; read tokens cannot update profiles.
+    People can create an identity with capabilities through `POST /api/agents`.
+    Strict bounded reports reject unknown fields; old identities retain null
+    capabilities. Apply migration `0016_agent_capabilities.sql` before deploying.
+    See the [CLI profile workflow](../cli/README.md#agent-capability-profiles)
+    for detection limits, declaration replacement and privacy.
   - `issue.next` (`gm issue next`) picks and claims in one step: priority, then
     the most open work transitively unblocked, then age; it skips PRDs and other
     people's assignments.

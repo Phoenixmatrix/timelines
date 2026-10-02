@@ -8,6 +8,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { chromium, expect as playwrightExpect, type BrowserContext } from "@playwright/test";
 import type {
+  Agent,
+  AgentCapabilities,
   CiLogs,
   CiRunDetail,
   CiRunList,
@@ -330,6 +332,184 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       /403|404|access|forbidden|not.found|permission/i,
     );
     record({ issue: fixtures.tracker.ready, status: completed.issue.status, evidenceSynced: true });
+  });
+
+  await scenario("agent-capabilities-self-reporting-and-claim-identity", async () => {
+    const name = `capabilities-${randomUUID().slice(0, 8)}`;
+    const skillDir = join(work, "capability-skills");
+    const home = join(work, "capability-home");
+    await mkdir(home, { recursive: true });
+    // Keep reports independent of the developer's installed skills and ancestors.
+    const profileGm = (args: string[], extra: NodeJS.ProcessEnv = {}) =>
+      gm(args, "marco", checkout, undefined, { HOME: home, USERPROFILE: home, ...extra });
+    await mkdir(join(skillDir, "native-review"), { recursive: true });
+    await writeFile(
+      join(skillDir, "native-review", "SKILL.md"),
+      "---\nname: native-review\ndescription: Review native changes.\n---\nPRIVATE_SKILL_BODY_NOT_FOR_PROFILE\n",
+    );
+    const detection = await profileGm(["agent", "detect", "--skill-dir", skillDir]);
+    const detected = JSON.parse(detection) as AgentCapabilities;
+    assert.equal(
+      detected.environment.os,
+      process.platform === "darwin"
+        ? "macos"
+        : process.platform === "win32"
+          ? "windows"
+          : process.platform,
+    );
+    assert.deepEqual(detected.skills, [
+      { name: "native-review", description: "Review native changes.", source: "detected" },
+    ]);
+    assert(
+      !detection.includes("PRIVATE_SKILL_BODY_NOT_FOR_PROFILE"),
+      "Skill prompts must not be exposed as capability metadata",
+    );
+    const created = JSON.parse(
+      await profileGm([
+        "agent",
+        "configure",
+        name,
+        "--model",
+        "fixture-model",
+        "--tag",
+        "native-e2e",
+        "--skill",
+        "fixture-review",
+        "--skill-dir",
+        skillDir,
+      ]),
+    ) as { agent: Agent };
+    const agent = created.agent;
+    assert.equal(agent.name, name);
+    assert.equal(agent.capabilities?.model, "fixture-model");
+    assert.deepEqual(agent.capabilities?.tags, ["native-e2e"]);
+    assert(
+      agent.capabilities?.skills.some(
+        (skill) => skill.name === "fixture-review" && skill.source === "declared",
+      ),
+    );
+    assert(agent.capabilitiesUpdatedAt && !Number.isNaN(Date.parse(agent.capabilitiesUpdatedAt)));
+
+    const writeToken = await json<CreatedAccessToken>(
+      `/api/agents/${agent.id}/tokens`,
+      ownerToken,
+      "POST",
+      { scope: "write" },
+      [201],
+    );
+    const readToken = await json<CreatedAccessToken>(
+      `/api/agents/${agent.id}/tokens`,
+      ownerToken,
+      "POST",
+      { scope: "read" },
+      [201],
+    );
+    secrets.add(writeToken.secret);
+    secrets.add(readToken.secret);
+    const agentEnv = { GM_TOKEN: writeToken.secret };
+    const refreshed = JSON.parse(
+      await profileGm(["agent", "configure", "--skill-dir", skillDir], agentEnv),
+    ) as { agent: Agent };
+    assert.equal(refreshed.agent.id, agent.id);
+    assert.equal(refreshed.agent.capabilities?.model, "fixture-model");
+    assert.deepEqual(refreshed.agent.capabilities?.tags, ["native-e2e"]);
+    assert(
+      refreshed.agent.capabilities?.skills.some(
+        (skill) => skill.name === "fixture-review" && skill.source === "declared",
+      ),
+    );
+    const shown = JSON.parse(await profileGm(["agent", "show"], agentEnv)) as {
+      agent: Agent;
+    };
+    assert.deepEqual(shown.agent.capabilities, refreshed.agent.capabilities);
+    const visible = JSON.parse(
+      await gm(["agent", "list", "--owner", fixtures.tracker.owner], "jun"),
+    ) as { agents: Pick<Agent, "id" | "capabilities">[] };
+    assert.deepEqual(
+      visible.agents.find((candidate) => candidate.id === agent.id)?.capabilities,
+      shown.agent.capabilities,
+    );
+
+    assert(shown.agent.capabilities);
+    const capabilities = shown.agent.capabilities;
+    await request(`/api/agents/self/capabilities`, readToken.secret, "PUT", capabilities, [403]);
+    await request(
+      `/api/agents/${agent.id}/capabilities`,
+      fixtures.tokens.sam,
+      "PUT",
+      capabilities,
+      [404],
+    );
+    await request(
+      `/api/agents/${agent.id}/tokens`,
+      writeToken.secret,
+      "POST",
+      { scope: "write" },
+      [403],
+    );
+    const other = await json<{ agent: Agent }>(
+      "/api/agents",
+      ownerToken,
+      "POST",
+      { name: `${name}-other` },
+      [201],
+    );
+    await request(
+      `/api/agents/${other.agent.id}/capabilities`,
+      writeToken.secret,
+      "PUT",
+      capabilities,
+      [403, 404],
+    );
+
+    const claim = JSON.parse(
+      await gm(
+        [
+          "issue",
+          "claim",
+          fixtures.tracker.blocker,
+          "--owner",
+          fixtures.tracker.owner,
+          "--agent",
+          name,
+        ],
+        "marco",
+        work,
+        undefined,
+        agentEnv,
+      ),
+    ) as { results: { leaseToken: string }[] };
+    const lease = claim.results[0]?.leaseToken;
+    assert(lease, "Agent claim must return a fencing token");
+    secrets.add(lease);
+    const claimed = JSON.parse(
+      await gm(
+        ["issue", "show", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+        "marco",
+        work,
+        undefined,
+        agentEnv,
+      ),
+    ) as { issue: { claim: { actorId: string; accountableId: string } } };
+    assert.equal(claimed.issue.claim.actorId, agent.id);
+    assert.equal(claimed.issue.claim.accountableId, agent.accountable.id);
+    await gm(
+      ["issue", "release", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+      "marco",
+      work,
+      undefined,
+      { ...agentEnv, GM_LEASE_TOKEN: lease },
+    );
+    await gm(["agent", "revoke", other.agent.id]);
+    await gm(["agent", "revoke", agent.id]);
+    record({
+      agent: name,
+      model: capabilities.model,
+      tags: capabilities.tags,
+      selfRefreshPreservedDeclarations: true,
+      trackerCapabilitiesVisible: true,
+      claimIdentity: claimed.issue.claim.actorId,
+    });
   });
 
   await scenario("package-upload-download-and-write-boundary", async () => {

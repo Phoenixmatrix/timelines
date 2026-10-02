@@ -102,7 +102,14 @@ async function agentsOf(d1: D1Database, members: TrackerIdentity[]): Promise<Tra
   const byId = new Map(members.map((m) => [m.id, m]));
   const rows = await gitmatrixDb(d1)
     .selectFrom("agents")
-    .select(["id", "name", "accountable_id"])
+    .select([
+      "id",
+      "name",
+      "accountable_id",
+      "capabilities",
+      "capabilities_updated_at",
+      "revoked_at",
+    ])
     .where(
       "accountable_id",
       "in",
@@ -114,6 +121,9 @@ async function agentsOf(d1: D1Database, members: TrackerIdentity[]): Promise<Tra
     id: row.id,
     name: row.name,
     accountable: byId.get(row.accountable_id)!,
+    capabilities: row.capabilities === null ? null : JSON.parse(row.capabilities),
+    capabilitiesUpdatedAt: row.capabilities_updated_at,
+    revokedAt: row.revoked_at,
   }));
 }
 function response<T>(c: Context<AppEnv>, result: TrackerReply<T>) {

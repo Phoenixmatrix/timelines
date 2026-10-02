@@ -93,6 +93,8 @@ export interface Database {
     description: Generated<string>;
     created_at: Generated<string>;
     revoked_at: string | null;
+    capabilities: Generated<string | null>;
+    capabilities_updated_at: Generated<string | null>;
   };
   ssh_keys: {
     id: string;
