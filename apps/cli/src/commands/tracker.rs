@@ -533,6 +533,40 @@ fn validate_batch(mutations: &[Value]) -> Result<()> {
     }
     Ok(())
 }
+fn validate_close_reason(
+    previous: Option<&Value>,
+    data: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let previous_status = previous.and_then(|issue| issue["status"].as_str());
+    let status = data
+        .get("status")
+        .and_then(Value::as_str)
+        .or(previous_status)
+        .unwrap_or("todo");
+    let reason = data.get("closeReason");
+    if status != "canceled" {
+        if reason.is_some_and(|value| !value.is_null()) {
+            return Err(GmError::usage(
+                "closeReason is only allowed with status canceled.",
+            ));
+        }
+        return Ok(());
+    }
+    if reason.is_none() && previous_status == Some("canceled") {
+        // Historical canceled issues may have no reason; unrelated edits remain valid.
+        return Ok(());
+    }
+    if !matches!(
+        reason.and_then(Value::as_str),
+        Some("duplicate" | "not_planned" | "obsolete" | "cannot_reproduce" | "other")
+    ) {
+        return Err(GmError::usage(
+            "Canceled issues require closeReason: duplicate, not_planned, obsolete, cannot_reproduce or other.",
+        ));
+    }
+    Ok(())
+}
+
 fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
     let kind = mutation["kind"].as_str().unwrap_or("");
     let (entity, action) = kind
@@ -557,12 +591,18 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
                 "Cannot update an entity missing from this replica.",
             )
         })?;
+        if entity == "issue" {
+            validate_close_reason(Some(&rows[index]), data)?;
+        }
         let row = rows[index].as_object_mut().unwrap();
         for (key, value) in data {
             if ["id", "key", "version", "createdAt", "claim", "teamId"].contains(&key.as_str()) {
                 return Err(GmError::usage(format!("Immutable field '{key}'.")));
             }
             row.insert(key.clone(), value.clone());
+        }
+        if entity == "issue" && row.get("status").and_then(Value::as_str) != Some("canceled") {
+            row.insert("closeReason".into(), Value::Null);
         }
         row.insert(
             "version".into(),
@@ -573,9 +613,12 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         if index.is_some() {
             return Err(GmError::usage("Duplicate create ID in replica."));
         }
+        if entity == "issue" {
+            validate_close_reason(None, data)?;
+        }
         let mut row = match entity {
             "issue" => {
-                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
+                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","closeReason":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
             }
             "team" => json!({"description":"","memberIds":[],"archived":false}),
             "workspace" => json!({"description":"","archived":false}),
@@ -1299,7 +1342,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 create(
                     "issue",
-                    json!({"teamId":id(&snapshot,"teams",&a.team)?,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
+                    json!({"teamId":id(&snapshot,"teams",&a.team)?,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
                 )
             }
             IssueCommand::Update(p) => patch(&snapshot, "issue", p)?,
@@ -1548,6 +1591,110 @@ mod tests {
         assert_eq!(resolve(&s, "issues", "ENG-9").unwrap()["id"], "stable");
         assert_eq!(s["issues"][0]["description"], "Second edit");
     }
+    #[test]
+    fn offline_closure_preserves_reason_until_reopened_or_done() {
+        for next_status in ["todo", "done"] {
+            let mut s = snapshot();
+            project(
+                &mut s,
+                &json!({"kind":"issue.create","id":"a","data":{"status":"canceled","closeReason":"duplicate"}}),
+            )
+            .unwrap();
+            project(
+                &mut s,
+                &json!({"kind":"issue.update","id":"a","expectedVersion":1,"data":{"title":"Updated"}}),
+            )
+            .unwrap();
+            assert_eq!(s["issues"][0]["closeReason"], "duplicate");
+            project(
+                &mut s,
+                &json!({"kind":"issue.update","id":"a","expectedVersion":2,"data":{"status":next_status}}),
+            )
+            .unwrap();
+            assert_eq!(s["issues"][0]["status"], next_status);
+            assert!(s["issues"][0]["closeReason"].is_null());
+            assert_eq!(s["issues"][0]["version"], 3);
+            let before = s.clone();
+            assert!(project(
+                &mut s,
+                &json!({"kind":"issue.update","id":"a","expectedVersion":3,"data":{"status":"canceled"}}),
+            )
+            .is_err());
+            assert_eq!(s, before);
+            project(
+                &mut s,
+                &json!({"kind":"issue.update","id":"a","expectedVersion":3,"data":{"status":"canceled","closeReason":"obsolete"}}),
+            )
+            .unwrap();
+            assert_eq!(s["issues"][0]["closeReason"], "obsolete");
+            assert_eq!(s["issues"][0]["version"], 4);
+        }
+    }
+
+    #[test]
+    fn offline_invalid_closures_do_not_change_projected_state() {
+        for data in [
+            json!({"status":"canceled"}),
+            json!({"status":"canceled","closeReason":null}),
+            json!({"status":"canceled","closeReason":"unknown"}),
+            json!({"status":"canceled","closeReason":7}),
+            json!({"status":"todo","closeReason":"other"}),
+            json!({"closeReason":"other"}),
+        ] {
+            let mut s = snapshot();
+            let before = s.clone();
+            assert!(
+                project(&mut s, &json!({"kind":"issue.create","id":"a","data":data}),).is_err()
+            );
+            assert_eq!(s, before);
+            s["issues"] = json!([{"id":"a","status":"todo","version":1}]);
+            let before = s.clone();
+            assert!(
+                project(
+                    &mut s,
+                    &json!({"kind":"issue.update","id":"a","expectedVersion":1,"data":data}),
+                )
+                .is_err()
+            );
+            assert_eq!(s, before);
+        }
+    }
+
+    #[test]
+    fn offline_historical_closure_allows_edits_but_not_clearing_reason() {
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"a","status":"canceled","version":1}]);
+        project(
+            &mut s,
+            &json!({"kind":"issue.update","id":"a","expectedVersion":1,"data":{"title":"Historical edit"}}),
+        )
+        .unwrap();
+        assert_eq!(s["issues"][0]["title"], "Historical edit");
+        assert!(s["issues"][0]["closeReason"].is_null());
+        for reason in [Value::Null, json!("invalid")] {
+            let before = s.clone();
+            assert!(project(
+                &mut s,
+                &json!({"kind":"issue.update","id":"a","expectedVersion":2,"data":{"closeReason":reason}}),
+            )
+            .is_err());
+            assert_eq!(s, before);
+        }
+        project(
+            &mut s,
+            &json!({"kind":"issue.update","id":"a","expectedVersion":2,"data":{"closeReason":"not_planned"}}),
+        )
+        .unwrap();
+        assert_eq!(s["issues"][0]["closeReason"], "not_planned");
+        let before = s.clone();
+        assert!(project(
+            &mut s,
+            &json!({"kind":"issue.update","id":"a","expectedVersion":3,"data":{"status":"done","closeReason":"other"}}),
+        )
+        .is_err());
+        assert_eq!(s, before);
+    }
+
     #[test]
     fn canceled_blockers_and_live_leases_are_not_ready_but_expired_claims_are() {
         let now = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")

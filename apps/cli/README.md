@@ -113,6 +113,23 @@ accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` 
 an authoritative permission, graph or lease validation. Tracker changes are **not**
 reversed by `gm undo`.
 
+Close an issue without completing it by setting `status` to `canceled` and supplying
+`closeReason`; there is no separate close command:
+
+```bash
+gm issue update ENG-1 --data '{"status":"canceled","closeReason":"duplicate"}'
+gm issue update ENG-1 --data '{"status":"todo"}' # Reopen; clears the saved reason
+gm issue create 'Obsolete request' --team ENG --status canceled --close-reason obsolete
+```
+
+Reasons are `duplicate`, `not_planned`, `obsolete` (no longer needed),
+`cannot_reproduce`, and `other`. A reason is required for every new cancellation,
+including canceled creation; it is forbidden on other statuses. Reopening or moving
+to `done` clears the reason automatically, online and in offline previews. Existing
+canceled issues without a reason remain editable, but explicitly clearing a reason
+while canceled is rejected. `issue show`, lists, and mutation output include the
+saved `closeReason`. Cancellation does not satisfy dependent issues' blockers.
+
 ### Offline replicas and explicit conflicts
 
 Initialize a replica online first. Offline mode is explicit: errors never silently

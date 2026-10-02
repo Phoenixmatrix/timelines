@@ -592,9 +592,7 @@ function Connectors({
             key: `${from}>${to}`,
             from,
             to,
-            open:
-              index.byId.get(from)?.status !== "done" &&
-              index.byId.get(from)?.status !== "canceled",
+            open: index.byId.get(from)?.status !== "done",
             d: `M${x0},${y0} C${mid},${y0} ${mid},${y1} ${x1 - 4},${y1}`,
           });
         }

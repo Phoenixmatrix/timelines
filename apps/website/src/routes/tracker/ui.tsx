@@ -6,11 +6,13 @@ import {
   actorName,
   claimAttribution,
   claimHolder,
+  CLOSE_REASONS,
   hasActiveClaim,
   leasedAncestor,
   readiness,
   readinessIndex,
   type Issue,
+  type IssueCloseReason,
   type Snapshot,
 } from "../../../shared/tracker.ts";
 import { popMotion } from "../../components/ui.tsx";
@@ -39,6 +41,37 @@ export function Field({ label, children }: { label: string; children: ReactNode 
         {children}
       </div>
     </div>
+  );
+}
+
+export function CloseReasonField({
+  value,
+  onChange,
+  required = true,
+}: {
+  value: IssueCloseReason | null | undefined;
+  onChange: (value: IssueCloseReason) => void;
+  required?: boolean;
+}) {
+  return (
+    <Field label="Close reason">
+      <select
+        className="mk-input"
+        aria-label="Close reason"
+        value={value ?? ""}
+        required={required}
+        onChange={(event) => onChange(event.target.value as IssueCloseReason)}
+      >
+        <option value="" disabled>
+          {required ? "Choose a reason" : "No reason recorded"}
+        </option>
+        {Object.entries(CLOSE_REASONS).map(([reason, label]) => (
+          <option key={reason} value={reason}>
+            {label}
+          </option>
+        ))}
+      </select>
+    </Field>
   );
 }
 // Markdown inside the tracker: headings stay at body size so a PRD's "# Title"

@@ -85,6 +85,7 @@ function fixture() {
   const issue = (id: string) =>
     mutate({ kind: "issue.create", id, data: { teamId: "team", title: id } });
   return {
+    db,
     store,
     access,
     mutate,
@@ -151,7 +152,7 @@ describe("tracker SQLite authority", () => {
       kind: "issue.update",
       id: "blocker",
       expectedVersion: 1,
-      data: { status: "canceled" },
+      data: { status: "canceled", closeReason: "not_planned" },
     });
     expect(() => f.mutate({ kind: "issue.claim", id: "target", data: { agent: "agent" } })).toThrow(
       /blockers/,
@@ -167,6 +168,124 @@ describe("tracker SQLite authority", () => {
       }),
     ).toThrow(/blockers/);
     expect(f.store.snapshot(f.access).comments).toEqual([]);
+  });
+  test("closing preserves its reason in snapshots and history without completing work, and reopening clears it", () => {
+    const f = fixture();
+    f.issue("blocker");
+    f.issue("target");
+    f.mutate({
+      kind: "link.add",
+      id: "link",
+      data: { fromId: "blocker", toId: "target", kind: "blocks" },
+    });
+    const closed = f.mutate({
+      kind: "issue.update",
+      id: "target",
+      expectedVersion: 1,
+      data: { status: "canceled", closeReason: "duplicate" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((issue) => issue.id === "target")).toMatchObject({
+      status: "canceled",
+      closeReason: "duplicate",
+      claim: null,
+      version: 2,
+    });
+    expect(f.store.snapshot(f.access).comments).toEqual([]);
+    f.mutate({
+      kind: "issue.update",
+      id: "target",
+      expectedVersion: 2,
+      data: { status: "todo" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((issue) => issue.id === "target")).toMatchObject({
+      status: "todo",
+      closeReason: null,
+      version: 3,
+    });
+    expect(
+      f.store.changes(0, 500).events.find((event) => event.cursor === closed.cursor)?.entity,
+    ).toMatchObject({ status: "canceled", closeReason: "duplicate" });
+  });
+  test("close reasons are required on cancellation, forbidden on open work, and validated atomically", () => {
+    const f = fixture();
+    f.issue("issue");
+    const before = f.store.snapshot(f.access);
+    for (const data of [
+      { status: "canceled" },
+      { status: "canceled", closeReason: null },
+      { closeReason: "duplicate" },
+      { status: "canceled", closeReason: "invented" },
+    ]) {
+      expect(() =>
+        f.store.mutate(f.access, {
+          operationId: crypto.randomUUID(),
+          mutations: [{ kind: "issue.update", id: "issue", expectedVersion: 1, data }],
+        }),
+      ).toThrow(/close reason/);
+      expect(f.store.snapshot(f.access)).toEqual(before);
+    }
+    expect(() =>
+      f.mutate({
+        kind: "issue.create",
+        id: "invalid",
+        data: { teamId: "team", title: "Invalid", status: "canceled" },
+      }),
+    ).toThrow(/close reason/);
+    f.mutate({
+      kind: "issue.create",
+      id: "closed",
+      data: { teamId: "team", title: "Closed", status: "canceled", closeReason: "obsolete" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((issue) => issue.id === "closed")).toMatchObject({
+      key: "ENG-2",
+      status: "canceled",
+      closeReason: "obsolete",
+    });
+    expect(() =>
+      f.mutate({
+        kind: "issue.update",
+        id: "closed",
+        expectedVersion: 1,
+        data: { closeReason: null },
+      }),
+    ).toThrow(/close reason/);
+    f.mutate({
+      kind: "issue.update",
+      id: "closed",
+      expectedVersion: 1,
+      data: { status: "done" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((issue) => issue.id === "closed")).toMatchObject({
+      status: "done",
+      closeReason: null,
+    });
+  });
+  test("historical cancellations stay editable without inventing a reason", () => {
+    const f = fixture();
+    f.issue("legacy");
+    f.db
+      .prepare(
+        "UPDATE issues SET data = json_set(json_remove(data, '$.closeReason'), '$.status', 'canceled') WHERE id = ?",
+      )
+      .run("legacy");
+    f.mutate({
+      kind: "issue.update",
+      id: "legacy",
+      expectedVersion: 1,
+      data: { title: "Clarified" },
+    });
+    expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+      title: "Clarified",
+      status: "canceled",
+    });
+    expect(f.store.snapshot(f.access).issues[0]!.closeReason).toBeUndefined();
+    f.mutate({
+      kind: "issue.update",
+      id: "legacy",
+      expectedVersion: 2,
+      data: { closeReason: "cannot_reproduce" },
+    });
+    expect(f.store.snapshot(f.access).issues[0]!.closeReason).toBe("cannot_reproduce");
   });
   test("cyclic batches roll back entities, sequence numbers, events and receipts", () => {
     const f = fixture();
@@ -527,6 +646,14 @@ describe("graph readiness", () => {
         data: { parentId: null },
       }),
     ).toThrow(/needs that lease's token/);
+    expect(() =>
+      g.mutate({
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: g.version("a"),
+        data: { status: "canceled", closeReason: "duplicate" },
+      }),
+    ).toThrow(/needs that lease's token/);
     // Editing details stays open, and the holder's token covers the whole subtree.
     g.mutate({
       kind: "issue.update",
@@ -538,7 +665,7 @@ describe("graph readiness", () => {
       kind: "issue.update",
       id: "a",
       expectedVersion: g.version("a"),
-      data: { status: "canceled", leaseToken: token },
+      data: { status: "canceled", closeReason: "duplicate", leaseToken: token },
     });
     // Once the lease ends, the subtree is open to everyone again.
     g.mutate({ kind: "issue.release", id: "project", data: { leaseToken: token } });
@@ -569,7 +696,11 @@ describe("graph readiness", () => {
         kind: "issue.update",
         id,
         expectedVersion: g.version(id),
-        data: { status: id === "a" ? "done" : "canceled", leaseToken: token },
+        data: {
+          status: id === "a" ? "done" : "canceled",
+          closeReason: id === "a" ? null : "obsolete",
+          leaseToken: token,
+        },
       });
     expect(g.state("project")).toBe("claimed");
     g.mutate({

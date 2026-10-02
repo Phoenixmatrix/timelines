@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import {
+  CLOSE_REASONS,
   DEFAULT_ATTEMPT_LIMIT,
   hasActiveClaim,
   isOpen,
@@ -10,6 +11,7 @@ import {
   type Comment,
   type HumanRequest,
   type IssueClaim,
+  type IssueCloseReason,
   type EntityType,
   type Issue,
   type Link,
@@ -29,6 +31,8 @@ import { sql as raw } from "kysely";
 import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
 
 export type { SqlDatabase } from "./sql.ts";
+
+const closeReasons = Object.keys(CLOSE_REASONS) as IssueCloseReason[];
 
 export class TrackerError extends Error {
   public status: 400 | 401 | 403 | 404 | 409 | 413;
@@ -773,6 +777,11 @@ export class TrackerStore {
             ["backlog", "todo", "in_progress", "done", "canceled"],
             "status",
           );
+        if ("closeReason" in data)
+          issue.closeReason =
+            data.closeReason === null
+              ? null
+              : choice(data.closeReason, closeReasons, "close reason");
         if ("priority" in data) {
           if (
             !Number.isInteger(data.priority) ||
@@ -946,6 +955,7 @@ export class TrackerStore {
               "acceptance",
               "type",
               "status",
+              "closeReason",
               "priority",
               "assigneeId",
               "parentId",
@@ -979,6 +989,7 @@ export class TrackerStore {
                 acceptance: "",
                 type: "task",
                 status: "todo",
+                closeReason: null,
                 priority: 2,
                 assigneeId: null,
                 parentId: null,
@@ -1000,6 +1011,17 @@ export class TrackerStore {
             }
             const previous = issue.status;
             fields(data, issue, creating);
+            if (issue.status === "canceled") {
+              if (
+                (creating || previous !== "canceled" || "closeReason" in data) &&
+                !issue.closeReason
+              )
+                fail("invalid_input", "Select a close reason when canceling an issue.");
+            } else {
+              if (data.closeReason != null)
+                fail("invalid_input", "A close reason is only valid for a canceled issue.");
+              issue.closeReason = null;
+            }
             if (issue.status === "done" && previous !== "done") childrenClosed(issue);
             if (
               (creating || issue.status !== previous) &&
@@ -1505,6 +1527,7 @@ export class TrackerStore {
               }
               const released = issue.claim!;
               issue.status = kind === "issue.complete" ? "done" : "todo";
+              issue.closeReason = null;
               issue.claim = null;
               run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
               dropOffer(issue);

@@ -107,10 +107,13 @@ pub struct Patch {
     /// Canonical ID, issue key, team key or workspace slug.
     pub id: String,
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file.
-    /// Issue fields: title, description, acceptance, type, status, priority (0–4),
-    /// assigneeId, parentId, workspaceIds and labels. Team fields: name, description,
-    /// memberIds and archived. Workspace fields: name, description and archived.
-    /// Relationships use canonical IDs; null clears assigneeId/parentId.
+    /// Issue fields: title, description, acceptance, type, status, closeReason,
+    /// priority (0–4), assigneeId, parentId, workspaceIds and labels. Team fields:
+    /// name, description, memberIds and archived. Workspace fields: name,
+    /// description and archived. Relationships use canonical IDs; null clears
+    /// assigneeId/parentId. Setting status to canceled requires closeReason:
+    /// duplicate, not_planned, obsolete, cannot_reproduce or other.
+    /// Leaving canceled clears closeReason automatically.
     #[arg(long)]
     pub data: String,
 }
@@ -159,6 +162,9 @@ pub struct IssueCreate {
     pub r#type: String,
     #[arg(long, default_value="todo", value_parser=["backlog","todo","in_progress","done","canceled"])]
     pub status: String,
+    /// Required for canceled issues; forbidden for other statuses.
+    #[arg(long, value_parser=["duplicate","not_planned","obsolete","cannot_reproduce","other"])]
+    pub close_reason: Option<String>,
     #[arg(long, default_value_t=2, value_parser=clap::value_parser!(u8).range(0..=4))]
     pub priority: u8,
     #[arg(long)]

@@ -57,6 +57,14 @@ export interface Workspace extends TrackerEntity {
 }
 export type IssueType = "task" | "bug" | "prd" | "chore" | "research";
 export type IssueStatus = "backlog" | "todo" | "in_progress" | "done" | "canceled";
+export const CLOSE_REASONS = {
+  duplicate: "Duplicate",
+  not_planned: "Not planned",
+  obsolete: "No longer needed",
+  cannot_reproduce: "Cannot reproduce",
+  other: "Other",
+} as const;
+export type IssueCloseReason = keyof typeof CLOSE_REASONS;
 export interface IssueClaim {
   /** The holder: an agent's id, or a person's. */
   actorId: string;
@@ -81,6 +89,8 @@ export interface Issue extends TrackerEntity {
   acceptance: string;
   type: IssueType;
   status: IssueStatus;
+  /** Why it was canceled. Historical cancellations may have no recorded reason. */
+  closeReason?: IssueCloseReason | null;
   priority: 0 | 1 | 2 | 3 | 4;
   assigneeId: string | null;
   parentId: string | null;
@@ -194,6 +204,7 @@ export type IssueFields = Pick<
   | "acceptance"
   | "type"
   | "status"
+  | "closeReason"
   | "priority"
   | "assigneeId"
   | "parentId"

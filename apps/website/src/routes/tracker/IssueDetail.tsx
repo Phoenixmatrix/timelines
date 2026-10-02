@@ -4,10 +4,12 @@ import {
   actorName,
   attribution,
   claimAttribution,
+  CLOSE_REASONS,
   leasedAncestor,
   readinessIndex,
   type Comment,
   type Issue,
+  type IssueCloseReason,
   type IssueFields,
   type Mutation,
   type Snapshot,
@@ -15,6 +17,7 @@ import {
 import { FormError, link as LINK, SelectField, TextField } from "../../components/ui.tsx";
 import {
   blockers,
+  CloseReasonField,
   Field,
   IssuePicker,
   IssueState,
@@ -38,6 +41,7 @@ const fieldNames: Record<keyof IssueFields, string> = {
   acceptance: "Acceptance criteria",
   type: "Type",
   status: "Status",
+  closeReason: "Close reason",
   priority: "Priority",
   assigneeId: "Assignee",
   parentId: "Parent issue",
@@ -60,7 +64,7 @@ const normalizedSet = (values: string[]) =>
 const same = (a: IssueFields[keyof IssueFields], b: IssueFields[keyof IssueFields]) =>
   Array.isArray(a) && Array.isArray(b)
     ? JSON.stringify(normalizedSet(a)) === JSON.stringify(normalizedSet(b))
-    : a === b;
+    : a === b || (a == null && b == null);
 function relativeTime(value: string, now: string) {
   const seconds = Math.max(
     0,
@@ -102,6 +106,7 @@ export function IssueDetail({
       acceptance: issue.acceptance,
       type: issue.type,
       status: issue.status,
+      closeReason: issue.closeReason ?? null,
       priority: issue.priority,
       assigneeId: issue.assigneeId,
       parentId: issue.parentId,
@@ -133,6 +138,10 @@ export function IssueDetail({
   const [target, setTarget] = useState("");
   const [notice, setNotice] = useState("");
   const [actionError, setActionError] = useState("");
+  const [closing, setClosing] = useState(false);
+  const [closeReason, setCloseReason] = useState<IssueCloseReason | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const closeFormRef = useRef<HTMLFormElement>(null);
   const [relationError, setRelationError] = useState("");
   const [commentError, setCommentError] = useState("");
   const [subtaskError, setSubtaskError] = useState("");
@@ -146,6 +155,9 @@ export function IssueDetail({
   useEffect(() => {
     if (editing) detailRef.current?.querySelector<HTMLInputElement>("input")?.focus();
   }, [editing]);
+  useEffect(() => {
+    if (closing) closeFormRef.current?.querySelector("select")?.focus();
+  }, [closing]);
   useEffect(() => {
     if (busy) {
       setNotice("");
@@ -164,7 +176,14 @@ export function IssueDetail({
   const change = <K extends keyof IssueFields>(key: K, value: IssueFields[K]) => {
     setNotice("");
     setLocalError("");
-    setDraft((previous) => ({ ...previous, fields: { ...previous.fields, [key]: value } }));
+    setDraft((previous) => ({
+      ...previous,
+      fields: {
+        ...previous.fields,
+        [key]: value,
+        ...(key === "status" && value !== "canceled" ? { closeReason: null } : {}),
+      },
+    }));
   };
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
@@ -180,6 +199,9 @@ export function IssueDetail({
     (activeClaim ||
       (unresolvedBlockers.length > 0 &&
         (draft.fields.status === "in_progress" || draft.fields.status === "done")));
+  const requiresCloseReason =
+    draft.fields.status === "canceled" && (issue.status !== "canceled" || !!issue.closeReason);
+  const invalidCloseReason = requiresCloseReason && !draft.fields.closeReason;
   const team = snapshot.teams.find((team) => team.id === issue.teamId);
   const members = snapshot.members.filter(
     (member) => !team?.memberIds.length || team.memberIds.includes(member.id),
@@ -192,6 +214,7 @@ export function IssueDetail({
       .map((agent) => ({ value: agent.id, label: actorName(snapshot, agent.id) })),
   ];
   const beginEdit = () => {
+    setClosing(false);
     setDraft(initial);
     setPreview(false);
     setNotice("");
@@ -230,14 +253,28 @@ export function IssueDetail({
     ]
       .filter(Boolean)
       .join(" ") || undefined;
-  const updateStatus = async (status: Issue["status"], message: string) => {
+  const updateStatus = async (
+    status: Issue["status"],
+    message: string,
+    reason: IssueCloseReason | null = null,
+  ) => {
     setNotice("");
     setActionError("");
     const result = await mutate([
-      { kind: "issue.update", id: issue.id, expectedVersion: issue.version, data: { status } },
+      {
+        kind: "issue.update",
+        id: issue.id,
+        expectedVersion: issue.version,
+        data: { status, closeReason: status === "canceled" ? reason : null },
+      },
     ]);
-    if (result.ok) setNotice(message);
-    else setActionError(result.error);
+    if (result.ok) {
+      setNotice(message);
+      if (closing) {
+        setClosing(false);
+        detailRef.current?.focus();
+      }
+    } else setActionError(result.error);
   };
   // Parent candidates exclude this issue's own subtree, so a move can't make a cycle.
   const descendants = useMemo(() => {
@@ -319,6 +356,8 @@ export function IssueDetail({
       );
     if (key === "labels") return fields.labels.join(", ") || "None";
     if (key === "status") return statuses.find((status) => status.value === value)?.label;
+    if (key === "closeReason")
+      return fields.closeReason ? CLOSE_REASONS[fields.closeReason] : "No reason recorded";
     if (key === "priority") return `P${fields.priority}`;
     return String(value);
   };
@@ -360,6 +399,14 @@ export function IssueDetail({
           <dd className="m-0 min-w-0">{typeLabel(issue.type)}</dd>
           <dt className="text-ink-faint">Priority</dt>
           <dd className="m-0 min-w-0">P{issue.priority}</dd>
+          {issue.status === "canceled" && (
+            <>
+              <dt className="text-ink-faint">Close reason</dt>
+              <dd className="m-0 min-w-0">
+                {issue.closeReason ? CLOSE_REASONS[issue.closeReason] : "No reason recorded"}
+              </dd>
+            </>
+          )}
           {(issue.attempts ?? 0) > 0 && (
             <>
               <dt className="text-ink-faint">Attempts</dt>
@@ -437,7 +484,7 @@ export function IssueDetail({
             </span>
           </p>
         )}
-        <div className="mt-3 flex flex-wrap gap-2 max-sm:flex-nowrap max-sm:[&>.mk-btn]:min-w-0 max-sm:[&>.mk-btn]:flex-1 max-sm:[&>.mk-btn]:px-2">
+        <div className="mt-3 flex flex-wrap gap-2 max-sm:grid max-sm:grid-cols-2 max-sm:[&>.mk-btn]:min-w-0 max-sm:[&>.mk-btn]:px-2">
           {!editing && (
             <button
               className="mk-btn mk-btn--primary mk-btn--sm"
@@ -467,6 +514,25 @@ export function IssueDetail({
               Mark done
             </button>
           )}
+          {!editing && issue.status !== "done" && issue.status !== "canceled" && (
+            <button
+              ref={closeButtonRef}
+              className="mk-btn mk-btn--sm"
+              disabled={busy || activeClaim}
+              aria-describedby={activeClaim ? "tracker-claim-reason" : undefined}
+              aria-expanded={closing}
+              aria-controls="tracker-close-form"
+              onClick={() => {
+                if (closing) return;
+                setCloseReason(null);
+                setActionError("");
+                setNotice("");
+                setClosing(true);
+              }}
+            >
+              Close issue
+            </button>
+          )}
           {!editing && (issue.status === "done" || issue.status === "canceled") && (
             <button
               className="mk-btn mk-btn--sm"
@@ -478,6 +544,46 @@ export function IssueDetail({
             </button>
           )}
         </div>
+        {closing && !editing && issue.status !== "done" && issue.status !== "canceled" && (
+          <form
+            id="tracker-close-form"
+            ref={closeFormRef}
+            className="mt-4 space-y-3"
+            aria-label="Close issue"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (busy || activeClaim || !closeReason) return;
+              void updateStatus("canceled", "Issue closed without completion.", closeReason);
+            }}
+          >
+            <p className="m-0 text-body-sm text-ink-muted">
+              Close without completing. Dependent issues will remain blocked.
+            </p>
+            <fieldset disabled={busy || activeClaim} className="m-0 min-w-0 border-0 p-0">
+              <CloseReasonField value={closeReason} onChange={setCloseReason} />
+            </fieldset>
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="mk-btn mk-btn--primary mk-btn--sm"
+                disabled={busy || activeClaim || !closeReason}
+              >
+                {busy ? "Closing…" : "Confirm close"}
+              </button>
+              <button
+                type="button"
+                className="mk-btn mk-btn--ghost mk-btn--sm"
+                disabled={busy}
+                onClick={() => {
+                  setClosing(false);
+                  setActionError("");
+                  closeButtonRef.current?.focus();
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
         <FormError message={actionError} />
         {unresolvedBlockers.length > 0 && (
           <p className="mk-hint mt-2 mb-0 max-w-[48ch]" id="tracker-completion-blockers">
@@ -555,8 +661,14 @@ export function IssueDetail({
               setLocalError("Give this issue a title.");
               return;
             }
+            if (invalidCloseReason) {
+              setLocalError("Choose a reason for closing this issue.");
+              return;
+            }
             const fields = {
               ...draft.fields,
+              closeReason:
+                draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
               labels: normalizedSet(draft.fields.labels),
               workspaceIds: normalizedSet(draft.fields.workspaceIds),
             };
@@ -566,6 +678,9 @@ export function IssueDetail({
                   !same(value, (draft.base ?? initial.fields)[key as keyof IssueFields]),
               ),
             ) as Partial<IssueFields>;
+            // Legacy canceled issues may keep their missing reason, but never send an
+            // explicit null while canceled: the API reserves that for reopening.
+            if (fields.status === "canceled" && !fields.closeReason) delete changes.closeReason;
             const result: MutationOutcome = !Object.keys(changes).length
               ? { ok: true }
               : await mutate([
@@ -697,6 +812,13 @@ export function IssueDetail({
                 ))}
               </select>
             </Field>
+            {draft.fields.status === "canceled" && (
+              <CloseReasonField
+                value={draft.fields.closeReason}
+                required={requiresCloseReason}
+                onChange={(value) => change("closeReason", value)}
+              />
+            )}
             <Field label="Type">
               <SelectField
                 ariaLabel="Issue type"
@@ -790,7 +912,9 @@ export function IssueDetail({
           <div className="flex flex-wrap gap-2">
             <button
               className="mk-btn mk-btn--primary mk-btn--sm"
-              disabled={busy || draft.version !== issue.version || invalidStatus}
+              disabled={
+                busy || draft.version !== issue.version || invalidStatus || invalidCloseReason
+              }
               aria-describedby={invalidStatus ? statusReason : undefined}
             >
               {busy ? "Saving…" : "Save issue"}

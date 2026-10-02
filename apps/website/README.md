@@ -392,6 +392,17 @@ phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
 acceptance criteria, parent/child plan, dependencies and durable comments, agent
 checkpoints or evidence.
 
+Use **Close issue** when work will not be completed. Choose Duplicate, Not planned,
+No longer needed, Cannot reproduce, or Other, then **Confirm close**. This saves
+the issue as `canceled`, not `done`; the selected reason stays visible after reload.
+Creating or editing an issue into Canceled also requires a reason. **Reopen**
+returns it to To do and clears its current reason; the event history retains the
+earlier closure. Historical cancellations without a reason remain editable.
+The API uses `issue.update` with `status: "canceled"` and `closeReason` set to
+`duplicate`, `not_planned`, `obsolete`, `cannot_reproduce`, or `other`.
+Existing version and lease checks still apply. Closing does not complete
+subtasks or satisfy dependent issues' blockers.
+
 - **Ownership:** a personal account or organization owns each tracker. An issue
   has one team and zero or more cross-team workspaces. Team prefixes and workspace
   slugs are permanent; archival preserves history.

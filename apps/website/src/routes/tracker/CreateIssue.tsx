@@ -1,6 +1,12 @@
 import { Dialog } from "@base-ui/react/dialog";
 import { useState } from "react";
-import { actorName, type Issue, type Mutation, type Snapshot } from "../../../shared/tracker.ts";
+import {
+  actorName,
+  type Issue,
+  type IssueCloseReason,
+  type Mutation,
+  type Snapshot,
+} from "../../../shared/tracker.ts";
 import {
   dialogMotion,
   fadeMotion,
@@ -9,7 +15,7 @@ import {
   TextField,
 } from "../../components/ui.tsx";
 import type { MutationOutcome } from "./IssueDetail.tsx";
-import { Field, MultiCheck, statuses, typeLabel, types } from "./ui.tsx";
+import { CloseReasonField, Field, MultiCheck, statuses, typeLabel, types } from "./ui.tsx";
 
 /** Expanded capture stays in the tracker; the existing editor handles the next step. */
 export function CreateIssue({
@@ -38,6 +44,7 @@ export function CreateIssue({
   const [description, setDescription] = useState("");
   const [type, setType] = useState<Issue["type"]>("task");
   const [status, setStatus] = useState<Issue["status"]>("todo");
+  const [closeReason, setCloseReason] = useState<IssueCloseReason | null>(null);
   const [priority, setPriority] = useState(2);
   const [assigneeId, setAssigneeId] = useState("");
   const [workspaceIds, setWorkspaceIds] = useState(initialWorkspaces);
@@ -71,12 +78,17 @@ export function CreateIssue({
                 event.preventDefault();
                 if (busy || uncertain || !team || !title.trim()) return;
                 setError("");
+                if (status === "canceled" && !closeReason) {
+                  setError("Choose a reason for closing this issue.");
+                  return;
+                }
                 const result = await onCreate({
                   title: title.trim(),
                   teamId,
                   description,
                   type,
                   status,
+                  closeReason: status === "canceled" ? closeReason : null,
                   priority: priority as Issue["priority"],
                   assigneeId: assigneeId || null,
                   workspaceIds,
@@ -138,9 +150,15 @@ export function CreateIssue({
                       ariaLabel="Issue status"
                       value={status}
                       options={statuses}
-                      onChange={(value) => setStatus(value as Issue["status"])}
+                      onChange={(value) => {
+                        setStatus(value as Issue["status"]);
+                        if (value !== "canceled") setCloseReason(null);
+                      }}
                     />
                   </Field>
+                  {status === "canceled" && (
+                    <CloseReasonField value={closeReason} onChange={setCloseReason} />
+                  )}
                   <Field label="Priority">
                     <SelectField
                       ariaLabel="Issue priority"
@@ -193,7 +211,13 @@ export function CreateIssue({
                 </button>
                 <button
                   className="mk-btn mk-btn--primary"
-                  disabled={busy || uncertain || !team || !title.trim()}
+                  disabled={
+                    busy ||
+                    uncertain ||
+                    !team ||
+                    !title.trim() ||
+                    (status === "canceled" && !closeReason)
+                  }
                 >
                   {busy ? "Creating…" : "Create and edit"}
                 </button>
