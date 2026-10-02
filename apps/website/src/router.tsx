@@ -28,12 +28,8 @@ import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Agents, agentsAction, agentsLoader } from "./routes/Agents.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
-import {
-  Tracker,
-  trackerLoader,
-  TrackerIndex,
-  trackerIndexLoader,
-} from "./routes/tracker/Tracker.tsx";
+import { Tracker, TrackerIndex } from "./routes/tracker/Tracker.tsx";
+import { trackerLoader, trackerIndexLoader } from "./routes/tracker/loaders.ts";
 import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
 
 export const router = createBrowserRouter([

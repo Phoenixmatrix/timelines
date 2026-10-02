@@ -35,20 +35,18 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
-  redirect,
   useLoaderData,
   useNavigate,
   useNavigation,
   useParams,
   useSearchParams,
-  type LoaderFunctionArgs,
 } from "react-router";
-import type { RepoSummary } from "../../../shared/api.ts";
-import type { Mutation, MutationRequest, Snapshot, TrackerOwner } from "../../../shared/tracker.ts";
+import type { Mutation, MutationRequest, Snapshot, TrackerView } from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
 import { FormError, popMotion, SelectField, Tip } from "../../components/ui.tsx";
-import { api, ApiError, load } from "../../lib/api.ts";
-import { requireViewer, useViewer } from "../../lib/session.ts";
+import { api, ApiError } from "../../lib/api.ts";
+import { useViewer } from "../../lib/session.ts";
+import type { trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { TrackerDefaultsForm } from "./Defaults.tsx";
 import { readTrackerDefaults, VIEW_LABEL, withTrackerDefaults, type View } from "./preferences.ts";
@@ -72,19 +70,6 @@ import {
   type SortKey,
 } from "./query.ts";
 
-interface TrackerData {
-  snapshot: Snapshot;
-  trackers: TrackerOwner[];
-  repos: RepoSummary[];
-}
-export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
-  const viewer = await requireViewer(request);
-  const { trackers } = await load<{ trackers: TrackerOwner[] }>("/tracker", request);
-  const defaults = readTrackerDefaults(viewer.id);
-  const tracker = trackers.find((entry) => entry.id === defaults?.ownerId) ?? trackers[0];
-  if (tracker) throw redirect(`/tracker/${tracker.slug}${new URL(request.url).search}`);
-  return { trackers };
-}
 export function TrackerIndex() {
   return (
     <div className="mx-auto max-w-4xl px-4 py-7 sm:px-8">
@@ -94,15 +79,6 @@ export function TrackerIndex() {
       </p>
     </div>
   );
-}
-export async function trackerLoader({ request, params }: LoaderFunctionArgs) {
-  await requireViewer(request);
-  const [snapshot, { trackers }, { repos }] = await Promise.all([
-    load<Snapshot>(`/tracker/${encodeURIComponent(params.owner!)}/snapshot`, request),
-    load<{ trackers: TrackerOwner[] }>("/tracker", request),
-    load<{ repos: RepoSummary[] }>("/repos", request),
-  ]);
-  return { snapshot, trackers, repos };
 }
 
 function Freshness({ receivedAt }: { receivedAt: number }) {
@@ -164,7 +140,7 @@ export function Tracker() {
   return <Workbench key={`${data.snapshot.owner.id}:${viewer?.id}`} data={data} />;
 }
 
-function Workbench({ data }: { data: TrackerData }) {
+function Workbench({ data }: { data: TrackerView }) {
   const [snapshot, setSnapshot] = useState(data.snapshot);
   const latestSnapshot = useRef(data.snapshot);
   const clock = useRef({ server: Date.parse(data.snapshot.serverTime), received: Date.now() });
@@ -704,12 +680,7 @@ function Workbench({ data }: { data: TrackerData }) {
 
       {admin ? (
         <fieldset className="m-0 border-0 p-0" disabled={busy || uncertain}>
-          <TrackerAdmin
-            snapshot={effective}
-            repos={data.repos}
-            mutate={mutate}
-            busy={busy || uncertain}
-          />
+          <TrackerAdmin snapshot={effective} mutate={mutate} busy={busy || uncertain} />
         </fieldset>
       ) : !hasTeam ? (
         <section className="mk-card max-w-xl">

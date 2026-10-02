@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { CaretRightIcon } from "@phosphor-icons/react";
 import { Link } from "react-router";
 import type { RepoSummary } from "../../../shared/api.ts";
@@ -9,6 +9,7 @@ import {
   type Workspace,
 } from "../../../shared/tracker.ts";
 import { FormError, link, SelectField, TextField } from "../../components/ui.tsx";
+import { api } from "../../lib/api.ts";
 import type { Mutate } from "./IssueDetail.tsx";
 import { Field, MultiCheck } from "./ui.tsx";
 
@@ -383,15 +384,30 @@ function WorkspaceForm({
 }
 export function TrackerAdmin({
   snapshot,
-  repos,
   mutate,
   busy,
 }: {
   snapshot: Snapshot;
-  repos: RepoSummary[];
   mutate: Mutate;
   busy: boolean;
 }) {
+  const [repos, setRepos] = useState<RepoSummary[] | null>(null);
+  const [reposError, setReposError] = useState("");
+  const [reposAttempt, setReposAttempt] = useState(0);
+  useEffect(() => {
+    if (!snapshot.canAdmin) return;
+    const controller = new AbortController();
+    setReposError("");
+    api<{ repos: RepoSummary[] }>("/repos", { signal: controller.signal }).then(
+      ({ repos }) => {
+        if (!controller.signal.aborted) setRepos(repos);
+      },
+      () => {
+        if (!controller.signal.aborted) setReposError("Could not load repository choices.");
+      },
+    );
+    return () => controller.abort();
+  }, [snapshot.canAdmin, reposAttempt]);
   const [workspaceId, setWorkspaceId] = useState("");
   const [repoId, setRepoId] = useState("");
   const [createTeamOpen, setCreateTeamOpen] = useState(!snapshot.teams.length);
@@ -400,7 +416,7 @@ export function TrackerAdmin({
   const [subscriptionSaved, setSubscriptionSaved] = useState("");
   const [removalErrors, setRemovalErrors] = useState<Record<string, string>>({});
   const [removalSaved, setRemovalSaved] = useState("");
-  const administeredRepos = repos.filter((repo) => repo.viewerRole === "admin");
+  const administeredRepos = (repos ?? []).filter((repo) => repo.viewerRole === "admin");
   const subscriptionGroups = new Map<string, Snapshot["subscriptions"]>();
   for (const subscription of snapshot.subscriptions) {
     const group = subscriptionGroups.get(subscription.repoId);
@@ -571,7 +587,23 @@ export function TrackerAdmin({
             {removalSaved}
           </p>
         )}
-        {snapshot.canAdmin && !administeredRepos.length && (
+        {snapshot.canAdmin && reposError && (
+          <div className="mt-4">
+            <FormError message={reposError} />
+            <button
+              className="mk-btn mk-btn--sm"
+              onClick={() => setReposAttempt((attempt) => attempt + 1)}
+            >
+              Retry repository choices
+            </button>
+          </div>
+        )}
+        {snapshot.canAdmin && repos === null && !reposError && (
+          <p role="status" className="mk-hint mt-4 mb-0">
+            Loading repository choices…
+          </p>
+        )}
+        {snapshot.canAdmin && repos !== null && !administeredRepos.length && (
           <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
             You don’t administer any repositories. Ask a repository administrator to grant you admin
             access before subscribing a repository to a workspace.

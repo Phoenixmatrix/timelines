@@ -14,6 +14,8 @@ import type {
   OpenRequests,
   TrackerAgent,
   TrackerIdentity,
+  TrackerList,
+  TrackerView,
   TrackerOwner,
 } from "../../shared/tracker.ts";
 import { TrackerError, validateRequest, type Access } from "./store.ts";
@@ -171,7 +173,7 @@ tracker.onError((error, c) => {
 tracker.get("/tracker", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
-  return c.json({ trackers: await accessible(c.env.DB, actor) });
+  return c.json<TrackerList>({ viewerId: actor.id, trackers: await accessible(c.env.DB, actor) });
 });
 /** Open requests to people across every tracker you're in: yours first, then the rest. */
 tracker.get("/requests", async (c) => {
@@ -206,6 +208,19 @@ tracker.get("/requests", async (c) => {
     for (const g of agents) names[g.id] = `${g.name} for ${g.display_name}`;
   }
   return c.json<OpenRequests>({ requests, names });
+});
+// A single authenticated browser request, without the repository list or a session preflight.
+tracker.get("/tracker/:owner/view", async (c) => {
+  const actor = c.get("actor");
+  if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
+  const [result, trackers] = await Promise.all([
+    authorize(c).then(
+      async (access) => await trackerObject(c.env, access.owner.id).snapshot(access),
+    ),
+    accessible(c.env.DB, actor),
+  ]);
+  if (!result.ok) return response(c, result);
+  return c.json<TrackerView>({ snapshot: result.value, trackers });
 });
 tracker.get("/tracker/:owner/snapshot", async (c) => {
   const access = await authorize(c);

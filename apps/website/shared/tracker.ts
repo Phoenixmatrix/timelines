@@ -160,6 +160,15 @@ export interface Snapshot {
   cursor: number;
   serverTime: string;
 }
+/** Initial browser data; repository choices are loaded only in management. */
+export interface TrackerView {
+  snapshot: Snapshot;
+  trackers: TrackerOwner[];
+}
+export interface TrackerList {
+  viewerId: string;
+  trackers: TrackerOwner[];
+}
 export type EntityType =
   | "team"
   | "workspace"
