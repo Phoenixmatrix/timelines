@@ -22,6 +22,21 @@ pub struct Credentials {
     pub auth: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_key: Option<String>,
+    /// Tokens of your agents set up on this machine (`gm agent setup`), by name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agents: std::collections::BTreeMap<String, String>,
+}
+
+/// Whose token a request uses.
+#[derive(Clone, Default, PartialEq)]
+pub enum Acting {
+    /// GM_TOKEN, else this checkout's agent when a harness drives gm, else you.
+    #[default]
+    Auto,
+    /// GM_TOKEN, else you: managing agents is a person's job.
+    Person,
+    /// Exactly this token.
+    Token(String),
 }
 
 /// gm.json. Sign-ins are kept per server, so signing in to one (say,
@@ -44,6 +59,8 @@ pub struct Config {
     pub ssh_key: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub servers: std::collections::BTreeMap<String, Credentials>,
+    #[serde(skip)]
+    pub acting: Acting,
 }
 
 fn normalize_server(server: &str) -> String {
@@ -78,6 +95,7 @@ impl Config {
             user: self.user.take(),
             auth: self.auth.take(),
             ssh_key: self.ssh_key.take(),
+            agents: Default::default(),
         };
         let legacy_server = normalize_server(self.server.as_deref().unwrap_or(DEFAULT_SERVER));
         if legacy != Credentials::default() && !self.servers.contains_key(&legacy_server) {
@@ -98,6 +116,7 @@ impl Config {
             user: self.user.clone(),
             auth: self.auth.clone(),
             ssh_key: self.ssh_key.clone(),
+            agents: self.agent_tokens().clone(),
         };
         if current == Credentials::default() {
             stored.servers.remove(active);
@@ -132,7 +151,40 @@ impl Config {
     }
 
     pub fn token(&self) -> Option<String> {
-        env_token().or_else(|| self.token.clone())
+        env_token()
+            .or_else(|| self.agent_token())
+            .or_else(|| self.token.clone())
+    }
+
+    /// Your agents' tokens on the server in use.
+    pub fn agent_tokens(&self) -> &std::collections::BTreeMap<String, String> {
+        static EMPTY: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        self.servers
+            .get(&self.server())
+            .map_or(&EMPTY, |c| &c.agents)
+    }
+
+    pub fn set_agent_token(&mut self, name: &str, token: String) {
+        let server = self.server();
+        self.servers
+            .entry(server)
+            .or_default()
+            .agents
+            .insert(name.to_string(), token);
+    }
+
+    /// The token this request acts with when not GM_TOKEN: an explicit one, or
+    /// this checkout's agent when a harness drives gm (`gm agent setup`).
+    fn agent_token(&self) -> Option<String> {
+        match &self.acting {
+            Acting::Token(token) => Some(token.clone()),
+            Acting::Person => None,
+            Acting::Auto => self
+                .agent_tokens()
+                .get(&crate::profile::acting_agent()?)
+                .cloned(),
+        }
     }
 
     pub fn uses_ssh(&self) -> bool {
@@ -144,7 +196,7 @@ impl Config {
 /// cached one is missing or ending), else the stored token. The flag says
 /// whether it came from SSH.
 pub fn credential(config: &Config) -> Result<(Option<String>, bool)> {
-    if let Some(token) = env_token() {
+    if let Some(token) = env_token().or_else(|| config.agent_token()) {
         return Ok((Some(token), false));
     }
     if config.uses_ssh() {

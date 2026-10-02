@@ -1,3 +1,4 @@
+pub mod agent_setup;
 pub mod agents;
 pub mod ci;
 pub mod local;

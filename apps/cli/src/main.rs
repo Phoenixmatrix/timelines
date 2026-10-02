@@ -4,6 +4,7 @@ mod commands;
 mod meta;
 mod model;
 mod output;
+mod profile;
 mod remote;
 mod repo;
 mod ssh;
@@ -280,6 +281,7 @@ fn main() {
         Some(dir) => dir.clone(),
         None => std::env::current_dir().expect("a current directory"),
     };
+    profile::set_dir(&cwd);
     let ctx = Ctx {
         format,
         dry_run: parsed.global.dry_run,

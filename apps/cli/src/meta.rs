@@ -63,7 +63,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("issue checkpoint", git: "", kw: "agent durable checkpoint progress decisions handoff resume", mutates: true, out: Out::Other("{operationId,queued,entities:[Comment],cursor}"), ex: ["gm issue checkpoint ENG-1 '@checkpoint.md'"]),
     meta!("issue evidence", git: "", kw: "verification evidence proof durable test result", mutates: true, out: Out::Other("{operationId,queued,entities:[Comment],cursor}"), ex: ["gm issue evidence ENG-1 'Verified with integration smoke'"]),
     meta!("issue batch", git: "", kw: "atomic graph dependency mutations offline batch json", mutates: true, out: Out::Other("{operationId,queued,entities:[Entity],cursor}; input array of {kind,id,expectedVersion?,data?}, max 100, canonical IDs"), ex: ["gm issue batch '@plan.json' --offline"]),
-    meta!("issue next", git: "", kw: "next ready work pick claim agent graph autonomous loop lease", mutates: true, out: Out::Other("{claimed:{issueId,key,leaseToken,expiresAt}|null,context,blockerEvidence}; leaseToken is secret and is not cached"), ex: ["gm issue next --agent builder --under CORE-4", "gm issue next --agent builder --team CORE"]),
+    meta!("issue next", git: "", kw: "next ready work pick claim agent graph autonomous loop lease", mutates: true, out: Out::Other("{claimed:{issueId,key,leaseToken,expiresAt}|null,context,blockerEvidence}; flags default from .gitmatrix (gm agent setup); gm keeps the lease token privately for this identity"), ex: ["gm issue next", "gm issue next --under CORE-4", "gm issue next --agent builder --team CORE"]),
     meta!("issue ask", git: "", kw: "ask person human question approval decision credential blocked waiting intervention park lease", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["GM_LEASE_TOKEN=… gm issue ask ENG-3 --kind question --prompt \"Which region should this deploy to?\"", "gm issue ask ENG-3 --kind decision --prompt \"Which store?\" --choice D1 --choice R2"]),
     meta!("issue resume", git: "", kw: "resume parked lease after answer continue", mutates: true, out: Out::Other("{cursor,events,results:[{id,leaseToken,expiresAt}]}; leaseToken is secret and is not cached"), ex: ["gm issue resume ENG-3"]),
     meta!("request list", git: "", kw: "requests needs you waiting on person questions approvals", mutates: false, out: Out::Other("{requests:[{id,issueId,kind,prompt,choices,secret,status,askedBy,routeTo,issue,asker,for}]}"), ex: ["gm request list"]),
@@ -73,7 +73,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("issue withdraw", git: "", kw: "withdraw cancel handoff offer", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["GM_LEASE_TOKEN=… gm issue withdraw ENG-3"]),
     meta!("issue accept", git: "", kw: "accept handoff take over lease transfer code", mutates: true, out: Out::Other("{cursor,events,results:[{id,leaseToken,expiresAt}]}; leaseToken is secret and is not cached"), ex: ["gm issue accept ENG-3.4f…"]),
     meta!("issue revoke", git: "", kw: "revoke take back delegated claim sub lease subtree", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["GM_UNDER_TOKEN=… gm issue revoke ENG-12"]),
-    meta!("issue claim", git: "", kw: "exclusive online claim fence agent lease token", mutates: true, out: Out::Other("{cursor,events,results:[{id,leaseToken,expiresAt}],serverTime}; leaseToken is secret and is not cached"), ex: ["gm issue claim ENG-1 --agent build-agent", "GM_UNDER_TOKEN=… gm issue claim ENG-12 --agent sub --for reviewer"]),
+    meta!("issue claim", git: "", kw: "exclusive online claim fence agent lease token", mutates: true, out: Out::Other("{cursor,events,results:[{id,leaseToken,expiresAt}],serverTime}; gm keeps leaseToken privately for this identity, so lease commands need no token"), ex: ["gm issue claim ENG-1", "gm issue claim ENG-1 --agent build-agent", "GM_UNDER_TOKEN=… gm issue claim ENG-12 --agent sub --for reviewer"]),
     meta!("issue renew", git: "", kw: "lease renew online fencing token expiration", mutates: true, out: Out::Other("{cursor,events,results,serverTime}; token may appear only in claim/renew responses"), ex: ["gm issue renew ENG-1 --ttl 900"]),
     meta!("issue release", git: "", kw: "release exclusive fenced claim online", mutates: true, out: Out::Other("{cursor,events,results,serverTime}; lease token redacted"), ex: ["gm issue release ENG-1"]),
     meta!("issue complete", git: "", kw: "finish issue online fencing evidence done", mutates: true, out: Out::Other("{cursor,events,results,serverTime}; lease token redacted"), ex: ["gm issue complete ENG-1 --evidence '@verification.md'"]),
@@ -134,6 +134,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("runner", git: "", kw: "ci runner agent worker execute jobs locally self-hosted run pipelines dev", mutates: false, out: Out::Other("{jobs:[{repo,run,job,status}]} (one JSON line per job while running)"), ex: ["gm runner", "gm runner --once", "gm runner -R orbit/engine -v"]),
     meta!("secret list", git: "", kw: "ci secrets environment variables credentials list", mutates: false, out: Out::Other("{secrets:[{name,updatedAt}]}"), ex: ["gm secret list"]),
     meta!("secret set", git: "", kw: "ci add secret token credential environment variable", mutates: true, out: Out::Other("{set}"), ex: ["gm secret set NPM_TOKEN --value xyz", "echo $TOKEN | gm secret set CLOUDFLARE_API_TOKEN"]),
+    meta!("agent setup", git: "", kw: "configure set up agent harness claude codex cursor AGENTS.md skills instructions identity token profile scope gm issue next defaults .gitmatrix", mutates: true, out: Out::Other("{dryRun,agent,harness,model,tags,scope,identity:{id,name,accountable,created,token,profile}|null,files:[{path,status}],next}; --check: {upToDate,files} or error code stale (exit 4)"), ex: ["gm agent setup", "gm agent setup --harness codex --model gpt-5 --tag rust", "gm agent setup --under CORE-4", "gm agent setup --check"]),
     meta!("agent list", git: "", kw: "agents identities accountable bots list capabilities selection owner", mutates: false, out: Out::Other("{agents:[{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}]}"), ex: ["gm agent list", "gm agent list --owner orbit"]),
     meta!("agent detect", git: "", kw: "agent local capabilities environment harness model skills tags detect", mutates: false, out: Out::Other("{version:1,harness,model,environment:{os,arch,runtime,cpuCount,memoryBytes},tags,skills:[{name,description,source}]}"), ex: ["gm agent detect", "gm agent detect --model explicit-model --tag rust"]),
     meta!("agent configure", git: "", kw: "agent create update refresh configure profile capabilities model harness skills tags", mutates: true, out: Out::Other("{agent:{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}}"), ex: ["gm agent configure builder --tag rust --skill review", "gm agent configure", "gm agent configure builder --clear-model --clear-tags --clear-skills --dry-run"]),
@@ -562,24 +563,19 @@ Tracker writes are not restored by `gm undo`. `gm schema issue batch` describes 
 graph input. `gm tracker status` exposes private replica paths for credential recovery.
 
 ## Working through a graph (agents)
-An agent has its own identity, accountable to a person: `gm agent create builder`,
-then `gm agent token builder`, and the agent runs with that token as GM_TOKEN.
-    gm agent detect                  # local only, no account or checkout needed
-    gm agent configure builder --tag rust --model explicit-model
-    gm agent show builder
-    gm agent list --owner orbit       # advisory profiles for selecting workers
-With an agent token, omit NAME for `configure`/`show` to use its own identity.
-Configure refreshes detected environment, harness and skills; it preserves
-model, tags and declared skills unless supplied replacements or --clear-model,
---clear-tags, --clear-skills. --skill NAME[=DESCRIPTION] declares a skill;
---skill-dir DIR adds bounded local metadata discovery. --dry-run previews the
-request without writing. These reports are self-reported advice, never proof
-of tool availability or authorization; configuring never selects a claim identity.
-    gm issue next --agent builder --under CORE-4   # pick + claim atomically; token once
-    gm issue checkpoint CORE-5 'Done X; next Y'    # as you go; renew before expiry
-    gm issue ask CORE-5 --kind question --prompt 'Which region?'  # GM_LEASE_TOKEN parks
-    gm issue resume CORE-5                         # after a person answers: fresh token
+An agent has its own identity, accountable to a person. `gm agent setup` (run
+once per checkout, again to update) creates it and keeps its token, publishes
+its advisory profile, writes the instructions and skill for its harness, and
+records scope and lease length in .gitmatrix/ (agents.yml shared,
+agent.local.yml per checkout). When the harness drives gm there, gm acts as
+the agent and keeps its lease tokens:
+    gm issue next                                  # pick + claim atomically, in scope
+    gm issue checkpoint CORE-5 'Done X; next Y'    # as you go; gm issue renew CORE-5
+    gm issue ask CORE-5 --kind question --prompt 'Which region?'  # parks the lease
+    gm issue resume CORE-5                         # after a person answers
     gm issue complete CORE-5 --evidence 'Shipped in <commit>, CI run #N green'
+Elsewhere, `gm agent create`/`token` with GM_TOKEN, `--agent`, and GM_LEASE_TOKEN
+do the same by hand.
 Ready means todo, unblocked, no open sub-issues, no one else's lease above, and not
 waiting on a person. `next` takes priority, then whatever unblocks the most work,
 then the oldest; it skips PRDs and other people's assignments. A lease covers its

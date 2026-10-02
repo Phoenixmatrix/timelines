@@ -661,6 +661,42 @@ pub enum SecretCommand {
 
 #[derive(Subcommand)]
 pub enum AgentCommand {
+    /// Set up this checkout for a coding agent: instructions, skills, identity and profile. Rerun to update.
+    Setup {
+        /// The agent's name; defaults to this checkout's, else the harness (claude-code…)
+        #[arg(long)]
+        name: Option<String>,
+        /// claude-code, codex, cursor-agent, gemini-agent, opencode…; detected when an agent runs this
+        #[arg(long)]
+        harness: Option<String>,
+        /// The model it runs (never inferred)
+        #[arg(long)]
+        model: Option<String>,
+        /// Add a profile tag (repeat)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Remove a profile tag (repeat)
+        #[arg(long = "drop-tag")]
+        drop_tags: Vec<String>,
+        /// Tracker owner; seeds .gitmatrix/agents.yml (default: origin's owner)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Team `gm issue next` picks from
+        #[arg(long)]
+        team: Option<String>,
+        /// Only work under this issue, e.g. a project
+        #[arg(long)]
+        under: Option<String>,
+        /// Lease seconds
+        #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: Option<u32>,
+        /// Only write the files; don't create the agent, keep a token or publish its profile
+        #[arg(long)]
+        no_identity: bool,
+        /// Report what's out of date without changing anything (exit 4 if stale)
+        #[arg(long)]
+        check: bool,
+    },
     /// Your agents and advisory capabilities, optionally from an owner's tracker
     List {
         #[arg(long)]

@@ -161,7 +161,6 @@ sections and advisory readiness; only an online claim grants exclusive work.
 
 ```bash
 gm issue claim ENG-1 --agent search-agent --ttl 900
-# Capture leaseToken securely from that response, then set GM_LEASE_TOKEN.
 gm issue renew ENG-1 --ttl 900
 gm issue checkpoint ENG-1 'Implementation complete; verifying edge cases'
 gm issue complete ENG-1 --evidence '@verification.md'
@@ -169,11 +168,43 @@ gm issue complete ENG-1 --evidence '@verification.md'
 ```
 
 Claim/renew/release/complete always require online access. Tokens appear only in
-claim/renew responses, never normal list/context/status output or SQLite. Prefer
-`GM_LEASE_TOKEN` to a command-line argument that shell history/process listings may
-expose. Expired or superseded tokens are rejected even for the same human account.
+claim/renew responses, never normal list/context/status output or SQLite. gm keeps
+the token a claim (or `next`, `renew`, `resume`, `accept`) returns in a private
+file per issue beside the identity's replica, never in the replica or its outbox;
+lease commands use it when no token is given, and `complete`/`release` delete it.
+`--lease-token` or `GM_LEASE_TOKEN` (preferred to a command-line argument that
+shell history/process listings may expose) still override it. Expired or superseded tokens are rejected even for the same human account.
 An ambiguous lease response is an error, not ownership: inspect the issue and do
 not start work without a received token.
+
+### Setting up an agent: `gm agent setup`
+
+One command configures a checkout so a coding agent works through the graph
+with nothing but `gm issue next`. Run it in the repository, and again to update:
+
+```bash
+gm agent setup                                   # detect the harness; do everything
+gm agent setup --model MODEL --tag rust --under ENG-4
+gm agent setup --check                           # exit 4 if instructions or skills are stale
+```
+
+- **Instructions and skills.** It keeps a managed section of the instruction
+  file current (AGENTS.md, or the harness's CLAUDE.md/GEMINI.md) and installs the
+  `gitmatrix-graph-work` skill where the harness loads skills (`.agents/skills`,
+  plus `.claude/skills` for Claude Code). Text outside the markers is untouched.
+- **Configuration.** `.gitmatrix/agents.yml` is shared and committed: tracker
+  `owner`, default scope (`team` or `under`), lease `ttl`, and `instructions`
+  (`file`, and how work `ship`s). `.gitmatrix/agent.local.yml` (git-ignored) is
+  this checkout's agent: name, harness, model, tags and scope overrides.
+- **Identity and profile.** As you, it creates the agent (default name: the
+  harness), mints a token and keeps it with gm's credentials without printing
+  it, and publishes the agent's capability profile (below) with this checkout's
+  harness, model and tags. When an agent harness drives gm in that checkout, gm
+  acts as the agent (`gm auth status` shows `actingAs`); in your own terminal you
+  stay yourself, and `GM_TOKEN` always wins. Run by the agent, it refreshes its
+  own profile. `--no-identity` writes only the files.
+- **Defaults.** `gm issue next` and `claim` take the session label, scope and
+  lease length from these files, and the tracker owner when none is selected.
 
 ### Agent capability profiles
 

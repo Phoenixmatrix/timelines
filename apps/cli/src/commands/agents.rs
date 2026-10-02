@@ -27,6 +27,12 @@ impl Render for Shown {
     }
 }
 
+impl Shown {
+    pub fn new(value: Value, text: String) -> Shown {
+        Shown { value, text }
+    }
+}
+
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
@@ -153,8 +159,49 @@ fn find(config: &Config, name: &str) -> Result<Value> {
 }
 
 pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
-    let config = Config::load();
+    let mut config = Config::load();
+    // Managing your agents is a person's job, even in a checkout where gm would
+    // act as its agent; showing or configuring "self" means the agent.
+    if matches!(
+        command,
+        AgentCommand::Create { .. }
+            | AgentCommand::Token { .. }
+            | AgentCommand::Revoke { .. }
+            | AgentCommand::Configure { name: Some(_), .. }
+            | AgentCommand::Show { name: Some(_) }
+            | AgentCommand::List { owner: None }
+    ) {
+        config.acting = remote::Acting::Person;
+    }
     match command {
+        AgentCommand::Setup {
+            name,
+            harness,
+            model,
+            tags,
+            drop_tags,
+            owner,
+            team,
+            under,
+            ttl,
+            no_identity,
+            check,
+        } => super::agent_setup::setup(
+            ctx,
+            &super::agent_setup::Options {
+                name: name.clone(),
+                harness: harness.clone(),
+                model: model.clone(),
+                tags: tags.clone(),
+                drop_tags: drop_tags.clone(),
+                owner: owner.clone(),
+                team: team.clone(),
+                under: under.clone(),
+                ttl: *ttl,
+                no_identity: *no_identity,
+                check: *check,
+            },
+        ),
         AgentCommand::Detect { capabilities: args } => {
             let value = serde_json::to_value(capabilities::detect(args, None, &ctx.cwd)?)?;
             Ok(Shown {

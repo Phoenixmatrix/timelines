@@ -3,7 +3,7 @@
 import { KeyIcon, RobotIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
-import type { Agent, CreatedAccessToken } from "../../shared/api.ts";
+import type { Agent, AgentCapabilities, CreatedAccessToken } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
@@ -69,6 +69,20 @@ export function Agents() {
       </p>
 
       <div className="mt-8 flex flex-col gap-6">
+        <Card
+          title="Set one up in a checkout"
+          description="In a repository, gm creates the agent, keeps its token, writes the instructions and skill its harness reads, and publishes its profile. Run it again to update; the agent then just runs gm issue next."
+        >
+          <div className="mk-card-body">
+            <CopyField value="gm agent setup" label="Command" />
+            <span className="mk-hint">
+              Add <code className="mk-mono">--model</code> or <code className="mk-mono">--tag</code>{" "}
+              to describe it, and <code className="mk-mono">--under CORE-4</code> to point it at a
+              project.
+            </span>
+          </div>
+        </Card>
+
         <Card title="Create an agent">
           <Form method="post" ref={formRef} className="mk-card-body">
             <input type="hidden" name="intent" value="create" />
@@ -165,7 +179,13 @@ function AgentRow({ agent }: { agent: Agent }) {
             ) : (
               <span title={fullDate(agent.createdAt)}>Created {timeAgo(agent.createdAt)}</span>
             )}
+            {agent.capabilitiesUpdatedAt && (
+              <span title={fullDate(agent.capabilitiesUpdatedAt)}>
+                {" · "}profile from {timeAgo(agent.capabilitiesUpdatedAt)}
+              </span>
+            )}
           </div>
+          {agent.capabilities && <Profile profile={agent.capabilities} />}
         </div>
         {!revoked && (
           <div className="flex shrink-0 flex-wrap justify-end gap-2 max-sm:w-full max-sm:justify-start max-sm:pl-8">
@@ -228,5 +248,53 @@ function TokenRow({ agent, token }: { agent: Agent; token: Agent["tokens"][numbe
         }
       />
     </li>
+  );
+}
+
+const HARNESSES: Record<string, string> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  "cursor-agent": "Cursor",
+  "gemini-agent": "Gemini CLI",
+  opencode: "OpenCode",
+  amp: "Amp",
+  auggie: "Auggie",
+  "qwen-code": "Qwen Code",
+  warp: "Warp",
+  "vscode-copilot-agent": "GitHub Copilot",
+};
+
+/** What the agent reported about itself: advice for choosing whom to delegate to. */
+function Profile({ profile }: { profile: AgentCapabilities }) {
+  const { environment: env } = profile;
+  const memory = env.memoryBytes ? `${Math.round(env.memoryBytes / 2 ** 30)} GB` : null;
+  const runs = [
+    profile.harness && (HARNESSES[profile.harness] ?? profile.harness),
+    profile.model,
+    `${env.os}/${env.arch}${env.runtime !== "host" && env.runtime !== "unknown" ? ` (${env.runtime})` : ""}`,
+    env.cpuCount && `${env.cpuCount} CPUs`,
+    memory,
+  ].filter(Boolean);
+  return (
+    <div className="mt-1.5 flex flex-col gap-1.5 text-body-sm text-ink-muted">
+      <span>{runs.join(" · ")}</span>
+      {(profile.tags.length > 0 || profile.skills.length > 0) && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {profile.tags.map((tag) => (
+            <span key={tag} className="mk-chip mk-chip--tag">
+              {tag}
+            </span>
+          ))}
+          {profile.skills.length > 0 && (
+            <span
+              className="text-ink-faint"
+              title={profile.skills.map((skill) => skill.name).join(", ")}
+            >
+              {profile.skills.length} skill{profile.skills.length === 1 ? "" : "s"}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

@@ -192,9 +192,10 @@ pub struct Note {
 #[derive(Args)]
 pub struct Lease {
     pub issue: String,
-    /// Fencing token; prefer GM_LEASE_TOKEN to avoid shell history/process arguments.
+    /// Fencing token; defaults to the one gm kept when this identity claimed the issue.
+    /// Otherwise prefer GM_LEASE_TOKEN to avoid shell history/process arguments.
     #[arg(long, env = "GM_LEASE_TOKEN", hide_env_values = true)]
-    pub lease_token: String,
+    pub lease_token: Option<String>,
 }
 /// Delegation inside a leased subtree: the covering lease's token, and who the claim is for.
 #[derive(Args)]
@@ -240,10 +241,12 @@ pub enum IssueCommand {
     /// Atomically acquire exclusive work online; returns the secret fencing token once.
     Claim {
         issue: String,
+        /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
         #[arg(long)]
-        agent: String,
-        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
-        ttl: u32,
+        agent: Option<String>,
+        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: Option<u32>,
         #[command(flatten)]
         delegation: Delegation,
     },
@@ -271,8 +274,9 @@ pub enum IssueCommand {
     /// Take a parked lease back up once its requests are answered; returns a fresh token.
     Resume {
         issue: String,
-        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
-        ttl: u32,
+        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: Option<u32>,
     },
     /// Hand your lease to another agent or person: prints a single-use code. You keep the lease until it's accepted.
     Handoff {
@@ -293,8 +297,9 @@ pub enum IssueCommand {
         /// A label for your working session (defaults to the giver's).
         #[arg(long)]
         agent: Option<String>,
-        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
-        ttl: u32,
+        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: Option<u32>,
     },
     /// Take back a claim inside your leased subtree; its token stops working.
     Revoke {
@@ -305,8 +310,10 @@ pub enum IssueCommand {
     },
     /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context.
     Next {
+        /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
         #[arg(long)]
-        agent: String,
+        agent: Option<String>,
+        /// Defaults to the scope in .gitmatrix/agents.toml (or this checkout's).
         #[arg(long)]
         team: Option<String>,
         #[arg(long)]
@@ -314,8 +321,9 @@ pub enum IssueCommand {
         /// Only work under this issue (a project or other parent).
         #[arg(long)]
         under: Option<String>,
-        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
-        ttl: u32,
+        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: Option<u32>,
         /// With --under: pick inside your own leased subtree.
         #[command(flatten)]
         delegation: Delegation,
@@ -324,8 +332,9 @@ pub enum IssueCommand {
     Renew {
         #[command(flatten)]
         lease: Lease,
-        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
-        ttl: u32,
+        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: Option<u32>,
     },
     /// Release the current fenced lease online.
     Release(Lease),

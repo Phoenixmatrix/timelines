@@ -60,6 +60,56 @@ fn private_file(path: &Path) -> Result<fs::File> {
     }
     Ok(file)
 }
+/// Lease tokens gm keeps for this identity: one private file per issue beside
+/// its replica (never in the replica or its outbox), so an agent's next command
+/// finds its lease without the token passing through prompts or shell history.
+fn lease_file(config: &Config, issue_id: &str) -> Result<PathBuf> {
+    if issue_id.is_empty()
+        || !issue_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(GmError::new("invalid_input", "Unexpected issue id."));
+    }
+    Ok(root(config)?.join("leases").join(issue_id))
+}
+fn keep_lease(config: &Config, issue_id: &str, token: &str) -> Result<()> {
+    let path = lease_file(config, issue_id)?;
+    private_dir(path.parent().unwrap())?;
+    let mut file = private_file(&path)?;
+    file.set_len(0)?;
+    std::io::Write::write_all(&mut file, token.as_bytes())?;
+    Ok(())
+}
+fn kept_lease(config: &Config, issue_id: &str) -> Option<String> {
+    fs::read_to_string(lease_file(config, issue_id).ok()?)
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+fn drop_lease(config: &Config, issue_id: &str) {
+    if let Ok(path) = lease_file(config, issue_id) {
+        let _ = fs::remove_file(path);
+    }
+}
+/// The lease token to act with: given, else kept.
+fn lease_token(
+    config: &Config,
+    issue_id: &str,
+    lease: &crate::tracker_cli::Lease,
+) -> Result<String> {
+    lease
+        .lease_token
+        .clone()
+        .or_else(|| kept_lease(config, issue_id))
+        .ok_or_else(|| {
+            GmError::usage(format!(
+                "No lease token for {}: this identity didn't claim it here.",
+                lease.issue
+            ))
+            .hint("Pass --lease-token or GM_LEASE_TOKEN, or take work with `gm issue next`.")
+        })
+}
+
 fn root(config: &Config) -> Result<PathBuf> {
     // Never use config.user alone: GM_TOKEN may belong to a different identity.
     // Rotated credentials deliberately start a separate replica, not someone else's outbox.
@@ -347,7 +397,8 @@ fn with_replica(
         .owner
         .clone()
         .or_else(|| fs::read_to_string(root.join("selected")).ok())
-        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER` or pass --owner OWNER."))?;
+        .or_else(|| crate::profile::defaults().scope.owner)
+        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER`, pass --owner OWNER, or set [tracker] owner in .gitmatrix/agents.toml."))?;
     safe_owner(&owner)?;
     if scope.offline && !root.join(format!("{owner}.sqlite")).exists() {
         return Err(GmError::new(
@@ -1182,7 +1233,7 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
         },
         "context": context,
         "blockerEvidence": blocker_evidence,
-        "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires, then gm issue complete with evidence.",
+        "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete with evidence. gm kept the lease token for this identity, so those commands need no token.",
     }))
 }
 pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
@@ -1205,6 +1256,17 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             "Claims, renewal, release and completion require online fencing. Offline readiness never grants ownership.",
         ));
     }
+    // Unset flags come from .gitmatrix (`gm agent setup`).
+    let defaults = crate::profile::defaults();
+    let session = |agent: &Option<String>| {
+        agent
+            .clone()
+            .or_else(|| defaults.agent.clone())
+            .ok_or_else(|| {
+                GmError::usage("Pass --agent <label> for your working session.")
+                    .hint("Or run `gm agent setup` once, and gm uses this checkout's agent.")
+            })
+    };
     with_replica(&args.scope, ctx, true, |r| {
         let snapshot = r.view()?;
         let mutation = match &args.command {
@@ -1244,7 +1306,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 ttl,
                 delegation,
             } => {
-                let mut data = json!({"agent":agent,"ttlSeconds":ttl});
+                let mut data =
+                    json!({"agent":session(agent)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 delegate(&snapshot, delegation, &mut data)?;
                 json!({"kind":"issue.claim","id":id(&snapshot,"issues",issue)?,"data":data})
             }
@@ -1278,13 +1341,20 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                         })?;
                     data["routeTo"] = member["id"].clone();
                 }
-                if let Some(token) = lease_token {
+                // Holding the issue's lease (given, or kept from claiming it) parks it while you wait.
+                let issue_id = id(&snapshot, "issues", issue)?;
+                if let Some(token) = lease_token
+                    .clone()
+                    .or_else(|| kept_lease(&r.config, &issue_id))
+                {
                     data["leaseToken"] = json!(token);
                 }
                 json!({"kind":"request.open","id":uid(),"data":data})
             }
             IssueCommand::Handoff { lease, to, ttl } => {
-                let mut data = json!({"leaseToken":lease.lease_token,"ttlSeconds":ttl});
+                let issue_id = id(&snapshot, "issues", &lease.issue)?;
+                let mut data =
+                    json!({"leaseToken":lease_token(&r.config,&issue_id,lease)?,"ttlSeconds":ttl});
                 if let Some(to) = to {
                     let found = ["agents", "members"]
                         .iter()
@@ -1302,21 +1372,22 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 json!({"kind":"issue.offer","id":id(&snapshot,"issues",&lease.issue)?,"data":data})
             }
             IssueCommand::Withdraw(lease) => {
-                json!({"kind":"issue.withdraw","id":id(&snapshot,"issues",&lease.issue)?,"data":{"leaseToken":lease.lease_token}})
+                let issue_id = id(&snapshot, "issues", &lease.issue)?;
+                json!({"kind":"issue.withdraw","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?}})
             }
             IssueCommand::Accept { code, agent, ttl } => {
                 // A code starts with its issue's key: ENG-12.<secret>.
                 let key = code.split_once('.').map(|(k, _)| k).ok_or_else(|| {
                     GmError::usage("That isn't a handoff code (ISSUE-KEY.secret).")
                 })?;
-                let mut data = json!({"code":code,"ttlSeconds":ttl});
+                let mut data = json!({"code":code,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 if let Some(agent) = agent {
                     data["agent"] = json!(agent);
                 }
                 json!({"kind":"issue.accept","id":id(&snapshot,"issues",key)?,"data":data})
             }
             IssueCommand::Resume { issue, ttl } => {
-                json!({"kind":"issue.resume","id":id(&snapshot,"issues",issue)?,"data":{"ttlSeconds":ttl}})
+                json!({"kind":"issue.resume","id":id(&snapshot,"issues",issue)?,"data":{"ttlSeconds":ttl.unwrap_or(defaults.ttl)}})
             }
             IssueCommand::Revoke { issue, under_token } => {
                 json!({"kind":"issue.revoke","id":id(&snapshot,"issues",issue)?,"data":{"underToken":under_token}})
@@ -1329,8 +1400,20 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 ttl,
                 delegation,
             } => {
-                let mut data = json!({"agent":agent,"ttlSeconds":ttl});
+                let mut data =
+                    json!({"agent":session(agent)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 delegate(&snapshot, delegation, &mut data)?;
+                // No scope given: this checkout's, else the project's (.gitmatrix/agents.toml).
+                let (team, workspace, under) =
+                    if team.is_none() && workspace.is_none() && under.is_none() {
+                        (
+                            &defaults.scope.team,
+                            &defaults.scope.workspace,
+                            &defaults.scope.under,
+                        )
+                    } else {
+                        (team, workspace, under)
+                    };
                 if let Some(t) = team {
                     data["teamId"] = json!(id(&snapshot, "teams", t)?);
                 }
@@ -1343,13 +1426,16 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 json!({"kind":"issue.next","id":uid(),"data":data})
             }
             IssueCommand::Renew { lease, ttl } => {
-                json!({"kind":"issue.renew","id":id(&snapshot,"issues",&lease.issue)?,"data":{"leaseToken":lease.lease_token,"ttlSeconds":ttl}})
+                let issue_id = id(&snapshot, "issues", &lease.issue)?;
+                json!({"kind":"issue.renew","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)}})
             }
             IssueCommand::Release(lease) => {
-                json!({"kind":"issue.release","id":id(&snapshot,"issues",&lease.issue)?,"data":{"leaseToken":lease.lease_token}})
+                let issue_id = id(&snapshot, "issues", &lease.issue)?;
+                json!({"kind":"issue.release","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?}})
             }
             IssueCommand::Complete { lease, evidence } => {
-                json!({"kind":"issue.complete","id":id(&snapshot,"issues",&lease.issue)?,"data":{"leaseToken":lease.lease_token,"evidence":input(evidence)?}})
+                let issue_id = id(&snapshot, "issues", &lease.issue)?;
+                json!({"kind":"issue.complete","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?,"evidence":input(evidence)?}})
             }
         };
         if lease_command {
@@ -1360,7 +1446,24 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             // Lease secrets are never persisted, even in a pending outbox. An
             // ambiguous lease response is reported, never represented as success.
-            let mut response=remote::api(&r.config,"POST",&r.path("mutate"),Some(&request)).map_err(|e|e.hint("Lease outcome may be uncertain after transport failure. Inspect the issue online; do not assume ownership without the returned fencing token."))?;
+            let target = mutation["id"].as_str().unwrap_or_default().to_string();
+            let mut response = match remote::api(
+                &r.config,
+                "POST",
+                &r.path("mutate"),
+                Some(&request),
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    // A kept token the server no longer honours is of no further use.
+                    if e.code == "conflict"
+                        && e.message.starts_with("Claim expired, was superseded")
+                    {
+                        drop_lease(&r.config, &target);
+                    }
+                    return Err(e.hint("Lease outcome may be uncertain after transport failure. Inspect the issue online; do not assume ownership without the returned fencing token."));
+                }
+            };
             if !response["results"].is_array()
                 || !response["events"].is_array()
                 || (matches!(
@@ -1372,6 +1475,19 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     "uncertain_ack",
                     "The lease response was incomplete. Inspect the issue online; do not assume ownership without a fencing token.",
                 ));
+            }
+            // Keep the newest token for the issue it holds; forget it once the lease ends.
+            let result = &response["results"][0];
+            match &args.command {
+                IssueCommand::Complete { .. } | IssueCommand::Release(_) => {
+                    drop_lease(&r.config, &target)
+                }
+                _ => {
+                    if let Some(token) = result["leaseToken"].as_str() {
+                        let issue = result["issueId"].as_str().unwrap_or(&target);
+                        keep_lease(&r.config, issue, token)?;
+                    }
+                }
             }
             if let IssueCommand::Next { .. } = args.command {
                 return Ok(next_result(&snapshot, &response));

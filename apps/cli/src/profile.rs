@@ -1,0 +1,253 @@
+//! How coding agents work on a repository (`gm agent setup`):
+//!
+//! - `.gitmatrix/agents.yml`, committed: the tracker and scope agents work in,
+//!   lease length, the instruction file agents read, and how work ships before
+//!   it's completed.
+//! - `.gitmatrix/agent.local.yml`, not committed: this checkout's agent — its
+//!   name, harness, model and tags, and any scope of its own.
+//!
+//! The agent's token lives with gm's other credentials (gm.json), never here;
+//! its advisory capability profile lives on the server (`gm agent configure`).
+//! When an agent harness drives gm in a checkout with a local profile, gm acts
+//! as that agent; the person typing in their own terminal stays themselves.
+
+use crate::output::{GmError, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+pub const PROJECT_FILE: &str = ".gitmatrix/agents.yml";
+pub const LOCAL_FILE: &str = ".gitmatrix/agent.local.yml";
+/// The skill every agent gets, managed by `gm agent setup`.
+pub const GRAPH_SKILL: &str = "gitmatrix-graph-work";
+pub const DEFAULT_TTL: u32 = 900;
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Scope {
+    /// Tracker account or organization slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Team key `gm issue next` picks from, e.g. CORE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// Only work under this issue (a project or other parent), e.g. CORE-4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub under: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Instructions {
+    /// The instruction file that gets gm's managed section; otherwise the
+    /// harness's own (AGENTS.md, CLAUDE.md, GEMINI.md), else AGENTS.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// How work ships before an issue is completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship: Option<String>,
+}
+
+/// `.gitmatrix/agents.yml`.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Project {
+    #[serde(default)]
+    pub tracker: Scope,
+    /// Seconds a lease lasts before it must be renewed (30 to 86400).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub instructions: Instructions,
+}
+
+/// `.gitmatrix/agent.local.yml`.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Local {
+    /// The agent identity's name (yours, accountable to you).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// claude-code, codex, cursor-agent…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// The model it runs, as you declare it (never inferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Published in its capability profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Overrides the project's scope for this checkout.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub scope: Scope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// Where a harness reads instructions and skills.
+pub struct Layout {
+    /// Instruction files it reads, preferred first.
+    pub instructions: &'static [&'static str],
+    /// Skill directories it loads, relative to the repository root.
+    pub skills: &'static [&'static str],
+}
+
+pub fn layout(harness: &str) -> Layout {
+    match harness {
+        "claude-code" => Layout {
+            instructions: &["AGENTS.md", "CLAUDE.md"],
+            skills: &[".agents/skills", ".claude/skills"],
+        },
+        "gemini-agent" => Layout {
+            instructions: &["AGENTS.md", "GEMINI.md"],
+            skills: &[".agents/skills"],
+        },
+        _ => Layout {
+            instructions: &["AGENTS.md"],
+            skills: &[".agents/skills"],
+        },
+    }
+}
+
+/// The directory gm was run in (`-C` included), set once at startup.
+static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_dir(dir: &Path) {
+    let _ = DIR.set(dir.to_path_buf());
+}
+
+/// The repository root above `dir`: the nearest directory with `.git` or `.gitmatrix`.
+pub fn root_from(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists() || d.join(".gitmatrix").is_dir())
+        .map(Path::to_path_buf)
+}
+
+pub fn root() -> Option<PathBuf> {
+    let dir = DIR
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_dir().ok())?;
+    root_from(&dir)
+}
+
+fn read<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    // A file with only comments is an empty configuration.
+    let empty = text
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'));
+    serde_yaml_ng::from_str(if empty { "{}" } else { &text })
+        .map(Some)
+        .map_err(|e| {
+            GmError::new("invalid_config", format!("{}: {e}", path.display()))
+                .hint("Fix the file, or delete it and rerun `gm agent setup`.")
+        })
+}
+
+pub fn project_at(root: &Path) -> Result<Option<Project>> {
+    read(&root.join(PROJECT_FILE))
+}
+
+pub fn local_at(root: &Path) -> Result<Option<Local>> {
+    read(&root.join(LOCAL_FILE))
+}
+
+/// This checkout's configuration, if any; a broken file counts as none here
+/// (`gm agent setup` reports the error).
+pub fn current() -> (Project, Local) {
+    let Some(root) = root() else {
+        return Default::default();
+    };
+    (
+        project_at(&root).ok().flatten().unwrap_or_default(),
+        local_at(&root).ok().flatten().unwrap_or_default(),
+    )
+}
+
+/// The agent gm acts as here: only when a harness is driving and this checkout
+/// was set up for an agent.
+pub fn acting_agent() -> Option<String> {
+    crate::agent::detect()?;
+    current().1.name
+}
+
+/// Defaults for `gm issue next` and friends: this checkout's, then the project's.
+pub struct Defaults {
+    pub agent: Option<String>,
+    pub scope: Scope,
+    pub ttl: u32,
+}
+
+pub fn defaults() -> Defaults {
+    let (project, local) = current();
+    resolve(&project, &local)
+}
+
+fn resolve(project: &Project, local: &Local) -> Defaults {
+    let pick = |mine: &Option<String>, shared: &Option<String>| mine.clone().or(shared.clone());
+    Defaults {
+        agent: local.name.clone(),
+        scope: Scope {
+            owner: pick(&local.scope.owner, &project.tracker.owner),
+            // A checkout scoped under an issue isn't also limited by the project's team.
+            team: if local.scope.under.is_some() {
+                local.scope.team.clone()
+            } else {
+                pick(&local.scope.team, &project.tracker.team)
+            },
+            under: pick(&local.scope.under, &project.tracker.under),
+            workspace: pick(&local.scope.workspace, &project.tracker.workspace),
+        },
+        ttl: local.ttl.or(project.ttl).unwrap_or(DEFAULT_TTL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_checkout_overrides_the_project() {
+        let project: Project = serde_yaml_ng::from_str(
+            "tracker:\n  owner: orbit\n  team: CORE\nttl: 3600\ninstructions:\n  ship: gm push\n",
+        )
+        .unwrap();
+        let local: Local =
+            serde_yaml_ng::from_str("name: builder\nscope:\n  under: CORE-4\n").unwrap();
+        let d = resolve(&project, &local);
+        assert_eq!(d.agent.as_deref(), Some("builder"));
+        assert_eq!(d.scope.owner.as_deref(), Some("orbit"));
+        // Under an issue, the project's team no longer narrows it.
+        assert_eq!(
+            (d.scope.under.as_deref(), d.scope.team),
+            (Some("CORE-4"), None)
+        );
+        assert_eq!(d.ttl, 3600);
+        assert_eq!(
+            resolve(&Project::default(), &Local::default()).ttl,
+            DEFAULT_TTL
+        );
+        // Unknown keys are mistakes, not silently ignored settings.
+        assert!(serde_yaml_ng::from_str::<Project>("tracker:\n  teem: CORE\n").is_err());
+        let text = serde_yaml_ng::to_string(&local).unwrap();
+        assert_eq!(serde_yaml_ng::from_str::<Local>(&text).unwrap(), local);
+    }
+
+    #[test]
+    fn each_harness_reads_its_own_files() {
+        assert!(layout("claude-code").skills.contains(&".claude/skills"));
+        assert_eq!(layout("codex").instructions, ["AGENTS.md"]);
+        assert_eq!(layout("anything").skills, [".agents/skills"]);
+    }
+}
