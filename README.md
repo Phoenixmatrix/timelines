@@ -183,6 +183,8 @@ unneeded environments. Publish source changes with ordinary `gm commit` / `gm pu
 **outside** the scoped `agent gm` wrapper, then check `gm runs wait`.
 `.gitmatrix/ci.yml` starts check, test, build and non-AI E2E independently; all four
 must pass. They exchange no artifacts, so no dependency-stage barrier is needed.
+Cargo is capped at four compiler workers per job so concurrent cold builds leave
+CPU capacity for JavaScript tests and the live server on the 24-CPU source host.
 It runs on the trusted Linux CI host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.
