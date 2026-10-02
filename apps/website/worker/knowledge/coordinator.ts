@@ -9,6 +9,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { db, nowIso } from "../schema.ts";
+import { watchdog } from "./watchdog.ts";
 
 /** Quiet period after the last push before building. */
 const DEBOUNCE_MS = 1_500;
@@ -16,8 +17,6 @@ const DEBOUNCE_MS = 1_500;
 const MAX_WAIT_MS = 8_000;
 /** Check on a running build this often, in case it died without reporting. */
 const WATCHDOG_MS = 60_000;
-/** A build running longer than this is presumed hung: terminated and retried. */
-const STALE_MS = 20 * 60_000;
 /** Retries of a build that crashed or hung, before giving up until the next push. */
 const MAX_RETRIES = 1;
 
@@ -91,7 +90,13 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
       // Watchdog: a build that crashed without reporting must not block forever.
       const instance = await this.env.KNOWLEDGE_BUILD.get(state.running.buildId).catch(() => null);
       const status = instance ? await instance.status().catch(() => null) : null;
-      const stale = Date.now() - state.running.startedAt > STALE_MS;
+      const build = await db(this.env.DB)
+        .selectFrom("kg_builds")
+        .select("progress_at")
+        .where("id", "=", state.running.buildId)
+        .executeTakeFirst();
+      const verdict = watchdog(Date.now(), state.running.startedAt, build?.progress_at ?? null);
+      const stale = verdict !== "running";
       if (status?.status === "complete") {
         state.lastError = null;
         state.builtSeq = state.running.seq;
@@ -104,7 +109,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
           .set({
             status: "failed",
             error: stale
-              ? "Build hung; stopped by the watchdog"
+              ? `Build ${verdict === "stalled" ? "stopped making progress" : "ran too long"}; stopped by the watchdog`
               : `Build ${status?.status ?? "vanished"}`,
             finished_at: nowIso(),
           })

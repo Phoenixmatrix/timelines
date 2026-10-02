@@ -101,9 +101,20 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
   const head = refs?.head ?? null;
   const indexed = state?.indexed_commit ?? null;
 
+  // A build of this very commit already failed; the next push tries again,
+  // not every page view.
+  const failedHere = recent[0]?.status === "failed" && recent[0].toCommit === head;
+
   // Repos that existed before the knowledge graph, or whose push we missed,
   // get built the first time someone looks.
-  if (head && head !== indexed && !current && !coordination.running && !coordination.pending) {
+  if (
+    head &&
+    head !== indexed &&
+    !failedHere &&
+    !current &&
+    !coordination.running &&
+    !coordination.pending
+  ) {
     c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
   }
   return {
@@ -114,7 +125,7 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
       current || coordination.running
         ? "building"
         : head && head !== indexed
-          ? recent[0]?.status === "failed" && recent[0].toCommit === head
+          ? failedHere
             ? "failed"
             : "queued"
           : indexed

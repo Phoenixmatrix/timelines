@@ -157,6 +157,7 @@ export interface Database {
     error: string | null;
     started_at: Generated<string>;
     finished_at: string | null;
+    progress_at: string | null;
   };
   kg_changes: {
     repo_id: string;

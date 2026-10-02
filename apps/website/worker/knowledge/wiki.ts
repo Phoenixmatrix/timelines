@@ -300,6 +300,11 @@ function diagramFor(page: PlannedPage, graph: BuiltGraph, syntheses: Syntheses):
   return fenced.replace(/^```mermaid\n/, "").replace(/\n```$/, "");
 }
 
+/** Room for a page's text. */
+const PAGE_TOKENS = 3500;
+/** Thinking counts against max_tokens, so pages that think get room for both. */
+const THINKING_TOKENS = 8000;
+
 async function write(env: Env, page: PlannedPage, inputs: PageInputs) {
   if (page.kind === "glossary") return { body: glossaryBody(inputs), model: null, tokens: 0 };
   const instruction =
@@ -308,121 +313,137 @@ async function write(env: Env, page: PlannedPage, inputs: PageInputs) {
       : page.kind === "architecture"
         ? "Write the Architecture page: the major parts, how requests and data flow between them, and the key design decisions. Link component pages."
         : `Write the page for the component "${page.title}": its purpose, how it works step by step, its key files and functions, its interfaces with the rest of the system, and anything surprising.`;
-  // The two front pages get the slower, more careful thinking mode.
-  const { text, usage } = await chatText(
-    env,
-    "reason",
-    PAGE_SYSTEM,
-    `${instruction}\n\nMaterial:\n${JSON.stringify(inputs)}`,
-    {
-      maxTokens: 3500,
-      think: page.kind !== "component",
-    },
-  );
+  const draft = (think: boolean) =>
+    chatText(env, "reason", PAGE_SYSTEM, `${instruction}\n\nMaterial:\n${JSON.stringify(inputs)}`, {
+      maxTokens: think ? THINKING_TOKENS : PAGE_TOKENS,
+      think,
+    });
+  // The two front pages get the slower, more careful thinking mode. If the
+  // thinking runs out of room or time, the page is written without it.
+  const { text, usage } =
+    page.kind === "component" ? await draft(false) : await draft(true).catch(() => draft(false));
   const body = stripTrailingDiagram(text.trim().replace(/^#\s+.*\n+/, ""));
   return { body, model: usage.model, tokens: usage.tokens };
+}
+
+/** Everything a wiki page is written from. */
+export interface WikiSource {
+  repoId: string;
+  commit: string;
+  reader: RepoReader;
+  graph: BuiltGraph;
+  syntheses: Syntheses;
+  files: SnapshotFile[];
+  analyses: Map<string, FileAnalysis>;
+  readme: string;
+}
+
+export interface WikiPlan {
+  /** Pages whose inputs changed: each needs clef, a writer, or both. */
+  pending: string[];
+  unchanged: number;
+  removed: number;
 }
 
 export interface WikiStats {
   written: number;
   kept: number;
   unchanged: number;
-  removed: number;
+  /** Pages that could not be settled; they keep their old text and inputs, so the next build tries again. */
+  failed: number;
   tokens: number;
+  /** The first few failures, for the build record. */
+  errors: string[];
 }
 
-/**
- * Bring the wiki up to date with the graph. `changedNodes` (this build's
- * change feed) tells clef what changed when deciding whether a page with new
- * inputs actually needs rewriting.
- */
-export async function updateWiki(
-  env: Env,
-  reader: RepoReader,
-  repoId: string,
-  commit: string,
-  graph: BuiltGraph,
-  syntheses: Syntheses,
-  files: SnapshotFile[],
-  analyses: Map<string, FileAnalysis>,
-  readme: string,
-  changedNodes: Set<string>,
-): Promise<WikiStats> {
-  const stats: WikiStats = { written: 0, kept: 0, unchanged: 0, removed: 0, tokens: 0 };
-  const pages = planPages(graph, syntheses);
-  const stored = await db(env.DB)
+async function pageInputs(source: WikiSource, page: PlannedPage, pages: PlannedPage[]) {
+  const { graph, syntheses, files, analyses, reader, readme } = source;
+  const inputs = await inputsFor(page, pages, graph, syntheses, files, analyses, reader, readme);
+  return { inputs, hash: await sha256(JSON.stringify(inputs)) };
+}
+
+async function storedPages(d1: D1Database, repoId: string) {
+  const stored = await db(d1)
     .selectFrom("wiki_pages")
     .select(["slug", "title", "body", "inputs_hash"])
     .where("repo_id", "=", repoId)
     .execute();
-  const existing = new Map(stored.map((p) => [p.slug, p]));
+  return new Map(stored.map((p) => [p.slug, p]));
+}
 
+// A page whose prose stays keeps its text, but its placement and diagram
+// always follow the current graph.
+const keep = (d1: D1Database, source: WikiSource, page: PlannedPage, hash: string, body: string) =>
+  db(d1)
+    .updateTable("wiki_pages")
+    .set({
+      inputs_hash: hash,
+      title: page.title,
+      section: page.section,
+      position: page.position,
+      node_id: page.nodeId,
+      body: stripTrailingDiagram(body),
+      diagram: diagramFor(page, source.graph, source.syntheses),
+    })
+    .where("repo_id", "=", source.repoId)
+    .where("slug", "=", page.slug);
+
+/**
+ * The cheap half of a wiki update: pages whose inputs are unchanged follow the
+ * graph's placement, pages the graph no longer plans are removed, and the rest
+ * are returned for `updatePages`.
+ */
+export async function planWiki(env: Env, source: WikiSource): Promise<WikiPlan> {
+  const pages = planPages(source.graph, source.syntheses);
+  const existing = await storedPages(env.DB, source.repoId);
   const statements: Statement[] = [];
-  const save = (
-    page: PlannedPage,
-    body: string,
-    hash: string,
-    model: string | null,
-    sources: string[],
-  ) =>
-    db(env.DB)
-      .insertInto("wiki_pages")
-      .values({
-        repo_id: repoId,
-        slug: page.slug,
-        title: page.title,
-        section: page.section,
-        position: page.position,
-        node_id: page.nodeId,
-        body,
-        diagram: diagramFor(page, graph, syntheses),
-        sources: JSON.stringify(sources),
-        inputs_hash: hash,
-        generated_in: commit,
-        model,
-        updated_at: nowIso(),
-      })
-      .onConflict((oc) =>
-        oc.columns(["repo_id", "slug"]).doUpdateSet((eb) => ({
-          title: eb.ref("excluded.title"),
-          section: eb.ref("excluded.section"),
-          position: eb.ref("excluded.position"),
-          node_id: eb.ref("excluded.node_id"),
-          body: eb.ref("excluded.body"),
-          diagram: eb.ref("excluded.diagram"),
-          sources: eb.ref("excluded.sources"),
-          inputs_hash: eb.ref("excluded.inputs_hash"),
-          generated_in: eb.ref("excluded.generated_in"),
-          model: eb.ref("excluded.model"),
-          updated_at: eb.ref("excluded.updated_at"),
-        })),
-      );
-
-  // A page whose prose stays keeps its text, but its placement and diagram
-  // always follow the current graph.
-  const keep = (page: PlannedPage, hash: string, body: string) =>
-    db(env.DB)
-      .updateTable("wiki_pages")
-      .set({
-        inputs_hash: hash,
-        title: page.title,
-        section: page.section,
-        position: page.position,
-        node_id: page.nodeId,
-        body: stripTrailingDiagram(body),
-        diagram: diagramFor(page, graph, syntheses),
-      })
-      .where("repo_id", "=", repoId)
-      .where("slug", "=", page.slug);
-
-  await pool(pages, 3, async (page) => {
-    const inputs = await inputsFor(page, pages, graph, syntheses, files, analyses, reader, readme);
-    const hash = await sha256(JSON.stringify(inputs));
+  const pending: string[] = [];
+  await pool(pages, 8, async (page) => {
+    const { hash } = await pageInputs(source, page, pages);
     const before = existing.get(page.slug);
-    const sources = page.component?.files ?? [];
+    if (before?.inputs_hash === hash)
+      statements.push(keep(env.DB, source, page, hash, before.body));
+    else pending.push(page.slug);
+  });
+  const wanted = new Set(pages.map((p) => p.slug));
+  const removed = [...existing.keys()].filter((s) => !wanted.has(s));
+  for (const slugName of removed) {
+    statements.push(
+      db(env.DB)
+        .deleteFrom("wiki_pages")
+        .where("repo_id", "=", source.repoId)
+        .where("slug", "=", slugName),
+    );
+  }
+  await runBatched(env.DB, statements);
+  const order = new Map(pages.map((p, i) => [p.slug, i]));
+  pending.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
+  return { pending, unchanged: pages.length - pending.length, removed: removed.length };
+}
+
+/**
+ * Bring the given pages up to date. A page with new inputs is rewritten only if
+ * clef agrees that `changedNodes` (this build's change feed) makes it out of
+ * date. Each page is saved as soon as it is settled, so a retried step only
+ * redoes the pages it had not finished; a page that fails is left as it was.
+ */
+export async function updatePages(
+  env: Env,
+  source: WikiSource,
+  slugs: string[],
+  changedNodes: Set<string>,
+): Promise<WikiStats> {
+  const stats: WikiStats = { written: 0, kept: 0, unchanged: 0, failed: 0, tokens: 0, errors: [] };
+  const { graph, syntheses, repoId, commit } = source;
+  const pages = planPages(graph, syntheses);
+  const wanted = new Set(slugs);
+  const existing = await storedPages(env.DB, repoId);
+
+  const settle = async (page: PlannedPage) => {
+    const { inputs, hash } = await pageInputs(source, page, pages);
+    const before = existing.get(page.slug);
     if (before?.inputs_hash === hash) {
       stats.unchanged++;
-      statements.push(keep(page, hash, before.body));
       return;
     }
     if (before && page.kind !== "glossary") {
@@ -440,45 +461,77 @@ export async function updateWiki(
           const node = graph.nodes.find((n) => n.id === id);
           return { node: id, now: node?.summary ?? "(removed)" };
         });
-      if (relevant.length === 0) {
-        stats.kept++;
-        statements.push(keep(page, hash, before.body));
-        return;
-      }
-      const answers = await decide(
-        env,
-        { page: { title: before.title, text: before.body.slice(0, 4000) }, changes: relevant },
-        {
-          stale: {
-            type: "noul",
-            instructions:
-              "Given what changed in the code (each change shows the element's current description), would this wiki page now be wrong, misleading or missing something important?",
+      let stale = false;
+      if (relevant.length > 0) {
+        const answers = await decide(
+          env,
+          { page: { title: before.title, text: before.body.slice(0, 4000) }, changes: relevant },
+          {
+            stale: {
+              type: "noul",
+              instructions:
+                "Given what changed in the code (each change shows the element's current description), would this wiki page now be wrong, misleading or missing something important?",
+            },
           },
-        },
-      );
-      if (yes(answers.stale) < 0.3) {
+        );
+        stale = yes(answers.stale) >= 0.3;
+      }
+      if (!stale) {
         stats.kept++;
-        statements.push(keep(page, hash, before.body));
+        await keep(env.DB, source, page, hash, before.body).execute();
         return;
       }
     }
     const written = await write(env, page, inputs);
+    await db(env.DB)
+      .insertInto("wiki_pages")
+      .values({
+        repo_id: repoId,
+        slug: page.slug,
+        title: page.title,
+        section: page.section,
+        position: page.position,
+        node_id: page.nodeId,
+        body: written.body,
+        diagram: diagramFor(page, graph, syntheses),
+        sources: JSON.stringify(page.component?.files ?? []),
+        inputs_hash: hash,
+        generated_in: commit,
+        model: written.model,
+        updated_at: nowIso(),
+      })
+      .onConflict((oc) =>
+        oc.columns(["repo_id", "slug"]).doUpdateSet((eb) => ({
+          title: eb.ref("excluded.title"),
+          section: eb.ref("excluded.section"),
+          position: eb.ref("excluded.position"),
+          node_id: eb.ref("excluded.node_id"),
+          body: eb.ref("excluded.body"),
+          diagram: eb.ref("excluded.diagram"),
+          sources: eb.ref("excluded.sources"),
+          inputs_hash: eb.ref("excluded.inputs_hash"),
+          generated_in: eb.ref("excluded.generated_in"),
+          model: eb.ref("excluded.model"),
+          updated_at: eb.ref("excluded.updated_at"),
+        })),
+      )
+      .execute();
     stats.written++;
     stats.tokens += written.tokens;
-    statements.push(save(page, written.body, hash, written.model, sources));
-  });
+  };
 
-  const wanted = new Set(pages.map((p) => p.slug));
-  for (const slugName of existing.keys()) {
-    if (wanted.has(slugName)) continue;
-    stats.removed++;
-    statements.push(
-      db(env.DB)
-        .deleteFrom("wiki_pages")
-        .where("repo_id", "=", repoId)
-        .where("slug", "=", slugName),
-    );
-  }
-  await runBatched(env.DB, statements);
+  await pool(
+    pages.filter((p) => wanted.has(p.slug)),
+    3,
+    async (page) => {
+      try {
+        await settle(page);
+      } catch (error) {
+        stats.failed++;
+        const message = error instanceof Error ? error.message : String(error);
+        if (stats.errors.length < 3) stats.errors.push(`${page.slug}: ${message.slice(0, 300)}`);
+      }
+    },
+  );
   return stats;
 }

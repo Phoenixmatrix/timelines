@@ -77,10 +77,12 @@ export function KnowledgeStatusPill({ status }: { status: KnowledgeStatus }) {
       : status.state === "up-to-date"
         ? "bg-online"
         : "bg-ink-faint";
+  // Why the last update failed; it retries on the next push.
+  const failure = status.state === "failed" ? status.recent[0]?.error : null;
   return (
     <span
       className="inline-flex items-center gap-2 rounded-full bg-raised px-3 py-1 text-body-sm text-ink-muted"
-      title={status.indexedAt ? `Indexed ${timeAgo(status.indexedAt)}` : undefined}
+      title={failure ?? (status.indexedAt ? `Indexed ${timeAgo(status.indexedAt)}` : undefined)}
       role="status"
       aria-live="polite"
     >

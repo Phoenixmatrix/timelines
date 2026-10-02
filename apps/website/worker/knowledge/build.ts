@@ -1,6 +1,7 @@
 // The build pipeline, as a Workflow: durable steps with retries, so a failed
 // model call retries that step instead of the whole build, and progress
-// survives restarts. Steps are ordered so cheap, exact results land first:
+// survives restarts. Each step records when it finished (progress_at) for the
+// coordinator's watchdog. Steps are ordered so cheap, exact results land first:
 //
 //   start       resolve HEAD, record the build
 //   snapshot    list the commit's files; find what changed since last time
@@ -12,7 +13,9 @@
 //   review      related kept concepts, asked again with definitions (clef)
 //   graph-final apply the new syntheses
 //   index       Vectorize (entities) and AI Search (passages)
-//   wiki        rewrite only the pages whose inputs changed and matter
+//   wiki-plan   keep pages whose inputs are unchanged; list the rest
+//   wiki-N      rewrite the listed pages that matter, a few per step
+//   wiki-search index the pages for AI Search
 //   finish      promote the snapshot, record stats, tell the coordinator
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
@@ -41,7 +44,7 @@ import { syncSearchFiles, syncSearchPages, syncVectors } from "./indexes.ts";
 import { synthesize } from "./synthesize.ts";
 import { coordinator } from "./coordinator.ts";
 import { chunk } from "./util.ts";
-import { updateWiki } from "./wiki.ts";
+import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.ts";
 
 export interface BuildParams {
   repoId: string;
@@ -63,6 +66,8 @@ const STEP = {
   timeout: "15 minutes",
 } as const;
 const ANALYZE_BATCH = 32;
+/** Wiki pages per step: a few model calls, far inside the step timeout. */
+const WIKI_BATCH = 6;
 
 async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> {
   const row = await db(d1)
@@ -162,11 +167,60 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     return blob ? new TextDecoder().decode(blob.bytes) : "";
   }
 
+  /** The build's files and graph with stored syntheses: what wiki pages are written from. */
+  async #wikiSource(
+    reader: RepoReader,
+    row: RepoRow,
+    buildId: string,
+    head: string,
+  ): Promise<WikiSource> {
+    const env = this.env;
+    const files = await loadSnapshot(env.DB, row.id, buildId);
+    const analyses = await loadAnalyses(
+      env.DB,
+      files.map((f) => f.blob),
+    );
+    const concepts = await loadConceptModel(env.DB, row.id);
+    const readme = await this.#readme(reader, files);
+    const { syntheses } = await synthesize(
+      env,
+      row.full_name,
+      files,
+      analyses,
+      buildGraph(
+        row.full_name,
+        files,
+        analyses,
+        {
+          components: new Map(),
+          concepts: new Map(),
+        },
+        concepts,
+      ),
+      readme,
+      true,
+    );
+    const graph = buildGraph(row.full_name, files, analyses, syntheses, concepts);
+    return { repoId: row.id, commit: head, reader, graph, syntheses, files, analyses, readme };
+  }
+
   async run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
     const { repoId, buildId, force } = event.payload;
     const env = this.env;
+    // A durable step that records when it finished, so the coordinator's
+    // watchdog can tell a slow build from a stuck one.
+    const progress = <T extends Rpc.Serializable<T>>(name: string, work: () => Promise<T>) =>
+      step.do(name, STEP, async () => {
+        const result = await work();
+        await db(env.DB)
+          .updateTable("kg_builds")
+          .set({ progress_at: nowIso() })
+          .where("id", "=", buildId)
+          .execute();
+        return result;
+      });
     try {
-      const start = await step.do("start", STEP, async () => {
+      const start = await progress("start", async () => {
         const row = await repoRow(env.DB, repoId);
         if (!row) return null;
         invalidateRefs(row.artifacts_name);
@@ -200,7 +254,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return { status: "up-to-date" };
       }
 
-      const toAnalyze = await step.do("snapshot", STEP, async () =>
+      const toAnalyze = await progress("snapshot", async () =>
         this.#withReader(row, async (reader) => {
           const commit = await reader.commit(head);
           if (!commit) throw new Error(`Commit ${head} not found`);
@@ -240,13 +294,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       let reused = 0;
       let failed = 0;
       for (const [i, group] of chunk(toAnalyze, ANALYZE_BATCH).entries()) {
-        const stats = await step.do(`analyze-${i}`, STEP, () =>
+        const stats = await progress(`analyze-${i}`, () =>
           this.#withReader(row, (reader) => analyzeFiles(env, reader, group)),
         );
         analyzed += stats.analyzed;
         reused += stats.reused;
         failed += stats.failed;
-        await step.do(`progress-${i}`, async () => {
+        await progress(`progress-${i}`, async () => {
           await setPhase(env.DB, buildId, "analyze", {
             analyzed,
             reused,
@@ -259,7 +313,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // The graph goes live with exact structure and whatever meaning is cached,
       // before any slow synthesis runs.
-      const firstPass = await step.do("graph", STEP, () =>
+      const firstPass = await progress("graph", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -313,7 +367,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       // Concepts: align names and trim noise with clef. After the first build
       // only the concepts a push introduced cost model calls.
       // Counted from what is stored, so calls made by a retried step count too.
-      const decidedBefore = await step.do("align-start", STEP, async () => {
+      const decidedBefore = await progress("align-start", async () => {
         const row = await db(env.DB)
           .selectFrom("kg_concept_pairs")
           .select((eb) => eb.fn.countAll<number>().as("n"))
@@ -323,7 +377,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       });
       let pairsAsked = 0;
       for (let round = 0; round < 25; round++) {
-        const aligned = await step.do(`align-${round}`, STEP, async () => {
+        const aligned = await progress(`align-${round}`, async () => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
             env.DB,
@@ -334,7 +388,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         pairsAsked = Math.max(0, aligned.decided - decidedBefore);
         if (aligned.remaining === 0) break;
       }
-      const conceptStats = await step.do("concepts", STEP, async () => {
+      const conceptStats = await progress("concepts", async () => {
         const files = await loadSnapshot(env.DB, repoId, buildId);
         const analyses = await loadAnalyses(
           env.DB,
@@ -351,7 +405,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return stats;
       });
 
-      const synthesis = await step.do("synthesize", STEP, () =>
+      const synthesis = await progress("synthesize", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -383,7 +437,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // With definitions written, related pairs of kept concepts get a second
       // look; any merge it finds regroups concepts and defines the new group.
-      const review = await step.do("review", STEP, () =>
+      const review = await progress("review", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -421,7 +475,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         }),
       );
 
-      await step.do("graph-final", STEP, () =>
+      await progress("graph-final", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -458,7 +512,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         }),
       );
 
-      await step.do("index", STEP, () =>
+      await progress("index", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -513,62 +567,65 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         }),
       );
 
-      const wiki = await step.do("wiki", STEP, () =>
-        this.#withReader(row, async (reader) => {
-          const files = await loadSnapshot(env.DB, repoId, buildId);
-          const analyses = await loadAnalyses(
-            env.DB,
-            files.map((f) => f.blob),
-          );
-          const concepts = await loadConceptModel(env.DB, repoId);
-          const readme = await this.#readme(reader, files);
-          const { syntheses } = await synthesize(
-            env,
-            row.full_name,
-            files,
-            analyses,
-            buildGraph(
-              row.full_name,
-              files,
-              analyses,
-              {
-                components: new Map(),
-                concepts: new Map(),
-              },
-              concepts,
-            ),
-            readme,
-            true,
-          );
-          const graph = buildGraph(row.full_name, files, analyses, syntheses, concepts);
-          const results = await db(env.DB)
-            .selectFrom("kg_changes")
-            .select("node_id")
-            .distinct()
-            .where("repo_id", "=", repoId)
-            .where("build_id", "=", buildId)
-            .execute();
-          const stats = await updateWiki(
-            env,
-            reader,
-            repoId,
-            head,
-            graph,
-            syntheses,
-            files,
-            analyses,
-            readme,
-            new Set(results.map((r) => r.node_id)),
-          );
-          const pages = await db(env.DB)
-            .selectFrom("wiki_pages")
-            .select(["slug", "title", "body", "inputs_hash"])
-            .where("repo_id", "=", repoId)
-            .execute();
-          await syncSearchPages(env, repoId, head, pages);
-          return stats;
-        }),
+      // The wiki, a few pages per step. Each page is saved as soon as it is
+      // settled, so a retried step or a restarted build resumes where it stopped.
+      const plan = await progress("wiki-plan", () =>
+        this.#withReader(row, async (reader) =>
+          planWiki(env, await this.#wikiSource(reader, row, buildId, head)),
+        ),
       );
+      const wiki: WikiStats = {
+        written: 0,
+        kept: 0,
+        unchanged: plan.unchanged,
+        failed: 0,
+        tokens: 0,
+        errors: [],
+      };
+      for (const [i, slugs] of chunk(plan.pending, WIKI_BATCH).entries()) {
+        const stats = await progress(`wiki-${i}`, () =>
+          this.#withReader(row, async (reader) => {
+            const results = await db(env.DB)
+              .selectFrom("kg_changes")
+              .select("node_id")
+              .distinct()
+              .where("repo_id", "=", repoId)
+              .where("build_id", "=", buildId)
+              .execute();
+            const stats = await updatePages(
+              env,
+              await this.#wikiSource(reader, row, buildId, head),
+              slugs,
+              new Set(results.map((r) => r.node_id)),
+            );
+            await setPhase(env.DB, buildId, "wiki", {
+              wikiPages: plan.pending.length,
+              wikiDone: Math.min((i + 1) * WIKI_BATCH, plan.pending.length),
+            });
+            return stats;
+          }),
+        );
+        wiki.written += stats.written;
+        wiki.kept += stats.kept;
+        wiki.unchanged += stats.unchanged;
+        wiki.failed += stats.failed;
+        wiki.tokens += stats.tokens;
+        wiki.errors.push(...stats.errors.slice(0, 3 - wiki.errors.length));
+      }
+      // Pages that fail keep their old text and are retried by the next build,
+      // but a wiki that could not write anything means the provider is down.
+      if (wiki.failed > 0 && wiki.written + wiki.kept === 0) {
+        throw new Error(`No wiki page could be written: ${wiki.errors[0] ?? "unknown error"}`);
+      }
+      await progress("wiki-search", async () => {
+        const pages = await db(env.DB)
+          .selectFrom("wiki_pages")
+          .select(["slug", "title", "body", "inputs_hash"])
+          .where("repo_id", "=", repoId)
+          .execute();
+        await syncSearchPages(env, repoId, head, pages);
+        return null;
+      });
 
       await this.#finish(step, repoId, buildId, head, {
         analyzed,
@@ -580,6 +637,8 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         conceptReviewMerges: review.newMerges,
         pagesWritten: wiki.written,
         pagesKept: wiki.kept,
+        pagesRemoved: plan.removed,
+        ...(wiki.failed ? { pagesFailed: wiki.failed, pageErrors: wiki.errors } : {}),
       });
       return { status: "succeeded", head };
     } catch (error) {

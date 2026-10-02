@@ -671,7 +671,7 @@ export async function reviewConcepts(
     mentioned_in: (graph.conceptFiles.get(key) ?? []).slice(0, 4),
   });
   let asked = 0;
-  const statements: Statement[] = [];
+  // Each answer is saved as it arrives, so a retried step doesn't ask again.
   await pool([...candidates], CLEF_CONCURRENCY, async (pk) => {
     const [a, b] = splitPair(pk);
     const hash = await sha256(`${ALIGNER}\u0000${JSON.stringify([kept.get(a), kept.get(b)])}`);
@@ -685,19 +685,17 @@ export async function reviewConcepts(
     const score = link?.type === "score" ? link.score : 0;
     asked++;
     reviews.set(pk, { a, b, score, inputs_hash: hash });
-    statements.push(
-      db(d1)
-        .insertInto("kg_concept_reviews")
-        .values({ repo_id: repoId, a, b, score, inputs_hash: hash })
-        .onConflict((oc) =>
-          oc.columns(["repo_id", "a", "b"]).doUpdateSet((eb) => ({
-            score: eb.ref("excluded.score"),
-            inputs_hash: eb.ref("excluded.inputs_hash"),
-          })),
-        ),
-    );
+    await db(d1)
+      .insertInto("kg_concept_reviews")
+      .values({ repo_id: repoId, a, b, score, inputs_hash: hash })
+      .onConflict((oc) =>
+        oc.columns(["repo_id", "a", "b"]).doUpdateSet((eb) => ({
+          score: eb.ref("excluded.score"),
+          inputs_hash: eb.ref("excluded.inputs_hash"),
+        })),
+      )
+      .execute();
   });
-  await runBatched(d1, statements);
   const newMerges = [...reviews.values()].filter(
     (r) => r.score >= SAME && (canonical.get(r.a) ?? r.a) !== (canonical.get(r.b) ?? r.b),
   ).length;
