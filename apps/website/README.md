@@ -673,7 +673,11 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   by a hash of their inputs.
 - **Retrieval:** Vectorize holds one embedding per entity
   (`qwen3-embedding-0.6b`); AI Search holds source files and wiki pages for
-  hybrid keyword + semantic passage search with reranking.
+  hybrid keyword + semantic passage search with reranking. The reranker scores
+  raw code far below prose about the same thing, so its cutoff alone hid source
+  passages whenever the wiki or a README covered them; search keeps passages the
+  reranker scores at 0.4 or more, then ones with vector similarity of 0.5 or more
+  (`selectPassages` in `worker/knowledge/indexes.ts`).
 - **Concepts are aligned and trimmed with `clef`** (`worker/knowledge/concepts.ts`),
   after the entity-alignment recipe: candidate pairs come from shared uncommon
   words and mutual nearest neighbours by name embedding; `clef` scores each

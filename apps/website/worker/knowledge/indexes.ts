@@ -184,3 +184,34 @@ export async function syncSearchPages(
   await pool(stale, 6, (row) => forget(env, repoId, row));
   return { uploaded: changed.length, deleted: stale.length };
 }
+
+/** The reranker's own bar for a passage (AI Search's default). */
+export const RERANK_MATCH = 0.4;
+/** Vector similarity strong enough to keep a passage the reranker underrates. */
+export const VECTOR_MATCH = 0.5;
+/** Candidates to ask AI Search for, before choosing passages. */
+export const PASSAGE_CANDIDATES = 20;
+const MAX_PASSAGES = 10;
+
+type SearchChunk = AiSearchSearchResponse["chunks"][number];
+
+/**
+ * Passages worth showing from candidates searched with no reranking cutoff.
+ * The reranker scores raw code far below prose about the same thing (a file
+ * that vector search ranks first can score 0.1), so its default cutoff alone
+ * hides code whenever the wiki or a README covers it. Keep what the reranker
+ * likes, then what vector similarity alone vouches for.
+ */
+export function selectPassages(chunks: SearchChunk[]): SearchChunk[] {
+  const reranked = chunks.filter(
+    (chunk) => (chunk.scoring_details?.reranking_score ?? chunk.score) >= RERANK_MATCH,
+  );
+  const similar = chunks.filter(
+    (chunk) =>
+      !reranked.includes(chunk) && (chunk.scoring_details?.vector_score ?? 0) >= VECTOR_MATCH,
+  );
+  similar.sort(
+    (a, b) => (b.scoring_details?.vector_score ?? 0) - (a.scoring_details?.vector_score ?? 0),
+  );
+  return [...reranked, ...similar].slice(0, MAX_PASSAGES);
+}

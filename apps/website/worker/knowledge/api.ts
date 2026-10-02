@@ -32,7 +32,7 @@ import type { RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { db, type Database } from "../schema.ts";
 import { coordinator, notifyKnowledge } from "./coordinator.ts";
-import { SEARCH_INSTANCE } from "./indexes.ts";
+import { PASSAGE_CANDIDATES, SEARCH_INSTANCE, selectPassages } from "./indexes.ts";
 import { embed } from "./models.ts";
 
 export const knowledge = new Hono<AppEnv>();
@@ -400,12 +400,17 @@ knowledge.get("/search", async (c) => {
     const result = await c.env.SEARCH.get(SEARCH_INSTANCE).search({
       query,
       ai_search_options: {
-        retrieval: { retrieval_type: "hybrid", max_num_results: 10, filters: { repo: row.id } },
-        reranking: { enabled: true },
+        retrieval: {
+          retrieval_type: "hybrid",
+          max_num_results: PASSAGE_CANDIDATES,
+          filters: { repo: row.id },
+        },
+        // Ordering only: selectPassages applies the relevance bar.
+        reranking: { enabled: true, match_threshold: 0 },
         cache: { enabled: false },
       },
     });
-    return result.chunks.map((chunk) => ({
+    return selectPassages(result.chunks).map((chunk) => ({
       kind: (chunk.item.metadata?.kind === "wiki" ? "wiki" : "code") as "code" | "wiki",
       path: text(chunk.item.metadata?.path) || chunk.item.key,
       text: chunk.text,
