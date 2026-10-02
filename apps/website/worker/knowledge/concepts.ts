@@ -166,10 +166,14 @@ function tokens(name: string): Set<string> {
  * that shares a word with dozens of concepts would otherwise cost a clef call
  * for each, nearly all "different": on this repository's decisions, four per
  * concept kept 91% of the merges for half the calls.
+ *
+ * With `newcomers`, only their own closest count: a newcomer that happens to
+ * rank among an established concept's closest is not asked about for that.
  */
 export function tokenCandidates(
   names: Map<string, string>,
   perConcept = PAIRS_PER_CONCEPT,
+  newcomers?: ReadonlySet<string>,
 ): [string, string][] {
   const tok = new Map([...names].map(([key, name]) => [key, tokens(name)]));
   const index = new Map<string, string[]>();
@@ -202,12 +206,15 @@ export function tokenCandidates(
       }
     }
   }
-  // Keep a pair when it is among the closest for either of its concepts. Ranks
-  // depend only on names, so pairs already decided keep their places and a new
-  // build asks only about what the newcomers changed.
+  // Keep a pair when it is among the closest for either of its concepts (or,
+  // given newcomers, for a newcomer). Ranks depend only on names, so pairs
+  // already decided keep their places.
   const closest = new Map<string, { pair: [string, string]; rank: number }[]>();
   for (const entry of ranked) {
-    for (const key of entry.pair) closest.set(key, [...(closest.get(key) ?? []), entry]);
+    for (const key of entry.pair) {
+      if (newcomers && !newcomers.has(key)) continue;
+      closest.set(key, [...(closest.get(key) ?? []), entry]);
+    }
   }
   const kept = new Set<{ pair: [string, string]; rank: number }>();
   for (const entries of closest.values()) {
@@ -425,7 +432,9 @@ export async function alignPairs(
   const fresh = [...names.keys()].filter((k) => !known.has(k));
 
   const candidates = new Map<string, [string, string]>();
-  for (const [a, b] of tokenCandidates(names)) candidates.set(pairKey(a, b), [a, b]);
+  // Only concepts new to the repository bring pairs (on its first build, all are).
+  for (const [a, b] of tokenCandidates(names, PAIRS_PER_CONCEPT, new Set(fresh)))
+    candidates.set(pairKey(a, b), [a, b]);
   // Embeddings find synonyms with no word in common; they are only worth
   // computing when there are new concepts to place.
   if (fresh.length && names.size <= MAX_EMBEDDED) {

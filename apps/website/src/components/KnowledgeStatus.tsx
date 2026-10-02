@@ -8,6 +8,7 @@ const PHASES: Record<string, string> = {
   queued: "Starting",
   snapshot: "Reading files",
   analyze: "Analyzing changed files",
+  graph: "Updating the graph",
   align: "Linking concepts",
   synthesize: "Summarizing components",
   index: "Updating search indexes",
@@ -22,6 +23,9 @@ function describe(status: KnowledgeStatus): string {
       const s = current?.stats ?? {};
       if (current?.phase === "analyze" && typeof s.toAnalyze === "number" && s.toAnalyze > 0) {
         return `${phase} (${Number(s.analyzeDone ?? 0)}/${s.toAnalyze})`;
+      }
+      if (current?.phase === "wiki" && typeof s.wikiPages === "number" && s.wikiPages > 0) {
+        return `${phase} (${Number(s.wikiDone ?? 0)}/${s.wikiPages})`;
       }
       return phase;
     }

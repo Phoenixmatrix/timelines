@@ -50,6 +50,10 @@ describe("tokenCandidates", () => {
     expect(uncapped.length).toBe(29);
     // Each concept contributes at most its two closest.
     expect(capped.length).toBeLessThanOrEqual(2 * names.size);
+    // Given newcomers, only their own closest count.
+    const fresh = tokenCandidates(names, 2, new Set(["artifact-registry"]));
+    expect(fresh.length).toBe(2);
+    expect(fresh.every((p) => p.includes("artifact-registry"))).toBe(true);
     // Nesting outranks shared words: with room for one, "Artifact Registry"
     // keeps the name it is made of.
     expect(tokenCandidates(names, 1).map(([a, b]) => pairKey(a, b))).toContain(

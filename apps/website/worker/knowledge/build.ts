@@ -89,15 +89,16 @@ async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> 
 const patchStats = (stats: Record<string, unknown>) =>
   sql<string>`json_patch(stats, ${JSON.stringify(stats)})`;
 
-async function setPhase(
-  d1: D1Database,
-  buildId: string,
-  phase: string,
-  stats?: Record<string, unknown>,
-) {
+/** The phase a build is in, set as each step starts (so labels never lag). */
+async function setPhase(d1: D1Database, buildId: string, phase: string) {
+  await db(d1).updateTable("kg_builds").set({ phase }).where("id", "=", buildId).execute();
+}
+
+/** Merge `stats` into a build's stats, leaving its phase alone. */
+async function recordStats(d1: D1Database, buildId: string, stats: Record<string, unknown>) {
   await db(d1)
     .updateTable("kg_builds")
-    .set(stats ? { phase, stats: patchStats(stats) } : { phase })
+    .set({ stats: patchStats(stats) })
     .where("id", "=", buildId)
     .execute();
 }
@@ -207,10 +208,15 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
   async run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
     const { repoId, buildId, force } = event.payload;
     const env = this.env;
-    // A durable step that records when it finished, so the coordinator's
-    // watchdog can tell a slow build from a stuck one.
-    const progress = <T extends Rpc.Serializable<T>>(name: string, work: () => Promise<T>) =>
+    // A durable step that shows its phase while it runs, and records when it
+    // finished so the coordinator's watchdog can tell a slow build from a stuck one.
+    const progress = <T extends Rpc.Serializable<T>>(
+      name: string,
+      phase: string,
+      work: () => Promise<T>,
+    ) =>
       step.do(name, STEP, async () => {
+        await setPhase(env.DB, buildId, phase);
         const result = await work();
         await db(env.DB)
           .updateTable("kg_builds")
@@ -220,7 +226,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return result;
       });
     try {
-      const start = await progress("start", async () => {
+      const start = await progress("start", "snapshot", async () => {
         const row = await repoRow(env.DB, repoId);
         if (!row) return null;
         invalidateRefs(row.artifacts_name);
@@ -254,7 +260,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return { status: "up-to-date" };
       }
 
-      const toAnalyze = await progress("snapshot", async () =>
+      const toAnalyze = await progress("snapshot", "snapshot", async () =>
         this.#withReader(row, async (reader) => {
           const commit = await reader.commit(head);
           if (!commit) throw new Error(`Commit ${head} not found`);
@@ -279,7 +285,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const pending: FileToAnalyze[] = files
             .filter((f) => !known.has(f.blob))
             .map((f) => ({ path: f.path, blob: f.blob, previousBlob: previous.get(f.path) }));
-          await setPhase(env.DB, buildId, "analyze", {
+          await recordStats(env.DB, buildId, {
             files: files.length,
             changedFiles: files.filter((f) => previous.get(f.path) !== f.blob).length,
             removedFiles: [...previous.keys()].filter((p) => !files.some((f) => f.path === p))
@@ -294,14 +300,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       let reused = 0;
       let failed = 0;
       for (const [i, group] of chunk(toAnalyze, ANALYZE_BATCH).entries()) {
-        const stats = await progress(`analyze-${i}`, () =>
+        const stats = await progress(`analyze-${i}`, "analyze", () =>
           this.#withReader(row, (reader) => analyzeFiles(env, reader, group)),
         );
         analyzed += stats.analyzed;
         reused += stats.reused;
         failed += stats.failed;
-        await progress(`progress-${i}`, async () => {
-          await setPhase(env.DB, buildId, "analyze", {
+        await progress(`progress-${i}`, "analyze", async () => {
+          await recordStats(env.DB, buildId, {
             analyzed,
             reused,
             failed,
@@ -313,7 +319,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // The graph goes live with exact structure and whatever meaning is cached,
       // before any slow synthesis runs.
-      const firstPass = await progress("graph", () =>
+      const firstPass = await progress("graph", "graph", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -349,7 +355,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             concepts,
           );
           const diff = await applyGraph(env.DB, repoId, buildId, head, graph);
-          await setPhase(env.DB, buildId, "align", {
+          await recordStats(env.DB, buildId, {
             nodes: graph.nodes.length,
             edges: graph.edges.length,
             graphAdded: diff.added.length,
@@ -367,7 +373,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       // Concepts: align names and trim noise with clef. After the first build
       // only the concepts a push introduced cost model calls.
       // Counted from what is stored, so calls made by a retried step count too.
-      const decidedBefore = await progress("align-start", async () => {
+      const decidedBefore = await progress("align-start", "align", async () => {
         const row = await db(env.DB)
           .selectFrom("kg_concept_pairs")
           .select((eb) => eb.fn.countAll<number>().as("n"))
@@ -377,7 +383,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       });
       let pairsAsked = 0;
       for (let round = 0; round < 25; round++) {
-        const aligned = await progress(`align-${round}`, async () => {
+        const aligned = await progress(`align-${round}`, "align", async () => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
             env.DB,
@@ -388,14 +394,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         pairsAsked = Math.max(0, aligned.decided - decidedBefore);
         if (aligned.remaining === 0) break;
       }
-      const conceptStats = await progress("concepts", async () => {
+      const conceptStats = await progress("concepts", "align", async () => {
         const files = await loadSnapshot(env.DB, repoId, buildId);
         const analyses = await loadAnalyses(
           env.DB,
           files.map((f) => f.blob),
         );
         const stats = await settleConcepts(env, repoId, files, analyses);
-        await setPhase(env.DB, buildId, "synthesize", {
+        await recordStats(env.DB, buildId, {
           conceptPairsAsked: pairsAsked,
           concepts: stats.groups,
           conceptsMerged: stats.merged,
@@ -405,7 +411,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return stats;
       });
 
-      const synthesis = await progress("synthesize", () =>
+      const synthesis = await progress("synthesize", "synthesize", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -437,7 +443,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // With definitions written, related pairs of kept concepts get a second
       // look; any merge it finds regroups concepts and defines the new group.
-      const review = await progress("review", () =>
+      const review = await progress("review", "synthesize", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -475,7 +481,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         }),
       );
 
-      await progress("graph-final", () =>
+      await progress("graph-final", "synthesize", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -505,14 +511,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           );
           const graph = buildGraph(row.full_name, files, analyses, syntheses, concepts);
           await applyGraph(env.DB, repoId, buildId, head, graph);
-          await setPhase(env.DB, buildId, "index", {
+          await recordStats(env.DB, buildId, {
             synthesized: synthesis.components + synthesis.concepts + (synthesis.repo ? 1 : 0),
           });
           return null;
         }),
       );
 
-      await progress("index", () =>
+      await progress("index", "index", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -559,7 +565,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           );
           const vectors = await syncVectors(env, repoId, graph.nodes, diff);
           const search = await syncSearchFiles(env, reader, repoId, head, files, analyses);
-          await setPhase(env.DB, buildId, "wiki", {
+          await recordStats(env.DB, buildId, {
             vectorsUpserted: vectors.upserted,
             searchUploaded: search.uploaded,
           });
@@ -569,7 +575,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // The wiki, a few pages per step. Each page is saved as soon as it is
       // settled, so a retried step or a restarted build resumes where it stopped.
-      const plan = await progress("wiki-plan", () =>
+      const plan = await progress("wiki-plan", "wiki", () =>
         this.#withReader(row, async (reader) =>
           planWiki(env, await this.#wikiSource(reader, row, buildId, head)),
         ),
@@ -583,7 +589,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         errors: [],
       };
       for (const [i, slugs] of chunk(plan.pending, WIKI_BATCH).entries()) {
-        const stats = await progress(`wiki-${i}`, () =>
+        const stats = await progress(`wiki-${i}`, "wiki", () =>
           this.#withReader(row, async (reader) => {
             const results = await db(env.DB)
               .selectFrom("kg_changes")
@@ -598,7 +604,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
               slugs,
               new Set(results.map((r) => r.node_id)),
             );
-            await setPhase(env.DB, buildId, "wiki", {
+            await recordStats(env.DB, buildId, {
               wikiPages: plan.pending.length,
               wikiDone: Math.min((i + 1) * WIKI_BATCH, plan.pending.length),
             });
@@ -617,7 +623,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       if (wiki.failed > 0 && wiki.written + wiki.kept === 0) {
         throw new Error(`No wiki page could be written: ${wiki.errors[0] ?? "unknown error"}`);
       }
-      await progress("wiki-search", async () => {
+      await progress("wiki-search", "wiki", async () => {
         const pages = await db(env.DB)
           .selectFrom("wiki_pages")
           .select(["slug", "title", "body", "inputs_hash"])
