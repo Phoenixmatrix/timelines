@@ -573,6 +573,9 @@ and semantic code changes; the `reason` model writes an introduction from the
 non-internal entries. Prompts describe code changes without claiming deployment.
 Entries retain their sources, model and inputs hash. Identical inputs reuse
 existing output across days and tags; new or changed groups require generation.
+Stale-entry cleanup compares persisted subjects with all current drafts, including
+unfinished ones, then deletes stale IDs in batches of at most 90. Large daily
+digests stay within D1's 100-parameter limit without losing pending entries.
 Both summary and entry APIs expose `lastCommitAt`, the latest Git committer
 timestamp in that group. Summary `kind` and entry `releaseKind` distinguish
 `daily` from `tag`; tracker completion remains source evidence only.

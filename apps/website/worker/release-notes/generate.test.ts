@@ -70,6 +70,17 @@ function setup() {
     },
   };
   const env = { DB: d1(sqlite), AI } as unknown as Env;
+  // node:sqlite permits more bindings than deployed D1.
+  const prepare = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    const statement = prepare(sql);
+    const bind = statement.bind.bind(statement);
+    statement.bind = (...values) => {
+      if (values.length > 100) throw new Error(`D1 binding limit exceeded: ${values.length}`);
+      return bind(...values);
+    };
+    return statement;
+  };
 
   // Oldest first; the newest commit is the head.
   const history: { hash: string; message: string; committedAt: number; authoredAt: number }[] = [];
@@ -261,6 +272,52 @@ describe("release note generation", () => {
     expect(rest.more).toBe(false);
     expect(r.entries(DAY)).toHaveLength(4);
     expect(rest.modelCalls).toBe(3);
+  });
+
+  test("large daily groups converge, preserve pending entries and prune stale subjects within D1 limits", async () => {
+    const r = setup();
+    const commits = Array.from({ length: 120 }, (_, i) => r.commit(`Change ${i}`));
+    const subjects = commits.map((hash) => `commit:${hash}`).sort();
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        expect((await r.run()).more).toBe(true);
+        expect(r.entries(DAY).map((e) => e.subject)).toEqual(
+          commits
+            .slice(-(pass + 1) * 40)
+            .map((hash) => `commit:${hash}`)
+            .sort(),
+        );
+      }
+      expect((await r.run()).more).toBe(false);
+      expect(r.entries(DAY).map((e) => e.subject)).toEqual(subjects);
+      expect(r.release(DAY)!.format_version).toBe(1);
+
+      // Changed drafts with no remaining budget must retain their previous output.
+      const log = r.source.log;
+      r.source.log = async (...args) =>
+        (await log(...args)).map((commit) => ({ ...commit, message: `Updated ${commit.message}` }));
+      const previous = r.entries(DAY);
+      expect((await r.run({ maxModelCalls: 0 })).more).toBe(true);
+      expect(r.entries(DAY)).toEqual(previous);
+
+      // Resolve 110 commits into one issue, requiring more than one stale-ID batch.
+      r.issues.set("ENG-1", issue("ENG-1"));
+      const grouped = new Set(commits.slice(0, 110));
+      r.source.log = async (...args) =>
+        (await log(...args)).map((commit) =>
+          grouped.has(commit.hash) ? { ...commit, message: `${commit.message} ENG-1` } : commit,
+        );
+      expect((await r.run()).more).toBe(false);
+      const entries = r.entries(DAY);
+      expect(entries.map((e) => e.subject).sort()).toEqual(
+        [...commits.slice(110).map((hash) => `commit:${hash}`), "issue:acc:ENG-1"].sort(),
+      );
+      expect(JSON.parse(entries.find((e) => e.subject === "issue:acc:ENG-1")!.commits!)).toEqual(
+        commits.slice(0, 110).reverse(),
+      );
+    } finally {
+      r.sqlite.close();
+    }
   });
   test("UTC committer days group noncontiguous ancestry, never author or completion dates", async () => {
     const r = setup();

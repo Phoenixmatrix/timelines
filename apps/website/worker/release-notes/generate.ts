@@ -372,13 +372,23 @@ export async function generateReleaseNotes(
       complete.push(draft.subject);
     }
     // Drop entries no longer in the release; unfinished ones keep their last version.
-    const keep = [...complete, ...pending];
-    let stale = d
-      .deleteFrom("release_note_entries")
+    const keep = new Set([...complete, ...pending]);
+    const persisted = await d
+      .selectFrom("release_note_entries")
+      .select(["id", "subject"])
       .where("repo_id", "=", repoId)
-      .where("release", "=", release.release);
-    if (keep.length) stale = stale.where("subject", "not in", keep);
-    await stale.execute();
+      .where("release", "=", release.release)
+      .execute();
+    const stale = persisted.filter((entry) => !keep.has(entry.subject)).map((entry) => entry.id);
+    // D1 allows 100 bindings per statement; never split a NOT IN keep-list.
+    for (let start = 0; start < stale.length; start += 90) {
+      await d
+        .deleteFrom("release_note_entries")
+        .where("repo_id", "=", repoId)
+        .where("release", "=", release.release)
+        .where("id", "in", stale.slice(start, start + 90))
+        .execute();
+    }
 
     if (pending.length) continue;
     const shown = await d
