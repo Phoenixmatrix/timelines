@@ -389,6 +389,16 @@ dependencies and durable comments, agent checkpoints or evidence.
   Closed board lanes retain their counts and expand to show closed issues.
   Add subtasks from the parent without leaving it; only active workspaces are
   inherited. Checkpoints, claims, blockers and completion evidence remain distinct.
+- **Startup defaults:** in **Tracker settings → Default view and team**, choose
+  List/Board/Graph, an issue-view preset, and an active team or all teams. Saving
+  also makes this tracker the destination of the global **Issues** link. Defaults
+  belong to the signed-in user in this browser, not to the whole organization.
+  The chosen team filters the initial view and supplies the new-issue team.
+  Explicit URL filters, layouts and capture teams override defaults, including an
+  empty query. Unavailable trackers fall back to the first accessible tracker;
+  archived or unavailable default teams fall back to all teams. **Reset defaults**
+  restores the built-in startup behavior. Browsers that refuse storage show an
+  error without dismissing the preference form.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
   fields are retained. Labels and workspace membership compare as sets, so

@@ -50,6 +50,8 @@ import { FormError, popMotion, SelectField, Tip } from "../../components/ui.tsx"
 import { api, ApiError, load } from "../../lib/api.ts";
 import { requireViewer, useViewer } from "../../lib/session.ts";
 import { TrackerAdmin } from "./Admin.tsx";
+import { TrackerDefaultsForm } from "./Defaults.tsx";
+import { readTrackerDefaults, VIEW_LABEL, withTrackerDefaults, type View } from "./preferences.ts";
 import { RelationLens } from "./Lens.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
 import { IssueLog } from "./Log.tsx";
@@ -76,9 +78,11 @@ interface TrackerData {
   repos: RepoSummary[];
 }
 export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
-  await requireViewer(request);
+  const viewer = await requireViewer(request);
   const { trackers } = await load<{ trackers: TrackerOwner[] }>("/tracker", request);
-  if (trackers[0]) throw redirect(`/tracker/${trackers[0].slug}`);
+  const defaults = readTrackerDefaults(viewer.id);
+  const tracker = trackers.find((entry) => entry.id === defaults?.ownerId) ?? trackers[0];
+  if (tracker) throw redirect(`/tracker/${tracker.slug}${new URL(request.url).search}`);
   return { trackers };
 }
 export function TrackerIndex() {
@@ -156,11 +160,9 @@ function scopeLabel(query: string, now: number): string | null {
 
 export function Tracker() {
   const data = useLoaderData<typeof trackerLoader>();
-  return <Workbench key={data.snapshot.owner.id} data={data} />;
+  const viewer = useViewer();
+  return <Workbench key={`${data.snapshot.owner.id}:${viewer?.id}`} data={data} />;
 }
-
-const VIEW_LABEL = { list: "List", board: "Board", graph: "Graph" } as const;
-type View = keyof typeof VIEW_LABEL;
 
 function Workbench({ data }: { data: TrackerData }) {
   const [snapshot, setSnapshot] = useState(data.snapshot);
@@ -182,11 +184,17 @@ function Workbench({ data }: { data: TrackerData }) {
       return false;
     }
   });
-  const [params, setParams] = useSearchParams();
+  const [urlParams, setParams] = useSearchParams();
   const route = useParams();
   const navigate = useNavigate();
   const navigation = useNavigation();
   const viewer = useViewer();
+  const [defaults, setDefaults] = useState(() => readTrackerDefaults(viewer?.id ?? ""));
+  const [defaultsOpen, setDefaultsOpen] = useState(false);
+  const params = useMemo(
+    () => withTrackerDefaults(urlParams, defaults, snapshot),
+    [urlParams, defaults, snapshot],
+  );
   const [title, setTitle] = useState("");
   const defaultTeam = snapshot.teams.find((team) => !team.archived)?.id ?? "";
   const requestedTeam = params.get("captureTeam") ?? defaultTeam;
@@ -201,7 +209,9 @@ function Workbench({ data }: { data: TrackerData }) {
   const selected =
     snapshot.issues.find((issue) => issue.id === route.issue || issue.key === route.issue) ?? null;
   const view = (
-    (params.get("view") ?? "list") in VIEW_LABEL ? (params.get("view") ?? "list") : "list"
+    Object.hasOwn(VIEW_LABEL, params.get("view") ?? "list")
+      ? (params.get("view") ?? "list")
+      : "list"
   ) as View;
   const admin = params.get("manage") === "true";
   const sort = (params.get("sort") ?? "rank") as SortKey;
@@ -218,17 +228,18 @@ function Workbench({ data }: { data: TrackerData }) {
     else next.set(key, value);
     setParams(next, { replace: true, preventScrollReset: true });
   };
-  const setQuery = (q: string) => setParam("q", q === DEFAULT_QUERY ? null : q);
+  const setQuery = (q: string) => setParam("q", q);
 
-  // Older links carry ?team=…&workspace=…; fold them into the query once.
+  // Materialize defaults in links; explicit and legacy URL filters always win.
   useEffect(() => {
-    const migrated = legacyQuery(params, data.snapshot);
-    if (migrated === null) return;
     const next = new URLSearchParams(params);
-    for (const k of ["team", "workspace", "status", "ready", "closed", "filters"]) next.delete(k);
-    next.set("q", migrated);
-    setParams(next, { replace: true });
-  }, [params, data.snapshot, setParams]);
+    const migrated = legacyQuery(urlParams, data.snapshot);
+    if (migrated !== null) {
+      for (const k of ["team", "workspace", "status", "ready", "closed", "filters"]) next.delete(k);
+      next.set("q", migrated);
+    }
+    if (next.toString() !== urlParams.toString()) setParams(next, { replace: true });
+  }, [urlParams, params, data.snapshot, setParams]);
 
   const accept = useCallback((next: Snapshot) => {
     const previous = latestSnapshot.current;
@@ -622,6 +633,9 @@ function Workbench({ data }: { data: TrackerData }) {
                   <Menu.LinkItem className="mk-menu-item" render={<Link to={managementHref} />}>
                     {admin ? "Back to issues" : "Teams and workspaces"}
                   </Menu.LinkItem>
+                  <Menu.Item className="mk-menu-item" onClick={() => setDefaultsOpen(true)}>
+                    Default view and team
+                  </Menu.Item>
                   <Menu.CheckboxItem
                     className="mk-menu-item"
                     checked={shortcuts}
@@ -643,6 +657,19 @@ function Workbench({ data }: { data: TrackerData }) {
           </Menu.Root>
         </div>
       </header>
+      {defaultsOpen && viewer && (
+        <TrackerDefaultsForm
+          viewerId={viewer.id}
+          snapshot={snapshot}
+          defaults={defaults}
+          onCancel={() => setDefaultsOpen(false)}
+          onSaved={(next) => {
+            setDefaults(next);
+            setDefaultsOpen(false);
+            void navigate(base, { replace: true });
+          }}
+        />
+      )}
       {shortcuts && (
         <p className="m-0 -mt-1 text-micro text-ink-faint">
           Shortcuts: c captures, / filters, j and k move, Escape closes the issue.
@@ -754,7 +781,7 @@ function Workbench({ data }: { data: TrackerData }) {
                     role="radio"
                     aria-checked={view === v}
                     className="mk-segment"
-                    onClick={() => setParam("view", v === "list" ? null : v)}
+                    onClick={() => setParam("view", v)}
                   >
                     {VIEW_LABEL[v]}
                   </button>
@@ -829,7 +856,7 @@ function Workbench({ data }: { data: TrackerData }) {
                 index={index}
                 matched={issues}
                 href={href}
-                listHref={(q) => `${base}?${new URLSearchParams({ q })}`}
+                listHref={(q) => `${base}?${new URLSearchParams({ q, view: "list" })}`}
                 detailsOpen={showInspector}
                 onDetails={() => setParam("details", "1")}
               />
@@ -840,7 +867,7 @@ function Workbench({ data }: { data: TrackerData }) {
                 selected={selected?.id ?? null}
                 href={href}
                 query={query}
-                listHref={(q) => `${base}?${new URLSearchParams({ q })}`}
+                listHref={(q) => `${base}?${new URLSearchParams({ q, view: "list" })}`}
                 now={now}
               />
             ) : (
