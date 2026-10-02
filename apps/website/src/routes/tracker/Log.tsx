@@ -7,7 +7,13 @@ import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { typeLabel } from "./ui.tsx";
-import { STATE_LABEL, type IssueIndex, type IssueState, type SortKey } from "./query.ts";
+import {
+  claimLabel,
+  STATE_LABEL,
+  type IssueIndex,
+  type IssueState,
+  type SortKey,
+} from "./query.ts";
 
 const ROW = 32;
 const OVERSCAN = 12;
@@ -86,7 +92,7 @@ export function StateLabel({
     state === "blocked"
       ? ` · ${blockers}`
       : state === "claimed"
-        ? ` · ${issue.claim?.agent}`
+        ? ` · ${issue.claim ? claimLabel(index, issue.claim) : ""}`
         : state === "leased"
           ? ` · ${index.leasedBy.get(issue.id)?.key}`
           : "";

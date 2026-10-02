@@ -10,10 +10,12 @@
 //   parent:CORE-12   words match key, title and labels; - excludes.
 
 import {
+  actorName,
   leasedAncestor,
   readiness,
   readinessIndex,
   type Issue,
+  type IssueClaim,
   type Snapshot,
 } from "../../../shared/tracker.ts";
 
@@ -68,6 +70,14 @@ export interface IssueIndex {
   workspaceSlug: Map<string, string>;
   memberSlug: Map<string, string>;
   memberName: Map<string, string>;
+  agentIds: Set<string>;
+}
+
+/** Who holds a claim: an agent identity as "builder for Ann Lee", else the session label. */
+export function claimLabel(index: IssueIndex, claim: IssueClaim): string {
+  return index.agentIds.has(claim.actorId)
+    ? (index.memberName.get(claim.actorId) ?? claim.agent)
+    : claim.agent;
 }
 
 export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
@@ -121,7 +131,12 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     teamKey: new Map(snapshot.teams.map((t) => [t.id, t.key])),
     workspaceSlug: new Map(snapshot.workspaces.map((w) => [w.id, w.slug])),
     memberSlug: new Map(snapshot.members.map((m) => [m.id, m.slug])),
-    memberName: new Map(snapshot.members.map((m) => [m.id, m.displayName])),
+    memberName: new Map([
+      ...snapshot.members.map((m): [string, string] => [m.id, m.displayName]),
+      // Agents read as "builder for Ann Lee" wherever a name is shown.
+      ...snapshot.agents.map((a): [string, string] => [a.id, actorName(snapshot, a.id)]),
+    ]),
+    agentIds: new Set(snapshot.agents.map((a) => a.id)),
   };
 }
 

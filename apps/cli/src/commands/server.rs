@@ -73,6 +73,15 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
             }
             let session = remote::api(&config, "GET", "/session", None)?;
             let mut out = json!({ "server": config.server(), "user": session["viewer"], "method": if config.uses_ssh() { "ssh" } else { "token" } });
+            // An agent's token: everything it does is attributed to the agent, answerable to its person.
+            let agent = &session["viewer"]["agent"];
+            if !agent.is_null() {
+                out["actingAs"] = json!(format!(
+                    "{} (for {})",
+                    agent["name"].as_str().unwrap_or(""),
+                    session["viewer"]["displayName"].as_str().unwrap_or("")
+                ));
+            }
             if config.uses_ssh()
                 && let Ok(ssh) = crate::ssh::session(&config)
             {

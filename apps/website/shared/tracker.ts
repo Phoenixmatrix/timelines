@@ -3,6 +3,12 @@ export interface TrackerIdentity {
   slug: string;
   displayName: string;
 }
+/** An agent in the tracker, with its accountable human inline. */
+export interface TrackerAgent {
+  id: string;
+  name: string;
+  accountable: TrackerIdentity;
+}
 export interface TrackerOwner extends TrackerIdentity {
   canAdmin: boolean;
 }
@@ -28,7 +34,11 @@ export interface Workspace extends TrackerEntity {
 export type IssueType = "task" | "bug" | "prd" | "chore" | "research";
 export type IssueStatus = "backlog" | "todo" | "in_progress" | "done" | "canceled";
 export interface IssueClaim {
+  /** The holder: an agent's id, or a person's. */
   actorId: string;
+  /** The human answerable for the holder (the holder itself for a person). */
+  accountableId?: string;
+  /** A label for the working session (from `gm issue claim --agent`). */
   agent: string;
   expiresAt: string;
 }
@@ -72,6 +82,8 @@ export interface Snapshot {
   owner: TrackerIdentity;
   canAdmin: boolean;
   members: TrackerIdentity[];
+  /** Agents accountable to members: who an actorId names when it isn't a member. */
+  agents: TrackerAgent[];
   teams: Team[];
   workspaces: Workspace[];
   issues: Issue[];
@@ -168,6 +180,30 @@ export interface Changes {
   hasMore: boolean;
   serverTime: string;
 }
+/** Who an actor id names: a member, or an agent with the human accountable for it. */
+export function actorOf(
+  snapshot: Pick<Snapshot, "members" | "agents">,
+  id: string,
+): { name: string; agent: TrackerAgent | null } {
+  const agent = snapshot.agents.find((a) => a.id === id) ?? null;
+  if (agent) return { name: agent.name, agent };
+  return { name: snapshot.members.find((m) => m.id === id)?.displayName ?? id, agent: null };
+}
+
+/** An actor in one line: "Ann Lee", or "builder for Ann Lee" for an agent. */
+export function actorName(snapshot: Pick<Snapshot, "members" | "agents">, id: string): string {
+  const { name, agent } = actorOf(snapshot, id);
+  return agent ? `${name} for ${agent.accountable.displayName}` : name;
+}
+
+/** Who holds a claim: an agent identity by name and human, else the session label. */
+export function claimHolder(
+  snapshot: Pick<Snapshot, "members" | "agents">,
+  claim: IssueClaim,
+): string {
+  return actorOf(snapshot, claim.actorId).agent ? actorName(snapshot, claim.actorId) : claim.agent;
+}
+
 /** Done and canceled issues are closed; everything else still has work in it. */
 export function isOpen(issue: Pick<Issue, "status">): boolean {
   return issue.status !== "done" && issue.status !== "canceled";

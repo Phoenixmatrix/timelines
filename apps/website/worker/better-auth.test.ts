@@ -1,57 +1,10 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, test } from "vite-plus/test";
 import { authenticate } from "../registry/core/auth/authenticate.ts";
 import { createAuth, linkAccount, mayJoin, recordFailure } from "./better-auth.ts";
-
-/** Enough of D1 over node:sqlite for Kysely (kysely-d1) and Better Auth's D1 dialect. */
-function d1(sqlite: DatabaseSync): D1Database {
-  const statement = (sql: string, params: SQLInputValue[] = []) => {
-    const run = () => {
-      const prepared = sqlite.prepare(sql);
-      const results = prepared.all(...params) as Record<string, unknown>[];
-      const { c } = sqlite.prepare("SELECT changes() AS c").get() as { c: number };
-      return { results, changes: c };
-    };
-    return {
-      bind: (...next: SQLInputValue[]) => statement(sql, next),
-      async all() {
-        const { results, changes } = run();
-        return { results, success: true, meta: { changes, last_row_id: 0, duration: 0 } };
-      },
-      async first(column?: string) {
-        const row = run().results[0] ?? null;
-        return column && row ? row[column] : row;
-      },
-      async run() {
-        const { changes } = run();
-        return { results: [], success: true, meta: { changes, last_row_id: 0, duration: 0 } };
-      },
-      async raw() {
-        return run().results.map((row) => Object.values(row));
-      },
-    };
-  };
-  return {
-    prepare: (sql: string) => statement(sql),
-    batch: async (statements: { all(): Promise<unknown> }[]) =>
-      Promise.all(statements.map((s) => s.all())),
-    exec: async (sql: string) => {
-      sqlite.exec(sql);
-      return { count: 0, duration: 0 };
-    },
-  } as unknown as D1Database;
-}
+import { d1, migratedDatabase } from "./testing/d1.ts";
 
 function setup({ org }: { org?: string } = {}) {
-  const sqlite = new DatabaseSync(":memory:");
-  const dir = fileURLToPath(new URL("../migrations/", import.meta.url).href);
-  for (const file of readdirSync(dir)
-    .filter((f) => f.endsWith(".sql"))
-    .sort())
-    sqlite.exec(readFileSync(join(dir, file), "utf8"));
+  const sqlite = migratedDatabase();
   const sent: { to: string; text: string }[] = [];
   const failures = new Map<string, number>();
   const env = {

@@ -14,6 +14,7 @@ import {
   type Snapshot,
   type Subscription,
   type Team,
+  type TrackerAgent,
   type TrackerEvent,
   type TrackerIdentity,
   type Workspace,
@@ -40,7 +41,12 @@ export class TrackerError extends Error {
   }
 }
 export interface Access {
+  /** Who actions are attributed to: an agent's id, or the person's. */
   actorId: string;
+  /** Whose memberships and permissions apply: the person (an agent's accountable human). */
+  principalId: string;
+  /** Agents accountable to members: they may hold leases and be assigned work. */
+  agents: TrackerAgent[];
   owner: TrackerIdentity;
   canAdmin: boolean;
   members: TrackerIdentity[];
@@ -182,6 +188,7 @@ export class TrackerStore {
       owner: access.owner,
       canAdmin: access.canAdmin,
       members: access.members,
+      agents: access.agents,
       teams: this.all("team"),
       workspaces: this.all("workspace"),
       issues: this.all("issue"),
@@ -315,6 +322,12 @@ export class TrackerStore {
         if (!access.members.some((m) => m.id === memberId))
           fail("invalid_member", "User is not a current account member.");
       };
+      /** A member, or an agent accountable to one: the human who answers for it. */
+      const answerable = (actorId: string) => {
+        const agent = access.agents.find((a) => a.id === actorId);
+        member(agent ? agent.accountable.id : actorId);
+        return agent ? agent.accountable.id : actorId;
+      };
       const unique = (type: EntityType, entityId: string) => {
         if (
           all(this.sql, tracker.selectFrom(tables[type]).select("id").where("id", "=", entityId))
@@ -333,7 +346,11 @@ export class TrackerStore {
       };
       const teamWritable = (team: Team) => {
         if (team.archived) fail("archived", "Team is archived.", 409);
-        if (!access.canAdmin && team.memberIds.length && !team.memberIds.includes(access.actorId))
+        if (
+          !access.canAdmin &&
+          team.memberIds.length &&
+          !team.memberIds.includes(access.principalId)
+        )
           fail("forbidden", "Only team members may change this team's work.", 403);
       };
       const unblocked = (issue: Issue) => {
@@ -424,9 +441,10 @@ export class TrackerStore {
         if ("assigneeId" in data)
           issue.assigneeId = data.assigneeId === null ? null : id(data.assigneeId);
         if (issue.assigneeId) {
-          member(issue.assigneeId);
+          // An agent can be assigned when its accountable human could be.
+          const human = answerable(issue.assigneeId);
           const team = this.get<Team>("team", issue.teamId);
-          if (team.memberIds.length && !team.memberIds.includes(issue.assigneeId))
+          if (team.memberIds.length && !team.memberIds.includes(human))
             fail("invalid_member", "Assignee must belong to the owning team.");
         }
         if ("parentId" in data) {
@@ -786,6 +804,7 @@ export class TrackerStore {
               const expiresAt = new Date(Date.parse(now) + Number(ttl) * 1000).toISOString();
               issue.claim = {
                 actorId: access.actorId,
+                accountableId: access.principalId,
                 agent: kind === "issue.claim" ? text(data.agent, "agent", 200) : issue.claim!.agent,
                 expiresAt,
               };

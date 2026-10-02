@@ -1,0 +1,227 @@
+// Your agents: identities that work on their own, accountable to you.
+
+import { KeyIcon, RobotIcon } from "@phosphor-icons/react";
+import { useEffect, useRef } from "react";
+import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
+import type { Agent, CreatedAccessToken } from "../../shared/api.ts";
+import { Page } from "../components/AppShell.tsx";
+import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
+import { api, attempt, field, load } from "../lib/api.ts";
+import { fullDate, timeAgo } from "../lib/format.ts";
+import { requireViewer } from "../lib/session.ts";
+
+export async function agentsLoader({ request }: { request: Request }) {
+  await requireViewer(request);
+  return load<{ agents: Agent[] }>("/agents", request);
+}
+
+type Result = { created: Agent } | { token: CreatedAccessToken; agent: string } | { error: string };
+
+export async function agentsAction({ request }: { request: Request }): Promise<Result | null> {
+  const form = await request.formData();
+  const intent = form.get("intent");
+  const id = intent === "create" ? "" : field(form, "id");
+  if (intent === "revoke-token")
+    return attempt(async () => {
+      await api(`/agents/${id}/tokens/${field(form, "tokenId")}`, { method: "DELETE" });
+      return null;
+    });
+  if (intent === "revoke")
+    return attempt(async () => {
+      await api(`/agents/${id}`, { method: "DELETE" });
+      return null;
+    });
+  if (intent === "token")
+    return attempt(async () => ({
+      token: await api<CreatedAccessToken>(`/agents/${id}/tokens`, { method: "POST", json: {} }),
+      agent: field(form, "name"),
+    }));
+  return attempt(async () => ({
+    created: (
+      await api<{ agent: Agent }>("/agents", {
+        method: "POST",
+        json: { name: form.get("name"), description: form.get("description") },
+      })
+    ).agent,
+  }));
+}
+
+export function Agents() {
+  const { agents } = useLoaderData<typeof agentsLoader>();
+  const result = useActionData<Result | null | undefined>();
+  const navigation = useNavigation();
+  const formRef = useRef<HTMLFormElement>(null);
+  const fresh = result && "token" in result ? result : null;
+  const error = result && "error" in result ? result.error : null;
+  const creating = navigation.formData?.get("intent") === "create";
+
+  useEffect(() => {
+    if (result && "created" in result) formRef.current?.reset();
+  }, [result]);
+
+  return (
+    <Page>
+      <h1 className="m-0 text-headline">Agents</h1>
+      <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
+        An agent works on its own: it claims tracker work, comments and checkpoints as itself, and
+        everywhere it shows up it names you as accountable for it. It signs in with its own tokens
+        and has your access.
+      </p>
+
+      <div className="mt-8 flex flex-col gap-6">
+        <Card title="Create an agent">
+          <Form method="post" ref={formRef} className="mk-card-body">
+            <input type="hidden" name="intent" value="create" />
+            <TextField
+              label="Name"
+              name="name"
+              required
+              maxLength={39}
+              pattern="[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9]))*"
+              placeholder="builder"
+              autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              hint="Lowercase letters, digits and hyphens. Shown as “builder for you”."
+            />
+            <TextField
+              label="Description"
+              name="description"
+              maxLength={500}
+              placeholder="Works through the CORE graph"
+              autoComplete="off"
+            />
+            <div className="flex items-center justify-end gap-3">
+              <FormError message={error} />
+              <button className="mk-btn mk-btn--primary" disabled={creating}>
+                Create agent
+              </button>
+            </div>
+          </Form>
+        </Card>
+
+        {fresh && (
+          <section className="mk-card mk-enter-up flex flex-col gap-4 bg-signal-wash">
+            <div>
+              <h2 className="mk-card-title">Copy {fresh.agent}'s token now</h2>
+              <p className="mk-card-desc">You won't be able to see “{fresh.token.name}” again.</p>
+            </div>
+            <CopyField value={fresh.token.secret} label="Token" />
+            <div className="mk-field">
+              <span className="mk-label">Use it with gm</span>
+              <CopyField value={`GM_TOKEN=${fresh.token.secret} gm issue next`} label="Command" />
+              <span className="mk-hint">
+                Or give the agent the token as GM_TOKEN in its environment.
+              </span>
+            </div>
+          </section>
+        )}
+
+        <Card title="Your agents">
+          {agents.length === 0 ? (
+            <div className="mk-empty mt-5">
+              No agents yet.
+              <br />
+              <span className="text-body-sm text-ink-faint">Create one above.</span>
+            </div>
+          ) : (
+            <ul className="m-0 mt-4 list-none divide-y divide-line-soft p-0">
+              {agents.map((agent) => (
+                <AgentRow key={agent.id} agent={agent} />
+              ))}
+            </ul>
+          )}
+        </Card>
+      </div>
+    </Page>
+  );
+}
+
+function AgentRow({ agent }: { agent: Agent }) {
+  const mint = useFetcher();
+  const revoke = useFetcher();
+  const revoked = agent.revokedAt !== null;
+  return (
+    <li className={`flex flex-col gap-3 py-4 ${revoked ? "opacity-60" : ""}`}>
+      <div className="flex items-start gap-3">
+        <RobotIcon className="mt-0.5 size-5 shrink-0 text-ink-faint" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold">{agent.name}</span>
+            <span className="mk-chip mk-chip--tag">for {agent.accountable.displayName}</span>
+            {revoked && <span className="mk-chip mk-chip--tag">Revoked</span>}
+          </div>
+          {agent.description && (
+            <p className="m-0 max-w-[48ch] text-body-sm text-ink-muted">{agent.description}</p>
+          )}
+          <div className="text-body-sm text-ink-faint">
+            {revoked ? (
+              <span title={fullDate(agent.revokedAt!)}>Revoked {timeAgo(agent.revokedAt!)}</span>
+            ) : (
+              <span title={fullDate(agent.createdAt)}>Created {timeAgo(agent.createdAt)}</span>
+            )}
+          </div>
+        </div>
+        {!revoked && (
+          <div className="flex shrink-0 flex-wrap justify-end gap-2">
+            <mint.Form method="post">
+              <input type="hidden" name="intent" value="token" />
+              <input type="hidden" name="id" value={agent.id} />
+              <input type="hidden" name="name" value={agent.name} />
+              <button className="mk-btn mk-btn--sm" disabled={mint.state !== "idle"}>
+                New token
+              </button>
+            </mint.Form>
+            <ConfirmDialog
+              trigger={<button className="mk-btn mk-btn--danger-ghost mk-btn--sm">Revoke</button>}
+              title={`Revoke ${agent.name}?`}
+              description="Its tokens stop working at once. Its name stays on what it did."
+              confirmLabel="Revoke agent"
+              busy={revoke.state !== "idle"}
+              onConfirm={() =>
+                revoke.submit({ intent: "revoke", id: agent.id }, { method: "post" })
+              }
+            />
+          </div>
+        )}
+      </div>
+      {agent.tokens.length > 0 && (
+        <ul className="m-0 ml-8 list-none p-0">
+          {agent.tokens.map((token) => (
+            <TokenRow key={token.id} agent={agent} token={token} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+function TokenRow({ agent, token }: { agent: Agent; token: Agent["tokens"][number] }) {
+  const revoke = useFetcher();
+  return (
+    <li className="flex items-center gap-3 py-1.5 text-body-sm">
+      <KeyIcon className="size-4 shrink-0 text-ink-faint" aria-hidden />
+      <span className="mk-mono text-mono text-ink-faint">gmx_…{token.lastFour}</span>
+      <span className="min-w-0 flex-1 truncate text-ink-faint">
+        {token.lastUsedAt ? (
+          <span title={fullDate(token.lastUsedAt)}>Last used {timeAgo(token.lastUsedAt)}</span>
+        ) : (
+          "Never used"
+        )}
+      </span>
+      <ConfirmDialog
+        trigger={<button className="mk-btn mk-btn--ghost mk-btn--sm">Revoke</button>}
+        title={`Revoke this token for ${agent.name}?`}
+        description="Anything using it stops working at once."
+        confirmLabel="Revoke token"
+        busy={revoke.state !== "idle"}
+        onConfirm={() =>
+          revoke.submit(
+            { intent: "revoke-token", id: agent.id, tokenId: token.id },
+            { method: "post" },
+          )
+        }
+      />
+    </li>
+  );
+}

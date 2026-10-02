@@ -83,6 +83,16 @@ export interface Database {
     last_used_at: string | null;
     expires_at: string | null;
     ssh_key_id: string | null;
+    /** Set when the token acts as one of the user's agents. */
+    agent_id: Generated<string | null>;
+  };
+  agents: {
+    id: string;
+    name: string;
+    accountable_id: string;
+    description: Generated<string>;
+    created_at: Generated<string>;
+    revoked_at: string | null;
   };
   ssh_keys: {
     id: string;

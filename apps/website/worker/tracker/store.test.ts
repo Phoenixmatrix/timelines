@@ -50,6 +50,14 @@ function fixture() {
   );
   const access: Access = {
     actorId: "alice",
+    principalId: "alice",
+    agents: [
+      {
+        id: "agt-bot",
+        name: "bot",
+        accountable: { id: "alice", slug: "alice", displayName: "Alice" },
+      },
+    ],
     owner: { id: "org", slug: "org", displayName: "Org" },
     canAdmin: true,
     members: [
@@ -221,9 +229,9 @@ describe("tracker SQLite authority", () => {
     expect(f.store.snapshot(f.access).comments).toEqual([
       expect.objectContaining({ id: "comment", body: "Checkpoint" }),
     ]);
-    expect(() => f.store.mutate({ ...f.access, actorId: "bob" }, request)).toThrow(
-      /different actor/,
-    );
+    expect(() =>
+      f.store.mutate({ ...f.access, actorId: "bob", principalId: "bob" }, request),
+    ).toThrow(/different actor/);
     expect(() =>
       f.store.mutate(f.access, {
         ...request,
@@ -256,7 +264,7 @@ describe("tracker SQLite authority", () => {
     ).toThrow(/owning team/);
     expect(() =>
       f.store.mutate(
-        { ...f.access, actorId: "bob", canAdmin: false },
+        { ...f.access, actorId: "bob", principalId: "bob", canAdmin: false },
         {
           operationId: "bob-create",
           mutations: [{ kind: "issue.create", id: "bad", data: { teamId: "team", title: "Bad" } }],
@@ -579,5 +587,58 @@ describe("graph readiness", () => {
     expect(() =>
       g.mutate({ kind: "link.add", id: "l2", data: { fromId: "b", toId: "a", kind: "blocks" } }),
     ).toThrow(/acyclic/);
+  });
+});
+
+describe("agents", () => {
+  test("an agent's actions are attributed to it, with its human answerable and its human's access", () => {
+    const f = fixture();
+    f.issue("work");
+    // Team restricted to alice: her agent still gets in through her membership.
+    f.mutate({
+      kind: "team.update",
+      id: "team",
+      expectedVersion: 1,
+      data: { memberIds: ["alice"] },
+    });
+    const asAgent: Access = { ...f.access, actorId: "agt-bot", principalId: "alice" };
+    const claimed = f.store.mutate(asAgent, {
+      operationId: "agent-claim",
+      mutations: [{ kind: "issue.claim", id: "work", data: { agent: "session-1" } }],
+    });
+    const issue = f.store.snapshot(f.access).issues.find((i) => i.id === "work")!;
+    expect(issue.claim).toMatchObject({ actorId: "agt-bot", accountableId: "alice" });
+    expect(claimed.events.at(-1)?.actorId).toBe("agt-bot");
+    // The lease is the agent's: its human holds no claim on it.
+    expect(() =>
+      f.mutate({
+        kind: "issue.release",
+        id: "work",
+        data: { leaseToken: String(claimed.results[0]!.leaseToken) },
+      }),
+    ).toThrow(/belongs to another agent/);
+    expect(
+      f.store.snapshot(f.access).agents.map((a) => `${a.name} for ${a.accountable.slug}`),
+    ).toEqual(["bot for alice"]);
+  });
+
+  test("an agent can be assigned when its human could be; unknown agents can't", () => {
+    const f = fixture();
+    f.issue("work");
+    f.mutate({
+      kind: "issue.update",
+      id: "work",
+      expectedVersion: 1,
+      data: { assigneeId: "agt-bot" },
+    });
+    expect(f.store.snapshot(f.access).issues[0]!.assigneeId).toBe("agt-bot");
+    expect(() =>
+      f.mutate({
+        kind: "issue.update",
+        id: "work",
+        expectedVersion: 2,
+        data: { assigneeId: "agt-stranger" },
+      }),
+    ).toThrow(/not a current account member/);
   });
 });

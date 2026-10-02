@@ -118,6 +118,9 @@ pub enum Command {
     /// Secrets that CI jobs can read as environment variables
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Agents: identities that work on their own, accountable to you
+    #[command(subcommand)]
+    Agent(AgentCommand),
     /// Packages: npm, Docker, PyPI, Cargo… versions, provenance and housekeeping
     #[command(subcommand, visible_alias = "packages")]
     Pkg(PkgCommand),
@@ -648,6 +651,35 @@ pub enum SecretCommand {
         name: String,
         #[arg(short = 'R', long)]
         repo: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// Your agents, with their tokens
+    List,
+    /// Create an agent accountable to you
+    Create {
+        /// Lowercase letters, digits and hyphens, e.g. builder
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Mint a token the agent signs in with (shown once)
+    Token {
+        /// The agent's name or id
+        name: String,
+        /// What to call the token
+        #[arg(long = "name")]
+        label: Option<String>,
+        /// read or write
+        #[arg(long, default_value = "write")]
+        scope: String,
+    },
+    /// Revoke an agent; its tokens stop working at once
+    Revoke {
+        /// The agent's name or id
+        name: String,
     },
 }
 

@@ -25,6 +25,7 @@ import { Device, deviceAction, deviceLoader } from "./routes/Device.tsx";
 import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
+import { Agents, agentsAction, agentsLoader } from "./routes/Agents.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
 import {
   Tracker,
@@ -71,6 +72,12 @@ export const router = createBrowserRouter([
                 : false,
             Component: Tracker,
             children: [{ path: "issues/:issue" }],
+          },
+          {
+            path: "settings/agents",
+            loader: agentsLoader,
+            action: agentsAction,
+            Component: Agents,
           },
           {
             path: "settings/tokens",

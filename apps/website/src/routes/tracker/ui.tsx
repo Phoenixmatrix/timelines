@@ -3,6 +3,7 @@ import { Combobox } from "@base-ui/react/combobox";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  claimHolder,
   leasedAncestor,
   readiness,
   readinessIndex,
@@ -171,7 +172,7 @@ export function IssueState({
         state="claimed"
         title={`Claim expires ${new Date(issue.claim.expiresAt).toLocaleString()}`}
       >
-        Claimed · {issue.claim.agent}
+        Claimed · {claimHolder(snapshot, issue.claim)}
       </StateBadge>
     );
   if (issue.status === "done" || issue.status === "canceled")
@@ -192,7 +193,7 @@ export function IssueState({
     return (
       <StateBadge
         state="leased"
-        title={`${above?.key}'s lease covers this issue: only ${above?.claim?.agent} can change its status`}
+        title={`${above?.key}'s lease covers this issue: only ${above?.claim ? claimHolder(snapshot, above.claim) : "its holder"} can change its status`}
       >
         Leased via {above?.key}
       </StateBadge>

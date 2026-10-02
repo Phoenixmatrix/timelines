@@ -46,6 +46,7 @@ function snapshot(issues: Issue[], links: Link[] = []): Snapshot {
       { id: "m-priya", slug: "priya", displayName: "Priya Raman" },
       { id: "m-jun", slug: "jun", displayName: "Jun Park" },
     ],
+    agents: [],
     teams: [
       {
         id: "t-core",

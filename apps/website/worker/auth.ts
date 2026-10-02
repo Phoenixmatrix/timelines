@@ -114,11 +114,16 @@ export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredenti
   const row = await db(c.env.DB)
     .selectFrom("access_tokens as t")
     .innerJoin("accounts as a", "a.id", "t.user_id")
-    .select(["t.id as token_id", "t.scope"])
+    .leftJoin("agents as g", "g.id", "t.agent_id")
+    .select(["t.id as token_id", "t.scope", "t.agent_id", "g.name as agent_name", "g.revoked_at"])
     .selectAll("a")
     .where("t.token_hash", "=", await hashToken(secret))
     .where((eb) => eb.or([eb("t.expires_at", "is", null), eb("t.expires_at", ">", sqlNow)]))
     .executeTakeFirst();
   if (!row) return { kind: "invalid" };
-  return { kind: "token", actor: actorFromRow(row), scope: row.scope, tokenId: row.token_id };
+  // A revoked agent's tokens stop working at once, even before they're deleted.
+  if (row.agent_id && (row.revoked_at || !row.agent_name)) return { kind: "invalid" };
+  const actor = actorFromRow(row);
+  if (row.agent_id && row.agent_name) actor.agent = { id: row.agent_id, name: row.agent_name };
+  return { kind: "token", actor, scope: row.scope, tokenId: row.token_id };
 }

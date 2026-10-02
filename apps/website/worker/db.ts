@@ -1,4 +1,11 @@
-import type { AccountSummary, RepoRole, RepoSummary, Viewer, Visibility } from "../shared/api.ts";
+import type {
+  AccountSummary,
+  AgentRef,
+  RepoRole,
+  RepoSummary,
+  Viewer,
+  Visibility,
+} from "../shared/api.ts";
 import { sql } from "kysely";
 import { repoRole } from "./permissions.ts";
 import { db } from "./schema.ts";
@@ -9,6 +16,11 @@ export interface Actor {
   slug: string;
   displayName: string;
   isSiteAdmin: boolean;
+  /**
+   * Set when an agent's token signed in: the agent acts with this person's
+   * permissions, and what it does is attributed to the agent.
+   */
+  agent?: AgentRef;
 }
 
 export interface AccountRow {
@@ -191,6 +203,7 @@ export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
     .executeTakeFirst()) ?? { email: null };
   return {
     ...self,
+    agent: actor.agent ?? null,
     kind: "user",
     isSiteAdmin: actor.isSiteAdmin,
     email,

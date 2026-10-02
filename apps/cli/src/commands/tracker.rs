@@ -866,6 +866,38 @@ fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
         .any(|i| i["parentId"] == issue["id"] && is_open(i));
     !blocked && !container && leased_ancestor(snapshot, issue, now).is_none()
 }
+/// How the tracker names an actor: a member by name, an agent as "builder (for Ann Lee)".
+fn actor_name(snapshot: &Value, id: &str) -> String {
+    let find = |table: &str| {
+        snapshot[table]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|v| v["id"] == id)
+            .cloned()
+    };
+    if let Some(agent) = find("agents") {
+        return format!(
+            "{} (for {})",
+            agent["name"].as_str().unwrap_or(id),
+            agent["accountable"]["displayName"].as_str().unwrap_or("?")
+        );
+    }
+    find("members")
+        .and_then(|m| m["displayName"].as_str().map(str::to_string))
+        .unwrap_or_else(|| id.to_string())
+}
+/// The issue as stored, plus who holds its claim and who it's assigned to, by name.
+fn named(snapshot: &Value, issue: &Value) -> Value {
+    let mut out = issue.clone();
+    if let Some(holder) = issue["claim"]["actorId"].as_str() {
+        out["claimedBy"] = json!(actor_name(snapshot, holder));
+    }
+    if let Some(assignee) = issue["assigneeId"].as_str() {
+        out["assignee"] = json!(actor_name(snapshot, assignee));
+    }
+    out
+}
 fn listing(snapshot: &Value, args: &ListIssues, only_ready: bool, offline: bool) -> Result<Shown> {
     let team = args
         .team
@@ -910,7 +942,7 @@ fn listing(snapshot: &Value, args: &ListIssues, only_ready: bool, offline: bool)
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
     Ok(Shown(
-        json!({"issues":matching.iter().take(args.limit as usize).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"next":"Acquire an online claim before starting exclusive work."}),
+        json!({"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"next":"Acquire an online claim before starting exclusive work."}),
     ))
 }
 fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Result<Shown> {
@@ -959,7 +991,7 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         .take(limit)
         .collect();
     Ok(Shown(
-        json!({"issue":issue,"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline}),
+        json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline}),
     ))
 }
 pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
@@ -1096,6 +1128,17 @@ mod tests {
         assert!(!ready(&s, &s["issues"][1], now));
         s["issues"][1]["claim"]["expiresAt"] = json!("2026-09-30T23:59:00Z");
         assert!(ready(&s, &s["issues"][1], now));
+    }
+    #[test]
+    fn agents_are_named_with_their_accountable_person() {
+        let mut s = snapshot();
+        s["members"] = json!([{"id":"acc_ann","displayName":"Ann Lee"}]);
+        s["agents"] = json!([{"id":"agt_1","name":"builder","accountable":{"id":"acc_ann","displayName":"Ann Lee"}}]);
+        let issue =
+            json!({"id":"i","claim":{"actorId":"agt_1","agent":"session"},"assigneeId":"acc_ann"});
+        let shown = named(&s, &issue);
+        assert_eq!(shown["claimedBy"], "builder (for Ann Lee)");
+        assert_eq!(shown["assignee"], "Ann Lee");
     }
     #[test]
     fn containers_and_issues_under_another_lease_are_not_ready() {

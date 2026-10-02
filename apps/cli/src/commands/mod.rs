@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod ci;
 pub mod local;
 pub mod network;

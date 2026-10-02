@@ -9,6 +9,7 @@ import {
   MoonIcon,
   PackageIcon,
   PlusIcon,
+  RobotIcon,
   SignInIcon,
   SignOutIcon,
   SunIcon,
@@ -99,6 +100,10 @@ function AccountMenu() {
             <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/tokens" />}>
               <KeyIcon className="size-4" aria-hidden />
               Access tokens
+            </Menu.LinkItem>
+            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/agents" />}>
+              <RobotIcon className="size-4" aria-hidden />
+              Agents
             </Menu.LinkItem>
             <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/ssh-keys" />}>
               <FingerprintIcon className="size-4" aria-hidden />

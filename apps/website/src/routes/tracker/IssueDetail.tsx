@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
+  actorName,
+  claimHolder,
   leasedAncestor,
   readinessIndex,
   type Comment,
@@ -173,6 +175,13 @@ export function IssueDetail({
   const members = snapshot.members.filter(
     (member) => !team?.memberIds.length || team.memberIds.includes(member.id),
   );
+  // Agents can be assigned when their human could be.
+  const assignable = [
+    ...members.map((member) => ({ value: member.id, label: member.displayName })),
+    ...snapshot.agents
+      .filter((agent) => members.some((member) => member.id === agent.accountable.id))
+      .map((agent) => ({ value: agent.id, label: actorName(snapshot, agent.id) })),
+  ];
   const beginEdit = () => {
     setDraft(initial);
     setPreview(false);
@@ -278,10 +287,7 @@ export function IssueDetail({
     if (key === "description" || key === "acceptance")
       return <MarkdownText text={String(value) || "Empty"} />;
     if (key === "assigneeId")
-      return (
-        snapshot.members.find((member) => member.id === value)?.displayName ??
-        (value ? "Unavailable member" : "Unassigned")
-      );
+      return (typeof value === "string" ? actorName(snapshot, value) : null) ?? "Unassigned";
     if (key === "parentId") {
       const item = typeof value === "string" ? index.byId.get(value) : undefined;
       return item ? `${item.key} · ${item.title}` : value ? "Unavailable issue" : "No parent";
@@ -341,8 +347,7 @@ export function IssueDetail({
           <dd className="m-0 min-w-0">P{issue.priority}</dd>
           <dt className="text-ink-faint">Assignee</dt>
           <dd className="m-0 min-w-0">
-            {snapshot.members.find((member) => member.id === issue.assigneeId)?.displayName ??
-              "Unassigned"}
+            {issue.assigneeId ? actorName(snapshot, issue.assigneeId) : "Unassigned"}
           </dd>
           {issue.workspaceIds.length > 0 && (
             <>
@@ -385,7 +390,7 @@ export function IssueDetail({
               aria-hidden
             />
             <span>
-              {covering!.claim!.agent} is working on{" "}
+              {claimHolder(snapshot, covering!.claim!)} is working on{" "}
               {covering === issue ? "this issue" : `${covering!.key}, which includes this issue,`}{" "}
               until{" "}
               {new Date(covering!.claim!.expiresAt).toLocaleString(undefined, {
@@ -461,8 +466,7 @@ export function IssueDetail({
             Latest checkpoint
           </h3>
           <p className="mk-hint mt-0.5 mb-2">
-            {snapshot.members.find((member) => member.id === latestCheckpoint.actorId)
-              ?.displayName ?? "Agent"}
+            {actorName(snapshot, latestCheckpoint.actorId)}
             {" · "}
             <time
               className="tabular-nums"
@@ -655,10 +659,7 @@ export function IssueDetail({
               <SelectField
                 ariaLabel="Issue assignee"
                 value={draft.fields.assigneeId ?? ""}
-                options={[
-                  { value: "", label: "Unassigned" },
-                  ...members.map((member) => ({ value: member.id, label: member.displayName })),
-                ]}
+                options={[{ value: "", label: "Unassigned" }, ...assignable]}
                 onChange={(value) => change("assigneeId", value || null)}
               />
             </Field>
@@ -991,8 +992,7 @@ export function IssueDetail({
             >
               <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
                 <strong className="font-semibold text-ink">
-                  {snapshot.members.find((member) => member.id === comment.actorId)?.displayName ??
-                    comment.actorId}
+                  {actorName(snapshot, comment.actorId)}
                 </strong>
                 <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>
                   {comment.kind !== "comment" && (

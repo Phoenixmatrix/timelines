@@ -19,6 +19,25 @@ export interface Viewer extends AccountSummary {
   email: string | null;
   /** Owners the viewer may create repositories under: themselves, then their orgs. */
   canCreateIn: AccountSummary[];
+  /** Set when signed in with an agent's token: the agent acting for this viewer. */
+  agent: AgentRef | null;
+}
+
+/** An agent as it's named in passing: enough to show who did something. */
+export interface AgentRef {
+  id: string;
+  name: string;
+}
+
+/** An identity that works on its own, with a human accountable for it. */
+export interface Agent extends AgentRef {
+  description: string;
+  /** The human answerable for everything the agent does. */
+  accountable: AccountSummary;
+  createdAt: string;
+  revokedAt: string | null;
+  /** Tokens it can sign in with. */
+  tokens: AccessToken[];
 }
 
 export interface Persona extends AccountSummary {

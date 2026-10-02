@@ -9,7 +9,7 @@ import {
   type Actor,
 } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
-import type { TrackerIdentity, TrackerOwner } from "../../shared/tracker.ts";
+import type { TrackerAgent, TrackerIdentity, TrackerOwner } from "../../shared/tracker.ts";
 import { TrackerError, validateRequest, type Access } from "./store.ts";
 import type { Tracker, TrackerReply } from "./object.ts";
 
@@ -73,17 +73,41 @@ async function authorize(c: Context<AppEnv>, includeMembers = true): Promise<Acc
           .where("m.org_id", "=", owner.id)
           .orderBy("a.slug")
           .execute();
+  const identities = members.map((m): TrackerIdentity => ({
+    id: m.id,
+    slug: m.slug,
+    displayName: m.display_name,
+  }));
   return {
-    actorId: actor.id,
+    // An agent's actions are its own; its human's memberships let it in.
+    actorId: actor.agent?.id ?? actor.id,
+    principalId: actor.id,
     owner: { id: owner.id, slug: owner.slug, displayName: owner.display_name },
     canAdmin,
-    members: members.map((m): TrackerIdentity => ({
-      id: m.id,
-      slug: m.slug,
-      displayName: m.display_name,
-    })),
+    members: identities,
+    agents: await agentsOf(c.env.DB, identities),
     repos: [],
   };
+}
+/** Every agent accountable to these members, revoked ones included so history still names them. */
+async function agentsOf(d1: D1Database, members: TrackerIdentity[]): Promise<TrackerAgent[]> {
+  if (!members.length) return [];
+  const byId = new Map(members.map((m) => [m.id, m]));
+  const rows = await gitmatrixDb(d1)
+    .selectFrom("agents")
+    .select(["id", "name", "accountable_id"])
+    .where(
+      "accountable_id",
+      "in",
+      members.map((m) => m.id),
+    )
+    .orderBy("name")
+    .execute();
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    accountable: byId.get(row.accountable_id)!,
+  }));
 }
 function response<T>(c: Context<AppEnv>, result: TrackerReply<T>) {
   return result.ok

@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { AccessToken, CreatedAccessToken, TokenScope } from "../../shared/api.ts";
 import { generateTokenSecret, hashToken, type AppEnv } from "../auth.ts";
 import { db } from "../schema.ts";
-import { fail, readJson, requireActor } from "./http.ts";
+import { fail, readJson, requireActor, requirePerson } from "./http.ts";
 
 interface TokenRow {
   id: string;
@@ -30,6 +30,8 @@ export async function issueToken(
   name: string,
   scope: TokenScope,
   session?: { expiresAt: string; sshKeyId: string },
+  /** The agent the token acts as; it still belongs to `userId`. */
+  agentId?: string,
 ): Promise<CreatedAccessToken> {
   const secret = generateTokenSecret();
   const row = await db(d1)
@@ -43,6 +45,7 @@ export async function issueToken(
       last_four: secret.slice(-4),
       expires_at: session?.expiresAt ?? null,
       ssh_key_id: session?.sshKeyId ?? null,
+      agent_id: agentId ?? null,
     })
     .returningAll()
     .executeTakeFirst();
@@ -61,13 +64,15 @@ tokens.get("/", async (c) => {
     .where("user_id", "=", actor.id)
     // Sessions minted from SSH keys come and go; they're listed with the keys.
     .where("ssh_key_id", "is", null)
+    // Agents' tokens are listed with their agents.
+    .where("agent_id", "is", null)
     .orderBy("created_at", "desc")
     .execute();
   return c.json({ tokens: results.map(toToken) });
 });
 
 tokens.post("/", async (c) => {
-  const actor = requireActor(c);
+  const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
   const body = await readJson<{ name: string; scope: TokenScope }>(c);
   const name = body.name?.trim() ?? "";
@@ -103,7 +108,7 @@ tokens.post("/device", async (c) => {
 });
 
 tokens.delete("/:id", async (c) => {
-  const actor = requireActor(c);
+  const actor = requirePerson(c);
   if (actor instanceof Response) return actor;
   const { numDeletedRows } = await db(c.env.DB)
     .deleteFrom("access_tokens")

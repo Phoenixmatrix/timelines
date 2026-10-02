@@ -11,7 +11,7 @@ mod tracker_cli;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::{BookmarkCommand, CliCommand, Command, FileCommand, OpCommand};
-use commands::{Ctx, ci, local, network, pkg, server, worktree};
+use commands::{Ctx, agents, ci, local, network, pkg, server, worktree};
 use output::{Format, GmError, Render, emit, emit_error, exit};
 
 /// Help text gets the git equivalent and examples from the manifest, and a
@@ -169,6 +169,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Runs(c) => out(f, ci::runs(ctx, &c)),
         Command::Runner(a) => out(f, ci::runner(ctx, &a)),
         Command::Secret(c) => out(f, ci::secret(ctx, &c)),
+        Command::Agent(c) => out(f, agents::agent(ctx, &c)),
         Command::Pkg(c) => out(f, pkg::pkg(ctx, &c)),
         Command::Api(a) => out(f, server::api(ctx, &a.method, &a.path, a.data.as_deref())),
         Command::Cli(CliCommand::Search { query }) => {

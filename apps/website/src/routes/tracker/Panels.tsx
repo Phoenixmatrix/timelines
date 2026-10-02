@@ -6,6 +6,7 @@ import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
 import { STATE_DOT } from "./Log.tsx";
 import {
+  claimLabel,
   filterToken,
   tokenize,
   withoutKeys,
@@ -165,7 +166,9 @@ function Lane({
                     Blocked · {index.openBlockers.get(issue.id)?.length}
                   </span>
                 )}
-                {state === "claimed" && <span>Claimed · {issue.claim?.agent}</span>}
+                {state === "claimed" && issue.claim && (
+                  <span>Claimed · {claimLabel(index, issue.claim)}</span>
+                )}
                 {state === "ready" && <span>Ready</span>}
               </span>
               <span className="truncate text-body-sm font-semibold">{issue.title}</span>
