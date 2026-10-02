@@ -264,12 +264,16 @@ Shift+Enter extends). Selection replaces the current history entry and uses
 after client-side rendering. Invalid anchors are ignored; ranges extending past
 the visible source are bounded to its last line.
 
-The selected-line controls stay visible while scrolling. **Copy link** shares
-the current branch/tag/ref and selection; **Copy permalink** pins the same file
-and lines to the exact commit used to load the displayed source, not a newer
-branch tip. The blob API returns that SHA as `BlobResponse.commitOid`. Successful
-copies show a toast; denied clipboard access shows an error rather than claiming
-the copy succeeded.
+The file header stays visible while scrolling, flush with the top of the
+viewport (below the bar on phones). **Copy link** and **Copy permalink** are
+always there: without a selection they link to the file, with one to its lines.
+**Copy link** shares the current branch/tag/ref; **Copy permalink** pins the same
+file and lines to the exact commit used to load the displayed source, not a newer
+branch tip. The blob API returns that SHA as `BlobResponse.commitOid`. A
+**Permalink** button also sits on the selection's first line, `Y` copies the
+permalink from anywhere on the page, and `Esc` (or **Clear**) drops the
+selection. Successful copies show a toast naming what was linked; denied
+clipboard access shows an error rather than claiming the copy succeeded.
 
 ### API and pagination
 

@@ -1,5 +1,19 @@
-import { CopyIcon, LinkSimpleIcon, MapTrifoldIcon, PackageIcon } from "@phosphor-icons/react";
-import { Suspense, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import {
+  CopyIcon,
+  LinkSimpleIcon,
+  MapTrifoldIcon,
+  PackageIcon,
+  XIcon,
+} from "@phosphor-icons/react";
+import {
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+} from "react";
 import {
   Await,
   Link,
@@ -49,6 +63,7 @@ export function Blob() {
   const [rangeOrigin, setRangeOrigin] = useState<{ file: string; hash: string } | null>(null);
   const extending = rangeOrigin?.file === file && rangeOrigin.hash === hash;
   const selectedHash = selection ? lineAnchor(selection.start, selection.end) : "";
+  const lineLabel = start === end ? `line ${start}` : `lines ${start}–${end}`;
   const permalink = `${blobUrl(repo.owner.slug, repo.name, blob.commitOid, blob.path)}${selectedHash}`;
 
   const selectLine = (event: MouseEvent<HTMLAnchorElement>, line: number) => {
@@ -67,13 +82,25 @@ export function Blob() {
     void navigate({ hash: next, search }, { replace: true, preventScrollReset: true });
   };
 
+  const clearSelection = () => {
+    anchor.current = null;
+    setRangeOrigin(null);
+    void navigate({ hash: "", search }, { replace: true, preventScrollReset: true });
+  };
+
   const copyLink = async (pinned: boolean) => {
     const path = pinned
       ? permalink
       : `${blobUrl(repo.owner.slug, repo.name, blob.ref, blob.path)}${selectedHash}`;
+    const what = selection ? lineLabel : fileName;
     try {
       await navigator.clipboard.writeText(new URL(path, window.location.origin).href);
-      toast.add({ title: pinned ? "Permalink copied" : "Link copied" });
+      toast.add({
+        title: pinned ? "Permalink copied" : "Link copied",
+        description: pinned
+          ? `To ${what} at ${blob.commitOid.slice(0, 7)}.`
+          : `To ${what} on ${blob.ref}.`,
+      });
     } catch {
       toast.add({
         title: "Couldn't copy the link",
@@ -83,10 +110,43 @@ export function Blob() {
     }
   };
 
+  // Y copies the permalink (to the selected lines, or the file); Escape clears
+  // the selection. Typing in a field is left alone.
+  const keys = useRef({ copyLink, clearSelection, selected: !!selection });
+  keys.current = { copyLink, clearSelection, selected: !!selection };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest("input, textarea, select, [contenteditable=''], [contenteditable='true']")
+      )
+        return;
+      if (event.key === "y" || event.key === "Y") {
+        event.preventDefault();
+        void keys.current.copyLink(true);
+      } else if (event.key === "Escape" && keys.current.selected) {
+        keys.current.clearSelection();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // Both initial deep links and subsequent selections render after route loading.
   useEffect(() => {
     if (start) document.getElementById(`L${start}`)?.scrollIntoView({ block: "center" });
   }, [start, end, file]);
+
+  // The inline permalink button sits on the selection's first line, outside the
+  // horizontal scroller so it stays in view beside long lines.
+  const code = useRef<HTMLDivElement>(null);
+  const [pinTop, setPinTop] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const row = start ? document.getElementById(`L${start}`) : null;
+    if (!row || !code.current) return setPinTop(null);
+    setPinTop(row.getBoundingClientRect().top - code.current.getBoundingClientRect().top);
+  }, [start, lines, highlights]);
 
   return (
     <div className="grid gap-x-8 gap-y-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
@@ -99,50 +159,67 @@ export function Blob() {
           onSwitch={(ref) => navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path))}
         />
         <section className="rounded-pane bg-pane">
-          <div className="sticky top-16 z-10 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-t-pane border-b border-line-soft bg-pane px-4 py-3 text-body-sm">
-            <span className="min-w-0 font-semibold break-all">{fileName}</span>
-            <span className="text-ink-faint">
-              {blob.binary ? bytes(blob.size) : `${lines.length} lines · ${bytes(blob.size)}`}
-            </span>
-            {selection ? (
-              <div
-                role="group"
-                aria-label="Selected source lines"
-                className="flex w-full flex-wrap items-center gap-2"
-              >
-                <span className="mr-auto text-ink-muted" aria-live="polite">
-                  {start === end ? `Line ${start}` : `Lines ${start}–${end}`}
-                </span>
+          <div className="sticky top-16 z-10 flex flex-col gap-2 rounded-t-pane border-b border-line-soft bg-pane px-4 py-3 text-body-sm sm:top-0">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+              <span className="min-w-0 font-semibold break-all">{fileName}</span>
+              <span className="mr-auto text-ink-faint">
+                {blob.binary ? bytes(blob.size) : `${lines.length} lines · ${bytes(blob.size)}`}
+              </span>
+              <div className="ml-auto flex items-center gap-2">
                 <button
                   type="button"
-                  className="mk-btn mk-btn--ghost min-h-11"
-                  aria-pressed={extending}
-                  onClick={() => setRangeOrigin(extending ? null : { file, hash })}
-                >
-                  {extending ? "Select last line" : "Extend range"}
-                </button>
-                <button
-                  type="button"
-                  className="mk-btn mk-btn--ghost min-h-11"
+                  className="mk-btn mk-btn--ghost mk-btn--sm max-sm:h-11"
                   onClick={() => void copyLink(false)}
+                  title={`Copy a link to ${selection ? lineLabel : "this file"} on ${blob.ref}`}
                 >
                   <CopyIcon aria-hidden />
                   Copy link
                 </button>
                 <button
                   type="button"
-                  className="mk-btn mk-btn--ghost min-h-11"
+                  className="mk-btn mk-btn--sm max-sm:h-11"
                   onClick={() => void copyLink(true)}
-                  title="Copy a link pinned to this exact commit"
+                  title={`Copy a link to ${selection ? lineLabel : "this file"} pinned to this exact commit (Y)`}
                 >
                   <LinkSimpleIcon aria-hidden />
                   Copy permalink
                 </button>
               </div>
+            </div>
+            {selection ? (
+              <div
+                role="group"
+                aria-label="Selected source lines"
+                className="flex flex-wrap items-center gap-2"
+              >
+                <span
+                  className="mr-auto inline-flex h-6 items-center gap-1.5 rounded-plate bg-signal-wash px-2 font-semibold text-ink tabular-nums"
+                  aria-live="polite"
+                >
+                  {start === end ? `Line ${start}` : `Lines ${start}–${end}`}
+                </span>
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost mk-btn--sm max-sm:h-11"
+                  aria-pressed={extending}
+                  onClick={() => setRangeOrigin(extending ? null : { file, hash })}
+                >
+                  {extending ? "Now select the last line" : "Extend range"}
+                </button>
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost mk-btn--sm max-sm:h-11"
+                  onClick={clearSelection}
+                  title="Clear the selection (Esc)"
+                >
+                  <XIcon aria-hidden />
+                  Clear
+                </button>
+              </div>
             ) : (
               !blob.binary && (
-                <span className="w-full text-ink-muted">
-                  Select a line number to share. Shift-click another to select a range.
+                <span className="text-ink-faint">
+                  Select a line number to link to it; shift-click another for a range.
                 </span>
               )
             )}
@@ -154,46 +231,62 @@ export function Blob() {
               <span className="text-body-sm text-ink-faint">Clone the repository to open it.</span>
             </div>
           ) : (
-            <div className="overflow-x-auto rounded-b-pane bg-sunken py-3">
-              <table className="w-full border-collapse font-mono text-body-sm leading-5">
-                <tbody>
-                  {lines.map((line, index) => {
-                    const selected =
-                      !!selection && index + 1 >= selection.start && index + 1 <= selection.end;
-                    return (
-                      <tr
-                        key={index}
-                        id={`L${index + 1}`}
-                        data-line-selected={selected || undefined}
-                        className={`scroll-mt-48 ${selected ? "bg-signal-wash" : ""}`}
-                      >
-                        <td className="w-px pr-4 pl-4 text-right align-top tabular-nums select-none">
-                          <a
-                            href={`#L${index + 1}`}
-                            className="inline-flex min-h-6 min-w-6 items-center justify-end text-ink-faint no-underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal-line"
-                            aria-label={`Line ${index + 1}`}
-                            aria-current={selected ? "location" : undefined}
-                            onClick={(event) => selectLine(event, index + 1)}
+            <div ref={code} className="relative">
+              <div className="overflow-x-auto rounded-b-pane bg-sunken py-3">
+                <table className="w-full border-collapse font-mono text-body-sm leading-5">
+                  <tbody>
+                    {lines.map((line, index) => {
+                      const selected =
+                        !!selection && index + 1 >= selection.start && index + 1 <= selection.end;
+                      return (
+                        <tr
+                          key={index}
+                          id={`L${index + 1}`}
+                          data-line-selected={selected || undefined}
+                          className={`scroll-mt-48 ${selected ? "bg-signal-wash" : ""}`}
+                        >
+                          <td
+                            className={`w-px p-0 text-right align-top tabular-nums select-none ${selected ? "shadow-[inset_2px_0_0_var(--signal)]" : ""}`}
                           >
-                            {index + 1}
-                          </a>
-                        </td>
-                        <td className="pr-4 whitespace-pre">
-                          {highlights?.[index] ? (
-                            <HighlightedSource text={line || " "} tokens={highlights[index]} />
-                          ) : (
-                            line || " "
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              {blob.truncated && (
-                <p className="mx-4 mt-3 mb-0 text-body-sm text-ink-faint">
-                  Showing the first 1 MB. Clone the repository for the rest.
-                </p>
+                            <a
+                              href={`#L${index + 1}`}
+                              className={`flex h-6 min-w-12 items-center justify-end pr-4 pl-4 no-underline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-signal-line ${selected ? "font-semibold text-ink" : "text-ink-faint hover:text-ink"}`}
+                              aria-label={`Line ${index + 1}`}
+                              aria-current={selected ? "location" : undefined}
+                              onClick={(event) => selectLine(event, index + 1)}
+                            >
+                              {index + 1}
+                            </a>
+                          </td>
+                          <td className="h-6 p-0 pr-4 whitespace-pre">
+                            {highlights?.[index] ? (
+                              <HighlightedSource text={line || " "} tokens={highlights[index]} />
+                            ) : (
+                              line || " "
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {blob.truncated && (
+                  <p className="mx-4 mt-3 mb-0 text-body-sm text-ink-faint">
+                    Showing the first 1 MB. Clone the repository for the rest.
+                  </p>
+                )}
+              </div>
+              {selection && pinTop !== null && (
+                <button
+                  type="button"
+                  className="absolute right-2 inline-flex h-6 cursor-pointer items-center gap-1.5 rounded-plate border-0 bg-raised px-2 font-sans text-micro font-semibold text-ink-muted transition-colors hover:bg-pressed hover:text-ink focus-visible:outline-2 focus-visible:outline-signal-line"
+                  style={{ top: pinTop }}
+                  onClick={() => void copyLink(true)}
+                  title={`Copy a permalink to ${lineLabel} (Y)`}
+                >
+                  <LinkSimpleIcon aria-hidden />
+                  Permalink
+                </button>
               )}
             </div>
           )}
