@@ -508,6 +508,15 @@ export function AtlasMap({
   }, [frame, atlas, hits, hover, selected]);
 
   const hoverNode = hover && hover.cell.node >= 0 ? map.nodes[hover.cell.node] : null;
+  const tooltipWidth = Math.min(384, Math.max(0, size.current.w - 16));
+  const tooltipStyle = hover
+    ? {
+        maxWidth: tooltipWidth,
+        left: Math.max(8, Math.min(hover.x + 14, size.current.w - tooltipWidth - 8)),
+        top: hover.y > size.current.h / 2 ? hover.y - 12 : hover.y + 16,
+        transform: hover.y > size.current.h / 2 ? "translateY(-100%)" : undefined,
+      }
+    : undefined;
 
   const zoomBy = (factor: number, cx = size.current.w / 2, cy = size.current.h / 2) => {
     const v = view.current;
@@ -649,13 +658,10 @@ export function AtlasMap({
       </ul>
       {hover && hoverNode && !drag.current && (
         <div
-          className="mk-tooltip pointer-events-none absolute z-[1] max-w-[24rem] flex-col items-start gap-0.5"
-          style={{
-            left: Math.min(hover.x + 14, size.current.w - 260),
-            top: Math.min(hover.y + 16, size.current.h - 64),
-          }}
+          className="mk-tooltip pointer-events-none absolute z-[1] flex-col items-start gap-0.5"
+          style={tooltipStyle}
         >
-          <span className="font-semibold">{hoverNode[2]}</span>
+          <span className="max-w-full font-semibold [overflow-wrap:anywhere]">{hoverNode[2]}</span>
           <span className="text-micro text-ink-faint">
             {KIND_LABEL[hoverNode[1]]}
             {hover.cell.level === "region" || hover.cell.level === "district"
@@ -671,8 +677,8 @@ export function AtlasMap({
       )}
       {hover && !hoverNode && !drag.current && (
         <div
-          className="mk-tooltip pointer-events-none absolute z-[1]"
-          style={{ left: Math.min(hover.x + 14, size.current.w - 200), top: hover.y + 16 }}
+          className="mk-tooltip pointer-events-none absolute z-[1] [overflow-wrap:anywhere]"
+          style={tooltipStyle}
         >
           {hover.cell.label} · {hover.cell.children.length.toLocaleString()} inside
         </div>

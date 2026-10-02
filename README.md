@@ -50,7 +50,8 @@ See [CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-an
 The Knowledge view reveals component, folder, file and symbol labels as you zoom
 in. Long names wrap or end in an ellipsis instead of leaving readable tiles blank;
 hover a tile or select it to see the complete name in the tooltip or inspector.
-Tiny tiles remain unlabeled until there is enough room to read them.
+Hover names wrap within the map, including near its edges. Tiny tiles remain
+unlabeled until there is enough room to read them.
 
 ## Agent-first development
 
