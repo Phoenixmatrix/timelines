@@ -279,7 +279,9 @@ vp run agent maintenance status
 - `maintenance uninstall` refuses while owned live environments remain. Do not
   remove the central journal to silence cleanup failures.
 
-`.worktreeinclude` copies no credentials or mutable state by default. Never copy
+`.worktreeinclude` copies no credentials or mutable state by default; `gm worktree
+add` always copies the checkout's agent (`.gitmatrix/agent.local.yml`, a name and
+profile, no token) so a worktree's work keeps its agent. Never copy
 `.gitmatrix-agent`, `.wrangler`, HOME/XDG state, binaries or another worktree's
 `node_modules`. Checkouts share immutable package contents, not mutable application
 state; the shared store and local runners assume mutually trusted agents, not

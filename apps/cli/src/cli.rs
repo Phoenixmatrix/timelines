@@ -148,6 +148,7 @@ pub enum WorktreeCommand {
         #[arg(short, long, default_value = "@")]
         revision: String,
         /// Copy ignored files matching the source checkout's .worktreeinclude.
+        /// The checkout's agent (.gitmatrix/agent.local.yml) is always copied.
         #[arg(long)]
         include: bool,
     },

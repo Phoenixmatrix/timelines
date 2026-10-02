@@ -216,11 +216,14 @@ fn add(ctx: &Ctx, path: &Path, revision: &str, include: bool) -> Result<Worktree
         Workspace::open(&ctx.cwd)?
     };
     let base = revset::resolve(&ws, revision)?.to_string();
-    let paths = if include {
+    let mut paths = if include {
         worktree_include::plan(&ws.repo)?
     } else {
         Vec::new()
     };
+    paths.extend(worktree_include::always(&ws.repo)?);
+    paths.sort();
+    paths.dedup();
     let source = ws
         .repo
         .workdir()

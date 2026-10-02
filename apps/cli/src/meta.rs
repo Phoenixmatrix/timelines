@@ -540,7 +540,9 @@ Ranges for `gm log -r`: `trunk..@`, `all`.
     gm worktree remove ../feature
 Each worktree has its own files, @ and undo log; objects and bookmarks are shared.
 `--include` copies ignored, untracked regular files matching the source root's
-`.worktreeinclude` (gitignore syntax). Symlinks/overwrites are rejected. Run
+`.worktreeinclude` (gitignore syntax). The checkout's agent
+(`.gitmatrix/agent.local.yml`, no credentials) is always copied, so work in a
+worktree keeps its agent. Symlinks/overwrites are rejected. Run
 dependency installation yourself in the new checkout; do not copy node_modules.
 `add --dry-run` previews the stored @ and include plan without snapshotting.
 Removal refuses dirty/ignored files unless --force, and always refuses locks,

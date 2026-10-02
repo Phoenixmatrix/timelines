@@ -61,6 +61,30 @@ fn regular_file(dir: &Dir, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Copied into every new worktree, with or without .worktreeinclude: this
+/// checkout's agent (`gm agent setup`), so work in a worktree is attributed to
+/// the same agent. It names the agent and its profile; its token stays with
+/// gm's credentials, never in the checkout.
+pub const ALWAYS: &[&str] = &[".gitmatrix/agent.local.yml"];
+
+/// The files of ALWAYS this checkout has: untracked regular files only (a
+/// tracked one arrives with the checkout; anything else is skipped, not copied).
+pub fn always(repo: &git2::Repository) -> Result<Vec<PathBuf>> {
+    let Some(source) = repo.workdir() else {
+        return Ok(Vec::new());
+    };
+    let dir = root(source)?;
+    let index = repo.index().map_err(|e| failure(source, e))?;
+    Ok(ALWAYS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| {
+            !(0..=3).any(|stage| index.get_path(path, stage).is_some())
+                && regular_file(&dir, path).is_ok()
+        })
+        .collect())
+}
+
 /// Resolve inclusion before creating a destination, so it cannot include itself.
 pub fn plan(repo: &git2::Repository) -> Result<Vec<PathBuf>> {
     let source = repo.workdir().ok_or_else(|| {
@@ -301,6 +325,24 @@ mod tests {
         repo.set_index(&mut snapshot).unwrap();
 
         assert_eq!(plan(&repo).unwrap(), vec![PathBuf::from("local.env")]);
+    }
+
+    #[test]
+    fn the_checkouts_agent_is_always_included_unless_tracked_or_absent() {
+        let (temp, repo) = fixture();
+        assert!(always(&repo).unwrap().is_empty());
+        put(temp.path(), ".gitignore", ".gitmatrix/agent.local.yml\n");
+        put(temp.path(), ".gitmatrix/agent.local.yml", "name: builder\n");
+        assert_eq!(
+            always(&repo).unwrap(),
+            vec![PathBuf::from(".gitmatrix/agent.local.yml")]
+        );
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(Path::new(".gitmatrix/agent.local.yml"))
+            .unwrap();
+        index.write().unwrap();
+        assert!(always(&repo).unwrap().is_empty());
     }
 
     #[test]
