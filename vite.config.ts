@@ -1,6 +1,7 @@
 import { defineConfig } from "vite-plus";
 
 export default defineConfig({
+  test: { maxWorkers: 2 },
   staged: {
     "*": "vp check --fix",
   },

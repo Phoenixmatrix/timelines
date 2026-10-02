@@ -1,6 +1,7 @@
 import { defineConfig } from "vite-plus";
 
 export default defineConfig({
+  test: { maxWorkers: 2 },
   pack: {
     deps: {
       // tsdown <0.23 compatibility: resolve external dependency subpaths.

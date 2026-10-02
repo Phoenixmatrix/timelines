@@ -20,6 +20,7 @@ export default defineConfig({
   ],
   server: { host: local.host, port: local.port, strictPort: true },
   test: {
+    maxWorkers: 2,
     include: [
       "worker/**/*.test.ts",
       "registry/**/*.test.ts",

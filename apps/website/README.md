@@ -441,8 +441,9 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   this machine instead, so development doesn't start paid containers, and
   they come and go the same way: when the CI Workflow queues a job it pings
   the dev server (`CI_DISPATCH_URL`), whose `vite/ci-runners.ts` plugin starts
-  `gm runner --once` processes until the queue is empty (4 at a time;
-  `GITMATRIX_CI_RUNNERS` changes it). Nothing has to be left running; jobs
+  `gm runner --once` processes until the queue is empty (one at a time by default,
+  or two in isolated agent environments; `GITMATRIX_CI_RUNNERS` overrides the
+  limit at server startup). Nothing has to be left running; jobs
   queued while the dev server was down start when it comes back. Outside
   `vp dev`, `gm runner` still works by hand. `GITMATRIX_CI_RUNNER=sandbox vp dev`
   runs the container path locally with Docker. The choice is made in

@@ -372,8 +372,8 @@ async function gates(): Promise<void> {
     ["cli-check", "vp", ["run", "--no-cache", "cli#check"]],
     ["types", "vp", ["run", "--no-cache", "@gitmatrix/agent#typecheck"]],
     ["website-types", "vp", ["run", "--no-cache", "website#typecheck"]],
-    ["tests", "vp", ["run", "-r", "--no-cache", "test"]],
-    ["build", "vp", ["run", "-r", "--no-cache", "build"]],
+    ["tests", "vp", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "test"]],
+    ["build", "vp", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "build"]],
   ];
   for (const [name, binary, commandArgs] of steps) {
     console.log(JSON.stringify({ event: "gate.start", name }));

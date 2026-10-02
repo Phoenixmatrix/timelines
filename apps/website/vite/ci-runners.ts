@@ -17,7 +17,7 @@ type RunnerResult = z.infer<typeof runnerResult>;
 
 export function ciRunners(): Plugin {
   const local = developmentEnvironment(process.env);
-  const slots = Number(process.env.GITMATRIX_CI_RUNNERS ?? (local.agent ? 2 : 4));
+  const slots = Number(process.env.GITMATRIX_CI_RUNNERS ?? (local.agent ? 2 : 1));
   if (!Number.isInteger(slots) || slots < 1)
     throw new Error("GITMATRIX_CI_RUNNERS must be a positive integer");
   const gm = process.env.GITMATRIX_GM || "gm";

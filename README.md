@@ -183,8 +183,15 @@ unneeded environments. Publish source changes with ordinary `gm commit` / `gm pu
 **outside** the scoped `agent gm` wrapper, then check `gm runs wait`.
 `.gitmatrix/ci.yml` starts check, test, build and non-AI E2E independently; all four
 must pass. They exchange no artifacts, so no dependency-stage barrier is needed.
-Cargo is capped at four compiler workers per job so concurrent cold builds leave
-CPU capacity for JavaScript tests and the live server on the 24-CPU source host.
+The canonical development server runs one CI job at a time by default;
+`GITMATRIX_CI_RUNNERS` overrides this when the server starts. Isolated agent
+environments keep two slots for their fixture jobs. No running server needs to
+be restarted just to adopt these defaults; they apply at its next normal start.
+Both `ready` and source CI run recursive workspace test/build tasks one at a time.
+Every Vitest pool is capped at two workers. `.cargo/config.toml` defaults Cargo to
+four compiler workers for local commands, and source CI explicitly uses the same
+limit. Manual recursive commands can use `vp run -r --concurrency-limit 1 build`
+or `vp run -r --concurrency-limit 1 test` to keep the same memory budget.
 It runs on the trusted Linux CI host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.

@@ -35,7 +35,7 @@ jobs:
       - name: Generate Worker types
         run: vp run website#cf-typegen
       - name: Tests (web and gm)
-        run: vp run -r --no-cache test
+        run: vp run -r --concurrency-limit 1 --no-cache test
 
   build:
     steps:
@@ -44,7 +44,7 @@ jobs:
       # Fresh clones gain nothing from the task cache, and its file tracking
       # can fail to spawn native tools (spawn EBUSY).
       - name: Build
-        run: vp run -r --no-cache build
+        run: vp run -r --concurrency-limit 1 --no-cache build
       - name: Publish changed gm CLI on main
         run: node tools/agent/publish-cli.ts
 
