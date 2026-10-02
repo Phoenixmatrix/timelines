@@ -558,6 +558,25 @@ Offline readiness is advisory, never a lease. Lease operations require online ac
 Tracker writes are not restored by `gm undo`. `gm schema issue batch` describes atomic
 graph input. `gm tracker status` exposes private replica paths for credential recovery.
 
+## Working through a graph (agents)
+An agent has its own identity, accountable to a person: `gm agent create builder`,
+then `gm agent token builder`, and the agent runs with that token as GM_TOKEN.
+    gm issue next --agent builder --under CORE-4   # pick + claim atomically; token once
+    gm issue checkpoint CORE-5 'Done X; next Y'    # as you go; renew before expiry
+    gm issue ask CORE-5 --kind question --prompt 'Which region?'  # GM_LEASE_TOKEN parks
+    gm issue resume CORE-5                         # after a person answers: fresh token
+    gm issue complete CORE-5 --evidence 'Shipped in <commit>, CI run #N green'
+Ready means todo, unblocked, no open sub-issues, no one else's lease above, and not
+waiting on a person. `next` takes priority, then whatever unblocks the most work,
+then the oldest; it skips PRDs and other people's assignments. A lease covers its
+subtree: claim a parent to own it, then delegate inside it with that lease's token
+(`--under-token`, or GM_UNDER_TOKEN) and `--for <agent>`; `gm issue revoke` takes a
+delegated claim back. `gm issue handoff` gives your lease to another agent as a
+single-use code (`gm issue accept CODE`). Questions, approvals, decisions and
+credentials go to a person: they answer on the web's Needs you page or with
+`gm request answer`; a credential is stored as its secret, never in the tracker.
+Repeatedly released work asks its accountable person what to do differently.
+
 ## CI
 Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,
 `secrets`). Check your work landed green:

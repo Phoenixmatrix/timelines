@@ -345,11 +345,38 @@ dependencies and durable comments, agent checkpoints or evidence.
 - **Graph:** `FROM blocks TO`; only `done` satisfies a blocker. Canceling a
   prerequisite does not silently unblock its dependents. Parent hierarchy is
   separate and does not imply blocking. Both blocker and parent cycles are rejected.
-- **Coordination:** ready work is unblocked, unclaimed `todo`, or an expired
-  claimed `in_progress` issue. Exclusive claims require an online transaction.
-  Renew, release and complete require the unexpired fencing token; completion
-  also records evidence and rechecks blockers. Tokens never appear in public
-  snapshots or event feeds.
+- **Coordination:** ready work is unblocked, unclaimed `todo` (or an expired
+  claimed `in_progress` issue) with no open sub-issues, no other active lease
+  above it, and nothing waiting on a person (`readiness` in `shared/tracker.ts`,
+  mirrored by gm). Exclusive claims require an online transaction. Renew,
+  release and complete require the unexpired fencing token; completion also
+  records evidence, rechecks blockers and refuses parents with open sub-issues.
+  Tokens never appear in public snapshots or event feeds.
+- **Graph engineering (CORE-4):** agents work through issue graphs on their own.
+  - _Agents_ are identities a person creates (Settings > Agents, `gm agent`); they
+    act with their person's access but everything is attributed to the agent, and
+    every mention names the accountable person ("builder for Ann Lee").
+  - `issue.next` (`gm issue next`) picks and claims in one step: priority, then
+    the most open work transitively unblocked, then age; it skips PRDs and other
+    people's assignments.
+  - _A lease covers its subtree._ Claiming a parent (allowed even with open
+    sub-issues, which are never offered as work themselves) excludes everyone else
+    below it; status and parent changes there need the covering token. The holder
+    delegates child leases with that token (`underToken`, optionally `forActorId`
+    for one of its agents) and any lease above a claim can revoke it.
+  - _Waiting on a person_ sits beside status: `request.open` asks a question,
+    approval, decision or credential, routed to the asker's accountable person.
+    Asking with the lease token parks it (no expiry); the last answer unparks it
+    for an hour for its holder to `issue.resume` with a fresh token. Only people
+    answer, on Needs you (`/needs-you`, `GET /api/requests`), on the issue, or
+    with `gm request`. Credentials go to the named repository secret; the tracker
+    records only where.
+  - _Handoff:_ `issue.offer` returns a single-use code bound to the current
+    lease token; `issue.accept` moves the lease (and its accountability) with a
+    fresh token and fences the giver's at that moment.
+  - _Escalation:_ releases without completion count as attempts; at the team's
+    `attemptLimit` (default 3, 0 off) the issue asks its accountable person what
+    to do differently, with the latest checkpoints, and waits until answered.
 - **Distribution:** each account has one `TRACKER` SQLite Durable Object authority.
   Atomic batches, actor/payload-bound operation receipts, version checks and an
   ordered event cursor synchronize private CLI replicas. Lost acknowledgements
