@@ -5,8 +5,10 @@
 //   gmj_…          a CI job's credential, minted when the job starts and gone
 //                  when it ends: the job publishes as its repository
 //   <JWT>          a token this registry issued (Docker's token service)
-//   gm_persona     the web app's sign-in cookie, for downloads from the UI
+//   gm.session_token   the web app's sign-in (Better Auth), for the UI
+//   gm_persona         a development persona's cookie (DEV_MODE only)
 
+import { createAuth } from "../../../worker/better-auth.ts";
 import { db as gitmatrixDb, nowIso, type DB } from "../../../worker/schema.ts";
 import { RegistryError } from "../errors.ts";
 import { ANONYMOUS, scopesForTokenScope, type Actor, type JobIdentity } from "./actor.ts";
@@ -16,6 +18,8 @@ import { REGISTRY_TOKEN_ISSUER, verifyRegistryToken } from "./registry-token.ts"
 export const TOKEN_PREFIX = "gmx_";
 export const JOB_TOKEN_PREFIX = "gmj_";
 const PERSONA_COOKIE = "gm_persona";
+/** Better Auth's session cookie, with its __Secure- variant over HTTPS. */
+const SESSION_COOKIE = /(?:^|;\s*)(?:__Secure-)?gm\.session_token=/;
 
 export async function hashSecret(secret: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
@@ -91,14 +95,24 @@ async function fromJobToken(db: DB, secret: string): Promise<Actor | null> {
   };
 }
 
-async function fromCookie(db: DB, headers: Headers): Promise<Actor | null> {
+/** The web app's signed-in user: an email sign-in, or a persona in development. */
+async function fromCookie(env: Env, db: DB, headers: Headers): Promise<Actor | null> {
   const cookie = headers.get("cookie") ?? "";
-  const match = cookie.match(new RegExp(`(?:^|;\\s*)${PERSONA_COOKIE}=([^;]+)`));
-  if (!match?.[1]) return null;
+  let accountId: string | null = null;
+  if (SESSION_COOKIE.test(cookie)) {
+    // A Better Auth user's id is their gitmatrix account id.
+    const session = await (await createAuth(env)).api.getSession({ headers });
+    accountId = session?.user.id ?? null;
+  }
+  if (!accountId && env.DEV_MODE === "true") {
+    const match = cookie.match(new RegExp(`(?:^|;\\s*)${PERSONA_COOKIE}=([^;]+)`));
+    accountId = match?.[1] ? decodeURIComponent(match[1]) : null;
+  }
+  if (!accountId) return null;
   const row = await db
     .selectFrom("accounts")
     .select(["id", "slug", "display_name", "is_site_admin"])
-    .where("id", "=", decodeURIComponent(match[1]))
+    .where("id", "=", accountId)
     .where("kind", "=", "user")
     .executeTakeFirst();
   if (!row) return null;
@@ -133,11 +147,7 @@ function unverifiedIssuer(token: string): string | null {
  */
 export async function authenticate(env: Env, headers: Headers): Promise<Actor> {
   const credential = extractCredential(headers);
-  if (!credential) {
-    return (
-      (env.DEV_MODE === "true" ? await fromCookie(gitmatrixDb(env.DB), headers) : null) ?? ANONYMOUS
-    );
-  }
+  if (!credential) return (await fromCookie(env, gitmatrixDb(env.DB), headers)) ?? ANONYMOUS;
   const db = gitmatrixDb(env.DB);
   const token = credential.token;
 

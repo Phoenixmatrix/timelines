@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, test } from "vite-plus/test";
+import { authenticate } from "../registry/core/auth/authenticate.ts";
 import { createAuth, linkAccount, mayJoin, recordFailure } from "./better-auth.ts";
 
 /** Enough of D1 over node:sqlite for Kysely (kysely-d1) and Better Auth's D1 dialect. */
@@ -204,5 +205,29 @@ describe("failure lockout", () => {
     expect(rows("SELECT * FROM auth_lockouts")).toHaveLength(0);
     await recordFailure(env, ["ip:1"]);
     expect(rows("SELECT key FROM auth_lockouts")).toEqual([{ key: "ip:1" }]);
+  });
+});
+
+describe("the registry and an email sign-in", () => {
+  test("the sign-in cookie alone identifies the user to the registry", async () => {
+    const { env, sent, rows } = setup();
+    const response = await signIn(env, sent, "owner@example.com");
+    const cookie = response.headers
+      .getSetCookie()
+      .map((c) => c.split(";")[0]!)
+      .find((c) => c.startsWith("gm.session_token="))!;
+    const [account] = rows("SELECT id FROM accounts WHERE email = 'owner@example.com'");
+
+    const actor = await authenticate(env, new Headers({ cookie }));
+    expect(actor).toMatchObject({
+      kind: "user",
+      subject: account!.id,
+      via: "session",
+      isSiteAdmin: true,
+    });
+    // A cookie that isn't a live session is just a signed-out visitor.
+    expect(
+      await authenticate(env, new Headers({ cookie: "gm.session_token=forged.value" })),
+    ).toMatchObject({ kind: "anonymous" });
   });
 });
