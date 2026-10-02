@@ -331,6 +331,9 @@ Read agent stderr as JSON lines: progress has `event: "clone.progress"`, while
 a failure ends with the existing `{"error": ...}` envelope and a nonzero exit.
 No `complete` event is emitted on failure. Callers that need stderr to contain
 only the final error document can pass `--quiet`.
+Authentication errors are identified from explicit HTTP or credential diagnostics,
+not numbers in progress counters or repository URLs. An interrupted pack transfer
+(such as early EOF) remains `git_failed` with exit code 1, not a sign-in failure.
 
 ## Commands
 

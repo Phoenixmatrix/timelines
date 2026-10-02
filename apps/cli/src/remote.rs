@@ -514,6 +514,19 @@ fn read_git_progress(
     Ok(diagnostics.into())
 }
 
+/// HTTP status numbers are meaningful only in Git's diagnostic records, not
+/// object counts, transfer rates or repository URLs retained with progress.
+fn has_http_error(stderr: &str, status: &str) -> bool {
+    stderr.split(['\r', '\n']).any(|line| {
+        if !line.starts_with("fatal: ") && !line.starts_with("error: ") {
+            return false;
+        }
+        line.split_once("The requested URL returned error: ")
+            .or_else(|| line.split_once("RPC failed; HTTP "))
+            .is_some_and(|(_, detail)| detail.split_ascii_whitespace().next() == Some(status))
+    })
+}
+
 /// Turn a failed git network command into a useful error.
 pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -540,7 +553,8 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
     if stderr.contains("Authentication failed")
         || stderr.contains("terminal prompts disabled")
         || stderr.contains("could not read Username")
-        || stderr.contains("401")
+        || stderr.contains("unable to get password from user")
+        || has_http_error(&stderr, "401")
     {
         return GmError::new(
             "unauthenticated",
@@ -549,7 +563,7 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
         .hint("Sign in: `gm auth login` (in the browser), or `--persona <name>` in dev.")
         .exit(exit::AUTH);
     }
-    if stderr.contains("403")
+    if has_http_error(&stderr, "403")
         || detail.contains("does not have write access")
         || detail.contains("read-only")
     {
@@ -577,6 +591,92 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
             }
         ),
     )
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+
+    fn failure(stderr: &str) -> GmError {
+        git_failure(
+            "Clone",
+            &Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            },
+        )
+    }
+
+    #[test]
+    fn object_counts_do_not_turn_early_eof_into_an_auth_error() {
+        for count in [401, 403] {
+            let error = failure(&format!(
+                "Receiving objects: 40% ({count}/1000)\rfatal: early EOF\n"
+            ));
+            assert_eq!(error.code, "git_failed", "{count}");
+            assert_eq!(error.exit, exit::ERROR, "{count}");
+            assert!(error.message.contains("early EOF"));
+            assert!(error.hint.is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_http_errors_keep_auth_classification_despite_progress_counts() {
+        for (status, count, code) in [(401, 403, "unauthenticated"), (403, 401, "forbidden")] {
+            for diagnostic in [
+                format!(
+                    "fatal: unable to access 'https://example.test/repo.git/': The requested URL returned error: {status}"
+                ),
+                format!(
+                    "error: RPC failed; HTTP {status} curl 22 The requested URL returned error: {status}"
+                ),
+            ] {
+                let error = failure(&format!(
+                    "Receiving objects: 40% ({count}/1000)\r{diagnostic}\n"
+                ));
+                assert_eq!(error.code, code, "{diagnostic}");
+                assert_eq!(error.exit, exit::AUTH);
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_numbers_and_longer_http_codes_are_not_auth_failures() {
+        for diagnostic in [
+            "fatal: unable to access 'https://example.test/401/403.git/': Could not resolve host: example.test",
+            "fatal: The requested URL returned error: 4010",
+            "error: RPC failed; HTTP 4030 curl 22",
+        ] {
+            let error = failure(diagnostic);
+            assert_ne!(error.exit, exit::AUTH, "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn credential_and_permission_diagnostics_still_classify_correctly() {
+        for (diagnostic, code) in [
+            (
+                "fatal: Authentication failed for 'https://example.test/repo.git/'",
+                "unauthenticated",
+            ),
+            (
+                "fatal: could not read Username: terminal prompts disabled",
+                "unauthenticated",
+            ),
+            ("fatal: unable to get password from user", "unauthenticated"),
+            ("remote: user does not have write access", "forbidden"),
+            ("remote: repository is read-only", "forbidden"),
+        ] {
+            let error = failure(diagnostic);
+            assert_eq!(error.code, code);
+            assert_eq!(error.exit, exit::AUTH);
+        }
+    }
 }
 
 #[cfg(test)]
