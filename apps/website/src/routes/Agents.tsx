@@ -138,17 +138,22 @@ export function Agents() {
 }
 
 function AgentRow({ agent }: { agent: Agent }) {
-  const mint = useFetcher();
+  // Minting navigates (a plain Form) so the page's action data carries the secret to show.
+  const navigation = useNavigation();
+  const minting =
+    navigation.formData?.get("intent") === "token" && navigation.formData.get("id") === agent.id;
   const revoke = useFetcher();
   const revoked = agent.revokedAt !== null;
   return (
     <li className={`flex flex-col gap-3 py-4 ${revoked ? "opacity-60" : ""}`}>
-      <div className="flex items-start gap-3">
+      <div className="flex flex-wrap items-start gap-3">
         <RobotIcon className="mt-0.5 size-5 shrink-0 text-ink-faint" aria-hidden />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold">{agent.name}</span>
-            <span className="mk-chip mk-chip--tag">for {agent.accountable.displayName}</span>
+            <span className="mk-chip mk-chip--tag whitespace-nowrap">
+              for {agent.accountable.displayName}
+            </span>
             {revoked && <span className="mk-chip mk-chip--tag">Revoked</span>}
           </div>
           {agent.description && (
@@ -163,15 +168,15 @@ function AgentRow({ agent }: { agent: Agent }) {
           </div>
         </div>
         {!revoked && (
-          <div className="flex shrink-0 flex-wrap justify-end gap-2">
-            <mint.Form method="post">
+          <div className="flex shrink-0 flex-wrap justify-end gap-2 max-sm:w-full max-sm:justify-start max-sm:pl-8">
+            <Form method="post">
               <input type="hidden" name="intent" value="token" />
               <input type="hidden" name="id" value={agent.id} />
               <input type="hidden" name="name" value={agent.name} />
-              <button className="mk-btn mk-btn--sm" disabled={mint.state !== "idle"}>
+              <button className="mk-btn mk-btn--sm" disabled={minting}>
                 New token
               </button>
-            </mint.Form>
+            </Form>
             <ConfirmDialog
               trigger={<button className="mk-btn mk-btn--danger-ghost mk-btn--sm">Revoke</button>}
               title={`Revoke ${agent.name}?`}
