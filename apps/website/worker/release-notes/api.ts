@@ -8,6 +8,7 @@ import { RepoReader } from "../objects.ts";
 import { accessible } from "../tracker/api.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
+import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
 import { issuesFrom } from "./trackers.ts";
 
 export const releaseNotes = new Hono<AppEnv>();
@@ -103,4 +104,25 @@ releaseNotes.get("/range", async (c) => {
   } finally {
     await objects.close();
   }
+});
+
+/** The releases this repository has notes for, and whether generation is running. */
+releaseNotes.get("/", async (c) => {
+  const loaded = await loadRepo(c);
+  if (loaded instanceof Response) return loaded;
+  c.header("cache-control", "private, no-store");
+  const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
+  return c.json(await releaseIndex(c.env.DB, loaded.row.id, trackers, Boolean(c.env.AI)));
+});
+
+/** One release's introduction and entries, as the viewer may see them. */
+releaseNotes.get("/release", async (c) => {
+  const loaded = await loadRepo(c);
+  if (loaded instanceof Response) return loaded;
+  c.header("cache-control", "private, no-store");
+  const name = c.req.query("name") ?? "";
+  const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
+  const body = await releaseNotesFor(c.env.DB, loaded.row.id, name, trackers);
+  if (!body) return c.json({ error: "No release notes for that release." }, 404);
+  return c.json(body);
 });

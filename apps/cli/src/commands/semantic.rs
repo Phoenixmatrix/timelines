@@ -26,7 +26,7 @@ impl Render for Shown {
 }
 
 /// Encode one path segment or query value, including cursor punctuation and UTF-8.
-fn encode_into(out: &mut String, value: &str) {
+pub(crate) fn encode_into(out: &mut String, value: &str) {
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {

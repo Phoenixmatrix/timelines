@@ -112,6 +112,9 @@ pub enum Command {
     /// Syntax-level changes from the server's repository history
     #[command(subcommand)]
     Semantic(SemanticCommand),
+    /// AI release notes written from commits, tracker issues and code changes
+    #[command(subcommand)]
+    Release(ReleaseCommand),
     /// CI/CD runs of .gitmatrix/ci.yml: list, inspect, read logs, wait for a result
     #[command(subcommand)]
     Runs(RunsCommand),
@@ -518,6 +521,30 @@ pub enum MirrorCommand {
         #[arg(short = 'R', long)]
         repo: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ReleaseCommand {
+    /// Releases with notes: unreleased work first, then tags newest first
+    List {
+        /// Repository as owner/name (default: this repository's origin).
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// One release's notes (default: the newest release with entries)
+    Notes(ReleaseNotesArgs),
+}
+
+#[derive(Args)]
+pub struct ReleaseNotesArgs {
+    /// A tag, or `unreleased` for the default branch's work since the newest tag.
+    pub release: Option<String>,
+    /// Repository as owner/name (default: this repository's origin).
+    #[arg(short = 'R', long)]
+    pub repo: Option<String>,
+    /// Include internal entries (chores, refactors, tests, tooling).
+    #[arg(long)]
+    pub internal: bool,
 }
 
 #[derive(Subcommand)]

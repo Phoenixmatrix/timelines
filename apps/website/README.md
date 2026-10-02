@@ -542,6 +542,20 @@ whose issues shaped it, so readers without access to them can be shown entries
 without it. Without AI bindings (automatic non-AI test environments) nothing is
 scheduled.
 
+**Reading** (`worker/release-notes/read.ts`): the repository's **Releases** tab
+lists unreleased work and tags with entry counts, and shows one release's
+introduction and entries grouped as New, Fixed, Improved and (collapsed)
+Internal, each linking to its issue and commits, with the models that wrote them.
+`gm release list` and `gm release notes` are the CLI equivalents. Entries about
+issues from trackers the viewer can't read are omitted, and an introduction is
+shown only to viewers who can read every tracker that shaped it.
+
+| Route                                                       | Contract                                   |
+| ----------------------------------------------------------- | ------------------------------------------ |
+| `GET /api/repos/:owner/:name/release-notes`                 | `ReleaseNotesIndex`: status and releases   |
+| `GET /api/repos/:owner/:name/release-notes/release?name=`   | `ReleaseNotesRelease`: intro and entries   |
+| `GET /api/repos/:owner/:name/release-notes/range?to=&from=` | `ReleaseRangeResponse`: commits and issues |
+
 ## Knowledge graph and wiki
 
 Every repository has a knowledge graph that stays current as it changes; the

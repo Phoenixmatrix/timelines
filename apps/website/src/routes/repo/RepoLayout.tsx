@@ -200,6 +200,9 @@ export function RepoLayout() {
             <Tab to={`${base}/tracker`} sections={[`${base}/tracker`]}>
               Issues
             </Tab>
+            <Tab to={`${base}/releases`} sections={[`${base}/releases`]}>
+              Releases
+            </Tab>
             <Tab to={`${base}/wiki`} sections={[`${base}/wiki`]}>
               Wiki
             </Tab>

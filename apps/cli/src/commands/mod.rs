@@ -4,6 +4,7 @@ pub mod ci;
 pub mod local;
 pub mod network;
 pub mod pkg;
+pub mod release;
 pub mod semantic;
 pub mod server;
 pub mod tracker;

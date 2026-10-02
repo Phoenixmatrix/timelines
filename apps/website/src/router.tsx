@@ -18,6 +18,7 @@ import { NeedsYou, needsYouLoader } from "./routes/NeedsYou.tsx";
 import { OwnerPackages, ownerPackagesLoader } from "./routes/packages/OwnerPackages.tsx";
 import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageConsole.tsx";
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
+import { Releases, releasesLoader } from "./routes/repo/Releases.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
 import { SemanticChanges } from "./routes/repo/SemanticChanges.tsx";
@@ -132,6 +133,7 @@ export const router = createBrowserRouter([
               { path: "commits/*", loader: commitsLoader, Component: Commits },
               { path: "changes", Component: SemanticChanges },
               { path: "wiki/*", loader: wikiLoader, Component: Wiki },
+              { path: "releases/*", loader: releasesLoader, Component: Releases },
               { path: "knowledge", loader: knowledgeLoader, Component: Knowledge },
               { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
               { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },

@@ -78,3 +78,35 @@ export interface ReleaseNoteEntry {
   model: string | null;
   updatedAt: string;
 }
+
+export type ReleaseNotesState = "disabled" | "idle" | "generating" | "ready" | "failed";
+
+export interface ReleaseSummary {
+  /** A tag, or UNRELEASED. */
+  name: string;
+  toOid: string;
+  fromTag: string | null;
+  releasedAt: string;
+  updatedAt: string;
+  /** Entries the viewer can see, internal ones included. */
+  entries: number;
+}
+
+/** GET /api/repos/:owner/:name/release-notes */
+export interface ReleaseNotesIndex {
+  status: { state: ReleaseNotesState; generatedAt: string | null };
+  /** Unreleased first, then tags newest first. */
+  releases: ReleaseSummary[];
+}
+
+/** GET /api/repos/:owner/:name/release-notes/release?name= */
+export interface ReleaseNotesRelease {
+  release: ReleaseSummary & {
+    fromOid: string | null;
+    truncated: boolean;
+    /** Null when the viewer can't read every tracker whose issues shaped it. */
+    intro: string | null;
+    introModel: string | null;
+  };
+  entries: ReleaseNoteEntry[];
+}

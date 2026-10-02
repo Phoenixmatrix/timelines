@@ -50,6 +50,26 @@ See the [API, adapter contract and limits](../website/README.md#semantic-changes
 and the repository-root `vp run semantic-smoke` for the real server/CLI fixture
 verification. The web Changes tab is functional work in progress, not final UI.
 
+## Release notes
+
+`gm release list` shows the releases a repository has AI-written notes for:
+unreleased work on the default branch first, then tags newest first, with how
+many entries you can see. `gm release notes [RELEASE]` prints one release as
+Markdown (default: the newest release with entries; `unreleased` names the
+default branch's work since the newest tag), grouped into New, Fixed and
+Improved. Internal entries (chores, refactors, tooling) are counted but shown
+only with `--internal`.
+
+```sh
+gm release list -R orbit/engine
+gm release notes v1.2.0 -R orbit/engine
+gm release notes unreleased --internal -o json
+```
+
+Entries about issues from trackers you can't read are omitted, and so is any
+introduction they shaped. See [release notes](../website/README.md#release-notes)
+for how entries are generated.
+
 ## Distributed issue tracker
 
 Tracker commands work anywhere, without `gm init` or a Git repository. Accounts and
