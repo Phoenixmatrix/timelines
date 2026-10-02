@@ -274,6 +274,28 @@ pub enum IssueCommand {
         #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: u32,
     },
+    /// Hand your lease to another agent or person: prints a single-use code. You keep the lease until it's accepted.
+    Handoff {
+        #[command(flatten)]
+        lease: Lease,
+        /// Only this agent (name or id) or member (slug) may accept.
+        #[arg(long)]
+        to: Option<String>,
+        /// How long the code works, in seconds.
+        #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u32).range(30..=3600))]
+        ttl: u32,
+    },
+    /// Withdraw a pending handoff of your lease.
+    Withdraw(Lease),
+    /// Accept a handoff code: the lease moves to you with a fresh token; the giver's stops working.
+    Accept {
+        code: String,
+        /// A label for your working session (defaults to the giver's).
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: u32,
+    },
     /// Take back a claim inside your leased subtree; its token stops working.
     Revoke {
         issue: String,

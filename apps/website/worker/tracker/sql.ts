@@ -30,6 +30,14 @@ export interface TrackerDatabase {
   subscriptions: EntityRow;
   team_numbers: { id: string; number: number };
   leases: { issue_id: string; token: string };
+  /** One pending handoff per issue, bound to the lease token it was offered under. */
+  offers: {
+    issue_id: string;
+    code: string;
+    lease_token: string;
+    to_actor: string | null;
+    expires_at: string;
+  };
   receipts: { id: string; actor_id: string; request: string; result: string };
   events: { cursor: Generated<number>; data: string };
 }

@@ -413,6 +413,10 @@ export function IssueDetail({
               })}
               . You can edit its details, but only that agent can change its status until the claim
               ends.
+              {covering === issue &&
+                issue.handoff &&
+                issue.handoff.expiresAt > snapshot.serverTime &&
+                ` It's handing the work to ${issue.handoff.to ? actorName(snapshot, issue.handoff.to) : "whoever has its code"}.`}
             </span>
           </p>
         )}

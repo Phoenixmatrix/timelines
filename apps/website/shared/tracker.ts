@@ -76,6 +76,8 @@ export interface Issue extends TrackerEntity {
   claim: IssueClaim | null;
   /** Open requests to a person: while any is open the issue waits, whatever its status. */
   waiting?: number;
+  /** A pending handoff of the lease: to whom (anyone with the code when null), and until when. */
+  handoff?: { to: string | null; expiresAt: string } | null;
 }
 
 export type RequestKind = "question" | "approval" | "decision" | "credential";
@@ -252,6 +254,22 @@ export type Mutation =
       data: { answer?: string; choice?: string; approved?: boolean; stored?: boolean };
     }
   | { kind: "request.cancel"; id: string }
+  /**
+   * Hand the lease on: returns a single-use code. The giver keeps the lease (and
+   * can withdraw) until the code is accepted; then its token stops working.
+   */
+  | {
+      kind: "issue.offer";
+      id: string;
+      data: { leaseToken: string; toActorId?: string; ttlSeconds?: number };
+    }
+  | { kind: "issue.withdraw"; id: string; data: { leaseToken: string } }
+  /** Take a handed-off lease: a fresh token, and the lease moves to you. */
+  | {
+      kind: "issue.accept";
+      id: string;
+      data: { code: string; agent?: string; ttlSeconds?: number };
+    }
   /** After its requests are answered, the parked lease's holder takes it back up. */
   | { kind: "issue.resume"; id: string; data: { ttlSeconds?: number } }
   /** The holder of a lease above an issue takes back the issue's claim. */
@@ -289,6 +307,8 @@ export interface MutationResult {
     /** For issue.next: the issue it claimed (absent when nothing was ready). */
     issueId?: string;
     key?: string;
+    /** For issue.offer: the single-use code to hand over, shown once. */
+    offerCode?: string;
   }[];
   serverTime: string;
 }

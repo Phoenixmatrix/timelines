@@ -1189,6 +1189,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     let lease_command = matches!(
         args.command,
         IssueCommand::Claim { .. }
+            | IssueCommand::Handoff { .. }
+            | IssueCommand::Withdraw(_)
+            | IssueCommand::Accept { .. }
             | IssueCommand::Ask { .. }
             | IssueCommand::Resume { .. }
             | IssueCommand::Revoke { .. }
@@ -1280,6 +1283,38 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 json!({"kind":"request.open","id":uid(),"data":data})
             }
+            IssueCommand::Handoff { lease, to, ttl } => {
+                let mut data = json!({"leaseToken":lease.lease_token,"ttlSeconds":ttl});
+                if let Some(to) = to {
+                    let found = ["agents", "members"]
+                        .iter()
+                        .flat_map(|t| snapshot[*t].as_array().into_iter().flatten())
+                        .find(|a| {
+                            a["id"] == to.as_str()
+                                || a["name"] == to.as_str()
+                                || a["slug"] == to.as_str()
+                        })
+                        .ok_or_else(|| {
+                            GmError::usage(format!("No agent or member {to} in this tracker."))
+                        })?;
+                    data["toActorId"] = found["id"].clone();
+                }
+                json!({"kind":"issue.offer","id":id(&snapshot,"issues",&lease.issue)?,"data":data})
+            }
+            IssueCommand::Withdraw(lease) => {
+                json!({"kind":"issue.withdraw","id":id(&snapshot,"issues",&lease.issue)?,"data":{"leaseToken":lease.lease_token}})
+            }
+            IssueCommand::Accept { code, agent, ttl } => {
+                // A code starts with its issue's key: ENG-12.<secret>.
+                let key = code.split_once('.').map(|(k, _)| k).ok_or_else(|| {
+                    GmError::usage("That isn't a handoff code (ISSUE-KEY.secret).")
+                })?;
+                let mut data = json!({"code":code,"ttlSeconds":ttl});
+                if let Some(agent) = agent {
+                    data["agent"] = json!(agent);
+                }
+                json!({"kind":"issue.accept","id":id(&snapshot,"issues",key)?,"data":data})
+            }
             IssueCommand::Resume { issue, ttl } => {
                 json!({"kind":"issue.resume","id":id(&snapshot,"issues",issue)?,"data":{"ttlSeconds":ttl}})
             }
@@ -1346,6 +1381,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 IssueCommand::Claim { .. }
                     | IssueCommand::Renew { .. }
                     | IssueCommand::Resume { .. }
+                    | IssueCommand::Accept { .. }
             ) {
                 redact(&mut response);
             }

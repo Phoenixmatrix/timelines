@@ -162,6 +162,7 @@ export class TrackerStore {
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS team_numbers (id TEXT PRIMARY KEY, number INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS leases (issue_id TEXT PRIMARY KEY, token TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS offers (issue_id TEXT PRIMARY KEY, code TEXT NOT NULL, lease_token TEXT NOT NULL, to_actor TEXT, expires_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS team_keys ON teams(json_extract(data, '$.key'));
@@ -386,6 +387,17 @@ export class TrackerStore {
         );
         if (blocked)
           fail("blocked", "Resolve all blockers before starting or completing work.", 409);
+      };
+      /** Constant-time comparison for secrets. */
+      const same = (a: string, b: string) => {
+        const x = new TextEncoder().encode(a);
+        const y = new TextEncoder().encode(b);
+        return x.length === y.length && timingSafeEqual(x, y);
+      };
+      /** A lease that ends or changes its token takes any pending handoff with it. */
+      const dropOffer = (issue: Issue) => {
+        run(this.sql, tracker.deleteFrom("offers").where("issue_id", "=", issue.id));
+        if (issue.handoff) issue.handoff = null;
       };
       /** Whether the caller holds `issue`'s active lease with `token`. */
       const holds = (issue: Issue, token: string) => {
@@ -848,6 +860,7 @@ export class TrackerStore {
             if ("status" in data && issue.status !== previous) {
               issue.claim = null;
               run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+              dropOffer(issue);
             }
             if (!creating) {
               issue.version++;
@@ -1105,6 +1118,99 @@ export class TrackerStore {
             settle(issue);
             break;
           }
+          case "issue.offer":
+          case "issue.withdraw": {
+            keys(
+              data,
+              mutation.kind === "issue.offer"
+                ? ["leaseToken", "toActorId", "ttlSeconds"]
+                : ["leaseToken"],
+            );
+            const issue = this.get<Issue>("issue", entityId);
+            teamWritable(this.get("team", issue.teamId));
+            lease(issue, data.leaseToken);
+            if (mutation.kind === "issue.withdraw") dropOffer(issue);
+            else {
+              const ttl = data.ttlSeconds === undefined ? 600 : data.ttlSeconds;
+              if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 3600)
+                fail("invalid_input", "An offer lasts 30 to 3600 seconds.");
+              // To a member or a member's agent; anyone with the code when unset.
+              const to = data.toActorId === undefined ? null : id(data.toActorId);
+              if (to) answerable(to);
+              const random = () => crypto.randomUUID().replaceAll("-", "");
+              const code = `${issue.key}.${random()}${random()}`;
+              const expiresAt = new Date(Date.parse(now) + Number(ttl) * 1000).toISOString();
+              const values = {
+                issue_id: issue.id,
+                code,
+                lease_token: String(data.leaseToken),
+                to_actor: to,
+                expires_at: expiresAt,
+              };
+              run(
+                this.sql,
+                tracker
+                  .insertInto("offers")
+                  .values(values)
+                  .onConflict((oc) => oc.column("issue_id").doUpdateSet(values)),
+              );
+              issue.handoff = { to, expiresAt };
+              result = { id: entityId, offerCode: code, expiresAt };
+            }
+            issue.version++;
+            issue.updatedAt = now;
+            emit("issue", entityId, issue, mutation.kind);
+            break;
+          }
+          case "issue.accept": {
+            keys(data, ["code", "agent", "ttlSeconds"]);
+            const issue = this.get<Issue>("issue", entityId);
+            teamWritable(this.get("team", issue.teamId));
+            const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
+            if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
+              fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
+            const code = text(data.code, "code", 300);
+            const offer = first(
+              this.sql,
+              tracker.selectFrom("offers").selectAll().where("issue_id", "=", issue.id),
+            );
+            const current = first(
+              this.sql,
+              tracker.selectFrom("leases").select("token").where("issue_id", "=", issue.id),
+            );
+            // The offer only stands while the lease it was made under does.
+            if (
+              !offer ||
+              !same(offer.code, code) ||
+              offer.expires_at <= now ||
+              !current ||
+              !same(current.token, offer.lease_token) ||
+              !hasActiveClaim(issue, now) ||
+              (offer.to_actor !== null && offer.to_actor !== access.actorId)
+            )
+              fail(
+                "offer_invalid",
+                "That handoff code is expired, used, withdrawn, or for someone else.",
+                409,
+              );
+            const previous = issue.claim!;
+            result = {
+              id: entityId,
+              ...grant(
+                issue,
+                data.agent === undefined ? previous.agent : text(data.agent, "agent", 200),
+                Number(ttl),
+                undefined,
+                { actorId: access.actorId, accountableId: access.principalId },
+                previous.delegatedFrom ? this.get<Issue>("issue", previous.delegatedFrom) : null,
+              ),
+            };
+            dropOffer(issue);
+            issue.version++;
+            issue.updatedAt = now;
+            emit("issue", entityId, issue, "issue.accept");
+            break;
+          }
           case "issue.resume": {
             keys(data, ["ttlSeconds"]);
             const issue = this.get<Issue>("issue", entityId);
@@ -1116,6 +1222,7 @@ export class TrackerStore {
               fail("not_holder", `Only ${issue.key}'s lease holder can resume it.`, 409);
             if (issue.waiting) fail("waiting", `${issue.key} still has open requests.`, 409);
             const claim = issue.claim;
+            dropOffer(issue);
             result = {
               id: entityId,
               ...grant(
@@ -1152,6 +1259,7 @@ export class TrackerStore {
             issue.claim = null;
             issue.status = "todo";
             run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+            dropOffer(issue);
             issue.version++;
             issue.updatedAt = now;
             emit("issue", entityId, issue, "issue.revoke");
@@ -1245,6 +1353,7 @@ export class TrackerStore {
               issue.status = kind === "issue.complete" ? "done" : "todo";
               issue.claim = null;
               run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+              dropOffer(issue);
             }
             issue.version++;
             issue.updatedAt = now;

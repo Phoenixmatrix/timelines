@@ -1030,3 +1030,84 @@ describe("waiting on a person", () => {
     expect(w.issue().waiting).toBe(0);
   });
 });
+
+describe("handoff", () => {
+  function handoff() {
+    const f = fixture();
+    f.issue("work");
+    const bot: Access = { ...f.access, actorId: "agt-bot" };
+    const bob: Access = { ...f.access, actorId: "bob", principalId: "bob" };
+    let n = 0;
+    const as = (access: Access, ...mutations: Mutation[]) =>
+      f.store.mutate(access, { operationId: `h-${++n}`, mutations });
+    const issue = () => f.store.snapshot(f.access).issues.find((i) => i.id === "work")!;
+    const giver = String(
+      as(bot, { kind: "issue.claim", id: "work", data: { agent: "first" } }).results[0]!.leaseToken,
+    );
+    const offer = (data: Record<string, unknown> = {}) =>
+      String(
+        as(bot, { kind: "issue.offer", id: "work", data: { leaseToken: giver, ...data } })
+          .results[0]!.offerCode,
+      );
+    return { ...f, bot, bob, as, issue, giver, offer };
+  }
+
+  test("accepting moves the lease and its accountability; the giver's token stops at that moment", () => {
+    const h = handoff();
+    const code = h.offer();
+    expect(code.startsWith("ENG-1.")).toBe(true);
+    expect(h.issue().handoff).toMatchObject({ to: null });
+    // Until it's accepted, the giver still holds the lease.
+    h.as(h.bot, { kind: "issue.renew", id: "work", data: { leaseToken: h.giver } });
+    const taken = String(
+      h.as(h.bob, { kind: "issue.accept", id: "work", data: { code, agent: "second" } }).results[0]!
+        .leaseToken,
+    );
+    expect(h.issue().claim).toMatchObject({
+      actorId: "bob",
+      accountableId: "bob",
+      agent: "second",
+    });
+    expect(h.issue().handoff).toBeNull();
+    expect(() =>
+      h.as(h.bot, { kind: "issue.renew", id: "work", data: { leaseToken: h.giver } }),
+    ).toThrow(/belongs to another agent/);
+    // A code works once.
+    expect(() => h.as(h.bob, { kind: "issue.accept", id: "work", data: { code } })).toThrow(
+      /expired, used, withdrawn/,
+    );
+    h.as(h.bob, {
+      kind: "issue.complete",
+      id: "work",
+      data: { leaseToken: taken, evidence: "Done" },
+    });
+  });
+
+  test("withdrawn, expired and someone else's offers can't be accepted", () => {
+    const h = handoff();
+    const withdrawn = h.offer();
+    h.as(h.bot, { kind: "issue.withdraw", id: "work", data: { leaseToken: h.giver } });
+    expect(() =>
+      h.as(h.bob, { kind: "issue.accept", id: "work", data: { code: withdrawn } }),
+    ).toThrow(/withdrawn/);
+    const forAlice = h.offer({ toActorId: "alice" });
+    expect(() =>
+      h.as(h.bob, { kind: "issue.accept", id: "work", data: { code: forAlice } }),
+    ).toThrow(/for someone else/);
+    const quick = h.offer({ ttlSeconds: 30 });
+    h.advance(30_000);
+    expect(() => h.as(h.bob, { kind: "issue.accept", id: "work", data: { code: quick } })).toThrow(
+      /expired/,
+    );
+  });
+
+  test("an offer dies with the lease it was made under", () => {
+    const h = handoff();
+    const code = h.offer();
+    h.as(h.bot, { kind: "issue.release", id: "work", data: { leaseToken: h.giver } });
+    expect(h.issue().handoff).toBeNull();
+    expect(() => h.as(h.bob, { kind: "issue.accept", id: "work", data: { code } })).toThrow(
+      /expired, used, withdrawn/,
+    );
+  });
+});
