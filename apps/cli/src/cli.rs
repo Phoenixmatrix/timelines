@@ -761,6 +761,36 @@ pub enum PkgCommand {
         #[arg(short = 'O', long)]
         owner: Option<String>,
     },
+    /// Download a generic artifact, verifying its SHA-256 before saving
+    Download {
+        /// <name>/<version>/<path>; use latest to resolve the newest published version.
+        target: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+        /// Destination file (default: the artifact's basename).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Atomically replace an existing regular file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install a Unix CLI artifact into ~/.local/bin (no installer scripts or archives)
+    Install {
+        /// Generic package and installed executable name.
+        name: String,
+        #[arg(short = 'O', long)]
+        owner: Option<String>,
+        #[arg(long, default_value = "latest")]
+        version: String,
+        /// Artifact path within the version (default: <os>-<arch>/<name>).
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// Atomically replace an existing executable, including this running gm.
+        #[arg(long)]
+        force: bool,
+    },
     /// Configure npm, Docker, pip, Cargo… on this machine for an owner's registries
     Setup {
         #[arg(short = 'O', long)]

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
 import { chromium, expect, type BrowserContext } from "@playwright/test";
 import type {
   CiLogs,
@@ -340,6 +341,100 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await request(`/generic/${repo.owner}/${packageName}/1.0.0/artifact.txt`, ownerToken),
       bytes,
     );
+    const downloaded = join(work, "downloaded-artifact.txt");
+    await gm([
+      "pkg",
+      "download",
+      `${packageName}/latest/artifact.txt`,
+      "--owner",
+      repo.owner,
+      "--dest",
+      downloaded,
+    ]);
+    assert.deepEqual(await readFile(downloaded), Buffer.from(bytes));
+    record({
+      downloaded,
+      version: "1.0.0",
+      sha256: createHash("sha256")
+        .update(await readFile(downloaded))
+        .digest("hex"),
+      exactBytes: true,
+    });
+
+    const executableName = `${packageName}-executable`;
+    const platform = `${process.platform === "darwin" ? "macos" : process.platform}-${process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : process.arch}`;
+    const executableFile = join(work, "executable-fixture");
+    const binDir = join(work, "installed-bin");
+    const installed = join(binDir, executableName);
+    const payload = (version: string) =>
+      `#!/bin/sh\nprintf '%s\\n' '${executableName} ${version}'\n`;
+    const installArgs = [
+      "pkg",
+      "install",
+      executableName,
+      "--owner",
+      repo.owner,
+      "--bin-dir",
+      binDir,
+    ];
+    const execute = promisify(execFile);
+    async function checkInstalled(version: string) {
+      const content = await readFile(installed);
+      assert.deepEqual(content, Buffer.from(payload(version)));
+      const mode = (await stat(installed)).mode & 0o777;
+      assert.equal(mode, 0o755);
+      const { stdout, stderr } = await execute(installed, [], {
+        cwd: work,
+        env: ctx.env,
+        timeout: 10_000,
+      });
+      assert.equal(stdout, `${executableName} ${version}\n`);
+      assert.equal(stderr, "");
+      record({
+        installed,
+        platform,
+        version,
+        mode: mode.toString(8),
+        sha256: createHash("sha256").update(content).digest("hex"),
+        stdout,
+      });
+    }
+    await writeFile(executableFile, payload("1.0.0"));
+    await gm([
+      "pkg",
+      "upload",
+      executableFile,
+      `${executableName}/1.0.0/${platform}/${executableName}`,
+      "--owner",
+      repo.owner,
+    ]);
+    await gm([...installArgs, "--dry-run"]);
+    await assert.rejects(stat(binDir), { code: "ENOENT" });
+    record({ dryRun: true, binDirectoryCreated: false });
+    await gm([...installArgs, "--version", "1.0.0"]);
+    await checkInstalled("1.0.0");
+
+    await writeFile(executableFile, payload("2.0.0"));
+    await gm([
+      "pkg",
+      "upload",
+      executableFile,
+      `${executableName}/2.0.0/${platform}/${executableName}`,
+      "--owner",
+      repo.owner,
+    ]);
+    await gm(installArgs, "marco", work, /exist|overwrite|force/i);
+    await checkInstalled("1.0.0");
+    await gm([...installArgs, "--force"]);
+    await checkInstalled("2.0.0");
+    await gm(
+      [...installArgs, "--version", "99.0.0", "--force"],
+      "marco",
+      work,
+      /404|not.found|missing/i,
+    );
+    await checkInstalled("2.0.0");
+    record({ rejectedOverwritePreserved: "1.0.0", missingVersionPreserved: "2.0.0" });
     await gm(
       ["pkg", "upload", file, `${packageName}/forbidden/artifact.txt`, "--owner", repo.owner],
       "read",

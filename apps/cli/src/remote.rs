@@ -128,6 +128,56 @@ pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
     })
 }
 
+/// Fetch a registry artifact without following redirects or forwarding credentials.
+pub fn artifact(
+    config: &Config,
+    path: &str,
+    head: bool,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let url = format!("{}{}", config.server(), path);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let fetch = |token: Option<&str>| {
+        let mut request = if head {
+            agent.head(&url)
+        } else {
+            agent.get(&url)
+        };
+        if let Some(token) = token {
+            request = request.header("authorization", &format!("Bearer {token}"));
+        }
+        request.call().map_err(|error| {
+            GmError::new(
+                "server_unreachable",
+                format!("Could not fetch artifact: {error}"),
+            )
+        })
+    };
+    let (token, from_ssh) = credential(config)?;
+    let mut response = fetch(token.as_deref())?;
+    if response.status().as_u16() == 401 && from_ssh {
+        crate::ssh::forget();
+        response = fetch(Some(&crate::ssh::session(config)?.token))?;
+    }
+    match response.status().as_u16() {
+        200 => Ok(response),
+        401 => Err(
+            GmError::new("unauthenticated", "Sign in to download this artifact.").exit(exit::AUTH),
+        ),
+        403 => Err(GmError::new("forbidden", "You cannot read this artifact.").exit(exit::AUTH)),
+        404 => Err(GmError::not_found("not_found", "Artifact not found.")),
+        status => Err(GmError::new(
+            "artifact_response",
+            format!(
+                "Expected HTTP 200 for artifact, received {status}. Redirects are not followed."
+            ),
+        )),
+    }
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)

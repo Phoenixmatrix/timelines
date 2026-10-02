@@ -138,6 +138,8 @@ pub const COMMANDS: &[Meta] = &[
     meta!("pkg revoke", git: "", kw: "remove repository publish permission source", mutates: true, out: Out::Other("{sources}"), ex: ["gm pkg revoke npm/@orbit/web orbit/website"]),
     meta!("pkg published", git: "", kw: "what did this run commit build publish artifacts outputs ci", mutates: false, out: Out::Other("{rows:[{format,package,feed,version,status}]}"), ex: ["gm pkg published", "gm pkg published --run 42", "gm pkg published --commit $(git rev-parse HEAD)"]),
     meta!("pkg upload", git: "", kw: "upload file artifact generic binary tarball release asset ci", mutates: true, out: Out::Other("{repo,path,downloadUri,size,checksums}"), ex: ["gm pkg upload dist/app.tgz app/1.4.0", "gm pkg upload build.zip app/$GITMATRIX_COMMIT/build.zip"]),
+    meta!("pkg download", git: "", kw: "download artifact binary file generic package checksum fetch save", mutates: true, out: Out::Other("{path,version,sha256,size,dry_run,installed}"), ex: ["gm pkg download gm/latest/linux-x86_64/gm -O orbit --dest ./gm", "gm pkg download app/1.4.0/app.tgz"]),
+    meta!("pkg install", git: "", kw: "install update upgrade cli executable binary unix artifact local bin", mutates: true, out: Out::Other("{path,version,sha256,size,dry_run,installed,platform}"), ex: ["gm pkg install gm -O orbit", "gm pkg install gm -O orbit --force", "gm pkg install gm -O orbit --version <commit> --bin-dir ./bin"]),
     meta!("pkg setup", git: "", kw: "configure npm docker pip cargo registry login npmrc credentials machine", mutates: true, out: Out::Other("{owner,npmrc,docker,pip,cargo,goproxy,maven,helm,generic}"), ex: ["gm pkg setup", "gm pkg setup -O orbit --write npm,docker"]),
     meta!("api", git: "", kw: "raw http api request endpoint json", mutates: true, out: Out::Other("the API's JSON response"), ex: ["gm api GET /repos", "gm api POST /repos -d '{\"owner\":\"jun\",\"name\":\"x\",\"visibility\":\"private\"}'"]),
     meta!("cli search", git: "", kw: "find command help discover how do i", mutates: false, out: Out::Typed(schema_of::<Vec<Hit>>), ex: ["gm cli search \"undo my last commit\""]),
@@ -561,6 +563,14 @@ repository, branch, commit and run. Packages are `<format>/<name>`:
     gm pkg delete oci/engine -q "branch:feature/* since:90d" --dry-run
     gm pkg grant npm/@orbit/web orbit/website        # let a repo publish it
     gm pkg setup --write npm,docker                  # this machine's tools
+    gm pkg download gm/latest/linux-x86_64/gm -O orbit --dest ./gm
+    gm pkg install gm -O orbit                      # verified executable in ~/.local/bin
+    gm pkg install gm -O orbit --force               # atomic update, including running gm
+
+Downloads verify the registry's SHA-256 before atomically saving. Install selects
+<os>-<arch>/<name> (for example linux-x86_64/gm); --file overrides that artifact
+path, --version pins a release and --bin-dir chooses the installation directory.
+Existing files require --force. No archives are unpacked or installer scripts run.
 
 ## Conflicts
 Rebases never stop halfway. A conflicted change gets conflict markers in its

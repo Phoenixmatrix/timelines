@@ -5,6 +5,45 @@ The React app and Worker live in `apps/website`; the Rust `gm` CLI lives in
 `apps/cli`. Gitmatrix hosts its own source. GitHub is a one-way backup, not the
 publication target.
 
+## Downloading and installing packages
+
+Authenticate `gm` with your Gitmatrix server before accessing private packages.
+Download any generic artifact to a local file, or install a direct Unix executable:
+
+```sh
+gm pkg download tools/1.2.3/linux-x86_64/tools --owner orbit --dest ./tools
+gm pkg install tools --owner orbit
+gm pkg install tools --owner orbit --force
+gm pkg install tools --owner orbit --version 1.2.3 --bin-dir ./disposable-bin
+```
+
+`download` defaults to the artifact's basename in the current directory; `install`
+defaults to `$HOME/.local/bin/<name>`. Both refuse existing files unless `--force`
+is supplied. Use `--force` to update an installed executable. Symlinks and other
+nonregular destinations are refused even with `--force`. Downloads verify the
+registry's SHA-256 checksum before atomically replacing a destination; a failed
+download leaves the existing file unchanged.
+
+Install defaults to `--version latest`. Download also accepts `latest` in place
+of the version, for example `tools/latest/linux-x86_64/tools`. Each command resolves
+`latest` once from package metadata; use an explicit version to pin an artifact.
+The default install artifact is `<os>-<arch>/<name>`, such as
+`linux-x86_64/tools`, `linux-aarch64/tools`, `macos-x86_64/tools`, or
+`macos-aarch64/tools`. Use `--file path/to/executable` to select another artifact
+inside the version. Installation writes the executable with mode `0755`; it does
+not unpack archives or run installer scripts.
+
+Add the chosen bin directory to `PATH` yourself if needed; `gm` does not edit shell
+configuration. `--dry-run` resolves the version and checks remote checksum metadata
+without creating local files or directories. For feature-worktree validation,
+always choose an external disposable `--bin-dir`, never a shared/global install.
+
+Gitmatrix publishes its own native release CLI from `main` when `apps/cli` changes:
+`gm pkg install gm --owner orbit`, then use `--force` for updates. Artifact versions
+are the last commit touching that source subtree; unrelated pushes do not republish.
+The current CI host produces `linux-x86_64`, not a cross-platform binary matrix.
+See [CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-and-installing-unix-clis).
+
 ## Agent-first development
 
 Use one **source worktree and isolated environment per agent**. Never test product
@@ -98,15 +137,15 @@ The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
 
-| Boundary                       | Observable behavior                                                                                                                        |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                            |
-| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                           |
-| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                               |
-| Registry                       | Real upload/download, denied writes, repository grants and CI publication provenance                                                       |
-| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                       |
-| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries                                 |
-| Providers                      | Authenticated Git mirror update/tag/prune and auth failure; knowledge build, graph, Vectorize entity search and AI Search source retrieval |
+| Boundary                       | Observable behavior                                                                                                                                |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                    |
+| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                   |
+| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                       |
+| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance |
+| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                               |
+| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries                                         |
+| Providers                      | Authenticated Git mirror update/tag/prune and auth failure; knowledge build, graph, Vectorize entity search and AI Search source retrieval         |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation

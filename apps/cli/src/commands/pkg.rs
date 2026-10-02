@@ -10,7 +10,9 @@ use crate::output::{GmError, Render, Result};
 use crate::remote::{self, Config};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
-use std::io::Write;
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub struct Shown {
@@ -428,8 +430,225 @@ pub fn pkg(ctx: &Ctx, command: &PkgCommand) -> Result<Shown> {
                 value,
             })
         }
+        PkgCommand::Download {
+            target,
+            owner: o,
+            dest,
+            force,
+        } => {
+            let owner = owner(ctx, &config, o)?;
+            let destination = dest
+                .clone()
+                .unwrap_or_else(|| target.rsplit('/').next().unwrap_or("").into());
+            save_artifact(
+                ctx,
+                &config,
+                &owner,
+                target,
+                &ctx.cwd.join(destination),
+                *force,
+                false,
+            )
+        }
+        PkgCommand::Install {
+            name,
+            owner: o,
+            version,
+            file,
+            bin_dir,
+            force,
+        } => {
+            path_segment(name)?;
+            let owner = owner(ctx, &config, o)?;
+            let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+            let file = file.clone().unwrap_or_else(|| format!("{platform}/{name}"));
+            let directory = match bin_dir {
+                Some(directory) => directory.clone(),
+                None => std::env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| std::path::PathBuf::from(home).join(".local/bin"))
+                    .ok_or_else(|| GmError::usage("Set HOME or choose --bin-dir."))?,
+            };
+            let destination = ctx.cwd.join(directory).join(name);
+            let mut shown = save_artifact(
+                ctx,
+                &config,
+                &owner,
+                &format!("{name}/{version}/{file}"),
+                &destination,
+                *force,
+                true,
+            )?;
+            shown.value["platform"] = json!(platform);
+            if !std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|path| path == destination.parent().unwrap())
+            }) {
+                shown.text.push_str(&format!(
+                    "\nAdd {} to PATH to run {name} by name.",
+                    destination.parent().unwrap().display()
+                ));
+            }
+            Ok(shown)
+        }
         PkgCommand::Setup { owner: o, write } => setup(ctx, &config, o, write),
     }
+}
+
+fn path_segment(segment: &str) -> Result<()> {
+    if segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment.contains(['/', '\\', '\0'])
+    {
+        return Err(GmError::usage(
+            "Artifact names and path segments must be nonempty, without traversal or separators.",
+        ));
+    }
+    Ok(())
+}
+
+fn check_destination(path: &Path, force: bool) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(GmError::new(
+            "unsafe_destination",
+            format!("Refusing non-regular destination {}.", path.display()),
+        )),
+        Ok(_) if !force => Err(GmError::new(
+            "already_exists",
+            format!(
+                "{} already exists; use --force to replace it.",
+                path.display()
+            ),
+        )
+        .exit(crate::output::exit::CONFLICT)),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_artifact(
+    ctx: &Ctx,
+    config: &Config,
+    owner: &str,
+    target: &str,
+    destination: &Path,
+    force: bool,
+    install: bool,
+) -> Result<Shown> {
+    use std::os::unix::fs::PermissionsExt;
+    path_segment(owner)?;
+    let mut segments = target.splitn(3, '/');
+    let name = segments.next().unwrap_or("");
+    let requested = segments.next().unwrap_or("");
+    let file = segments.next().ok_or_else(|| {
+        GmError::usage("Use <name>/<version>/<path>, such as gm/latest/linux-x86_64/gm.")
+    })?;
+    for segment in [name, requested].into_iter().chain(file.split('/')) {
+        path_segment(segment)?;
+    }
+    check_destination(destination, force)?;
+    let version = if requested == "latest" {
+        let detail = remote::api(config, "GET", &base(&encode(owner), "generic", name), None)?;
+        detail["package"]["latest"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                GmError::not_found("not_found", "This package has no published version.")
+            })?
+            .to_string()
+    } else {
+        requested.to_string()
+    };
+    path_segment(&version)?;
+    let path = format!(
+        "/generic/{}/{}/{}/{}",
+        encode(owner),
+        encode(name),
+        encode(&version),
+        file.split('/').map(encode).collect::<Vec<_>>().join("/")
+    );
+    let mut response = remote::artifact(config, &path, ctx.dry_run)?;
+    let expected = response
+        .headers()
+        .get("x-checksum-sha256")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            GmError::new(
+                "missing_checksum",
+                "Artifact has no valid SHA-256 checksum; refusing to save it.",
+            )
+        })?
+        .to_ascii_lowercase();
+    let mut size = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if !ctx.dry_run {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| GmError::usage("Choose a destination file."))?;
+        if install {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".gm-download-")
+            .tempfile_in(parent)?;
+        let mut reader = response.body_mut().as_reader();
+        let mut hash = Sha256::new();
+        let mut count = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            temporary.write_all(&buffer[..n])?;
+            hash.update(&buffer[..n]);
+            count += n as u64;
+        }
+        let actual = format!("{:x}", hash.finalize());
+        if actual != expected || size.is_some_and(|size| size != count) {
+            return Err(GmError::new(
+                "checksum_mismatch",
+                "Artifact content does not match its checksum or size; destination was not changed.",
+            ));
+        }
+        size = Some(count);
+        if install {
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+        temporary.as_file().sync_all()?;
+        check_destination(destination, force)?;
+        let persisted = if force {
+            temporary.persist(destination)
+        } else {
+            temporary.persist_noclobber(destination)
+        };
+        persisted.map_err(|error| GmError::from(error.error))?;
+    }
+    Ok(Shown {
+        value: json!({
+            "path": destination.to_string_lossy(), "version": version, "sha256": expected,
+            "size": size, "dry_run": ctx.dry_run, "installed": install && !ctx.dry_run,
+        }),
+        text: format!(
+            "{} {} to {} (version {version}, SHA-256 {expected}).",
+            if ctx.dry_run {
+                "Would save"
+            } else if install {
+                "Installed"
+            } else {
+                "Downloaded"
+            },
+            name,
+            destination.display()
+        ),
+    })
 }
 
 fn sources_text(sources: &Value) -> String {

@@ -338,6 +338,44 @@ lists keys with `ssh-add.exe -L` and signs with `ssh-keygen.exe -Y sign`
 so 1Password's prompt appears on Windows. `user.signingKey` counts as a key
 too, and `gitmatrix.sshCommand` sets the ssh for gm without touching git.
 
+## Downloading artifacts and installing Unix CLIs
+
+```sh
+gm pkg download gm/latest/linux-x86_64/gm --owner orbit --dest ./gm
+gm pkg install gm --owner orbit
+gm pkg install gm --owner orbit --force
+gm pkg install gm --owner orbit --version <cli-source-commit> --bin-dir ./bin
+```
+
+`download` accepts `<name>/<version>/<path>` in the generic registry. Its default
+destination is the artifact's basename. `install` defaults to
+`$HOME/.local/bin/<name>` and selects `<os>-<arch>/<name>` within the version
+(for example `linux-x86_64/gm` or `macos-aarch64/gm`). `--file` selects a different
+artifact path. These are direct executable files, not archives or installer scripts.
+
+Both commands use the normal Gitmatrix credentials, resolve `latest` once, and
+verify SHA-256 while streaming to a temporary file beside the destination.
+Installation sets mode `0755`. Only a verified complete download is atomically
+published; `--force` is required to replace an existing regular file, including
+a running `gm` binary. Symlinks and nonregular destinations are refused.
+`--dry-run` checks remote metadata without creating files or directories.
+Add the bin directory to `PATH` yourself; no shell configuration is edited.
+
+The hosted `orbit/gitmatrix` pipeline publishes native release binaries as
+`gm/<last-commit-touching-apps/cli>/<os>-<arch>/gm`. The version changes only when
+the CLI source subtree changes; unrelated pushes and reruns reuse the existing
+artifact. CI unshallows its checkout before finding that commit so older source
+changes are not mistaken for a shallow-history boundary. Publication runs only
+on `main`, after check/test and a successful build, using the job credential and
+the already-built release binary. The current Linux host publishes
+`linux-x86_64`; the installer supports Unix naming, but does not cross-build or
+make a native binary compatible with a different OS, architecture, or libc.
+
+To bootstrap from an older `gm` without these commands, use
+`./apps/cli/target/release/gm pkg install gm --owner orbit` after a local release
+build. For feature validation, always pass an external disposable `--bin-dir`
+instead of replacing a shared/global binary.
+
 ## Layout
 
 - `src/repo/`: the change model on git. `mod.rs` holds the workspace:
