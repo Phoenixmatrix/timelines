@@ -75,6 +75,9 @@ jobs:
   deploy:
     needs: [check, test, build]
     if: branch == "main" && runner == "sandbox"
+    # One deploy at a time, and a waiting deploy gives way to a newer push's: a
+    # burst of pushes deploys once, from the newest commit.
+    concurrency: production
     instance: standard-4
     secrets: [CLOUDFLARE_API_TOKEN]
     env:

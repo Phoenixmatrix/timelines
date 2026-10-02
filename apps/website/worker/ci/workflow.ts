@@ -14,6 +14,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { CiJobStatus } from "../../shared/api.ts";
 import { batch, db, nowIso } from "../schema.ts";
+import { concurrencyGate } from "./concurrency.ts";
 import { stages, type JobSpec } from "./config.ts";
 import { doneEvent, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
@@ -26,11 +27,15 @@ interface PlannedJob {
   runner: "local" | "sandbox";
   needs: string[];
   timeoutMinutes: number;
+  concurrency: string | null;
 }
 
 const DB_STEP = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" } } as const;
 /** How long a local job may wait for a runner, on top of its own timeout. */
 const QUEUE_GRACE_MINUTES = 60;
+/** How often a job waiting for its concurrency group checks again, and for how long. */
+const GATE_INTERVAL = "20 seconds";
+const GATE_CHECKS = 360;
 
 /**
  * Ask the development server to start a runner (best effort: a runner that is
@@ -79,6 +84,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
           runner: row.runner as PlannedJob["runner"],
           needs: spec.needs,
           timeoutMinutes: spec.timeoutMinutes,
+          concurrency: spec.concurrency ?? null,
         };
       });
     });
@@ -113,6 +119,47 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .execute();
       return status;
     });
+  }
+
+  /**
+   * A job in a concurrency group (deploys, say) runs one at a time per repository.
+   * While it waits, a newer run on the same branch that will run (or ran) its own
+   * job in the group supersedes it: the newer one covers this one's work.
+   */
+  async #gate(step: WorkflowStep, runId: string, job: PlannedJob): Promise<"go" | CiJobStatus> {
+    const d1 = this.env.DB;
+    const kdb = db(d1);
+    const group = job.concurrency!;
+    for (let check = 0; ; check++) {
+      const verdict = await step.do(`gate:${job.name}:${check}`, DB_STEP, () =>
+        concurrencyGate(d1, runId, job.id, group),
+      );
+      if (verdict.kind === "go") return "go";
+      if (verdict.kind === "cancelled") return "cancelled";
+      if (verdict.kind === "superseded" || check >= GATE_CHECKS) {
+        const error =
+          verdict.kind === "superseded"
+            ? `Superseded by run #${verdict.by}, which covers a newer commit.`
+            : `Waited too long for another ${group} job to finish.`;
+        const status = verdict.kind === "superseded" ? ("skipped" as const) : ("failed" as const);
+        await step.do(`gate:${job.name}:end`, DB_STEP, async () => {
+          await batch(d1, [
+            kdb
+              .updateTable("ci_jobs")
+              .set({ status, error, finished_at: nowIso() })
+              .where("id", "=", job.id)
+              .where("status", "in", ["pending", "queued"]),
+            kdb
+              .updateTable("ci_steps")
+              .set({ status: "skipped" })
+              .where("job_id", "=", job.id)
+              .where("status", "=", "pending"),
+          ]);
+        });
+        return status;
+      }
+      await step.sleep(`gate:${job.name}:${check}:wait`, GATE_INTERVAL);
+    }
   }
 
   async #job(
@@ -159,6 +206,10 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
       return "queued" as const;
     });
     if (start !== "queued") return start;
+    if (job.concurrency) {
+      const gated = await this.#gate(step, runId, job);
+      if (gated !== "go") return gated;
+    }
     if (job.runner === "local") {
       await step.do(`dispatch:${job.name}`, async () => {
         await dispatchLocalRunner(this.env);
@@ -172,7 +223,9 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
           // A retry would re-run the job's commands; only infrastructure
           // failures throw here, so try once more and no more.
           {
-            retries: { limit: 1, delay: "10 seconds" },
+            // A deploy (this repo's, or anyone's to this Worker) restarts the Durable
+            // Object mid-job; the job then starts over in a fresh sandbox. Allow a few.
+            retries: { limit: 3, delay: "10 seconds", backoff: "exponential" },
             timeout: `${job.timeoutMinutes + 10} minutes`,
           },
           async () => {

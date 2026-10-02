@@ -25,7 +25,9 @@ const BASE_ENV = {
 };
 const FLUSH_MS = 1000;
 const FLUSH_BYTES = 16 * 1024;
-const READY_TIMEOUT_MS = 90_000;
+const READY_TIMEOUT_MS = 180_000;
+/** A container that still isn't running after this long is asked to start again. */
+const RESTART_AFTER_MS = 10_000;
 /** Log lines before step 0 (start-up and checkout) are filed under this step. */
 export const SETUP_STEP = -1;
 
@@ -97,13 +99,15 @@ export class CiSandbox extends DurableObject<Env> {
         for (const until = Date.now() + 60_000; container.running && Date.now() < until;)
           await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      container.start({
-        image: container.images[spec.image] ?? container.images.default!,
-        instance: spec.instance,
-        enableInternet: true,
-        env: BASE_ENV,
-      });
-      await this.#ready(container);
+      const start = () =>
+        container.start({
+          image: container.images[spec.image] ?? container.images.default!,
+          instance: spec.instance,
+          enableInternet: true,
+          env: BASE_ENV,
+        });
+      start();
+      await this.#ready(container, start);
 
       await say(`Checking out ${payload.ref} at ${payload.commit.slice(0, 12)}…\n`);
       const token = await upstreamToken(this.env, job.artifacts_name, "read");
@@ -207,14 +211,28 @@ export class CiSandbox extends DurableObject<Env> {
   }
 
   /** Wait until the container accepts exec. */
-  async #ready(container: Container) {
+  /**
+   * Wait until the container answers. A start can silently not take (right after a
+   * deploy, while the previous container is still being torn down), so a container
+   * that still isn't running is asked to start again every few seconds.
+   */
+  async #ready(container: Container, start: () => void) {
     const until = Date.now() + READY_TIMEOUT_MS;
+    let restartAt = Date.now() + RESTART_AFTER_MS;
     for (;;) {
       try {
         const probe = await container.exec(["true"]);
         if ((await probe.exitCode) === 0) return;
       } catch (error) {
         if (Date.now() > until) throw new Error(`The sandbox did not start: ${String(error)}`);
+        if (!container.running && Date.now() >= restartAt) {
+          try {
+            start();
+          } catch {
+            // Already starting; the next probe will tell.
+          }
+          restartAt = Date.now() + RESTART_AFTER_MS;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }

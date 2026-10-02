@@ -136,6 +136,7 @@ export async function startRun(
         secrets: job.secrets,
         timeoutMinutes: job.timeoutMinutes,
         steps: job.steps,
+        concurrency: job.concurrency ?? null,
       };
       statements.push(
         kdb.insertInto("ci_jobs").values({

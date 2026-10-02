@@ -93,6 +93,7 @@ test("this repository's pipeline is set up to run in Sandbox containers", () => 
   const deploy = job("deploy");
   expect([...deploy.needs].sort()).toEqual(["build", "check", "test"]);
   expect(deploy.secrets).toEqual(["CLOUDFLARE_API_TOKEN"]);
+  expect(deploy.concurrency).toBe("production");
   const at = (branch: string, runner: "local" | "sandbox") =>
     evaluate(deploy.if!, { branch, trigger: "push", commit: "abc", runner });
   expect([at("main", "sandbox"), at("main", "local"), at("feature", "sandbox")]).toEqual([

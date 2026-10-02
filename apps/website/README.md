@@ -89,6 +89,14 @@ never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
 
 The job's `CLOUDFLARE_API_TOKEN` is a repository CI secret (`gm secret set`).
 
+**Parallel pushes.** The deploy job has `concurrency: production`: one deploy per
+repository at a time, and a deploy still waiting when a newer push's run reaches
+(or passes) its own deploy is skipped as superseded, so a burst of pushes deploys
+once, from the newest commit (`worker/ci/concurrency.ts`). A deploy restarts the
+CI Durable Objects and Workflows of runs in flight: their jobs start over in a
+fresh sandbox (an attempt in progress is joined, a leftover container replaced,
+a start that doesn't take is retried), with three retries per job.
+
 ## Personas (dev sign-in)
 
 Development data (the personas below, Orbit Labs, the owner account) lives in

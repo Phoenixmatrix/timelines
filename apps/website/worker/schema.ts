@@ -261,6 +261,8 @@ export interface Database {
     error: string | null;
     started_at: string | null;
     finished_at: string | null;
+    /** Set when a job in a concurrency group took the group's slot. */
+    concurrency_claimed_at: Generated<string | null>;
   };
   ci_steps: {
     job_id: string;

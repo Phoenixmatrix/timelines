@@ -18,6 +18,7 @@
 //       timeout_minutes: 15
 //       image: default          # sandbox image (see cloudflare.config.ts)
 //       instance: standard-1    # sandbox size
+//       concurrency: production  # one at a time per repo; superseded runs skip it
 //       steps:
 //         - run: cf deploy
 
@@ -42,6 +43,11 @@ export interface JobSpec {
   secrets: string[];
   timeoutMinutes: number;
   steps: StepSpec[];
+  /**
+   * One job of a group runs at a time per repository, and a waiting one is
+   * skipped once a newer run on its branch has its own (e.g. deploys).
+   */
+  concurrency?: string | null;
 }
 
 export interface Pipeline {
@@ -136,6 +142,11 @@ export function parsePipeline(source: string): Pipeline {
     }
     if (job.if !== undefined && typeof job.if !== "string")
       throw new ConfigError(`jobs.${name}.if must be a string.`);
+    if (
+      job.concurrency !== undefined &&
+      (typeof job.concurrency !== "string" || !NAME.test(job.concurrency))
+    )
+      throw new ConfigError(`jobs.${name}.concurrency must be a name like "production".`);
     return {
       name,
       needs: stringList(job.needs, `jobs.${name}.needs`),
@@ -146,6 +157,7 @@ export function parsePipeline(source: string): Pipeline {
       secrets: stringList(job.secrets, `jobs.${name}.secrets`),
       timeoutMinutes: timeout,
       steps,
+      concurrency: (job.concurrency as string | undefined) ?? null,
     };
   });
 
