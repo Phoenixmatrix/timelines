@@ -4,7 +4,7 @@ import {
   EnvelopeSimpleIcon,
   FingerprintIcon,
   HandWavingIcon,
-  HouseIcon,
+  GitBranchIcon,
   KeyIcon,
   ListChecksIcon,
   MoonIcon,
@@ -20,6 +20,7 @@ import {
 import { useState } from "react";
 import { Link, NavLink, Outlet, useFetcher, useLocation, useNavigation } from "react-router";
 import { useViewer } from "../lib/session.ts";
+import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
@@ -90,33 +91,66 @@ function AccountMenu() {
               </div>
             </div>
             <div className="mk-menu-sep" />
-            <Menu.LinkItem className="mk-menu-item" render={<Link to={`/${viewer.slug}`} />}>
-              <HouseIcon className="size-4" aria-hidden />
-              Your profile
-            </Menu.LinkItem>
-            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/profile" />}>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to="/settings/profile" />}
+            >
               <UserCircleIcon className="size-4" aria-hidden />
-              Edit profile
+              Profile
             </Menu.LinkItem>
-            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/tokens" />}>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to={`/${viewer.slug}`} />}
+            >
+              <GitBranchIcon className="size-4" aria-hidden />
+              Your repositories
+            </Menu.LinkItem>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to={packagesPath(viewer.slug)} />}
+            >
+              <PackageIcon className="size-4" aria-hidden />
+              Your packages
+            </Menu.LinkItem>
+            <div className="mk-menu-sep" />
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to="/settings/tokens" />}
+            >
               <KeyIcon className="size-4" aria-hidden />
               Access tokens
             </Menu.LinkItem>
-            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/agents" />}>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to="/settings/agents" />}
+            >
               <RobotIcon className="size-4" aria-hidden />
               Agents
             </Menu.LinkItem>
-            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/ssh-keys" />}>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to="/settings/ssh-keys" />}
+            >
               <FingerprintIcon className="size-4" aria-hidden />
               SSH keys
             </Menu.LinkItem>
             {viewer.isSiteAdmin && (
-              <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/invites" />}>
+              <Menu.LinkItem
+                closeOnClick
+                className="mk-menu-item"
+                render={<Link to="/settings/invites" />}
+              >
                 <EnvelopeSimpleIcon className="size-4" aria-hidden />
                 Invitations
               </Menu.LinkItem>
             )}
-            <Menu.LinkItem className="mk-menu-item" render={<Link to="/signin" />}>
+            <Menu.LinkItem closeOnClick className="mk-menu-item" render={<Link to="/signin" />}>
               <UserSwitchIcon className="size-4" aria-hidden />
               Switch account
             </Menu.LinkItem>

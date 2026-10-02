@@ -41,15 +41,15 @@ export function Profile() {
     <Page>
       <h1 className="m-0 text-headline">Profile</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
-        How you appear across Gitmatrix: on repositories, issues, commits you push and{" "}
+        Manage your display name and username. These identify you across Gitmatrix. See{" "}
         <Link to={`/${viewer.slug}`} className={link}>
-          your profile page
-        </Link>
-        .
+          your repositories
+        </Link>{" "}
+        for the projects you own.
       </p>
 
       <div className="mt-8 flex flex-col gap-6">
-        <Card title="Name" className="max-w-xl">
+        <Card title="Personal details" className="max-w-xl">
           <Form method="post" className="mk-card-body" key={viewer.slug}>
             <TextField
               label="Display name"
