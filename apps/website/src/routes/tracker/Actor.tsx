@@ -1,21 +1,21 @@
 // Who did or holds something, with the accountable person always in view.
 
 import { RobotIcon } from "@phosphor-icons/react";
-import { attributionText, type Attribution } from "../../../shared/tracker.ts";
+import type { Attribution } from "../../../shared/tracker.ts";
 import { Monogram } from "../../components/Monogram.tsx";
 
 function described(who: Attribution): string {
+  if (who.kind === "agent") {
+    return `${who.name} · Agent${who.person ? ` · Accountable: ${who.person.displayName}` : ""}`;
+  }
   if (!who.person || who.kind === "person") return who.name;
-  return who.kind === "agent"
-    ? `${who.name}, an agent ${who.person.displayName} is accountable for`
-    : `${who.person.displayName}, working as “${who.name}”`;
+  return `${who.person.displayName} · ${who.name}`;
 }
 
 /**
- * The person's monogram, a robot for an agent, then the name. An agent reads
- * "builder for Ann Lee"; a person's labeled session "Ann Lee laptop". `compact`
- * keeps one name for tight cells and `face` shows the monogram alone: either
- * way it shows whose it is, and the tooltip and screen readers get the rest.
+ * The person's monogram, an agent robot badge, and one primary name. Ownership
+ * stays in the monogram, tooltip and accessible text instead of repeated prose.
+ * `compact` hides session labels; `face` keeps only the identity icons.
  */
 export function Actor({
   who,
@@ -30,12 +30,7 @@ export function Actor({
 }) {
   const person = who.person?.displayName ?? who.name;
   const primary = who.kind === "session" ? person : who.name;
-  const secondary =
-    who.kind === "agent" && who.person
-      ? `for ${who.person.displayName}`
-      : who.kind === "session"
-        ? who.name
-        : null;
+  const secondary = who.kind === "session" ? who.name : null;
   return (
     <span
       className={`inline-flex max-w-full min-w-0 items-center gap-1 align-middle ${className}`}
@@ -45,7 +40,7 @@ export function Actor({
       {who.kind === "agent" && (
         <RobotIcon weight="bold" className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
       )}
-      <span className="sr-only">{attributionText(who)}</span>
+      <span className="sr-only">{described(who)}</span>
       {!face && (
         <span aria-hidden className="ml-0.5 min-w-0 truncate">
           {primary}
