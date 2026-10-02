@@ -559,27 +559,35 @@ impl Workspace {
             drop(wc);
             self.rebase_descendants(HashMap::from([(wc_oid, new_wc)]), HashMap::new())?;
             changed = true;
+        } else {
+            drop(wc);
         }
-        // Conflict markers the user has removed no longer count.
-        if let Some(paths) = self.view.conflicts.get(&change_id).cloned() {
-            let tree = self.repo.find_tree(tree)?;
-            let remaining: Vec<String> = paths
-                .into_iter()
-                .filter(|p| {
-                    tree.get_path(Path::new(p))
-                        .ok()
-                        .and_then(|e| self.repo.find_blob(e.id()).ok())
-                        .map(|b| trees::has_conflict_markers(b.content()))
-                        .unwrap_or(false)
-                })
-                .collect();
-            if remaining.is_empty() {
-                self.view.conflicts.remove(&change_id);
-            } else {
-                self.view.conflicts.insert(change_id, remaining);
-            }
-        }
+        self.prune_resolved_conflicts(&change_id, tree)?;
         Ok(changed)
+    }
+
+    /// Conflict markers removed from a change's files no longer count.
+    fn prune_resolved_conflicts(&mut self, change_id: &str, tree: Oid) -> Result<()> {
+        let Some(paths) = self.view.conflicts.get(change_id).cloned() else {
+            return Ok(());
+        };
+        let tree = self.repo.find_tree(tree)?;
+        let remaining: Vec<String> = paths
+            .into_iter()
+            .filter(|p| {
+                tree.get_path(Path::new(p))
+                    .ok()
+                    .and_then(|e| self.repo.find_blob(e.id()).ok())
+                    .map(|b| trees::has_conflict_markers(b.content()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if remaining.is_empty() {
+            self.view.conflicts.remove(change_id);
+        } else {
+            self.view.conflicts.insert(change_id.to_string(), remaining);
+        }
+        Ok(())
     }
 
     /// An empty, undescribed change nothing depends on: safe to drop when `@` moves away.
@@ -674,6 +682,7 @@ impl Workspace {
         let graph = self.graph()?;
         let mut outcome = Rebased::default();
         let explicit: HashSet<Oid> = rewritten.keys().copied().collect();
+        let mut fresh: HashSet<String> = HashSet::new();
 
         fn resolve(
             oid: Oid,
@@ -720,6 +729,7 @@ impl Workspace {
                 self.view
                     .conflicts
                     .insert(change_id.clone(), conflicts.clone());
+                fresh.insert(change_id.clone());
                 outcome.conflicts.push((change_id, conflicts));
             }
             if !explicit.contains(oid) {
@@ -776,6 +786,18 @@ impl Workspace {
             });
             if !kept {
                 self.view.conflicts.remove(&change);
+            }
+        }
+        // A rewrite (a squash into a conflicted change, say) can remove the
+        // markers from a change other than @; recheck every rewritten change
+        // whose conflicts predate this rebase.
+        let rewritten_now: Vec<Oid> = rewritten.values().copied().collect();
+        for oid in rewritten_now {
+            let commit = self.repo.find_commit(oid)?;
+            let (change, tree) = (self.change_id(&commit), commit.tree_id());
+            drop(commit);
+            if !fresh.contains(&change) {
+                self.prune_resolved_conflicts(&change, tree)?;
             }
         }
         self.normalize_heads()?;

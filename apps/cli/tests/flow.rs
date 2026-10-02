@@ -310,6 +310,22 @@ fn conflicts_are_recorded_then_cleared_by_editing() {
 }
 
 #[test]
+fn conflicts_resolved_in_a_child_clear_when_squashed() {
+    let s = Sandbox::new();
+    s.write("README.md", "hello from work\n");
+    s.ok(&["commit", "-m", "Work edit"]);
+    s.teammate_pushes("README.md", "hello from seed\n", "Seed edit");
+    s.ok(&["sync"]);
+
+    // Resolve in the working copy on top of the conflicted change, then fold it in.
+    assert!(s.read("README.md").contains("<<<<<<<"));
+    s.write("README.md", "hello from both\n");
+    s.ok(&["squash"]);
+    assert_eq!(s.ok(&["status"])["conflicts"], Value::Array(vec![]));
+    s.ok(&["push"]);
+}
+
+#[test]
 fn backout_and_duplicate_insert_below_the_working_copy() {
     let s = Sandbox::new();
     s.write("a.txt", "one\n");
