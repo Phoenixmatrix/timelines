@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
   actorName,
@@ -34,7 +34,8 @@ import { Actor } from "./Actor.tsx";
 
 export type MutationOutcome = { ok: true } | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
-type Draft = { version: number; fields: IssueFields; base?: IssueFields };
+type EditMode = "all" | "title" | "description" | "acceptance";
+type Draft = { version: number; fields: IssueFields; base?: IssueFields; mode?: EditMode };
 const fieldNames: Record<keyof IssueFields, string> = {
   title: "Title",
   description: "Description / PRD",
@@ -123,6 +124,7 @@ export function IssueDetail({
       return initial;
     }
   });
+  const mode = draft.mode ?? "all";
   const [editing, setEditing] = useState(() => {
     try {
       return initialEditing || !!sessionStorage.getItem(storageKey);
@@ -149,12 +151,13 @@ export function IssueDetail({
   const [subtaskNotice, setSubtaskNotice] = useState("");
   const [removeError, setRemoveError] = useState<{ id: string; error: string } | null>(null);
   const detailRef = useRef<HTMLElement>(null);
-  useEffect(() => {
-    if (window.matchMedia("(max-width: 760px)").matches) detailRef.current?.focus();
-  }, []);
-  useEffect(() => {
-    if (editing) detailRef.current?.querySelector<HTMLInputElement>("input")?.focus();
-  }, [editing]);
+  useLayoutEffect(() => {
+    if (editing)
+      detailRef.current
+        ?.querySelector<HTMLElement>("[data-issue-editor] input, [data-issue-editor] textarea")
+        ?.focus();
+    else if (window.matchMedia("(max-width: 760px)").matches) detailRef.current?.focus();
+  }, [editing, mode]);
   useEffect(() => {
     if (closing) closeFormRef.current?.querySelector("select")?.focus();
   }, [closing]);
@@ -213,14 +216,27 @@ export function IssueDetail({
       .filter((agent) => members.some((member) => member.id === agent.accountable.id))
       .map((agent) => ({ value: agent.id, label: actorName(snapshot, agent.id) })),
   ];
-  const beginEdit = () => {
+  const beginEdit = (mode: EditMode = "all") => {
     setClosing(false);
-    setDraft(initial);
+    setDraft({ ...initial, mode });
     setPreview(false);
     setNotice("");
     setActionError("");
     setLocalError("");
     setEditing(true);
+  };
+  const finishEdit = (message = "") => {
+    setEditing(false);
+    setDraft(initial);
+    setNotice(message);
+    try {
+      sessionStorage.removeItem(storageKey);
+    } catch {
+      /* Storage can be disabled. */
+    }
+    requestAnimationFrame(() =>
+      detailRef.current?.querySelector<HTMLElement>(`[data-edit-field="${mode}"]`)?.focus(),
+    );
   };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -368,10 +384,318 @@ export function IssueDetail({
         if (!previous.base || !same(previous.fields[key], previous.base[key]))
           Object.assign(fields, { [key]: previous.fields[key] });
       }
-      return { version: issue.version, base: initial.fields, fields };
+      return { ...previous, version: issue.version, base: initial.fields, fields };
     });
     setLocalError("");
   };
+  const editor = editing && (
+    <form
+      className="space-y-4"
+      data-issue-editor
+      aria-label={mode === "all" ? "Edit issue" : `Edit ${fieldNames[mode]}`}
+      onKeyDown={(event) => {
+        if (busy || event.defaultPrevented || event.nativeEvent.isComposing) return;
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          event.preventDefault();
+          event.currentTarget.requestSubmit();
+        } else if (
+          event.key === "Escape" &&
+          !(
+            event.target instanceof Element &&
+            event.target.closest("select, [role=combobox], [role=listbox]")
+          )
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          finishEdit();
+        }
+      }}
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (busy || invalidStatus) return;
+        setLocalError("");
+        setNotice("");
+        if (draft.version !== issue.version) {
+          setLocalError("Review the newer version before saving.");
+          return;
+        }
+        if (!draft.fields.title.trim()) {
+          setLocalError("Give this issue a title.");
+          return;
+        }
+        if (invalidCloseReason) {
+          setLocalError("Choose a reason for closing this issue.");
+          return;
+        }
+        const fields = {
+          ...draft.fields,
+          closeReason:
+            draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
+          labels: normalizedSet(draft.fields.labels),
+          workspaceIds: normalizedSet(draft.fields.workspaceIds),
+        };
+        const changes = Object.fromEntries(
+          Object.entries(fields).filter(
+            ([key, value]) =>
+              !same(value, (draft.base ?? initial.fields)[key as keyof IssueFields]),
+          ),
+        ) as Partial<IssueFields>;
+        // Legacy canceled issues may keep their missing reason, but never send an
+        // explicit null while canceled: the API reserves that for reopening.
+        if (fields.status === "canceled" && !fields.closeReason) delete changes.closeReason;
+        const result: MutationOutcome = !Object.keys(changes).length
+          ? { ok: true }
+          : await mutate([
+              {
+                kind: "issue.update",
+                id: issue.id,
+                expectedVersion: draft.version,
+                data: changes,
+              },
+            ]);
+        if (result.ok) finishEdit(mode === "all" ? "Issue saved." : `${fieldNames[mode]} saved.`);
+        else setLocalError(result.error);
+      }}
+    >
+      {mode === "all" && <h3 className={HEADING}>Edit issue</h3>}
+      {draft.version !== issue.version && (
+        <section className="rounded-control bg-danger-wash p-3 text-body-sm" role="alert">
+          <h4 className="m-0 font-semibold">This issue changed while you were editing</h4>
+          <p className="mt-1 mb-0 max-w-[48ch]">
+            Your draft is kept. Review differences below. Untouched fields will use the current
+            version when you rebase.
+          </p>
+          {!draft.base && (
+            <p className="mk-hint mt-2 mb-0 max-w-[48ch]">
+              This older saved draft has no original comparison. Review every difference before
+              keeping your edits.
+            </p>
+          )}
+          {(["Your edited fields", "Changed by others"] as const).map((group) => {
+            const keys = fieldKeys.filter((key) => {
+              const edited = !draft.base || !same(draft.fields[key], draft.base[key]);
+              return (
+                !same(initial.fields[key], draft.fields[key]) &&
+                edited === (group === "Your edited fields")
+              );
+            });
+            return (
+              keys.length > 0 && (
+                <section key={group}>
+                  <h4 className="mt-4 mb-1 text-body-sm font-semibold">{group}</h4>
+                  {keys.map((key) => {
+                    const plain = key !== "description" && key !== "acceptance";
+                    return (
+                      <section key={key} className="border-t border-line-soft py-3">
+                        <h5 className="m-0 mb-2 text-body-sm font-semibold">{fieldNames[key]}</h5>
+                        <div className="mb-3 grid grid-cols-1 gap-3 [overflow-wrap:anywhere] sm:grid-cols-2">
+                          <div className="min-w-0">
+                            <strong className="mb-1 block text-label text-ink-muted">Theirs</strong>
+                            <div className={plain ? "whitespace-pre-wrap" : undefined}>
+                              {displayField(key, initial.fields)}
+                            </div>
+                          </div>
+                          <div className="min-w-0">
+                            <strong className="mb-1 block text-label text-ink-muted">
+                              {group === "Your edited fields"
+                                ? "Your draft"
+                                : "Original (you didn't edit)"}
+                            </strong>
+                            <div className={plain ? "whitespace-pre-wrap" : undefined}>
+                              {displayField(key, draft.fields)}
+                            </div>
+                          </div>
+                        </div>
+                        {group === "Your edited fields" ? (
+                          <button
+                            type="button"
+                            className="mk-btn mk-btn--sm"
+                            onClick={() => change(key, initial.fields[key])}
+                          >
+                            Use theirs for {fieldNames[key]}
+                          </button>
+                        ) : (
+                          <p className="mk-hint m-0">Theirs will be preserved when you rebase.</p>
+                        )}
+                      </section>
+                    );
+                  })}
+                </section>
+              )
+            );
+          })}
+          <button type="button" className="mk-btn mk-btn--sm mt-3" onClick={rebase}>
+            Keep my edits — rebase on version {issue.version}
+          </button>
+        </section>
+      )}
+      {(mode === "all" || mode === "title") && (
+        <TextField
+          label="Title"
+          value={draft.fields.title}
+          required
+          maxLength={500}
+          onChange={(event) => change("title", event.target.value)}
+        />
+      )}
+      {mode === "all" && (
+        <>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field label="Status">
+              <select
+                className="mk-input"
+                aria-label="Issue status"
+                aria-describedby={statusReason}
+                value={draft.fields.status}
+                onChange={(event) => change("status", event.target.value as Issue["status"])}
+              >
+                {statuses.map((status) => (
+                  <option
+                    key={status.value}
+                    value={status.value}
+                    disabled={
+                      status.value !== issue.status &&
+                      (activeClaim ||
+                        (unresolvedBlockers.length > 0 &&
+                          (status.value === "in_progress" || status.value === "done")))
+                    }
+                  >
+                    {status.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {draft.fields.status === "canceled" && (
+              <CloseReasonField
+                value={draft.fields.closeReason}
+                required={requiresCloseReason}
+                onChange={(value) => change("closeReason", value)}
+              />
+            )}
+            <Field label="Type">
+              <SelectField
+                ariaLabel="Issue type"
+                value={draft.fields.type}
+                options={types.map((value) => ({ value, label: typeLabel(value) }))}
+                onChange={(value) => change("type", value as Issue["type"])}
+              />
+            </Field>
+            <Field label="Priority">
+              <SelectField
+                ariaLabel="Issue priority"
+                value={String(draft.fields.priority)}
+                options={[0, 1, 2, 3, 4].map((value) => ({
+                  value: String(value),
+                  label: `P${value}${value === 0 ? " · Urgent" : value === 4 ? " · Lowest" : ""}`,
+                }))}
+                onChange={(value) => change("priority", Number(value) as Issue["priority"])}
+              />
+            </Field>
+            <Field label="Assignee">
+              <SelectField
+                ariaLabel="Issue assignee"
+                value={draft.fields.assigneeId ?? ""}
+                options={[{ value: "", label: "Unassigned" }, ...assignable]}
+                onChange={(value) => change("assigneeId", value || null)}
+              />
+            </Field>
+            <IssuePicker
+              label="Parent issue"
+              value={draft.fields.parentId ?? ""}
+              issues={parentCandidates}
+              allowNone
+              onChange={(value) => change("parentId", value || null)}
+            />
+            <TextField
+              label="Labels (comma separated)"
+              value={draft.fields.labels.join(",")}
+              onChange={(event) => change("labels", event.target.value.split(","))}
+            />
+          </div>
+          <MultiCheck
+            label="Workspaces"
+            options={snapshot.workspaces.filter(
+              (workspace) =>
+                !workspace.archived || draft.fields.workspaceIds.includes(workspace.id),
+            )}
+            values={draft.fields.workspaceIds}
+            onChange={(values) => change("workspaceIds", values)}
+          />
+        </>
+      )}
+      {mode !== "title" && (
+        <button
+          className="mk-btn mk-btn--sm"
+          type="button"
+          aria-pressed={preview}
+          onClick={() => setPreview(!preview)}
+        >
+          {preview ? "Write Markdown" : "Preview Markdown"}
+        </button>
+      )}
+      {(mode === "all" || mode === "description") && (
+        <Field label="Description / PRD">
+          {preview ? (
+            <div className="mk-well">
+              <MarkdownText text={draft.fields.description || "No description yet."} />
+            </div>
+          ) : (
+            <textarea
+              aria-label="Description / PRD"
+              className={TEXTAREA}
+              rows={12}
+              value={draft.fields.description}
+              onChange={(event) => change("description", event.target.value)}
+              placeholder="Describe the outcome, context, and approach. Markdown supported."
+            />
+          )}
+        </Field>
+      )}
+      {(mode === "all" || mode === "acceptance") && (
+        <Field label="Acceptance criteria">
+          {preview ? (
+            <div className="mk-well">
+              <MarkdownText text={draft.fields.acceptance || "No acceptance criteria yet."} />
+            </div>
+          ) : (
+            <textarea
+              aria-label="Acceptance criteria"
+              className={TEXTAREA}
+              rows={6}
+              value={draft.fields.acceptance}
+              onChange={(event) => change("acceptance", event.target.value)}
+              placeholder="- [ ] What must be true when this is done?"
+            />
+          )}
+        </Field>
+      )}
+      <FormError message={localError} />
+      <div className="flex flex-wrap gap-2">
+        <button
+          className="mk-btn mk-btn--primary mk-btn--sm"
+          disabled={busy || draft.version !== issue.version || invalidStatus || invalidCloseReason}
+          aria-describedby={invalidStatus ? statusReason : undefined}
+          aria-keyshortcuts="Control+Enter Meta+Enter"
+        >
+          {busy
+            ? "Saving…"
+            : mode === "all"
+              ? "Save issue"
+              : `Save ${mode === "acceptance" ? "acceptance criteria" : mode}`}
+        </button>
+        <button
+          className="mk-btn mk-btn--ghost mk-btn--sm"
+          type="button"
+          disabled={busy}
+          aria-keyshortcuts="Escape"
+          onClick={() => finishEdit()}
+        >
+          {mode === "all" ? "Discard draft" : "Cancel"}
+        </button>
+      </div>
+      <p className="mk-hint m-0">Ctrl/Cmd+Enter saves. Esc cancels.</p>
+    </form>
+  );
 
   return (
     <article
@@ -391,7 +715,22 @@ export function IssueDetail({
           <span className="mk-mono text-ink-muted">{issue.key}</span>
           <IssueState issue={issue} snapshot={snapshot} index={index} />
         </div>
-        <h2 className="mt-1 mb-0 text-title-lg break-words">{issue.title}</h2>
+        {editing && mode === "title" ? (
+          <div className="mt-2">{editor}</div>
+        ) : (
+          <h2 className="mt-1 mb-0 text-title-lg break-words">
+            <button
+              type="button"
+              className="w-full rounded-control text-left hover:bg-sunken disabled:bg-transparent max-sm:min-h-11"
+              title="Edit title"
+              data-edit-field="title"
+              disabled={busy || editing}
+              onClick={() => beginEdit("title")}
+            >
+              {issue.title}
+            </button>
+          </h2>
+        )}
         <dl className={`${META} mt-3`}>
           <dt className="text-ink-faint">Team</dt>
           <dd className="m-0 min-w-0">{team?.name}</dd>
@@ -489,7 +828,9 @@ export function IssueDetail({
             <button
               className="mk-btn mk-btn--primary mk-btn--sm"
               aria-keyshortcuts="e"
-              onClick={beginEdit}
+              data-edit-field="all"
+              disabled={busy}
+              onClick={() => beginEdit()}
             >
               Edit issue
             </button>
@@ -646,314 +987,63 @@ export function IssueDetail({
           <MarkdownText text={latestCheckpoint.body} />
         </section>
       )}
-      {editing ? (
-        <form
-          className={`${SECTION} space-y-4`}
-          onSubmit={async (event) => {
-            event.preventDefault();
-            setLocalError("");
-            setNotice("");
-            if (draft.version !== issue.version) {
-              setLocalError("Review the newer version before saving.");
-              return;
-            }
-            if (!draft.fields.title.trim()) {
-              setLocalError("Give this issue a title.");
-              return;
-            }
-            if (invalidCloseReason) {
-              setLocalError("Choose a reason for closing this issue.");
-              return;
-            }
-            const fields = {
-              ...draft.fields,
-              closeReason:
-                draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
-              labels: normalizedSet(draft.fields.labels),
-              workspaceIds: normalizedSet(draft.fields.workspaceIds),
-            };
-            const changes = Object.fromEntries(
-              Object.entries(fields).filter(
-                ([key, value]) =>
-                  !same(value, (draft.base ?? initial.fields)[key as keyof IssueFields]),
-              ),
-            ) as Partial<IssueFields>;
-            // Legacy canceled issues may keep their missing reason, but never send an
-            // explicit null while canceled: the API reserves that for reopening.
-            if (fields.status === "canceled" && !fields.closeReason) delete changes.closeReason;
-            const result: MutationOutcome = !Object.keys(changes).length
-              ? { ok: true }
-              : await mutate([
-                  {
-                    kind: "issue.update",
-                    id: issue.id,
-                    expectedVersion: draft.version,
-                    data: changes,
-                  },
-                ]);
-            if (result.ok) {
-              setEditing(false);
-              try {
-                sessionStorage.removeItem(storageKey);
-              } catch {
-                /* Storage can be disabled. */
-              }
-              setNotice("Issue saved.");
-            } else setLocalError(result.error);
-          }}
-        >
-          <h3 className={HEADING}>Edit issue</h3>
-          {draft.version !== issue.version && (
-            <section className="rounded-control bg-danger-wash p-3 text-body-sm" role="alert">
-              <h4 className="m-0 font-semibold">This issue changed while you were editing</h4>
-              <p className="mt-1 mb-0 max-w-[48ch]">
-                Your draft is kept. Review differences below. Untouched fields will use the current
-                version when you rebase.
-              </p>
-              {!draft.base && (
-                <p className="mk-hint mt-2 mb-0 max-w-[48ch]">
-                  This older saved draft has no original comparison. Review every difference before
-                  keeping your edits.
-                </p>
-              )}
-              {(["Your edited fields", "Changed by others"] as const).map((group) => {
-                const keys = fieldKeys.filter((key) => {
-                  const edited = !draft.base || !same(draft.fields[key], draft.base[key]);
-                  return (
-                    !same(initial.fields[key], draft.fields[key]) &&
-                    edited === (group === "Your edited fields")
-                  );
-                });
-                return (
-                  keys.length > 0 && (
-                    <section key={group}>
-                      <h4 className="mt-4 mb-1 text-body-sm font-semibold">{group}</h4>
-                      {keys.map((key) => {
-                        const plain = key !== "description" && key !== "acceptance";
-                        return (
-                          <section key={key} className="border-t border-line-soft py-3">
-                            <h5 className="m-0 mb-2 text-body-sm font-semibold">
-                              {fieldNames[key]}
-                            </h5>
-                            <div className="mb-3 grid grid-cols-1 gap-3 [overflow-wrap:anywhere] sm:grid-cols-2">
-                              <div className="min-w-0">
-                                <strong className="mb-1 block text-label text-ink-muted">
-                                  Theirs
-                                </strong>
-                                <div className={plain ? "whitespace-pre-wrap" : undefined}>
-                                  {displayField(key, initial.fields)}
-                                </div>
-                              </div>
-                              <div className="min-w-0">
-                                <strong className="mb-1 block text-label text-ink-muted">
-                                  {group === "Your edited fields"
-                                    ? "Your draft"
-                                    : "Original (you didn't edit)"}
-                                </strong>
-                                <div className={plain ? "whitespace-pre-wrap" : undefined}>
-                                  {displayField(key, draft.fields)}
-                                </div>
-                              </div>
-                            </div>
-                            {group === "Your edited fields" ? (
-                              <button
-                                type="button"
-                                className="mk-btn mk-btn--sm"
-                                onClick={() => change(key, initial.fields[key])}
-                              >
-                                Use theirs for {fieldNames[key]}
-                              </button>
-                            ) : (
-                              <p className="mk-hint m-0">
-                                Theirs will be preserved when you rebase.
-                              </p>
-                            )}
-                          </section>
-                        );
-                      })}
-                    </section>
-                  )
-                );
-              })}
-              <button type="button" className="mk-btn mk-btn--sm mt-3" onClick={rebase}>
-                Keep my edits — rebase on version {issue.version}
-              </button>
-            </section>
-          )}
-          <TextField
-            label="Title"
-            value={draft.fields.title}
-            required
-            maxLength={500}
-            onChange={(event) => change("title", event.target.value)}
-          />
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field label="Status">
-              <select
-                className="mk-input"
-                aria-label="Issue status"
-                aria-describedby={statusReason}
-                value={draft.fields.status}
-                onChange={(event) => change("status", event.target.value as Issue["status"])}
-              >
-                {statuses.map((status) => (
-                  <option
-                    key={status.value}
-                    value={status.value}
-                    disabled={
-                      status.value !== issue.status &&
-                      (activeClaim ||
-                        (unresolvedBlockers.length > 0 &&
-                          (status.value === "in_progress" || status.value === "done")))
-                    }
-                  >
-                    {status.label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            {draft.fields.status === "canceled" && (
-              <CloseReasonField
-                value={draft.fields.closeReason}
-                required={requiresCloseReason}
-                onChange={(value) => change("closeReason", value)}
-              />
-            )}
-            <Field label="Type">
-              <SelectField
-                ariaLabel="Issue type"
-                value={draft.fields.type}
-                options={types.map((value) => ({ value, label: typeLabel(value) }))}
-                onChange={(value) => change("type", value as Issue["type"])}
-              />
-            </Field>
-            <Field label="Priority">
-              <SelectField
-                ariaLabel="Issue priority"
-                value={String(draft.fields.priority)}
-                options={[0, 1, 2, 3, 4].map((value) => ({
-                  value: String(value),
-                  label: `P${value}${value === 0 ? " · Urgent" : value === 4 ? " · Lowest" : ""}`,
-                }))}
-                onChange={(value) => change("priority", Number(value) as Issue["priority"])}
-              />
-            </Field>
-            <Field label="Assignee">
-              <SelectField
-                ariaLabel="Issue assignee"
-                value={draft.fields.assigneeId ?? ""}
-                options={[{ value: "", label: "Unassigned" }, ...assignable]}
-                onChange={(value) => change("assigneeId", value || null)}
-              />
-            </Field>
-            <IssuePicker
-              label="Parent issue"
-              value={draft.fields.parentId ?? ""}
-              issues={parentCandidates}
-              allowNone
-              onChange={(value) => change("parentId", value || null)}
-            />
-            <TextField
-              label="Labels (comma separated)"
-              value={draft.fields.labels.join(",")}
-              onChange={(event) => change("labels", event.target.value.split(","))}
-            />
-          </div>
-          <MultiCheck
-            label="Workspaces"
-            options={snapshot.workspaces.filter(
-              (workspace) =>
-                !workspace.archived || draft.fields.workspaceIds.includes(workspace.id),
-            )}
-            values={draft.fields.workspaceIds}
-            onChange={(values) => change("workspaceIds", values)}
-          />
-          <button
-            className="mk-btn mk-btn--sm"
-            type="button"
-            aria-pressed={preview}
-            onClick={() => setPreview(!preview)}
-          >
-            {preview ? "Write Markdown" : "Preview Markdown"}
-          </button>
-          <Field label="Description / PRD">
-            {preview ? (
-              <div className="mk-well">
-                <MarkdownText text={draft.fields.description || "No description yet."} />
-              </div>
-            ) : (
-              <textarea
-                aria-label="Description / PRD"
-                className={TEXTAREA}
-                rows={12}
-                value={draft.fields.description}
-                onChange={(event) => change("description", event.target.value)}
-                placeholder="Describe the outcome, context, and approach. Markdown supported."
-              />
-            )}
-          </Field>
-          <Field label="Acceptance criteria">
-            {preview ? (
-              <div className="mk-well">
-                <MarkdownText text={draft.fields.acceptance || "No acceptance criteria yet."} />
-              </div>
-            ) : (
-              <textarea
-                aria-label="Acceptance criteria"
-                className={TEXTAREA}
-                rows={6}
-                value={draft.fields.acceptance}
-                onChange={(event) => change("acceptance", event.target.value)}
-                placeholder="- [ ] What must be true when this is done?"
-              />
-            )}
-          </Field>
-          <FormError message={localError} />
-          <div className="flex flex-wrap gap-2">
-            <button
-              className="mk-btn mk-btn--primary mk-btn--sm"
-              disabled={
-                busy || draft.version !== issue.version || invalidStatus || invalidCloseReason
-              }
-              aria-describedby={invalidStatus ? statusReason : undefined}
-            >
-              {busy ? "Saving…" : "Save issue"}
-            </button>
-            <button
-              className="mk-btn mk-btn--ghost mk-btn--sm"
-              type="button"
-              disabled={busy}
-              onClick={() => {
-                setEditing(false);
-                setDraft(initial);
-                try {
-                  sessionStorage.removeItem(storageKey);
-                } catch {
-                  /* Storage can be disabled. */
-                }
-              }}
-            >
-              Discard draft
-            </button>
-          </div>
-        </form>
+      {editing && mode === "all" ? (
+        <section className={SECTION}>{editor}</section>
       ) : (
-        <section className={SECTION}>
-          <h3 className={`${HEADING} mb-2`}>Description / PRD</h3>
-          {issue.description ? (
-            <MarkdownText text={issue.description} />
-          ) : (
-            <p className="m-0 max-w-[48ch] text-body-sm text-ink-muted">
-              No description yet. Edit this issue to add context or a full PRD.
-            </p>
-          )}
-          <h3 className={`${HEADING} mt-5 mb-2`}>Acceptance criteria</h3>
-          {issue.acceptance ? (
-            <MarkdownText text={issue.acceptance} />
-          ) : (
-            <p className="m-0 text-body-sm text-ink-muted">No acceptance criteria yet.</p>
-          )}
-        </section>
+        (["description", "acceptance"] as const).map((field) => (
+          <section className={SECTION} key={field} aria-label={fieldNames[field]}>
+            {editing && mode === field ? (
+              editor
+            ) : (
+              <>
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <h3 className={HEADING}>{fieldNames[field]}</h3>
+                  <button
+                    type="button"
+                    className="mk-btn mk-btn--ghost mk-btn--sm"
+                    aria-label={`Edit ${field === "description" ? "description" : "acceptance criteria"}`}
+                    data-edit-field={field}
+                    disabled={busy || editing}
+                    onClick={() => beginEdit(field)}
+                  >
+                    Edit
+                  </button>
+                </div>
+                {issue[field] ? (
+                  <div
+                    className={
+                      !busy && !editing ? "cursor-text rounded-control hover:bg-sunken" : undefined
+                    }
+                    onPointerUp={(event) => {
+                      // The Edit button is the keyboard entry point; prose also accepts a click.
+                      if (
+                        busy ||
+                        editing ||
+                        event.button !== 0 ||
+                        !window.getSelection()?.isCollapsed ||
+                        (event.target instanceof Element &&
+                          event.target.closest("a, button, input, textarea, select, [role=button]"))
+                      )
+                        return;
+                      beginEdit(field);
+                    }}
+                  >
+                    <MarkdownText text={issue[field]} />
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="min-h-11 w-full rounded-control text-left text-body-sm text-ink-muted hover:bg-sunken disabled:bg-transparent"
+                    disabled={busy || editing}
+                    onClick={() => beginEdit(field)}
+                  >
+                    {field === "description" ? "Add a description…" : "Add acceptance criteria…"}
+                  </button>
+                )}
+              </>
+            )}
+          </section>
+        ))
       )}
       <section className={SECTION}>
         <h3 className={HEADING}>Dependencies & hierarchy</h3>

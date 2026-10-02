@@ -493,6 +493,13 @@ subtasks or satisfy dependent issues' blockers.
   archived or unavailable default teams fall back to all teams. **Reset defaults**
   restores the built-in startup behavior. Browsers that refuse storage show an
   error without dismissing the preference form.
+- **Inline editing:** click an issue title or its description/acceptance text to
+  edit just that field in place. Each text section also has a keyboard-accessible
+  **Edit** button, and empty sections offer an **Add** action. Markdown preview
+  remains available; links in rendered Markdown still navigate normally.
+  **Ctrl/Cmd+Enter** saves, **Esc** cancels, and Enter saves a title. The focused
+  field and its draft survive a reload. **Edit issue** (or `e`) still opens the
+  complete form for grouped changes, as does **Create and edit**.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
   fields are retained. Labels and workspace membership compare as sets, so
