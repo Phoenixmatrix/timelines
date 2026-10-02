@@ -333,6 +333,8 @@ export interface CiRunSummary {
   title: string;
   status: CiRunStatus;
   actor: string | null;
+  /** The agent that pushed or started it, acting for `actor`. */
+  agent: string | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;

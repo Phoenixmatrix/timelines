@@ -1133,7 +1133,7 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
 pub fn runner(ctx: &Ctx, args: &RunnerArgs) -> Result<Shown> {
     let _signals = RunnerSignals::start()?;
     let config = Config::load();
-    if config.token().is_none() && !config.uses_ssh() {
+    if config.token()?.is_none() && !config.uses_ssh() {
         return Err(
             GmError::new("unauthenticated", "The runner needs to sign in.")
                 .hint("`gm auth login --persona <name>` (dev) or `gm auth login --token gmx_…`.")

@@ -113,7 +113,7 @@ fn lease_token(
 fn root(config: &Config) -> Result<PathBuf> {
     // Never use config.user alone: GM_TOKEN may belong to a different identity.
     // Rotated credentials deliberately start a separate replica, not someone else's outbox.
-    let auth = if let Some(token) = config.token() {
+    let auth = if let Some(token) = config.token()? {
         format!("token:{token}")
     } else if config.uses_ssh() {
         format!(

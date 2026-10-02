@@ -150,10 +150,11 @@ impl Config {
             .to_string()
     }
 
-    pub fn token(&self) -> Option<String> {
-        env_token()
-            .or_else(|| self.agent_token())
-            .or_else(|| self.token.clone())
+    pub fn token(&self) -> Result<Option<String>> {
+        if let Some(token) = env_token() {
+            return Ok(Some(token));
+        }
+        Ok(self.agent_token()?.or_else(|| self.token.clone()))
     }
 
     /// Your agents' tokens on the server in use.
@@ -175,15 +176,20 @@ impl Config {
     }
 
     /// The token this request acts with when not GM_TOKEN: an explicit one, or
-    /// this checkout's agent when a harness drives gm (`gm agent setup`).
-    fn agent_token(&self) -> Option<String> {
+    /// this checkout's agent when a harness drives gm (`gm agent setup`). An
+    /// agent the checkout names but this machine holds no token for gets one
+    /// now, so its work is never quietly attributed to its person.
+    fn agent_token(&self) -> Result<Option<String>> {
         match &self.acting {
-            Acting::Token(token) => Some(token.clone()),
-            Acting::Person => None,
-            Acting::Auto => self
-                .agent_tokens()
-                .get(&crate::profile::acting_agent()?)
-                .cloned(),
+            Acting::Token(token) => Ok(Some(token.clone())),
+            Acting::Person => Ok(None),
+            Acting::Auto => match crate::profile::acting_agent() {
+                None => Ok(None),
+                Some(name) => match self.agent_tokens().get(&name) {
+                    Some(token) => Ok(Some(token.clone())),
+                    None => provision_agent(self, &name),
+                },
+            },
         }
     }
 
@@ -192,11 +198,77 @@ impl Config {
     }
 }
 
-/// The token to send: GM_TOKEN, else an SSH session (signing in when the
-/// cached one is missing or ending), else the stored token. The flag says
-/// whether it came from SSH.
+/// What `gm agent setup` does for its identity, on the first command that
+/// needs it: with its person's sign-in, find or create this checkout's agent,
+/// mint it a token and keep it with gm's credentials. None when nobody is
+/// signed in, as there is no person to act for.
+fn provision_agent(config: &Config, name: &str) -> Result<Option<String>> {
+    use std::sync::{Mutex, OnceLock};
+    // One process may look the token up many times; mint it once.
+    static MINTED: OnceLock<Mutex<std::collections::BTreeMap<String, String>>> = OnceLock::new();
+    let minted = MINTED.get_or_init(Default::default);
+    let key = format!("{}\u{0}{name}", config.server());
+    if let Some(token) = minted.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return Ok(Some(token));
+    }
+    let mut person = config.clone();
+    person.acting = Acting::Person;
+    if person.token.is_none() && !person.uses_ssh() {
+        return Ok(None);
+    }
+    let agents = api(&person, "GET", "/agents", None)?["agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let agent = match agents.into_iter().find(|a| a["name"] == name) {
+        Some(agent) if !agent["revokedAt"].is_null() => {
+            return Err(GmError::new(
+                "revoked",
+                format!("This checkout's agent {name} was revoked."),
+            )
+            .hint("Name another agent in .gitmatrix/agent.local.yml, then run `gm agent setup`.")
+            .exit(exit::AUTH));
+        }
+        Some(agent) => agent,
+        None => api(
+            &person,
+            "POST",
+            "/agents",
+            Some(&serde_json::json!({ "name": name })),
+        )?["agent"]
+            .clone(),
+    };
+    let id = agent["id"].as_str().unwrap_or_default();
+    let label = format!("gm on {}", chrono::Utc::now().format("%Y-%m-%d"));
+    let secret = api(
+        &person,
+        "POST",
+        &format!("/agents/{id}/tokens"),
+        Some(&serde_json::json!({ "name": label, "scope": "write" })),
+    )?["secret"]
+        .as_str()
+        .ok_or_else(|| GmError::new("protocol_error", "The server didn't return a token."))?
+        .to_string();
+    let mut kept = config.clone();
+    kept.set_agent_token(name, secret.clone());
+    kept.save()?;
+    if let Ok(mut m) = minted.lock() {
+        m.insert(key, secret.clone());
+    }
+    eprintln!(
+        "gm: acting as your agent {name}; it had no token on this machine, so gm minted one (`gm agent setup` also publishes its profile)."
+    );
+    Ok(Some(secret))
+}
+
+/// The token to send: GM_TOKEN, else this checkout's agent, else an SSH
+/// session (signing in when the cached one is missing or ending), else the
+/// stored token. The flag says whether it came from SSH.
 pub fn credential(config: &Config) -> Result<(Option<String>, bool)> {
-    if let Some(token) = env_token().or_else(|| config.agent_token()) {
+    if let Some(token) = env_token() {
+        return Ok((Some(token), false));
+    }
+    if let Some(token) = config.agent_token()? {
         return Ok((Some(token), false));
     }
     if config.uses_ssh() {

@@ -824,6 +824,82 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("agent-identity-provisioned-on-first-use", async () => {
+    // A harness drives gm in a checkout set up for an agent, but this machine
+    // holds no token for it: gm must act as the agent, never quietly as its person.
+    const name = `harness-${randomUUID().slice(0, 8)}`;
+    const home = join(work, "provision-home");
+    const dir = join(work, "provision-checkout");
+    await mkdir(join(dir, ".gitmatrix"), { recursive: true });
+    await writeFile(join(dir, ".gitmatrix", "agent.local.yml"), `name: ${name}\n`);
+    const machine = { HOME: home, XDG_CONFIG_HOME: join(home, "config"), GM_TOKEN: "" };
+    const harness = { ...machine, GM_AGENT: "1" };
+    await gm(["auth", "login", "--token", ownerToken], "marco", dir, undefined, {
+      ...machine,
+      GM_AGENT: "0",
+    });
+    const status = JSON.parse(await gm(["auth", "status"], "marco", dir, undefined, harness)) as {
+      actingAs?: string;
+      user: { id: string; agent: { id: string; name: string } | null };
+    };
+    assert.equal(status.user.agent?.name, name, "gm must act as the checkout's agent");
+    assert.match(status.actingAs ?? "", new RegExp(`^${name} \\(for `));
+    const claim = JSON.parse(
+      await gm(
+        ["issue", "claim", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+        "marco",
+        dir,
+        undefined,
+        harness,
+      ),
+    ) as { results: { leaseToken: string }[] };
+    const lease = claim.results[0]?.leaseToken;
+    assert(lease, "Agent claim must return a fencing token");
+    secrets.add(lease);
+    const shown = JSON.parse(
+      await gm(
+        ["issue", "show", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+        "marco",
+        dir,
+        undefined,
+        harness,
+      ),
+    ) as { issue: { claim: { actorId: string; accountableId: string } } };
+    assert.equal(shown.issue.claim.actorId, status.user.agent?.id, "The agent holds the claim");
+    assert.equal(shown.issue.claim.accountableId, status.user.id, "Its person is accountable");
+    const { agents } = await json<{ agents: Agent[] }>("/api/agents", ownerToken);
+    const agent = agents.find((candidate) => candidate.name === name);
+    assert(agent, "gm must have created the checkout's agent");
+    assert.equal(agent.tokens.length, 1, "Later commands reuse the kept token");
+    await gm(
+      ["issue", "release", fixtures.tracker.blocker, "--owner", fixtures.tracker.owner],
+      "marco",
+      dir,
+      undefined,
+      { ...harness, GM_LEASE_TOKEN: lease },
+    );
+    // CI keeps the agent too: a run it starts names it with its person.
+    const started = JSON.parse(
+      await gm(
+        ["runs", "start", "--ref", "agent-ci-failure", "--repo", fullName],
+        "marco",
+        dir,
+        undefined,
+        harness,
+      ),
+    ) as { number: number };
+    const run = await poll(() => runDetail(started.number), terminal, "agent-started run");
+    assert.equal(run.agent, name, "The run records the agent that started it");
+    assert.equal(run.actor, "marco", "…and the person it acts for");
+    await gm(["agent", "revoke", agent.id]);
+    record({
+      agent: name,
+      claimIdentity: shown.issue.claim.actorId,
+      tokens: agent.tokens.length,
+      run: { number: run.number, actor: run.actor, agent: run.agent },
+    });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

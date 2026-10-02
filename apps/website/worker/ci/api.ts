@@ -47,8 +47,9 @@ const selectRuns = (kdb: DB) =>
   kdb
     .selectFrom("ci_runs as r")
     .leftJoin("accounts as a", "a.id", "r.actor_id")
+    .leftJoin("agents as g", "g.id", "r.agent_id")
     .selectAll("r")
-    .select("a.slug as actor");
+    .select(["a.slug as actor", "g.name as agent"]);
 
 type RunRow = InferResult<ReturnType<typeof selectRuns>>[number];
 
@@ -61,6 +62,7 @@ const toRun = (row: RunRow): CiRunSummary => ({
   title: row.title,
   status: row.status,
   actor: row.actor,
+  agent: row.agent,
   createdAt: row.created_at,
   startedAt: row.started_at,
   finishedAt: row.finished_at,
@@ -103,7 +105,7 @@ ci.post("/runs", async (c) => {
     branch,
     commit: target.oid,
     trigger: "manual",
-    actorId: c.get("actor")?.id ?? null,
+    actor: c.get("actor") ?? null,
     waitUntil: (work) => c.executionCtx.waitUntil(work),
   });
   if ("skipped" in started) return fail(c, 422, started.skipped);
@@ -221,7 +223,7 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
     branch: run.ref,
     commit: run.commit_oid,
     trigger: "manual",
-    actorId: c.get("actor")?.id ?? null,
+    actor: c.get("actor") ?? null,
     waitUntil: (work) => c.executionCtx.waitUntil(work),
   });
   if ("skipped" in started) return fail(c, 422, started.skipped);

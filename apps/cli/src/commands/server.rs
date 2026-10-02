@@ -66,7 +66,7 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
         AuthCommand::SshKey(command) => ssh_key(ctx, &config, command),
         AuthCommand::GitCredential { .. } => unreachable!("handled in main"),
         AuthCommand::Status => {
-            if config.token().is_none() && !config.uses_ssh() {
+            if config.token()?.is_none() && !config.uses_ssh() {
                 return Ok(Json(
                     json!({ "server": config.server(), "user": null, "hint": "Sign in with `gm auth login` (in the browser), `--ssh`, or `--persona <name>` in dev." }),
                 ));

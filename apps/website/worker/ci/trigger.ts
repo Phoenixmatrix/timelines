@@ -5,6 +5,7 @@
 
 import type { InferResult } from "kysely";
 import { listRefs } from "../artifacts.ts";
+import type { Actor } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
@@ -64,7 +65,8 @@ export async function startRun(
     branch: string;
     commit: string;
     trigger: "push" | "manual";
-    actorId: string | null;
+    /** Who pushed or started it: a person, or an agent acting for one. */
+    actor: Pick<Actor, "id" | "agent"> | null;
     waitUntil: Waiter;
   },
 ): Promise<{ runId: string; number: number } | { skipped: string }> {
@@ -109,6 +111,7 @@ export async function startRun(
           "ref",
           "trigger",
           "actor_id",
+          "agent_id",
           "title",
           "status",
           "config_error",
@@ -124,7 +127,8 @@ export async function startRun(
               eb.val(options.commit).as("commit_oid"),
               eb.val(options.branch).as("ref"),
               eb.val(options.trigger).as("trigger"),
-              eb.val(options.actorId).as("actor_id"),
+              eb.val(options.actor?.id ?? null).as("actor_id"),
+              eb.val(options.actor?.agent?.id ?? null).as("agent_id"),
               eb.val(title).as("title"),
               eb.val(error ? "failed" : "queued").as("status"),
               eb.val(error).as("config_error"),
@@ -252,7 +256,12 @@ export async function startRun(
  * After a push: start a run for every branch that moved. The upsert is
  * conditional, so concurrent pushes (or retries) never start the same run twice.
  */
-export async function onPush(env: Env, repo: CiRepo, actorId: string | null, waitUntil: Waiter) {
+export async function onPush(
+  env: Env,
+  repo: CiRepo,
+  actor: Pick<Actor, "id" | "agent"> | null,
+  waitUntil: Waiter,
+) {
   const refs = await listRefs(env, repo.artifacts_name, repo.artifacts_remote);
   const kdb = db(env.DB);
   const known = new Set(
@@ -295,7 +304,7 @@ export async function onPush(env: Env, repo: CiRepo, actorId: string | null, wai
         branch: row.ref,
         commit: row.oid,
         trigger: "push",
-        actorId,
+        actor,
         waitUntil,
       });
     } catch (error) {

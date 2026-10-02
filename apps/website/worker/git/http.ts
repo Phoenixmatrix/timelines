@@ -132,8 +132,8 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
       queueMirror(c.env, repo.id).catch((error) => console.error("Mirror: enqueue failed", error)),
     );
     c.executionCtx.waitUntil(
-      onPush(c.env, repo, actor?.id ?? null, (work) => c.executionCtx.waitUntil(work)).catch(
-        (error) => console.error("CI: push trigger failed", error),
+      onPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work)).catch((error) =>
+        console.error("CI: push trigger failed", error),
       ),
     );
     c.executionCtx.waitUntil(

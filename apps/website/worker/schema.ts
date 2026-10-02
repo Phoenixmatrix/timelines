@@ -299,6 +299,7 @@ export interface Database {
     ref: string;
     trigger: "push" | "manual";
     actor_id: string | null;
+    agent_id: string | null;
     title: Generated<string>;
     status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
     config_error: string | null;

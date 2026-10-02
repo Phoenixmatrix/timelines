@@ -195,10 +195,14 @@ const RUN_GRID =
 const WIDE = "hidden @2xl:block";
 const WIDER = "hidden @4xl:block";
 
+/** Who pushed or started a run: an agent is named with the person it acts for. */
+const runBy = (run: CiRunSummary) =>
+  run.agent && run.actor ? `${run.agent} for ${run.actor}` : run.actor;
+
 const trigger = (run: CiRunSummary) =>
   run.trigger === "manual"
-    ? `started by ${run.actor ?? "someone"}`
-    : `pushed${run.actor ? ` by ${run.actor}` : ""}`;
+    ? `started by ${runBy(run) ?? "someone"}`
+    : `pushed${run.actor ? ` by ${runBy(run)}` : ""}`;
 
 function RunRow({ run }: { run: CiRunSummary }) {
   const repo = useRepo();
@@ -641,7 +645,7 @@ export function CiRun() {
             )}
             <span>·</span>
             <span>
-              {run.trigger === "manual" ? "Started by" : "Pushed by"} {run.actor ?? "someone"}{" "}
+              {run.trigger === "manual" ? "Started by" : "Pushed by"} {runBy(run) ?? "someone"}{" "}
               <span title={fullDate(run.createdAt)}>{timeAgo(run.createdAt)}</span>
             </span>
             {run.startedAt && (
