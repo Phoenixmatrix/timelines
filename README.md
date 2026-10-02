@@ -45,6 +45,13 @@ On 64-bit Raspberry Pi OS (Bookworm or newer), the installer selects
 `linux-aarch64/gm` automatically. A 32-bit OS cannot run this ARM64 binary.
 See [CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-and-installing-unix-clis).
 
+## Knowledge map labels
+
+The Knowledge view reveals component, folder, file and symbol labels as you zoom
+in. Long names wrap or end in an ellipsis instead of leaving readable tiles blank;
+hover a tile or select it to see the complete name in the tooltip or inspector.
+Tiny tiles remain unlabeled until there is enough room to read them.
+
 ## Agent-first development
 
 Use one **source worktree and isolated environment per agent**. Never test product

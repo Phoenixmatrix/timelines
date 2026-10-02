@@ -27,6 +27,7 @@ interface View {
 
 /** Minimum on-screen size (px) before a level is drawn or picked. */
 const SHOW = { district: 48, plot: 3, lots: 110 };
+const labelSegments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888";
@@ -208,9 +209,9 @@ export function AtlasMap({
     const visible = (c: Cell) =>
       sx(c.x) <= w && sx(c.x + c.w) >= 0 && sy(c.y) <= h && sy(c.y + c.h) >= 0;
 
-    // Labels are placed after the territory, most important first, and only
-    // where they fit whole: never truncated into fragments, never under the
-    // floating search and zoom controls or the legend, never on each other.
+    // Labels are placed after the territory, most important first. Long names
+    // are ellipsized, not dropped; the hover and inspector keep the full name.
+    // Keep labels clear of controls, the legend and higher-priority labels.
     interface Label {
       priority: number;
       box: [number, number, number, number];
@@ -225,24 +226,42 @@ export function AtlasMap({
     ];
     const overlaps = (a: [number, number, number, number], b: [number, number, number, number]) =>
       a[0] < b[0] + b[2] && a[0] + a[2] > b[0] && a[1] < b[1] + b[3] && a[1] + a[3] > b[1];
-    /** Up to two lines that fit the width whole, or null. */
+    /** Fit a readable prefix without splitting a grapheme or stretching the font. */
+    const fitLine = (text: string, max: number): string | null => {
+      if (ctx.measureText(text).width <= max) return text;
+      if (ctx.measureText("…").width > max) return null;
+      const starts = Array.from(labelSegments.segment(text), (part) => part.index);
+      let low = 0;
+      let high = starts.length - 1;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        const candidate = `${text.slice(0, starts[mid]).trimEnd()}…`;
+        if (ctx.measureText(candidate).width <= max) low = mid;
+        else high = mid - 1;
+      }
+      return `${text.slice(0, starts[low]).trimEnd()}…`;
+    };
+    /** Wrap at words, then ellipsize the last line instead of hiding the name. */
     const wrapLines = (text: string, max: number): string[] | null => {
+      const words = text.trim().split(/\s+/);
       const lines: string[] = [];
       let line = "";
-      for (const word of text.split(/\s+/)) {
-        const next = line ? `${line} ${word}` : word;
+      for (let i = 0; i < words.length; i++) {
+        const next = line ? `${line} ${words[i]}` : words[i]!;
         if (ctx.measureText(next).width <= max) line = next;
-        else {
-          if (!line || ctx.measureText(word).width > max) return null;
+        else if (line && lines.length === 0) {
           lines.push(line);
-          line = word;
+          line = words[i]!;
+        } else {
+          const last = fitLine([line, ...words.slice(i)].filter(Boolean).join(" "), max);
+          if (last) lines.push(last);
+          return lines.length ? lines : null;
         }
       }
-      if (line) lines.push(line);
-      return lines.length <= 2 ? lines : null;
+      const last = fitLine(line, max);
+      if (last) lines.push(last);
+      return lines.length ? lines : null;
     };
-    /** A single line that fits whole, or null. */
-    const whole = (text: string, max: number) => (ctx.measureText(text).width <= max ? text : null);
     const inBand = (
       cell: Cell,
       X: number,
@@ -256,7 +275,7 @@ export function AtlasMap({
       priority: number,
     ) => {
       ctx.font = `${weight} ${size}px ${family}`;
-      const text = whole(cell.label, W - 12);
+      const text = fitLine(cell.label, W - 12);
       if (!text) return;
       const tw = ctx.measureText(text).width;
       labels.push({
@@ -394,7 +413,7 @@ export function AtlasMap({
         ctx.fillRect(X, Y, W, H);
         if (W > 42 && H > 13) {
           ctx.font = `${Math.min(11, H * 0.55)}px ${mono}`;
-          const text = whole(cell.label, W - 6);
+          const text = fitLine(cell.label, W - 6);
           // Room for a second line: where the symbol starts in its file.
           const line = map.nodes[cell.node]?.[4] ?? 0;
           const detail = H > 34 && line > 0 ? `line ${line}` : "";
