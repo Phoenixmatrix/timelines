@@ -11,9 +11,10 @@ ENV PNPM_HOME=/usr/local/pnpm PATH=/usr/local/pnpm/bin:/usr/local/pnpm:$PATH
 RUN corepack enable && corepack prepare pnpm@latest --activate \
   && pnpm add -g vite-plus
 
-# Rust, for the gm CLI.
+# Rust, for the gm CLI; check runs cargo fmt and clippy, which minimal leaves out.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+    --component rustfmt,clippy \
   && chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
 WORKDIR /workspace

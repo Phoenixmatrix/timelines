@@ -31,12 +31,29 @@ export const SETUP_STEP = -1;
 
 class Cancelled extends Error {}
 
+const FINISHED = new Set(["succeeded", "failed", "cancelled", "skipped"]);
+
 export class CiSandbox extends DurableObject<Env> {
-  async run(jobId: string): Promise<void> {
+  #running: Promise<void> | null = null;
+
+  /**
+   * Run the job, once. Workflows replay a step whose invocation ended while it
+   * was in flight, so a second call joins the run in progress, and a call for
+   * a job that already finished returns at once instead of starting it over.
+   */
+  run(jobId: string): Promise<void> {
+    this.#running ??= this.#run(jobId).finally(() => {
+      this.#running = null;
+    });
+    return this.#running;
+  }
+
+  async #run(jobId: string): Promise<void> {
     const container = this.ctx.container;
     const d1 = this.env.DB;
     const job = await loadJob(d1, jobId);
     if (!job) throw new Error(`No CI job ${jobId}`);
+    if (FINISHED.has(job.status)) return;
     if (!container) {
       await report(this.env, jobId, {
         done: {
@@ -91,6 +108,8 @@ export class CiSandbox extends DurableObject<Env> {
         GIT_TERMINAL_PROMPT: "0",
       };
       const checkout = [
+        // A container that outlived an earlier attempt still has its checkout.
+        `rm -rf ${WORKDIR}`,
         `git clone --quiet --depth 50 --single-branch --branch "$BRANCH" "$REMOTE" ${WORKDIR}`,
         `cd ${WORKDIR}`,
         `git checkout --quiet "$COMMIT" 2>/dev/null || { git fetch --quiet --depth 1 origin "$COMMIT" && git checkout --quiet "$COMMIT"; }`,
@@ -138,13 +157,12 @@ export class CiSandbox extends DurableObject<Env> {
         deadline,
       );
     } catch (error) {
-      const cancelled = error instanceof Cancelled;
-      await report(this.env, jobId, {
-        done: cancelled
-          ? { status: "cancelled" }
-          : { status: "failed", error: error instanceof Error ? error.message : String(error) },
-      });
-      if (!cancelled) throw error;
+      if (!(error instanceof Cancelled)) {
+        // Left unfinished so the step's retry runs the job again; once retries
+        // run out, the workflow marks it failed with this message.
+        throw error;
+      }
+      await report(this.env, jobId, { done: { status: "cancelled" } });
     } finally {
       await container.destroy().catch(() => {});
     }
