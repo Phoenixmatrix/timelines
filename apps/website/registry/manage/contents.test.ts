@@ -52,7 +52,16 @@ describe("package version contents API", () => {
   const send = (path: string, body: BodyInit, method = "PUT", extra: Record<string, string> = {}) =>
     h.request(path, { method, headers: { ...headers(), ...extra }, body });
   const feed = async (format: FormatId, visibility = "private") => {
-    const response = await h.createRepo({ key: "test", format, kind: "local", visibility });
+    const response = await h.createRepo({
+      key: "test",
+      format,
+      kind: "local",
+      visibility,
+      // apt and rpm sign their indexes with a key made on first use. RSA-4096,
+      // the default, takes seconds to generate (and varies widely) on slower
+      // hosts; these tests are about contents, not the algorithm.
+      config: { signingAlgorithm: "ed25519" },
+    });
     expect(response.status, await response.clone().text()).toBe(201);
   };
   const url = (
