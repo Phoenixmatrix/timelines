@@ -4,6 +4,7 @@
 # one stage so the stage-based scheduler never serializes one behind another.
 # Those get standard-4 (4 vCPU, 12 GiB): on the default standard-1 (4 GiB),
 # oxlint's allocator failed before linting and the test container was lost.
+# On main, a deploy job then ships only what changed (see the job below).
 #
 # Non-AI E2E is too expensive to run per push. It runs only on local runners
 # (the trusted Linux host, with cf authentication and user systemd), where
@@ -57,8 +58,6 @@ jobs:
       # can fail to spawn native tools (spawn EBUSY).
       - name: Build
         run: vp run -r --concurrency-limit 1 --no-cache build
-      - name: Publish changed gm CLI on main
-        run: node tools/agent/publish-cli.ts
 
   e2e:
     if: runner == "local"
@@ -68,3 +67,22 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Live isolated CLI, API, browser, CI and mirror journeys (no AI)
         run: vp run agent test
+
+  # On main, once the gates pass: publish gm when its source changed, then
+  # deploy what changed since the deployed Worker version (tools/agent/deploy.ts):
+  # migrations, then the Worker. A changed CI image fails the job after the
+  # rest has shipped; deploy it from a machine with Docker (`vp run deploy`).
+  deploy:
+    needs: [check, test, build]
+    if: branch == "main" && runner == "sandbox"
+    instance: standard-4
+    secrets: [CLOUDFLARE_API_TOKEN]
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Publish gm if it changed
+        run: node tools/agent/publish-cli.ts
+      - name: Deploy what changed
+        run: node tools/agent/deploy.ts

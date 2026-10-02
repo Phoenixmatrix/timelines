@@ -72,6 +72,23 @@ serves https://gitmatrix.fward.dev (override with `GITMATRIX_PUBLIC_URL` at depl
 time), with production-only D1, Artifacts, Vectorize and AI Search resources so it
 never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
 
+**CI deploys main.** Once check, test and build pass on main, the `deploy` job
+(`tools/agent/deploy.ts`) ships only what changed since the deployed version:
+
+- Every deploy tags its Worker version with its commit (`cf deploy --tag`), and
+  the next run diffs from that commit. `node tools/agent/deploy.ts --plan` prints
+  the plan from any checkout without changing anything.
+- Changed `migrations/` or `registry/migrations/` apply to their database first;
+  Worker code, assets or dependencies then deploy with `--containers-rollout none`.
+  Docs, tests, `seed/` and `gm` changes deploy nothing.
+- `gm` publishes to the owner's generic registry only when its source changed
+  (`tools/agent/publish-cli.ts` asks the registry before compiling).
+- A Sandbox has no Docker, so CI reuses the deployed CI image
+  (`GITMATRIX_CI_IMAGE`). A change under `ci/` fails the job after the rest has
+  shipped: run `vp run deploy` here, which builds the image and tags the commit.
+
+The job's `CLOUDFLARE_API_TOKEN` is a repository CI secret (`gm secret set`).
+
 ## Personas (dev sign-in)
 
 Development data (the personas below, Orbit Labs, the owner account) lives in

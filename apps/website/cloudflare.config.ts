@@ -44,11 +44,18 @@ const OWNER_EMAIL = "hello@fward.me";
 /** Sign-in codes come from this address (Email Service, mail.fward.dev). */
 const EMAIL_FROM = "gitmatrix@mail.fward.dev";
 
-const ciSandbox = defineContainer({
-  name: "gitmatrix-ci",
-  schedulingPolicy: "durable-object",
-  images: { default: { dockerfile: "./ci/Dockerfile" } },
-});
+/**
+ * The CI image. Deploys from CI pass GITMATRIX_CI_IMAGE, the deployed
+ * version's image reference: a Sandbox has no Docker to rebuild it, so CI
+ * reuses it, and changes to ci/Dockerfile deploy from a machine with Docker.
+ */
+function ciSandbox(image: string | undefined) {
+  return defineContainer({
+    name: "gitmatrix-ci",
+    schedulingPolicy: "durable-object",
+    images: { default: image ? { reference: image } : { dockerfile: "./ci/Dockerfile" } },
+  });
+}
 
 export default defineConfig(({ mode }) => {
   // cf evaluates this in Node, while the Worker's tsconfig excludes Node globals.
@@ -66,11 +73,12 @@ export default defineConfig(({ mode }) => {
   // Docker. CI's build check runs inside a Sandbox without it and never
   // deploys, so it sets GITMATRIX_CONTAINER_IMAGES=skip.
   const container = sandboxed && env.GITMATRIX_CONTAINER_IMAGES !== "skip";
+  const ci = ciSandbox(env.GITMATRIX_CI_IMAGE);
   const publicUrl = dev
     ? local.publicUrl
     : (env.GITMATRIX_PUBLIC_URL ?? `https://${PRODUCTION_HOST}`);
   return {
-    ...(container ? { containers: [ciSandbox] } : {}),
+    ...(container ? { containers: [ci] } : {}),
     worker: {
       name: "gitmatrix",
       compatibilityDate: "2026-09-30",
@@ -231,7 +239,7 @@ export default defineConfig(({ mode }) => {
         RegistryLogin: exports.durableObject({ storage: "sqlite" }),
         CiSandbox: exports.durableObject({
           storage: "sqlite",
-          ...(container ? { container: ciSandbox } : {}),
+          ...(container ? { container: ci } : {}),
         }),
       },
     },

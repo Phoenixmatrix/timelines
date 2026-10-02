@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 
 // Version by the last CLI-source change, not every website/docs push. Full history
 // matters: a shallow boundary otherwise looks like it introduced every file.
-function publish(): void {
+async function publish(): Promise<void> {
   if (process.env.GITMATRIX_BRANCH !== "main") {
     console.log(JSON.stringify({ event: "cli.publish.skipped", reason: "not-main" }));
     return;
@@ -42,21 +42,14 @@ function publish(): void {
     process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : process.arch;
   const platform = `${os}-${arch}`;
   const target = `gm/${version}/${platform}/gm`;
-  // The CI runner's managed compiler cache moves Cargo's output via CARGO_TARGET_DIR.
-  const gm = resolve(
-    process.argv[2] ?? join(process.env.CARGO_TARGET_DIR ?? "apps/cli/target", "release/gm"),
-  );
-  try {
-    run(gm, [
-      "pkg",
-      "download",
-      target,
-      "--owner",
-      owner,
-      "--dest",
-      ".gitmatrix/publish-check",
-      "--dry-run",
-    ]);
+  // Ask the registry first, so a push that didn't change gm doesn't compile it.
+  // Only a genuine 404 permits publication; auth or network failures must fail
+  // CI rather than silently skipping the release.
+  const status = await fetch(`${server.replace(/\/$/, "")}/generic/${owner}/${target}`, {
+    method: "HEAD",
+    headers: { authorization: `Bearer ${token}` },
+  }).then((response) => response.status);
+  if (status === 200) {
     console.log(
       JSON.stringify({
         event: "cli.publish.skipped",
@@ -66,17 +59,22 @@ function publish(): void {
       }),
     );
     return;
-  } catch (error) {
-    // Only a genuine missing artifact permits publication; auth/network failures
-    // must fail CI rather than silently skipping the release.
-    if (!(error instanceof Error) || !("status" in error) || error.status !== 3) throw error;
   }
+  if (status !== 404) throw new Error(`Checking for ${target} returned HTTP ${status}.`);
+  execFileSync("cargo", ["build", "--release", "--manifest-path", "apps/cli/Cargo.toml"], {
+    env,
+    stdio: "inherit",
+  });
+  // The CI runner's managed compiler cache moves Cargo's output via CARGO_TARGET_DIR.
+  const gm = resolve(
+    process.argv[2] ?? join(process.env.CARGO_TARGET_DIR ?? "apps/cli/target", "release/gm"),
+  );
   const artifact = JSON.parse(run(gm, ["pkg", "upload", gm, target, "--owner", owner]));
   console.log(JSON.stringify({ event: "cli.published", version, platform, artifact }));
 }
 
 try {
-  publish();
+  await publish();
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;

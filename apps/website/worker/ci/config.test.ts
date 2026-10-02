@@ -89,6 +89,17 @@ test("this repository's pipeline is set up to run in Sandbox containers", () => 
   for (const name of ["check", "test", "build"]) expect(job(name).instance).toBe("standard-4");
   // A Sandbox has no Docker to build the CI image with during `vite build`.
   expect(job("build").env.GITMATRIX_CONTAINER_IMAGES).toBe("skip");
+  // Deploys run once the gates pass, only on main and only in production.
+  const deploy = job("deploy");
+  expect([...deploy.needs].sort()).toEqual(["build", "check", "test"]);
+  expect(deploy.secrets).toEqual(["CLOUDFLARE_API_TOKEN"]);
+  const at = (branch: string, runner: "local" | "sandbox") =>
+    evaluate(deploy.if!, { branch, trigger: "push", commit: "abc", runner });
+  expect([at("main", "sandbox"), at("main", "local"), at("feature", "sandbox")]).toEqual([
+    true,
+    false,
+    false,
+  ]);
   const e2e = job("e2e").if!;
   const base = { branch: "main", trigger: "push" as const, commit: "abc" };
   expect(evaluate(e2e, { ...base, runner: "local" })).toBe(true);

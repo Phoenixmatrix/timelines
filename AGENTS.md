@@ -76,7 +76,8 @@ This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
   there: the mirror overwrites it. Use `gh` only to read GitHub.
 - **Every push runs the quality gates** in `.gitmatrix/ci.yml` on production,
   in Cloudflare Sandbox containers: check, test and build, independently;
-  all must pass. E2E is local-only (`if: runner == "local"`), so run
+  all must pass. On main, a `deploy` job then ships what changed (migrations,
+  the Worker, `gm`); pushing to main **is** deploying to production. E2E is local-only (`if: runner == "local"`), so run
   `vp run ready` first, then `gm push && gm runs wait` to confirm the
   pipeline. Real AI checks are explicit, never automatic.
 - **Testing Gitmatrix itself:** use the scoped workflow above. Keep all product
