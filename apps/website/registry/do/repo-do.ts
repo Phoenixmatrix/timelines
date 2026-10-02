@@ -2,12 +2,25 @@ import { DurableObject } from "cloudflare:workers";
 
 import type { Actor } from "../core/auth/actor.ts";
 import { RepoLogic } from "./repo-logic.ts";
+import { cacheNpmArchive } from "../manage/archive.ts";
 
 const REBUILD_DELAY_MS = 2_000;
 
 /** One per repository (named by repository id). */
 export class RepoDO extends DurableObject<Env> {
   private readonly logic: RepoLogic;
+  private readonly archives = new Map<string, Promise<string>>();
+
+  npmArchive(repoId: string, digest: string): Promise<string> {
+    const key = `${repoId}:${digest}`;
+    let pending = this.archives.get(key);
+    if (!pending) {
+      pending = cacheNpmArchive(this.env, repoId, digest).finally(() => this.archives.delete(key));
+      this.archives.set(key, pending);
+      this.ctx.waitUntil(pending);
+    }
+    return pending;
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);

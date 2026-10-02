@@ -36,6 +36,7 @@ import {
 } from "../core/repos.ts";
 import { resetDerivedKeys } from "../core/secrets.ts";
 import { RepoLogic } from "../do/repo-logic.ts";
+import { cacheNpmArchive } from "../manage/archive.ts";
 
 const REGISTRY_MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url).href);
 const GITMATRIX_MIGRATIONS = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
@@ -68,8 +69,20 @@ class FakeNamespace<T> {
 /** Rebuilds run immediately so tests see indexes right after a publish. */
 class FakeRepoObject {
   private readonly logic: RepoLogic;
-  constructor(logic: RepoLogic) {
+  private readonly archives = new Map<string, Promise<string>>();
+  private readonly env: Env;
+  constructor(logic: RepoLogic, env: Env) {
     this.logic = logic;
+    this.env = env;
+  }
+  npmArchive(repoId: string, digest: string): Promise<string> {
+    const key = `${repoId}:${digest}`;
+    let pending = this.archives.get(key);
+    if (!pending) {
+      pending = cacheNpmArchive(this.env, repoId, digest).finally(() => this.archives.delete(key));
+      this.archives.set(key, pending);
+    }
+    return pending;
   }
   /** Like the real object: a separate context, reached by copies of the arguments. */
   mutate(repoId: string, op: string, payload: unknown, actor?: Actor) {
@@ -219,7 +232,7 @@ export async function makeHarness(
     REGISTRY_KEK: btoa("k".repeat(32)),
     ...overrides,
   } as unknown as Env;
-  const repoNamespace = new FakeNamespace(() => new FakeRepoObject(new RepoLogic(env)));
+  const repoNamespace = new FakeNamespace(() => new FakeRepoObject(new RepoLogic(env), env));
   Object.assign(env, {
     REGISTRY_REPO: repoNamespace,
     REGISTRY_UPLOAD: new FakeNamespace(() => new FakeStateObject()),

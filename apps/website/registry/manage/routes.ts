@@ -26,6 +26,7 @@ import type {
 } from "../../shared/packages.ts";
 import { services, type AppEnv } from "../core/context.ts";
 import { asRegistryError, RegistryError } from "../core/errors.ts";
+import { downloadPackageContent, packageContents } from "./contents.ts";
 import {
   approveNpmLogin,
   bulkAction,
@@ -113,6 +114,28 @@ export function packagesApi(): Hono<AppEnv> {
   const at = (c: Context<AppEnv>) =>
     [c.req.param("owner") ?? "", c.req.param("format") ?? "", c.req.param("name") ?? ""] as const;
 
+  api.get("/:owner/:format/:name/contents", async (c) =>
+    c.json(
+      await packageContents(services(c), ...at(c), {
+        version: c.req.query("version") ?? "",
+        path: c.req.query("path"),
+        manifest: c.req.query("manifest"),
+        offset: number(c.req.query("offset"), 0),
+        limit: number(c.req.query("limit"), 100),
+      }),
+    ),
+  );
+  api.get("/:owner/:format/:name/contents/download", async (c) =>
+    downloadPackageContent(
+      services(c),
+      ...at(c),
+      {
+        version: c.req.query("version") ?? "",
+        manifest: c.req.query("manifest"),
+      },
+      c.req.query("id") ?? "",
+    ),
+  );
   api.get("/:owner/:format/:name", async (c) => c.json(await packageDetail(services(c), ...at(c))));
   api.get("/:owner/:format/:name/publishes", async (c) =>
     c.json(

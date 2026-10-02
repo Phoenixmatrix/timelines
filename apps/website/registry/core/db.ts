@@ -9,6 +9,22 @@ import { D1Dialect } from "kysely-d1";
  * live in gitmatrix's database (DB), not here.
  */
 export interface Database {
+  archive_caches: {
+    id: string;
+    repo_id: string;
+    digest: string;
+    r2_key: string;
+    ready: Generated<number>;
+  };
+  archive_members: {
+    cache_id: string;
+    path: string;
+    parent: string;
+    kind: "file" | "directory";
+    offset: number;
+    size: number;
+    digest: string | null;
+  };
   repositories: {
     id: string;
     key: string;

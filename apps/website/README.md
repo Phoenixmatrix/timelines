@@ -647,6 +647,11 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
   - a virtualized table, built for tens of thousands of versions;
   - bulk delete, yank, deprecate and tag, for a selection or everything a
     query matches.
+  - version links open paginated contents without losing the history query:
+    generic files and release assets show sizes, checksums and downloads; npm
+    shows the archive's directory tree and actual `package.json`; OCI shows
+    manifests, platform choices, config and layers. Other formats expose their
+    recorded distribution files and package/version metadata.
 
   Repositories have a Packages tab, and CI runs list what they published.
 
@@ -663,6 +668,34 @@ Deployed, package indexes embed https://gitmatrix.fward.dev (or
 db:migrate` applies both databases' migrations. Account slugs must not take
 the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
 `helm`, `apt`, `rpm`, `brew`, `generic`, `releases`) or `-`.
+
+### Version contents
+
+`GET /api/packages/:owner/:format/:name/contents?version=…` returns a
+`PackageContents` page. Encode the package name as one API path segment.
+`offset` and `limit` paginate entries; `path` selects an npm archive directory,
+and `manifest` selects a manifest reachable from the selected OCI version.
+The web console keeps that selection in `version`, `path`, `contentOffset` and
+`manifest` URL parameters.
+
+Each downloadable entry has a version-scoped `downloadUrl`. Downloads use the
+same feed/package authorization as listings and accept the web session, so
+private packages never require a public or unscoped blob URL. Responses stream
+as attachments; npm archive members support HEAD and byte ranges. Homebrew
+versions resolve their recorded digest rather than the current formula file.
+
+npm's first view streams and indexes the tarball once, serialized by its
+repository Durable Object. A persistent D1 index and cached uncompressed tar in
+R2 serve subsequent directory pages and member ranges without decompressing
+again. Index writes are batched and directory entries deduplicated. Inspection
+is bounded to a 1 GiB uncompressed archive, 100,000 archive entries and 16 MiB
+of indexed names. Manifest and config JSON inspection is bounded to 4 MiB.
+PyPI, Cargo, Maven, Helm, Go,
+APT, RPM and Homebrew use existing catalog metadata instead of unpacking
+distribution archives.
+
+Apply registry migration `0005_package_contents.sql` before running the updated
+Worker. Cache rows are tied to their source blobs for registry garbage collection.
 
 ### Historical artifact storage
 

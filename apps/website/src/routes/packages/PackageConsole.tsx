@@ -72,6 +72,7 @@ import {
 import { repoPath, treeUrl } from "../../lib/refs.ts";
 import { load } from "../../lib/api.ts";
 import type { FormatId } from "@gitmatrix/formats/info";
+import { PackageVersionContents, versionContentsSearch } from "./PackageVersionContents.tsx";
 
 const PAGE = 100;
 
@@ -588,6 +589,7 @@ function VersionRow({
   selectable,
   onSelect,
   onFilter,
+  contentsHref,
 }: {
   row: PublishRow;
   owner: string;
@@ -595,6 +597,7 @@ function VersionRow({
   selectable: boolean;
   onSelect: (row: PublishRow, extend: boolean) => void;
   onFilter: (key: QueryKey, value: string) => void;
+  contentsHref: string;
 }) {
   const [repoOwner, repoName] = row.repo?.split("/") ?? [];
   return (
@@ -617,12 +620,15 @@ function VersionRow({
         )}
       </span>
       <span role="cell" className={CELLS.version}>
-        <span
-          className="mk-mono truncate group-data-[status=deleted]/row:text-ink-faint group-data-[status=deleted]/row:line-through group-data-[status=deleted]/row:decoration-line"
+        <Link
+          to={contentsHref}
+          preventScrollReset
+          aria-label={`View contents of ${row.version}`}
+          className="mk-mono truncate py-2 text-signal underline-offset-4 hover:underline group-data-[status=deleted]/row:text-ink-faint group-data-[status=deleted]/row:line-through group-data-[status=deleted]/row:decoration-line"
           title={row.size !== null ? `${row.version} · ${bytes(row.size)}` : row.version}
         >
           {row.version}
-        </span>
+        </Link>
         {row.tags.slice(0, 3).map((tag) => (
           <span key={tag} className="mk-chip mk-chip--tag flex-none">
             {tag}
@@ -714,6 +720,7 @@ function VersionTable({
   onFilter: (key: QueryKey, value: string) => void;
   selectable: boolean;
 }) {
+  const [params] = useSearchParams();
   const rowHeight = useRowHeight();
   const body = useRef<HTMLDivElement>(null);
   const { row, ensure } = usePublishWindows(data.base, data.query, page);
@@ -831,6 +838,7 @@ function VersionTable({
                     selectable={selectable}
                     onSelect={(r, extend) => onSelect(r, extend, selectableRows)}
                     onFilter={onFilter}
+                    contentsHref={versionContentsSearch(params, r.version)}
                   />
                 ) : (
                   <SkeletonRow />
@@ -1166,7 +1174,8 @@ function Sources({ detail, base }: { detail: PackageDetail; base: string }) {
 export function PackageConsole() {
   const data = useLoaderData<typeof packageConsoleLoader>();
   const { detail, page, query } = data;
-  const [, setParams] = useSearchParams();
+  const [params, setParams] = useSearchParams();
+  const contentsVersion = params.get("version");
   const revalidator = useRevalidator();
   const toast = useToast();
   const [selection, setSelection] = useState<Selection>({ versions: new Map(), all: false });
@@ -1182,7 +1191,16 @@ export function PackageConsole() {
   useEffect(() => setSelection({ versions: new Map(), all: false }), [query]);
 
   const onQuery = useCallback(
-    (q: string) => setParams(q === DEFAULT_QUERY ? {} : { q }, { preventScrollReset: true }),
+    (q: string) =>
+      setParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          if (q === DEFAULT_QUERY) next.delete("q");
+          else next.set("q", q);
+          return next;
+        },
+        { preventScrollReset: true },
+      ),
     [setParams],
   );
   const onFilter = (key: QueryKey, value: string) => onQuery(toggleFilter(query, key, value));
@@ -1334,6 +1352,9 @@ export function PackageConsole() {
         <div className="flex min-w-0 flex-col gap-4">
           <QueryBar query={query} onQuery={onQuery} error={data.error} />
           <SavedViews query={query} onQuery={onQuery} />
+          {contentsVersion !== null && (
+            <PackageVersionContents base={data.base} version={contentsVersion} />
+          )}
           {/* Below the two-column layout the facets come first: the table is unending. */}
           <details className="rounded-pane bg-pane px-3.5 py-1 open:pb-3.5 lg:hidden">
             <summary className="flex min-h-10 cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 font-semibold [&::-webkit-details-marker]:hidden">

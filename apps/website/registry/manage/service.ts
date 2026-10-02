@@ -267,14 +267,14 @@ export async function ownerPackages(services: Services, slug: string): Promise<O
   };
 }
 
-interface Located {
+export interface Located {
   owner: Owner;
   feed: Repository;
   pkg: PackageRow;
   access: PackageAccess;
 }
 
-async function locate(
+export async function locate(
   services: Services,
   slug: string,
   format: string,
