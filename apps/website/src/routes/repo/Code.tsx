@@ -86,33 +86,34 @@ function EntryRow({
           {label}
         </PrefetchLink>
       )}
-      <div className="min-h-11 min-w-0 pl-7 sm:pl-0">
+      <div className="grid min-h-11 min-w-0 grid-cols-[minmax(0,1fr)_auto] content-center items-baseline gap-x-3 pl-7 sm:pl-0">
         {change ? (
           <>
-            <div className="flex min-w-0 items-center gap-3">
-              <Link
-                to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
-                className="min-w-0 flex-1 truncate text-body-sm text-ink-muted no-underline hover:underline"
-                title={firstLine(change.latest.message)}
-              >
-                {firstLine(change.latest.message)}
-              </Link>
-              <Link
-                to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
-                className="shrink-0 text-micro text-ink-faint no-underline hover:underline"
-                title={fullDate(change.latest.authoredAt)}
-              >
-                {timeAgo(change.latest.authoredAt)}
-              </Link>
-            </div>
-            <div className="truncate" title={change.latest.message}>
+            <Link
+              to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
+              className="min-w-0 truncate text-body-sm text-ink-muted no-underline hover:underline sm:text-right"
+              title={firstLine(change.latest.message)}
+            >
+              {firstLine(change.latest.message)}
+            </Link>
+            <Link
+              to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
+              className="text-micro whitespace-nowrap text-ink-faint no-underline hover:underline"
+              title={fullDate(change.latest.authoredAt)}
+            >
+              {timeAgo(change.latest.authoredAt)}
+            </Link>
+            <div
+              className="col-span-2 min-w-0 truncate sm:col-span-1 sm:text-right"
+              title={change.latest.message}
+            >
               <Attribution commit={change.latest} />
             </div>
           </>
         ) : (
           <Link
             to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
-            className="text-body-sm text-ink-faint no-underline hover:underline"
+            className="col-span-2 text-body-sm text-ink-faint no-underline hover:underline sm:text-right"
           >
             View history
           </Link>
