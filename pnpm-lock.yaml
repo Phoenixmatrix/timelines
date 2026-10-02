@@ -324,6 +324,7 @@ overrides:
 packageExtensionsChecksum: sha256-iNc6ICSBBqrl659PKZa+jBGWRIsFWZb9PmiqJ6jD59Y=
 
 patchedDependencies:
+  '@cloudflare/ai-chat@0.12.1': d56cc8f014b63b7284fe3a593ec04b07394d43d7e6694229b33d31cff9c3e7b1
   cf@1.0.0-beta.7: e8114ba3de4870ba725619e95a949e6998ba9e96794c5ad04d5a0a3ff19b3e4f
   miniflare@5.20260930.0-alpha: f96b2861e63b8386aab457f86c998fec8fa34d5d21b4e19716c68d2f8c780df8
 
@@ -347,7 +348,7 @@ importers:
         version: 1.8.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@cloudflare/ai-chat':
         specifier: 'catalog:'
-        version: 0.12.1(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(agents@0.26.0(@ai-sdk/provider@4.0.21)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.6)(@babel/runtime@7.29.7)(@cloudflare/codemode@0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1))(ai@7.0.127(zod@4.6.5))(react@19.3.0)(rolldown@1.2.12)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(react@19.3.0)
+        version: 0.12.1(patch_hash=d56cc8f014b63b7284fe3a593ec04b07394d43d7e6694229b33d31cff9c3e7b1)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(agents@0.26.0(@ai-sdk/provider@4.0.21)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.6)(@babel/runtime@7.29.7)(@cloudflare/codemode@0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1))(ai@7.0.127(zod@4.6.5))(react@19.3.0)(rolldown@1.2.12)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(react@19.3.0)
       '@cloudflare/codemode':
         specifier: 'catalog:'
         version: 0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5)
@@ -4610,7 +4611,7 @@ snapshots:
 
   '@chevrotain/utils@11.1.2': {}
 
-  '@cloudflare/ai-chat@0.12.1(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(agents@0.26.0(@ai-sdk/provider@4.0.21)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.6)(@babel/runtime@7.29.7)(@cloudflare/codemode@0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1))(ai@7.0.127(zod@4.6.5))(react@19.3.0)(rolldown@1.2.12)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(react@19.3.0)':
+  '@cloudflare/ai-chat@0.12.1(patch_hash=d56cc8f014b63b7284fe3a593ec04b07394d43d7e6694229b33d31cff9c3e7b1)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(agents@0.26.0(@ai-sdk/provider@4.0.21)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.6)(@babel/runtime@7.29.7)(@cloudflare/codemode@0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1))(ai@7.0.127(zod@4.6.5))(react@19.3.0)(rolldown@1.2.12)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(react@19.3.0)':
     dependencies:
       agents: 0.26.0(@ai-sdk/provider@4.0.21)(@ai-sdk/react@4.0.130(react@19.3.0)(zod@4.6.5))(@babel/core@8.0.6)(@babel/runtime@7.29.7)(@cloudflare/codemode@0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1))(ai@7.0.127(zod@4.6.5))(react@19.3.0)(rolldown@1.2.12)(zod@4.6.5)
       ai: 7.0.127(zod@4.6.5)
@@ -8051,6 +8052,45 @@ snapshots:
     optionalDependencies:
       '@types/node': 24.19.0
       '@vitest/browser-preview': 5.0.1(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(vitest@5.0.1)(yaml@2.9.1)
+      '@vitest/ui': 5.0.1(vitest@5.0.1)
+    transitivePeerDependencies:
+      - '@arethetypeswrong/core'
+      - '@vitejs/devtools'
+      - esbuild
+      - jiti
+      - less
+      - msw
+      - publint
+      - sass
+      - sass-embedded
+      - stylus
+      - sugarss
+      - terser
+      - tsx
+      - typescript
+      - unplugin-unused
+      - unrun
+      - yaml
+
+  vitest@5.0.1(@types/node@24.19.0)(@vitest/browser-preview@5.0.1)(@vitest/ui@5.0.1)(@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@26.6.3)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1))(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1):
+    dependencies:
+      '@types/chai': 5.2.3
+      '@vitest/mocker': 5.0.1(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
+      chai: 6.2.2
+      es-module-lexer: 2.3.2
+      expect-type: 1.4.0
+      magic-string: 1.4.2
+      obug: 2.2.1
+      picomatch: 4.0.7
+      std-env: 4.3.0
+      tinybench: 6.1.4
+      tinyexec: 1.3.0
+      tinyglobby: 0.2.17
+      vite: '@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@26.6.3)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)'
+      why-is-node-running: 2.3.0
+    optionalDependencies:
+      '@types/node': 24.19.0
+      '@vitest/browser-preview': 5.0.1(@types/node@26.6.3)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(vitest@5.0.1)(yaml@2.9.1)
       '@vitest/ui': 5.0.1(vitest@5.0.1)
     transitivePeerDependencies:
       - '@arethetypeswrong/core'

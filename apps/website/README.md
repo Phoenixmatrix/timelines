@@ -1124,10 +1124,25 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
   issue, run) goes with each message and shows as a removable chip; receipts
   fold finished reads into one line; typing while an approval waits declines it
   and redirects; approved writes revalidate the page.
+  Approvals and browser-tool results continue through the AI SDK's automatic
+  submission predicates, with the existing assistant message and page context.
+  The server stream receives `originalMessages` to retain that message's identity.
+  Agents SDK server-driven continuation is disabled: AI SDK 7's reconnect path
+  starts an empty response for settled tool inputs and cannot attach their results.
+  The version-pinned `@cloudflare/ai-chat` patch treats those submitted assistant
+  tails as continuations during tool repair, streaming, persistence and recovery;
+  otherwise a later step overwrites the saved tool receipts with only new prose.
 - **The CLI.** `POST /api/assistant/ask` streams newline-delimited events
   (`chat`, `plan`, `status`, `tool`, `text`, `done`, `error`); `gm ask` prints
   them, or returns one JSON object to agents. It lands in the same transcript,
   so a terminal conversation continues on the web.
+
+`vp run agent test-ai` covers a real browser approval, exactly-once issue creation,
+conversation-aware follow-up, retry after an injected stream failure, redirecting
+a pending approval without executing it or generating a second reply, and reload.
+It retains `assistant-approval.png` and `assistant-approval.zip` with the provider
+evidence. Provider stream errors also pass through the assistant's error handler
+so Worker logs include their message rather than only a provider stack trace.
 
 ## Mirrors
 

@@ -170,7 +170,17 @@ export class Assistant extends AIChatAgent<Env> {
     const lastReply = [...this.messages].reverse().find((m) => m.role === "assistant");
     await this.touch(web ? "web" : "cli");
 
+    const history = this.messages.slice(-60);
+    const onError = (error: unknown) => {
+      console.error(
+        "assistant turn failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      void cli?.emit({ type: "error", message: "The assistant couldn't finish that." });
+      return "The assistant ran into a problem. Try again in a moment.";
+    };
     const stream = createUIMessageStream({
+      originalMessages: history,
       execute: async ({ writer }) => {
         const status = (value: string) => {
           writer.write({ type: "data-status", data: { text: value }, transient: true });
@@ -261,7 +271,7 @@ export class Assistant extends AIChatAgent<Env> {
             skills,
             web,
           }),
-          messages: await convertToModelMessages(this.messages.slice(-60)),
+          messages: await convertToModelMessages(history),
           tools: { ...active, ...registry.tools() },
           stopWhen: stepCountIs(plan.tier === "deep" ? 30 : 16),
           abortSignal: options?.abortSignal,
@@ -282,13 +292,9 @@ export class Assistant extends AIChatAgent<Env> {
             : undefined,
           onFinish: onFinish as never,
         });
-        writer.merge(result.toUIMessageStream({ sendReasoning: false }));
+        writer.merge(result.toUIMessageStream({ sendReasoning: false, onError }));
       },
-      onError: (error) => {
-        console.error("assistant turn failed", error);
-        void cli?.emit({ type: "error", message: "The assistant couldn't finish that." });
-        return "The assistant ran into a problem. Try again in a moment.";
-      },
+      onError,
     });
     return createUIMessageStreamResponse({ stream });
   }

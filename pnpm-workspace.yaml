@@ -6,6 +6,7 @@ packages:
 virtualStoreType: global
 
 patchedDependencies:
+  "@cloudflare/ai-chat@0.12.1": patches/@cloudflare__ai-chat@0.12.1.patch
   cf@1.0.0-beta.7: patches/cf@1.0.0-beta.7.patch
   miniflare@5.20260930.0-alpha: patches/miniflare@5.20260930.0-alpha.patch
 

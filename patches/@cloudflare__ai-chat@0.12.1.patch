@@ -1,0 +1,46 @@
+diff --git a/dist/index.js b/dist/index.js
+index 02dcaf4450a9ae2c46e50180e2d8531498ed53f8..8b9f0aab0b65304c2b2936cfd9281d0e74019e26 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -408,6 +408,7 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 					const chatMessageId = event.id;
+ 					const transformedMessages = autoTransformMessages(messages);
+ 					const requestTrigger = _trigger === "regenerate-message" ? "regenerate-message" : "submit-message";
++					const continuation = requestTrigger === "submit-message" && transformedMessages.at(-1)?.role === "assistant";
+ 					const requestClientTools = clientTools?.length ? clientTools : void 0;
+ 					const requestBody = Object.keys(customBody).length > 0 ? customBody : void 0;
+ 					const epoch = this._turnQueue.generation;
+@@ -507,13 +508,13 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 												"cloudflare.agents.turn.trigger": requestTrigger,
+ 												"cloudflare.agents.turn.admission": "queue",
+ 												"cloudflare.agents.turn.generation": epoch
+-											}, () => this._repairInterruptedToolsBeforeTurn({ continuation: false }));
++											}, () => this._repairInterruptedToolsBeforeTurn({ continuation }));
+ 											const response = await this.onChatMessage(async (_finishResult) => {}, {
+ 												requestId: chatMessageId,
+ 												abortSignal,
+ 												clientTools: requestClientTools,
+ 												body: requestBody,
+-												continuation: false
++												continuation
+ 											});
+ 											if (response) await withAgentSpan(this, "persist_chat_result", "turn", {
+ 												"cloudflare.agents.component": "ai_chat",
+@@ -521,7 +522,7 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 												"cloudflare.agents.turn.trigger": requestTrigger,
+ 												"cloudflare.agents.turn.admission": "queue",
+ 												"cloudflare.agents.turn.generation": epoch
+-											}, () => this._reply(chatMessageId, response, [connection.id], { chatMessageId }));
++											}, () => this._reply(chatMessageId, response, [connection.id], { chatMessageId, continuation }));
+ 											else {
+ 												console.warn(`[AIChatAgent] onChatMessage returned no response for chatMessageId: ${chatMessageId}`);
+ 												this._broadcastChatMessage({
+@@ -537,7 +538,7 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 											this._settlePreStreamTurn(chatMessageId);
+ 										}
+ 									};
+-									await this._runChatRecoveryFiber(chatMessageId, false, chatTurnBody);
++									await this._runChatRecoveryFiber(chatMessageId, continuation, chatTurnBody);
+ 								});
+ 							});
+ 						}, {

@@ -4,6 +4,11 @@
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { ArrowUpIcon, StopIcon, XIcon } from "@phosphor-icons/react";
 import { useAgent } from "agents/react";
+import {
+  isToolUIPart,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+  lastAssistantMessageIsCompleteWithToolCalls,
+} from "ai";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useNavigate, useRevalidator } from "react-router";
 import { WRITE_TOOLS, type PageContext } from "../../shared/assistant.ts";
@@ -78,11 +83,34 @@ export default function Chat({
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
+  const redirectedApprovals = useRef(new Set<string>());
 
   const agent = useAgent({ agent: "assistant", basePath: `api/assistant/chats/${chatId}/agent` });
   const chat = useAgentChat({
     agent,
     getInitialMessages: fresh ? null : undefined,
+    // AI SDK 7 resumes reconnects from an empty response unless a tool is still
+    // input-streaming. Submit approvals with their existing message instead.
+    autoContinueAfterToolResult: false,
+    sendAutomaticallyWhen: (state) => {
+      const parts = state.messages.at(-1)?.parts ?? [];
+      const lastStep = parts.findLastIndex((part) => part.type === "step-start");
+      if (lastAssistantMessageIsCompleteWithApprovalResponses(state))
+        return parts.some(
+          (part, index) =>
+            index > lastStep &&
+            isToolUIPart(part) &&
+            part.state === "approval-responded" &&
+            !redirectedApprovals.current.has(part.approval.id),
+        );
+      // Only browser tools need another client submission; server-only batches
+      // must still stop at the orchestrator's step budget.
+      return (
+        parts.some((part, index) => index > lastStep && part.type === "tool-navigate") &&
+        lastAssistantMessageIsCompleteWithToolCalls(state)
+      );
+    },
+    body: () => ({ page: withPage ? page : null }),
     onData: (part: { type: string; data?: unknown }) => {
       if (part.type === "data-status") setStatus((part.data as { text: string }).text);
     },
@@ -97,28 +125,9 @@ export default function Chat({
     onTurnEnd: () => {
       setStatus(null);
       onTurnEnd();
-      // A write this tab approved finishes on the server, which doesn't echo
-      // the result back to the tab that approved it: reload the transcript.
-      const stale = (chat.messages as unknown as Message[]).some((m) =>
-        m.parts.some((p) => isTool(p) && (p as unknown as ToolPart).state === "approval-responded"),
-      );
-      if (stale)
-        void fetch(`/api/assistant/chats/${chatId}/agent/get-messages`, {
-          credentials: "same-origin",
-        })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((messages) => {
-            if (Array.isArray(messages)) chat.setMessages(messages as typeof chat.messages);
-          })
-          .catch(() => {});
     },
   });
-  // A continuation (after an approval) can deliver its message again: keep the newest copy.
-  const messages = useMemo(() => {
-    const all = chat.messages as unknown as Message[];
-    const last = new Map(all.map((m, i) => [m.id, i]));
-    return all.filter((m, i) => last.get(m.id) === i);
-  }, [chat.messages]);
+  const messages = chat.messages as unknown as Message[];
   const busy = chat.status === "submitted" || chat.status === "streaming";
 
   // The page behind the chat refreshes once a write the person approved lands.
@@ -155,11 +164,14 @@ export default function Chat({
   const send = (text: string) => {
     const prompt = text.trim();
     if (!prompt) return;
-    // Typing instead of deciding is a "no, do this instead".
-    for (const part of pending)
-      if (part.approval) chat.addToolApprovalResponse({ id: part.approval.id, approved: false });
+    // The replacement prompt owns the request; don't also submit its denials.
+    for (const part of pending) {
+      if (!part.approval) continue;
+      redirectedApprovals.current.add(part.approval.id);
+      chat.addToolApprovalResponse({ id: part.approval.id, approved: false });
+    }
     setStatus("Thinking");
-    void chat.sendMessage({ text: prompt }, { body: { page: withPage ? page : null } });
+    void chat.sendMessage({ text: prompt });
     assistant.sent();
     setDraft("");
     pinned.current = true;
@@ -253,7 +265,7 @@ export default function Chat({
                 <button
                   type="button"
                   className="mk-btn mk-btn--ghost mk-btn--sm"
-                  onClick={() => void chat.regenerate({ body: { page: withPage ? page : null } })}
+                  onClick={() => void chat.regenerate()}
                 >
                   Try again
                 </button>

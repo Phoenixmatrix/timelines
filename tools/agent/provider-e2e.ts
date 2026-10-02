@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { chromium, expect as playwrightExpect } from "@playwright/test";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 import type {
   ReleaseFeed,
@@ -499,6 +500,234 @@ export async function runProviderE2E(
         ),
         "The conversation must be in the person's directory",
       );
+      enter("assistant-approval-continuation");
+      {
+        const teamKey = `C${randomBytes(2).toString("hex").toUpperCase()}`;
+        await api("/tracker/priya/mutate", "POST", {
+          operationId: randomUUID(),
+          mutations: [
+            {
+              kind: "team.create",
+              id: randomUUID(),
+              data: { key: teamKey, name: "Assistant verification" },
+            },
+          ],
+        });
+        const browser = await chromium.launch({ headless: true });
+        const context = await browser.newContext({ baseURL: ctx.origin });
+        const page = await context.newPage();
+        const expect = playwrightExpect.configure({ timeout: 120_000 });
+        page.setDefaultTimeout(120_000);
+        await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+        let rejectNextResponse = false;
+        await page.routeWebSocket(/\/api\/assistant\/chats\//, (socket) => {
+          const server = socket.connectToServer();
+          server.onMessage((message) => {
+            const frame = JSON.parse(message.toString());
+            if (
+              rejectNextResponse &&
+              frame.type === "cf_agent_use_chat_response" &&
+              frame.body &&
+              JSON.parse(frame.body).type === "start"
+            ) {
+              rejectNextResponse = false;
+              socket.send(
+                JSON.stringify({
+                  ...frame,
+                  body: JSON.stringify({ type: "error", errorText: "Injected stream failure" }),
+                }),
+              );
+            } else socket.send(message);
+          });
+        });
+        try {
+          await page.goto("/signin");
+          await page.getByRole("button", { name: /Continue as Priya/i }).click();
+          await page.waitForURL((url) => url.pathname !== "/signin");
+          await page.getByRole("button", { name: "Assistant", exact: true }).click();
+          const composer = page.getByRole("textbox", { name: "Message the assistant" });
+          const title = `Approval continuity ${randomBytes(4).toString("hex")}`;
+          await composer.fill(
+            `Use create_issue to create exactly one task in owner priya, team ${teamKey}, titled "${title}". Request my approval before creating it, then open the new issue.`,
+          );
+          await page.getByRole("button", { name: "Send", exact: true }).click();
+          await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
+          const chatId = await page.evaluate(() => localStorage.getItem("gm.assistant.chat"));
+          assert(chatId, "The browser must retain its conversation");
+          const messagesPath = `/assistant/chats/${chatId}/agent/get-messages`;
+          type Message = {
+            id: string;
+            role: string;
+            parts: {
+              type: string;
+              state?: string;
+              toolCallId?: string;
+              text?: string;
+              output?: { created?: string };
+            }[];
+          };
+          const pending: Message[] = await api(messagesPath);
+          const approval = pending.findLast((message) =>
+            message.parts.some((part) => part.state === "approval-requested"),
+          );
+          assert(approval, "The pending tool invocation must already be persisted");
+          const call = approval.parts.find((part) => part.state === "approval-requested")!;
+          const matchingIssues = async () =>
+            (await api("/tracker/priya/snapshot")).issues.filter(
+              (issue: { title: string }) => issue.title === title,
+            );
+          assert.equal((await matchingIssues()).length, 0, "No write may precede approval");
+          await page.getByRole("button", { name: "Approve", exact: true }).click();
+          await waitFor(stage, 120_000, async () => {
+            const messages: Message[] = await api(messagesPath);
+            return messages.some(
+              (message) =>
+                message.id === approval.id &&
+                message.parts.some(
+                  (part) =>
+                    part.toolCallId === call.toolCallId && part.state === "output-available",
+                ),
+            );
+          });
+          const created = await matchingIssues();
+          assert.equal(created.length, 1, "One approval must create exactly one issue");
+          await expect(
+            page
+              .locator(
+                `[aria-label="Conversation"] a[href="/tracker/priya/issues/${created[0].key}"]`,
+              )
+              .first(),
+          ).toBeVisible();
+          await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
+          await expect(page.getByRole("alert")).toBeHidden();
+          await composer.fill(
+            "What exact issue title did I just ask you to create? Answer from this conversation without tools.",
+          );
+          await page.getByRole("button", { name: "Send", exact: true }).click();
+          await waitFor(stage, 120_000, async () => {
+            const messages: Message[] = await api(messagesPath);
+            const last = messages.at(-1);
+            return (
+              last?.role === "assistant" &&
+              last.id !== approval.id &&
+              last.parts.some((part) => part.type === "text" && part.text?.includes(title))
+            );
+          });
+          await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
+          await expect(page.getByRole("alert")).toBeHidden();
+          rejectNextResponse = true;
+          const retryMarker = `recovered-${randomBytes(4).toString("hex")}`;
+          await composer.fill(`Reply with "${retryMarker}" only. Do not call tools.`);
+          await page.getByRole("button", { name: "Send", exact: true }).click();
+          await expect(page.getByRole("alert")).toBeVisible();
+          let failedMessageId: string | undefined;
+          await waitFor(stage, 120_000, async () => {
+            const messages: Message[] = await api(messagesPath);
+            const last = messages.at(-1);
+            if (
+              last?.role === "assistant" &&
+              last.parts.some((part) => part.type === "text" && part.text?.includes(retryMarker))
+            ) {
+              failedMessageId = last.id;
+              return true;
+            }
+            return false;
+          });
+          await page.getByRole("button", { name: "Try again", exact: true }).click();
+          await waitFor(stage, 120_000, async () => {
+            const messages: Message[] = await api(messagesPath);
+            const last = messages.at(-1);
+            return (
+              last?.role === "assistant" &&
+              last.id !== failedMessageId &&
+              last.parts.some((part) => part.type === "text" && part.text?.includes(retryMarker))
+            );
+          });
+          await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
+          await expect(page.getByRole("alert")).toBeHidden();
+          await expect(page.getByRole("list", { name: "Conversation" })).toContainText(retryMarker);
+          const declinedTitle = `Declined ${title}`;
+          await composer.fill(
+            `Create one task in owner priya, team ${teamKey}, titled "${declinedTitle}". Ask for my approval.`,
+          );
+          await page.getByRole("button", { name: "Send", exact: true }).click();
+          await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
+          const beforeRedirect: Message[] = await api(messagesPath);
+          const declined = beforeRedirect.findLast((message) =>
+            message.parts.some((part) => part.state === "approval-requested"),
+          );
+          assert(declined);
+          const redirectMarker = `redirected-${randomBytes(4).toString("hex")}`;
+          await composer.fill(
+            `Do not create that issue. Reply with "${redirectMarker}" only instead.`,
+          );
+          await page.getByRole("button", { name: "Send", exact: true }).click();
+          await waitFor(stage, 120_000, async () => {
+            const messages: Message[] = await api(messagesPath);
+            const last = messages.at(-1);
+            return (
+              last?.role === "assistant" &&
+              last.id !== declined.id &&
+              last.parts.some((part) => part.type === "text" && part.text?.includes(redirectMarker))
+            );
+          });
+          await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
+          await expect(page.getByRole("alert")).toBeHidden();
+          assert.equal(
+            (await api("/tracker/priya/snapshot")).issues.filter(
+              (issue: { title: string }) => issue.title === declinedTitle,
+            ).length,
+            0,
+            "A replacement prompt must not authorize the pending write",
+          );
+          await page.reload();
+          await expect(page.getByRole("list", { name: "Conversation" })).toContainText(title);
+          await expect(page.getByRole("alert")).toBeHidden();
+          assert.equal(
+            (await matchingIssues()).length,
+            1,
+            "Follow-ups and retries must not replay the write",
+          );
+          const retained: Message[] = await api(messagesPath);
+          assert(
+            !retained
+              .find((message) => message.id === declined.id)
+              ?.parts.some((part) => part.type === "text" && part.text?.includes(redirectMarker)),
+            "A replacement prompt must not also generate a reply on the declined turn",
+          );
+          const receipt = retained
+            .find((message) => message.id === approval.id)
+            ?.parts.find((part) => part.toolCallId === call.toolCallId);
+          assert.equal(
+            receipt?.state,
+            "output-available",
+            "Continuation must retain the original tool result",
+          );
+          assert.equal(receipt?.output?.created, created[0].key);
+          assert.equal(
+            new Set(retained.map((message) => message.id)).size,
+            retained.length,
+            "Continuation must not duplicate assistant message IDs",
+          );
+          evidence.assistantApproval = {
+            chatId,
+            messageId: approval.id,
+            toolCallId: call.toolCallId,
+            issue: created[0].key,
+            followupRetainedHistory: true,
+            retryRecovered: true,
+            redirectSkippedWrite: true,
+          };
+        } finally {
+          await page
+            .screenshot({ path: join(ctx.artifacts, "assistant-approval.png"), fullPage: true })
+            .catch(() => {});
+          await context.tracing
+            .stop({ path: join(ctx.artifacts, "assistant-approval.zip") })
+            .catch(() => {});
+          await browser.close();
+        }
+      }
       const waitForNotes = async (names: string[]) => {
         await waitFor(stage, 5 * 60_000, async () => {
           const index: ReleaseNotesIndex = await api(`${base}/release-notes`);
