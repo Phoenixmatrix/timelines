@@ -136,20 +136,123 @@ For direct HTTP clients, use the environment's printed origin and a scoped token
 never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 `/api/dev/environment` require the harness capability in isolated environments.
 
-| Route                                                                                     | Does                                                           |
-| ----------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a dev token; capability required in isolated environments |
-| `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                 |
-| `GET /api/session`                                                                        | Who the token or cookie belongs to                             |
-| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                |
-| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                         |
-| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                  |
-| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                          |
-| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                                  |
-| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                                           |
-| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                          |
-| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                    |
-| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                                         |
+| Route                                                                                     | Does                                                              |
+| ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a dev token; capability required in isolated environments    |
+| `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                    |
+| `GET /api/session`                                                                        | Who the token or cookie belongs to                                |
+| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                   |
+| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                            |
+| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                     |
+| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                             |
+| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                                     |
+| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                                              |
+| `GET /api/repos/:owner/:name/semantic?ref=&cursor=&limit=&path=&kind=&language=`          | Individual syntax changes with source links and analysis coverage |
+| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                             |
+| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                       |
+| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                                            |
+
+## Semantic changes
+
+The repository **Changes** tab (`/:owner/:repo/changes`) is a functional
+work-in-progress feed of individual changes, not commit rows. Each entry links
+to its originating commit and before/after source lines, with syntax-highlighted
+excerpts. Ref, exact-path, change-kind and language filters are independent of
+the existing Code and Commits views; ordinary Git diffs remain unchanged.
+Final UI design and polish are intentionally separate work.
+
+The shared engine in `shared/semantic/` supports TypeScript/TSX, Rust, Python,
+Go, Markdown, XML, JSON, HTML and CSS:
+
+- Programming adapters extract declarations, signatures, parameters, calls,
+  arguments and imports. Unique same-scope declaration shapes permit conservative
+  rename pairing; ambiguous matches remain additions/removals.
+- Document adapters extract Markdown sections/links, JSON properties and array
+  positions, XML/HTML elements/attributes/text, and CSS rules/declarations.
+- Changes carry `evidence: "syntax"`: these are parser-backed facts, not resolved
+  types, cross-file symbol identity, macro expansion, runtime effects or inferred
+  author intent. Parent and child changes can both appear.
+
+### API and pagination
+
+`GET /api/repos/:owner/:name/semantic` returns the versioned
+`SemanticFeedResponse` from `shared/semantic/types.ts`: `entries`, immutable
+`head`, `nextCursor`, and separate file-analysis `coverage`. Kinds use
+`<entity>.added|removed|changed|renamed`, plus `symbol.signature_changed`.
+Source positions are one-based line/column coordinates with UTF-16 columns;
+highlight token offsets are relative to the excerpt.
+
+History follows the first parent; merge changes are compared with that parent.
+The default limit is 30 entries (maximum 100), not commits. An opaque cursor
+pins the head, repository, ref, filters and analysis version. Keep ref/filters
+unchanged when continuing. Empty pages can have a `nextCursor` because scanning
+is bounded: continue until the cursor is null, not until `entries` is empty.
+Changing filters starts a new scan. File moves are not inferred across paths.
+
+Per-page scan budgets are 12 commits, 24 tree reads, 8 changed files and 512
+traversal steps. Unchanged trees are skipped. Sources are limited to 256 KiB,
+10,000 extracted facts and 8,000 characters per excerpt. Large directories,
+excessive nesting, binary content, unsupported files and parser failures have
+explicit coverage diagnostics, never invented semantic results. Coverage is
+independent of kind/language filters. Ordinary blob/diff access remains available.
+
+Analysis is derived on demand and cached by repository, analysis version,
+commit, path and blob pair; no schema migration or background index is required.
+Repository authorization precedes analysis-cache access. Feed responses are
+private/no-store.
+Git object, ref and upstream-token caches share only completed data across
+requests. Pending object loads stay reader-local so a closed request cannot
+cancel another request's cached read.
+
+### Extending the adapters
+
+1. Implement `LanguageAdapter` in `shared/semantic/types.ts`: declare the language
+   and extensions, then parse source into a Lezer tree, `SyntaxFact[]` and
+   diagnostics. Register the adapter in `shared/semantic/index.ts`.
+2. Give each fact a stable scope-local key and actual UTF-16 source offsets.
+   Normalize insignificant syntax without changing strings or meaningful text.
+   Use `signature` for declaration headers; supply `shape` only when conservative
+   name-independent rename matching is justified. Report parser errors rather
+   than guessing through invalid syntax.
+3. Extend the language union and web filter list for a new language. Add exact
+   before/after fixtures under `shared/semantic/fixtures/`, including ambiguity,
+   formatting, meaningful whitespace and malformed source. Existing adapter tests
+   and the real server/CLI smoke consume these fixtures.
+4. Bump `ANALYSIS_VERSION` when extraction/comparison semantics change so cached
+   analyses and continuation cursors cannot mix versions.
+
+Lezer's pure-JavaScript parsers run inside Workers without native processes.
+Language servers are appropriate for workspace-aware type/reference resolution,
+but require project files, dependencies and a separate process host; this Worker
+does not pretend to run them or label syntax evidence as LSP results. Lezer
+grammars are not full compiler frontends: the current JavaScript grammar rejects
+shorthand destructuring defaults such as `const {x = fallback} = source`, the Go
+grammar has method-expression/type-argument limitations, and Rust macros remain
+token trees. Rejected grammar forms are reported as `parse_error`.
+
+### Isolated end-to-end smoke
+
+Use the root [agent-first workflow](../../README.md#agent-first-development):
+run `vp run agent setup`, keep `vp run agent up` running in another terminal,
+then run `vp run semantic-smoke` from the repository root.
+
+The smoke validates the scoped server identity and uses the harness's `agent gm`
+wrapper, compiled binary, credentials and external disposable workspace. It creates
+one uniquely named private repository in the environment's own Artifacts namespace,
+pushes before/after fixtures for every supported language, and verifies actual
+API/CLI entries, filters, pagination, source links, private access and ordinary
+diff/blob/history behavior. Cleanup deletes only that repository and clone; it
+never resets the environment, changes global credentials or uses canonical dev
+resources. Missing setup or a stopped environment is an error, not a fallback.
+
+For browser inspection, run
+`SEMANTIC_SMOKE_KEEP=1 node apps/website/scripts/semantic-smoke.ts` directly
+from the root so the environment flag reaches the script. Use a fresh browser
+context, sign in as Priya, and open the printed URL. Send SIGINT or SIGTERM to the
+printed smoke PID when finished; it removes the disposable repository and clone
+without stopping the agent server. Use `vp run agent destroy` when the worktree's
+environment is no longer needed. Run `vp run ready` for the complete uncached
+quality and real-service E2E gate in addition to this semantic-specific smoke.
 
 ## Distributed issue tracker
 

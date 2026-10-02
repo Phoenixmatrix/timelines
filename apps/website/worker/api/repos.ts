@@ -28,6 +28,7 @@ import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { isCommitId, RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
+import { semanticResponse } from "../semantic/api.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
 const REPO_NAME = /^(?!\.)[A-Za-z0-9._-]{1,100}$/;
@@ -203,6 +204,12 @@ async function resolveTarget(
   const refs = await objects.refs();
   return { ref: refs.headBranch ?? row.default_branch, path };
 }
+
+repos.get("/:owner/:name/semantic", async (c) => {
+  const loaded = await loadRepo(c);
+  if (loaded instanceof Response) return loaded;
+  return semanticResponse(c, loaded.row);
+});
 
 repos.get("/:owner/:name", async (c) => {
   const loaded = await loadRepo(c);

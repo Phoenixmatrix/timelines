@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vp run website#dev",
+    "semantic-smoke": "vp run website#semantic-smoke",
     "prepare": "vp config"
   },
   "devDependencies": {

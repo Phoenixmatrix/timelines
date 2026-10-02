@@ -18,6 +18,7 @@ import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageC
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
+import { SemanticChanges } from "./routes/repo/SemanticChanges.tsx";
 import { SignIn, signInAction, signInLoader } from "./routes/SignIn.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
@@ -106,6 +107,7 @@ export const router = createBrowserRouter([
               { path: "tree/*", loader: codeLoader, Component: Code },
               { path: "blob/*", loader: blobLoader, Component: Blob },
               { path: "commits/*", loader: commitsLoader, Component: Commits },
+              { path: "changes", Component: SemanticChanges },
               { path: "wiki/*", loader: wikiLoader, Component: Wiki },
               { path: "knowledge", loader: knowledgeLoader, Component: Knowledge },
               { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },

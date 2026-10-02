@@ -16,7 +16,7 @@ interface CachedToken {
 
 // Minting a token is a control-plane call (rate limited per namespace), so each
 // isolate reuses a repo's token until it is close to expiring.
-const tokenCache = new Map<string, Promise<CachedToken>>();
+const tokenCache = new Map<string, CachedToken>();
 
 export async function upstreamToken(
   env: Env,
@@ -25,18 +25,13 @@ export async function upstreamToken(
 ): Promise<string> {
   const key = `${artifactsName}:${scope}`;
   const cached = tokenCache.get(key);
-  if (cached) {
-    const token = await cached.catch(() => null);
-    if (token && token.expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) return token.secret;
-  }
-  const minting = (async () => {
-    using repo = await env.ARTIFACTS.get(artifactsName);
-    const created = await repo.createToken(scope, TOKEN_TTL_SECONDS);
-    return { secret: created.plaintext, expiresAt: Date.parse(created.expiresAt) };
-  })();
-  tokenCache.set(key, minting);
-  minting.catch(() => tokenCache.delete(key));
-  return (await minting).secret;
+  if (cached && cached.expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) return cached.secret;
+  // A pending binding call cannot be shared with a different request's lifetime.
+  using repo = await env.ARTIFACTS.get(artifactsName);
+  const created = await repo.createToken(scope, TOKEN_TTL_SECONDS);
+  const token = { secret: created.plaintext, expiresAt: Date.parse(created.expiresAt) };
+  tokenCache.set(key, token);
+  return token.secret;
 }
 
 export function forgetUpstreamTokens(artifactsName: string): void {

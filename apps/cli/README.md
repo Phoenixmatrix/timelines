@@ -17,6 +17,39 @@ gm push --sync                  # rebase onto the latest trunk, then land on mai
 `gm cli guide` prints the whole workflow in one page; it is written to be pasted
 into an AGENTS.md.
 
+## Semantic changes
+
+`gm semantic list` reads the repository's individual syntax-change feed without
+replacing `gm diff`, `gm show`, or ordinary Git history. It uses the current
+repository, or `--repo owner/name` from anywhere:
+
+```bash
+gm semantic list --ref main --limit 30
+gm semantic list -R orbit/engine --ref main --path src/client.ts \
+  --kind call.added --language typescript -o json
+gm semantic list -R orbit/engine --ref main --cursor OPAQUE_CURSOR -o json
+gm schema semantic list
+```
+
+`--ref` is a server branch, tag or commit OID (default `HEAD`), not an unpushed
+local change ID. `--path`, `--kind` and `--language` are exact filters. JSON
+preserves the API's versioned `entries`, pinned `head`, `nextCursor` and separate
+analysis `coverage`; each entry includes its kind, syntax evidence, commit,
+before/after excerpts and source-location links. Text output also reports
+coverage and the continuation cursor.
+
+Pages contain changes, not commits. Repeat the same ref and filters with the
+returned cursor until `nextCursor` is null—even when a page has no entries.
+Starting without a cursor observes the latest head. History follows first
+parents; unsupported, binary, oversized and unparsable source is reported rather
+than fabricated into semantic events.
+
+TypeScript/TSX, Rust, Python, Go, Markdown, XML, JSON, HTML and CSS are supported.
+These are parser-backed syntax facts, not inferred intent or resolved types.
+See the [API, adapter contract and limits](../website/README.md#semantic-changes)
+and the repository-root `vp run semantic-smoke` for the real server/CLI fixture
+verification. The web Changes tab is functional work in progress, not final UI.
+
 ## Distributed issue tracker
 
 Tracker commands work anywhere, without `gm init` or a Git repository. Accounts and
@@ -191,6 +224,7 @@ The design follows Cloudflare's agent-first `cf` CLI:
 |             |                                                                                                                                           |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Inspect     | `status`, `log`, `show`, `diff`, `file show`, `file list`                                                                                 |
+| Semantics   | `semantic list [--repo owner/name] [--ref ref] [--cursor cursor] [--path path] [--kind kind] [--language language] [--limit N]`           |
 | Change      | `commit`, `describe`, `new`, `squash`, `split`, `edit`, `abandon`, `restore`                                                              |
 | Restructure | `rebase`, `backout` (revert), `duplicate` (cherry-pick)                                                                                   |
 | History     | `undo`, `op log`, `op restore`                                                                                                            |

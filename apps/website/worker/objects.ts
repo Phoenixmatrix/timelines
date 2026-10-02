@@ -42,9 +42,8 @@ function recall<T>(key: string): T | undefined {
   return entry.value as T;
 }
 
-const refsCache = new Map<string, { at: number; refs: Promise<RepoRefs> }>();
-/** Loads in flight, so a page and the background warm-up never fetch twice. */
-const inflight = new Map<string, Promise<unknown>>();
+// Only completed data may cross request boundaries. Pending I/O belongs to a reader.
+const refsCache = new Map<string, { at: number; refs: RepoRefs }>();
 /** Heads already warmed in this isolate. */
 const warmed = new Set<string>();
 const WARM_MAX_BLOBS = 400;
@@ -69,6 +68,8 @@ export function isCommitId(ref: string): boolean {
 
 export class RepoReader {
   #stub: Promise<ArtifactsRepo> | undefined;
+  #inflight: Map<string, Promise<unknown>> | undefined;
+  #refs: Promise<RepoRefs> | undefined;
   private env: Env;
   private artifactsName: string;
   private remote: string;
@@ -114,7 +115,7 @@ export class RepoReader {
       this.timing.count(`${kind}-memory`);
       return hit;
     }
-    const pending = inflight.get(key) as Promise<T> | undefined;
+    const pending = this.#inflight?.get(key) as Promise<T> | undefined;
     if (pending) {
       this.timing.count(`${kind}-shared`);
       return pending;
@@ -138,11 +139,11 @@ export class RepoReader {
       );
       return value;
     })();
-    inflight.set(key, work);
+    (this.#inflight ??= new Map()).set(key, work);
     try {
       return await work;
     } finally {
-      inflight.delete(key);
+      this.#inflight.delete(key);
     }
   }
 
@@ -199,32 +200,45 @@ export class RepoReader {
     );
   }
 
+  /** Inspect size before materializing source bytes for bounded semantic analysis.
+   * Oversized blobs return their size with no bytes, never a truncated cache entry. */
+  async blobLimited(oid: string, maxBytes: number): Promise<BlobData | null> {
+    const cached = recall<BlobData | null>(`${this.artifactsName}/blob/${oid}`);
+    if (cached !== undefined) {
+      return cached && cached.size > maxBytes
+        ? { size: cached.size, bytes: new Uint8Array(0) }
+        : cached;
+    }
+    const blob = await this.timing.measure("blob-limited", (await this.#repo()).readBlob(oid));
+    if (!blob) return null;
+    if (blob.size > maxBytes) return { size: blob.size, bytes: new Uint8Array(0) };
+    const value = { size: blob.size, bytes: new Uint8Array(await blob.arrayBuffer()) };
+    remember(`${this.artifactsName}/blob/${oid}`, value, value.size);
+    return value;
+  }
+
   /** Branch and tag tips: cached, and refreshed in the background once stale. */
-  refs(): Promise<RepoRefs> {
+  async refs(): Promise<RepoRefs> {
     const cached = refsCache.get(this.artifactsName);
     const age = cached ? Date.now() - cached.at : Infinity;
     if (cached && age < REFS_FRESH_MS) {
       this.timing.count("refs-memory");
       return cached.refs;
     }
-    const refresh = () => {
-      const refs = listRefs(this.env, this.artifactsName, this.remote);
-      refs.then(
-        () => refsCache.set(this.artifactsName, { at: Date.now(), refs }),
-        () => refsCache.delete(this.artifactsName),
-      );
+    const refresh = async () => {
+      const refs = await listRefs(this.env, this.artifactsName, this.remote);
+      refsCache.set(this.artifactsName, { at: Date.now(), refs });
       return refs;
     };
     if (cached && age < REFS_STALE_MS) {
       this.timing.count("refs-stale");
       // Mark it fresh now so concurrent requests don't all refresh at once.
       refsCache.set(this.artifactsName, { at: Date.now(), refs: cached.refs });
-      this.waitUntil(refresh().catch(() => undefined));
+      this.waitUntil(refresh().catch(() => refsCache.delete(this.artifactsName)));
       return cached.refs;
     }
-    const refs = this.timing.measure("ls-refs", refresh());
-    refsCache.set(this.artifactsName, { at: Date.now(), refs });
-    return refs;
+    this.#refs ??= this.timing.measure("ls-refs", refresh());
+    return this.#refs;
   }
 
   /** A branch, tag or commit id, as a commit id. */

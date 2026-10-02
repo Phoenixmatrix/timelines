@@ -43,7 +43,7 @@ export function Blob() {
   useEffect(() => {
     if (LINE.test(hash))
       document.getElementById(hash.slice(1))?.scrollIntoView({ block: "center" });
-  }, [hash, blob.path]);
+  }, [hash, blob.path, blob.ref]);
 
   return (
     <div className="grid gap-x-8 gap-y-4 xl:grid-cols-[minmax(0,1fr)_20rem]">

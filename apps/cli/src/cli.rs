@@ -107,6 +107,9 @@ pub enum Command {
     /// Manage repositories on the Gitmatrix server
     #[command(subcommand)]
     Repo(RepoCommand),
+    /// Syntax-level changes from the server's repository history
+    #[command(subcommand)]
+    Semantic(SemanticCommand),
     /// CI/CD runs of .gitmatrix/ci.yml: list, inspect, read logs, wait for a result
     #[command(subcommand)]
     Runs(RunsCommand),
@@ -503,6 +506,37 @@ pub enum MirrorCommand {
         #[arg(short = 'R', long)]
         repo: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SemanticCommand {
+    /// One page of individual semantic changes, with source links and analysis coverage
+    List(SemanticListArgs),
+}
+
+#[derive(Args)]
+pub struct SemanticListArgs {
+    /// Repository as owner/name (default: this repository's origin).
+    #[arg(short = 'R', long)]
+    pub repo: Option<String>,
+    /// Server branch or commit id (default: repository default branch).
+    #[arg(long = "ref")]
+    pub reference: Option<String>,
+    /// Opaque nextCursor from the previous page; keep the same filters.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Maximum entries in this page; empty pages may still have a nextCursor.
+    #[arg(short = 'n', long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: u32,
+    /// Exact repository-relative file path.
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Exact change kind, e.g. symbol.added or symbol.signature_changed.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Language: typescript, tsx, rust, python, go, markdown, xml, json, html, css.
+    #[arg(long)]
+    pub language: Option<String>,
 }
 
 #[derive(Subcommand)]

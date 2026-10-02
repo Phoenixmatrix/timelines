@@ -165,6 +165,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         }
         Command::Auth(c) => out(f, server::auth(ctx, &c)),
         Command::Repo(c) => out(f, server::repo(ctx, &c)),
+        Command::Semantic(c) => out(f, commands::semantic::run(ctx, &c)),
         Command::Runs(c) => out(f, ci::runs(ctx, &c)),
         Command::Runner(a) => out(f, ci::runner(ctx, &a)),
         Command::Secret(c) => out(f, ci::secret(ctx, &c)),

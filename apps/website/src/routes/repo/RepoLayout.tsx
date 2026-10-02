@@ -188,6 +188,9 @@ export function RepoLayout() {
                 Commits
               </Tab>
             )}
+            <Tab to={`${base}/changes`} sections={[`${base}/changes`]}>
+              Changes
+            </Tab>
             <Tab to={`${base}/ci`} sections={[`${base}/ci`]}>
               CI
             </Tab>
