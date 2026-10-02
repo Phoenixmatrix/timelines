@@ -133,7 +133,9 @@ async function write(env: Env, source: GeneratorSource, draft: Draft): Promise<W
     "fast",
     ENTRY_SYSTEM,
     entryPrompt(draft, changes),
-    { maxTokens: 500 },
+    // The reply is short, but a tight budget can end the turn before any
+    // JSON appears ("no content (length)"); match the knowledge pipeline's.
+    { maxTokens: 1600 },
   );
   const fallback = draft.issue?.title ?? firstLine(draft.commits[0]!.message);
   return {
@@ -428,7 +430,7 @@ export async function generateReleaseNotes(
       modelCalls++;
       const prompt = shown.map((e) => `- [${e.category}] ${e.title}: ${e.summary}`).join("\n");
       const { text, usage } = await chatText(env, "reason", INTRO_SYSTEM, prompt, {
-        maxTokens: 600,
+        maxTokens: 1200,
       });
       intro = text.trim().slice(0, 2000);
       introModel = usage.model;
