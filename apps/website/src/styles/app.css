@@ -18,6 +18,7 @@
   --color-ink: var(--ink);
   --color-ink-muted: var(--ink-muted);
   --color-ink-faint: var(--ink-faint);
+  --color-brand: var(--brand);
   --color-signal: var(--signal);
   --color-signal-hover: var(--signal-hover);
   --color-signal-ink: var(--signal-ink);

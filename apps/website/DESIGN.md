@@ -12,6 +12,7 @@ colors:
   ink: "oklch(0.945 0.008 80)"
   ink-muted: "oklch(0.76 0.012 75)"
   ink-faint: "oklch(0.64 0.012 75)"
+  brand: "#91f5be"
   signal: "oklch(0.81 0.145 76)"
   signal-ink: "oklch(0.23 0.035 65)"
   danger-text: "oklch(0.72 0.16 25)"
@@ -97,13 +98,13 @@ The tracker received a dual-assessor Claude CLI / Impeccable re-review with a **
 
 ## Brand identity
 
-The Gitmatrix logo pairs an angular, interlocking **G** with a custom lowercase **gitmatrix** wordmark. Its joined paths and diagonal cuts suggest branches converging without using a stock git icon. The lettering is outlined artwork, not a font substitution.
+The approved **Pounce** identity is a nimble cat formed from flowing paths that separate and rejoin: cats, parallel agents and fast development, without a generic lettermark. The user selected this generated silhouette as “perfect”; preserve it rather than redesigning or replacing the cat. It replaces the former angular G.
 
-`public/brand/gitmatrix.svg` is the scalable source, with separate `mark` and `wordmark` groups. `src/components/GitmatrixLogo.tsx` references those groups: the mark uses `signal-line`, and the lettering uses `ink`, so both adapt to the existing dark and light themes. Use the full lockup on Home and in the shared authentication frame (SignIn and device authorization); use only the mark in the compact navigation rail. Preserve its aspect ratio and the existing accessible navigation labels.
+`public/brand/gitmatrix.svg` is the scalable source, with separate `mark` and `wordmark` groups. `src/components/GitmatrixLogo.tsx` references those groups: the mark uses `brand` (mint `#91f5be` in dark, deep forest `#10251c` in light), and the lettering uses `ink`. Brand color is confined to the identity; amber actions and existing status colors remain unchanged. Use the full lockup on Home and in the shared authentication frame (SignIn and device authorization); use only the mark in the compact navigation rail. Preserve its aspect ratio and the existing accessible navigation labels.
 
-The logo was generated with `openai-codex/gpt-image-2-codex` and vector-traced from that artwork. The SVG metadata preserves the generation prompt and provenance. Do not replace its geometry with a stock symbol or retype the wordmark.
+The cat was generated with `openai-codex/gpt-image-2-codex` and vector-traced from the approved artwork. The lowercase wordmark preserves the selected viewer pairing: the existing Figtree Variable font at weight 730 with -0.03em tracking, shaped and outlined so no font loading is needed to render the logo. SVG metadata preserves the generation prompt, approval and lettering provenance; do not substitute a stock symbol or retype the outlined wordmark.
 
-`public/favicon.svg` uses the same mark in warm amber (`#ebaf43`) on a charcoal (`#211d19`) rounded tile. Its paths are embedded rather than externally referenced so the favicon works independently. Derive the 32px PNG, 180px Apple touch icon and 16/32/48px ICO from this favicon artwork; the PNGs also carry generation provenance. `index.html` declares all formats and versions the SVG URL to replace the old four-square icon in browser caches.
+`public/favicon.svg` uses the same Pounce paths in mint (`#91f5be`) on a deep-forest (`#10251c`) rounded tile. Paths are embedded rather than externally referenced so the favicon works independently. Derive the 32px PNG, 180px Apple touch icon and 16/32/48px ICO from this favicon artwork; the PNGs also carry generation provenance. The component and `index.html` version every logo/icon URL with `v=pounce` so cached G artwork is replaced in SVG, raster and touch-icon consumers.
 
 ## Colors
 

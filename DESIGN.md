@@ -13,6 +13,7 @@ colors:
   ink: "oklch(0.945 0.008 80)"
   ink-muted: "oklch(0.76 0.012 75)"
   ink-faint: "oklch(0.64 0.012 75)"
+  brand: "#91f5be"
   signal: "oklch(0.81 0.145 76)"
   signal-hover: "oklch(0.85 0.13 80)"
   signal-ink: "oklch(0.23 0.035 65)"
@@ -211,7 +212,7 @@ components:
 
 **Creative North Star: "The Night Shift Console"**
 
-Gitmatrix is read by people checking on work their agents did while they weren't looking: what landed, what CI said, what a commit published, what the knowledge graph now believes. The system is a dark, warm, quiet console for that review. Charcoal panes with a faint warm cast (hue 70) sit on a slightly lighter page; text is warm off-white in three strengths; one amber signal marks what is selected, current or the next thing to press. Everything else stays neutral, so a person scanning a long table sees the amber and nothing competing with it.
+Gitmatrix is read by people checking on work their agents did while they weren't looking: what landed, what CI said, what a commit published, what the knowledge graph now believes. The system is a dark, warm, quiet console for that review. Charcoal panes with a faint warm cast (hue 70) sit on a slightly lighter page; text is warm off-white in three strengths; one amber signal marks what is selected, current or the next thing to press. Outside status/data colors and the Pounce brand mark, surfaces stay neutral, so a person scanning a long table sees the amber and nothing competing with it.
 
 Density is that of a working tool, not a marketing page. Lists are single panes with hairline-divided rows; numbers line up in tabular figures; versions, hashes, commands and counts are set in Geist Mono and words in Figtree. The densest surface (the package console: query bar, saved views, publish-rate strip, virtualized version table, facet column) and the sparsest (the sign-in ledger) are built from the same handful of pieces. MatrixKit Neo is the incumbent system, vendored from Claude Design as is; Gitmatrix composes it with Tailwind utilities and adds almost no CSS of its own.
 
@@ -227,9 +228,15 @@ Dark is the home theme (`data-theme="dark"` on `<html>`); a light theme redefine
 - Tailwind utilities on the kit's role names; `mk-*` classes for kit components; CSS only where utilities can't reach.
 - Phones lift every control to a 44px touch floor.
 
+## Brand identity
+
+**Pounce** is the user-approved Gitmatrix identity: a flowing cat silhouette whose paths separate and rejoin, suggesting nimble, parallel agent work. Preserve the selected artwork, not the former G lettermark. The logo alone uses the `brand` role: mint `#91f5be` in dark and deep forest `#10251c` in light. Its outlined Figtree wordmark uses `ink`; the interface's amber action signal does not change.
+
+Use `GitmatrixLogo` for the full lockup on Home and authentication pages and the mark alone in the rail. The master SVG, matching favicon family, generation provenance and cache-version convention are documented in [the website brand specification](apps/website/DESIGN.md#brand-identity).
+
 ## Colors
 
-A near-monochrome warm charcoal palette with a single amber accent, a red reserved for danger and failure, a green for success, and data hues used only inside charts. Tokens live in `apps/website/src/styles/tokens.css` and are mapped to Tailwind color utilities in `app.css` (`bg-pane`, `text-ink-muted`, `border-line-soft`, `bg-signal-wash`, and so on). The `@theme` block resets `--color-*` first, so Tailwind's default palette does not exist in this project: only the kit's roles do.
+A near-monochrome warm charcoal palette with a single amber action accent, a red reserved for danger and failure, a green for success, and data hues used only inside charts. The Pounce logo has its own brand-only mint/forest role. Tokens live in `apps/website/src/styles/tokens.css` and are mapped to Tailwind color utilities in `app.css` (`bg-pane`, `text-ink-muted`, `border-line-soft`, `bg-signal-wash`, and so on). The `@theme` block resets `--color-*` first, so Tailwind's default palette does not exist in this project: only the kit's roles do.
 
 ### Primary
 

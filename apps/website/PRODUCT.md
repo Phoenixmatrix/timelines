@@ -34,7 +34,7 @@ Multiple humans and agents work across machines, repositories and worktrees. CLI
 
 ## Brand Commitments
 
-Preserve the Gitmatrix name and incumbent MatrixKit Neo interface. This is a product extension, not a rebrand or replacement visual system.
+Preserve the Gitmatrix name and incumbent MatrixKit Neo interface. The approved brand identity is **Pounce**: the selected flowing cat silhouette, expressing parallel agents and fast development. Preserve that artwork instead of returning to a generic G lettermark or substituting another cat. Mint/deep-forest brand colors belong to the logo; amber actions and existing status semantics remain unchanged.
 
 ## Evidence on Hand
 
