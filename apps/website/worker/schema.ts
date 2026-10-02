@@ -247,6 +247,7 @@ export interface Database {
   release_notes: {
     repo_id: string;
     release: string;
+    format_version: Generated<number>;
     to_oid: string;
     from_tag: string | null;
     from_oid: string | null;
@@ -288,6 +289,7 @@ export interface Database {
   };
   release_note_state: {
     repo_id: string;
+    format_version: Generated<number>;
     dirty: Generated<number>;
     lease_until: Generated<number>;
     status: Generated<string>;

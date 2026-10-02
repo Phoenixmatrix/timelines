@@ -10,7 +10,7 @@ import type {
   ReleaseNotesState,
   ReleaseSummary,
 } from "../../shared/release-notes.ts";
-import { UNRELEASED } from "../../shared/release-notes.ts";
+import { releaseKind } from "../../shared/release-notes.ts";
 import type { Actor } from "../db.ts";
 import { db, type Database } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
@@ -43,6 +43,7 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
   return {
     id: row.id,
     release: row.release,
+    releaseKind: releaseKind(row.release),
     kind: row.kind,
     category: row.category,
     title: row.title,
@@ -52,7 +53,7 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
     workspaceIds: JSON.parse(row.workspace_ids) as string[],
     commits: JSON.parse(row.commits) as string[],
     changes: JSON.parse(row.changes) as ReleaseNoteChange[],
-    shippedAt: row.shipped_at,
+    lastCommitAt: row.shipped_at,
     model: row.model,
     updatedAt: row.updated_at,
   };
@@ -60,10 +61,10 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
 
 const CATEGORY_ORDER = { feature: 0, fix: 1, improvement: 2, internal: 3 } as const;
 
-/** Releases newest first, unreleased work on top. */
+/** Daily digests first, then named snapshots; newest committer time first. */
 function byRecency(a: { release: string; released_at: string }, b: typeof a) {
-  if (a.release === UNRELEASED) return -1;
-  if (b.release === UNRELEASED) return 1;
+  if (releaseKind(a.release) !== releaseKind(b.release))
+    return releaseKind(a.release) === "daily" ? -1 : 1;
   return b.released_at.localeCompare(a.released_at) || b.release.localeCompare(a.release);
 }
 
@@ -77,10 +78,17 @@ export async function releaseIndex(
   const [state, releases, entries] = await Promise.all([
     d
       .selectFrom("release_note_state")
-      .select(["status", "generated_at", "dirty"])
+      .select(["status", "generated_at", "dirty", "format_version"])
       .where("repo_id", "=", repoId)
       .executeTakeFirst(),
-    d.selectFrom("release_notes").selectAll().where("repo_id", "=", repoId).execute(),
+    d
+      .selectFrom("release_notes as n")
+      .innerJoin("release_note_state as s", "s.repo_id", "n.repo_id")
+      .where("n.format_version", "=", 1)
+      .selectAll("n")
+      .where("n.repo_id", "=", repoId)
+      .where("s.format_version", "=", 1)
+      .execute(),
     d
       .selectFrom("release_note_entries")
       .select(["release", "kind", "tracker_owner_id"])
@@ -93,19 +101,25 @@ export async function releaseIndex(
       counts.set(entry.release, (counts.get(entry.release) ?? 0) + 1);
   let stateName: ReleaseNotesState = "idle";
   if (!aiEnabled) stateName = "disabled";
-  else if (state?.status === "generating" || state?.dirty) stateName = "generating";
   else if (state?.status === "failed") stateName = "failed";
-  else if (state?.status === "ready") stateName = "ready";
+  else if (state?.status === "generating" || state?.dirty) stateName = "generating";
+  else if (state?.status === "ready" && state.format_version === 1) stateName = "ready";
   return {
-    status: { state: stateName, generatedAt: state?.generated_at ?? null },
-    releases: releases.sort(byRecency).map((row): ReleaseSummary => ({
-      name: row.release,
-      toOid: row.to_oid,
-      fromTag: row.from_tag,
-      releasedAt: row.released_at,
-      updatedAt: row.updated_at,
-      entries: counts.get(row.release) ?? 0,
-    })),
+    status: {
+      state: stateName,
+      generatedAt: state?.format_version === 1 ? state.generated_at : null,
+    },
+    releases: (state?.format_version === 1 ? releases : [])
+      .sort(byRecency)
+      .map((row): ReleaseSummary => ({
+        name: row.release,
+        kind: releaseKind(row.release),
+        toOid: row.to_oid,
+        fromTag: row.from_tag,
+        lastCommitAt: row.released_at,
+        updatedAt: row.updated_at,
+        entries: counts.get(row.release) ?? 0,
+      })),
   };
 }
 
@@ -116,11 +130,20 @@ export async function releaseNotesFor(
   trackers: ViewerTrackers,
 ): Promise<ReleaseNotesRelease | null> {
   const d = db(d1);
-  const row = await d
-    .selectFrom("release_notes")
-    .selectAll()
+  const state = await d
+    .selectFrom("release_note_state")
+    .select("format_version")
     .where("repo_id", "=", repoId)
-    .where("release", "=", name)
+    .executeTakeFirst();
+  if (state?.format_version !== 1) return null;
+  const row = await d
+    .selectFrom("release_notes as n")
+    .innerJoin("release_note_state as s", "s.repo_id", "n.repo_id")
+    .selectAll("n")
+    .where("s.format_version", "=", 1)
+    .where("n.format_version", "=", 1)
+    .where("n.repo_id", "=", repoId)
+    .where("n.release", "=", name)
     .executeTakeFirst();
   if (!row) return null;
   const rows = await d
@@ -134,7 +157,7 @@ export async function releaseNotesFor(
     .sort(
       (a, b) =>
         CATEGORY_ORDER[a.category] - CATEGORY_ORDER[b.category] ||
-        b.shippedAt.localeCompare(a.shippedAt) ||
+        b.lastCommitAt.localeCompare(a.lastCommitAt) ||
         a.title.localeCompare(b.title),
     );
   const shapedBy = JSON.parse(row.intro_trackers) as string[];
@@ -142,11 +165,12 @@ export async function releaseNotesFor(
   return {
     release: {
       name: row.release,
+      kind: releaseKind(row.release),
       toOid: row.to_oid,
       fromTag: row.from_tag,
       fromOid: row.from_oid,
       truncated: Boolean(row.truncated),
-      releasedAt: row.released_at,
+      lastCommitAt: row.released_at,
       updatedAt: row.updated_at,
       entries: entries.length,
       intro,

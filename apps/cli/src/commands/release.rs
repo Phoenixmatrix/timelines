@@ -11,7 +11,7 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::fmt::Write;
 
-const UNRELEASED: &str = "@unreleased";
+const DAILY_RELEASE_PREFIX: &str = "@day:";
 
 pub struct Shown {
     value: Value,
@@ -40,11 +40,14 @@ fn s<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 
-fn title(name: &str) -> &str {
-    if name == UNRELEASED {
-        "Unreleased"
+fn title(name: &str, kind: &str) -> String {
+    if kind == "daily" {
+        format!(
+            "{} UTC",
+            name.strip_prefix(DAILY_RELEASE_PREFIX).unwrap_or(name)
+        )
     } else {
-        name
+        format!("Tag {name}")
     }
 }
 
@@ -68,18 +71,55 @@ fn base(repo: &str) -> Result<String> {
     Ok(path)
 }
 
-/// `unreleased` (any case) names the default branch's work; anything else is a tag.
-fn release_name(release: &str) -> &str {
-    if release.eq_ignore_ascii_case("unreleased") {
-        UNRELEASED
+/// Only an exact `day:YYYY-MM-DD` selector names a daily update; tags stay literal.
+fn release_name(release: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = release.as_bytes();
+    if bytes.len() == 14
+        && bytes.starts_with(b"day:")
+        && bytes[8] == b'-'
+        && bytes[11] == b'-'
+        && bytes[4..8]
+            .iter()
+            .chain(&bytes[9..11])
+            .chain(&bytes[12..14])
+            .all(u8::is_ascii_digit)
+    {
+        format!("@{release}").into()
     } else {
-        release
+        release.into()
     }
+}
+
+fn default_release(index: &Value) -> Option<&Value> {
+    let releases = index["releases"].as_array()?;
+    releases
+        .iter()
+        .filter(|release| s(release, "kind") == "daily")
+        .max_by_key(|release| {
+            (
+                release["entries"].as_u64().unwrap_or(0) > 0,
+                s(release, "name"),
+            )
+        })
+        .or_else(|| {
+            releases
+                .iter()
+                .filter(|release| {
+                    s(release, "kind") == "tag" && release["entries"].as_u64().unwrap_or(0) > 0
+                })
+                .max_by_key(|release| s(release, "lastCommitAt"))
+                .or_else(|| releases.iter().find(|release| s(release, "kind") == "tag"))
+        })
 }
 
 fn list_text(value: &Value) -> String {
     let mut out = String::new();
-    let releases = value["releases"].as_array().cloned().unwrap_or_default();
+    let mut releases: Vec<&Value> = value["releases"].as_array().into_iter().flatten().collect();
+    releases.sort_by(|a, b| {
+        (s(a, "kind") != "daily")
+            .cmp(&(s(b, "kind") != "daily"))
+            .then_with(|| s(b, "lastCommitAt").cmp(s(a, "lastCommitAt")))
+    });
     if releases.is_empty() {
         out.push_str("No release notes yet.\n");
     }
@@ -90,10 +130,10 @@ fn list_text(value: &Value) -> String {
             .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:<20} {:>3} entries  {}{}",
-            title(s(release, "name")),
+            "{:<20} {:>3} entries  last commit {}{}",
+            title(s(release, "name"), s(release, "kind")),
             release["entries"].as_u64().unwrap_or(0),
-            s(release, "releasedAt").get(..10).unwrap_or(""),
+            s(release, "lastCommitAt"),
             since
         );
     }
@@ -107,12 +147,19 @@ fn list_text(value: &Value) -> String {
 
 fn notes_text(value: &Value, internal: bool) -> String {
     let release = &value["release"];
-    let mut out = format!("# {}\n", title(s(release, "name")));
-    match release["fromTag"].as_str() {
-        Some(tag) => {
-            let _ = writeln!(out, "Changes since {tag}.");
+    let mut out = format!("# {}\n", title(s(release, "name"), s(release, "kind")));
+    if s(release, "kind") == "daily" {
+        out.push_str("Default-branch code updates grouped by Git committer date (UTC).\n");
+    } else {
+        match release["fromTag"].as_str() {
+            Some(tag) => {
+                let _ = writeln!(out, "Code changes since {tag}.");
+            }
+            None => out.push_str("Code changes up to this tag.\n"),
         }
-        None => out.push_str("Everything up to this release.\n"),
+    }
+    if let Some(at) = release["lastCommitAt"].as_str() {
+        let _ = writeln!(out, "Last commit: {at}.");
     }
     if let Some(intro) = release["intro"].as_str().filter(|intro| !intro.is_empty()) {
         let _ = write!(out, "\n{intro}\n");
@@ -194,26 +241,35 @@ fn feed_text(value: &Value, internal: bool) -> String {
     }
     let entries = value["entries"].as_array().cloned().unwrap_or_default();
     if entries.is_empty() {
-        out.push_str("\nNothing shipped matches.\n");
+        out.push_str("\nNo code updates match.\n");
     }
     let mut day = String::new();
     for entry in &entries {
-        let shipped = s(entry, "shippedAt").get(..10).unwrap_or("");
-        if shipped != day {
-            day = shipped.to_string();
-            let _ = write!(out, "\n## {day}\n");
+        let committed = s(entry, "lastCommitAt").get(..10).unwrap_or("");
+        if committed != day {
+            day = committed.to_string();
+            let _ = write!(out, "\n## {day} UTC\n");
         }
         let mut refs: Vec<String> = Vec::new();
         if let Some(key) = entry["issue"]["key"].as_str() {
             refs.push(key.to_string());
         }
         for repo in entry["repos"].as_array().into_iter().flatten() {
-            let releases: Vec<&str> = repo["releases"]
+            let releases: Vec<String> = repo["releases"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .map(|r| if r == UNRELEASED { "unreleased" } else { r })
+                .map(|name| {
+                    title(
+                        name,
+                        if name.starts_with(DAILY_RELEASE_PREFIX) {
+                            "daily"
+                        } else {
+                            "tag"
+                        },
+                    )
+                })
                 .collect();
             refs.push(format!(
                 "{}/{} {}",
@@ -280,13 +336,9 @@ pub fn run(ctx: &Ctx, command: &ReleaseCommand) -> Result<Shown> {
         });
     };
     let name = match args.release.as_deref() {
-        Some(release) => release_name(release).to_string(),
+        Some(release) => release_name(release).into_owned(),
         None => {
-            let releases = index["releases"].as_array().cloned().unwrap_or_default();
-            let pick = releases
-                .iter()
-                .find(|release| release["entries"].as_u64().unwrap_or(0) > 0)
-                .or(releases.first())
+            let pick = default_release(&index)
                 .ok_or_else(|| GmError::usage("This repository has no release notes yet."))?;
             s(pick, "name").to_string()
         }
@@ -314,25 +366,31 @@ mod tests {
         assert!(base("orbit").is_err());
         assert!(base("orbit/../x").is_err());
         let mut path = String::new();
-        encode_into(&mut path, release_name("release/1.0&x=y"));
+        encode_into(&mut path, &release_name("release/1.0&x=y"));
         assert_eq!(path, "release%2F1.0%26x%3Dy");
-        assert_eq!(release_name("Unreleased"), UNRELEASED);
+        assert_eq!(release_name("day:2026-10-02"), "@day:2026-10-02");
+        assert_eq!(
+            release_name("day:2026-10-02-preview"),
+            "day:2026-10-02-preview"
+        );
+        assert_eq!(release_name("day:2026-1-02"), "day:2026-1-02");
     }
 
     #[test]
     fn notes_render_as_markdown_grouped_by_category() {
         let value = json!({
-            "release": {"name": "v2", "fromTag": "v1", "intro": "Faster search."},
+            "release": {"name": "v2", "kind": "tag", "fromTag": "v1", "intro": "Faster search.", "lastCommitAt": "2026-10-02T12:00:00Z"},
             "entries": [
                 {"category": "internal", "title": "Bump deps", "summary": "", "issue": null, "commits": ["abcdef0123"]},
                 {"category": "fix", "title": "Fix ranking", "summary": "Results sort by relevance.", "issue": {"key": "ENG-2"}, "commits": ["1234567890", "2345678901"]},
                 {"category": "feature", "title": "Add search", "summary": "Find anything.", "issue": null, "commits": ["9876543210"]}
             ]
         });
-        assert_eq!(
-            notes_text(&value, false),
-            "# v2\nChanges since v1.\n\nFaster search.\n\n## New\n- **Add search** — Find anything. (9876543)\n\n## Fixed\n- **Fix ranking** — Results sort by relevance. (ENG-2, 1234567, 2345678)\n\n1 internal entries hidden; show them with --internal."
-        );
+        let text = notes_text(&value, false);
+        assert!(text.contains("## New\n- **Add search**"));
+        assert!(text.contains("## Fixed\n- **Fix ranking**"));
+        assert!(text.contains("ENG-2, 1234567, 2345678"));
+        assert!(!text.contains("Bump deps"));
         assert!(notes_text(&value, true).contains("## Internal\n- **Bump deps** (abcdef0)"));
     }
 
@@ -357,34 +415,53 @@ mod tests {
     }
 
     #[test]
-    fn feed_renders_days_with_where_it_shipped() {
+    fn feed_preserves_repository_and_tracker_provenance() {
         let value = json!({
             "owner": {"displayName": "Orbit Labs"},
             "query": {"unknown": ["color:red"]},
             "truncated": false,
             "facets": {},
             "entries": [
-                {"category": "fix", "title": "Fix rollback", "summary": "Rollbacks finish.", "shippedAt": "2026-09-25T00:00:00Z", "issue": {"key": "OPS-3"},
-                 "repos": [{"owner": "orbit", "name": "engine", "releases": ["v2", "@unreleased"]}]}
+                {"category": "fix", "title": "Fix rollback", "summary": "Rollbacks finish.", "releaseKind": "daily", "lastCommitAt": "2026-09-25T00:00:00Z", "issue": {"key": "OPS-3"},
+                 "repos": [{"owner": "orbit", "name": "engine", "releases": ["v2", "@day:2026-09-25"]}]}
             ]
         });
-        assert_eq!(
-            feed_text(&value, true),
-            "# Release notes: Orbit Labs\nNot understood: color:red\n\n## 2026-09-25\n- [fix] **Fix rollback** — Rollbacks finish. (OPS-3; orbit/engine v2, unreleased)"
-        );
+        let text = feed_text(&value, true);
+        assert!(text.contains("2026-09-25 UTC"));
+        assert!(text.contains("OPS-3; orbit/engine Tag v2, 2026-09-25 UTC"));
     }
 
     #[test]
-    fn list_shows_unreleased_by_name_and_status() {
-        let value = json!({
+    fn default_selection_prefers_visible_daily_updates_before_tags() {
+        let mut value = json!({
             "status": {"state": "ready", "generatedAt": "2026-10-02T00:00:00Z"},
             "releases": [
-                {"name": "@unreleased", "entries": 3, "releasedAt": "2026-10-02T00:00:00Z", "fromTag": "v1"},
-                {"name": "v1", "entries": 2, "releasedAt": "2026-09-01T00:00:00Z", "fromTag": null}
+                {"name": "v2", "kind": "tag", "entries": 2, "lastCommitAt": "2026-10-03T00:00:00Z", "fromTag": "v1"},
+                {"name": "@day:2026-10-01", "kind": "daily", "entries": 3, "lastCommitAt": "2026-10-01T00:00:00Z", "fromTag": null},
+                {"name": "@day:2026-10-02", "kind": "daily", "entries": 0, "lastCommitAt": "2026-10-02T00:00:00Z", "fromTag": null}
             ]
         });
+        assert_eq!(
+            s(default_release(&value).unwrap(), "name"),
+            "@day:2026-10-01"
+        );
         let text = list_text(&value);
-        assert!(text.starts_with("Unreleased             3 entries  2026-10-02  since v1\nv1"));
-        assert!(text.ends_with("Status: ready, updated 2026-10-02T00:00:00Z"));
+        assert!(text.find("2026-10-02 UTC").unwrap() < text.find("Tag v2").unwrap());
+        assert!(text.contains("last commit 2026-10-02T00:00:00Z"));
+        value["releases"][1]["entries"] = json!(0);
+        assert_eq!(
+            s(default_release(&value).unwrap(), "name"),
+            "@day:2026-10-02"
+        );
+        let mut tags = json!({"releases": [
+            {"name": "v3", "kind": "tag", "entries": 0, "lastCommitAt": "2026-10-03T00:00:00Z"},
+            {"name": "v1", "kind": "tag", "entries": 2, "lastCommitAt": "2026-10-01T00:00:00Z"},
+            {"name": "v2", "kind": "tag", "entries": 2, "lastCommitAt": "2026-10-02T00:00:00Z"}
+        ]});
+        assert_eq!(s(default_release(&tags).unwrap(), "name"), "v2");
+        tags["releases"][1]["entries"] = json!(0);
+        tags["releases"][2]["entries"] = json!(0);
+        assert_eq!(s(default_release(&tags).unwrap(), "name"), "v3");
+        assert!(default_release(&json!({"releases": []})).is_none());
     }
 }

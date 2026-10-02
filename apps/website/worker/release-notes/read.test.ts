@@ -11,8 +11,9 @@ function setup() {
     INSERT INTO release_notes (repo_id, release, to_oid, from_tag, released_at, updated_at, intro, intro_model, intro_trackers)
       VALUES ('repo', 'v1', 'c1', NULL, '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'v1 intro', 'm', '[]'),
              ('repo', 'v2', 'c5', 'v1', '2026-09-20T00:00:00Z', '2026-10-01T00:00:00Z', 'Shaped by private work.', 'm', '["secret"]'),
-             ('repo', '@unreleased', 'c9', 'v2', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', '', NULL, '[]');
-    INSERT INTO release_note_state (repo_id, status, generated_at) VALUES ('repo', 'ready', '2026-10-01T00:00:00Z');
+             ('repo', '@day:2026-09-30', 'c9', NULL, '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', '', NULL, '[]');
+    INSERT INTO release_note_state (repo_id, status, generated_at, format_version) VALUES ('repo', 'ready', '2026-10-01T00:00:00Z', 1);
+    UPDATE release_notes SET format_version = 1;
   `);
   const entry = (
     id: string,
@@ -47,16 +48,16 @@ function setup() {
   entry("private", "v2", "feature", "2026-09-15T00:00:00Z", "secret");
   entry("chore", "v2", "internal", "2026-09-16T00:00:00Z", null);
   entry("later-feature", "v2", "feature", "2026-09-12T00:00:00Z", null);
-  return { db: d1(sqlite) };
+  return { db: d1(sqlite), sqlite };
 }
 
 describe("reading release notes", () => {
-  test("lists unreleased first, then tags newest first, counting what the viewer can see", async () => {
+  test("lists daily digests first, then tags newest first, counting what the viewer can see", async () => {
     const { db } = setup();
     const member = await releaseIndex(db, "repo", new Map([["acc", "org"]]), true);
     expect(member.status).toEqual({ state: "ready", generatedAt: "2026-10-01T00:00:00Z" });
     expect(member.releases.map((r) => [r.name, r.entries, r.fromTag])).toEqual([
-      ["@unreleased", 0, "v2"],
+      ["@day:2026-09-30", 0, null],
       ["v2", 4, "v1"],
       ["v1", 0, null],
     ]);
@@ -100,5 +101,21 @@ describe("reading release notes", () => {
     expect(anonymous.entries.map((e) => e.kind)).toEqual(["commit", "commit"]);
     expect((await releaseNotesFor(db, "repo", "v1", new Map()))!.release.intro).toBe("v1 intro");
     expect(await releaseNotesFor(db, "repo", "v9", new Map())).toBeNull();
+  });
+  test("old format rows and their tracker-shaped introductions stay hidden until cutover", async () => {
+    const { db, sqlite } = setup();
+    sqlite.exec("UPDATE release_note_state SET format_version = 0");
+    expect(
+      (await releaseIndex(db, "repo", new Map([["secret", "secret-co"]]), true)).releases,
+    ).toEqual([]);
+    expect(await releaseNotesFor(db, "repo", "v2", new Map([["secret", "secret-co"]]))).toBeNull();
+    sqlite.exec("UPDATE release_note_state SET format_version = 1");
+    const ready = (await releaseNotesFor(db, "repo", "v2", new Map()))!;
+    expect(ready.release).toMatchObject({
+      kind: "tag",
+      lastCommitAt: "2026-09-20T00:00:00Z",
+      intro: null,
+    });
+    expect(ready.entries.map((e) => e.id)).toEqual(["later-feature", "chore"]);
   });
 });

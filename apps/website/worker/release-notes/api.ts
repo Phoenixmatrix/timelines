@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { CommitSummary } from "../../shared/api.ts";
 import type { LinkedIssue, RangeCommit, ReleaseRangeResponse } from "../../shared/release-notes.ts";
+import { releaseName } from "../../shared/release-notes.ts";
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor, RepoRow } from "../db.ts";
@@ -11,6 +12,7 @@ import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
 import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
 import { issuesFrom } from "./trackers.ts";
+import { ensureReleaseNotes } from "./queue.ts";
 
 export const releaseNotes = new Hono<AppEnv>();
 
@@ -112,6 +114,7 @@ releaseNotes.get("/", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   c.header("cache-control", "private, no-store");
+  await ensureReleaseNotes(c.env, loaded.row.id);
   const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
   return c.json(await releaseIndex(c.env.DB, loaded.row.id, trackers, Boolean(c.env.AI)));
 });
@@ -121,7 +124,8 @@ releaseNotes.get("/release", async (c) => {
   const loaded = await loadRepo(c);
   if (loaded instanceof Response) return loaded;
   c.header("cache-control", "private, no-store");
-  const name = c.req.query("name") ?? "";
+  await ensureReleaseNotes(c.env, loaded.row.id);
+  const name = releaseName(c.req.query("name") ?? "");
   const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
   const body = await releaseNotesFor(c.env.DB, loaded.row.id, name, trackers);
   if (!body) return c.json({ error: "No release notes for that release." }, 404);

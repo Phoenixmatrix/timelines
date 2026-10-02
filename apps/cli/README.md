@@ -52,35 +52,42 @@ verification. The web Changes tab is functional work in progress, not final UI.
 
 ## Release notes
 
-`gm release list` shows the releases a repository has AI-written notes for:
-unreleased work on the default branch first, then tags newest first, with how
-many entries you can see. `gm release notes [RELEASE]` prints one release as
-Markdown (default: the newest release with entries; `unreleased` names the
-default branch's work since the newest tag), grouped into New, Fixed and
-Improved. Internal entries (chores, refactors, tooling) are counted but shown
-only with `--internal`.
+`gm release list` shows AI-written **daily updates** on the default branch first,
+then named **tag** snapshots, with visible entry counts. Days use UTC Git committer
+dates, not authored, tracker completion or deployment dates. `gm release notes
+[RELEASE]` prints notes as Markdown, grouped into New, Fixed and Improved. Its
+default is the newest day with visible entries, then the newest day; tags are the
+fallback only when there are no daily groups. Select a day with `day:YYYY-MM-DD`
+or a tag by its literal name. Internal entries (chores, refactors, tooling) are
+counted but shown only with `--internal`. Neither kind of notes proves deployment.
 
 ```sh
 gm release list -R orbit/engine
 gm release notes v1.2.0 -R orbit/engine
-gm release notes unreleased --internal -o json
+gm release notes day:2026-10-02 --internal -o json
 ```
 
-`gm release feed` reads a tracker account's notes across repositories, newest
-first: everything its teams shipped and everything shipped in its repositories.
-`--team KEY` narrows it to one team; any feed query filters it (`type:fix
-repo:engine since:30d`, `-label:docs`, search words). The account comes from
-`--owner`, else `gm tracker use`. Internal entries are left out unless you pass
-`--internal` or a `type:` filter.
+`gm release feed` reads a tracker account's daily code updates across repositories,
+latest commit first. Named tags are excluded by default to avoid counting the
+same changes twice; use `kind:tag` or a positive `release:v1.2.0` filter to select
+them. `release:day:2026-10-02` selects a UTC day. `--team KEY` narrows the feed to
+one team; other filters include `type:fix repo:engine since:30d`, `-label:docs`,
+and search words. The account comes from `--owner`, else `gm tracker use`.
+Internal entries are left out unless you pass `--internal` or a `type:` filter.
 
 ```sh
 gm release feed --owner orbit --team CORE since:2w
 gm release feed type:fix -o json
+gm release feed kind:tag --owner orbit
 ```
 
 Entries about issues from trackers you can't read are omitted, and so is any
 introduction they shaped. See [release notes](../website/README.md#release-notes)
 for how entries are generated.
+
+JSON summaries expose `kind: daily|tag`; entries expose `releaseKind`. Both use
+`lastCommitAt` for the latest Git committer timestamp in the group. Stored legacy
+notes regenerate lazily on read; check the index's status while generation runs.
 
 ## Distributed issue tracker
 

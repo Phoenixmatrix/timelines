@@ -1,8 +1,16 @@
 import { MagnifyingGlassIcon, RocketLaunchIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
-import { Form, Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import {
-  UNRELEASED,
+  Form,
+  Link,
+  useLoaderData,
+  useNavigate,
+  useRevalidator,
+  type LoaderFunctionArgs,
+} from "react-router";
+import {
+  releaseKind,
+  releaseLabel,
   type ReleaseCategory,
   type ReleaseFeed,
   type ReleaseFeedEntry,
@@ -11,7 +19,7 @@ import {
 import type { TrackerOwner } from "../../../shared/tracker.ts";
 import { SelectField } from "../../components/ui.tsx";
 import { api, load } from "../../lib/api.ts";
-import { fullDate, timeAgo } from "../../lib/format.ts";
+import { timeAgo } from "../../lib/format.ts";
 import { repoPath } from "../../lib/refs.ts";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
@@ -126,10 +134,17 @@ function Entry({ entry }: { entry: ReleaseFeedEntry }) {
             >
               {repo.owner}/{repo.name}
             </Link>{" "}
-            {repo.releases.map((r) => (r === UNRELEASED ? "unreleased" : r)).join(", ")}
+            {repo.releases
+              .map(
+                (name) =>
+                  `${releaseKind(name) === "daily" ? "Daily update" : "Tag"} ${releaseLabel(name)}`,
+              )
+              .join(", ")}
           </span>
         ))}
-        <span title={fullDate(entry.shippedAt)}>shipped {timeAgo(entry.shippedAt)}</span>
+        <span title={new Date(entry.lastCommitAt).toUTCString()}>
+          last commit {timeAgo(entry.lastCommitAt)}
+        </span>
       </div>
     </li>
   );
@@ -138,6 +153,7 @@ function Entry({ entry }: { entry: ReleaseFeedEntry }) {
 export function TrackerReleases() {
   const { feed, q, trackers } = useLoaderData<typeof trackerReleasesLoader>();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
   const owner = feed.owner.slug;
@@ -148,7 +164,7 @@ export function TrackerReleases() {
 
   const weeks = new Map<string, ReleaseFeedEntry[]>();
   for (const entry of feed.entries) {
-    const week = weekOf(entry.shippedAt);
+    const week = weekOf(entry.lastCommitAt);
     weeks.set(week, [...(weeks.get(week) ?? []), entry]);
   }
 
@@ -163,13 +179,25 @@ export function TrackerReleases() {
           options={trackers.map((tracker) => ({ value: tracker.slug, label: tracker.displayName }))}
           onChange={(value) => navigate(`/tracker/${encodeURIComponent(value)}/releases`)}
         />
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm ml-auto"
+          disabled={revalidator.state !== "idle"}
+          onClick={() => void revalidator.revalidate()}
+        >
+          Refresh notes
+        </button>
         <Link
-          className="mk-btn mk-btn--ghost mk-btn--sm ml-auto no-underline"
+          className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
           to={`/tracker/${encodeURIComponent(owner)}`}
         >
           Issues
         </Link>
       </header>
+      <p className="m-0 max-w-[52rem] text-body-sm text-ink-muted">
+        Daily updates group default-branch first-parent commits by UTC Git commit date. Named tags
+        are optional snapshots, not deployment records.
+      </p>
       <Form method="get" className="relative flex max-w-[52rem] items-center" role="search">
         <MagnifyingGlassIcon
           className="pointer-events-none absolute left-3 size-4 text-ink-faint"
@@ -191,9 +219,39 @@ export function TrackerReleases() {
       </Form>
       <p id="release-query-help" className="m-0 -mt-2 text-micro text-ink-faint">
         {feed.query.unknown.length ? `Not understood: ${feed.query.unknown.join(" ")}. ` : ""}
-        Filter by team, repo, ws, type, label, release, since and until; prefix with - to exclude.
+        Daily updates are shown by default. Use kind:tag for named snapshots or
+        release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, label, release, kind,
+        since and until; prefix with - to exclude. These are code updates, not deployments.
       </p>
       <div className="flex max-w-[52rem] flex-col gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="mr-1 text-micro text-ink-faint">History</span>
+          {(["daily", "tag"] as const).map((kind) => (
+            <button
+              key={kind}
+              type="button"
+              className="mk-chip"
+              aria-pressed={
+                feed.query.filters.some(
+                  (filter) => filter.key === "kind" && !filter.negated && filter.value === kind,
+                ) ||
+                (kind === "daily" &&
+                  !feed.query.filters.some(
+                    (filter) =>
+                      filter.key === "kind" || (filter.key === "release" && !filter.negated),
+                  ))
+              }
+              onClick={() => {
+                const tokens = q.match(/(-?[A-Za-z]+:)?"[^"]*"|\S+/g) ?? [];
+                return onQuery(
+                  [...tokens.filter((token) => !/^-?kind:/i.test(token)), `kind:${kind}`].join(" "),
+                );
+              }}
+            >
+              {kind === "daily" ? "Daily updates" : "Tags"}
+            </button>
+          ))}
+        </div>
         <Facets
           title="Teams"
           facets={feed.facets.teams}
@@ -231,9 +289,12 @@ export function TrackerReleases() {
           <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
           <div>
             {q
-              ? "Nothing shipped matches this filter."
-              : `Nothing shipped yet in ${feed.owner.displayName}'s repositories or by its teams.`}
+              ? "No code updates match this filter."
+              : `No daily notes are available for ${feed.owner.displayName}'s repositories or teams yet.`}
           </div>
+          <p className="m-0 text-body-sm text-ink-faint">
+            Refresh to check for newly processed notes.
+          </p>
         </div>
       ) : (
         <div className="flex max-w-[52rem] flex-col gap-8 pb-8">
@@ -246,7 +307,8 @@ export function TrackerReleases() {
                   day: "numeric",
                   year: "numeric",
                   timeZone: "UTC",
-                })}
+                })}{" "}
+                UTC
               </h2>
               <ul className="m-0 list-none p-0">
                 {entries.map((entry) => (

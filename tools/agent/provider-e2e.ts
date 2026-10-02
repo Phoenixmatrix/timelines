@@ -6,6 +6,11 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { HarnessContext, SeedManifest } from "./types.ts";
+import type {
+  ReleaseFeed,
+  ReleaseNotesIndex,
+  ReleaseNotesRelease,
+} from "../../apps/website/shared/release-notes.ts";
 
 // Real git http-backend provides the target; all state belongs to this invocation.
 interface MirrorTarget {
@@ -497,6 +502,38 @@ export async function runProviderE2E(
         ),
         "The conversation must be in the person's directory",
       );
+      const waitForNotes = async (names: string[]) => {
+        await waitFor(stage, 5 * 60_000, async () => {
+          const index: ReleaseNotesIndex = await api(`${base}/release-notes`);
+          evidence.releaseIndex = index;
+          if (index.status.state === "failed")
+            throw new Error("Release-note generation failed; see provider evidence");
+          return (
+            index.status.state === "ready" &&
+            JSON.stringify(index.releases.map((release) => release.name).sort()) ===
+              JSON.stringify([...names].sort())
+          );
+        });
+      };
+      const notesFor = async (name: string): Promise<ReleaseNotesRelease> =>
+        api(`${base}/release-notes/release?name=${encodeURIComponent(name)}`);
+      enter("release-daily-initial");
+      await waitForNotes(["@day:2026-01-01"]);
+      const firstDay = await notesFor("day:2026-01-01");
+      assert.equal(firstDay.release.kind, "daily");
+      assert.equal(firstDay.release.toOid, final);
+      assert.equal(firstDay.release.lastCommitAt, "2026-01-01T00:00:00.000Z");
+      assert.deepEqual(
+        firstDay.entries.map((entry) => entry.commits),
+        [[final]],
+      );
+      assert(firstDay.entries[0]?.model, "Daily notes must record the real generation model");
+      assert.match(
+        `${firstDay.entries[0]?.title} ${firstDay.entries[0]?.summary}`,
+        /checksum|65521/i,
+        "Daily notes must describe the committed checksum behavior",
+      );
+      evidence.initialDailyNotes = firstDay;
       enter("knowledge-edit");
       // A meaningful edit re-analyzes checksum.ts; the concepts it still deals
       // with must keep their names, or every edit becomes new concepts to align.
@@ -517,6 +554,8 @@ export async function runProviderE2E(
         join(work, "checksum.ts"),
         "/** Copper Finch parcel checksum: UTF-16 code units modulo 65521. */\nexport function copperFinchChecksum(parcel: string): number {\n  let checksum = 0;\n  for (let i = 0; i < parcel.length; i++) checksum = (checksum + parcel.charCodeAt(i)) % 65521;\n  return checksum;\n}\n\n/** Whether a received parcel still matches the checksum sent with it. */\nexport function copperFinchVerify(parcel: string, expected: number): boolean {\n  return copperFinchChecksum(parcel) === expected;\n}\n",
       );
+      // Authorship stays on Jan 1; the new daily group must follow the committer date.
+      env.GIT_COMMITTER_DATE = "2026-01-02T00:00:00Z";
       await git(["-c", "core.hooksPath=/dev/null", "commit", "-am", "Verify Copper Finch parcels"]);
       await git(["push", "origin", "main"], work, true);
       const edited = await git(["rev-parse", "HEAD"]);
@@ -555,6 +594,58 @@ export async function runProviderE2E(
         kept.length * 2 >= conceptsBefore.length,
         "A meaningful edit renamed most of the file's concepts",
       );
+      enter("release-daily-rollover");
+      await waitForNotes(["@day:2026-01-01", "@day:2026-01-02"]);
+      const secondDay = await notesFor("day:2026-01-02");
+      assert.equal(secondDay.release.kind, "daily");
+      assert.equal(secondDay.release.toOid, edited);
+      assert.equal(secondDay.release.lastCommitAt, "2026-01-02T00:00:00.000Z");
+      assert.deepEqual(
+        secondDay.entries.map((entry) => entry.commits),
+        [[edited]],
+      );
+      assert.equal(secondDay.entries[0]?.lastCommitAt, "2026-01-02T00:00:00.000Z");
+      assert(secondDay.entries[0]?.model, "Rollover notes must record the real generation model");
+      assert.match(
+        `${secondDay.entries[0]?.title} ${secondDay.entries[0]?.summary}`,
+        /verif|validat|match|integrity|check/i,
+        "Rollover notes must describe parcel verification",
+      );
+      assert.deepEqual(
+        (await notesFor("day:2026-01-01")).entries.map((entry) => entry.commits),
+        [[final]],
+        "A new day must retain the earlier day's commit provenance",
+      );
+      evidence.rolloverDailyNotes = secondDay;
+      enter("release-tag-checkpoint");
+      await git(["tag", "-a", "provider-v1", "-m", "Copper Finch named checkpoint"]);
+      await git(["push", "origin", "refs/tags/provider-v1"], work, true);
+      await waitForNotes(["@day:2026-01-01", "@day:2026-01-02", "provider-v1"]);
+      const tagged = await notesFor("provider-v1");
+      assert.equal(tagged.release.kind, "tag");
+      assert.equal(tagged.release.toOid, edited);
+      assert.deepEqual(
+        tagged.entries.flatMap((entry) => entry.commits).sort(),
+        [final, edited].sort(),
+      );
+      const feed: ReleaseFeed = await api(
+        `/tracker/${owner}/release-notes?q=${encodeURIComponent(`repo:${owner}/${name}`)}`,
+      );
+      assert.deepEqual(
+        feed.entries.flatMap((entry) => entry.commits).sort(),
+        [final, edited].sort(),
+      );
+      assert(feed.entries.every((entry) => entry.releaseKind === "daily"));
+      const tagFeed: ReleaseFeed = await api(
+        `/tracker/${owner}/release-notes?q=${encodeURIComponent(`repo:${owner}/${name} release:provider-v1`)}`,
+      );
+      assert.deepEqual(
+        tagFeed.entries.flatMap((entry) => entry.commits).sort(),
+        [final, edited].sort(),
+      );
+      assert(tagFeed.entries.every((entry) => entry.releaseKind === "tag"));
+      evidence.taggedNotes = tagged;
+      evidence.releaseFeeds = { daily: feed.entries, tag: tagFeed.entries };
     }
     evidence.outcome = "passed";
   } catch (error) {

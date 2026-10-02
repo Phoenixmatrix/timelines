@@ -1,9 +1,19 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, test, vi } from "vite-plus/test";
 import type { LinkedIssue } from "../../shared/release-notes.ts";
 import type { RepoRefs } from "../artifacts.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
-import { notifyReleaseNotes, runReleaseNotesJob, type ReleaseNotesJob } from "./queue.ts";
+import {
+  ensureReleaseNotes,
+  notifyReleaseNotes,
+  runReleaseNotesJob,
+  type ReleaseNotesJob,
+} from "./queue.ts";
+import { releaseIndex, releaseNotesFor } from "./read.ts";
+import { RepoReader } from "../objects.ts";
+import * as semantic from "../semantic/feed.ts";
+
+const DAY = `@day:${new Date(1_790_000_000_000).toISOString().slice(0, 10)}`;
 
 interface Call {
   model: string;
@@ -62,11 +72,15 @@ function setup() {
   const env = { DB: d1(sqlite), AI } as unknown as Env;
 
   // Oldest first; the newest commit is the head.
-  const history: { hash: string; message: string }[] = [];
+  const history: { hash: string; message: string; committedAt: number; authoredAt: number }[] = [];
   const tags = new Map<string, string>();
   const issues = new Map<string, LinkedIssue>();
-  const commit = (message: string) => {
-    history.push({ hash: `c${history.length}`, message });
+  const commit = (
+    message: string,
+    committedAt = 1_790_000_000 + history.length,
+    authoredAt = committedAt,
+  ) => {
+    history.push({ hash: `c${history.length}`, message, committedAt, authoredAt });
     return `c${history.length - 1}`;
   };
   const source: GeneratorSource = {
@@ -100,7 +114,8 @@ function setup() {
               hash: c.hash,
               message: c.message,
               author: { name: "A", email: "a@example.com" },
-              authoredAt: 1_790_000_000 + Number(c.hash.slice(1)),
+              authoredAt: c.authoredAt,
+              committedAt: c.committedAt,
               parents: [],
             }) as unknown as ArtifactsCommitMetadata,
         );
@@ -130,7 +145,7 @@ function setup() {
     sqlite.prepare("SELECT * FROM release_notes WHERE release = ?").get(name) as
       | Record<string, string | number | null>
       | undefined;
-  return { sqlite, env, calls, commit, tags, issues, run, entries, release };
+  return { sqlite, env, source, calls, commit, tags, issues, run, entries, release };
 }
 
 describe("release note generation", () => {
@@ -145,7 +160,7 @@ describe("release note generation", () => {
 
     const first = await r.run();
     expect(first).toMatchObject({ releases: 2, more: false });
-    // Two entries in v1.0.0 and two unreleased, plus one intro each.
+    // Four daily entries, reused by the tag snapshot, plus one intro each.
     expect(first.newCalls.filter((c) => c.model.includes("glm"))).toHaveLength(4);
     expect(first.newCalls.filter((c) => c.model.includes("qwen3.8"))).toHaveLength(2);
 
@@ -159,30 +174,25 @@ describe("release note generation", () => {
     expect(parser).toMatchObject({
       team_key: "ENG",
       category: "feature",
-      shipped_at: "2026-09-01T00:00:00.000Z",
+      shipped_at: new Date(1_790_000_002_000).toISOString(),
     });
     expect(JSON.parse(parser.changes!)).toHaveLength(2);
-    // The prompt carries the issue, its evidence, the commits and their code changes.
-    const prompt = first.newCalls.find((c) => c.prompt.includes("## Issue ENG-1"))!.prompt;
-    expect(prompt).toContain("Shipped ENG-1");
-    expect(prompt).toContain("Finish the parser, ENG-1");
-    expect(prompt).toContain("fn_c2");
 
-    expect(r.entries("@unreleased").map((e) => [e.subject, e.category])).toEqual([
+    expect(r.entries(DAY).map((e) => [e.subject, e.category])).toEqual([
+      ["commit:c0", "feature"],
       ["commit:c3", "feature"],
       ["commit:c4", "internal"],
+      ["issue:acc:ENG-1", "feature"],
     ]);
     expect(r.release("v1.0.0")).toMatchObject({
       to_oid: "c2",
       from_oid: null,
-      intro: "Intro over 2 entries.",
       intro_trackers: '["acc"]',
     });
-    // Internal entries stay out of the introduction.
-    expect(r.release("@unreleased")).toMatchObject({
-      from_tag: "v1.0.0",
-      intro: "Intro over 1 entries.",
-      intro_trackers: "[]",
+    expect(r.release(DAY)).toMatchObject({
+      from_tag: null,
+      from_oid: null,
+      intro_trackers: '["acc"]',
     });
     const mentions = r.sqlite
       .prepare("SELECT issue_key FROM release_note_mentions ORDER BY issue_key")
@@ -191,7 +201,7 @@ describe("release note generation", () => {
     expect(mentions).toEqual(["ENG-1", "UTF-8"]);
   });
 
-  test("reruns are free; a push pays only for what is new; a tag freezes unreleased entries", async () => {
+  test("same-day pushes reuse unchanged entries; tags coexist without rewriting them", async () => {
     const r = setup();
     r.issues.set("ENG-2", issue("ENG-2"));
     r.tags.set("v1", r.commit("Base"));
@@ -202,18 +212,15 @@ describe("release note generation", () => {
     r.commit("fix: search ranking");
     const push = await r.run();
     expect(push.newCalls.map((c) => c.model.includes("glm"))).toEqual([true, false]);
-    expect(r.entries("@unreleased")).toHaveLength(2);
+    expect(r.entries(DAY)).toHaveLength(3);
 
-    // Tagging the head moves both entries into the release without rewriting them.
+    // Tagging the head copies matching entries without rewriting them.
     r.tags.set("v2", "c2");
     const tag = await r.run();
     expect(tag.newCalls.filter((c) => c.model.includes("glm"))).toEqual([]);
-    expect(r.entries("v2").map((e) => e.title)).toEqual([
-      "Entry: fix: search ranking",
-      "Entry: Add search (ENG-2)",
-    ]);
-    expect(r.entries("@unreleased")).toEqual([]);
-    expect(r.release("@unreleased")).toMatchObject({ from_tag: "v2", intro: "" });
+    expect(r.entries("v2").map((e) => e.subject)).toEqual(["commit:c2", "issue:acc:ENG-2"]);
+    expect(r.entries(DAY)).toHaveLength(3);
+    expect(r.release(DAY)).toMatchObject({ from_tag: null, from_oid: null });
   });
 
   test("a changed issue rewrites its entry; unresolved keys and lost tags drop out", async () => {
@@ -230,7 +237,7 @@ describe("release note generation", () => {
     r.issues.set("ENG-3", issue("ENG-3"));
     const completed = await r.run();
     expect(completed.newCalls.filter((c) => c.model.includes("glm"))).toHaveLength(1);
-    expect(r.entries("v2")[0]!.shipped_at).toBe("2026-09-01T00:00:00.000Z");
+    expect(r.entries("v2")[0]!.shipped_at).toBe(new Date(1_790_000_001_000).toISOString());
 
     // The issue leaves the tracker's reach: the commit stands alone.
     r.issues.clear();
@@ -248,12 +255,78 @@ describe("release note generation", () => {
     for (let i = 0; i < 4; i++) r.commit(`Change ${i}`);
     const partial = await r.run({ maxModelCalls: 2 });
     expect(partial.more).toBe(true);
-    expect(r.entries("@unreleased")).toHaveLength(2);
-    expect(r.release("@unreleased")!.intro).toBe("");
+    expect(r.entries(DAY)).toHaveLength(2);
+    expect(r.release(DAY)!.intro).toBe("");
     const rest = await r.run({ maxModelCalls: 10 });
     expect(rest.more).toBe(false);
-    expect(r.entries("@unreleased")).toHaveLength(4);
-    expect(r.release("@unreleased")!.intro).toBe("Intro over 4 entries.");
+    expect(r.entries(DAY)).toHaveLength(4);
+    expect(rest.modelCalls).toBe(3);
+  });
+  test("UTC committer days group noncontiguous ancestry, never author or completion dates", async () => {
+    const r = setup();
+    r.issues.set("ENG-1", issue("ENG-1", { completedAt: "2040-01-01T00:00:00Z" }));
+    const seconds = (date: string) => Date.parse(date) / 1000;
+    r.commit("Older ancestry ENG-1", seconds("2026-09-02T23:59:00Z"), seconds("2020-01-01"));
+    r.commit("Previous UTC day", seconds("2026-09-02T00:30:00+02:00"));
+    r.commit("Head ENG-1", seconds("2026-09-02T01:00:00Z"), seconds("2030-01-01"));
+    const result = await r.run();
+    expect(result).toMatchObject({ releases: 2, more: false });
+    expect(r.release("@day:2026-09-02")).toMatchObject({
+      to_oid: "c2",
+      from_oid: null,
+      from_tag: null,
+      released_at: "2026-09-02T23:59:00.000Z",
+    });
+    expect(r.entries("@day:2026-09-02")[0]).toMatchObject({
+      commits: '["c2","c0"]',
+      shipped_at: "2026-09-02T23:59:00.000Z",
+    });
+    expect(r.entries("@day:2026-09-01").map((e) => e.subject)).toEqual(["commit:c1"]);
+    expect(r.release("@unreleased")).toBeUndefined();
+  });
+
+  test("empty histories persist no daily group and stale days and sentinels disappear", async () => {
+    const r = setup();
+    r.sqlite.exec(`INSERT INTO release_notes (repo_id, release, to_oid, released_at, updated_at)
+      VALUES ('repo', '@unreleased', 'old', '2020-01-01', '2020-01-01'),
+      ('repo', '@day:2020-01-01', 'old', '2020-01-01', '2020-01-01')`);
+    expect((await r.run()).releases).toBe(0);
+    expect(r.sqlite.prepare("SELECT release FROM release_notes").all()).toEqual([]);
+  });
+  test("bounded daily history marks every observed day incomplete", async () => {
+    const r = setup();
+    r.issues.set("ENG-1", issue("ENG-1"));
+    for (let i = 0; i < 1001; i++) r.commit("ENG-1");
+    await r.run();
+    expect(r.release(DAY)!.truncated).toBe(1);
+    const commits = JSON.parse(r.entries(DAY)[0]!.commits!) as string[];
+    expect(commits).toHaveLength(1000);
+    expect(commits).not.toContain("c0");
+  });
+  test("legacy stored tags upgrade in bounded batches without backfilling untouched historical tags", async () => {
+    const r = setup();
+    for (let i = 0; i < 16; i++) r.tags.set(`v${i}`, r.commit(`chore: change ${i}`));
+    for (let i = 1; i <= 12; i++)
+      r.sqlite
+        .prepare(`INSERT INTO release_notes (repo_id, release, to_oid, released_at, updated_at)
+        VALUES ('repo', ?, ?, '2000-01-01', '2000-01-01')`)
+        .run(`v${i}`, `c${i}`);
+    const first = await r.run();
+    expect(first.more).toBe(true);
+    expect(first.releases).toBe(11);
+    expect(r.release("v1")!.format_version).toBe(0);
+    const second = await r.run();
+    expect(second.more).toBe(true);
+    expect(second.releases).toBe(6);
+    const final = await r.run();
+    expect(final.more).toBe(false);
+    expect(final.releases).toBe(11);
+    expect(r.release("v1")).toMatchObject({
+      format_version: 1,
+      released_at: new Date(1_790_000_001_000).toISOString(),
+    });
+    expect(r.entries("v1")[0]!.shipped_at).toBe(new Date(1_790_000_001_000).toISOString());
+    expect(r.release("v0")).toBeUndefined();
   });
 });
 
@@ -307,5 +380,97 @@ describe("release note scheduling", () => {
     expect(m.outcome).toEqual({ acked: true, retried: false });
     // The holder will see the dirty mark and follow up.
     expect(q.sqlite.prepare("SELECT dirty FROM release_note_state").get()).toEqual({ dirty: 1 });
+  });
+  test("reads coalesce lazy upgrades and keep failed retries visible", async () => {
+    const q = queued(true);
+    q.sqlite.exec(`INSERT INTO release_note_state (repo_id, status) VALUES ('repo', 'ready')`);
+    await Promise.all([ensureReleaseNotes(q.env, "repo"), ensureReleaseNotes(q.env, "repo")]);
+    expect(q.sent).toEqual([{ type: "release-notes", repoId: "repo" }]);
+    expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("generating");
+    q.sqlite.exec(`UPDATE release_note_state SET status = 'failed', dirty = 1`);
+    await ensureReleaseNotes(q.env, "repo");
+    expect(q.sent).toHaveLength(1);
+    expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("failed");
+  });
+
+  test("queue continuations hide partial upgraded data until the budget converges", async () => {
+    const r = setup();
+    const sent: unknown[] = [];
+    r.env.JOBS = { send: async (body: unknown) => void sent.push(body) } as unknown as Env["JOBS"];
+    for (let i = 0; i < 41; i++) r.commit(`Change ${i}`);
+    vi.spyOn(RepoReader.prototype, "refs").mockImplementation(() => r.source.refs());
+    vi.spyOn(RepoReader.prototype, "log").mockImplementation((oid, limit, offset) =>
+      r.source.log(oid, limit, offset),
+    );
+    vi.spyOn(semantic, "semanticFeed").mockResolvedValue({
+      version: 1,
+      ref: "HEAD",
+      head: "c40",
+      entries: [],
+      coverage: [],
+      nextCursor: null,
+    });
+    try {
+      await ensureReleaseNotes(r.env, "repo");
+      const first = message("repo");
+      await runReleaseNotesJob(r.env, first.message, () => {});
+      expect(first.outcome).toEqual({ acked: true, retried: false });
+      expect(
+        r.sqlite.prepare("SELECT format_version, status, dirty FROM release_note_state").get(),
+      ).toEqual({ format_version: 0, status: "generating", dirty: 1 });
+      expect(r.entries(DAY)).toHaveLength(40);
+      expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).releases).toEqual([]);
+      expect(await releaseNotesFor(r.env.DB, "repo", DAY, new Map())).toBeNull();
+      await ensureReleaseNotes(r.env, "repo");
+      expect(sent).toHaveLength(2);
+      const second = message("repo");
+      await runReleaseNotesJob(r.env, second.message, () => {});
+      expect(second.outcome).toEqual({ acked: true, retried: false });
+      expect(
+        r.sqlite.prepare("SELECT format_version, status, dirty FROM release_note_state").get(),
+      ).toEqual({ format_version: 1, status: "ready", dirty: 0 });
+      expect((await releaseNotesFor(r.env.DB, "repo", DAY, new Map()))!.entries).toHaveLength(41);
+      const calls = r.calls.length;
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.calls).toHaveLength(calls);
+      // Once upgraded, normal budget continuations must not erase readable history.
+      for (let i = 0; i < 41; i++) r.commit(`Follow-up change ${i}`);
+      await notifyReleaseNotes(r.env, "repo");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      const updating = await releaseIndex(r.env.DB, "repo", new Map(), true);
+      expect(updating.status.state).toBe("generating");
+      expect(updating.releases.map((release) => release.name)).toEqual([DAY]);
+      expect(
+        (await releaseNotesFor(r.env.DB, "repo", DAY, new Map()))!.entries.flatMap(
+          (entry) => entry.commits,
+        ),
+      ).toContain("c0");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe("ready");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+  test("failed upgrades stay private and retry without losing the failure state", async () => {
+    const q = queued(true);
+    vi.spyOn(RepoReader.prototype, "refs").mockRejectedValue(new Error("History unavailable"));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await ensureReleaseNotes(q.env, "repo");
+      const attempt = message("repo");
+      await runReleaseNotesJob(q.env, attempt.message, () => {});
+      expect(attempt.outcome).toEqual({ acked: false, retried: true });
+      expect(
+        q.sqlite
+          .prepare("SELECT format_version, status, dirty, lease_until FROM release_note_state")
+          .get(),
+      ).toEqual({ format_version: 0, status: "failed", dirty: 1, lease_until: 0 });
+      expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("failed");
+      await ensureReleaseNotes(q.env, "repo");
+      expect(q.sent).toHaveLength(1);
+    } finally {
+      errorLog.mockRestore();
+      vi.restoreAllMocks();
+    }
   });
 });

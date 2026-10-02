@@ -42,8 +42,22 @@ export interface ReleaseRangeResponse {
   issues: LinkedIssue[];
 }
 
-/** The release name for the default branch's work since the newest tag. */
-export const UNRELEASED = "@unreleased";
+/** Colons cannot occur in Git tag names, so daily update IDs cannot collide with tags. */
+export const DAILY_RELEASE_PREFIX = "@day:";
+export type ReleaseKind = "daily" | "tag";
+
+export function releaseKind(name: string): ReleaseKind {
+  return name.startsWith(DAILY_RELEASE_PREFIX) ? "daily" : "tag";
+}
+
+/** Human-facing selectors use `day:YYYY-MM-DD`; tag names remain literal. */
+export function releaseName(value: string): string {
+  return /^day:\d{4}-\d{2}-\d{2}$/.test(value) ? `@${value}` : value;
+}
+
+export function releaseLabel(name: string): string {
+  return releaseKind(name) === "daily" ? name.slice(DAILY_RELEASE_PREFIX.length) : name;
+}
 
 export type ReleaseCategory = "feature" | "fix" | "improvement" | "internal";
 
@@ -55,10 +69,11 @@ export interface ReleaseNoteChange {
   summary: string;
 }
 
-/** One shipped change: a tracker issue with its commits, or a commit citing none. */
+/** A code update: a tracker issue with its commits, or a commit citing none. */
 export interface ReleaseNoteEntry {
   id: string;
   release: string;
+  releaseKind: ReleaseKind;
   kind: "issue" | "commit";
   category: ReleaseCategory;
   title: string;
@@ -74,7 +89,8 @@ export interface ReleaseNoteEntry {
   workspaceIds: string[];
   commits: string[];
   changes: ReleaseNoteChange[];
-  shippedAt: string;
+  /** Latest Git committer timestamp among this entry's commits; not a deployment time. */
+  lastCommitAt: string;
   model: string | null;
   updatedAt: string;
 }
@@ -82,11 +98,13 @@ export interface ReleaseNoteEntry {
 export type ReleaseNotesState = "disabled" | "idle" | "generating" | "ready" | "failed";
 
 export interface ReleaseSummary {
-  /** A tag, or UNRELEASED. */
+  /** A Git tag name, or `@day:YYYY-MM-DD` for a UTC commit-date digest. */
   name: string;
+  kind: ReleaseKind;
   toOid: string;
   fromTag: string | null;
-  releasedAt: string;
+  /** Latest Git committer timestamp in this group; not a publication or deployment time. */
+  lastCommitAt: string;
   updatedAt: string;
   /** Entries the viewer can see, internal ones included. */
   entries: number;
@@ -95,7 +113,7 @@ export interface ReleaseSummary {
 /** GET /api/repos/:owner/:name/release-notes */
 export interface ReleaseNotesIndex {
   status: { state: ReleaseNotesState; generatedAt: string | null };
-  /** Unreleased first, then tags newest first. */
+  /** Daily updates first, then named tags; each group newest first. */
   releases: ReleaseSummary[];
 }
 
@@ -111,9 +129,9 @@ export interface ReleaseNotesRelease {
   entries: ReleaseNoteEntry[];
 }
 
-/** An entry in a tracker's release feed, with the repository and release it shipped in. */
+/** An entry in a tracker's code-update feed, with its repository and grouping. */
 export interface ReleaseFeedEntry extends ReleaseNoteEntry {
-  /** Each repository it shipped in, with its releases there (newest first). */
+  /** Repository and release-note groups containing this entry. */
   repos: { owner: string; name: string; releases: string[] }[];
 }
 
@@ -127,7 +145,7 @@ export interface ReleaseFeedFacet {
 export interface ReleaseFeed {
   owner: { slug: string; displayName: string };
   query: ParsedReleaseQuery;
-  /** Shipped newest first; an issue appears once per release it shipped in. */
+  /** Latest commit first. Daily updates by default; explicit kind/release filters can select tags. */
   entries: ReleaseFeedEntry[];
   /** More entries matched than were returned. */
   truncated: boolean;
@@ -148,6 +166,7 @@ export const RELEASE_QUERY_KEYS = [
   "type",
   "label",
   "release",
+  "kind",
   "since",
   "until",
 ] as const;
@@ -168,7 +187,7 @@ export interface ParsedReleaseQuery {
  * The release feed's query language, like the tracker's: `team:core repo:engine
  * ws:platform type:fix label:web release:v1.2 since:2026-09-01 until:30d search
  * words`, any filter negated with a leading `-`, values quoted when they contain
- * spaces. `release:unreleased` names unreleased work.
+ * spaces. `release:day:2026-10-02` selects a UTC day; `kind:tag` selects named tags.
  */
 export function parseReleaseQuery(query: string): ParsedReleaseQuery {
   const parsed: ParsedReleaseQuery = { filters: [], words: [], unknown: [] };
@@ -189,7 +208,7 @@ export function parseReleaseQuery(query: string): ParsedReleaseQuery {
       continue;
     }
     let value = filter[3].toLowerCase();
-    if (key === "release" && value === "unreleased") value = UNRELEASED;
+    if (key === "release") value = releaseName(value);
     parsed.filters.push({ key, value, negated: filter[1] === "-" });
   }
   return parsed;

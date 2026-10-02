@@ -20,6 +20,37 @@ export interface ReleaseNotesJob {
 const DEBOUNCE_SECONDS = 20;
 const LEASE_MS = 14 * 60_000;
 
+/** Lazily rebuild old derived data; the dirty mark coalesces concurrent reads. */
+export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void> {
+  if (!env.AI) return;
+  const claimed = await db(env.DB)
+    .insertInto("release_note_state")
+    .values({ repo_id: repoId, dirty: 1, status: "generating" })
+    .onConflict((oc) =>
+      oc
+        .column("repo_id")
+        .doUpdateSet({ dirty: 1, status: "generating" })
+        .where("format_version", "<", 1)
+        .where("dirty", "=", 0)
+        .where("lease_until", "<", Date.now())
+        .where("status", "!=", "failed"),
+    )
+    .returning("repo_id")
+    .executeTakeFirst();
+  if (!claimed) return;
+  try {
+    await env.JOBS.send({ type: "release-notes", repoId } satisfies ReleaseNotesJob, {
+      delaySeconds: DEBOUNCE_SECONDS,
+    });
+  } catch (error) {
+    await db(env.DB)
+      .updateTable("release_note_state")
+      .set({ dirty: 0, status: "idle" })
+      .where("repo_id", "=", repoId)
+      .execute();
+    throw error;
+  }
+}
 /** Something a repository's release notes depend on changed. */
 export async function notifyReleaseNotes(env: Env, repoId: string): Promise<void> {
   // Automatic non-AI agent environments omit provider bindings altogether.
@@ -118,6 +149,7 @@ export async function runReleaseNotesJob(
     .set({ lease_until: now + LEASE_MS, dirty: 0, status: "generating" })
     .where("repo_id", "=", repoId)
     .where("lease_until", "<", now)
+    .where((eb) => eb.or([eb("dirty", "=", 1), eb("format_version", "<", 1)]))
     .executeTakeFirst();
   // Another run holds it; that run sees the dirty mark and follows up.
   if (!leased.numUpdatedRows) return message.ack();
@@ -135,7 +167,33 @@ export async function runReleaseNotesJob(
     }
     const state = await d
       .updateTable("release_note_state")
-      .set({ lease_until: 0, status: "ready", error: null, generated_at: new Date().toISOString() })
+      .set((eb) => ({
+        lease_until: 0,
+        status: eb
+          .case()
+          .when("dirty", "=", 1)
+          .then("generating" as const)
+          .else(again ? ("generating" as const) : ("ready" as const))
+          .end(),
+        format_version: again
+          ? eb.ref("format_version")
+          : eb.case().when("dirty", "=", 0).then(1).else(eb.ref("format_version")).end(),
+        dirty: eb
+          .case()
+          .when("dirty", "=", 1)
+          .then(1)
+          .else(again ? 1 : 0)
+          .end(),
+        error: null,
+        generated_at: again
+          ? eb.ref("generated_at")
+          : eb
+              .case()
+              .when("dirty", "=", 0)
+              .then(new Date().toISOString())
+              .else(eb.ref("generated_at"))
+              .end(),
+      }))
       .where("repo_id", "=", repoId)
       .returning("dirty")
       .executeTakeFirst();

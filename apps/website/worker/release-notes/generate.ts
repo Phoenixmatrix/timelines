@@ -1,15 +1,15 @@
 // Release notes (CORE-29): turn each release's commits and the tracker
 // issues they cite into stored entries, plus a short introduction per
 // release. Entries whose inputs are unchanged are reused, wherever in the
-// repository they were written, so a push only pays for what is new and a
-// tag push freezes unreleased entries without another model call.
+// repository they were written, so a push only pays for what is new and
+// tag snapshots can reuse entries without another model call.
 
 import type {
   LinkedIssue,
   ReleaseCategory,
   ReleaseNoteChange,
 } from "../../shared/release-notes.ts";
-import { UNRELEASED } from "../../shared/release-notes.ts";
+import { DAILY_RELEASE_PREFIX } from "../../shared/release-notes.ts";
 import type { RepoRefs } from "../artifacts.ts";
 import { chatJson, chatText } from "../knowledge/models.ts";
 import { batch, db } from "../schema.ts";
@@ -17,7 +17,7 @@ import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
 
 /** Bump when prompts change, so entries are rewritten. */
-const PROMPT_VERSION = 1;
+const PROMPT_VERSION = 2;
 /** Tags with notes kept current; older releases keep what they have. */
 export const MAX_TAGS = 10;
 /** Model calls per run; the rest continue in a follow-up run. */
@@ -79,7 +79,7 @@ function issueInputs(issue: LinkedIssue) {
 }
 
 export const ENTRY_SYSTEM = `You write one entry of a software project's release notes.
-You get a tracker issue (when there is one), the commits that shipped it and
+You get a tracker issue (when there is one), commits that reference it and
 the code changes they made. Reply with JSON only:
 {"category": "feature" | "fix" | "improvement" | "internal",
  "title": "<at most 80 characters, plain words a user of the project would recognize>",
@@ -88,12 +88,14 @@ Use "fix" for corrected defects, "feature" for new capabilities, "improvement"
 for better existing behavior, "internal" for chores, refactors, tests, docs and
 tooling with no user-visible effect. Describe the change itself; never mention
 commit hashes, issue keys, agents or the people involved. Do not invent details
-the inputs do not support.`;
+the inputs do not support. Commits describe code updates, not proof that anything
+was deployed, released to users, or is live. Tracker completion is evidence only.`;
 
-export const INTRO_SYSTEM = `You write the short introduction to a release of a
-software project, from its release-note entries. Two to four sentences of plain
-prose: the main themes and the most important changes, most significant first.
-No headings, lists, issue keys or commit hashes. Do not invent details.`;
+export const INTRO_SYSTEM = `You summarize a software project's code-update history
+from its entries. Two to four sentences of plain prose: the main themes and the
+most important changes, most significant first. No headings, lists, issue keys
+or commit hashes. Do not invent details or claim changes are deployed, live,
+or released to users: commits and tags alone do not establish that.`;
 
 function entryPrompt(draft: Draft, changes: ReleaseNoteChange[]): string {
   const parts: string[] = [];
@@ -145,10 +147,14 @@ async function write(env: Env, source: GeneratorSource, draft: Draft): Promise<W
   };
 }
 
-/** Each release's range: the newest tags, then the default branch's unreleased work. */
-async function ranges(source: GeneratorSource, refs: RepoRefs) {
+/** Daily default-branch digests plus the newest named tag snapshots. */
+async function ranges(
+  source: GeneratorSource,
+  refs: RepoRefs,
+  stored: { release: string; format_version: number; to_oid: string }[],
+) {
   const tagged = new Map<string, string>();
-  // Tags sort newest first; a commit with several tags is released once, as the newest.
+  // Tags sort newest first; several names on one commit share the newest snapshot.
   for (const tag of refs.tags) if (!tagged.has(tag.oid)) tagged.set(tag.oid, tag.shortName);
   const isTagged = (oid: string) => tagged.has(oid);
   const result: {
@@ -159,14 +165,39 @@ async function ranges(source: GeneratorSource, refs: RepoRefs) {
     truncated: boolean;
   }[] = [];
   if (refs.head) {
-    const walk = await walkRange(source, refs.head, isTagged);
-    result.push({ release: UNRELEASED, toOid: refs.head, ...walk });
+    const walk = await walkRange(source, refs.head, () => false);
+    const days = new Map<string, (typeof result)[number]>();
+    for (const commit of walk.commits) {
+      const release = `${DAILY_RELEASE_PREFIX}${iso(commit.committedAt).slice(0, 10)}`;
+      let day = days.get(release);
+      if (!day) {
+        day = { release, toOid: commit.hash, commits: [], base: null, truncated: walk.truncated };
+        days.set(release, day);
+      }
+      day.commits.push(commit);
+    }
+    result.push(...[...days.values()].sort((a, b) => b.release.localeCompare(a.release)));
   }
-  for (const [oid, tag] of [...tagged].slice(0, MAX_TAGS)) {
+  const byName = new Map(stored.map((row) => [row.release, row]));
+  const legacy = refs.tags.filter((tag) => byName.get(tag.shortName)?.format_version === 0);
+  const newest = [...tagged].slice(0, MAX_TAGS).map(([oid, shortName]) => ({ oid, shortName }));
+  // Upgrade only previously materialized historical tags, never all historical tags.
+  // Completed batches drop out on the next pass. One final normal pass refreshes
+  // the newest window in case tracker inputs changed during the upgrade.
+  const pending = legacy.length
+    ? refs.tags.filter((tag) => {
+        const old = byName.get(tag.shortName);
+        return (
+          old?.format_version === 0 ||
+          (newest.some((t) => t.shortName === tag.shortName) && (!old || old.to_oid !== tag.oid))
+        );
+      })
+    : newest;
+  for (const { oid, shortName } of pending.slice(0, MAX_TAGS)) {
     const walk = await walkRange(source, oid, isTagged, { includeStart: true });
-    result.push({ release: tag, toOid: oid, ...walk });
+    if (walk.commits.length) result.push({ release: shortName, toOid: oid, ...walk });
   }
-  return { result, tagged };
+  return { result, tagged, upgrading: legacy.length > 0 };
 }
 
 export async function generateReleaseNotes(
@@ -177,7 +208,12 @@ export async function generateReleaseNotes(
 ): Promise<GenerateResult> {
   const d = db(env.DB);
   const refs = await source.refs();
-  const { result: releases, tagged } = await ranges(source, refs);
+  const stored = await d
+    .selectFrom("release_notes")
+    .select(["release", "format_version", "to_oid"])
+    .where("repo_id", "=", repoId)
+    .execute();
+  const { result: releases, tagged, upgrading } = await ranges(source, refs, stored);
 
   // Every key any release cites, resolved once.
   const keys = [
@@ -256,16 +292,16 @@ export async function generateReleaseNotes(
   }
 
   let modelCalls = 0;
-  let more = false;
+  let more = upgrading;
   const stamp = now();
   for (const release of releases) {
-    const head = release.commits[0];
-    const releasedAt = head ? iso(head.authoredAt) : stamp;
+    const releasedAt = iso(Math.max(...release.commits.map((c) => c.committedAt)));
     await d
       .insertInto("release_notes")
       .values({
         repo_id: repoId,
         release: release.release,
+        format_version: 0,
         to_oid: release.toOid,
         from_tag: release.base ? (tagged.get(release.base) ?? null) : null,
         from_oid: release.base,
@@ -301,7 +337,7 @@ export async function generateReleaseNotes(
         reusable.set(draft.inputsHash, written);
       }
       const issue = draft.issue;
-      const newest = draft.commits[0]!;
+      const lastCommitAt = iso(Math.max(...draft.commits.map((c) => c.committedAt)));
       const values = {
         kind: draft.kind,
         category: written.category,
@@ -317,7 +353,7 @@ export async function generateReleaseNotes(
         workspace_ids: JSON.stringify(issue?.workspaceIds ?? []),
         commits: JSON.stringify(draft.commits.map((c) => c.hash)),
         changes: JSON.stringify(written.changes),
-        shipped_at: issue?.completedAt ?? iso(newest.authoredAt),
+        shipped_at: lastCommitAt,
         model: written.model,
         inputs_hash: draft.inputsHash,
         updated_at: stamp,
@@ -363,7 +399,15 @@ export async function generateReleaseNotes(
       .where("repo_id", "=", repoId)
       .where("release", "=", release.release)
       .executeTakeFirstOrThrow();
-    if (current.intro_inputs_hash === introHash) continue;
+    if (current.intro_inputs_hash === introHash) {
+      await d
+        .updateTable("release_notes")
+        .set({ format_version: 1 })
+        .where("repo_id", "=", repoId)
+        .where("release", "=", release.release)
+        .execute();
+      continue;
+    }
     let intro = "";
     let introModel: string | null = null;
     if (shown.length) {
@@ -382,6 +426,7 @@ export async function generateReleaseNotes(
     await d
       .updateTable("release_notes")
       .set({
+        format_version: 1,
         intro,
         intro_model: introModel,
         intro_inputs_hash: introHash,
@@ -397,7 +442,10 @@ export async function generateReleaseNotes(
   }
 
   // Tags that no longer exist lose their notes; older tags beyond the window keep theirs.
-  const live = new Set([UNRELEASED, ...refs.tags.map((tag) => tag.shortName)]);
+  const live = new Set([
+    ...releases.map((r) => r.release),
+    ...refs.tags.map((tag) => tag.shortName),
+  ]);
   const existing = await d
     .selectFrom("release_notes")
     .select("release")

@@ -40,6 +40,8 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
 - GET /search?q=&kinds= — entities + code passages. GET /graph?kind=&q=&limit=, /graph/node?id= — nodes and their links.
 - GET /wiki — table of contents. GET /wiki/page?slug= — a page.
 - GET /repos/:o/:n/release-notes/range?from=&to= — release notes between two refs.
+- GET /repos/:o/:n/release-notes — daily UTC committer-date code updates and optional tag snapshots. GET /repos/:o/:n/release-notes/release?name=day:YYYY-MM-DD (or a tag) — entries and introduction. Commits and tags are not deployment evidence.
+- GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects named snapshots. Filters include kind, team, repo, ws, type, label, release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
 
 ## CI (/repos/:o/:n/ci)
 - GET /ci — runs. POST /ci/runs {ref?, commit?} — start a run. GET /ci/runs/:number — jobs and steps.

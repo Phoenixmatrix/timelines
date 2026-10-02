@@ -1,11 +1,10 @@
-// A tracker account's release feed (CORE-39): everything its teams shipped,
-// and everything shipped in its repositories, across repositories and
-// releases, filtered by facets. A team's notes are the feed with `team:KEY`.
+// A tracker account's code-update feed, filtered by facets.
 
 import {
   parseReleaseQuery,
   parseReleaseWhen,
-  UNRELEASED,
+  DAILY_RELEASE_PREFIX,
+  releaseLabel,
   type ParsedReleaseQuery,
   type ReleaseFeed,
   type ReleaseFeedEntry,
@@ -15,6 +14,7 @@ import { findAccountBySlug, visibleRepos, type Actor } from "../db.ts";
 import { db } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { toEntry, viewerTrackers, type EntryRow, type ViewerTrackers } from "./read.ts";
+import { ensureReleaseNotes } from "./queue.ts";
 
 export interface FeedRow extends EntryRow {
   repo_owner: string;
@@ -48,11 +48,15 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     return false;
   });
 
+  const includeTags = query.filters.some(
+    (f) => f.key === "kind" || (f.key === "release" && !f.negated),
+  );
   const shipped: ReleaseFeedEntry[] = [];
   for (const row of rows) {
     if (!context.visibleRepoIds.has(row.repo_id)) continue;
     const entry = toEntry(row, context.trackers);
     if (!entry) continue;
+    if (!includeTags && entry.releaseKind !== "daily") continue;
     const repo = `${row.repo_owner}/${row.repo_name}`.toLowerCase();
     const slugs = entry.workspaceIds.flatMap((id) => context.workspaces.get(id) ?? []);
     const text = `${entry.title}\n${entry.summary}\n${entry.issue?.key ?? ""}`.toLowerCase();
@@ -68,6 +72,8 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
           return entry.category === value;
         case "label":
           return entry.labels.some((label) => label.toLowerCase() === value);
+        case "kind":
+          return entry.releaseKind === value;
         case "release":
           return entry.release.toLowerCase() === value;
         default:
@@ -77,13 +83,15 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     if (facetFilters.some((f) => matches(f.key, f.value) === f.negated)) continue;
     if (
       bounds.some(
-        (b) => (b.key === "since" ? entry.shippedAt >= b.at : entry.shippedAt < b.at) === b.negated,
+        (b) =>
+          (b.key === "since" ? entry.lastCommitAt >= b.at : entry.lastCommitAt < b.at) ===
+          b.negated,
       )
     )
       continue;
     if (query.words.some((w) => text.includes(w.text) === w.negated)) continue;
 
-    // Entries in different releases come from different commits: each is its own shipment.
+    // Explicit named snapshots remain distinct; the default feed contains only days.
     shipped.push({
       ...entry,
       repos: [{ owner: row.repo_owner, name: row.repo_name, releases: [entry.release] }],
@@ -91,7 +99,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
   }
 
   const all = shipped.sort(
-    (a, b) => b.shippedAt.localeCompare(a.shippedAt) || a.title.localeCompare(b.title),
+    (a, b) => b.lastCommitAt.localeCompare(a.lastCommitAt) || a.title.localeCompare(b.title),
   );
   const facet = (pick: (entry: ReleaseFeedEntry) => [string, string][]): ReleaseFeedFacet[] => {
     const counts = new Map<string, ReleaseFeedFacet>();
@@ -122,10 +130,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
       labels: facet((e) => e.labels.map((l) => [l.toLowerCase(), l] as [string, string])),
       releases: facet((e) =>
         e.repos.flatMap((r) =>
-          r.releases.map(
-            (name) =>
-              [name.toLowerCase(), name === UNRELEASED ? "Unreleased" : name] as [string, string],
-          ),
+          r.releases.map((name) => [name.toLowerCase(), releaseLabel(name)] as [string, string]),
         ),
       ),
     },
@@ -156,36 +161,70 @@ export async function releaseFeed(
 
   const query = parseReleaseQuery(q);
   const d = db(env.DB);
+  const repos = await visibleRepos(env.DB, actor);
+  const visibleRepoIds = new Set(repos.map((repo) => repo.id));
+  const candidates = await d
+    .selectFrom("repos")
+    .select("id")
+    .where((eb) =>
+      eb.or([
+        eb("owner_id", "=", owner.id),
+        eb(
+          "id",
+          "in",
+          eb
+            .selectFrom("tracker_repo_subscriptions")
+            .select("repo_id")
+            .where("tracker_owner_id", "=", owner.id),
+        ),
+      ]),
+    )
+    .execute();
+  for (const repo of candidates)
+    if (visibleRepoIds.has(repo.id)) await ensureReleaseNotes(env, repo.id);
   // Narrow in SQL by the cheap facets; the rest are applied with access rules.
   let select = d
     .selectFrom("release_note_entries as e")
     .innerJoin("repos as r", "r.id", "e.repo_id")
     .innerJoin("accounts as a", "a.id", "r.owner_id")
+    .innerJoin("release_note_state as s", "s.repo_id", "e.repo_id")
+    .where("s.format_version", "=", 1)
+    .innerJoin("release_notes as n", (join) =>
+      join.onRef("n.repo_id", "=", "e.repo_id").onRef("n.release", "=", "e.release"),
+    )
+    .where("n.format_version", "=", 1)
     .selectAll("e")
     .select(["a.slug as repo_owner", "r.name as repo_name"])
     .where((eb) =>
       eb.or([eb("e.tracker_owner_id", "=", owner.id), eb("r.owner_id", "=", owner.id)]),
     );
+  if (!query.filters.some((f) => f.key === "kind" || (f.key === "release" && !f.negated)))
+    select = select.where("e.release", "like", `${DAILY_RELEASE_PREFIX}%`);
   for (const filter of query.filters) {
+    if (filter.key === "kind" && (filter.value === "daily" || filter.value === "tag")) {
+      const daily = (filter.value === "daily") !== filter.negated;
+      select = select.where("e.release", daily ? "like" : "not like", `${DAILY_RELEASE_PREFIX}%`);
+    }
     if (filter.negated) continue;
     if (filter.key === "type")
       select = select.where("e.category", "=", filter.value as EntryRow["category"]);
     if (filter.key === "team") select = select.where("e.team_key", "=", filter.value.toUpperCase());
   }
-  const [rows, repos, workspaces] = await Promise.all([
+  const [rows, workspaces] = await Promise.all([
     select.orderBy("e.shipped_at", "desc").limit(SCAN_LIMIT).execute(),
-    visibleRepos(env.DB, actor),
     trackerObject(env, owner.id).workspaceSlugs(),
   ]);
+  const feed = buildFeed(rows, {
+    trackers,
+    visibleRepoIds,
+    workspaces: new Map(workspaces.ok ? workspaces.value.map((w) => [w.id, w.slug]) : []),
+    query,
+    now: Date.now(),
+    limit: FEED_LIMIT,
+  });
   return {
     owner: { slug: owner.slug, displayName: owner.display_name },
-    ...buildFeed(rows, {
-      trackers,
-      visibleRepoIds: new Set(repos.map((repo) => repo.id)),
-      workspaces: new Map(workspaces.ok ? workspaces.value.map((w) => [w.id, w.slug]) : []),
-      query,
-      now: Date.now(),
-      limit: FEED_LIMIT,
-    }),
+    ...feed,
+    truncated: feed.truncated || rows.length === SCAN_LIMIT,
   };
 }

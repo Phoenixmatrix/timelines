@@ -210,13 +210,16 @@ checkouts; concurrent jobs lease separate slots. Tests still run every time.
 ### AI capability verification
 
 Real AI checks are **not automatic CI requirements**. For changes to knowledge
-builds, graph extraction, generated wiki, embeddings or AI Search, follow the
+builds, graph extraction, generated wiki, embeddings, AI Search or AI-written
+release notes, follow the
 [AI verification skill](.agents/skills/gitmatrix-ai-verification/SKILL.md) and run
 `vp run agent test-ai`. It provisions its own paid resources and verifies the exact
 pushed commit, named graph relationships, generated wiki provenance/content, and
-matching Vectorize entities plus AI Search source passages. Assertions check source
-facts, not exact generated wording. Missing providers or an expired visibility
-deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
+matching Vectorize entities plus AI Search source passages. It also verifies
+daily release-note rollover by UTC committer date, retained commit provenance,
+optional named tags and non-duplicated daily tracker feeds. Assertions check
+source facts, not exact generated wording. Missing providers or an expired
+visibility deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
 
 Build completion acknowledges uploads, not search visibility. The AI gate keeps
 at most six retrieval calls, with increasing waits totaling up to five minutes,

@@ -537,13 +537,17 @@ execution loop is not included.
 
 ## Release notes
 
-Release notes (CORE-29) start from what a release contains: its commits and the
-tracker issues they mention. `GET /api/repos/:owner/:name/release-notes/range`
-returns both (`shared/release-notes.ts`). Without parameters the range is the
-default branch's unreleased work, back to the nearest tagged commit; `?to=<tag>`
-covers that tag's release, including its own commit; `?from=<ref>` sets the
-base explicitly. Ranges follow first-parent history and stop at 1,000 commits
-with `truncated: true`.
+Release notes are code-update history, not deployment records. The default view
+groups the default branch's first-parent commits into **daily UTC digests**, using
+Git committer timestamps. Neither authored dates nor tracker completion dates
+decide which day a change belongs to. Tags remain optional named checkpoints;
+successful CI alone is not treated as proof of deployment.
+
+`GET /api/repos/:owner/:name/release-notes/range` still provides explicit Git
+ranges and the tracker issues their commits mention (`shared/release-notes.ts`).
+Without parameters it walks the default branch back to the nearest tagged commit;
+`?to=<tag>` includes that tag's own commit, and `?from=<ref>` sets the base explicitly.
+Ranges follow first-parent history and stop at 1,000 commits with `truncated: true`.
 
 Issue keys (`TEAM-N`, e.g. `(CORE-13)` or `CORE-15:`) are parsed from commit
 messages and resolved only through trackers that subscribe a workspace to the
@@ -553,16 +557,25 @@ unsubscribed trackers get the commits without issues. Key-shaped words such as
 (when it last became done) and evidence. The tracker also answers which issues
 were completed in a time window, for team and organization views.
 
-**Generated entries** (`worker/release-notes/generate.ts`, migration 0017) are
-stored per release: `@unreleased` plus the ten newest tags. An entry is a
-tracker issue with the release's commits that cite it, or a commit that cites
-none. The `fast` model writes its category (feature, fix, improvement or
-internal), title and summary from the issue, its evidence, the commits and their
-semantic code changes; the `reason` model writes each release's introduction from
-its non-internal entries. Entries record their sources, model and an inputs hash.
-Anything already written from identical inputs is reused anywhere in the
-repository, so reruns are free, a push pays only for new work and tagging the
-head moves unreleased entries into the tag without new entry calls.
+**Generated entries** (`worker/release-notes/generate.ts`) belong to a daily digest
+(`@day:YYYY-MM-DD`) or a named tag snapshot. Colons cannot occur in Git tag names,
+so the identifiers cannot collide. Daily digests cover the newest 1,000
+default-branch first-parent commits, including tagged commits; empty days are not
+stored. Commit dates need not follow ancestry order, so a day is a set of commits,
+not a contiguous Git range. Digests outside the bounded walk drop out; truncation
+is reported. Named snapshots retain the normal ten-tag regeneration window, and
+previously generated older tags remain readable while those tags still exist.
+
+An entry groups an issue's cited commits within that day or tag, or describes a
+commit citing no resolved issue. The `fast` model writes its category (feature,
+fix, improvement or internal), title and summary from the issue, evidence, commits
+and semantic code changes; the `reason` model writes an introduction from the
+non-internal entries. Prompts describe code changes without claiming deployment.
+Entries retain their sources, model and inputs hash. Identical inputs reuse
+existing output across days and tags; new or changed groups require generation.
+Both summary and entry APIs expose `lastCommitAt`, the latest Git committer
+timestamp in that group. Summary `kind` and entry `releaseKind` distinguish
+`daily` from `tag`; tracker completion remains source evidence only.
 
 Work runs on the `gitmatrix-jobs` queue: pushes, tracker changes to cited issues
 and subscription changes mark the repository dirty and enqueue it after 20
@@ -574,12 +587,26 @@ whose issues shaped it, so readers without access to them can be shown entries
 without it. Without AI bindings (automatic non-AI test environments) nothing is
 scheduled.
 
+**Stored-data upgrade** (migration 0020): repository and per-release format
+versions keep legacy materialization hidden until it has been regenerated.
+Reading a repository's index/detail or a related, accessible tracker feed
+coalesces a lazy rebuild, including repositories with no new push after upgrade.
+Previously stored older tags upgrade in batches of at most ten tag groups per
+pass, within the same model-call budget; untouched historical tags are not
+backfilled. Continuations finish the upgrade before publishing the new format.
+Afterward, ordinary incremental updates preserve readable current-format
+history while generation continues. Failed generation remains visible as a
+failure and uses the existing queue retry path.
+
 **Reading** (`worker/release-notes/read.ts`): the repository's **Releases** tab
-lists unreleased work and tags with entry counts, and shows one release's
-introduction and entries grouped as New, Fixed, Improved and (collapsed)
-Internal, each linking to its issue and commits, with the models that wrote them.
-`gm release list` and `gm release notes` are the CLI equivalents. Entries about
-issues from trackers the viewer can't read are omitted, and an introduction is
+separates daily updates from tags and defaults to the newest day with visible
+entries (or the newest day if none has entries; tags are the fallback when no days
+exist). It shows the selected group's introduction and entries as New, Fixed,
+Improved and collapsed Internal, linking to issues and commits with model
+provenance. Daily groups explicitly identify UTC commit dates, not Git ranges.
+The page refreshes while generating. `gm release list` and `gm release notes`
+are the CLI equivalents; `gm release notes day:2026-10-02` selects a UTC day.
+Entries about issues from trackers the viewer can't read are omitted, and an introduction is
 shown only to viewers who can read every tracker that shaped it.
 
 | Route                                                       | Contract                                   |
@@ -591,16 +618,24 @@ shown only to viewers who can read every tracker that shaped it.
 
 **Team and organization views** (`worker/release-notes/feed.ts`): a tracker
 account's **Release notes** page (`/tracker/:owner/releases`, linked from the
-tracker header) lists everything its teams shipped and everything shipped in its
-repositories, newest first and grouped by week; an issue appears once per release
-it shipped in. A team's notes are the same view with `team:KEY` (the Teams
-facet). The query language follows the tracker's: `team:`, `repo:` (name or
-owner/name), `ws:`, `type:` (feature, fix, improvement, internal), `label:`,
-`release:` (a tag or `unreleased`), `since:`/`until:` (a date or `30d`, `2w`,
-`12h`), search words, and `-` to exclude; unknown tokens are reported back.
+tracker header) defaults to daily changes in its repositories and changes citing
+its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Named
+tags do not duplicate entries in the default feed. An explicit `kind:tag` or
+positive `release:` filter selects named snapshots when requested; `kind:daily`
+selects daily history. An issue may have distinct updates on several days.
+A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
+`ws:`, `type:` (feature, fix, improvement, internal), `label:`,
+`release:` (a literal tag or `day:YYYY-MM-DD`), `since:`/`until:` (a date or `30d`,
+`2w`, `12h`), search words, and `-` to exclude; unknown tokens are reported back.
 Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
 `gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
+
+Real-provider coverage in `vp run agent test-ai` checks daily generation without
+tags, a second commit on a different UTC committer date despite unchanged
+authorship, retained earlier-day provenance, a named tag containing both changes,
+and daily/tag tracker feeds without duplicate default entries. This is separate
+from the non-AI readiness gate.
 
 ## Knowledge graph and wiki
 
