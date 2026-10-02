@@ -6,7 +6,7 @@ import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
-import { chromium, expect, type BrowserContext } from "@playwright/test";
+import { chromium, expect as playwrightExpect, type BrowserContext } from "@playwright/test";
 import type {
   CiLogs,
   CiRunDetail,
@@ -645,6 +645,9 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
   });
 
   await scenario("browser-personas-persisted-product-state", async () => {
+    // Hydration on the live dev server needs the same budget as page actions.
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
     const browser = await chromium.launch({ headless: true });
     const contexts: BrowserContext[] = [];
     try {
@@ -653,7 +656,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         contexts.push(context);
         await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
         const page = await context.newPage();
-        page.setDefaultTimeout(15_000);
+        page.setDefaultTimeout(browserTimeout);
         try {
           await page.goto("/signin");
           await page
