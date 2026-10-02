@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import {
+  DEFAULT_ATTEMPT_LIMIT,
   hasActiveClaim,
   isOpen,
   leasedAncestor,
@@ -8,6 +9,7 @@ import {
   type Changes,
   type Comment,
   type HumanRequest,
+  type IssueClaim,
   type EntityType,
   type Issue,
   type Link,
@@ -610,6 +612,55 @@ export class TrackerStore {
         issue.updatedAt = now;
         emit("issue", issue.id, issue, "issue.update");
       };
+      /**
+       * A claim released without completion. At the team's limit, the issue asks the
+       * claim's accountable person what the next attempt should do differently, and
+       * waits (out of ready) until someone answers.
+       */
+      const failedAttempt = (issue: Issue, released: IssueClaim) => {
+        issue.attempts = (issue.attempts ?? 0) + 1;
+        const limit = this.get<Team>("team", issue.teamId).attemptLimit ?? DEFAULT_ATTEMPT_LIMIT;
+        const requests = this.all<HumanRequest>("request");
+        if (
+          !limit ||
+          issue.attempts < limit ||
+          requests.some((r) => r.issueId === issue.id && r.status === "open" && r.escalation)
+        )
+          return;
+        const checkpoints = this.all<Comment>("comment")
+          .filter((c) => c.issueId === issue.id && c.kind === "checkpoint")
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .slice(0, 3);
+        const quoted = checkpoints.map((c) => `> ${c.body.split("\n").join("\n> ")}`).join("\n\n");
+        const human = released.accountableId ?? access.principalId;
+        const requestId = crypto.randomUUID();
+        emit(
+          "request",
+          requestId,
+          {
+            id: requestId,
+            issueId: issue.id,
+            kind: "question",
+            prompt:
+              `Agents have released ${issue.key} ${issue.attempts} times without finishing it. ` +
+              `What should the next attempt do differently?` +
+              (quoted ? `\n\nLatest checkpoints:\n\n${quoted}` : ""),
+            choices: [],
+            secret: null,
+            status: "open",
+            askedBy: access.actorId,
+            routeTo: access.members.some((m) => m.id === human) ? human : access.principalId,
+            answer: null,
+            answeredBy: null,
+            answeredAt: null,
+            createdAt: now,
+            escalation: true,
+          },
+          "request.open",
+        );
+        issue.waiting =
+          requests.filter((r) => r.issueId === issue.id && r.status === "open").length + 1;
+      };
       const childrenClosed = (issue: Issue) => {
         const open = (graph().children.get(issue.id) ?? []).filter(isOpen);
         if (open.length)
@@ -752,7 +803,7 @@ export class TrackerStore {
             keys(
               data,
               type === "team"
-                ? ["name", "description", "memberIds", "archived"]
+                ? ["name", "description", "memberIds", "archived", "attemptLimit"]
                 : ["name", "description", "archived"],
             );
             const entity = this.get<Team | Workspace>(type, entityId);
@@ -764,6 +815,15 @@ export class TrackerStore {
               if (typeof data.archived !== "boolean")
                 fail("invalid_input", "archived must be boolean.");
               entity.archived = data.archived;
+            }
+            if ("attemptLimit" in data && "memberIds" in entity) {
+              if (
+                !Number.isInteger(data.attemptLimit) ||
+                Number(data.attemptLimit) < 0 ||
+                Number(data.attemptLimit) > 20
+              )
+                fail("invalid_input", "attemptLimit must be 0 (never ask) to 20.");
+              entity.attemptLimit = Number(data.attemptLimit);
             }
             if ("memberIds" in data && "memberIds" in entity) {
               const memberIds = strings(data.memberIds, "memberIds");
@@ -1113,6 +1173,8 @@ export class TrackerStore {
               request.status = "answered";
               request.answeredBy = access.actorId;
               request.answeredAt = now;
+              // The person said what to try next: the attempts start over.
+              if (request.escalation) issue.attempts = 0;
             }
             emit("request", entityId, request, mutation.kind);
             settle(issue);
@@ -1350,10 +1412,12 @@ export class TrackerStore {
                   "comment.add",
                 );
               }
+              const released = issue.claim!;
               issue.status = kind === "issue.complete" ? "done" : "todo";
               issue.claim = null;
               run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
               dropOffer(issue);
+              if (kind === "issue.release") failedAttempt(issue, released);
             }
             issue.version++;
             issue.updatedAt = now;

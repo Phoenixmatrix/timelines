@@ -356,6 +356,12 @@ export function IssueDetail({
           <dd className="m-0 min-w-0">{typeLabel(issue.type)}</dd>
           <dt className="text-ink-faint">Priority</dt>
           <dd className="m-0 min-w-0">P{issue.priority}</dd>
+          {(issue.attempts ?? 0) > 0 && (
+            <>
+              <dt className="text-ink-faint">Attempts</dt>
+              <dd className="m-0 min-w-0">{issue.attempts} released unfinished</dd>
+            </>
+          )}
           <dt className="text-ink-faint">Assignee</dt>
           <dd className="m-0 min-w-0">
             {issue.assigneeId ? actorName(snapshot, issue.assigneeId) : "Unassigned"}

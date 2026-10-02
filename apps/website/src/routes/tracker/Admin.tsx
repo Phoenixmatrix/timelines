@@ -2,7 +2,12 @@ import { useState } from "react";
 import { CaretRightIcon } from "@phosphor-icons/react";
 import { Link } from "react-router";
 import type { RepoSummary } from "../../../shared/api.ts";
-import type { Snapshot, Team, Workspace } from "../../../shared/tracker.ts";
+import {
+  DEFAULT_ATTEMPT_LIMIT,
+  type Snapshot,
+  type Team,
+  type Workspace,
+} from "../../../shared/tracker.ts";
 import { FormError, link, SelectField, TextField } from "../../components/ui.tsx";
 import type { Mutate } from "./IssueDetail.tsx";
 import { Field, MultiCheck } from "./ui.tsx";
@@ -45,6 +50,7 @@ function TeamForm({
   const [members, setMembers] = useState(team?.memberIds ?? []);
   const [version, setVersion] = useState(team?.version);
   const [membership, setMembership] = useState(team?.memberIds.length ? "specific" : "everyone");
+  const [attemptLimit, setAttemptLimit] = useState(team?.attemptLimit ?? DEFAULT_ATTEMPT_LIMIT);
   const [saved, setSaved] = useState("");
   const [error, setError] = useState("");
   return (
@@ -68,7 +74,7 @@ function TeamForm({
                 kind: "team.update",
                 id: team.id,
                 expectedVersion: version!,
-                data: { name, description, memberIds },
+                data: { name, description, memberIds, attemptLimit },
               }
             : {
                 kind: "team.create",
@@ -119,6 +125,17 @@ function TeamForm({
         value={description}
         onChange={(event) => setDescription(event.target.value)}
       />
+      {team && (
+        <TextField
+          label="Ask a person after"
+          type="number"
+          min={0}
+          max={20}
+          value={attemptLimit}
+          onChange={(event) => setAttemptLimit(Number(event.target.value))}
+          hint="Failed attempts (agents releasing work unfinished) before the issue asks its accountable person what to do differently. 0 never asks."
+        />
+      )}
       <Field label="Team membership">
         <SelectField
           ariaLabel="Team membership"

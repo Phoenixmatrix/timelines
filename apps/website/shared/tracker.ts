@@ -35,7 +35,15 @@ export interface Team extends TrackerEntity {
   description: string;
   memberIds: string[];
   archived: boolean;
+  /**
+   * Releases without completion before an issue asks its accountable person what
+   * to do differently (default 3; 0 never asks).
+   */
+  attemptLimit?: number;
 }
+
+/** Releases without completion before a team's issues escalate, unless it sets its own. */
+export const DEFAULT_ATTEMPT_LIMIT = 3;
 export interface Workspace extends TrackerEntity {
   slug: string;
   name: string;
@@ -76,6 +84,8 @@ export interface Issue extends TrackerEntity {
   claim: IssueClaim | null;
   /** Open requests to a person: while any is open the issue waits, whatever its status. */
   waiting?: number;
+  /** Claims released without completion since it was last escalated to a person. */
+  attempts?: number;
   /** A pending handoff of the lease: to whom (anyone with the code when null), and until when. */
   handoff?: { to: string | null; expiresAt: string } | null;
 }
@@ -105,6 +115,8 @@ export interface HumanRequest {
   answeredBy: string | null;
   answeredAt: string | null;
   createdAt: string;
+  /** Opened by the tracker after repeated failed attempts; answering resets the count. */
+  escalation?: boolean;
 }
 export interface Comment {
   id: string;
@@ -184,7 +196,7 @@ export type Mutation =
       kind: "team.update";
       id: string;
       expectedVersion: number;
-      data: Partial<Pick<Team, "name" | "description" | "memberIds" | "archived">>;
+      data: Partial<Pick<Team, "name" | "description" | "memberIds" | "archived" | "attemptLimit">>;
     }
   | {
       kind: "workspace.create";

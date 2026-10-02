@@ -1111,3 +1111,74 @@ describe("handoff", () => {
     );
   });
 });
+
+describe("escalating repeated failures", () => {
+  function attempts(limit?: number) {
+    const f = fixture();
+    if (limit !== undefined)
+      f.mutate({
+        kind: "team.update",
+        id: "team",
+        expectedVersion: 1,
+        data: { attemptLimit: limit },
+      });
+    f.issue("flaky");
+    const bot: Access = { ...f.access, actorId: "agt-bot" };
+    let n = 0;
+    const as = (access: Access, ...mutations: Mutation[]) =>
+      f.store.mutate(access, { operationId: `e-${++n}`, mutations });
+    const issue = () => f.store.snapshot(f.access).issues.find((i) => i.id === "flaky")!;
+    const open = () =>
+      f.store
+        .snapshot(f.access)
+        .requests.filter((r) => r.issueId === "flaky" && r.status === "open");
+    const fail = (note: string) => {
+      const token = String(
+        as(bot, { kind: "issue.claim", id: "flaky", data: { agent: "try" } }).results[0]!
+          .leaseToken,
+      );
+      as(bot, {
+        kind: "comment.add",
+        id: `c-${n}`,
+        data: { issueId: "flaky", body: note, kind: "checkpoint" },
+      });
+      as(bot, { kind: "issue.release", id: "flaky", data: { leaseToken: token } });
+    };
+    return { ...f, bot, as, issue, open, fail };
+  }
+
+  test("the third failed attempt asks the accountable person, with the latest checkpoints, and leaves ready", () => {
+    const e = attempts();
+    e.fail("Tried the cache");
+    e.fail("Tried a retry loop");
+    expect(e.issue().attempts).toBe(2);
+    expect(e.open()).toHaveLength(0);
+    e.fail("Tried a bigger timeout");
+    const [ask] = e.open();
+    expect(ask).toMatchObject({ kind: "question", routeTo: "alice", escalation: true });
+    expect(ask!.prompt).toContain("released ENG-1 3 times");
+    expect(ask!.prompt).toContain("> Tried a bigger timeout");
+    expect(e.issue().waiting).toBe(1);
+    expect(() =>
+      e.as(e.bot, { kind: "issue.claim", id: "flaky", data: { agent: "again" } }),
+    ).toThrow(/waiting on a person/);
+    expect(
+      e.as(e.bot, { kind: "issue.next", id: "pick", data: { agent: "walker" } }).results[0]!
+        .issueId,
+    ).toBeUndefined();
+    // The answer is the guidance, and the attempts start over.
+    e.mutate({ kind: "request.answer", id: ask!.id, data: { answer: "Mock the clock instead." } });
+    expect(e.issue()).toMatchObject({ attempts: 0, waiting: 0 });
+    e.as(e.bot, { kind: "issue.claim", id: "flaky", data: { agent: "again" } });
+  });
+
+  test("a team can ask sooner, or never", () => {
+    const soon = attempts(1);
+    soon.fail("Once");
+    expect(soon.open()).toHaveLength(1);
+    const never = attempts(0);
+    for (const note of ["1", "2", "3", "4"]) never.fail(note);
+    expect(never.issue().attempts).toBe(4);
+    expect(never.open()).toHaveLength(0);
+  });
+});
