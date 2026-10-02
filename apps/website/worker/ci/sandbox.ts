@@ -88,14 +88,21 @@ export class CiSandbox extends DurableObject<Env> {
     try {
       const say = (text: string) => report(this.env, jobId, { logs: [{ step: SETUP_STEP, text }] });
       await say(`Starting a ${spec.instance} sandbox (image ${spec.image})…\n`);
-      if (!container.running) {
-        container.start({
-          image: container.images[spec.image] ?? container.images.default!,
-          instance: spec.instance,
-          enableInternet: true,
-          env: BASE_ENV,
-        });
+      // A container already running belongs to an earlier attempt (a run in progress
+      // in this object would have been joined): after a deploy restarts the object,
+      // its processes may still be writing. Replace it rather than build on top.
+      if (container.running) {
+        await say("Replacing the sandbox an earlier attempt left running…\n");
+        await container.destroy().catch(() => {});
+        for (const until = Date.now() + 60_000; container.running && Date.now() < until;)
+          await new Promise((resolve) => setTimeout(resolve, 500));
       }
+      container.start({
+        image: container.images[spec.image] ?? container.images.default!,
+        instance: spec.instance,
+        enableInternet: true,
+        env: BASE_ENV,
+      });
       await this.#ready(container);
 
       await say(`Checking out ${payload.ref} at ${payload.commit.slice(0, 12)}…\n`);
