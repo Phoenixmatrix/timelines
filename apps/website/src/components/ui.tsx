@@ -9,7 +9,7 @@ import {
   GlobeSimpleIcon,
   LockSimpleIcon,
 } from "@phosphor-icons/react";
-import { useId, useState, type ReactElement, type ReactNode } from "react";
+import { useId, useMemo, useState, type ReactElement, type ReactNode } from "react";
 import type { RepoRole, Visibility } from "../../shared/api.ts";
 
 /** Links in running text: ink, with a signal-line underline that thickens on hover. */
@@ -74,8 +74,13 @@ export function VisibilityChip({ visibility }: { visibility: Visibility }) {
   );
 }
 
+/**
+ * The toast methods, stable across renders. Base UI's manager object changes
+ * with every toast, so an effect that depends on it and adds a toast loops.
+ */
 export function useToast() {
-  return Toast.useToastManager();
+  const { add, close, update, promise } = Toast.useToastManager();
+  return useMemo(() => ({ add, close, update, promise }), [add, close, update, promise]);
 }
 
 export function Toasts() {

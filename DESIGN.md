@@ -345,11 +345,12 @@ The kit's classes (`mk-btn`, `mk-input`, `mk-chip`, `mk-card`, `mk-popup`…) ar
 ### Buttons
 
 - **Shape:** gently rounded (8px), 40px tall, 16px side padding, Figtree semibold body size; 32px tall and body-small in the small size, which is the default inside panes and toolbars.
-- **Primary:** amber fill with signal-ink text. One per view (Clone, New repository, Create token, Save changes, the query bar's Run, the confirm inside a popover).
+- **Primary:** amber fill with signal-ink text. One per view (Clone, New repository, Create token, Save changes, the query bar's Run, the confirm inside a popover). On settings pages each card that saves on its own (General, Mirror) gets its own primary, so every save reads as one.
 - **Default:** raised fill with ink text, stepping to pressed on hover. Used for secondary actions (Check again, Tag, Deprecate, Feeds and proxies).
 - **Ghost:** transparent with muted text, raised fill on hover; for low-stakes actions (Keep it, Select all, clearing a range).
 - **Danger:** filled red only as the confirming button inside a destructive dialog. Elsewhere destructive actions are **danger-ghost**: red text, red wash on hover.
 - **Hover / Focus / Active:** 150ms color transitions; pressing nudges the button down 1px (not ghosts); focus shows the global 2px signal-line outline at 2px offset. Disabled drops to faint ink (primary falls back to the raised fill).
+- **Busy:** a button whose request is running stays lit (`aria-busy`, still disabled for clicks) and swaps its label for a spinning CircleNotch and a present-participle (Saving…, Adding…, Syncing…), so a slow save never looks like nothing happened.
 - **Icon-only:** square (40px, or 32px with a 6px radius when small), always wrapped in a tooltip and given an aria-label.
 
 ### Chips

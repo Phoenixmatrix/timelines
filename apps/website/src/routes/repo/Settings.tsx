@@ -1,4 +1,4 @@
-import { GlobeSimpleIcon, LockSimpleIcon, XIcon } from "@phosphor-icons/react";
+import { CircleNotchIcon, GlobeSimpleIcon, LockSimpleIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import {
   Form,
@@ -202,6 +202,18 @@ function Switch({
   );
 }
 
+/** A button label that shows a spinner and a present-tense label while its request runs. */
+function BusyLabel({ busy, idle, working }: { busy: boolean; idle: string; working: string }) {
+  return busy ? (
+    <>
+      <CircleNotchIcon weight="bold" className="size-4 animate-spin" aria-hidden />
+      {working}
+    </>
+  ) : (
+    idle
+  );
+}
+
 /** Every push here is pushed on to another git host: a one-way backup. */
 function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: string }) {
   const [mirror, setMirror] = useState(initial);
@@ -356,18 +368,24 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
               type="button"
               className="mk-btn"
               disabled={!!busy || !mirror.enabled}
+              aria-busy={busy === "sync"}
               onClick={() => void sync()}
             >
-              {busy === "sync" ? "Syncing…" : "Sync now"}
+              <BusyLabel busy={busy === "sync"} idle="Sync now" working="Syncing…" />
             </button>
           )}
           <button
             type="button"
-            className="mk-btn"
+            className="mk-btn mk-btn--primary"
             disabled={!!busy || !url.trim() || (!token && !mirror?.hasToken)}
+            aria-busy={busy === "save"}
             onClick={() => void save()}
           >
-            {mirror ? "Save mirror" : "Add mirror"}
+            <BusyLabel
+              busy={busy === "save"}
+              idle={mirror ? "Save mirror" : "Add mirror"}
+              working={mirror ? "Saving…" : "Adding…"}
+            />
           </button>
         </div>
       </div>
@@ -435,8 +453,8 @@ export function Settings() {
           </div>
           <div className="flex items-center justify-end gap-3">
             <FormError message={actionData?.error} />
-            <button className="mk-btn mk-btn--primary" disabled={saving}>
-              Save changes
+            <button className="mk-btn mk-btn--primary" disabled={saving} aria-busy={saving}>
+              <BusyLabel busy={saving} idle="Save changes" working="Saving…" />
             </button>
           </div>
         </Form>
