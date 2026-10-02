@@ -184,10 +184,16 @@ export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
     slug: actor.slug,
     displayName: actor.displayName,
   };
+  const { email } = (await db(d1)
+    .selectFrom("accounts")
+    .select("email")
+    .where("id", "=", actor.id)
+    .executeTakeFirst()) ?? { email: null };
   return {
     ...self,
     kind: "user",
     isSiteAdmin: actor.isSiteAdmin,
+    email,
     canCreateIn: [self, ...orgs.map(accountSummary)],
   };
 }

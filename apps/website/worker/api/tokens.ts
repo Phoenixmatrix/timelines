@@ -78,6 +78,30 @@ tokens.post("/", async (c) => {
   return c.json(await issueToken(c.env.DB, actor.id, name, body.scope), 201);
 });
 
+/**
+ * Device login for gm: after the device flow (POST /api/identity/device/token)
+ * the CLI holds a Better Auth session token. It trades it here, once, for a
+ * personal access token, which is what git and the API take.
+ */
+tokens.post("/device", async (c) => {
+  const secret = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+  const session = secret
+    ? await db(c.env.DB)
+        .selectFrom("auth_sessions")
+        .select(["id", "userId", "expiresAt"])
+        .where("token", "=", secret)
+        .executeTakeFirst()
+    : undefined;
+  if (!session || Date.parse(session.expiresAt) <= Date.now())
+    return fail(c, 401, "That device sign-in has expired. Run `gm auth login` again.");
+  const body = await readJson<{ name?: string }>(c).catch(() => ({ name: undefined }));
+  const name = (body.name?.trim() || "gm CLI").slice(0, 80);
+  const created = await issueToken(c.env.DB, session.userId, name, "write");
+  // The session only existed to make this exchange.
+  await db(c.env.DB).deleteFrom("auth_sessions").where("id", "=", session.id).execute();
+  return c.json(created, 201);
+});
+
 tokens.delete("/:id", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;

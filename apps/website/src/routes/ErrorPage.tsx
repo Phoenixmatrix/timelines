@@ -19,7 +19,7 @@ export function ErrorPage() {
           : "Something went wrong";
   const hint =
     status === 404 && !viewer
-      ? "It may be private. Choose a persona that can see it."
+      ? "It may be private. Sign in with an account that can see it."
       : status === 404
         ? `It doesn't exist, or ${viewer?.displayName ?? "you"} can't see it.`
         : status >= 500
@@ -39,7 +39,7 @@ export function ErrorPage() {
           Go home
         </Link>
         <Link to="/signin" className="mk-btn mk-btn--ghost no-underline">
-          Switch persona
+          {viewer ? "Switch account" : "Sign in"}
         </Link>
       </div>
     </div>

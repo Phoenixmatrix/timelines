@@ -41,12 +41,42 @@ patch makes local `cf d1` commands exit normally; do not terminate them early
 after merely seeing output.
 
 The canonical source host remains a separate, owner-managed environment:
-from this directory, `vp run db:migrate` and `vp dev` use port 5180 and
+from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port 5180 and
 `.wrangler/state`. Feature agents must not reuse that state or test mutations
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 
+## Sign-in
+
+People sign in with an emailed one-time code ([Better Auth](https://www.better-auth.com),
+`worker/better-auth.ts`, under `/api/identity`). Sign-up is **invite only**: a
+code is only sent to an existing user, the instance owner (`OWNER_EMAIL`,
+hello@fward.me) or an address a site admin invited at `/settings/invites`;
+anyone else gets the same "check your email" answer. Failed codes and device
+approvals count against the email and the IP through the `AUTH_FAILURES`
+rate-limit binding; past the limit the key is locked out for 15 minutes.
+
+- **Locally**, codes print in the dev server's log (the Email Service binding
+  only simulates delivery), and hello@fward.me is the seeded superuser `fward`,
+  reachable by email code or as a persona.
+- **Deployed**, the owner's first sign-in makes them a site admin and the owner
+  of the `matrixorg` organization (`OWNER_ORG`); the database starts with no
+  other data. Codes are sent from gitmatrix@mail.fward.dev. Mirror pushes are
+  attributed to the owner account, whoever configured the mirror.
+- **gm** signs in through the browser: `gm auth login` shows a code and a link
+  to `/device`, you approve it while signed in, and gm trades that one-time
+  session for a personal access token (`POST /api/tokens/device`).
+
+Deploying needs the `BETTER_AUTH_SECRET` and `REGISTRY_KEK` secrets. The Worker
+serves https://gitmatrix.fward.dev (override with `GITMATRIX_PUBLIC_URL` at deploy
+time), with production-only D1, Artifacts, Vectorize and AI Search resources so it
+never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
+
 ## Personas (dev sign-in)
+
+Development data (the personas below, Orbit Labs, the owner account) lives in
+`seed/`, applied by `vp run db:seed` and the agent harness as local-only
+migrations; deploys apply `migrations/` alone.
 
 Picking a persona in development sets a cookie holding the account id. Production
 rejects persona cookies and dev sign-in/token/seed endpoints; this mechanism is
@@ -59,6 +89,7 @@ for headless bootstrap. Always use a separate browser context for each environme
 | Marco      | Owner of the Orbit Labs org: admin on its repos                |
 | Jun        | Orbit member (read), plus write collaborator on `orbit/engine` |
 | Sam        | Read collaborator on `orbit/engine`; owns private `sam/notes`  |
+| Francois   | hello@fward.me: superuser, also signs in by email code         |
 | Signed out | Public repos, read only                                        |
 
 Roles add up: public → read, org member → the org's base role, collaborator →
@@ -120,7 +151,7 @@ gm ─ POST /api/auth/ssh/token {nonce, signature} ─▶ 1-hour session token (
   `git config --global credential.<server>.helper '!gm auth git-credential'`.
 
 ```bash
-gm auth login --persona priya   # (dev) any sign-in, to register a key
+gm auth login                   # in the browser (or --persona priya in dev), to register a key
 gm auth ssh-key add             # first key in your agent or ~/.ssh; --key to pick
 gm auth login --ssh             # from now on gm signs in with the key
 ```
@@ -153,7 +184,10 @@ never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 | `GET /api/repos/:owner/:name/semantic?ref=&cursor=&limit=&path=&kind=&language=`          | Individual syntax changes with source links and analysis coverage |
 | `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                             |
 | `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                       |
-| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie                                            |
+| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie; DELETE also ends an email sign-in         |
+| `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)              |
+| `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                    |
+| `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                         |
 
 ## Semantic changes
 
@@ -523,8 +557,8 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
 - **npm login** works both ways: an access token as the password, or
   `--auth-type=web`, which approves the login at `/cli-auth/npm/:id`.
 
-Deployed, set `GITMATRIX_PUBLIC_URL` (package indexes embed it) and the
-`REGISTRY_KEK` secret. Development uses a fixed public key. `pnpm run
+Deployed, package indexes embed https://gitmatrix.fward.dev (or
+`GITMATRIX_PUBLIC_URL`), and the `REGISTRY_KEK` secret seals keys. Development uses a fixed public key. `pnpm run
 db:migrate` applies both databases' migrations. Account slugs must not take
 the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
 `helm`, `apt`, `rpm`, `brew`, `generic`, `releases`) or `-`.

@@ -1,10 +1,12 @@
 import { Hono } from "hono";
 import { sql } from "kysely";
 import type { AccountPage, Persona, SessionResponse } from "../../shared/api.ts";
-import { endSession, startPersonaSession, type AppEnv } from "../auth.ts";
+import { endAllSessions, startPersonaSession, type AppEnv } from "../auth.ts";
 import { accountSummary, findAccountBySlug, findUserById, viewerFor, visibleRepos } from "../db.ts";
 import { db } from "../schema.ts";
-import { fail, readJson } from "./http.ts";
+import { createDb } from "../../registry/core/db.ts";
+import { slugProblem } from "../names.ts";
+import { fail, readJson, requireActor } from "./http.ts";
 
 export const accounts = new Hono<AppEnv>();
 
@@ -25,8 +27,8 @@ accounts.post("/session", async (c) => {
   return c.json(body);
 });
 
-accounts.delete("/session", (c) => {
-  endSession(c);
+accounts.delete("/session", async (c) => {
+  await endAllSessions(c);
   return c.body(null, 204);
 });
 
@@ -44,6 +46,60 @@ accounts.get("/personas", async (c) => {
     isSiteAdmin: row.is_site_admin === 1,
   }));
   return c.json({ personas });
+});
+
+/**
+ * Your own display name and username. The display name can always change.
+ * The username is the root of your URLs; it can change while you own no
+ * package feeds, whose keys and client URLs are built from it.
+ */
+accounts.patch("/account", async (c) => {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  const body = await readJson<{ displayName: string; slug: string }>(c);
+  const changes: { display_name?: string; slug?: string } = {};
+  if (body.displayName !== undefined) {
+    const name = body.displayName.trim();
+    if (!name || name.length > 80)
+      return fail(c, 400, "Give a display name of up to 80 characters.");
+    changes.display_name = name;
+  }
+  if (body.slug !== undefined && body.slug !== actor.slug) {
+    const slug = body.slug.trim().toLowerCase();
+    const problem = slugProblem(slug);
+    if (problem) return fail(c, 400, problem);
+    const taken = await db(c.env.DB)
+      .selectFrom("accounts")
+      .select("id")
+      .where("slug", "=", slug)
+      .where("id", "!=", actor.id)
+      .executeTakeFirst();
+    if (taken) return fail(c, 409, `"${slug}" is taken.`);
+    const feed = await createDb(c.env.REGISTRY_DB)
+      .selectFrom("repositories")
+      .select("key")
+      .where("owner_id", "=", actor.id)
+      .executeTakeFirst();
+    if (feed)
+      return fail(
+        c,
+        409,
+        "You own package feeds, and their addresses are built from your username, so it can't change yet.",
+      );
+    changes.slug = slug;
+  }
+  if (changes.display_name || changes.slug) {
+    await db(c.env.DB).updateTable("accounts").set(changes).where("id", "=", actor.id).execute();
+    if (changes.display_name)
+      await db(c.env.DB)
+        .updateTable("auth_users")
+        .set({ name: changes.display_name })
+        .where("id", "=", actor.id)
+        .execute();
+  }
+  const updated = await findUserById(c.env.DB, actor.id);
+  const response: SessionResponse = { viewer: updated ? await viewerFor(c.env.DB, updated) : null };
+  return c.json(response);
 });
 
 accounts.get("/users", async (c) => {

@@ -18,7 +18,35 @@ export interface Database {
     is_site_admin: Generated<number>;
     /** Orgs only: the role every member gets on every repo the org owns. */
     member_repo_role: "none" | "read" | "write" | null;
+    /** Users who sign in by email; null for orgs and seed personas. */
+    email: string | null;
     created_at: Generated<string>;
+  };
+  // Better Auth's tables (worker/better-auth.ts): only what Gitmatrix reads.
+  auth_users: {
+    id: string;
+    name: string;
+    email: string;
+    emailVerified: number;
+    createdAt: string;
+    updatedAt: string;
+  };
+  auth_sessions: {
+    id: string;
+    token: string;
+    userId: string;
+    expiresAt: string;
+    createdAt: string;
+    updatedAt: string;
+  };
+  auth_invites: {
+    email: string;
+    invited_by: string | null;
+    created_at: Generated<string>;
+  };
+  auth_lockouts: {
+    key: string;
+    until: string;
   };
   org_members: {
     org_id: string;

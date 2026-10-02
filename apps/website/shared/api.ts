@@ -15,6 +15,8 @@ export interface AccountSummary {
 export interface Viewer extends AccountSummary {
   kind: "user";
   isSiteAdmin: boolean;
+  /** The address they sign in with; null for development personas. */
+  email: string | null;
   /** Owners the viewer may create repositories under: themselves, then their orgs. */
   canCreateIn: AccountSummary[];
 }
@@ -108,6 +110,14 @@ export interface AccountPage extends AccountSummary {
 
 export interface Collaborator extends AccountSummary {
   role: CollaboratorRole;
+}
+
+/** An address allowed to create an account (sign-up is invite only). */
+export interface Invite {
+  email: string;
+  /** Slug of the admin who invited them. */
+  invitedBy: string | null;
+  createdAt: string;
 }
 
 export interface AccessToken {
@@ -381,6 +391,11 @@ export interface RepoMirror {
   lastAttemptAt: string | null;
   lastSyncedAt: string | null;
   lastSyncedCommit: string | null;
+  /**
+   * The system identity mirror pushes are attributed to: the instance owner
+   * (OWNER_EMAIL), whoever configured the mirror. Null until they have an account.
+   */
+  pushedAs: AccountSummary | null;
 }
 
 export interface UpdateMirrorRequest {

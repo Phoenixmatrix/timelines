@@ -380,8 +380,11 @@ pub struct PushArgs {
 
 #[derive(Subcommand)]
 pub enum AuthCommand {
-    /// Sign in with an SSH key (agent, 1Password, ~/.ssh), a token, or a dev persona
+    /// Sign in: in the browser (default, device login), or with an SSH key, a token, or a dev persona
     Login {
+        /// Approve this sign-in in the browser with a one-time code (the default without other flags).
+        #[arg(long, conflicts_with_all = ["ssh", "persona", "token"])]
+        device: bool,
         /// Sign in with an SSH key registered on the server, through your SSH agent or key files.
         #[arg(long, conflicts_with_all = ["persona", "token"])]
         ssh: bool,
@@ -394,8 +397,9 @@ pub enum AuthCommand {
         /// Existing personal access token (gmx_…).
         #[arg(long)]
         token: Option<String>,
-        /// Server URL.
-        #[arg(long, env = "GM_SERVER")]
+        /// Server URL; also makes it the default. GM_SERVER signs in to a server
+        /// for this run without changing the default.
+        #[arg(long)]
         server: Option<String>,
     },
     /// SSH keys registered for signing in (`gm auth login --ssh`)

@@ -39,6 +39,8 @@ import { RepoLogic } from "../do/repo-logic.ts";
 
 const REGISTRY_MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url).href);
 const GITMATRIX_MIGRATIONS = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
+/** Development accounts (personas, Orbit Labs): local-only, applied after the migrations. */
+const GITMATRIX_SEED = fileURLToPath(new URL("../../seed/", import.meta.url).href);
 export const REGISTRY_URL = "https://pkg.test";
 /** The org that owns every feed tests create. */
 export const OWNER_ID = "acc_test";
@@ -199,6 +201,7 @@ export async function makeHarness(
   migrate(db, REGISTRY_MIGRATIONS);
   const gitmatrix = new FakeD1();
   migrate(gitmatrix, GITMATRIX_MIGRATIONS);
+  migrate(gitmatrix, GITMATRIX_SEED);
   gitmatrix.applySql(
     `INSERT INTO accounts (id, kind, slug, display_name, member_repo_role)
      VALUES (${quote(OWNER_ID)}, 'org', 'test', 'Test Org', 'write')`,

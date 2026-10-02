@@ -41,7 +41,7 @@ export function Home() {
           </Link>
         ) : (
           <Link to="/signin" className="mk-btn mk-btn--primary no-underline">
-            Choose a persona
+            Sign in
           </Link>
         )}
       </header>
@@ -54,9 +54,7 @@ export function Home() {
               No repositories yet.
               <br />
               <span className="text-body-sm text-ink-faint">
-                {viewer
-                  ? "Create one, or load the samples from the persona screen."
-                  : "Sign in to see private ones."}
+                {viewer ? "Create one to get started." : "Sign in to see private ones."}
               </span>
             </>
           }

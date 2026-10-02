@@ -12,8 +12,37 @@ const remote = { dev: { remote: true } };
 // (needs Docker).
 type Runner = "local" | "sandbox";
 
+/** Where the deployed Worker lives; GITMATRIX_PUBLIC_URL can override it. */
+const PRODUCTION_HOST = "gitmatrix.fward.dev";
+
+/**
+ * Remote resources dev also talks to (Artifacts, Vectorize, AI Search) get
+ * production-only names, so a deploy never shares repositories or indexes with
+ * `vp dev`. Created with `cf` on the "Pile of cats" account.
+ */
+const PRODUCTION = {
+  artifacts: "gitmatrix",
+  vectors: "gitmatrix-knowledge-prod",
+  search: "gitmatrix-prod",
+  db: "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77",
+  registryDb: "caea2f3d-d4d3-43cd-aaf9-f14a3d84621d",
+};
+
 /** A fixed, public development key for the registry. Never used once deployed. */
 const DEV_KEK = btoa("gitmatrix-development-key-not-secret!");
+/** Signs development sessions only; deployed, the Secrets Store holds the real one. */
+const DEV_AUTH_SECRET = "gitmatrix-development-auth-secret-not-secret";
+/**
+ * The account's Secrets Store, shared with the other ~/dev projects; names are
+ * prefixed with the project (gitmatrix_…) so they never collide. readSecret()
+ * reads NAME, else the NAME_SECRET binding.
+ */
+const SECRETS_STORE = "2dcc6c92ee1743548ad303924b4e0f11";
+
+/** The instance owner: superuser everywhere, owner of OWNER_ORG once deployed. */
+const OWNER_EMAIL = "hello@fward.me";
+/** Sign-in codes come from this address (Email Service, mail.fward.dev). */
+const EMAIL_FROM = "gitmatrix@mail.fward.dev";
 
 const ciSandbox = defineContainer({
   name: "gitmatrix-ci",
@@ -33,7 +62,9 @@ export default defineConfig(({ mode }) => {
   const ai = !(dev && local.agent && env.GITMATRIX_AGENT_AI === "disabled");
   const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
   const sandboxed = runner === "sandbox";
-  const publicUrl = dev ? local.publicUrl : env.GITMATRIX_PUBLIC_URL;
+  const publicUrl = dev
+    ? local.publicUrl
+    : (env.GITMATRIX_PUBLIC_URL ?? `https://${PRODUCTION_HOST}`);
   return {
     ...(sandboxed ? { containers: [ciSandbox] } : {}),
     worker: {
@@ -41,6 +72,7 @@ export default defineConfig(({ mode }) => {
       compatibilityDate: "2026-09-30",
       compatibilityFlags: ["nodejs_compat"],
       entrypoint: "./worker/index.ts",
+      ...(dev ? {} : { domains: [PRODUCTION_HOST] }),
       observability: { enabled: true },
       // Hashing multi-GB image layers and building signed package indexes.
       limits: { cpuMs: 300_000 },
@@ -66,10 +98,16 @@ export default defineConfig(({ mode }) => {
         ],
       },
       env: {
-        DB: bindings.d1({ name: "gitmatrix", id: "00000000000000000000000000000000" }),
+        // Local D1 keeps the zero ids (`vp run db:migrate` targets them).
+        DB: bindings.d1({
+          name: "gitmatrix",
+          id: dev ? "00000000000000000000000000000000" : PRODUCTION.db,
+        }),
         TRACKER: bindings.durableObject({ worker: "gitmatrix", exportName: "Tracker" }),
         ARTIFACTS: bindings.artifacts({
-          namespace: dev ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev") : "gitmatrix-dev",
+          namespace: dev
+            ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev")
+            : PRODUCTION.artifacts,
           ...remote,
         }),
         // Knowledge graph and wiki.
@@ -79,11 +117,13 @@ export default defineConfig(({ mode }) => {
               VECTORS: bindings.vectorize({
                 name: dev
                   ? (env.GITMATRIX_VECTORIZE_INDEX ?? "gitmatrix-knowledge")
-                  : "gitmatrix-knowledge",
+                  : PRODUCTION.vectors,
                 ...remote,
               }),
               SEARCH: bindings.aiSearchNamespace({
-                namespace: dev ? (env.GITMATRIX_SEARCH_NAMESPACE ?? "gitmatrix") : "gitmatrix",
+                namespace: dev
+                  ? (env.GITMATRIX_SEARCH_NAMESPACE ?? "gitmatrix")
+                  : PRODUCTION.search,
                 ...remote,
               }),
             }
@@ -119,7 +159,7 @@ export default defineConfig(({ mode }) => {
         // tables never meet gitmatrix's. People and permissions stay in DB.
         REGISTRY_DB: bindings.d1({
           name: "gitmatrix-registry",
-          id: "00000000000000000000000000000001",
+          id: dev ? "00000000000000000000000000000001" : PRODUCTION.registryDb,
         }),
         REGISTRY_BLOBS: bindings.r2({ name: "gitmatrix-registry-blobs" }),
         REGISTRY_REPO: bindings.durableObject({ worker: "gitmatrix", exportName: "RegistryRepo" }),
@@ -138,9 +178,36 @@ export default defineConfig(({ mode }) => {
         // Development uses a fixed public key; deployed, set the REGISTRY_KEK secret.
         ...(dev
           ? { REGISTRY_KEK: bindings.text(DEV_KEK), DEV_MODE: bindings.text("true") }
-          : { REGISTRY_KEK: bindings.secret() }),
+          : {
+              REGISTRY_KEK_SECRET: bindings.secretsStoreSecret({
+                storeId: SECRETS_STORE,
+                secretName: "gitmatrix_registry_kek",
+              }),
+            }),
+        // Sign-in (worker/better-auth.ts): emailed one-time codes and device
+        // login for gm. Invite only; OWNER_EMAIL may always sign in.
+        ...(dev
+          ? { BETTER_AUTH_SECRET: bindings.text(DEV_AUTH_SECRET) }
+          : {
+              BETTER_AUTH_SECRET_SECRET: bindings.secretsStoreSecret({
+                storeId: SECRETS_STORE,
+                secretName: "gitmatrix_better_auth_secret",
+              }),
+            }),
+        OWNER_EMAIL: bindings.text(OWNER_EMAIL),
+        // Deployed only: the owner's org, created on their first sign-in. It
+        // will hold the gitmatrix repository; development keeps the seed data.
+        ...(dev ? {} : { OWNER_ORG: bindings.text("matrixorg") }),
+        EMAIL_FROM: bindings.text(EMAIL_FROM),
+        // Locally the binding simulates delivery: messages are logged, never sent.
+        EMAIL: bindings.sendEmail({ allowedSenderAddresses: [EMAIL_FROM] }),
+        // Failed codes and device approvals, per email and per IP. Crossing the
+        // limit locks the key out for 15 minutes (auth_lockouts).
+        // Namespace ids are account-wide: ~/dev projects use 1001 and 4x01 per
+        // project (4101 trustmatrix … 4301 mailmatrix), so gitmatrix is 4401.
+        AUTH_FAILURES: bindings.rateLimit({ namespace: "4401", simple: { limit: 5, period: 60 } }),
         // Where package clients and CI sandboxes reach gitmatrix. Generated
-        // indexes (Helm, APT, RPM…) embed it; deployed, set GITMATRIX_PUBLIC_URL.
+        // indexes (Helm, APT, RPM…) embed it; deployed, https://gitmatrix.fward.dev.
         ...(publicUrl ? { PUBLIC_URL: bindings.text(publicUrl) } : {}),
       },
       triggers: [

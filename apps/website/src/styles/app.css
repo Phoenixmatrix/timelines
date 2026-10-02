@@ -188,6 +188,16 @@ body {
 .mk-root {
   scrollbar-color: var(--line) transparent;
 }
+/* Browser surfaces carry the palette too: selection takes the amber wash, the
+   caret the signal colour. */
+.mk-root ::selection {
+  background: var(--signal-wash);
+  color: var(--ink);
+}
+.mk-root input,
+.mk-root textarea {
+  caret-color: var(--signal);
+}
 .mk-root ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

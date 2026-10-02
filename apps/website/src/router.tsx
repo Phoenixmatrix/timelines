@@ -20,6 +20,9 @@ import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/Repo
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
 import { SemanticChanges } from "./routes/repo/SemanticChanges.tsx";
 import { SignIn, signInAction, signInLoader } from "./routes/SignIn.tsx";
+import { Device, deviceAction, deviceLoader } from "./routes/Device.tsx";
+import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
+import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
 import {
@@ -45,6 +48,7 @@ export const router = createBrowserRouter([
         children: [
           { index: true, loader: homeLoader, Component: Home },
           { path: "signin", loader: signInLoader, action: signInAction, Component: SignIn },
+          { path: "device", loader: deviceLoader, action: deviceAction, Component: Device },
           { path: "new", loader: newRepoLoader, action: newRepoAction, Component: NewRepo },
           { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
           {
@@ -71,6 +75,18 @@ export const router = createBrowserRouter([
             loader: tokensLoader,
             action: tokensAction,
             Component: Tokens,
+          },
+          {
+            path: "settings/profile",
+            loader: profileLoader,
+            action: profileAction,
+            Component: Profile,
+          },
+          {
+            path: "settings/invites",
+            loader: invitesLoader,
+            action: invitesAction,
+            Component: Invites,
           },
           {
             path: "settings/ssh-keys",

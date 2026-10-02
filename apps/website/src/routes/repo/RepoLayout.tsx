@@ -103,7 +103,7 @@ function ClonePopover({ repo }: { repo: RepoDetail }) {
                   {canPush ? "You can push to this repository." : "You can clone but not push."}
                 </>
               ) : repo.visibility === "public" ? (
-                "Public repositories clone without signing in. Pushing needs a persona with write access."
+                "Public repositories clone without signing in. Pushing needs an account with write access."
               ) : null}
             </Popover.Description>
           </Popover.Popup>

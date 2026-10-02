@@ -107,6 +107,23 @@ async function migrate(env: Environment): Promise<void> {
       ],
       { cwd: website },
     );
+  // Development data (personas, Orbit Labs) lives in seed/, applied like
+  // migrations but only here and in local dev, so a deployed database starts empty.
+  await command(
+    "cf",
+    [
+      "d1",
+      "migrations",
+      "apply",
+      "00000000000000000000000000000000",
+      "--local",
+      "--persist-to",
+      join(env.dir, "state"),
+      "--dir",
+      "seed",
+    ],
+    { cwd: website },
+  );
 }
 
 async function identity(env: Environment): Promise<boolean> {

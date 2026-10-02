@@ -11,7 +11,7 @@ export function useViewer(): Viewer | null {
   return session?.viewer ?? null;
 }
 
-/** For loaders of pages that need a signed-in persona. */
+/** For loaders of pages that need someone signed in. */
 export async function requireViewer(request: Request): Promise<Viewer> {
   const { viewer } = await load<SessionResponse>("/session", request);
   if (!viewer) {

@@ -3,18 +3,33 @@ import type { RepoMirror, UpdateMirrorRequest } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import { loadRepo } from "../api/repos.ts";
 import { fail, readJson } from "../api/http.ts";
+import { accountSummary } from "../db.ts";
 import { db, nowIso } from "../schema.ts";
 import { MirrorError, normalizeMirrorUrl, sealMirrorToken, syncMirror } from "./sync.ts";
 
 /** `/api/repos/:owner/:name/mirror`: a repository's one-way mirror (admins only). */
 export const mirrors = new Hono<AppEnv>();
 
-async function current(env: Env, repoId: string): Promise<RepoMirror | null> {
+/** Mirror pushes come from one system identity: the instance owner's account. */
+export async function mirrorPusher(env: Env) {
   const row = await db(env.DB)
-    .selectFrom("repo_mirrors")
+    .selectFrom("accounts")
     .selectAll()
-    .where("repo_id", "=", repoId)
+    .where("email", "=", env.OWNER_EMAIL.toLowerCase())
+    .where("kind", "=", "user")
     .executeTakeFirst();
+  return row ? accountSummary(row) : null;
+}
+
+async function current(env: Env, repoId: string): Promise<RepoMirror | null> {
+  const [row, pushedAs] = await Promise.all([
+    db(env.DB)
+      .selectFrom("repo_mirrors")
+      .selectAll()
+      .where("repo_id", "=", repoId)
+      .executeTakeFirst(),
+    mirrorPusher(env),
+  ]);
   if (!row) return null;
   return {
     url: row.url,
@@ -27,6 +42,7 @@ async function current(env: Env, repoId: string): Promise<RepoMirror | null> {
     lastAttemptAt: row.last_attempt_at,
     lastSyncedAt: row.last_synced_at,
     lastSyncedCommit: row.last_synced_commit,
+    pushedAs,
   };
 }
 

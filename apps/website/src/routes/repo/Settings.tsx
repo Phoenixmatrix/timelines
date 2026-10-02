@@ -267,6 +267,8 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
             mirror.lastSyncedCommit ? ` at ${shortOid(mirror.lastSyncedCommit)}` : ""
           }${mirror.status === "pending" || mirror.status === "syncing" ? "; a newer push is syncing" : ""}.`
         : "Not synced yet. The next push syncs it.";
+  // Mirror pushes come from one system identity, whoever set the mirror up.
+  const pusher = mirror?.pushedAs ? ` Pushes as ${mirror.pushedAs.displayName}.` : "";
 
   return (
     <Card
@@ -328,6 +330,7 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
               title={mirror?.lastSyncedAt ? fullDate(mirror.lastSyncedAt) : undefined}
             >
               {status}
+              {pusher}
             </p>
           )
         )}

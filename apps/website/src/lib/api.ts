@@ -24,12 +24,14 @@ export async function api<T>(path: string, init?: RequestInit & { json?: unknown
   if (response.status === 204) return undefined as T;
   const body = (await response.json().catch(() => null)) as {
     error?: string;
+    /** Better Auth (/api/identity) reports errors as `message`. */
+    message?: string;
     code?: string;
   } | null;
   if (!response.ok) {
     throw new ApiError(
       response.status,
-      body?.error ?? `Request failed (${response.status}).`,
+      body?.error ?? body?.message ?? `Request failed (${response.status}).`,
       typeof body?.code === "string" ? body.code : undefined,
     );
   }

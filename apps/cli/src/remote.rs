@@ -9,17 +9,43 @@ use std::process::Command;
 
 pub const DEFAULT_SERVER: &str = "http://localhost:5180";
 
-#[derive(Serialize, Deserialize, Default, Clone)]
-pub struct Config {
-    pub server: Option<String>,
+/// One server's sign-in, as stored in gm.json under `servers`.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
+pub struct Credentials {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// "ssh" to sign in with an SSH key for every session (see ssh.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
-    /// Fingerprint of the SSH key to use; any registered key when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_key: Option<String>,
+}
+
+/// gm.json. Sign-ins are kept per server, so signing in to one (say,
+/// production with GM_SERVER) never replaces another (the local dev server).
+/// The flat fields are the sign-in of the server in use: `load` fills them
+/// from `servers`, `save` writes them back there.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Config {
+    /// The default server; GM_SERVER and GITMATRIX_URL override it.
+    pub server: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub user: Option<String>,
+    /// "ssh" to sign in with an SSH key for every session (see ssh.rs).
+    #[serde(default, skip_serializing)]
+    pub auth: Option<String>,
+    /// Fingerprint of the SSH key to use; any registered key when unset.
+    #[serde(default, skip_serializing)]
+    pub ssh_key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub servers: std::collections::BTreeMap<String, Credentials>,
+}
+
+fn normalize_server(server: &str) -> String {
+    server.trim_end_matches('/').to_string()
 }
 
 fn config_path() -> PathBuf {
@@ -32,16 +58,58 @@ fn config_path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Config {
-        std::fs::read(config_path())
+        let mut config: Config = std::fs::read(config_path())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let active = config.server();
+        config.select(&active);
+        config
+    }
+
+    /// Fill the flat fields with the sign-in of the server in use. A config
+    /// from before per-server sign-ins keeps its flat fields for the server it
+    /// was written for (the stored server, else the default).
+    fn select(&mut self, active: &str) {
+        let legacy = Credentials {
+            token: self.token.take(),
+            user: self.user.take(),
+            auth: self.auth.take(),
+            ssh_key: self.ssh_key.take(),
+        };
+        let legacy_server = normalize_server(self.server.as_deref().unwrap_or(DEFAULT_SERVER));
+        if legacy != Credentials::default() && !self.servers.contains_key(&legacy_server) {
+            self.servers.insert(legacy_server, legacy);
+        }
+        let current = self.servers.get(active).cloned().unwrap_or_default();
+        self.token = current.token;
+        self.user = current.user;
+        self.auth = current.auth;
+        self.ssh_key = current.ssh_key;
+    }
+
+    /// What gm.json holds: every server's sign-in, the one in use updated.
+    fn stored(&self, active: &str) -> Config {
+        let mut stored = self.clone();
+        let current = Credentials {
+            token: self.token.clone(),
+            user: self.user.clone(),
+            auth: self.auth.clone(),
+            ssh_key: self.ssh_key.clone(),
+        };
+        if current == Credentials::default() {
+            stored.servers.remove(active);
+        } else {
+            stored.servers.insert(active.to_string(), current);
+        }
+        stored
     }
 
     pub fn save(&self) -> Result<()> {
         let path = config_path();
         std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
+        let stored = self.stored(&self.server());
+        std::fs::write(&path, serde_json::to_vec_pretty(&stored)?)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -201,6 +269,22 @@ pub fn api(config: &Config, method: &str, path: &str, body: Option<&Value>) -> R
 }
 
 /// Call the JSON API with exactly this token (or none).
+/// POST JSON and return the status and body as they are, errors included, for
+/// protocols that answer with error bodies by design (OAuth device polling).
+pub fn post_raw(config: &Config, path: &str, body: &Value) -> Result<(u16, Value)> {
+    let url = format!("{}/api{}", config.server(), path);
+    let mut response = agent().post(&url).send_json(body.clone()).map_err(|e| {
+        GmError::new(
+            "server_unreachable",
+            format!("Could not reach {}: {e}", config.server()),
+        )
+    })?;
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().unwrap_or_default();
+    let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    Ok((status, value))
+}
+
 pub fn api_with(
     config: &Config,
     method: &str,
@@ -264,9 +348,7 @@ pub fn api_with(
         .to_string();
     Err(match status {
         401 => GmError::new("unauthenticated", message)
-            .hint(
-                "Sign in: `gm auth login --persona <name>` (dev) or `gm auth login --token gmx_…`.",
-            )
+            .hint("Sign in: `gm auth login` (in the browser), or `--persona <name>` in dev.")
             .exit(exit::AUTH),
         403 => GmError::new("forbidden", message).exit(exit::AUTH),
         404 => GmError::not_found("not_found", message),
@@ -338,7 +420,7 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
             "unauthenticated",
             format!("{action} failed: not signed in. {detail}"),
         )
-        .hint("Sign in: `gm auth login --persona <name>` (dev) or `gm auth login --token gmx_…`.")
+        .hint("Sign in: `gm auth login` (in the browser), or `--persona <name>` in dev.")
         .exit(exit::AUTH);
     }
     if stderr.contains("403")
@@ -369,4 +451,55 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
             }
         ),
     )
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn loaded(json: &str, active: &str) -> Config {
+        let mut config: Config = serde_json::from_str(json).unwrap();
+        config.select(active);
+        config
+    }
+
+    #[test]
+    fn a_flat_config_belongs_to_the_server_it_was_written_for() {
+        let json = r#"{"server":null,"token":"gmx_local","user":"priya"}"#;
+        let local = loaded(json, DEFAULT_SERVER);
+        assert_eq!(local.token.as_deref(), Some("gmx_local"));
+        let prod = loaded(json, "https://gitmatrix.example");
+        assert_eq!(prod.token, None);
+    }
+
+    #[test]
+    fn signing_in_to_one_server_keeps_the_others() {
+        let json = r#"{"server":null,"token":"gmx_local","user":"priya"}"#;
+        let prod_server = "https://gitmatrix.example";
+        let mut prod = loaded(json, prod_server);
+        prod.token = Some("gmx_prod".into());
+        prod.user = Some("fward".into());
+        let stored = prod.stored(prod_server);
+        let text = serde_json::to_string(&stored).unwrap();
+        // Flat fields are never written; each sign-in sits under its server.
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("token").is_none() && value.get("user").is_none());
+        let again: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            loaded(&text, DEFAULT_SERVER).token.as_deref(),
+            Some("gmx_local")
+        );
+        assert_eq!(loaded(&text, prod_server).user.as_deref(), Some("fward"));
+        assert_eq!(again.token, None);
+    }
+
+    #[test]
+    fn signing_out_clears_only_the_server_in_use() {
+        let json = r#"{"servers":{"http://localhost:5180":{"token":"a"},"https://gitmatrix.example":{"token":"b"}}}"#;
+        let mut prod = loaded(json, "https://gitmatrix.example");
+        prod.token = None;
+        let text = serde_json::to_string(&prod.stored("https://gitmatrix.example")).unwrap();
+        assert_eq!(loaded(&text, DEFAULT_SERVER).token.as_deref(), Some("a"));
+        assert_eq!(loaded(&text, "https://gitmatrix.example").token, None);
+    }
 }

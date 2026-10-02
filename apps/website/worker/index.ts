@@ -3,8 +3,10 @@ import { accounts } from "./api/accounts.ts";
 import { dev } from "./api/dev.ts";
 import { repos } from "./api/repos.ts";
 import { sshAuth, sshKeys } from "./api/ssh.ts";
+import { invites } from "./api/invites.ts";
 import { tokens } from "./api/tokens.ts";
 import { sessionActor, tokenCredential, type AppEnv } from "./auth.ts";
+import { createAuth } from "./better-auth.ts";
 import { isArtifactsError } from "./artifacts.ts";
 import { sqlNow } from "./db.ts";
 import { ci, runner } from "./ci/api.ts";
@@ -27,12 +29,17 @@ api.use(async (c, next) => {
   c.res.headers.set("server-timing", timing.header());
 });
 
-// Browsers authenticate with the persona cookie; scripts and CLIs send a
-// personal access token (`Authorization: Bearer gmx_…`). Read-scoped tokens
-// may only read.
+// Browsers authenticate with a Better Auth session cookie (or, in development,
+// the persona cookie); scripts and CLIs send a personal access token
+// (`Authorization: Bearer gmx_…`). Read-scoped tokens may only read.
 api.use(async (c, next) => {
-  // Dev endpoints authenticate their own environment secret, not a user PAT.
-  if (c.req.path === "/api/dev" || c.req.path.startsWith("/api/dev/")) {
+  // Dev endpoints authenticate their own environment secret, and the device
+  // exchange a Better Auth session token, not a user PAT.
+  if (
+    c.req.path === "/api/dev" ||
+    c.req.path.startsWith("/api/dev/") ||
+    c.req.path === "/api/tokens/device"
+  ) {
     c.set("actor", null);
     return next();
   }
@@ -63,6 +70,7 @@ api.route("/ci/runner", runner);
 api.route("/repos", repos);
 api.route("/repos", mirrors);
 api.route("/tokens", tokens);
+api.route("/invites", invites);
 api.route("/ssh-keys", sshKeys);
 api.route("/auth/ssh", sshAuth);
 api.route("/dev", dev);
@@ -83,6 +91,10 @@ api.onError((error, c) => {
 });
 
 const app = new Hono<AppEnv>();
+// Sign-in: emailed codes and device login (worker/better-auth.ts).
+app.on(["GET", "POST"], "/api/identity/*", async (c) =>
+  (await createAuth(c.env, new URL(c.req.url).origin)).handler(c.req.raw),
+);
 // Package protocols (/v2, /npm/…, /pypi/…) and their REST extras
 // (/api/registry/…) come first; their middleware is scoped to those paths.
 app.route("/", buildRegistry() as unknown as Hono<AppEnv>);

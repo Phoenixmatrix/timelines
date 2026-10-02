@@ -1,15 +1,17 @@
 import { popMotion } from "./ui.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
-  HouseIcon,
-  ListChecksIcon,
+  EnvelopeSimpleIcon,
   FingerprintIcon,
+  HouseIcon,
   KeyIcon,
+  ListChecksIcon,
   MoonIcon,
   PlusIcon,
   SignInIcon,
   SignOutIcon,
   SunIcon,
+  UserCircleIcon,
   UserSwitchIcon,
 } from "@phosphor-icons/react";
 import { useState } from "react";
@@ -77,6 +79,10 @@ function AccountMenu() {
               <HouseIcon className="size-4" aria-hidden />
               Your profile
             </Menu.LinkItem>
+            <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/profile" />}>
+              <UserCircleIcon className="size-4" aria-hidden />
+              Edit profile
+            </Menu.LinkItem>
             <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/tokens" />}>
               <KeyIcon className="size-4" aria-hidden />
               Access tokens
@@ -85,9 +91,15 @@ function AccountMenu() {
               <FingerprintIcon className="size-4" aria-hidden />
               SSH keys
             </Menu.LinkItem>
+            {viewer.isSiteAdmin && (
+              <Menu.LinkItem className="mk-menu-item" render={<Link to="/settings/invites" />}>
+                <EnvelopeSimpleIcon className="size-4" aria-hidden />
+                Invitations
+              </Menu.LinkItem>
+            )}
             <Menu.LinkItem className="mk-menu-item" render={<Link to="/signin" />}>
               <UserSwitchIcon className="size-4" aria-hidden />
-              Switch persona
+              Switch account
             </Menu.LinkItem>
             <div className="mk-menu-sep" />
             <Menu.RadioGroup value={theme} onValueChange={chooseTheme}>
@@ -125,6 +137,15 @@ export function AppShell() {
   const navigation = useNavigation();
   const location = useLocation();
   const places = viewer?.canCreateIn.slice(1) ?? [];
+
+  // Sign-in and device approval are their own focused pages, outside the shell.
+  if (location.pathname === "/signin" || location.pathname === "/device")
+    return (
+      <>
+        <Outlet />
+        <Toasts />
+      </>
+    );
 
   return (
     <div className="flex min-h-dvh max-sm:flex-col">

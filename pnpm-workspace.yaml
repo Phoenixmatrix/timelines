@@ -6,6 +6,7 @@ packages:
 virtualStoreType: global
 
 patchedDependencies:
+  cf@1.0.0-beta.7: patches/cf@1.0.0-beta.7.patch
   miniflare@5.20260930.0-alpha: patches/miniflare@5.20260930.0-alpha.patch
 
 # These declarations import React types but omit the type peer dependencies.
@@ -33,6 +34,7 @@ catalog:
   "@vitejs/plugin-react": ^6.1.1
   cf: 1.0.0-beta.7
   diff: ^9.0.0
+  better-auth: ^1.7.7
   fflate: ^0.8.3
   fzstd: ^0.1.1
   hono: ^4.13.12

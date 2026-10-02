@@ -2,19 +2,44 @@ import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { TokenScope } from "../shared/api.ts";
 import type { Timing } from "./timing.ts";
+import { createAuth } from "./better-auth.ts";
 import { actorFromRow, findUserById, sqlNow, type Actor } from "./db.ts";
 import { db } from "./schema.ts";
 
 export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null; timing: Timing } };
 
 // DEVELOPMENT ONLY. Picking a persona sets this cookie to their account id, with
-// no secret involved. Real sign-in replaces this module's session half.
+// no secret involved. Real sign-in is Better Auth (worker/better-auth.ts).
 const PERSONA_COOKIE = "gm_persona";
 
+/** Better Auth's session cookie (with its __Secure- variant over HTTPS). */
+const SESSION_COOKIES = ["gm.session_token", "__Secure-gm.session_token"];
+
 export async function sessionActor(c: Context<AppEnv>): Promise<Actor | null> {
+  if (SESSION_COOKIES.some((name) => getCookie(c, name))) {
+    const auth = await createAuth(c.env, new URL(c.req.url).origin);
+    const session = await auth.api.getSession({
+      headers: c.req.raw.headers,
+    });
+    if (session) return findUserById(c.env.DB, session.user.id);
+  }
   if (c.env.DEV_MODE !== "true") return null;
   const id = getCookie(c, PERSONA_COOKIE);
   return id ? findUserById(c.env.DB, id) : null;
+}
+
+/** Sign out of Better Auth (if signed in) and drop the persona cookie. */
+export async function endAllSessions(c: Context<AppEnv>) {
+  if (SESSION_COOKIES.some((name) => getCookie(c, name))) {
+    const auth = await createAuth(c.env, new URL(c.req.url).origin);
+    const response = await auth.api.signOut({
+      headers: c.req.raw.headers,
+      asResponse: true,
+    });
+    for (const cookie of response.headers.getSetCookie())
+      c.header("set-cookie", cookie, { append: true });
+  }
+  endSession(c);
 }
 
 export function startPersonaSession(c: Context<AppEnv>, accountId: string) {

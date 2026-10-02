@@ -12,6 +12,7 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
     let mut config = Config::load();
     match command {
         AuthCommand::Login {
+            device,
             ssh,
             key,
             persona,
@@ -23,6 +24,15 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
             }
             if *ssh {
                 return login_ssh(ctx, config, key.as_deref());
+            }
+            if *device || (persona.is_none() && token.is_none()) {
+                if ctx.dry_run {
+                    return Ok(Json(
+                        json!({ "dry_run": true, "server": config.server(), "method": "device" }),
+                    ));
+                }
+                let secret = login_device(&config)?;
+                return finish_token_login(config, secret, "device");
             }
             let secret = match (persona, token) {
                 (_, Some(token)) => token.clone(),
@@ -46,43 +56,19 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
                             GmError::new("server_error", "The server returned no token.")
                         })?
                 }
-                (None, None) => {
-                    return Err(GmError::usage(
-                        "Pass --ssh (SSH key), --token gmx_… or --persona <name> (dev).",
-                    )
-                    .hint("Dev personas: `gm api GET /personas` lists them."));
-                }
+                (None, None) => unreachable!("device login handles no flags"),
             };
             if ctx.dry_run {
                 return Ok(Json(json!({ "dry_run": true, "server": config.server() })));
             }
-            config.token = Some(secret);
-            config.auth = None;
-            config.ssh_key = None;
-            let session = remote::api(&config, "GET", "/session", None)?;
-            let viewer = session.get("viewer").cloned().unwrap_or(Value::Null);
-            if viewer.is_null() {
-                return Err(
-                    GmError::new("unauthenticated", "That token was not accepted.")
-                        .exit(exit::AUTH),
-                );
-            }
-            config.user = viewer["slug"].as_str().map(str::to_string);
-            config.save()?;
-            crate::ssh::forget();
-            Ok(Json(json!({
-                "server": config.server(),
-                "method": "token",
-                "user": { "slug": viewer["slug"], "displayName": viewer["displayName"], "isSiteAdmin": viewer["isSiteAdmin"] },
-                "message": format!("Signed in to {} as {}.", config.server(), viewer["slug"].as_str().unwrap_or("?")),
-            })))
+            finish_token_login(config, secret, "token")
         }
         AuthCommand::SshKey(command) => ssh_key(ctx, &config, command),
         AuthCommand::GitCredential { .. } => unreachable!("handled in main"),
         AuthCommand::Status => {
             if config.token().is_none() && !config.uses_ssh() {
                 return Ok(Json(
-                    json!({ "server": config.server(), "user": null, "hint": "Sign in with `gm auth login --ssh`, or `--persona <name>` in dev." }),
+                    json!({ "server": config.server(), "user": null, "hint": "Sign in with `gm auth login` (in the browser), `--ssh`, or `--persona <name>` in dev." }),
                 ));
             }
             let session = remote::api(&config, "GET", "/session", None)?;
@@ -108,6 +94,137 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
             ))
         }
     }
+}
+
+/// Save a personal access token as the sign-in, after checking the server takes it.
+fn finish_token_login(mut config: Config, secret: String, method: &str) -> Result<Json> {
+    config.token = Some(secret);
+    config.auth = None;
+    config.ssh_key = None;
+    let session = remote::api(&config, "GET", "/session", None)?;
+    let viewer = session.get("viewer").cloned().unwrap_or(Value::Null);
+    if viewer.is_null() {
+        return Err(
+            GmError::new("unauthenticated", "That token was not accepted.").exit(exit::AUTH),
+        );
+    }
+    config.user = viewer["slug"].as_str().map(str::to_string);
+    config.save()?;
+    crate::ssh::forget();
+    Ok(Json(json!({
+        "server": config.server(),
+        "method": method,
+        "user": { "slug": viewer["slug"], "displayName": viewer["displayName"], "isSiteAdmin": viewer["isSiteAdmin"] },
+        "message": format!("Signed in to {} as {}.", config.server(), viewer["slug"].as_str().unwrap_or("?")),
+    })))
+}
+
+/// Device login (RFC 8628): show a code, let the person approve it in the
+/// browser, poll until they do, then trade the session for a token.
+fn login_device(config: &Config) -> Result<String> {
+    const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+    let (status, start) = remote::post_raw(
+        config,
+        "/identity/device/code",
+        &json!({ "client_id": "gm" }),
+    )?;
+    let field = |v: &Value, k: &str| v[k].as_str().map(str::to_string);
+    let (Some(device_code), Some(user_code)) =
+        (field(&start, "device_code"), field(&start, "user_code"))
+    else {
+        return Err(GmError::new(
+            "server_error",
+            format!("The server didn't start a device sign-in (HTTP {status})."),
+        )
+        .hint(
+            "Device login needs a server with email sign-in; in dev, `--persona <name>` works too.",
+        ));
+    };
+    let link = field(&start, "verification_uri_complete")
+        .unwrap_or_else(|| format!("{}/device?user_code={user_code}", config.server()));
+    let mut interval = start["interval"].as_u64().unwrap_or(5).max(1);
+    let expires = std::time::Instant::now()
+        + std::time::Duration::from_secs(start["expires_in"].as_u64().unwrap_or(600));
+    // Instructions go to stderr; stdout stays the command's JSON result.
+    eprintln!("To sign in, open {link}");
+    eprintln!("and check that it shows the code {user_code}. Waiting for approval…");
+    open_browser(&link);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+        if std::time::Instant::now() > expires {
+            return Err(GmError::new(
+                "expired",
+                "The sign-in code expired before it was approved.",
+            )
+            .hint("Run `gm auth login` again.")
+            .exit(exit::AUTH));
+        }
+        let (status, body) = remote::post_raw(
+            config,
+            "/identity/device/token",
+            &json!({ "grant_type": GRANT, "device_code": device_code, "client_id": "gm" }),
+        )?;
+        if let Some(access) = body["access_token"].as_str().filter(|_| status == 200) {
+            let host = std::env::var("HOSTNAME")
+                .ok()
+                .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| "this machine".into());
+            let created = remote::api_with(
+                config,
+                "POST",
+                "/tokens/device",
+                Some(&json!({ "name": format!("gm on {host}") })),
+                Some(access),
+            )?;
+            return created["secret"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| GmError::new("server_error", "The server returned no token."));
+        }
+        match body["error"].as_str() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => interval += 5,
+            Some("access_denied") => {
+                return Err(
+                    GmError::new("denied", "The sign-in was denied in the browser.")
+                        .exit(exit::AUTH),
+                );
+            }
+            Some("expired_token") => {
+                return Err(GmError::new("expired", "The sign-in code expired.")
+                    .hint("Run `gm auth login` again.")
+                    .exit(exit::AUTH));
+            }
+            other => {
+                return Err(GmError::new(
+                    "server_error",
+                    format!(
+                        "Device sign-in failed (HTTP {status}): {}",
+                        other.unwrap_or("unexpected response")
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Best effort: open the approval page; the printed link works either way.
+fn open_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn login_ssh(ctx: &Ctx, mut config: Config, key: Option<&str>) -> Result<Json> {
