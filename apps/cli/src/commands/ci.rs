@@ -560,6 +560,10 @@ pub fn secret(ctx: &Ctx, command: &SecretCommand) -> Result<Shown> {
             let repo = repo_arg(ctx, repo)?;
             let value = match value {
                 Some(v) => v.clone(),
+                // At a terminal, ask without echoing; otherwise read what's piped in.
+                None if std::io::stdin().is_terminal() => {
+                    rpassword::prompt_password(format!("Value for {name} (hidden): "))?
+                }
                 None => {
                     let mut buffer = String::new();
                     std::io::stdin().read_to_string(&mut buffer)?;
