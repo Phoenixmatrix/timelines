@@ -1,5 +1,7 @@
 //! Commands that talk to the Gitmatrix git endpoint: clone, fetch, sync, push.
 
+mod progress;
+
 use super::{Ctx, Outcome, mutate, report, short};
 use crate::cli;
 use crate::model::{Change, Json, OpResult};
@@ -83,21 +85,35 @@ pub fn clone(ctx: &Ctx, args: &cli::CloneArgs) -> Result<Cloned> {
     if ctx.dry_run {
         return Err(GmError::usage("`gm clone` doesn't support --dry-run."));
     }
-    let output = remote::git(
+    let mut progress = progress::Progress::new(ctx.format, args.quiet);
+    progress.stage(
+        "connecting",
+        &format!("Cloning {repository} into {}...", target.display()),
+    );
+    let output = remote::git_progress(
         &config,
         &ctx.cwd,
-        &["clone", "--quiet", &url, &target.to_string_lossy()],
+        &[
+            "clone",
+            if args.quiet { "--quiet" } else { "--progress" },
+            &url,
+            &target.to_string_lossy(),
+        ],
+        |message| progress.git(message),
     )?;
     if !output.status.success() {
         return Err(remote::git_failure("Clone", &output));
     }
+    progress.stage("initializing", "Initializing the Gitmatrix workspace...");
     let ws = Workspace::init(&target)?;
-    Ok(Cloned {
+    let cloned = Cloned {
         repository: repository.to_string(),
         directory: target.to_string_lossy().into_owned(),
         url,
         working_copy: Change::load(&ws, ws.wc())?,
-    })
+    };
+    progress.stage("complete", "Clone complete.");
+    Ok(cloned)
 }
 
 // ---- fetch / sync -------------------------------------------------------------

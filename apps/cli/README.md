@@ -268,6 +268,39 @@ The design follows Cloudflare's agent-first `cf` CLI:
 - **Concurrency.** Mutations are serialized across the repository; each
   worktree keeps its own working copy, index, conflicts and operation log.
 
+### Clone progress
+
+`gm clone` reports live progress on **stderr**, leaving stdout as the single
+final clone result. Text mode shows Git's transfer counters and byte/rate
+information when available, followed by workspace initialization and completion.
+Use `gm clone orbit/engine --quiet` to suppress progress; results and errors remain.
+
+In JSON and pretty modes, stderr carries compact newline-delimited events:
+
+```json
+{
+  "event": "clone.progress",
+  "phase": "receiving",
+  "elapsed_ms": 1389,
+  "message": "Receiving objects:  18% (7/38)",
+  "percent": 18,
+  "current": 7,
+  "total": 38
+}
+```
+
+Phases are `connecting`, `enumerating`, `counting`, `compressing`, `receiving`,
+`resolving`, `checkout`, `initializing`, and `complete`. Git determines which
+transfer phases occur; other Git/server messages use `git` or `remote`.
+Counters are omitted when unavailable and describe the current phase, not an
+overall completion estimate. Updates within a phase are throttled to one per
+250 ms, except phase completion; phase changes report immediately.
+
+Read agent stderr as JSON lines: progress has `event: "clone.progress"`, while
+a failure ends with the existing `{"error": ...}` envelope and a nonzero exit.
+No `complete` event is emitted on failure. Callers that need stderr to contain
+only the final error document can pass `--quiet`.
+
 ## Commands
 
 |             |                                                                                                                                           |

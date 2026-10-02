@@ -4,8 +4,10 @@
 use crate::output::{GmError, Result, exit};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 pub const DEFAULT_SERVER: &str = "http://localhost:5180";
 
@@ -359,7 +361,7 @@ pub fn api_with(
 
 /// Run git with the stored token sent as a Bearer header to the server only,
 /// passed through the environment so it never shows up in `ps`.
-pub fn git(config: &Config, cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+fn git_command(config: &Config, cwd: &Path, args: &[&str]) -> Result<Command> {
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
@@ -381,11 +383,83 @@ pub fn git(config: &Config, cwd: &Path, args: &[&str]) -> Result<std::process::O
             .env(format!("GIT_CONFIG_KEY_{i}"), key)
             .env(format!("GIT_CONFIG_VALUE_{i}"), value);
     }
-    let output = command.output().map_err(|e| {
-        GmError::new("git_missing", format!("Could not run git: {e}"))
-            .hint("gm uses the git binary for network operations; install git.")
-    })?;
-    Ok(output)
+    Ok(command)
+}
+
+pub fn git(config: &Config, cwd: &Path, args: &[&str]) -> Result<Output> {
+    git_command(config, cwd, args)?
+        .output()
+        .map_err(git_missing)
+}
+
+fn git_missing(error: std::io::Error) -> GmError {
+    GmError::new("git_missing", format!("Could not run git: {error}"))
+        .hint("gm uses the git binary for network operations; install git.")
+}
+
+/// Clone's stdout belongs to gm's result, not git. Drain progress as it arrives,
+/// retaining bounded diagnostics for the normal network-error classification.
+pub fn git_progress(
+    config: &Config,
+    cwd: &Path,
+    args: &[&str],
+    mut report: impl FnMut(&str),
+) -> Result<Output> {
+    let mut child = git_command(config, cwd, args)?
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(git_missing)?;
+    let stderr = read_git_progress(child.stderr.take().expect("piped stderr"), &mut report);
+    if stderr.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr: stderr?,
+    })
+}
+
+fn read_git_progress(
+    mut reader: impl Read,
+    report: &mut impl FnMut(&str),
+) -> std::io::Result<Vec<u8>> {
+    const DIAGNOSTICS: usize = 64 * 1024;
+    const RECORD: usize = 8 * 1024;
+    let mut diagnostics = VecDeque::with_capacity(DIAGNOSTICS);
+    let mut record = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let bytes = &buffer[..count];
+        let overflow = (diagnostics.len() + count).saturating_sub(DIAGNOSTICS);
+        diagnostics.drain(..overflow);
+        diagnostics.extend(bytes);
+        // Git redraws progress with CR; diagnostics use LF. Neither should wait
+        // for the other delimiter or for the process to finish.
+        for part in bytes.split_inclusive(|b| *b == b'\r' || *b == b'\n') {
+            record.extend_from_slice(part);
+            if matches!(part.last(), Some(b'\r' | b'\n')) || record.len() >= RECORD {
+                let text = String::from_utf8_lossy(&record);
+                let text = text.trim();
+                if !text.is_empty() {
+                    report(text);
+                }
+                record.clear();
+            }
+        }
+    }
+    if !record.is_empty() {
+        report(String::from_utf8_lossy(&record).trim());
+    }
+    Ok(diagnostics.into())
 }
 
 /// Turn a failed git network command into a useful error.
@@ -451,6 +525,55 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
             }
         ),
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::read_git_progress;
+    use std::io::{Cursor, Read};
+
+    struct Fragmented(Cursor<Vec<u8>>);
+
+    impl Read for Fragmented {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(&mut buffer[..1])
+        }
+    }
+
+    #[test]
+    fn streams_carriage_returns_newlines_and_unterminated_diagnostics() {
+        let bytes = b"Receiving objects: 1% (1/100)\rReceiving objects: 100% (100/100)\r\nfatal: lost connection".to_vec();
+        let mut records = Vec::new();
+        let diagnostics = read_git_progress(Fragmented(Cursor::new(bytes.clone())), &mut |s| {
+            records.push(s.to_owned());
+        })
+        .unwrap();
+        assert_eq!(
+            records,
+            [
+                "Receiving objects: 1% (1/100)",
+                "Receiving objects: 100% (100/100)",
+                "fatal: lost connection",
+            ]
+        );
+        assert_eq!(diagnostics, bytes);
+    }
+
+    #[test]
+    fn bounds_retained_output_without_losing_final_failure() {
+        let mut bytes = vec![b'x'; 128 * 1024];
+        bytes.extend_from_slice(b"\nfatal: Authentication failed\n");
+        let mut largest = 0;
+        let mut last = String::new();
+        let diagnostics = read_git_progress(Cursor::new(&bytes), &mut |s| {
+            largest = largest.max(s.len());
+            last = s.to_owned();
+        })
+        .unwrap();
+        assert!(largest <= 12 * 1024);
+        assert_eq!(last, "fatal: Authentication failed");
+        assert_eq!(diagnostics, bytes[bytes.len() - 64 * 1024..]);
+    }
 }
 
 #[cfg(test)]

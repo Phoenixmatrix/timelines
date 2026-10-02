@@ -368,6 +368,9 @@ pub struct CloneArgs {
     pub repository: String,
     /// Directory to clone into (default: the repository name).
     pub directory: Option<PathBuf>,
+    /// Suppress live progress on stderr (the final result and errors remain).
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 #[derive(Args)]
