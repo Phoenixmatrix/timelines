@@ -12,6 +12,8 @@ import { join, resolve } from "node:path";
 const WORKER = "gitmatrix";
 const root = resolve(import.meta.dirname, "../..");
 const website = join(root, "apps/website");
+/** The website's own cf: pinned, patched, and not on PATH in CI. */
+const cf = join(website, "node_modules/.bin/cf");
 
 /** Migration directories (relative to apps/website) and the D1 binding they target. */
 const MIGRATIONS = [
@@ -83,12 +85,12 @@ interface Deployed {
 /** The version serving traffic: its commit tag, CI image and D1 ids. */
 function deployed(): Deployed {
   const { deployments } = JSON.parse(
-    run("cf", ["workers", "deployments", "list", "--worker", WORKER], website),
+    run(cf, ["workers", "deployments", "list", "--worker", WORKER], website),
   ) as { deployments: { versions: { version_id: string; percentage: number }[] }[] };
   const current = deployments[0]?.versions.toSorted((a, b) => b.percentage - a.percentage)[0];
   if (!current) throw new Error(`${WORKER} has no deployment to compare with.`);
   const version = JSON.parse(
-    run("cf", ["workers", "versions", "get", current.version_id, "--worker-id", WORKER], website),
+    run(cf, ["workers", "versions", "get", current.version_id, "--worker-id", WORKER], website),
   ) as {
     annotations?: Record<string, string>;
     bindings: { type: string; name: string; id?: string }[];
@@ -152,12 +154,12 @@ function deploy(planOnly: boolean): void {
   for (const migration of todo.migrations) {
     const id = current.databases[migration.binding];
     if (!id) throw new Error(`The deployed Worker has no ${migration.binding} binding.`);
-    stream("cf", ["d1", "migrations", "apply", id, "--dir", migration.dir], website);
+    stream(cf, ["d1", "migrations", "apply", id, "--dir", migration.dir], website);
   }
   if (todo.worker) {
     const subject = run("git", ["log", "-1", "--format=%s", head]);
     stream(
-      "cf",
+      cf,
       ["deploy", "--tag", head, "--message", subject.slice(0, 100), "--containers-rollout", "none"],
       website,
       { GITMATRIX_CI_IMAGE: current.image },
