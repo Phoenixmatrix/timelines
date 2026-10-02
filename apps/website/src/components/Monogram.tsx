@@ -24,7 +24,7 @@ interface MonogramProps {
   name: string;
   /** Circles for people, squircles for places (orgs). */
   shape?: "person" | "place";
-  size?: "sm" | "md" | "lg";
+  size?: "xs" | "sm" | "md" | "lg";
   className?: string;
 }
 
@@ -32,6 +32,7 @@ export function Monogram({ name, shape = "person", size = "md", className = "" }
   const classes = [
     "mk-monogram",
     shape === "place" && "mk-monogram--squircle",
+    size === "xs" && "mk-monogram--xs",
     size === "sm" && "mk-monogram--sm",
     size === "lg" && "mk-monogram--lg",
     className,

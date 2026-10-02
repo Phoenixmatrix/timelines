@@ -226,6 +226,7 @@ textarea.mk-input { height: auto; min-height: var(--size-field); padding: 10px 1
 [data-theme="light"] [data-theme="dark"] .mk-monogram { background: oklch(0.36 0.05 var(--hue, 70)); color: oklch(0.92 0.04 var(--hue, 70)); }
 .mk-monogram--squircle { border-radius: var(--radius-squircle); }
 .mk-monogram--sm { width: 32px; height: 32px; font-size: 0.75rem; }
+.mk-monogram--xs { width: 20px; height: 20px; font-size: 0.5625rem; letter-spacing: 0; }
 .mk-monogram--lg { width: 48px; height: 48px; font-size: 0.9375rem; }
 
 /* ---- Rail (app shell navigation) ------------------------------------ */

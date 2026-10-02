@@ -361,11 +361,50 @@ export function actorName(snapshot: Pick<Snapshot, "members" | "agents">, id: st
 }
 
 /** Who holds a claim: an agent identity by name and human, else the session label. */
+/** Who's behind an actor or a claim, so the accountable person is visible at a glance. */
+export interface Attribution {
+  /** What to call it: an agent's name, a person's display name, or a session's label. */
+  name: string;
+  /** An agent identity, a person, or a person's own labeled working session (`--agent`). */
+  kind: "agent" | "person" | "session";
+  /** The human accountable: the agent's person, or the person themself. */
+  person: TrackerIdentity | null;
+}
+export function attribution(
+  snapshot: Pick<Snapshot, "members" | "agents">,
+  id: string,
+): Attribution {
+  const agent = snapshot.agents.find((a) => a.id === id);
+  if (agent) return { name: agent.name, kind: "agent", person: agent.accountable };
+  const person = snapshot.members.find((m) => m.id === id) ?? null;
+  return { name: person?.displayName ?? id, kind: "person", person };
+}
+/** A claim's holder: its agent, or the person with their session label when they gave one. */
+export function claimAttribution(
+  snapshot: Pick<Snapshot, "members" | "agents">,
+  claim: IssueClaim,
+): Attribution {
+  const who = attribution(snapshot, claim.actorId);
+  if (who.kind === "agent") return who;
+  const person =
+    snapshot.members.find((m) => m.id === (claim.accountableId ?? claim.actorId)) ?? who.person;
+  const label = claim.agent.trim();
+  return label && label !== person?.displayName && label !== person?.slug
+    ? { name: label, kind: "session", person }
+    : { name: person?.displayName ?? label, kind: "person", person };
+}
+/** "builder for Ann Lee", "Ann Lee (laptop)", "Ann Lee": the same, in words. */
+export function attributionText(who: Attribution): string {
+  if (!who.person || who.kind === "person") return who.name;
+  return who.kind === "agent"
+    ? `${who.name} for ${who.person.displayName}`
+    : `${who.person.displayName} (${who.name})`;
+}
 export function claimHolder(
   snapshot: Pick<Snapshot, "members" | "agents">,
   claim: IssueClaim,
 ): string {
-  return actorOf(snapshot, claim.actorId).agent ? actorName(snapshot, claim.actorId) : claim.agent;
+  return attributionText(claimAttribution(snapshot, claim));
 }
 
 /** Done and canceled issues are closed; everything else still has work in it. */

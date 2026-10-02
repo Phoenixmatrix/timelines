@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   actorName,
+  claimAttribution,
   claimHolder,
   hasActiveClaim,
   leasedAncestor,
@@ -14,6 +15,7 @@ import {
 } from "../../../shared/tracker.ts";
 import { popMotion } from "../../components/ui.tsx";
 import type { IssueIndex } from "./query.ts";
+import { Actor } from "./Actor.tsx";
 
 export const statuses = [
   { value: "backlog", label: "Backlog" },
@@ -184,7 +186,7 @@ export function IssueState({
         state="claimed"
         title={`Claim expires ${new Date(issue.claim.expiresAt).toLocaleString()}`}
       >
-        Claimed · {claimHolder(snapshot, issue.claim)}
+        Claimed · <Actor who={claimAttribution(snapshot, issue.claim)} compact />
       </StateBadge>
     );
   if (issue.status === "done" || issue.status === "canceled")

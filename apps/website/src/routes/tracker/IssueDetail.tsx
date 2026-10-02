@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
   actorName,
-  claimHolder,
+  attribution,
+  claimAttribution,
   leasedAncestor,
   readinessIndex,
   type Comment,
@@ -26,6 +27,7 @@ import {
 import type { IssueIndex } from "./query.ts";
 import { RequestCard } from "./Requests.tsx";
 import { useViewer } from "../../lib/session.ts";
+import { Actor } from "./Actor.tsx";
 
 export type MutationOutcome = { ok: true } | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
@@ -364,7 +366,11 @@ export function IssueDetail({
           )}
           <dt className="text-ink-faint">Assignee</dt>
           <dd className="m-0 min-w-0">
-            {issue.assigneeId ? actorName(snapshot, issue.assigneeId) : "Unassigned"}
+            {issue.assigneeId ? (
+              <Actor who={attribution(snapshot, issue.assigneeId)} />
+            ) : (
+              "Unassigned"
+            )}
           </dd>
           {issue.workspaceIds.length > 0 && (
             <>
@@ -407,7 +413,10 @@ export function IssueDetail({
               aria-hidden
             />
             <span>
-              {claimHolder(snapshot, covering!.claim!)}
+              <Actor
+                who={claimAttribution(snapshot, covering!.claim!)}
+                className="font-semibold text-ink"
+              />
               {covering!.claim!.delegatedFrom &&
                 ` (delegated from ${index.byId.get(covering!.claim!.delegatedFrom)?.key ?? "a parent"})`}{" "}
               is working on{" "}
@@ -417,7 +426,7 @@ export function IssueDetail({
                 dateStyle: "medium",
                 timeStyle: "short",
               })}
-              . You can edit its details, but only that agent can change its status until the claim
+              . You can edit its details, but only its holder can change its status until the claim
               ends.
               {covering === issue &&
                 issue.handoff &&
@@ -515,8 +524,8 @@ export function IssueDetail({
             />
             Latest checkpoint
           </h3>
-          <p className="mk-hint mt-0.5 mb-2">
-            {actorName(snapshot, latestCheckpoint.actorId)}
+          <p className="mk-hint mt-0.5 mb-2 flex flex-wrap items-center gap-x-1">
+            <Actor who={attribution(snapshot, latestCheckpoint.actorId)} />
             {" · "}
             <time
               className="tabular-nums"
@@ -1041,9 +1050,10 @@ export function IssueDetail({
               data-kind={comment.kind}
             >
               <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
-                <strong className="font-semibold text-ink">
-                  {actorName(snapshot, comment.actorId)}
-                </strong>
+                <Actor
+                  who={attribution(snapshot, comment.actorId)}
+                  className="[&>span:last-child]:font-semibold [&>span:last-child]:text-ink"
+                />
                 <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>
                   {comment.kind !== "comment" && (
                     <span

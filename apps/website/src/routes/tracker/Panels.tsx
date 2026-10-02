@@ -6,7 +6,6 @@ import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
 import { STATE_DOT } from "./Log.tsx";
 import {
-  claimLabel,
   filterToken,
   tokenize,
   withoutKeys,
@@ -14,6 +13,8 @@ import {
   type FacetValue,
   type IssueIndex,
 } from "./query.ts";
+import { claimAttribution } from "../../../shared/tracker.ts";
+import { Actor } from "./Actor.tsx";
 
 const FACET_GROUPS: { key: keyof Facets; title: string }[] = [
   { key: "state", title: "State" },
@@ -167,7 +168,10 @@ function Lane({
                   </span>
                 )}
                 {state === "claimed" && issue.claim && (
-                  <span>Claimed · {claimLabel(index, issue.claim)}</span>
+                  <span className="inline-flex min-w-0 items-center gap-1">
+                    Claimed ·
+                    <Actor who={claimAttribution(index.people, issue.claim)} compact />
+                  </span>
                 )}
                 {state === "ready" && <span>Ready</span>}
               </span>

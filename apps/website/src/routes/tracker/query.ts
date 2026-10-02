@@ -11,6 +11,7 @@
 
 import {
   actorName,
+  claimHolder,
   leasedAncestor,
   readiness,
   readinessIndex,
@@ -75,13 +76,13 @@ export interface IssueIndex {
   memberSlug: Map<string, string>;
   memberName: Map<string, string>;
   agentIds: Set<string>;
+  /** Members and agents, to show who's accountable for an actor or claim. */
+  people: Pick<Snapshot, "members" | "agents">;
 }
 
-/** Who holds a claim: an agent identity as "builder for Ann Lee", else the session label. */
+/** Who holds a claim, in words: "builder for Ann Lee", or "Ann Lee (laptop)". */
 export function claimLabel(index: IssueIndex, claim: IssueClaim): string {
-  return index.agentIds.has(claim.actorId)
-    ? (index.memberName.get(claim.actorId) ?? claim.agent)
-    : claim.agent;
+  return claimHolder(index.people, claim);
 }
 
 export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
@@ -142,6 +143,7 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
       ...snapshot.agents.map((a): [string, string] => [a.id, actorName(snapshot, a.id)]),
     ]),
     agentIds: new Set(snapshot.agents.map((a) => a.id)),
+    people: { members: snapshot.members, agents: snapshot.agents },
   };
 }
 

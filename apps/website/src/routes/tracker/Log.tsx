@@ -14,6 +14,8 @@ import {
   type IssueState,
   type SortKey,
 } from "./query.ts";
+import { attribution, claimAttribution } from "../../../shared/tracker.ts";
+import { Actor } from "./Actor.tsx";
 
 const ROW = 32;
 const OVERSCAN = 12;
@@ -90,11 +92,12 @@ export function StateLabel({
 }) {
   const state = index.state.get(issue.id) ?? "todo";
   const blockers = index.openBlockers.get(issue.id)?.length ?? 0;
+  const holder = state === "claimed" && issue.claim ? issue.claim : null;
   const detail =
     state === "blocked"
       ? ` · ${blockers}`
-      : state === "claimed"
-        ? ` · ${issue.claim ? claimLabel(index, issue.claim) : ""}`
+      : holder
+        ? ` · ${claimLabel(index, holder)}`
         : state === "leased"
           ? ` · ${index.leasedBy.get(issue.id)?.key}`
           : "";
@@ -115,8 +118,15 @@ export function StateLabel({
         className={`truncate ${words ? "@max-lg:sr-only" : "sr-only"} ${state === "done" || state === "canceled" ? "text-ink-faint" : "text-ink-muted"}`}
       >
         {STATE_LABEL[state]}
-        {detail}
+        {holder ? "" : detail}
       </span>
+      {holder && words && (
+        <Actor
+          who={claimAttribution(index.people, holder)}
+          face
+          className="shrink-0 @max-lg:hidden"
+        />
+      )}
     </span>
   );
 }
@@ -253,7 +263,7 @@ export function IssueLog({
               </span>
               <span role="cell" className={`truncate text-ink-muted ${ASSIGNEE}`}>
                 {issue.assigneeId ? (
-                  index.memberName.get(issue.assigneeId)
+                  <Actor who={attribution(index.people, issue.assigneeId)} compact />
                 ) : (
                   <span className="text-ink-faint">Unassigned</span>
                 )}

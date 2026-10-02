@@ -14,6 +14,8 @@ import { Link, useNavigate } from "react-router";
 import type { Issue, Snapshot } from "../../../shared/tracker.ts";
 import { STATE_DOT, StateLegend } from "./Log.tsx";
 import { STATE_LABEL, type IssueIndex, type IssueState } from "./query.ts";
+import { attribution } from "../../../shared/tracker.ts";
+import { Actor } from "./Actor.tsx";
 
 const PER_COLUMN = 7;
 
@@ -446,7 +448,11 @@ export function RelationLens({
               <h2 className="m-0 text-title break-words">{focus.title}</h2>
               <p className="m-0 text-body-sm text-ink-muted">
                 {index.teamKey.get(focus.teamId)} ·{" "}
-                {focus.assigneeId ? index.memberName.get(focus.assigneeId) : "Unassigned"}
+                {focus.assigneeId ? (
+                  <Actor who={attribution(index.people, focus.assigneeId)} />
+                ) : (
+                  "Unassigned"
+                )}
                 {(relations.upDepth.get(focus.id) ?? 0) > 1 &&
                   ` · ${relations.upDepth.get(focus.id)} blockers deep`}
               </p>
