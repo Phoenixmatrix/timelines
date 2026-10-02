@@ -382,12 +382,7 @@ export function RelationLens({
           else if (e.key === "ArrowDown") go(children[0]);
         }}
       >
-        <Connectors
-          focus={focus.id}
-          relations={relations}
-          index={index}
-          deps={[focus.id, depth, depthChoice]}
-        />
+        <Connectors focus={focus.id} relations={relations} index={index} depth={depth} />
         <div
           className="relative grid grid-cols-1 items-start gap-y-6 md:justify-start md:[grid-template-columns:var(--lens-columns)] md:gap-x-12"
           style={
@@ -529,12 +524,12 @@ function Connectors({
   focus,
   relations,
   index,
-  deps,
+  depth,
 }: {
   focus: string;
   relations: Relations;
   index: IssueIndex;
-  deps: unknown[];
+  depth: number;
 }) {
   const [paths, setPaths] = useState<
     { d: string; open: boolean; key: string; from: string; to: string }[]
@@ -607,8 +602,8 @@ function Connectors({
     if (el.firstElementChild?.nextElementSibling)
       observer.observe(el.firstElementChild.nextElementSibling);
     return () => observer.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- remeasure when the lens moves
-  }, deps);
+    // Live edits can move cards without resizing the grid or changing focus.
+  }, [focus, relations, index, depth]);
   return (
     <svg
       ref={svg}

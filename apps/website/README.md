@@ -385,6 +385,8 @@ dependencies and durable comments, agent checkpoints or evidence.
   The relationship view starts at the leftmost occupied dependency column rather
   than reserving space for missing steps. Blockers remain left of the selected
   issue and dependents right; phones stack the selected issue first.
+  Live dependency and issue-state edits refresh connector positions and styling
+  without requiring a focus change or a resize.
 - **Coordination:** ready work is unblocked, unclaimed `todo` (or an expired
   claimed `in_progress` issue) with no open sub-issues, no other active lease
   above it, and nothing waiting on a person (`readiness` in `shared/tracker.ts`,
