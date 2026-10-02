@@ -378,10 +378,19 @@ quality and real-service E2E gate in addition to this semantic-specific smoke.
 ## Distributed issue tracker
 
 Open `/tracker` from the global navigation. Select an account, create a team,
-and capture a title-only issue. The workbench keeps the list, board or blocker
-graph beside the selected issue; phones navigate from the list into detail.
-Expand a ticket into a Markdown PRD, acceptance criteria, parent/child plan,
-dependencies and durable comments, agent checkpoints or evidence.
+and capture a title-only issue with **Create**. For more context up front, choose
+**Add details**: the dialog carries over the title, selected team and current
+workspace scope, and lets you set a Markdown description, type, status, priority,
+assignee and workspaces. **Create and edit** saves the issue and immediately
+opens the existing editor for acceptance criteria, labels and relationships,
+including from the blocker graph. Rejected submissions keep the draft; an
+unconfirmed submission stays open with an idempotent retry rather than creating
+another issue.
+
+The workbench keeps the list, board or blocker graph beside the selected issue;
+phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
+acceptance criteria, parent/child plan, dependencies and durable comments, agent
+checkpoints or evidence.
 
 - **Ownership:** a personal account or organization owns each tracker. An issue
   has one team and zero or more cross-team workspaces. Team prefixes and workspace

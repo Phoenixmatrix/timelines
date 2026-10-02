@@ -82,6 +82,7 @@ export function IssueDetail({
   mutate,
   busy,
   href,
+  initialEditing = false,
 }: {
   issue: Issue;
   snapshot: Snapshot;
@@ -90,6 +91,7 @@ export function IssueDetail({
   mutate: Mutate;
   busy: boolean;
   href: (id?: string) => string;
+  initialEditing?: boolean;
 }) {
   const storageKey = `gitmatrix:issue-draft:${snapshot.owner.id}:${issue.id}`;
   const initial: Draft = {
@@ -118,9 +120,9 @@ export function IssueDetail({
   });
   const [editing, setEditing] = useState(() => {
     try {
-      return !!sessionStorage.getItem(storageKey);
+      return initialEditing || !!sessionStorage.getItem(storageKey);
     } catch {
-      return false;
+      return initialEditing;
     }
   });
   const [preview, setPreview] = useState(false);
@@ -141,6 +143,9 @@ export function IssueDetail({
   useEffect(() => {
     if (window.matchMedia("(max-width: 760px)").matches) detailRef.current?.focus();
   }, []);
+  useEffect(() => {
+    if (editing) detailRef.current?.querySelector<HTMLInputElement>("input")?.focus();
+  }, [editing]);
   useEffect(() => {
     if (busy) {
       setNotice("");
@@ -193,9 +198,6 @@ export function IssueDetail({
     setActionError("");
     setLocalError("");
     setEditing(true);
-    requestAnimationFrame(() =>
-      detailRef.current?.querySelector<HTMLInputElement>("input")?.focus(),
-    );
   };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {

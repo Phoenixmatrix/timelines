@@ -49,6 +49,7 @@ import { useViewer } from "../../lib/session.ts";
 import type { trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { TrackerDefaultsForm } from "./Defaults.tsx";
+import { CreateIssue } from "./CreateIssue.tsx";
 import { readTrackerDefaults, VIEW_LABEL, withTrackerDefaults, type View } from "./preferences.ts";
 import { RelationLens } from "./Lens.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
@@ -178,12 +179,17 @@ function Workbench({ data }: { data: TrackerView }) {
     ? requestedTeam
     : "";
   const [createError, setCreateError] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editOnCreate, setEditOnCreate] = useState<string | null>(null);
   const titleRef = useRef<HTMLInputElement>(null);
   const queryRef = useRef<HTMLInputElement>(null);
   const owner = data.snapshot.owner.slug;
   const base = `/tracker/${encodeURIComponent(owner)}`;
   const selected =
     snapshot.issues.find((issue) => issue.id === route.issue || issue.key === route.issue) ?? null;
+  useEffect(() => {
+    if (selected?.id === editOnCreate) setEditOnCreate(null);
+  }, [selected?.id, editOnCreate]);
   const view = (
     Object.hasOwn(VIEW_LABEL, params.get("view") ?? "list")
       ? (params.get("view") ?? "list")
@@ -437,36 +443,55 @@ function Workbench({ data }: { data: TrackerView }) {
   const managementHref = `${base}?${managementParams}`;
   const hasTeam = snapshot.teams.some((team) => !team.archived);
   const parsedUnknown = compiled.parsed.unknown;
+  const workspaceToken = tokenize(query)
+    .find((token) => token.toLowerCase().startsWith("ws:"))
+    ?.slice(3);
+  const captureWorkspace = snapshot.workspaces.find(
+    (workspace) =>
+      !workspace.archived && workspace.slug.toLowerCase() === workspaceToken?.toLowerCase(),
+  );
+  const createIssue = async (
+    fields: Extract<Mutation, { kind: "issue.create" }>["data"],
+    edit: boolean,
+  ): Promise<MutationOutcome> => {
+    const id = crypto.randomUUID();
+    const result = await mutate([{ kind: "issue.create", id, data: fields }]);
+    if (result.ok) {
+      setTitle("");
+      if (edit) {
+        setCreateOpen(false);
+        setEditOnCreate(id);
+      }
+      const next = new URLSearchParams(params);
+      if (edit && view === "graph") next.set("details", "true");
+      await navigate(`${base}/issues/${id}${next.size ? `?${next}` : ""}`);
+    }
+    return result;
+  };
+  const retryPending = () => {
+    if (pending.current)
+      void mutate(pending.current.mutations).then((result) => {
+        if (!result.ok) setError(result.error);
+      });
+  };
 
   const capture = (
     <fieldset disabled={busy || uncertain} className="m-0 flex min-w-0 flex-1 border-0 p-0">
       <form
-        className="flex min-w-0 flex-1 gap-2"
+        className="flex min-w-0 flex-1 flex-wrap gap-2"
         onSubmit={async (event) => {
           event.preventDefault();
-          const id = crypto.randomUUID();
-          const ws = tokenize(query)
-            .find((t) => t.toLowerCase().startsWith("ws:"))
-            ?.slice(3);
-          const workspace = snapshot.workspaces.find(
-            (w) => w.slug.toLowerCase() === ws?.toLowerCase(),
-          );
+          if (busy || uncertain || !createTeam || !title.trim()) return;
           setCreateError("");
-          const result = await mutate([
+          const result = await createIssue(
             {
-              kind: "issue.create",
-              id,
-              data: {
-                teamId: createTeam,
-                title: title.trim(),
-                ...(workspace ? { workspaceIds: [workspace.id] } : {}),
-              },
+              teamId: createTeam,
+              title: title.trim(),
+              workspaceIds: captureWorkspace ? [captureWorkspace.id] : [],
             },
-          ]);
-          if (result.ok) {
-            setTitle("");
-            await navigate(href(id));
-          } else setCreateError(result.error);
+            false,
+          );
+          if (!result.ok) setCreateError(result.error);
         }}
       >
         <SelectField
@@ -485,7 +510,7 @@ function Workbench({ data }: { data: TrackerView }) {
           ref={titleRef}
           aria-label="New issue title"
           aria-keyshortcuts={shortcuts ? "c n" : undefined}
-          className="mk-input min-w-0 flex-1"
+          className="mk-input min-w-0 flex-1 basis-40"
           placeholder="Capture an issue"
           required
           maxLength={500}
@@ -500,6 +525,16 @@ function Workbench({ data }: { data: TrackerView }) {
           disabled={busy || !createTeam || !title.trim()}
         >
           Create
+        </button>
+        <button
+          type="button"
+          className="mk-btn h-(--size-field)"
+          onClick={() => {
+            setCreateError("");
+            setCreateOpen(true);
+          }}
+        >
+          Add details
         </button>
       </form>
     </fieldset>
@@ -543,6 +578,7 @@ function Workbench({ data }: { data: TrackerView }) {
         mutate={mutate}
         busy={busy || uncertain}
         href={href}
+        initialEditing={editOnCreate === selected.id}
       />
     </fieldset>
   ) : route.issue ? (
@@ -636,6 +672,22 @@ function Workbench({ data }: { data: TrackerView }) {
           </Menu.Root>
         </div>
       </header>
+      {createOpen && (
+        <CreateIssue
+          snapshot={snapshot}
+          initialTitle={title}
+          initialTeam={createTeam}
+          initialWorkspaces={captureWorkspace ? [captureWorkspace.id] : []}
+          busy={busy}
+          uncertain={uncertain}
+          onCreate={(fields) => createIssue(fields, true)}
+          onRetry={retryPending}
+          onCancel={() => {
+            setCreateOpen(false);
+            requestAnimationFrame(() => titleRef.current?.focus());
+          }}
+        />
+      )}
       {defaultsOpen && viewer && (
         <TrackerDefaultsForm
           viewerId={viewer.id}
@@ -662,16 +714,7 @@ function Workbench({ data }: { data: TrackerView }) {
               The server may have saved your change. Retry sends the same operation ID, so it can't
               apply twice.
             </p>
-            <button
-              className="mk-btn mk-btn--sm"
-              disabled={busy}
-              onClick={() => {
-                if (pending.current)
-                  void mutate(pending.current.mutations).then((result) => {
-                    if (!result.ok) setError(result.error);
-                  });
-              }}
-            >
+            <button className="mk-btn mk-btn--sm" disabled={busy} onClick={retryPending}>
               Retry pending change
             </button>
           </div>
