@@ -436,6 +436,64 @@ export async function runProviderE2E(
         found,
         "Vectorize entity and AI Search source passage invariants were not both visible",
       );
+      enter("knowledge-edit");
+      // A meaningful edit re-analyzes checksum.ts; the concepts it still deals
+      // with must keep their names, or every edit becomes new concepts to align.
+      const conceptsOf = (g: {
+        nodes: { id: string; kind: string; path: string; data: { topics?: string[] } }[];
+        edges: { src: string; dst: string; kind: string }[];
+      }) => {
+        const node = g.nodes.find((n) => n.kind === "file" && n.path === "checksum.ts");
+        assert(node, "Graph lacks the fixture file");
+        const linked = g.edges
+          .filter((e) => e.src === node.id && e.kind === "mentions")
+          .map((e) => e.dst.replace(/^concept:/, ""));
+        const topics = (node.data.topics ?? []).map((t) => t.toLowerCase());
+        return [...new Set([...linked, ...topics])].sort();
+      };
+      const conceptsBefore = conceptsOf(graph);
+      await writeFile(
+        join(work, "checksum.ts"),
+        "/** Copper Finch parcel checksum: UTF-16 code units modulo 65521. */\nexport function copperFinchChecksum(parcel: string): number {\n  let checksum = 0;\n  for (let i = 0; i < parcel.length; i++) checksum = (checksum + parcel.charCodeAt(i)) % 65521;\n  return checksum;\n}\n\n/** Whether a received parcel still matches the checksum sent with it. */\nexport function copperFinchVerify(parcel: string, expected: number): boolean {\n  return copperFinchChecksum(parcel) === expected;\n}\n",
+      );
+      await git(["-c", "core.hooksPath=/dev/null", "commit", "-am", "Verify Copper Finch parcels"]);
+      await git(["push", "origin", "main"], work, true);
+      const edited = await git(["rev-parse", "HEAD"]);
+      let editBuild: { stats: { analyzed?: number; reused?: number } } | undefined;
+      await waitFor(stage, 12 * 60_000, async () => {
+        const status = await api(`${base}/knowledge/status`);
+        if (status.state === "failed")
+          throw new Error("Knowledge build of the edit failed; see redacted provider evidence");
+        editBuild = status.recent.find(
+          (entry: { toCommit: string; status: string }) =>
+            entry.toCommit === edited && entry.status === "succeeded",
+        );
+        return status.state === "up-to-date" && status.indexedCommit === edited;
+      });
+      // A cosmetic verdict would reuse the old card and prove nothing about naming.
+      assert.equal(editBuild?.stats.analyzed, 1, "The edit was not re-analyzed by the model");
+      const editedGraph = await api(`${base}/knowledge/graph/export`);
+      assert(
+        editedGraph.nodes.some(
+          (n: { kind: string; name: string }) =>
+            n.kind === "symbol" && n.name === "copperFinchVerify",
+        ),
+        "Graph lacks the symbol the edit added",
+      );
+      const conceptsAfter = conceptsOf(editedGraph);
+      const kept = conceptsBefore.filter((c) => conceptsAfter.includes(c));
+      evidence.conceptRetention = {
+        before: conceptsBefore,
+        after: conceptsAfter,
+        kept,
+        analyzed: editBuild?.stats.analyzed,
+        reused: editBuild?.stats.reused,
+      };
+      assert(conceptsBefore.length > 0, "The fixture file named no concepts");
+      assert(
+        kept.length * 2 >= conceptsBefore.length,
+        "A meaningful edit renamed most of the file's concepts",
+      );
     }
     evidence.outcome = "passed";
   } catch (error) {

@@ -108,6 +108,7 @@ async function card(
   role: FileRole,
   content: string,
   symbols: FileSymbol[],
+  previousConcepts: string[],
 ) {
   const body =
     content.length > MAX_CARD_INPUT
@@ -116,11 +117,18 @@ async function card(
   const known = symbols.length
     ? `Symbols found by the parser: ${symbols.map((s) => s.name).join(", ")}\n`
     : "";
+  // Left to itself the model rewords a file's concepts on every edit, and each
+  // new wording is a new concept to align against the rest of the repository.
+  const before = previousConcepts.length
+    ? `Concepts of this file before its latest edit: ${previousConcepts.join("; ")}\n` +
+      "Keep each of those names exactly as written while the file still deals with it; " +
+      "change the list only for what the edit added or removed.\n"
+    : "";
   return chatJson<Card>(
     env,
     "fast",
     CARD_SYSTEM,
-    `File: ${path}\nRole: ${role}\n${known}\n${body}`,
+    `File: ${path}\nRole: ${role}\n${known}${before}\n${body}`,
     {
       maxTokens: 1600,
     },
@@ -348,7 +356,8 @@ export async function analyzeFiles(
     }
     let result;
     try {
-      result = await card(env, file.path, role, file.content, symbols);
+      const before = file.previousBlob ? previous.get(file.previousBlob) : undefined;
+      result = await card(env, file.path, role, file.content, symbols, before?.concepts ?? []);
     } catch (error) {
       // Left without an analysis: the graph shows it as pending and the next
       // build tries again. Only a failure of every file fails the step.

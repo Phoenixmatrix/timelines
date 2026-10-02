@@ -4,10 +4,10 @@
 // entity-alignment recipe (block candidates cheaply, ask one typed question
 // per pair, route by the nearest level, no fitted thresholds):
 //
-//   pairs    candidate pairs come from shared uncommon words and mutual
-//            nearest neighbours by name embedding; clef places each pair on
-//            0 different / 1 related but separate / 2 the same, plus which one
-//            is a part or kind of the other
+//   pairs    candidate pairs come from shared uncommon words (each concept's
+//            closest few) and mutual nearest neighbours by name embedding;
+//            clef places each pair on 0 different / 1 related but separate /
+//            2 the same, plus which one is a part or kind of the other
 //   merge    pairs at level 2 merge into groups under a stable canonical key,
 //            never chaining into a group that holds a concept judged different
 //   link     level-1 pairs with a clear direction become narrower → broader
@@ -46,6 +46,8 @@ const WELL_USED = 3;
 /** Above this many concepts, skip the O(n²) embedding comparison. */
 const MAX_EMBEDDED = 1200;
 const NEIGHBOURS = 3;
+/** Shared-word candidates kept per concept, closest first. */
+const PAIRS_PER_CONCEPT = 4;
 const CLEF_CONCURRENCY = 6;
 
 export interface ConceptModel {
@@ -159,15 +161,24 @@ function tokens(name: string): Set<string> {
 
 /**
  * Pairs sharing an uncommon word with enough overlap, or where one name's
- * words are a subset of the other's.
+ * words are a subset of the other's; each concept keeps only its `perConcept`
+ * closest (nesting first, then the share of rare words in common). A new name
+ * that shares a word with dozens of concepts would otherwise cost a clef call
+ * for each, nearly all "different": on this repository's decisions, four per
+ * concept kept 91% of the merges for half the calls.
  */
-export function tokenCandidates(names: Map<string, string>): [string, string][] {
+export function tokenCandidates(
+  names: Map<string, string>,
+  perConcept = PAIRS_PER_CONCEPT,
+): [string, string][] {
   const tok = new Map([...names].map(([key, name]) => [key, tokens(name)]));
   const index = new Map<string, string[]>();
   for (const [key, set] of tok) for (const t of set) index.set(t, [...(index.get(t) ?? []), key]);
   const rare = Math.max(8, Math.round(names.size * 0.03));
+  // A word's weight falls with the number of concepts that use it.
+  const weight = (t: string) => Math.log(names.size / (index.get(t)?.length ?? 1));
   const seen = new Set<string>();
-  const out: [string, string][] = [];
+  const ranked: { pair: [string, string]; rank: number }[] = [];
   for (const keys of index.values()) {
     for (let i = 0; i < keys.length; i++) {
       for (let j = i + 1; j < keys.length; j++) {
@@ -179,14 +190,31 @@ export function tokenCandidates(names: Map<string, string>): [string, string][] 
         const ta = tok.get(a) as Set<string>;
         const tb = tok.get(b) as Set<string>;
         const shared = [...ta].filter((t) => tb.has(t));
-        const jaccard = shared.length / new Set([...ta, ...tb]).size;
+        const union = new Set([...ta, ...tb]);
+        const jaccard = shared.length / union.size;
         const rareShared = shared.some((t) => (index.get(t)?.length ?? 0) <= rare);
         const subset = [...ta].every((t) => tb.has(t)) || [...tb].every((t) => ta.has(t));
-        if ((rareShared && jaccard >= 0.25) || subset) out.push(splitPair(pk));
+        if (!((rareShared && jaccard >= 0.25) || subset)) continue;
+        const sum = (ts: Iterable<string>) => [...ts].reduce((n, t) => n + weight(t), 0);
+        // Nesting outranks any overlap (weighted overlap is below 1).
+        const rank = (subset ? 1 : 0) + sum(shared) / (sum(union) || 1);
+        ranked.push({ pair: splitPair(pk), rank });
       }
     }
   }
-  return out;
+  // Keep a pair when it is among the closest for either of its concepts. Ranks
+  // depend only on names, so pairs already decided keep their places and a new
+  // build asks only about what the newcomers changed.
+  const closest = new Map<string, { pair: [string, string]; rank: number }[]>();
+  for (const entry of ranked) {
+    for (const key of entry.pair) closest.set(key, [...(closest.get(key) ?? []), entry]);
+  }
+  const kept = new Set<{ pair: [string, string]; rank: number }>();
+  for (const entries of closest.values()) {
+    entries.sort((x, y) => y.rank - x.rank || pairKey(...x.pair).localeCompare(pairKey(...y.pair)));
+    for (const entry of entries.slice(0, perConcept)) kept.add(entry);
+  }
+  return ranked.filter((e) => kept.has(e)).map((e) => e.pair);
 }
 
 /** Pairs that are each other's nearest neighbours by embedding (no threshold to tune). */

@@ -36,6 +36,26 @@ describe("tokenCandidates", () => {
     expect(pairs).toContain(pairKey("theme", "theme-switching"));
     expect(pairs.some((p) => p.includes("exit-code"))).toBe(false);
   });
+
+  test("keeps only each concept's closest candidates, nesting first", () => {
+    // Eight names share the uncommon word "artifact": 28 pairs among them alone.
+    const words = ["Build", "Blob", "Cache", "Token", "Upload", "Mirror", "Digest"];
+    const names = new Map<string, string>([
+      ["artifact-registry", "Artifact Registry"],
+      ["registry", "Registry"],
+      ...words.map((w) => [`artifact-${w.toLowerCase()}`, `Artifact ${w}`] as [string, string]),
+    ]);
+    const uncapped = tokenCandidates(names, 100);
+    const capped = tokenCandidates(names, 2);
+    expect(uncapped.length).toBe(29);
+    // Each concept contributes at most its two closest.
+    expect(capped.length).toBeLessThanOrEqual(2 * names.size);
+    // Nesting outranks shared words: with room for one, "Artifact Registry"
+    // keeps the name it is made of.
+    expect(tokenCandidates(names, 1).map(([a, b]) => pairKey(a, b))).toContain(
+      pairKey("artifact-registry", "registry"),
+    );
+  });
 });
 
 test("mutualNeighbours keeps only pairs that pick each other", () => {
