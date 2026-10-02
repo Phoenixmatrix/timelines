@@ -230,13 +230,28 @@ Go, Markdown, XML, JSON, HTML and CSS:
 The repository file view uses those same grammars and the Changes tab's shared
 token renderer in both themes. Source appears immediately as selectable plain
 text; a dedicated Web Worker applies syntax colors without parsing on the UI
-thread. Line numbers, `#L` links and the knowledge rail remain unchanged.
+thread. Source text selection and the knowledge rail remain available.
 Highlighting is limited to 256 KiB of UTF-8 source. Unknown extensions,
 truncated/oversized files and unavailable or failed workers retain plain text;
 binary files retain the existing not-shown notice. Navigation cancels the worker,
 stale results cannot color another file, and a five-second watchdog terminates
 unfinished worker loading/parsing. The worker uses only the syntax tree, not
 semantic fact extraction.
+
+Click a line number to select it; Shift-click another to extend the range in
+either direction. On touch screens, choose **Extend range**, then tap the other
+endpoint. Line-number links remain keyboard-focusable (Enter selects a line;
+Shift+Enter extends). Selection replaces the current history entry and uses
+`#L12` or `#L12-L20`; opening either form highlights and scrolls to the selection
+after client-side rendering. Invalid anchors are ignored; ranges extending past
+the visible source are bounded to its last line.
+
+The selected-line controls stay visible while scrolling. **Copy link** shares
+the current branch/tag/ref and selection; **Copy permalink** pins the same file
+and lines to the exact commit used to load the displayed source, not a newer
+branch tip. The blob API returns that SHA as `BlobResponse.commitOid`. Successful
+copies show a toast; denied clipboard access shows an error rather than claiming
+the copy succeeded.
 
 ### API and pagination
 

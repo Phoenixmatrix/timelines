@@ -339,6 +339,7 @@ repos.get("/:owner/:name/blob", async (c) => {
     cacheIfImmutable(c, ref);
     const body: BlobResponse = {
       ref,
+      commitOid: commit.hash,
       path,
       size: blob.size,
       contentType: binary ? "application/octet-stream" : "text/plain; charset=utf-8",

@@ -106,6 +106,8 @@ export interface TreeResponse {
 
 export interface BlobResponse {
   ref: string;
+  /** The exact commit used to read this blob, even if its branch moves afterward. */
+  commitOid: string;
   path: string;
   size: number;
   contentType: string;

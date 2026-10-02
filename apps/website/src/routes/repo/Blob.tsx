@@ -1,5 +1,5 @@
-import { MapTrifoldIcon, PackageIcon } from "@phosphor-icons/react";
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { CopyIcon, LinkSimpleIcon, MapTrifoldIcon, PackageIcon } from "@phosphor-icons/react";
+import { Suspense, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   Await,
   Link,
@@ -11,8 +11,9 @@ import {
 import type { BlobResponse, GraphNodeDetail, RepoDetail } from "../../../shared/api.ts";
 import { HighlightedSource } from "../../components/HighlightedSource.tsx";
 import { FileRow, RailSection, railClass } from "../../components/Rail.tsx";
-import { link } from "../../components/ui.tsx";
+import { link, useToast } from "../../components/ui.tsx";
 import { bytes } from "../../lib/format.ts";
+import { lineAnchor, parseLineAnchor } from "../../lib/lineAnchors.ts";
 import { findDefinitions } from "../../lib/outline.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
@@ -30,23 +31,62 @@ export async function blobLoader({ params }: LoaderFunctionArgs) {
   return { blob, knowledge };
 }
 
-const LINE = /^#L(\d+)$/;
-
 export function Blob() {
   const { blob, knowledge } = useLoaderData<typeof blobLoader>();
   const repo = useRepo();
   const navigate = useNavigate();
-  const { hash } = useLocation();
+  const { hash, search } = useLocation();
   const lines = useMemo(() => blob.text?.replace(/\n$/, "").split("\n") ?? [], [blob.text]);
   const highlights = useSourceHighlight(blob);
   const fileName = blob.path.split("/").pop();
 
-  // The code renders after the loader, so the browser's own jump to #L123 on
-  // load finds nothing; do it once the lines exist.
+  const selection = parseLineAnchor(hash, lines.length);
+  const start = selection?.start;
+  const end = selection?.end;
+  const toast = useToast();
+  const anchor = useRef<{ file: string; hash: string; line: number } | null>(null);
+  const file = `${repo.id}:${blob.ref}:${blob.path}`;
+  const [rangeOrigin, setRangeOrigin] = useState<{ file: string; hash: string } | null>(null);
+  const extending = rangeOrigin?.file === file && rangeOrigin.hash === hash;
+  const selectedHash = selection ? lineAnchor(selection.start, selection.end) : "";
+  const permalink = `${blobUrl(repo.owner.slug, repo.name, blob.commitOid, blob.path)}${selectedHash}`;
+
+  const selectLine = (event: MouseEvent<HTMLAnchorElement>, line: number) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey) return;
+    event.preventDefault();
+    const previous = anchor.current;
+    const pivot =
+      event.shiftKey || extending
+        ? previous?.file === file && previous.hash === hash
+          ? previous.line
+          : (start ?? line)
+        : line;
+    const next = lineAnchor(pivot, line);
+    anchor.current = { file, hash: next, line: pivot };
+    setRangeOrigin(null);
+    void navigate({ hash: next, search }, { replace: true, preventScrollReset: true });
+  };
+
+  const copyLink = async (pinned: boolean) => {
+    const path = pinned
+      ? permalink
+      : `${blobUrl(repo.owner.slug, repo.name, blob.ref, blob.path)}${selectedHash}`;
+    try {
+      await navigator.clipboard.writeText(new URL(path, window.location.origin).href);
+      toast.add({ title: pinned ? "Permalink copied" : "Link copied" });
+    } catch {
+      toast.add({
+        title: "Couldn't copy the link",
+        description: "Allow clipboard access and try again.",
+        type: "error",
+      });
+    }
+  };
+
+  // Both initial deep links and subsequent selections render after route loading.
   useEffect(() => {
-    if (LINE.test(hash))
-      document.getElementById(hash.slice(1))?.scrollIntoView({ block: "center" });
-  }, [hash, blob.path, blob.ref]);
+    if (start) document.getElementById(`L${start}`)?.scrollIntoView({ block: "center" });
+  }, [start, end, file]);
 
   return (
     <div className="grid gap-x-8 gap-y-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
@@ -58,12 +98,54 @@ export function Blob() {
           view="blob"
           onSwitch={(ref) => navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path))}
         />
-        <section className="overflow-hidden rounded-pane bg-pane">
-          <div className="flex items-center gap-3 border-b border-line-soft px-4 py-3 text-body-sm">
-            <span className="font-semibold">{fileName}</span>
+        <section className="rounded-pane bg-pane">
+          <div className="sticky top-16 z-10 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-t-pane border-b border-line-soft bg-pane px-4 py-3 text-body-sm">
+            <span className="min-w-0 font-semibold break-all">{fileName}</span>
             <span className="text-ink-faint">
               {blob.binary ? bytes(blob.size) : `${lines.length} lines · ${bytes(blob.size)}`}
             </span>
+            {selection ? (
+              <div
+                role="group"
+                aria-label="Selected source lines"
+                className="flex w-full flex-wrap items-center gap-2"
+              >
+                <span className="mr-auto text-ink-muted" aria-live="polite">
+                  {start === end ? `Line ${start}` : `Lines ${start}–${end}`}
+                </span>
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost min-h-11"
+                  aria-pressed={extending}
+                  onClick={() => setRangeOrigin(extending ? null : { file, hash })}
+                >
+                  {extending ? "Select last line" : "Extend range"}
+                </button>
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost min-h-11"
+                  onClick={() => void copyLink(false)}
+                >
+                  <CopyIcon aria-hidden />
+                  Copy link
+                </button>
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost min-h-11"
+                  onClick={() => void copyLink(true)}
+                  title="Copy a link pinned to this exact commit"
+                >
+                  <LinkSimpleIcon aria-hidden />
+                  Copy permalink
+                </button>
+              </div>
+            ) : (
+              !blob.binary && (
+                <span className="w-full text-ink-muted">
+                  Select a line number to share. Shift-click another to select a range.
+                </span>
+              )
+            )}
           </div>
           {blob.binary ? (
             <div className="mk-empty m-4">
@@ -72,33 +154,40 @@ export function Blob() {
               <span className="text-body-sm text-ink-faint">Clone the repository to open it.</span>
             </div>
           ) : (
-            <div className="overflow-x-auto bg-sunken py-3">
+            <div className="overflow-x-auto rounded-b-pane bg-sunken py-3">
               <table className="w-full border-collapse font-mono text-body-sm leading-5">
                 <tbody>
-                  {lines.map((line, index) => (
-                    <tr
-                      key={index}
-                      id={`L${index + 1}`}
-                      className="scroll-mt-24 target:bg-signal-wash"
-                    >
-                      <td className="w-px pr-4 pl-4 text-right align-top tabular-nums select-none">
-                        <a
-                          href={`#L${index + 1}`}
-                          className="text-ink-faint no-underline hover:text-ink"
-                          aria-label={`Line ${index + 1}`}
-                        >
-                          {index + 1}
-                        </a>
-                      </td>
-                      <td className="pr-4 whitespace-pre">
-                        {highlights?.[index] ? (
-                          <HighlightedSource text={line || " "} tokens={highlights[index]} />
-                        ) : (
-                          line || " "
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                  {lines.map((line, index) => {
+                    const selected =
+                      !!selection && index + 1 >= selection.start && index + 1 <= selection.end;
+                    return (
+                      <tr
+                        key={index}
+                        id={`L${index + 1}`}
+                        data-line-selected={selected || undefined}
+                        className={`scroll-mt-48 ${selected ? "bg-signal-wash" : ""}`}
+                      >
+                        <td className="w-px pr-4 pl-4 text-right align-top tabular-nums select-none">
+                          <a
+                            href={`#L${index + 1}`}
+                            className="inline-flex min-h-6 min-w-6 items-center justify-end text-ink-faint no-underline hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal-line"
+                            aria-label={`Line ${index + 1}`}
+                            aria-current={selected ? "location" : undefined}
+                            onClick={(event) => selectLine(event, index + 1)}
+                          >
+                            {index + 1}
+                          </a>
+                        </td>
+                        <td className="pr-4 whitespace-pre">
+                          {highlights?.[index] ? (
+                            <HighlightedSource text={line || " "} tokens={highlights[index]} />
+                          ) : (
+                            line || " "
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
               {blob.truncated && (
