@@ -897,6 +897,10 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 - `src/`: React Router (data mode), Base UI and Tailwind, styled with MatrixKit Neo
   (`src/styles/tokens.css` is generated from the design system's tokens;
   `matrixkit.css` is its component stylesheet, vendored as is)
+  `AppShell.tsx` anchors desktop navigation to both viewport edges and reserves
+  its width using `--size-rail`; phones retain a sticky top bar without that
+  gutter. Keeping the desktop rail out of sticky page flow prevents bottom gaps
+  when document heights land on fractional CSS pixels.
 
 ## Known gaps
 

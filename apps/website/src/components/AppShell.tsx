@@ -167,10 +167,10 @@ export function AppShell() {
     );
 
   return (
-    <div className="flex min-h-dvh max-sm:flex-col">
+    <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
       <nav
         aria-label="Places"
-        className="mk-rail sticky top-0 z-20 h-dvh shrink-0 max-sm:h-auto max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2"
+        className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2 sm:fixed sm:inset-y-0 sm:left-0"
       >
         <Place to="/" label="Home" end>
           {() => <GitmatrixLogo markOnly className="size-8" />}
