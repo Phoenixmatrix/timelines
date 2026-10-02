@@ -615,6 +615,10 @@ Apply registry migration `0004_artifact_storage.sql` before running the updated
 Worker. Existing raw locators remain readable during backfill. Compaction changes
 storage only: clients and artifact URLs do not change.
 
+The [Git LFS and Xet investigation](../../ARTIFACT-STORAGE-RESEARCH.md) records
+measured comparisons, shared-chunk storage tradeoffs, and the evidence needed
+before revisiting this design.
+
 ## Mirrors
 
 A repository can mirror every push on to another git host: Settings → Mirror,
