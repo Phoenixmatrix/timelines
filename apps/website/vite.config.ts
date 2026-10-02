@@ -7,6 +7,10 @@ import { developmentEnvironment } from "./vite/environment.ts";
 
 const local = developmentEnvironment(process.env);
 
+// Remote bindings authenticate through the plugin's bundled wrangler unless this
+// is set; with it, they reuse the `cf auth login` session instead.
+process.env.CLOUDFLARE_CF_AUTH ??= "1";
+
 export default defineConfig({
   // The Cloudflare plugin owns the dev server, which clashes with Vitest's own;
   // the unit tests are plain functions and don't need workerd.
