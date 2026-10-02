@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vite-plus/test";
 import type { FileAnalysis } from "./analyze.ts";
+import { d1, migratedDatabase } from "../testing/d1.ts";
 import {
+  alignPairs,
   cluster,
   mutualNeighbours,
   pairKey,
@@ -196,4 +198,37 @@ test("buildGraph merges aliases, links part_of and turns trimmed concepts into t
   expect(graph.nodes.find((n) => n.id === "file:a.ts")?.data.topics).toEqual([
     "Grapheme Segmentation",
   ]);
+});
+
+test("alignPairs counts stored pair decisions only, not reviews", async () => {
+  const sqlite = migratedDatabase();
+  sqlite.exec(`
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
+    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
+    INSERT INTO kg_concept_reviews (repo_id, a, b, score, inputs_hash)
+      VALUES ('repo', 'billing', 'invoice', 0, 'h');
+  `);
+  const AI = {
+    // Small repositories also embed names; orthogonal vectors pair nothing.
+    run: async (_model: string, inputs: { text?: string[] }) =>
+      inputs.text
+        ? { data: inputs.text.map((_, i) => inputs.text!.map((__, j) => (i === j ? 1 : 0))) }
+        : {
+            answers: {
+              link: { type: "score", score: 0, probabilities: [1, 0, 0], confidence: 1 },
+              a_in_b: { type: "noul", noul: 0 },
+              b_in_a: { type: "noul", noul: 0 },
+            },
+          },
+  };
+  const env = { DB: d1(sqlite), AI } as unknown as Env;
+  const files = [{ path: "src/a.ts", blob: "a1", mode: "100644" }];
+  const analyses = new Map([
+    ["a1", { concepts: ["Theme", "Theme Switching"], skipped: undefined } as never],
+  ]);
+  const stats = await alignPairs(env, "repo", files, analyses);
+  expect(stats.asked).toBe(1);
+  // One stored first-pass decision; the review-only pair must not read as asked.
+  expect(stats.decided).toBe(1);
 });

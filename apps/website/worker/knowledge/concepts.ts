@@ -403,7 +403,7 @@ export interface AlignStats {
   concepts: number;
   candidates: number;
   asked: number;
-  /** Decisions stored once this call is done. */
+  /** First-pass pair decisions stored once this call is done. */
   decided: number;
   remaining: number;
 }
@@ -499,11 +499,18 @@ export async function alignPairs(
     if (unsaved.length >= 40) await save();
   });
   await save();
+  // Count stored first-pass decisions, as the build's baseline does: `decided`
+  // above also holds review-only pairs, which would read as pairs asked.
+  const stored = await db(env.DB)
+    .selectFrom("kg_concept_pairs")
+    .select((eb) => eb.fn.countAll<number>().as("n"))
+    .where("repo_id", "=", repoId)
+    .executeTakeFirst();
   return {
     concepts: names.size,
     candidates: candidates.size,
     asked: batch.length,
-    decided: decided.size + batch.length,
+    decided: stored?.n ?? 0,
     remaining: pending.length - batch.length,
   };
 }
