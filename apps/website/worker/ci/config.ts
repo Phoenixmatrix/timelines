@@ -156,7 +156,7 @@ export function parsePipeline(source: string): Pipeline {
       if (!names.has(need))
         throw new ConfigError(`jobs.${job.name}.needs names unknown job "${need}".`);
     }
-    if (job.if) evaluate(job.if, { branch: "", trigger: "push", commit: "" });
+    if (job.if) evaluate(job.if, { branch: "", trigger: "push", commit: "", runner: "local" });
   }
   stages(jobs);
   return { branches, env, jobs };
@@ -203,10 +203,12 @@ export interface ConditionContext {
   branch: string;
   trigger: "push" | "manual";
   commit: string;
+  /** Where jobs run: "local" (gm runner under vp dev) or "sandbox" (deployed). */
+  runner: "local" | "sandbox";
 }
 
 /**
- * Evaluate a job's `if:` — comparisons of `branch`, `trigger` or `commit`
+ * Evaluate a job's `if:` — comparisons of `branch`, `trigger`, `commit` or `runner`
  * with quoted strings using == and !=, joined by && and ||, with parentheses.
  */
 export function evaluate(expression: string, context: ConditionContext): boolean {
@@ -224,7 +226,9 @@ export function evaluate(expression: string, context: ConditionContext): boolean
     if (!token) throw new ConfigError(`Condition "${expression}" ends early.`);
     if (/^["']/.test(token)) return token.slice(1, -1);
     if (token in context) return context[token as keyof ConditionContext];
-    throw new ConfigError(`Unknown name "${token}" in condition; use branch, trigger or commit.`);
+    throw new ConfigError(
+      `Unknown name "${token}" in condition; use branch, trigger, commit or runner.`,
+    );
   };
   const comparison = (): boolean => {
     if (peek() === "(") {

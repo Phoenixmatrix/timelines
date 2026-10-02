@@ -82,7 +82,12 @@ export async function startRun(
     }
 
     const runId = crypto.randomUUID().replaceAll("-", "");
-    const context = { branch: options.branch, trigger: options.trigger, commit: options.commit };
+    const context = {
+      branch: options.branch,
+      trigger: options.trigger,
+      commit: options.commit,
+      runner: env.CI_RUNNER,
+    };
     const kdb = db(env.DB);
     const statements: Parameters<typeof batch>[1] = [
       kdb

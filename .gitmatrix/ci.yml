@@ -4,6 +4,12 @@
 # dedicated resources; its finally cleanup and the hourly janitor both apply.
 # All four jobs are required, but exchange no artifacts. Keep them in one stage
 # so the stage-based scheduler never serializes build behind independent E2E.
+#
+# Deployed, each job runs in a Cloudflare Sandbox container (runner "sandbox").
+# Those get standard-4 (4 vCPU, 12 GiB): on the default standard-1 (4 GiB),
+# oxlint's allocator failed before linting and the test container was lost.
+# E2E needs this host's cf login and user systemd, so it runs on local runners
+# only; `instance` is ignored there.
 on:
   push: {}
 
@@ -14,6 +20,7 @@ env:
 
 jobs:
   check:
+    instance: standard-4
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -28,6 +35,7 @@ jobs:
         run: vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
 
   test:
+    instance: standard-4
     timeout_minutes: 30
     steps:
       - name: Install
@@ -38,6 +46,7 @@ jobs:
         run: vp run -r --concurrency-limit 1 --no-cache test
 
   build:
+    instance: standard-4
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -49,6 +58,7 @@ jobs:
         run: node tools/agent/publish-cli.ts
 
   e2e:
+    if: runner == "local"
     timeout_minutes: 30
     steps:
       - name: Install

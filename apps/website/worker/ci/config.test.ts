@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vite-plus/test";
 import { branchMatches, ConfigError, evaluate, parsePipeline, stages } from "./config.ts";
 
@@ -69,10 +71,24 @@ test("branch filters use globs", () => {
 });
 
 test("conditions", () => {
-  const ctx = { branch: "main", trigger: "push" as const, commit: "abc" };
+  const ctx = { branch: "main", trigger: "push" as const, commit: "abc", runner: "local" as const };
   expect(evaluate('branch == "main"', ctx)).toBe(true);
   expect(evaluate("branch != 'main' || trigger == 'push'", ctx)).toBe(true);
   expect(evaluate('(branch == "x" || branch == "main") && trigger == "manual"', ctx)).toBe(false);
   expect(() => evaluate("branch = main", ctx)).toThrow(ConfigError);
   expect(() => evaluate('owner == "x"', ctx)).toThrow(/Unknown name/);
+  expect(evaluate('runner == "local"', ctx)).toBe(true);
+  expect(evaluate('runner == "local"', { ...ctx, runner: "sandbox" })).toBe(false);
+});
+
+test("this repository's pipeline sizes sandbox jobs and keeps E2E on local runners", () => {
+  const path = fileURLToPath(new URL("../../../../.gitmatrix/ci.yml", import.meta.url).href);
+  const source = readFileSync(path, "utf8");
+  const pipeline = parsePipeline(source);
+  const job = (name: string) => pipeline.jobs.find((j) => j.name === name)!;
+  for (const name of ["check", "test", "build"]) expect(job(name).instance).toBe("standard-4");
+  const e2e = job("e2e").if!;
+  const base = { branch: "main", trigger: "push" as const, commit: "abc" };
+  expect(evaluate(e2e, { ...base, runner: "local" })).toBe(true);
+  expect(evaluate(e2e, { ...base, runner: "sandbox" })).toBe(false);
 });

@@ -16,7 +16,9 @@ const WORKDIR = "/workspace/repo";
 const CONFIG_DIR = "/root/.gitmatrix-ci";
 const BASE_ENV = {
   HOME: "/root",
-  PATH: "/usr/local/pnpm/bin:/usr/local/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  // The checkout's own tools first: once installed, `vp` is the repository's
+  // pinned Vite+, which refuses to run under a different global version.
+  PATH: "/workspace/repo/node_modules/.bin:/usr/local/pnpm/bin:/usr/local/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
   RUSTUP_HOME: "/usr/local/rustup",
   CARGO_HOME: "/usr/local/cargo",
   PNPM_HOME: "/usr/local/pnpm",

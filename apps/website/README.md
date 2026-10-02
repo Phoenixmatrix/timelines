@@ -451,7 +451,7 @@ jobs:
       - run: vp test
   deploy:
     needs: [test] # runs only if test succeeded
-    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger, commit
+    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger, commit, runner
     secrets: [CLOUDFLARE_API_TOKEN] # `gm secret set`, masked in logs
     timeout_minutes: 15 # default 20
     instance: standard-2 # sandbox size (default standard-1)
