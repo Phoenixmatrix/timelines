@@ -5,9 +5,10 @@ import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor, RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
-import { accessible, trackerObject } from "../tracker/api.ts";
+import { accessible } from "../tracker/api.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
+import { issuesFrom } from "./trackers.ts";
 
 export const releaseNotes = new Hono<AppEnv>();
 
@@ -34,22 +35,7 @@ export async function linkedIssues(
   keys: string[],
 ): Promise<LinkedIssue[]> {
   if (!actor || !keys.length) return [];
-  const issues: LinkedIssue[] = [];
-  for (const owner of await accessible(env.DB, actor)) {
-    const stub = trackerObject(env, owner.id);
-    const subscribed = await stub.subscribedWorkspaces(repo.id);
-    if (!subscribed.ok || !subscribed.value.length) continue;
-    // The tracker looks up at most 500 keys per call.
-    for (let start = 0; start < keys.length; start += 500) {
-      const found = await stub.issuesByKey(keys.slice(start, start + 500));
-      if (!found.ok) throw new Error(`Tracker lookup failed: ${found.error}`);
-      for (const issue of found.value) issues.push({ ...issue, trackerOwner: owner.slug });
-    }
-  }
-  return issues.sort(
-    (a, b) =>
-      keys.indexOf(a.key) - keys.indexOf(b.key) || a.trackerOwner.localeCompare(b.trackerOwner),
-  );
+  return issuesFrom(env, await accessible(env.DB, actor), repo.id, keys);
 }
 
 /**

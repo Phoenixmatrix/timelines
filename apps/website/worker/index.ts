@@ -16,6 +16,7 @@ import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { gitHttp } from "./git/http.ts";
 import { knowledge } from "./knowledge/api.ts";
 import { releaseNotes } from "./release-notes/api.ts";
+import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
 import { buildRegistry } from "../registry/app.ts";
@@ -108,13 +109,18 @@ app.route("/", gitHttp);
 export default {
   fetch: app.fetch,
   /**
-   * Work queued off the request path: repository mirrors (gitmatrix-jobs),
-   * and registry index rebuilds, retention and GC (gitmatrix-registry-jobs).
+   * Work queued off the request path: repository mirrors and release notes
+   * (gitmatrix-jobs), and registry index rebuilds, retention and GC
+   * (gitmatrix-registry-jobs).
    */
-  async queue(batch, env) {
+  async queue(batch, env, ctx) {
     if (batch.queue === "gitmatrix-jobs") {
-      for (const message of batch.messages) {
-        await runMirrorJob(env, message as Message<MirrorJob>);
+      for (const message of batch.messages as readonly Message<MirrorJob | ReleaseNotesJob>[]) {
+        if (message.body.type === "release-notes")
+          await runReleaseNotesJob(env, message as Message<ReleaseNotesJob>, (work) =>
+            ctx.waitUntil(work),
+          );
+        else await runMirrorJob(env, message as Message<MirrorJob>);
       }
       return;
     }
@@ -131,7 +137,7 @@ export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduleSweeps(env));
   },
-} satisfies ExportedHandler<Env, Job | MirrorJob>;
+} satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob>;
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
 export { CiRun } from "./ci/workflow.ts";

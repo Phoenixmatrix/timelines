@@ -6,6 +6,27 @@ import { fail } from "../api/http.ts";
 import type { FileAnalysis } from "../../shared/semantic/types.ts";
 import { parseFeedQuery, semanticFeed, SemanticRequestError, type AnalysisCache } from "./feed.ts";
 
+/** Per-file analyses keyed by content: they contain no actor data, so any caller may share them. */
+export function semanticCache(): AnalysisCache {
+  return {
+    async get(key) {
+      const hit = await caches.default.match(`https://semantic.gitmatrix.internal/${key}`);
+      return hit ? await hit.json<FileAnalysis>() : undefined;
+    },
+    async put(key, value) {
+      await caches.default.put(
+        `https://semantic.gitmatrix.internal/${key}`,
+        new Response(JSON.stringify(value), {
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "public, max-age=31536000, immutable",
+          },
+        }),
+      );
+    },
+  };
+}
+
 /** Called only after loadRepo has authorized this request. Cached values contain no actor data. */
 export async function semanticResponse(c: Context<AppEnv>, row: RepoRow): Promise<Response> {
   c.header("cache-control", "private, no-store");
@@ -19,23 +40,7 @@ export async function semanticResponse(c: Context<AppEnv>, row: RepoRow): Promis
   );
   try {
     const query = parseFeedQuery(c.req.query());
-    const cache: AnalysisCache = {
-      async get(key) {
-        const hit = await caches.default.match(`https://semantic.gitmatrix.internal/${key}`);
-        return hit ? await hit.json<FileAnalysis>() : undefined;
-      },
-      async put(key, value) {
-        await caches.default.put(
-          `https://semantic.gitmatrix.internal/${key}`,
-          new Response(JSON.stringify(value), {
-            headers: {
-              "content-type": "application/json",
-              "cache-control": "public, max-age=31536000, immutable",
-            },
-          }),
-        );
-      },
-    };
+    const cache = semanticCache();
     return c.json(
       await semanticFeed(
         objects,

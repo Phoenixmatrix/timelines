@@ -232,6 +232,60 @@ export interface Database {
     updated_at: Generated<string>;
     diagram: Generated<string>;
   };
+  tracker_repo_subscriptions: {
+    tracker_owner_id: string;
+    repo_id: string;
+  };
+  release_notes: {
+    repo_id: string;
+    release: string;
+    to_oid: string;
+    from_tag: string | null;
+    from_oid: string | null;
+    truncated: Generated<number>;
+    intro: Generated<string>;
+    intro_model: string | null;
+    intro_inputs_hash: Generated<string>;
+    intro_trackers: Generated<string>;
+    released_at: string;
+    updated_at: string;
+  };
+  release_note_entries: {
+    id: string;
+    repo_id: string;
+    release: string;
+    subject: string;
+    kind: "issue" | "commit";
+    category: "feature" | "fix" | "improvement" | "internal";
+    title: string;
+    summary: string;
+    tracker_owner_id: string | null;
+    issue_id: string | null;
+    issue_key: string | null;
+    team_id: string | null;
+    team_key: string | null;
+    issue_type: string | null;
+    labels: Generated<string>;
+    workspace_ids: Generated<string>;
+    commits: Generated<string>;
+    changes: Generated<string>;
+    shipped_at: string;
+    model: string | null;
+    inputs_hash: string;
+    updated_at: string;
+  };
+  release_note_mentions: {
+    repo_id: string;
+    issue_key: string;
+  };
+  release_note_state: {
+    repo_id: string;
+    dirty: Generated<number>;
+    lease_until: Generated<number>;
+    status: Generated<string>;
+    error: string | null;
+    generated_at: string | null;
+  };
   ci_refs: {
     repo_id: string;
     ref: string;

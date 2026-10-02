@@ -504,6 +504,27 @@ unsubscribed trackers get the commits without issues. Key-shaped words such as
 (when it last became done) and evidence. The tracker also answers which issues
 were completed in a time window, for team and organization views.
 
+**Generated entries** (`worker/release-notes/generate.ts`, migration 0017) are
+stored per release: `@unreleased` plus the ten newest tags. An entry is a
+tracker issue with the release's commits that cite it, or a commit that cites
+none. The `fast` model writes its category (feature, fix, improvement or
+internal), title and summary from the issue, its evidence, the commits and their
+semantic code changes; the `reason` model writes each release's introduction from
+its non-internal entries. Entries record their sources, model and an inputs hash.
+Anything already written from identical inputs is reused anywhere in the
+repository, so reruns are free, a push pays only for new work and tagging the
+head moves unreleased entries into the tag without new entry calls.
+
+Work runs on the `gitmatrix-jobs` queue: pushes, tracker changes to cited issues
+and subscription changes mark the repository dirty and enqueue it after 20
+seconds; a D1 lease allows one run per repository, and runs are capped at 40
+model calls, continuing in a follow-up run. Server-side resolution uses the
+repository owner's tracker plus subscriptions mirrored into
+`tracker_repo_subscriptions` as they change. An introduction lists the trackers
+whose issues shaped it, so readers without access to them can be shown entries
+without it. Without AI bindings (automatic non-AI test environments) nothing is
+scheduled.
+
 ## Knowledge graph and wiki
 
 Every repository has a knowledge graph that stays current as it changes; the

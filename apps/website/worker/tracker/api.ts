@@ -19,14 +19,11 @@ import type {
   TrackerOwner,
 } from "../../shared/tracker.ts";
 import { TrackerError, validateRequest, type Access } from "./store.ts";
-import type { Tracker, TrackerReply } from "./object.ts";
+import type { TrackerReply } from "./object.ts";
+import { trackerObject } from "./stub.ts";
+import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
 
 export const tracker = new Hono<AppEnv>();
-
-export function trackerObject(env: Env, ownerId: string): DurableObjectStub<Tracker> {
-  // String-named exports in the config cannot infer their RPC class.
-  return (env.TRACKER as unknown as DurableObjectNamespace<Tracker>).getByName(ownerId);
-}
 
 /** The trackers an actor can read: their own, and their organizations'. */
 export async function accessible(db: D1Database, actor: Actor): Promise<TrackerOwner[]> {
@@ -240,6 +237,7 @@ tracker.get("/tracker/:owner/changes", async (c) => {
 tracker.post("/tracker/:owner/mutate", async (c) => {
   const access = await authorize(c);
   const request = validateRequest(await body(c));
+  let removedRepoIds: string[] = [];
   if (
     request.mutations.some(
       (mutation) => mutation.kind === "subscription.add" || mutation.kind === "subscription.remove",
@@ -260,6 +258,7 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
     if (removals.length) {
       const lookup = await trackerObject(c.env, access.owner.id).subscriptionRepoIds(removals);
       if (!lookup.ok) return response(c, lookup);
+      removedRepoIds = lookup.value;
       if (lookup.value.length) {
         const existing = await gitmatrixDb(c.env.DB)
           .selectFrom("repos")
@@ -271,7 +270,12 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
       }
     }
   }
-  return response(c, await trackerObject(c.env, access.owner.id).mutate(access, request));
+  const result = await trackerObject(c.env, access.owner.id).mutate(access, request);
+  if (result.ok)
+    c.executionCtx.waitUntil(
+      refreshAfterTrackerMutation(c.env, access.owner.id, result.value, removedRepoIds),
+    );
+  return response(c, result);
 });
 tracker.get("/repos/:owner/:name/tracker", async (c) => {
   const actor = c.get("actor");

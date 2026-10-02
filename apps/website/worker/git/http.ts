@@ -4,6 +4,7 @@ import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { onPush } from "../ci/trigger.ts";
 import { queueMirror } from "../mirror/queue.ts";
 import { findRepo, roleFor, sqlNow } from "../db.ts";
+import { notifyReleaseNotes } from "../release-notes/queue.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { invalidateRefs } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
@@ -122,6 +123,11 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
     invalidateRefs(repo.artifacts_name);
     c.executionCtx.waitUntil(notifyKnowledge(c.env, repo.id));
+    c.executionCtx.waitUntil(
+      notifyReleaseNotes(c.env, repo.id).catch((error) =>
+        console.error("Release notes: enqueue failed", error),
+      ),
+    );
     c.executionCtx.waitUntil(
       queueMirror(c.env, repo.id).catch((error) => console.error("Mirror: enqueue failed", error)),
     );
