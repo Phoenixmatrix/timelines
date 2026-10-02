@@ -7,6 +7,7 @@ import {
   KeyIcon,
   ListChecksIcon,
   MoonIcon,
+  PackageIcon,
   PlusIcon,
   SignInIcon,
   SignOutIcon,
@@ -26,18 +27,29 @@ function Place({
   to,
   label,
   end,
+  also,
   children,
 }: {
   to: string;
   label: string;
   end?: boolean;
+  /** Other pages that belong to this place and light it up too. */
+  also?: RegExp;
   children: (active: boolean) => React.ReactNode;
 }) {
+  const { pathname } = useLocation();
+  const className = "mk-place max-sm:before:hidden";
   return (
     <Tip label={label} side="right">
-      <NavLink to={to} end={end} className="mk-place max-sm:before:hidden" aria-label={label}>
-        {({ isActive }) => children(isActive)}
-      </NavLink>
+      {also?.test(pathname) ? (
+        <Link to={to} className={className} aria-current="page" aria-label={label}>
+          {children(true)}
+        </Link>
+      ) : (
+        <NavLink to={to} end={end} className={className} aria-label={label}>
+          {({ isActive }) => children(isActive)}
+        </NavLink>
+      )}
     </Tip>
   );
 }
@@ -162,6 +174,11 @@ export function AppShell() {
             {(active) => (
               <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
             )}
+          </Place>
+        )}
+        {viewer && (
+          <Place to="/packages" label="Packages" also={/^\/[^/]+\/-\/(packages|feeds)(\/|$)/}>
+            {(active) => <PackageIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
           </Place>
         )}
         {viewer && (
