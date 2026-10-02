@@ -81,12 +81,14 @@ test("conditions", () => {
   expect(evaluate('runner == "local"', { ...ctx, runner: "sandbox" })).toBe(false);
 });
 
-test("this repository's pipeline sizes sandbox jobs and keeps E2E on local runners", () => {
+test("this repository's pipeline is set up to run in Sandbox containers", () => {
   const path = fileURLToPath(new URL("../../../../.gitmatrix/ci.yml", import.meta.url).href);
   const source = readFileSync(path, "utf8");
   const pipeline = parsePipeline(source);
   const job = (name: string) => pipeline.jobs.find((j) => j.name === name)!;
   for (const name of ["check", "test", "build"]) expect(job(name).instance).toBe("standard-4");
+  // A Sandbox has no Docker to build the CI image with during `vite build`.
+  expect(job("build").env.GITMATRIX_CONTAINER_IMAGES).toBe("skip");
   const e2e = job("e2e").if!;
   const base = { branch: "main", trigger: "push" as const, commit: "abc" };
   expect(evaluate(e2e, { ...base, runner: "local" })).toBe(true);

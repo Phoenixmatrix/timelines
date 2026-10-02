@@ -62,11 +62,15 @@ export default defineConfig(({ mode }) => {
   const ai = !(dev && local.agent && env.GITMATRIX_AGENT_AI === "disabled");
   const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
   const sandboxed = runner === "sandbox";
+  // Declaring the container makes `vite build` build its image, which needs
+  // Docker. CI's build check runs inside a Sandbox without it and never
+  // deploys, so it sets GITMATRIX_CONTAINER_IMAGES=skip.
+  const container = sandboxed && env.GITMATRIX_CONTAINER_IMAGES !== "skip";
   const publicUrl = dev
     ? local.publicUrl
     : (env.GITMATRIX_PUBLIC_URL ?? `https://${PRODUCTION_HOST}`);
   return {
-    ...(sandboxed ? { containers: [ciSandbox] } : {}),
+    ...(container ? { containers: [ciSandbox] } : {}),
     worker: {
       name: "gitmatrix",
       compatibilityDate: "2026-09-30",
@@ -227,7 +231,7 @@ export default defineConfig(({ mode }) => {
         RegistryLogin: exports.durableObject({ storage: "sqlite" }),
         CiSandbox: exports.durableObject({
           storage: "sqlite",
-          ...(sandboxed ? { container: ciSandbox } : {}),
+          ...(container ? { container: ciSandbox } : {}),
         }),
       },
     },

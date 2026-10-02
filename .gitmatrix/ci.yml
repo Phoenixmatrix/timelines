@@ -47,6 +47,9 @@ jobs:
 
   build:
     instance: standard-4
+    # Building the CI image needs Docker, which a Sandbox doesn't have.
+    env:
+      GITMATRIX_CONTAINER_IMAGES: skip
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile

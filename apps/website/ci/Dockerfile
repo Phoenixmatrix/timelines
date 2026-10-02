@@ -17,5 +17,9 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-to
     --component rustfmt,clippy \
   && chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
+# Cached `vp run` tasks don't pass RUSTUP_HOME or CARGO_HOME through, so rustup
+# must also find its toolchains at the default ~/.rustup.
+RUN ln -s $RUSTUP_HOME /root/.rustup && ln -s $CARGO_HOME /root/.cargo
+
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
