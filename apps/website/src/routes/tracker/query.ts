@@ -3,16 +3,23 @@
 // query language over it, facet counts, and opened/closed activity buckets.
 // Everything here is pure, so it is tested without a browser.
 //
-//   is:ready is:blocked is:claimed is:open is:closed
+//   is:ready is:blocked is:claimed is:leased is:open is:closed
 //   status:backlog|todo|in_progress|done|canceled
 //   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
 //   since:7d until:2026-09-01   (last activity: updatedAt)
 //   parent:CORE-12   words match key, title and labels; - excludes.
 
-import type { Issue, Snapshot } from "../../../shared/tracker.ts";
+import {
+  leasedAncestor,
+  readiness,
+  readinessIndex,
+  type Issue,
+  type Snapshot,
+} from "../../../shared/tracker.ts";
 
 export type IssueState =
   | "claimed"
+  | "leased"
   | "blocked"
   | "ready"
   | "in_progress"
@@ -25,6 +32,7 @@ export const STATE_LABEL: Record<IssueState, string> = {
   ready: "Ready",
   in_progress: "In progress",
   claimed: "Claimed",
+  leased: "Leased",
   blocked: "Blocked",
   todo: "To do",
   backlog: "Backlog",
@@ -36,12 +44,13 @@ export const STATE_LABEL: Record<IssueState, string> = {
 const STATE_RANK: Record<IssueState, number> = {
   ready: 0,
   claimed: 1,
-  in_progress: 2,
-  todo: 3,
-  blocked: 4,
-  backlog: 5,
-  done: 6,
-  canceled: 7,
+  leased: 2,
+  in_progress: 3,
+  todo: 4,
+  blocked: 5,
+  backlog: 6,
+  done: 7,
+  canceled: 8,
 };
 
 export interface IssueIndex {
@@ -53,6 +62,8 @@ export interface IssueIndex {
   dependents: Map<string, string[]>;
   children: Map<string, string[]>;
   state: Map<string, IssueState>;
+  /** For leased issues: the ancestor whose active lease covers them. */
+  leasedBy: Map<string, Issue>;
   teamKey: Map<string, string>;
   workspaceSlug: Map<string, string>;
   memberSlug: Map<string, string>;
@@ -82,15 +93,20 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     if (issue.parentId)
       children.set(issue.parentId, [...(children.get(issue.parentId) ?? []), issue.id]);
   }
+  // Readiness is shared with the server and gm, so "ready" here means what an agent can take.
+  const graph = readinessIndex(snapshot.issues, snapshot.links);
   const state = new Map<string, IssueState>();
+  const leasedBy = new Map<string, Issue>();
   for (const issue of snapshot.issues) {
-    const claimed = issue.claim !== null && issue.claim.expiresAt > serverTime;
+    const why = readiness(issue, graph, serverTime);
+    if (why === "leased_above") leasedBy.set(issue.id, leasedAncestor(issue, graph, serverTime)!);
     let value: IssueState;
-    if (claimed) value = "claimed";
+    if (why === "claimed") value = "claimed";
     else if (issue.status === "done" || issue.status === "canceled") value = issue.status;
-    else if (openBlockers.has(issue.id)) value = "blocked";
-    else if (issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null))
-      value = "ready";
+    else if (why === "blocked") value = "blocked";
+    else if (why === "leased_above") value = "leased";
+    else if (why === "ready") value = "ready";
+    // Containers (open sub-issues) and everything else show their status.
     else value = issue.status;
     state.set(issue.id, value);
   }
@@ -101,6 +117,7 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     dependents,
     children,
     state,
+    leasedBy,
     teamKey: new Map(snapshot.teams.map((t) => [t.id, t.key])),
     workspaceSlug: new Map(snapshot.workspaces.map((w) => [w.id, w.slug])),
     memberSlug: new Map(snapshot.members.map((m) => [m.id, m.slug])),
@@ -315,6 +332,7 @@ export interface Facets {
 const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
   ready: { key: "is", value: "ready" },
   claimed: { key: "is", value: "claimed" },
+  leased: { key: "is", value: "leased" },
   blocked: { key: "is", value: "blocked" },
   in_progress: { key: "status", value: "in_progress" },
   todo: { key: "status", value: "todo" },

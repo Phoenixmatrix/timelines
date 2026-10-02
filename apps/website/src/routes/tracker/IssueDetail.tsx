@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
-import type { Comment, Issue, IssueFields, Mutation, Snapshot } from "../../../shared/tracker.ts";
+import {
+  leasedAncestor,
+  readinessIndex,
+  type Comment,
+  type Issue,
+  type IssueFields,
+  type Mutation,
+  type Snapshot,
+} from "../../../shared/tracker.ts";
 import { FormError, link as LINK, SelectField, TextField } from "../../components/ui.tsx";
 import {
   blockers,
@@ -149,7 +157,12 @@ export function IssueDetail({
   };
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
-  const activeClaim = !!issue.claim && issue.claim.expiresAt > snapshot.serverTime;
+  // The issue's own lease, or an ancestor's: either way only its holder changes the status.
+  const covering =
+    issue.claim && issue.claim.expiresAt > snapshot.serverTime
+      ? issue
+      : leasedAncestor(issue, readinessIndex(snapshot.issues, snapshot.links), snapshot.serverTime);
+  const activeClaim = covering !== null;
   const unresolvedBlockers = blockers(issue, snapshot, index);
   const invalidStatus =
     draft.fields.status !== issue.status &&
@@ -372,8 +385,10 @@ export function IssueDetail({
               aria-hidden
             />
             <span>
-              {issue.claim!.agent} is working on this issue until{" "}
-              {new Date(issue.claim!.expiresAt).toLocaleString(undefined, {
+              {covering!.claim!.agent} is working on{" "}
+              {covering === issue ? "this issue" : `${covering!.key}, which includes this issue,`}{" "}
+              until{" "}
+              {new Date(covering!.claim!.expiresAt).toLocaleString(undefined, {
                 dateStyle: "medium",
                 timeStyle: "short",
               })}

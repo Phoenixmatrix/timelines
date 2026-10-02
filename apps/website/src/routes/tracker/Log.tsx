@@ -37,6 +37,7 @@ const ASSIGNEE = "hidden @5xl:block";
 export const STATE_DOT: Record<IssueState, string> = {
   ready: "bg-online",
   claimed: "bg-transparent ring-[1.5px] ring-inset ring-ink",
+  leased: "bg-transparent ring-[1.5px] ring-inset ring-ink-faint",
   blocked: "bg-danger-text",
   in_progress: "bg-ink",
   todo: "bg-ink-muted",
@@ -51,6 +52,7 @@ export function StateLegend({ className = "" }: { className?: string }) {
     "ready",
     "in_progress",
     "claimed",
+    "leased",
     "todo",
     "backlog",
     "blocked",
@@ -81,7 +83,13 @@ export function StateLabel({
   const state = index.state.get(issue.id) ?? "todo";
   const blockers = index.openBlockers.get(issue.id)?.length ?? 0;
   const detail =
-    state === "blocked" ? ` · ${blockers}` : state === "claimed" ? ` · ${issue.claim?.agent}` : "";
+    state === "blocked"
+      ? ` · ${blockers}`
+      : state === "claimed"
+        ? ` · ${issue.claim?.agent}`
+        : state === "leased"
+          ? ` · ${index.leasedBy.get(issue.id)?.key}`
+          : "";
   return (
     <span
       className="inline-flex min-w-0 items-center gap-1.5"

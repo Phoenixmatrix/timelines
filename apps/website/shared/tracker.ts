@@ -168,21 +168,83 @@ export interface Changes {
   hasMore: boolean;
   serverTime: string;
 }
+/** Done and canceled issues are closed; everything else still has work in it. */
+export function isOpen(issue: Pick<Issue, "status">): boolean {
+  return issue.status !== "done" && issue.status !== "canceled";
+}
+
+export function hasActiveClaim(issue: Issue, now: string): boolean {
+  return issue.claim !== null && issue.claim.expiresAt > now;
+}
+
+/** Lookups readiness needs, built once per snapshot. */
+export interface ReadinessIndex {
+  byId: Map<string, Issue>;
+  children: Map<string, Issue[]>;
+  /** Blocking issue ids by blocked issue id. */
+  blockers: Map<string, string[]>;
+}
+
+export function readinessIndex(issues: Issue[], links: Link[]): ReadinessIndex {
+  const byId = new Map(issues.map((issue) => [issue.id, issue]));
+  const children = new Map<string, Issue[]>();
+  for (const issue of issues)
+    if (issue.parentId)
+      children.set(issue.parentId, [...(children.get(issue.parentId) ?? []), issue]);
+  const blockers = new Map<string, string[]>();
+  for (const link of links)
+    if (link.kind === "blocks")
+      blockers.set(link.toId, [...(blockers.get(link.toId) ?? []), link.fromId]);
+  return { byId, children, blockers };
+}
+
+/** The nearest ancestor with an active lease: its holder owns this whole subtree. */
+export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string): Issue | null {
+  const seen = new Set([issue.id]);
+  for (let id = issue.parentId; id && !seen.has(id);) {
+    seen.add(id);
+    const ancestor = index.byId.get(id);
+    if (!ancestor) return null;
+    if (hasActiveClaim(ancestor, now)) return ancestor;
+    id = ancestor.parentId;
+  }
+  return null;
+}
+
+/**
+ * Why an issue can or can't be picked up:
+ * - `ready`: todo (or in progress with an expired claim), unblocked, a leaf,
+ *   and outside any other active lease's subtree;
+ * - `claimed`: it has an active lease;
+ * - `unavailable`: backlog, done, canceled, or in progress without a claim;
+ * - `blocked`: a `blocks` predecessor isn't done (a missing one still blocks);
+ * - `container`: it has open sub-issues, so the work is in those;
+ * - `leased_above`: an ancestor's active lease covers it.
+ */
+export type Readiness =
+  | "ready"
+  | "claimed"
+  | "unavailable"
+  | "blocked"
+  | "container"
+  | "leased_above";
+
+export function readiness(issue: Issue, index: ReadinessIndex, now: string): Readiness {
+  if (hasActiveClaim(issue, now)) return "claimed";
+  if (!(issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null)))
+    return "unavailable";
+  if ((index.blockers.get(issue.id) ?? []).some((id) => index.byId.get(id)?.status !== "done"))
+    return "blocked";
+  if ((index.children.get(issue.id) ?? []).some(isOpen)) return "container";
+  if (leasedAncestor(issue, index, now)) return "leased_above";
+  return "ready";
+}
+
 export function isIssueReady(
   issue: Issue,
   issues: Issue[],
   links: Link[],
   serverTime = new Date().toISOString(),
 ): boolean {
-  const active = issue.claim !== null && issue.claim.expiresAt > serverTime;
-  return (
-    !active &&
-    (issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null)) &&
-    !links.some(
-      (link) =>
-        link.kind === "blocks" &&
-        link.toId === issue.id &&
-        issues.find((item) => item.id === link.fromId)?.status !== "done",
-    )
-  );
+  return readiness(issue, readinessIndex(issues, links), serverTime) === "ready";
 }

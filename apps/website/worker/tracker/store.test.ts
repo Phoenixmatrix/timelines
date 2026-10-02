@@ -1,6 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
-import type { Mutation } from "../../shared/tracker.ts";
+import { readiness, readinessIndex, type Issue, type Mutation } from "../../shared/tracker.ts";
 import { TrackerStore, type Access, type SqlDatabase } from "./store.ts";
 
 const databases: DatabaseSync[] = [];
@@ -445,5 +445,139 @@ describe("tracker SQLite authority", () => {
     ).toThrow(/blockers/);
     expect(f.store.snapshot(f.access).issues.find((i) => i.id === "b")?.claim).toBeNull();
     expect(f.store.snapshot(f.access).links).toEqual([]);
+  });
+});
+
+describe("graph readiness", () => {
+  function graph() {
+    const f = fixture();
+    for (const id of ["project", "a", "b"]) f.issue(id);
+    const version = (id: string) =>
+      (f.store.snapshot(f.access).issues.find((i) => i.id === id) as Issue).version;
+    for (const id of ["a", "b"])
+      f.mutate({
+        kind: "issue.update",
+        id,
+        expectedVersion: version(id),
+        data: { parentId: "project" },
+      });
+    const state = (id: string) => {
+      const snap = f.store.snapshot(f.access);
+      const index = readinessIndex(snap.issues, snap.links);
+      return readiness(index.byId.get(id)!, index, snap.serverTime);
+    };
+    const claim = (id: string, agent: string, ttlSeconds?: number) =>
+      String(
+        f.mutate({
+          kind: "issue.claim",
+          id,
+          data: { agent, ...(ttlSeconds ? { ttlSeconds } : {}) },
+        }).results[0]!.leaseToken,
+      );
+    return { ...f, version, state, claim };
+  }
+
+  test("a parent with open sub-issues is a container, not work, but can be claimed to take its subtree", () => {
+    const g = graph();
+    expect([g.state("project"), g.state("a"), g.state("b")]).toEqual([
+      "container",
+      "ready",
+      "ready",
+    ]);
+    g.claim("project", "lead");
+    expect([g.state("a"), g.state("b")]).toEqual(["leased_above", "leased_above"]);
+  });
+
+  test("another agent can't claim or change status or parent inside a leased subtree", () => {
+    const g = graph();
+    const token = g.claim("project", "lead");
+    expect(() => g.claim("a", "other")).toThrow(
+      /ENG-1 is leased by lead, and its lease covers ENG-2/,
+    );
+    expect(() =>
+      g.mutate({
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: g.version("a"),
+        data: { status: "in_progress" },
+      }),
+    ).toThrow(/needs that lease's token/);
+    expect(() =>
+      g.mutate({
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: g.version("a"),
+        data: { parentId: null },
+      }),
+    ).toThrow(/needs that lease's token/);
+    // Editing details stays open, and the holder's token covers the whole subtree.
+    g.mutate({
+      kind: "issue.update",
+      id: "a",
+      expectedVersion: g.version("a"),
+      data: { title: "Renamed" },
+    });
+    g.mutate({
+      kind: "issue.update",
+      id: "a",
+      expectedVersion: g.version("a"),
+      data: { status: "canceled", leaseToken: token },
+    });
+    // Once the lease ends, the subtree is open to everyone again.
+    g.mutate({ kind: "issue.release", id: "project", data: { leaseToken: token } });
+    expect(g.state("b")).toBe("ready");
+    g.claim("b", "other");
+  });
+
+  test("an expired lease no longer covers its subtree", () => {
+    const g = graph();
+    g.claim("project", "lead", 30);
+    expect(g.state("a")).toBe("leased_above");
+    g.advance(30_000);
+    expect(g.state("a")).toBe("ready");
+  });
+
+  test("a parent can't be completed or set done while a sub-issue is open; canceled ones don't count", () => {
+    const g = graph();
+    const token = g.claim("project", "lead");
+    expect(() =>
+      g.mutate({
+        kind: "issue.complete",
+        id: "project",
+        data: { leaseToken: token, evidence: "All done" },
+      }),
+    ).toThrow(/Close its sub-issues first: ENG-2, ENG-3/);
+    for (const id of ["a", "b"])
+      g.mutate({
+        kind: "issue.update",
+        id,
+        expectedVersion: g.version(id),
+        data: { status: id === "a" ? "done" : "canceled", leaseToken: token },
+      });
+    expect(g.state("project")).toBe("claimed");
+    g.mutate({
+      kind: "issue.complete",
+      id: "project",
+      data: { leaseToken: token, evidence: "All done" },
+    });
+
+    const h = graph();
+    expect(() =>
+      h.mutate({
+        kind: "issue.update",
+        id: "project",
+        expectedVersion: h.version("project"),
+        data: { status: "done" },
+      }),
+    ).toThrow(/Close its sub-issues first/);
+  });
+
+  test("blocker cycles are rejected", () => {
+    const g = graph();
+    g.mutate({ kind: "link.add", id: "l1", data: { fromId: "a", toId: "b", kind: "blocks" } });
+    expect(g.state("b")).toBe("blocked");
+    expect(() =>
+      g.mutate({ kind: "link.add", id: "l2", data: { fromId: "b", toId: "a", kind: "blocks" } }),
+    ).toThrow(/acyclic/);
   });
 });

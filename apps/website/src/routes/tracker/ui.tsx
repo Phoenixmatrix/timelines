@@ -2,7 +2,13 @@ import { memo, useId, useMemo, type ReactNode } from "react";
 import { Combobox } from "@base-ui/react/combobox";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { type Issue, type Snapshot } from "../../../shared/tracker.ts";
+import {
+  leasedAncestor,
+  readiness,
+  readinessIndex,
+  type Issue,
+  type Snapshot,
+} from "../../../shared/tracker.ts";
 import { popMotion } from "../../components/ui.tsx";
 import type { IssueIndex } from "./query.ts";
 
@@ -122,6 +128,7 @@ export function blockers(issue: Issue, snapshot: Snapshot, index?: IssueIndex) {
 const STATE_DOT: Record<string, string> = {
   ready: "bg-online",
   claimed: "bg-transparent ring-[1.5px] ring-inset ring-ink",
+  leased: "bg-transparent ring-[1.5px] ring-inset ring-ink-faint",
   blocked: "bg-danger-text",
 };
 function StateBadge({
@@ -129,7 +136,7 @@ function StateBadge({
   title,
   children,
 }: {
-  state?: "ready" | "claimed" | "blocked";
+  state?: "ready" | "claimed" | "leased" | "blocked";
   title?: string;
   children: ReactNode;
 }) {
@@ -177,24 +184,32 @@ export function IssueState({
         Blocked · {blocked.length}
       </StateBadge>
     );
-  if (isReady(issue, snapshot, index))
+  const why = index ? index.state.get(issue.id) : stateOf(issue, snapshot);
+  if (why === "leased") {
+    const above =
+      index?.leasedBy.get(issue.id) ??
+      leasedAncestor(issue, readinessIndex(snapshot.issues, snapshot.links), snapshot.serverTime);
+    return (
+      <StateBadge
+        state="leased"
+        title={`${above?.key}'s lease covers this issue: only ${above?.claim?.agent} can change its status`}
+      >
+        Leased via {above?.key}
+      </StateBadge>
+    );
+  }
+  if (why === "ready")
     return <StateBadge state="ready">Ready{issue.claim ? " to reclaim" : ""}</StateBadge>;
   return <StateBadge>{statuses.find((status) => status.value === issue.status)?.label}</StateBadge>;
 }
-// isIssueReady from shared/tracker.ts, with the blocker lookup going through the
-// index when there is one. A blocks link to a missing issue still blocks.
-function isReady(issue: Issue, snapshot: Snapshot, index?: IssueIndex) {
-  const active = issue.claim !== null && issue.claim.expiresAt > snapshot.serverTime;
-  const find = (id: string) =>
-    index ? index.byId.get(id) : snapshot.issues.find((item) => item.id === id);
-  return (
-    !active &&
-    (issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null)) &&
-    !snapshot.links.some(
-      (link) =>
-        link.kind === "blocks" && link.toId === issue.id && find(link.fromId)?.status !== "done",
-    )
+/** Readiness shared with the server and gm, for a page without a list index. */
+function stateOf(issue: Issue, snapshot: Snapshot): "ready" | "leased" | null {
+  const why = readiness(
+    issue,
+    readinessIndex(snapshot.issues, snapshot.links),
+    snapshot.serverTime,
   );
+  return why === "ready" ? "ready" : why === "leased_above" ? "leased" : null;
 }
 export function MultiCheck({
   label,

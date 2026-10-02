@@ -1,19 +1,22 @@
 import { timingSafeEqual } from "node:crypto";
-import type {
-  Changes,
-  Comment,
-  EntityType,
-  Issue,
-  Link,
-  Mutation,
-  MutationRequest,
-  MutationResult,
-  Snapshot,
-  Subscription,
-  Team,
-  TrackerEvent,
-  TrackerIdentity,
-  Workspace,
+import {
+  isOpen,
+  leasedAncestor,
+  readinessIndex,
+  type Changes,
+  type Comment,
+  type EntityType,
+  type Issue,
+  type Link,
+  type Mutation,
+  type MutationRequest,
+  type MutationResult,
+  type Snapshot,
+  type Subscription,
+  type Team,
+  type TrackerEvent,
+  type TrackerIdentity,
+  type Workspace,
 } from "../../shared/tracker.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
@@ -333,7 +336,7 @@ export class TrackerStore {
         if (!access.canAdmin && team.memberIds.length && !team.memberIds.includes(access.actorId))
           fail("forbidden", "Only team members may change this team's work.", 403);
       };
-      const ready = (issue: Issue) => {
+      const unblocked = (issue: Issue) => {
         const blocked = all(
           this.sql,
           tracker
@@ -348,7 +351,14 @@ export class TrackerStore {
         if (blocked)
           fail("blocked", "Resolve all blockers before starting or completing work.", 409);
       };
-      const lease = (issue: Issue, token: unknown) => {
+      /** `issue`'s lease must match `token`; `covered` is the descendant being changed, if any. */
+      const lease = (issue: Issue, token: unknown, covered?: Issue) => {
+        if (covered && covered.id !== issue.id && typeof token !== "string")
+          fail(
+            "subtree_leased",
+            `${issue.key} is leased by ${issue.claim!.agent}, and its lease covers ${covered.key}; changing its status or parent needs that lease's token.`,
+            409,
+          );
         const supplied = text(token, "leaseToken", 200);
         const row = first(
           this.sql,
@@ -364,6 +374,31 @@ export class TrackerStore {
           !timingSafeEqual(a, b)
         )
           fail("lease_lost", "Claim expired, was superseded, or belongs to another agent.", 409);
+      };
+      // The graph as this transaction sees it so far.
+      const graph = () => readinessIndex(this.all<Issue>("issue"), this.all<Link>("link"));
+      /** A lease on an issue covers its subtree: its holder speaks for every descendant. */
+      const coveringLease = (issue: Issue) =>
+        issue.claim && issue.claim.expiresAt > now ? issue : leasedAncestor(issue, graph(), now);
+      // A parent with open sub-issues is never offered as work, but claiming it
+      // explicitly is how an orchestrating agent takes its whole subtree.
+      const claimable = (issue: Issue) => {
+        const above = leasedAncestor(issue, graph(), now);
+        if (above)
+          fail(
+            "subtree_leased",
+            `${above.key} is leased by ${above.claim!.agent}, and its lease covers ${issue.key}.`,
+            409,
+          );
+      };
+      const childrenClosed = (issue: Issue) => {
+        const open = (graph().children.get(issue.id) ?? []).filter(isOpen);
+        if (open.length)
+          fail(
+            "children_open",
+            `Close its sub-issues first: ${open.map((child) => child.key).join(", ")}.`,
+            409,
+          );
       };
       const fields = (data: Record<string, unknown>, issue: Issue, creating: boolean) => {
         for (const key of ["title", "description", "acceptance"] as const)
@@ -584,21 +619,22 @@ export class TrackerStore {
               issue = this.get<Issue>("issue", entityId);
               teamWritable(this.get("team", issue.teamId));
               version(issue, mutation.expectedVersion);
+              const covering = coveringLease(issue);
               if (
-                "status" in data &&
-                data.status !== issue.status &&
-                issue.claim &&
-                issue.claim.expiresAt > now
+                covering &&
+                (("status" in data && data.status !== issue.status) ||
+                  ("parentId" in data && data.parentId !== issue.parentId))
               )
-                lease(issue, data.leaseToken);
+                lease(covering, data.leaseToken, issue);
             }
             const previous = issue.status;
             fields(data, issue, creating);
+            if (issue.status === "done" && previous !== "done") childrenClosed(issue);
             if (
               (creating || issue.status !== previous) &&
               ["in_progress", "done"].includes(issue.status)
             ) {
-              ready(issue);
+              unblocked(issue);
               started.add(entityId);
             }
             if ("status" in data && issue.status !== previous) {
@@ -740,7 +776,8 @@ export class TrackerStore {
                   !(issue.status === "in_progress" && issue.claim && issue.claim.expiresAt <= now)
                 )
                   fail("not_ready", "Only todo or expired claimed work may be claimed.", 409);
-                ready(issue);
+                unblocked(issue);
+                claimable(issue);
               } else lease(issue, data.leaseToken);
               const token =
                 kind === "issue.claim"
@@ -768,7 +805,8 @@ export class TrackerStore {
             } else {
               lease(issue, data.leaseToken);
               if (kind === "issue.complete") {
-                ready(issue);
+                unblocked(issue);
+                childrenClosed(issue);
                 const body = text(data.evidence, "evidence", 131072);
                 const commentId = crypto.randomUUID();
                 emit(
@@ -806,7 +844,8 @@ export class TrackerStore {
       }
       for (const issueId of started) {
         const issue = this.get<Issue>("issue", issueId);
-        if (issue.status === "in_progress" || issue.status === "done") ready(issue);
+        if (issue.status === "in_progress" || issue.status === "done") unblocked(issue);
+        if (issue.status === "done") childrenClosed(issue);
       }
       const result: MutationResult = { cursor: this.cursor(), events, results, serverTime: now };
       run(

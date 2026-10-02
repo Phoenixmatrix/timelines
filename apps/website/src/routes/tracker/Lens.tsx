@@ -93,12 +93,13 @@ function columnsFrom(
 const RANK: Record<IssueState, number> = {
   blocked: 0,
   claimed: 1,
-  in_progress: 2,
-  ready: 3,
-  todo: 4,
-  backlog: 5,
-  done: 6,
-  canceled: 7,
+  leased: 2,
+  in_progress: 3,
+  ready: 4,
+  todo: 5,
+  backlog: 6,
+  done: 7,
+  canceled: 8,
 };
 
 function Card({

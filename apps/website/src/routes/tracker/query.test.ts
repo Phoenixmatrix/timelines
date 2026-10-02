@@ -134,6 +134,32 @@ describe("buildIndex", () => {
   });
 });
 
+describe("graph states", () => {
+  it("shows containers by status and issues under another lease as leased", () => {
+    const later = new Date(NOW + 3_600_000).toISOString();
+    const snap = snapshot([
+      issue("CORE-1", {
+        claim: { actorId: "m-jun", agent: "lead", expiresAt: later },
+        status: "in_progress",
+      }),
+      issue("CORE-2", { parentId: "core-1" }),
+      issue("CORE-3"),
+      issue("CORE-4", { parentId: "core-3" }),
+      issue("CORE-5", { parentId: "core-3", status: "done" }),
+    ]);
+    const index = buildIndex(snap, snap.serverTime);
+    expect(["core-1", "core-2", "core-3", "core-4"].map((id) => index.state.get(id))).toEqual([
+      "claimed",
+      "leased",
+      "todo",
+      "ready",
+    ]);
+    expect(index.leasedBy.get("core-2")?.key).toBe("CORE-1");
+    const leased = compile("is:leased", index, "m-priya", NOW);
+    expect(snap.issues.filter((i) => leased.matches(i)).map((i) => i.key)).toEqual(["CORE-2"]);
+  });
+});
+
 describe("query language", () => {
   it("tokenizes quoted values and keeps the key", () => {
     expect(tokenize('label:"needs design" team:core  retention')).toEqual([

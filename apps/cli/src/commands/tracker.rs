@@ -813,6 +813,36 @@ fn active_claim(issue: &Value, now: DateTime<Utc>) -> bool {
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .is_some_and(|t| t.with_timezone(&Utc) > now)
 }
+fn is_open(issue: &Value) -> bool {
+    !matches!(issue["status"].as_str(), Some("done" | "canceled"))
+}
+fn find<'a>(snapshot: &'a Value, id: &Value) -> Option<&'a Value> {
+    snapshot["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|i| i["id"] == *id)
+}
+/// The nearest ancestor with an active lease: its holder owns the whole subtree.
+fn leased_ancestor<'a>(
+    snapshot: &'a Value,
+    issue: &Value,
+    now: DateTime<Utc>,
+) -> Option<&'a Value> {
+    let mut seen = vec![issue["id"].clone()];
+    let mut parent = issue["parentId"].clone();
+    while !parent.is_null() && !seen.contains(&parent) {
+        seen.push(parent.clone());
+        let ancestor = find(snapshot, &parent)?;
+        if active_claim(ancestor, now) {
+            return Some(ancestor);
+        }
+        parent = ancestor["parentId"].clone();
+    }
+    None
+}
+/// Mirrors `readiness` in apps/website/shared/tracker.ts: todo (or in progress with an
+/// expired claim), unblocked, a leaf, and outside any other active lease's subtree.
 fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
     let status = issue["status"].as_str().unwrap_or("");
     if !(status == "todo" || (status == "in_progress" && !issue["claim"].is_null()))
@@ -820,20 +850,21 @@ fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
     {
         return false;
     }
-    !snapshot["links"]
+    let blocked = snapshot["links"]
         .as_array()
         .into_iter()
         .flatten()
         .any(|link| {
             link["kind"] == "blocks"
                 && link["toId"] == issue["id"]
-                && snapshot["issues"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|i| i["id"] == link["fromId"])
-                    .is_none_or(|i| i["status"] != "done")
-        })
+                && find(snapshot, &link["fromId"]).is_none_or(|i| i["status"] != "done")
+        });
+    let container = snapshot["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|i| i["parentId"] == issue["id"] && is_open(i));
+    !blocked && !container && leased_ancestor(snapshot, issue, now).is_none()
 }
 fn listing(snapshot: &Value, args: &ListIssues, only_ready: bool, offline: bool) -> Result<Shown> {
     let team = args
@@ -1064,6 +1095,31 @@ mod tests {
         s["issues"][1]["claim"] = json!({"expiresAt":"2026-10-01T00:01:00Z"});
         assert!(!ready(&s, &s["issues"][1], now));
         s["issues"][1]["claim"]["expiresAt"] = json!("2026-09-30T23:59:00Z");
+        assert!(ready(&s, &s["issues"][1], now));
+    }
+    #[test]
+    fn containers_and_issues_under_another_lease_are_not_ready() {
+        let now = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut s = snapshot();
+        s["issues"] = json!([
+            {"id":"p","status":"todo","claim":null,"parentId":null},
+            {"id":"a","status":"todo","claim":null,"parentId":"p"},
+            {"id":"b","status":"done","claim":null,"parentId":"p"}
+        ]);
+        // An open sub-issue makes its parent a container; done ones don't count.
+        assert!(!ready(&s, &s["issues"][0], now));
+        assert!(ready(&s, &s["issues"][1], now));
+        s["issues"][1]["status"] = json!("canceled");
+        assert!(ready(&s, &s["issues"][0], now));
+        // A live lease on the parent covers its subtree; an expired one doesn't.
+        s["issues"][1]["status"] = json!("todo");
+        s["issues"][0]["status"] = json!("in_progress");
+        s["issues"][0]["claim"] = json!({"expiresAt":"2026-10-01T00:01:00Z"});
+        assert!(!ready(&s, &s["issues"][1], now));
+        assert!(leased_ancestor(&s, &s["issues"][1], now).is_some());
+        s["issues"][0]["claim"]["expiresAt"] = json!("2026-09-30T23:59:00Z");
         assert!(ready(&s, &s["issues"][1], now));
     }
     #[test]
