@@ -226,6 +226,27 @@ shell history/process listings may expose) still override it. Expired or superse
 An ambiguous lease response is an error, not ownership: inspect the issue and do
 not start work without a received token.
 
+### Asking the assistant: `gm ask`
+
+`gm ask` puts a question to Gitmatrix's assistant, which reads code and the
+knowledge graph, issues, CI runs and packages with your permissions, the way a
+DeepWiki MCP answers questions about a codebase, but across everything the
+server holds:
+
+```bash
+gm ask "Why did run 44 fail?"                          # inside a checkout: about its repository
+gm ask -R matrixorg/gitmatrix "Where is readiness computed?"
+gm ask --chat CHAT_ID "And who changed it last?"       # follow up
+gm ask --write "File a P1 bug in CORE for the flaky clone test"
+gm assistant list | show CHAT_ID | delete CHAT_ID
+```
+
+People see the answer stream in (status and tool lines on stderr). Agents and
+pipes get one JSON object: `{chatId, url, repo, answer, tools, plan, next}`,
+where `plan` reports how clef routed the turn (intent, model, tool groups, Code
+Mode). It's read-only unless `--write`, since a terminal can't approve each
+change; the conversation continues on the web at the printed URL.
+
 ### Setting up an agent: `gm agent setup`
 
 One command configures a checkout so a coding agent works through the graph

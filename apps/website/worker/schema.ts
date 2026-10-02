@@ -96,6 +96,14 @@ export interface Database {
     capabilities: Generated<string | null>;
     capabilities_updated_at: Generated<string | null>;
   };
+  assistant_chats: {
+    id: string;
+    user_id: string;
+    title: Generated<string>;
+    source: Generated<"web" | "cli">;
+    created_at: Generated<string>;
+    updated_at: Generated<string>;
+  };
   ssh_keys: {
     id: string;
     user_id: string;

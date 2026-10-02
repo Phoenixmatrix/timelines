@@ -115,7 +115,9 @@ Work is tracked in Gitmatrix: matrixorg, team CORE. The loop, in brief (the
    Nothing ready means stop, not retry.
 2. Work it: `gm issue checkpoint <issue> '<done; next>'` as you go, and
    `gm issue renew <issue>` before the lease (1 hour) ends.
-3. Blocked on a person? `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`.
+3. Need to find something out (where code lives, why CI failed, what an issue
+   depends on)? `gm ask "<question>"` asks the Gitmatrix assistant. Blocked on
+   a person? `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`.
 4. Ship (`vp run ready`, then `gm push && gm runs wait`), then `gm issue complete <issue> --evidence '…'`. Can't
    finish: `gm issue release <issue>`.
 

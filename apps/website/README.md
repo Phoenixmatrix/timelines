@@ -863,6 +863,57 @@ The [Git LFS and Xet investigation](../../ARTIFACT-STORAGE-RESEARCH.md) records
 measured comparisons, shared-chunk storage tradeoffs, and the evidence needed
 before revisiting this design.
 
+## Assistant
+
+Ask Gitmatrix (CORE-25/26) is an assistant that reads and changes everything a
+person can: code and its knowledge graph, issues, CI, packages, repository
+settings. It chats in a column docked beside the page (rail button or ⌘J /
+Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
+
+- **Where it runs.** `worker/assistant/agent.ts`: an `AIChatAgent` (Cloudflare
+  Agents SDK) Durable Object per conversation, named `<userId>:<chatId>` by
+  `worker/api/assistant.ts` from the signed-in actor, so nobody reaches someone
+  else's chat by naming it. Transcripts persist in the object's SQLite; the
+  directory is `assistant_chats` in D1 (`GET /api/assistant/chats`).
+- **Who it is.** It acts as an `assistant` agent identity accountable to the
+  person (created on first use, `identity.ts`), with a short-lived token, and
+  calls the real JSON API in-process (`internal.ts`, `worker/app.ts`), so every
+  permission check and CORE-52 attribution applies ("assistant for Ann Lee").
+  It can't touch tokens, agents, SSH keys, dev endpoints or the CI runner.
+- **Every turn starts with clef.** One `@cf/cloudflare/clef-flash` call
+  (`plan.ts`, ~0.3–0.5 s, 2.5 s deadline) answers a dozen typed questions about
+  the message: intent, which tool groups it needs, difficulty, whether it
+  aggregates many items, whether it's about the page on screen, and a status
+  line. The answers pick the model (`@cf/zai-org/glm-5.3-flash`, or
+  `@cf/zai-org/glm-5.3` for planning and hard turns) and reasoning effort, the
+  tools the model sees, the skills preloaded into its instructions, and whether
+  Code Mode is offered. Chat titles come from `@cf/ibm-granite/granite-4.0-h-micro`.
+- **Tools** (`tools.ts`): reads (`list_repos`, `list_files`, `read_file`,
+  `list_commits`, `semantic_changes`, `search_code`, `read_wiki`, `find_issues`,
+  `show_issue`, `ci_runs`, `ci_run`, `ci_logs`, `find_packages`, `api_get`) and
+  writes (`create_issue`, `update_issue`, `comment_on_issue`, `link_issues`,
+  `rerun_ci`, `cancel_ci`, `api_write`). On the web every write waits for an
+  approval card whose wording comes from the request itself
+  (`shared/assistant.ts` `describeWrite`), never the model's summary.
+  `navigate` runs in the browser (the page beside the chat moves).
+- **Code Mode.** When clef says a turn aggregates (count, compare, join across
+  many issues or runs), the model gets `codemode`: it writes one script over the
+  read tools that runs in a Dynamic Worker (`LOADER`, no network) instead of a
+  dozen round trips. Writes never run there.
+- **Skills** (`skills.ts`): SKILL.md-style built-ins (the API catalog, tracker,
+  code, CI, packages, knowledge, navigation, repository, gm), a catalog line
+  each, bodies preloaded for the turn's groups and otherwise one
+  `activate_skill` away. A repository's own `.agents/skills/*/SKILL.md` join
+  them when the chat is about it.
+- **The web** (`src/assistant/`): page context (repository, file and lines,
+  issue, run) goes with each message and shows as a removable chip; receipts
+  fold finished reads into one line; typing while an approval waits declines it
+  and redirects; approved writes revalidate the page.
+- **The CLI.** `POST /api/assistant/ask` streams newline-delimited events
+  (`chat`, `plan`, `status`, `tool`, `text`, `done`, `error`); `gm ask` prints
+  them, or returns one JSON object to agents. It lands in the same transcript,
+  so a terminal conversation continues on the web.
+
 ## Mirrors
 
 A repository can mirror every push on to another git host: Settings → Mirror,

@@ -1,6 +1,7 @@
 import { popMotion } from "./ui.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
+  ChatCenteredDotsIcon,
   EnvelopeSimpleIcon,
   FingerprintIcon,
   HandWavingIcon,
@@ -19,6 +20,8 @@ import {
 } from "@phosphor-icons/react";
 import { useState } from "react";
 import { Link, NavLink, Outlet, useFetcher, useLocation, useNavigation } from "react-router";
+import { AssistantDock } from "../assistant/Dock.tsx";
+import { AssistantProvider, useAssistant } from "../assistant/state.tsx";
 import { useViewer } from "../lib/session.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
@@ -201,78 +204,102 @@ export function AppShell() {
     );
 
   return (
-    <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
-      <nav
-        aria-label="Places"
-        className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2 sm:fixed sm:inset-y-0 sm:left-0"
+    <AssistantProvider>
+      <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
+        <nav
+          aria-label="Places"
+          className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2 sm:fixed sm:inset-y-0 sm:left-0"
+        >
+          <Place to="/" label="Home" end>
+            {() => <GitmatrixLogo markOnly className="size-8" />}
+          </Place>
+          {viewer && (
+            <Place to="/tracker" label="Issue tracker">
+              {(active) => (
+                <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+              )}
+            </Place>
+          )}
+          {viewer && (
+            <Place to="/needs-you" label="Needs you">
+              {(active) => (
+                <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+              )}
+            </Place>
+          )}
+          {viewer && (
+            <Place to="/packages" label="Packages" also={/^\/[^/]+\/-\/(packages|feeds)(\/|$)/}>
+              {(active) => (
+                <PackageIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+              )}
+            </Place>
+          )}
+          {viewer && (
+            <Place to="/settings/tokens" label="Access tokens">
+              {(active) => <KeyIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
+            </Place>
+          )}
+          {places.length > 0 && <span className="mk-rail-rule max-sm:hidden" />}
+          {places.map((org) => (
+            <Tip key={org.id} label={org.displayName} side="right">
+              <NavLink
+                to={`/${org.slug}`}
+                className="grid size-12 place-items-center rounded-[16px]"
+                aria-label={org.displayName}
+              >
+                <Monogram name={org.displayName} shape="place" size="lg" />
+              </NavLink>
+            </Tip>
+          ))}
+          {viewer && (
+            <Tip label="New repository" side="right">
+              <NavLink
+                to="/new"
+                className="mk-place mk-place--add max-sm:before:hidden"
+                aria-label="New repository"
+              >
+                <PlusIcon size={20} weight="bold" aria-hidden />
+              </NavLink>
+            </Tip>
+          )}
+          <div className="flex-1" />
+          {viewer && <AskButton />}
+          {viewer ? (
+            <AccountMenu />
+          ) : (
+            <Place to={`/signin?next=${encodeURIComponent(location.pathname)}`} label="Sign in">
+              {() => <SignInIcon size={22} aria-hidden />}
+            </Place>
+          )}
+        </nav>
+        <main
+          className="min-w-0 flex-1 transition-opacity"
+          style={{ opacity: navigation.state === "loading" ? 0.7 : 1 }}
+        >
+          <Outlet />
+        </main>
+        {viewer && <AssistantDock />}
+        <Toasts />
+      </div>
+    </AssistantProvider>
+  );
+}
+
+/** Opens and closes the assistant: a toggle, not a place. */
+function AskButton() {
+  const assistant = useAssistant();
+  return (
+    <Tip label={`${assistant.open ? "Close" : "Ask"} the assistant (⌘J)`} side="right">
+      <button
+        type="button"
+        className="mk-place max-sm:before:hidden"
+        aria-label="Assistant"
+        aria-pressed={assistant.open}
+        onClick={() => assistant.toggle()}
       >
-        <Place to="/" label="Home" end>
-          {() => <GitmatrixLogo markOnly className="size-8" />}
-        </Place>
-        {viewer && (
-          <Place to="/tracker" label="Issue tracker">
-            {(active) => (
-              <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
-            )}
-          </Place>
-        )}
-        {viewer && (
-          <Place to="/needs-you" label="Needs you">
-            {(active) => (
-              <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
-            )}
-          </Place>
-        )}
-        {viewer && (
-          <Place to="/packages" label="Packages" also={/^\/[^/]+\/-\/(packages|feeds)(\/|$)/}>
-            {(active) => <PackageIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
-          </Place>
-        )}
-        {viewer && (
-          <Place to="/settings/tokens" label="Access tokens">
-            {(active) => <KeyIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
-          </Place>
-        )}
-        {places.length > 0 && <span className="mk-rail-rule max-sm:hidden" />}
-        {places.map((org) => (
-          <Tip key={org.id} label={org.displayName} side="right">
-            <NavLink
-              to={`/${org.slug}`}
-              className="grid size-12 place-items-center rounded-[16px]"
-              aria-label={org.displayName}
-            >
-              <Monogram name={org.displayName} shape="place" size="lg" />
-            </NavLink>
-          </Tip>
-        ))}
-        {viewer && (
-          <Tip label="New repository" side="right">
-            <NavLink
-              to="/new"
-              className="mk-place mk-place--add max-sm:before:hidden"
-              aria-label="New repository"
-            >
-              <PlusIcon size={20} weight="bold" aria-hidden />
-            </NavLink>
-          </Tip>
-        )}
-        <div className="flex-1" />
-        {viewer ? (
-          <AccountMenu />
-        ) : (
-          <Place to={`/signin?next=${encodeURIComponent(location.pathname)}`} label="Sign in">
-            {() => <SignInIcon size={22} aria-hidden />}
-          </Place>
-        )}
-      </nav>
-      <main
-        className="min-w-0 flex-1 transition-opacity"
-        style={{ opacity: navigation.state === "loading" ? 0.7 : 1 }}
-      >
-        <Outlet />
-      </main>
-      <Toasts />
-    </div>
+        <ChatCenteredDotsIcon size={22} weight={assistant.open ? "fill" : "regular"} aria-hidden />
+      </button>
+    </Tip>
   );
 }
 

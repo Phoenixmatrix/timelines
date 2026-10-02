@@ -137,6 +137,10 @@ pub const COMMANDS: &[Meta] = &[
     meta!("runner", git: "", kw: "ci runner agent worker execute jobs locally self-hosted run pipelines dev", mutates: false, out: Out::Other("{jobs:[{repo,run,job,status}]} (one JSON line per job while running)"), ex: ["gm runner", "gm runner --once", "gm runner -R orbit/engine -v"]),
     meta!("secret list", git: "", kw: "ci secrets environment variables credentials list", mutates: false, out: Out::Other("{secrets:[{name,updatedAt}]}"), ex: ["gm secret list"]),
     meta!("secret set", git: "", kw: "ci add secret token credential environment variable", mutates: true, out: Out::Other("{set}"), ex: ["gm secret set NPM_TOKEN --value xyz", "echo $TOKEN | gm secret set CLOUDFLARE_API_TOKEN"]),
+    meta!("ask", git: "", kw: "ask question assistant ai explain why how deepwiki chat codebase knowledge issues ci packages agent query", mutates: false, out: Out::Other("{chatId,url,repo,answer,tools:[label],next}; text output streams the answer; --write lets it change things"), ex: ["gm ask \"Why did run 44 fail?\"", "gm ask -R matrixorg/gitmatrix \"Where is the tracker's readiness computed?\"", "gm ask --chat CHAT_ID \"And who changed it last?\"", "gm ask --write \"File a bug for the flaky clone test in CORE\""]),
+    meta!("assistant list", git: "", kw: "assistant conversations chats history", mutates: false, out: Out::Other("{chats:[{id,title,source,createdAt,updatedAt}]}"), ex: ["gm assistant list"]),
+    meta!("assistant show", git: "", kw: "assistant conversation transcript messages", mutates: false, out: Out::Other("{id,title,source,messages:[{role,text,tools}]}"), ex: ["gm assistant show CHAT_ID"]),
+    meta!("assistant delete", git: "", kw: "assistant delete conversation", mutates: true, out: Out::Other("{deleted}"), ex: ["gm assistant delete CHAT_ID"]),
     meta!("agent setup", git: "", kw: "configure set up agent harness claude codex cursor AGENTS.md skills instructions identity token profile scope gm issue next defaults .gitmatrix", mutates: true, out: Out::Other("{dryRun,agent,harness,model,tags,scope,identity:{id,name,accountable,created,token,profile}|null,files:[{path,status}],next}; --check: {upToDate,files} or error code stale (exit 4)"), ex: ["gm agent setup", "gm agent setup --harness codex --model gpt-5 --tag rust", "gm agent setup --under CORE-4", "gm agent setup --check"]),
     meta!("agent list", git: "", kw: "agents identities accountable bots list capabilities selection owner", mutates: false, out: Out::Other("{agents:[{id,name,description,accountable,createdAt,revokedAt,tokens,capabilities,capabilitiesUpdatedAt}]}"), ex: ["gm agent list", "gm agent list --owner orbit"]),
     meta!("agent detect", git: "", kw: "agent local capabilities environment harness model skills tags detect", mutates: false, out: Out::Other("{version:1,harness,model,environment:{os,arch,runtime,cpuCount,memoryBytes},tags,skills:[{name,description,source}]}"), ex: ["gm agent detect", "gm agent detect --model explicit-model --tag rust"]),
@@ -591,6 +595,13 @@ single-use code (`gm issue accept CODE`). Questions, approvals, decisions and
 credentials go to a person: they answer on the web's Needs you page or with
 `gm request answer`; a credential is stored as its secret, never in the tracker.
 Repeatedly released work asks its accountable person what to do differently.
+
+## Asking the assistant
+`gm ask "<question>"` asks Gitmatrix's assistant, which reads code (and the
+knowledge graph), issues, CI runs and packages with your permissions and answers
+with links. Inside a checkout it knows the repository; `-R owner/name` otherwise.
+It's read-only unless `--write`; follow up with `--chat <id>`. Conversations are
+shared with the web (`gm assistant list`, or open the printed link).
 
 ## CI
 Pushes run the pipeline in `.gitmatrix/ci.yml` (jobs, steps, `needs`, `if`,

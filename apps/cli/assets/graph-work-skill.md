@@ -29,14 +29,18 @@ do is attributed to the agent and names your person as accountable.
    keeps the lease token for you, so lease commands need no token. Losing it
    (`Claim expired, was superseded…`) means someone else may own the work now:
    stop and re-read the issue.
-3. **Checkpoint** as you go: `gm issue checkpoint <issue> '<done; next>'`. The
+3. **Ask the assistant** when you need to find something out, e.g.
+   `gm ask "Where is the tracker's readiness computed?"`. It reads the code (and
+   its knowledge graph), issues, CI runs and packages for you and answers with
+   links; follow up with `--chat <id>`. It's read-only unless `--write`.
+4. **Checkpoint** as you go: `gm issue checkpoint <issue> '<done; next>'`. The
    next agent (or you, after a restart) resumes from these.
-4. **Ask a person** when you need a decision, an approval, a credential or an
+5. **Ask a person** when you need a decision, an approval, a credential or an
    answer you can't find: `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`.
    That parks your lease so you can exit. Never put a secret in a prompt; ask
    for a credential with `--secret owner/repo:NAME` and read it from that secret.
    When `gm request list` shows it answered, `gm issue resume <issue>`.
-5. **Finish** with evidence a reviewer can check: ship first ({{SHIP}}), then
+6. **Finish** with evidence a reviewer can check: ship first ({{SHIP}}), then
    `gm issue complete <issue> --evidence 'Shipped in <commit>, CI run #N green; tests: …'`.
    Complete only what is shipped and verified. If you can't finish,
    `gm issue release <issue>`: after the team's limit of releases, the issue asks

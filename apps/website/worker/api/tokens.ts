@@ -29,7 +29,7 @@ export async function issueToken(
   userId: string,
   name: string,
   scope: TokenScope,
-  session?: { expiresAt: string; sshKeyId: string },
+  session?: { expiresAt: string; sshKeyId?: string },
   /** The agent the token acts as; it still belongs to `userId`. */
   agentId?: string,
 ): Promise<CreatedAccessToken> {

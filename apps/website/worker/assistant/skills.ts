@@ -1,0 +1,296 @@
+// The assistant's skills, SKILL.md-style: a catalog line each in the system
+// prompt, the body loaded when needed. clef preloads the ones a turn needs
+// (plan.ts); the rest stay one activate_skill call away. A repository's own
+// skills (.agents/skills/<name>/SKILL.md) join them when the chat is about it.
+
+import { tool, type ToolSet } from "ai";
+import { z } from "zod";
+import type { CallApi } from "./internal.ts";
+import type { Group } from "./plan.ts";
+
+interface Builtin {
+  name: string;
+  description: string;
+  /** The tool group whose turns preload it. */
+  group?: Group | "navigation";
+  body: string;
+}
+
+export const BUILTIN: Builtin[] = [
+  {
+    name: "gitmatrix-api",
+    description:
+      "Every Gitmatrix JSON API route, for api_get and api_write: repositories, collaborators, mirrors, knowledge, CI, secrets, packages and registries, tracker mutations, people.",
+    body: `# Gitmatrix JSON API
+
+Paths are under /api; pass them to api_get (GET) or api_write (everything else) without the /api prefix. Responses are JSON; errors are {"error": "..."} with an HTTP status. You act as the person's assistant agent, with their permissions: a 403 means they can't do it either, so say so.
+
+## Repositories (/repos)
+- GET /repos — repositories you can see. POST /repos {owner, name, description, visibility: "public"|"private", importFrom?} — create or import.
+- GET /repos/:o/:n — detail: default branch, branches, tags, clone URL, your role.
+- GET /repos/:o/:n/tree?ref=&path= — a folder. GET /repos/:o/:n/blob?ref=&path= — a file.
+- GET /repos/:o/:n/commits?ref=&page= — commits. GET /repos/:o/:n/history?ref=&entries=a,b — last commit touching each path.
+- GET /repos/:o/:n/semantic — meaning-level changes (functions/types added, changed, removed).
+- PATCH /repos/:o/:n {description?, visibility?, defaultBranch?, name?} — settings (admin). DELETE /repos/:o/:n — delete (admin; confirm twice in words first).
+- GET /repos/:o/:n/collaborators. PUT /repos/:o/:n/collaborators/:username {role: "read"|"write"|"admin"}. DELETE the same to remove.
+- GET|PUT|DELETE /repos/:o/:n/mirror — GitHub mirror config (admin). POST /repos/:o/:n/mirror/sync — sync now.
+
+## Knowledge (/repos/:o/:n/knowledge)
+- GET /status — graph build state. POST /rebuild — rebuild (admin).
+- GET /search?q=&kinds= — entities + code passages. GET /graph?kind=&q=&limit=, /graph/node?id= — nodes and their links.
+- GET /wiki — table of contents. GET /wiki/page?slug= — a page.
+- GET /repos/:o/:n/release-notes/range?from=&to= — release notes between two refs.
+
+## CI (/repos/:o/:n/ci)
+- GET /ci — runs. POST /ci/runs {ref?, commit?} — start a run. GET /ci/runs/:number — jobs and steps.
+- POST /ci/runs/:number/cancel, POST /ci/runs/:number/rerun.
+- GET /ci/jobs/:job/logs?after=N — log chunks {chunks, next, done}.
+- GET /ci/status?commits=a,b — status per commit.
+- GET /ci/secrets — names only. PUT /ci/secrets/:NAME {value} and DELETE — never ask for or repeat secret values in chat; for a credential, tell the person to set it themselves (Settings or gm secret set).
+
+## Packages (/packages)
+- GET /packages/:owner — packages and feeds. GET /packages/:owner/:format/:name — one package; /publishes?q=&offset=&limit=; /contents.
+- POST /packages/:owner/:format/:name/actions {action: "tag"|"untag"|"deprecate"|"yank"|"delete", versions: [...], ...} — bulk version actions.
+- POST|PATCH|DELETE /packages/:owner/feeds[/:format/:key] — feeds and upstream proxies.
+
+## Tracker (/tracker)
+- GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view.
+- POST /tracker/:owner/mutate {operationId: uuid, mutations: [...]}: kinds team.create|update, workspace.create|update, issue.create {id: uuid, data: {teamId, title, ...}} | issue.update {id, expectedVersion, data} , link.add {id, data: {fromId, toId, kind}} | link.remove, comment.add {id, data: {issueId, body, kind}}, subscription.add|remove, request.answer|cancel. Prefer the dedicated issue tools; use this for teams, workspaces and bulk changes.
+- GET /requests — open requests waiting on the person ("Needs you").
+- Claims, leases and handoffs (issue.claim, renew, complete…) belong to agents doing the work with gm, not to this chat.
+
+## People
+- GET /session — who you act for. GET /users?q= — find people. GET /accounts/:slug — an account or organization.`,
+  },
+  {
+    name: "tracker",
+    group: "tracker",
+    description:
+      "How the Gitmatrix tracker works and how to plan with it: teams, statuses, priorities, PRDs and sub-issues, blockers, claims, requests to people.",
+    body: `# The tracker
+
+- Trackers belong to an account or organization (the owner), independent of repositories. Issues belong to a team (key like CORE) and get keys CORE-1, CORE-2…
+- Status: backlog, todo, in_progress, done, canceled. Priority 0 (urgent) to 4 (none); 2 is normal. Types: task, bug, prd, chore, research.
+- Ready = todo, every blocker done, nobody holding a claim, no open sub-issues. find_issues with ready: true finds them.
+- Links: "A blocks B" (B can't start until A is done), related, duplicates. Parent/sub-issue is structure, not blocking.
+- A claim (lease) means an agent is working on it; only its holder changes its status. Don't change status on claimed issues.
+- A PRD (type prd) is a plan, implemented through sub-issues. To break work down: create the sub-issues with parent set, then link blockers between them in execution order. Give each a crisp title and acceptance criteria.
+- Requests are questions/approvals/decisions/credentials an agent asked a person; they show on the Needs you page (/needs-you).
+- Write issue titles as outcomes ("Users can reset passwords"), not activities. Descriptions are Markdown.
+- Link every issue you mention: [CORE-25](/tracker/<owner>/issues/CORE-25).`,
+  },
+  {
+    name: "code",
+    group: "code",
+    description:
+      "Investigating code in a repository: finding where things are, reading the right lines, explaining and citing them.",
+    body: `# Reading code
+
+1. Find before reading: search_code (meaning search over the knowledge graph and code passages) beats listing folders. Use list_files for structure, read_file with lines for the part that matters.
+2. Cite what you read with links to exact lines: [worker/app.ts:12-30](/<owner>/<repo>/blob/<ref>/worker/app.ts#L12-L30).
+3. Quote only the few lines that carry the point, in fenced code blocks with the language.
+4. Say what you didn't check. Don't describe code you haven't read.
+5. For "what changed", use list_commits and semantic_changes; for "who/when", file_history via api_get /repos/:o/:n/history?entries=path.`,
+  },
+  {
+    name: "ci",
+    group: "ci",
+    description:
+      "Diagnosing CI: finding the failing job and step, reading its logs, explaining the failure, rerunning.",
+    body: `# CI
+
+- ci_runs for recent runs; ci_run for a run's jobs and steps; ci_logs on the failing job (the end of the log is usually enough).
+- Explain a failure as: what failed (job, step, exit code), why (quote the 3-10 decisive log lines), and the likely fix (link the code involved).
+- Statuses: queued, running, succeeded, failed, cancelled, skipped. A job "skipped" as unchanged counts as passed.
+- Rerun only when the failure looks transient (network, timeouts, infrastructure) or the person asks; otherwise explain first.
+- Link runs: [run #44](/<owner>/<repo>/ci/44).`,
+  },
+  {
+    name: "packages",
+    group: "packages",
+    description:
+      "Packages in the Gitmatrix registry: formats, feeds, versions, tags, yanking and deprecating.",
+    body: `# Packages
+
+- Formats include npm, pypi, oci (containers), cargo, go, maven, nuget, rubygems, apt, rpm, brew, generic and releases. Each account or organization publishes into its own feeds.
+- find_packages lists them; api_get /packages/:owner/:format/:name for one package and its versions (publishes?q= to search versions).
+- Version actions (tag, deprecate, yank, delete) go through api_write POST /packages/:owner/:format/:name/actions. Yank and delete can break installs: say so before proposing them.
+- Link packages: [name](/<owner>/-/packages/<format>/<name>).`,
+  },
+  {
+    name: "knowledge",
+    group: "knowledge",
+    description:
+      "The knowledge graph and wiki: what a repository's parts are and mean, summaries, components, concepts.",
+    body: `# Knowledge graph and wiki
+
+- Every push rebuilds a graph of the repository: files, symbols, components and concepts, each summarized, with links (defines, imports, contains, uses).
+- search_code searches it by meaning. read_wiki without a slug gives the table of contents; with one, the page. The wiki is generated from the graph and cites sources.
+- api_get /repos/:o/:n/knowledge/graph/node?id=... reads a node and its neighbours (ids look like file:path, sym:path#name, component:name).
+- Prefer the wiki overview for "what is this repository / how does X work at a high level"; read code for exact behaviour.
+- Link: [the wiki](/<owner>/<repo>/wiki), [the map](/<owner>/<repo>/knowledge?node=<id>).`,
+  },
+  {
+    name: "navigation",
+    group: "navigation",
+    description:
+      "Gitmatrix's pages and their paths: for links in answers and for opening pages with navigate.",
+    body: `# Pages
+
+- Home / ; Issue tracker /tracker and /tracker/<owner> ; an issue /tracker/<owner>/issues/<KEY> ; Needs you /needs-you ; Packages /packages
+- Account or organization /<owner> ; its packages /<owner>/-/packages ; a package /<owner>/-/packages/<format>/<name>
+- Repository /<owner>/<repo> ; folder /<owner>/<repo>/tree/<ref>/<path> ; file /<owner>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<owner>/<repo>/commits/<ref> ; changes /<owner>/<repo>/changes ; CI /<owner>/<repo>/ci and /<owner>/<repo>/ci/<number> ; wiki /<owner>/<repo>/wiki/<slug> ; knowledge map /<owner>/<repo>/knowledge ; settings /<owner>/<repo>/settings
+- Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites ; new repository /new
+
+Use navigate when the person asks to go somewhere or see something, or to show what you just made or found; it opens beside the chat. Otherwise just link.`,
+  },
+  {
+    name: "repository",
+    group: "repository",
+    description:
+      "Administering repositories: settings, visibility, collaborators and roles, GitHub mirrors, creating and importing.",
+    body: `# Repository administration
+
+- Roles: read, write, admin; owners of an organization are admins of its repositories. Settings, collaborators, mirrors and deletion need admin.
+- Change settings with api_write PATCH /repos/:o/:n; collaborators with PUT/DELETE /repos/:o/:n/collaborators/:username; mirrors with /repos/:o/:n/mirror.
+- Create: api_write POST /repos {owner, name, description, visibility}. Import a public git URL with importFrom.
+- Never delete a repository unless the person asked for exactly that in this conversation, and state that it can't be undone.`,
+  },
+  {
+    name: "gm-cli",
+    description:
+      "How people and agents do things with gm, the Gitmatrix CLI: clone, commit, push, CI, issues, packages, agents.",
+    body: `# gm
+
+gm is jj-style version control plus the Gitmatrix client. Every edit lives in a change; operations can be undone (gm undo).
+- gm clone owner/repo · gm status · gm commit -m "…" · gm push (gm push --sync when trunk moved) · gm sync · gm log
+- gm runs list / wait / logs --follow · gm secret set NAME
+- gm issue create "Title" --team CORE [--owner <tracker>] · gm issue next · claim · checkpoint · complete --evidence · gm request list/answer
+- gm pkg upload/download/install · gm agent setup (configure a coding agent for a checkout)
+- gm ask "question" — ask this assistant from a terminal (read-only unless --write)
+- gm cli guide (the workflow), gm cli search "<task>", gm schema <command>
+Answer "how do I…" questions with the exact command.`,
+  },
+];
+
+export interface Skill {
+  name: string;
+  description: string;
+  body: string;
+}
+
+/** Where skills come from: built in, or a repository's .agents/skills. */
+export interface SkillSource {
+  list(): Promise<Skill[]>;
+}
+
+/** name and description from a SKILL.md's frontmatter, and the body after it. */
+export function parseSkill(markdown: string): Skill | null {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(markdown);
+  if (!match) return null;
+  const field = (key: string) => {
+    const line = new RegExp(`^${key}:\\s*(.+)$`, "m").exec(match[1]!)?.[1]?.trim();
+    return line?.replace(/^(["'])(.*)\1$/, "$2") ?? null;
+  };
+  const name = field("name");
+  const description = field("description");
+  return name && description ? { name, description, body: match[2]!.trim() } : null;
+}
+
+/**
+ * The skills a turn can use: a catalog line each in the instructions, bodies
+ * preloaded when clef says the turn needs them, the rest one activate_skill
+ * call away. The same model as Agent Skills (SKILL.md), without a script runner.
+ */
+export class SkillRegistry {
+  private skills = new Map<string, Skill>();
+  private sources: SkillSource[];
+  constructor(sources: SkillSource[]) {
+    this.sources = sources;
+  }
+
+  async load() {
+    const lists = await Promise.all(this.sources.map((s) => s.list().catch(() => [])));
+    for (const skill of lists.flat())
+      if (!this.skills.has(skill.name)) this.skills.set(skill.name, skill);
+  }
+
+  get(name: string): Skill | null {
+    return this.skills.get(name) ?? null;
+  }
+
+  catalog(except: readonly string[] = []): string {
+    const rest = [...this.skills.values()].filter((s) => !except.includes(s.name));
+    if (!rest.length) return "";
+    return `## Skills\n\nWhen a task matches one of these, call activate_skill with its name first:\n${rest
+      .map((s) => `- ${s.name}: ${s.description}`)
+      .join("\n")}`;
+  }
+
+  tools(): ToolSet {
+    if (!this.skills.size) return {};
+    return {
+      activate_skill: tool({
+        description: "Load a skill's full instructions by name (see the Skills list).",
+        inputSchema: z.object({ name: z.string() }),
+        execute: async ({ name }) => {
+          const skill = this.get(name);
+          return skill
+            ? { name: skill.name, instructions: skill.body }
+            : { error: `No skill ${name}. Skills: ${[...this.skills.keys()].join(", ")}` };
+        },
+      }),
+    };
+  }
+}
+
+/** The built-in skills. */
+export function builtinSkills(): SkillSource {
+  return {
+    list: async () => BUILTIN.map(({ name, description, body }) => ({ name, description, body })),
+  };
+}
+
+/**
+ * Skills a turn starts with loaded: the API catalog whenever it uses tools (so
+ * paths come from it, not guesses), and those for its tool groups.
+ */
+export function preloaded(groups: readonly string[], navigate: boolean): string[] {
+  if (!groups.length && !navigate) return [];
+  return BUILTIN.filter(
+    (skill) =>
+      skill.name === "gitmatrix-api" ||
+      (skill.group !== undefined &&
+        (groups.includes(skill.group) || (navigate && skill.group === "navigation"))),
+  ).map((skill) => skill.name);
+}
+
+/**
+ * A repository's own skills: .agents/skills/<name>/SKILL.md, read through the
+ * API as the assistant (so a private repository's skills need access to it).
+ */
+export function repositorySkills(api: CallApi, repo: string): SkillSource {
+  const [owner, name] = repo.split("/");
+  const base = `/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(name!)}`;
+  return {
+    async list() {
+      const tree = await api("GET", `${base}/tree?path=.agents/skills`);
+      if (!tree.ok) return [];
+      const dirs = (tree.body as { entries: { path: string; type: string }[] }).entries
+        .filter((e) => e.type === "tree")
+        .slice(0, 20);
+      const skills = await Promise.all(
+        dirs.map(async (dir) => {
+          const file = await api(
+            "GET",
+            `${base}/blob?path=${encodeURIComponent(`${dir.path}/SKILL.md`)}`,
+          );
+          const text = file.ok ? (file.body as { text: string | null }).text : null;
+          const skill = text ? parseSkill(text) : null;
+          return skill ? { ...skill, description: `${skill.description} (from ${repo})` } : null;
+        }),
+      );
+      return skills.filter((s): s is Skill => s !== null);
+    },
+  };
+}

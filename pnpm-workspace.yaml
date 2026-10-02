@@ -68,6 +68,12 @@ catalog:
   "@lezer/python": ^1.1.19
   "@lezer/rust": ^1.0.3
   "@lezer/xml": ^1.0.6
+  "@ai-sdk/react": ^4.0.130
+  "@cloudflare/ai-chat": ^0.12.1
+  "@cloudflare/codemode": ^0.5.3
+  agents: ^0.26.0
+  ai: ^7.0.127
+  workers-ai-provider: ^4.0.0
 overrides:
   vite@*: "catalog:"
 peerDependencyRules:
@@ -76,7 +82,11 @@ peerDependencyRules:
   allowedVersions:
     vite: "*"
 allowBuilds:
+  core-js-pure: false
   esbuild: true
   workerd: true
 minimumReleaseAgeExclude:
   - "@cloudflare/vite-plugin@2.0.0-beta.sha-52b0dc0e9"
+  - "@cloudflare/ai-chat@0.12.1"
+  - "@cloudflare/codemode@0.5.3"
+  - agents@0.26.0

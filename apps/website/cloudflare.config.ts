@@ -116,6 +116,10 @@ export default defineConfig(({ mode }) => {
           id: dev ? "00000000000000000000000000000000" : PRODUCTION.db,
         }),
         TRACKER: bindings.durableObject({ worker: "gitmatrix", exportName: "Tracker" }),
+        // The assistant (CORE-25): one Durable Object per conversation, and the
+        // Worker Loader its Code Mode scripts run in (isolated, no network).
+        ASSISTANT: bindings.durableObject({ worker: "gitmatrix", exportName: "Assistant" }),
+        LOADER: bindings.workerLoader(),
         ARTIFACTS: bindings.artifacts({
           namespace: dev
             ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev")
@@ -231,6 +235,7 @@ export default defineConfig(({ mode }) => {
       ],
       exports: {
         Tracker: exports.durableObject({ storage: "sqlite" }),
+        Assistant: exports.durableObject({ storage: "sqlite" }),
         KnowledgeCoordinator: exports.durableObject({ storage: "sqlite" }),
         KnowledgeBuild: exports.workflow({ name: "knowledge-build" }),
         CiRun: exports.workflow({ name: "ci-run" }),

@@ -183,6 +183,94 @@ body {
   border: 1px solid var(--line-soft);
 }
 
+/* The assistant's prose: the same voice, tighter for a 26rem column. */
+.gm-prose--chat {
+  max-width: none;
+}
+.gm-prose--chat p,
+.gm-prose--chat ul,
+.gm-prose--chat ol,
+.gm-prose--chat pre,
+.gm-prose--chat blockquote,
+.gm-prose--chat table {
+  margin-bottom: 0.65em;
+}
+.gm-prose--chat > :last-child {
+  margin-bottom: 0;
+}
+.gm-prose--chat h1,
+.gm-prose--chat h2,
+.gm-prose--chat h3 {
+  margin: 1em 0 0.35em;
+  font-size: 1rem;
+  line-height: 1.4rem;
+}
+.gm-prose--chat pre {
+  font-size: 0.75rem;
+  line-height: 1.1rem;
+}
+.gm-prose--chat li + li {
+  margin-top: 0.2em;
+}
+.gm-prose--chat table {
+  display: block;
+  overflow-x: auto;
+  font-size: 0.8125rem;
+}
+
+/* Working: three dots that breathe in turn. Reduced motion holds them still. */
+.gm-thinking {
+  display: inline-flex;
+  gap: 3px;
+}
+.gm-thinking span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  animation: gm-breathe 1.2s ease-in-out infinite;
+}
+.gm-thinking span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.gm-thinking span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes gm-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+/* The assistant arrives from the edge it lives on. */
+.gm-dock {
+  animation: gm-dock-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes gm-dock-in {
+  from {
+    opacity: 0;
+    translate: 12px 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gm-thinking span {
+    animation: none;
+    opacity: 0.7;
+  }
+  .gm-dock {
+    animation-name: gm-dock-fade;
+  }
+  @keyframes gm-dock-fade {
+    from {
+      opacity: 0;
+    }
+  }
+}
+
 /* Things utilities can't reach. */
 
 /* Scrollbars are the browser's own surface; theme them from the palette. */

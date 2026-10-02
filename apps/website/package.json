@@ -18,7 +18,10 @@
     "db:pending": "cf d1 migrations list 00000000000000000000000000000000 --local --persist-to .wrangler/state"
   },
   "dependencies": {
+    "@ai-sdk/react": "catalog:",
     "@base-ui/react": "catalog:",
+    "@cloudflare/ai-chat": "catalog:",
+    "@cloudflare/codemode": "catalog:",
     "@gitmatrix/formats": "workspace:*",
     "@lezer/common": "catalog:",
     "@lezer/css": "catalog:",
@@ -32,6 +35,8 @@
     "@lezer/rust": "catalog:",
     "@lezer/xml": "catalog:",
     "@phosphor-icons/react": "catalog:",
+    "agents": "catalog:",
+    "ai": "catalog:",
     "better-auth": "catalog:",
     "diff": "catalog:",
     "hono": "catalog:",
@@ -44,6 +49,7 @@
     "react-markdown": "catalog:",
     "react-router": "catalog:",
     "remark-gfm": "catalog:",
+    "workers-ai-provider": "catalog:",
     "yaml": "catalog:",
     "zod": "catalog:"
   },

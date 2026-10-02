@@ -451,6 +451,52 @@ export async function runProviderE2E(
         found,
         "Vectorize entity and AI Search source passage invariants were not both visible",
       );
+      enter("assistant");
+      // The assistant (CORE-25/26): one real turn through clef routing, the
+      // orchestrator model and its tools, answered from the indexed fixture.
+      const asked = await fetch(`${ctx.origin}/api/assistant/ask`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${fixtures.tokens.priya}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          repo: `${owner}/${name}`,
+          question: "What does copperFinchChecksum compute, and modulo what number?",
+        }),
+        signal: AbortSignal.timeout(180_000),
+      });
+      events.push({ stage, method: "POST", path: "/assistant/ask", status: asked.status });
+      assert.equal(asked.status, 200, `assistant: HTTP ${asked.status}`);
+      const turn = (await asked.text())
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [key: string]: unknown });
+      const done = turn.find((e) => e.type === "done") as { answer: string } | undefined;
+      const plan = turn.find((e) => e.type === "plan") as
+        | { routedMs: number | null; groups: string[]; model: string }
+        | undefined;
+      const chat = turn.find((e) => e.type === "chat") as { chatId: string } | undefined;
+      evidence.assistant = {
+        plan,
+        tools: turn.filter((e) => e.type === "tool").map((e) => e.label),
+        answer: done?.answer,
+        error: turn.find((e) => e.type === "error"),
+      };
+      assert(done, "The assistant's turn didn't finish");
+      assert(plan && typeof plan.routedMs === "number", "clef didn't route the turn in time");
+      assert(
+        turn.some((e) => e.type === "tool"),
+        "The assistant answered without looking anything up",
+      );
+      assert.match(done.answer, /65521/, "The assistant's answer must come from the fixture code");
+      const chats = await api("/assistant/chats");
+      assert(
+        chats.chats.some(
+          (c: { id: string; source: string }) => c.id === chat?.chatId && c.source === "cli",
+        ),
+        "The conversation must be in the person's directory",
+      );
       enter("knowledge-edit");
       // A meaningful edit re-analyzes checksum.ts; the concepts it still deals
       // with must keep their names, or every edit becomes new concepts to align.

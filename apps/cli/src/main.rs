@@ -173,6 +173,8 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Runner(a) => out(f, ci::runner(ctx, &a)),
         Command::Secret(c) => out(f, ci::secret(ctx, &c)),
         Command::Agent(c) => out(f, agents::agent(ctx, &c)),
+        Command::Ask(a) => out(f, commands::ask::ask(ctx, &a)),
+        Command::Assistant(c) => out(f, commands::ask::assistant(ctx, &c)),
         Command::Pkg(c) => out(f, pkg::pkg(ctx, &c)),
         Command::Api(a) => out(f, server::api(ctx, &a.method, &a.path, a.data.as_deref())),
         Command::Cli(CliCommand::Search { query }) => {

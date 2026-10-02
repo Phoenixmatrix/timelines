@@ -126,6 +126,11 @@ pub enum Command {
     /// Agents: identities that work on their own, accountable to you
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Ask the Gitmatrix assistant about code, issues, CI and packages (read-only unless --write)
+    Ask(AskArgs),
+    /// Your conversations with the assistant, from the web and gm ask
+    #[command(subcommand)]
+    Assistant(AssistantCommand),
     /// Packages: npm, Docker, PyPI, Cargo… versions, provenance and housekeeping
     #[command(subcommand, visible_alias = "packages")]
     Pkg(PkgCommand),
@@ -815,6 +820,32 @@ pub struct CapabilityArgs {
     /// Additional directory containing skill directories or a SKILL.md
     #[arg(long = "skill-dir")]
     pub skill_dirs: Vec<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct AskArgs {
+    /// The question; '-' reads it from stdin.
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    pub question: Vec<String>,
+    /// owner/name it's about; defaults to this checkout's repository.
+    #[arg(short = 'R', long)]
+    pub repo: Option<String>,
+    /// Continue a conversation (an id from the last answer or `gm assistant list`).
+    #[arg(long)]
+    pub chat: Option<String>,
+    /// Let the assistant make changes (create issues, comment, rerun CI…) without asking.
+    #[arg(long)]
+    pub write: bool,
+}
+
+#[derive(Subcommand)]
+pub enum AssistantCommand {
+    /// Your conversations, newest first
+    List,
+    /// A conversation's messages and what the assistant did
+    Show { id: String },
+    /// Delete a conversation
+    Delete { id: String },
 }
 
 #[derive(Args)]

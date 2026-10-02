@@ -10,6 +10,8 @@ export const MODELS = {
   fast: "@cf/zai-org/glm-5.3-flash",
   reason: "@cf/qwen/qwen3.8-27b",
   classify: "@cf/cloudflare/clef",
+  // The 9B clef: per-turn routing in chat, where latency matters most.
+  route: "@cf/cloudflare/clef-flash",
   embed: "@cf/qwen/qwen3-embedding-0.6b",
 } as const;
 
@@ -38,6 +40,7 @@ const TIMEOUT_MS: Record<string, number> = {
   [MODELS.fast]: 90_000,
   [MODELS.reason]: 180_000,
   [MODELS.classify]: 60_000,
+  [MODELS.route]: 8_000,
   [MODELS.embed]: 30_000,
 };
 const RATE_LIMIT_RETRIES = 6;
@@ -167,14 +170,15 @@ export type ClefAnswer =
   | { type: "choice"; choice: string; probabilities: Record<string, number>; confidence: number }
   | { type: "score"; score: number; probabilities: number[]; confidence: number };
 
-/** Ask clef up to 64 typed questions about one state. */
+/** Ask clef up to 64 typed questions about one state (`flash` for the 9B model). */
 export async function decide(
   env: Env,
   state: unknown,
   questions: Record<string, ClefQuestion>,
+  options: { flash?: boolean } = {},
 ): Promise<Record<string, ClefAnswer>> {
-  const result = (await ai(env).run(MODELS.classify, {
-    model: "clef",
+  const result = (await ai(env).run(options.flash ? MODELS.route : MODELS.classify, {
+    model: options.flash ? "clef-flash" : "clef",
     state,
     questions,
   })) as { answers?: Record<string, ClefAnswer> };
