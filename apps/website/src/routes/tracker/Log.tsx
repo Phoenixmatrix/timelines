@@ -100,14 +100,14 @@ export function StateLabel({
           : "";
   return (
     <span
-      className="inline-flex min-w-0 items-center gap-1.5"
+      className="inline-flex max-w-full min-w-0 items-center gap-1.5"
       title={
         state === "blocked"
           ? index.openBlockers
               .get(issue.id)
               ?.map((b) => b.key)
               .join(", ")
-          : undefined
+          : `${STATE_LABEL[state]}${detail}`
       }
     >
       <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]}`} aria-hidden />
