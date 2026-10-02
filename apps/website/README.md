@@ -378,6 +378,9 @@ dependencies and durable comments, agent checkpoints or evidence.
 - **Graph:** `FROM blocks TO`; only `done` satisfies a blocker. Canceling a
   prerequisite does not silently unblock its dependents. Parent hierarchy is
   separate and does not imply blocking. Both blocker and parent cycles are rejected.
+  The relationship view starts at the leftmost occupied dependency column rather
+  than reserving space for missing steps. Blockers remain left of the selected
+  issue and dependents right; phones stack the selected issue first.
 - **Coordination:** ready work is unblocked, unclaimed `todo` (or an expired
   claimed `in_progress` issue) with no open sub-issues, no other active lease
   above it, and nothing waiting on a person (`readiness` in `shared/tracker.ts`,

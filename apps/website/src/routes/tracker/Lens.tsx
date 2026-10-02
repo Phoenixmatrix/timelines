@@ -152,13 +152,11 @@ function Card({
 function Column({
   title,
   ids,
-  empty,
   side,
   render,
 }: {
   title: string;
   ids: string[];
-  empty: string;
   side: "up" | "down";
   render: (id: string) => React.ReactNode;
 }) {
@@ -170,15 +168,11 @@ function Column({
         {title}
         <span className="font-mono tabular-nums">{ids.length || ""}</span>
       </h3>
-      {ids.length === 0 ? (
-        <p className="m-0 text-body-sm text-ink-faint">{empty}</p>
-      ) : (
-        <ul className="m-0 flex list-none flex-col gap-2 p-0">
-          {shown.map((id) => (
-            <li key={id}>{render(id)}</li>
-          ))}
-        </ul>
-      )}
+      <ul className="m-0 flex list-none flex-col gap-2 p-0">
+        {shown.map((id) => (
+          <li key={id}>{render(id)}</li>
+        ))}
+      </ul>
       {ids.length > PER_COLUMN && (
         <button
           type="button"
@@ -298,9 +292,8 @@ export function RelationLens({
       col={col}
     />
   );
-  // Pad missing steps so blockers stay left of the centre and dependents right.
-  const upCols = Array.from({ length: depth }, (_, d) => up[d] ?? null).reverse();
-  const downCols = Array.from({ length: depth }, (_, d) => down[d] ?? null);
+  // Only occupied steps take space; dependency direction doesn't need empty columns.
+  const upCols = up.toReversed();
 
   return (
     <section
@@ -396,30 +389,27 @@ export function RelationLens({
           deps={[focus.id, depth, depthChoice]}
         />
         <div
-          className="relative grid grid-cols-1 items-start gap-y-6 md:justify-center md:[grid-template-columns:var(--lens-columns)] md:gap-x-12"
+          className="relative grid grid-cols-1 items-start gap-y-6 md:justify-start md:[grid-template-columns:var(--lens-columns)] md:gap-x-12"
           style={
             {
-              "--lens-columns": `repeat(${depth}, minmax(11rem, 18rem)) minmax(15rem, 24rem) repeat(${depth}, minmax(11rem, 18rem))`,
+              "--lens-columns": [
+                ...up.map(() => "minmax(11rem, 18rem)"),
+                "minmax(15rem, 24rem)",
+                ...down.map(() => "minmax(11rem, 18rem)"),
+              ].join(" "),
             } as React.CSSProperties
           }
         >
           {upCols.map((ids, n) => {
-            const d = depth - 1 - n;
-            return ids ? (
+            const d = upCols.length - 1 - n;
+            return (
               <Column
                 key={`u${d}`}
                 side="up"
                 title={UP_TITLES[d]!}
                 ids={ids}
-                empty=""
                 render={(id) => card(id, -(d + 1))}
               />
-            ) : (
-              <section key={`u${d}`} aria-hidden className="max-md:hidden">
-                {d === 0 && (
-                  <p className="m-0 mt-6 text-body-sm text-ink-faint">Nothing blocks this.</p>
-                )}
-              </section>
             );
           })}
           <div className="flex min-w-0 flex-col gap-3 max-md:order-first">
@@ -471,6 +461,12 @@ export function RelationLens({
                 </button>
               )}
             </article>
+            {up.length === 0 && (
+              <p className="m-0 text-body-sm text-ink-faint">Nothing blocks this.</p>
+            )}
+            {down.length === 0 && (
+              <p className="m-0 text-body-sm text-ink-faint">Blocks nothing.</p>
+            )}
             {children.length > 0 && (
               <section aria-label="Sub-issues" className="flex flex-col gap-2">
                 <h3 className="m-0 flex items-center gap-2 text-label text-ink-faint">
@@ -513,22 +509,15 @@ export function RelationLens({
               </section>
             )}
           </div>
-          {downCols.map((ids, d) =>
-            ids ? (
-              <Column
-                key={`d${d}`}
-                side="down"
-                title={DOWN_TITLES[d]!}
-                ids={ids}
-                empty=""
-                render={(id) => card(id, d + 1)}
-              />
-            ) : (
-              <section key={`d${d}`} aria-hidden className="max-md:hidden">
-                {d === 0 && <p className="m-0 mt-6 text-body-sm text-ink-faint">Blocks nothing.</p>}
-              </section>
-            ),
-          )}
+          {down.map((ids, d) => (
+            <Column
+              key={`d${d}`}
+              side="down"
+              title={DOWN_TITLES[d]!}
+              ids={ids}
+              render={(id) => card(id, d + 1)}
+            />
+          ))}
         </div>
       </div>
     </section>
