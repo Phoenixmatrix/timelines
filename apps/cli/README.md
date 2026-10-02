@@ -382,17 +382,29 @@ a running `gm` binary. Symlinks and nonregular destinations are refused.
 `--dry-run` checks remote metadata without creating files or directories.
 Add the bin directory to `PATH` yourself; no shell configuration is edited.
 
-The `matrixorg/gitmatrix` pipeline on gitmatrix.fward.dev publishes native release
+The `matrixorg/gitmatrix` pipeline on gitmatrix.fward.dev publishes Linux x86-64 and ARM64 release
 binaries as `gm/<apps/cli tree id>/<os>-<arch>/gm`: the git tree id of the CLI's
 source (`git rev-parse HEAD:apps/cli`, `Cargo.lock` included). The same source
 always has the same version, so unrelated pushes and reruns reuse the existing
 artifact, and finding it needs only the checked-out commit, not history. Each
 publish records the commit and CI run it came from. Publication runs in the
 `deploy` job on `main`, after check, test and build pass; it asks the registry
-first and builds the release binary only when that version is missing. The CI
-host publishes `linux-x86_64`; the installer supports Unix naming, but does not
-cross-build or make a native binary compatible with a different OS,
-architecture, or libc.
+first for each platform and builds only when an artifact is missing. The x86-64
+CI host publishes `linux-x86_64/gm` and cross-compiles `linux-aarch64/gm` with
+`aarch64-unknown-linux-gnu` and Debian Bookworm's ARM64 GNU toolchain. Both builds
+finish before uploads start; reruns fill missing artifacts without replacing
+ones already published. The native binary uploads both architectures.
+
+On a Raspberry Pi running 64-bit Raspberry Pi OS Bookworm or newer, use
+`gm pkg install gm --owner matrixorg` (add `--force` to update). It automatically
+selects the ARM64 binary. The release requires glibc 2.36 or newer; it does not
+run on a 32-bit Raspberry Pi OS or musl-based Linux. To bootstrap without `gm`,
+build from source with `vp run cli#build`, then use the resulting release binary.
+For manual cross-builds, install `gcc-aarch64-linux-gnu` and `libc6-dev-arm64-cross`,
+run `rustup target add aarch64-unknown-linux-gnu`, and set
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc` and
+`CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc` when building with
+`cargo build --locked --release --manifest-path apps/cli/Cargo.toml --target aarch64-unknown-linux-gnu`.
 
 To bootstrap from an older `gm` without these commands, use
 `./apps/cli/target/release/gm pkg install gm --owner orbit` after a local release

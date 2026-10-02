@@ -103,6 +103,11 @@ jobs:
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
+      - name: Install ARM64 cross compiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          rustup target add aarch64-unknown-linux-gnu
       - name: Publish gm if it changed
         run: node tools/agent/publish-cli.ts
       - name: Deploy what changed

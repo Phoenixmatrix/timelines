@@ -38,10 +38,11 @@ configuration. `--dry-run` resolves the version and checks remote checksum metad
 without creating local files or directories. For feature-worktree validation,
 always choose an external disposable `--bin-dir`, never a shared/global install.
 
-Gitmatrix publishes its own native release CLI from `main` when `apps/cli` changes:
-`gm pkg install gm --owner orbit`, then use `--force` for updates. Artifact versions
-are the last commit touching that source subtree; unrelated pushes do not republish.
-The current CI host produces `linux-x86_64`, not a cross-platform binary matrix.
+Gitmatrix publishes Linux x86-64 and ARM64 release binaries from `main`:
+`gm pkg install gm --owner matrixorg`, then use `--force` for updates. Versions
+use the `apps/cli` source tree id; unrelated pushes reuse existing artifacts.
+On 64-bit Raspberry Pi OS (Bookworm or newer), the installer selects
+`linux-aarch64/gm` automatically. A 32-bit OS cannot run this ARM64 binary.
 See [CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-and-installing-unix-clis).
 
 ## Agent-first development
