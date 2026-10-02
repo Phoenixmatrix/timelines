@@ -21,12 +21,13 @@ import type { Tracker, TrackerReply } from "./object.ts";
 
 export const tracker = new Hono<AppEnv>();
 
-function trackerObject(env: Env, ownerId: string): DurableObjectStub<Tracker> {
+export function trackerObject(env: Env, ownerId: string): DurableObjectStub<Tracker> {
   // String-named exports in the config cannot infer their RPC class.
   return (env.TRACKER as unknown as DurableObjectNamespace<Tracker>).getByName(ownerId);
 }
 
-async function accessible(db: D1Database, actor: Actor): Promise<TrackerOwner[]> {
+/** The trackers an actor can read: their own, and their organizations'. */
+export async function accessible(db: D1Database, actor: Actor): Promise<TrackerOwner[]> {
   const rows = await gitmatrixDb(db)
     .selectFrom("accounts as a")
     .leftJoin("org_members as m", (join) =>

@@ -24,6 +24,7 @@ import {
   type TrackerIdentity,
   type Workspace,
 } from "../../shared/tracker.ts";
+import type { ShippedIssue } from "../../shared/release-notes.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
 
@@ -172,7 +173,11 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS blockers ON links(json_extract(data, '$.toId'), json_extract(data, '$.kind'));
       CREATE INDEX IF NOT EXISTS subscriptions_repo ON subscriptions(json_extract(data, '$.repoId'));
       CREATE INDEX IF NOT EXISTS parents ON issues(json_extract(data, '$.parentId'));
-      CREATE INDEX IF NOT EXISTS request_issues ON requests(json_extract(data, '$.issueId'));`);
+      CREATE INDEX IF NOT EXISTS request_issues ON requests(json_extract(data, '$.issueId'));
+      CREATE INDEX IF NOT EXISTS issue_keys ON issues(json_extract(data, '$.key'));
+      CREATE INDEX IF NOT EXISTS comment_issues ON comments(json_extract(data, '$.issueId'));
+      CREATE INDEX IF NOT EXISTS event_entities ON events(json_extract(data, '$.entityId'));
+      CREATE INDEX IF NOT EXISTS event_times ON events(json_extract(data, '$.createdAt'));`);
   }
   private all<T extends Entity>(type: EntityType): T[] {
     return all(this.sql, tracker.selectFrom(tables[type]).select("data").orderBy("id")).map(
@@ -251,6 +256,88 @@ export class TrackerStore {
         .distinct()
         .where("id", "in", subscriptionIds),
     ).map((row) => row.repoId);
+  }
+  /** Issues by key, as release notes see them; unknown keys are skipped. */
+  issuesByKey(keys: string[]): ShippedIssue[] {
+    if (keys.length > 500) fail("invalid_input", "Look up at most 500 keys at once.");
+    if (!keys.length) return [];
+    return all(
+      this.sql,
+      tracker.selectFrom("issues").select("data").where(json("data", "$.key"), "in", keys),
+    ).map((row) => this.shipped(JSON.parse(row.data) as Issue));
+  }
+  /** Issues that became done in [since, until) and still are, oldest first. */
+  completedBetween(since: string, until: string, limit: number): ShippedIssue[] {
+    if (Number.isNaN(Date.parse(since)) || Number.isNaN(Date.parse(until)))
+      fail("invalid_input", "since and until must be ISO timestamps.");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500)
+      fail("invalid_input", "limit must be 1–500.");
+    const ids = all(
+      this.sql,
+      tracker
+        .selectFrom("events")
+        .select(json<string>("data", "$.entityId").as("issueId"))
+        .distinct()
+        .where(json("data", "$.createdAt"), ">=", since)
+        .where(json("data", "$.createdAt"), "<", until)
+        .where(json("data", "$.entityType"), "=", "issue")
+        .where(json("data", "$.entity.status"), "=", "done"),
+    ).map((row) => row.issueId);
+    return ids
+      .flatMap((issueId) => {
+        const row = first(
+          this.sql,
+          tracker.selectFrom("issues").select("data").where("id", "=", issueId),
+        );
+        return row ? [this.shipped(JSON.parse(row.data) as Issue)] : [];
+      })
+      .filter((issue) => issue.completedAt! >= since && issue.completedAt! < until)
+      .sort((a, b) => a.completedAt!.localeCompare(b.completedAt!) || a.key.localeCompare(b.key))
+      .slice(0, limit);
+  }
+  private shipped(issue: Issue): ShippedIssue {
+    const team = this.get<Team>("team", issue.teamId);
+    // The issue's own history: it was completed when it last entered done.
+    let completedAt: string | null = null;
+    let done = false;
+    for (const row of all(
+      this.sql,
+      tracker
+        .selectFrom("events")
+        .select("data")
+        .where(json("data", "$.entityId"), "=", issue.id)
+        .where(json("data", "$.entityType"), "=", "issue")
+        .orderBy("cursor"),
+    )) {
+      const event = JSON.parse(row.data) as TrackerEvent;
+      const now = (event.entity as Issue | null)?.status === "done";
+      if (now && !done) completedAt = event.createdAt;
+      done = now;
+    }
+    const evidence = all(
+      this.sql,
+      tracker
+        .selectFrom("comments")
+        .select("data")
+        .where(json("data", "$.issueId"), "=", issue.id)
+        .where(json("data", "$.kind"), "=", "evidence"),
+    )
+      .map((row) => JSON.parse(row.data) as Comment)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map(({ body, actorId, createdAt }) => ({ body, actorId, createdAt }));
+    return {
+      id: issue.id,
+      key: issue.key,
+      title: issue.title,
+      description: issue.description,
+      type: issue.type,
+      status: issue.status,
+      labels: issue.labels,
+      workspaceIds: issue.workspaceIds,
+      team: { id: team.id, key: team.key, name: team.name },
+      completedAt: issue.status === "done" ? completedAt : null,
+      evidence,
+    };
   }
   changes(after: number, limit: number): Changes {
     if (

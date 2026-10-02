@@ -47,6 +47,12 @@ export class Tracker extends DurableObject<Env> {
   subscriptionRepoIds(subscriptionIds: string[]) {
     return this.reply(() => this.store.subscriptionRepoIds(subscriptionIds));
   }
+  issuesByKey(keys: string[]) {
+    return this.reply(() => this.store.issuesByKey(keys));
+  }
+  completedBetween(since: string, until: string, limit: number) {
+    return this.reply(() => this.store.completedBetween(since, until, limit));
+  }
   mutate(access: Access, input: MutationRequest) {
     return this.reply(() => this.store.mutate(access, input));
   }

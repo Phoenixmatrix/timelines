@@ -1182,3 +1182,83 @@ describe("escalating repeated failures", () => {
     expect(never.open()).toHaveLength(0);
   });
 });
+
+describe("shipped issues for release notes", () => {
+  function shipping() {
+    const f = fixture();
+    const version = (id: string) =>
+      f.store.snapshot(f.access).issues.find((issue) => issue.id === id)!.version;
+    const status = (id: string, value: Issue["status"]) =>
+      f.mutate({ kind: "issue.update", id, expectedVersion: version(id), data: { status: value } });
+    const hour = 3_600_000;
+    f.issue("leased");
+    f.issue("reopened");
+    f.issue("redone");
+    f.issue("open");
+    f.advance(hour);
+    const lease = f.mutate({ kind: "issue.claim", id: "leased", data: { agent: "agent" } });
+    f.mutate({
+      kind: "issue.complete",
+      id: "leased",
+      data: { leaseToken: String(lease.results[0]!.leaseToken), evidence: "Shipped in abc123" },
+    });
+    f.advance(hour);
+    status("reopened", "done");
+    status("redone", "done");
+    f.advance(hour);
+    status("reopened", "todo");
+    status("redone", "todo");
+    f.advance(hour);
+    status("redone", "done");
+    // Edits after completion don't move it.
+    f.advance(hour);
+    f.mutate({
+      kind: "issue.update",
+      id: "redone",
+      expectedVersion: version("redone"),
+      data: { title: "Renamed" },
+    });
+    return f;
+  }
+
+  test("look up by key with team, completion time and evidence; unknown keys are skipped", () => {
+    const f = shipping();
+    const found = f.store.issuesByKey(["ENG-3", "ENG-1", "ENG-2", "ENG-4", "UTF-8"]);
+    const byKey = Object.fromEntries(found.map((issue) => [issue.key, issue]));
+    expect(Object.keys(byKey).sort()).toEqual(["ENG-1", "ENG-2", "ENG-3", "ENG-4"]);
+    expect(byKey["ENG-1"]).toMatchObject({
+      title: "leased",
+      status: "done",
+      team: { id: "team", key: "ENG", name: "Engineering" },
+      completedAt: "2026-10-01T01:00:00.000Z",
+      evidence: [
+        { body: "Shipped in abc123", actorId: "alice", createdAt: "2026-10-01T01:00:00.000Z" },
+      ],
+    });
+    expect(byKey["ENG-2"]).toMatchObject({ status: "todo", completedAt: null, evidence: [] });
+    expect(byKey["ENG-3"]).toMatchObject({
+      title: "Renamed",
+      completedAt: "2026-10-01T04:00:00.000Z",
+    });
+    expect(byKey["ENG-4"]!.completedAt).toBeNull();
+    expect(f.store.issuesByKey([])).toEqual([]);
+  });
+
+  test("completed in a window counts the latest completion of issues still done", () => {
+    const f = shipping();
+    const keys = (since: string, until: string) =>
+      f.store.completedBetween(since, until, 100).map((issue) => issue.key);
+    expect(keys("2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z")).toEqual(["ENG-1", "ENG-3"]);
+    // The first completion of a reopened-then-redone issue is not its completion.
+    expect(keys("2026-10-01T01:30:00Z", "2026-10-01T03:30:00Z")).toEqual([]);
+    expect(keys("2026-10-01T04:00:00.000Z", "2026-10-01T04:00:00.001Z")).toEqual(["ENG-3"]);
+    expect(keys("2026-10-01T01:00:00.001Z", "2026-10-01T04:00:00.000Z")).toEqual([]);
+    expect(
+      f.store.completedBetween("2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", 1),
+    ).toHaveLength(1);
+    expect(() => f.store.completedBetween("yesterday", "2026-10-02T00:00:00Z", 10)).toThrow(/ISO/);
+    expect(() =>
+      f.store.issuesByKey(Array.from({ length: 501 }, (_, i) => `ENG-${i + 1}`)),
+    ).toThrow(/500/);
+  });
+});

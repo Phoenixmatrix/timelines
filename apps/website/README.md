@@ -471,6 +471,24 @@ own schema. Generate the new binding with `cf workers types`.
 These primitives support durable agent handoffs. An autonomous hours/days-long
 execution loop is not included.
 
+## Release notes
+
+Release notes (CORE-29) start from what a release contains: its commits and the
+tracker issues they mention. `GET /api/repos/:owner/:name/release-notes/range`
+returns both (`shared/release-notes.ts`). Without parameters the range is the
+default branch's unreleased work, back to the nearest tagged commit; `?to=<tag>`
+covers that tag's release, including its own commit; `?from=<ref>` sets the
+base explicitly. Ranges follow first-parent history and stop at 1,000 commits
+with `truncated: true`.
+
+Issue keys (`TEAM-N`, e.g. `(CORE-13)` or `CORE-15:`) are parsed from commit
+messages and resolved only through trackers that subscribe a workspace to the
+repository and that the caller can read. Anonymous callers, non-members and
+unsubscribed trackers get the commits without issues. Key-shaped words such as
+`UTF-8` match no team and drop out. Each issue carries its team, completion time
+(when it last became done) and evidence. The tracker also answers which issues
+were completed in a time window, for team and organization views.
+
 ## Knowledge graph and wiki
 
 Every repository has a knowledge graph that stays current as it changes; the

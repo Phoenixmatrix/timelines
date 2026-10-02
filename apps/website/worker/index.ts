@@ -15,6 +15,7 @@ import { mirrors } from "./mirror/api.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { gitHttp } from "./git/http.ts";
 import { knowledge } from "./knowledge/api.ts";
+import { releaseNotes } from "./release-notes/api.ts";
 import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
 import { buildRegistry } from "../registry/app.ts";
@@ -66,6 +67,7 @@ api.use(async (c, next) => {
 api.route("/", accounts);
 api.route("/", tracker);
 api.route("/repos/:owner/:name/knowledge", knowledge);
+api.route("/repos/:owner/:name/release-notes", releaseNotes);
 api.route("/repos/:owner/:name/ci", ci);
 api.route("/ci/runner", runner);
 api.route("/repos", repos);
