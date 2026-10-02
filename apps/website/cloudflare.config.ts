@@ -74,8 +74,8 @@ export default defineConfig(({ mode }) => {
       entrypoint: "./worker/index.ts",
       ...(dev ? {} : { domains: [PRODUCTION_HOST] }),
       observability: { enabled: true },
-      // Hashing multi-GB image layers and building signed package indexes.
-      limits: { cpuMs: 300_000 },
+      // Multi-GB hashing/indexing; up to 20,000 historical frames with base/cache I/O.
+      limits: { cpuMs: 300_000, subrequests: 200_000 },
       assets: {
         notFoundHandling: "single-page-application",
         // The API and git smart-HTTP endpoints must never fall through to index.html.

@@ -1,5 +1,8 @@
 import { createHash, type Hash } from "node:crypto";
 
+import { sql } from "kysely";
+
+import { readBlobStream } from "./blob-storage.ts";
 import { nowIso, type DB } from "./db.ts";
 import { RegistryError } from "./errors.ts";
 
@@ -165,8 +168,8 @@ export interface StoredBlob {
 }
 
 /**
- * Records a written blob. If the digest already exists, the new copy is
- * deleted and the existing one is returned (global deduplication).
+ * Deduplicates raw objects, but promotes a republished compacted blob back to the
+ * hot path. Refreshing the grace period protects reattachment from concurrent GC.
  */
 export async function commitBlob(
   db: DB,
@@ -184,30 +187,25 @@ export async function commitBlob(
       sha512: written.sha512 ?? null,
       created_at: nowIso(),
     })
-    .onConflict((oc) => oc.column("digest").doNothing())
-    .executeTakeFirst();
-  if (Number(result.numInsertedOrUpdatedRows ?? 0n) === 0) {
-    const existing = await getBlob(db, written.digest);
-    if (existing && existing.r2Key !== written.r2Key) {
-      await bucket.delete(written.r2Key);
-      // Backfill digests the earlier writer did not compute (e.g. OCI uploads).
-      if (written.md5 && !existing.md5) {
-        await db
-          .updateTable("blobs")
-          .set({ md5: written.md5, sha1: written.sha1 ?? null, sha512: written.sha512 ?? null })
-          .where("digest", "=", written.digest)
-          .execute();
-      }
-      return existing;
-    }
-  }
+    .onConflict((oc) =>
+      oc.column("digest").doUpdateSet({
+        r2_key: sql<string>`case when blobs.r2_key like 'c/%' then excluded.r2_key else blobs.r2_key end`,
+        md5: sql<string | null>`coalesce(blobs.md5, excluded.md5)`,
+        sha1: sql<string | null>`coalesce(blobs.sha1, excluded.sha1)`,
+        sha512: sql<string | null>`coalesce(blobs.sha512, excluded.sha512)`,
+        created_at: sql<string>`excluded.created_at`,
+      }),
+    )
+    .returningAll()
+    .executeTakeFirstOrThrow();
+  if (result.r2_key !== written.r2Key) await bucket.delete(written.r2Key);
   return {
-    digest: written.digest,
-    r2Key: written.r2Key,
-    size: written.size,
-    md5: written.md5 ?? null,
-    sha1: written.sha1 ?? null,
-    sha512: written.sha512 ?? null,
+    digest: result.digest,
+    r2Key: result.r2_key,
+    size: result.size,
+    md5: result.md5,
+    sha1: result.sha1,
+    sha512: result.sha512,
   };
 }
 
@@ -239,9 +237,7 @@ export async function getBlob(db: DB, digest: string): Promise<StoredBlob | null
 }
 
 export async function readBlobBytes(bucket: R2Bucket, r2Key: string): Promise<Uint8Array> {
-  const object = await bucket.get(r2Key);
-  if (!object) throw new RegistryError("internal", `Blob ${r2Key} is missing from storage`);
-  return new Uint8Array(await object.arrayBuffer());
+  return new Uint8Array(await new Response(await readBlobStream(bucket, r2Key)).arrayBuffer());
 }
 
 export async function readBlobText(bucket: R2Bucket, r2Key: string): Promise<string> {
@@ -316,17 +312,14 @@ export async function serveBlob(
     return new Response(null, { status: range ? 206 : 200, headers });
   }
 
-  const object = await bucket.get(blob.r2Key, range ? { range } : undefined);
-  if (!object || !("body" in object)) {
-    throw new RegistryError("internal", "Blob is missing from storage");
-  }
+  const body = await readBlobStream(bucket, blob.r2Key, range ?? undefined);
   headers.set("content-length", String(range ? range.length : blob.size));
   if (range) {
     headers.set(
       "content-range",
       `bytes ${range.offset}-${range.offset + range.length - 1}/${blob.size}`,
     );
-    return new Response(object.body, { status: 206, headers });
+    return new Response(body, { status: 206, headers });
   }
-  return new Response(object.body, { status: 200, headers });
+  return new Response(body, { status: 200, headers });
 }

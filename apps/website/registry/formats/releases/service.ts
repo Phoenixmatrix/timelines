@@ -1,3 +1,4 @@
+import { requestCompaction } from "../../core/blob-compaction.ts";
 import {
   assetNameError,
   renderSha256Sums,
@@ -571,6 +572,7 @@ export async function uploadAsset(
       created = false;
     }
   }
+  await requestCompaction(services);
   await recordFile(
     services.db,
     { packageId: pkg.id, repoId: ctx.repo.id, version: release.tag, action: "releases.publish" },

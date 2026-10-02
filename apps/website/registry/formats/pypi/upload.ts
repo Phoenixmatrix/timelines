@@ -20,6 +20,7 @@ import {
 
 import { audit } from "../../core/audit.ts";
 import { principalOf } from "../../core/auth/actor.ts";
+import { readBlobRange } from "../../core/blob-storage.ts";
 import { storeBlob, type StoredBlob } from "../../core/blobs.ts";
 import { addFile, createVersion, ensurePackage, getFile, getVersion } from "../../core/catalog.ts";
 import { services, type AppContext } from "../../core/context.ts";
@@ -69,11 +70,7 @@ function field(fields: Fields, name: string): string | undefined {
 }
 
 function blobReader(bucket: R2Bucket, r2Key: string): RangeReader {
-  return async (offset, length) => {
-    const object = await bucket.get(r2Key, { range: { offset, length } });
-    if (!object) throw new RegistryError("internal", "Blob is missing from storage");
-    return new Uint8Array(await object.arrayBuffer());
-  };
+  return (offset, length) => readBlobRange(bucket, r2Key, offset, length);
 }
 
 /** `<name>-<version>.dist-info/METADATA` from a stored wheel, read with range requests. */

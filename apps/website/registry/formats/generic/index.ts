@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 
 import { serveBlob, storeBlob } from "../../core/blobs.ts";
+import { requestCompaction } from "../../core/blob-compaction.ts";
 import { audit } from "../../core/audit.ts";
 import { genericCoordinates, markPublishes, recordFile } from "../../core/provenance.ts";
 import { principalOf } from "../../core/auth/actor.ts";
@@ -216,6 +217,7 @@ async function upload(c: AppContext): Promise<Response> {
     createdBy: principalOf(actor),
     overwrite,
   });
+  await requestCompaction(svc);
   await recordFile(
     svc.db,
     { packageId: pkg.id, repoId: repo.id, version: coords.version, action: "generic.deploy" },

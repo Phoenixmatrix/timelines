@@ -563,6 +563,40 @@ db:migrate` applies both databases' migrations. Account slugs must not take
 the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
 `helm`, `apt`, `rpm`, `brew`, `generic`, `releases`) or `-`.
 
+### Historical artifact storage
+
+Generic `<artifact>/<version>/<relative-file>` uploads and release assets are
+compacted automatically in R2. A lineage is one repository plus artifact/file
+path, or release project/asset name; platforms and filenames never share a
+version sequence.
+
+- The newest two distinct published versions stay raw for the normal streaming
+  fast path. Identical upload retries do not advance the sequence. Hotness follows
+  publication history, so deleting a recent version does not make old history hot.
+- Older versions use independently compressed **4 MiB frames**. Each delta
+  references one immutable full snapshot directly, never another delta. A new
+  full snapshot occurs by the 32nd update after its anchor, or earlier when delta
+  payloads exceed 50% of an independently compressed full version. Incompressible
+  frames use raw bytes instead of growing compressed payloads.
+- Downloads preserve original bytes, checksums, ETags, HEAD and Range semantics.
+  Historical ranges reconstruct only intersecting frames; full downloads stream
+  frame by frame. Original and full-base frames use opportunistic one-hour
+  Cache API entries on reads. Staging verification does not prewarm new frames.
+- Queue work checkpoints after at most two frames per delivery, verifies SHA-256,
+  and publishes with a fenced locator compare-and-swap. Hourly sweeps recover
+  interrupted jobs. Existing data is backfilled with persistent 200-row cursors;
+  recent-version tracking holds only two rows per lineage. Hot-digest lookups start
+  from that bounded table and resolve publication primary keys, even when millions
+  of historical versions share the same digest.
+- Logical version deletion and physical generation GC are separate. Dependent
+  deltas and in-flight work pin full snapshots even after their original version
+  is deleted. Superseded raw objects and unused staging candidates have a 24-hour
+  grace; expired abandoned builds release their pins after seven days.
+
+Apply registry migration `0004_artifact_storage.sql` before running the updated
+Worker. Existing raw locators remain readable during backfill. Compaction changes
+storage only: clients and artifact URLs do not change.
+
 ## Mirrors
 
 A repository can mirror every push on to another git host: Settings → Mirror,

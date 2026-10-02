@@ -26,6 +26,7 @@ import { Hono } from "hono";
 
 import { audit } from "../../core/audit.ts";
 import { principalOf } from "../../core/auth/actor.ts";
+import { readBlobRange } from "../../core/blob-storage.ts";
 import { serveBlob, storeBlob, type StoredBlob } from "../../core/blobs.ts";
 import {
   addFile,
@@ -72,11 +73,7 @@ function textResponse(c: AppContext, body: string, contentType = TEXT): Response
 }
 
 function blobReader(bucket: R2Bucket, r2Key: string): RangeReader {
-  return async (offset, length) => {
-    const object = await bucket.get(r2Key, { range: { offset, length } });
-    if (!object) throw new RegistryError("internal", "Blob is missing from storage");
-    return new Uint8Array(await object.arrayBuffer());
-  };
+  return (offset, length) => readBlobRange(bucket, r2Key, offset, length);
 }
 
 const zipPath = (module: string, version: string) => `${module}/@v/${version}.zip`;

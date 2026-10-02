@@ -38,6 +38,57 @@ export interface Database {
     sha512: string | null;
     created_at: string;
   };
+  blob_representations: {
+    key: string;
+    digest: string;
+    base_key: string | null;
+    state: Generated<"live" | "retired" | "deleting">;
+    retired_at: string | null;
+  };
+  artifact_publications: {
+    id: Generated<number>;
+    repo_id: string;
+    lineage: string;
+    version: string;
+    source: string;
+    digest: string;
+    created_at: string;
+    status: Generated<"pending" | "done" | "gone">;
+    snapshot_key: string | null;
+  };
+  artifact_backfill: { name: string; cursor: Generated<number>; done: Generated<number> };
+  artifact_hot_versions: {
+    repo_id: string;
+    lineage: string;
+    version: string;
+    publication_id: number;
+    created_at: string;
+  };
+  blob_compactions: {
+    id: string;
+    publication_id: number;
+    digest: string;
+    source_key: string;
+    base_key: string | null;
+    size: number;
+    frame: Generated<number>;
+    hash_state: string;
+    full_bytes: Generated<number>;
+    delta_bytes: Generated<number>;
+    phase: Generated<"build" | "cleanup">;
+    cleanup_cursor: string | null;
+    result_key: string | null;
+    fence: string | null;
+    lease_until: Generated<number>;
+    updated_at: number;
+    created_at: number;
+  };
+  blob_compaction_frames: {
+    work_id: string;
+    frame: number;
+    full_frame: string;
+    delta_frame: string | null;
+  };
   packages: {
     id: string;
     repo_id: string;

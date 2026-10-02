@@ -1,6 +1,6 @@
+import { readBlobRange } from "../../core/blob-storage.ts";
 import type { AppContext, Services } from "../../core/context.ts";
 import { getDerived, readDerivedText, serveDerived, type DerivedFile } from "../../core/derived.ts";
-import { RegistryError } from "../../core/errors.ts";
 import type { Repository } from "../../core/repos.ts";
 
 /** Helpers shared by the signed package repositories (apt, rpm). */
@@ -14,9 +14,7 @@ export async function readRange(
 ): Promise<Uint8Array> {
   const end = Math.min(blob.size, offset + length);
   if (offset >= end) return new Uint8Array();
-  const object = await bucket.get(blob.r2Key, { range: { offset, length: end - offset } });
-  if (!object) throw new RegistryError("internal", "Blob is missing from storage");
-  return new Uint8Array(await object.arrayBuffer());
+  return readBlobRange(bucket, blob.r2Key, offset, end - offset);
 }
 
 /** Serves a generated index file with a Last-Modified header. */
