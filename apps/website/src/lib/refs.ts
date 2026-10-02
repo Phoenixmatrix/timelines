@@ -16,6 +16,6 @@ export function blobUrl(owner: string, name: string, ref: string, path: string):
   return repoPath(owner, name, "blob", encodePath(ref), encodePath(path));
 }
 
-export function commitsUrl(owner: string, name: string, ref: string): string {
-  return repoPath(owner, name, "commits", encodePath(ref));
+export function commitsUrl(owner: string, name: string, ref: string, path = ""): string {
+  return repoPath(owner, name, "commits", encodePath(ref), encodePath(path));
 }

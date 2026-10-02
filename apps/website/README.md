@@ -46,6 +46,23 @@ from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 
+## File history
+
+The repository file list shows each entry's most recent change, author,
+co-authors and date. File views include the last change and a link to scoped
+history. History and commit counts follow the selected revision's first-parent
+chain; a path's history includes additions, deletions and mode changes but does
+not follow renames. Co-authors (including agents) come from `Co-authored-by`
+commit trailers, not verified account identities.
+
+`GET /api/repos/:owner/:name/history` accepts `at=<ref>/<path>` or `ref` and
+`path`, plus `entries=true` for immediate-child metadata. Each request scans at
+most 100 commits. `next` is the next commit to scan; pass it as `cursor` and pin
+`ref` to the returned `head` for subsequent pages. The UI loads this separately
+from files, labels partial counts with `+`, and offers **Load older history**
+until counts are exact. It reuses immutable commit/tree caches and never reads
+file contents to calculate history.
+
 ## Sign-in
 
 People sign in with an emailed one-time code ([Better Auth](https://www.better-auth.com),

@@ -4,6 +4,7 @@ import type {
   CiRunList,
   CommitsResponse,
   GraphNodeDetail,
+  HistoryPage,
   RepoDetail,
   TreeResponse,
 } from "../../shared/api.ts";
@@ -45,6 +46,10 @@ export const repoData = {
   commits: (owner: string, name: string, at: string, page: number) =>
     cached<CommitsResponse>(
       `${base(owner, name)}/commits?at=${encodeURIComponent(at)}&page=${page}`,
+    ),
+  history: (owner: string, name: string, at: string, entries = false, cursor = "") =>
+    cached<HistoryPage>(
+      `${base(owner, name)}/history?at=${encodeURIComponent(at)}&entries=${entries}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
     ),
   /** One knowledge-graph node with its neighbors ("repo", "file:<path>", ...). */
   graphNode: (owner: string, name: string, id: string) =>
@@ -90,7 +95,6 @@ export function prefetchRoute(to: string) {
   else if (view === "tree") repoData.tree(owner, name, tail).catch(ignore);
   else if (view === "blob") repoData.blob(owner, name, tail).catch(ignore);
   else if (view === "commits") {
-    const page = Number(url.searchParams.get("page") ?? "1") || 1;
-    repoData.commits(owner, name, tail, page).catch(ignore);
+    repoData.history(owner, name, tail).catch(ignore);
   }
 }

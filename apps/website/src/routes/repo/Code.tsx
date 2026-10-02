@@ -3,15 +3,15 @@ import { Suspense } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Await, Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
-import type { RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
-import { Monogram } from "../../components/Monogram.tsx";
+import type { CommitSummary, RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
 import { CopyField, link } from "../../components/ui.tsx";
-import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
-import { blobUrl, treeUrl } from "../../lib/refs.ts";
+import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
+import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
+import { Attribution, CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
 import { About } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
@@ -50,10 +50,12 @@ function EntryRow({
   repo,
   refName,
   entry,
+  change,
 }: {
   repo: RepoDetail;
   refName: string;
   entry: TreeEntry;
+  change?: { latest: CommitSummary; count: number };
 }) {
   const Icon = ICONS[entry.type];
   const to =
@@ -71,20 +73,112 @@ function EntryRow({
     </>
   );
   return (
-    <li>
+    <li className="grid gap-x-4 px-4 py-2 sm:grid-cols-[minmax(10rem,1fr)_minmax(0,2fr)]">
       {entry.type === "gitlink" ? (
-        <span className="flex h-10 items-center gap-3 px-4 text-ink-muted" title="Submodule">
+        <span className="flex min-h-8 min-w-0 items-center gap-3 text-ink-muted" title="Submodule">
           {label}
         </span>
       ) : (
         <PrefetchLink
           to={to}
-          className="flex h-10 items-center gap-3 px-4 text-ink no-underline transition-colors hover:bg-raised"
+          className="flex min-h-8 min-w-0 items-center gap-3 text-ink no-underline transition-colors hover:underline"
         >
           {label}
         </PrefetchLink>
       )}
+      <div className="min-h-11 min-w-0 pl-7 sm:pl-0">
+        {change ? (
+          <>
+            <div className="flex min-w-0 items-center gap-3">
+              <Link
+                to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
+                className="min-w-0 flex-1 truncate text-body-sm text-ink-muted no-underline hover:underline"
+                title={firstLine(change.latest.message)}
+              >
+                {firstLine(change.latest.message)}
+              </Link>
+              <Link
+                to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
+                className="shrink-0 text-micro text-ink-faint no-underline hover:underline"
+                title={fullDate(change.latest.authoredAt)}
+              >
+                {timeAgo(change.latest.authoredAt)}
+              </Link>
+            </div>
+            <div className="truncate" title={change.latest.message}>
+              <Attribution commit={change.latest} />
+            </div>
+          </>
+        ) : (
+          <Link
+            to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
+            className="text-body-sm text-ink-faint no-underline hover:underline"
+          >
+            View history
+          </Link>
+        )}
+      </div>
     </li>
+  );
+}
+
+function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
+  const state = useHistory(repo, tree.commit.oid, tree.path, true);
+  const history = state.history;
+  const latest = history?.commits[0] ?? (!tree.path ? tree.commit : null);
+  return (
+    <section className="overflow-hidden rounded-pane bg-pane" aria-label="Repository files">
+      <div className="flex flex-wrap items-center gap-3 border-b border-line-soft px-4 py-3">
+        {latest ? (
+          <CommitInfo repo={repo} commit={latest} />
+        ) : (
+          <span className="mr-auto text-body-sm text-ink-faint">Folder history</span>
+        )}
+        <Link
+          className="mk-btn mk-btn--sm no-underline"
+          to={commitsUrl(repo.owner.slug, repo.name, tree.commit.oid, tree.path)}
+        >
+          {history ? countLabel(history.commits.length, !!history.next) : "History"}
+        </Link>
+      </div>
+      <ul className="m-0 list-none divide-y divide-line-soft p-0">
+        {tree.path && (
+          <li>
+            <PrefetchLink
+              to={treeUrl(
+                repo.owner.slug,
+                repo.name,
+                tree.ref,
+                tree.path.split("/").slice(0, -1).join("/"),
+              )}
+              className="flex h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised"
+              aria-label="Parent folder"
+            >
+              <FolderSimpleIcon className="size-4" aria-hidden />
+              ..
+            </PrefetchLink>
+          </li>
+        )}
+        {tree.entries.map((entry) => (
+          <EntryRow
+            key={entry.path}
+            repo={repo}
+            refName={tree.ref}
+            entry={entry}
+            change={
+              history && Object.hasOwn(history.entries, entry.path)
+                ? history.entries[entry.path]
+                : undefined
+            }
+          />
+        ))}
+      </ul>
+      {(state.loading || state.error || history?.next) && (
+        <div className="border-t border-line-soft px-4 py-3">
+          <HistoryProgress state={state} />
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -127,7 +221,6 @@ export function Code() {
   const navigate = useNavigate();
   if (!tree) return <EmptyRepo repo={repo} />;
 
-  const { commit } = tree;
   return (
     <div className="grid gap-x-8 gap-y-6 xl:grid-cols-[minmax(0,1fr)_20rem]">
       <div className="flex min-w-0 flex-col gap-4">
@@ -139,50 +232,11 @@ export function Code() {
           onSwitch={(ref) => navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path))}
         />
 
-        <section className="overflow-hidden rounded-pane bg-pane">
-          <div className="flex items-center gap-3 border-b border-line-soft px-4 py-3">
-            <Monogram name={commit.authorName} size="sm" />
-            <div className="min-w-0 flex-1">
-              <div className="truncate">
-                <span className="font-semibold">
-                  <bdi>{commit.authorName}</bdi>
-                </span>{" "}
-                <span className="text-ink-muted" dir="auto">
-                  {firstLine(commit.message)}
-                </span>
-              </div>
-            </div>
-            <span className="mk-mono text-mono text-ink-faint">{shortOid(commit.oid)}</span>
-            <span
-              className="hidden text-body-sm text-ink-faint sm:inline"
-              title={fullDate(commit.authoredAt)}
-            >
-              {timeAgo(commit.authoredAt)}
-            </span>
-          </div>
-          <ul className="m-0 list-none divide-y divide-line-soft p-0">
-            {tree.path && (
-              <li>
-                <PrefetchLink
-                  to={treeUrl(
-                    repo.owner.slug,
-                    repo.name,
-                    tree.ref,
-                    tree.path.split("/").slice(0, -1).join("/"),
-                  )}
-                  className="flex h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised"
-                  aria-label="Parent folder"
-                >
-                  <FolderSimpleIcon className="size-4" aria-hidden />
-                  ..
-                </PrefetchLink>
-              </li>
-            )}
-            {tree.entries.map((entry) => (
-              <EntryRow key={entry.path} repo={repo} refName={tree.ref} entry={entry} />
-            ))}
-          </ul>
-        </section>
+        <FileList
+          key={`${repo.id}:${tree.ref}:${tree.commit.oid}:${tree.path}`}
+          repo={repo}
+          tree={tree}
+        />
 
         {tree.readme && (
           <section className="rounded-pane bg-pane">

@@ -141,6 +141,19 @@ export interface CommitsResponse {
   hasMore: boolean;
 }
 
+/** One bounded page of first-parent history, pinned to an immutable head. */
+export interface HistoryPage {
+  ref: string;
+  /** Null for an empty repository. */
+  head: string | null;
+  path: string;
+  scanned: number;
+  /** Next first-parent commit to scan, or null when counts are exact. */
+  next: string | null;
+  commits: CommitSummary[];
+  entries: Record<string, { latest: CommitSummary; count: number }>;
+}
+
 export interface AccountPage extends AccountSummary {
   bio: string;
   repos: RepoSummary[];

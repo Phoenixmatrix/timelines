@@ -28,6 +28,7 @@ import { notifyKnowledge } from "../knowledge/coordinator.ts";
 import { isCommitId, RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
+import { readHistory } from "../history/read.ts";
 import { semanticResponse } from "../semantic/api.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
@@ -348,6 +349,42 @@ repos.get("/:owner/:name/blob", async (c) => {
       truncated: !binary && blob.size > MAX_TEXT_BYTES,
     };
     return c.json(body);
+  } finally {
+    await objects.close();
+  }
+});
+
+repos.get("/:owner/:name/history", async (c) => {
+  const loaded = await loadRepo(c);
+  if (loaded instanceof Response) return loaded;
+  const cursor = c.req.query("cursor");
+  if (cursor && !isCommitId(cursor)) return fail(c, 400, "Invalid history cursor.");
+  const objects = reader(c, loaded.row);
+  try {
+    const target = await resolveTarget(c, objects, loaded.row);
+    if (target instanceof Response) return target;
+    const { ref, path } = target;
+    const head = await objects.resolve(ref);
+    if (
+      !head &&
+      ref === loaded.row.default_branch &&
+      !path &&
+      !cursor &&
+      !(await objects.refs()).head
+    ) {
+      return c.json({ ref, head: null, path, scanned: 0, next: null, commits: [], entries: {} });
+    }
+    if (!head || !(await objects.commit(head)))
+      return fail(c, 404, `No branch, tag or commit named ${ref}.`);
+    const history = await readHistory(
+      objects,
+      head,
+      path,
+      c.req.query("entries") === "true",
+      cursor,
+    );
+    cacheIfImmutable(c, ref);
+    return c.json({ ...history, ref });
   } finally {
     await objects.close();
   }

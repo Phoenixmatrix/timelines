@@ -32,6 +32,7 @@ import { findDefinitions } from "../../lib/outline.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { useSourceHighlight } from "../../lib/useSourceHighlight.ts";
+import { FileHistory } from "./History.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
@@ -157,6 +158,12 @@ export function Blob() {
           path={blob.path}
           view="blob"
           onSwitch={(ref) => navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path))}
+        />
+        <FileHistory
+          key={`${repo.id}:${blob.ref}:${blob.commitOid}:${blob.path}`}
+          repo={repo}
+          head={blob.commitOid}
+          path={blob.path}
         />
         <section className="rounded-pane bg-pane">
           <div className="sticky top-16 z-10 flex flex-col gap-2 rounded-t-pane border-b border-line-soft bg-pane px-4 py-3 text-body-sm sm:top-0">

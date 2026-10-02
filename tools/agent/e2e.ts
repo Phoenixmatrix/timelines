@@ -14,6 +14,7 @@ import type {
   CiRunDetail,
   CiRunList,
   CreatedAccessToken,
+  HistoryPage,
   RepoDetail,
 } from "../../apps/website/shared/api.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
@@ -234,7 +235,15 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
   await scenario("gm-clone-commit-push-and-denied-push", async () => {
     await gm(["clone", fullName, checkout]);
     await writeFile(join(checkout, "agent-e2e.txt"), bytes);
-    await gm(["commit", "-m", "Agent live transport regression"], "jun", checkout);
+    await gm(
+      [
+        "commit",
+        "-m",
+        "Agent live transport regression\n\nCo-authored-by: Fixture Agent <agent@gitmatrix.invalid>",
+      ],
+      "jun",
+      checkout,
+    );
     await gm(["push", "--bookmark", "agent-e2e"], "jun", checkout);
     const detail = await json<RepoDetail>(api, ownerToken);
     const branch = detail.branches.find((b) => b.shortName === "agent-e2e");
@@ -265,6 +274,42 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "Denied pushes must not move the server ref",
     );
     record({ ref: branch.shortName, oid: branch.oid, deniedRefUnchanged: true });
+  });
+
+  await scenario("repository-file-history-and-attribution", async () => {
+    const history = await json<HistoryPage>(`${api}/history?at=agent-e2e&entries=true`, ownerToken);
+    assert.equal(history.next, null);
+    assert.equal(history.commits.length, 2);
+    assert.equal(history.entries["agent-e2e.txt"]?.count, 1);
+    assert.equal(history.entries["agent-e2e.txt"]?.latest.oid, history.head);
+    assert.match(history.entries["agent-e2e.txt"]!.latest.message, /Co-authored-by: Fixture Agent/);
+    const file = await json<HistoryPage>(
+      `${api}/history?at=${history.head}/agent-e2e.txt`,
+      ownerToken,
+    );
+    assert.equal(file.commits.length, 1);
+    assert.equal(file.commits[0]?.oid, history.head);
+    const readme = await json<HistoryPage>(
+      `${api}/history?at=${history.head}/README.md`,
+      ownerToken,
+    );
+    assert.equal(readme.commits.length, 1);
+    assert.notEqual(readme.commits[0]?.oid, history.head);
+    await request(`${api}/history`, null, "GET", undefined, [401, 404]);
+    await request(
+      `/api/repos/${outsiderRepo.owner}/${outsiderRepo.name}/history`,
+      ownerToken,
+      "GET",
+      undefined,
+      [404],
+    );
+    await request(`${api}/history?ref=main&path=../README.md`, ownerToken, "GET", undefined, [400]);
+    record({
+      pinnedHead: history.head,
+      repoCommits: history.commits.length,
+      fileCommits: file.commits.length,
+      coAuthor: "Fixture Agent",
+    });
   });
 
   await scenario("tracker-claim-sync-complete-and-blocked-transitions", async () => {
