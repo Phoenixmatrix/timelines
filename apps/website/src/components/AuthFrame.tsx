@@ -26,21 +26,7 @@
 import { CheckIcon } from "@phosphor-icons/react";
 import { useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
-
-/** The Gitmatrix mark: four cells, the top-right one lit (as in the favicon). */
-export function Mark({ className = "size-7" }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 64 64" className={className} aria-hidden>
-      <rect width="64" height="64" rx="14" className="fill-raised" />
-      <g className="fill-ink">
-        <rect x="14" y="14" width="16" height="16" rx="4" />
-        <rect x="14" y="34" width="16" height="16" rx="4" />
-        <rect x="34" y="34" width="16" height="16" rx="4" />
-      </g>
-      <rect x="34" y="14" width="16" height="16" rx="4" className="fill-signal" />
-    </svg>
-  );
-}
+import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
 
 /** A focused page outside the app shell: mark and host on top, one column, a footer. */
 export function AuthFrame({ children, footer }: { children: ReactNode; footer?: ReactNode }) {
@@ -48,9 +34,8 @@ export function AuthFrame({ children, footer }: { children: ReactNode; footer?: 
   return (
     <div className="flex min-h-dvh flex-col bg-stage">
       <header className="flex items-center justify-between gap-4 px-5 py-4 sm:px-8 sm:py-5">
-        <Link to="/" className="flex items-center gap-2.5 text-ink no-underline">
-          <Mark />
-          <span className="text-title font-bold tracking-[-0.01em]">Gitmatrix</span>
+        <Link to="/" aria-label="Gitmatrix" className="shrink-0 rounded-control">
+          <GitmatrixLogo className="h-8 w-auto" />
         </Link>
         <span className="truncate font-mono text-micro text-ink-faint">{host}</span>
       </header>

@@ -95,6 +95,16 @@ This is an extraction of the approved existing system, not a new visual directio
 
 The tracker received a dual-assessor Claude CLI / Impeccable re-review with a **SHIP** verdict and no P0/P1 findings. Remaining P2/P3 findings were corrected and verified in the live browser: semantic conflict comparisons, closed-work recovery, opt-in shortcuts, immutable administration metadata, compact graph overview, and responsive controls. Review captures are local verification evidence, not production assets.
 
+## Brand identity
+
+The Gitmatrix logo pairs an angular, interlocking **G** with a custom lowercase **gitmatrix** wordmark. Its joined paths and diagonal cuts suggest branches converging without using a stock git icon. The lettering is outlined artwork, not a font substitution.
+
+`public/brand/gitmatrix.svg` is the scalable source, with separate `mark` and `wordmark` groups. `src/components/GitmatrixLogo.tsx` references those groups: the mark uses `signal-line`, and the lettering uses `ink`, so both adapt to the existing dark and light themes. Use the full lockup on Home and in the shared authentication frame (SignIn and device authorization); use only the mark in the compact navigation rail. Preserve its aspect ratio and the existing accessible navigation labels.
+
+The logo was generated with `openai-codex/gpt-image-2-codex` and vector-traced from that artwork. The SVG metadata preserves the generation prompt and provenance. Do not replace its geometry with a stock symbol or retype the wordmark.
+
+`public/favicon.svg` uses the same mark in warm amber (`#ebaf43`) on a charcoal (`#211d19`) rounded tile. Its paths are embedded rather than externally referenced so the favicon works independently. Derive the 32px PNG, 180px Apple touch icon and 16/32/48px ICO from this favicon artwork; the PNGs also carry generation provenance. `index.html` declares all formats and versions the SVG URL to replace the old four-square icon in browser caches.
+
 ## Colors
 
 ### Primary

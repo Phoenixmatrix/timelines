@@ -3,6 +3,7 @@ import { Link, useLoaderData } from "react-router";
 import type { RepoSummary } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
 import { RepoList } from "../components/RepoList.tsx";
+import { GitmatrixLogo } from "../components/GitmatrixLogo.tsx";
 import { load } from "../lib/api.ts";
 import { greeting } from "../lib/format.ts";
 import { useViewer } from "../lib/session.ts";
@@ -17,6 +18,7 @@ export function Home() {
 
   return (
     <Page>
+      <GitmatrixLogo className="mb-8 h-10 w-auto" />
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="m-0 text-headline">

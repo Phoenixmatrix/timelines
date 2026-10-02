@@ -19,6 +19,7 @@ import { Link, NavLink, Outlet, useFetcher, useLocation, useNavigation } from "r
 import { useViewer } from "../lib/session.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
 import { Monogram } from "./Monogram.tsx";
+import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
 function Place({
@@ -154,7 +155,7 @@ export function AppShell() {
         className="mk-rail sticky top-0 z-20 h-dvh shrink-0 max-sm:h-auto max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2"
       >
         <Place to="/" label="Home" end>
-          {(active) => <HouseIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
+          {() => <GitmatrixLogo markOnly className="size-8" />}
         </Place>
         {viewer && (
           <Place to="/tracker" label="Issue tracker">
