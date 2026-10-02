@@ -41,11 +41,22 @@ function write(key: string, value: string | null) {
 }
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
-  const [open, setOpen] = useState(() => read(OPEN) === "1");
+  // A link from `gm ask` (…/?chat=<id>) opens that conversation.
+  const [linked] = useState(() => {
+    const id = new URLSearchParams(window.location.search).get("chat");
+    return id && /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : null;
+  });
+  const [open, setOpen] = useState(() => linked !== null || read(OPEN) === "1");
   const [chat, setChat] = useState(() => {
-    const stored = read(CHAT);
+    const stored = linked ?? read(CHAT);
     return stored ? { id: stored, fresh: false } : { id: crypto.randomUUID(), fresh: true };
   });
+  useEffect(() => {
+    if (!linked) return;
+    const url = new URL(window.location.href);
+    url.searchParams.delete("chat");
+    window.history.replaceState(window.history.state, "", url);
+  }, [linked]);
   const [queued, setQueued] = useState<string | null>(null);
 
   useEffect(() => write(OPEN, open ? "1" : null), [open]);
