@@ -994,6 +994,25 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline}),
     ))
 }
+/// Adds a delegation's underToken and forActorId (an agent resolved by name or id).
+fn delegate(snapshot: &Value, delegation: &Delegation, data: &mut Value) -> Result<()> {
+    if let Some(token) = &delegation.under_token {
+        data["underToken"] = json!(token);
+    }
+    if let Some(agent) = &delegation.for_agent {
+        let found = snapshot["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["id"] == agent.as_str() || a["name"] == agent.as_str())
+            .ok_or_else(|| {
+                GmError::usage(format!("No agent named {agent} in this tracker."))
+                    .hint("See your agents with `gm agent list`.")
+            })?;
+        data["forActorId"] = found["id"].clone();
+    }
+    Ok(())
+}
 /// What `gm issue next` reports: the claim (its token shown once) and the issue's working
 /// context, or that nothing in scope is ready.
 fn next_result(snapshot: &Value, response: &Value) -> Shown {
@@ -1037,6 +1056,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     let lease_command = matches!(
         args.command,
         IssueCommand::Claim { .. }
+            | IssueCommand::Revoke { .. }
             | IssueCommand::Next { .. }
             | IssueCommand::Renew { .. }
             | IssueCommand::Release(_)
@@ -1080,8 +1100,18 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 let mutations: Vec<Value> = serde_json::from_str(&input(data)?)?;
                 return r.submit(ctx, args.scope.offline, mutations);
             }
-            IssueCommand::Claim { issue, agent, ttl } => {
-                json!({"kind":"issue.claim","id":id(&snapshot,"issues",issue)?,"data":{"agent":agent,"ttlSeconds":ttl}})
+            IssueCommand::Claim {
+                issue,
+                agent,
+                ttl,
+                delegation,
+            } => {
+                let mut data = json!({"agent":agent,"ttlSeconds":ttl});
+                delegate(&snapshot, delegation, &mut data)?;
+                json!({"kind":"issue.claim","id":id(&snapshot,"issues",issue)?,"data":data})
+            }
+            IssueCommand::Revoke { issue, under_token } => {
+                json!({"kind":"issue.revoke","id":id(&snapshot,"issues",issue)?,"data":{"underToken":under_token}})
             }
             IssueCommand::Next {
                 agent,
@@ -1089,8 +1119,10 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 workspace,
                 under,
                 ttl,
+                delegation,
             } => {
                 let mut data = json!({"agent":agent,"ttlSeconds":ttl});
+                delegate(&snapshot, delegation, &mut data)?;
                 if let Some(t) = team {
                     data["teamId"] = json!(id(&snapshot, "teams", t)?);
                 }

@@ -41,6 +41,8 @@ export interface IssueClaim {
   /** A label for the working session (from `gm issue claim --agent`). */
   agent: string;
   expiresAt: string;
+  /** For a delegated claim: the ancestor whose lease handed this one out. */
+  delegatedFrom?: string;
 }
 export interface Issue extends TrackerEntity {
   key: string;
@@ -160,7 +162,20 @@ export type Mutation =
     }
   | { kind: "subscription.add"; id: string; data: { workspaceId: string; repoId: string } }
   | { kind: "subscription.remove"; id: string }
-  | { kind: "issue.claim"; id: string; data: { agent: string; ttlSeconds?: number } }
+  | {
+      kind: "issue.claim";
+      id: string;
+      data: {
+        agent: string;
+        ttlSeconds?: number;
+        /** Inside a leased subtree: the covering lease's token, delegating this claim. */
+        underToken?: string;
+        /** Delegate to one of your agents instead of holding it yourself. */
+        forActorId?: string;
+      };
+    }
+  /** The holder of a lease above an issue takes back the issue's claim. */
+  | { kind: "issue.revoke"; id: string; data: { underToken: string } }
   | {
       kind: "issue.next";
       /** A fresh id for this request; the claimed issue comes back as `issueId`. */
@@ -172,6 +187,9 @@ export type Mutation =
         workspaceId?: string;
         /** Only descendants of this issue. */
         underId?: string;
+        /** With underId: that issue's lease token, to pick inside your own leased subtree. */
+        underToken?: string;
+        forActorId?: string;
       };
     }
   | { kind: "issue.renew"; id: string; data: { leaseToken: string; ttlSeconds?: number } }

@@ -721,3 +721,139 @@ describe("issue.next", () => {
     });
   });
 });
+
+describe("delegated leases", () => {
+  function tree() {
+    const f = fixture();
+    const make = (id: string, parentId?: string) =>
+      f.mutate({
+        kind: "issue.create",
+        id,
+        data: { teamId: "team", title: id, ...(parentId ? { parentId } : {}) },
+      });
+    make("project");
+    make("child", "project");
+    make("grandchild", "child");
+    make("sibling", "project");
+    const asBot: Access = { ...f.access, actorId: "agt-bot" };
+    let n = 0;
+    const as = (access: Access, ...mutations: Mutation[]) =>
+      f.store.mutate(access, { operationId: `d-${++n}`, mutations });
+    const version = (id: string) =>
+      f.store.snapshot(f.access).issues.find((i) => i.id === id)!.version;
+    const claimOf = (id: string) =>
+      f.store.snapshot(f.access).issues.find((i) => i.id === id)!.claim;
+    const lead = String(
+      f.mutate({ kind: "issue.claim", id: "project", data: { agent: "lead" } }).results[0]!
+        .leaseToken,
+    );
+    return { ...f, asBot, as, version, claimOf, lead };
+  }
+
+  test("the subtree's holder delegates a child to one of its own agents, who works it with its own token", () => {
+    const t = tree();
+    const delegated = t.mutate({
+      kind: "issue.claim",
+      id: "child",
+      data: { agent: "sub", underToken: t.lead, forActorId: "agt-bot" },
+    });
+    const child = String(delegated.results[0]!.leaseToken);
+    expect(t.claimOf("child")).toMatchObject({
+      actorId: "agt-bot",
+      accountableId: "alice",
+      delegatedFrom: "project",
+    });
+    // The lead's token no longer speaks for the delegated child; the child's does, for its holder.
+    expect(() =>
+      t.mutate({
+        kind: "issue.update",
+        id: "child",
+        expectedVersion: t.version("child"),
+        data: { status: "backlog", leaseToken: t.lead },
+      }),
+    ).toThrow(/belongs to another agent/);
+    // A child token can't change anything above it.
+    expect(() =>
+      t.as(t.asBot, {
+        kind: "issue.update",
+        id: "project",
+        expectedVersion: t.version("project"),
+        data: { status: "todo", leaseToken: child },
+      }),
+    ).toThrow(/belongs to another agent/);
+    t.as(t.asBot, {
+      kind: "issue.update",
+      id: "grandchild",
+      expectedVersion: t.version("grandchild"),
+      data: { status: "done", leaseToken: child },
+    });
+    t.as(t.asBot, {
+      kind: "issue.complete",
+      id: "child",
+      data: { leaseToken: child, evidence: "Done" },
+    });
+  });
+
+  test("delegation needs the covering lease's token, and only to yourself or your own agents", () => {
+    const t = tree();
+    expect(() =>
+      t.mutate({ kind: "issue.claim", id: "child", data: { agent: "x", underToken: "wrong" } }),
+    ).toThrow(/doesn't hold ENG-1's lease/);
+    expect(() =>
+      t.mutate({
+        kind: "issue.claim",
+        id: "child",
+        data: { agent: "x", underToken: t.lead, forActorId: "agt-stranger" },
+      }),
+    ).toThrow(/your own agents/);
+    expect(() =>
+      t.mutate({ kind: "issue.claim", id: "sibling", data: { agent: "x", forActorId: "agt-bot" } }),
+    ).toThrow(/leased by lead/);
+    // Delegating to yourself is allowed too.
+    t.mutate({ kind: "issue.claim", id: "sibling", data: { agent: "x", underToken: t.lead } });
+    expect(t.claimOf("sibling")).toMatchObject({ actorId: "alice", delegatedFrom: "project" });
+  });
+
+  test("any lease above a claim can revoke it, which fences its token; others can't", () => {
+    const t = tree();
+    const childToken = String(
+      t.mutate({
+        kind: "issue.claim",
+        id: "child",
+        data: { agent: "sub", underToken: t.lead, forActorId: "agt-bot" },
+      }).results[0]!.leaseToken,
+    );
+    const deep = String(
+      t.as(t.asBot, {
+        kind: "issue.claim",
+        id: "grandchild",
+        data: { agent: "deeper", underToken: childToken },
+      }).results[0]!.leaseToken,
+    );
+    expect(() =>
+      t.mutate({ kind: "issue.revoke", id: "grandchild", data: { underToken: "nope" } }),
+    ).toThrow(/Only the holder of a lease above/);
+    // The project's holder reaches past the child to the grandchild.
+    t.mutate({ kind: "issue.revoke", id: "grandchild", data: { underToken: t.lead } });
+    expect(t.claimOf("grandchild")).toBeNull();
+    expect(() =>
+      t.as(t.asBot, { kind: "issue.renew", id: "grandchild", data: { leaseToken: deep } }),
+    ).toThrow(/expired, was superseded/);
+    t.mutate({ kind: "issue.revoke", id: "child", data: { underToken: t.lead } });
+    expect(t.claimOf("child")).toBeNull();
+  });
+
+  test("next picks inside your own leased subtree only with its token", () => {
+    const t = tree();
+    const pick = (data: Record<string, unknown>) =>
+      t.mutate({
+        kind: "issue.next",
+        id: `p-${JSON.stringify(data).length}`,
+        data: { agent: "w", ...data },
+      }).results[0]!;
+    expect(pick({ underId: "project" }).issueId).toBeUndefined();
+    const own = pick({ underId: "project", underToken: t.lead, forActorId: "agt-bot" });
+    expect(["grandchild", "sibling"]).toContain(own.issueId);
+    expect(t.claimOf(own.issueId!)).toMatchObject({ actorId: "agt-bot", delegatedFrom: "project" });
+  });
+});

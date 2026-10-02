@@ -369,6 +369,39 @@ export class TrackerStore {
         if (blocked)
           fail("blocked", "Resolve all blockers before starting or completing work.", 409);
       };
+      /** Whether the caller holds `issue`'s active lease with `token`. */
+      const holds = (issue: Issue, token: string) => {
+        if (!issue.claim || issue.claim.expiresAt <= now || issue.claim.actorId !== access.actorId)
+          return false;
+        const row = first(
+          this.sql,
+          tracker.selectFrom("leases").select("token").where("issue_id", "=", issue.id),
+        );
+        const a = new TextEncoder().encode(token);
+        const b = new TextEncoder().encode(row?.token ?? "");
+        return a.length === b.length && timingSafeEqual(a, b);
+      };
+      /** The active leases above an issue, nearest first. */
+      const leasedAbove = (issue: Issue) => {
+        const index = graph();
+        const out: Issue[] = [];
+        for (
+          let above = leasedAncestor(issue, index, now);
+          above;
+          above = leasedAncestor(above, index, now)
+        )
+          out.push(above);
+        return out;
+      };
+      /** Who a claim is for: the caller, or one of the caller's own agents. */
+      const holderFor = (forActorId: unknown) => {
+        if (forActorId === undefined || forActorId === access.actorId)
+          return { actorId: access.actorId, accountableId: access.principalId };
+        const agent = access.agents.find((a) => a.id === id(forActorId));
+        if (!agent || agent.accountable.id !== access.principalId)
+          fail("forbidden", "Claims can only be delegated to yourself or your own agents.", 403);
+        return { actorId: agent.id, accountableId: agent.accountable.id };
+      };
       /** `issue`'s lease must match `token`; `covered` is the descendant being changed, if any. */
       const lease = (issue: Issue, token: unknown, covered?: Issue) => {
         if (covered && covered.id !== issue.id && typeof token !== "string")
@@ -400,24 +433,44 @@ export class TrackerStore {
         issue.claim && issue.claim.expiresAt > now ? issue : leasedAncestor(issue, graph(), now);
       // A parent with open sub-issues is never offered as work, but claiming it
       // explicitly is how an orchestrating agent takes its whole subtree.
-      const claimable = (issue: Issue) => {
+      const claimable = (issue: Issue, underToken?: unknown) => {
         const above = leasedAncestor(issue, graph(), now);
+        if (above && underToken !== undefined) {
+          if (!holds(above, text(underToken, "underToken", 200)))
+            fail(
+              "lease_lost",
+              `That token doesn't hold ${above.key}'s lease, which covers ${issue.key}.`,
+              409,
+            );
+          return above;
+        }
         if (above)
           fail(
             "subtree_leased",
             `${above.key} is leased by ${above.claim!.agent}, and its lease covers ${issue.key}.`,
             409,
           );
+        return null;
       };
       /** Hold `issue` for the caller: a fresh token, or the same one when renewing. */
-      const grant = (issue: Issue, agent: string, ttl: number, token?: string) => {
+      const grant = (
+        issue: Issue,
+        agent: string,
+        ttl: number,
+        token?: string,
+        holder: { actorId: string; accountableId: string } = {
+          actorId: access.actorId,
+          accountableId: access.principalId,
+        },
+        delegatedFrom?: Issue | null,
+      ) => {
         const leaseToken = token ?? crypto.randomUUID() + crypto.randomUUID();
         const expiresAt = new Date(Date.parse(now) + ttl * 1000).toISOString();
         issue.claim = {
-          actorId: access.actorId,
-          accountableId: access.principalId,
+          ...holder,
           agent,
           expiresAt,
+          ...(delegatedFrom ? { delegatedFrom: delegatedFrom.id } : {}),
         };
         issue.status = "in_progress";
         run(
@@ -436,8 +489,21 @@ export class TrackerStore {
        * the caller; first by priority, then by how much open work it unblocks
        * (critical path first), then by age.
        */
-      const pick = (scope: { teamId?: string; workspaceId?: string; underId?: string }) => {
+      const pick = (scope: {
+        teamId?: string;
+        workspaceId?: string;
+        underId?: string;
+        /** The caller holds underId's lease: its own subtree is open to it. */
+        own?: Issue;
+      }) => {
         const index = graph();
+        const takeable = (issue: Issue) => {
+          const why = readiness(issue, index, now);
+          return (
+            why === "ready" ||
+            (why === "leased_above" && leasedAncestor(issue, index, now)?.id === scope.own?.id)
+          );
+        };
         const writable = (issue: Issue) => {
           const team = this.get<Team>("team", issue.teamId);
           return (
@@ -476,7 +542,7 @@ export class TrackerStore {
         };
         const candidates = [...index.byId.values()].filter(
           (issue) =>
-            readiness(issue, index, now) === "ready" &&
+            takeable(issue) &&
             issue.type !== "prd" &&
             (issue.assigneeId === null || issue.assigneeId === access.actorId) &&
             (!scope.teamId || issue.teamId === scope.teamId) &&
@@ -853,7 +919,15 @@ export class TrackerStore {
             break;
           }
           case "issue.next": {
-            keys(data, ["agent", "ttlSeconds", "teamId", "workspaceId", "underId"]);
+            keys(data, [
+              "agent",
+              "ttlSeconds",
+              "teamId",
+              "workspaceId",
+              "underId",
+              "underToken",
+              "forActorId",
+            ]);
             const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
             if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
               fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
@@ -865,19 +939,51 @@ export class TrackerStore {
             };
             if (scope.teamId) this.get<Team>("team", scope.teamId);
             if (scope.workspaceId) this.get<Workspace>("workspace", scope.workspaceId);
-            if (scope.underId) this.get<Issue>("issue", scope.underId);
-            const issue = pick(scope);
+            let own: Issue | null = null;
+            if (scope.underId) {
+              const under = this.get<Issue>("issue", scope.underId);
+              if (data.underToken !== undefined) {
+                if (!holds(under, text(data.underToken, "underToken", 200)))
+                  fail("lease_lost", `That token doesn't hold ${under.key}'s lease.`, 409);
+                own = under;
+              }
+            } else if (data.underToken !== undefined)
+              fail("invalid_input", "underToken needs underId: the issue whose lease it is.");
+            const holder = holderFor(data.forActorId);
+            const issue = pick({ ...scope, ...(own ? { own } : {}) });
             // Nothing ready is an answer, not an error: the agent can stop or wait.
             if (!issue) break;
             result = {
               id: entityId,
               issueId: issue.id,
               key: issue.key,
-              ...grant(issue, agent, Number(ttl)),
+              ...grant(issue, agent, Number(ttl), undefined, holder, own),
             };
             issue.version++;
             issue.updatedAt = now;
             emit("issue", issue.id, issue, "issue.claim");
+            break;
+          }
+          case "issue.revoke": {
+            keys(data, ["underToken"]);
+            const issue = this.get<Issue>("issue", entityId);
+            teamWritable(this.get("team", issue.teamId));
+            if (!issue.claim || issue.claim.expiresAt <= now)
+              fail("not_claimed", `${issue.key} has no active claim to revoke.`, 409);
+            const token = text(data.underToken, "underToken", 200);
+            // Any lease above the issue may take it back, not just the nearest.
+            if (!leasedAbove(issue).some((above) => holds(above, token)))
+              fail(
+                "lease_lost",
+                `Only the holder of a lease above ${issue.key} can revoke its claim.`,
+                409,
+              );
+            issue.claim = null;
+            issue.status = "todo";
+            run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+            issue.version++;
+            issue.updatedAt = now;
+            emit("issue", entityId, issue, "issue.revoke");
             break;
           }
           case "issue.claim":
@@ -888,7 +994,7 @@ export class TrackerStore {
             keys(
               data,
               kind === "issue.claim"
-                ? ["agent", "ttlSeconds"]
+                ? ["agent", "ttlSeconds", "underToken", "forActorId"]
                 : kind === "issue.renew"
                   ? ["leaseToken", "ttlSeconds"]
                   : kind === "issue.complete"
@@ -897,6 +1003,7 @@ export class TrackerStore {
             );
             const issue = this.get<Issue>("issue", entityId);
             teamWritable(this.get("team", issue.teamId));
+            let delegator: Issue | null = null;
             if (kind === "issue.claim" || kind === "issue.renew") {
               const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
               if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
@@ -910,7 +1017,12 @@ export class TrackerStore {
                 )
                   fail("not_ready", "Only todo or expired claimed work may be claimed.", 409);
                 unblocked(issue);
-                claimable(issue);
+                delegator = claimable(issue, data.underToken);
+                if (!delegator && data.forActorId !== undefined)
+                  fail(
+                    "invalid_input",
+                    "forActorId delegates inside your leased subtree; pass that lease's underToken.",
+                  );
               } else lease(issue, data.leaseToken);
               result = {
                 id: entityId,
@@ -919,6 +1031,17 @@ export class TrackerStore {
                   kind === "issue.claim" ? text(data.agent, "agent", 200) : issue.claim!.agent,
                   Number(ttl),
                   kind === "issue.claim" ? undefined : String(data.leaseToken),
+                  kind === "issue.claim"
+                    ? holderFor(data.forActorId)
+                    : {
+                        actorId: issue.claim!.actorId,
+                        accountableId: issue.claim!.accountableId ?? access.principalId,
+                      },
+                  kind === "issue.claim"
+                    ? delegator
+                    : issue.claim?.delegatedFrom
+                      ? this.get<Issue>("issue", issue.claim.delegatedFrom)
+                      : null,
                 ),
               };
             } else {

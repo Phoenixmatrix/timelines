@@ -390,7 +390,10 @@ export function IssueDetail({
               aria-hidden
             />
             <span>
-              {claimHolder(snapshot, covering!.claim!)} is working on{" "}
+              {claimHolder(snapshot, covering!.claim!)}
+              {covering!.claim!.delegatedFrom &&
+                ` (delegated from ${index.byId.get(covering!.claim!.delegatedFrom)?.key ?? "a parent"})`}{" "}
+              is working on{" "}
               {covering === issue ? "this issue" : `${covering!.key}, which includes this issue,`}{" "}
               until{" "}
               {new Date(covering!.claim!.expiresAt).toLocaleString(undefined, {

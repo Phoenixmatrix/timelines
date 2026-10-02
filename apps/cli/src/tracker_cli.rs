@@ -170,6 +170,16 @@ pub struct Lease {
     #[arg(long, env = "GM_LEASE_TOKEN", hide_env_values = true)]
     pub lease_token: String,
 }
+/// Delegation inside a leased subtree: the covering lease's token, and who the claim is for.
+#[derive(Args)]
+pub struct Delegation {
+    /// The lease token of the issue whose subtree this is; prefer GM_UNDER_TOKEN.
+    #[arg(long, env = "GM_UNDER_TOKEN", hide_env_values = true)]
+    pub under_token: Option<String>,
+    /// Hold the claim as one of your agents (name or id) instead of yourself.
+    #[arg(long = "for")]
+    pub for_agent: Option<String>,
+}
 #[derive(Subcommand)]
 pub enum IssueCommand {
     /// Create a ticket or full Markdown PRD with a stable offline ID.
@@ -208,6 +218,15 @@ pub enum IssueCommand {
         agent: String,
         #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: u32,
+        #[command(flatten)]
+        delegation: Delegation,
+    },
+    /// Take back a claim inside your leased subtree; its token stops working.
+    Revoke {
+        issue: String,
+        /// The lease token of an issue above it; prefer GM_UNDER_TOKEN.
+        #[arg(long, env = "GM_UNDER_TOKEN", hide_env_values = true)]
+        under_token: String,
     },
     /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context.
     Next {
@@ -222,6 +241,9 @@ pub enum IssueCommand {
         under: Option<String>,
         #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: u32,
+        /// With --under: pick inside your own leased subtree.
+        #[command(flatten)]
+        delegation: Delegation,
     },
     /// Renew an online fenced lease; returns its token only in this response.
     Renew {
