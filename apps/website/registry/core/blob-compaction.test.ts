@@ -107,7 +107,10 @@ async function drain(f: Fixture) {
   }
 }
 
-describe("artifact compaction", () => {
+// These compress, delta and restore real frames: the heaviest take 0.5–0.75 s
+// alone on a 4-core ARM host, and several times that beside a second Vitest
+// worker or another checkout's gate. The default 5 s budget made them flaky.
+describe("artifact compaction", { timeout: 30_000 }, () => {
   it("only heats repeated historical content through a live recent publication", async () => {
     const f = fixture();
     const shared = await storeBlob(f.services.db, f.services.bucket, bytes(0));
