@@ -237,6 +237,27 @@ The design follows Cloudflare's agent-first `cf` CLI:
 | Packages    | `pkg list/show/versions`, `pkg delete/yank/restore/deprecate/tag`, `pkg sources/grant/revoke`, `pkg published`, `pkg upload`, `pkg setup` |
 | Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                                                                                       |
 
+## Local CI storage
+
+`gm runner` uses `--workdir`, or `$XDG_CACHE_HOME/gitmatrix/runner` (falling back
+to `~/.cache/gitmatrix/runner`), for job storage. Each attempt gets a fresh
+`jobs/<attempt>/repo` checkout; cleanup removes it and its package credentials
+before reporting the terminal result, including failed jobs.
+
+Cargo compiler outputs persist under `cache/<scope>/slot-N/target`. The scope
+hash includes the canonical server, repository and job name; active jobs lease
+different slots so they cannot replace one another's running binaries. Later
+jobs reuse released slots. Cargo still checks source/dependency freshness, and
+tests always run. Explicit job or inherited `CARGO_TARGET_DIR` bypasses managed
+caching unchanged; its lifetime and concurrency remain the caller's responsibility.
+
+`GITMATRIX_CI_ARTIFACTS_DIR` is an absolute private directory under
+`artifacts/<scope>/<attempt>`, retained after checkout cleanup. Its path is printed
+in setup logs. Producers must write sanitized reports only; the runner does not
+copy files from the checkout or provide remote artifact upload. The agent harness
+exports only its allowlisted redacted JSON reports. Local cache/report directories
+remain until removed by their owner; do not remove cache slots while jobs are active.
+
 ## Worktrees
 
 Create parallel working directories without cloning objects or sharing

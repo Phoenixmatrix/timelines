@@ -56,7 +56,8 @@ a feature worktree's `gm` over the shared binary.
 - Vite+, Node 24+, the Rust toolchain, Git and curl. `vp install` selects pinned
   pnpm 12.8.1; each worktree installs its own links into the shared global store.
 - `cf` installed outside the worktree, authenticated with `cf auth login`.
-  The development account must permit Artifacts, Vectorize, AI Search and Workers AI.
+  Automatic non-AI E2E needs Artifacts access. Interactive setup and explicit AI
+  verification also need Vectorize, AI Search and Workers AI.
   If login exposes multiple accounts, set `CLOUDFLARE_ACCOUNT_ID` explicitly.
 - Chromium's OS dependencies. Setup installs the pinned Playwright browser and
   checks that it launches; missing host libraries are a setup error, not a skipped test.
@@ -124,14 +125,16 @@ development; harness dev endpoints additionally require an environment capabilit
 ### Completion gate
 
 ```bash
-vp run ready                 # complete, uncached gate
-vp run agent test            # fresh live E2E only
+vp run ready                 # uncached quality gates + non-AI live E2E
+vp run agent test            # fresh non-AI live E2E only
+vp run agent test-ai         # explicit paid knowledge/wiki/search verification
 ```
 
 `ready` runs formatting/lint checks, Rust format/clippy, all website and harness
 TypeScript projects, recursive unit/integration tests, recursive builds, then the
-real-service end-to-end suite. It never treats a cached task, missing credentials,
-provider outage or unavailable browser as a passing live test.
+non-AI real-service end-to-end suite. Test commands always execute; Cargo may reuse
+compiled outputs, not test results. Missing credentials, required provider outages
+or an unavailable browser fail the command.
 
 The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
@@ -145,53 +148,81 @@ environment. Its checks include:
 | Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance |
 | CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                               |
 | Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries                                         |
-| Providers                      | Authenticated Git mirror update/tag/prune and auth failure; knowledge build, graph, Vectorize entity search and AI Search source retrieval         |
+| Mirror                         | Authenticated Git mirror update/tag/prune, rejected credentials and recovery against a real local HTTP target                                      |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation
 scenario requires the held process to disconnect without the test releasing it.
 
-Provider assertions check source identity and state, not exact generated prose.
-Fixtures and search attempts are bounded. The mirror target is a real local Git
-HTTP server, not GitHub. This gate exercises **local Linux runners**, not deployed
+Automatic E2E provisions only Artifacts and omits Workers AI, Vectorize and AI Search
+bindings. It verifies that fixture pushes/status reads do not start knowledge builds;
+explicit AI rebuild/search requests return 503 in this isolated non-AI mode.
+Independent mirror checks run alongside the other scenarios; both finish before
+teardown, even when one fails. This gate exercises **local Linux runners**, not deployed
 Cloudflare Sandbox containers or production sign-in. Changes to those deployment
 boundaries require their own targeted smoke run; do not claim deployment parity.
 
-Evidence is retained under `.gitmatrix-agent/runs/<id>/artifacts/`: completion
-status, scenario observations, failed CI details/logs, provider evidence, server
-logs, browser screenshots and failure traces. Treat traces/logs as private even
-though textual bearer credentials are redacted. A failed run is a failed gate;
-fix the cause and rerun it rather than skipping the scenario.
+Local evidence remains under `.gitmatrix-agent/runs/<id>/artifacts/`: completion
+status, lifecycle timings, scenario observations, mirror/AI evidence, server logs,
+browser screenshots and failure traces. Failures before provisioning use
+`.gitmatrix-agent/artifacts/test-<mode>-<timestamp>/`. Treat local traces/logs as
+private even though textual bearer credentials are redacted.
+
+Local CI runners set `GITMATRIX_CI_ARTIFACTS_DIR` to a private job-specific directory
+outside the disposable checkout and print its path in setup logs. The harness
+retains only allowlisted sanitized JSON reports there, including failures; it strips
+scenario observations and never copies credentials, raw logs or browser storage.
+`timings.json` separates preparation, provisioning, migrations, startup, seeding,
+scenarios, shutdown and cleanup. Provider reports separate knowledge generation
+from search-index visibility. A failed run is a failed gate; fix the cause rather
+than skipping the scenario.
 
 Before calling work complete: run `ready`, exercise the specific changed consumer
 path, inspect the evidence, update affected contracts/docs, and stop or destroy
 unneeded environments. Publish source changes with ordinary `gm commit` / `gm push`
 **outside** the scoped `agent gm` wrapper, then check `gm runs wait`.
-`.gitmatrix/ci.yml` enforces check → test → build → live E2E on the trusted local
-Linux CI host, which needs the same Cloudflare login and user-systemd prerequisites.
+`.gitmatrix/ci.yml` starts check, test, build and non-AI E2E independently; all four
+must pass. They exchange no artifacts, so no dependency-stage barrier is needed.
+It runs on the trusted Linux CI host with Cloudflare login and user-systemd
+prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
+checkouts; concurrent jobs lease separate slots. Tests still run every time.
+
+### AI capability verification
+
+Real AI checks are **not automatic CI requirements**. For changes to knowledge
+builds, graph extraction, generated wiki, embeddings or AI Search, follow the
+[AI verification skill](.agents/skills/gitmatrix-ai-verification/SKILL.md) and run
+`vp run agent test-ai`. It provisions its own paid resources and verifies the exact
+pushed commit, named graph relationships, generated wiki provenance/content, and
+matching Vectorize entities plus AI Search source passages. Assertions check source
+facts, not exact generated wording. Missing providers or an expired visibility
+deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
 
 ### Fast edit loop
 
 Keep `vp run agent up` running and reuse its environment while editing. Use targeted
 package tests and `vp check` for feedback; run `vp run ready` at completion, not after
-every edit. CI repeats the full gate, including the expensive live provider checks.
+every edit. CI repeats the non-AI gate; run the explicit AI command when the changed
+capability requires it, not on every push.
 
 Observed on the local Linux/WSL workstation with warm caches; these are measurements,
 not cold-install or provider-latency guarantees:
 
-| Operation                              | Observed duration  |
-| -------------------------------------- | ------------------ |
-| Format/lint/type-aware check           | About 3–4 seconds  |
-| Website unit tests                     | About 3–4 seconds  |
-| Setup with an existing environment     | 17 seconds         |
-| New environment with CLI already built | 44 seconds         |
-| Fresh worktree install/build/setup     | 82–98 seconds      |
-| Full uncached completion gate          | About 4–5½ minutes |
+| Operation                              | Observed duration |
+| -------------------------------------- | ----------------- |
+| Format/lint/type-aware check           | About 3–4 seconds |
+| Website unit tests                     | About 3–4 seconds |
+| Setup with an existing environment     | 17 seconds        |
+| New environment with CLI already built | 44 seconds        |
+| Fresh worktree install/build/setup     | 82–98 seconds     |
+| Full non-AI completion gate            | 157 seconds       |
+| Non-AI E2E including lifecycle         | 107 seconds       |
 
-Live provider verification accounts for roughly 2–3¾ minutes of the full gate;
-browser checks take about 20 seconds. The four runner-supervision regressions add
-no provider provisioning and complete with the focused CI unit checks in about
-0.3 seconds.
+These setup measurements include AI-enabled interactive resources. Use the current
+run's `timings.json` for automatic-gate measurements; historical totals that included
+live AI generation/search are not comparable to the non-AI gate.
+The measured non-AI E2E spent 41 seconds exercising scenarios, with mirror work
+overlapped. These are local verification measurements, not a new trunk CI run.
 
 ### Cleanup and cost bounds
 

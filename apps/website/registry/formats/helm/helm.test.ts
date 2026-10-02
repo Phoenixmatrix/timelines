@@ -128,9 +128,10 @@ describe("helm local repositories", () => {
   it("applies the overwrite rules", async () => {
     const post = (body: Uint8Array, query = "", token = writer) =>
       api(`api/charts${query}`, { method: "POST", body }, token);
-    expect((await post(chart("app", "1.0.0"))).status).toBe(201);
-    // Identical bytes are idempotent.
-    expect((await post(chart("app", "1.0.0"))).status).toBe(201);
+    const original = chart("app", "1.0.0");
+    expect((await post(original)).status).toBe(201);
+    // Reuse identical bytes: regenerating gzip can change its timestamp.
+    expect((await post(original)).status).toBe(201);
     const changed = chart("app", "1.0.0", "replicas: 3\n");
     const conflict = await post(changed);
     expect(conflict.status).toBe(409);

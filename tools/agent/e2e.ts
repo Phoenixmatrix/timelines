@@ -15,7 +15,6 @@ import type {
   RepoDetail,
 } from "../../apps/website/shared/api.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
-import { runProviderE2E } from "./provider-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 type Evidence = {
@@ -730,6 +729,4 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await browser.close();
     }
   });
-
-  await scenario("provider-boundaries", () => runProviderE2E(ctx, fixtures));
 }

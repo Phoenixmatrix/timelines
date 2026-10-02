@@ -1,0 +1,49 @@
+---
+name: gitmatrix-ai-verification
+description: Verify changes to real knowledge builds, graph extraction, generated wiki, embeddings/Vectorize or AI Search using owned isolated resources. Required before claiming AI behavior works; ordinary ready intentionally does not run AI.
+---
+
+# Real AI verification
+
+## When required
+
+Run after changing knowledge scheduling/builds, extraction/model prompts, wiki generation, embedding/index schemas, AI Search indexing/retrieval, or their API/UI consumers. `vp run ready` and `vp run agent test` cover non-AI journeys and real mirror transport, not AI correctness. Never infer AI correctness from their success.
+
+## Prerequisites and command
+
+Use this worktree's Linux agent workflow with Node 24+, Vite+, Rust, Git, Chromium dependencies and authenticated `cf` access. Discover operations with `cf cli search "<anonymous action/resource description>"`, then the selected command's help; never Wrangler. Select an authorized development account with `CLOUDFLARE_ACCOUNT_ID`; optionally select `GITMATRIX_CF_PROFILE`. The harness needs real Artifacts, Workers AI, Vectorize and AI Search permissions. Missing access is a blocker, not a reason to mock, skip or weaken assertions.
+
+```sh
+vp run agent test-ai
+```
+
+This builds this worktree's gm with Cargo freshness checks (compiled outputs may be reused), provisions uniquely named owned resources, migrates local databases, starts an isolated origin, seeds fixtures, and exercises real providers. It consumes paid inference, embeddings and provider storage/indexing, including knowledge work triggered by seeded repositories; run deliberately, not in automatic CI or in a retry loop. Four live environments per user and a 24-hour expiry apply. Never point it at the canonical development server or shared namespaces. Normal `agent setup` remains AI-enabled; only automatic non-AI test environments omit AI bindings/resources.
+
+## Exact evidence and honest failures
+
+The final `e2e.complete` event prints the local evidence directory. Inspect:
+
+- `completion.json`: mode, overall success, environment ID, requested resource selection, cleanup state, failed lifecycle stages.
+- `timings.json`: elapsed milliseconds and pass/fail for prepare, provision, migrate, start, seed, scenarios, shutdown and cleanup (executed stages only).
+- `ai-e2e.json`: unique fixture repository, observed build status/commit, graph file/symbol membership, generated overview body/model/commit, exact entity and passage results, API observations and per-stage timings. `knowledge-build` and `index-visibility` are separate timings.
+
+The Copper Finch fixture must produce a successful build of its pushed commit; a `checksum.ts` file linked to `copperFinchChecksum`; a generated overview explaining checksum behavior at that commit; and both the matching Vectorize entity and an AI Search code passage containing the fixture function and modulus. These are real assertions, not a non-empty-result check. A provider failure, missing wiki, graph mismatch or index-visibility deadline fails the command. Build timeout means inspect build status/phase; search timeout after a successful build means inspect indexing/visibility and the separate entity/passage evidence. Do not turn a provider outage into a pass.
+
+For retained CI evidence, set `GITMATRIX_CI_ARTIFACTS_DIR` to a private absolute job-specific directory outside the disposable checkout. Only allowlisted sanitized JSON reports are retained there, including failures. Never upload raw server/build logs, credentials, environment journals, browser storage or screenshots. Local logs remain available in the owned artifact directory for diagnosis.
+
+## Changed-path extensions
+
+Baseline coverage is deliberately small. Extend `tools/agent/provider-e2e.ts` with a deterministic tiny fixture and consumer-visible assertion when the changed capability is not covered:
+
+- Scheduling/invalidation: push a second meaningful source change, wait for its exact commit, assert updated graph/wiki and stale output removal.
+- Extraction/graph: add the changed language construct and assert its named node, path and relationship, not merely graph size.
+- Wiki: inspect the changed page's prose, provenance/model/commit and relevant source facts; UI changes additionally require opening the real wiki surface.
+- Vectorize: query for the changed named entity and verify its identity/path and repository isolation.
+- AI Search: assert exact source passage kind/path and discriminating fixture content; verify metadata filtering when changed.
+- Failure behavior: exercise the real capability-specific failure boundary without fake provider success, then prove cleanup.
+
+Keep provider calls bounded and source fixtures free of secrets. Preserve independent mirror coverage in `agent test`; do not reattach AI checks to ready or CI.
+
+## Cleanup
+
+The command waits for its work and always attempts owned shutdown/deletion, retaining evidence before it returns or throws. `cleanup: deleted` is the success condition. If deletion fails, preserve the ownership journal and use `vp run agent status` to inspect ownership; use `vp run agent cleanup --expired` for the expiry sweep. The installed hourly user-systemd maintenance retries expired resources. `vp run agent destroy` targets the persistent setup environment, not an arbitrary ephemeral test run. Never manually edit ownership records or delete shared resources. Report pending cleanup as a blocker, with the environment ID and sanitized evidence.

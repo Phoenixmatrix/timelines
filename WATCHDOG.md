@@ -69,6 +69,8 @@ to `apps/website/` unless explicitly rooted elsewhere.
   access, visible errors, narrow screens, and retained drafts where affected.
 - **Verification:** require evidence for changed behavior: allowed/denied personas,
   replay/conflict cases, actual `gm` flows, or browser interaction as applicable.
-  Follow the repository gates (`vp check`, `vp test`, `vp run cli#check`); after
-  an authorized push, `gm runs wait` verifies server CI. Report blocked checks
-  honestly; compilation, mocked forwarding, or a queued job is not runtime proof.
+  Follow `vp run ready`; AI capability changes additionally require the repo's
+  `gitmatrix-ai-verification` skill and explicit `vp run agent test-ai`, not
+  automatic AI CI. After an authorized push, `gm runs wait` verifies server CI.
+  Report blocked checks honestly; compilation, mocked forwarding, or a queued
+  job is not runtime proof.

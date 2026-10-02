@@ -476,7 +476,11 @@ async function allocatePort(): Promise<number> {
   return address.port;
 }
 
-export async function createEnvironment(root: string, ephemeral = false): Promise<Environment> {
+export async function createEnvironment(
+  root: string,
+  ephemeral = false,
+  ai = true,
+): Promise<Environment> {
   root = await realpath(root);
   await cleanupExpired();
   return registryLock(async () => {
@@ -530,7 +534,11 @@ export async function createEnvironment(root: string, ephemeral = false): Promis
       expires: created + TTL,
       secret: randomBytes(32).toString("hex"),
       dispatchSecret: randomBytes(32).toString("hex"),
-      resources: { artifacts: "pending", vectors: "pending", search: "pending" },
+      resources: {
+        artifacts: "pending",
+        vectors: ai ? "pending" : "deleted",
+        search: ai ? "pending" : "deleted",
+      },
       status: "provisioning",
     };
     await persist(env);
@@ -538,57 +546,59 @@ export async function createEnvironment(root: string, ephemeral = false): Promis
       await cf(env, ["artifacts", "namespaces", "create", "--namespace", id]);
       env.resources.artifacts = "created";
       await persist(env);
-      await cf(env, [
-        "vectorize",
-        "create",
-        "--name",
-        id,
-        "--config-dimensions",
-        "1024",
-        "--config-metric",
-        "cosine",
-        "--description",
-        `Gitmatrix agent; expires ${new Date(env.expires).toISOString()}`,
-      ]);
-      env.resources.vectors = "created";
-      await persist(env);
-      for (const property of ["repo", "kind", "path"])
+      if (ai) {
         await cf(env, [
           "vectorize",
-          "metadata-index",
+          "create",
+          "--name",
+          id,
+          "--config-dimensions",
+          "1024",
+          "--config-metric",
+          "cosine",
+          "--description",
+          `Gitmatrix agent; expires ${new Date(env.expires).toISOString()}`,
+        ]);
+        env.resources.vectors = "created";
+        await persist(env);
+        for (const property of ["repo", "kind", "path"])
+          await cf(env, [
+            "vectorize",
+            "metadata-index",
+            "create",
+            id,
+            "--property-name",
+            property,
+            "--index-type",
+            "string",
+          ]);
+        await cf(env, [
+          "ai-search",
+          "namespace",
           "create",
           id,
-          "--property-name",
-          property,
-          "--index-type",
-          "string",
+          "--description",
+          `Gitmatrix agent; expires ${new Date(env.expires).toISOString()}`,
         ]);
-      await cf(env, [
-        "ai-search",
-        "namespace",
-        "create",
-        id,
-        "--description",
-        `Gitmatrix agent; expires ${new Date(env.expires).toISOString()}`,
-      ]);
-      env.resources.search = "created";
-      await persist(env);
-      await cf(env, [
-        "ai-search",
-        "create",
-        id,
-        "knowledge",
-        "--body",
-        JSON.stringify({
-          id: "knowledge",
-          embedding_model: "@cf/qwen/qwen3-embedding-0.6b",
-          indexing_options: { keyword_tokenizer: "trigram" },
-          custom_metadata: ["repo", "kind", "path", "commit", "lang"].map((field_name) => ({
-            field_name,
-            data_type: "text",
-          })),
-        }),
-      ]);
+        env.resources.search = "created";
+        await persist(env);
+        await cf(env, [
+          "ai-search",
+          "create",
+          id,
+          "knowledge",
+          "--body",
+          JSON.stringify({
+            id: "knowledge",
+            embedding_model: "@cf/qwen/qwen3-embedding-0.6b",
+            indexing_options: { keyword_tokenizer: "trigram" },
+            custom_metadata: ["repo", "kind", "path", "commit", "lang"].map((field_name) => ({
+              field_name,
+              data_type: "text",
+            })),
+          }),
+        ]);
+      }
       env.status = "ready";
       await persist(env);
       console.log(
@@ -648,6 +658,7 @@ export async function context(env: Environment): Promise<HarnessContext> {
     GITMATRIX_PUBLIC_URL: env.origin,
     GITMATRIX_STATE_DIR: join(env.dir, "state"),
     GITMATRIX_ARTIFACTS_NAMESPACE: env.id,
+    GITMATRIX_AGENT_AI: env.resources.vectors === "deleted" ? "disabled" : "enabled",
     GITMATRIX_VECTORIZE_INDEX: env.id,
     GITMATRIX_SEARCH_NAMESPACE: env.id,
     GITMATRIX_GM: gm,

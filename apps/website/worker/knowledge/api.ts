@@ -140,6 +140,8 @@ knowledge.get("/status", async (c) => {
 knowledge.post("/rebuild", async (c) => {
   const row = await repoOrFail(c, "admin");
   if (row instanceof Response) return row;
+  if (!c.env.AI)
+    return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
   await notifyKnowledge(c.env, row.id, { force: true });
   return c.json(await status(c, row), 202);
 });
@@ -347,6 +349,8 @@ knowledge.get("/changes", async (c) => {
 knowledge.get("/search", async (c) => {
   const row = await repoOrFail(c);
   if (row instanceof Response) return row;
+  if (!c.env.AI)
+    return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
   const query = c.req.query("q")?.trim() ?? "";
   if (!query) return fail(c, 400, "Pass a query: ?q=…");
   const kinds = c.req.query("kinds")?.split(",").filter(Boolean);

@@ -26,9 +26,12 @@ vp run agent up
 Use the origin printed by `up`. Setup builds the worktree's CLI, installs and
 checks Chromium, provisions dedicated Artifacts/Vectorize/AI Search resources,
 migrates both local D1 databases, and seeds deterministic Git/tracker fixtures.
-Use `vp run agent inspect` for data, `vp run agent test` for real-service E2E,
-and `vp run agent destroy` when finished. Hourly cleanup and 24-hour expiry
-bound resource accumulation; see the root README for costs and failure recovery.
+Use `vp run agent inspect` for data, `vp run agent test` for non-AI real-service
+E2E, and `vp run agent test-ai` when verifying knowledge/wiki/search capabilities.
+Automatic E2E provisions only Artifacts and disables background AI work; normal
+interactive setup remains AI-enabled. Use `vp run agent destroy` when finished.
+Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
+for costs and failure recovery.
 
 There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
 These bindings use real services; D1, Durable Objects and Workflows run locally
@@ -332,6 +335,12 @@ wiki is one consumer of it (the Knowledge tab and `/api/repos/:o/:n/knowledge/*`
 are others). Inspired by OpenDeepWiki, rebuilt around the graph and around
 real-time incremental updates on Cloudflare.
 
+AI behavior is verified on demand, not by automatic CI. Follow the repository's
+[AI verification skill](../../.agents/skills/gitmatrix-ai-verification/SKILL.md)
+and run `vp run agent test-ai` for real build/graph/wiki/Vectorize/AI Search evidence.
+The isolated non-AI test mode omits provider bindings, suppresses background builds,
+and rejects explicit rebuild/search with 503; production behavior is unchanged.
+
 ```
 push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
                        debounce 1.5s (max 8s), one build in flight, rebuild if dirty
@@ -438,6 +447,18 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   `vp dev`, `gm runner` still works by hand. `GITMATRIX_CI_RUNNER=sandbox vp dev`
   runs the container path locally with Docker. The choice is made in
   `cloudflare.config.ts`, which attaches the container only when sandboxed.
+- **Local compiler reuse and evidence.** The local runner keeps Cargo outputs
+  outside disposable checkouts, partitioned by server/repository/job and leased
+  per concurrent job. Cargo checks freshness; every test command still executes.
+  Explicit `CARGO_TARGET_DIR` keeps normal Cargo semantics and bypasses managed
+  caching. `GITMATRIX_CI_ARTIFACTS_DIR` points to a private retained job directory;
+  write only sanitized reports there. The harness retains allowlisted JSON, not
+  credentials, raw logs or browser storage. Setup logs print cache/evidence paths.
+  Checkout credentials are deleted before terminal reporting, on success or failure.
+- **This repository's pipeline.** Check, test, build and non-AI E2E start
+  independently; all four must pass. No job consumes another's artifacts, and
+  keeping them in one stage avoids a scheduler barrier. Real AI verification is
+  an explicit agent command.
 - **Both runners report the same way** (`worker/ci/jobs.ts`): batched log
   chunks, step transitions, the end. Secret values are masked server-side; a
   cancelled job is told so in the reply to its next report and kills its

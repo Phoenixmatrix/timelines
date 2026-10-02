@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, realpath } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { copyFile, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "@playwright/test";
@@ -25,6 +25,7 @@ import type { HarnessContext } from "./types.ts";
 import { installMaintenance, maintenanceStatus, uninstallMaintenance } from "./maintenance.ts";
 import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
+import { runProviderE2E } from "./provider-e2e.ts";
 
 const root = await realpath(join(dirname(fileURLToPath(import.meta.url)), "../.."));
 const args = process.argv.slice(2);
@@ -38,8 +39,9 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent gm -- <args>       Use this worktree's binary, server, credentials and replica
   vp run agent exec -- <command>  Run another tool with isolated Git/XDG/GM settings
   vp run agent inspect [db|registry] [SQL]  Read local data; defaults to table inventory
-  vp run agent check              Uncached quality gates plus fresh real-service CLI/API/browser/provider E2E
-  vp run agent test               Fresh real-service E2E only; always destroy remote resources
+  vp run agent check              Uncached quality gates plus fresh non-AI CLI/API/browser/mirror E2E
+  vp run agent test               Fresh non-AI E2E; no AI resources or inference
+  vp run agent test-ai            Explicit real knowledge/graph/wiki/search verification; paid isolated resources
   vp run agent stop               Stop only the owned dev server and its runners
   vp run agent reset              Destroy/recreate this environment; never touch canonical dev state
   vp run agent destroy            Delete owned remote resources and local credentials/state
@@ -52,21 +54,29 @@ Canonical source publication uses ordinary gm outside 'agent gm'. Never point te
 async function prepare(): Promise<void> {
   await installMaintenance();
   console.log(JSON.stringify({ event: "prepare", step: "gm-build" }));
+  const target = process.env.CARGO_TARGET_DIR
+    ? resolve(root, process.env.CARGO_TARGET_DIR)
+    : join(root, "apps/cli/target");
   await command(
     "cargo",
-    [
-      "build",
-      "--manifest-path",
-      join(root, "apps/cli/Cargo.toml"),
-      "--target-dir",
-      join(root, "apps/cli/target"),
-    ],
+    ["build", "--manifest-path", join(root, "apps/cli/Cargo.toml"), "--target-dir", target],
     {
       cwd: root,
       timeout: 900_000,
       log: join(root, ".gitmatrix-agent", "artifacts", "cargo-build.log"),
     },
   );
+  const scopedTarget = join(root, "apps/cli/target");
+  if (target !== scopedTarget) {
+    await mkdir(join(scopedTarget, "debug"), { recursive: true });
+    const temporary = join(scopedTarget, "debug", `.gm-${process.pid}-${Date.now()}`);
+    try {
+      await copyFile(join(target, "debug", "gm"), temporary);
+      await rename(temporary, join(scopedTarget, "debug", "gm"));
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  }
   await command("cf", ["workers", "types"], { cwd: website });
   await command("vp", ["exec", "playwright", "install", "chromium"], {
     cwd: join(root, "tools/agent"),
@@ -176,7 +186,12 @@ async function start(
   throw new Error(`Server identity/readiness timed out. See ${ctx.artifacts}/server.log`);
 }
 
-function superviseEnvironment(env: Environment) {
+interface EnvironmentSupervisor {
+  assertRunning(): void;
+  close(): Promise<void>;
+}
+
+function superviseEnvironment(env: Environment): EnvironmentSupervisor {
   let interrupted = false;
   let stopping: Promise<void> | undefined;
   let stopFailure: unknown;
@@ -229,52 +244,124 @@ async function setup(): Promise<void> {
   }
 }
 
-async function liveTest(): Promise<void> {
-  await prepare();
-  const env = await createEnvironment(root, true);
-  const ctx = await context(env);
-  const supervisor = superviseEnvironment(env);
+async function liveTest(ai = false): Promise<void> {
   const started = Date.now();
-  let failure: unknown;
-  try {
-    await migrate(env);
-    await start(env, ctx);
-    supervisor.assertRunning();
-    const fixtures = await seed(ctx);
-    await seed(ctx); // Bootstrap must be repeatable against the same real data.
-    await runE2E(ctx, fixtures);
-    supervisor.assertRunning();
-  } catch (error) {
-    failure = error;
-  }
-  try {
-    await supervisor.close();
-  } catch (error) {
-    failure = failure ? new AggregateError([failure, error], "E2E and shutdown failed") : error;
-  }
-  try {
-    await registryLock(() => destroyEnvironment(env));
-  } catch (error) {
-    failure = failure ? new AggregateError([failure, error], "E2E and cleanup failed") : error;
-  }
-  await privateJson(join(ctx.artifacts, "completion.json"), {
-    success: !failure,
-    id: env.id,
-    elapsedMs: Date.now() - started,
-    cleanup: env.status,
-    error: failure
-      ? redact(failure instanceof Error ? failure.message : JSON.stringify(failure))
-      : null,
-  });
-  console.log(
-    JSON.stringify({
-      event: "e2e.complete",
-      success: !failure,
-      evidence: ctx.artifacts,
-      cleanup: env.status,
-    }),
+  let artifacts = join(
+    root,
+    ".gitmatrix-agent",
+    "artifacts",
+    `test-${ai ? "ai" : "non-ai"}-${started}`,
   );
-  if (failure) throw failure;
+  const timings: { stage: string; elapsedMs: number; outcome: string }[] = [];
+  const timed = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
+    const began = Date.now();
+    let outcome = "failed";
+    try {
+      const result = await action();
+      outcome = "passed";
+      return result;
+    } finally {
+      timings.push({ stage, elapsedMs: Date.now() - began, outcome });
+    }
+  };
+  let env: Environment | undefined;
+  let supervisor: EnvironmentSupervisor | undefined;
+  const failures: unknown[] = [];
+  try {
+    await timed("prepare", prepare);
+    env = await timed("provision", () => createEnvironment(root, true, ai));
+    const ctx = await context(env);
+    artifacts = ctx.artifacts;
+    supervisor = superviseEnvironment(env);
+    await timed("migrate", () => migrate(env!));
+    await timed("start", () => start(env!, ctx));
+    supervisor.assertRunning();
+    const fixtures = await timed("seed", async () => {
+      const fixtures = await seed(ctx);
+      if (!ai) await seed(ctx); // Bootstrap remains repeatable against real data.
+      return fixtures;
+    });
+    await timed("scenarios", async () => {
+      // Independent repositories and reports; neither failure tears down the other's server.
+      const results = await Promise.allSettled(
+        ai
+          ? [runProviderE2E(ctx, fixtures, "ai")]
+          : [runE2E(ctx, fixtures), runProviderE2E(ctx, fixtures, "mirror")],
+      );
+      const errors = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (errors.length) throw new AggregateError(errors, "E2E scenarios failed");
+    });
+    supervisor.assertRunning();
+  } catch (error) {
+    failures.push(error);
+  } finally {
+    try {
+      await timed("shutdown", async () => {
+        try {
+          await supervisor?.close();
+        } finally {
+          if (env) await stopEnvironment(env);
+        }
+      });
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await timed("cleanup", async () => {
+        if (env) await registryLock(() => destroyEnvironment(env!));
+      });
+    } catch (error) {
+      failures.push(error);
+    }
+    const completion = {
+      success: failures.length === 0,
+      mode: ai ? "ai" : "non-ai",
+      id: env?.id ?? null,
+      elapsedMs: Date.now() - started,
+      cleanup: env?.status ?? "provision-not-completed",
+      resources: env ? Object.keys(env.resources).filter((name) => ai || name === "artifacts") : [],
+      failedStages: timings
+        .filter((stage) => stage.outcome === "failed")
+        .map((stage) => stage.stage),
+    };
+    await privateJson(join(artifacts, "timings.json"), timings);
+    await privateJson(join(artifacts, "completion.json"), completion);
+    await retainReports(artifacts);
+    console.log(JSON.stringify({ event: "e2e.complete", ...completion, evidence: artifacts }));
+  }
+  if (failures.length) throw new AggregateError(failures, "Agent verification failed");
+}
+
+async function retainReports(artifacts: string): Promise<void> {
+  const destination = process.env.GITMATRIX_CI_ARTIFACTS_DIR;
+  if (!destination) return;
+  if (!isAbsolute(destination)) throw new Error("GITMATRIX_CI_ARTIFACTS_DIR must be absolute.");
+  if (resolve(destination) === root || resolve(destination).startsWith(`${root}/`))
+    throw new Error("Retained CI artifacts must live outside the disposable checkout.");
+  // Explicit files only: never copy logs, tokens, ownership journals or browser storage.
+  for (const name of [
+    "completion.json",
+    "timings.json",
+    "e2e.json",
+    "mirror-e2e.json",
+    "ai-e2e.json",
+  ]) {
+    let report: unknown;
+    try {
+      report = JSON.parse(await readFile(join(artifacts, name), "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (name === "e2e.json") {
+      report = (report as { scenario: string; status: string; elapsedMs: number }[]).map(
+        ({ scenario, status, elapsedMs }) => ({ scenario, status, elapsedMs }),
+      );
+    }
+    await privateJson(join(destination, name), JSON.parse(redact(JSON.stringify(report))));
+  }
 }
 
 async function gates(): Promise<void> {
@@ -333,6 +420,7 @@ try {
     await destroyCurrent();
     await setup();
   } else if (operation === "test") await liveTest();
+  else if (operation === "test-ai") await liveTest(true);
   else if (operation === "check") await gates();
   else {
     const env = await loadEnvironment(root);

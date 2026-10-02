@@ -180,5 +180,7 @@ export function coordinator(env: Env, repoId: string): DurableObjectStub<Knowled
 
 /** Tell a repository's coordinator that something changed. */
 export function notifyKnowledge(env: Env, repoId: string, options: { force?: boolean } = {}) {
+  // Automatic non-AI agent environments omit provider bindings altogether.
+  if (!env.AI) return Promise.resolve();
   return coordinator(env, repoId).notify(repoId, options);
 }

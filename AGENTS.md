@@ -39,9 +39,12 @@ release. Add a tool name to select part of the graph. For example, run
   reconciles fixtures; `agent reset` destroys and recreates them. Inspect data
   with `agent inspect` or scoped tracker/issue commands.
 - Before completion, run **`vp run ready`**. It runs uncached static gates,
-  every workspace's tests/builds and fresh real CLI/API/browser/provider E2E.
-  Also exercise the specific changed consumer path. Missing providers, browser
-  dependencies or credentials are failures, not reasons to skip acceptance.
+  every workspace's tests/builds and fresh real CLI/API/browser/mirror E2E,
+  without AI inference or AI resource provisioning. For changes to knowledge,
+  wiki, embeddings or AI Search, follow
+  `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run
+  `vp run agent test-ai`. Also exercise the specific changed consumer path.
+  Missing required services, browser dependencies or credentials are failures.
 - Keep the E2E artifacts and inspect failures before changing assertions.
   The gate covers local Linux CI; Sandbox/deployment changes need their own
   deployment-boundary smoke run.
@@ -68,7 +71,8 @@ This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
   Gitmatrix is mirrored to GitHub (the `github` remote) one way. Don't push
   there: the mirror overwrites it. Use `gh` only to read GitHub.
 - **Every push runs the quality gates** in `.gitmatrix/ci.yml`: check, test,
-  build and live E2E. Run `vp run ready` first, then
+  build and non-AI live E2E. All four run independently and must pass.
+  Real AI checks are explicit, not automatic. Run `vp run ready` first, then
   `gm push && gm runs wait` to confirm the source pipeline.
 - **Testing Gitmatrix itself:** use the scoped workflow above. Keep all product
   clones outside this source checkout. `gm -C <clone>` selects a disposable

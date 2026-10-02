@@ -2,6 +2,8 @@
 # Source CI runs on the trusted Linux development host with cf authentication
 # and user systemd. Vite starts local runners on demand. The live gate provisions
 # dedicated resources; its finally cleanup and the hourly janitor both apply.
+# All four jobs are required, but exchange no artifacts. Keep them in one stage
+# so the stage-based scheduler never serializes build behind independent E2E.
 on:
   push: {}
 
@@ -31,7 +33,6 @@ jobs:
         run: vp run -r --no-cache test
 
   build:
-    needs: [check, test]
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -43,10 +44,9 @@ jobs:
         run: node tools/agent/publish-cli.ts
 
   e2e:
-    needs: [build]
     timeout_minutes: 30
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Live isolated CLI, API, browser, CI and provider journeys
+      - name: Live isolated CLI, API, browser, CI and mirror journeys (no AI)
         run: vp run agent test

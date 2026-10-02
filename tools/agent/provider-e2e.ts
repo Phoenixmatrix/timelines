@@ -133,7 +133,11 @@ async function targetServer(
   };
 }
 
-export async function runProviderE2E(ctx: HarnessContext, fixtures: SeedManifest): Promise<void> {
+export async function runProviderE2E(
+  ctx: HarnessContext,
+  fixtures: SeedManifest,
+  mode: "mirror" | "ai",
+): Promise<void> {
   await mkdir(ctx.artifacts, { recursive: true });
   const root = await mkdtemp(join(ctx.work, "providers-"));
   const work = join(root, "source");
@@ -142,12 +146,21 @@ export async function runProviderE2E(ctx: HarnessContext, fixtures: SeedManifest
   const authorization = `Basic ${Buffer.from(`agent:${token}`).toString("base64")}`;
   const evidence: Record<string, unknown> = {
     version: 1,
+    mode,
     startedAt: new Date().toISOString(),
     outcome: "running",
   };
   const events: unknown[] = [];
   evidence.events = events;
   let stage = "setup";
+  let stageStarted = Date.now();
+  const timings: { stage: string; elapsedMs: number; outcome: string }[] = [];
+  evidence.timings = timings;
+  const enter = (next: string) => {
+    timings.push({ stage, elapsedMs: Date.now() - stageStarted, outcome: "passed" });
+    stage = next;
+    stageStarted = Date.now();
+  };
   let target: MirrorTarget | undefined;
   const env: NodeJS.ProcessEnv = {
     ...ctx.env,
@@ -204,22 +217,26 @@ export async function runProviderE2E(ctx: HarnessContext, fixtures: SeedManifest
     return response.json();
   };
   const waitFor = async (label: string, timeout: number, check: () => Promise<boolean>) => {
+    const started = Date.now();
     const deadline = Date.now() + timeout;
     let attempts = 0;
     while (Date.now() < deadline) {
       attempts++;
       if (await check()) {
-        events.push({ label, attempts, outcome: "passed" });
+        events.push({ label, attempts, elapsedMs: Date.now() - started, outcome: "passed" });
         return;
       }
       await delay(5_000);
     }
     throw new Error(`${label}: deadline exceeded after ${attempts} observations`);
   };
+  let failure: unknown;
   try {
-    await git(["init", "--bare", "--initial-branch=main", join(root, "target.git")]);
-    await git(["--git-dir", join(root, "target.git"), "config", "http.receivepack", "true"]);
-    target = await targetServer(root, authorization, env);
+    if (mode === "mirror") {
+      await git(["init", "--bare", "--initial-branch=main", join(root, "target.git")]);
+      await git(["--git-dir", join(root, "target.git"), "config", "http.receivepack", "true"]);
+      target = await targetServer(root, authorization, env);
+    }
     const owner = "priya";
     const name = `provider-${randomBytes(5).toString("hex")}`;
     const base = `/repos/${encodeURIComponent(owner)}/${name}`;
@@ -249,149 +266,202 @@ export async function runProviderE2E(ctx: HarnessContext, fixtures: SeedManifest
     await git(["add", "README.md", "checksum.ts"]);
     await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Copper Finch fixture"]);
     await git(["remote", "add", "origin", `${ctx.origin}/${owner}/${name}.git`]);
-    stage = "mirror-configure";
-    await api(`${base}/mirror`, "PUT", {
-      url: target.url,
-      username: "agent",
-      token,
-      enabled: true,
-      prune: true,
-    });
-    stage = "mirror-initial-queue";
-    await git(["push", "origin", "main"], work, true);
-    const initial = await git(["rev-parse", "HEAD"]);
-    const refs = async () => {
-      const result = new Map<string, string>(
-        (
-          await git([
-            "--git-dir",
-            join(root, "target.git"),
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-          ])
-        )
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            const [ref, oid] = line.split(" ");
-            return [ref!, oid!];
-          }),
-      );
-      evidence.observedMirrorRefs = Object.fromEntries(result);
-      return result;
-    };
-    await waitFor(stage, 120_000, async () => (await refs()).get("refs/heads/main") === initial);
-    await git([
-      "--git-dir",
-      join(root, "target.git"),
-      "update-ref",
-      "refs/heads/stale-fixture",
-      initial,
-    ]);
-    stage = "mirror-update-tag-prune";
-    await git([
-      "-c",
-      "core.hooksPath=/dev/null",
-      "commit",
-      "--allow-empty",
-      "-m",
-      "Verify mirror update",
-    ]);
-    await git(["tag", "-a", "provider-v1", "-m", "Provider fixture tag"]);
-    const final = await git(["rev-parse", "HEAD"]);
-    const tag = await git(["rev-parse", "refs/tags/provider-v1"]);
-    await git(["push", "origin", "main", "refs/tags/provider-v1"], work, true);
-    await waitFor(stage, 120_000, async () => {
-      const actual = await refs();
-      return (
-        actual.size === 2 &&
-        actual.get("refs/heads/main") === final &&
-        actual.get("refs/tags/provider-v1") === tag
-      );
-    });
-    evidence.mirrorRefs = { main: final, tag };
-    // Observe the persisted queue result before attempting synchronous auth checks.
-    await waitFor("mirror-queue-settled", 30_000, async () => {
-      const { mirror } = await api(`${base}/mirror`);
-      return mirror.status === "ok" && mirror.lastSyncedCommit === final;
-    });
-    stage = "mirror-auth-rejection";
-    await api(`${base}/mirror`, "PUT", { token: randomBytes(24).toString("hex") });
-    await api(`${base}/mirror/sync`, "POST", undefined, 502);
-    const { mirror: failed } = await api(`${base}/mirror`);
-    assert.equal(failed.status, "failed");
-    assert.match(failed.lastError, /401|token/i);
-    assert(target.counts.rejected > 0, "Real HTTP target did not reject invalid credentials");
-    stage = "mirror-auth-recovery";
-    await api(`${base}/mirror`, "PUT", { token });
-    const { mirror: recovered } = await api(`${base}/mirror/sync`, "POST");
-    assert.equal(recovered.status, "ok");
-    assert.equal(recovered.lastSyncedCommit, final);
-    assert.equal(recovered.lastError, null);
-    evidence.mirrorRequests = target.counts;
-    stage = "knowledge-build";
-    await waitFor(stage, 12 * 60_000, async () => {
-      const status = await api(`${base}/knowledge/status`);
-      evidence.knowledge = status;
-      const build = status.recent.find(
-        (entry: { toCommit: string; status: string }) =>
-          entry.toCommit === final && entry.status === "succeeded",
-      );
-      if (status.state === "failed")
-        throw new Error("Knowledge build failed; see redacted provider evidence");
-      return status.state === "up-to-date" && status.indexedCommit === final && Boolean(build);
-    });
-    stage = "knowledge-graph";
-    const graph = await api(`${base}/knowledge/graph/export`);
-    const symbol = graph.nodes.find(
-      (node: { kind: string; name: string; path: string }) =>
-        node.kind === "symbol" &&
-        node.name === "copperFinchChecksum" &&
-        node.path === "checksum.ts",
-    );
-    const file = graph.nodes.find(
-      (node: { kind: string; path: string }) => node.kind === "file" && node.path === "checksum.ts",
-    );
-    assert(symbol && file, "Graph lacks the fixture file and exported checksum symbol");
-    assert(
-      graph.edges.some(
-        (edge: { src: string; dst: string }) => edge.src === file.id && edge.dst === symbol.id,
-      ),
-      "Graph lacks file-to-symbol membership",
-    );
-    evidence.graph = { file: file.id, symbol: symbol.id };
-    stage = "knowledge-search";
-    // At most six real embedding + hybrid retrieval calls while provider indexes settle.
-    let found = false;
-    for (let attempt = 1; attempt <= 6; attempt++) {
-      const result = await api(
-        `${base}/knowledge/search?q=${encodeURIComponent("Copper Finch copperFinchChecksum parcel checksum modulo 65521")}`,
-      );
-      evidence.search = result;
-      found =
-        result.entities.some(
-          (entity: { id: string }) => entity.id === symbol.id || entity.id === file.id,
-        ) &&
-        result.passages.some(
-          (passage: { kind: string; path: string; text: string }) =>
-            passage.kind === "code" &&
-            passage.path === "checksum.ts" &&
-            passage.text.includes("copperFinchChecksum") &&
-            passage.text.includes("65521"),
+    let final: string;
+    if (mode === "mirror") {
+      assert(target);
+      enter("mirror-configure");
+      await api(`${base}/mirror`, "PUT", {
+        url: target.url,
+        username: "agent",
+        token,
+        enabled: true,
+        prune: true,
+      });
+      enter("mirror-initial-queue");
+      await git(["push", "origin", "main"], work, true);
+      const initial = await git(["rev-parse", "HEAD"]);
+      const refs = async () => {
+        const result = new Map<string, string>(
+          (
+            await git([
+              "--git-dir",
+              join(root, "target.git"),
+              "for-each-ref",
+              "--format=%(refname) %(objectname)",
+            ])
+          )
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => {
+              const [ref, oid] = line.split(" ");
+              return [ref!, oid!];
+            }),
         );
-      if (found) break;
-      if (attempt < 6) await delay(20_000);
+        evidence.observedMirrorRefs = Object.fromEntries(result);
+        return result;
+      };
+      await waitFor(stage, 120_000, async () => (await refs()).get("refs/heads/main") === initial);
+      await git([
+        "--git-dir",
+        join(root, "target.git"),
+        "update-ref",
+        "refs/heads/stale-fixture",
+        initial,
+      ]);
+      enter("mirror-update-tag-prune");
+      await git([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Verify mirror update",
+      ]);
+      await git(["tag", "-a", "provider-v1", "-m", "Provider fixture tag"]);
+      final = await git(["rev-parse", "HEAD"]);
+      const tag = await git(["rev-parse", "refs/tags/provider-v1"]);
+      await git(["push", "origin", "main", "refs/tags/provider-v1"], work, true);
+      await waitFor(stage, 120_000, async () => {
+        const actual = await refs();
+        return (
+          actual.size === 2 &&
+          actual.get("refs/heads/main") === final &&
+          actual.get("refs/tags/provider-v1") === tag
+        );
+      });
+      evidence.mirrorRefs = { main: final, tag };
+      // Observe the persisted queue result before attempting synchronous auth checks.
+      await waitFor("mirror-queue-settled", 30_000, async () => {
+        const { mirror } = await api(`${base}/mirror`);
+        return mirror.status === "ok" && mirror.lastSyncedCommit === final;
+      });
+      enter("mirror-auth-rejection");
+      await api(`${base}/mirror`, "PUT", { token: randomBytes(24).toString("hex") });
+      await api(`${base}/mirror/sync`, "POST", undefined, 502);
+      const { mirror: failed } = await api(`${base}/mirror`);
+      assert.equal(failed.status, "failed");
+      assert.match(failed.lastError, /401|token/i);
+      assert(target.counts.rejected > 0, "Real HTTP target did not reject invalid credentials");
+      enter("mirror-auth-recovery");
+      await api(`${base}/mirror`, "PUT", { token });
+      const { mirror: recovered } = await api(`${base}/mirror/sync`, "POST");
+      assert.equal(recovered.status, "ok");
+      assert.equal(recovered.lastSyncedCommit, final);
+      assert.equal(recovered.lastError, null);
+      evidence.mirrorRequests = target.counts;
+      enter("non-ai-boundary");
+      const status = await api(`${base}/knowledge/status`);
+      assert.equal(status.current, null, "Automatic fixture push launched knowledge work");
+      assert.deepEqual(status.recent, [], "Automatic fixture push created knowledge builds");
+      assert.equal(status.indexedCommit, null);
+      await api(`${base}/knowledge/rebuild`, "POST", undefined, 503);
+      await api(`${base}/knowledge/search?q=checksum`, "GET", undefined, 503);
+      await delay(2_000); // Past the coordinator debounce: status reads must not start a build either.
+      const afterRead = await api(`${base}/knowledge/status`);
+      assert.equal(afterRead.current, null, "Status read launched knowledge work");
+      assert.deepEqual(afterRead.recent, [], "Status read created knowledge builds");
+      evidence.knowledge = {
+        current: status.current,
+        recent: status.recent,
+        indexedCommit: status.indexedCommit,
+      };
+    } else {
+      await git(["push", "origin", "main"], work, true);
+      final = await git(["rev-parse", "HEAD"]);
+      enter("knowledge-build");
+      await waitFor(stage, 12 * 60_000, async () => {
+        const status = await api(`${base}/knowledge/status`);
+        evidence.knowledge = status;
+        const build = status.recent.find(
+          (entry: { toCommit: string; status: string }) =>
+            entry.toCommit === final && entry.status === "succeeded",
+        );
+        if (status.state === "failed")
+          throw new Error("Knowledge build failed; see redacted provider evidence");
+        return status.state === "up-to-date" && status.indexedCommit === final && Boolean(build);
+      });
+      enter("knowledge-graph");
+      const graph = await api(`${base}/knowledge/graph/export`);
+      const symbol = graph.nodes.find(
+        (node: { kind: string; name: string; path: string }) =>
+          node.kind === "symbol" &&
+          node.name === "copperFinchChecksum" &&
+          node.path === "checksum.ts",
+      );
+      const file = graph.nodes.find(
+        (node: { kind: string; path: string }) =>
+          node.kind === "file" && node.path === "checksum.ts",
+      );
+      assert(symbol && file, "Graph lacks the fixture file and exported checksum symbol");
+      assert(
+        graph.edges.some(
+          (edge: { src: string; dst: string }) => edge.src === file.id && edge.dst === symbol.id,
+        ),
+        "Graph lacks file-to-symbol membership",
+      );
+      evidence.graph = { file: file.id, symbol: symbol.id };
+      enter("knowledge-wiki");
+      const catalog = await api(`${base}/knowledge/wiki`);
+      const overview = catalog.pages.find((page: { slug: string }) => page.slug === "overview");
+      assert(overview, "Generated wiki has no overview");
+      const page = await api(`${base}/knowledge/wiki/page?slug=overview`);
+      assert.match(page.body, /Copper Finch|copperFinchChecksum/i, "Wiki must explain the fixture");
+      assert.match(page.body, /65521|checksum/i, "Wiki must describe checksum behavior");
+      assert.equal(page.generatedIn, final, "Wiki must describe the indexed fixture commit");
+      assert(page.model, "Wiki must record its real generation model");
+      evidence.wiki = page;
+      enter("index-visibility");
+      // At most six real embedding + hybrid retrieval calls while provider indexes settle.
+      let found = false;
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        const result = await api(
+          `${base}/knowledge/search?q=${encodeURIComponent("Copper Finch copperFinchChecksum parcel checksum modulo 65521")}`,
+        );
+        evidence.search = result;
+        found =
+          result.entities.some(
+            (entity: { id: string }) => entity.id === symbol.id || entity.id === file.id,
+          ) &&
+          result.passages.some(
+            (passage: { kind: string; path: string; text: string }) =>
+              passage.kind === "code" &&
+              passage.path === "checksum.ts" &&
+              passage.text.includes("copperFinchChecksum") &&
+              passage.text.includes("65521"),
+          );
+        if (found) break;
+        if (attempt < 6) await delay(20_000);
+      }
+      assert(
+        found,
+        "Vectorize entity and AI Search source passage invariants were not both visible",
+      );
     }
-    assert(found, "Vectorize entity and AI Search source passage invariants were not both visible");
     evidence.outcome = "passed";
   } catch (error) {
     evidence.outcome = "failed";
     evidence.failedStage = stage;
     evidence.error = error instanceof Error ? error.message : "Unknown provider failure";
-    throw new Error(`Provider E2E failed at ${stage}; inspect provider-e2e.json`, { cause: error });
+    failure = new Error(`Provider E2E failed at ${stage}; inspect ${mode}-e2e.json`, {
+      cause: error,
+    });
   } finally {
+    timings.push({
+      stage,
+      elapsedMs: Date.now() - stageStarted,
+      outcome: String(evidence.outcome),
+    });
     if (target) evidence.mirrorRequests = target.counts;
-    await target?.close();
+    try {
+      await target?.close();
+    } catch (error) {
+      failure = failure
+        ? new AggregateError([failure, error], "Provider verification and mirror shutdown failed")
+        : error;
+      evidence.outcome = "failed";
+      evidence.failedStage ??= "mirror-shutdown";
+      evidence.cleanupError = error instanceof Error ? error.message : "Mirror shutdown failed";
+    }
     evidence.finishedAt = new Date().toISOString();
     let serialized = JSON.stringify(evidence, null, 2);
     for (const secret of [
@@ -402,6 +472,7 @@ export async function runProviderE2E(ctx: HarnessContext, fixtures: SeedManifest
     ]) {
       if (secret) serialized = serialized.replaceAll(secret, "[REDACTED]");
     }
-    await writeFile(join(ctx.artifacts, "provider-e2e.json"), serialized + "\n", { mode: 0o600 });
+    await writeFile(join(ctx.artifacts, `${mode}-e2e.json`), serialized + "\n", { mode: 0o600 });
   }
+  if (failure) throw failure;
 }

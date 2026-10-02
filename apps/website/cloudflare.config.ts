@@ -30,6 +30,7 @@ export default defineConfig(({ mode }) => {
   const dev = mode === "development";
   const local = developmentEnvironment(env);
   if (local.agent && !dev) throw new Error("Agent environments must never deploy");
+  const ai = !(dev && local.agent && env.GITMATRIX_AGENT_AI === "disabled");
   const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
   const sandboxed = runner === "sandbox";
   const publicUrl = dev ? local.publicUrl : env.GITMATRIX_PUBLIC_URL;
@@ -72,17 +73,21 @@ export default defineConfig(({ mode }) => {
           ...remote,
         }),
         // Knowledge graph and wiki.
-        AI: bindings.ai(remote),
-        VECTORS: bindings.vectorize({
-          name: dev
-            ? (env.GITMATRIX_VECTORIZE_INDEX ?? "gitmatrix-knowledge")
-            : "gitmatrix-knowledge",
-          ...remote,
-        }),
-        SEARCH: bindings.aiSearchNamespace({
-          namespace: dev ? (env.GITMATRIX_SEARCH_NAMESPACE ?? "gitmatrix") : "gitmatrix",
-          ...remote,
-        }),
+        ...(ai
+          ? {
+              AI: bindings.ai(remote),
+              VECTORS: bindings.vectorize({
+                name: dev
+                  ? (env.GITMATRIX_VECTORIZE_INDEX ?? "gitmatrix-knowledge")
+                  : "gitmatrix-knowledge",
+                ...remote,
+              }),
+              SEARCH: bindings.aiSearchNamespace({
+                namespace: dev ? (env.GITMATRIX_SEARCH_NAMESPACE ?? "gitmatrix") : "gitmatrix",
+                ...remote,
+              }),
+            }
+          : {}),
         KNOWLEDGE_COORDINATOR: bindings.durableObject({
           worker: "gitmatrix",
           exportName: "KnowledgeCoordinator",

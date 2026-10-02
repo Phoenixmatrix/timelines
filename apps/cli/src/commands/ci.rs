@@ -625,6 +625,92 @@ fn runner_dir(args: &RunnerArgs) -> PathBuf {
     })
 }
 
+fn private_runner_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+fn cache_scope(server: &str, repo: &str, job: &str) -> String {
+    use sha2::{Digest, Sha256};
+    // Normalize URL spelling without folding case-sensitive repository/path names.
+    let server = server.trim_end_matches('/');
+    let canonical = if let Some((scheme, rest)) = server.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let authority = authority.to_ascii_lowercase();
+        let default_port = match scheme.as_str() {
+            "http" => ":80",
+            "https" => ":443",
+            _ => "",
+        };
+        let authority = if default_port.is_empty() {
+            &authority
+        } else {
+            authority.strip_suffix(default_port).unwrap_or(&authority)
+        };
+        format!("{scheme}://{authority}/{path}")
+    } else {
+        server.to_string()
+    };
+    let mut digest = Sha256::new();
+    for part in [canonical.as_str(), repo, job] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+struct CompilerCache {
+    target: PathBuf,
+    // Held until all job steps and their background descendants have stopped.
+    _lease: std::fs::File,
+}
+
+impl CompilerCache {
+    fn acquire(base: &Path, scope: &str) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let base = base.join(scope);
+        private_runner_dir(&base)?;
+        for slot in 0u64.. {
+            let directory = base.join(format!("slot-{slot}"));
+            private_runner_dir(&directory)?;
+            let lease = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(directory.join("lease"))?;
+            match lease.try_lock() {
+                Ok(()) => {
+                    let target = directory.join("target");
+                    private_runner_dir(&target)?;
+                    return Ok(Self {
+                        target: std::fs::canonicalize(target)?,
+                        _lease: lease,
+                    });
+                }
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+        unreachable!("cache slot space exhausted")
+    }
+}
+
+struct JobDirectory(PathBuf);
+
+impl Drop for JobDirectory {
+    fn drop(&mut self) {
+        // Includes package credentials; also runs when reporting to the server fails.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn default_name() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -857,9 +943,19 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
     };
     let deadline =
         Instant::now() + Duration::from_secs(job["timeoutMinutes"].as_u64().unwrap_or(20) * 60);
-    let dir = root.join(&id);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+    let scope = cache_scope(&config.server(), s(job, "repo"), s(job, "name"));
+    let attempt = format!("{:032x}", rand::random::<u128>());
+    let dir = root.join("jobs").join(&attempt);
+    private_runner_dir(&dir)?;
+    let _cleanup = JobDirectory(dir.clone());
+    let artifacts = root.join("artifacts").join(&scope).join(&attempt);
+    private_runner_dir(&artifacts)?;
+    let artifacts = std::fs::canonicalize(artifacts)?;
+    let evidence = format!("[gitmatrix] Retained evidence: {}\n", artifacts.display());
+    reporter.log(SETUP_STEP, evidence.clone());
+    if echo {
+        eprint!("{evidence}");
+    }
     let checkout = dir.join("repo");
 
     let outcome = (|| -> Result<(&'static str, Option<i32>, Option<String>)> {
@@ -921,7 +1017,7 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
             std::fs::write(&file, content.as_str().unwrap_or(""))?;
         }
         let tools = tools.to_string_lossy();
-        let env: serde_json::Map<String, Value> = job["env"]
+        let mut env: serde_json::Map<String, Value> = job["env"]
             .as_object()
             .into_iter()
             .flatten()
@@ -933,6 +1029,34 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
                 (key.clone(), Value::String(value))
             })
             .collect();
+        // An explicit Cargo target keeps ordinary Cargo semantics, including
+        // cwd-relative paths. Its lifetime and concurrency are caller-owned.
+        let _cache = if env.contains_key("CARGO_TARGET_DIR")
+            || std::env::var_os("CARGO_TARGET_DIR").is_some()
+        {
+            reporter.log(
+                SETUP_STEP,
+                "[gitmatrix] Explicit CARGO_TARGET_DIR; managed compiler cache bypassed.\n".into(),
+            );
+            None
+        } else {
+            let cache = CompilerCache::acquire(&root.join("cache"), &scope)?;
+            reporter.log(
+                SETUP_STEP,
+                format!("[gitmatrix] Compiler cache: {}\n", cache.target.display()),
+            );
+            env.insert(
+                "CARGO_TARGET_DIR".into(),
+                Value::String(cache.target.to_string_lossy().into_owned()),
+            );
+            Some(cache)
+        };
+        // Producers may write only their sanitized, allowlisted reports. The
+        // runner never copies checkout files, credentials or raw logs here.
+        env.insert(
+            "GITMATRIX_CI_ARTIFACTS_DIR".into(),
+            Value::String(artifacts.to_string_lossy().into_owned()),
+        );
         let env = &env;
         for step in job["steps"].as_array().into_iter().flatten() {
             let position = step["position"].as_i64().unwrap_or(0);
@@ -980,8 +1104,9 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
             Some(format!("The runner failed: {}", e.message)),
         ),
     };
+    // Remove credentials even if the final server report fails.
+    std::fs::remove_dir_all(&dir)?;
     reporter.send(json!({ "done": { "status": status, "exitCode": code, "error": error } }))?;
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(status)
 }
 
@@ -996,7 +1121,8 @@ pub fn runner(ctx: &Ctx, args: &RunnerArgs) -> Result<Shown> {
         );
     }
     let root = runner_dir(args);
-    std::fs::create_dir_all(&root)?;
+    private_runner_dir(&root)?;
+    let root = std::fs::canonicalize(root)?;
     let name = args.name.clone().unwrap_or_else(default_name);
     let text = ctx.format == crate::output::Format::Text;
     let echo = text && args.verbose;
@@ -1073,6 +1199,80 @@ mod tests {
     use std::net::TcpListener;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn compiler_cache_scopes_separate_untrusted_identities() {
+        use super::cache_scope;
+        let scope = cache_scope("HTTPS://Example.COM:443/", "owner/repo", "e2e");
+        assert_eq!(
+            scope,
+            cache_scope("https://example.com", "owner/repo", "e2e")
+        );
+        for (server, repo, job) in [
+            ("https://other.example", "owner/repo", "e2e"),
+            ("https://example.com", "other/repo", "e2e"),
+            ("https://example.com", "owner/repo", "build"),
+            ("https://example.com/path", "owner/repo", "e2e"),
+        ] {
+            assert_ne!(scope, cache_scope(server, repo, job));
+        }
+        assert_ne!(
+            cache_scope("https://example.com", "a", "bc"),
+            cache_scope("https://example.com", "ab", "c")
+        );
+        let hostile = cache_scope("https://example.com", "../../outside", "/tmp/escape");
+        assert_eq!(hostile.len(), 64);
+        assert!(hostile.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compiler_cache_leases_isolate_active_jobs_and_reuse_released_outputs() {
+        use super::{CompilerCache, cache_scope};
+        let root = tempfile::tempdir().unwrap();
+        let scope = cache_scope("https://example.com", "owner/repo", "test");
+        let first = CompilerCache::acquire(root.path(), &scope).unwrap();
+        let first_path = first.target.clone();
+        std::fs::write(first_path.join("compiled-output"), "first").unwrap();
+        let concurrent = CompilerCache::acquire(root.path(), &scope).unwrap();
+        assert_ne!(first_path, concurrent.target);
+        std::fs::write(concurrent.target.join("compiled-output"), "second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first_path.join("compiled-output")).unwrap(),
+            "first"
+        );
+        drop(first);
+        let next = CompilerCache::acquire(root.path(), &scope).unwrap();
+        assert_eq!(next.target, first_path);
+        assert_eq!(
+            std::fs::read_to_string(next.target.join("compiled-output")).unwrap(),
+            "first"
+        );
+    }
+
+    #[test]
+    fn job_cleanup_removes_credentials_but_retains_private_evidence() {
+        use super::{JobDirectory, private_runner_dir};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("jobs/attempt");
+        let evidence = root.path().join("artifacts/scope/attempt");
+        private_runner_dir(&job.join("config")).unwrap();
+        private_runner_dir(&evidence).unwrap();
+        std::fs::write(job.join("config/token"), "credential").unwrap();
+        std::fs::write(evidence.join("report.json"), "{\"status\":\"failed\"}").unwrap();
+        {
+            let _cleanup = JobDirectory(job.clone());
+        }
+        assert!(!job.exists());
+        assert_eq!(
+            std::fs::read_to_string(evidence.join("report.json")).unwrap(),
+            "{\"status\":\"failed\"}"
+        );
+        assert_eq!(
+            std::fs::metadata(evidence).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     // Each runner owns a process-global step group. A subprocess also prevents
     // inherited GM credentials/server overrides from reaching the test server.
