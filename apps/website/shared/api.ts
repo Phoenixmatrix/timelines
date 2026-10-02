@@ -207,6 +207,18 @@ export interface GraphLink {
   node: Pick<GraphNode, "id" | "kind" | "name" | "path" | "summary">;
 }
 
+/**
+ * The whole graph, lean enough to draw at tens of thousands of nodes:
+ * summaries and data load per node from /graph/node.
+ */
+export interface KnowledgeMap {
+  commit: string | null;
+  /** [id, kind, name, path, size (lines for files, line for symbols), changed in the latest build] */
+  nodes: [string, GraphNode["kind"], string, string | null, number, 0 | 1][];
+  /** [source index, target index, kind] */
+  edges: [number, number, string][];
+}
+
 export interface GraphNodeDetail {
   node: GraphNode;
   outgoing: GraphLink[];

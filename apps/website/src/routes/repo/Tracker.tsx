@@ -1,8 +1,9 @@
 import { Suspense } from "react";
 import { Await, Link, useLoaderData, useRevalidator, type LoaderFunctionArgs } from "react-router";
-import { isIssueReady, type Issue, type Snapshot } from "../../../shared/tracker.ts";
+import type { Issue, Snapshot } from "../../../shared/tracker.ts";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { requireViewer } from "../../lib/session.ts";
+import { buildIndex, sortIssues } from "../tracker/query.ts";
 
 interface RepoWorkspace {
   trackerOwner: string;
@@ -10,8 +11,12 @@ interface RepoWorkspace {
   slug: string;
   name: string;
 }
+interface WorkspaceWork {
+  ready: Issue[];
+  counts: Record<"ready" | "in_progress" | "blocked" | "open", number>;
+}
 type ReadyPreview =
-  | { ok: true; workspaces: Record<string, { issues: Issue[]; total: number }> }
+  | { ok: true; workspaces: Record<string, WorkspaceWork> }
   | { ok: false; error: string };
 
 async function readyPreview(owner: string, request: Request): Promise<ReadyPreview> {
@@ -20,21 +25,29 @@ async function readyPreview(owner: string, request: Request): Promise<ReadyPrevi
     const snapshot = await api<Snapshot>(`/tracker/${encodeURIComponent(owner)}/snapshot`, {
       signal: request.signal,
     });
-    const ready = snapshot.issues
-      .filter((issue) => isIssueReady(issue, snapshot.issues, snapshot.links, snapshot.serverTime))
-      .sort(
-        (a, b) =>
-          a.priority - b.priority || a.key.localeCompare(b.key, undefined, { numeric: true }),
-      );
-    return {
-      ok: true,
-      workspaces: Object.fromEntries(
-        snapshot.workspaces.map((workspace) => {
-          const issues = ready.filter((issue) => issue.workspaceIds.includes(workspace.id));
-          return [workspace.id, { issues: issues.slice(0, 5), total: issues.length }];
-        }),
-      ),
-    };
+    const index = buildIndex(snapshot, snapshot.serverTime);
+    const work = new Map<string, WorkspaceWork>(
+      snapshot.workspaces.map((w) => [
+        w.id,
+        { ready: [], counts: { ready: 0, in_progress: 0, blocked: 0, open: 0 } },
+      ]),
+    );
+    for (const issue of snapshot.issues) {
+      const state = index.state.get(issue.id);
+      if (state === "done" || state === "canceled") continue;
+      for (const id of issue.workspaceIds) {
+        const w = work.get(id);
+        if (!w) continue;
+        w.counts.open++;
+        if (state === "ready") {
+          w.counts.ready++;
+          w.ready.push(issue);
+        } else if (state === "in_progress" || state === "claimed") w.counts.in_progress++;
+        else if (state === "blocked") w.counts.blocked++;
+      }
+    }
+    for (const w of work.values()) w.ready = sortIssues(w.ready, index, "priority").slice(0, 8);
+    return { ok: true, workspaces: Object.fromEntries(work) };
   } catch (error) {
     if (request.signal.aborted) throw error;
     return {
@@ -61,102 +74,132 @@ export async function repoTrackerLoader({ request, params }: LoaderFunctionArgs)
   );
   return { workspaces, previews };
 }
+const COUNTS = [
+  { key: "ready", label: "ready", query: "is:ready", dot: "bg-online" },
+  { key: "in_progress", label: "in progress", query: "status:in_progress", dot: "bg-ink" },
+  { key: "blocked", label: "blocked", query: "is:blocked", dot: "bg-danger-text" },
+  { key: "open", label: "open", query: "is:open", dot: "" },
+] as const;
+
 export function RepoTracker() {
   const { workspaces, previews } = useLoaderData<typeof repoTrackerLoader>();
   const revalidator = useRevalidator();
   return (
-    <section>
-      <h2 className="text-title">Ready issues</h2>
-      <p className="text-ink-muted max-w-[70ch]">
-        This repository is connected to work through these workspaces. Issues belong to teams, not
-        repositories. Only trackers you can access appear here.
-      </p>
+    <section className="flex flex-col gap-4">
+      <header>
+        <h2 className="m-0 text-title">Work for this repository</h2>
+        <p className="mt-1 mb-0 max-w-[48ch] text-body-sm text-ink-muted">
+          Issues belong to teams; workspaces connect them here. Only trackers you can access appear.
+        </p>
+      </header>
       {workspaces.length ? (
-        <ul className="list-none p-0 divide-y divide-line-soft">
-          {workspaces.map((workspace) => {
-            const base = `/tracker/${encodeURIComponent(workspace.trackerOwner)}`;
-            const query = new URLSearchParams({ workspace: workspace.workspaceId });
-            return (
-              <li className="py-4" key={`${workspace.trackerOwner}:${workspace.workspaceId}`}>
-                <h3 className="text-title m-0">
-                  <Link className="gm-link" to={`${base}?${query}`}>
+        workspaces.map((workspace) => {
+          const base = `/tracker/${encodeURIComponent(workspace.trackerOwner)}`;
+          const scoped = (q: string) =>
+            `?${new URLSearchParams({ q: `ws:${workspace.slug} ${q}`.trim() })}`;
+          return (
+            <section
+              key={`${workspace.trackerOwner}:${workspace.workspaceId}`}
+              aria-label={workspace.name}
+              className="rounded-pane bg-pane"
+            >
+              <header className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-line-soft px-3 py-2.5">
+                <h3 className="m-0 text-body font-semibold">
+                  <Link className="gm-link" to={`${base}${scoped("is:open")}`}>
                     {workspace.name}
                   </Link>
                 </h3>
-                <p className="mk-hint mt-1">
-                  {workspace.trackerOwner} / {workspace.slug}
-                </p>
-                <Suspense
-                  fallback={
-                    <p role="status" className="mk-hint">
-                      Loading ready issues…
-                    </p>
-                  }
-                >
-                  <Await resolve={previews[workspace.trackerOwner]!}>
-                    {(preview: ReadyPreview) => {
-                      if (!preview.ok) {
-                        return (
-                          <div>
-                            <p role="alert">{preview.error}</p>
-                            <button
-                              className="mk-btn mk-btn--sm"
-                              disabled={revalidator.state !== "idle"}
-                              onClick={() => void revalidator.revalidate()}
-                              aria-label={`Retry loading issues for ${workspace.name}`}
-                            >
-                              {revalidator.state === "idle" ? "Retry" : "Loading…"}
-                            </button>
-                          </div>
-                        );
-                      }
-                      const ready = preview.workspaces[workspace.workspaceId];
-                      if (!ready)
-                        return <p className="mk-hint">This workspace is no longer available.</p>;
+                <span className="font-mono text-micro text-ink-faint">
+                  {workspace.trackerOwner}/{workspace.slug}
+                </span>
+              </header>
+              <Suspense
+                fallback={
+                  <p role="status" className="m-0 px-3 py-3 text-body-sm text-ink-muted">
+                    Loading work…
+                  </p>
+                }
+              >
+                <Await resolve={previews[workspace.trackerOwner]!}>
+                  {(preview: ReadyPreview) => {
+                    if (!preview.ok)
                       return (
-                        <>
-                          {ready.total ? (
-                            <>
-                              <p className="mk-hint">
-                                Showing {ready.issues.length} of {ready.total} ready issues
-                              </p>
-                              <ul className="list-none p-0 space-y-2">
-                                {ready.issues.map((issue) => (
-                                  <li key={issue.id}>
-                                    <Link
-                                      className="gm-link inline-flex min-h-11 items-center gap-2"
-                                      to={`${base}/issues/${encodeURIComponent(issue.id)}?${query}`}
-                                    >
-                                      <span className="mk-mono shrink-0">{issue.key}</span>
-                                      <span>{issue.title}</span>
-                                    </Link>
-                                  </li>
-                                ))}
-                              </ul>
-                            </>
-                          ) : (
-                            <p className="mk-hint">
-                              No ready issues in this workspace. Open it to see planned, blocked, or
-                              completed work.
-                            </p>
-                          )}
-                          <Link
-                            className="mk-btn mk-btn--sm no-underline mt-3"
-                            to={`${base}?${query}`}
+                        <div className="flex flex-wrap items-center gap-3 px-3 py-3">
+                          <p role="alert" className="m-0 text-body-sm">
+                            {preview.error}
+                          </p>
+                          <button
+                            className="mk-btn mk-btn--sm"
+                            disabled={revalidator.state !== "idle"}
+                            onClick={() => void revalidator.revalidate()}
+                            aria-label={`Retry loading issues for ${workspace.name}`}
                           >
-                            Open {workspace.name} issues
-                          </Link>
-                        </>
+                            {revalidator.state === "idle" ? "Retry" : "Loading…"}
+                          </button>
+                        </div>
                       );
-                    }}
-                  </Await>
-                </Suspense>
-              </li>
-            );
-          })}
-        </ul>
+                    const work = preview.workspaces[workspace.workspaceId];
+                    if (!work)
+                      return (
+                        <p className="m-0 px-3 py-3 text-body-sm text-ink-muted">
+                          This workspace is no longer available.
+                        </p>
+                      );
+                    return (
+                      <>
+                        <ul className="m-0 flex list-none flex-wrap gap-x-5 gap-y-1 px-3 py-2 text-body-sm">
+                          {COUNTS.map((c) => (
+                            <li key={c.key}>
+                              <Link
+                                className="inline-flex min-h-8 items-center gap-1.5 text-ink-muted no-underline hover:text-ink"
+                                to={`${base}${scoped(c.query)}`}
+                              >
+                                {c.dot && (
+                                  <span className={`size-2 rounded-full ${c.dot}`} aria-hidden />
+                                )}
+                                <span className="font-mono text-mono text-ink tabular-nums">
+                                  {work.counts[c.key].toLocaleString()}
+                                </span>
+                                {c.label}
+                              </Link>
+                            </li>
+                          ))}
+                        </ul>
+                        {work.ready.length ? (
+                          <ul className="m-0 list-none border-t border-line-soft p-0">
+                            {work.ready.map((issue) => (
+                              <li key={issue.id}>
+                                <Link
+                                  className="grid h-8 grid-cols-[0.5rem_5.5rem_minmax(0,1fr)_2rem] items-center gap-x-3 border-b border-line-soft px-3 text-body-sm text-ink no-underline last:border-b-0 hover:bg-surface"
+                                  to={`${base}/issues/${encodeURIComponent(issue.id)}${scoped("is:ready")}`}
+                                >
+                                  <span className="size-2 rounded-full bg-online" aria-hidden />
+                                  <span className="truncate font-mono text-mono text-ink-faint">
+                                    {issue.key}
+                                  </span>
+                                  <span className="truncate">{issue.title}</span>
+                                  <span className="font-mono text-mono text-ink-faint">
+                                    P{issue.priority}
+                                  </span>
+                                </Link>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="m-0 border-t border-line-soft px-3 py-3 text-body-sm text-ink-muted">
+                            Nothing is ready to pick up here.
+                          </p>
+                        )}
+                      </>
+                    );
+                  }}
+                </Await>
+              </Suspense>
+            </section>
+          );
+        })
       ) : (
-        <div className="mk-empty my-6">
+        <div className="mk-empty max-w-[44rem]">
           No subscribed workspaces are visible. A repository and tracker administrator can connect a
           workspace from tracker management.
         </div>

@@ -1,4 +1,5 @@
 import { Popover } from "@base-ui/react/popover";
+import { useEffect, useRef } from "react";
 import { ArrowClockwiseIcon, CaretDownIcon, TerminalWindowIcon } from "@phosphor-icons/react";
 import {
   Link,
@@ -56,8 +57,14 @@ function Tab({
   const current = sections.some((section) =>
     section === "" ? pathname === to : pathname.startsWith(section),
   );
+  // On narrow screens the tab row scrolls; keep the current tab in it.
+  const ref = useRef<HTMLAnchorElement>(null);
+  useEffect(() => {
+    if (current) ref.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [current]);
   return (
     <PrefetchLink
+      ref={ref}
       to={to}
       aria-current={current ? "page" : undefined}
       className="-mb-px shrink-0 border-b-2 border-transparent px-1 pb-2.5 font-semibold text-ink-muted no-underline transition-colors hover:text-ink aria-[current=page]:border-signal-line aria-[current=page]:text-ink"
@@ -110,10 +117,11 @@ export function RepoLayout() {
   const repo = useLoaderData<typeof repoLoader>();
   const revalidator = useRevalidator();
   const base = repoPath(repo.owner.slug, repo.name);
-
+  // Every repository tab uses the same full-width column, so the header and
+  // tabs never shift; pages that read better narrow constrain their own content.
   return (
-    <Page wide>
-      <header className="flex flex-wrap items-start justify-between gap-4">
+    <Page full>
+      <header className="flex items-start justify-between gap-3 sm:gap-4">
         <div className="min-w-0">
           <h1 className="m-0 flex flex-wrap items-baseline gap-x-2 text-headline">
             <Link
@@ -167,7 +175,7 @@ export function RepoLayout() {
         <>
           <nav
             aria-label="Repository"
-            className="mt-6 flex gap-5 overflow-x-auto border-b border-line-soft [scrollbar-width:none]"
+            className="mt-4 flex gap-5 overflow-x-auto border-b border-line-soft [scrollbar-width:none] max-sm:[mask-image:linear-gradient(to_right,transparent,black_1.25rem,black_calc(100%-1.25rem),transparent)] max-sm:px-3 sm:mt-6"
           >
             <Tab to={base} sections={["", `${base}/tree/`, `${base}/blob/`]}>
               Code
@@ -201,7 +209,7 @@ export function RepoLayout() {
               </Tab>
             )}
           </nav>
-          <div className="mt-6">
+          <div className="mt-4 sm:mt-6">
             <Outlet />
           </div>
         </>

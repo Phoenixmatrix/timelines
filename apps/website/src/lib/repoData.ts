@@ -1,5 +1,12 @@
 import { data } from "react-router";
-import type { BlobResponse, CommitsResponse, RepoDetail, TreeResponse } from "../../shared/api.ts";
+import type {
+  BlobResponse,
+  CiRunList,
+  CommitsResponse,
+  GraphNodeDetail,
+  RepoDetail,
+  TreeResponse,
+} from "../../shared/api.ts";
 import { api, ApiError } from "./api.ts";
 
 // Every repository read goes through this cache, so a link that was hovered
@@ -39,6 +46,13 @@ export const repoData = {
     cached<CommitsResponse>(
       `${base(owner, name)}/commits?at=${encodeURIComponent(at)}&page=${page}`,
     ),
+  /** One knowledge-graph node with its neighbors ("repo", "file:<path>", ...). */
+  graphNode: (owner: string, name: string, id: string) =>
+    cached<GraphNodeDetail>(
+      `${base(owner, name)}/knowledge/graph/node?id=${encodeURIComponent(id)}`,
+    ),
+  /** The latest CI runs, newest first (for side rails; the CI page polls its own). */
+  ciRuns: (owner: string, name: string) => cached<CiRunList>(`${base(owner, name)}/ci`),
 };
 
 /** Drop everything cached for a repository (after changing it). */

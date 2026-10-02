@@ -4,23 +4,21 @@ slug: "src-routes-tracker-tracker-tsx"
 primary_target: "src/routes/tracker/Tracker.tsx"
 related_targets:
   [
+    "src/routes/tracker/Lens.tsx",
+    "src/routes/tracker/Log.tsx",
     "src/routes/tracker/IssueDetail.tsx",
     "src/routes/tracker/Admin.tsx",
-    "src/routes/tracker/Graph.tsx",
     "src/routes/repo/Tracker.tsx",
   ]
 ---
 
-# Issue tracker workbench
+# Issue tracker: throughput console
 
-- **Scope / mode:** `/tracker`, account tracker routes, issue detail, tracker administration, and repository Issues links. Operate mode within the existing Gitmatrix visual system.
-- **Audience and job:** humans organizing work alongside agents executing it; capture a small task quickly, expand it into a PRD when needed, and understand readiness and handoff context without leaving the selected issue.
-- **Primary task:** choose account/team/workspace, capture or select an issue, inspect or edit its plan and dependencies, then record progress or completion evidence.
-- **Content and proof:** real account-authorized issue data, explicit status/readiness/claim state, Markdown description and acceptance, separate hierarchy and blockers, durable discussion, and visible version-conflict recovery. Never populate production with demonstration records.
-- **Chosen direction:** Issue workbench, candidate 3, seed `c9cce501`, approved through the structured fallback after the decision-page launcher reported no local browser. Code-first explicitly selected; no generated visual comp.
-- **Composition:** the established global rail and account controls; fast capture and scoped filters above a 42/58 collection/detail split. List, board and focused blocker graph share one selected issue. Mobile navigates list to detail with a clear return path and focus clear of sticky navigation.
-- **Memorable interaction:** the selected task and its execution context remain together; blockers explain readiness rather than becoming a separate project dashboard.
-- **Constraints:** preserve MatrixKit identity and component conventions. Repository subscriptions only improve navigation. Every edit must survive a conflicting server version; lease-dependent completion must not imply an offline guarantee. Do not imply an autonomous execution loop exists.
-- **Required states:** empty tracker and filtered list, loading and failed requests, pending writes, preserved drafts and explicit version review, active/expired claims, blocked completion, archived teams/workspaces, and permission-limited management.
-- **Review and finish:** dual-assessor Claude CLI / Impeccable re-review returned SHIP, with no P0/P1 findings. Remaining P2/P3 findings were corrected and verified locally through real browser/API scenarios, including repeated lost acknowledgements, semantic set conflicts, closed-work recovery, mobile focus, clock skew and light contrast. `DESIGN.md` records the shipped system. No production illustration or generated raster was introduced.
-- **Unresolved decisions:** none in the approved surface direction.
+- **Scope / mode:** `/tracker/:owner` (list, board, graph), issue inspector, tracker administration, and the repository Issues tab. Operate mode inside MatrixKit Neo.
+- **Audience and job:** humans organizing work alongside agents executing it, at tens of thousands of issues: see what can move now, narrow fast, open an issue beside the stream, trace what blocks what.
+- **Chosen direction:** throughput-console, seed `49700b21`, code-led (decision page, 2026-10-01). Supersedes the earlier issue workbench (`c9cce501`).
+- **Composition:** one header row (owner, team + capture, sync, settings menu); a mono query bar with List/Board/Graph; saved-view chips and the count; a brushable opened/closed strip; then the 32px virtualized log filling the height, with a 17rem facet column that becomes the inspector when an issue opens. Phones fold facets, count and strip into "Narrow it down"; an open issue replaces the list.
+- **Graph view:** the relationship lens (user direction, 2026-10-01): one issue centred, blockers left and dependents right in columns per step (1–3), parent trail above, sub-issues and related below, connectors only between neighbouring columns (red while still blocking), click to re-centre with a view transition, a trail back, and a start screen (search, Bottlenecks, Furthest from ready). Explicitly not a whole-graph canvas, force layout or flame-graph mosaic.
+- **Scale:** one index per sync (`query.ts`), so readiness, blockers and facets are lookups; list and board lanes are virtualized; the lens renders only a neighbourhood. Verified against a labelled synthetic 20,005-issue tracker in a dev persona's account, never the real Gitmatrix tracker.
+- **Constraints:** amber only for selection, the primary action and live state; data hues only in the strip; claimed is a hollow ink ring. Every edit survives a conflicting server version; retries reuse the operation ID.
+- **Review and finish:** finish review (general-purpose agent following the degraded finish-reviewer role) returned fix; fixes applied and recaptured for the verdict pass. DESIGN.md records the event log, relationship lens and status-by-shape rule.

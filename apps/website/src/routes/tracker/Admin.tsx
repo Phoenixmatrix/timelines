@@ -1,10 +1,32 @@
 import { useState } from "react";
+import { CaretRightIcon } from "@phosphor-icons/react";
 import { Link } from "react-router";
 import type { RepoSummary } from "../../../shared/api.ts";
 import type { Snapshot, Team, Workspace } from "../../../shared/tracker.ts";
-import { FormError, SelectField, TextField } from "../../components/ui.tsx";
+import { FormError, link, SelectField, TextField } from "../../components/ui.tsx";
 import type { Mutate } from "./IssueDetail.tsx";
 import { Field, MultiCheck } from "./ui.tsx";
+
+const GRID = "grid grid-cols-1 gap-4 sm:grid-cols-2";
+const CONFLICT = "rounded-control bg-danger-wash p-3 text-body-sm";
+const SECTION = "rounded-pane bg-pane p-4 sm:p-5";
+const INTRO = "mt-1 mb-0 max-w-[48ch] text-body-sm text-ink-muted";
+
+const ITEM = "group border-t border-line-soft first-of-type:mt-3";
+const SUMMARY =
+  "flex min-h-11 cursor-pointer list-none items-center gap-2 font-semibold [&::-webkit-details-marker]:hidden";
+const BODY = "pt-1 pb-4 pl-6";
+
+/** The disclosure triangle, turned when the item is open. */
+function Caret() {
+  return (
+    <CaretRightIcon
+      weight="bold"
+      className="size-3.5 shrink-0 text-ink-faint transition-transform group-open:rotate-90"
+      aria-hidden
+    />
+  );
+}
 
 function TeamForm({
   team,
@@ -67,7 +89,7 @@ function TeamForm({
         } else setError(`Could not ${team ? "save" : "create"} team ${name}: ${result.error}`);
       }}
     >
-      <div className="tracker-form-grid">
+      <div className={GRID}>
         <TextField
           label="Team name"
           required
@@ -77,8 +99,8 @@ function TeamForm({
         />
         {team ? (
           <Field label="Issue prefix">
-            <p className="mk-mono m-0">{team.key}</p>
-            <p className="mk-hint">Permanent · cannot be changed.</p>
+            <p className="mk-mono m-0 flex min-h-11 items-center">{team.key}</p>
+            <p className="mk-hint m-0">Permanent · cannot be changed.</p>
           </Field>
         ) : (
           <TextField
@@ -113,7 +135,7 @@ function TeamForm({
         />
       </Field>
       {membership === "specific" && (
-        <>
+        <div className="space-y-2">
           <MultiCheck
             label="Specific team members"
             options={snapshot.members.map((member) => ({
@@ -127,20 +149,20 @@ function TeamForm({
               setError("");
             }}
           />
-          <p className="mk-hint">
+          <p className="mk-hint m-0 max-w-[48ch]">
             Select at least one member. Clearing this list never selects everyone.
           </p>
-        </>
+        </div>
       )}
       {team && version !== team.version && (
-        <div className="tracker-conflict" role="alert">
+        <div className={CONFLICT} role="alert">
           This team changed. Your fields are preserved. Current: {team.name}; members:{" "}
           {team.memberIds
             .map((id) => snapshot.members.find((member) => member.id === id)?.displayName ?? id)
             .join(", ") || "All"}
           ; description: {team.description}.
           <button
-            className="mk-btn mt-2"
+            className="mk-btn mk-btn--sm mt-2 flex"
             type="button"
             onClick={() => {
               setVersion(team.version);
@@ -192,7 +214,7 @@ function TeamForm({
       </div>
       <FormError message={error} />
       {saved && (
-        <p role="status" className="mk-hint">
+        <p role="status" className="mk-hint m-0">
           {saved}
         </p>
       )}
@@ -248,7 +270,7 @@ function WorkspaceForm({
           setError(`Could not ${workspace ? "save" : "create"} workspace ${name}: ${result.error}`);
       }}
     >
-      <div className="tracker-form-grid">
+      <div className={GRID}>
         <TextField
           label="Workspace name"
           required
@@ -258,8 +280,8 @@ function WorkspaceForm({
         />
         {workspace ? (
           <Field label="Workspace slug">
-            <p className="mk-mono m-0">{workspace.slug}</p>
-            <p className="mk-hint">Permanent · cannot be changed.</p>
+            <p className="mk-mono m-0 flex min-h-11 items-center">{workspace.slug}</p>
+            <p className="mk-hint m-0">Permanent · cannot be changed.</p>
           </Field>
         ) : (
           <TextField
@@ -279,12 +301,12 @@ function WorkspaceForm({
         onChange={(event) => setDescription(event.target.value)}
       />
       {workspace && version !== workspace.version && (
-        <div className="tracker-conflict" role="alert">
+        <div className={CONFLICT} role="alert">
           This workspace changed. Your fields are preserved. Current: {workspace.name}; description:{" "}
           {workspace.description}.
           <button
             type="button"
-            className="mk-btn mt-2"
+            className="mk-btn mk-btn--sm mt-2 flex"
             onClick={() => {
               setVersion(workspace.version);
               setSaved("");
@@ -335,7 +357,7 @@ function WorkspaceForm({
       </div>
       <FormError message={error} />
       {saved && (
-        <p role="status" className="mk-hint">
+        <p role="status" className="mk-hint m-0">
           {saved}
         </p>
       )}
@@ -369,101 +391,120 @@ export function TrackerAdmin({
     else subscriptionGroups.set(subscription.repoId, [subscription]);
   }
   return (
-    <div className="tracker-admin">
-      <section className="tracker-section">
-        <h2 className="text-title">Teams</h2>
-        <p className="text-ink-muted">
+    <div className="w-full max-w-4xl space-y-4">
+      <section className={SECTION}>
+        <h2 className="m-0 text-title">Teams</h2>
+        <p className={INTRO}>
           Each issue belongs to one team. Team prefixes are permanent; archive a team to stop new
           capture without losing its issues.
         </p>
         {snapshot.canAdmin && (
           <details
-            className="tracker-admin-item"
+            className={ITEM}
             open={createTeamOpen}
             onToggle={(event) => setCreateTeamOpen(event.currentTarget.open)}
           >
-            <summary>Create a team</summary>
-            <TeamForm snapshot={snapshot} mutate={mutate} busy={busy} />
+            <summary className={SUMMARY}>
+              <Caret />
+              Create a team
+            </summary>
+            <div className={BODY}>
+              <TeamForm snapshot={snapshot} mutate={mutate} busy={busy} />
+            </div>
           </details>
         )}
         {snapshot.teams.map((team) => (
-          <details className="tracker-admin-item" key={team.id}>
-            <summary>
-              {team.name}{" "}
-              <span className="text-ink-muted">
+          <details className={ITEM} key={team.id}>
+            <summary className={SUMMARY}>
+              <Caret />
+              <span className="min-w-0 break-words">{team.name}</span>{" "}
+              <span className="mk-mono text-body-sm font-normal text-ink-muted">
                 {team.key}
                 {team.archived ? " · Archived" : ""}
               </span>
             </summary>
-            {snapshot.canAdmin ? (
-              <TeamForm team={team} snapshot={snapshot} mutate={mutate} busy={busy} />
-            ) : (
-              <p>{team.description || "No description."}</p>
-            )}
+            <div className={BODY}>
+              {snapshot.canAdmin ? (
+                <TeamForm team={team} snapshot={snapshot} mutate={mutate} busy={busy} />
+              ) : (
+                <p className="m-0 text-body-sm">{team.description || "No description."}</p>
+              )}
+            </div>
           </details>
         ))}
       </section>
-      <section className="tracker-section">
-        <h2 className="text-title">Workspaces</h2>
-        <p className="text-ink-muted">
-          Group work across teams. An issue can belong to several workspaces.
-        </p>
+      <section className={SECTION}>
+        <h2 className="m-0 text-title">Workspaces</h2>
+        <p className={INTRO}>Group work across teams. An issue can belong to several workspaces.</p>
         {snapshot.canAdmin && (
           <details
-            className="tracker-admin-item"
+            className={ITEM}
             open={createWorkspaceOpen}
             onToggle={(event) => setCreateWorkspaceOpen(event.currentTarget.open)}
           >
-            <summary>Create a workspace</summary>
-            <WorkspaceForm mutate={mutate} busy={busy} />
+            <summary className={SUMMARY}>
+              <Caret />
+              Create a workspace
+            </summary>
+            <div className={BODY}>
+              <WorkspaceForm mutate={mutate} busy={busy} />
+            </div>
           </details>
         )}
         {snapshot.workspaces.map((workspace) => (
-          <details className="tracker-admin-item" key={workspace.id}>
-            <summary>
-              {workspace.name}
-              {workspace.archived ? " · Archived" : ""}
+          <details className={ITEM} key={workspace.id}>
+            <summary className={SUMMARY}>
+              <Caret />
+              <span className="min-w-0 break-words">
+                {workspace.name}
+                {workspace.archived ? " · Archived" : ""}
+              </span>
             </summary>
-            <Link
-              className="gm-link inline-block mb-4"
-              to={`/tracker/${snapshot.owner.slug}?workspace=${workspace.id}`}
-            >
-              View workspace issues
-            </Link>
-            {snapshot.canAdmin ? (
-              <WorkspaceForm workspace={workspace} mutate={mutate} busy={busy} />
-            ) : (
-              <p>{workspace.description || "No description."}</p>
-            )}
+            <div className={BODY}>
+              <Link
+                className={`${link} mb-4 inline-block text-body-sm`}
+                to={`/tracker/${snapshot.owner.slug}?workspace=${workspace.id}`}
+              >
+                View workspace issues
+              </Link>
+              {snapshot.canAdmin ? (
+                <WorkspaceForm workspace={workspace} mutate={mutate} busy={busy} />
+              ) : (
+                <p className="m-0 text-body-sm">{workspace.description || "No description."}</p>
+              )}
+            </div>
           </details>
         ))}
       </section>
-      <section className="tracker-section">
-        <h2 className="text-title">Repository subscriptions</h2>
-        <p className="text-ink-muted">
+      <section className={SECTION}>
+        <h2 className="m-0 text-title">Repository subscriptions</h2>
+        <p className={INTRO}>
           Repositories subscribe to workspaces for navigation only. Subscriptions never grant
           tracker access.
         </p>
         {snapshot.subscriptions.length ? (
-          <div className="space-y-4">
+          <div className="mt-4 space-y-4">
             {[...subscriptionGroups].map(([id, subscriptions]) => {
               const repository = subscriptions[0]!;
               const repoName = `${repository.owner}/${repository.name}`;
               return (
                 <section key={id} aria-label={`${repoName} subscriptions`}>
-                  <h3 className="font-semibold break-words">
-                    <Link className="gm-link" to={`/${repoName}/tracker`}>
+                  <h3 className="m-0 text-body-sm font-semibold break-words">
+                    <Link className={link} to={`/${repoName}/tracker`}>
                       {repoName}
                     </Link>
                   </h3>
-                  <ul className="tracker-relations">
+                  <ul className="m-0 mt-1 list-none p-0">
                     {subscriptions.map((subscription) => {
                       const workspaceName =
                         snapshot.workspaces.find(
                           (workspace) => workspace.id === subscription.workspaceId,
                         )?.name ?? "Unavailable workspace";
                       return (
-                        <li key={subscription.id}>
+                        <li
+                          key={subscription.id}
+                          className="flex items-center justify-between gap-2 border-b border-line-soft py-1.5 text-body-sm [overflow-wrap:anywhere] last:border-b-0"
+                        >
                           <div className="min-w-0">
                             <span>{workspaceName}</span>
                             <FormError message={removalErrors[subscription.id]} />
@@ -506,22 +547,22 @@ export function TrackerAdmin({
             })}
           </div>
         ) : (
-          <p className="text-ink-muted">No repository subscriptions yet.</p>
+          <p className="mt-4 mb-0 text-body-sm text-ink-muted">No repository subscriptions yet.</p>
         )}
         {removalSaved && (
-          <p role="status" className="mk-hint">
+          <p role="status" className="mk-hint mt-3 mb-0">
             {removalSaved}
           </p>
         )}
         {snapshot.canAdmin && !administeredRepos.length && (
-          <p className="mk-hint">
+          <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
             You don’t administer any repositories. Ask a repository administrator to grant you admin
             access before subscribing a repository to a workspace.
           </p>
         )}
         {snapshot.canAdmin && administeredRepos.length > 0 && (
           <form
-            className="space-y-4"
+            className="mt-4 space-y-4 border-t border-line-soft pt-4"
             onSubmit={async (event) => {
               event.preventDefault();
               setSubscriptionError("");
@@ -550,7 +591,7 @@ export function TrackerAdmin({
                 );
             }}
           >
-            <div className="tracker-form-grid">
+            <div className={GRID}>
               <Field label="Workspace">
                 <SelectField
                   ariaLabel="Subscription workspace"
@@ -594,14 +635,14 @@ export function TrackerAdmin({
             </button>
             <FormError message={subscriptionError} />
             {subscriptionSaved && (
-              <p role="status" className="mk-hint">
+              <p role="status" className="mk-hint m-0">
                 {subscriptionSaved}
               </p>
             )}
           </form>
         )}
         {!snapshot.canAdmin && (
-          <p className="mk-hint">
+          <p className="mk-hint mt-4 mb-0 max-w-[48ch]">
             A tracker administrator manages teams, workspaces and subscriptions.
           </p>
         )}

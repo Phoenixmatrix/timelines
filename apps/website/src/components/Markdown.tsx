@@ -7,7 +7,49 @@ import { Mermaid } from "./Mermaid.tsx";
 
 function textOf(node: unknown): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
-  return Array.isArray(node) ? node.map(textOf).join("") : "";
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (typeof node === "object" && node !== null && "props" in node) {
+    return textOf((node.props as { children?: unknown }).children);
+  }
+  return "";
+}
+
+/** A heading's anchor id: lowercase words joined by hyphens, punctuation dropped. */
+export function slug(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, "")
+    .trim()
+    .replace(/\s+/g, "-");
+}
+
+/** The h2 and h3 headings of a Markdown text, with the ids `Markdown` gives them. */
+export function outline(text: string): { depth: 2 | 3; text: string; id: string }[] {
+  const headings: { depth: 2 | 3; text: string; id: string }[] = [];
+  const seen = new Set<string>();
+  let fence: string | null = null;
+  for (const line of text.split("\n")) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker) {
+      if (fence === null) fence = marker[0]!;
+      else if (marker[0] === fence) fence = null;
+      continue;
+    }
+    if (fence !== null) continue;
+    const match = /^(#{2,3})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (!match) continue;
+    // Links and images read as their text; the rest of the markup slug() drops.
+    const label = match[2]!.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1");
+    const id = slug(label);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    headings.push({
+      depth: match[1]!.length as 2 | 3,
+      text: label.replace(/[`*_]/g, ""),
+      id,
+    });
+  }
+  return headings;
 }
 
 /**
@@ -31,6 +73,12 @@ export function Markdown({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          h2({ children }) {
+            return <h2 id={slug(textOf(children))}>{children}</h2>;
+          },
+          h3({ children }) {
+            return <h3 id={slug(textOf(children))}>{children}</h3>;
+          },
           a({ href = "", children }) {
             if (href.startsWith("wiki:")) {
               return (

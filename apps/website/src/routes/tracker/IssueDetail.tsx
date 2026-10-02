@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Comment, Issue, IssueFields, Mutation, Snapshot } from "../../../shared/tracker.ts";
-import { FormError, SelectField, TextField } from "../../components/ui.tsx";
+import { FormError, link as LINK, SelectField, TextField } from "../../components/ui.tsx";
 import {
   blockers,
   Field,
@@ -10,8 +10,10 @@ import {
   MarkdownText,
   MultiCheck,
   statuses,
+  typeLabel,
   types,
 } from "./ui.tsx";
+import type { IssueIndex } from "./query.ts";
 
 export type MutationOutcome = { ok: true } | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
@@ -29,6 +31,16 @@ const fieldNames: Record<keyof IssueFields, string> = {
   labels: "Labels",
 };
 const fieldKeys = Object.keys(fieldNames) as (keyof IssueFields)[];
+
+// The detail renders in a narrow inspector: hairline-split sections, small headings.
+const SECTION = "border-t border-line-soft py-4";
+const HEADING = "m-0 text-body-sm font-semibold";
+const SUBHEADING = "mt-4 mb-1 text-label text-ink-faint";
+const META = "m-0 grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-body-sm";
+const LIST = "m-0 list-none p-0";
+const ROW =
+  "flex items-center justify-between gap-2 border-b border-line-soft py-1.5 text-body-sm [overflow-wrap:anywhere] last:border-b-0 max-md:items-start";
+const TEXTAREA = "mk-input min-h-28 resize-y leading-[1.6]";
 const normalizedSet = (values: string[]) =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 const same = (a: IssueFields[keyof IssueFields], b: IssueFields[keyof IssueFields]) =>
@@ -52,12 +64,15 @@ function relativeTime(value: string, now: string) {
 export function IssueDetail({
   issue,
   snapshot,
+  index,
   mutate,
   busy,
   href,
 }: {
   issue: Issue;
   snapshot: Snapshot;
+  /** The workbench's index; keeps lookups constant-time at tens of thousands of issues. */
+  index: IssueIndex;
   mutate: Mutate;
   busy: boolean;
   href: (id?: string) => string;
@@ -135,7 +150,7 @@ export function IssueDetail({
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
   const activeClaim = !!issue.claim && issue.claim.expiresAt > snapshot.serverTime;
-  const unresolvedBlockers = blockers(issue, snapshot);
+  const unresolvedBlockers = blockers(issue, snapshot, index);
   const invalidStatus =
     draft.fields.status !== issue.status &&
     (activeClaim ||
@@ -159,7 +174,7 @@ export function IssueDetail({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (
-        !detailRef.current?.closest(".tracker-shell[data-shortcuts='true']") ||
+        !detailRef.current?.closest("[data-shortcuts='true']") ||
         busy ||
         event.defaultPrevented ||
         event.ctrlKey ||
@@ -196,41 +211,52 @@ export function IssueDetail({
     if (result.ok) setNotice(message);
     else setActionError(result.error);
   };
-  const descendants = new Set([issue.id]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const item of snapshot.issues) {
-      if (item.parentId && descendants.has(item.parentId) && !descendants.has(item.id)) {
-        descendants.add(item.id);
-        changed = true;
-      }
+  // Parent candidates exclude this issue's own subtree, so a move can't make a cycle.
+  const descendants = useMemo(() => {
+    const seen = new Set([issue.id]);
+    const queue = [issue.id];
+    while (queue.length)
+      for (const child of index.children.get(queue.pop()!) ?? [])
+        if (!seen.has(child)) {
+          seen.add(child);
+          queue.push(child);
+        }
+    return seen;
+  }, [issue.id, index]);
+  const parentCandidates = useMemo(
+    () => snapshot.issues.filter((item) => !descendants.has(item.id)),
+    [snapshot.issues, descendants],
+  );
+  // A new blocks link must not close a cycle: one walk over the blocks graph
+  // finds every issue that can't be linked in the chosen direction.
+  const relationCandidates = useMemo(() => {
+    if (relation !== "blocks" && relation !== "blocked_by")
+      return snapshot.issues.filter((item) => item.id !== issue.id);
+    const forward = relation === "blocked_by";
+    const next = new Map<string, string[]>();
+    const direct = new Set<string>();
+    for (const link of snapshot.links) {
+      if (link.kind !== "blocks") continue;
+      const [a, b] = forward ? [link.fromId, link.toId] : [link.toId, link.fromId];
+      next.set(a, [...(next.get(a) ?? []), b]);
+      if (relation === "blocks" ? link.fromId === issue.id : link.toId === issue.id)
+        direct.add(relation === "blocks" ? link.toId : link.fromId);
     }
-  }
-  const relationCandidates = snapshot.issues.filter((item) => {
-    if (item.id === issue.id) return false;
-    if (relation !== "blocks" && relation !== "blocked_by") return true;
-    const from = relation === "blocks" ? issue.id : item.id;
-    const to = relation === "blocks" ? item.id : issue.id;
-    const visited = new Set<string>();
-    const queue = [to];
-    while (queue.length) {
-      const current = queue.pop()!;
-      if (current === from) return false;
-      if (visited.has(current)) continue;
-      visited.add(current);
-      for (const link of snapshot.links)
-        if (link.kind === "blocks" && link.fromId === current) queue.push(link.toId);
-    }
-    return !snapshot.links.some(
-      (link) => link.kind === "blocks" && link.fromId === from && link.toId === to,
-    );
-  });
+    const reached = new Set([issue.id]);
+    const queue = [issue.id];
+    while (queue.length)
+      for (const id of next.get(queue.pop()!) ?? [])
+        if (!reached.has(id)) {
+          reached.add(id);
+          queue.push(id);
+        }
+    return snapshot.issues.filter((item) => !reached.has(item.id) && !direct.has(item.id));
+  }, [relation, snapshot.issues, snapshot.links, issue.id]);
   const latestCheckpoint = comments
     .filter((comment) => comment.kind === "checkpoint")
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  const parent = snapshot.issues.find((item) => item.id === issue.parentId);
-  const children = snapshot.issues.filter((item) => item.parentId === issue.id);
+  const parent = issue.parentId ? index.byId.get(issue.parentId) : undefined;
+  const children = (index.children.get(issue.id) ?? []).flatMap((id) => index.byId.get(id) ?? []);
   const inheritedWorkspaces = snapshot.workspaces.filter(
     (workspace) => !workspace.archived && issue.workspaceIds.includes(workspace.id),
   );
@@ -244,7 +270,7 @@ export function IssueDetail({
         (value ? "Unavailable member" : "Unassigned")
       );
     if (key === "parentId") {
-      const item = snapshot.issues.find((item) => item.id === value);
+      const item = typeof value === "string" ? index.byId.get(value) : undefined;
       return item ? `${item.key} · ${item.title}` : value ? "Unavailable issue" : "No parent";
     }
     if (key === "workspaceIds")
@@ -278,76 +304,97 @@ export function IssueDetail({
     <article
       ref={detailRef}
       tabIndex={-1}
-      className="tracker-detail"
+      className="min-w-0 outline-none max-sm:scroll-mt-[calc(var(--size-dock)+16px)]"
       aria-label={`${issue.key} issue detail`}
     >
-      <header className="tracker-detail-header">
-        <div className="flex flex-wrap items-center gap-2">
-          <Link className="gm-link tracker-back" to={href()}>
+      <header className="pr-10 pb-4">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <Link
+            className={`${LINK} inline-flex min-h-11 items-center text-body-sm lg:hidden`}
+            to={href()}
+          >
             Back to issues
           </Link>
           <span className="mk-mono text-ink-muted">{issue.key}</span>
-          <IssueState issue={issue} snapshot={snapshot} />
+          <IssueState issue={issue} snapshot={snapshot} index={index} />
         </div>
-        <h2 className="mt-3 mb-2 text-headline break-words">{issue.title}</h2>
-        <p className="m-0 text-body-sm text-ink-muted">
-          {team?.name} · {issue.type.toUpperCase()} · P{issue.priority} ·{" "}
-          {snapshot.members.find((member) => member.id === issue.assigneeId)?.displayName ??
-            "Unassigned"}
-        </p>
-        {(issue.workspaceIds.length > 0 || issue.labels.length > 0) && (
-          <dl className="tracker-detail-metadata">
-            {issue.workspaceIds.length > 0 && (
-              <div>
-                <dt>Workspaces</dt>
-                <dd>
-                  {issue.workspaceIds.map((id) => (
-                    <Link
-                      className="gm-link"
-                      key={id}
-                      to={`/tracker/${snapshot.owner.slug}?workspace=${encodeURIComponent(id)}`}
-                    >
-                      {snapshot.workspaces.find((workspace) => workspace.id === id)?.name ??
-                        "Unavailable workspace"}
-                    </Link>
-                  ))}
-                </dd>
-              </div>
-            )}
-            {issue.labels.length > 0 && (
-              <div>
-                <dt>Labels</dt>
-                <dd>
-                  {issue.labels.map((label) => (
-                    <span className="mk-chip mk-chip--tag" key={label}>
-                      {label}
-                    </span>
-                  ))}
-                </dd>
-              </div>
-            )}
-          </dl>
-        )}
+        <h2 className="mt-1 mb-0 text-title-lg break-words">{issue.title}</h2>
+        <dl className={`${META} mt-3`}>
+          <dt className="text-ink-faint">Team</dt>
+          <dd className="m-0 min-w-0">{team?.name}</dd>
+          <dt className="text-ink-faint">Type</dt>
+          <dd className="m-0 min-w-0">{typeLabel(issue.type)}</dd>
+          <dt className="text-ink-faint">Priority</dt>
+          <dd className="m-0 min-w-0">P{issue.priority}</dd>
+          <dt className="text-ink-faint">Assignee</dt>
+          <dd className="m-0 min-w-0">
+            {snapshot.members.find((member) => member.id === issue.assigneeId)?.displayName ??
+              "Unassigned"}
+          </dd>
+          {issue.workspaceIds.length > 0 && (
+            <>
+              <dt className="text-ink-faint">Workspaces</dt>
+              <dd className="m-0 flex min-w-0 flex-wrap gap-x-3 gap-y-1">
+                {issue.workspaceIds.map((id) => (
+                  <Link
+                    className={`${LINK} max-md:inline-flex max-md:min-h-11 max-md:items-center`}
+                    key={id}
+                    to={`/tracker/${snapshot.owner.slug}?workspace=${encodeURIComponent(id)}`}
+                  >
+                    {snapshot.workspaces.find((workspace) => workspace.id === id)?.name ??
+                      "Unavailable workspace"}
+                  </Link>
+                ))}
+              </dd>
+            </>
+          )}
+          {issue.labels.length > 0 && (
+            <>
+              <dt className="text-ink-faint">Labels</dt>
+              <dd className="m-0 flex min-w-0 flex-wrap items-center gap-1">
+                {issue.labels.map((label) => (
+                  <span className="mk-chip mk-chip--tag" key={label}>
+                    {label}
+                  </span>
+                ))}
+              </dd>
+            </>
+          )}
+        </dl>
         {activeClaim && (
-          <p className="tracker-handoff-note" data-kind="checkpoint" id="tracker-claim-reason">
-            {issue.claim!.agent} is working on this issue until{" "}
-            {new Date(issue.claim!.expiresAt).toLocaleString(undefined, {
-              dateStyle: "medium",
-              timeStyle: "short",
-            })}
-            . You can edit its details, but only that agent can change its status until the claim
-            ends.
+          <p
+            className="mt-3 mb-0 flex gap-2 rounded-control bg-sunken px-3 py-2 text-body-sm text-ink-muted"
+            data-kind="checkpoint"
+            id="tracker-claim-reason"
+          >
+            <span
+              className="mt-1.5 size-2 shrink-0 rounded-full ring-[1.5px] ring-inset ring-ink"
+              aria-hidden
+            />
+            <span>
+              {issue.claim!.agent} is working on this issue until{" "}
+              {new Date(issue.claim!.expiresAt).toLocaleString(undefined, {
+                dateStyle: "medium",
+                timeStyle: "short",
+              })}
+              . You can edit its details, but only that agent can change its status until the claim
+              ends.
+            </span>
           </p>
         )}
-        <div className="mt-4 flex flex-wrap gap-2">
+        <div className="mt-3 flex flex-wrap gap-2 max-sm:flex-nowrap max-sm:[&>.mk-btn]:min-w-0 max-sm:[&>.mk-btn]:flex-1 max-sm:[&>.mk-btn]:px-2">
           {!editing && (
-            <button className="mk-btn mk-btn--primary" aria-keyshortcuts="e" onClick={beginEdit}>
+            <button
+              className="mk-btn mk-btn--primary mk-btn--sm"
+              aria-keyshortcuts="e"
+              onClick={beginEdit}
+            >
               Edit issue
             </button>
           )}
           {!editing && (issue.status === "todo" || issue.status === "backlog") && (
             <button
-              className="mk-btn"
+              className="mk-btn mk-btn--sm"
               disabled={busy || activeClaim || unresolvedBlockers.length > 0}
               aria-describedby={statusReason}
               onClick={() => void updateStatus("in_progress", "Work started.")}
@@ -357,7 +404,7 @@ export function IssueDetail({
           )}
           {!editing && issue.status !== "done" && issue.status !== "canceled" && (
             <button
-              className="mk-btn"
+              className="mk-btn mk-btn--sm"
               disabled={busy || activeClaim || unresolvedBlockers.length > 0}
               aria-describedby={statusReason}
               onClick={() => void updateStatus("done", "Issue completed.")}
@@ -367,7 +414,7 @@ export function IssueDetail({
           )}
           {!editing && (issue.status === "done" || issue.status === "canceled") && (
             <button
-              className="mk-btn"
+              className="mk-btn mk-btn--sm"
               disabled={busy || activeClaim}
               aria-describedby={activeClaim ? "tracker-claim-reason" : undefined}
               onClick={() => void updateStatus("todo", "Issue reopened.")}
@@ -378,24 +425,32 @@ export function IssueDetail({
         </div>
         <FormError message={actionError} />
         {unresolvedBlockers.length > 0 && (
-          <p className="mk-hint mt-3" id="tracker-completion-blockers">
+          <p className="mk-hint mt-2 mb-0 max-w-[48ch]" id="tracker-completion-blockers">
             Complete or remove {unresolvedBlockers.map((blocker) => blocker.key).join(", ")} before
             starting or completing this issue.
           </p>
         )}
+        {notice && (
+          <p className="mk-hint mt-2 mb-0" role="status">
+            {notice}
+          </p>
+        )}
       </header>
       {latestCheckpoint && (
-        <section
-          className="tracker-handoff-note"
-          data-kind="checkpoint"
-          aria-label="Latest checkpoint"
-        >
-          <h3 className="text-title">Latest checkpoint</h3>
-          <p className="mk-hint">
+        <section className={SECTION} data-kind="checkpoint" aria-label="Latest checkpoint">
+          <h3 className={`${HEADING} flex items-center gap-2`}>
+            <span
+              className="size-2 shrink-0 rounded-full ring-[1.5px] ring-inset ring-ink"
+              aria-hidden
+            />
+            Latest checkpoint
+          </h3>
+          <p className="mk-hint mt-0.5 mb-2">
             {snapshot.members.find((member) => member.id === latestCheckpoint.actorId)
               ?.displayName ?? "Agent"}
             {" · "}
             <time
+              className="tabular-nums"
               dateTime={latestCheckpoint.createdAt}
               title={new Date(latestCheckpoint.createdAt).toLocaleString()}
             >
@@ -405,14 +460,9 @@ export function IssueDetail({
           <MarkdownText text={latestCheckpoint.body} />
         </section>
       )}
-      {notice && (
-        <p className="mk-hint" role="status">
-          {notice}
-        </p>
-      )}
       {editing ? (
         <form
-          className="tracker-section space-y-4"
+          className={`${SECTION} space-y-4`}
           onSubmit={async (event) => {
             event.preventDefault();
             setLocalError("");
@@ -457,16 +507,16 @@ export function IssueDetail({
             } else setLocalError(result.error);
           }}
         >
-          <h3 className="text-title m-0">Edit issue</h3>
+          <h3 className={HEADING}>Edit issue</h3>
           {draft.version !== issue.version && (
-            <section className="tracker-conflict" role="alert">
+            <section className="rounded-control bg-danger-wash p-3 text-body-sm" role="alert">
               <h4 className="m-0 font-semibold">This issue changed while you were editing</h4>
-              <p>
+              <p className="mt-1 mb-0 max-w-[48ch]">
                 Your draft is kept. Review differences below. Untouched fields will use the current
                 version when you rebase.
               </p>
               {!draft.base && (
-                <p className="mk-hint">
+                <p className="mk-hint mt-2 mb-0 max-w-[48ch]">
                   This older saved draft has no original comparison. Review every difference before
                   keeping your edits.
                 </p>
@@ -481,46 +531,56 @@ export function IssueDetail({
                 });
                 return (
                   keys.length > 0 && (
-                    <section key={group} className="tracker-conflict-group">
-                      <h4>{group}</h4>
-                      {keys.map((key) => (
-                        <section key={key} className="tracker-field-comparison">
-                          <h5>{fieldNames[key]}</h5>
-                          <div
-                            className="tracker-comparison-values"
-                            data-plain-text={key !== "description" && key !== "acceptance"}
-                          >
-                            <div>
-                              <strong>Theirs</strong>
-                              <div>{displayField(key, initial.fields)}</div>
+                    <section key={group}>
+                      <h4 className="mt-4 mb-1 text-body-sm font-semibold">{group}</h4>
+                      {keys.map((key) => {
+                        const plain = key !== "description" && key !== "acceptance";
+                        return (
+                          <section key={key} className="border-t border-line-soft py-3">
+                            <h5 className="m-0 mb-2 text-body-sm font-semibold">
+                              {fieldNames[key]}
+                            </h5>
+                            <div className="mb-3 grid grid-cols-1 gap-3 [overflow-wrap:anywhere] sm:grid-cols-2">
+                              <div className="min-w-0">
+                                <strong className="mb-1 block text-label text-ink-muted">
+                                  Theirs
+                                </strong>
+                                <div className={plain ? "whitespace-pre-wrap" : undefined}>
+                                  {displayField(key, initial.fields)}
+                                </div>
+                              </div>
+                              <div className="min-w-0">
+                                <strong className="mb-1 block text-label text-ink-muted">
+                                  {group === "Your edited fields"
+                                    ? "Your draft"
+                                    : "Original (you didn't edit)"}
+                                </strong>
+                                <div className={plain ? "whitespace-pre-wrap" : undefined}>
+                                  {displayField(key, draft.fields)}
+                                </div>
+                              </div>
                             </div>
-                            <div>
-                              <strong>
-                                {group === "Your edited fields"
-                                  ? "Your draft"
-                                  : "Original (you didn't edit)"}
-                              </strong>
-                              <div>{displayField(key, draft.fields)}</div>
-                            </div>
-                          </div>
-                          {group === "Your edited fields" ? (
-                            <button
-                              type="button"
-                              className="mk-btn mk-btn--sm"
-                              onClick={() => change(key, initial.fields[key])}
-                            >
-                              Use theirs for {fieldNames[key]}
-                            </button>
-                          ) : (
-                            <p className="mk-hint">Theirs will be preserved when you rebase.</p>
-                          )}
-                        </section>
-                      ))}
+                            {group === "Your edited fields" ? (
+                              <button
+                                type="button"
+                                className="mk-btn mk-btn--sm"
+                                onClick={() => change(key, initial.fields[key])}
+                              >
+                                Use theirs for {fieldNames[key]}
+                              </button>
+                            ) : (
+                              <p className="mk-hint m-0">
+                                Theirs will be preserved when you rebase.
+                              </p>
+                            )}
+                          </section>
+                        );
+                      })}
                     </section>
                   )
                 );
               })}
-              <button type="button" className="mk-btn mt-3" onClick={rebase}>
+              <button type="button" className="mk-btn mk-btn--sm mt-3" onClick={rebase}>
                 Keep my edits — rebase on version {issue.version}
               </button>
             </section>
@@ -532,7 +592,7 @@ export function IssueDetail({
             maxLength={500}
             onChange={(event) => change("title", event.target.value)}
           />
-          <div className="tracker-form-grid">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Field label="Status">
               <select
                 className="mk-input"
@@ -561,7 +621,7 @@ export function IssueDetail({
               <SelectField
                 ariaLabel="Issue type"
                 value={draft.fields.type}
-                options={types.map((value) => ({ value, label: value.toUpperCase() }))}
+                options={types.map((value) => ({ value, label: typeLabel(value) }))}
                 onChange={(value) => change("type", value as Issue["type"])}
               />
             </Field>
@@ -590,7 +650,7 @@ export function IssueDetail({
             <IssuePicker
               label="Parent issue"
               value={draft.fields.parentId ?? ""}
-              issues={snapshot.issues.filter((item) => !descendants.has(item.id))}
+              issues={parentCandidates}
               allowNone
               onChange={(value) => change("parentId", value || null)}
             />
@@ -625,7 +685,7 @@ export function IssueDetail({
             ) : (
               <textarea
                 aria-label="Description / PRD"
-                className="mk-input tracker-markdown"
+                className={TEXTAREA}
                 rows={12}
                 value={draft.fields.description}
                 onChange={(event) => change("description", event.target.value)}
@@ -641,7 +701,7 @@ export function IssueDetail({
             ) : (
               <textarea
                 aria-label="Acceptance criteria"
-                className="mk-input tracker-markdown"
+                className={TEXTAREA}
                 rows={6}
                 value={draft.fields.acceptance}
                 onChange={(event) => change("acceptance", event.target.value)}
@@ -652,14 +712,14 @@ export function IssueDetail({
           <FormError message={localError} />
           <div className="flex flex-wrap gap-2">
             <button
-              className="mk-btn mk-btn--primary"
+              className="mk-btn mk-btn--primary mk-btn--sm"
               disabled={busy || draft.version !== issue.version || invalidStatus}
               aria-describedby={invalidStatus ? statusReason : undefined}
             >
               {busy ? "Saving…" : "Save issue"}
             </button>
             <button
-              className="mk-btn mk-btn--ghost"
+              className="mk-btn mk-btn--ghost mk-btn--sm"
               type="button"
               disabled={busy}
               onClick={() => {
@@ -677,56 +737,54 @@ export function IssueDetail({
           </div>
         </form>
       ) : (
-        <>
-          <section className="tracker-section">
-            <h3 className="text-title">Description / PRD</h3>
-            {issue.description ? (
-              <MarkdownText text={issue.description} />
-            ) : (
-              <p className="text-ink-muted">
-                No description yet. Edit this issue to add context or a full PRD.
-              </p>
-            )}
-            <h3 className="text-title tracker-acceptance-heading">Acceptance criteria</h3>
-            {issue.acceptance ? (
-              <MarkdownText text={issue.acceptance} />
-            ) : (
-              <p className="text-ink-muted">No acceptance criteria yet.</p>
-            )}
-          </section>
-        </>
+        <section className={SECTION}>
+          <h3 className={`${HEADING} mb-2`}>Description / PRD</h3>
+          {issue.description ? (
+            <MarkdownText text={issue.description} />
+          ) : (
+            <p className="m-0 max-w-[48ch] text-body-sm text-ink-muted">
+              No description yet. Edit this issue to add context or a full PRD.
+            </p>
+          )}
+          <h3 className={`${HEADING} mt-5 mb-2`}>Acceptance criteria</h3>
+          {issue.acceptance ? (
+            <MarkdownText text={issue.acceptance} />
+          ) : (
+            <p className="m-0 text-body-sm text-ink-muted">No acceptance criteria yet.</p>
+          )}
+        </section>
       )}
-      <section className="tracker-section">
-        <h3 className="text-title">Dependencies & hierarchy</h3>
-        <p className="mk-hint">
+      <section className={SECTION}>
+        <h3 className={HEADING}>Dependencies & hierarchy</h3>
+        <p className="mk-hint mt-0.5 mb-0 max-w-[48ch]">
           A blocker must be done to unblock work. Parents organize subtasks; they do not block them.
         </p>
         {parent && (
           <section>
-            <h4 className="tracker-detail-subheading">Parent</h4>
-            <Link className="gm-link" to={href(parent.id)}>
-              {parent.key} · {parent.title}
+            <h4 className={SUBHEADING}>Parent</h4>
+            <Link className={`${LINK} text-body-sm [overflow-wrap:anywhere]`} to={href(parent.id)}>
+              <span className="mk-mono">{parent.key}</span> · {parent.title}
             </Link>
           </section>
         )}
         <section>
-          <h4 className="tracker-detail-subheading">Subtasks</h4>
+          <h4 className={SUBHEADING}>Subtasks</h4>
           {children.length ? (
-            <ul className="tracker-relations">
+            <ul className={LIST}>
               {children.map((child) => (
-                <li key={child.id}>
-                  <Link className="gm-link" to={href(child.id)}>
-                    {child.key} · {child.title}
+                <li key={child.id} className={ROW}>
+                  <Link className={`${LINK} min-w-0`} to={href(child.id)}>
+                    <span className="mk-mono">{child.key}</span> · {child.title}
                   </Link>
-                  <IssueState issue={child} snapshot={snapshot} />
+                  <IssueState issue={child} snapshot={snapshot} index={index} />
                 </li>
               ))}
             </ul>
           ) : (
-            <p className="mk-hint">No subtasks yet. Break this issue into smaller outcomes.</p>
+            <p className="mk-hint m-0">No subtasks yet. Break this issue into smaller outcomes.</p>
           )}
           <form
-            className="tracker-subtask-form"
+            className="mt-3 flex flex-wrap items-end gap-2 [&>p]:m-0 [&>p]:basis-full"
             onSubmit={async (event) => {
               event.preventDefault();
               setNotice("");
@@ -756,11 +814,12 @@ export function IssueDetail({
             }}
           >
             <TextField
+              className="min-w-0 flex-[1_1_180px]"
               label="New subtask"
               value={subtaskTitle}
               maxLength={500}
               required
-              placeholder="Describe the next outcome…"
+              placeholder="Next outcome…"
               onChange={(event) => {
                 setSubtaskTitle(event.target.value);
                 setSubtaskError("");
@@ -768,11 +827,11 @@ export function IssueDetail({
                 setNotice("");
               }}
             />
-            <button className="mk-btn" disabled={busy || !subtaskTitle.trim()}>
+            <button className="mk-btn h-(--size-field)" disabled={busy || !subtaskTitle.trim()}>
               Add subtask
             </button>
             {issue.workspaceIds.length > 0 && (
-              <p className="mk-hint">
+              <p className="mk-hint max-w-[48ch]">
                 {inheritedWorkspaces.length > 0
                   ? `Subtasks inherit active workspaces: ${inheritedWorkspaces.map((workspace) => workspace.name).join(", ")}.`
                   : "This issue's workspaces are archived. New subtasks will have no workspace."}
@@ -800,18 +859,18 @@ export function IssueDetail({
           return (
             grouped.length > 0 && (
               <section key={group}>
-                <h4 className="tracker-detail-subheading">{group}</h4>
-                <ul className="tracker-relations">
+                <h4 className={SUBHEADING}>{group}</h4>
+                <ul className={LIST}>
                   {grouped.map((link) => {
-                    const other = snapshot.issues.find(
-                      (item) => item.id === (link.fromId === issue.id ? link.toId : link.fromId),
+                    const other = index.byId.get(
+                      link.fromId === issue.id ? link.toId : link.fromId,
                     );
                     return (
-                      <li key={link.id}>
-                        <Link className="gm-link" to={href(other?.id)}>
-                          {other?.key} · {other?.title}
+                      <li key={link.id} className={ROW}>
+                        <Link className={`${LINK} min-w-0`} to={href(other?.id)}>
+                          <span className="mk-mono">{other?.key}</span> · {other?.title}
                         </Link>
-                        <div>
+                        <div className="flex shrink-0 flex-col items-end">
                           <button
                             className="mk-btn mk-btn--ghost mk-btn--sm"
                             disabled={busy}
@@ -836,7 +895,7 @@ export function IssueDetail({
           );
         })}
         <form
-          className="tracker-relation-form"
+          className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)] [&>button]:justify-self-start [&>:is(p,button)]:col-span-full"
           onSubmit={async (event) => {
             event.preventDefault();
             setNotice("");
@@ -893,31 +952,44 @@ export function IssueDetail({
           />
           <FormError message={relationError} />
           <button
-            className="mk-btn"
-            disabled={busy || !relationCandidates.some((item) => item.id === target)}
+            className="mk-btn mk-btn--sm"
+            disabled={busy || !target || !relationCandidates.some((item) => item.id === target)}
           >
             Add relation
           </button>
         </form>
       </section>
-      <section className="tracker-section">
-        <h3 className="text-title">Activity & handoff</h3>
-        <p className="mk-hint">
+      <section className={SECTION}>
+        <h3 className={HEADING}>Activity & handoff</h3>
+        <p className="mk-hint mt-0.5 mb-0 max-w-[48ch]">
           Leave decisions, a checkpoint for the next agent, or evidence of completion.
         </p>
-        {comments.length === 0 && <p className="text-ink-muted">No activity notes yet.</p>}
-        <ol className="tracker-activity">
+        {comments.length === 0 && (
+          <p className="mt-3 mb-0 text-body-sm text-ink-muted">No activity notes yet.</p>
+        )}
+        <ol className="m-0 mb-3 list-none p-0">
           {comments.map((comment) => (
-            <li key={comment.id} className="tracker-handoff-entry" data-kind={comment.kind}>
-              <header>
-                <strong>
+            <li
+              key={comment.id}
+              className="border-b border-line-soft py-3"
+              data-kind={comment.kind}
+            >
+              <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
+                <strong className="font-semibold text-ink">
                   {snapshot.members.find((member) => member.id === comment.actorId)?.displayName ??
                     comment.actorId}
                 </strong>
-                <span className="tracker-activity-kind" data-kind={comment.kind}>
+                <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>
+                  {comment.kind !== "comment" && (
+                    <span
+                      className={`size-1.5 rounded-full ${comment.kind === "checkpoint" ? "ring-[1.5px] ring-inset ring-ink" : "bg-online"}`}
+                      aria-hidden
+                    />
+                  )}
                   {comment.kind[0]!.toUpperCase() + comment.kind.slice(1)}
                 </span>
                 <time
+                  className="text-ink-faint tabular-nums"
                   dateTime={comment.createdAt}
                   title={new Date(comment.createdAt).toLocaleString()}
                 >
@@ -962,7 +1034,7 @@ export function IssueDetail({
           </Field>
           <textarea
             aria-label="Activity note"
-            className="mk-input tracker-markdown"
+            className={TEXTAREA}
             rows={4}
             value={body}
             onChange={(event) => {
@@ -974,7 +1046,7 @@ export function IssueDetail({
             placeholder="Add a note. Markdown supported."
           />
           <FormError message={commentError} />
-          <button className="mk-btn" disabled={busy || !body.trim()}>
+          <button className="mk-btn mk-btn--sm" disabled={busy || !body.trim()}>
             Post {kind}
           </button>
         </form>

@@ -1,3 +1,37 @@
+/*
+ * DIRECTION (impeccable, locked: throughput-console, seed 49700b21)
+ *
+ * THESIS       Work as a stream. One query over every issue, opened/closed
+ *              activity over time, facet counts, and a one-line log that
+ *              reads at 30,000 rows like an event log. Board and Graph are
+ *              lenses on the same query. Refuses the card-per-issue column
+ *              that wasted the screen.
+ * OWN-WORLD    MatrixKit Neo: warm charcoal panes, one amber signal for the
+ *              selection and the primary action, Geist Mono for keys and
+ *              counts, data hues (teal opened, berry closed) only in the strip.
+ * STORY        See what can move now (Ready), narrow by clicking counts,
+ *              open an issue beside the log to read and hand off, switch to
+ *              the graph to trace what blocks what.
+ * FIRST VIEW   One header row (owner, capture, sync), the query bar with view
+ *              switch, saved views, the activity strip, then the log filling
+ *              the height; facets in a 17rem column that becomes the
+ *              inspector when an issue opens.
+ * FORM         throughput-console, rank 4 of 7, seed key 49700b21. Signature:
+ *              brushing the strip scopes the query; the canvas graph lights a
+ *              selection's whole blocking chain.
+ * FINISH       unreviewed and undocumented is unfinished; this build ends with
+ *              the finish review, the verdict, DESIGN.md, and every shipping
+ *              raster carrying its provenance
+ */
+
+import { Menu } from "@base-ui/react/menu";
+import {
+  ArrowClockwiseIcon,
+  DotsThreeIcon,
+  FunnelSimpleIcon,
+  MagnifyingGlassIcon,
+  XIcon,
+} from "@phosphor-icons/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
@@ -10,22 +44,31 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import type { RepoSummary } from "../../../shared/api.ts";
-import {
-  isIssueReady,
-  type Issue,
-  type Mutation,
-  type MutationRequest,
-  type Snapshot,
-  type TrackerOwner,
-} from "../../../shared/tracker.ts";
-import { FormError, SelectField } from "../../components/ui.tsx";
+import type { Mutation, MutationRequest, Snapshot, TrackerOwner } from "../../../shared/tracker.ts";
+import { ActivityStrip } from "../../components/ActivityStrip.tsx";
+import { FormError, popMotion, SelectField, Tip } from "../../components/ui.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
-import { requireViewer } from "../../lib/session.ts";
+import { requireViewer, useViewer } from "../../lib/session.ts";
 import { TrackerAdmin } from "./Admin.tsx";
-import { DependencyGraph } from "./Graph.tsx";
+import { RelationLens } from "./Lens.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
-import { IssueState, statuses } from "./ui.tsx";
-import "./tracker.css";
+import { IssueLog } from "./Log.tsx";
+import { FacetColumn, IssueBoard } from "./Panels.tsx";
+import {
+  activityOf,
+  buildIndex,
+  compile,
+  DEFAULT_QUERY,
+  facetsOf,
+  filterToken,
+  parseWhen,
+  sortIssues,
+  toggleToken,
+  tokenize,
+  VIEWS,
+  withoutKeys,
+  type SortKey,
+} from "./query.ts";
 
 interface TrackerData {
   snapshot: Snapshot;
@@ -40,9 +83,9 @@ export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
 }
 export function TrackerIndex() {
   return (
-    <div className="p-8">
-      <h1 className="text-headline">Issue tracker</h1>
-      <p className="mk-empty">
+    <div className="mx-auto max-w-4xl px-4 py-7 sm:px-8">
+      <h1 className="m-0 text-headline">Issue tracker</h1>
+      <p className="mk-empty mt-4">
         No trackers are available to this account. Ask an organization administrator for membership.
       </p>
     </div>
@@ -67,7 +110,7 @@ function Freshness({ receivedAt }: { receivedAt: number }) {
   const seconds = Math.max(0, Math.floor((now - receivedAt) / 1000));
   return (
     <time
-      className="tracker-freshness"
+      className="text-micro whitespace-nowrap text-ink-faint"
       dateTime={new Date(receivedAt).toISOString()}
       title={`Last synced ${new Date(receivedAt).toLocaleString()}`}
     >
@@ -81,10 +124,44 @@ function Freshness({ receivedAt }: { receivedAt: number }) {
   );
 }
 
+/** Filters from older links (?team=…&workspace=…&status=…) become query tokens. */
+function legacyQuery(params: URLSearchParams, snapshot: Snapshot): string | null {
+  const keys = ["team", "workspace", "status", "ready", "closed"];
+  if (!keys.some((k) => params.has(k))) return null;
+  const tokens: string[] = tokenize(params.get("q") ?? DEFAULT_QUERY);
+  const team = snapshot.teams.find((t) => t.id === params.get("team"));
+  if (team) tokens.push(filterToken("team", team.key.toLowerCase()));
+  const ws = snapshot.workspaces.find((w) => w.id === params.get("workspace"));
+  if (ws) tokens.push(filterToken("ws", ws.slug));
+  if (params.get("status")) tokens.push(filterToken("status", params.get("status")!));
+  if (params.get("ready") === "true") tokens.push("is:ready");
+  if (params.get("closed") === "true") return tokens.filter((t) => t !== "is:open").join(" ");
+  return tokens.join(" ");
+}
+
+function scopeLabel(query: string, now: number): string | null {
+  const tokens = tokenize(query);
+  const since = tokens.find((t) => t.toLowerCase().startsWith("since:"))?.slice(6);
+  const until = tokens.find((t) => t.toLowerCase().startsWith("until:"))?.slice(6);
+  if (!since && !until) return null;
+  const fmt = (v: string | undefined) => {
+    if (!v) return "now";
+    const t = parseWhen(v, now);
+    return t === null
+      ? v
+      : new Date(t).toLocaleDateString("en", { month: "short", day: "numeric" });
+  };
+  return `${fmt(since)} → ${fmt(until)}`;
+}
+
 export function Tracker() {
   const data = useLoaderData<typeof trackerLoader>();
   return <Workbench key={data.snapshot.owner.id} data={data} />;
 }
+
+const VIEW_LABEL = { list: "List", board: "Board", graph: "Graph" } as const;
+type View = keyof typeof VIEW_LABEL;
+
 function Workbench({ data }: { data: TrackerData }) {
   const [snapshot, setSnapshot] = useState(data.snapshot);
   const latestSnapshot = useRef(data.snapshot);
@@ -106,58 +183,53 @@ function Workbench({ data }: { data: TrackerData }) {
     }
   });
   const [params, setParams] = useSearchParams();
-  const searchQuery = params.get("q") ?? "";
-  const [searchText, setSearchText] = useState(searchQuery);
-  useEffect(() => setSearchText(searchQuery), [searchQuery]);
   const route = useParams();
   const navigate = useNavigate();
   const navigation = useNavigation();
+  const viewer = useViewer();
   const [title, setTitle] = useState("");
   const defaultTeam = snapshot.teams.find((team) => !team.archived)?.id ?? "";
-  const requestedTeam = params.get("captureTeam") ?? params.get("team") ?? defaultTeam;
+  const requestedTeam = params.get("captureTeam") ?? defaultTeam;
   const createTeam = snapshot.teams.some((team) => team.id === requestedTeam && !team.archived)
     ? requestedTeam
     : "";
   const [createError, setCreateError] = useState("");
-  const searchRef = useRef<HTMLInputElement>(null);
-  const inspectorRef = useRef<HTMLDivElement>(null);
-  const collectionRef = useRef<HTMLElement>(null);
-  const [ownerMenuOpen, setOwnerMenuOpen] = useState(
-    () => window.matchMedia("(min-width: 761px)").matches,
-  );
-  useEffect(() => {
-    const desktop = window.matchMedia("(min-width: 761px)");
-    const update = () => setOwnerMenuOpen(desktop.matches);
-    desktop.addEventListener("change", update);
-    return () => desktop.removeEventListener("change", update);
-  }, []);
   const titleRef = useRef<HTMLInputElement>(null);
-  const pendingFocus = useRef<"capture" | "search" | null>(null);
-  useEffect(() => {
-    if (!pendingFocus.current) return;
-    const field = pendingFocus.current === "capture" ? titleRef.current : searchRef.current;
-    if (field?.getClientRects().length) {
-      field.focus();
-      pendingFocus.current = null;
-    }
-  }, [route.issue, params]);
+  const queryRef = useRef<HTMLInputElement>(null);
   const owner = data.snapshot.owner.slug;
   const base = `/tracker/${encodeURIComponent(owner)}`;
-  const selected = snapshot.issues.find(
-    (issue) => issue.id === route.issue || issue.key === route.issue,
-  );
-  const view = params.get("view") ?? "list";
+  const selected =
+    snapshot.issues.find((issue) => issue.id === route.issue || issue.key === route.issue) ?? null;
+  const view = (
+    (params.get("view") ?? "list") in VIEW_LABEL ? (params.get("view") ?? "list") : "list"
+  ) as View;
   const admin = params.get("manage") === "true";
+  const sort = (params.get("sort") ?? "rank") as SortKey;
+  const query = params.has("q") ? (params.get("q") ?? "") : DEFAULT_QUERY;
+  const [draft, setDraft] = useState(query);
+  const [queryFocused, setQueryFocused] = useState(false);
+  useEffect(() => setDraft(query), [query]);
   const effective = useMemo(() => ({ ...snapshot, serverTime: time }), [snapshot, time]);
   const href = (id?: string) =>
     `${base}${id ? `/issues/${encodeURIComponent(id)}` : ""}${params.size ? `?${params}` : ""}`;
-  const filter = (key: string, value: string) => {
+  const setParam = (key: string, value: string | null) => {
     const next = new URLSearchParams(params);
-    if (value) next.set(key, value);
-    else next.delete(key);
-    if (key === "team") next.delete("captureTeam");
-    setParams(next, { replace: true });
+    if (value === null) next.delete(key);
+    else next.set(key, value);
+    setParams(next, { replace: true, preventScrollReset: true });
   };
+  const setQuery = (q: string) => setParam("q", q === DEFAULT_QUERY ? null : q);
+
+  // Older links carry ?team=…&workspace=…; fold them into the query once.
+  useEffect(() => {
+    const migrated = legacyQuery(params, data.snapshot);
+    if (migrated === null) return;
+    const next = new URLSearchParams(params);
+    for (const k of ["team", "workspace", "status", "ready", "closed", "filters"]) next.delete(k);
+    next.set("q", migrated);
+    setParams(next, { replace: true });
+  }, [params, data.snapshot, setParams]);
+
   const accept = useCallback((next: Snapshot) => {
     const previous = latestSnapshot.current;
     if (
@@ -216,6 +288,7 @@ function Workbench({ data }: { data: TrackerData }) {
       clearInterval(interval);
     };
   }, [refresh]);
+
   const mutate: Mutate = async (mutations: Mutation[]) => {
     if (busyRef.current)
       return { ok: false, error: "Another change is saving. Try again when it finishes." };
@@ -282,94 +355,56 @@ function Workbench({ data }: { data: TrackerData }) {
       setBusy(false);
     }
   };
-  const query = (params.get("q") ?? "").trim().toLowerCase();
-  const teamFilter = params.get("team");
-  const workspaceFilter = params.get("workspace");
-  const statusFilter = params.get("status");
-  const readyOnly = params.get("ready") === "true";
-  const showClosed = params.get("closed") === "true";
-  const scopedIssues = useMemo(
-    () =>
-      snapshot.issues.filter(
-        (issue) =>
-          (!teamFilter || issue.teamId === teamFilter) &&
-          (!workspaceFilter || issue.workspaceIds.includes(workspaceFilter)) &&
-          (!statusFilter || issue.status === statusFilter) &&
-          (!query ||
-            `${issue.key} ${issue.title} ${issue.description} ${issue.labels.join(" ")}`
-              .toLowerCase()
-              .includes(query)),
-      ),
-    [snapshot.issues, teamFilter, workspaceFilter, statusFilter, query],
+
+  // The working set: an index per sync, then the query over it.
+  const now = Date.parse(time);
+  const index = useMemo(() => buildIndex(snapshot, time), [snapshot, time]);
+  const compiled = useMemo(
+    () => compile(query, index, viewer?.id ?? "", now),
+    [query, index, viewer?.id, now],
   );
-  const readyIds = useMemo(
-    () =>
-      new Set(
-        snapshot.issues
-          .filter((issue) => isIssueReady(issue, snapshot.issues, snapshot.links, time))
-          .map((issue) => issue.id),
-      ),
-    [snapshot.issues, snapshot.links, time],
+  const matched = useMemo(
+    () => snapshot.issues.filter((issue) => compiled.matches(issue)),
+    [snapshot.issues, compiled],
   );
-  const closedCount = scopedIssues.filter(
-    (issue) => issue.status === "done" || issue.status === "canceled",
-  ).length;
-  const readyCount = scopedIssues.filter((issue) => readyIds.has(issue.id)).length;
-  const issues = useMemo(() => {
-    const rank = (issue: Issue) =>
-      issue.status === "done" || issue.status === "canceled"
-        ? 4
-        : readyIds.has(issue.id)
-          ? 0
-          : issue.status === "in_progress"
-            ? 1
-            : issue.status === "backlog"
-              ? 3
-              : 2;
-    return scopedIssues
-      .filter(
-        (issue) =>
-          (!readyOnly || readyIds.has(issue.id)) &&
-          (statusFilter || showClosed || (issue.status !== "done" && issue.status !== "canceled")),
-      )
-      .sort(
-        (a, b) =>
-          rank(a) - rank(b) || a.priority - b.priority || b.updatedAt.localeCompare(a.updatedAt),
-      );
-  }, [scopedIssues, readyIds, readyOnly, statusFilter, showClosed]);
-  const filterLabels: Record<string, string> = {
-    q: `Search: ${params.get("q") ?? ""}`,
-    team: `Team: ${snapshot.teams.find((team) => team.id === teamFilter)?.name ?? teamFilter}`,
-    workspace: `Workspace: ${snapshot.workspaces.find((workspace) => workspace.id === workspaceFilter)?.name ?? workspaceFilter}`,
-    status: `Status: ${statuses.find((status) => status.value === statusFilter)?.label ?? statusFilter}`,
-    ready: "Ready work",
-    closed: "Including closed",
-  };
-  const activeFilters = Object.keys(filterLabels).filter((key) => params.has(key));
-  const clearFilters = () => {
+  const issues = useMemo(() => sortIssues(matched, index, sort), [matched, index, sort]);
+  const facets = useMemo(
+    () => facetsOf(snapshot.issues, compiled, index, snapshot),
+    [snapshot, compiled, index],
+  );
+  const activity = useMemo(() => {
+    const inScope = snapshot.issues.filter((issue) =>
+      compiled.matches(issue, ["since", "until", "is", "status"]),
+    );
+    return activityOf(inScope, now);
+  }, [snapshot.issues, compiled, now]);
+  const scoped = scopeLabel(query, now);
+  // The graph view is about relationships: an issue there is the lens's
+  // centre, and its details open beside it only when asked for.
+  const showInspector = !!(selected || route.issue) && (view !== "graph" || params.has("details"));
+  const closeHref = (() => {
+    if (view !== "graph" || !selected) return href();
     const next = new URLSearchParams(params);
-    for (const key of Object.keys(filterLabels)) next.delete(key);
-    next.delete("captureTeam");
-    setParams(next, { replace: true });
-  };
-  const showClosedWork = () => {
-    const next = new URLSearchParams(params);
-    next.set("closed", "true");
-    next.delete("ready");
-    setParams(next, { replace: true });
-  };
-  const onlyClosed =
-    closedCount > 0 && closedCount === scopedIssues.length && !showClosed && !statusFilter;
-  const managementParams = new URLSearchParams(params);
-  if (admin) managementParams.delete("manage");
-  else managementParams.set("manage", "true");
-  const managementHref = `${base}${route.issue ? `/issues/${encodeURIComponent(route.issue)}` : ""}?${managementParams}`;
-  useEffect(() => {
-    inspectorRef.current?.scrollTo({ top: 0 });
-    const card = collectionRef.current?.querySelector<HTMLElement>('[aria-current="true"]');
-    if (card && window.matchMedia("(min-width: 761px)").matches)
-      card.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [selected?.id, view]);
+    next.delete("details");
+    return `${base}/issues/${encodeURIComponent(selected.id)}?${next}`;
+  })();
+  // A query that already names one state makes the state column repeat itself.
+  const pinsState =
+    compiled.parsed.filters.filter(
+      (f) =>
+        !f.negated &&
+        (f.key === "status" || (f.key === "is" && f.value !== "open" && f.value !== "closed")),
+    ).length === 1;
+  const count = (
+    <>
+      {issues.length.toLocaleString()}
+      <span className="text-ink-faint"> of {snapshot.issues.length.toLocaleString()}</span>
+      {compiled.parsed.unknown.length > 0 && (
+        <span className="text-danger-text"> · ignoring {compiled.parsed.unknown.join(" ")}</span>
+      )}
+    </>
+  );
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (
@@ -389,169 +424,256 @@ function Workbench({ data }: { data: TrackerData }) {
         return;
       if (event.key === "c" || event.key === "n") {
         event.preventDefault();
-        if (window.matchMedia("(max-width: 760px)").matches && route.issue) {
-          pendingFocus.current = "capture";
-          void navigate(href());
-        } else titleRef.current?.focus();
+        titleRef.current?.focus();
       } else if (event.key === "/") {
         event.preventDefault();
-        const next = new URLSearchParams(params);
-        next.set("filters", "true");
-        const searchPath = window.matchMedia("(max-width: 760px)").matches
-          ? base
-          : `${base}${route.issue ? `/issues/${encodeURIComponent(route.issue)}` : ""}`;
-        pendingFocus.current = "search";
-        if (searchRef.current?.getClientRects().length) {
-          searchRef.current.focus();
-          pendingFocus.current = null;
-        }
-        void navigate(`${searchPath}?${next}`);
+        queryRef.current?.focus();
       } else if ((event.key === "j" || event.key === "k") && issues.length) {
         event.preventDefault();
         const current = issues.findIndex((issue) => issue.id === selected?.id);
-        const index =
+        const at =
           current < 0
             ? 0
             : Math.max(0, Math.min(issues.length - 1, current + (event.key === "j" ? 1 : -1)));
-        void navigate(href(issues[index]!.id));
+        void navigate(href(issues[at]!.id), { preventScrollReset: true });
+      } else if (event.key === "Escape" && selected) {
+        void navigate(showInspector ? closeHref : href(), { preventScrollReset: true });
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   });
-  const row = (issue: Issue) => (
-    <Link
-      key={issue.id}
-      className="tracker-row"
-      aria-current={selected?.id === issue.id ? "true" : undefined}
-      to={href(issue.id)}
-    >
-      <div className="tracker-row-meta">
-        <span className="mk-mono">{issue.key}</span>
-        <span>P{issue.priority}</span>
-        <IssueState issue={issue} snapshot={effective} />
-      </div>
-      <strong>{issue.title}</strong>
-      <div className="tracker-row-footer">
-        <span>
-          {snapshot.members.find((member) => member.id === issue.assigneeId)?.displayName ??
-            "Unassigned"}
-        </span>
-        {issue.type === "prd" && <span>PRD</span>}
-        {issue.workspaceIds.map((id) => {
-          const workspace = snapshot.workspaces.find((item) => item.id === id);
-          return workspace ? <span key={id}>{workspace.name}</span> : null;
-        })}
-      </div>
-    </Link>
+
+  const managementParams = new URLSearchParams(params);
+  if (admin) managementParams.delete("manage");
+  else managementParams.set("manage", "true");
+  const managementHref = `${base}?${managementParams}`;
+  const hasTeam = snapshot.teams.some((team) => !team.archived);
+  const parsedUnknown = compiled.parsed.unknown;
+
+  const capture = (
+    <fieldset disabled={busy || uncertain} className="m-0 flex min-w-0 flex-1 border-0 p-0">
+      <form
+        className="flex min-w-0 flex-1 gap-2"
+        onSubmit={async (event) => {
+          event.preventDefault();
+          const id = crypto.randomUUID();
+          const ws = tokenize(query)
+            .find((t) => t.toLowerCase().startsWith("ws:"))
+            ?.slice(3);
+          const workspace = snapshot.workspaces.find(
+            (w) => w.slug.toLowerCase() === ws?.toLowerCase(),
+          );
+          setCreateError("");
+          const result = await mutate([
+            {
+              kind: "issue.create",
+              id,
+              data: {
+                teamId: createTeam,
+                title: title.trim(),
+                ...(workspace ? { workspaceIds: [workspace.id] } : {}),
+              },
+            },
+          ]);
+          if (result.ok) {
+            setTitle("");
+            await navigate(href(id));
+          } else setCreateError(result.error);
+        }}
+      >
+        <SelectField
+          ariaLabel="Team for the new issue"
+          value={createTeam}
+          className="w-28 shrink-0"
+          options={[
+            { value: "", label: "Team" },
+            ...snapshot.teams
+              .filter((team) => !team.archived)
+              .map((team) => ({ value: team.id, label: team.key })),
+          ]}
+          onChange={(value) => setParam("captureTeam", value || null)}
+        />
+        <input
+          ref={titleRef}
+          aria-label="New issue title"
+          aria-keyshortcuts={shortcuts ? "c n" : undefined}
+          className="mk-input min-w-0 flex-1"
+          placeholder="Capture an issue"
+          required
+          maxLength={500}
+          value={title}
+          onChange={(event) => {
+            setTitle(event.target.value);
+            setCreateError("");
+          }}
+        />
+        <button className="mk-btn mk-btn--primary" disabled={busy || !createTeam || !title.trim()}>
+          Create
+        </button>
+      </form>
+    </fieldset>
   );
+
+  const strip = (height: string) => (
+    <ActivityStrip
+      start={activity.start}
+      bucketMs={activity.bucketMs}
+      series={[
+        { label: "Opened", values: activity.opened, className: "bg-data-teal" },
+        { label: "Closed", values: activity.closed, className: "bg-data-berry" },
+      ]}
+      caption={`${activity.opened.reduce((a, b) => a + b, 0).toLocaleString()} opened, ${activity.closed.reduce((a, b) => a + b, 0).toLocaleString()} closed in this scope · drag across the bars to filter by last activity`}
+      scoped={scoped}
+      onRange={(from, until) =>
+        setQuery(
+          `${withoutKeys(query, ["since", "until"])} since:${from.toISOString().slice(0, 16)}Z until:${until.toISOString().slice(0, 16)}Z`.trim(),
+        )
+      }
+      onClear={() => setQuery(withoutKeys(query, ["since", "until"]))}
+      height={height}
+    />
+  );
+
+  const facetColumn = (
+    <FacetColumn
+      facets={facets}
+      query={query}
+      onToggle={(v) => setQuery(toggleToken(query, v.token.key, v.token.value))}
+    />
+  );
+
+  const inspector = selected ? (
+    <fieldset className="m-0 min-w-0 border-0 p-0" disabled={busy || uncertain}>
+      <IssueDetail
+        key={selected.id}
+        issue={selected}
+        snapshot={effective}
+        index={index}
+        mutate={mutate}
+        busy={busy || uncertain}
+        href={href}
+      />
+    </fieldset>
+  ) : route.issue ? (
+    <div className="p-4">
+      <h2 className="m-0 text-title">Issue not found</h2>
+      <p className="mk-card-desc">This issue is unavailable in this tracker.</p>
+      <Link className="gm-link" to={href()}>
+        Back to issues
+      </Link>
+    </div>
+  ) : null;
+
   return (
     <div
-      className={`tracker-shell${route.issue && !admin ? " tracker-detail-open" : ""}`}
+      className="flex min-h-dvh flex-col gap-3 px-4 py-3 lg:h-dvh lg:min-h-0 lg:overflow-hidden"
       aria-busy={navigation.state !== "idle"}
       data-shortcuts={shortcuts}
-      data-management={admin}
     >
-      {navigation.state !== "idle" && (
-        <p role="status" className="tracker-loading mk-hint">
-          Loading tracker view…
-        </p>
-      )}
-      <header className="tracker-header">
-        <div>
-          {admin && (
-            <Link className="gm-link tracker-breadcrumb" to={managementHref}>
-              Issue tracker
-            </Link>
-          )}
-          <h1 className="text-headline m-0">{admin ? "Teams & workspaces" : "Issue tracker"}</h1>
-          {!admin && (
-            <p className="mt-1 mb-0 text-ink-muted">Plan together. Hand off work with context.</p>
-          )}
-        </div>
-        <div className="tracker-header-actions">
-          <SelectField
-            ariaLabel="Tracker owner"
-            value={owner}
-            options={data.trackers.map((tracker) => ({
-              value: tracker.slug,
-              label: tracker.displayName,
-            }))}
-            onChange={(value) => navigate(`/tracker/${value}`)}
-          />
-          <details
-            className="tracker-owner-menu"
-            open={ownerMenuOpen}
-            onToggle={(event) => setOwnerMenuOpen(event.currentTarget.open)}
-          >
-            <summary className="mk-btn">Actions</summary>
-            <div className="tracker-owner-menu-content">
-              <button
-                className="mk-btn"
-                onClick={() => {
-                  setError("");
-                  void refresh();
-                }}
-                disabled={busy || refreshing}
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <h1 className="m-0 text-title-lg">{admin ? "Teams and workspaces" : "Issues"}</h1>
+        <SelectField
+          ariaLabel="Tracker owner"
+          value={owner}
+          className="w-44"
+          options={data.trackers.map((tracker) => ({
+            value: tracker.slug,
+            label: tracker.displayName,
+          }))}
+          onChange={(value) => navigate(`/tracker/${value}`)}
+        />
+        {!admin && hasTeam && (
+          <div className="order-last flex min-w-0 basis-full md:order-none md:basis-0 md:flex-1">
+            {capture}
+          </div>
+        )}
+        {admin && <span className="flex-1" />}
+        <div className="ml-auto flex items-center gap-1">
+          <span className="max-sm:hidden">
+            <Freshness receivedAt={clock.current.received} />
+          </span>
+          <Tip label={refreshing ? "Refreshing" : "Refresh now"}>
+            <button
+              type="button"
+              className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm"
+              aria-label="Refresh now"
+              disabled={busy || refreshing}
+              onClick={() => {
+                setError("");
+                void refresh();
+              }}
+            >
+              <ArrowClockwiseIcon weight="bold" className={refreshing ? "animate-spin" : ""} />
+            </button>
+          </Tip>
+          <Menu.Root>
+            <Tip label="Tracker settings">
+              <Menu.Trigger
+                className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm"
+                aria-label="Tracker settings"
               >
-                {refreshing ? "Refreshing…" : "Refresh"}
-              </button>
-              <Freshness receivedAt={clock.current.received} />
-              <Link className="mk-btn" to={managementHref}>
-                {admin ? "Back to work" : "Teams & workspaces"}
-              </Link>
-              <button
-                className="mk-btn"
-                aria-pressed={shortcuts}
-                aria-describedby="tracker-shortcut-help"
-                onClick={() => {
-                  setShortcuts(!shortcuts);
-                  try {
-                    localStorage.setItem("gitmatrix:tracker-shortcuts", String(!shortcuts));
-                  } catch {
-                    // The preference still applies for this page when storage is unavailable.
-                  }
-                }}
-              >
-                Shortcuts {shortcuts ? "on" : "off"}
-              </button>
-            </div>
-          </details>
+                <DotsThreeIcon weight="bold" />
+              </Menu.Trigger>
+            </Tip>
+            <Menu.Portal>
+              <Menu.Positioner align="end" sideOffset={6} className="z-50">
+                <Menu.Popup className={`mk-popup ${popMotion}`}>
+                  <Menu.LinkItem className="mk-menu-item" render={<Link to={managementHref} />}>
+                    {admin ? "Back to issues" : "Teams and workspaces"}
+                  </Menu.LinkItem>
+                  <Menu.CheckboxItem
+                    className="mk-menu-item"
+                    checked={shortcuts}
+                    onCheckedChange={(on) => {
+                      setShortcuts(on);
+                      try {
+                        localStorage.setItem("gitmatrix:tracker-shortcuts", String(on));
+                      } catch {
+                        // Still applies for this page when storage is unavailable.
+                      }
+                    }}
+                  >
+                    <span className="flex-1">Keyboard shortcuts</span>
+                    <span className="text-micro text-ink-faint">{shortcuts ? "On" : "Off"}</span>
+                  </Menu.CheckboxItem>
+                </Menu.Popup>
+              </Menu.Positioner>
+            </Menu.Portal>
+          </Menu.Root>
         </div>
       </header>
-      <p id="tracker-shortcut-help" className={shortcuts ? "mk-hint" : "sr-only"}>
-        Optional shortcuts: c or n captures an issue; / searches; j and k select issues; e edits.
-        They do not run while typing or using form controls. Turn them off in Actions.
-      </p>
-      <div className="tracker-feedback" aria-live="polite">
-        {error && (
-          <>
-            <FormError message={error} />
-            {uncertain && (
-              <div className="mt-2">
-                <p className="mk-hint">
-                  The server may have saved your change. Retry sends the same operation ID, so it
-                  cannot apply twice.
-                </p>
-                <button
-                  className="mk-btn"
-                  disabled={busy}
-                  onClick={() => {
-                    if (pending.current)
-                      void mutate(pending.current.mutations).then((result) => {
-                        if (!result.ok) setError(result.error);
-                      });
-                  }}
-                >
-                  Retry pending change
-                </button>
-              </div>
-            )}
-          </>
+      {shortcuts && (
+        <p className="m-0 -mt-1 text-micro text-ink-faint">
+          Shortcuts: c captures, / filters, j and k move, Escape closes the issue.
+        </p>
+      )}
+      <div aria-live="polite">
+        {(error || createError) && <FormError message={error || createError} />}
+        {uncertain && (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <p className="m-0 text-body-sm text-ink-muted">
+              The server may have saved your change. Retry sends the same operation ID, so it can't
+              apply twice.
+            </p>
+            <button
+              className="mk-btn mk-btn--sm"
+              disabled={busy}
+              onClick={() => {
+                if (pending.current)
+                  void mutate(pending.current.mutations).then((result) => {
+                    if (!result.ok) setError(result.error);
+                  });
+              }}
+            >
+              Retry pending change
+            </button>
+          </div>
         )}
       </div>
+
       {admin ? (
-        <fieldset className="tracker-action-fields" disabled={busy || uncertain}>
+        <fieldset className="m-0 border-0 p-0" disabled={busy || uncertain}>
           <TrackerAdmin
             snapshot={effective}
             repos={data.repos}
@@ -559,325 +681,208 @@ function Workbench({ data }: { data: TrackerData }) {
             busy={busy || uncertain}
           />
         </fieldset>
-      ) : (
-        <>
-          <fieldset className="tracker-action-fields" disabled={busy || uncertain}>
-            <form
-              className="tracker-quick-create"
-              onSubmit={async (event) => {
-                event.preventDefault();
-                const id = crypto.randomUUID();
-                const workspace = params.get("workspace");
-                setCreateError("");
-                const result = await mutate([
-                  {
-                    kind: "issue.create",
-                    id,
-                    data: {
-                      teamId: createTeam,
-                      title: title.trim(),
-                      ...(workspace ? { workspaceIds: [workspace] } : {}),
-                    },
-                  },
-                ]);
-                if (result.ok) {
-                  setTitle("");
-                  await navigate(href(id));
-                } else setCreateError(result.error);
-              }}
-            >
-              <SelectField
-                ariaLabel="New issue team"
-                value={createTeam}
-                options={[
-                  { value: "", label: "Choose team" },
-                  ...snapshot.teams
-                    .filter((team) => !team.archived)
-                    .map((team) => ({
-                      value: team.id,
-                      label: `Team · ${team.name} (${team.key})`,
-                    })),
-                ]}
-                onChange={(value) => filter("captureTeam", value)}
-              />
-              <input
-                ref={titleRef}
-                aria-label="New issue title"
-                aria-keyshortcuts={shortcuts ? "c n" : undefined}
-                className="mk-input"
-                placeholder="Capture an issue…"
-                required
-                maxLength={500}
-                value={title}
-                onChange={(event) => {
-                  setTitle(event.target.value);
-                  setCreateError("");
-                }}
-              />
-              <button
-                className="mk-btn mk-btn--primary"
-                disabled={busy || !createTeam || !title.trim()}
-              >
-                Create
-              </button>
-            </form>
-          </fieldset>
-          {createError && <FormError message={createError} />}
-          {!snapshot.teams.some((team) => !team.archived) && (
-            <div className="tracker-onboarding">
-              <h2 className="text-title">Start with a team</h2>
-              <p>
-                A team gives each issue an owner and a readable key. Workspaces can bring several
-                teams together later.
+      ) : !hasTeam ? (
+        <section className="mk-card max-w-xl">
+          <h2 className="mk-card-title">Start with a team</h2>
+          <p className="mk-card-desc max-w-[48ch]">
+            A team gives each issue an owner and a readable key. Workspaces bring several teams
+            together later.
+          </p>
+          <div className="mt-4">
+            {snapshot.canAdmin ? (
+              <Link className="mk-btn mk-btn--primary no-underline" to={managementHref}>
+                Create your first team
+              </Link>
+            ) : (
+              <p className="m-0 text-body-sm text-ink-muted">
+                Ask a tracker administrator to create a team.
               </p>
-              {snapshot.canAdmin ? (
-                <Link className="mk-btn mk-btn--primary" to={managementHref}>
-                  Create your first team
-                </Link>
-              ) : (
-                <p>Ask a tracker administrator to create a team.</p>
-              )}
-            </div>
-          )}
-          <button
-            className="mk-btn tracker-filter-toggle"
-            aria-expanded={params.get("filters") === "true"}
-            aria-controls="tracker-filters"
-            onClick={() => filter("filters", params.get("filters") === "true" ? "" : "true")}
-          >
-            Filters{activeFilters.length ? ` (${activeFilters.length})` : ""}
-          </button>
+            )}
+          </div>
+        </section>
+      ) : (
+        <div className="flex min-h-0 flex-1 gap-4">
           <div
-            id="tracker-filters"
-            className={`tracker-filters${params.get("filters") === "true" ? " tracker-filters-open" : ""}`}
+            className={`flex min-w-0 flex-1 flex-col gap-2 ${showInspector ? "max-lg:hidden" : ""}`}
           >
-            <input
-              ref={searchRef}
-              className="mk-input"
-              aria-label="Search issues"
-              aria-keyshortcuts={shortcuts ? "/" : undefined}
-              placeholder="Search title, key, labels…"
-              value={searchText}
-              onChange={(event) => {
-                setSearchText(event.target.value);
-                filter("q", event.target.value);
-              }}
-            />
-            <SelectField
-              ariaLabel="Filter by team"
-              value={params.get("team") ?? ""}
-              options={[
-                { value: "", label: "All teams" },
-                ...snapshot.teams.map((team) => ({
-                  value: team.id,
-                  label: `${team.name}${team.archived ? " (archived)" : ""}`,
-                })),
-              ]}
-              onChange={(value) => filter("team", value)}
-            />
-            <SelectField
-              ariaLabel="Filter by workspace"
-              value={params.get("workspace") ?? ""}
-              options={[
-                { value: "", label: "All workspaces" },
-                ...snapshot.workspaces.map((workspace) => ({
-                  value: workspace.id,
-                  label: `${workspace.name}${workspace.archived ? " (archived)" : ""}`,
-                })),
-              ]}
-              onChange={(value) => filter("workspace", value)}
-            />
-            <SelectField
-              ariaLabel="Filter by status"
-              value={params.get("status") ?? ""}
-              options={[{ value: "", label: "All statuses" }, ...statuses]}
-              onChange={(value) => filter("status", value)}
-            />
-          </div>
-          {activeFilters.length > 0 && (
-            <div className="tracker-active-filters" aria-label="Active filters">
-              {activeFilters.map((key) => (
-                <button
-                  key={key}
-                  className="mk-btn mk-btn--sm"
-                  aria-label={`Remove ${filterLabels[key]}`}
-                  onClick={() => filter(key, "")}
-                >
-                  {filterLabels[key]} <span className="text-ink-muted">Remove</span>
-                </button>
-              ))}
-              <button className="mk-btn mk-btn--sm" onClick={clearFilters}>
-                Clear all
-              </button>
-            </div>
-          )}
-          <div className="tracker-viewbar">
-            <div className="flex flex-wrap gap-2">
-              <button
-                className="mk-btn mk-btn--sm"
-                aria-pressed={readyOnly}
-                onClick={() => filter("ready", readyOnly ? "" : "true")}
+            <div className="flex flex-wrap items-center gap-2">
+              <form
+                role="search"
+                className="relative flex min-w-0 flex-1 basis-72 items-center"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  setQuery(draft.trim());
+                }}
               >
-                Ready · {readyCount}
-              </button>
-              <span className="self-center text-body-sm text-ink-muted">
-                Showing {issues.length} of {scopedIssues.length}
-              </span>
-              {!statusFilter && closedCount > 0 && (
-                <button
-                  className="mk-btn mk-btn--sm tracker-closed-toggle"
-                  aria-pressed={showClosed}
-                  onClick={() => (showClosed ? filter("closed", "") : showClosedWork())}
-                >
-                  {showClosed ? "Hide" : "Show"} closed ({closedCount})
-                </button>
-              )}
-            </div>
-            <div className="flex gap-1" role="group" aria-label="Issue view">
-              {["list", "board", "graph"].map((item) => (
-                <button
-                  className="mk-btn mk-btn--sm"
-                  key={item}
-                  aria-pressed={view === item}
-                  onClick={() => filter("view", item)}
-                >
-                  {item[0]!.toUpperCase() + item.slice(1)}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className={`tracker-workbench${route.issue ? " tracker-has-detail" : ""}`}>
-            <section ref={collectionRef} className="tracker-collection" aria-label="Issues">
-              {view === "graph" ? (
-                <DependencyGraph
-                  issues={issues}
-                  snapshot={effective}
-                  selected={selected?.id}
-                  href={href}
+                <MagnifyingGlassIcon
+                  className="pointer-events-none absolute left-3 size-4 text-ink-faint"
+                  aria-hidden
                 />
-              ) : issues.length || (view === "board" && closedCount > 0 && !readyOnly) ? (
-                view === "board" ? (
+                <input
+                  ref={queryRef}
+                  className="mk-input mk-input--code h-10 min-w-0 flex-1 pl-9 sm:text-body-sm"
+                  aria-label="Filter issues"
+                  aria-keyshortcuts={shortcuts ? "/" : undefined}
+                  aria-invalid={parsedUnknown.length ? "true" : undefined}
+                  aria-describedby="tracker-query-help"
+                  value={draft}
+                  placeholder="is:ready team:core assignee:me retention"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoComplete="off"
+                  onChange={(event) => setDraft(event.target.value)}
+                  onFocus={() => setQueryFocused(true)}
+                  onBlur={() => setQueryFocused(false)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") setDraft(query);
+                  }}
+                />
+                {draft !== query && (
+                  <button
+                    type="submit"
+                    className="mk-btn mk-btn--sm mk-btn--primary absolute right-1"
+                  >
+                    Run
+                  </button>
+                )}
+              </form>
+              <div className="mk-segmented" role="radiogroup" aria-label="View">
+                {(Object.keys(VIEW_LABEL) as View[]).map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    role="radio"
+                    aria-checked={view === v}
+                    className="mk-segment"
+                    onClick={() => setParam("view", v === "list" ? null : v)}
+                  >
+                    {VIEW_LABEL[v]}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p
+              id="tracker-query-help"
+              className={`m-0 text-micro ${parsedUnknown.length ? "text-danger-text" : queryFocused ? "text-ink-faint" : "sr-only"}`}
+            >
+              {parsedUnknown.length
+                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, label:, type:, p:, since:, until:, parent:.`
+                : "is:ready is:blocked · status: · team: · ws: · assignee:me · label: · type: · p:1 · since:7d · parent:KEY · words match key and title; - excludes"}
+            </p>
+            <div className="flex items-center gap-2">
+              <div
+                className="flex min-w-0 flex-1 gap-1.5 overflow-x-auto [mask-image:linear-gradient(to_right,black_calc(100%-2rem),transparent)] pr-6 [scrollbar-width:none]"
+                role="group"
+                aria-label="Saved views"
+              >
+                {VIEWS.map((v) => (
+                  <button
+                    key={v.label}
+                    type="button"
+                    className="mk-chip shrink-0"
+                    aria-pressed={query.trim() === v.query}
+                    onClick={() => setQuery(v.query)}
+                  >
+                    {v.label}
+                  </button>
+                ))}
+              </div>
+              <span className="shrink-0 text-body-sm text-ink-muted tabular-nums max-lg:hidden">
+                {count}
+              </span>
+            </div>
+            <details className="rounded-pane bg-pane px-3 py-1 open:pb-3 lg:hidden">
+              <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 font-semibold [&::-webkit-details-marker]:hidden">
+                <FunnelSimpleIcon weight="bold" aria-hidden />
+                Narrow it down
+                <span className="ml-auto text-body-sm font-normal text-ink-muted tabular-nums">
+                  {count}
+                </span>
+              </summary>
+              <div className="flex flex-col gap-4 pt-2">
+                {view !== "graph" && strip("h-10")}
+                {facetColumn}
+              </div>
+            </details>
+            {view !== "graph" && <div className="max-lg:hidden">{strip("h-8")}</div>}
+            {issues.length === 0 ? (
+              <div className="mk-empty">
+                {snapshot.issues.length ? (
                   <>
-                    <p className="tracker-board-cue">Scroll sideways to explore status lanes.</p>
-                    <div
-                      className="tracker-board"
-                      tabIndex={0}
-                      role="region"
-                      aria-label="Issue board, scroll horizontally for more statuses"
+                    No issues match <code className="mk-mono">{query || "everything"}</code>.{" "}
+                    <button
+                      type="button"
+                      className="mk-btn mk-btn--ghost mk-btn--sm"
+                      onClick={() => setQuery("")}
                     >
-                      {statuses.map((status) => {
-                        const closedLane = status.value === "done" || status.value === "canceled";
-                        const lane = (closedLane && !readyOnly ? scopedIssues : issues).filter(
-                          (issue) => issue.status === status.value,
-                        );
-                        const collapsed =
-                          !lane.length || status.value === "done" || status.value === "canceled";
-                        const expanded =
-                          params.get(`lane-${status.value}`) === "true" ||
-                          lane.some((issue) => issue.id === selected?.id);
-                        return (
-                          <section
-                            className={`tracker-board-column${collapsed && !expanded ? " tracker-board-column-collapsed" : ""}`}
-                            key={status.value}
-                          >
-                            <h2>
-                              {collapsed ? (
-                                <button
-                                  className="mk-btn mk-btn--sm"
-                                  aria-expanded={expanded}
-                                  onClick={() =>
-                                    filter(`lane-${status.value}`, expanded ? "" : "true")
-                                  }
-                                >
-                                  <span>{status.label}</span>{" "}
-                                  <span>
-                                    {lane.length}
-                                    {closedLane && !showClosed && !expanded ? " hidden" : ""}
-                                  </span>
-                                </button>
-                              ) : (
-                                <>
-                                  {status.label}{" "}
-                                  <span className="text-ink-muted">{lane.length}</span>
-                                </>
-                              )}
-                            </h2>
-                            {(!collapsed || expanded) && lane.map(row)}
-                            {expanded && !lane.length && (
-                              <p className="mk-hint px-3">No issues in this lane.</p>
-                            )}
-                          </section>
-                        );
-                      })}
-                    </div>
+                      Show everything
+                    </button>
                   </>
                 ) : (
-                  <div>{issues.map(row)}</div>
-                )
-              ) : (
-                <div className="tracker-empty">
-                  <h2 className="text-title">
-                    {onlyClosed
-                      ? `All ${closedCount} ${closedCount === 1 ? "issue here is" : "issues here are"} closed`
-                      : snapshot.issues.length
-                        ? "No issues match"
-                        : "Your team's work starts here"}
-                  </h2>
-                  <p className="text-ink-muted">
-                    {onlyClosed
-                      ? "Show completed and canceled work to review it or reopen an issue."
-                      : snapshot.issues.length
-                        ? "Try another search or clear the filters to see more work."
-                        : "Capture a tiny task above, then open it to add a PRD, acceptance criteria, or blockers."}
-                  </p>
-                  {onlyClosed ? (
-                    <button className="mk-btn" onClick={showClosedWork}>
-                      Show closed work
-                    </button>
-                  ) : snapshot.issues.length ? (
-                    <button className="mk-btn" onClick={clearFilters}>
-                      Clear filters
-                    </button>
-                  ) : (
-                    <button className="mk-btn" onClick={() => titleRef.current?.focus()}>
-                      Write an issue title
-                    </button>
-                  )}
-                </div>
-              )}
-            </section>
-            <div ref={inspectorRef} className="tracker-inspector">
-              {selected ? (
-                <fieldset className="tracker-action-fields" disabled={busy || uncertain}>
-                  <IssueDetail
-                    key={selected.id}
-                    issue={selected}
-                    snapshot={effective}
-                    mutate={mutate}
-                    busy={busy || uncertain}
-                    href={href}
-                  />
-                </fieldset>
-              ) : (
-                <div className="tracker-empty">
-                  <h2 className="text-title">
-                    {route.issue ? "Issue not found" : "Keep the work in view"}
-                  </h2>
-                  <p className="text-ink-muted">
-                    {route.issue
-                      ? "This issue is unavailable in this tracker."
-                      : "Select an issue to read its context, trace blockers, and leave a durable handoff without losing your place."}
-                  </p>
-                  {route.issue && (
-                    <Link className="gm-link" to={href()}>
-                      Back to issues
-                    </Link>
-                  )}
-                </div>
-              )}
-            </div>
+                  "Capture an issue above. Open it to add a PRD, acceptance criteria or blockers."
+                )}
+              </div>
+            ) : view === "graph" ? (
+              <RelationLens
+                focus={selected}
+                snapshot={snapshot}
+                index={index}
+                matched={issues}
+                href={href}
+                listHref={(q) => `${base}?${new URLSearchParams({ q })}`}
+                detailsOpen={showInspector}
+                onDetails={() => setParam("details", "1")}
+              />
+            ) : view === "board" ? (
+              <IssueBoard
+                issues={issues}
+                index={index}
+                selected={selected?.id ?? null}
+                href={href}
+                query={query}
+                listHref={(q) => `${base}?${new URLSearchParams({ q })}`}
+                now={now}
+              />
+            ) : (
+              <IssueLog
+                issues={issues}
+                index={index}
+                selected={selected?.id ?? null}
+                href={href}
+                sort={sort}
+                onSort={(next) => setParam("sort", next === "rank" ? null : next)}
+                stateWords={!selected && !pinsState}
+              />
+            )}
           </div>
-        </>
+          <aside
+            aria-label={selected ? `Issue ${selected.key}` : "Narrow it down"}
+            className={
+              showInspector
+                ? "relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-pane bg-pane lg:max-w-[40rem] lg:flex-none lg:basis-[44%]"
+                : selected
+                  ? "hidden"
+                  : "hidden w-64 shrink-0 overflow-y-auto pr-1 lg:block"
+            }
+          >
+            {showInspector ? (
+              <>
+                <Tip label="Close (Escape)">
+                  <Link
+                    to={closeHref}
+                    className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm absolute top-2 right-2 z-[1] no-underline"
+                    aria-label="Close the issue"
+                  >
+                    <XIcon weight="bold" />
+                  </Link>
+                </Tip>
+                <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">{inspector}</div>
+              </>
+            ) : (
+              facetColumn
+            )}
+          </aside>
+        </div>
       )}
     </div>
   );

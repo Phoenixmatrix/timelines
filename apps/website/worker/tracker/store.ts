@@ -15,6 +15,10 @@ import type {
   TrackerIdentity,
   Workspace,
 } from "../../shared/tracker.ts";
+import { sql as raw } from "kysely";
+import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
+
+export type { SqlDatabase } from "./sql.ts";
 
 export class TrackerError extends Error {
   public status: 400 | 401 | 403 | 404 | 409 | 413;
@@ -40,12 +44,6 @@ export interface Access {
   repos: { id: string; owner: string; name: string }[];
   /** D1-confirmed missing repositories; permits removing their orphan associations only. */
   deletedRepoIds?: string[];
-}
-export interface SqlDatabase {
-  exec<T extends Record<string, SqlStorageValue> = Record<string, SqlStorageValue>>(
-    query: string,
-    ...bindings: SqlStorageValue[]
-  ): { toArray(): T[]; one(): T };
 }
 type Entity = Team | Workspace | Issue | Link | Comment | Subscription;
 const tables = {
@@ -156,22 +154,25 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS parents ON issues(json_extract(data, '$.parentId'));`);
   }
   private all<T extends Entity>(type: EntityType): T[] {
-    return this.sql
-      .exec<{ data: string }>(`SELECT data FROM ${tables[type]} ORDER BY id`)
-      .toArray()
-      .map((r) => JSON.parse(r.data) as T);
+    return all(this.sql, tracker.selectFrom(tables[type]).select("data").orderBy("id")).map(
+      (r) => JSON.parse(r.data) as T,
+    );
   }
   private get<T extends Entity>(type: EntityType, entityId: string): T {
-    const row = this.sql
-      .exec<{ data: string }>(`SELECT data FROM ${tables[type]} WHERE id=?`, entityId)
-      .toArray()[0];
+    const row = first(
+      this.sql,
+      tracker.selectFrom(tables[type]).select("data").where("id", "=", entityId),
+    );
     if (!row) fail("not_found", `${type} ${entityId} not found.`, 404);
     return JSON.parse(row.data) as T;
   }
   private cursor(): number {
-    return this.sql
-      .exec<{ cursor: number }>("SELECT COALESCE(MAX(cursor),0) AS cursor FROM events")
-      .one().cursor;
+    return one(
+      this.sql,
+      tracker
+        .selectFrom("events")
+        .select((eb) => eb.fn.coalesce(eb.fn.max("cursor"), eb.lit(0)).as("cursor")),
+    ).cursor;
   }
   snapshot(access: Access): Snapshot {
     return {
@@ -190,24 +191,34 @@ export class TrackerStore {
   }
   subscribedWorkspaces(repoId: string): { workspaceId: string; slug: string; name: string }[] {
     id(repoId);
-    return this.sql
-      .exec<{ workspaceId: string; slug: string; name: string }>(
-        `SELECT DISTINCT w.id AS workspaceId, json_extract(w.data,'$.slug') AS slug, json_extract(w.data,'$.name') AS name
-       FROM subscriptions s JOIN workspaces w ON w.id=json_extract(s.data,'$.workspaceId')
-       WHERE json_extract(s.data,'$.repoId')=? AND json_extract(w.data,'$.archived')=0 ORDER BY slug`,
-        repoId,
-      )
-      .toArray();
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("subscriptions as s")
+        .innerJoin("workspaces as w", (join) =>
+          join.on("w.id", "=", json<string>("s.data", "$.workspaceId")),
+        )
+        .select([
+          "w.id as workspaceId",
+          json<string>("w.data", "$.slug").as("slug"),
+          json<string>("w.data", "$.name").as("name"),
+        ])
+        .distinct()
+        .where(json("s.data", "$.repoId"), "=", repoId)
+        .where(json("w.data", "$.archived"), "=", raw.lit(0))
+        .orderBy("slug"),
+    );
   }
   subscriptionRepoIds(subscriptionIds: string[]): string[] {
     if (!subscriptionIds.length) return [];
-    return this.sql
-      .exec<{ repoId: string }>(
-        `SELECT DISTINCT json_extract(data,'$.repoId') AS repoId FROM subscriptions WHERE id IN (${subscriptionIds.map(() => "?").join(",")})`,
-        ...subscriptionIds,
-      )
-      .toArray()
-      .map((row) => row.repoId);
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("subscriptions")
+        .select(json<string>("data", "$.repoId").as("repoId"))
+        .distinct()
+        .where("id", "in", subscriptionIds),
+    ).map((row) => row.repoId);
   }
   changes(after: number, limit: number): Changes {
     if (
@@ -218,13 +229,15 @@ export class TrackerStore {
       limit > 500
     )
       fail("invalid_input", "after must be a nonnegative integer; limit must be 1–500.");
-    const rows = this.sql
-      .exec<{ cursor: number; data: string }>(
-        "SELECT cursor,data FROM events WHERE cursor>? ORDER BY cursor LIMIT ?",
-        after,
-        limit + 1,
-      )
-      .toArray();
+    const rows = all(
+      this.sql,
+      tracker
+        .selectFrom("events")
+        .select(["cursor", "data"])
+        .where("cursor", ">", after)
+        .orderBy("cursor")
+        .limit(limit + 1),
+    );
     const events = rows
       .slice(0, limit)
       .map((row) => ({ ...JSON.parse(row.data), cursor: row.cursor }) as TrackerEvent);
@@ -241,12 +254,13 @@ export class TrackerStore {
     if (new TextEncoder().encode(encoded).byteLength > 1_048_576)
       fail("body_too_large", "Mutation body exceeds 1 MiB.", 413);
     return this.transaction(() => {
-      const receipt = this.sql
-        .exec<{ actor_id: string; request: string; result: string }>(
-          "SELECT actor_id,request,result FROM receipts WHERE id=?",
-          request.operationId,
-        )
-        .toArray()[0];
+      const receipt = first(
+        this.sql,
+        tracker
+          .selectFrom("receipts")
+          .select(["actor_id", "request", "result"])
+          .where("id", "=", request.operationId),
+      );
       if (receipt) {
         if (receipt.actor_id !== access.actorId || receipt.request !== encoded)
           fail(
@@ -262,12 +276,16 @@ export class TrackerStore {
       const started = new Set<string>();
       const emit = (type: EntityType, entityId: string, entity: Entity | null, kind: string) => {
         if (entity)
-          this.sql.exec(
-            `INSERT INTO ${tables[type]} (id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
-            entityId,
-            JSON.stringify(entity),
+          run(
+            this.sql,
+            tracker
+              .insertInto(tables[type])
+              .values({ id: entityId, data: JSON.stringify(entity) })
+              .onConflict((oc) =>
+                oc.column("id").doUpdateSet((eb) => ({ data: eb.ref("excluded.data") })),
+              ),
           );
-        else this.sql.exec(`DELETE FROM ${tables[type]} WHERE id=?`, entityId);
+        else run(this.sql, tracker.deleteFrom(tables[type]).where("id", "=", entityId));
         const event = {
           operationId: request.operationId,
           actorId: access.actorId,
@@ -277,12 +295,13 @@ export class TrackerStore {
           entity,
           createdAt: now,
         };
-        const cursor = this.sql
-          .exec<{ cursor: number }>(
-            "INSERT INTO events(data) VALUES (?) RETURNING cursor",
-            JSON.stringify(event),
-          )
-          .one().cursor;
+        const cursor = one(
+          this.sql,
+          tracker
+            .insertInto("events")
+            .values({ data: JSON.stringify(event) })
+            .returning("cursor"),
+        ).cursor;
         events.push({ ...event, cursor });
       };
       const admin = () => {
@@ -294,7 +313,10 @@ export class TrackerStore {
           fail("invalid_member", "User is not a current account member.");
       };
       const unique = (type: EntityType, entityId: string) => {
-        if (this.sql.exec(`SELECT id FROM ${tables[type]} WHERE id=?`, entityId).toArray().length)
+        if (
+          all(this.sql, tracker.selectFrom(tables[type]).select("id").where("id", "=", entityId))
+            .length
+        )
           fail("already_exists", `${type} ID already exists.`, 409);
       };
       const version = (entity: Team | Workspace | Issue, expected: unknown) => {
@@ -312,24 +334,26 @@ export class TrackerStore {
           fail("forbidden", "Only team members may change this team's work.", 403);
       };
       const ready = (issue: Issue) => {
-        const blocked = this.sql
-          .exec<{ data: string }>(
-            "SELECT data FROM links WHERE json_extract(data,'$.toId')=? AND json_extract(data,'$.kind')='blocks'",
-            issue.id,
-          )
-          .toArray()
-          .some(
-            (row) =>
-              this.get<Issue>("issue", (JSON.parse(row.data) as Link).fromId).status !== "done",
-          );
+        const blocked = all(
+          this.sql,
+          tracker
+            .selectFrom("links")
+            .select("data")
+            .where(json("data", "$.toId"), "=", issue.id)
+            .where(json("data", "$.kind"), "=", raw.lit("blocks")),
+        ).some(
+          (row) =>
+            this.get<Issue>("issue", (JSON.parse(row.data) as Link).fromId).status !== "done",
+        );
         if (blocked)
           fail("blocked", "Resolve all blockers before starting or completing work.", 409);
       };
       const lease = (issue: Issue, token: unknown) => {
         const supplied = text(token, "leaseToken", 200);
-        const row = this.sql
-          .exec<{ token: string }>("SELECT token FROM leases WHERE issue_id=?", issue.id)
-          .toArray()[0];
+        const row = first(
+          this.sql,
+          tracker.selectFrom("leases").select("token").where("issue_id", "=", issue.id),
+        );
         const a = new TextEncoder().encode(supplied);
         const b = new TextEncoder().encode(row?.token ?? "");
         if (
@@ -528,12 +552,18 @@ export class TrackerStore {
               unique("issue", entityId);
               const team = this.get<Team>("team", id(data.teamId));
               teamWritable(team);
-              const number = this.sql
-                .exec<{ number: number }>(
-                  "INSERT INTO team_numbers(id,number) VALUES (?,1) ON CONFLICT(id) DO UPDATE SET number=number+1 RETURNING number",
-                  team.id,
-                )
-                .one().number;
+              const number = one(
+                this.sql,
+                tracker
+                  .insertInto("team_numbers")
+                  .values({ id: team.id, number: raw.lit(1) })
+                  .onConflict((oc) =>
+                    oc
+                      .column("id")
+                      .doUpdateSet((eb) => ({ number: eb("number", "+", raw.lit(1)) })),
+                  )
+                  .returning("number"),
+              ).number;
               issue = {
                 ...base,
                 teamId: team.id,
@@ -573,7 +603,7 @@ export class TrackerStore {
             }
             if ("status" in data && issue.status !== previous) {
               issue.claim = null;
-              this.sql.exec("DELETE FROM leases WHERE issue_id=?", entityId);
+              run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
             }
             if (!creating) {
               issue.version++;
@@ -723,10 +753,16 @@ export class TrackerStore {
                 expiresAt,
               };
               issue.status = "in_progress";
-              this.sql.exec(
-                "INSERT INTO leases(issue_id,token) VALUES (?,?) ON CONFLICT(issue_id) DO UPDATE SET token=excluded.token",
-                entityId,
-                token,
+              run(
+                this.sql,
+                tracker
+                  .insertInto("leases")
+                  .values({ issue_id: entityId, token })
+                  .onConflict((oc) =>
+                    oc
+                      .column("issue_id")
+                      .doUpdateSet((eb) => ({ token: eb.ref("excluded.token") })),
+                  ),
               );
               result = { id: entityId, leaseToken: token, expiresAt };
             } else {
@@ -751,7 +787,7 @@ export class TrackerStore {
               }
               issue.status = kind === "issue.complete" ? "done" : "todo";
               issue.claim = null;
-              this.sql.exec("DELETE FROM leases WHERE issue_id=?", entityId);
+              run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
             }
             issue.version++;
             issue.updatedAt = now;
@@ -773,12 +809,14 @@ export class TrackerStore {
         if (issue.status === "in_progress" || issue.status === "done") ready(issue);
       }
       const result: MutationResult = { cursor: this.cursor(), events, results, serverTime: now };
-      this.sql.exec(
-        "INSERT INTO receipts(id,actor_id,request,result) VALUES (?,?,?,?)",
-        request.operationId,
-        access.actorId,
-        encoded,
-        JSON.stringify(result),
+      run(
+        this.sql,
+        tracker.insertInto("receipts").values({
+          id: request.operationId,
+          actor_id: access.actorId,
+          request: encoded,
+          result: JSON.stringify(result),
+        }),
       );
       return result;
     });

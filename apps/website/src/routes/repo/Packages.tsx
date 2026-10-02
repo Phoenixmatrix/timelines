@@ -20,7 +20,7 @@ export function RepoPackages() {
   const repo = useRepo();
   if (packages.length === 0) {
     return (
-      <section className="mk-card">
+      <section className="mk-card max-w-[44rem]">
         <h2 className="mk-card-title">Nothing published from {repo.name} yet</h2>
         <p className="mk-card-desc max-w-[48ch]">
           A CI job that runs <code className="mk-mono">npm publish</code>,{" "}

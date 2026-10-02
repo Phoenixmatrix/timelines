@@ -191,10 +191,20 @@ export function AppShell() {
 }
 
 /** The page column: comfortable reading width, generous section spacing. */
-export function Page({ children, wide = false }: { children: React.ReactNode; wide?: boolean }) {
-  return (
-    <div className={`mx-auto w-full px-4 py-7 sm:px-8 ${wide ? "max-w-6xl" : "max-w-4xl"}`}>
-      {children}
-    </div>
-  );
+/**
+ * The page column. Reading and settings pages stay narrow; `wide` suits
+ * familiar document layouts (code, commits); `full` is for workspaces that
+ * get better with room (CI, packages, issues, knowledge, wiki).
+ */
+export function Page({
+  children,
+  wide = false,
+  full = false,
+}: {
+  children: React.ReactNode;
+  wide?: boolean;
+  full?: boolean;
+}) {
+  const width = full ? "max-w-[120rem]" : wide ? "max-w-6xl" : "max-w-4xl";
+  return <div className={`mx-auto w-full px-4 py-5 sm:px-8 sm:py-7 ${width}`}>{children}</div>;
 }

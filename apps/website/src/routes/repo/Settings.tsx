@@ -390,7 +390,8 @@ export function Settings() {
   const fullName = `${repo.owner.slug}/${repo.name}`;
 
   return (
-    <div className="flex max-w-3xl flex-col gap-6">
+    // Settings read as forms: one readable column, two side by side on wide screens.
+    <div className="max-w-3xl gap-6 xl:max-w-none xl:columns-2 [&>*]:mb-6 [&>*]:break-inside-avoid">
       <Card title="General">
         <Form method="post" className="mk-card-body">
           <input type="hidden" name="intent" value="update" />

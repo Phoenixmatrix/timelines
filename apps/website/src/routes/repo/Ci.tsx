@@ -5,8 +5,9 @@ import {
   PlayIcon,
   StopIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import {
+  Await,
   Form,
   Link,
   redirect,
@@ -33,8 +34,29 @@ import { useRepo } from "./RepoLayout.tsx";
 const SETUP_STEP = -1;
 const base = (owner?: string, name?: string) => `/repos/${owner}/${name}/ci`;
 
+/** Older pages never change; the strip reads them once per page. */
+const olderPages = new Map<string, Promise<CiRunSummary[]>>();
+
 export async function ciLoader({ request, params }: LoaderFunctionArgs) {
-  return load<CiRunList>(base(params.owner, params.repo), request);
+  const path = base(params.owner, params.repo);
+  const list = await load<CiRunList>(path, request);
+  // The health strip shows up to 60 runs; the page holds 30. The next page
+  // streams in behind the table and never holds it up.
+  const last = list.runs.at(-1);
+  let older: Promise<CiRunSummary[]> = Promise.resolve([]);
+  if (last && list.runs.length >= 30) {
+    const key = `${path}?before=${last.number}`;
+    older =
+      olderPages.get(key) ??
+      api<CiRunList>(key)
+        .then((page) => page.runs)
+        .catch(() => {
+          olderPages.delete(key);
+          return [];
+        });
+    olderPages.set(key, older);
+  }
+  return { ...list, older };
 }
 
 export async function ciRunLoader({ request, params }: LoaderFunctionArgs) {
@@ -133,7 +155,7 @@ function RunnerHint({ runner, waiting }: { runner: CiRunList["runner"]; waiting:
 
 function EmptyState() {
   return (
-    <section className="mk-card">
+    <section className="mk-card max-w-[44rem]">
       <h2 className="mk-card-title">No runs yet</h2>
       <p className="mk-card-desc">
         Add a pipeline at <code className="mk-mono">.gitmatrix/ci.yml</code> and push. Every push to
@@ -160,49 +182,195 @@ jobs:
   );
 }
 
+/**
+ * One grid for the header and every row; columns join as the pane gets room
+ * (container queries), and the title keeps its width first. Under 42rem a
+ * row is two lines: the title over its run number, branch and duration.
+ */
+const RUN_GRID =
+  "grid items-center gap-x-4 px-4 grid-cols-[1rem_minmax(0,1fr)_4.5rem] " +
+  "@2xl:grid-cols-[1rem_minmax(0,1fr)_10rem_4.5rem_6.5rem] " +
+  "@4xl:grid-cols-[1rem_minmax(0,1fr)_10rem_8rem_4.5rem_4.5rem_6.5rem] " +
+  "@6xl:grid-cols-[1rem_minmax(0,1fr)_13rem_10rem_4.5rem_4.5rem_6.5rem]";
+const WIDE = "hidden @2xl:block";
+const WIDER = "hidden @4xl:block";
+
+const trigger = (run: CiRunSummary) =>
+  run.trigger === "manual"
+    ? `started by ${run.actor ?? "someone"}`
+    : `pushed${run.actor ? ` by ${run.actor}` : ""}`;
+
 function RunRow({ run }: { run: CiRunSummary }) {
   const repo = useRepo();
   return (
     <li>
       <PrefetchLink
         to={repoPath(repo.owner.slug, repo.name, "ci", String(run.number))}
-        className="flex items-center gap-3 px-4 py-3 text-ink no-underline hover:bg-raised"
+        className={`${RUN_GRID} min-h-11 py-2 text-body-sm text-ink no-underline transition-colors hover:bg-raised @2xl:h-11 @2xl:py-0`}
       >
-        <CiStatusIcon status={run.status} className="size-5" />
-        <div className="min-w-0 flex-1">
-          <div className="truncate font-semibold" dir="auto">
+        <CiStatusIcon status={run.status} />
+        <span className="min-w-0">
+          <span className="block truncate font-semibold" dir="auto">
             {run.title || "(no message)"}
-          </div>
-          <div className="flex flex-wrap items-center gap-x-2 text-body-sm text-ink-faint">
-            <span>#{run.number}</span>
-            <span>·</span>
-            <span>
-              {run.trigger === "manual"
-                ? `Started by ${run.actor ?? "someone"}`
-                : `Pushed${run.actor ? ` by ${run.actor}` : ""}`}
-            </span>
-            <span>·</span>
-            <span title={fullDate(run.createdAt)}>{timeAgo(run.createdAt)}</span>
-            {run.startedAt && (
-              <>
-                <span>·</span>
-                <span>{duration(run.startedAt, run.finishedAt)}</span>
-              </>
-            )}
-          </div>
-        </div>
-        <span className="mk-chip mk-chip--tag hidden h-6 gap-1 sm:inline-flex">
-          <GitBranchIcon weight="bold" aria-hidden />
-          {run.ref}
+          </span>
+          <span className="block truncate text-micro text-ink-faint @2xl:hidden">
+            <span className="font-mono">#{run.number}</span> · {run.ref}
+            {run.startedAt && ` · ${duration(run.startedAt, run.finishedAt)}`}
+          </span>
         </span>
-        <span className="mk-chip mk-chip--tag mk-mono h-6">{shortOid(run.commit)}</span>
+        <span className={`truncate text-ink-faint ${WIDE}`}>
+          <span className="font-mono text-mono text-ink-muted">#{run.number}</span> {trigger(run)}
+        </span>
+        <span className="hidden min-w-0 items-center gap-1 @4xl:flex">
+          <GitBranchIcon weight="bold" className="shrink-0 text-ink-faint" aria-hidden />
+          <span className="truncate font-mono text-mono text-ink-muted">{run.ref}</span>
+        </span>
+        <span className={`font-mono text-mono text-ink-faint ${WIDER}`}>
+          {shortOid(run.commit)}
+        </span>
+        <span className={`text-right font-mono text-mono text-ink-muted tabular-nums ${WIDE}`}>
+          {run.startedAt ? duration(run.startedAt, run.finishedAt) : ""}
+        </span>
+        <span
+          className="truncate text-right text-micro text-ink-faint tabular-nums"
+          title={fullDate(run.createdAt)}
+        >
+          <span className="@2xl:hidden">{timeAgo(run.createdAt).replace(" ago", "")}</span>
+          <span className="hidden @2xl:inline">{timeAgo(run.createdAt)}</span>
+        </span>
       </PrefetchLink>
     </li>
   );
 }
 
+const SLOTS = 60;
+const BAR_FILL: Partial<Record<CiRunSummary["status"], string>> = {
+  succeeded: "bg-online",
+  failed: "bg-danger-text",
+};
+const seconds = (run: CiRunSummary) =>
+  run.startedAt
+    ? Math.max(
+        0,
+        ((run.finishedAt ? Date.parse(run.finishedAt) : Date.now()) - Date.parse(run.startedAt)) /
+          1000,
+      )
+    : 0;
+
+function formatSeconds(total: number): string {
+  const at = new Date(0).toISOString();
+  return duration(at, new Date(total * 1000).toISOString());
+}
+
+/**
+ * The last runs as bars, oldest on the left: height is how long a run took
+ * (square-root scale, so one slow run doesn't flatten the rest), color is how
+ * it ended. Hovering reads a run out in the caption; clicking opens it.
+ */
+function HealthStrip({ runs }: { runs: CiRunSummary[] }) {
+  const repo = useRepo();
+  const [hover, setHover] = useState<CiRunSummary | null>(null);
+  const shown = runs.slice(0, SLOTS).reverse();
+  const peak = Math.sqrt(Math.max(1, ...shown.map(seconds)));
+  const finished = shown.filter((r) => r.status === "succeeded" || r.status === "failed");
+  const passed = finished.filter((r) => r.status === "succeeded").length;
+  const times = finished.map(seconds).sort((a, b) => a - b);
+  const median = times.length ? times[Math.floor(times.length / 2)]! : null;
+
+  const caption = hover ? (
+    <>
+      <span className="font-mono text-ink">#{hover.number}</span> {hover.title || "(no message)"}
+      {" · "}
+      {ciLabel(hover.status)}
+      {hover.startedAt && ` in ${duration(hover.startedAt, hover.finishedAt)}`} ·{" "}
+      {timeAgo(hover.createdAt)}
+    </>
+  ) : (
+    <>
+      Last <span className="font-mono text-ink">{shown.length}</span> runs
+      {finished.length > 0 && (
+        <>
+          {" · "}
+          <span className="font-mono text-ink">{passed}</span> of{" "}
+          <span className="font-mono text-ink">{finished.length}</span> passed
+        </>
+      )}
+      {median !== null && (
+        <>
+          {" · "}median <span className="font-mono text-ink">{formatSeconds(median)}</span>
+        </>
+      )}
+    </>
+  );
+
+  return (
+    <section
+      aria-label="Recent runs"
+      className="flex flex-col gap-1.5 rounded-pane bg-pane px-3 pt-2 pb-1.5"
+    >
+      <div className="flex min-h-6 flex-wrap items-center gap-x-4 gap-y-1">
+        <p
+          className="m-0 min-w-0 flex-1 truncate text-body-sm text-ink-muted tabular-nums"
+          aria-live="polite"
+        >
+          {caption}
+        </p>
+        <ul className="mk-legend text-micro max-sm:hidden" aria-hidden>
+          <li>
+            <span className="mk-key mk-key--bar bg-online" />
+            Passed
+          </li>
+          <li>
+            <span className="mk-key mk-key--bar bg-danger-text" />
+            Failed
+          </li>
+          <li>
+            <span className="mk-key mk-key--bar bg-ink-faint" />
+            Running or cancelled
+          </li>
+        </ul>
+      </div>
+      <ol
+        className="m-0 flex h-12 list-none items-end gap-px p-0"
+        onMouseLeave={() => setHover(null)}
+      >
+        {Array.from({ length: SLOTS - shown.length }, (_, i) => (
+          <li
+            key={`empty-${i}`}
+            className="flex h-full min-w-0 flex-1 basis-0 items-end"
+            aria-hidden
+          >
+            <span className="h-px w-full bg-line-soft" />
+          </li>
+        ))}
+        {shown.map((run) => (
+          <li key={run.id} className="flex h-full min-w-0 flex-1 basis-0">
+            <PrefetchLink
+              to={repoPath(repo.owner.slug, repo.name, "ci", String(run.number))}
+              aria-label={`Run ${run.number}: ${ciLabel(run.status)}${run.startedAt ? `, ${duration(run.startedAt, run.finishedAt)}` : ""}`}
+              className="flex h-full w-full items-end rounded-t-[4px] transition-colors hover:bg-raised focus-visible:bg-raised"
+              onPointerEnter={() => setHover(run)}
+              onFocus={() => setHover(run)}
+              onBlur={() => setHover(null)}
+            >
+              <span
+                className={`w-full rounded-t-[4px] ${BAR_FILL[run.status] ?? "bg-ink-faint"}`}
+                style={{ height: `${Math.max(8, (Math.sqrt(seconds(run)) / peak) * 100)}%` }}
+              />
+            </PrefetchLink>
+          </li>
+        ))}
+      </ol>
+      <div className="flex justify-between text-micro text-ink-faint" aria-hidden>
+        <span>Older</span>
+        <span>Latest</span>
+      </div>
+    </section>
+  );
+}
+
 export function CiRuns() {
-  const { runs, runner } = useLoaderData<typeof ciLoader>();
+  const { runs, runner, older } = useLoaderData<typeof ciLoader>();
   const error = useActionData<typeof ciAction>();
   const repo = useRepo();
   const navigation = useNavigation();
@@ -236,11 +404,32 @@ export function CiRuns() {
       {runs.length === 0 ? (
         <EmptyState />
       ) : (
-        <ol className="m-0 list-none divide-y divide-line-soft overflow-hidden rounded-pane bg-pane p-0">
-          {runs.map((run) => (
-            <RunRow key={run.id} run={run} />
-          ))}
-        </ol>
+        <>
+          <Suspense fallback={<HealthStrip runs={runs} />}>
+            <Await resolve={older} errorElement={<HealthStrip runs={runs} />}>
+              {(more: CiRunSummary[]) => <HealthStrip runs={[...runs, ...more]} />}
+            </Await>
+          </Suspense>
+          <div className="@container overflow-hidden rounded-pane bg-pane">
+            <div
+              aria-hidden
+              className={`${RUN_GRID} hidden h-9 border-b border-line-soft text-label text-ink-faint @2xl:grid`}
+            >
+              <span />
+              <span>Title</span>
+              <span className={WIDE}>Run</span>
+              <span className={WIDER}>Branch</span>
+              <span className={WIDER}>Commit</span>
+              <span className={`text-right ${WIDE}`}>Duration</span>
+              <span className="text-right">Started</span>
+            </div>
+            <ol className="m-0 list-none divide-y divide-line-soft p-0">
+              {runs.map((run) => (
+                <RunRow key={run.id} run={run} />
+              ))}
+            </ol>
+          </div>
+        </>
       )}
     </div>
   );

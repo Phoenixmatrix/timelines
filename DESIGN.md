@@ -309,9 +309,13 @@ Breakpoints come from Tailwind's defaults and are used consistently by role:
 - **Under 768px (md):** wide tables re-flow into two-line rows (the version table goes from one 40px line to a 60px two-line grid); extra columns in package lists drop out.
 - **From 1024px (lg):** side columns appear: the package console's 17rem facet column (sticky), two-up knowledge panes. Below lg the facets fold into a `<details>` pane above the table.
 
-Repository pages share a header (title, visibility and role tags, description, Clone popover on the right) over an underlined tab bar (Code, Commits, CI, Packages, Wiki, Knowledge, Settings) that scrolls horizontally on narrow screens.
+Repository pages share a header (title, visibility and role tags, description, Clone popover on the right) over an underlined tab bar (Code, Commits, CI, Packages, Issues, Wiki, Knowledge, Settings) that scrolls horizontally on narrow screens and keeps the current tab in view.
+
+Page width follows the job. `Page` has three columns: reading (`max-w-4xl`) for account settings and forms, wide (`max-w-6xl`) for the package console, and full (`max-w-[120rem]`) for every repository tab, so the repository header and tabs never move between tabs. Inside a full page, content that reads better narrow constrains itself: repository settings are cards in one 48rem column that become two columns from `xl`. Full-width pages earn the space with a side rail from `xl` (1280px): the code tree's About rail (knowledge summary, recent CI as status squares), the file view's "in the knowledge graph" rail (summary, defined symbols linking to `#L` anchors, uses and used-by), the wiki's contents and sources rail. Reading text keeps its measure (about 72ch) inside a full page; empty states cap at 44rem and sit left with the content. Full-height workspaces (the tracker, the atlas) fill the viewport height and scroll inside their panes, not the page.
 
 ### Named Rules
+
+**The Room Rule.** A wide screen is for more columns of the same work (a rail, an inspector, more log columns), never for stretching one column of text or an empty card across it.
 
 **The Pane List Rule.** Anything listed (repositories, commits, runs, files, packages, versions, published artifacts) is one `pane` with `rounded-pane`, rows divided by `line-soft` hairlines, and `raised` on row hover. Not a stack of separate cards.
 
@@ -394,6 +398,26 @@ State changes are 150ms color transitions. Popups scale from 95% and fade in 150
 
 The package version explorer: a mono query bar with filter help, a row of saved-view chips, the publish-rate strip (a pane of teal columns with berry for retired versions, a raised backdrop on hover and an amber wash behind a brushed span; dragging across bars scopes the query to that time range), a virtualized version table in one pane (sticky label-size header, 40px rows, amber-wash selected rows, read-only tags and commit-hash chips, source and run as links, branch as a filter), and a sticky facet column of count bars (raised bars scaled to the largest count, amber wash when pressed). The header shows dist-tags as filter chips. Selecting rows raises a floating bar for bulk tag, deprecate, yank and delete. It is the reference for any future "lots of machine-made records" view: CI runs and commits should grow toward it, not away from it.
 
+### Event log (tracker list)
+
+The issue tracker's list is the query console's sibling at a larger scale: a mono query bar (syntax hint only while focused or when a token doesn't parse, and unknown tokens are named as ignored beside the count), saved-view chips, the brushable activity strip (teal opened, berry closed, the shared `ActivityStrip` component), then one 32px row per issue in a single virtualized pane. Columns join by container width so the title keeps its room first: state, key, title and age always; team and priority at 42rem; type at 56rem; assignee at 64rem. State reads as a dot alone when the words would repeat (an issue is open beside the log, or the query pins one state); the word stays in the tooltip and for screen readers. The 17rem facet column (count rows with a thin bar under each, amber wash when pressed) becomes the issue inspector when a row opens; on phones the facets, the count and the strip fold into one "Narrow it down" pane.
+
+### Board and the backlog digest
+
+The board keeps one lane per status, each virtualized; Done and Canceled fold to a vertical count until opened. A backlog of thousands is groomed, not read, so the Backlog lane is a digest rather than a card stack: its total, one line on staleness ("N% untouched for 90+ days"), a group-by segmented control (priority, team, label, age), and count rows with a thin bar each. One group opens at a time to show its twelve most important issues (priority, then longest waiting) as one-line rows with their age, and "All N in the list" opens the same filter in the event log. To do stays a queue: its header splits ready from blocked, and ready work leads.
+
+### Relationship lens
+
+The tracker's graph view never draws the whole graph. One issue sits at the centre (raised card, amber ring); what blocks it fans out in columns to the left, one column per step up the chain (1 to 3, limited by width), what it blocks to the right; its parent trail sits above it and sub-issues (with a done/total bar) and related issues below. Every column is a plain list of cards, so nothing overlaps at any size; SVG connectors run only between neighbouring columns, red while the blocker is still open and `line` once resolved, and hovering a card dims every connector but its own. Clicking any card re-centres the lens with a view transition (cards that stay on screen glide 320ms on the expo ease; reduced motion cuts straight), and a trail of visited keys leads back. With nothing chosen it opens on where to start: find an issue, Bottlenecks (open issues blocking the most open work) and Furthest from ready (longest chains of blockers). The inspector opens beside the lens only on Details. Issues outside the current query still appear, at 60% opacity.
+
+### Atlas (signature component)
+
+The knowledge page is a zoomable map of the repository on one canvas: components are regions, folders districts, files plots, symbols lots, laid out as a squarified treemap in the pane's own shape and kept still between builds (weights are bucketed, ties break by name). Depth is tonal: regions on `surface` with a constant 1.5px seam, districts as darker `pane` wells, files on `raised`, symbols back down on `pane`; files the latest build changed are tinted berry. Semantic zoom draws only what reads at the current scale, and labels follow **The Whole-Label Rule**: a name is drawn whole (wrapping to two lines at most) or not at all, largest regions first, collision-checked, never under the floating search and zoom controls or the legend; far out a region's name may overhang it like a city on a map. Hover lights a node's links (teal "uses", violet "used by", each with a legend key); selection flies to the node with an amber outline. Search floats top-left (instant name matches, then a "search meaning and passages" row); the inspector reads the selected node at right and, on phones, is a bottom sheet that peeks with the name. The map loads once per build from a lean endpoint (ETag per commit) and stays smooth at 30,000 files.
+
+### Status by shape
+
+When a state can't take a status hue, it takes a shape. A claimed issue (an agent holds a lease) is a hollow ink ring, in progress a filled ink dot, ready green, blocked red, waiting faint ink; agent checkpoints use the same ring. Data hues never mark a status.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -407,6 +431,8 @@ The package version explorer: a mono query bar with filter help, a row of saved-
 - **Do** teach in empty states: say what will appear here and show the exact command or config that makes it appear.
 - **Do** keep controls at 44px on phones (the kit's phone rule) and re-flow wide tables into two-line rows under 768px rather than scrolling them sideways.
 - **Do** check both themes; anything built from roles will already work.
+- **Do** give canvas views the kit's tonal stack (sunken, pane, surface, raised) for structure, and draw labels whole or not at all.
+- **Do** explore relationships one hop at a time around a focus (the relationship lens), and let wide screens add columns of the same work.
 
 ### Don't:
 
@@ -414,7 +440,8 @@ The package version explorer: a mono query bar with filter help, a row of saved-
 - **Don't** put borders or shadows on panes, cards or tables; separate them by tone and spacing.
 - **Don't** put a shadow on anything that doesn't float (The Float-Only Shadow Rule).
 - **Don't** use amber to mean warning or status; failure is red, success is green, waiting is faint ink.
-- **Don't** use the data hues outside charts and their legend keys.
+- **Don't** use the data hues outside charts and their legend keys, and never for a status (a claim is a hollow ring, not violet).
+- **Don't** draw a whole dependency graph as a hairball, a force layout or a flame-graph mosaic; centre an issue and show its neighbours as lists.
 - **Don't** stack separate cards for list items, or nest a card inside a card.
 - **Don't** set text in uppercase with letter-spacing, or add small labels above headings; headings stand on their own.
 - **Don't** step off the type scale with Tailwind's stock sizes (`text-xs`, `text-sm`); use `text-micro`, `text-body-sm` and the rest.

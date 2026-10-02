@@ -5,18 +5,20 @@
 //   GET  /graph?kind=&q=&limit=  nodes
 //   GET  /graph/node?id=         one node with its neighbors
 //   GET  /graph/export           the whole graph (nodes + edges)
+//   GET  /graph/map              the whole graph, lean, for the atlas (ETag per commit)
 //   GET  /changes?build=         the change feed for a build (default: latest)
 //   GET  /search?q=              entities (Vectorize) + passages (AI Search)
 //   GET  /wiki                   the catalog
 //   GET  /wiki/page?slug=        one page
 
 import { Hono, type Context } from "hono";
-import type { Selectable } from "kysely";
+import { sql, type Selectable } from "kysely";
 import type {
   GraphLink,
   GraphNode,
   GraphNodeDetail,
   KnowledgeBuild,
+  KnowledgeMap,
   KnowledgeSearchResults,
   KnowledgeStatus,
   WikiCatalog,
@@ -248,6 +250,63 @@ knowledge.get("/graph/export", async (c) => {
     nodes: nodes.map(toNode),
     edges,
   });
+});
+
+knowledge.get("/graph/map", async (c) => {
+  const row = await repoOrFail(c);
+  if (row instanceof Response) return row;
+  const state = await db(c.env.DB)
+    .selectFrom("kg_state")
+    .select("indexed_commit")
+    .where("repo_id", "=", row.id)
+    .executeTakeFirst();
+  const commit = state?.indexed_commit ?? null;
+  // The map only changes when a build lands, so a revalidation is usually free.
+  const etag = `W/"map-${row.id}-${commit ?? "none"}"`;
+  c.header("ETag", etag);
+  c.header("Cache-Control", "private, no-cache");
+  if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
+  const [nodes, edges] = await Promise.all([
+    db(c.env.DB)
+      .selectFrom("kg_nodes")
+      .select([
+        "id",
+        "kind",
+        "name",
+        "path",
+        "changed_in",
+        sql<
+          number | null
+        >`coalesce(json_extract(data, '$.lines'), json_extract(data, '$.line'))`.as("size"),
+      ])
+      .where("repo_id", "=", row.id)
+      .orderBy("path")
+      .orderBy("name")
+      .execute(),
+    db(c.env.DB)
+      .selectFrom("kg_edges")
+      .select(["src", "dst", "kind"])
+      .where("repo_id", "=", row.id)
+      .execute(),
+  ]);
+  const at = new Map(nodes.map((n, i) => [n.id, i]));
+  const body: KnowledgeMap = {
+    commit,
+    nodes: nodes.map((n) => [
+      n.id,
+      n.kind as GraphNode["kind"],
+      n.name,
+      n.path,
+      Number(n.size) || 0,
+      commit && n.changed_in === commit ? 1 : 0,
+    ]),
+    edges: edges.flatMap((e) => {
+      const a = at.get(e.src);
+      const b = at.get(e.dst);
+      return a === undefined || b === undefined ? [] : [[a, b, e.kind] as [number, number, string]];
+    }),
+  };
+  return c.json(body);
 });
 
 knowledge.get("/changes", async (c) => {

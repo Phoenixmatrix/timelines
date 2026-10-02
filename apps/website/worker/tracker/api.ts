@@ -8,6 +8,7 @@ import {
   type AccountRow,
   type Actor,
 } from "../db.ts";
+import { db as gitmatrixDb } from "../schema.ts";
 import type { TrackerIdentity, TrackerOwner } from "../../shared/tracker.ts";
 import { TrackerError, validateRequest, type Access } from "./store.ts";
 import type { Tracker, TrackerReply } from "./object.ts";
@@ -20,13 +21,21 @@ function trackerObject(env: Env, ownerId: string): DurableObjectStub<Tracker> {
 }
 
 async function accessible(db: D1Database, actor: Actor): Promise<TrackerOwner[]> {
-  const rows = await db
-    .prepare(`SELECT a.id,a.slug,a.display_name,m.role FROM accounts a
-    LEFT JOIN org_members m ON m.org_id=a.id AND m.user_id=?
-    WHERE a.id=? OR (a.kind='org' AND m.user_id IS NOT NULL) ORDER BY a.slug`)
-    .bind(actor.id, actor.id)
-    .all<{ id: string; slug: string; display_name: string; role: string | null }>();
-  return rows.results.map((row) => ({
+  const rows = await gitmatrixDb(db)
+    .selectFrom("accounts as a")
+    .leftJoin("org_members as m", (join) =>
+      join.onRef("m.org_id", "=", "a.id").on("m.user_id", "=", actor.id),
+    )
+    .select(["a.id", "a.slug", "a.display_name", "m.role"])
+    .where((eb) =>
+      eb.or([
+        eb("a.id", "=", actor.id),
+        eb.and([eb("a.kind", "=", "org"), eb("m.user_id", "is not", null)]),
+      ]),
+    )
+    .orderBy("a.slug")
+    .execute();
+  return rows.map((row) => ({
     id: row.id,
     slug: row.slug,
     displayName: row.display_name,
@@ -42,25 +51,28 @@ async function authorize(c: Context<AppEnv>, includeMembers = true): Promise<Acc
   if (!canAdmin) {
     const membership =
       owner.kind === "org"
-        ? await c.env.DB.prepare("SELECT role FROM org_members WHERE org_id=? AND user_id=?")
-            .bind(owner.id, actor.id)
-            .first<{ role: string }>()
+        ? await gitmatrixDb(c.env.DB)
+            .selectFrom("org_members")
+            .select("role")
+            .where("org_id", "=", owner.id)
+            .where("user_id", "=", actor.id)
+            .executeTakeFirst()
         : null;
     if (!membership)
       throw new TrackerError(403, "forbidden", "Tracker access requires account membership.");
     canAdmin = membership.role === "owner";
   }
-  const members = !includeMembers
+  const members: AccountRow[] = !includeMembers
     ? []
     : owner.kind === "user"
       ? [owner]
-      : (
-          await c.env.DB.prepare(
-            "SELECT a.* FROM accounts a JOIN org_members m ON m.user_id=a.id WHERE m.org_id=? ORDER BY a.slug",
-          )
-            .bind(owner.id)
-            .all<AccountRow>()
-        ).results;
+      : await gitmatrixDb(c.env.DB)
+          .selectFrom("accounts as a")
+          .innerJoin("org_members as m", "m.user_id", "a.id")
+          .selectAll("a")
+          .where("m.org_id", "=", owner.id)
+          .orderBy("a.slug")
+          .execute();
   return {
     actorId: actor.id,
     owner: { id: owner.id, slug: owner.slug, displayName: owner.display_name },
@@ -159,12 +171,12 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
       const lookup = await trackerObject(c.env, access.owner.id).subscriptionRepoIds(removals);
       if (!lookup.ok) return response(c, lookup);
       if (lookup.value.length) {
-        const existing = await c.env.DB.prepare(
-          `SELECT id FROM repos WHERE id IN (${lookup.value.map(() => "?").join(",")})`,
-        )
-          .bind(...lookup.value)
-          .all<{ id: string }>();
-        const ids = new Set(existing.results.map((repo) => repo.id));
+        const existing = await gitmatrixDb(c.env.DB)
+          .selectFrom("repos")
+          .select("id")
+          .where("id", "in", lookup.value)
+          .execute();
+        const ids = new Set(existing.map((repo) => repo.id));
         access.deletedRepoIds = lookup.value.filter((repoId) => !ids.has(repoId));
       }
     }

@@ -1,7 +1,8 @@
 import { FileIcon, FolderSimpleIcon, LinkSimpleIcon, CubeIcon } from "@phosphor-icons/react";
+import { Suspense } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
+import { Await, Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
 import { Monogram } from "../../components/Monogram.tsx";
 import { CopyField, link } from "../../components/ui.tsx";
@@ -9,7 +10,9 @@ import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { blobUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
+import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
+import { About } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
@@ -22,9 +25,17 @@ export async function codeLoader({ params }: LoaderFunctionArgs) {
     routeData(repoData.detail(owner, name)),
     repoData.tree(owner, name, params["*"] ?? "").catch((error: unknown) => error),
   ]);
-  if (!repo.head || repo.state !== "ready") return { tree: null };
-  if (tree instanceof Error || !tree) return { tree: await routeData(Promise.reject(tree)) };
-  return { tree: tree as TreeResponse };
+  if (!repo.head || repo.state !== "ready") return { tree: null, about: null };
+  if (tree instanceof Error || !tree) {
+    return { tree: await routeData(Promise.reject(tree)), about: null };
+  }
+  // The About rail is extra: it streams in beside the files and never holds
+  // them up. Both reads are cached, so moving between folders reuses them.
+  const about = Promise.all([
+    repoData.graphNode(owner, name, "repo").catch(() => null),
+    repoData.ciRuns(owner, name).catch(() => null),
+  ]).then(([knowledge, ci]) => ({ knowledge, ci }));
+  return { tree: tree as TreeResponse, about };
 }
 
 const ICONS = {
@@ -111,86 +122,95 @@ function EmptyRepo({ repo }: { repo: RepoDetail }) {
 }
 
 export function Code() {
-  const { tree } = useLoaderData<typeof codeLoader>();
+  const { tree, about } = useLoaderData<typeof codeLoader>();
   const repo = useRepo();
   const navigate = useNavigate();
   if (!tree) return <EmptyRepo repo={repo} />;
 
   const { commit } = tree;
   return (
-    <div className="flex flex-col gap-4">
-      <RefBar
-        repo={repo}
-        refName={tree.ref}
-        path={tree.path}
-        view="tree"
-        onSwitch={(ref) => navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path))}
-      />
+    <div className="grid gap-x-8 gap-y-6 xl:grid-cols-[minmax(0,1fr)_20rem]">
+      <div className="flex min-w-0 flex-col gap-4">
+        <RefBar
+          repo={repo}
+          refName={tree.ref}
+          path={tree.path}
+          view="tree"
+          onSwitch={(ref) => navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path))}
+        />
 
-      <section className="overflow-hidden rounded-pane bg-pane">
-        <div className="flex items-center gap-3 border-b border-line-soft px-4 py-3">
-          <Monogram name={commit.authorName} size="sm" />
-          <div className="min-w-0 flex-1">
-            <div className="truncate">
-              <span className="font-semibold">
-                <bdi>{commit.authorName}</bdi>
-              </span>{" "}
-              <span className="text-ink-muted" dir="auto">
-                {firstLine(commit.message)}
-              </span>
-            </div>
-          </div>
-          <span className="mk-mono text-mono text-ink-faint">{shortOid(commit.oid)}</span>
-          <span
-            className="hidden text-body-sm text-ink-faint sm:inline"
-            title={fullDate(commit.authoredAt)}
-          >
-            {timeAgo(commit.authoredAt)}
-          </span>
-        </div>
-        <ul className="m-0 list-none divide-y divide-line-soft p-0">
-          {tree.path && (
-            <li>
-              <PrefetchLink
-                to={treeUrl(
-                  repo.owner.slug,
-                  repo.name,
-                  tree.ref,
-                  tree.path.split("/").slice(0, -1).join("/"),
-                )}
-                className="flex h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised"
-                aria-label="Parent folder"
-              >
-                <FolderSimpleIcon className="size-4" aria-hidden />
-                ..
-              </PrefetchLink>
-            </li>
-          )}
-          {tree.entries.map((entry) => (
-            <EntryRow key={entry.path} repo={repo} refName={tree.ref} entry={entry} />
-          ))}
-        </ul>
-      </section>
-
-      {tree.readme && (
-        <section className="rounded-pane bg-pane">
-          <h2 className="m-0 border-b border-line-soft px-5 py-3 text-body font-semibold">
-            {tree.readme.name}
-          </h2>
-          <div className="px-5 py-5">
-            {/\.(md|markdown)$/i.test(tree.readme.name) ? (
-              <div className="gm-prose" dir="auto">
-                {/* react-markdown never renders raw HTML, so READMEs can't inject markup. */}
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{tree.readme.text}</ReactMarkdown>
+        <section className="overflow-hidden rounded-pane bg-pane">
+          <div className="flex items-center gap-3 border-b border-line-soft px-4 py-3">
+            <Monogram name={commit.authorName} size="sm" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate">
+                <span className="font-semibold">
+                  <bdi>{commit.authorName}</bdi>
+                </span>{" "}
+                <span className="text-ink-muted" dir="auto">
+                  {firstLine(commit.message)}
+                </span>
               </div>
-            ) : (
-              <pre className="m-0 font-mono text-body-sm whitespace-pre-wrap">
-                {tree.readme.text}
-              </pre>
-            )}
+            </div>
+            <span className="mk-mono text-mono text-ink-faint">{shortOid(commit.oid)}</span>
+            <span
+              className="hidden text-body-sm text-ink-faint sm:inline"
+              title={fullDate(commit.authoredAt)}
+            >
+              {timeAgo(commit.authoredAt)}
+            </span>
           </div>
+          <ul className="m-0 list-none divide-y divide-line-soft p-0">
+            {tree.path && (
+              <li>
+                <PrefetchLink
+                  to={treeUrl(
+                    repo.owner.slug,
+                    repo.name,
+                    tree.ref,
+                    tree.path.split("/").slice(0, -1).join("/"),
+                  )}
+                  className="flex h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised"
+                  aria-label="Parent folder"
+                >
+                  <FolderSimpleIcon className="size-4" aria-hidden />
+                  ..
+                </PrefetchLink>
+              </li>
+            )}
+            {tree.entries.map((entry) => (
+              <EntryRow key={entry.path} repo={repo} refName={tree.ref} entry={entry} />
+            ))}
+          </ul>
         </section>
-      )}
+
+        {tree.readme && (
+          <section className="rounded-pane bg-pane">
+            <h2 className="m-0 border-b border-line-soft px-5 py-3 text-body font-semibold">
+              {tree.readme.name}
+            </h2>
+            <div className="px-5 py-5">
+              {/\.(md|markdown)$/i.test(tree.readme.name) ? (
+                <div className="gm-prose" dir="auto">
+                  {/* react-markdown never renders raw HTML, so READMEs can't inject markup. */}
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{tree.readme.text}</ReactMarkdown>
+                </div>
+              ) : (
+                <pre className="m-0 font-mono text-body-sm whitespace-pre-wrap">
+                  {tree.readme.text}
+                </pre>
+              )}
+            </div>
+          </section>
+        )}
+      </div>
+      <aside aria-label="About this repository" className={`hidden xl:block ${railClass}`}>
+        <Suspense fallback={null}>
+          <Await resolve={about} errorElement={null}>
+            {(data: Awaited<NonNullable<typeof about>>) => <About repo={repo} {...data} />}
+          </Await>
+        </Suspense>
+      </aside>
     </div>
   );
 }

@@ -141,7 +141,7 @@ Navigation uses links; view toggles use pressed buttons. Workspace names are und
 
 ### Issue selection and handoff
 
-A selected issue row uses a subtle amber wash and fine stroke. Readiness combines a text label and state indicator. Parent hierarchy, blockers and related links are separately labelled. Checkpoints and evidence use their semantic color and a fine one-pixel rule; the latest checkpoint sits near the issue header.
+A selected issue row uses a subtle amber wash. Readiness combines a text label and a state dot (a hollow ink ring for a claim; see "Status by shape" in the root DESIGN.md). Parent hierarchy, blockers and related links are separately labelled. Checkpoints carry the same ink ring and evidence a green dot; the latest checkpoint sits near the issue header. The list, relationship lens and Atlas are recorded in the root DESIGN.md.
 
 ### Conflict comparison
 
