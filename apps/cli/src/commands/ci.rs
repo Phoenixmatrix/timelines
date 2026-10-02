@@ -1245,7 +1245,20 @@ mod tests {
             "first"
         );
         drop(first);
-        let next = CompilerCache::acquire(root.path(), &scope).unwrap();
+        // A process forked by a parallel test briefly shares open lease files
+        // until it execs (they're close-on-exec), so a just-released slot can
+        // still look taken for a moment; leases must reuse it once it's free.
+        let next = (0..100)
+            .find_map(|_| {
+                let lease = CompilerCache::acquire(root.path(), &scope).unwrap();
+                if lease.target == first_path {
+                    return Some(lease);
+                }
+                drop(lease);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                None
+            })
+            .expect("the released slot is reused");
         assert_eq!(next.target, first_path);
         assert_eq!(
             std::fs::read_to_string(next.target.join("compiled-output")).unwrap(),
