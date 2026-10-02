@@ -66,6 +66,18 @@ gm release notes v1.2.0 -R orbit/engine
 gm release notes unreleased --internal -o json
 ```
 
+`gm release feed` reads a tracker account's notes across repositories, newest
+first: everything its teams shipped and everything shipped in its repositories.
+`--team KEY` narrows it to one team; any feed query filters it (`type:fix
+repo:engine since:30d`, `-label:docs`, search words). The account comes from
+`--owner`, else `gm tracker use`. Internal entries are left out unless you pass
+`--internal` or a `type:` filter.
+
+```sh
+gm release feed --owner orbit --team CORE since:2w
+gm release feed type:fix -o json
+```
+
 Entries about issues from trackers you can't read are omitted, and so is any
 introduction they shaped. See [release notes](../website/README.md#release-notes)
 for how entries are generated.

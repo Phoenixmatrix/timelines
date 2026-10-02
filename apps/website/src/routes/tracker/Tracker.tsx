@@ -616,6 +616,12 @@ function Workbench({ data }: { data: TrackerView }) {
         )}
         {admin && <span className="flex-1" />}
         <div className="ml-auto flex items-center gap-1">
+          <Link
+            className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+            to={`/tracker/${encodeURIComponent(owner)}/releases`}
+          >
+            Release notes
+          </Link>
           <span className="max-sm:hidden">
             <Freshness receivedAt={clock.current.received} />
           </span>

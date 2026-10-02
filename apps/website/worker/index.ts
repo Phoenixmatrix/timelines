@@ -15,7 +15,7 @@ import { mirrors } from "./mirror/api.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { gitHttp } from "./git/http.ts";
 import { knowledge } from "./knowledge/api.ts";
-import { releaseNotes } from "./release-notes/api.ts";
+import { releaseNotes, trackerReleaseNotes } from "./release-notes/api.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
@@ -66,6 +66,7 @@ api.use(async (c, next) => {
   return next();
 });
 api.route("/", accounts);
+api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
 api.route("/", tracker);
 api.route("/repos/:owner/:name/knowledge", knowledge);
 api.route("/repos/:owner/:name/release-notes", releaseNotes);

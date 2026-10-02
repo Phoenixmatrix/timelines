@@ -140,6 +140,15 @@ fn root(config: &Config) -> Result<PathBuf> {
         .join("gitmatrix/tracker")
         .join(digest(&format!("{}\n{auth}", config.server()))))
 }
+/// The tracker account to act on: explicit, else `gm tracker use`, else agents.toml.
+pub(crate) fn selected_owner(config: &Config, explicit: Option<String>) -> Result<String> {
+    let owner = explicit
+        .or_else(|| fs::read_to_string(root(config).ok()?.join("selected")).ok())
+        .or_else(|| crate::profile::defaults().scope.owner)
+        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER`, pass --owner OWNER, or set [tracker] owner in .gitmatrix/agents.toml."))?;
+    safe_owner(&owner)?;
+    Ok(owner)
+}
 fn safe_owner(owner: &str) -> Result<()> {
     if owner.is_empty()
         || !owner
@@ -393,13 +402,7 @@ fn with_replica(
 ) -> Result<Shown> {
     let config = Config::load();
     let root = root(&config)?;
-    let owner = scope
-        .owner
-        .clone()
-        .or_else(|| fs::read_to_string(root.join("selected")).ok())
-        .or_else(|| crate::profile::defaults().scope.owner)
-        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER`, pass --owner OWNER, or set [tracker] owner in .gitmatrix/agents.toml."))?;
-    safe_owner(&owner)?;
+    let owner = selected_owner(&config, scope.owner.clone())?;
     if scope.offline && !root.join(format!("{owner}.sqlite")).exists() {
         return Err(GmError::new(
             "replica_uninitialized",

@@ -564,6 +564,20 @@ shown only to viewers who can read every tracker that shaped it.
 | `GET /api/repos/:owner/:name/release-notes`                 | `ReleaseNotesIndex`: status and releases   |
 | `GET /api/repos/:owner/:name/release-notes/release?name=`   | `ReleaseNotesRelease`: intro and entries   |
 | `GET /api/repos/:owner/:name/release-notes/range?to=&from=` | `ReleaseRangeResponse`: commits and issues |
+| `GET /api/tracker/:owner/release-notes?q=`                  | `ReleaseFeed`: a tracker account's entries |
+
+**Team and organization views** (`worker/release-notes/feed.ts`): a tracker
+account's **Release notes** page (`/tracker/:owner/releases`, linked from the
+tracker header) lists everything its teams shipped and everything shipped in its
+repositories, newest first and grouped by week; an issue appears once per release
+it shipped in. A team's notes are the same view with `team:KEY` (the Teams
+facet). The query language follows the tracker's: `team:`, `repo:` (name or
+owner/name), `ws:`, `type:` (feature, fix, improvement, internal), `label:`,
+`release:` (a tag or `unreleased`), `since:`/`until:` (a date or `30d`, `2w`,
+`12h`), search words, and `-` to exclude; unknown tokens are reported back.
+Facets count the matching entries. It requires membership in the tracker
+account, and also applies repository visibility and per-entry tracker access.
+`gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
 
 ## Knowledge graph and wiki
 

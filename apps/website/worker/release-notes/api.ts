@@ -6,6 +6,7 @@ import type { AppEnv } from "../auth.ts";
 import type { Actor, RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { accessible } from "../tracker/api.ts";
+import { FeedError, releaseFeed } from "./feed.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
 import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
@@ -125,4 +126,18 @@ releaseNotes.get("/release", async (c) => {
   const body = await releaseNotesFor(c.env.DB, loaded.row.id, name, trackers);
   if (!body) return c.json({ error: "No release notes for that release." }, 404);
   return c.json(body);
+});
+
+/** A tracker account's release feed: `?q=` takes the feed query language. */
+export const trackerReleaseNotes = new Hono<AppEnv>();
+trackerReleaseNotes.get("/", async (c) => {
+  c.header("cache-control", "private, no-store");
+  try {
+    return c.json(
+      await releaseFeed(c.env, c.get("actor"), c.req.param("owner") ?? "", c.req.query("q") ?? ""),
+    );
+  } catch (error) {
+    if (error instanceof FeedError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
 });

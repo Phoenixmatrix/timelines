@@ -257,6 +257,10 @@ export class TrackerStore {
         .where("id", "in", subscriptionIds),
     ).map((row) => row.repoId);
   }
+  /** Every workspace's id and slug, archived ones included, for resolving filters. */
+  workspaceSlugs(): { id: string; slug: string }[] {
+    return this.all<Workspace>("workspace").map(({ id, slug }) => ({ id, slug }));
+  }
   /** Issues by key, as release notes see them; unknown keys are skipped. */
   issuesByKey(keys: string[]): ShippedIssue[] {
     if (keys.length > 500) fail("invalid_input", "Look up at most 500 keys at once.");

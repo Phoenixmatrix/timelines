@@ -534,6 +534,24 @@ pub enum ReleaseCommand {
     },
     /// One release's notes (default: the newest release with entries)
     Notes(ReleaseNotesArgs),
+    /// A tracker account's notes across repositories, filtered by facets
+    Feed(ReleaseFeedArgs),
+}
+
+#[derive(Args)]
+pub struct ReleaseFeedArgs {
+    /// Filters and words, e.g. `type:fix repo:engine since:30d`; keys are team, repo,
+    /// ws, type, label, release, since and until, negated with a leading `-`.
+    pub query: Vec<String>,
+    /// Only this team's work (adds `team:KEY`).
+    #[arg(long)]
+    pub team: Option<String>,
+    /// Tracker account/organization slug; otherwise use saved tracker context.
+    #[arg(long)]
+    pub owner: Option<String>,
+    /// Include internal entries (chores, refactors, tests, tooling).
+    #[arg(long)]
+    pub internal: bool,
 }
 
 #[derive(Args)]

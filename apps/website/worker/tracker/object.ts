@@ -47,6 +47,9 @@ export class Tracker extends DurableObject<Env> {
   subscriptionRepoIds(subscriptionIds: string[]) {
     return this.reply(() => this.store.subscriptionRepoIds(subscriptionIds));
   }
+  workspaceSlugs() {
+    return this.reply(() => this.store.workspaceSlugs());
+  }
   issuesByKey(keys: string[]) {
     return this.reply(() => this.store.issuesByKey(keys));
   }
