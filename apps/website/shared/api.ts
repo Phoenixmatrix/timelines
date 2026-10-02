@@ -217,6 +217,8 @@ export interface KnowledgeStatus {
   /** The repository's current HEAD, to compare with `indexedCommit`. */
   head: string | null;
   state: "empty" | "up-to-date" | "queued" | "building" | "failed";
+  /** Changes whenever the stored graph does, including mid-build; the map is cached by it. */
+  graphVersion: string;
   current: KnowledgeBuild | null;
   recent: KnowledgeBuild[];
   counts: Record<string, number>;
@@ -244,6 +246,8 @@ export interface GraphLink {
  */
 export interface KnowledgeMap {
   commit: string | null;
+  /** The graph version this map was read at (see KnowledgeStatus.graphVersion). */
+  version: string;
   /** [id, kind, name, path, size (lines for files, line for symbols), changed in the latest build] */
   nodes: [string, GraphNode["kind"], string, string | null, number, 0 | 1][];
   /** [source index, target index, kind] */

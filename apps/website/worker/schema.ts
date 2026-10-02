@@ -171,6 +171,7 @@ export interface Database {
     indexed_commit: string | null;
     indexed_at: string | null;
     last_build_id: string | null;
+    graph_at: string | null;
   };
   kg_files: {
     repo_id: string;

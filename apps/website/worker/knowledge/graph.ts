@@ -462,6 +462,17 @@ export async function applyGraph(
         .where("kind", "=", edge.kind),
     );
   }
+  // Last, so the version moves only once the writes before it have landed.
+  if (statements.length) {
+    statements.push(
+      db(d1)
+        .insertInto("kg_state")
+        .values({ repo_id: repoId, graph_at: nowIso() })
+        .onConflict((oc) =>
+          oc.column("repo_id").doUpdateSet((eb) => ({ graph_at: eb.ref("excluded.graph_at") })),
+        ),
+    );
+  }
   await runBatched(d1, statements);
   return diff;
 }

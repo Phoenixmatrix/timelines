@@ -26,7 +26,7 @@ function synthetic(files: number): KnowledgeMap {
     }
     if (f > 0) edges.push([file, file - 4 * (f % 2), "imports"]);
   }
-  return { commit: "c", nodes, edges };
+  return { commit: "c", version: "c.none", nodes, edges };
 }
 
 const all = (cell: Cell): Cell[] => [cell, ...cell.children.flatMap(all)];

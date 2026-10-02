@@ -5,7 +5,7 @@
 //   GET  /graph?kind=&q=&limit=  nodes
 //   GET  /graph/node?id=         one node with its neighbors
 //   GET  /graph/export           the whole graph (nodes + edges)
-//   GET  /graph/map              the whole graph, lean, for the atlas (ETag per commit)
+//   GET  /graph/map              the whole graph, lean, for the atlas (ETag per graph version)
 //   GET  /changes?build=         the change feed for a build (default: latest)
 //   GET  /search?q=              entities (Vectorize) + passages (AI Search)
 //   GET  /wiki                   the catalog
@@ -51,6 +51,11 @@ const toBuild = (row: Selectable<Database["kg_builds"]>): KnowledgeBuild => ({
   finishedAt: row.finished_at,
 });
 
+/** Changes when the stored graph does, or when a build lands (which moves the "changed" marks). */
+const graphVersion = (
+  state: { indexed_commit: string | null; graph_at: string | null } | undefined,
+) => `${state?.indexed_commit ?? "none"}.${state?.graph_at ?? "none"}`;
+
 const NODE_COLUMNS = ["id", "kind", "name", "path", "summary", "data", "changed_in"] as const;
 
 type NodeRow = Pick<Selectable<Database["kg_nodes"]>, (typeof NODE_COLUMNS)[number]>;
@@ -76,7 +81,7 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
   const [state, builds, counts, refs, coordination] = await Promise.all([
     db(c.env.DB)
       .selectFrom("kg_state")
-      .select(["indexed_commit", "indexed_at"])
+      .select(["indexed_commit", "indexed_at", "graph_at"])
       .where("repo_id", "=", row.id)
       .executeTakeFirst(),
     db(c.env.DB)
@@ -131,6 +136,7 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
           : indexed
             ? "up-to-date"
             : "empty",
+    graphVersion: graphVersion(state),
     current,
     recent,
     counts: Object.fromEntries(counts.map((r) => [r.kind, r.n])),
@@ -270,12 +276,13 @@ knowledge.get("/graph/map", async (c) => {
   if (row instanceof Response) return row;
   const state = await db(c.env.DB)
     .selectFrom("kg_state")
-    .select("indexed_commit")
+    .select(["indexed_commit", "graph_at"])
     .where("repo_id", "=", row.id)
     .executeTakeFirst();
   const commit = state?.indexed_commit ?? null;
-  // The map only changes when a build lands, so a revalidation is usually free.
-  const etag = `W/"map-${row.id}-${commit ?? "none"}"`;
+  const version = graphVersion(state);
+  // The map only changes when a build writes the graph, so a revalidation is usually free.
+  const etag = `W/"map-${row.id}-${version}"`;
   c.header("ETag", etag);
   c.header("Cache-Control", "private, no-cache");
   if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
@@ -305,6 +312,7 @@ knowledge.get("/graph/map", async (c) => {
   const at = new Map(nodes.map((n, i) => [n.id, i]));
   const body: KnowledgeMap = {
     commit,
+    version,
     nodes: nodes.map((n) => [
       n.id,
       n.kind as GraphNode["kind"],

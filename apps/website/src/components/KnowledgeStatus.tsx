@@ -38,7 +38,8 @@ function describe(status: KnowledgeStatus): string {
 
 /**
  * Live status of a repository's knowledge graph. Polls while a build runs and
- * revalidates the page once it finishes, so new content appears on its own.
+ * revalidates the page when the graph changes or the build finishes, so new
+ * content appears on its own.
  */
 export function useKnowledgeStatus(owner: string, name: string, initial: KnowledgeStatus) {
   const [status, setStatus] = useState(initial);
@@ -55,7 +56,12 @@ export function useKnowledgeStatus(owner: string, name: string, initial: Knowled
         const next = await api<KnowledgeStatus>(`/repos/${owner}/${name}/knowledge/status`);
         setStatus(next);
         const nowBusy = next.state === "building" || next.state === "queued";
-        if (wasBusy.current && !nowBusy) void revalidator.revalidate();
+        // A build writes the graph and wiki pages long before it finishes: show
+        // each as it lands.
+        const landed =
+          next.graphVersion !== status.graphVersion ||
+          next.current?.stats.wikiDone !== status.current?.stats.wikiDone;
+        if ((wasBusy.current && !nowBusy) || landed) void revalidator.revalidate();
         wasBusy.current = nowBusy;
       } catch {
         // Try again on the next tick.

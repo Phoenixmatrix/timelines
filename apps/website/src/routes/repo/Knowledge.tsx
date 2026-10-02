@@ -59,7 +59,7 @@ import { useRepo } from "./RepoLayout.tsx";
 // copy for this repository and commit, so moving around never refetches it.
 let cached: {
   repo: string;
-  commit: string | null;
+  version: string;
   map: KnowledgeMap;
   wiki: WikiCatalog["pages"];
 } | null = null;
@@ -85,14 +85,14 @@ export async function knowledgeLoader({ request, params }: LoaderFunctionArgs) {
     ),
   ]);
   let current = fresh
-    ? { repo, commit: fresh[0].commit, map: fresh[0], wiki: fresh[1].pages }
+    ? { repo, version: fresh[0].version, map: fresh[0], wiki: fresh[1].pages }
     : reuse!;
-  if (!fresh && status.indexedCommit !== reuse!.commit) {
+  if (!fresh && status.graphVersion !== reuse!.version) {
     const [map, wiki] = await Promise.all([
       load<KnowledgeMap>(`${base}/graph/map`, request),
       load<WikiCatalog>(`${base}/wiki`, request),
     ]);
-    current = { repo, commit: map.commit, map, wiki: wiki.pages };
+    current = { repo, version: map.version, map, wiki: wiki.pages };
   }
   cached = current;
   // An entry the latest build dropped falls back to the repository overview.

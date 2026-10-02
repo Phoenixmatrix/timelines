@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 import type { FileAnalysis } from "./analyze.ts";
-import { buildGraph, conceptKey, planComponents } from "./graph.ts";
+import { d1, migratedDatabase } from "../testing/d1.ts";
+import { applyGraph, buildGraph, conceptKey, planComponents } from "./graph.ts";
 
 const analysis = (over: Partial<FileAnalysis>): FileAnalysis => ({
   language: "typescript",
@@ -73,4 +74,41 @@ test("buildGraph links files, symbols, packages, concepts and components", () =>
   expect(graph.conceptFiles.get(conceptKey("Git Proxy"))).toEqual(["src/a.ts", "src/b.ts"]);
   // The lockfile is a file node but belongs to no component.
   expect(graph.components.flatMap((c) => c.files)).toEqual(["src/a.ts", "src/b.ts"]);
+});
+
+test("applyGraph moves the graph version only when the stored graph changes", async () => {
+  const sqlite = migratedDatabase();
+  sqlite.exec(`
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
+    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
+  `);
+  const version = () =>
+    (
+      sqlite.prepare("SELECT graph_at FROM kg_state WHERE repo_id = 'repo'").get() as
+        | { graph_at: string | null }
+        | undefined
+    )?.graph_at ?? null;
+  const graphOf = (files: string[]) =>
+    buildGraph(
+      "org/app",
+      files.map((path) => ({ path, blob: path, mode: "100644" })),
+      new Map(files.map((path) => [path, analysis({})])),
+      { components: new Map(), concepts: new Map() },
+    );
+
+  await applyGraph(d1(sqlite), "repo", "b1", "c1", graphOf(["src/a.ts"]));
+  const first = version();
+  expect(first).not.toBeNull();
+  // No build has finished, but the graph is there to show.
+  expect(sqlite.prepare("SELECT indexed_commit FROM kg_state").get()).toEqual({
+    indexed_commit: null,
+  });
+
+  sqlite.exec("UPDATE kg_state SET graph_at = 'unchanged'");
+  await applyGraph(d1(sqlite), "repo", "b2", "c1", graphOf(["src/a.ts"]));
+  expect(version()).toBe("unchanged");
+
+  await applyGraph(d1(sqlite), "repo", "b3", "c2", graphOf(["src/a.ts", "src/b.ts"]));
+  expect(version()).not.toBe("unchanged");
 });
