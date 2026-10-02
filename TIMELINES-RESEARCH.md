@@ -2,91 +2,95 @@
 
 Date: 2026-10-02.
 
-Status: research recorded for CORE-50 ("Not ready for work yet, need to think
-this through"). Nothing is built or approved by this document. CORE-42 (timeline
-visualization in the tracker) and CORE-51 (discussions) are blocked on it.
+Status: research and owner decisions for CORE-50 ("Not ready for work yet, need
+to think this through"). The owner answered the open questions in an interview
+on 2026-10-02. The answers are listed under [Decisions](#decisions) and the
+design below follows them. Nothing is built, and nothing in this document is
+approved for implementation. The work is filed as CORE-62 to CORE-86, under
+CORE-50. CORE-42 (timeline visualization in the tracker) and CORE-51
+(discussions) are blocked on CORE-50.
 
 ## Conclusion
 
-- **A timeline is one object that every part of Gitmatrix projects. It is
-  neither a branch nor a pull request.**
-  - It has a name, a parent (main or another timeline), a fork point, a policy
-    (land automatically, land after approval, or experimental and never land),
-    a status and an expiry.
-  - Under it sit a bookmark in each repository it touches, tracker events tagged
-    with it, CI runs and deployments of its commits, prerelease packages, and a
-    knowledge overlay.
-  - Selecting it in the web app filters all of these to "main plus this
-    timeline".
-- **Trunk stays the truth.** A timeline is a hypothesis until it _lands_: rebase
-  onto current trunk, run the gates on the result, fast-forward. This is the
-  merge queue [CI-RUNS-RESEARCH.md](CI-RUNS-RESEARCH.md) deferred because it
-  changes every agent's loop. Timelines are where it belongs, and plain
-  `gm push` to main can stay as it is.
-- **Identity is global and state belongs to a timeline.**
-  - Global: issue keys, people, agents, leases and secret definitions.
-  - Per timeline: issue status, comments, checkpoints, runs, deployments,
-    packages and knowledge. An issue finished inside a timeline is "done in T"
-    until T lands.
-  - Leases stay held while their work sits on an unlanded timeline, and are
-    released when it lands or is pruned (Unity's Smart Locks do the same).
-- **Build on stable change ids and landing records, not git topology.**
-  - gm already writes jj's `change-id` commit header, but the server never reads
-    it.
-  - Reading it, and recording each landing (timeline, change ids, trunk commit
-    range, approval), gives the visualization, "why did this change" and
-    pruning after landing a basis that survives rebases.
-  - Trunk can stay linear.
-- **Cloudflare can now preview code per timeline, but not state.**
-  - Worker Previews (GA 2026-09-22; `cf previews deploy <name>`) give each
-    branch its own URL and fresh Durable Object storage.
-  - They share D1, R2, Vectorize and AI Search with production, run
-    _production_ Workflows, and neither consume Queues nor fire cron.
-  - So a timeline preview needs:
-    - its own D1, built from migrations plus a seed;
-    - a side-effect profile (no email, no mirror, no stable publishes);
-    - secrets limited to preview environments.
-  - "View the app at any point" is cheap for code and expensive for data. The UI
-    must show which kind each preview is.
-- **"Prune" means two different things.**
-  - Before landing it is _abandoning_: cheap, and history is kept.
-  - After landing it is a planned compensating change through the same queue:
-    - revert the landing's change ids;
-    - list what depends on them;
-    - run recorded compensating migrations;
-    - deprecate the packages it published;
-    - list what cannot be undone (sent email, the GitHub mirror, downloads).
-  - Main's history is never rewritten.
-- **The real risks are review load, cost and semantic conflicts, not git
-  mechanics.**
-  - Agent platforms report review as the bottleneck.
-  - Previews per timeline cost money and hit account caps (500 Workers, 100 AI
-    Search namespaces).
-  - Two timelines that each pass CI can still break together. Only testing the
-    combined result catches that.
-- **Start with a thin slice, dogfooded on this repository:** the timeline
-  object, `gm timeline`, a bookmark, CI context and tracker tags per timeline,
-  and a landing queue with an approval gate. Previews, the visualization,
-  knowledge overlays and pruning after landing follow, each useful on its own.
+- **A timeline is an account-wide object that every part of Gitmatrix scopes its
+  data to.**
+  - It lives next to the tracker and can touch several repositories.
+  - It has a parent (main or another timeline), a fork point, a status and an
+    expiry for its previews.
+  - It has a policy: land automatically, land after a person approves a
+    checkpoint, or experimental, which never lands.
+  - Selecting it in the web app filters code, issues, runs, previews, packages
+    and knowledge to "main plus this timeline".
+- **Timelines are optional.** An agent uses one when the context calls for it:
+  - a field on the issue;
+  - the issue's description or PRD;
+  - what a person asked;
+  - later, other signals.
+
+  Plain pushes to main stay as they are.
+
+- **Timelines are git branches joined by real merges, with more history than
+  git keeps.**
+  - A timeline can fork into other timelines, which merge into each other or
+    into main.
+  - A timeline stays separate from main until it lands. Main is merged into it
+    only by a person, or by an agent asked to do it.
+  - Gitmatrix records the history git doesn't keep, so the whole graph can be
+    reviewed afterwards:
+    - forks, merges and landings;
+    - which changes (by jj `change-id`) entered which timeline;
+    - every ref update.
+- **Landing merges an approved checkpoint into main through a queue.** The queue
+  runs the gates on the merged result.
+  - An approval pins one checkpoint: its commits, preview and CI run.
+  - New commits need a new checkpoint and a new approval.
+  - Any person with write access may approve.
+- **An issue finished in a timeline has its own status, "done in a timeline".**
+  - The issue and the timeline link to each other.
+  - The issue becomes done on main when the timeline lands, and goes back to
+    ready if the timeline is abandoned.
+  - Leases stay unique per issue across timelines, and are held until then.
+- **Gitmatrix does not own deployment.** It offers primitives that make it aware
+  of previews:
+  - environments;
+  - deployment records;
+  - a contract to create, tear down and regenerate a preview for a checkpoint.
+
+  Projects implement the contract in their own CI. Gitmatrix's own previews
+  (Cloudflare Worker Previews, plus a D1 per timeline built from migrations and
+  seed) are one reference implementation, and use only the public primitives.
+
+- **Previews expire, but their records don't, and any preview can be
+  regenerated from its checkpoint.** Code is regenerated from the commit; data
+  comes from migrations and seed, never from a copy of production.
+- **Prune means abandon, for now.** Removing a landed timeline's effect on main
+  is out of scope; mistakes that landed are fixed forward.
+- **Knowledge per timeline:** the graph diff against main updates on every push.
+  Wiki pages are written at checkpoints and gates, or on demand.
+- **Before timelines:**
+  - Fix now: only main moves a package's `latest`, and new migrations get names
+    that can't collide.
+  - Unchanged: secrets stay per repository, an accepted risk.
+  - Changed: only main and tags are mirrored to GitHub.
 
 ## What CORE-50 asks for
 
 | CORE-50 asks                                                              | What it implies                                                                | Hardest part                                  |
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------- |
-| Agents work in a separate thread, "likely one or more branches"           | A server-side object above branches, possibly spanning repos                   | Landing atomically across repos               |
+| Agents work in a separate thread, "likely one or more branches"           | An account-level object above branches, spanning repos                         | Landing across repos                          |
 | Artifacts are deployed but kept apart; selecting a timeline shows only it | Every subsystem filters by timeline; an app-wide switcher                      | Scoping consistently across eight subsystems  |
 | Two agents can't lease the same issue, even in different timelines        | Leases stay global and are held until the work lands                           | Release-on-land semantics; best-of-N attempts |
-| Human intervention before main, with independent work until then          | A policy per timeline; gates as tracker requests                               | Review becomes the bottleneck                 |
-| Issues may be specific to a timeline                                      | Issues and status scoped to a timeline                                         | What happens to them on landing or pruning    |
-| View the app in preview at any point, especially at the gate              | Deployment and checkpoint records; data per timeline                           | State at old checkpoints                      |
-| Some timelines merge automatically                                        | An automatic policy through a merge queue                                      | Semantic conflicts                            |
-| A git-history-like view of forks, merges and splits                       | Landing records; lanes over time (CORE-42)                                     | Hundreds of short-lived agent timelines       |
-| Prune, even removing the impact on main afterwards                        | Compensating changes, dependent changes, a ledger of side effects              | Irreversible effects                          |
-| Experimental timelines never merge but persist                            | A kind of timeline without landing rights                                      | Isolation from production; rot                |
-| Merged timelines stay visible                                             | Landing records and archived refs                                              | Retention                                     |
-| Knowledge explains "why" to agents and humans                             | A provenance chain: change, timeline, issue, checkpoints, discussion, approval | Links that survive rebase and squash          |
+| Human intervention before main, with independent work until then          | A policy per timeline; approvals pinned to checkpoints                         | Review becomes the bottleneck                 |
+| Issues may be specific to a timeline                                      | Issues and a "done in a timeline" status scoped to a timeline                  | Merges between timelines                      |
+| View the app in preview at any point, especially at the gate              | Preview primitives; checkpoints; regenerating expired previews                 | State at old checkpoints                      |
+| Some timelines merge automatically                                        | An automatic policy through a landing queue                                    | Semantic conflicts                            |
+| A git-history-like view of forks, merges and splits                       | Real merges plus history git doesn't keep                                      | Many short-lived agent timelines              |
+| Prune, even removing the impact on main afterwards                        | For now: abandon before landing only                                           | (Deferred) irreversible effects               |
+| Experimental timelines never merge but persist                            | A kind of timeline that can't land                                             | Rot                                           |
+| Merged timelines stay visible                                             | Timeline events and archived refs, kept forever                                | Retention                                     |
+| Knowledge explains "why" to agents and humans                             | A provenance chain: change, timeline, issue, checkpoints, discussion, approval | Following changes across merges               |
 
-## What "timeline" could mean
+## What "timeline" means
 
 There are three readings, from thinnest to thickest:
 
@@ -99,77 +103,85 @@ There are three readings, from thinnest to thickest:
 3. **An alternate world:** code, issues, deployments, packages, knowledge and
    release notes, all as of that timeline. CORE-50's "select a timeline and
    everything shows what's part of that timeline" is this reading. The nearest
-   precedents are Upsun (every branch is a full environment with cloned data)
-   and Figma branches.
+   precedents are Upsun (every branch is a full environment) and Figma
+   branches.
 
-The recommendation is to present the third and implement it as the first, one
-subsystem at a time. One account-level `timelines` record holds the timeline.
-Each subsystem stores a timeline id next to its own data and filters by it, and
-none of them forks its storage.
+The design presents the third and implements it as the first, one subsystem at
+a time. One account-level record holds the timeline. Each subsystem stores a
+timeline id next to its own data and filters by it, and none of them forks its
+storage.
 
-**Naming.** CORE-42 uses "timeline" for a time axis (a video editor's or Chrome
-DevTools' timeline). The two fit together: a video editor's timeline has
-parallel _tracks_. CORE-42's view can be the timeline view in which each CORE-50
-timeline is a track running next to main. CORE-50's own words (main timeline,
-alternate timelines, prune) work, and fork, land and prune read well as verbs.
+**Naming:** "Timeline". CORE-42's time axis is a variation of the same concept,
+to be designed later.
 
 ### A timeline, concretely
 
 - **Identity:** a stable `id` that is never reused, plus `slug` and `name`. The
-  owner is the tracker's account, where issues and leases already live.
-- **`kind`:** `landing` or `experimental`. Experimental timelines can't land,
-  can't receive production secrets and can't publish stable packages. A person
-  can promote one to `landing`, after which it must pass the gates like any
-  other.
+  owner is the tracker's account, and a timeline lists the repositories it
+  touches.
+- **`kind`:** `landing` or `experimental`. Experimental timelines can merge into
+  other timelines but never into main. A person can promote one to `landing`.
 - **`policy`:** `auto` lands when the gates pass. `approval` lands after a person
-  approves a checkpoint. Gate rules say who may approve, and an agent never
-  approves its own timeline.
+  with write access approves the current checkpoint. Agents never approve.
 - **Lineage:** a `parent` (main or another timeline) and a fork point, which is
-  a trunk commit per repository plus a tracker cursor.
+  a commit per repository plus a tracker cursor.
 - **Per repository:** a bookmark `timeline/<slug>`.
 - **`status`:**
-  - landing timelines: `active`, `waiting` (at a gate), `landing` (queued),
-    `landed`, `abandoned`, `pruned`;
+  - landing timelines: `active`, `waiting` (a checkpoint awaits approval),
+    `landing` (queued), `landed`, `abandoned`;
   - experimental timelines: `active`, `paused`, `archived`.
 - **People and work:** the accountable person, the agents that worked in it, and
-  the issues it works on.
+  its issues.
 - **Checkpoints,** which are immutable. Each holds:
-  - the commit per repository and the trunk commit it was based on;
+  - the commit per repository and the main commit it would merge onto;
   - change ids and the CI run;
-  - deployment ids and the data snapshot, if there is one;
-  - an agent-written summary and approvals.
-- **Expiry:** previews and idle experiments expire. The metadata never does.
+  - preview deployment records and an agent-written summary;
+  - the approval.
+- **Events,** kept forever: fork, merge (timeline into timeline, main into
+  timeline, timeline into main), checkpoint, approval, landing, abandon.
+
+### When an agent uses a timeline
+
+- **A field on the issue:** `timeline: required | agent decides | never`,
+  optionally naming the timeline to join and its policy. `gm issue next` and
+  `gm issue claim` return it with the claim.
+- **The issue's description or PRD,** in plain words (for example, "do this in
+  an approval timeline"). The agent guide and the graph-work skill tell agents
+  to look there.
+- **What a person asks,** in a comment or a request.
+- **Later signals,** such as the risk of a change or defaults per workspace, are
+  deliberately not part of the first version.
 
 ## What Gitmatrix has today
 
-| Area                                                     | Today                                                                                                                                                        | Gap for timelines                                                                                                      |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| gm (`apps/cli/src/repo/mod.rs`, `commands/network.rs`)   | jj-style changes with a `change-id` header on every commit; a local op log; trunk immutable, other bookmarks rewritable; `gm push -b` pushes any bookmark    | The server never reads change ids; gm has no notion of a timeline                                                      |
-| Git server (`worker/git/http.ts`, `worker/artifacts.ts`) | Every branch is stored and browsable; a ref picker on tree, blob and commits                                                                                 | No per-ref metadata, push log, compare view or branch protection                                                       |
-| Tracker (`worker/tracker/store.ts`, `shared/tracker.ts`) | One Durable Object per account; an event log with a cursor; one claim per issue; subtree leases, delegation and handoff; approval requests that park a lease | No git or timeline fields; a request references only an issue; a lease ends at complete or release                     |
-| CI (`worker/ci`, `.gitmatrix/ci.yml`)                    | Runs on every branch; `if:` over branch, trigger, commit and runner; concurrency groups; coalescing                                                          | No environments, deployments or preview URLs; any branch's job can request any repo secret (`worker/ci/jobs.ts:42-51`) |
-| Deploy (`tools/agent/deploy.ts`)                         | One production Worker, deployed only from main                                                                                                               | Nothing parameterizes a second deployed instance                                                                       |
-| Registry (`registry/`)                                   | Provenance records the ref, run and commit; branch filters                                                                                                   | An npm publish with no dist-tags moves `latest`, from any branch (`registry/formats/npm/local.ts:361`)                 |
-| Knowledge (`worker/knowledge`)                           | Default branch HEAD only; analyses cached by blob; a change feed per build; a per-ref semantic feed                                                          | One graph per repository; no overlays                                                                                  |
-| Release notes (`worker/release-notes`)                   | Default branch and tags                                                                                                                                      | No per-timeline drafts                                                                                                 |
-| Identity (CORE-52)                                       | Agents act as themselves, accountable to a person; CI runs record the agent                                                                                  | Already in place                                                                                                       |
-| Isolated environments (`tools/agent/environment.ts`)     | Isolated local instances using remote Artifacts, Vectorize and AI Search; 24-hour expiry; four per user                                                      | Local only, not previews                                                                                               |
+| Area                                                     | Today                                                                                                                                                        | Gap for timelines                                                                                                 |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| gm (`apps/cli/src/repo/mod.rs`, `commands/network.rs`)   | jj-style changes with a `change-id` header on every commit; a local op log; trunk immutable, other bookmarks rewritable; `gm push -b` pushes any bookmark    | Linear and rebase-first: merges are rebased by their first parent only, and `gm log` draws no graph; no timelines |
+| Git server (`worker/git/http.ts`, `worker/artifacts.ts`) | Every branch is stored and browsable; a ref picker on tree, blob and commits                                                                                 | No ref-update log, per-ref metadata, compare view or branch protection; the server never reads change ids         |
+| Tracker (`worker/tracker/store.ts`, `shared/tracker.ts`) | One Durable Object per account; an event log with a cursor; one claim per issue; subtree leases, delegation and handoff; approval requests that park a lease | No git or timeline fields; a request references only an issue; a lease ends at complete or release                |
+| CI (`worker/ci`, `.gitmatrix/ci.yml`)                    | Runs on every branch; `if:` over branch, trigger, commit and runner; concurrency groups; coalescing                                                          | No environments, deployment records or preview triggers                                                           |
+| Deploy (`tools/agent/deploy.ts`)                         | One production Worker, deployed only from main                                                                                                               | Nothing parameterizes a second deployed instance                                                                  |
+| Registry (`registry/`)                                   | Provenance records the ref, run and commit; branch filters                                                                                                   | An npm publish with no dist-tags moves `latest`, from any branch (`registry/formats/npm/local.ts:361`)            |
+| Knowledge (`worker/knowledge`)                           | Default branch HEAD only; analyses cached by blob; a change feed per build; a per-ref semantic feed                                                          | One graph per repository; no overlays                                                                             |
+| Release notes (`worker/release-notes`)                   | Default branch and tags, walking first-parent history                                                                                                        | No per-timeline drafts; landing merges change what first-parent history shows                                     |
+| Mirror (`worker/mirror`)                                 | Every branch and tag, force-pushed                                                                                                                           | Must mirror only main and tags                                                                                    |
+| Identity (CORE-52)                                       | Agents act as themselves, accountable to a person; CI runs record the agent                                                                                  | Already in place                                                                                                  |
+| Isolated environments (`tools/agent/environment.ts`)     | Isolated local instances using remote Artifacts, Vectorize and AI Search; 24-hour expiry; four per user                                                      | Local only, not previews                                                                                          |
 
 Today's parallel work already shows problems that timelines would make routine:
 
 - **Migration numbers collided.** Two lines of work each added a `0016_`
   migration (`0016_agent_capabilities.sql` and
   `0016_knowledge_graph_version.sql`). D1 applies both because it tracks file
-  names, but the order between them is an accident. Parallel timelines need
-  migration names that can't collide (timestamps) or a check when landing.
+  names, but the order between them is an accident.
 - **Deploys queue behind each other.** Newer runs superseded deploys (#43 by
   #44, #54 by #56).
 - **Indexes lag.** An AI test failed because AI Search had not yet indexed one
   file (CORE-58). Per-timeline indexes will be eventually consistent too.
 - **Knowledge cost is now small per push.** Since CORE-17, an incremental
   knowledge build for a small push costs about 7 concept questions and 10
-  minutes. The first build took 43 minutes. Per-timeline knowledge overlays
-  are affordable; per-timeline full rebuilds are not.
+  minutes. The first build took 43 minutes. Per-timeline graph overlays are
+  affordable; per-timeline full rebuilds are not.
 
 ## What others have done
 
@@ -220,7 +232,7 @@ Today's parallel work already shows problems that timelines would make routine:
     is deleted, its Durable Object state included.
   - **Older "version URLs":** they use production bindings, and Workers that
     define Durable Objects (like Gitmatrix) don't get them ([cf-version-urls]).
-- **Upsun (formerly Platform.sh)** is the closest model to timelines
+- **Upsun (formerly Platform.sh)** is the closest existing product to timelines
   ([upsun-envs], [upsun-clone]):
   - **Branching:** every branch is an environment in a parent/child tree.
     Branching copies code and all service data with copy-on-write in about a
@@ -230,23 +242,26 @@ Today's parallel work already shows problems that timelines would make routine:
   - **Isolation:** outgoing email is blocked outside production by default, and
     production secrets can be made non-inheritable.
 - **Other preview hosts:**
-  - Vercel: an immutable deployment per commit plus a branch alias, with comments
-    on previews ([vercel-urls], [vercel-comments]).
+  - Vercel: an immutable deployment per commit plus a branch alias, with
+    comments on previews ([vercel-urls], [vercel-comments]).
   - Netlify gives each deploy preview and agent run its own database branch
     ([netlify-db]).
   - Heroku review apps: no database copying, seeded instead ([heroku-review]).
   - Render ([render-previews]) and Railway ([railway-envs]) copy the service
     topology with empty datastores and an expiry.
+- **GitHub and GitLab** both model what Gitmatrix needs as primitives:
+  - environments, with deployment records whose statuses carry an environment
+    URL ([gh-envs]);
+  - review environments that stop automatically, or when the branch merges
+    ([gl-envs]).
 - **Databases with branches:**
   - Neon: copy-on-write branches, but nothing merges back ([neon]).
   - PlanetScale deploy requests: schema-only branches, checked against current
-    production, a serial queue and a held cutover; a revert within 30 minutes
-    keeps the writes made since ([ps-deploy], [ps-revert]).
+    production, a serial queue and a held cutover ([ps-deploy], [ps-revert]).
   - Dolt merges rows as well as schema ([dolt]).
 - **D1 has no fork** ([d1-time-travel], [d1-export], [d1-limits]):
   - Time Travel restores in place, discarding every later write.
-  - An export blocks other requests to the database while it runs, and skips
-    FTS5 tables.
+  - An export blocks other requests to the database while it runs.
   - There are no down migrations.
   - New databases are cheap: 50,000 per account, with no per-database fee.
 
@@ -272,9 +287,9 @@ Today's parallel work already shows problems that timelines would make routine:
 
 ### Gates and merge queues
 
-- **The "not rocket science" rule:** test the result of the merge, then
-  fast-forward ([nrsr]). GitHub's merge queue and GitLab's merge trains test
-  each change with everything ahead of it in the queue ([gh-merge-queue],
+- **The "not rocket science" rule:** test the result of the merge, then advance
+  main ([nrsr]). GitHub's merge queue and GitLab's merge trains test each change
+  with everything ahead of it in the queue ([gh-merge-queue],
   [gl-merge-trains]).
 - **Doing less work in the queue:**
   - Mergify bisects failed batches ([mergify]).
@@ -283,12 +298,13 @@ Today's parallel work already shows problems that timelines would make routine:
   - Uber's SubmitQueue speculates on likely outcomes ([submitqueue]).
 - **Gerrit submit requirements** are query expressions over votes, with
   overrides ([gerrit-submit]). They are a good model for timeline policies.
-- **GitHub environments** put required reviewers, a ban on self-review and
-  branch policies in front of _secrets_, not just merges ([gh-envs]).
 - **Semantic conflicts** (textually clean merges that break behaviour) are only
   caught by testing the combined state ([fowler-semantic]).
 
-### Undoing work after it landed
+### Undoing work after it landed (deferred)
+
+Pruning landed work is out of scope for now. The research is kept for when it
+returns:
 
 - **Reverting a merge in git** undoes the content but not the history.
   Re-merging later silently drops the reverted changes unless you first revert
@@ -296,11 +312,9 @@ Today's parallel work already shows problems that timelines would make routine:
 - **Plastic's "subtractive merge"** has the same trap, and its authors recommend
   fixing forward ([plastic-book]).
 - **Pijul** removes a change cleanly only together with everything that depends
-  on it, and refuses otherwise ([pijul-unrecord]). It tracks textual
-  dependencies, not behavioural ones.
+  on it ([pijul-unrecord]).
 - **Gerrit's "Revert Submission"** reverts everything that was submitted
-  together ([gerrit-revert]). It is the model for reverting one timeline's
-  whole landing.
+  together ([gerrit-revert]).
 - **Compensating transactions** need explicit points of no return
   ([azure-compensating]), and schema changes need expand/contract
   ([fowler-parallel-change]).
@@ -327,302 +341,314 @@ Today's parallel work already shows problems that timelines would make routine:
   reach production ([linear-releases]).
 - **GitHub** closes issues only when a PR targets the default branch
   ([gh-closing]).
-- **GitLab** stops review environments when the branch merges ([gl-envs]).
 
 ## A design for Gitmatrix
 
 ### What is global and what belongs to a timeline
 
-| Thing                       | Main                         | Timeline                                                                            |
-| --------------------------- | ---------------------------- | ----------------------------------------------------------------------------------- |
-| Code                        | Trunk                        | Bookmark `timeline/<slug>` in each repository it touches                            |
-| Issues                      | Global identity and keys     | Can be created in a timeline (seen only there until it lands); status per timeline  |
-| Leases                      | One per issue, global        | Retained while the work is on the timeline; released when it lands or is pruned     |
-| Comments, checkpoints       | Main's                       | Tagged with the timeline                                                            |
-| CI runs                     | Per ref (as today)           | Tagged; `timeline` available in `if:` and the job environment                       |
-| Deployments                 | Production                   | Previews per timeline and per checkpoint                                            |
-| Secrets                     | Production environment       | Preview environment only; experimental timelines never receive production secrets   |
-| Packages                    | Stable versions and `latest` | Prerelease versions and a dist-tag per timeline; never `latest`                     |
-| Knowledge                   | Main's graph and wiki        | An overlay: the graph diff against main; wiki pages generated at gates or on demand |
-| Release notes               | Released plus `@unreleased`  | A draft per timeline, folded into `@unreleased` when it lands                       |
-| GitHub mirror               | Mirrored                     | Not mirrored by default, so experiments stay private                                |
-| People, agents, permissions | Global                       | Global; the timeline records which agents worked in it                              |
+| Thing                       | Main                                     | Timeline                                                                |
+| --------------------------- | ---------------------------------------- | ----------------------------------------------------------------------- |
+| Code                        | Trunk                                    | Bookmark `timeline/<slug>` in each repository it touches                |
+| Issues                      | Global identity and keys                 | Can be created in a timeline; a "done in a timeline" status             |
+| Leases                      | One per issue, global                    | Held while done in an unlanded timeline; released on landing or abandon |
+| Comments, checkpoints       | Main's                                   | Tagged with the timeline                                                |
+| CI runs                     | Per ref (as today)                       | Tagged; `timeline` available in `if:` and the job environment           |
+| Deployments                 | Production records                       | Preview records per timeline and checkpoint                             |
+| Secrets                     | Per repository; any job may request them | The same (an accepted risk)                                             |
+| Packages                    | Only main moves `latest`                 | Prerelease versions and a dist-tag per timeline                         |
+| Knowledge                   | Main's graph and wiki                    | Graph diff against main on every push; wiki pages at gates or on demand |
+| Release notes               | Released plus `@unreleased`              | A draft per timeline, folded into `@unreleased` when it lands           |
+| GitHub mirror               | Main and tags                            | Not mirrored                                                            |
+| People, agents, permissions | Global                                   | Global; the timeline records which agents worked in it                  |
 
-### Code: bookmarks, change ids and landing records
+### Git: branches, merges, and the history git doesn't keep
 
-- **A timeline's work lives on `timeline/<slug>`.**
-  - Agents bound to the timeline push there: the checkout's
-    `.gitmatrix/agent.local.yml` names the timeline, which worktrees now
-    inherit.
-  - `gm push` from inside a timeline goes to its bookmark, never to trunk.
-- **The server starts reading `change-id` headers on push** and records which
-  timeline each change belongs to.
-- **Landing records** keep the history meaningful without merge commits. A
-  record holds:
-  - the timeline;
-  - the change ids;
-  - the trunk commit range each became;
-  - the approval and the CI run.
-- **Trunk stays linear,** which matches gm today: merges are rebased by their
-  first parent only.
+- **A timeline's work lives on `timeline/<slug>` in each repository.** A checkout
+  bound to a timeline pushes there: `.gitmatrix/agent.local.yml` names the
+  timeline, and new worktrees inherit that file.
+- **Merges are the native mechanism.** A timeline forks from main or from
+  another timeline, and merges into another timeline or into main as a real git
+  merge. This keeps compatibility with ordinary git tools and with the GitHub
+  mirror.
+- **gm needs real merge support first.** Today it is linear and rebase-first:
+  merges are rebased by their first parent only, and `gm log` draws no graph.
+  It needs:
+  - merge changes (`gm merge <timeline or main>`);
+  - rewrites that keep both parents;
+  - conflicts recorded on merges like on any other change;
+  - a graph in `gm log`.
+- **The server keeps the history git doesn't:**
+  - a ref-update log (old commit, new commit, actor, agent, time), which doesn't
+    exist today;
+  - change membership: on each push it reads the `change-id` headers and records
+    the timeline each change first appeared in, and every timeline it was later
+    merged into;
+  - the timeline events listed above.
+- **Main's history gains merge commits.** Code that walks first-parent history
+  must treat a landing merge's second parent as the timeline's work:
+  - release notes;
+  - `gm sync`'s detection of changes that landed;
+  - knowledge change feeds.
 
-### Landing: one queue for all timelines
+### Landing
 
-- **Landing tests the combined result.** It rebases onto current trunk, runs the
-  gates on the result, and fast-forwards (the not-rocket-science rule).
-- **Batching and speculation** are added once volume needs them. The
-  coalescing and concurrency code from CORE-23 is the starting point.
-- **Policy decides who triggers a landing:**
-  - an `auto` timeline enqueues itself when its checkpoint is green;
-  - an `approval` timeline enqueues when a person approves that exact
-    checkpoint (its commit and deployment ids, never a moving alias).
-- **Experimental timelines never enter the queue.**
-- **Direct pushes to main stay allowed.** Timelines then need a "base moved"
-  event and automatic rebasing, which owning the server makes possible.
+- **The queue merges the approved checkpoint into the current main.** It runs
+  the gates on that merge and advances main to the merge commit: the
+  not-rocket-science rule, with a merge instead of a rebase.
+- **The merge runs where git already runs, in a CI sandbox job** with a landing
+  credential. The Worker can't run `git merge`.
+- **How a timeline enters the queue:**
+  - `auto` timelines enqueue themselves when a checkpoint is green;
+  - `approval` timelines enqueue when a person approves a checkpoint, and only
+    while that checkpoint is still the timeline's head;
+  - experimental timelines never enter the queue.
+- **There is no automatic sync with main.** If main has moved since the
+  checkpoint and the merge is clean, the queue lands it (the gates test the
+  merged result). If it conflicts, landing stops and asks for a sync: a person
+  merges main into the timeline, or asks an agent to. That creates a new
+  checkpoint, which needs approval again.
 
-### Tracker: one event log, many views
+### Tracker
 
-- **Events gain an optional `timelineId`;** issues gain an optional home
-  timeline.
-- **Views are projections of the one log:**
-  - Main's view folds events from main and from landed timelines.
-  - Timeline T's view folds main's events plus T's own and its ancestors'.
-  - Status is therefore per view: on main, an issue T finished shows as "in
-    progress in T" until T lands.
-- **`issue.next` inside a timeline uses that timeline's view,** so an agent can
-  continue a dependency chain before the timeline lands, as stacked work does.
-- **Approval requests point at a checkpoint:** its commits, deployment and
-  diff. The inbox shows the preview and evidence at the gate.
-- **Landing and pruning are events.**
-  - On landing, issues that exist only in the timeline become main issues.
-  - On pruning, they are archived, or promoted to main's backlog if the person
-    chooses. Main issues the timeline finished reopen, with "pruned" as the
-    reason.
+- **Events and issues gain an optional `timelineId`.**
+- **A new status: "done in a timeline",** with the timeline it was done in.
+  - It is distinct from in progress and from done. On main the issue shows
+    "Done in `<timeline>`" with a link.
+  - The timeline's page lists its issues, and an issue lists the timelines it
+    is part of.
+- **Readiness follows the timeline:**
+  - Inside the timeline (and timelines it merges into), the issue counts as done
+    for blocking.
+  - On main it keeps blocking until the timeline lands.
+  - `issue.next` inside a timeline uses that timeline's view.
+- **Transitions:**
+  - When timeline T2 merges into timeline T1, T2's finished issues become done
+    in T1.
+  - Landing makes them done.
+  - Abandoning returns them to ready, releases their leases, and adds a note
+    linking the abandoned timeline.
+- **Approval requests point at a checkpoint:** its commits, previews, CI run and
+  graph diff.
 
-### Leases: retained until the work lands
+### Leases
 
-Leases already have TTLs and are already unique per issue across the account.
-The change is that completing an issue inside a timeline _retains_ its claim
-instead of releasing it, so no other agent picks the work up on a stale base.
-Landing releases it as done; pruning releases it back to ready. Cursor's
-finding still applies: keep claiming optimistic and short-lived, and don't add
-locks on files or areas.
+Leases stay unique per issue across every timeline, and already have TTLs. The
+change is that finishing an issue inside a timeline _keeps_ its lease (the
+"retained" state of Unity's Smart Locks). Landing releases it as done;
+abandoning releases it back to ready. Cursor's finding still applies: keep
+claiming optimistic and short-lived, and don't add locks on files or areas.
 
-### CI, environments and secrets
+### Previews: primitives, not hosting
 
-- **CI context:** `timeline` and `kind` become available in `if:`, and
-  `GITMATRIX_TIMELINE` in the job environment.
-- **Environments become records** (`production`, `preview`, …), each with:
-  - its secrets;
-  - rules for who may deploy to it: production only from trunk after a
-    landing; experimental timelines never.
-- **This closes a gap that exists today:** any branch's `ci.yml` can name
-  `CLOUDFLARE_API_TOKEN` and receive it.
-- **Deployments become records:** environment, timeline, checkpoint, commit,
-  URL, status and expiry. A job reports one with `gm deploy record --url …`, or
-  the server records it for previews it creates.
+- **Gitmatrix doesn't deploy anything.** It knows where previews are and asks
+  projects to create or remove them.
+- **Environments:** named per repository. There is `production`, plus one per
+  timeline (`timeline/<slug>`), each listing its deployments.
+- **Deployment records hold:**
+  - the environment, timeline, checkpoint and commit;
+  - the URL and a status (active, sleeping, expired, failed);
+  - who created it (CI run, agent) and an expiry.
 
-### Previews for projects hosted on Gitmatrix
+  A job creates one with `gm deploy record` (or the API). A system outside
+  Gitmatrix can do the same with a token.
 
-- **Gitmatrix tracks deployments; the project's own CI performs them.**
-  - Projects on Cloudflare run `cf previews deploy timeline-<slug>` in a
-    `preview` job.
-  - Other projects deploy wherever they like and record the URL.
-- **The web app reads the records** to show the preview at each timeline's head
-  and at every checkpoint.
-- **Expiry:** previews expire with the timeline's expiry or when it lands. The
-  records persist after teardown.
+- **A preview contract in `ci.yml`:** jobs triggered for `preview`, with an
+  action (`create` or `teardown`) and the context (`timeline`, `commit`,
+  `checkpoint`). Gitmatrix runs:
+  - `create` for each new checkpoint of a timeline that wants previews;
+  - `teardown` when a preview expires;
+  - `create` again when someone presses "Regenerate" on an expired checkpoint.
+- **Expiry and regeneration:**
+  - Previews are torn down after a grace period once their timeline lands or is
+    abandoned, and records are kept.
+  - Regeneration rebuilds from the record: the commit's code with migrations
+    plus seed.
+  - A regenerated preview can differ from the original if the toolchain or seed
+    changed since; the UI says so.
 
-### Previews of Gitmatrix itself
+### Gitmatrix's own previews: the reference implementation
 
-- **A Worker Preview of Gitmatrix is only a partial instance.**
-  - Its seven SQLite Durable Object classes would be isolated.
-  - Its two D1 databases, two Workflows (CI runs, knowledge builds), two queue
-    consumers, hourly cron, R2, Artifacts, Vectorize, AI Search, email and
-    mirror would not be.
-- **A full preview needs:**
-  - **Configuration:** `cloudflare.config.ts` parameterized by instance.
-  - **Data:** a D1 per timeline, built from migrations plus `agent seed`
-    fixtures. Never live production data, which an export would also block.
-  - **Asynchronous work:** run inline in previews, or through a Worker per
-    timeline (the account allows 500).
-  - **A side-effect profile:**
-    - email stubbed;
-    - mirror off;
-    - publishing only to the timeline's tags;
-    - its own Artifacts namespace;
-    - an AI budget.
-- **This is `vp run agent up` moved server-side.** Today it provisions remote
-  Artifacts, Vectorize and AI Search, expires after 24 hours and allows four per
-  user. AI Search allows only 100 namespaces per account, so AI previews must
-  be rare or share one.
+- **A `preview` job in `.gitmatrix/ci.yml`:**
+  - `create` runs `cf previews deploy timeline-<slug>`, builds a D1 per
+    timeline from migrations plus the `agent seed` fixtures, and reports the
+    URL with `gm deploy record`;
+  - `teardown` deletes the Preview and its databases.
+- **What Worker Previews don't isolate must be handled in the app's public
+  configuration:**
+  - Workflows (CI runs, knowledge builds) would run in production;
+  - queue consumers and cron don't run;
+  - R2, Artifacts, Vectorize and AI Search are shared unless bound per preview.
+
+  A preview mode turns these off or runs them inline, and binds separate
+  namespaces where needed. Email and mirroring are off.
+
+- **No internal shortcuts.** If Gitmatrix's previews need something, it becomes
+  a primitive any project can use.
 
 ### Packages
 
-- **Publishes from a timeline get a prerelease version and a `timeline-<slug>`
-  dist-tag.** They never move `latest`, which today's npm path does whenever a
-  publish has no tags.
-- **Ending a timeline cleans up its versions:** abandoning or pruning it
-  deprecates or deletes them, and retention can treat them as short-lived.
+- **Fix now:** only publishes from main move `latest`. Other refs publish
+  prereleases or a tag named after the branch or timeline.
+- **Abandoning a timeline deprecates its versions.**
 
 ### Knowledge and the "why"
 
-- **A timeline's overlay is its graph diff against main.** Analyses are cached
-  by blob, and alignment now asks only about genuinely new concepts, so this
-  costs about what an incremental build costs (CORE-17).
-- **The overlay is a review aid at the gate:** "adds concept X, changes component
-  Y, rewrites wiki page Z". Wiki pages for a timeline are written at gates or on
-  demand, not on every push.
+- **Every push to a timeline updates its graph diff against main.** Main's graph
+  is untouched. Wiki pages for a timeline are written at checkpoints and gates,
+  or on demand.
 - **"Why" is a chain that agents and people both walk:**
   - from a line, through blame, to a commit and its change id;
-  - then to the timeline and its issue;
-  - then to checkpoints and discussions (CORE-51), and to approval and landing.
+  - then to the timelines it passed through (from the ref-update log and the
+    merges) and its issue;
+  - then to checkpoints, discussions (CORE-51), approval and landing.
   - It needs a `gm why <path:line>` command and the same in the web app.
 
-### Visualization and the timeline switcher
+### Visualization and switching timelines
 
-- **One view with time on the x-axis and lanes for timelines.** Main runs down
-  the middle, and each lane forks from it:
-  - checkpoints and gates appear as marks;
-  - deployments appear as preview links;
-  - a landing rejoins main, a prune ends the lane with a mark, and experimental
-    lanes are dashed and never rejoin.
+- **The graph is drawn from git's merges plus the server's timeline events.**
+  Main runs down the middle and each timeline is a lane:
+  - forks, merges between timelines and landings into main are drawn;
+  - abandoned lanes end with a mark, and experimental lanes are dashed.
 - **Scaling to many lanes:**
   - By default, show the selected timeline, main and what depends on the
     selection.
   - Collapse each landed timeline to one node on main, and group the rest by
     workspace, team or agent.
-- **This view is CORE-42's video-editor timeline,** with tracks.
+- **CORE-42's time axis** is a later variation of the same view.
 - **The app-wide switcher is persistent,** with a coloured banner and a `?tl=`
   parameter so links carry the scope:
   - the tracker, code browser, CI, packages, knowledge and release notes all
     honour it;
-  - a person reviewing sees changes overlaid on main, and the preview to comment
-    on.
+  - main is the default.
 
-### Pruning
+### Abandoning
 
-- **Before landing (abandon):**
-  - delete the bookmark but keep archived refs;
-  - stop the previews;
-  - deprecate the prereleases;
-  - archive or promote the timeline's own issues;
-  - release its leases.
-- **After landing (prune plan),** shown like `terraform plan` and approved by a
-  person:
-  1. Revert the landing's change ids as a new timeline, through the queue.
-  2. List later landings that depend on them: descendants, the same files and
-     symbols, the same concepts in the knowledge graph. Offer to prune those
-     too.
-  3. Run recorded compensating migrations. Schema changes must follow
-     expand/contract to be prunable. Without a compensation the plan says
-     "partly prunable".
-  4. Deprecate the packages it published, and roll production forward to the
-     revert.
-  5. List what cannot be undone: email sent, the GitHub mirror (it keeps the
-     history), downloads, webhooks, AI spend, published release notes.
-  6. Record re-landing after a prune explicitly, to avoid git's
-     revert-the-revert trap.
+- **What abandoning does:**
+  - delete the bookmark, keeping archived refs and events;
+  - tear down previews, keeping the records;
+  - deprecate prereleases;
+  - archive the timeline's own issues, or move them to main's backlog;
+  - return its finished issues to ready, and release their leases.
+- **Pruning landed work comes later** (see the deferred research above).
 
 ### Experimental timelines and competing attempts
 
-- **Experimental timelines are sandboxed:** no production environment, secrets
-  or stable publishes. They pause when idle, keep their records forever, and can
-  be promoted.
+- **Experimental timelines can't land,** but they can merge into other
+  timelines. They pause when idle, keep their records forever, and a person can
+  promote one.
 - **Best-of-N uses existing tracker machinery.** An orchestrator holds the
-  issue's lease and delegates attempts to N experimental child timelines, using
+  issue's lease and delegates attempts to experimental child timelines, using
   the subtree delegation that already exists. Choosing a winner promotes it and
   abandons the others.
 
 ## Where it wouldn't work
 
-1. **State at old checkpoints.** All deployments in a preview share its data,
-   so an old checkpoint runs on newer data. D1 can't fork, and exports block.
-   Label such previews "old code, current data" unless a snapshot was taken at
-   the checkpoint.
-2. **Async machinery in previews.** Workflows, queue consumers, cron and service
-   bindings aren't isolated per Preview. For Gitmatrix that is CI, knowledge,
-   the mirror and registry jobs.
-3. **Pruning what others built on.** Reverts conflict, or behaviour changes
-   silently. Dependency analysis catches the textual cases, not all of them.
-4. **Irreversible effects:** migrations without compensation, data written by
-   users, email, published packages, the GitHub mirror, external webhooks, AI
-   spend.
-5. **Semantic conflicts** between timelines that each passed CI. Only landing
-   through the queue catches them, and some only show up after landing.
+1. **Regenerating old checkpoints.** A regenerated preview rebuilds code from
+   the commit and data from migrations plus seed. It never brings back the
+   original data, and an old commit may no longer build with today's toolchain
+   or seed.
+2. **Async machinery in previews.** For Gitmatrix's reference implementation,
+   Workflows, queue consumers and cron aren't isolated per Preview. That means
+   CI, knowledge, the mirror and registry jobs.
+3. **Drift without automatic sync.** Timelines that stay separate for long
+   conflict more when they land, and every sync needs approval again.
+4. **Merge commits on main.** Tools that walk first-parent history need
+   updating, and gm needs proper merge support before any of this works.
+5. **Semantic conflicts.** Gates on the merged result catch most of them. What
+   breaks after landing is fixed forward, since there is no pruning.
 6. **Review load:** many gated timelines waiting on one person. Mitigations are
-   auto policies for low-risk work, checkpoint summaries, graph diffs, previews,
-   and batching approvals.
-7. **Cost and caps:**
-   - 500 Workers and 500 Previews per Worker;
-   - 1,000 KV namespaces and 100 AI Search namespaces;
-   - the oldest Preview evicted at the cap;
-   - knowledge and AI per timeline.
-     Expiry, pausing when idle, per-person caps and budgets must be defaults.
+   auto policies for low-risk work, checkpoint summaries, graph diffs and
+   previews.
+7. **Cost and caps** in our reference implementation:
+   - 500 Previews per Worker, with the oldest evicted;
+   - 100 AI Search namespaces;
+   - knowledge per timeline.
+
+   Expiry and per-person caps must be defaults.
+
 8. **Divergence:** two agents rewriting the same change produce two commits
    with one change id. The server must detect it and refuse, or ask.
 9. **Long-lived drift:** experimental timelines rot like stale feature flags.
-   They need expiry and "rebase or archive" prompts.
+   They need expiry and "merge main or archive" prompts.
 10. **Shared singletons:**
     - the production database;
-    - the package `latest` tag;
-    - semver ordering;
+    - the package `latest` tag and semver ordering;
     - tags;
     - domains and OAuth callback URLs;
     - global queues and rate-limit namespaces.
-11. **Migration ordering:** collisions like the duplicate `0016_` today. Names
-    need timestamps, or landing needs a lineage check.
-12. **Landing across repositories:** a timeline touching two repos can land in
-    one and fail in the other (as Gerrit topics can).
+11. **Secrets:** any job in any timeline can request any repository secret,
+    production ones included. This is accepted for now; revisit with untrusted
+    agents or more users.
+12. **Landing across repositories:** a timeline touching two repositories can
+    land in one and fail in the other (as Gerrit topics can).
 13. **Mode errors:** acting in the wrong timeline, like being on the wrong git
-    branch. The switcher needs constant, unmistakable cues, and main as the
+    branch. The switcher needs constant, unmistakable cues, with main as the
     default.
 
 ## A path to build it
 
-| Phase | Scope                                                                                                                                                                                                                                                                      | What it proves                                                                                                                   |
-| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| 0     | Decide the open questions below; update PRODUCT.md's "trunk is the truth" principle; switch migration names to timestamps; scope secrets to environments; stop timeline publishes from moving `latest`                                                                     | The vocabulary, plus two gaps closed that matter even without timelines                                                          |
-| 1     | Timeline records; `gm timeline start/list/use/land/abandon`; a bookmark per timeline; the server reads change ids; CI context; tracker events tagged with timelines and per-timeline views; leases retained until landing; a landing queue with auto and approval policies | Two agents in two timelines in parallel, one landing automatically when green, one waiting for approval, with no duplicated work |
-| 2     | Environment and deployment records; preview jobs (`cf previews deploy`); checkpoints; approvals that point at checkpoints                                                                                                                                                  | "View the app at the gate" for hosted projects                                                                                   |
-| 3     | Previews of Gitmatrix itself: a parameterized instance, D1 per timeline from migrations and seed, async work inline, the side-effect profile                                                                                                                               | Dogfooding with real previews                                                                                                    |
-| 4     | Lanes visualization (with CORE-42) and the app-wide switcher                                                                                                                                                                                                               | Seeing forks, landings and prunes                                                                                                |
-| 5     | Knowledge overlays, `gm why`, discussions on timelines (CORE-51)                                                                                                                                                                                                           | The "why" for agents and people                                                                                                  |
-| 6     | Prune plans after landing; experimental best-of-N                                                                                                                                                                                                                          | Undo at the level of a timeline                                                                                                  |
+The work is tracked as sub-issues of CORE-50, linked by what blocks what.
+CORE-62 (the open questions) comes first; the issues with no blockers can start
+in parallel.
 
-## Decisions needed before work starts
+| Phase        | Scope                                                                                                                                                                                                                      | Issues                             | What it proves                                                                                                  |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 0            | Decide the open questions; only main moves `latest`; collision-free migration names; mirror only main and tags                                                                                                             | CORE-62, CORE-63, CORE-64, CORE-65 | Decisions settled, and gaps closed that matter even without timelines                                           |
+| 1            | Merges in gm (merge changes, rewrites that keep both parents, a graph in `gm log`); the server's ref-update log and change membership; timeline records and events; `gm timeline`; the issue field; first-parent consumers | CORE-66 to CORE-72                 | Timelines that fork and merge, with their history reviewable                                                    |
+| 2            | Tracker: `timelineId`, "done in a timeline", navigation both ways, per-timeline views, leases held until landing; checkpoints with pinned approvals; the landing queue (merge, gates, advance main)                        | CORE-73 to CORE-77                 | Two agents in two timelines in parallel, one landing automatically, one after approval, with no duplicated work |
+| 3            | Preview primitives: environments, deployment records, the preview job contract (create, teardown, regenerate), expiry; Gitmatrix's reference implementation                                                                | CORE-78, CORE-79, CORE-80          | "View the app at the gate", built by the project's own CI                                                       |
+| 4            | The timeline graph view and the app-wide switcher                                                                                                                                                                          | CORE-81, CORE-82                   | Seeing forks, merges and landings                                                                               |
+| 5            | Knowledge overlays on every push, wiki pages at checkpoints, `gm why`; discussions on timelines (CORE-51)                                                                                                                  | CORE-83, CORE-84, CORE-85          | The "why" for agents and people                                                                                 |
+| Experimental | Experimental timelines: never land, pause when idle, promote                                                                                                                                                               | CORE-86                            | Experiments that persist without landing                                                                        |
+| Later        | Pruning landed work; experimental best-of-N; secrets per environment; CORE-42's time axis                                                                                                                                  | Not filed                          |                                                                                                                 |
 
-1. **Repository or account scope.** Is a timeline per repository, or
-   account-wide like the tracker, spanning repositories? The recommendation is
-   account-wide, landing one repository at a time at first.
-2. **"Done" for an issue finished in a timeline.** Does it count as done on
-   main before the timeline lands? The recommendation is no: show "done in T".
-3. **Direct pushes to main.** Do they remain, or does all agent work go through
-   timelines (and so the queue)?
-4. **Landing shape.** Squash each timeline into one commit, or keep its changes
-   (with landing records)? The recommendation is to keep the changes.
-5. **Approvers.** Can agents approve other agents' timelines, or only people?
-   Must the approver differ from the timeline's accountable person, as GitHub
-   and GitLab can require?
-6. **Previews for hosted projects.** Does Gitmatrix only record them, or also
-   host them (Workers for Platforms or Dynamic Workers)?
-7. **Data mode for previews.** A fresh seed, shared staging, or a sanitized
-   copy, and who may choose?
-8. **Retention.** How long do previews, experimental timelines and archived
-   refs live, and what are the per-person caps?
-9. **Pruning after landing.** Is it allowed for every timeline, or only those
-   whose side effects are all compensable?
-10. **The GitHub mirror.** Should timelines be mirrored, given that experiments
-    may be private?
-11. **Naming next to CORE-42.** Is it "timeline" for the parallel lines and
-    "timeline view" for the time axis?
+## Decisions
+
+From the interview on 2026-10-02:
+
+| Question                                         | Decision                                                                                                                            |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Per repository or account-wide?                  | Account-wide, like the tracker                                                                                                      |
+| Is an issue finished in a timeline done on main? | Only when the timeline lands. Until then it has its own status, "done in a timeline", linked both ways with the timeline            |
+| Can agents still push straight to main?          | Timelines are optional and contextual: agents use them or not, depending on the issue, a person's request and later signals         |
+| Who approves?                                    | Any person with write access                                                                                                        |
+| How does a timeline land?                        | As a real git merge. Timelines fork into timelines and merge into each other or main, and Gitmatrix keeps the history git doesn't   |
+| Prune after landing?                             | Not for now: prune means abandon                                                                                                    |
+| Signals for using a timeline                     | A field on the issue, and the issue's description or PRD                                                                            |
+| Who deploys previews?                            | Not Gitmatrix. It offers primitives; Gitmatrix's own Cloudflare previews are a reference implementation using only those primitives |
+| Keeping up with main                             | A timeline stays separate until it lands; main is merged into it by a person, or by an agent asked to                               |
+| Issues done in an abandoned timeline             | Back to ready, with leases released                                                                                                 |
+| Fix before timelines                             | Only main moves `latest`; collision-free migration names                                                                            |
+| Preview data                                     | Migrations plus seed                                                                                                                |
+| Retention                                        | Previews expire and records stay; previews can be regenerated                                                                       |
+| GitHub mirror                                    | Main and tags only                                                                                                                  |
+| Naming                                           | "Timeline"; CORE-42's time axis is a later variation of the same concept                                                            |
+| Is an approval valid after new commits?          | No. It pins the approved checkpoint                                                                                                 |
+| Knowledge per timeline                           | The graph on every push; wiki pages at gates                                                                                        |
+| Keep preview jobs away from production secrets?  | Not needed                                                                                                                          |
+
+### Still open
+
+Tracked in CORE-62.
+
+- **Landing across repositories:** atomically, or one repository at a time?
+- **The issue field:** its exact values, whether it names a policy, and how an
+  agent records the choice it made.
+- **The preview contract:** its syntax in `ci.yml`, and how a project opts in.
+- **Permissions:** who may create, merge and abandon timelines (any writer, or
+  only the lease holder?).
+- **Experimental timelines:** whether they can merge into landing timelines.
+- **Release notes:** how landing merges appear in them.
+- **Retention numbers:** the grace period before teardown, and the idle time
+  before an experiment pauses.
+- **The mirror:** how to retire non-main branches already mirrored to GitHub.
 
 ## Sources
 
 Sources were consulted on 2026-10-02. Cloudflare's Worker Previews launched ten
 days earlier, and `cf` support for them is in beta; recheck their limits and
-pricing (not found) before building on them. Claims about agent platforms
-come from vendor documentation and blogs and change often.
+pricing (not found) before building on them. Claims about agent platforms come
+from vendor documentation and blogs, and change often.
 
 [p4-types]: https://help.perforce.com/helix-core/server-apps/p4guide/current/Content/P4Guide/streams.types.html
 [p4-paths]: https://perforce.com/manuals/p4guide/Content/P4Guide/streams.concepts.paths.inherit.html
@@ -648,6 +674,8 @@ come from vendor documentation and blogs and change often.
 [heroku-review]: https://devcenter.heroku.com/articles/github-integration-review-apps
 [render-previews]: https://render.com/docs/service-previews
 [railway-envs]: https://docs.railway.com/guides/environments
+[gh-envs]: https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments
+[gl-envs]: https://docs.gitlab.com/ci/environments/
 [neon]: https://neon.com/docs/introduction/branching
 [ps-deploy]: https://planetscale.com/docs/vitess/schema-changes/deploy-requests
 [ps-revert]: https://planetscale.com/blog/revert-a-migration-without-losing-data
@@ -668,7 +696,6 @@ come from vendor documentation and blogs and change often.
 [aviator]: https://docs.aviator.co/mergequeue/concepts/affected-targets
 [submitqueue]: https://arxiv.org/abs/2501.03440
 [gerrit-submit]: https://gerrit-review.googlesource.com/Documentation/config-submit-requirements.html
-[gh-envs]: https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments
 [fowler-semantic]: https://martinfowler.com/bliki/SemanticConflict.html
 [git-revert-merge]: https://github.com/git/git/blob/HEAD/Documentation/howto/revert-a-faulty-merge.adoc
 [plastic-book]: https://www.plasticscm.com/downloads/plasticscm-book.pdf
@@ -684,4 +711,3 @@ come from vendor documentation and blogs and change often.
 [linear-agents]: https://linear.app/docs/agents-in-linear
 [linear-releases]: https://linear.app/docs/releases
 [gh-closing]: https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
-[gl-envs]: https://docs.gitlab.com/ci/environments/
