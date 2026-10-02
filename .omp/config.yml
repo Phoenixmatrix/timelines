@@ -1,0 +1,3 @@
+# Inherit modelRoles.advisor from the user's OMP configuration.
+advisor:
+  enabled: true
