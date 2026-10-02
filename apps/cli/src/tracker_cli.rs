@@ -209,6 +209,20 @@ pub enum IssueCommand {
         #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: u32,
     },
+    /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context.
+    Next {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Only work under this issue (a project or other parent).
+        #[arg(long)]
+        under: Option<String>,
+        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: u32,
+    },
     /// Renew an online fenced lease; returns its token only in this response.
     Renew {
         #[command(flatten)]

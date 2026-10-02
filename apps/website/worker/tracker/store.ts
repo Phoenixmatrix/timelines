@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import {
   isOpen,
   leasedAncestor,
+  readiness,
   readinessIndex,
   type Changes,
   type Comment,
@@ -408,6 +409,92 @@ export class TrackerStore {
             409,
           );
       };
+      /** Hold `issue` for the caller: a fresh token, or the same one when renewing. */
+      const grant = (issue: Issue, agent: string, ttl: number, token?: string) => {
+        const leaseToken = token ?? crypto.randomUUID() + crypto.randomUUID();
+        const expiresAt = new Date(Date.parse(now) + ttl * 1000).toISOString();
+        issue.claim = {
+          actorId: access.actorId,
+          accountableId: access.principalId,
+          agent,
+          expiresAt,
+        };
+        issue.status = "in_progress";
+        run(
+          this.sql,
+          tracker
+            .insertInto("leases")
+            .values({ issue_id: issue.id, token: leaseToken })
+            .onConflict((oc) =>
+              oc.column("issue_id").doUpdateSet((eb) => ({ token: eb.ref("excluded.token") })),
+            ),
+        );
+        return { leaseToken, expiresAt };
+      };
+      /**
+       * The next issue to take in a scope: ready, not a PRD, unassigned or assigned to
+       * the caller; first by priority, then by how much open work it unblocks
+       * (critical path first), then by age.
+       */
+      const pick = (scope: { teamId?: string; workspaceId?: string; underId?: string }) => {
+        const index = graph();
+        const writable = (issue: Issue) => {
+          const team = this.get<Team>("team", issue.teamId);
+          return (
+            !team.archived &&
+            (access.canAdmin ||
+              !team.memberIds.length ||
+              team.memberIds.includes(access.principalId))
+          );
+        };
+        const under = (issue: Issue) => {
+          const seen = new Set<string>();
+          for (
+            let id = issue.parentId;
+            id && !seen.has(id);
+            id = index.byId.get(id)?.parentId ?? null
+          ) {
+            if (id === scope.underId) return true;
+            seen.add(id);
+          }
+          return false;
+        };
+        const dependents = new Map<string, string[]>();
+        for (const link of this.all<Link>("link"))
+          if (link.kind === "blocks")
+            dependents.set(link.fromId, [...(dependents.get(link.fromId) ?? []), link.toId]);
+        const unblocks = (issue: Issue) => {
+          const reached = new Set<string>();
+          const queue = [issue.id];
+          while (queue.length)
+            for (const next of dependents.get(queue.pop()!) ?? [])
+              if (!reached.has(next) && index.byId.get(next) && isOpen(index.byId.get(next)!)) {
+                reached.add(next);
+                queue.push(next);
+              }
+          return reached.size;
+        };
+        const candidates = [...index.byId.values()].filter(
+          (issue) =>
+            readiness(issue, index, now) === "ready" &&
+            issue.type !== "prd" &&
+            (issue.assigneeId === null || issue.assigneeId === access.actorId) &&
+            (!scope.teamId || issue.teamId === scope.teamId) &&
+            (!scope.workspaceId || issue.workspaceIds.includes(scope.workspaceId)) &&
+            (!scope.underId || under(issue)) &&
+            writable(issue),
+        );
+        const weight = new Map(candidates.map((issue) => [issue.id, unblocks(issue)]));
+        return (
+          candidates.sort(
+            (a, b) =>
+              a.priority - b.priority ||
+              weight.get(b.id)! - weight.get(a.id)! ||
+              a.createdAt.localeCompare(b.createdAt) ||
+              a.id.localeCompare(b.id),
+          )[0] ?? null
+        );
+      };
       const childrenClosed = (issue: Issue) => {
         const open = (graph().children.get(issue.id) ?? []).filter(isOpen);
         if (open.length)
@@ -765,6 +852,34 @@ export class TrackerStore {
             emit("subscription", entityId, null, mutation.kind);
             break;
           }
+          case "issue.next": {
+            keys(data, ["agent", "ttlSeconds", "teamId", "workspaceId", "underId"]);
+            const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
+            if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
+              fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
+            const agent = text(data.agent, "agent", 200);
+            const scope = {
+              ...(data.teamId === undefined ? {} : { teamId: id(data.teamId) }),
+              ...(data.workspaceId === undefined ? {} : { workspaceId: id(data.workspaceId) }),
+              ...(data.underId === undefined ? {} : { underId: id(data.underId) }),
+            };
+            if (scope.teamId) this.get<Team>("team", scope.teamId);
+            if (scope.workspaceId) this.get<Workspace>("workspace", scope.workspaceId);
+            if (scope.underId) this.get<Issue>("issue", scope.underId);
+            const issue = pick(scope);
+            // Nothing ready is an answer, not an error: the agent can stop or wait.
+            if (!issue) break;
+            result = {
+              id: entityId,
+              issueId: issue.id,
+              key: issue.key,
+              ...grant(issue, agent, Number(ttl)),
+            };
+            issue.version++;
+            issue.updatedAt = now;
+            emit("issue", issue.id, issue, "issue.claim");
+            break;
+          }
           case "issue.claim":
           case "issue.renew":
           case "issue.release":
@@ -797,30 +912,15 @@ export class TrackerStore {
                 unblocked(issue);
                 claimable(issue);
               } else lease(issue, data.leaseToken);
-              const token =
-                kind === "issue.claim"
-                  ? crypto.randomUUID() + crypto.randomUUID()
-                  : String(data.leaseToken);
-              const expiresAt = new Date(Date.parse(now) + Number(ttl) * 1000).toISOString();
-              issue.claim = {
-                actorId: access.actorId,
-                accountableId: access.principalId,
-                agent: kind === "issue.claim" ? text(data.agent, "agent", 200) : issue.claim!.agent,
-                expiresAt,
+              result = {
+                id: entityId,
+                ...grant(
+                  issue,
+                  kind === "issue.claim" ? text(data.agent, "agent", 200) : issue.claim!.agent,
+                  Number(ttl),
+                  kind === "issue.claim" ? undefined : String(data.leaseToken),
+                ),
               };
-              issue.status = "in_progress";
-              run(
-                this.sql,
-                tracker
-                  .insertInto("leases")
-                  .values({ issue_id: entityId, token })
-                  .onConflict((oc) =>
-                    oc
-                      .column("issue_id")
-                      .doUpdateSet((eb) => ({ token: eb.ref("excluded.token") })),
-                  ),
-              );
-              result = { id: entityId, leaseToken: token, expiresAt };
             } else {
               lease(issue, data.leaseToken);
               if (kind === "issue.complete") {

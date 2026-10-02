@@ -994,10 +994,50 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline}),
     ))
 }
+/// What `gm issue next` reports: the claim (its token shown once) and the issue's working
+/// context, or that nothing in scope is ready.
+fn next_result(snapshot: &Value, response: &Value) -> Shown {
+    let result = &response["results"][0];
+    let Some(issue_id) = result["issueId"].as_str() else {
+        return Shown(json!({
+            "claimed": null,
+            "message": "Nothing in scope is ready: everything is claimed, blocked, waiting, or done.",
+        }));
+    };
+    let context = context(snapshot, issue_id, 30, false)
+        .map(|shown| shown.0)
+        .unwrap_or(Value::Null);
+    // What finished blockers left behind: the evidence this work builds on.
+    let blocker_evidence: Vec<&Value> = snapshot["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| l["kind"] == "blocks" && l["toId"] == issue_id)
+        .flat_map(|l| {
+            snapshot["comments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(move |c| c["issueId"] == l["fromId"] && c["kind"] == "evidence")
+        })
+        .collect();
+    Shown(json!({
+        "claimed": {
+            "issueId": issue_id,
+            "key": result["key"],
+            "leaseToken": result["leaseToken"],
+            "expiresAt": result["expiresAt"],
+        },
+        "context": context,
+        "blockerEvidence": blocker_evidence,
+        "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires, then gm issue complete with evidence.",
+    }))
+}
 pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     let lease_command = matches!(
         args.command,
         IssueCommand::Claim { .. }
+            | IssueCommand::Next { .. }
             | IssueCommand::Renew { .. }
             | IssueCommand::Release(_)
             | IssueCommand::Complete { .. }
@@ -1043,6 +1083,25 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             IssueCommand::Claim { issue, agent, ttl } => {
                 json!({"kind":"issue.claim","id":id(&snapshot,"issues",issue)?,"data":{"agent":agent,"ttlSeconds":ttl}})
             }
+            IssueCommand::Next {
+                agent,
+                team,
+                workspace,
+                under,
+                ttl,
+            } => {
+                let mut data = json!({"agent":agent,"ttlSeconds":ttl});
+                if let Some(t) = team {
+                    data["teamId"] = json!(id(&snapshot, "teams", t)?);
+                }
+                if let Some(w) = workspace {
+                    data["workspaceId"] = json!(id(&snapshot, "workspaces", w)?);
+                }
+                if let Some(u) = under {
+                    data["underId"] = json!(id(&snapshot, "issues", u)?);
+                }
+                json!({"kind":"issue.next","id":uid(),"data":data})
+            }
             IssueCommand::Renew { lease, ttl } => {
                 json!({"kind":"issue.renew","id":id(&snapshot,"issues",&lease.issue)?,"data":{"leaseToken":lease.lease_token,"ttlSeconds":ttl}})
             }
@@ -1073,6 +1132,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     "uncertain_ack",
                     "The lease response was incomplete. Inspect the issue online; do not assume ownership without a fencing token.",
                 ));
+            }
+            if let IssueCommand::Next { .. } = args.command {
+                return Ok(next_result(&snapshot, &response));
             }
             if !matches!(
                 args.command,
@@ -1128,6 +1190,31 @@ mod tests {
         assert!(!ready(&s, &s["issues"][1], now));
         s["issues"][1]["claim"]["expiresAt"] = json!("2026-09-30T23:59:00Z");
         assert!(ready(&s, &s["issues"][1], now));
+    }
+    #[test]
+    fn next_reports_the_claim_with_context_and_blocker_evidence_or_nothing_ready() {
+        let mut s = snapshot();
+        s["members"] = json!([]);
+        s["agents"] = json!([]);
+        s["issues"] = json!([
+            {"id":"a","key":"ENG-1","status":"done","parentId":null,"claim":null},
+            {"id":"b","key":"ENG-2","status":"in_progress","parentId":null,"claim":null}
+        ]);
+        s["links"] = json!([{"id":"l","fromId":"a","toId":"b","kind":"blocks"}]);
+        s["comments"] = json!([
+            {"id":"c1","issueId":"a","kind":"evidence","body":"Shipped","createdAt":"2026-10-01T00:00:00Z"},
+            {"id":"c2","issueId":"a","kind":"comment","body":"Chatter","createdAt":"2026-10-01T00:00:00Z"}
+        ]);
+        let claimed = next_result(
+            &s,
+            &json!({"results":[{"issueId":"b","key":"ENG-2","leaseToken":"secret","expiresAt":"later"}]}),
+        );
+        assert_eq!(claimed.0["claimed"]["key"], "ENG-2");
+        assert_eq!(claimed.0["claimed"]["leaseToken"], "secret");
+        assert_eq!(claimed.0["context"]["issue"]["key"], "ENG-2");
+        assert_eq!(claimed.0["blockerEvidence"].as_array().unwrap().len(), 1);
+        let none = next_result(&s, &json!({"results":[{"id":"pick"}]}));
+        assert!(none.0["claimed"].is_null());
     }
     #[test]
     fn agents_are_named_with_their_accountable_person() {

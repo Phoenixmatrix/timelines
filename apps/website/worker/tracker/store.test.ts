@@ -642,3 +642,82 @@ describe("agents", () => {
     ).toThrow(/not a current account member/);
   });
 });
+
+describe("issue.next", () => {
+  function board() {
+    const f = fixture();
+    const make = (id: string, data: Record<string, unknown> = {}) =>
+      f.mutate({ kind: "issue.create", id, data: { teamId: "team", title: id, ...data } });
+    let n = 0;
+    const next = (data: Record<string, unknown> = {}, operationId = `next-${++n}`) =>
+      f.store.mutate(f.access, {
+        operationId,
+        mutations: [
+          { kind: "issue.next", id: `pick-${operationId}`, data: { agent: "walker", ...data } },
+        ],
+      }).results[0]!;
+    return { ...f, make, next };
+  }
+
+  test("takes the highest priority, then whatever unblocks the most work, then the oldest", () => {
+    const b = board();
+    b.make("old", { priority: 2 });
+    b.advance(1000);
+    b.make("leaf", { priority: 2 });
+    b.make("hub", { priority: 2 });
+    b.make("after-1", { priority: 3 });
+    b.make("after-2", { priority: 3 });
+    b.make("urgent", { priority: 1 });
+    b.mutate(
+      { kind: "link.add", id: "l1", data: { fromId: "hub", toId: "after-1", kind: "blocks" } },
+      { kind: "link.add", id: "l2", data: { fromId: "after-1", toId: "after-2", kind: "blocks" } },
+    );
+    expect(b.next().key).toBe("ENG-6");
+    expect(b.next().key).toBe("ENG-3");
+    expect(b.next().key).toBe("ENG-1");
+    expect(b.next().key).toBe("ENG-2");
+  });
+
+  test("skips containers, PRDs, blocked work and other people's assignments, and stays in scope", () => {
+    const b = board();
+    b.make("project");
+    b.make("child", { parentId: "project" });
+    b.make("prd", { type: "prd" });
+    b.make("theirs", { assigneeId: "bob" });
+    b.make("blocked");
+    b.make("blocker", { status: "backlog" });
+    b.mutate({
+      kind: "link.add",
+      id: "l1",
+      data: { fromId: "blocker", toId: "blocked", kind: "blocks" },
+    });
+    b.make("tagged", { workspaceIds: ["workspace"] });
+    expect(b.next({ workspaceId: "workspace" })).toMatchObject({ issueId: "tagged" });
+    expect(b.next({ underId: "project" })).toMatchObject({ issueId: "child" });
+    // Everything left is a container, a PRD, someone else's, blocked or in the backlog.
+    expect(b.next().issueId).toBeUndefined();
+    expect(b.next({ teamId: "team" }).leaseToken).toBeUndefined();
+  });
+
+  test("claims atomically: two callers never get the same issue, and a retry returns the same claim", () => {
+    const b = board();
+    b.make("a");
+    b.make("b");
+    const first = b.next({}, "op-1");
+    const replay = b.next({}, "op-1");
+    const second = b.next({}, "op-2");
+    expect(replay).toEqual(first);
+    expect([first.issueId!, second.issueId!].sort((x, y) => x.localeCompare(y))).toEqual([
+      "a",
+      "b",
+    ]);
+    const claimed = b.store.snapshot(b.access).issues.find((i) => i.id === first.issueId)!;
+    expect(claimed).toMatchObject({ status: "in_progress", claim: { agent: "walker" } });
+    // The token is a real lease on the issue it named.
+    b.mutate({
+      kind: "issue.complete",
+      id: first.issueId!,
+      data: { leaseToken: first.leaseToken!, evidence: "Done" },
+    });
+  });
+});

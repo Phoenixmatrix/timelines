@@ -161,6 +161,19 @@ export type Mutation =
   | { kind: "subscription.add"; id: string; data: { workspaceId: string; repoId: string } }
   | { kind: "subscription.remove"; id: string }
   | { kind: "issue.claim"; id: string; data: { agent: string; ttlSeconds?: number } }
+  | {
+      kind: "issue.next";
+      /** A fresh id for this request; the claimed issue comes back as `issueId`. */
+      id: string;
+      data: {
+        agent: string;
+        ttlSeconds?: number;
+        teamId?: string;
+        workspaceId?: string;
+        /** Only descendants of this issue. */
+        underId?: string;
+      };
+    }
   | { kind: "issue.renew"; id: string; data: { leaseToken: string; ttlSeconds?: number } }
   | { kind: "issue.release"; id: string; data: { leaseToken: string } }
   | { kind: "issue.complete"; id: string; data: { leaseToken: string; evidence: string } };
@@ -171,7 +184,14 @@ export interface MutationRequest {
 export interface MutationResult {
   cursor: number;
   events: TrackerEvent[];
-  results: { id: string; leaseToken?: string; expiresAt?: string }[];
+  results: {
+    id: string;
+    leaseToken?: string;
+    expiresAt?: string;
+    /** For issue.next: the issue it claimed (absent when nothing was ready). */
+    issueId?: string;
+    key?: string;
+  }[];
   serverTime: string;
 }
 export interface Changes {
