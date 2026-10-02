@@ -86,6 +86,7 @@ function snapshot(issues: Issue[], links: Link[] = []): Snapshot {
     issues,
     links,
     comments: [],
+    requests: [],
     subscriptions: [],
     cursor: 1,
     serverTime: new Date(NOW).toISOString(),

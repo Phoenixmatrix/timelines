@@ -14,6 +14,7 @@ import { RepoPackages, repoPackagesLoader } from "./routes/repo/Packages.tsx";
 import { Feeds, feedsAction, feedsLoader } from "./routes/packages/Feeds.tsx";
 import { NpmLogin, npmLoginAction, npmLoginLoader } from "./routes/packages/NpmLogin.tsx";
 import { AllPackages, allPackagesLoader } from "./routes/packages/AllPackages.tsx";
+import { NeedsYou, needsYouLoader } from "./routes/NeedsYou.tsx";
 import { OwnerPackages, ownerPackagesLoader } from "./routes/packages/OwnerPackages.tsx";
 import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageConsole.tsx";
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
@@ -54,6 +55,7 @@ export const router = createBrowserRouter([
           { path: "new", loader: newRepoLoader, action: newRepoAction, Component: NewRepo },
           { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
+          { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
           {
             path: "tracker/:owner",
             loader: trackerLoader,

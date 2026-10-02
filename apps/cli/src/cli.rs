@@ -43,6 +43,8 @@ pub enum Command {
     Workspace(crate::tracker_cli::WorkspaceArgs),
     /// Agent-first issues, PRDs, dependency graph, checkpoints and fenced claims
     Issue(crate::tracker_cli::IssueArgs),
+    /// Requests to people: what agents are waiting on, and answering them
+    Request(crate::tracker_cli::RequestArgs),
     /// Show the working-copy change, its files and where it sits relative to trunk
     #[command(visible_alias = "st")]
     Status,

@@ -41,6 +41,7 @@ const TYPE = "hidden @4xl:block";
 const ASSIGNEE = "hidden @5xl:block";
 
 export const STATE_DOT: Record<IssueState, string> = {
+  waiting: "bg-signal",
   ready: "bg-online",
   claimed: "bg-transparent ring-[1.5px] ring-inset ring-ink",
   leased: "bg-transparent ring-[1.5px] ring-inset ring-ink-faint",
@@ -55,6 +56,7 @@ export const STATE_DOT: Record<IssueState, string> = {
 /** What the state dots mean, wherever dots appear without their words. */
 export function StateLegend({ className = "" }: { className?: string }) {
   const states: IssueState[] = [
+    "waiting",
     "ready",
     "in_progress",
     "claimed",

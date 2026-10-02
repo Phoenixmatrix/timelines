@@ -1,7 +1,13 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
-import { readiness, readinessIndex, type Issue, type Mutation } from "../../shared/tracker.ts";
-import { TrackerStore, type Access, type SqlDatabase } from "./store.ts";
+import {
+  readiness,
+  readinessIndex,
+  type HumanRequest,
+  type Issue,
+  type Mutation,
+} from "../../shared/tracker.ts";
+import { RESUME_WINDOW_SECONDS, TrackerStore, type Access, type SqlDatabase } from "./store.ts";
 
 const databases: DatabaseSync[] = [];
 afterEach(() => {
@@ -855,5 +861,172 @@ describe("delegated leases", () => {
     const own = pick({ underId: "project", underToken: t.lead, forActorId: "agt-bot" });
     expect(["grandchild", "sibling"]).toContain(own.issueId);
     expect(t.claimOf(own.issueId!)).toMatchObject({ actorId: "agt-bot", delegatedFrom: "project" });
+  });
+});
+
+describe("waiting on a person", () => {
+  function waiting() {
+    const f = fixture();
+    f.issue("work");
+    const bot: Access = { ...f.access, actorId: "agt-bot" };
+    let n = 0;
+    const as = (access: Access, ...mutations: Mutation[]) =>
+      f.store.mutate(access, { operationId: `w-${++n}`, mutations });
+    const issue = () => f.store.snapshot(f.access).issues.find((i) => i.id === "work")!;
+    const request = (id: string) =>
+      f.store.snapshot(f.access).requests.find((r) => r.id === id) as HumanRequest;
+    const state = () => {
+      const snap = f.store.snapshot(f.access);
+      const index = readinessIndex(snap.issues, snap.links);
+      return readiness(index.byId.get("work")!, index, snap.serverTime);
+    };
+    const token = String(
+      as(bot, { kind: "issue.claim", id: "work", data: { agent: "session" } }).results[0]!
+        .leaseToken,
+    );
+    return { ...f, bot, as, issue, request, state, token };
+  }
+
+  test("asking with the lease parks it: the issue waits, in progress, and the lease outlives its ttl", () => {
+    const w = waiting();
+    w.as(w.bot, {
+      kind: "request.open",
+      id: "q1",
+      data: { issueId: "work", kind: "question", prompt: "Which region?", leaseToken: w.token },
+    });
+    expect(w.issue()).toMatchObject({ status: "in_progress", waiting: 1 });
+    expect(w.issue().claim?.parkedAt).toBeTruthy();
+    expect(w.request("q1")).toMatchObject({ status: "open", askedBy: "agt-bot", routeTo: "alice" });
+    expect(w.state()).toBe("waiting");
+    w.advance(2 * 86_400_000);
+    expect(() => w.mutate({ kind: "issue.claim", id: "work", data: { agent: "thief" } })).toThrow(
+      /active claim/,
+    );
+  });
+
+  test("a person answers, the lease unparks for its holder to resume with a fresh token", () => {
+    const w = waiting();
+    w.as(w.bot, {
+      kind: "request.open",
+      id: "q1",
+      data: { issueId: "work", kind: "question", prompt: "Which region?", leaseToken: w.token },
+    });
+    expect(() =>
+      w.as(w.bot, { kind: "request.answer", id: "q1", data: { answer: "Me, answering myself" } }),
+    ).toThrow(/a person has to/);
+    expect(() => w.as(w.bot, { kind: "issue.resume", id: "work", data: {} })).toThrow(
+      /open requests/,
+    );
+    w.mutate({ kind: "request.answer", id: "q1", data: { answer: "eu-west" } });
+    expect(w.request("q1")).toMatchObject({
+      status: "answered",
+      answer: "eu-west",
+      answeredBy: "alice",
+    });
+    expect(w.issue().waiting).toBe(0);
+    expect(w.issue().claim?.parkedAt).toBeUndefined();
+    expect(() => w.mutate({ kind: "issue.resume", id: "work", data: {} })).toThrow(/lease holder/);
+    const resumed = String(
+      w.as(w.bot, { kind: "issue.resume", id: "work", data: {} }).results[0]!.leaseToken,
+    );
+    expect(resumed).not.toBe(w.token);
+    expect(() =>
+      w.as(w.bot, { kind: "issue.renew", id: "work", data: { leaseToken: w.token } }),
+    ).toThrow(/superseded/);
+    w.as(w.bot, {
+      kind: "issue.complete",
+      id: "work",
+      data: { leaseToken: resumed, evidence: "Done" },
+    });
+  });
+
+  test("if the holder doesn't come back within the window, anyone can take the work", () => {
+    const w = waiting();
+    w.as(w.bot, {
+      kind: "request.open",
+      id: "q1",
+      data: { issueId: "work", kind: "question", prompt: "?", leaseToken: w.token },
+    });
+    w.mutate({ kind: "request.answer", id: "q1", data: { answer: "!" } });
+    w.advance(RESUME_WINDOW_SECONDS * 1000);
+    expect(w.state()).toBe("ready");
+    w.mutate({ kind: "issue.claim", id: "work", data: { agent: "someone" } });
+  });
+
+  test("each kind takes its own answer, and credentials are recorded only as where they went", () => {
+    const w = waiting();
+    w.as(
+      w.bot,
+      {
+        kind: "request.open",
+        id: "d",
+        data: { issueId: "work", kind: "decision", prompt: "Pick", choices: ["A", "B"] },
+      },
+      {
+        kind: "request.open",
+        id: "a",
+        data: { issueId: "work", kind: "approval", prompt: "Ship?" },
+      },
+      {
+        kind: "request.open",
+        id: "c",
+        data: {
+          issueId: "work",
+          kind: "credential",
+          prompt: "Deploy token",
+          secret: { repo: "org/private", name: "DEPLOY_TOKEN" },
+        },
+      },
+    );
+    expect(w.issue().waiting).toBe(3);
+    expect(() => w.mutate({ kind: "request.answer", id: "d", data: { choice: "C" } })).toThrow(
+      /Choose one of: A, B/,
+    );
+    w.mutate({ kind: "request.answer", id: "d", data: { choice: "B" } });
+    w.mutate({ kind: "request.answer", id: "a", data: { approved: false, answer: "Not yet" } });
+    expect(() =>
+      w.mutate({ kind: "request.answer", id: "c", data: { answer: "s3cr3t", stored: true } }),
+    ).toThrow(/no value/);
+    w.mutate({ kind: "request.answer", id: "c", data: { stored: true } });
+    expect(["d", "a", "c"].map((id) => w.request(id).answer)).toEqual([
+      "B",
+      "rejected · Not yet",
+      "Stored as DEPLOY_TOKEN on org/private",
+    ]);
+    expect(JSON.stringify(w.store.snapshot(w.access))).not.toContain("s3cr3t");
+    expect(w.issue().waiting).toBe(0);
+    expect(() =>
+      w.as(w.bot, {
+        kind: "request.open",
+        id: "x",
+        data: { issueId: "work", kind: "decision", prompt: "?", choices: ["one"] },
+      }),
+    ).toThrow(/at least two choices/);
+  });
+
+  test("only the asker cancels; requests can be routed to another member, not an outsider", () => {
+    const w = waiting();
+    w.as(w.bot, {
+      kind: "request.open",
+      id: "q",
+      data: { issueId: "work", kind: "question", prompt: "?", routeTo: "bob" },
+    });
+    expect(w.request("q").routeTo).toBe("bob");
+    expect(() =>
+      w.as(w.bot, {
+        kind: "request.open",
+        id: "q2",
+        data: { issueId: "work", kind: "question", prompt: "?", routeTo: "outsider" },
+      }),
+    ).toThrow(/not a current account member/);
+    expect(() =>
+      w.store.mutate(
+        { ...w.access, actorId: "bob", principalId: "bob", canAdmin: false },
+        { operationId: "bob-cancel", mutations: [{ kind: "request.cancel", id: "q" }] },
+      ),
+    ).toThrow(/Only whoever asked/);
+    w.as(w.bot, { kind: "request.cancel", id: "q" });
+    expect(w.request("q").status).toBe("canceled");
+    expect(w.issue().waiting).toBe(0);
   });
 });

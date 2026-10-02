@@ -3,7 +3,7 @@
 // query language over it, facet counts, and opened/closed activity buckets.
 // Everything here is pure, so it is tested without a browser.
 //
-//   is:ready is:blocked is:claimed is:leased is:open is:closed
+//   is:ready is:waiting is:blocked is:claimed is:leased is:open is:closed
 //   status:backlog|todo|in_progress|done|canceled
 //   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
 //   since:7d until:2026-09-01   (last activity: updatedAt)
@@ -20,6 +20,7 @@ import {
 } from "../../../shared/tracker.ts";
 
 export type IssueState =
+  | "waiting"
   | "claimed"
   | "leased"
   | "blocked"
@@ -31,6 +32,7 @@ export type IssueState =
   | "canceled";
 
 export const STATE_LABEL: Record<IssueState, string> = {
+  waiting: "Waiting",
   ready: "Ready",
   in_progress: "In progress",
   claimed: "Claimed",
@@ -44,15 +46,17 @@ export const STATE_LABEL: Record<IssueState, string> = {
 
 /** How work sorts by default: what can move now first, closed last. */
 const STATE_RANK: Record<IssueState, number> = {
-  ready: 0,
-  claimed: 1,
-  leased: 2,
-  in_progress: 3,
-  todo: 4,
-  blocked: 5,
-  backlog: 6,
-  done: 7,
-  canceled: 8,
+  // Waiting needs a person, so it leads.
+  waiting: 0,
+  ready: 1,
+  claimed: 2,
+  leased: 3,
+  in_progress: 4,
+  todo: 5,
+  blocked: 6,
+  backlog: 7,
+  done: 8,
+  canceled: 9,
 };
 
 export interface IssueIndex {
@@ -111,7 +115,8 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     const why = readiness(issue, graph, serverTime);
     if (why === "leased_above") leasedBy.set(issue.id, leasedAncestor(issue, graph, serverTime)!);
     let value: IssueState;
-    if (why === "claimed") value = "claimed";
+    if (why === "waiting") value = "waiting";
+    else if (why === "claimed") value = "claimed";
     else if (issue.status === "done" || issue.status === "canceled") value = issue.status;
     else if (why === "blocked") value = "blocked";
     else if (why === "leased_above") value = "leased";
@@ -345,6 +350,7 @@ export interface Facets {
 }
 
 const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
+  waiting: { key: "is", value: "waiting" },
   ready: { key: "is", value: "ready" },
   claimed: { key: "is", value: "claimed" },
   leased: { key: "is", value: "leased" },

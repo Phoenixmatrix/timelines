@@ -9,7 +9,13 @@ import {
   type Actor,
 } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
-import type { TrackerAgent, TrackerIdentity, TrackerOwner } from "../../shared/tracker.ts";
+import type {
+  OpenRequest,
+  OpenRequests,
+  TrackerAgent,
+  TrackerIdentity,
+  TrackerOwner,
+} from "../../shared/tracker.ts";
 import { TrackerError, validateRequest, type Access } from "./store.ts";
 import type { Tracker, TrackerReply } from "./object.ts";
 
@@ -155,6 +161,40 @@ tracker.get("/tracker", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
   return c.json({ trackers: await accessible(c.env.DB, actor) });
+});
+/** Open requests to people across every tracker you're in: yours first, then the rest. */
+tracker.get("/requests", async (c) => {
+  const actor = c.get("actor");
+  if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
+  const requests: OpenRequest[] = [];
+  for (const owner of await accessible(c.env.DB, actor)) {
+    const result = await trackerObject(c.env, owner.id).openRequests();
+    if (!result.ok) return response(c, result);
+    for (const item of result.value)
+      requests.push({ tracker: { slug: owner.slug, displayName: owner.displayName }, ...item });
+  }
+  requests.sort(
+    (a, b) =>
+      Number(b.request.routeTo === actor.id) - Number(a.request.routeTo === actor.id) ||
+      a.request.createdAt.localeCompare(b.request.createdAt),
+  );
+  const ids = [...new Set(requests.flatMap(({ request }) => [request.askedBy, request.routeTo]))];
+  const names: Record<string, string> = {};
+  if (ids.length) {
+    const k = gitmatrixDb(c.env.DB);
+    const [people, agents] = await Promise.all([
+      k.selectFrom("accounts").select(["id", "display_name"]).where("id", "in", ids).execute(),
+      k
+        .selectFrom("agents as g")
+        .innerJoin("accounts as a", "a.id", "g.accountable_id")
+        .select(["g.id", "g.name", "a.display_name"])
+        .where("g.id", "in", ids)
+        .execute(),
+    ]);
+    for (const p of people) names[p.id] = p.display_name;
+    for (const g of agents) names[g.id] = `${g.name} for ${g.display_name}`;
+  }
+  return c.json<OpenRequests>({ requests, names });
 });
 tracker.get("/tracker/:owner/snapshot", async (c) => {
   const access = await authorize(c);

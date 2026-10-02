@@ -11,6 +11,7 @@ export const RESERVED_SLUGS = new Set([
   "cli-auth",
   "device",
   "knowledge",
+  "needs-you",
   "new",
   "packages",
   "settings",

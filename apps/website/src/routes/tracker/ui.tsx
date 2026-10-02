@@ -3,7 +3,9 @@ import { Combobox } from "@base-ui/react/combobox";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  actorName,
   claimHolder,
+  hasActiveClaim,
   leasedAncestor,
   readiness,
   readinessIndex,
@@ -127,6 +129,7 @@ export function blockers(issue: Issue, snapshot: Snapshot, index?: IssueIndex) {
     .filter((item): item is Issue => !!item && item.status !== "done");
 }
 const STATE_DOT: Record<string, string> = {
+  waiting: "bg-signal",
   ready: "bg-online",
   claimed: "bg-transparent ring-[1.5px] ring-inset ring-ink",
   leased: "bg-transparent ring-[1.5px] ring-inset ring-ink-faint",
@@ -137,7 +140,7 @@ function StateBadge({
   title,
   children,
 }: {
-  state?: "ready" | "claimed" | "leased" | "blocked";
+  state?: "waiting" | "ready" | "claimed" | "leased" | "blocked";
   title?: string;
   children: ReactNode;
 }) {
@@ -166,7 +169,16 @@ export function IssueState({
   index?: IssueIndex;
 }) {
   const blocked = blockers(issue, snapshot, index);
-  if (issue.claim && issue.claim.expiresAt > snapshot.serverTime)
+  if (issue.waiting) {
+    const asks = snapshot.requests.filter((r) => r.issueId === issue.id && r.status === "open");
+    const who = [...new Set(asks.map((r) => actorName(snapshot, r.routeTo)))];
+    return (
+      <StateBadge state="waiting" title={asks.map((r) => r.prompt.split("\n")[0]).join("\n")}>
+        Waiting on {who.join(", ") || "a person"}
+      </StateBadge>
+    );
+  }
+  if (issue.claim && hasActiveClaim(issue, snapshot.serverTime))
     return (
       <StateBadge
         state="claimed"

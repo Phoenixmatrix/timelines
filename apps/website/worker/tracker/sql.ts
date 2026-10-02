@@ -26,6 +26,7 @@ export interface TrackerDatabase {
   issues: EntityRow;
   links: EntityRow;
   comments: EntityRow;
+  requests: EntityRow;
   subscriptions: EntityRow;
   team_numbers: { id: string; number: number };
   leases: { issue_id: string; token: string };

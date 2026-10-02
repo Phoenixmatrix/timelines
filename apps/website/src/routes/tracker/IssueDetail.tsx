@@ -24,6 +24,8 @@ import {
   types,
 } from "./ui.tsx";
 import type { IssueIndex } from "./query.ts";
+import { RequestCard } from "./Requests.tsx";
+import { useViewer } from "../../lib/session.ts";
 
 export type MutationOutcome = { ok: true } | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
@@ -274,6 +276,15 @@ export function IssueDetail({
         }
     return snapshot.issues.filter((item) => !reached.has(item.id) && !direct.has(item.id));
   }, [relation, snapshot.issues, snapshot.links, issue.id]);
+  const viewer = useViewer();
+  // What this issue is waiting on: open requests first, then the answered history.
+  const requests = snapshot.requests
+    .filter((request) => request.issueId === issue.id)
+    .sort(
+      (a, b) =>
+        Number(b.status === "open") - Number(a.status === "open") ||
+        b.createdAt.localeCompare(a.createdAt),
+    );
   const latestCheckpoint = comments
     .filter((comment) => comment.kind === "checkpoint")
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
@@ -459,6 +470,32 @@ export function IssueDetail({
           </p>
         )}
       </header>
+      {requests.length > 0 && (
+        <section className={SECTION} aria-label="Requests to people">
+          <h3 className={HEADING}>
+            {issue.waiting
+              ? `Waiting on ${issue.waiting === 1 ? "a person" : "people"}`
+              : "Requests"}
+          </h3>
+          <div className="flex flex-col gap-2">
+            {requests.map((request) => (
+              <RequestCard
+                key={request.id}
+                request={request}
+                name={(id) => actorName(snapshot, id)}
+                onAnswer={(answer) =>
+                  mutate([{ kind: "request.answer", id: request.id, data: answer }])
+                }
+                onCancel={
+                  request.askedBy === viewer?.id
+                    ? () => mutate([{ kind: "request.cancel", id: request.id }])
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        </section>
+      )}
       {latestCheckpoint && (
         <section className={SECTION} data-kind="checkpoint" aria-label="Latest checkpoint">
           <h3 className={`${HEADING} flex items-center gap-2`}>

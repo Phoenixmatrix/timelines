@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Read,
+    io::{IsTerminal, Read},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -379,6 +379,7 @@ fn collection(kind: &str) -> Option<&'static str> {
         "issue" => Some("issues"),
         "link" => Some("links"),
         "comment" => Some("comments"),
+        "request" => Some("requests"),
         "subscription" => Some("subscriptions"),
         _ => None,
     }
@@ -756,6 +757,130 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
     })
 }
 
+/// Requests to people: listed from the replica, answered online. A credential's value
+/// goes straight to its repository secret; the tracker only hears where it went.
+pub fn request(ctx: &Ctx, args: &RequestArgs) -> Result<Shown> {
+    with_replica(&args.scope, ctx, true, |r| {
+        let snapshot = r.view()?;
+        let me = remote::api(&r.config, "GET", "/session", None)
+            .ok()
+            .and_then(|s| s["viewer"]["id"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        let find = |id: &str| -> Result<Value> {
+            snapshot["requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|q| q["id"] == id || q["id"].as_str().is_some_and(|v| v.starts_with(id)))
+                .cloned()
+                .ok_or_else(|| GmError::usage(format!("No request {id}; see `gm request list`.")))
+        };
+        let mutation = match &args.command {
+            RequestCommand::List => {
+                let mut open: Vec<Value> = snapshot["requests"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|q| q["status"] == "open")
+                    .map(|q| {
+                        let mut q = q.clone();
+                        let issue = find_issue(&snapshot, &q["issueId"]);
+                        q["issue"] = json!({"key":issue["key"],"title":issue["title"]});
+                        q["asker"] =
+                            json!(actor_name(&snapshot, q["askedBy"].as_str().unwrap_or("")));
+                        q["for"] =
+                            json!(actor_name(&snapshot, q["routeTo"].as_str().unwrap_or("")));
+                        q
+                    })
+                    .collect();
+                open.sort_by_key(|q| q["routeTo"] != me.as_str());
+                return Ok(Shown(
+                    json!({"requests":open,"next":"Answer with `gm request answer ID`."}),
+                ));
+            }
+            RequestCommand::Cancel { id } => {
+                json!({"kind":"request.cancel","id":find(id)?["id"]})
+            }
+            RequestCommand::Answer {
+                id,
+                answer,
+                choice,
+                approve,
+                reject,
+            } => {
+                let q = find(id)?;
+                let mut data = json!({});
+                match q["kind"].as_str() {
+                    Some("decision") => {
+                        data["choice"] = json!(choice.clone().ok_or_else(|| GmError::usage(
+                            format!("Pass --choice: {}.", q["choices"])
+                        ))?)
+                    }
+                    Some("approval") => {
+                        if !approve && !reject {
+                            return Err(GmError::usage(
+                                "Pass --approve or --reject (and --answer for a note).",
+                            ));
+                        }
+                        data["approved"] = json!(*approve);
+                        if let Some(note) = answer {
+                            data["answer"] = json!(input(note)?);
+                        }
+                    }
+                    Some("credential") => {
+                        let repo = q["secret"]["repo"].as_str().unwrap_or("");
+                        let name = q["secret"]["name"].as_str().unwrap_or("");
+                        let value = if std::io::stdin().is_terminal() {
+                            rpassword::prompt_password(format!(
+                                "Value for {name} on {repo} (hidden): "
+                            ))?
+                        } else {
+                            let mut buffer = String::new();
+                            std::io::stdin().read_to_string(&mut buffer)?;
+                            buffer.trim_end_matches(['\n', '\r']).to_string()
+                        };
+                        if value.is_empty() {
+                            return Err(GmError::usage("The credential's value is empty."));
+                        }
+                        if !ctx.dry_run {
+                            remote::api(
+                                &r.config,
+                                "PUT",
+                                &format!("/repos/{repo}/ci/secrets/{name}"),
+                                Some(&json!({"value":value})),
+                            )?;
+                        }
+                        data["stored"] = json!(true);
+                    }
+                    _ => {
+                        data["answer"] = json!(input(
+                            answer
+                                .as_deref()
+                                .ok_or_else(|| GmError::usage("Pass --answer."))?
+                        )?)
+                    }
+                }
+                json!({"kind":"request.answer","id":q["id"],"data":data})
+            }
+        };
+        let request = json!({"operationId":uid(),"mutations":[mutation]});
+        if ctx.dry_run {
+            return Ok(Shown(json!({"dryRun":true,"request":request})));
+        }
+        let response = remote::api(&r.config, "POST", &r.path("mutate"), Some(&request))?;
+        r.sync()?;
+        Ok(Shown(response))
+    })
+}
+fn find_issue(snapshot: &Value, id: &Value) -> Value {
+    snapshot["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|i| i["id"] == *id)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
 pub fn team(ctx: &Ctx, args: &TeamArgs) -> Result<Shown> {
     with_replica(&args.scope, ctx, true, |r| {
         let snapshot = r.view()?;
@@ -807,7 +932,11 @@ fn markdown(text: &Option<String>, file: &Option<PathBuf>) -> Result<String> {
         Ok(text.clone().unwrap_or_default())
     }
 }
+/// A claim holds while it's unexpired, or parked waiting on a person.
 fn active_claim(issue: &Value, now: DateTime<Utc>) -> bool {
+    if issue["claim"]["parkedAt"].is_string() {
+        return true;
+    }
     issue["claim"]["expiresAt"]
         .as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -844,6 +973,10 @@ fn leased_ancestor<'a>(
 /// Mirrors `readiness` in apps/website/shared/tracker.ts: todo (or in progress with an
 /// expired claim), unblocked, a leaf, and outside any other active lease's subtree.
 fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
+    // Waiting on a person is never ready, whatever the status says.
+    if issue["waiting"].as_u64().unwrap_or(0) > 0 {
+        return false;
+    }
     let status = issue["status"].as_str().unwrap_or("");
     if !(status == "todo" || (status == "in_progress" && !issue["claim"].is_null()))
         || active_claim(issue, now)
@@ -1056,6 +1189,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     let lease_command = matches!(
         args.command,
         IssueCommand::Claim { .. }
+            | IssueCommand::Ask { .. }
+            | IssueCommand::Resume { .. }
             | IssueCommand::Revoke { .. }
             | IssueCommand::Next { .. }
             | IssueCommand::Renew { .. }
@@ -1109,6 +1244,44 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 let mut data = json!({"agent":agent,"ttlSeconds":ttl});
                 delegate(&snapshot, delegation, &mut data)?;
                 json!({"kind":"issue.claim","id":id(&snapshot,"issues",issue)?,"data":data})
+            }
+            IssueCommand::Ask {
+                issue,
+                kind,
+                prompt,
+                choices,
+                secret,
+                route_to,
+                lease_token,
+            } => {
+                let mut data = json!({"issueId":id(&snapshot,"issues",issue)?,"kind":kind,"prompt":input(prompt)?});
+                if !choices.is_empty() {
+                    data["choices"] = json!(choices);
+                }
+                if let Some(target) = secret {
+                    let (repo, name) = target.split_once(':').ok_or_else(|| {
+                        GmError::usage("--secret is owner/repo:NAME, e.g. orbit/app:DEPLOY_TOKEN.")
+                    })?;
+                    data["secret"] = json!({"repo":repo,"name":name});
+                }
+                if let Some(slug) = route_to {
+                    let member = snapshot["members"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|m| m["slug"] == slug.as_str() || m["id"] == slug.as_str())
+                        .ok_or_else(|| {
+                            GmError::usage(format!("{slug} isn't a member of this tracker."))
+                        })?;
+                    data["routeTo"] = member["id"].clone();
+                }
+                if let Some(token) = lease_token {
+                    data["leaseToken"] = json!(token);
+                }
+                json!({"kind":"request.open","id":uid(),"data":data})
+            }
+            IssueCommand::Resume { issue, ttl } => {
+                json!({"kind":"issue.resume","id":id(&snapshot,"issues",issue)?,"data":{"ttlSeconds":ttl}})
             }
             IssueCommand::Revoke { issue, under_token } => {
                 json!({"kind":"issue.revoke","id":id(&snapshot,"issues",issue)?,"data":{"underToken":under_token}})
@@ -1170,7 +1343,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             if !matches!(
                 args.command,
-                IssueCommand::Claim { .. } | IssueCommand::Renew { .. }
+                IssueCommand::Claim { .. }
+                    | IssueCommand::Renew { .. }
+                    | IssueCommand::Resume { .. }
             ) {
                 redact(&mut response);
             }
@@ -1258,6 +1433,26 @@ mod tests {
         let shown = named(&s, &issue);
         assert_eq!(shown["claimedBy"], "builder (for Ann Lee)");
         assert_eq!(shown["assignee"], "Ann Lee");
+    }
+    #[test]
+    fn waiting_issues_and_parked_leases_are_not_ready() {
+        let now = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"w","status":"todo","claim":null,"parentId":null,"waiting":1}]);
+        assert!(!ready(&s, &s["issues"][0], now));
+        // A parked lease long past its expiry still holds.
+        s["issues"][0]["waiting"] = json!(0);
+        s["issues"][0]["status"] = json!("in_progress");
+        s["issues"][0]["claim"] =
+            json!({"expiresAt":"2026-09-01T00:00:00Z","parkedAt":"2026-08-31T00:00:00Z"});
+        assert!(!ready(&s, &s["issues"][0], now));
+        s["issues"][0]["claim"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parkedAt");
+        assert!(ready(&s, &s["issues"][0], now));
     }
     #[test]
     fn containers_and_issues_under_another_lease_are_not_ready() {

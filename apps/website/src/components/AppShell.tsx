@@ -3,6 +3,7 @@ import { Menu } from "@base-ui/react/menu";
 import {
   EnvelopeSimpleIcon,
   FingerprintIcon,
+  HandWavingIcon,
   HouseIcon,
   KeyIcon,
   ListChecksIcon,
@@ -178,6 +179,13 @@ export function AppShell() {
           <Place to="/tracker" label="Issue tracker">
             {(active) => (
               <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+            )}
+          </Place>
+        )}
+        {viewer && (
+          <Place to="/needs-you" label="Needs you">
+            {(active) => (
+              <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
             )}
           </Place>
         )}

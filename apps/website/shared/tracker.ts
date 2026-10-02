@@ -3,6 +3,17 @@ export interface TrackerIdentity {
   slug: string;
   displayName: string;
 }
+/** An open request on the Needs you page: which tracker and issue it's about. */
+export interface OpenRequest {
+  tracker: { slug: string; displayName: string };
+  request: HumanRequest;
+  issue: { id: string; key: string; title: string };
+}
+export interface OpenRequests {
+  requests: OpenRequest[];
+  /** Names for the ids the requests mention: a person, or "builder for Ann Lee". */
+  names: Record<string, string>;
+}
 /** An agent in the tracker, with its accountable human inline. */
 export interface TrackerAgent {
   id: string;
@@ -43,6 +54,11 @@ export interface IssueClaim {
   expiresAt: string;
   /** For a delegated claim: the ancestor whose lease handed this one out. */
   delegatedFrom?: string;
+  /**
+   * Set while the issue waits on a person: the lease doesn't expire, and its holder
+   * may exit. Answering the last request unparks it for the holder to resume.
+   */
+  parkedAt?: string;
 }
 export interface Issue extends TrackerEntity {
   key: string;
@@ -58,6 +74,35 @@ export interface Issue extends TrackerEntity {
   workspaceIds: string[];
   labels: string[];
   claim: IssueClaim | null;
+  /** Open requests to a person: while any is open the issue waits, whatever its status. */
+  waiting?: number;
+}
+
+export type RequestKind = "question" | "approval" | "decision" | "credential";
+/**
+ * Something an agent (or anyone) needs from a person to carry on with an issue.
+ * A credential's value never lives here: answering stores it as a secret and
+ * records only where.
+ */
+export interface HumanRequest {
+  id: string;
+  issueId: string;
+  kind: RequestKind;
+  /** Markdown: what's needed and why. */
+  prompt: string;
+  /** For a decision: the options to choose from. */
+  choices: string[];
+  /** For a credential: the repository secret the answer is stored as. */
+  secret: { repo: string; name: string } | null;
+  status: "open" | "answered" | "canceled";
+  askedBy: string;
+  /** The person it's for: the asker's accountable human, unless routed elsewhere. */
+  routeTo: string;
+  /** The answer: text, the chosen option, approved/rejected, or where a secret went. */
+  answer: string | null;
+  answeredBy: string | null;
+  answeredAt: string | null;
+  createdAt: string;
 }
 export interface Comment {
   id: string;
@@ -91,11 +136,19 @@ export interface Snapshot {
   issues: Issue[];
   links: Link[];
   comments: Comment[];
+  requests: HumanRequest[];
   subscriptions: Subscription[];
   cursor: number;
   serverTime: string;
 }
-export type EntityType = "team" | "workspace" | "issue" | "link" | "comment" | "subscription";
+export type EntityType =
+  | "team"
+  | "workspace"
+  | "issue"
+  | "link"
+  | "comment"
+  | "request"
+  | "subscription";
 export interface TrackerEvent {
   cursor: number;
   operationId: string;
@@ -103,7 +156,7 @@ export interface TrackerEvent {
   kind: string;
   entityType: EntityType;
   entityId: string;
-  entity: Team | Workspace | Issue | Link | Comment | Subscription | null;
+  entity: Team | Workspace | Issue | Link | Comment | HumanRequest | Subscription | null;
   createdAt: string;
 }
 export type IssueFields = Pick<
@@ -174,6 +227,33 @@ export type Mutation =
         forActorId?: string;
       };
     }
+  /** Ask a person for something; with the issue's lease token, the lease is parked. */
+  | {
+      kind: "request.open";
+      id: string;
+      data: {
+        issueId: string;
+        kind: RequestKind;
+        prompt: string;
+        choices?: string[];
+        secret?: { repo: string; name: string };
+        /** A member to ask instead of the asker's accountable human. */
+        routeTo?: string;
+        leaseToken?: string;
+      };
+    }
+  /**
+   * Answer a request: `answer` for a question, `choice` for a decision,
+   * `approved` for an approval; a credential sets `stored` once the secret is saved.
+   */
+  | {
+      kind: "request.answer";
+      id: string;
+      data: { answer?: string; choice?: string; approved?: boolean; stored?: boolean };
+    }
+  | { kind: "request.cancel"; id: string }
+  /** After its requests are answered, the parked lease's holder takes it back up. */
+  | { kind: "issue.resume"; id: string; data: { ttlSeconds?: number } }
   /** The holder of a lease above an issue takes back the issue's claim. */
   | { kind: "issue.revoke"; id: string; data: { underToken: string } }
   | {
@@ -247,8 +327,11 @@ export function isOpen(issue: Pick<Issue, "status">): boolean {
   return issue.status !== "done" && issue.status !== "canceled";
 }
 
+/** A claim holds while it's unexpired, or parked waiting on a person. */
 export function hasActiveClaim(issue: Issue, now: string): boolean {
-  return issue.claim !== null && issue.claim.expiresAt > now;
+  return (
+    issue.claim !== null && (issue.claim.parkedAt !== undefined || issue.claim.expiresAt > now)
+  );
 }
 
 /** Lookups readiness needs, built once per snapshot. */
@@ -293,10 +376,12 @@ export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string)
  * - `unavailable`: backlog, done, canceled, or in progress without a claim;
  * - `blocked`: a `blocks` predecessor isn't done (a missing one still blocks);
  * - `container`: it has open sub-issues, so the work is in those;
- * - `leased_above`: an ancestor's active lease covers it.
+ * - `leased_above`: an ancestor's active lease covers it;
+ * - `waiting`: it has open requests to a person.
  */
 export type Readiness =
   | "ready"
+  | "waiting"
   | "claimed"
   | "unavailable"
   | "blocked"
@@ -304,6 +389,7 @@ export type Readiness =
   | "leased_above";
 
 export function readiness(issue: Issue, index: ReadinessIndex, now: string): Readiness {
+  if (issue.waiting) return "waiting";
   if (hasActiveClaim(issue, now)) return "claimed";
   if (!(issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null)))
     return "unavailable";

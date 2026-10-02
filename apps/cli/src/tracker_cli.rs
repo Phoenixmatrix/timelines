@@ -17,6 +17,32 @@ pub struct TeamArgs {
     pub command: TeamCommand,
 }
 #[derive(Args)]
+pub struct RequestArgs {
+    #[command(flatten)]
+    pub scope: Scope,
+    #[command(subcommand)]
+    pub command: RequestCommand,
+}
+#[derive(Subcommand)]
+pub enum RequestCommand {
+    /// Open requests to people in this tracker: yours first.
+    List,
+    /// Answer a request: --answer for a question, --choice for a decision, --approve/--reject; a credential asks for its value (hidden) and stores it as its secret.
+    Answer {
+        id: String,
+        #[arg(long)]
+        answer: Option<String>,
+        #[arg(long)]
+        choice: Option<String>,
+        #[arg(long, conflicts_with = "reject")]
+        approve: bool,
+        #[arg(long)]
+        reject: bool,
+    },
+    /// Withdraw a request you asked.
+    Cancel { id: String },
+}
+#[derive(Args)]
 pub struct WorkspaceArgs {
     #[command(flatten)]
     pub scope: Scope,
@@ -220,6 +246,33 @@ pub enum IssueCommand {
         ttl: u32,
         #[command(flatten)]
         delegation: Delegation,
+    },
+    /// Ask a person for something: a question, an approval, a decision or a credential. With the issue's lease token the lease is parked while you wait.
+    Ask {
+        issue: String,
+        #[arg(long, value_parser=["question","approval","decision","credential"])]
+        kind: String,
+        /// Markdown; '-' reads stdin and '@path' reads a file.
+        #[arg(long)]
+        prompt: String,
+        /// For a decision: an option (repeat for each).
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+        /// For a credential: the secret to store the answer as, owner/repo:NAME.
+        #[arg(long)]
+        secret: Option<String>,
+        /// Ask this member (slug) instead of your accountable person.
+        #[arg(long)]
+        route_to: Option<String>,
+        /// The issue's lease token, to park the lease; prefer GM_LEASE_TOKEN.
+        #[arg(long, env = "GM_LEASE_TOKEN", hide_env_values = true)]
+        lease_token: Option<String>,
+    },
+    /// Take a parked lease back up once its requests are answered; returns a fresh token.
+    Resume {
+        issue: String,
+        #[arg(long, default_value_t=900, value_parser=clap::value_parser!(u32).range(30..=86400))]
+        ttl: u32,
     },
     /// Take back a claim inside your leased subtree; its token stops working.
     Revoke {

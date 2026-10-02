@@ -1,11 +1,13 @@
 import { timingSafeEqual } from "node:crypto";
 import {
+  hasActiveClaim,
   isOpen,
   leasedAncestor,
   readiness,
   readinessIndex,
   type Changes,
   type Comment,
+  type HumanRequest,
   type EntityType,
   type Issue,
   type Link,
@@ -55,13 +57,14 @@ export interface Access {
   /** D1-confirmed missing repositories; permits removing their orphan associations only. */
   deletedRepoIds?: string[];
 }
-type Entity = Team | Workspace | Issue | Link | Comment | Subscription;
+type Entity = Team | Workspace | Issue | Link | Comment | HumanRequest | Subscription;
 const tables = {
   team: "teams",
   workspace: "workspaces",
   issue: "issues",
   link: "links",
   comment: "comments",
+  request: "requests",
   subscription: "subscriptions",
 } as const;
 function fail(code: string, message: string, status: TrackerError["status"] = 400): never {
@@ -134,6 +137,9 @@ export function validateRequest(value: unknown): MutationRequest {
   return { operationId: String(body.operationId), mutations: body.mutations as Mutation[] };
 }
 
+/** After its last request is answered, a parked lease's holder has this long to resume. */
+export const RESUME_WINDOW_SECONDS = 3600;
+
 /** All state and event writes run synchronously inside the caller's SQLite transaction. */
 export class TrackerStore {
   private sql: SqlDatabase;
@@ -152,6 +158,7 @@ export class TrackerStore {
       CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS links (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS team_numbers (id TEXT PRIMARY KEY, number INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS leases (issue_id TEXT PRIMARY KEY, token TEXT NOT NULL);
@@ -161,7 +168,8 @@ export class TrackerStore {
       CREATE UNIQUE INDEX IF NOT EXISTS workspace_slugs ON workspaces(json_extract(data, '$.slug'));
       CREATE INDEX IF NOT EXISTS blockers ON links(json_extract(data, '$.toId'), json_extract(data, '$.kind'));
       CREATE INDEX IF NOT EXISTS subscriptions_repo ON subscriptions(json_extract(data, '$.repoId'));
-      CREATE INDEX IF NOT EXISTS parents ON issues(json_extract(data, '$.parentId'));`);
+      CREATE INDEX IF NOT EXISTS parents ON issues(json_extract(data, '$.parentId'));
+      CREATE INDEX IF NOT EXISTS request_issues ON requests(json_extract(data, '$.issueId'));`);
   }
   private all<T extends Entity>(type: EntityType): T[] {
     return all(this.sql, tracker.selectFrom(tables[type]).select("data").orderBy("id")).map(
@@ -195,10 +203,20 @@ export class TrackerStore {
       issues: this.all("issue"),
       links: this.all("link"),
       comments: this.all("comment"),
+      requests: this.all("request"),
       subscriptions: this.all("subscription"),
       cursor: this.cursor(),
       serverTime: new Date(this.clock()).toISOString(),
     };
+  }
+  /** Open requests to people, with the issue each is about. */
+  openRequests(): { request: HumanRequest; issue: Pick<Issue, "id" | "key" | "title"> }[] {
+    return this.all<HumanRequest>("request")
+      .filter((request) => request.status === "open")
+      .map((request) => {
+        const issue = this.get<Issue>("issue", request.issueId);
+        return { request, issue: { id: issue.id, key: issue.key, title: issue.title } };
+      });
   }
   subscribedWorkspaces(repoId: string): { workspaceId: string; slug: string; name: string }[] {
     id(repoId);
@@ -371,7 +389,7 @@ export class TrackerStore {
       };
       /** Whether the caller holds `issue`'s active lease with `token`. */
       const holds = (issue: Issue, token: string) => {
-        if (!issue.claim || issue.claim.expiresAt <= now || issue.claim.actorId !== access.actorId)
+        if (!issue.claim || !hasActiveClaim(issue, now) || issue.claim.actorId !== access.actorId)
           return false;
         const row = first(
           this.sql,
@@ -419,7 +437,7 @@ export class TrackerStore {
         const b = new TextEncoder().encode(row?.token ?? "");
         if (
           !issue.claim ||
-          issue.claim.expiresAt <= now ||
+          !hasActiveClaim(issue, now) ||
           issue.claim.actorId !== access.actorId ||
           a.length !== b.length ||
           !timingSafeEqual(a, b)
@@ -430,7 +448,7 @@ export class TrackerStore {
       const graph = () => readinessIndex(this.all<Issue>("issue"), this.all<Link>("link"));
       /** A lease on an issue covers its subtree: its holder speaks for every descendant. */
       const coveringLease = (issue: Issue) =>
-        issue.claim && issue.claim.expiresAt > now ? issue : leasedAncestor(issue, graph(), now);
+        hasActiveClaim(issue, now) ? issue : leasedAncestor(issue, graph(), now);
       // A parent with open sub-issues is never offered as work, but claiming it
       // explicitly is how an orchestrating agent takes its whole subtree.
       const claimable = (issue: Issue, underToken?: unknown) => {
@@ -560,6 +578,25 @@ export class TrackerStore {
               a.id.localeCompare(b.id),
           )[0] ?? null
         );
+      };
+      /**
+       * Recount an issue's open requests. When none are left, a parked lease unparks
+       * with a window for its holder to resume; after that anyone may claim it.
+       */
+      const settle = (issue: Issue) => {
+        const open = this.all<HumanRequest>("request").filter(
+          (r) => r.issueId === issue.id && r.status === "open",
+        ).length;
+        issue.waiting = open;
+        if (!open && issue.claim?.parkedAt) {
+          delete issue.claim.parkedAt;
+          issue.claim.expiresAt = new Date(
+            Date.parse(now) + RESUME_WINDOW_SECONDS * 1000,
+          ).toISOString();
+        }
+        issue.version++;
+        issue.updatedAt = now;
+        emit("issue", issue.id, issue, "issue.update");
       };
       const childrenClosed = (issue: Issue) => {
         const open = (graph().children.get(issue.id) ?? []).filter(isOpen);
@@ -964,11 +1001,145 @@ export class TrackerStore {
             emit("issue", issue.id, issue, "issue.claim");
             break;
           }
+          case "request.open": {
+            keys(data, ["issueId", "kind", "prompt", "choices", "secret", "routeTo", "leaseToken"]);
+            unique("request", entityId);
+            const issue = this.get<Issue>("issue", id(data.issueId));
+            teamWritable(this.get("team", issue.teamId));
+            const kind = choice(
+              data.kind,
+              ["question", "approval", "decision", "credential"] as const,
+              "request kind",
+            );
+            const choices = kind === "decision" ? strings(data.choices ?? [], "choices", 20) : [];
+            if (kind === "decision" && choices.length < 2)
+              fail("invalid_input", "A decision needs at least two choices.");
+            if (kind !== "decision" && data.choices !== undefined)
+              fail("invalid_input", "Only decisions have choices.");
+            let secret: HumanRequest["secret"] = null;
+            if (kind === "credential") {
+              const target = object(data.secret);
+              keys(target, ["repo", "name"]);
+              const repo = text(target.repo, "secret.repo", 200);
+              const name = text(target.name, "secret.name", 100);
+              if (!/^[^/\s]+\/[^/\s]+$/.test(repo))
+                fail("invalid_input", "secret.repo must be owner/name.");
+              if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
+                fail("invalid_input", "secret.name must be letters, digits and underscores.");
+              secret = { repo, name };
+            } else if (data.secret !== undefined)
+              fail("invalid_input", "Only credential requests name a secret.");
+            const routeTo = data.routeTo === undefined ? access.principalId : id(data.routeTo);
+            member(routeTo);
+            // Asking with the issue's own lease parks it: it holds while the agent waits.
+            if (data.leaseToken !== undefined) {
+              lease(issue, data.leaseToken);
+              issue.claim!.parkedAt = now;
+            }
+            emit(
+              "request",
+              entityId,
+              {
+                id: entityId,
+                issueId: issue.id,
+                kind,
+                prompt: text(data.prompt, "prompt", 20000),
+                choices,
+                secret,
+                status: "open",
+                askedBy: access.actorId,
+                routeTo,
+                answer: null,
+                answeredBy: null,
+                answeredAt: null,
+                createdAt: now,
+              },
+              mutation.kind,
+            );
+            settle(issue);
+            break;
+          }
+          case "request.answer":
+          case "request.cancel": {
+            const request = this.get<HumanRequest>("request", entityId);
+            const issue = this.get<Issue>("issue", request.issueId);
+            teamWritable(this.get("team", issue.teamId));
+            if (request.status !== "open")
+              fail("not_open", `This request was already ${request.status}.`, 409);
+            if (mutation.kind === "request.cancel") {
+              keys(data, []);
+              if (request.askedBy !== access.actorId && !access.canAdmin)
+                fail("forbidden", "Only whoever asked can cancel a request.", 403);
+              request.status = "canceled";
+            } else {
+              keys(data, ["answer", "choice", "approved", "stored"]);
+              // Requests are for people: an agent can't answer its own (or another's) question.
+              if (access.actorId !== access.principalId)
+                fail("forbidden", "Agents can't answer requests; a person has to.", 403);
+              if (request.kind === "question") request.answer = text(data.answer, "answer", 20000);
+              else if (request.kind === "decision") {
+                const picked = text(data.choice, "choice", 100);
+                if (!request.choices.includes(picked))
+                  fail("invalid_input", `Choose one of: ${request.choices.join(", ")}.`);
+                request.answer = picked;
+              } else if (request.kind === "approval") {
+                if (typeof data.approved !== "boolean")
+                  fail("invalid_input", "Approve or reject: approved must be true or false.");
+                const note =
+                  data.answer === undefined ? "" : ` · ${text(data.answer, "answer", 20000)}`;
+                request.answer = `${data.approved ? "approved" : "rejected"}${note}`;
+              } else {
+                // The value went to the secret store; the tracker only records where.
+                if (data.stored !== true || data.answer !== undefined)
+                  fail(
+                    "invalid_input",
+                    "Store the credential as its secret, then answer with stored: true and no value.",
+                  );
+                request.answer = `Stored as ${request.secret!.name} on ${request.secret!.repo}`;
+              }
+              request.status = "answered";
+              request.answeredBy = access.actorId;
+              request.answeredAt = now;
+            }
+            emit("request", entityId, request, mutation.kind);
+            settle(issue);
+            break;
+          }
+          case "issue.resume": {
+            keys(data, ["ttlSeconds"]);
+            const issue = this.get<Issue>("issue", entityId);
+            teamWritable(this.get("team", issue.teamId));
+            const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
+            if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
+              fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
+            if (!issue.claim || issue.claim.actorId !== access.actorId)
+              fail("not_holder", `Only ${issue.key}'s lease holder can resume it.`, 409);
+            if (issue.waiting) fail("waiting", `${issue.key} still has open requests.`, 409);
+            const claim = issue.claim;
+            result = {
+              id: entityId,
+              ...grant(
+                issue,
+                claim.agent,
+                Number(ttl),
+                undefined,
+                {
+                  actorId: claim.actorId,
+                  accountableId: claim.accountableId ?? access.principalId,
+                },
+                claim.delegatedFrom ? this.get<Issue>("issue", claim.delegatedFrom) : null,
+              ),
+            };
+            issue.version++;
+            issue.updatedAt = now;
+            emit("issue", entityId, issue, "issue.resume");
+            break;
+          }
           case "issue.revoke": {
             keys(data, ["underToken"]);
             const issue = this.get<Issue>("issue", entityId);
             teamWritable(this.get("team", issue.teamId));
-            if (!issue.claim || issue.claim.expiresAt <= now)
+            if (!issue.claim || !hasActiveClaim(issue, now))
               fail("not_claimed", `${issue.key} has no active claim to revoke.`, 409);
             const token = text(data.underToken, "underToken", 200);
             // Any lease above the issue may take it back, not just the nearest.
@@ -1009,11 +1180,17 @@ export class TrackerStore {
               if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
                 fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
               if (kind === "issue.claim") {
-                if (issue.claim && issue.claim.expiresAt > now)
+                if (hasActiveClaim(issue, now))
                   fail("claim_busy", "Issue already has an active claim.", 409);
+                if (issue.waiting)
+                  fail(
+                    "waiting",
+                    `${issue.key} is waiting on a person; answer its requests first.`,
+                    409,
+                  );
                 if (
                   issue.status !== "todo" &&
-                  !(issue.status === "in_progress" && issue.claim && issue.claim.expiresAt <= now)
+                  !(issue.status === "in_progress" && issue.claim && !hasActiveClaim(issue, now))
                 )
                   fail("not_ready", "Only todo or expired claimed work may be claimed.", 409);
                 unblocked(issue);

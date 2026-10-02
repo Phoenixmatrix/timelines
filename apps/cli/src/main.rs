@@ -121,6 +121,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Team(a) => out(f, commands::tracker::team(ctx, &a)),
         Command::Workspace(a) => out(f, commands::tracker::workspace(ctx, &a)),
         Command::Issue(a) => out(f, commands::tracker::issue(ctx, &a)),
+        Command::Request(a) => out(f, commands::tracker::request(ctx, &a)),
         Command::Status => out(f, local::status(ctx)),
         Command::Log(a) => out(f, local::log(ctx, &a)),
         Command::Show(a) => out(f, local::show(ctx, &a)),
