@@ -519,7 +519,10 @@ function Workbench({ data }: { data: TrackerData }) {
             setCreateError("");
           }}
         />
-        <button className="mk-btn mk-btn--primary" disabled={busy || !createTeam || !title.trim()}>
+        <button
+          className="mk-btn mk-btn--primary h-(--size-field)"
+          disabled={busy || !createTeam || !title.trim()}
+        >
           Create
         </button>
       </form>
