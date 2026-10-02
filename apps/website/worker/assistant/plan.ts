@@ -33,10 +33,12 @@ const STATUS = {
 } as const;
 
 export const INTENTS = {
-  answer: "Wants information or an explanation",
-  act: "Wants something changed (create, edit, comment, rerun, delete…)",
-  navigate: "Wants to be taken to a page or shown something in the app",
-  plan: "Wants work planned, broken down or written up (a PRD, sub-issues, a release summary)",
+  answer:
+    "Wants to know something: what's ready, blocked, assigned or changed, a status, a count, a list, an explanation, where some code is, why something failed",
+  act: "Wants something changed now: create, edit, comment on, link, close, rerun or delete something",
+  navigate:
+    'Explicitly asks to open, go to or be shown a page, file or issue in the app ("open", "take me to", "show me the page")',
+  plan: "Wants new work designed and written up: break an issue into sub-issues, draft a PRD, project plan or release summary",
   chat: "Greeting, thanks or small talk; needs no tools",
 } as const;
 export type Intent = keyof typeof INTENTS;
@@ -91,6 +93,11 @@ export function questions(): Record<string, ClefQuestion> {
       instructions:
         "Does answering mean reading many items (for example every open issue, all recent CI runs, many files) and combining or counting them?",
     },
+    open_page: {
+      type: "noul",
+      instructions:
+        "Does the person explicitly ask to open, go to or be taken to a page, file or issue in the app (as opposed to asking for information about it)?",
+    },
     about_page: {
       type: "noul",
       instructions:
@@ -118,7 +125,9 @@ export function planFrom(answers: Record<string, ClefAnswer> | null): TurnPlan {
       aboutPage: true,
       status: STATUS.answering,
     };
-  const intent = (answers.intent?.type === "choice" ? answers.intent.choice : "answer") as Intent;
+  let intent = (answers.intent?.type === "choice" ? answers.intent.choice : "answer") as Intent;
+  // Opening a page needs an explicit ask: "what should I work on?" wants an answer, not a page.
+  if (intent === "navigate" && p(answers.open_page) < 0.5) intent = "answer";
   // Generous threshold: a missing tool costs a failed turn, an extra one a few tokens.
   const groups = (Object.keys(GROUPS) as Group[]).filter((g) => p(answers[`needs_${g}`]) >= 0.3);
   const difficulty = answers.difficulty?.type === "score" ? answers.difficulty.score : 2;
@@ -127,6 +136,8 @@ export function planFrom(answers: Record<string, ClefAnswer> | null): TurnPlan {
     answers.status?.type === "choice" && answers.status.choice in STATUS
       ? STATUS[answers.status.choice as keyof typeof STATUS]
       : STATUS.answering;
+  // Planning means looking at and writing issues, whatever else it touches.
+  if (intent === "plan" && !groups.includes("tracker")) groups.push("tracker");
   return {
     intent,
     groups: intent === "chat" ? [] : groups,

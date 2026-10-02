@@ -42,6 +42,27 @@ describe("clef routing", () => {
     ).toMatchObject({ groups: [], codemode: false, tier: "fast" });
   });
 
+  test("navigation needs an explicit ask to open something", () => {
+    const navigate = {
+      type: "choice" as const,
+      choice: "navigate",
+      probabilities: {},
+      confidence: 0.6,
+    };
+    expect(planFrom({ intent: navigate, open_page: { type: "noul", noul: 0.2 } }).intent).toBe(
+      "answer",
+    );
+    expect(planFrom({ intent: navigate, open_page: { type: "noul", noul: 0.9 } })).toMatchObject({
+      intent: "navigate",
+      status: "Finding the page",
+    });
+    // Planning always gets the tracker.
+    expect(
+      planFrom({ intent: { type: "choice", choice: "plan", probabilities: {}, confidence: 0.9 } })
+        .groups,
+    ).toContain("tracker");
+  });
+
   test("without clef (a timeout or outage) the turn gets every tool", () => {
     expect(planFrom(null)).toMatchObject({
       groups: expect.arrayContaining(["code", "tracker", "ci"]),

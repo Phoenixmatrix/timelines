@@ -473,6 +473,14 @@ subtasks or satisfy dependent issues' blockers.
   - _Handoff:_ `issue.offer` returns a single-use code bound to the current
     lease token; `issue.accept` moves the lease (and its accountability) with a
     fresh token and fences the giver's at that moment.
+  - _Owner override:_ when a claim's holder won't finish (a lost session, a
+    deleted token, a stuck agent), a tracker owner acting as themselves (not
+    through an agent token) can take it over with `issue.claim {force: true}`
+    (`gm issue claim KEY --force`), getting a fresh token, or end it with
+    `issue.release {force: true}` (`gm issue release KEY --force`, or End claim
+    on the issue page), returning it to todo. The holder's token stops working,
+    the issue gets a comment naming the claim that was overridden, and it
+    doesn't count as the holder's failed attempt.
   - _Escalation:_ releases without completion count as attempts; at the team's
     `attemptLimit` (default 3, 0 off) the issue asks its accountable person what
     to do differently, with the latest checkpoints, and waits until answered.

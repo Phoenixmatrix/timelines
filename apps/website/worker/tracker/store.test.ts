@@ -862,6 +862,87 @@ describe("issue.next", () => {
   });
 });
 
+describe("taking over a claim", () => {
+  test("an owner, as themselves, takes over a live claim; the holder's token stops working", () => {
+    const f = fixture();
+    f.issue("issue");
+    const holder: Access = { ...f.access, actorId: "agt-bot" };
+    const held = f.store.mutate(holder, {
+      operationId: "held",
+      mutations: [
+        { kind: "issue.claim", id: "issue", data: { agent: "lost-session", ttlSeconds: 86400 } },
+      ],
+    }).results[0]!;
+    // Not an owner, or an owner's agent: refused.
+    expect(() =>
+      f.store.mutate(
+        { ...f.access, canAdmin: false },
+        {
+          operationId: "member",
+          mutations: [{ kind: "issue.claim", id: "issue", data: { agent: "x", force: true } }],
+        },
+      ),
+    ).toThrow(/tracker owner/);
+    expect(() =>
+      f.store.mutate(holder, {
+        operationId: "agent",
+        mutations: [{ kind: "issue.claim", id: "issue", data: { agent: "x", force: true } }],
+      }),
+    ).toThrow(/tracker owner/);
+    // Without force it's still busy.
+    expect(() => f.mutate({ kind: "issue.claim", id: "issue", data: { agent: "x" } })).toThrow(
+      /active claim/,
+    );
+
+    const taken = f.mutate({
+      kind: "issue.claim",
+      id: "issue",
+      data: { agent: "alice-cli", force: true },
+    });
+    const token = String(taken.results[0]!.leaseToken);
+    const snapshot = f.store.snapshot(f.access);
+    const issue = snapshot.issues.find((i) => i.id === "issue")!;
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      claim: { agent: "alice-cli", actorId: "alice" },
+    });
+    expect(issue.attempts ?? 0).toBe(0);
+    expect(snapshot.comments.find((c) => c.issueId === "issue")?.body).toMatch(
+      /Took over the claim held by `lost-session`/,
+    );
+    expect(() =>
+      f.store.mutate(holder, {
+        operationId: "old",
+        mutations: [
+          {
+            kind: "issue.complete",
+            id: "issue",
+            data: { leaseToken: String(held.leaseToken), evidence: "x" },
+          },
+        ],
+      }),
+    ).toThrow(/expired, was superseded/);
+    // Or end it outright (the web's "End claim"): back to todo, no failure counted.
+    f.mutate({ kind: "issue.release", id: "issue", data: { force: true } });
+    const ended = f.store.snapshot(f.access).issues.find((i) => i.id === "issue")!;
+    expect(ended).toMatchObject({ status: "todo", claim: null });
+    expect(ended.attempts ?? 0).toBe(0);
+    expect(() => f.mutate({ kind: "issue.release", id: "issue", data: { force: true } })).toThrow(
+      /Nobody holds/,
+    );
+    expect(() =>
+      f.mutate({ kind: "issue.complete", id: "issue", data: { leaseToken: token, evidence: "x" } }),
+    ).toThrow();
+    const again = f.mutate({ kind: "issue.claim", id: "issue", data: { agent: "alice-cli" } });
+    f.mutate({
+      kind: "issue.complete",
+      id: "issue",
+      data: { leaseToken: String(again.results[0]!.leaseToken), evidence: "Shipped" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((i) => i.id === "issue")?.status).toBe("done");
+  });
+});
+
 describe("delegated leases", () => {
   function tree() {
     const f = fixture();

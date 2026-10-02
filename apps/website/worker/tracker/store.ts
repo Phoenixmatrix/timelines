@@ -1448,12 +1448,12 @@ export class TrackerStore {
             keys(
               data,
               kind === "issue.claim"
-                ? ["agent", "ttlSeconds", "underToken", "forActorId"]
+                ? ["agent", "ttlSeconds", "underToken", "forActorId", "force"]
                 : kind === "issue.renew"
                   ? ["leaseToken", "ttlSeconds"]
                   : kind === "issue.complete"
                     ? ["leaseToken", "evidence"]
-                    : ["leaseToken"],
+                    : ["leaseToken", "force"],
             );
             const issue = this.get<Issue>("issue", entityId);
             teamWritable(this.get("team", issue.teamId));
@@ -1463,7 +1463,17 @@ export class TrackerStore {
               if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
                 fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
               if (kind === "issue.claim") {
-                if (hasActiveClaim(issue, now))
+                const force = data.force === true;
+                if (data.force !== undefined && typeof data.force !== "boolean")
+                  fail("invalid_input", "force must be true or false.");
+                if (force && (!access.canAdmin || access.actorId !== access.principalId))
+                  fail(
+                    "forbidden",
+                    "Only a tracker owner, acting as themselves rather than through an agent, can take over a claim.",
+                    403,
+                  );
+                const taken = force && hasActiveClaim(issue, now) ? issue.claim : null;
+                if (hasActiveClaim(issue, now) && !force)
                   fail("claim_busy", "Issue already has an active claim.", 409);
                 if (issue.waiting)
                   fail(
@@ -1473,9 +1483,32 @@ export class TrackerStore {
                   );
                 if (
                   issue.status !== "todo" &&
-                  !(issue.status === "in_progress" && issue.claim && !hasActiveClaim(issue, now))
+                  !(
+                    issue.status === "in_progress" &&
+                    issue.claim &&
+                    (!hasActiveClaim(issue, now) || taken)
+                  )
                 )
                   fail("not_ready", "Only todo or expired claimed work may be claimed.", 409);
+                if (taken) {
+                  // On the record: who took it from whom. The holder's token dies with the
+                  // new grant below; a pending handoff of the old lease goes too.
+                  dropOffer(issue);
+                  const commentId = crypto.randomUUID();
+                  emit(
+                    "comment",
+                    commentId,
+                    {
+                      id: commentId,
+                      issueId: entityId,
+                      body: `Took over the claim held by \`${taken.agent}\` (until ${taken.expiresAt}).`,
+                      kind: "comment",
+                      actorId: access.actorId,
+                      createdAt: now,
+                    },
+                    "comment.add",
+                  );
+                }
                 unblocked(issue);
                 delegator = claimable(issue, data.underToken);
                 if (!delegator && data.forActorId !== undefined)
@@ -1505,7 +1538,32 @@ export class TrackerStore {
                 ),
               };
             } else {
-              lease(issue, data.leaseToken);
+              const forced = kind === "issue.release" && data.force === true;
+              const ended = forced ? issue.claim : null;
+              if (forced) {
+                if (!access.canAdmin || access.actorId !== access.principalId)
+                  fail(
+                    "forbidden",
+                    "Only a tracker owner, acting as themselves rather than through an agent, can end someone else's claim.",
+                    403,
+                  );
+                if (!ended || !hasActiveClaim(issue, now))
+                  fail("not_claimed", "Nobody holds a claim on it.", 409);
+                const commentId = crypto.randomUUID();
+                emit(
+                  "comment",
+                  commentId,
+                  {
+                    id: commentId,
+                    issueId: entityId,
+                    body: `Ended the claim held by \`${ended!.agent}\` (until ${ended!.expiresAt}).`,
+                    kind: "comment",
+                    actorId: access.actorId,
+                    createdAt: now,
+                  },
+                  "comment.add",
+                );
+              } else lease(issue, data.leaseToken);
               if (kind === "issue.complete") {
                 unblocked(issue);
                 childrenClosed(issue);
@@ -1531,7 +1589,8 @@ export class TrackerStore {
               issue.claim = null;
               run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
               dropOffer(issue);
-              if (kind === "issue.release") failedAttempt(issue, released);
+              // Ending a claim by force isn't the holder failing.
+              if (kind === "issue.release" && !forced) failedAttempt(issue, released);
             }
             issue.version++;
             issue.updatedAt = now;

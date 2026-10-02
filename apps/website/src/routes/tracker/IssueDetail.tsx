@@ -14,7 +14,13 @@ import {
   type Mutation,
   type Snapshot,
 } from "../../../shared/tracker.ts";
-import { FormError, link as LINK, SelectField, TextField } from "../../components/ui.tsx";
+import {
+  ConfirmDialog,
+  FormError,
+  link as LINK,
+  SelectField,
+  TextField,
+} from "../../components/ui.tsx";
 import {
   blockers,
   CloseReasonField,
@@ -821,6 +827,32 @@ export function IssueDetail({
                 issue.handoff.expiresAt > snapshot.serverTime &&
                 ` It's handing the work to ${issue.handoff.to ? actorName(snapshot, issue.handoff.to) : "whoever has its code"}.`}
             </span>
+            {/* Owners can end a claim nobody is going to finish (a lost session, a stuck agent). */}
+            {covering === issue && snapshot.canAdmin && viewer && !viewer.agent && (
+              <ConfirmDialog
+                trigger={
+                  <button
+                    type="button"
+                    className="mk-btn mk-btn--danger-ghost mk-btn--sm -my-1 ml-auto shrink-0 self-start"
+                  >
+                    End claim
+                  </button>
+                }
+                title={`End the claim on ${issue.key}?`}
+                description={`Its holder's lease stops working at once and ${issue.key} goes back to todo. The issue notes that you ended it; it doesn't count as their failed attempt.`}
+                confirmLabel="End claim"
+                busy={busy}
+                onConfirm={async () => {
+                  setNotice("");
+                  setActionError("");
+                  const result = await mutate([
+                    { kind: "issue.release", id: issue.id, data: { force: true } },
+                  ]);
+                  if (result.ok) setNotice("Claim ended; the issue is back in todo.");
+                  else setActionError(result.error);
+                }}
+              />
+            )}
           </p>
         )}
         <div className="mt-3 flex flex-wrap gap-2 max-sm:grid max-sm:grid-cols-2 max-sm:[&>.mk-btn]:min-w-0 max-sm:[&>.mk-btn]:px-2">

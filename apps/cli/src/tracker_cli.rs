@@ -250,11 +250,14 @@ pub enum IssueCommand {
         /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
         #[arg(long)]
         agent: Option<String>,
-        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,
         #[command(flatten)]
         delegation: Delegation,
+        /// Take over someone else's active claim (tracker owners, as themselves). Their token stops working; the takeover is noted on the issue.
+        #[arg(long)]
+        force: bool,
     },
     /// Ask a person for something: a question, an approval, a decision or a credential. With the issue's lease token the lease is parked while you wait.
     Ask {
@@ -280,7 +283,7 @@ pub enum IssueCommand {
     /// Take a parked lease back up once its requests are answered; returns a fresh token.
     Resume {
         issue: String,
-        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,
     },
@@ -303,7 +306,7 @@ pub enum IssueCommand {
         /// A label for your working session (defaults to the giver's).
         #[arg(long)]
         agent: Option<String>,
-        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,
     },
@@ -327,7 +330,7 @@ pub enum IssueCommand {
         /// Only work under this issue (a project or other parent).
         #[arg(long)]
         under: Option<String>,
-        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,
         /// With --under: pick inside your own leased subtree.
@@ -338,12 +341,18 @@ pub enum IssueCommand {
     Renew {
         #[command(flatten)]
         lease: Lease,
-        /// Lease seconds; defaults to .gitmatrix/agents.toml's, else 900.
+        /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,
     },
     /// Release the current fenced lease online.
-    Release(Lease),
+    Release {
+        #[command(flatten)]
+        lease: Lease,
+        /// End someone else's claim without its token (tracker owners, as themselves); noted on the issue, not counted as their failure.
+        #[arg(long)]
+        force: bool,
+    },
     /// Complete claimed work online with durable evidence and a valid fencing token.
     Complete {
         #[command(flatten)]

@@ -1307,7 +1307,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             | IssueCommand::Revoke { .. }
             | IssueCommand::Next { .. }
             | IssueCommand::Renew { .. }
-            | IssueCommand::Release(_)
+            | IssueCommand::Release { .. }
             | IssueCommand::Complete { .. }
     );
     if lease_command && args.scope.offline {
@@ -1364,10 +1364,14 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 agent,
                 ttl,
                 delegation,
+                force,
             } => {
                 let mut data =
                     json!({"agent":session(agent)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 delegate(&snapshot, delegation, &mut data)?;
+                if *force {
+                    data["force"] = json!(true);
+                }
                 json!({"kind":"issue.claim","id":id(&snapshot,"issues",issue)?,"data":data})
             }
             IssueCommand::Ask {
@@ -1488,9 +1492,13 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
                 json!({"kind":"issue.renew","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)}})
             }
-            IssueCommand::Release(lease) => {
+            IssueCommand::Release { lease, force } => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
-                json!({"kind":"issue.release","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?}})
+                if *force {
+                    json!({"kind":"issue.release","id":issue_id,"data":{"force":true}})
+                } else {
+                    json!({"kind":"issue.release","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?}})
+                }
             }
             IssueCommand::Complete { lease, evidence } => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
@@ -1538,7 +1546,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             // Keep the newest token for the issue it holds; forget it once the lease ends.
             let result = &response["results"][0];
             match &args.command {
-                IssueCommand::Complete { .. } | IssueCommand::Release(_) => {
+                IssueCommand::Complete { .. } | IssueCommand::Release { .. } => {
                     drop_lease(&r.config, &target)
                 }
                 _ => {

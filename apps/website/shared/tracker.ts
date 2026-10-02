@@ -264,6 +264,12 @@ export type Mutation =
         underToken?: string;
         /** Delegate to one of your agents instead of holding it yourself. */
         forActorId?: string;
+        /**
+         * Take over an active claim: tracker owners only, acting as themselves
+         * (not through an agent). The holder's token stops working, the
+         * takeover is noted on the issue, and it isn't counted as their failure.
+         */
+        force?: boolean;
       };
     }
   /** Ask a person for something; with the issue's lease token, the lease is parked. */
@@ -328,7 +334,8 @@ export type Mutation =
       };
     }
   | { kind: "issue.renew"; id: string; data: { leaseToken: string; ttlSeconds?: number } }
-  | { kind: "issue.release"; id: string; data: { leaseToken: string } }
+  /** Owners acting as themselves may end someone else's claim with force and no token. */
+  | { kind: "issue.release"; id: string; data: { leaseToken?: string; force?: boolean } }
   | { kind: "issue.complete"; id: string; data: { leaseToken: string; evidence: string } };
 export interface MutationRequest {
   operationId: string;
