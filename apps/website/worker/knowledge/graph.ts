@@ -24,6 +24,7 @@ import {
   type ConceptGroup,
   type ConceptModel,
 } from "./concepts.ts";
+import { feedStatements, type FeedEdge } from "../atlas/feed.ts";
 import { resolveImport } from "./extract.ts";
 import { runBatched, sha256, type Statement } from "./util.ts";
 
@@ -431,9 +432,11 @@ export async function applyGraph(
     `${e.src}\u0000${e.dst}\u0000${e.kind}`;
   const oldByKey = new Map(oldEdges.map((e) => [key(e), e]));
   const newKeys = new Set<string>();
+  const changedEdges: FeedEdge[] = [];
   for (const edge of graph.edges) {
     newKeys.add(key(edge));
     if (oldByKey.get(key(edge))?.weight === edge.weight) continue;
+    changedEdges.push(edge);
     statements.push(
       db(d1)
         .insertInto("kg_edges")
@@ -453,6 +456,7 @@ export async function applyGraph(
   }
   for (const [k, edge] of oldByKey) {
     if (newKeys.has(k)) continue;
+    changedEdges.push(edge);
     statements.push(
       db(d1)
         .deleteFrom("kg_edges")
@@ -462,6 +466,15 @@ export async function applyGraph(
         .where("kind", "=", edge.kind),
     );
   }
+  // The Atlas feed first, so no graph change lands without it (CORE-166).
+  statements.unshift(
+    ...(await feedStatements(
+      d1,
+      repoId,
+      [...diff.added, ...diff.changed, ...diff.removed],
+      changedEdges.map(({ src, dst, kind }) => ({ src, dst, kind })),
+    )),
+  );
   // Last, so the version moves only once the writes before it have landed.
   if (statements.length) {
     statements.push(

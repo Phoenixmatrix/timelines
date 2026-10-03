@@ -411,12 +411,18 @@ export function groupCapabilities(
     areaMembers.set(a, list);
   });
 
+  // Every mention by file, duplicates included, so weighing a group reads only its members'.
+  const mentionsOf = new Map<string, string[]>();
+  for (const { file, concept } of input.mentions) {
+    const list = mentionsOf.get(file);
+    if (list) list.push(concept);
+    else mentionsOf.set(file, [concept]);
+  }
   const conceptWeight = (members: number[]) => {
-    const memberSet = new Set(members.map((i) => files[i]!));
     const weights = new Map<string, number>();
-    for (const { file, concept } of input.mentions)
-      if (memberSet.has(file) && (idf.get(concept) ?? 0) > 0.05)
-        weights.set(concept, (weights.get(concept) ?? 0) + 1);
+    for (const file of new Set(members.map((i) => files[i]!)))
+      for (const concept of mentionsOf.get(file) ?? [])
+        if ((idf.get(concept) ?? 0) > 0.05) weights.set(concept, (weights.get(concept) ?? 0) + 1);
     return [...weights]
       .filter(([, w]) => w >= 2 || members.length === 1)
       .sort((a, b) => b[1] - a[1] || byId(a[0], b[0]))

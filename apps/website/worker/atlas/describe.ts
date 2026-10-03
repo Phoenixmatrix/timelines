@@ -41,6 +41,7 @@ import { cached, remember } from "../knowledge/synthesize.ts";
 import { pool, sha256 } from "../knowledge/util.ts";
 import { GROUPING_VERSION } from "./grouping.ts";
 import {
+  buildingMemberships,
   currentSnapshot,
   entityAt,
   repoScope,
@@ -228,10 +229,7 @@ async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
       )
       .bind(scope, ctx.seq, ctx.seq)
       .all<{ entity_id: string; data: string }>(),
-    d1
-      .prepare(`SELECT entity_id, data FROM atlas_assignments WHERE scope = ? AND seq = ?`)
-      .bind(scope, ctx.seq)
-      .all<{ entity_id: string; data: string }>(),
+    buildingMemberships(d1, ctx.snapshotId),
     d1
       .prepare(
         `SELECT src, dst FROM kg_edges WHERE repo_id = ? AND kind = 'imports'
@@ -251,7 +249,7 @@ async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
   // Primary members only: cross-cutting references never describe a capability.
   const members = new Map<string, Member[]>();
   const capabilityOf = new Map<string, string>();
-  for (const row of assignments.results) {
+  for (const row of assignments) {
     const data = parseData(row.data) as {
       capability?: string | null;
       area?: string | null;

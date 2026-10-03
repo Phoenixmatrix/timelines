@@ -14,11 +14,22 @@
 // is complete once a build's `graph-final` step has run, in keyset batches of
 // at most ENTITY_BATCH entities or EDGE_BATCH edges per Workflow step. Every
 // batch is idempotent, so a retried step converges on the same rows.
+//
+// Incremental projection (CORE-166). When the published snapshot was built by
+// this projection and grouping version and the change feed (feed.ts) lists
+// what changed since, a snapshot reads only that: the changed nodes, the
+// endpoints of changed edges (their parents and counts derive from those
+// edges) and the files whose placement grouping changed. Grouping itself runs
+// only when its inputs (imports between files, mentions, which files are
+// analyzed, concept names) changed, and then records only placements that
+// differ from the published ones. Everything else stays in the rows the
+// snapshots share, so the result equals a full pass over the same graph.
 
 import { batch, db, nowIso } from "../schema.ts";
 import { sha256 } from "../knowledge/util.ts";
 import { groupCapabilities, GROUPING_VERSION, type Grouping } from "./grouping.ts";
 import { cell, GRID_WIDTH, reconcile, type PriorGroup, type Reconciled } from "./identity.ts";
+import { FEED_LIMIT } from "./feed.ts";
 
 /** Bump when the projected shape changes: snapshots record which one built them. */
 export const PROJECTION_VERSION = 3;
@@ -163,12 +174,28 @@ async function rollBackUnpublished(d1: D1Database, scope: string) {
   ]);
 }
 
-/** Start a snapshot for a repository's projection, after rolling back any unpublished one. */
+/** A started snapshot, and whether it reads only the change feed since the published one. */
+export interface ProjectionStart {
+  snapshotId: string;
+  seq: number;
+  incremental: boolean;
+  /** Feed rows it reads (incremental only). */
+  feedRows: number;
+}
+
+/**
+ * Start a snapshot for a repository's projection, after rolling back any
+ * unpublished one. It is incremental when the published snapshot was built by
+ * this projection and grouping version from a known feed position and the
+ * feed since lists every change; otherwise (or with `full`) it reads the
+ * whole graph.
+ */
 export async function beginRepoProjection(
   d1: D1Database,
   repoId: string,
   vector: VectorEntry[],
-): Promise<{ snapshotId: string; seq: number }> {
+  options: { full?: boolean } = {},
+): Promise<ProjectionStart> {
   const scope = repoScope(repoId);
   await db(d1)
     .insertInto("atlas_scopes")
@@ -182,6 +209,36 @@ export async function beginRepoProjection(
     .where("scope", "=", scope)
     .executeTakeFirst();
   const seq = Number(last?.seq ?? 0) + 1;
+  const published = await d1
+    .prepare(
+      `SELECT s.projection_version, s.grouping_version, s.feed_mark FROM atlas_current c
+       JOIN atlas_snapshots s ON s.id = c.snapshot_id WHERE c.scope = ?`,
+    )
+    .bind(scope)
+    .first<{
+      projection_version: number;
+      grouping_version: number | null;
+      feed_mark: number | null;
+    }>();
+  const base = published?.feed_mark ?? null;
+  const feed = await d1
+    .prepare(
+      `SELECT max(id) AS mark, count(*) AS n, coalesce(max(kind = 'full'), 0) AS full
+       FROM atlas_feed WHERE repo_id = ? AND id > ?`,
+    )
+    .bind(repoId, base ?? -1)
+    .first<{ mark: number | null; n: number; full: number }>();
+  // The position this snapshot will reflect: unknown until the feed has recorded something.
+  const marks = [base, feed?.mark ?? null].filter((m): m is number => m !== null);
+  const mark = marks.length ? Math.max(...marks) : null;
+  const incremental =
+    !options.full &&
+    published !== null &&
+    published.projection_version === PROJECTION_VERSION &&
+    published.grouping_version === GROUPING_VERSION &&
+    base !== null &&
+    !Number(feed?.full ?? 0) &&
+    Number(feed?.n ?? 0) <= FEED_LIMIT;
   const snapshotId = crypto.randomUUID();
   await db(d1)
     .insertInto("atlas_snapshots")
@@ -195,10 +252,65 @@ export async function beginRepoProjection(
       error: null,
       published_at: null,
       expires_at: null,
+      feed_mark: mark,
+      feed_base: incremental ? base : null,
     })
     .execute();
-  return { snapshotId, seq };
+  return { snapshotId, seq, incremental, feedRows: incremental ? Number(feed?.n ?? 0) : 0 };
 }
+
+/** What an incremental snapshot reads: the feed in (base, mark] against published `baseSeq`. */
+interface Increment {
+  repoId: string;
+  scope: string;
+  seq: number;
+  base: number;
+  mark: number;
+  baseSeq: number;
+}
+
+/** The increment snapshot `snapshotId` projects, or null when it reads the whole graph. */
+async function incrementOf(d1: D1Database, snapshotId: string): Promise<Increment | null> {
+  const row = await d1
+    .prepare(
+      `SELECT s.scope, s.seq, s.feed_base, s.feed_mark, sc.repo_id, c.seq AS base_seq
+       FROM atlas_snapshots s JOIN atlas_scopes sc ON sc.scope = s.scope
+       LEFT JOIN atlas_current c ON c.scope = s.scope
+       WHERE s.id = ?`,
+    )
+    .bind(snapshotId)
+    .first<{
+      scope: string;
+      seq: number;
+      feed_base: number | null;
+      feed_mark: number | null;
+      repo_id: string | null;
+      base_seq: number | null;
+    }>();
+  if (!row || row.feed_base === null || row.feed_mark === null || row.base_seq === null)
+    return null;
+  if (!row.repo_id) return null;
+  return {
+    repoId: row.repo_id,
+    scope: row.scope,
+    seq: row.seq,
+    base: row.feed_base,
+    mark: row.feed_mark,
+    baseSeq: row.base_seq,
+  };
+}
+
+/** Feed rows of an increment; binds ?1 repo, ?2 base, ?3 mark. */
+const FEED = (kind: "node" | "edge") =>
+  `SELECT * FROM atlas_feed WHERE repo_id = ?1 AND kind = '${kind}' AND id > ?2 AND id <= ?3`;
+/**
+ * Entities an increment re-projects: changed nodes, both ends of changed
+ * edges, and files whose placement changed; binds ?1-?3 and ?4 scope, ?5 seq.
+ */
+const DIRTY_IDS = `SELECT src AS id FROM (${FEED("node")})
+  UNION SELECT src FROM (${FEED("edge")})
+  UNION SELECT dst FROM (${FEED("edge")})
+  UNION SELECT entity_id FROM atlas_assignments WHERE scope = ?4 AND seq = ?5`;
 
 /** Mark a snapshot failed and undo its writes; the published one stays current. */
 export async function failProjection(
@@ -273,6 +385,13 @@ export async function publishProjection(
       snapshotId,
     ),
     raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq = ?", scope, seq),
+    // The feed up to what this snapshot reflects is consumed (CORE-166).
+    raw(
+      `DELETE FROM atlas_feed WHERE repo_id = (SELECT repo_id FROM atlas_scopes WHERE scope = ?)
+       AND id <= coalesce((SELECT feed_mark FROM atlas_snapshots WHERE id = ? AND status = 'published'), -1)`,
+      scope,
+      snapshotId,
+    ),
     raw(
       `INSERT INTO atlas_current (scope, snapshot_id, seq, published_at)
        SELECT scope, id, seq, ? FROM atlas_snapshots WHERE id = ? AND status = 'published'
@@ -352,24 +471,31 @@ async function writeEntities(
     owns?: (id: string) => boolean;
     /** Only these ids' open rows are considered (a pass revising some entities). */
     only?: string[];
+    /** The open rows to compare with, already read by the caller (an increment's). */
+    open?: OpenEntity[];
   },
 ): Promise<number> {
   const [after, upTo] = range;
   const bounded = upTo !== null && !options.final;
-  const open = await d1
-    .prepare(
-      `SELECT entity_id, from_seq, content_hash, ${ENTITY_BYTES_SQL} AS size FROM atlas_entities
-       WHERE scope = ? AND to_seq IS NULL AND entity_id > ? ${bounded ? "AND entity_id <= ?" : ""}
-       ${options.only ? "AND entity_id IN (SELECT value FROM json_each(?))" : ""}`,
-    )
-    .bind(
-      scope,
-      after ?? "",
-      ...(bounded ? [upTo] : []),
-      ...(options.only ? [JSON.stringify(options.only)] : []),
-    )
-    .all<{ entity_id: string; from_seq: number; content_hash: string; size: number }>();
-  const existing = new Map(open.results.map((r) => [r.entity_id, r]));
+  // `+to_seq`: walk the id range by primary key, not every open row by to_seq.
+  const open =
+    options.open ??
+    (
+      await d1
+        .prepare(
+          `SELECT entity_id, from_seq, content_hash, ${ENTITY_BYTES_SQL} AS size FROM atlas_entities
+           WHERE scope = ? AND +to_seq IS NULL AND entity_id > ? ${bounded ? "AND entity_id <= ?" : ""}
+           ${options.only ? "AND entity_id IN (SELECT value FROM json_each(?))" : ""}`,
+        )
+        .bind(
+          scope,
+          after ?? "",
+          ...(bounded ? [upTo] : []),
+          ...(options.only ? [JSON.stringify(options.only)] : []),
+        )
+        .all<OpenEntity>()
+    ).results;
+  const existing = new Map(open.map((r) => [r.entity_id, r]));
 
   const rows: Record<string, unknown>[] = [];
   const close: string[] = [];
@@ -460,6 +586,13 @@ async function writeEntities(
   return bytes;
 }
 
+interface OpenEntity {
+  entity_id: string;
+  from_seq: number;
+  content_hash: string;
+  size: number;
+}
+
 interface NodeRow {
   id: string;
   kind: string;
@@ -467,6 +600,73 @@ interface NodeRow {
   path: string | null;
   summary: string;
   data: string;
+}
+
+/** What placing and counting a batch of nodes reads from the graph's edges. */
+interface Derived {
+  componentOf: Map<string, string>;
+  broaderOf: Map<string, string>;
+  symbols: Map<string, number>;
+  componentFiles: Map<string, number>;
+  mentions: Map<string, number>;
+}
+
+function derived(rows: {
+  containers: { src: string; dst: string }[];
+  broader: { src: string; dst: string }[];
+  defines: { src: string; n: number }[];
+  members: { src: string; n: number }[];
+  mentioned: { dst: string; n: number }[];
+}): Derived {
+  const out: Derived = {
+    componentOf: new Map(),
+    broaderOf: new Map(),
+    symbols: new Map(),
+    componentFiles: new Map(),
+    mentions: new Map(),
+  };
+  // A file in two components (it can't be, but be deterministic) takes the first.
+  for (const row of rows.containers.sort((a, b) => a.src.localeCompare(b.src)))
+    if (!out.componentOf.has(row.dst)) out.componentOf.set(row.dst, row.src);
+  for (const row of rows.broader) out.broaderOf.set(row.src, row.dst);
+  for (const row of rows.defines) out.symbols.set(row.src, Number(row.n));
+  for (const row of rows.members) out.componentFiles.set(row.src, Number(row.n));
+  for (const row of rows.mentioned) out.mentions.set(row.dst, Number(row.n));
+  return out;
+}
+
+/** Graph nodes as Atlas entities, placed and counted. */
+function toEntities(
+  nodes: NodeRow[],
+  edges: Derived,
+  assigned: Map<string, string> | null,
+  membership: Map<string, unknown>,
+): { entities: AtlasEntity[]; partial: boolean } {
+  let partial = false;
+  const entities = nodes.map((node) => {
+    const data = JSON.parse(node.data) as Record<string, unknown>;
+    if (node.kind === "file" && (data.pending || data.skipped)) partial ||= Boolean(data.pending);
+    // Deduplicated counts: each source unit counts once, at its primary place.
+    const counts: Record<string, number> = {};
+    if (node.kind === "file") counts.symbols = edges.symbols.get(node.id) ?? 0;
+    if (node.kind === "component") counts.files = edges.componentFiles.get(node.id) ?? 0;
+    if (node.kind === "concept") counts.files = edges.mentions.get(node.id) ?? 0;
+    return {
+      id: node.id,
+      kind: node.kind,
+      parentId: parentOf(
+        { id: node.id, kind: node.kind, path: node.path, data },
+        { componentOf: edges.componentOf, broaderOf: edges.broaderOf, assigned },
+      ),
+      name: node.name,
+      path: node.path,
+      summary: node.summary,
+      data: membership.has(node.id)
+        ? { ...data, counts, membership: membership.get(node.id) }
+        : { ...data, counts },
+    };
+  });
+  return { entities, partial };
 }
 
 /**
@@ -481,6 +681,8 @@ export async function projectEntities(
   after: string | null,
   limit = ENTITY_BATCH,
 ): Promise<{ next: string | null; written: number }> {
+  const increment = await incrementOf(d1, snapshotId);
+  if (increment) return projectChangedEntities(d1, increment, snapshotId, after, limit);
   const scope = repoScope(repoId);
   const nodes = await d1
     .prepare(
@@ -494,11 +696,6 @@ export async function projectEntities(
   const first = batchNodes[0]?.id ?? null;
   const last = batchNodes.at(-1)?.id ?? null;
 
-  const componentOf = new Map<string, string>();
-  const broaderOf = new Map<string, string>();
-  const symbols = new Map<string, number>();
-  const componentFiles = new Map<string, number>();
-  const mentions = new Map<string, number>();
   const grouped = await db(d1)
     .selectFrom("atlas_snapshots")
     .select("grouping_version")
@@ -519,6 +716,7 @@ export async function projectEntities(
       membership.set(row.entity_id, JSON.parse(row.data));
     }
   }
+  let edges = derived({ containers: [], broader: [], defines: [], members: [], mentioned: [] });
   if (first !== null && last !== null) {
     const [containers, broader, defines, members, mentioned] = await Promise.all([
       d1
@@ -557,40 +755,16 @@ export async function projectEntities(
         .bind(repoId, first, last)
         .all<{ dst: string; n: number }>(),
     ]);
-    // A file in two components (it can't be, but be deterministic) takes the first.
-    for (const row of containers.results.sort((a, b) => a.src.localeCompare(b.src)))
-      if (!componentOf.has(row.dst)) componentOf.set(row.dst, row.src);
-    for (const row of broader.results) broaderOf.set(row.src, row.dst);
-    for (const row of defines.results) symbols.set(row.src, Number(row.n));
-    for (const row of members.results) componentFiles.set(row.src, Number(row.n));
-    for (const row of mentioned.results) mentions.set(row.dst, Number(row.n));
+    edges = derived({
+      containers: containers.results,
+      broader: broader.results,
+      defines: defines.results,
+      members: members.results,
+      mentioned: mentioned.results,
+    });
   }
 
-  let partial = false;
-  const entities: AtlasEntity[] = batchNodes.map((node) => {
-    const data = JSON.parse(node.data) as Record<string, unknown>;
-    if (node.kind === "file" && (data.pending || data.skipped)) partial ||= Boolean(data.pending);
-    // Deduplicated counts: each source unit counts once, at its primary place.
-    const counts: Record<string, number> = {};
-    if (node.kind === "file") counts.symbols = symbols.get(node.id) ?? 0;
-    if (node.kind === "component") counts.files = componentFiles.get(node.id) ?? 0;
-    if (node.kind === "concept") counts.files = mentions.get(node.id) ?? 0;
-    return {
-      id: node.id,
-      kind: node.kind,
-      parentId: parentOf(
-        { id: node.id, kind: node.kind, path: node.path, data },
-        { componentOf, broaderOf, assigned },
-      ),
-      name: node.name,
-      path: node.path,
-      summary: node.summary,
-      data: membership.has(node.id)
-        ? { ...data, counts, membership: membership.get(node.id) }
-        : { ...data, counts },
-    };
-  });
-
+  const { entities, partial } = toEntities(batchNodes, edges, assigned, membership);
   const bytes = await writeEntities(d1, scope, seq, entities, [after, last], { final });
   await db(d1)
     .updateTable("atlas_snapshots")
@@ -598,6 +772,129 @@ export async function projectEntities(
       bytes: eb("bytes", "+", bytes),
       ...(partial ? { partial: 1 } : {}),
     }))
+    .where("id", "=", snapshotId)
+    .execute();
+  return { next: final ? null : last, written: entities.length };
+}
+
+/**
+ * An increment's entity batch: the next `limit` changed entity ids after
+ * `after` (see DIRTY_IDS), re-projected from the graph, or closed when their
+ * node is gone. A file grouping didn't move keeps its published placement.
+ */
+async function projectChangedEntities(
+  d1: D1Database,
+  inc: Increment,
+  snapshotId: string,
+  after: string | null,
+  limit: number,
+): Promise<{ next: string | null; written: number }> {
+  const { repoId, scope, seq } = inc;
+  const ids = await d1
+    .prepare(`SELECT id FROM (${DIRTY_IDS}) WHERE id > ?6 ORDER BY id LIMIT ?7`)
+    .bind(repoId, inc.base, inc.mark, scope, seq, after ?? "", limit)
+    .all<{ id: string }>();
+  const final = ids.results.length < limit;
+  const last = ids.results.at(-1)?.id ?? null;
+  // Whether any file still waits for analysis: once per snapshot, over every file.
+  const partial =
+    after === null &&
+    Boolean(
+      (
+        await d1
+          .prepare(
+            `SELECT EXISTS (SELECT 1 FROM kg_nodes WHERE repo_id = ? AND kind = 'file'
+               AND json_extract(data, '$.pending')) AS p`,
+          )
+          .bind(repoId)
+          .first<{ p: number }>()
+      )?.p,
+    );
+  if (last === null) {
+    if (partial)
+      await db(d1)
+        .updateTable("atlas_snapshots")
+        .set({ partial: 1 })
+        .where("id", "=", snapshotId)
+        .execute();
+    return { next: null, written: 0 };
+  }
+  // Every query below reads this batch's ids: ?1-?5 as in DIRTY_IDS, (?6, ?7].
+  const batch = `WITH batch(id) AS (SELECT id FROM (${DIRTY_IDS}) WHERE id > ?6 AND id <= ?7)`;
+  const read = <T>(sql: string, ...more: unknown[]) =>
+    d1
+      .prepare(`${batch} ${sql}`)
+      .bind(repoId, inc.base, inc.mark, scope, seq, after ?? "", last, ...more)
+      .all<T>()
+      .then((r) => r.results);
+  const [nodes, containers, broader, defines, members, mentioned, assignments, published, open] =
+    await Promise.all([
+      read<NodeRow>(
+        `SELECT id, kind, name, path, summary, data FROM kg_nodes
+         WHERE repo_id = ?1 AND id IN (SELECT id FROM batch) ORDER BY id`,
+      ),
+      read<{ src: string; dst: string }>(
+        `SELECT src, dst FROM kg_edges WHERE repo_id = ?1 AND kind = 'contains'
+         AND dst IN (SELECT id FROM batch) AND src LIKE 'component:%'`,
+      ),
+      read<{ src: string; dst: string }>(
+        `SELECT src, min(dst) AS dst FROM kg_edges WHERE repo_id = ?1 AND kind = 'part_of'
+         AND src IN (SELECT id FROM batch) GROUP BY src`,
+      ),
+      read<{ src: string; n: number }>(
+        `SELECT src, count(*) AS n FROM kg_edges WHERE repo_id = ?1 AND kind = 'defines'
+         AND src IN (SELECT id FROM batch) GROUP BY src`,
+      ),
+      read<{ src: string; n: number }>(
+        `SELECT src, count(*) AS n FROM kg_edges WHERE repo_id = ?1 AND kind = 'contains'
+         AND src IN (SELECT id FROM batch) AND src LIKE 'component:%' GROUP BY src`,
+      ),
+      read<{ dst: string; n: number }>(
+        `SELECT dst, count(*) AS n FROM kg_edges WHERE repo_id = ?1 AND kind = 'mentions'
+         AND dst IN (SELECT id FROM batch) GROUP BY dst`,
+      ),
+      read<{ entity_id: string; parent_id: string; data: string }>(
+        `SELECT entity_id, parent_id, data FROM atlas_assignments
+         WHERE scope = ?4 AND seq = ?5 AND entity_id IN (SELECT id FROM batch)`,
+      ),
+      // Placements of files grouping didn't move, as published.
+      read<{ entity_id: string; parent_id: string | null; membership: string | null }>(
+        `SELECT entity_id, parent_id, json_extract(data, '$.membership') AS membership
+         FROM atlas_entities WHERE scope = ?4 AND kind = 'file' AND entity_id IN (SELECT id FROM batch)
+         AND from_seq <= ?8 AND (to_seq IS NULL OR to_seq > ?8)`,
+        inc.baseSeq,
+      ),
+      read<OpenEntity>(
+        `SELECT entity_id, from_seq, content_hash, ${ENTITY_BYTES_SQL} AS size FROM atlas_entities
+         WHERE scope = ?4 AND to_seq IS NULL AND entity_id IN (SELECT id FROM batch)`,
+      ),
+    ]);
+  const assigned = new Map<string, string>();
+  const membership = new Map<string, unknown>();
+  for (const row of published) {
+    if (row.parent_id) assigned.set(row.entity_id, row.parent_id);
+    if (row.membership !== null) membership.set(row.entity_id, JSON.parse(row.membership));
+  }
+  for (const row of assignments) {
+    assigned.set(row.entity_id, row.parent_id);
+    const data = JSON.parse(row.data) as unknown;
+    // `null`: grouping no longer places it (removed, or no longer analyzed).
+    if (data === null) membership.delete(row.entity_id);
+    else membership.set(row.entity_id, data);
+  }
+  const { entities } = toEntities(
+    nodes,
+    derived({ containers, broader, defines, members, mentioned }),
+    assigned,
+    membership,
+  );
+  const bytes = await writeEntities(d1, scope, seq, entities, [null, null], {
+    final: true,
+    open,
+  });
+  await db(d1)
+    .updateTable("atlas_snapshots")
+    .set((eb) => ({ bytes: eb("bytes", "+", bytes), ...(partial ? { partial: 1 } : {}) }))
     .where("id", "=", snapshotId)
     .execute();
   return { next: final ? null : last, written: entities.length };
@@ -674,23 +971,104 @@ export async function reviseEntities(
 
 // ---- capabilities --------------------------------------------------------------
 
+export type GroupStats = Partial<Grouping["stats"]> & {
+  capabilities: number;
+  areas: number;
+  unclassified: number;
+  /** False when an increment changed no grouping input and kept the published groups. */
+  regrouped: boolean;
+};
+
+/**
+ * Whether an increment changed anything grouping reads: an import between
+ * files, a mention, which files are analyzed, or a concept's name.
+ */
+async function groupingInputsChanged(d1: D1Database, inc: Increment): Promise<boolean> {
+  const edge = await d1
+    .prepare(
+      `SELECT 1 AS hit FROM (${FEED("edge")})
+       WHERE edge_kind = 'mentions' OR (edge_kind = 'imports' AND src LIKE 'file:%' AND dst LIKE 'file:%')
+       LIMIT 1`,
+    )
+    .bind(inc.repoId, inc.base, inc.mark)
+    .first<{ hit: number }>();
+  if (edge) return true;
+  const nodes = await d1
+    .prepare(
+      `SELECT f.id, n.kind, n.name, json_extract(n.data, '$.pending') AS pending,
+              json_extract(n.data, '$.skipped') AS skipped, e.entity_id AS was, e.name AS was_name,
+              json_type(e.data, '$.membership') AS grouped
+       FROM (SELECT DISTINCT src AS id FROM (${FEED("node")})
+             WHERE src LIKE 'file:%' OR src LIKE 'concept:%') f
+       LEFT JOIN kg_nodes n ON n.repo_id = ?1 AND n.id = f.id
+       LEFT JOIN atlas_entities e ON e.scope = ?4 AND e.entity_id = f.id
+         AND e.from_seq <= ?5 AND (e.to_seq IS NULL OR e.to_seq > ?5)`,
+    )
+    .bind(inc.repoId, inc.base, inc.mark, inc.scope, inc.baseSeq)
+    .all<{
+      id: string;
+      kind: string | null;
+      name: string | null;
+      pending: unknown;
+      skipped: unknown;
+      was: string | null;
+      was_name: string | null;
+      grouped: string | null;
+    }>();
+  return nodes.results.some((n) => {
+    if (n.id.startsWith("concept:")) return n.name !== n.was_name;
+    // A file is a grouping unit when analyzed; published, units have a membership.
+    const unit = n.kind !== null && !n.pending && !n.skipped;
+    return unit !== (n.grouped === "object");
+  });
+}
+
 /**
  * Group a repository's analyzed files into capabilities (CORE-163) for
  * snapshot `seq`: write capability and area entities, and record each file's
- * placement for the entity batches. Deterministic and inference-free.
+ * placement for the entity batches. Deterministic and inference-free. An
+ * increment that changed no grouping input keeps the published groups and
+ * placements; one that did regroups and records only placements that moved.
  */
 export async function groupRepoCapabilities(
   d1: D1Database,
   repoId: string,
   snapshotId: string,
   seq: number,
-): Promise<Grouping["stats"] & { capabilities: number; areas: number }> {
+): Promise<GroupStats> {
   const scope = repoScope(repoId);
+  const increment = await incrementOf(d1, snapshotId);
+  if (increment && !(await groupingInputsChanged(d1, increment))) {
+    const counts = await d1
+      .prepare(
+        `SELECT
+           (SELECT count(*) FROM atlas_entities WHERE scope = ?1 AND kind = 'capability' AND to_seq IS NULL) AS capabilities,
+           (SELECT count(*) FROM atlas_entities WHERE scope = ?1 AND kind = 'area' AND to_seq IS NULL) AS areas,
+           (SELECT count(*) FROM atlas_entities WHERE scope = ?1 AND parent_id = ?2 AND kind = 'file'
+              AND to_seq IS NULL AND json_type(data, '$.membership') = 'object') AS unclassified`,
+      )
+      .bind(scope, GROUPS.unclassified)
+      .first<{ capabilities: number; areas: number; unclassified: number }>();
+    await db(d1)
+      .updateTable("atlas_snapshots")
+      .set({ grouping_version: GROUPING_VERSION })
+      .where("id", "=", snapshotId)
+      .execute();
+    return {
+      capabilities: Number(counts?.capabilities ?? 0),
+      areas: Number(counts?.areas ?? 0),
+      unclassified: Number(counts?.unclassified ?? 0),
+      regrouped: false,
+    };
+  }
   const [fileRows, imports, mentions, concepts] = await Promise.all([
     d1
-      .prepare(`SELECT id, data FROM kg_nodes WHERE repo_id = ? AND kind = 'file'`)
+      .prepare(
+        `SELECT id, json_extract(data, '$.pending') AS pending, json_extract(data, '$.skipped') AS skipped
+         FROM kg_nodes WHERE repo_id = ? AND kind = 'file'`,
+      )
       .bind(repoId)
-      .all<{ id: string; data: string }>(),
+      .all<{ id: string; pending: unknown; skipped: unknown }>(),
     d1
       .prepare(
         `SELECT src, dst FROM kg_edges WHERE repo_id = ? AND kind = 'imports'
@@ -710,12 +1088,7 @@ export async function groupRepoCapabilities(
       .all<{ id: string; name: string }>(),
   ]);
   // Only analyzed files are units; pending and skipped ones stay unclassified.
-  const files = fileRows.results
-    .filter((row) => {
-      const data = JSON.parse(row.data) as { pending?: boolean; skipped?: unknown };
-      return !data.pending && !data.skipped;
-    })
-    .map((row) => row.id);
+  const files = fileRows.results.filter((row) => !row.pending && !row.skipped).map((row) => row.id);
   const grouping = groupCapabilities({
     files,
     imports: imports.results,
@@ -782,7 +1155,7 @@ export async function groupRepoCapabilities(
     owns: (id) => id.startsWith("cap:") || id.startsWith("area:"),
   });
 
-  const placements = grouping.members.map((m) => {
+  let placements = grouping.members.map((m) => {
     const area = m.area && shown.has(m.area) ? areaId(m.area) : null;
     const capability = m.capability ? capId(m.capability) : null;
     return {
@@ -816,6 +1189,23 @@ export async function groupRepoCapabilities(
       return { src, dst, kind: "depends_on", weight };
     }),
   );
+  if (increment) {
+    // Only placements that moved; a published unit that is no longer one
+    // (removed, or no longer analyzed) is recorded as placed nowhere (`null`).
+    const units = new Set(placements.map((p) => p.id));
+    placements = placements.filter((p) => {
+      const was = identity.priorFiles.get(p.id);
+      return (
+        !was ||
+        was.parent !== p.parent ||
+        was.membership === null ||
+        JSON.stringify(JSON.parse(was.membership)) !== p.data
+      );
+    });
+    for (const [id, was] of identity.priorFiles)
+      if (!units.has(id) && was.membership !== null)
+        placements.push({ id, parent: GROUPS.unclassified, data: "null" });
+  }
   const statements: Statement[] = [
     raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq = ?", scope, seq),
   ];
@@ -869,6 +1259,7 @@ export async function groupRepoCapabilities(
     ...grouping.stats,
     capabilities: grouping.capabilities.length,
     areas: shownAreas.length,
+    regrouped: true,
   };
 }
 
@@ -941,6 +1332,39 @@ export async function writeCapabilityEdges(
 }
 
 /**
+ * Every grouped file's membership JSON in a snapshot being built, once its
+ * grouping step has run: the placements it recorded, and for an increment the
+ * published placements of the files it didn't move.
+ */
+export async function buildingMemberships(
+  d1: D1Database,
+  snapshotId: string,
+): Promise<{ entity_id: string; data: string }[]> {
+  const inc = await incrementOf(d1, snapshotId);
+  const snapshot = await db(d1)
+    .selectFrom("atlas_snapshots")
+    .select(["scope", "seq"])
+    .where("id", "=", snapshotId)
+    .executeTakeFirst();
+  if (!snapshot) return [];
+  const recorded = `SELECT entity_id, data FROM atlas_assignments WHERE scope = ?1 AND seq = ?2 AND data != 'null'`;
+  const rows = await d1
+    .prepare(
+      inc
+        ? `${recorded}
+           UNION ALL
+           SELECT e.entity_id, json_extract(e.data, '$.membership') FROM atlas_entities e
+           WHERE e.scope = ?1 AND e.kind = 'file' AND e.from_seq <= ?3 AND (e.to_seq IS NULL OR e.to_seq > ?3)
+             AND json_type(e.data, '$.membership') = 'object'
+             AND NOT EXISTS (SELECT 1 FROM atlas_assignments a WHERE a.scope = ?1 AND a.seq = ?2 AND a.entity_id = e.entity_id)`
+        : recorded,
+    )
+    .bind(snapshot.scope, snapshot.seq, ...(inc ? [inc.baseSeq] : []))
+    .all<{ entity_id: string; data: string }>();
+  return rows.results;
+}
+
+/**
  * Reconcile this build's capabilities and areas with the published snapshot's
  * (CORE-165): continuing ones keep their ids and slots, others get opaque ids
  * minted from the scope, snapshot and anchor (so a retried step reuses them).
@@ -957,6 +1381,8 @@ async function reconcileIdentity(
   priorAreaSlots: Map<string, { slot: number | null; parent: string | null }>;
   priorNames: Map<string, string>;
   origins: Map<string, unknown>;
+  /** Published files' placements: parent and membership JSON (null when ungrouped). */
+  priorFiles: Map<string, { parent: string | null; membership: string | null }>;
 }> {
   const published = await db(d1)
     .selectFrom("atlas_current")
@@ -964,6 +1390,7 @@ async function reconcileIdentity(
     .where("scope", "=", scope)
     .executeTakeFirst();
   const priorSeq = published?.seq ?? null;
+  const priorFiles = new Map<string, { parent: string | null; membership: string | null }>();
   const capMembers = new Map<string, string[]>();
   const areaMembers = new Map<string, string[]>();
   const regions = new Map<
@@ -974,11 +1401,11 @@ async function reconcileIdentity(
     const [files, groups] = await Promise.all([
       d1
         .prepare(
-          `SELECT entity_id, json_extract(data, '$.membership.capability') AS cap, json_extract(data, '$.membership.area') AS area
+          `SELECT entity_id, parent_id, json_extract(data, '$.membership') AS membership
            FROM atlas_entities WHERE scope = ? AND kind = 'file' AND ${VISIBLE}`,
         )
         .bind(scope, priorSeq, priorSeq)
-        .all<{ entity_id: string; cap: string | null; area: string | null }>(),
+        .all<{ entity_id: string; parent_id: string | null; membership: string | null }>(),
       d1
         .prepare(
           `SELECT entity_id, kind, parent_id, name, json_extract(data, '$.layout.slot') AS slot,
@@ -996,8 +1423,14 @@ async function reconcileIdentity(
         }>(),
     ]);
     for (const f of files.results) {
-      if (f.cap) capMembers.set(f.cap, [...(capMembers.get(f.cap) ?? []), f.entity_id]);
-      if (f.area) areaMembers.set(f.area, [...(areaMembers.get(f.area) ?? []), f.entity_id]);
+      priorFiles.set(f.entity_id, { parent: f.parent_id, membership: f.membership });
+      const membership = f.membership
+        ? (JSON.parse(f.membership) as { capability?: string | null; area?: string | null } | null)
+        : null;
+      const cap = membership?.capability;
+      const area = membership?.area;
+      if (cap) capMembers.set(cap, [...(capMembers.get(cap) ?? []), f.entity_id]);
+      if (area) areaMembers.set(area, [...(areaMembers.get(area) ?? []), f.entity_id]);
     }
     for (const g of groups.results)
       regions.set(g.entity_id, {
@@ -1058,6 +1491,7 @@ async function reconcileIdentity(
     priorAreaSlots,
     priorNames: new Map([...regions].map(([id, r]) => [id, r.name])),
     origins,
+    priorFiles,
   };
 }
 
@@ -1112,30 +1546,70 @@ export async function projectEdges(
 ): Promise<{ next: EdgeCursor; written: number }> {
   const scope = repoScope(repoId);
   const start = after ?? ["", "", ""];
-  const edges = await d1
-    .prepare(
-      `SELECT src, dst, kind, weight FROM kg_edges
-       WHERE repo_id = ? AND (src, dst, kind) > (?, ?, ?)
-       ORDER BY src, dst, kind LIMIT ?`,
-    )
-    .bind(repoId, ...start, limit)
-    .all<{ src: string; dst: string; kind: string; weight: number }>();
-  const rows = edges.results;
-  const final = rows.length < limit;
-  const lastRow = rows.at(-1);
-  const last: EdgeCursor = lastRow ? [lastRow.src, lastRow.dst, lastRow.kind] : null;
-
-  const bounds = final || !last ? "" : "AND (src, dst, kind) <= (?, ?, ?)";
-  const open = await d1
-    .prepare(
-      `SELECT src, dst, kind, from_seq, weight FROM atlas_edges
-       WHERE scope = ? AND to_seq IS NULL AND (src, dst, kind) > (?, ?, ?) ${bounds}`,
-    )
-    .bind(scope, ...start, ...(final || !last ? [] : last))
-    .all<{ src: string; dst: string; kind: string; from_seq: number; weight: number }>();
+  const increment = await incrementOf(d1, snapshotId);
+  let rows: { src: string; dst: string; kind: string; weight: number }[];
+  let final: boolean;
+  let last: EdgeCursor;
+  let open: { src: string; dst: string; kind: string; from_seq: number; weight: number }[];
+  if (increment) {
+    // An increment's batch: the next changed edges, as the graph has them now
+    // (no weight: removed) and as the projection has them open.
+    const changed = `WITH changed AS (
+      SELECT DISTINCT src, dst, edge_kind AS kind FROM atlas_feed
+      WHERE repo_id = ?1 AND kind = 'edge' AND id > ?2 AND id <= ?3 AND (src, dst, edge_kind) > (?4, ?5, ?6)
+      ORDER BY src, dst, edge_kind LIMIT ?7)`;
+    const bind = [repoId, increment.base, increment.mark, ...start, limit];
+    const [now, before] = await Promise.all([
+      d1
+        .prepare(
+          `${changed} SELECT c.src, c.dst, c.kind, k.weight FROM changed c
+           LEFT JOIN kg_edges k ON k.repo_id = ?1 AND k.src = c.src AND k.dst = c.dst AND k.kind = c.kind
+           ORDER BY c.src, c.dst, c.kind`,
+        )
+        .bind(...bind)
+        .all<{ src: string; dst: string; kind: string; weight: number | null }>(),
+      d1
+        .prepare(
+          `${changed} SELECT a.src, a.dst, a.kind, a.from_seq, a.weight FROM changed c
+           JOIN atlas_edges a ON a.scope = ?8 AND a.src = c.src AND a.dst = c.dst AND a.kind = c.kind
+           AND a.to_seq IS NULL`,
+        )
+        .bind(...bind, scope)
+        .all<{ src: string; dst: string; kind: string; from_seq: number; weight: number }>(),
+    ]);
+    final = now.results.length < limit;
+    const lastRow = now.results.at(-1);
+    last = lastRow ? [lastRow.src, lastRow.dst, lastRow.kind] : null;
+    rows = now.results.flatMap((r) => (r.weight === null ? [] : [{ ...r, weight: r.weight }]));
+    open = before.results;
+  } else {
+    const edges = await d1
+      .prepare(
+        `SELECT src, dst, kind, weight FROM kg_edges
+         WHERE repo_id = ? AND (src, dst, kind) > (?, ?, ?)
+         ORDER BY src, dst, kind LIMIT ?`,
+      )
+      .bind(repoId, ...start, limit)
+      .all<{ src: string; dst: string; kind: string; weight: number }>();
+    rows = edges.results;
+    final = rows.length < limit;
+    const lastRow = rows.at(-1);
+    last = lastRow ? [lastRow.src, lastRow.dst, lastRow.kind] : null;
+    const bounds = final || !last ? "" : "AND (src, dst, kind) <= (?, ?, ?)";
+    // `+to_seq`: walk the key range by primary key, not every open row by to_seq.
+    open = (
+      await d1
+        .prepare(
+          `SELECT src, dst, kind, from_seq, weight FROM atlas_edges
+           WHERE scope = ? AND +to_seq IS NULL AND (src, dst, kind) > (?, ?, ?) ${bounds}`,
+        )
+        .bind(scope, ...start, ...(final || !last ? [] : last))
+        .all<{ src: string; dst: string; kind: string; from_seq: number; weight: number }>()
+    ).results;
+  }
   const key = (e: { src: string; dst: string; kind: string }) =>
     `${e.src}\u0000${e.dst}\u0000${e.kind}`;
-  const existing = new Map(open.results.map((e) => [key(e), e]));
+  const existing = new Map(open.map((e) => [key(e), e]));
 
   const insert: { src: string; dst: string; kind: string; weight: number }[] = [];
   const close: { src: string; dst: string; kind: string }[] = [];

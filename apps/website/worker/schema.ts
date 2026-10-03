@@ -358,6 +358,19 @@ export interface Database {
     failure: "capacity" | null;
     /** CORE-167: packages the repository publishes, frozen at build (worker/atlas/publishers.ts). */
     packages: string | null;
+    /** CORE-166: the atlas_feed position it reflects (null: the next projection is full). */
+    feed_mark: number | null;
+    /** CORE-166: the position an incremental projection started from (null: full). */
+    feed_base: number | null;
+  };
+  /** CORE-166: graph changes not yet reflected in a published Atlas snapshot. */
+  atlas_feed: {
+    id: Generated<number>;
+    repo_id: string;
+    kind: "node" | "edge" | "full";
+    src: Generated<string>;
+    dst: Generated<string>;
+    edge_kind: Generated<string>;
   };
   atlas_assignments: {
     scope: string;

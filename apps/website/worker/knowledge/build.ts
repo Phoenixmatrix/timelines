@@ -288,7 +288,9 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const current = await currentSnapshot(env.DB, repoScope(repoId));
           return !current || !(await recordsPackages(env.DB, current.id));
         });
-        const atlas = missing ? await this.#project(step, progress, repoId, buildId, head) : {};
+        const atlas = missing
+          ? await this.#project(step, progress, repoId, buildId, head, null)
+          : {};
         await this.#finish(step, repoId, buildId, head, { upToDate: true, ...atlas });
         return { status: "up-to-date" };
       }
@@ -514,7 +516,8 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         }),
       );
 
-      await progress("graph-final", "synthesize", () =>
+      // When upstream graph inputs are ready: what Atlas timings are measured from.
+      const graphFinal = await progress("graph-final", "synthesize", () =>
         this.#withReader(row, async (reader) => {
           const files = await loadSnapshot(env.DB, repoId, buildId);
           const analyses = await loadAnalyses(
@@ -547,10 +550,12 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           await recordStats(env.DB, buildId, {
             synthesized: synthesis.components + synthesis.concepts + (synthesis.repo ? 1 : 0),
           });
-          return null;
+          return { readyAt: Date.now() };
         }),
       );
-      const atlas = await this.#project(step, progress, repoId, buildId, head);
+      // A replay of a step recorded before readiness was returned has none.
+      const readyAt = graphFinal?.readyAt ?? null;
+      const atlas = await this.#project(step, progress, repoId, buildId, head, readyAt);
 
       await progress("index", "index", () =>
         this.#withReader(row, async (reader) => {
@@ -602,6 +607,8 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           await recordStats(env.DB, buildId, {
             vectorsUpserted: vectors.upserted,
             searchUploaded: search.uploaded,
+            // Index lag, reported apart from the Atlas projection (CORE-166).
+            ...(readyAt === null ? {} : { indexLagMs: Date.now() - readyAt }),
           });
           return null;
         }),
@@ -768,6 +775,12 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
    * retries are safe. A failure is rolled back and recorded in the build's
    * stats; it never fails the knowledge build, and the published snapshot
    * stays current.
+   *
+   * After a published snapshot, only what the graph's change feed lists is
+   * projected (CORE-166). `atlasTimings` records the time from `readyAt`
+   * (upstream graph inputs ready; null: from this pass's start) to
+   * publication, with the model's share and stale or missing prose beside it,
+   * so slow or stale inference is never hidden inside the projection time.
    */
   async #project(
     step: WorkflowStep,
@@ -775,12 +788,16 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     repoId: string,
     buildId: string,
     head: string,
+    readyAt: number | null,
   ): Promise<Record<string, unknown>> {
     const env = this.env;
     const scope = repoScope(repoId);
-    const begun = await progress("atlas-start", "atlas", () =>
-      beginRepoProjection(env.DB, repoId, [{ repoId, commit: head, buildId }]),
-    );
+    const begun = await progress("atlas-start", "atlas", async () => ({
+      ...(await beginRepoProjection(env.DB, repoId, [{ repoId, commit: head, buildId }])),
+      startedAt: Date.now(),
+    }));
+    // (A start recorded before CORE-166 has no time: measure from now.)
+    const from = readyAt ?? begun.startedAt ?? Date.now();
     try {
       // What the repository publishes, frozen into the snapshot for resolving
       // cross-repository dependencies (CORE-167). Never fails the projection.
@@ -801,25 +818,41 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         seq: begun.seq,
         commit: head,
       };
-      let described: DescribeStats | { error: string };
+      let described: DescribeStats | { error: string; fallback: DescribeStats };
+      let describeMs = 0;
+      // Describe's own time rides along in its stats (steps recorded before had none).
+      const timed = async (work: () => Promise<DescribeStats>) => {
+        const started = Date.now();
+        const stats = await work();
+        return { ...stats, ms: Date.now() - started };
+      };
       try {
-        described = await progress(
+        const result = await progress(
           "atlas-describe",
           "atlas",
           () =>
-            describeRepoCapabilities(env, context, {
-              infer: atlasInfer(env.DB, { kind: "build", repoId, buildId }),
-            }),
+            timed(() =>
+              describeRepoCapabilities(env, context, {
+                infer: atlasInfer(env.DB, { kind: "build", repoId, buildId }),
+              }),
+            ),
           PAID_STEP,
         );
+        described = result;
+        describeMs = result.ms ?? 0;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error("Atlas capability descriptions failed", repoId, error);
-        await progress("atlas-describe-fallback", "atlas", () =>
-          describeRepoCapabilities(env, context, { infer: null, unavailable: "error" }),
+        const fallback = await progress("atlas-describe-fallback", "atlas", () =>
+          timed(() =>
+            describeRepoCapabilities(env, context, { infer: null, unavailable: "error" }),
+          ),
         );
-        described = { error: message.slice(0, 500) };
+        // What the fallback labelled stale or unavailable stays visible.
+        described = { error: message.slice(0, 500), fallback };
+        describeMs = fallback.ms ?? 0;
       }
+      let entitySteps = 0;
       let after: string | null = null;
       for (let i = 0; ; i++) {
         const cursor: string | null = after;
@@ -828,9 +861,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           "atlas",
           () => projectEntities(env.DB, repoId, begun.snapshotId, begun.seq, cursor),
         );
+        entitySteps++;
         after = batch.next;
         if (!after) break;
       }
+      let edgeSteps = 0;
       let edges: EdgeCursor = null;
       for (let i = 0; ; i++) {
         const cursor: EdgeCursor = edges;
@@ -839,6 +874,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           "atlas",
           () => projectEdges(env.DB, repoId, begun.snapshotId, begun.seq, cursor),
         );
+        edgeSteps++;
         edges = batch.next;
         if (!edges) break;
       }
@@ -854,8 +890,28 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           atlasError: admission.error.slice(0, 500),
           atlasCapacity: { storedBytes: admission.storedBytes, capBytes: admission.capBytes },
         };
-      await progress("atlas-publish", "atlas", async () => {
+      const publishedAt = await progress("atlas-publish", "atlas", async () => {
         await publishProjection(env.DB, scope, begun.snapshotId, begun.seq);
+        return Date.now();
+      });
+      const summaries = "error" in described ? described.fallback : described;
+      const atlasTimings = {
+        mode: begun.incremental ? "incremental" : "full",
+        // From upstream graph readiness (or this pass's start) to publication.
+        projectMs: publishedAt - from,
+        // The model's share of it, with what it couldn't keep current.
+        describeMs,
+        modelCalls: summaries.inferred,
+        staleSummaries: summaries.stale,
+        unavailableSummaries: summaries.unavailable,
+        measuredFrom: readyAt === null ? "atlas-start" : "graph-final",
+        regrouped: grouping.regrouped,
+        feedRows: begun.feedRows,
+        entitySteps,
+        edgeSteps,
+      };
+      await progress("atlas-timings", "atlas", async () => {
+        await recordStats(env.DB, buildId, { atlasTimings });
         return null;
       });
       // The superseded snapshot becomes a prior: stamp its expiry, and drop
@@ -868,6 +924,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       return {
         atlasSnapshot: begun.snapshotId,
         atlasSeq: begun.seq,
+        atlasTimings,
         atlasCapabilities: grouping.capabilities,
         atlasUnclassified: grouping.unclassified,
         atlasDescribed: described,

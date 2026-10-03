@@ -1188,6 +1188,25 @@ a snapshot writes only what changed, and `atlas_current` moves to it in one
 statement once it's complete. Interrupted snapshots never become current and
 are rolled back before the next.
 
+**Incremental Atlas projection** (`worker/atlas/feed.ts`, CORE-166).
+`applyGraph` appends every node and edge it changes to `atlas_feed`, ahead of
+the graph writes; a published snapshot records the feed position it reflects
+(`feed_mark`) and consumes the rows up to it, while a failed one leaves them for
+the next build. So after the first projection a build reads only the changed
+nodes, both ends of changed edges and the files whose placement moved, not the
+whole graph, and regroups only when grouping's inputs changed (imports between
+files, mentions, which files are analyzed, concept names), recording only the
+placements that differ from the published ones. Past `FEED_LIMIT` listed
+changes, after a projection or grouping version change, or after a snapshot from
+before the feed, it reads everything. Either way the published content equals a
+full pass over the same graph and history (`incremental.test.ts`). Build stats
+carry `atlasTimings`: `projectMs` from `graph-final` (upstream graph inputs
+ready) to publication, with the model's share (`describeMs`, `modelCalls`) and
+the prose it couldn't keep current (`staleSummaries`, `unavailableSummaries`)
+beside it, and index lag separately as `indexLagMs`. To measure on a synthetic
+repository: `ATLAS_BENCH=20000 vp test --disableConsoleIntercept
+worker/atlas/incremental.bench.test.ts`.
+
 **Capability grouping** (`worker/atlas/grouping.ts`, CORE-163, v3 from
 CORE-183, `GROUPING_VERSION`). Before the entity batches, the build groups
 analyzed files into capabilities from non-path evidence only: direct imports
@@ -1209,6 +1228,26 @@ and cross-cutting references that never count twice. Directory components
 remain, under their folders, as inputs. On this repository v3 gives 12
 capabilities and 80 areas with 90 related capability pairs, where v2 merged any
 linked areas (9 capabilities, 31 related pairs).
+
+**Capability names and summaries** (`worker/atlas/describe.ts`, CORE-164,
+`DESCRIBE_VERSION`). The `atlas-describe` step, after grouping and before the
+entity batches, names each capability and writes a 2-3 sentence summary and a
+membership rationale, from source-backed inputs only: member files' cards, the
+directory components' syntheses and the shared concepts, never other
+capabilities' prose. It never moves a member or changes an id, so a change in
+wording can't change membership. Results are cached in `kg_synthesis` under a
+hash of exactly those inputs (and the repository), so identical inputs are
+never inferred twice. A miss is one paid call through the Atlas budget
+(`atlasInfer`), in a step that doesn't retry. Capabilities' `data` keeps three
+kinds apart (types in `shared/atlas.ts`): `description` (`status` current,
+stale or unavailable, with `reason`), `provenance.structural` (grouping),
+`provenance.inferred` (model, versions, inputs hash, the source version it was
+written from, what it was derived from, and the cited files at their commit
+and blob, with ranges or `unavailable`) and `provenance.curated` (none yet).
+With a cap reached, an unpriced model, a provider error or a failed step,
+capabilities keep their interim names and empty `summary`; `description`
+carries the previous snapshot's prose labelled `stale` with its original basis,
+or nothing (`unavailable`). List responses show it as `summaryState`.
 
 **Capability identity and layout** (`worker/atlas/identity.ts`, CORE-165).
 Grouping recomputes capabilities every build, so public ids come from
