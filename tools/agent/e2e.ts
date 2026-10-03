@@ -1257,6 +1257,35 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
                 ).toBeVisible();
               },
             );
+            // A single physical click must discard even after refocusing invalid text.
+            // Locator.click() can retry a detached button and hide the blur/unmount race.
+            await page.locator('[data-edit-field="title"]').click();
+            const editor = page.getByRole("form", { name: "Edit Title", exact: true });
+            const title = editor.getByRole("textbox", { name: "Title", exact: true });
+            await title.fill("");
+            await editor
+              .getByText("Text saves when you leave a field. Selections save immediately.")
+              .click();
+            await expect(editor.getByRole("alert")).toHaveText("Give this issue a title.");
+            await title.focus();
+            const discard = editor.getByRole("button", { name: "Discard unsaved changes" });
+            const discardBox = await discard.boundingBox();
+            assert.ok(discardBox, "Discard must be visible");
+            await page.mouse.click(
+              discardBox.x + discardBox.width / 2,
+              discardBox.y + discardBox.height / 2,
+            );
+            await expect(editor).toBeHidden();
+            await page.reload();
+            await expect(page.locator('[data-edit-field="title"]')).toHaveText(
+              "Agent ready fixture",
+            );
+            await expect(editor).toHaveCount(0);
+            record({
+              discardedInvalidDraft: true,
+              singlePointerClick: true,
+              reloadAssertions: true,
+            });
             await persistent(`/${repo.owner}/-/packages/generic/${packageName}`, async () => {
               await expect(
                 page.getByRole("heading", { name: packageName, exact: true }),

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FocusEvent } from "react";
 import { Link, useBlocker } from "react-router";
 import {
   actorName,
@@ -158,12 +158,18 @@ export function IssueDetail({
   const savingRef = useRef(false);
   const [saved, setSaved] = useState(false);
   const [finishRequested, setFinishRequested] = useState(false);
+  const discardButtonRef = useRef<HTMLButtonElement>(null);
   const dirty = fieldKeys.some((key) => !same(draft.fields[key], draft.base?.[key]));
   const hasUnsavedChanges = editing && (dirty || saving || pendingFields.length > 0);
   const navigation = useBlocker(hasUnsavedChanges);
   const enqueue = (keys: (keyof IssueFields)[]) => {
     setPendingFields((previous) => [...new Set([...previous, ...keys])]);
     setLocalError("");
+  };
+  const saveOnBlur = (event: FocusEvent, field: keyof IssueFields) => {
+    // Discard must retain its error controls until its click runs, without saving.
+    if (discardButtonRef.current && event.relatedTarget === discardButtonRef.current) return;
+    enqueue([field]);
   };
   const [body, setBody] = useState("");
   const [kind, setKind] = useState<Comment["kind"]>("comment");
@@ -601,6 +607,7 @@ export function IssueDetail({
             Retry saving
           </button>
           <button
+            ref={discardButtonRef}
             className="mk-btn mk-btn--ghost mk-btn--sm"
             type="button"
             disabled={busy || saving}
@@ -696,7 +703,7 @@ export function IssueDetail({
           required
           maxLength={500}
           onChange={(event) => change("title", event.target.value)}
-          onBlur={() => enqueue(["title"])}
+          onBlur={(event) => saveOnBlur(event, "title")}
         />
       )}
       {mode === "all" && (
@@ -779,7 +786,7 @@ export function IssueDetail({
               label="Labels (comma separated)"
               value={draft.fields.labels.join(",")}
               onChange={(event) => change("labels", event.target.value.split(","))}
-              onBlur={() => enqueue(["labels"])}
+              onBlur={(event) => saveOnBlur(event, "labels")}
             />
           </div>
           <MultiCheck
@@ -816,7 +823,7 @@ export function IssueDetail({
               rows={12}
               value={draft.fields.description}
               onChange={(event) => change("description", event.target.value)}
-              onBlur={() => enqueue(["description"])}
+              onBlur={(event) => saveOnBlur(event, "description")}
               placeholder="Describe the outcome, context, and approach. Markdown supported."
             />
           )}
@@ -835,7 +842,7 @@ export function IssueDetail({
               rows={6}
               value={draft.fields.acceptance}
               onChange={(event) => change("acceptance", event.target.value)}
-              onBlur={() => enqueue(["acceptance"])}
+              onBlur={(event) => saveOnBlur(event, "acceptance")}
               placeholder="- [ ] What must be true when this is done?"
             />
           )}

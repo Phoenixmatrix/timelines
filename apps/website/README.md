@@ -657,6 +657,8 @@ read as `agent_decides`.
   workspace checkboxes save immediately. Saves are serialized, preserving edits
   made while an earlier request is running. The editor shows Saving, Saved, or
   an error with retry/discard controls; closing an issue waits for a close reason.
+  **Discard unsaved changes** closes the draft without autosaving the focused
+  field; previously saved values remain unchanged.
   **Done**, **Ctrl/Cmd+Enter**, or **Esc** saves remaining changes and finishes
   editing; Enter does the same in a title. Navigation waits for pending edits to
   save, and unsaved drafts survive a reload in the same tab. **Edit issue** (or
