@@ -143,7 +143,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("runs wait", git: "", kw: "ci wait block until build finishes tests pass green check result after push", mutates: false, out: Out::Other("CiRunDetail; exits 4 (code run_failed) when the run fails"), ex: ["gm runs wait", "gm push && gm runs wait", "gm runs wait 12", "gm runs wait --commit @-"]),
     meta!("runs start", git: "", kw: "ci trigger start run build manually dispatch", mutates: true, out: Out::Other("{number}"), ex: ["gm runs start", "gm runs start --ref feature-x"]),
     meta!("runs cancel", git: "", kw: "ci cancel stop abort run build", mutates: true, out: Out::Other("{cancelled}"), ex: ["gm runs cancel 12"]),
-    meta!("deploy record", git: "", kw: "deploy deployment record preview environment url production timeline checkpoint ci job report where deployed", mutates: true, out: Out::Other("Deployment {id,environment,timeline,timelineId,checkpoint,commit,url,status:'active'|'sleeping'|'expired'|'failed',run,job,actor,agent,expiresAt,createdAt,updatedAt}. In a CI job (GITMATRIX_TOKEN) the server fills in the run, job, commit and environment from the branch; elsewhere pass --commit. Records outlive expired previews."), ex: ["gm deploy record --url \"$PREVIEW_URL\"", "gm deploy record --url https://app.example.com --environment production --commit @-", "gm deploy record --status failed --timeline fast-search"]),
+    meta!("deploy record", git: "", kw: "deploy deployment record preview environment url production timeline checkpoint ci job report where deployed", mutates: true, out: Out::Other("Deployment {id,environment,timeline,timelineId,checkpoint,commit,url,status:'active'|'sleeping'|'expired'|'failed',run,job,actor,agent,expiresAt,createdAt,updatedAt}. In a CI job (GITMATRIX_TOKEN) the server fills in the run, job, commit and environment from the branch (production, timeline/<slug> or branch/<name>); elsewhere pass --commit. Records outlive expired previews."), ex: ["gm deploy record --url \"$PREVIEW_URL\"", "gm deploy record --url https://app.example.com --environment production --commit @-", "gm deploy record --status failed --timeline fast-search"]),
     meta!("deploy list", git: "", kw: "deployments environments previews where is it deployed url status history timeline commit run", mutates: false, out: Out::Other("{deployments:[Deployment],next:number|null}; newest first"), ex: ["gm deploy list", "gm deploy list --timeline fast-search", "gm deploy list --run 12", "gm deploy list --environment production --status active"]),
     meta!("deploy update", git: "", kw: "deployment status expire teardown sleeping failed url change mark preview expired", mutates: true, out: Out::Other("Deployment"), ex: ["gm deploy update 42 --status expired", "gm deploy update 42 --expires 2d"]),
     meta!("runs rerun", git: "", kw: "ci retry rerun again restart build flaky", mutates: true, out: Out::Other("{number}"), ex: ["gm runs rerun 12"]),
@@ -678,7 +678,8 @@ Starting a commit that's already running returns that run; jobs with `paths:` sk
 themselves when those paths are unchanged since they last passed.
 Gitmatrix deploys nothing; a job that deploys records where it went with
 `gm deploy record --url "$URL"` (environment, commit and run come from the job;
-a `timeline/<slug>` branch makes it that timeline's preview). Outside CI pass
+a `timeline/<slug>` branch makes it that timeline's preview, another branch
+deploys to `branch/<name>`; `--environment` overrides). Outside CI pass
 `--commit`. `gm deploy list --run N|--timeline SLUG`, `gm deploy update ID --status expired`.
 
 ## Packages

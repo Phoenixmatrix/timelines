@@ -26,6 +26,33 @@ export function timelineOfEnvironment(environment: string): string | null {
   return match ? match[1]! : null;
 }
 
+/** The longest `branch/<name>` environment. */
+export const MAX_BRANCH_ENVIRONMENT = 200;
+
+/**
+ * A branch's environment, for a branch that is neither the default branch nor
+ * a timeline's (CORE-138): `branch/<name>`, lowercased, with each run of
+ * characters other than letters, digits, '.', '_' and '-' as one '-', and each
+ * '/'-separated part starting with a letter or digit and ending with one
+ * (`Feature/Add login` is `branch/feature/add-login`). Null when nothing
+ * usable is left or the name is longer than {@link MAX_BRANCH_ENVIRONMENT}.
+ */
+export function branchEnvironment(branch: string): string | null {
+  const parts = branch
+    .toLowerCase()
+    .split("/")
+    .map((part) =>
+      part
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^[^a-z0-9]+/, "")
+        .replace(/[^a-z0-9]+$/, ""),
+    )
+    .filter(Boolean);
+  if (!parts.length) return null;
+  const environment = `branch/${parts.join("/")}`;
+  return environment.length > MAX_BRANCH_ENVIRONMENT ? null : environment;
+}
+
 export interface Deployment {
   id: number;
   environment: string;
@@ -64,7 +91,8 @@ export interface RecordDeployment {
   /**
    * Default: `timeline/<slug>` for a timeline; inside CI, the job's branch
    * (`production` for the default branch, its timeline for a timeline
-   * bookmark); otherwise `production`.
+   * bookmark, `branch/<name>` for any other: see {@link branchEnvironment});
+   * otherwise `production`.
    */
   environment?: string;
   /** A timeline slug; implied by a `timeline/<slug>` environment or branch. */

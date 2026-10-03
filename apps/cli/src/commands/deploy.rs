@@ -49,9 +49,10 @@ pub struct RecordArgs {
     /// Where the deployment answers (http or https). Only a failed deployment may omit it.
     #[arg(long)]
     pub url: Option<String>,
-    /// Environment: `production`, `timeline/<slug>` or a name of your own. Default: the
-    /// timeline's; in CI, from the branch (default branch: production; timeline/<slug>: its
-    /// timeline); otherwise production.
+    /// Environment: `production`, `timeline/<slug>`, `branch/<name>` or a name of your own.
+    /// Default: the timeline's; in CI, from the branch (default branch: production;
+    /// timeline/<slug>: its timeline; any other: branch/<name>, lowercased); otherwise
+    /// production.
     #[arg(short, long)]
     pub environment: Option<String>,
     /// Timeline slug (default: $GITMATRIX_TIMELINE).

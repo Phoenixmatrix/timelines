@@ -1,10 +1,11 @@
 import { Hono } from "hono";
 import { describe, expect, test, vi } from "vite-plus/test";
-import type {
-  Deployment,
-  DeploymentList,
-  EnvironmentList,
-  PreviewSettings,
+import {
+  branchEnvironment,
+  type Deployment,
+  type DeploymentList,
+  type EnvironmentList,
+  type PreviewSettings,
 } from "../../shared/deployments.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
@@ -85,7 +86,7 @@ async function setup() {
     );
     return { status: response.status, json: (await response.json()) as never };
   };
-  return { call, tokens, sqlite };
+  return { call, tokens, sqlite, env };
 }
 
 describe("recording deployments", () => {
@@ -142,14 +143,59 @@ describe("recording deployments", () => {
     expect(days).toBeLessThanOrEqual(7);
   });
 
-  test("a job on another branch must name its environment", async () => {
+  test("a job on another branch records into branch/<name> unless it names one", async () => {
     const t = await setup();
     const path = "/api/repos/orbit/app/deployments";
     const url = "https://topic.example.com";
-    expect((await t.call(t.tokens.topic, "POST", path, { url })).status).toBe(400);
+    const inferred = await t.call(t.tokens.topic, "POST", path, { url });
+    expect(inferred.status).toBe(201);
+    expect(inferred.json as Deployment).toMatchObject({
+      environment: "branch/topic",
+      timeline: null,
+      commit: oid(9),
+      run: 9,
+      expiresAt: null,
+    });
     const named = await t.call(t.tokens.topic, "POST", path, { url, environment: "staging" });
     expect(named.status).toBe(201);
     expect((named.json as Deployment).environment).toBe("staging");
+    const environments = (await t.call(t.tokens.ann, "GET", "/api/repos/orbit/app/environments"))
+      .json as EnvironmentList;
+    expect(environments.environments.map((e) => [e.name, e.timeline])).toEqual([
+      ["production", null],
+      ["staging", null],
+      ["branch/topic", null],
+    ]);
+  });
+
+  test("a job on a nested branch records into its normalised branch/<name>", async () => {
+    const t = await setup();
+    t.sqlite.exec(`
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status)
+        VALUES ('run4', 'repo', 10, '${oid(10)}', 'Feature/Login_v2.1+fix', 'push', 'acc_ann', 'running');
+      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
+        VALUES ('job5', 'run4', 'repo', 'preview', '{}', 'running', 'sandbox');
+    `);
+    const { status, json } = await t.call(
+      await mintJobToken(t.env.DB, "job5", 30),
+      "POST",
+      "/api/repos/orbit/app/deployments",
+      { url: "https://login.example.com" },
+    );
+    expect(status).toBe(201);
+    expect(json as Deployment).toMatchObject({
+      environment: "branch/feature/login_v2.1-fix",
+      timeline: null,
+    });
+    // The normalised name reads back as an environment of its own.
+    const list = (
+      await t.call(
+        t.tokens.ann,
+        "GET",
+        "/api/repos/orbit/app/deployments?environment=branch/feature/login_v2.1-fix",
+      )
+    ).json as DeploymentList;
+    expect(list.deployments.map((d) => d.run)).toEqual([10]);
   });
 
   test("a job only writes its own repository, and only while it runs", async () => {
@@ -203,6 +249,12 @@ describe("recording deployments", () => {
     expect((await post({ url: "https://x.example.com", environment: "timeline/x/y" })).status).toBe(
       400,
     );
+    // branch/<name> takes slashes, but only in its normal form.
+    for (const environment of ["branch/Topic", "branch/a//b", "branch/a b", "branch/-a", "branch/"])
+      expect((await post({ url: "https://x.example.com", environment })).status).toBe(400);
+    const nested = await post({ url: "https://x.example.com", environment: "branch/a/b.c/d_e-f" });
+    expect(nested.status).toBe(201);
+    expect((nested.json as Deployment).environment).toBe("branch/a/b.c/d_e-f");
     expect(
       (await post({ url: "https://x.example.com", environment: "production", timeline: "a" }))
         .status,
@@ -306,7 +358,33 @@ describe("placement", () => {
       environment: "timeline/y",
       timeline: "y",
     });
+    expect(placement({}, { ref: "topic", defaultBranch: "main" })).toEqual({
+      environment: "branch/topic",
+      timeline: null,
+    });
+    expect(placement({ environment: "staging" }, { ref: "topic", defaultBranch: "main" })).toEqual({
+      environment: "staging",
+      timeline: null,
+    });
     expect(() => placement({ environment: "timeline/x", timeline: "y" }, null)).toThrow();
+    // A branch whose name leaves nothing usable must name its environment.
+    expect(() => placement({}, { ref: "+++", defaultBranch: "main" })).toThrow(
+      /name the environment/,
+    );
+  });
+});
+
+describe("branchEnvironment", () => {
+  test("lowercases a branch and keeps its parts, with unsafe characters as '-'", () => {
+    expect(branchEnvironment("topic")).toBe("branch/topic");
+    expect(branchEnvironment("feature/add-login")).toBe("branch/feature/add-login");
+    expect(branchEnvironment("release/1.2.x")).toBe("branch/release/1.2.x");
+    expect(branchEnvironment("Fix/Some Bug#12")).toBe("branch/fix/some-bug-12");
+    expect(branchEnvironment("deps/@types/node")).toBe("branch/deps/types/node");
+    expect(branchEnvironment("users/ann/.wip-")).toBe("branch/users/ann/wip");
+    expect(branchEnvironment("timeline/Not_A_Slug")).toBe("branch/timeline/not_a_slug");
+    expect(branchEnvironment("+/@")).toBeNull();
+    expect(branchEnvironment("x".repeat(300))).toBeNull();
   });
 });
 

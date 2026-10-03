@@ -9,6 +9,10 @@
 //   GET    /environments          `production` and every environment recorded,
 //                                 each with its newest deployment
 //
+// Environments: `production` (the default branch), `timeline/<slug>` (a
+// timeline's previews), `branch/<name>` (any other branch a CI job deploys
+// from) or a name of the recorder's own.
+//
 // Gitmatrix deploys nothing (TIMELINES-RESEARCH.md, "Previews: primitives, not
 // hosting"); jobs and outside systems record what they deployed. Records stay
 // when a preview expires: only the status changes.
@@ -16,7 +20,9 @@
 import { Hono, type Context } from "hono";
 import { sql, type InferResult } from "kysely";
 import {
+  branchEnvironment,
   DEPLOYMENT_STATUSES,
+  MAX_BRANCH_ENVIRONMENT,
   PRODUCTION,
   timelineEnvironment,
   timelineOfEnvironment,
@@ -44,6 +50,7 @@ const MAX_ENVIRONMENTS = 200;
 const OID = /^[0-9a-f]{40}$/;
 const SEGMENT = "[a-z0-9](?:[a-z0-9._-]{0,62})";
 const ENVIRONMENT = new RegExp(`^${SEGMENT}(?:/${SEGMENT})?$`);
+const BRANCH = "branch/";
 const TIMELINE_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CHECKPOINT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const MAX_URL = 2048;
@@ -185,9 +192,16 @@ function expiry(value: unknown): string | null | undefined {
 }
 
 function environmentName(value: string): string {
+  if (value.startsWith(BRANCH)) {
+    if (branchEnvironment(value.slice(BRANCH.length)) !== value)
+      throw new Invalid(
+        `A branch's environment is branch/<name>: lowercase letters, digits, '.', '_' and '-' in '/'-separated parts that start and end with a letter or digit, ${MAX_BRANCH_ENVIRONMENT} characters at most.`,
+      );
+    return value;
+  }
   if (!ENVIRONMENT.test(value))
     throw new Invalid(
-      "An environment is a lowercase name such as production or timeline/<slug>: letters, digits, '.', '_' and '-', with at most one '/'.",
+      "An environment is a lowercase name such as production, timeline/<slug> or branch/<name>: letters, digits, '.', '_' and '-', with at most one '/' outside branch/<name>.",
     );
   if (value.startsWith("timeline/") && !timelineOfEnvironment(value))
     throw new Invalid("A timeline's environment is timeline/<slug>.");
@@ -222,8 +236,11 @@ export function placement(
   const fromBranch = timelineSlugOf(`refs/heads/${job.ref}`);
   if (fromBranch) return { environment: timelineEnvironment(fromBranch), timeline: fromBranch };
   if (job.ref === job.defaultBranch) return { environment: PRODUCTION, timeline: null };
+  // Any other branch gets its own environment (CORE-138).
+  const fromOther = branchEnvironment(job.ref);
+  if (fromOther) return { environment: fromOther, timeline: null };
   throw new Invalid(
-    `Branch ${job.ref} is neither the default branch nor a timeline; name the environment.`,
+    `Branch ${job.ref} has no usable environment name (branch/<name>, ${MAX_BRANCH_ENVIRONMENT} characters at most); name the environment.`,
   );
 }
 

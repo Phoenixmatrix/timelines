@@ -1101,8 +1101,8 @@ re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
 Gitmatrix deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not
 hosting"): a job that deploys records where it went, and the run page and the
 commit list show it. An environment is a name per repository: `production`,
-`timeline/<slug>` for a timeline's previews, or any name a project uses
-(`staging`). Records keep the environment, timeline, checkpoint, commit, URL,
+`timeline/<slug>` for a timeline's previews, `branch/<name>` for any other
+branch a job deploys from, or any name a project uses (`staging`). Records keep the environment, timeline, checkpoint, commit, URL,
 status (`active`, `sleeping`, `expired`, `failed`), the run and job that
 recorded them, the person and agent accountable, and an expiry. Expiring a
 preview changes its status; the record stays. `shared/deployments.ts` defines
@@ -1122,7 +1122,11 @@ the wire types (`worker/deployments/`).
   only for the job's repository while it runs. A job's record takes its run,
   job, commit and accountable person from the run, and its environment from
   the branch: `production` on the default branch, `timeline/<slug>` on a
-  timeline bookmark; other branches name one.
+  timeline bookmark, `branch/<name>` on any other branch (lowercased; runs of
+  characters other than letters, digits, `.`, `_` and `-` become `-`, so
+  `Feature/Add login` deploys to `branch/feature/add-login`). An explicit
+  `environment` always wins. A `branch/<name>` given by hand must already be
+  in that form.
 - **`gm deploy record --url <url>`** in a job; outside CI add `--commit`.
   `gm deploy list` and `gm deploy update <id> --status expired` read and
   change records.

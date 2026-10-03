@@ -94,7 +94,8 @@ notes regenerate lazily on read; check the index's status while generation runs.
 Gitmatrix deploys nothing; whatever deploys tells it where code went. Inside a CI
 job, `gm deploy record` acts as the job (`GITMATRIX_TOKEN`): the server fills in
 the repository, run, job and commit, and the environment from the branch
-(`production` on the default branch, `timeline/<slug>` on a timeline bookmark).
+(`production` on the default branch, `timeline/<slug>` on a timeline bookmark,
+`branch/<name>` on any other, lowercased); `--environment` overrides it.
 Elsewhere it records as you and needs `--commit`. Records outlive their
 previews: tearing one down marks it `expired`.
 
