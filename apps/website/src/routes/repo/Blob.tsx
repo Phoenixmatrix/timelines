@@ -157,6 +157,7 @@ export function Blob() {
           refName={blob.ref}
           path={blob.path}
           view="blob"
+          commit={blob.commitOid}
           onSwitch={(ref) => navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path))}
         />
         <FileHistory

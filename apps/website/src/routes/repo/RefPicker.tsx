@@ -3,6 +3,7 @@ import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import type { RepoDetail } from "../../../shared/api.ts";
 import { SelectField } from "../../components/ui.tsx";
 import { encodePath, repoPath } from "../../lib/refs.ts";
+import { CommitCi, refCommit } from "./CommitCi.tsx";
 
 /** Branch or tag switcher plus a breadcrumb for the current path. */
 export function RefBar({
@@ -10,12 +11,15 @@ export function RefBar({
   refName,
   path,
   view,
+  commit,
   onSwitch,
 }: {
   repo: RepoDetail;
   refName: string;
   path: string;
   view: "tree" | "blob" | "commits";
+  /** The exact commit on screen, when the page read one; else the ref's head. */
+  commit?: string;
   onSwitch: (ref: string) => void;
 }) {
   const options = [
@@ -78,6 +82,7 @@ export function RefBar({
           })}
         </nav>
       )}
+      <CommitCi repo={repo} refName={refName} oid={commit ?? refCommit(repo, refName)} />
     </div>
   );
 }

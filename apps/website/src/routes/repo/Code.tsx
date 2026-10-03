@@ -308,6 +308,7 @@ export function Code() {
           refName={tree.ref}
           path={tree.path}
           view="tree"
+          commit={tree.commit.oid}
           onSwitch={(ref) => navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path))}
         />
 
