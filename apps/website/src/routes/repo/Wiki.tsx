@@ -151,7 +151,7 @@ export function Wiki() {
 
   return (
     <div className="grid gap-x-8 gap-y-8 md:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,46rem)_minmax(15rem,19rem)] xl:gap-x-12">
-      <aside className="md:row-span-3 md:sticky md:top-6 md:max-h-[calc(100dvh-3rem)] md:self-start md:overflow-y-auto">
+      <aside className="md:row-span-3 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start md:overflow-y-auto">
         <Sidebar catalog={catalog} owner={repo.owner.slug} name={repo.name} />
       </aside>
       <article className="min-w-0 md:col-start-2 [&_h2]:scroll-mt-6 [&_h3]:scroll-mt-6">

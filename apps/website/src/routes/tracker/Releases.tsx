@@ -4,11 +4,13 @@ import {
   Form,
   Link,
   useLoaderData,
+  useLocation,
   useNavigate,
   useRevalidator,
   type LoaderFunctionArgs,
 } from "react-router";
 import {
+  landedTimelineSlug,
   releaseKind,
   releaseLabel,
   timelineLabel,
@@ -22,6 +24,7 @@ import { SelectField } from "../../components/ui.tsx";
 import { api, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { scopeOf } from "../../lib/timelineScope.ts";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
   const q = new URL(request.url).searchParams.get("q") ?? "";
@@ -102,11 +105,14 @@ function Facets({
   );
 }
 
-function Entry({ entry }: { entry: ReleaseFeedEntry }) {
+function Entry({ entry, scope }: { entry: ReleaseFeedEntry; scope: string | null }) {
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <span className="mk-chip mk-chip--tag">{CATEGORY_LABELS[entry.category]}</span>
+        {scope && landedTimelineSlug(entry.timeline) === scope && (
+          <span className="mk-chip mk-chip--tag">This timeline</span>
+        )}
         <span className="text-body font-semibold text-ink">{entry.title}</span>
       </div>
       {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
@@ -169,6 +175,8 @@ export function TrackerReleases() {
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
   const owner = feed.owner.slug;
+  // In a timeline's scope (?tl=) what it landed is marked; the Timelines facet narrows to it.
+  const scope = scopeOf(useLocation().search);
   const onQuery = (next: string) =>
     navigate(
       `/tracker/${encodeURIComponent(owner)}/releases${next ? `?q=${encodeURIComponent(next)}` : ""}`,
@@ -239,7 +247,8 @@ export function TrackerReleases() {
         {feed.query.unknown.length ? `Not understood: ${feed.query.unknown.join(" ")}. ` : ""}
         Daily updates are shown by default. Use kind:tag for named snapshots or
         release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, label, release, kind,
-        since and until; prefix with - to exclude. These are code updates, not deployments.
+        timeline, since and until; prefix with - to exclude. These are code updates, not
+        deployments.
       </p>
       <div className="flex max-w-[52rem] flex-col gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
@@ -301,6 +310,14 @@ export function TrackerReleases() {
           queryKey="label"
           onQuery={onQuery}
         />
+        <Facets
+          title="Timelines"
+          facets={feed.facets.timelines ?? []}
+          q={q}
+          queryKey="timeline"
+          onQuery={onQuery}
+          min={scope ? 1 : 2}
+        />
       </div>
       {feed.entries.length === 0 ? (
         <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
@@ -330,7 +347,7 @@ export function TrackerReleases() {
               </h2>
               <ul className="m-0 list-none p-0">
                 {entries.map((entry) => (
-                  <Entry key={entry.id} entry={entry} />
+                  <Entry key={entry.id} entry={entry} scope={scope} />
                 ))}
               </ul>
             </section>

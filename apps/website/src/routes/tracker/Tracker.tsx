@@ -694,7 +694,7 @@ function Workbench({ data }: { data: TrackerView }) {
 
   return (
     <div
-      className="flex min-h-dvh flex-col gap-3 px-4 py-3 lg:h-dvh lg:min-h-0 lg:overflow-hidden"
+      className="flex min-h-dvh flex-col gap-3 px-4 py-3 lg:h-[calc(100dvh-var(--scope-banner))] lg:min-h-0 lg:overflow-hidden"
       aria-busy={navigation.state !== "idle"}
       data-shortcuts={shortcuts}
     >
@@ -753,36 +753,6 @@ function Workbench({ data }: { data: TrackerView }) {
           )}
         </div>
       </header>
-      {timeline && (
-        <div className="mk-strip" role="status">
-          <span className="mk-strip-dot" aria-hidden />
-          <p className="mk-strip-text m-0 text-body-sm">
-            Timeline <strong>{timeline.name}</strong>{" "}
-            <span className="mk-mono text-ink-muted">timeline/{timeline.slug}</span>
-            {timeline.status !== "active" && (
-              <span className="text-ink-muted"> · {timeline.status.replace("_", " ")}</span>
-            )}
-            <span className="text-ink-muted">
-              {" "}
-              {timeline.status === "abandoned"
-                ? "· abandoned: read-only, its issues as it left them. Main has its finished work back to do."
-                : timeline.status === "landed"
-                  ? "· landed: read-only; its work is on main."
-                  : "· main's issues with this timeline's changes; what you change here stays in it until it lands."}
-            </span>
-          </p>
-          <Link
-            className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
-            to={(() => {
-              const next = new URLSearchParams(params);
-              next.delete("tl");
-              return `${base}${route.issue ? `/issues/${encodeURIComponent(route.issue)}` : ""}${next.size ? `?${next}` : ""}`;
-            })()}
-          >
-            View main
-          </Link>
-        </div>
-      )}
       {createOpen && (
         <CreateIssue
           snapshot={snapshot}

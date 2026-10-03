@@ -325,3 +325,15 @@ body {
     animation: none !important;
   }
 }
+
+/* The timeline banner (CORE-82) stays above the page from 640px while a
+   timeline is selected; page-level sticky elements and full-height
+   workspaces start below it. Phones keep the scope in the sticky rail. */
+:root {
+  --scope-banner: 0px;
+}
+@media (min-width: 640px) {
+  [data-scoped] {
+    --scope-banner: 2.75rem;
+  }
+}

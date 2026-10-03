@@ -1,7 +1,8 @@
 // The CI API.
 //
 // Per repository, under /api/repos/:owner/:name/ci:
-//   GET    /                       recent runs (?before=<number> pages back)
+//   GET    /                       recent runs (?before=<number> pages back, ?ref=<branch>
+//                                   only that branch's: a timeline's bookmark, say)
 //   POST   /runs                   start a run for {ref} (write)
 //   GET    /runs/:number           one run with jobs and steps
 //   POST   /runs/:number/cancel    cancel it (write)
@@ -76,12 +77,12 @@ ci.get("/", async (c) => {
   const repo = await loadRepo(c);
   if (repo instanceof Response) return repo;
   const before = Number(c.req.query("before")) || Number.MAX_SAFE_INTEGER;
-  const results = await selectRuns(db(c.env.DB))
+  const ref = c.req.query("ref")?.replace(/^refs\/heads\//, "");
+  let query = selectRuns(db(c.env.DB))
     .where("r.repo_id", "=", repo.row.id)
-    .where("r.number", "<", before)
-    .orderBy("r.number", "desc")
-    .limit(PAGE)
-    .execute();
+    .where("r.number", "<", before);
+  if (ref) query = query.where("r.ref", "=", ref);
+  const results = await query.orderBy("r.number", "desc").limit(PAGE).execute();
   return c.json<CiRunList>({ runs: results.map(toRun), runner: c.env.CI_RUNNER });
 });
 

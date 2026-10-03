@@ -54,6 +54,7 @@ import { link } from "../../components/ui.tsx";
 import { load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
+import { scopeOf, withScope } from "../../lib/timelineScope.ts";
 import { AtlasMap, KIND_LABEL } from "./AtlasMap.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import { OverlayPanel, TimelinePicker } from "./TimelineOverlay.tsx";
@@ -73,7 +74,8 @@ export async function knowledgeLoader({ request, params }: LoaderFunctionArgs) {
   const url = new URL(request.url);
   const q = url.searchParams.get("q")?.trim() ?? "";
   const nodeId = url.searchParams.get("node") ?? "repo";
-  const timeline = url.searchParams.get("timeline");
+  // The app-wide timeline scope (?tl=; the old ?timeline= is rewritten to it).
+  const timeline = scopeOf(url.search);
   const reuse = cached?.repo === repo ? cached : null;
   const [status, fresh, search, detail, overlays, overlay] = await Promise.all([
     load<KnowledgeStatus>(`${base}/status`, request),
@@ -668,12 +670,10 @@ export function Knowledge() {
         {(overlays.length > 0 || overlay) && (
           <TimelinePicker
             overlays={overlays}
-            value={params.get("timeline")}
+            value={scopeOf(params)}
             onChange={(timeline) => {
-              const next = new URLSearchParams(params);
-              if (timeline) next.set("timeline", timeline);
-              else next.delete("timeline");
-              void navigate(`${base}?${next}`, { preventScrollReset: true });
+              // Choosing here switches the whole app's scope, as the switcher does.
+              void navigate(withScope(`${base}?${params}`, timeline), { preventScrollReset: true });
             }}
           />
         )}

@@ -36,8 +36,10 @@ import { PaletteProvider, SearchButton } from "../palette/Palette.tsx";
 import { useViewer } from "../lib/session.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
+import { scopeOf } from "../lib/timelineScope.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
+import { TimelineBanner, TimelineSwitcher } from "./TimelineScope.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
 function Place({
@@ -245,7 +247,10 @@ export function AppShell() {
   return (
     <AssistantProvider>
       <PaletteProvider>
-        <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
+        <div
+          className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]"
+          data-scoped={scopeOf(location.search) ? "" : undefined}
+        >
           <nav
             aria-label="Places"
             className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:flex-wrap max-sm:gap-1 max-sm:px-3 max-sm:py-2 max-sm:[--size-dock:44px] sm:fixed sm:inset-y-0 sm:left-0"
@@ -254,6 +259,7 @@ export function AppShell() {
               {() => <GitmatrixLogo markOnly className="size-8" />}
             </Place>
             <SearchButton />
+            {viewer && <TimelineSwitcher variant="rail" />}
             {viewer && (
               <Place
                 to="/tracker"
@@ -328,6 +334,7 @@ export function AppShell() {
             className="min-w-0 flex-1 transition-opacity"
             style={{ opacity: navigation.state === "loading" ? 0.7 : 1 }}
           >
+            <TimelineBanner />
             <Outlet />
           </main>
           {viewer && <AssistantDock />}

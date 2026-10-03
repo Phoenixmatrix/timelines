@@ -1,6 +1,13 @@
 import { RocketLaunchIcon } from "@phosphor-icons/react";
-import { Link, useLoaderData, useRevalidator, type LoaderFunctionArgs } from "react-router";
 import {
+  Link,
+  useLoaderData,
+  useLocation,
+  useRevalidator,
+  type LoaderFunctionArgs,
+} from "react-router";
+import {
+  landedTimelineSlug,
   releaseLabel,
   timelineLabel,
   type ReleaseCategory,
@@ -12,6 +19,7 @@ import { RailSection, railClass } from "../../components/Rail.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
 import { useEffect } from "react";
 
@@ -44,7 +52,18 @@ const HEADINGS: Record<ReleaseCategory, string> = {
   internal: "Internal",
 };
 
-function Entry({ entry, owner, name }: { entry: ReleaseNoteEntry; owner: string; name: string }) {
+function Entry({
+  entry,
+  owner,
+  name,
+  scope,
+}: {
+  entry: ReleaseNoteEntry;
+  owner: string;
+  name: string;
+  /** The app's timeline scope (?tl=): what that timeline landed is marked. */
+  scope: string | null;
+}) {
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
       <div className="text-body font-semibold text-ink">{entry.title}</div>
@@ -57,6 +76,9 @@ function Entry({ entry, owner, name }: { entry: ReleaseNoteEntry; owner: string;
           >
             {entry.issue.key}
           </Link>
+        )}
+        {scope && landedTimelineSlug(entry.timeline) === scope && (
+          <span className="mk-chip mk-chip--tag">This timeline</span>
         )}
         {entry.timeline && (
           <span>
@@ -148,6 +170,7 @@ export function Releases() {
   const { index, release, name } = useLoaderData<typeof releasesLoader>();
   const repo = useRepo();
   const owner = repo.owner.slug;
+  const scope = scopeOf(useLocation().search);
   const revalidator = useRevalidator();
   useEffect(() => {
     if (index.status.state !== "generating") return;
@@ -195,7 +218,7 @@ export function Releases() {
 
   return (
     <div className="grid gap-x-8 gap-y-8 md:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,46rem)_minmax(15rem,19rem)] xl:gap-x-12">
-      <aside className="max-h-64 overflow-y-auto md:row-span-2 md:sticky md:top-6 md:max-h-[calc(100dvh-3rem)] md:self-start">
+      <aside className="max-h-64 overflow-y-auto md:row-span-2 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start">
         <Sidebar index={index} owner={owner} name={repo.name} selected={name} />
       </aside>
       <article className="min-w-0 md:col-start-2">
@@ -245,7 +268,13 @@ export function Releases() {
                   </summary>
                   <ul className="m-0 list-none p-0">
                     {group.entries.map((entry) => (
-                      <Entry key={entry.id} entry={entry} owner={owner} name={repo.name} />
+                      <Entry
+                        key={entry.id}
+                        entry={entry}
+                        owner={owner}
+                        name={repo.name}
+                        scope={scope}
+                      />
                     ))}
                   </ul>
                 </details>
@@ -254,7 +283,13 @@ export function Releases() {
                   <h3 className="mt-0 mb-3 text-title">{HEADINGS[group.category]}</h3>
                   <ul className="m-0 list-none p-0">
                     {group.entries.map((entry) => (
-                      <Entry key={entry.id} entry={entry} owner={owner} name={repo.name} />
+                      <Entry
+                        key={entry.id}
+                        entry={entry}
+                        owner={owner}
+                        name={repo.name}
+                        scope={scope}
+                      />
                     ))}
                   </ul>
                 </section>

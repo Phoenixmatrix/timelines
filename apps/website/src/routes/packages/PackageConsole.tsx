@@ -58,6 +58,7 @@ import {
   type QueryKey,
 } from "../../../shared/packages.ts";
 import { Page } from "../../components/AppShell.tsx";
+import { scopeBookmark, scopeOf } from "../../lib/timelineScope.ts";
 import { ConfirmDialog, CopyField, link, popMotion, Tip, useToast } from "../../components/ui.tsx";
 import { ApiError, api } from "../../lib/api.ts";
 import { bytes, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
@@ -99,7 +100,13 @@ export async function packageConsoleLoader({ request, params }: LoaderFunctionAr
   const owner = params.owner ?? "";
   const format = params.format as FormatId;
   const name = params["*"] ?? "";
-  const query = new URL(request.url).searchParams.get("q") ?? DEFAULT_QUERY;
+  const url = new URL(request.url);
+  // In a timeline's scope (?tl=), the versions built from its bookmark.
+  const scope = scopeOf(url.search);
+  const defaultQuery = scope
+    ? `${DEFAULT_QUERY} ${filterToken("branch", scopeBookmark(scope))}`
+    : DEFAULT_QUERY;
+  const query = url.searchParams.get("q") ?? defaultQuery;
   const base = packageApi(owner, format, name);
   const detail = load<PackageDetail>(base, request);
   // Awaited below; an abort mid-navigation mustn't surface as unhandled first.
@@ -116,7 +123,7 @@ export async function packageConsoleLoader({ request, params }: LoaderFunctionAr
     if (e instanceof ApiError && e.status === 400) error = e.message;
     else throw e;
   }
-  return { detail: await detail, page, error, query, base };
+  return { detail: await detail, page, error, query, defaultQuery, base };
 }
 
 type LoaderData = Awaited<ReturnType<typeof packageConsoleLoader>>;
@@ -787,7 +794,7 @@ function VersionTable({
       >
         <div
           role="row"
-          className={`${ROW} sticky top-0 z-[2] h-9 rounded-t-pane bg-pane text-label text-ink-faint max-md:hidden`}
+          className={`${ROW} sticky top-[var(--scope-banner)] z-[2] h-9 rounded-t-pane bg-pane text-label text-ink-faint max-md:hidden`}
         >
           <span role="columnheader" className={CELLS.check}>
             {selectable && selectableRows.length > 0 && (
@@ -1195,13 +1202,13 @@ export function PackageConsole() {
       setParams(
         (current) => {
           const next = new URLSearchParams(current);
-          if (q === DEFAULT_QUERY) next.delete("q");
+          if (q === data.defaultQuery) next.delete("q");
           else next.set("q", q);
           return next;
         },
         { preventScrollReset: true },
       ),
-    [setParams],
+    [setParams, data.defaultQuery],
   );
   const onFilter = (key: QueryKey, value: string) => onQuery(toggleFilter(query, key, value));
 
@@ -1407,7 +1414,7 @@ export function PackageConsole() {
           />
         </div>
         <aside
-          className="hidden flex-col gap-6 lg:sticky lg:top-6 lg:flex lg:self-start"
+          className="hidden flex-col gap-6 lg:sticky lg:top-[calc(var(--scope-banner)+1.5rem)] lg:flex lg:self-start"
           aria-label="Narrow it down"
         >
           <div className="flex items-center gap-2 text-title">

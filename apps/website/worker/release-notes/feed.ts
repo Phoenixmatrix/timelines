@@ -1,6 +1,7 @@
 // A tracker account's code-update feed, filtered by facets.
 
 import {
+  landedTimelineSlug,
   parseReleaseQuery,
   parseReleaseWhen,
   DAILY_RELEASE_PREFIX,
@@ -77,6 +78,8 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
           return entry.releaseKind === value;
         case "release":
           return entry.release.toLowerCase() === value;
+        case "timeline":
+          return landedTimelineSlug(entry.timeline) === value;
         default:
           return false;
       }
@@ -129,6 +132,10 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
       ),
       categories: facet((e) => [[e.category, e.category]]),
       labels: facet((e) => e.labels.map((l) => [l.toLowerCase(), l] as [string, string])),
+      timelines: facet((e) => {
+        const slug = landedTimelineSlug(e.timeline);
+        return slug ? [[slug, e.timeline!.branch!]] : [];
+      }),
       releases: facet((e) =>
         e.repos.flatMap((r) =>
           r.releases.map((name) => [name.toLowerCase(), releaseLabel(name)] as [string, string]),

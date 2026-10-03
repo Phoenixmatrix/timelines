@@ -59,6 +59,12 @@ export interface ReleaseRangeResponse {
   issues: LinkedIssue[];
 }
 
+/** The slug of the timeline an entry landed with, when its branch is a timeline bookmark. */
+export function landedTimelineSlug(timeline: LandedTimeline | null): string | null {
+  const match = /^timeline\/(.+)$/.exec(timeline?.branch ?? "");
+  return match ? match[1]! : null;
+}
+
 /** How an entry names its timeline: the branch, else the landing merge. */
 export function timelineLabel(timeline: LandedTimeline): string {
   return timeline.branch ?? `merge ${timeline.landing.slice(0, 7)}`;
@@ -183,6 +189,8 @@ export interface ReleaseFeed {
     categories: ReleaseFeedFacet[];
     labels: ReleaseFeedFacet[];
     releases: ReleaseFeedFacet[];
+    /** Timelines the entries landed with, by slug. */
+    timelines?: ReleaseFeedFacet[];
   };
 }
 
@@ -194,6 +202,7 @@ export const RELEASE_QUERY_KEYS = [
   "label",
   "release",
   "kind",
+  "timeline",
   "since",
   "until",
 ] as const;
@@ -214,7 +223,8 @@ export interface ParsedReleaseQuery {
  * The release feed's query language, like the tracker's: `team:core repo:engine
  * ws:platform type:fix label:web release:v1.2 since:2026-09-01 until:30d search
  * words`, any filter negated with a leading `-`, values quoted when they contain
- * spaces. `release:day:2026-10-02` selects a UTC day; `kind:tag` selects named tags.
+ * spaces. `release:day:2026-10-02` selects a UTC day; `kind:tag` selects named tags;
+ * `timeline:search` what landed with the timeline whose bookmark is `timeline/search`.
  */
 export function parseReleaseQuery(query: string): ParsedReleaseQuery {
   const parsed: ParsedReleaseQuery = { filters: [], words: [], unknown: [] };

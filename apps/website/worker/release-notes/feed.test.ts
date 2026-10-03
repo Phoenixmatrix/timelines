@@ -114,7 +114,7 @@ describe("release feed query", () => {
 
 describe("release feed", () => {
   test("entries show the timeline they landed with, and searches match its branch", () => {
-    const landed = (q: string, trackers = new Map([["orbit", "orbit"]])) =>
+    const feed = (q: string, trackers = new Map([["orbit", "orbit"]])) =>
       buildFeed(
         [
           row({
@@ -139,13 +139,21 @@ describe("release feed", () => {
           now: Date.parse("2026-10-01T00:00:00Z"),
           limit: 50,
         },
-      ).entries;
+      );
+    const landed = (q: string, trackers?: Map<string, string>) => feed(q, trackers).entries;
     expect(landed("timeline/search").map((e) => [e.title, e.timeline])).toEqual([
       ["Faster search", { id: null, branch: "timeline/search", landing: "l2" }],
     ]);
     // A landing's own entry cites no issue, so any reader of the repository sees it.
     expect(landed("", new Map()).map((e) => [e.kind, e.title])).toEqual([
       ["landing", "Polish styles"],
+    ]);
+    // In a timeline's scope the page offers what it landed as a filter (CORE-82).
+    expect(landed("timeline:polish").map((e) => e.title)).toEqual(["Polish styles"]);
+    expect(landed("-timeline:polish").map((e) => e.title)).toEqual(["Faster search"]);
+    expect(feed("").facets.timelines?.map((f) => [f.value, f.label, f.count])).toEqual([
+      ["polish", "timeline/polish", 1],
+      ["search", "timeline/search", 1],
     ]);
   });
 

@@ -31,6 +31,8 @@ import { formatLabel, packagePath } from "../../lib/packages.ts";
 import { STATUS_LABEL } from "../packages/PackageConsole.tsx";
 import type { Published } from "../../../shared/packages.ts";
 import { repoPath, treeUrl } from "../../lib/refs.ts";
+import { repoData, routeData } from "../../lib/repoData.ts";
+import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
 
 const SETUP_STEP = -1;
@@ -41,13 +43,19 @@ const olderPages = new Map<string, Promise<CiRunSummary[]>>();
 
 export async function ciLoader({ request, params }: LoaderFunctionArgs) {
   const path = base(params.owner, params.repo);
-  const list = await load<CiRunList>(path, request);
+  // In a timeline's scope (?tl=), the runs on its bookmark, where the repository has one.
+  const scope = scopeOf(new URL(request.url).search);
+  const ref = scope
+    ? bookmarkIn(await routeData(repoData.detail(params.owner ?? "", params.repo ?? "")), scope)
+    : null;
+  const only = ref ? `ref=${encodeURIComponent(ref)}` : "";
+  const list = await load<CiRunList>(only ? `${path}?${only}` : path, request);
   // The health strip shows up to 60 runs; the page holds 30. The next page
   // streams in behind the table and never holds it up.
   const last = list.runs.at(-1);
   let older: Promise<CiRunSummary[]> = Promise.resolve([]);
   if (last && list.runs.length >= 30) {
-    const key = `${path}?before=${last.number}`;
+    const key = `${path}?before=${last.number}${only ? `&${only}` : ""}`;
     older =
       olderPages.get(key) ??
       api<CiRunList>(key)
@@ -58,7 +66,7 @@ export async function ciLoader({ request, params }: LoaderFunctionArgs) {
         });
     olderPages.set(key, older);
   }
-  return { ...list, older };
+  return { ...list, older, ref };
 }
 
 export async function ciRunLoader({ request, params }: LoaderFunctionArgs) {
@@ -386,7 +394,7 @@ function HealthStrip({ runs }: { runs: CiRunSummary[] }) {
 }
 
 export function CiRuns() {
-  const { runs, runner, older } = useLoaderData<typeof ciLoader>();
+  const { runs, runner, older, ref } = useLoaderData<typeof ciLoader>();
   const error = useActionData<typeof ciAction>();
   const repo = useRepo();
   const navigation = useNavigation();
@@ -400,14 +408,14 @@ export function CiRuns() {
         {canRun && repo.head && (
           <Form method="post" className="flex items-center gap-2">
             <input type="hidden" name="intent" value="start" />
-            <input type="hidden" name="ref" value={repo.defaultBranch} />
+            <input type="hidden" name="ref" value={ref ?? repo.defaultBranch} />
             <button
               type="submit"
               className="mk-btn mk-btn--sm"
               disabled={navigation.state !== "idle"}
             >
               <PlayIcon weight="bold" aria-hidden />
-              Run {repo.defaultBranch}
+              Run <span className={ref ? "mk-mono" : ""}>{ref ?? repo.defaultBranch}</span>
             </button>
           </Form>
         )}
@@ -417,7 +425,11 @@ export function CiRuns() {
         runner={runner}
         waiting={runs.some((r) => r.status === "queued" || r.status === "running")}
       />
-      {runs.length === 0 ? (
+      {runs.length === 0 && ref ? (
+        <div className="mk-empty max-w-[44rem]">
+          No runs on <span className="mk-mono">{ref}</span> yet. Each push to it runs CI.
+        </div>
+      ) : runs.length === 0 ? (
         <EmptyState />
       ) : (
         <>

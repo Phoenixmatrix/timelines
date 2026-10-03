@@ -827,6 +827,32 @@ says how it ended; changes made in it fail with `timeline_ended`. Its own
 issues are left alone when it is abandoned, and its issue list keeps the
 status each had in it, even after main's copies went back to do.
 
+**The app-wide scope** (CORE-82, `src/lib/timelineScope.ts`). `?tl=<slug>`
+scopes every page to main plus that timeline; no `tl` is main, and `tl=main`
+names main explicitly, which is how a link leaves a timeline. The switcher in
+the rail lists the account's timelines (the page's account, else the default
+tracker's) and a banner above every page names the selected one and says what
+the scope means there; from 640px it stays in view (`--scope-banner` offsets
+page-level sticky elements and the tracker's height), and on phones the rail's
+switcher carries a dot. Links carry the scope (`router.createHref` adds the
+current `tl` to every href that names none), and so does every navigation, form
+and redirect (a root middleware); going back, forward or reloading keeps what
+the URL says. What each surface does with it:
+
+- **Tracker**: the timeline's view (above); the timeline graph centres on it.
+- **Code browser**: a repository and its history open on `timeline/<slug>` when
+  the timeline touches it; a path that names a branch keeps it, and switching
+  follows main's or the old bookmark to the new one.
+- **CI**: runs on the bookmark (`GET …/ci?ref=`), and Run starts one there.
+- **Packages**: the console's default query adds `branch:timeline/<slug>`.
+- **Knowledge**: the timeline's overlay; the tab's old `?timeline=` is
+  rewritten to `?tl=`.
+- **Release notes** cover landed work: entries the timeline landed are marked,
+  and `timeline:<slug>` (a Timelines facet) narrows to them.
+
+A landed or abandoned timeline stays selectable: the shell banner says how it
+ended and that its view is read-only, on the tracker and every other page.
+
 ## Release notes
 
 Release notes are code-update history, not deployment records. The default view
@@ -920,7 +946,8 @@ positive `release:` filter selects named snapshots when requested; `kind:daily`
 selects daily history. An issue may have distinct updates on several days.
 A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
 `ws:`, `type:` (feature, fix, improvement, internal), `label:`,
-`release:` (a literal tag or `day:YYYY-MM-DD`), `since:`/`until:` (a date or `30d`,
+`release:` (a literal tag or `day:YYYY-MM-DD`), `timeline:` (what landed with
+`timeline/<slug>`), `since:`/`until:` (a date or `30d`,
 `2w`, `12h`), search words, and `-` to exclude; unknown tokens are reported back.
 Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
@@ -1100,8 +1127,9 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
 - **Agents** push, then `gm runs wait`: it blocks on the commit's run and exits
   non-zero with the failing job named; `gm runs logs --job <name>` has the output.
 
-API: `/api/repos/:o/:n/ci` (runs, run detail, logs with `?after=`, cancel,
-re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
+API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
+logs with `?after=`, cancel, re-run, commit statuses, secrets) and
+`/api/ci/runner` (claim, report).
 
 ### Deployments and previews
 

@@ -1,6 +1,7 @@
 import { createBrowserRouter } from "react-router";
 import { AppShell } from "./components/AppShell.tsx";
 import { rootLoader } from "./lib/session.ts";
+import { scopeLinks, timelineScopeMiddleware } from "./lib/timelineScope.ts";
 import { Account, accountLoader } from "./routes/Account.tsx";
 import { ErrorPage } from "./routes/ErrorPage.tsx";
 import { Home, homeLoader } from "./routes/Home.tsx";
@@ -39,6 +40,8 @@ import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
 export const router = createBrowserRouter([
   {
     id: "root",
+    // The timeline scope (?tl=) follows every navigation that doesn't name one.
+    middleware: [timelineScopeMiddleware],
     loader: rootLoader,
     // The session only changes through forms (sign in, sign out).
     shouldRevalidate: ({ formMethod, currentUrl, nextUrl, defaultShouldRevalidate }) =>
@@ -170,3 +173,6 @@ export const router = createBrowserRouter([
     ],
   },
 ]);
+
+// ...and every link's href, so a copied or new-tab link keeps it too.
+scopeLinks(router);

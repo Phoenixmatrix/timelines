@@ -1,6 +1,6 @@
 // The timeline graph (CORE-81): forks, merges between timelines, landings on
-// main, abandoned and experimental lanes, around the selected timeline (`?tl=`,
-// the parameter the app-wide switcher will carry). The layout is in
+// main, abandoned and experimental lanes, around the selected timeline: the
+// app-wide scope (`?tl=`, lib/timelineScope.ts). The layout is in
 // timelineGraph.ts and the drawing in TimelineLanes.tsx.
 
 import { ArrowClockwiseIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
@@ -21,6 +21,7 @@ import { SelectField, Tip, link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, treeUrl } from "../../lib/refs.ts";
+import { withScope } from "../../lib/timelineScope.ts";
 import {
   DEFAULT_FILTERS,
   STATUS_LABEL,
@@ -111,14 +112,12 @@ export function TrackerTimelines() {
     return c;
   }, [data]);
 
-  /** The page with a timeline selected (null: main), keeping other parameters. */
-  const select = (timeline: Timeline | null) => {
-    const next = new URLSearchParams(params);
-    if (timeline) next.set("tl", timeline.slug);
-    else next.delete("tl");
-    const query = next.toString();
-    return `${base}${query ? `?${query}` : ""}`;
-  };
+  /**
+   * The page with a timeline selected (null: main), keeping other parameters.
+   * Selecting one here scopes the whole app to it, as the switcher does.
+   */
+  const select = (timeline: Timeline | null) =>
+    withScope(`${base}?${params}`, timeline?.slug ?? null);
   const name = (timeline: Timeline | null, strong = false): ReactNode => (
     <Link
       to={select(timeline)}
@@ -343,7 +342,7 @@ export function TrackerTimelines() {
               </ol>
             </section>
 
-            <aside className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-3">
+            <aside className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-[calc(var(--scope-banner)+0.75rem)]">
               <section className="rounded-pane bg-pane p-4" aria-label="Selected timeline">
                 {selected ? (
                   <TimelineDetails

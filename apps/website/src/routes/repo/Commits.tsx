@@ -5,6 +5,7 @@ import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
 import { DeploymentMark, useCommitDeployments } from "../../components/Deployments.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
 import { repoData, routeData } from "../../lib/repoData.ts";
+import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { shortOid } from "../../lib/format.ts";
 import { api } from "../../lib/api.ts";
@@ -13,8 +14,14 @@ import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.t
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
-export async function commitsLoader({ params }: LoaderFunctionArgs) {
-  return routeData(repoData.history(params.owner ?? "", params.repo ?? "", params["*"] ?? ""));
+export async function commitsLoader({ request, params }: LoaderFunctionArgs) {
+  const owner = params.owner ?? "";
+  const name = params.repo ?? "";
+  let at = params["*"] ?? "";
+  // In a timeline's scope, history without a named branch is the bookmark's.
+  const scope = at ? null : scopeOf(new URL(request.url).search);
+  if (scope) at = bookmarkIn(await routeData(repoData.detail(owner, name)), scope) ?? "";
+  return routeData(repoData.history(owner, name, at));
 }
 
 /** CI results for the listed commits, loaded after the page shows so it never waits on them. */

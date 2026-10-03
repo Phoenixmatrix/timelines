@@ -15,6 +15,7 @@ import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
+import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
@@ -23,14 +24,23 @@ import { About } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
-export async function codeLoader({ params }: LoaderFunctionArgs) {
+export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
   const name = params.repo ?? "";
-  // The tree and the repo detail load in parallel; the server splits the
-  // branch from the path, so neither waits for the other.
+  const at = params["*"] ?? "";
+  // In a timeline's scope (?tl=) the repository opens on the timeline's
+  // bookmark when it has one; a path that names a branch keeps it.
+  const scope = at ? null : scopeOf(new URL(request.url).search);
+  // Otherwise the tree and the repo detail load in parallel; the server splits
+  // the branch from the path, so neither waits for the other.
   const [repo, tree] = await Promise.all([
     routeData(repoData.detail(owner, name)),
-    repoData.tree(owner, name, params["*"] ?? "").catch((error: unknown) => error),
+    (scope
+      ? repoData.detail(owner, name).then((detail) => bookmarkIn(detail, scope) ?? "")
+      : Promise.resolve(at)
+    )
+      .then((path) => repoData.tree(owner, name, path))
+      .catch((error: unknown) => error),
   ]);
   if (!repo.head || repo.state !== "ready") return { tree: null, about: null };
   if (tree instanceof Error || !tree) {

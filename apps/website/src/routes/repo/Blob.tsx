@@ -167,7 +167,7 @@ export function Blob() {
           path={blob.path}
         />
         <section className="rounded-pane bg-pane">
-          <div className="sticky top-16 z-10 flex flex-col gap-2 rounded-t-pane border-b border-line-soft bg-pane px-4 py-3 text-body-sm sm:top-0">
+          <div className="sticky top-16 z-10 flex flex-col gap-2 rounded-t-pane border-b border-line-soft bg-pane px-4 py-3 text-body-sm sm:top-[var(--scope-banner)]">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
               <span className="min-w-0 font-semibold break-all">{fileName}</span>
               <span className="mr-auto text-ink-faint">

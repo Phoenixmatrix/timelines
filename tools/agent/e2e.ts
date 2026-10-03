@@ -1495,4 +1495,72 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await browser.close();
     }
   });
+
+  await scenario("browser-timeline-switcher-scopes-the-app", async () => {
+    // CORE-82: choosing a timeline in the rail scopes every page to it. The
+    // banner names it, links and navigation carry ?tl=, the code browser and
+    // CI follow its bookmark, the Knowledge tab's old ?timeline= becomes
+    // ?tl=, and Back to main leaves it.
+    const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
+    const slug = `e2e-switch-${randomUUID().slice(0, 8)}`;
+    const name = `Switcher ${slug.slice(-8)}`;
+    const bookmark = `timeline/${slug}`;
+    await json(timelines, fixtures.tokens.jun, "POST", { slug, name, repos: [fullName] }, [201]);
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      baseURL: ctx.origin,
+      viewport: { width: 1280, height: 800 },
+    });
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+    const page = await context.newPage();
+    page.setDefaultTimeout(browserTimeout);
+    try {
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as marco/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/${fullName}`);
+      const banner = page.getByRole("region", { name: "Timeline scope" });
+      await expect(banner).toHaveCount(0);
+
+      await page.getByRole("button", { name: /^Timeline: main/ }).click();
+      await page.getByRole("link", { name: new RegExp(name) }).click();
+      await page.waitForURL((url) => url.searchParams.get("tl") === slug);
+      await expect(banner).toContainText(name);
+      await expect(banner).toContainText(`Code on ${bookmark}`);
+      await expect(page.getByLabel("Branch or tag")).toContainText(bookmark);
+
+      const ci = page.getByRole("link", { name: "CI", exact: true });
+      await expect(ci).toHaveAttribute("href", new RegExp(`[?&]tl=${slug}`));
+      await ci.click();
+      await page.waitForURL((url) => url.pathname.endsWith("/ci"));
+      assert.equal(new URL(page.url()).searchParams.get("tl"), slug, "Navigation keeps the scope");
+      await expect(banner).toContainText(`Runs on ${bookmark}`);
+
+      await page.goto(`/${fullName}/knowledge?timeline=${slug}`);
+      await page.waitForURL((url) => url.searchParams.get("tl") === slug);
+      assert.equal(new URL(page.url()).searchParams.get("timeline"), null);
+      await expect(banner).toContainText(name);
+
+      await banner.getByRole("link", { name: "Back to main" }).click();
+      await page.waitForURL((url) => url.searchParams.get("tl") === "main");
+      await expect(banner).toHaveCount(0);
+      await page.screenshot({ path: join(ctx.artifacts, "browser-timeline-switcher.png") });
+      await context.tracing.stop();
+      record({ timeline: slug, scoped: ["code", "ci", "knowledge"] });
+    } catch (error) {
+      await page
+        .screenshot({ path: join(ctx.artifacts, "browser-timeline-failure.png"), fullPage: true })
+        .catch(() => {});
+      await context.tracing
+        .stop({ path: join(ctx.artifacts, "browser-timeline-failure.zip") })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+      await request(`${timelines}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
+    }
+  });
 }

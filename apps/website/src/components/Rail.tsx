@@ -12,7 +12,7 @@ import { PrefetchLink } from "./PrefetchLink.tsx";
  * back with a negative margin so the content stays on the grid.
  */
 export const railClass =
-  "min-w-0 xl:sticky xl:top-6 xl:-mx-2 xl:max-h-[calc(100dvh-3rem)] xl:self-start xl:overflow-x-hidden xl:overflow-y-auto xl:px-2 xl:[scrollbar-width:thin]";
+  "min-w-0 xl:sticky xl:top-[calc(var(--scope-banner)+1.5rem)] xl:-mx-2 xl:max-h-[calc(100dvh-3rem-var(--scope-banner))] xl:self-start xl:overflow-x-hidden xl:overflow-y-auto xl:px-2 xl:[scrollbar-width:thin]";
 
 export function RailSection({
   title,
