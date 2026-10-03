@@ -666,8 +666,14 @@ export interface AtlasWorkspaceComposition extends AtlasWorkspacePage<AtlasCompo
 //   summary     only the words changed: a file's summary with the same blob,
 //               a region's name, summary or description state with the same
 //               members (summary-only)
-//   other       recorded differently with none of the above (analysis
-//               details, concepts, layout, provenance…): `fields` says which
+//   evidence    none of the above, and only derived evidence was recomputed
+//               (membership rationale weights, cross-cutting support, counts,
+//               concepts, layout fill, anchor, uncurated provenance): nothing a
+//               reader sees differs, so the default listing leaves these out
+//               and only counts them; `class=evidence` lists them
+//   other       recorded differently in a way none of the above explains
+//               (analysis details, lineage, curated provenance…): `fields`
+//               says which, never empty
 //
 // Comparisons read only the rows that changed between the two snapshots
 // (worker/atlas/compare.ts), are deterministic, and run no model. A snapshot
@@ -676,12 +682,13 @@ export interface AtlasWorkspaceComposition extends AtlasWorkspacePage<AtlasCompo
 // are, so a timeline-versus-main comparison can reuse it.
 
 /** What kind of change a record is. */
-export type AtlasChangeClass = "source" | "regrouping" | "summary" | "other";
+export type AtlasChangeClass = "source" | "regrouping" | "summary" | "evidence" | "other";
 
 export const ATLAS_CHANGE_CLASSES: readonly AtlasChangeClass[] = [
   "source",
   "regrouping",
   "summary",
+  "evidence",
   "other",
 ];
 
@@ -699,12 +706,19 @@ export type AtlasChangeField =
   | "counts"
   /** A file's membership evidence (rationale, cross-cutting references). */
   | "membership"
-  /** A file's analysis (pending, skipped, language, role, lines, responsibilities). */
+  /** A file's analysis (pending, skipped, language, role, lines, responsibilities, topics). */
   | "analysis"
+  /** A region's concepts, or the interim name drawn from them. */
   | "concepts"
   | "layout"
   | "lineage"
-  | "provenance";
+  | "provenance"
+  /** The member a region's identity is anchored on. */
+  | "anchor"
+  /** The grouping version and evidence kinds a region was built with. */
+  | "grouping"
+  /** A recorded part no other field names. */
+  | "detail";
 
 /** One side of a change record: the entity as that snapshot recorded it. */
 export interface AtlasChangeSide {
@@ -797,6 +811,7 @@ export type AtlasComparisonCaveat =
 export interface AtlasComparisonSummary {
   /** Records in each class; a record can count in several. */
   classes: Record<AtlasChangeClass, number>;
+  /** Records the default listing shows: every class but evidence (counted in `classes` only). */
   total: number;
   kinds: { capability: number; area: number; file: number };
   /** Source-level file changes. */

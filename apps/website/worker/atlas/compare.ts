@@ -20,7 +20,14 @@
 //   summary     only words: a file's summary with the same blob; a region's
 //               name, summary or description state with the same members
 //               and parent (summary-only).
-//   other       none of those: `fields` says what was recorded differently.
+//   evidence    none of those, and only derived evidence was recomputed:
+//               membership rationale and cross-cutting support, counts,
+//               concepts (and the interim name drawn from them), layout fill,
+//               the anchor, the grouping record, uncurated provenance. A
+//               reader sees nothing different, so the default listing leaves
+//               these out and counts them (CORE-185); `class=evidence` lists them.
+//   other       none of those: `fields` says what was recorded differently
+//               (`detail` for a recorded part no other field names).
 //
 // A region's member movement comes from the changed files themselves (their
 // capability and area at S and at T), aggregated per region. Everything is
@@ -70,8 +77,35 @@ const side = (t: "a" | "b") => `
 
 const differs = (path: string) =>
   `(json_extract(a.data, '${path}') IS NOT json_extract(b.data, '${path}'))`;
+/** Top-level data keys a field below already names; any other differing key is `detail`. */
+const NAMED_KEYS = [
+  "blob",
+  "pending",
+  "skipped",
+  "language",
+  "role",
+  "lines",
+  "responsibilities",
+  "topics",
+  "description",
+  "counts",
+  "membership",
+  "concepts",
+  "interimName",
+  "layout",
+  "lineage",
+  "provenance",
+  "anchor",
+  "grouping",
+];
+const NAMED_SQL = `(${NAMED_KEYS.map((k) => `'${k}'`).join(", ")})`;
+/** Some top-level data key no field names differs between the two sides. */
+const DETAIL = `EXISTS (
+        SELECT 1 FROM (SELECT key FROM json_each(a.data) UNION SELECT key FROM json_each(b.data)) k
+        WHERE k.key NOT IN ${NAMED_SQL}
+          AND json_extract(a.data, '$."' || k.key || '"') IS NOT json_extract(b.data, '$."' || k.key || '"'))`;
 const ANALYSIS = (t: string) =>
-  `json_array(${["pending", "skipped", "language", "role", "lines", "responsibilities"]
+  `json_array(${["pending", "skipped", "language", "role", "lines", "responsibilities", "topics"]
     .map((k) => `json_extract(${t}.data, '$.${k}')`)
     .join(", ")})`;
 
@@ -100,10 +134,15 @@ const RECORDS = `
       ${differs("$.counts")} AS f_counts,
       ${differs("$.membership")} AS f_membership,
       (${ANALYSIS("a")} IS NOT ${ANALYSIS("b")}) AS f_analysis,
-      ${differs("$.concepts")} AS f_concepts,
+      (${differs("$.concepts")} OR ${differs("$.interimName")}) AS f_concepts,
       ${differs("$.layout")} AS f_layout,
       ${differs("$.lineage")} AS f_lineage,
-      ${differs("$.provenance")} AS f_provenance
+      ${differs("$.provenance")} AS f_provenance,
+      ${differs("$.provenance.curated")} AS f_curated,
+      ${differs("$.anchor")} AS f_anchor,
+      ${differs("$.grouping")} AS f_grouping,
+      (a.path IS NOT b.path) AS f_path,
+      ${DETAIL} AS f_detail
     FROM changed c
     LEFT JOIN atlas_entities a ON a.entity_id = c.id AND ${at("a", 2)}
     LEFT JOIN atlas_entities b ON b.entity_id = c.id AND ${at("b", 3)}
@@ -144,16 +183,23 @@ const RECORDS = `
                + coalesce(m.added, 0) + coalesce(m.removed, 0) = 0 END) AS c_summary
     FROM pairs p LEFT JOIN moves m ON m.region = p.id
   ),
+  evidenced AS (
+    SELECT *, (had AND has AND NOT (c_source OR c_regrouping OR c_summary)
+      AND NOT (f_name OR f_summary OR f_description OR f_analysis OR f_lineage OR f_curated
+               OR f_path OR f_detail)) AS c_evidence
+    FROM classed
+  ),
   records AS (
-    SELECT *, NOT (c_source OR c_regrouping OR c_summary) AS c_other FROM classed
+    SELECT *, NOT (c_source OR c_regrouping OR c_summary OR c_evidence) AS c_other FROM evidenced
   )`;
 
 /** Records within ?4 (null: all): the region itself, its areas and its files at either side. */
 const WITHIN = `(?4 IS NULL OR id = ?4 OR a_parent = ?4 OR b_parent = ?4 OR a_cap = ?4 OR b_cap = ?4
   OR a_area = ?4 OR b_area = ?4)`;
-/** Records of class ?5 (null: all). */
-const OF_CLASS = `(?5 IS NULL OR (?5 = 'source' AND c_source) OR (?5 = 'regrouping' AND c_regrouping)
-  OR (?5 = 'summary' AND c_summary) OR (?5 = 'other' AND c_other))`;
+/** Records of class ?5 (null: every class but evidence, which is only counted). */
+const OF_CLASS = `((?5 IS NULL AND NOT c_evidence) OR (?5 = 'source' AND c_source)
+  OR (?5 = 'regrouping' AND c_regrouping) OR (?5 = 'summary' AND c_summary)
+  OR (?5 = 'evidence' AND c_evidence) OR (?5 = 'other' AND c_other))`;
 
 interface RecordRow {
   id: string;
@@ -189,6 +235,7 @@ interface RecordRow {
   c_source: number;
   c_regrouping: number;
   c_summary: number;
+  c_evidence: number;
   c_other: number;
   [flag: `f_${string}`]: number;
 }
@@ -206,6 +253,9 @@ const FIELDS: [AtlasChangeField, (r: RecordRow) => boolean][] = [
   ["layout", (r) => Boolean(r.f_layout)],
   ["lineage", (r) => Boolean(r.f_lineage)],
   ["provenance", (r) => Boolean(r.f_provenance)],
+  ["anchor", (r) => Boolean(r.f_anchor)],
+  ["grouping", (r) => Boolean(r.f_grouping)],
+  ["detail", (r) => Boolean(r.f_path || r.f_detail)],
 ];
 
 function sideOf(r: RecordRow, t: "a" | "b"): AtlasChangeSide | null {
@@ -233,6 +283,7 @@ function classesOf(r: RecordRow): AtlasChangeClass[] {
   if (r.c_source) classes.push("source");
   if (r.c_regrouping) classes.push("regrouping");
   if (r.c_summary) classes.push("summary");
+  if (r.c_evidence) classes.push("evidence");
   if (r.c_other) classes.push("other");
   return classes;
 }
@@ -399,7 +450,11 @@ export async function comparePage(
   };
 }
 
-/** Counts over the whole comparison within `within` (every class). */
+/**
+ * Counts over the whole comparison within `within`: `total`, `kinds` and
+ * `files` over what the default listing shows (every class but evidence),
+ * `classes` per class, evidence included.
+ */
 export async function compareSummary(
   d1: D1Database,
   scope: string,
@@ -411,8 +466,9 @@ export async function compareSummary(
     d1
       .prepare(
         `WITH ${RECORDS}
-         SELECT kind, count(*) AS n, sum(c_source) AS source, sum(c_regrouping) AS regrouping,
-           sum(c_summary) AS summary, sum(c_other) AS other,
+         SELECT kind, sum(NOT c_evidence) AS n, sum(c_source) AS source,
+           sum(c_regrouping) AS regrouping, sum(c_summary) AS summary,
+           sum(c_evidence) AS evidence, sum(c_other) AS other,
            sum(kind = 'file' AND NOT had) AS added, sum(kind = 'file' AND NOT has) AS removed,
            sum(kind = 'file' AND had AND has AND a_blob IS NOT b_blob) AS modified
          FROM records WHERE ${WITHIN} GROUP BY kind`,
@@ -424,6 +480,7 @@ export async function compareSummary(
         source: number;
         regrouping: number;
         summary: number;
+        evidence: number;
         other: number;
         added: number;
         removed: number;
@@ -444,7 +501,7 @@ export async function compareSummary(
           .first<{ n: number }>(),
   ]);
   const summary: AtlasComparisonSummary = {
-    classes: { source: 0, regrouping: 0, summary: 0, other: 0 },
+    classes: { source: 0, regrouping: 0, summary: 0, evidence: 0, other: 0 },
     total: 0,
     kinds: { capability: 0, area: 0, file: 0 },
     files: { added: 0, removed: 0, modified: 0 },
@@ -457,6 +514,7 @@ export async function compareSummary(
     summary.classes.source += Number(row.source);
     summary.classes.regrouping += Number(row.regrouping);
     summary.classes.summary += Number(row.summary);
+    summary.classes.evidence += Number(row.evidence);
     summary.classes.other += Number(row.other);
     summary.files.added += Number(row.added);
     summary.files.removed += Number(row.removed);

@@ -754,7 +754,12 @@ atlas.get("/compare", async (c) => {
   );
   if (ctx instanceof Response) return ctx;
   if (cls !== null && !(ATLAS_CHANGE_CLASSES as readonly string[]).includes(cls))
-    return failWith(c, 400, "bad_request", "class is source, regrouping, summary or other.");
+    return failWith(
+      c,
+      400,
+      "bad_request",
+      "class is source, regrouping, summary, evidence or other.",
+    );
   if (within !== null && within.length > 2048)
     return failWith(c, 400, "bad_request", "That capability id is too long.");
   const limit = limitOf(c);

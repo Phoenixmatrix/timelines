@@ -13,7 +13,6 @@ import { ArrowClockwiseIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import {
-  ATLAS_CHANGE_CLASSES,
   type AtlasChange,
   type AtlasChangeClass,
   type AtlasComparison,
@@ -32,6 +31,7 @@ import {
   CLASS_LABEL,
   CLASS_MEANING,
   describeChange,
+  LISTED_CLASSES,
   readCompareUrl,
   stateOf,
   unavailableText,
@@ -411,7 +411,7 @@ function Comparison({
       {head && summary && !failed && (
         <>
           <div role="group" aria-label="Kind of change" className="flex flex-wrap gap-1">
-            {[null, ...ATLAS_CHANGE_CLASSES].map((cls: AtlasChangeClass | null) => (
+            {[null, ...LISTED_CLASSES].map((cls: AtlasChangeClass | null) => (
               <button
                 key={cls ?? "all"}
                 type="button"
@@ -432,6 +432,27 @@ function Comparison({
               ? `${CLASS_LABEL[url.changes]}: ${CLASS_MEANING[url.changes]}.`
               : "A change can be more than one kind: a file can change source and move."}
           </p>
+          {summary.classes.evidence > 0 && (
+            <p className="m-0 flex flex-wrap items-center gap-x-2 gap-y-1 text-micro text-ink-faint">
+              <span>
+                {url.changes === "evidence" ? "Showing" : "Not listed:"}{" "}
+                {summary.classes.evidence.toLocaleString()} record
+                {summary.classes.evidence === 1 ? "" : "s"} whose grouping evidence was only
+                recalculated (rationale weights, cross-cutting support, counts, layout), with the
+                same source, placement and words.
+              </span>
+              <button
+                type="button"
+                aria-pressed={url.changes === "evidence"}
+                className="mk-btn mk-btn--ghost mk-btn--sm pointer-coarse:min-h-11"
+                onClick={() =>
+                  navigate({ changes: url.changes === "evidence" ? null : "evidence" })
+                }
+              >
+                {url.changes === "evidence" ? "Hide them" : "Show them"}
+              </button>
+            </p>
+          )}
           {url.within ? (
             <p className="m-0 flex flex-wrap items-center gap-2 text-body-sm">
               <span className="text-ink-muted">
@@ -508,7 +529,9 @@ function Comparison({
           {current.items.length === 0 ? (
             <p className="m-0 text-body-sm text-ink-muted" role="status">
               {summary.total === 0
-                ? `Nothing ${url.within ? "here " : ""}changed between these two snapshots.`
+                ? summary.classes.evidence > 0
+                  ? `Nothing a reader would notice ${url.within ? "here " : ""}changed between these two snapshots.`
+                  : `Nothing ${url.within ? "here " : ""}changed between these two snapshots.`
                 : `No ${url.changes ? CLASS_LABEL[url.changes].toLowerCase() : ""} changes${url.within ? " here" : ""}.`}
             </p>
           ) : (

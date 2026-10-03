@@ -5,7 +5,8 @@
 //
 //   compare=<snapshot id>     the older snapshot; the newer one is the view's
 //                             own (`snapshot`, pinned when a comparison starts)
-//   changes=<class>           source, regrouping, summary or other; absent: all
+//   changes=<class>           source, regrouping, summary, evidence or other;
+//                             absent: every class but evidence (only counted)
 //   within=<entity id>        only this capability or area
 //
 // Every sentence here says what the records say, no more: a comparison
@@ -62,6 +63,7 @@ export const CLASS_LABEL: Record<AtlasChangeClass, string> = {
   source: "Source",
   regrouping: "Regrouping",
   summary: "Summary only",
+  evidence: "Evidence recalculated",
   other: "Other",
 };
 
@@ -70,8 +72,13 @@ export const CLASS_MEANING: Record<AtlasChangeClass, string> = {
   source: "the code changed: files added, removed or edited",
   regrouping: "the grouping placed files or capabilities differently",
   summary: "only names or descriptions changed, with the same source and members",
-  other: "recorded differently in another way (analysis details, concepts, layout)",
+  evidence:
+    "only derived grouping evidence was recomputed (rationale weights, cross-cutting support, counts, concepts, layout): the same source, placement and words",
+  other: "recorded differently in a way the other kinds don't explain (analysis details, lineage)",
 };
+
+/** The classes the comparison offers as filters; evidence is offered apart, collapsed. */
+export const LISTED_CLASSES = ATLAS_CHANGE_CLASSES.filter((c) => c !== "evidence");
 
 const KIND_LABEL: Record<AtlasChange["kind"], string> = {
   capability: "Capability",
@@ -147,12 +154,15 @@ export function stateOf(side: AtlasChangeSide | null): string | null {
 
 const OTHER_FIELDS: Partial<Record<AtlasChange["fields"][number], string>> = {
   counts: "counts",
-  membership: "grouping evidence (rationale, cross-cutting references)",
-  analysis: "analysis (lines, language, role or whether it's analyzed)",
+  membership: "membership rationale and cross-cutting support",
+  analysis: "analysis (lines, language, role, topics or whether it's analyzed)",
   concepts: "concepts",
   layout: "map placement",
   lineage: "recorded lineage",
   provenance: "provenance",
+  anchor: "identity anchor",
+  grouping: "grouping record",
+  detail: "other recorded details",
 };
 
 /** A change record in sentences, most important first. */
@@ -229,7 +239,9 @@ export function describeChange(change: AtlasChange): string[] {
     )
     .map((f) => OTHER_FIELDS[f])
     .filter((f): f is string => Boolean(f));
-  if (change.classes.includes("other") || (rest.length && !out.length))
+  if (change.classes.includes("evidence"))
+    out.push(`Only its grouping evidence was recalculated: ${list(rest) || "details"}.`);
+  else if (change.classes.includes("other") || (rest.length && !out.length))
     out.push(`Recorded differently: ${list(rest) || "details"}.`);
   return out;
 }

@@ -207,7 +207,7 @@ describe("Atlas snapshot comparisons", () => {
     expect(first.caveats.map((c) => c.code)).toEqual(["relations"]);
 
     // A class filter pages exactly what the summary counts.
-    for (const cls of ["source", "regrouping", "summary", "other"] as const) {
+    for (const cls of ["source", "regrouping", "summary", "evidence", "other"] as const) {
       const only = await all(reworded.snapshotId, merged.snapshotId, { class: cls, limit: 2 });
       expect(
         only.items.every((c) => c.classes.includes(cls)),
@@ -277,9 +277,105 @@ describe("Atlas snapshot comparisons", () => {
     expect(items[0]!.to?.blob).toBe("f".repeat(40));
     expect(first.summary).toMatchObject({
       total: 1,
-      classes: { source: 1, regrouping: 0, summary: 0, other: 0 },
+      classes: { source: 1, regrouping: 0, summary: 0, evidence: 0, other: 0 },
       files: { added: 0, removed: 0, modified: 1 },
     });
+  });
+
+  test("recalculated grouping evidence is counted apart, never listed as other", async () => {
+    const s = setup();
+    await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
+    const before = await publishAtlasFixture(s.env, "r1", C1);
+    // Concept extraction now also sees the ledger in a deploy script: the
+    // ledger concept is less rare, so every rationale weighing it is
+    // recomputed. No blob, placement or word changes.
+    s.sqlite
+      .prepare(
+        `INSERT INTO kg_edges (repo_id, src, dst, kind, weight) VALUES ('r1', ?, ?, 'mentions', 1)`,
+      )
+      .run("file:ops/deploy.ts", "concept:ledger");
+    const after = await publishAtlasFixture(s.env, "r1", C3);
+
+    const listed = await all(before.snapshotId, after.snapshotId, { limit: 2 });
+    expect(listed.items).toEqual([]);
+    expect(listed.first.next).toBeNull();
+    const summary = listed.first.summary!;
+    expect(summary).toMatchObject({
+      total: 0,
+      kinds: { capability: 0, area: 0, file: 0 },
+      classes: { source: 0, regrouping: 0, summary: 0, other: 0 },
+      files: { added: 0, removed: 0, modified: 0 },
+    });
+    expect(listed.first.counts.knownTotal).toBe(0);
+    // The ledger's four files, whose rationale weighs the ledger concept.
+    expect(summary.classes.evidence).toBe(4);
+
+    // Asked for, they page exactly, each saying only evidence moved.
+    const evidence = await all(before.snapshotId, after.snapshotId, {
+      class: "evidence",
+      limit: 1,
+    });
+    expect(evidence.pages).toHaveLength(4);
+    expect(evidence.items).toHaveLength(summary.classes.evidence);
+    expect(evidence.first.counts.knownTotal).toBe(summary.classes.evidence);
+    expect(new Set(evidence.items.map((c) => c.id)).size).toBe(evidence.items.length);
+    expect(evidence.items.map((c) => c.id)).toEqual([
+      "file:billing/ledger/audit.ts",
+      "file:billing/ledger/balance.ts",
+      "file:billing/ledger/entry.ts",
+      "file:billing/ledger/ledger.ts",
+    ]);
+    const derived = new Set([
+      "membership",
+      "counts",
+      "concepts",
+      "layout",
+      "anchor",
+      "grouping",
+      "provenance",
+    ]);
+    for (const change of evidence.items) {
+      expect(change.presence, change.id).toBe("changed");
+      expect(change.classes, change.id).toEqual(["evidence"]);
+      expect(
+        change.fields.every((f) => derived.has(f)),
+        `${change.id} ${change.fields.join(",")}`,
+      ).toBe(true);
+      expect(change.from?.blob).toBe(change.to?.blob);
+      expect(change.from?.capability).toBe(change.to?.capability);
+      expect(change.from?.area).toBe(change.to?.area);
+    }
+    const ledger = evidence.items.find((c) => c.id === "file:billing/ledger/ledger.ts")!;
+    expect(ledger.fields).toEqual(["membership"]);
+    expect(describeChange(ledger)).toEqual([
+      "Only its grouping evidence was recalculated: membership rationale and cross-cutting support.",
+    ]);
+    // Nothing is "other", and a filter for it is empty with an exact zero.
+    const other = await all(before.snapshotId, after.snapshotId, { class: "other" });
+    expect(other.items).toEqual([]);
+    expect(other.first.counts.knownTotal).toBe(0);
+    expect(s.touched).toEqual([]);
+  });
+
+  test("other lists what differs, even a part no field names", async () => {
+    const s = setup();
+    await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
+    const before = await publishAtlasFixture(s.env, "r1", C1);
+    // The analysis recorded a detail with the same blob: explained by its field.
+    s.sqlite
+      .prepare(
+        `UPDATE kg_nodes SET data = json_set(data, '$.lines', 99) WHERE repo_id = 'r1' AND id = ?`,
+      )
+      .run("file:misc/notes.ts");
+    const after = await publishAtlasFixture(s.env, "r1", C3);
+    const { first, items } = await all(before.snapshotId, after.snapshotId);
+    expect(items.map((c) => [c.id, c.classes, c.fields])).toEqual([
+      ["file:misc/notes.ts", ["other"], ["analysis"]],
+    ]);
+    expect(first.summary).toMatchObject({ total: 1, classes: { other: 1, evidence: 0 } });
+    expect(describeChange(items[0]!)).toEqual([
+      "Recorded differently: analysis (lines, language, role, topics or whether it's analyzed).",
+    ]);
   });
 
   test("outside retention a comparison is unavailable, never empty", async () => {
