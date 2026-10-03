@@ -5,6 +5,7 @@
 //   snapshot=<snapshot id>   the snapshot it was read from; absent, the current one
 //   lens=out:imports         the relationship lens: direction, then kind
 //   q=<text>&kind=<kind>     the catalogue lookup and its kind filter
+//   view=map|outline         the picture or the outline; absent, the screen's default
 //
 // Everything else in the search string (the app-wide `tl` timeline scope
 // among it) is left exactly as it was.
@@ -24,7 +25,11 @@ export interface AtlasUrlState {
   q: string;
   /** The lookup's kind filter; null: every kind. */
   kind: string | null;
+  /** Chosen explicitly; null: the outline on narrow screens, the map otherwise. */
+  view: AtlasView | null;
 }
+
+export type AtlasView = "map" | "outline";
 
 export const DEFAULT_LENS: AtlasLens = { direction: "out", kind: null };
 
@@ -59,6 +64,8 @@ export function readAtlasUrl(search: string | URLSearchParams): AtlasUrlState {
     lens: parseLens(params.get("lens")),
     q: (params.get("q") ?? "").slice(0, 200),
     kind: kind && (LOOKUP_KINDS as readonly string[]).includes(kind) ? kind : null,
+    view:
+      params.get("view") === "map" ? "map" : params.get("view") === "outline" ? "outline" : null,
   };
 }
 
@@ -82,6 +89,7 @@ export function writeAtlasUrl(
   if (patch.lens !== undefined) set("lens", formatLens(patch.lens));
   set("q", patch.q === undefined ? undefined : patch.q.trim() ? patch.q : null);
   set("kind", patch.kind);
+  set("view", patch.view);
   return params;
 }
 

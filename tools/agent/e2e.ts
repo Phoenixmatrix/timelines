@@ -20,7 +20,7 @@ import type {
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
-import { atlasBrowserScenario } from "./atlas-e2e.ts";
+import { atlasAccessibleScenario, atlasBrowserScenario } from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 type Evidence = {
@@ -2015,6 +2015,19 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     // CORE-171: the repository Atlas's address restores its state; cold links
     // read only the path; lookup and browsing never fan out paid search.
     await atlasBrowserScenario({
+      ctx,
+      work,
+      token: ownerToken,
+      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
+      json,
+      record,
+    });
+  });
+
+  await scenario("browser-atlas-keyboard-touch-themes-and-motion", async () => {
+    // CORE-170: every Atlas journey by keyboard alone and by touch at 320px,
+    // never through the canvas; light and dark; reduced motion.
+    await atlasAccessibleScenario({
       ctx,
       work,
       token: ownerToken,

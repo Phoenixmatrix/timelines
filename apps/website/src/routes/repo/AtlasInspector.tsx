@@ -194,7 +194,7 @@ export function AtlasInspector({
               <span key={a.id}>
                 <button
                   type="button"
-                  className="cursor-pointer border-0 bg-transparent p-0 text-ink-faint hover:text-ink hover:underline"
+                  className="cursor-pointer border-0 bg-transparent p-0 text-ink-faint hover:text-ink hover:underline pointer-coarse:min-h-11 pointer-coarse:px-1"
                   onClick={() => onPick(a)}
                 >
                   {a.name}
@@ -329,7 +329,7 @@ function Lens({
               key={d}
               type="button"
               aria-pressed={direction === d}
-              className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink"
+              className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
               onClick={() => onLens({ direction: d, kind: null })}
             >
               {d === "out" ? "Uses" : "Used by"}
@@ -351,7 +351,7 @@ function Lens({
                   key={k}
                   type="button"
                   aria-pressed={active === k}
-                  className="mk-chip cursor-pointer border-0"
+                  className="mk-chip cursor-pointer border-0 pointer-coarse:min-h-11"
                   onClick={() => onLens({ direction, kind: k })}
                 >
                   {VERB[direction][k] ?? k} {n.toLocaleString()}
@@ -359,7 +359,11 @@ function Lens({
               ))}
             </div>
           )}
-          {list.status === "loading" && <p className="m-0 text-body-sm text-ink-faint">Loading…</p>}
+          {list.status === "loading" && (
+            <p role="status" className="m-0 text-body-sm text-ink-faint">
+              Loading links…
+            </p>
+          )}
           {list.status === "error" && (
             <p className="m-0 text-body-sm text-danger-text" role="alert">
               Couldn't load these links.{" "}
@@ -430,19 +434,19 @@ function RelationRow({
   const capabilityLink = relation.kind === "depends_on" && other.startsWith("cap:");
   return (
     <li className="flex flex-col">
-      <div className="flex min-h-8 items-center gap-1">
+      <div className="flex min-h-8 items-center gap-1 pointer-coarse:min-h-11">
         {capabilityLink ? (
           <button
             type="button"
             aria-expanded={open}
             aria-label={open ? "Hide the imports behind this" : "Show the imports behind this"}
-            className="grid size-6 shrink-0 cursor-pointer place-items-center rounded-plate border-0 bg-transparent text-ink-faint hover:bg-raised"
+            className="grid size-6 shrink-0 cursor-pointer place-items-center rounded-plate border-0 bg-transparent text-ink-faint hover:bg-raised pointer-coarse:size-11"
             onClick={() => setOpen(!open)}
           >
             {open ? <CaretDownIcon aria-hidden /> : <CaretRightIcon aria-hidden />}
           </button>
         ) : (
-          <span className="size-6 shrink-0" />
+          <span className="size-6 shrink-0 pointer-coarse:size-11" />
         )}
         {relation.neighbor ? (
           <button
@@ -504,7 +508,11 @@ function Contributing({
   );
   const commit = snapshot.vector[0]?.commit;
   if (list.status === "loading")
-    return <p className="m-0 ml-7 text-micro text-ink-faint">Loading…</p>;
+    return (
+      <p role="status" className="m-0 ml-7 text-micro text-ink-faint">
+        Loading the imports behind it…
+      </p>
+    );
   if (list.status === "error")
     return (
       <p className="m-0 ml-7 text-micro text-danger-text">
@@ -561,7 +569,22 @@ function Evidence({
   const list = usePaged<AtlasEvidence>(`${entity.id}|${snapshot.id}`, (cursor, signal) =>
     atlasApi.evidence(repo, entity.id, { snapshot: snapshot.id, cursor, signal, limit: 10 }),
   );
-  if (list.status !== "ready" || !list.page?.items.length) return null;
+  if (list.status === "loading")
+    return (
+      <p role="status" className="m-0 text-micro text-ink-faint">
+        Loading sources…
+      </p>
+    );
+  if (list.status === "error")
+    return (
+      <p className="m-0 text-micro text-danger-text">
+        Couldn't load its sources.{" "}
+        <button type="button" className="mk-btn mk-btn--ghost mk-btn--sm" onClick={list.retry}>
+          Retry
+        </button>
+      </p>
+    );
+  if (!list.page?.items.length) return null;
   return (
     <div className="flex flex-col gap-1">
       <h3 className="m-0 text-label text-ink-muted">Source</h3>
@@ -577,7 +600,7 @@ function Evidence({
             <li key={`${e.entityId}|${e.via}`} className="flex items-baseline gap-2 text-micro">
               <Link
                 to={`${blobUrl(repo.owner, repo.name, e.commit, e.path)}${anchor}`}
-                className="min-w-0 flex-1 truncate font-mono text-ink-muted hover:text-ink"
+                className="min-w-0 flex-1 truncate font-mono text-ink-muted hover:text-ink pointer-coarse:py-2.5"
                 title={`${e.path} at ${e.commit.slice(0, 7)}`}
               >
                 {e.path}

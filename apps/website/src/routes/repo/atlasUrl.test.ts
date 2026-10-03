@@ -11,6 +11,7 @@ describe("the Atlas's address", () => {
       lens: { direction: "in", kind: "imports" },
       q: "ledger",
       kind: "file",
+      view: "outline",
     });
     expect(written.get("tl")).toBe("launch");
     expect(written.get("other")).toBe("1");
@@ -21,16 +22,18 @@ describe("the Atlas's address", () => {
       lens: { direction: "in", kind: "imports" },
       q: "ledger",
       kind: "file",
+      view: "outline",
     });
   });
 
   test("defaults and clears leave nothing behind but what isn't the Atlas's", () => {
-    const cleared = writeAtlasUrl("select=a&snapshot=s&lens=in&q=x&kind=area&tl=main", {
+    const cleared = writeAtlasUrl("select=a&snapshot=s&lens=in&q=x&kind=area&view=map&tl=main", {
       select: null,
       snapshot: null,
       lens: { direction: "out", kind: null },
       q: "  ",
       kind: null,
+      view: null,
     });
     expect(cleared.toString()).toBe("tl=main");
     expect(readAtlasUrl("")).toEqual({
@@ -39,6 +42,7 @@ describe("the Atlas's address", () => {
       lens: { direction: "out", kind: null },
       q: "",
       kind: null,
+      view: null,
     });
   });
 
@@ -48,6 +52,7 @@ describe("the Atlas's address", () => {
     expect(parseLens("in")).toEqual({ direction: "in", kind: null });
     expect(readAtlasUrl("kind=package&select=%20x").kind).toBeNull();
     expect(readAtlasUrl("select=%20x").select).toBeNull();
+    expect(readAtlasUrl("view=globe").view).toBeNull();
   });
 
   test("links into the Atlas carry the rest of the address", () => {

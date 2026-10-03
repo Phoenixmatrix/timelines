@@ -35,7 +35,9 @@ import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../..
 import { timeAgo } from "../../lib/format.ts";
 import { useViewer } from "../../lib/session.ts";
 import { usePalette } from "../../palette/Palette.tsx";
+import { useMediaQuery } from "../../lib/useMediaQuery.ts";
 import { AtlasInspector } from "./AtlasInspector.tsx";
+import { AtlasOutline } from "./AtlasOutline.tsx";
 import {
   CatalogueLookup,
   FocusResolver,
@@ -50,8 +52,9 @@ import {
   writeAtlasUrl,
   type AtlasLens,
   type AtlasUrlState,
+  type AtlasView,
 } from "./atlasUrl.ts";
-import { scopeNotices, summaryNote, type AtlasNotice } from "./atlasStates.ts";
+import { scopeNotices, type AtlasNotice } from "./atlasStates.ts";
 import { AtlasTerritory } from "./AtlasTerritory.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./territory.ts";
@@ -116,6 +119,9 @@ const FILTER_LABEL: Record<string, string> = {
   file: "Files",
   symbol: "Symbols",
 };
+
+/** Below this, the outline is the default and the inspector reads in line. */
+const NARROW = "(max-width: 1023.98px)";
 
 const files = (n: number | undefined) =>
   n === undefined ? "" : `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
@@ -290,10 +296,12 @@ function Territory({
     [snapshot.id],
   );
   useEffect(() => () => resolver.dispose(), [resolver]);
+  const narrowNow = useRef(false);
   useEffect(() => {
-    // A restored link, Back or Forward moves focus to what it shows; a click
-    // in the page leaves focus where it is.
-    setFocusOnShow(navigationType === "POP" ? url.select : null);
+    // A restored link, Back or Forward moves focus to what it shows. A click
+    // in the page leaves focus where it is, except on a narrow screen, where
+    // what's selected is read in line, so focus goes to it.
+    setFocusOnShow(navigationType === "POP" || narrowNow.current ? url.select : null);
     void resolver.focus(
       url.select,
       url.select ? territoryRef.current.byId.get(url.select)?.entity : undefined,
@@ -329,9 +337,193 @@ function Territory({
   const commit = snapshot.vector[0]?.commit ?? null;
   const capabilities = overview.regions.filter((r) => !r.structural).length;
 
+  // ---- the outline's top level: the overview's regions, then the catalogue ----------
+  const [catalogue, setCatalogue] = useState<{
+    items: AtlasRegion[];
+    next: string | null;
+    loading: boolean;
+    error: string | null;
+  }>({
+    items: overview.catalogue.items,
+    next: overview.catalogue.next,
+    loading: false,
+    error: null,
+  });
+  const moreRegions = () => {
+    if (!catalogue.next || catalogue.loading) return;
+    setCatalogue({ ...catalogue, loading: true, error: null });
+    atlasApi.regions(ref, { snapshot: snapshot.id, cursor: catalogue.next, limit: 50 }).then(
+      (page) =>
+        setCatalogue((now) => ({
+          items: [...now.items, ...page.items],
+          next: page.next,
+          loading: false,
+          error: null,
+        })),
+      (error: unknown) => {
+        const atlasError = atlasErrorOf(error);
+        if (atlasError && atlasNeedsRestart(error)) setRestart(atlasError);
+        setCatalogue((now) => ({
+          ...now,
+          loading: false,
+          error: error instanceof Error ? error.message : "Couldn't load more regions.",
+        }));
+      },
+    );
+  };
+  const roots = useMemo(
+    () => [...overview.regions, ...catalogue.items],
+    [overview.regions, catalogue.items],
+  );
+  // The outline opens the way to the selection: its ancestors, read or drawn.
+  const path = useMemo(() => {
+    if (focus.state !== "ready") return [];
+    if (focus.ancestors) return focus.ancestors.filter((a) => a.parentId !== null).map((a) => a.id);
+    const up: string[] = [];
+    for (let cell = territory.byId.get(focus.id); cell?.parent;) {
+      up.unshift(cell.parent);
+      cell = territory.byId.get(cell.parent);
+    }
+    return up;
+  }, [focus, territory]);
+
+  // Where the selection is, in words, for the live announcement.
+  const where = useMemo(
+    () =>
+      focus.state !== "ready"
+        ? []
+        : focus.ancestors
+          ? focus.ancestors.slice(1).map((a) => a.name)
+          : path.flatMap((id) => {
+              const name = territory.byId.get(id)?.entity.name;
+              return name ? [name] : [];
+            }),
+    [focus, path, territory],
+  );
+
+  // ---- the view: the map, or the outline (the default on narrow screens) --------------
+  const narrow = useMediaQuery(NARROW);
+  narrowNow.current = narrow;
+  const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
+  const tree = useRef<HTMLDivElement>(null);
+  const backToOutline = () => {
+    const items = tree.current?.querySelectorAll<HTMLElement>('[role="treeitem"]');
+    const target =
+      tree.current?.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]') ??
+      items?.[0];
+    target?.focus();
+  };
+
+  const outline = (
+    <AtlasOutline
+      treeRef={tree}
+      label={`Outline of ${ref.owner}/${ref.name}`}
+      roots={roots}
+      rootsMore={catalogue.next !== null}
+      rootsCount={overview.totalRegions}
+      rootsState={catalogue.loading ? "loading" : catalogue.error ? "error" : null}
+      loads={loads}
+      selected={url.select}
+      path={path}
+      seq={snapshot.seq}
+      onOpen={open}
+      onRetry={(id) => void loader.load(id)}
+      onMore={(id) => {
+        const load = loads.get(id);
+        if (load?.state === "ready" && load.next) void loader.load(id, load.next, load.items);
+      }}
+      onMoreRoots={moreRegions}
+      onSelect={select}
+    />
+  );
+  const lookup = (
+    <Lookup
+      atlas={ref}
+      base={base}
+      snapshot={snapshot}
+      commit={commit}
+      url={url}
+      onQuery={(q) => navigate({ q }, true)}
+      onKind={(kind) => navigate({ kind }, true)}
+      onPick={select}
+    />
+  );
+  const selection = (
+    <>
+      {focus.state === "resolving" && (
+        <p className="m-0 text-body-sm text-ink-faint">Opening the selection…</p>
+      )}
+      {(focus.state === "missing" || focus.state === "error") && (
+        <Missing
+          focus={focus}
+          atlas={ref}
+          base={base}
+          snapshot={snapshot}
+          onRetry={() => void resolver.focus(focus.id)}
+        />
+      )}
+      {selected && (
+        <AtlasInspector
+          key={selected.id}
+          repo={ref}
+          snapshot={snapshot}
+          entity={selected}
+          lens={url.lens}
+          autoFocus={focusOnShow === selected.id}
+          onPick={select}
+          onLens={setLens}
+          onRestart={setRestart}
+          contents={
+            OPENS.has(selected.kind) ? (
+              <Contents
+                entity={selected}
+                load={loads.get(selected.id)}
+                onPick={select}
+                onRetry={() => void loader.load(selected.id)}
+                onMore={(cursor, items) => void loader.load(selected.id, cursor, items)}
+              />
+            ) : null
+          }
+        />
+      )}
+      {selected && view === "outline" && narrow && (
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm self-start pointer-coarse:min-h-11"
+          onClick={backToOutline}
+        >
+          Back to the outline
+        </button>
+      )}
+    </>
+  );
+
   return (
     <div className="flex flex-col gap-3">
-      <SnapshotLine overview={overview} pinned={url.snapshot !== null} />
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <SnapshotLine overview={overview} pinned={url.snapshot !== null} />
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Link
+            to={`/${encodeURIComponent(ref.owner)}/-/atlas?repos=${encodeURIComponent(ref.name)}`}
+            className="mk-btn mk-btn--ghost mk-btn--sm pointer-coarse:min-h-11"
+          >
+            Across repositories
+          </Link>
+          <div role="group" aria-label="View" className="flex gap-1">
+            {(["map", "outline"] as const).map((v) => (
+              <button
+                key={v}
+                type="button"
+                aria-pressed={view === v}
+                className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
+                onClick={() => navigate({ view: v })}
+              >
+                {v === "map" ? "Map" : "Outline"}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
       {notices.length > 0 && (
         <ul aria-label="Map state" className="m-0 flex list-none flex-col gap-0.5 p-0 text-body-sm">
           {notices.map((n) => (
@@ -358,95 +550,67 @@ function Territory({
           ? "Opening the selection…"
           : focus.state === "ready"
             ? `Selected ${focus.entity.name}, ${KIND_LABEL[focus.entity.kind] ?? focus.entity.kind}${
-                focus.ancestors && focus.ancestors.length > 1
-                  ? `, in ${focus.ancestors
-                      .slice(1)
-                      .map((a) => a.name)
-                      .join(" › ")}`
-                  : ""
+                where.length ? `, in ${where.join(" › ")}` : ""
               }.`
             : focus.state === "missing" || focus.state === "error"
               ? "The selection couldn't be shown."
               : ""}
       </p>
 
-      <div className="grid gap-3 lg:h-[max(34rem,calc(100dvh-16rem))] lg:grid-cols-[minmax(0,1fr)_23rem]">
-        <div className="h-[62dvh] min-h-[22rem] lg:h-auto lg:min-h-0">
-          <AtlasTerritory
-            territory={territory}
-            selected={mapFocus}
-            loading={loading}
-            onSelect={(cell: TerritoryCell) => select(cell.entity)}
-            label={`Capability map: ${capabilities} capabilities${
-              overview.regions.length > capabilities ? " and structural groups" : ""
-            }. The list beside it has the same regions.`}
-          />
+      {view === "map" ? (
+        <div className="grid gap-3 lg:h-[max(34rem,calc(100dvh-16rem))] lg:grid-cols-[minmax(0,1fr)_23rem]">
+          <div className="h-[62dvh] min-h-[22rem] lg:h-auto lg:min-h-0">
+            <AtlasTerritory
+              territory={territory}
+              selected={mapFocus}
+              loading={loading}
+              onSelect={(cell: TerritoryCell) => select(cell.entity)}
+              label={`Capability map: ${capabilities} capabilities${
+                overview.regions.length > capabilities ? " and structural groups" : ""
+              }. The outline beside it has the same regions, and more.`}
+            />
+          </div>
+          <aside
+            aria-label="Regions"
+            className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto rounded-pane bg-pane p-3"
+          >
+            {lookup}
+            {selection}
+            {outline}
+            <Legend />
+          </aside>
         </div>
-        <aside
-          aria-label="Regions"
-          className="flex min-h-0 flex-col gap-3 overflow-y-auto rounded-pane bg-pane p-3"
-        >
-          <Lookup
-            atlas={ref}
-            base={base}
-            snapshot={snapshot}
-            commit={commit}
-            url={url}
-            onQuery={(q) => navigate({ q }, true)}
-            onKind={(kind) => navigate({ kind }, true)}
-            onPick={select}
-          />
-          {focus.state === "resolving" && (
-            <p className="m-0 text-body-sm text-ink-faint">Opening the selection…</p>
-          )}
-          {(focus.state === "missing" || focus.state === "error") && (
-            <Missing
-              focus={focus}
-              atlas={ref}
-              base={base}
-              snapshot={snapshot}
-              onRetry={() => void resolver.focus(focus.id)}
-            />
-          )}
-          {selected && (
-            <AtlasInspector
-              key={selected.id}
-              repo={ref}
-              snapshot={snapshot}
-              entity={selected}
-              lens={url.lens}
-              autoFocus={focusOnShow === selected.id}
-              onPick={select}
-              onLens={setLens}
-              onRestart={setRestart}
-              contents={
-                OPENS.has(selected.kind) ? (
-                  <Contents
-                    entity={selected}
-                    load={loads.get(selected.id)}
-                    onPick={select}
-                    onRetry={() => void loader.load(selected.id)}
-                    onMore={(cursor, items) => void loader.load(selected.id, cursor, items)}
-                  />
-                ) : null
-              }
-            />
-          )}
-          <RegionList
-            regions={overview.regions}
-            selected={url.select}
-            seq={snapshot.seq}
-            onPick={select}
-          />
-          {overview.catalogue.items.length > 0 && (
-            <p className="m-0 text-micro text-ink-faint">
-              {(overview.totalRegions - overview.regions.length).toLocaleString()} smaller regions
-              are in the catalogue: look them up above.
-            </p>
-          )}
+      ) : narrow ? (
+        // A phone reads top to bottom: find, what's selected, then the outline.
+        <div className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3">
+          {lookup}
+          {selection}
+          {outline}
           <Legend />
-        </aside>
-      </div>
+        </div>
+      ) : (
+        <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_23rem]">
+          <section
+            aria-label="Outline"
+            className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3"
+          >
+            {lookup}
+            {outline}
+            <Legend />
+          </section>
+          <aside
+            aria-label="Selection"
+            className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3 lg:sticky lg:top-3 lg:max-h-[calc(100dvh-1.5rem)] lg:overflow-y-auto"
+          >
+            {selection}
+            {!selected && focus.state === "none" && (
+              <p className="m-0 text-body-sm text-ink-faint">
+                Choose an entry in the outline to read about it here.
+              </p>
+            )}
+          </aside>
+        </div>
+      )}
     </div>
   );
 }
@@ -729,7 +893,7 @@ function Lookup({
             key={kind ?? "all"}
             type="button"
             aria-pressed={url.kind === kind}
-            className="mk-chip cursor-pointer border-0 aria-pressed:bg-signal-wash aria-pressed:text-ink"
+            className="mk-chip cursor-pointer border-0 aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
             onClick={() => {
               setShowMatches(true);
               onKind(kind);
@@ -767,7 +931,7 @@ function Lookup({
                   type="button"
                   aria-current={item.id === url.select || undefined}
                   onClick={() => onPick(item)}
-                  className="flex min-h-10 w-full cursor-pointer flex-col items-start gap-0.5 rounded-plate border-0 bg-transparent px-2 py-1.5 text-left hover:bg-raised aria-[current]:bg-signal-wash"
+                  className="flex min-h-10 w-full cursor-pointer flex-col items-start gap-0.5 rounded-plate border-0 bg-transparent px-2 py-1.5 text-left hover:bg-raised aria-[current]:bg-signal-wash pointer-coarse:min-h-11"
                 >
                   <span className="flex w-full items-baseline gap-2">
                     <span className="min-w-0 flex-1 truncate text-body-sm text-ink">
@@ -802,7 +966,7 @@ function Lookup({
         <div className="flex flex-col gap-1 border-t border-line-soft pt-2">
           <button
             type="button"
-            className="mk-btn mk-btn--ghost mk-btn--sm self-start"
+            className="mk-btn mk-btn--ghost mk-btn--sm h-auto min-h-8 max-w-full self-start py-1 text-left whitespace-normal pointer-coarse:min-h-11"
             onClick={() =>
               palette.open({
                 repo: {
@@ -826,58 +990,6 @@ function Lookup({
         </div>
       )}
     </div>
-  );
-}
-
-function summaryLine(entity: AtlasEntitySummary): string {
-  return entity.summary || summaryNote(entity.summaryState) || "";
-}
-
-function RegionList({
-  regions,
-  selected,
-  seq,
-  onPick,
-}: {
-  regions: readonly AtlasRegion[];
-  selected: string | null;
-  seq: number;
-  onPick: (entity: AtlasEntitySummary) => void;
-}) {
-  return (
-    <ul className="m-0 flex list-none flex-col gap-1 p-0" aria-label="Largest regions">
-      {regions.map((region) => (
-        <li key={region.id}>
-          <button
-            type="button"
-            aria-current={region.id === selected || undefined}
-            onClick={() => onPick(region)}
-            className="flex w-full cursor-pointer flex-col gap-0.5 rounded-plate border-0 bg-transparent px-2.5 py-2 text-left hover:bg-raised aria-[current]:bg-signal-wash"
-          >
-            <span className="flex w-full items-baseline gap-2">
-              <span
-                className={`min-w-0 flex-1 truncate text-body-sm font-semibold ${region.structural ? "text-ink-muted" : "text-ink"}`}
-              >
-                {region.name}
-              </span>
-              {seq > 1 && region.since === seq && (
-                <span className="text-micro text-ink-faint" title="Changed in this build">
-                  changed
-                </span>
-              )}
-              <span className="text-micro text-ink-faint tabular-nums">
-                {region.structural
-                  ? `${region.size.members.toLocaleString()} item${region.size.members === 1 ? "" : "s"}`
-                  : files(region.size.files)}
-              </span>
-            </span>
-            {summaryLine(region) && (
-              <span className="line-clamp-2 text-micro text-ink-muted">{summaryLine(region)}</span>
-            )}
-          </button>
-        </li>
-      ))}
-    </ul>
   );
 }
 
@@ -919,7 +1031,7 @@ function Contents({
                 <button
                   type="button"
                   onClick={() => onPick(child)}
-                  className="flex min-h-8 w-full cursor-pointer items-center gap-2 rounded-plate border-0 bg-transparent px-2 text-left text-body-sm hover:bg-raised"
+                  className="flex min-h-8 w-full cursor-pointer items-center gap-2 rounded-plate border-0 bg-transparent px-2 text-left text-body-sm hover:bg-raised pointer-coarse:min-h-11"
                 >
                   {OPENS.has(child.kind) && (
                     <CaretRightIcon className="size-3 shrink-0 text-ink-faint" aria-hidden />
@@ -972,11 +1084,20 @@ function Legend() {
         </li>
         <li>
           <strong className="text-ink">Dashed regions</strong> are structural groups (unclassified
-          files, concepts, dependencies, folders), not capabilities.
+          files, concepts, dependencies, folders), not capabilities; the outline says “Structural
+          group”.
         </li>
         <li>
-          <span className="mr-1 inline-block size-2 rounded-full bg-data-berry align-middle" />
-          Changed in the build this map shows.
+          <span
+            aria-hidden
+            className="mr-1 inline-block size-2 rounded-full bg-data-berry align-middle"
+          />
+          <strong className="text-ink">A dot in a region's corner</strong>: it changed in the build
+          this map shows; the outline says “changed in this build”.
+        </li>
+        <li>
+          <strong className="text-ink">The outline</strong> holds everything the map draws, and
+          more: use the arrow keys to move, Right to open, Left to close, Enter to select.
         </li>
       </ul>
     </details>

@@ -143,6 +143,20 @@ export function AtlasTerritory({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fly when the target's place changes
   }, [target?.id, target?.x, target?.y, target?.w]);
   useEffect(() => () => cancelAnimationFrame(flight.current), []);
+  // Colours come from the theme's tokens: draw again when the theme changes.
+  useEffect(() => {
+    const observer = new MutationObserver(redraw);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme", "class"],
+    });
+    const scheme = window.matchMedia("(prefers-color-scheme: dark)");
+    scheme.addEventListener("change", redraw);
+    return () => {
+      observer.disconnect();
+      scheme.removeEventListener("change", redraw);
+    };
+  }, []);
 
   useEffect(() => {
     const el = canvas.current;
@@ -356,7 +370,7 @@ export function AtlasTerritory({
       <div className="absolute top-2 right-2 flex gap-1">
         <button
           type="button"
-          className="mk-btn mk-btn--icon mk-btn--sm"
+          className="mk-btn mk-btn--icon mk-btn--sm pointer-coarse:size-11"
           aria-label="Zoom in"
           onClick={() => zoomBy(1.4)}
         >
@@ -364,7 +378,7 @@ export function AtlasTerritory({
         </button>
         <button
           type="button"
-          className="mk-btn mk-btn--icon mk-btn--sm"
+          className="mk-btn mk-btn--icon mk-btn--sm pointer-coarse:size-11"
           aria-label="Zoom out"
           onClick={() => zoomBy(1 / 1.4)}
         >
@@ -372,7 +386,7 @@ export function AtlasTerritory({
         </button>
         <button
           type="button"
-          className="mk-btn mk-btn--icon mk-btn--sm"
+          className="mk-btn mk-btn--icon mk-btn--sm pointer-coarse:size-11"
           aria-label="Fit the map"
           onClick={fit}
         >
