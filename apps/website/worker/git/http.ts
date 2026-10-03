@@ -6,6 +6,7 @@ import { queueMirror } from "../mirror/queue.ts";
 import { findRepo, roleFor, sqlNow } from "../db.ts";
 import { notifyReleaseNotes } from "../release-notes/queue.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
+import { recordPush } from "../ref-log/record.ts";
 import { invalidateRefs } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
@@ -130,6 +131,11 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     );
     c.executionCtx.waitUntil(
       queueMirror(c.env, repo.id).catch((error) => console.error("Mirror: enqueue failed", error)),
+    );
+    c.executionCtx.waitUntil(
+      recordPush(c.env, repo, actor).catch((error) =>
+        console.error("Push log: recording failed", error),
+      ),
     );
     c.executionCtx.waitUntil(
       onPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work)).catch((error) =>

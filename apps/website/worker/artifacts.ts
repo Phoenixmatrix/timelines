@@ -1,5 +1,5 @@
 import type { GitRef } from "../shared/api.ts";
-import { lsRefsRequest, parseLsRefs } from "./git/pktline.ts";
+import { lsRefsRequest, parseLsRefs, type LsRefsEntry } from "./git/pktline.ts";
 
 const TOKEN_TTL_SECONDS = 60 * 60;
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -52,20 +52,7 @@ export interface RepoRefs {
  * protocol v2 `ls-refs` command.
  */
 export async function listRefs(env: Env, artifactsName: string, remote: string): Promise<RepoRefs> {
-  const token = await upstreamToken(env, artifactsName, "read");
-  const response = await fetch(`${remote}/git-upload-pack`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/x-git-upload-pack-request",
-      accept: "application/x-git-upload-pack-result",
-      "git-protocol": "version=2",
-    },
-    body: lsRefsRequest(),
-  });
-  if (!response.ok) throw new Error(`ls-refs failed with HTTP ${response.status}`);
-  const refs = parseLsRefs(new Uint8Array(await response.arrayBuffer()));
-
+  const refs = await lsRefs(env, artifactsName, remote);
   const result: RepoRefs = { headBranch: null, head: null, branches: [], tags: [] };
   for (const ref of refs) {
     if (ref.name === "HEAD") {
@@ -90,6 +77,27 @@ export async function listRefs(env: Env, artifactsName: string, remote: string):
   result.branches.sort((a, b) => a.shortName.localeCompare(b.shortName));
   result.tags.sort((a, b) => b.shortName.localeCompare(a.shortName, undefined, { numeric: true }));
   return result;
+}
+
+/** HEAD, branches and tags as `ls-refs` lists them: tags unpeeled, with `peeled`. */
+export async function lsRefs(
+  env: Env,
+  artifactsName: string,
+  remote: string,
+): Promise<LsRefsEntry[]> {
+  const token = await upstreamToken(env, artifactsName, "read");
+  const response = await fetch(`${remote}/git-upload-pack`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/x-git-upload-pack-request",
+      accept: "application/x-git-upload-pack-result",
+      "git-protocol": "version=2",
+    },
+    body: lsRefsRequest(),
+  });
+  if (!response.ok) throw new Error(`ls-refs failed with HTTP ${response.status}`);
+  return parseLsRefs(new Uint8Array(await response.arrayBuffer()));
 }
 
 export function isArtifactsError(error: unknown, code: ArtifactsErrorCode): boolean {

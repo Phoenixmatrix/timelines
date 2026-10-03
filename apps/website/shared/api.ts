@@ -362,6 +362,48 @@ export interface CiRunList {
   runner: CiRunner;
 }
 
+/** One ref update a push made, from the push log. */
+export interface RefUpdate {
+  id: number;
+  /** Full name: refs/heads/main, refs/tags/v1. */
+  ref: string;
+  /** Null when the push created the ref. */
+  old: string | null;
+  /** Null when the push deleted it. */
+  new: string | null;
+  /** A force push (the old commit isn't an ancestor of the new); null when unknown. */
+  forced: boolean | null;
+  /** Who pushed: the person, and the agent that pushed for them. */
+  actor: string | null;
+  agent: string | null;
+  createdAt: string;
+}
+
+export interface RefUpdateList {
+  updates: RefUpdate[];
+  /** Pass as `before` for the next (older) page; null on the last. */
+  next: number | null;
+}
+
+/** A ref a change reached: first when a push made one of its commits reachable from it. */
+export interface ChangeRef {
+  changeId: string;
+  ref: string;
+  firstCommit: string;
+  firstSeenAt: string;
+  /** The push that brought it. */
+  firstUpdate: RefUpdate;
+  /** The latest of its commits to reach the ref (a rewrite has a new commit). */
+  lastCommit: string;
+  lastSeenAt: string;
+}
+
+export interface ChangeHistory {
+  changeId: string;
+  /** Oldest first. */
+  refs: ChangeRef[];
+}
+
 export interface CiStep {
   position: number;
   name: string;

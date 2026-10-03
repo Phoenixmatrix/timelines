@@ -301,6 +301,33 @@ export interface Database {
     ref: string;
     oid: string;
   };
+  repo_refs: {
+    repo_id: string;
+    ref: string;
+    oid: string;
+  };
+  ref_updates: {
+    id: Generated<number>;
+    repo_id: string;
+    ref: string;
+    old_oid: string | null;
+    new_oid: string | null;
+    /** 1 for a force push; null until (or when) the commits couldn't be read. */
+    forced: number | null;
+    actor_id: string | null;
+    agent_id: string | null;
+    created_at: Generated<string>;
+  };
+  change_refs: {
+    repo_id: string;
+    change_id: string;
+    ref: string;
+    first_commit_oid: string;
+    first_update_id: number;
+    first_seen_at: Generated<string>;
+    last_commit_oid: string;
+    last_seen_at: Generated<string>;
+  };
   ci_runs: {
     id: string;
     repo_id: string;
