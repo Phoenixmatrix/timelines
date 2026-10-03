@@ -182,4 +182,20 @@ describe("capability grouping", () => {
     }
     expect(same / Math.ceil(600 / 37)).toBeGreaterThan(0.8);
   }, 60_000);
+
+  test("a pair linked by one import is too little evidence for a capability", () => {
+    const input = fixture();
+    input.files.push(f("tools/a.ts"), f("tools/b.ts"));
+    input.imports.push({ src: f("tools/a.ts"), dst: f("tools/b.ts") });
+    const grouping = groupCapabilities(input);
+    for (const path of ["tools/a.ts", "tools/b.ts"])
+      expect(grouping.members.find((m) => m.file === f(path))).toMatchObject({
+        capability: null,
+        unclassified: "weak-evidence",
+      });
+    for (const c of grouping.capabilities) expect(c.files).toBeGreaterThanOrEqual(3);
+    // Areas of dropped groups don't linger.
+    const areaIds = new Set(grouping.areas.map((a) => a.id));
+    for (const m of grouping.members) if (m.area) expect(areaIds.has(m.area)).toBe(true);
+  });
 });

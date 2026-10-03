@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
 import { d1, migratedDatabase } from "../testing/d1.ts";
+import { GROUPING_VERSION } from "./grouping.ts";
 import {
   beginRepoProjection,
   childrenAt,
@@ -352,6 +353,7 @@ describe("Atlas projections", () => {
       "web/checkout.ts",
       "web/cart.ts",
       "ops/deploy.ts",
+      "ops/canary.ts",
       "ops/rollback.ts",
       "misc/notes.ts",
     ])
@@ -367,10 +369,12 @@ describe("Atlas projections", () => {
     edge(sqlite, "component:web", "file:web/cart.ts", "contains");
     edge(sqlite, "component:ops", "file:ops/deploy.ts", "contains");
     edge(sqlite, "component:ops", "file:ops/rollback.ts", "contains");
+    edge(sqlite, "component:ops", "file:ops/canary.ts", "contains");
     edge(sqlite, "file:web/checkout.ts", "file:src/billing/charge.ts", "imports");
     edge(sqlite, "file:src/billing/invoice.ts", "file:src/billing/charge.ts", "imports");
     edge(sqlite, "file:web/cart.ts", "file:web/checkout.ts", "imports");
     edge(sqlite, "file:ops/rollback.ts", "file:ops/deploy.ts", "imports");
+    edge(sqlite, "file:ops/canary.ts", "file:ops/rollback.ts", "imports");
     for (const [path, concepts] of [
       ["src/billing/charge.ts", ["payments", "code"]],
       ["src/billing/invoice.ts", ["payments", "code"]],
@@ -378,6 +382,7 @@ describe("Atlas projections", () => {
       ["web/cart.ts", ["cart", "code"]],
       ["ops/deploy.ts", ["deployment", "code"]],
       ["ops/rollback.ts", ["deployment", "code"]],
+      ["ops/canary.ts", ["deployment", "code"]],
       ["misc/notes.ts", ["code"]],
     ] as const)
       for (const c of concepts) edge(sqlite, `file:${path}`, `concept:${c}`, "mentions");
@@ -397,11 +402,11 @@ describe("Atlas projections", () => {
       return { seq, stats };
     };
     const { seq, stats } = await build("c1");
-    expect(stats).toMatchObject({ capabilities: 2, unclassified: 1, files: 7 });
+    expect(stats).toMatchObject({ capabilities: 2, unclassified: 1, files: 8 });
     expect(
       sqlite.prepare("SELECT grouping_version FROM atlas_snapshots WHERE seq = ?").get(seq),
     ).toEqual({
-      grouping_version: 1,
+      grouping_version: GROUPING_VERSION,
     });
 
     const top = await childrenAt(db, scope, seq, "repo", null, 100);
@@ -429,7 +434,7 @@ describe("Atlas projections", () => {
     expect(billing.data).toMatchObject({
       counts: { files: 4 },
       nameSource: "concepts",
-      grouping: { version: 1 },
+      grouping: { version: GROUPING_VERSION },
     });
     expect((checkout.data.membership as { rationale: unknown[] }).rationale.length).toBeGreaterThan(
       0,

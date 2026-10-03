@@ -1198,8 +1198,9 @@ concepts link through a bounded ring), never by comparing all pairs. Two
 levels of deterministic Louvain give areas and capabilities, so identical
 inputs give identical groups. Every file has one primary placement with the
 links that justify it (`membership.rationale`) and cross-cutting references
-that never count twice; files without evidence, or not analyzed yet, go to the
-**Unclassified** group. Directory components remain, under their folders, as
+that never count twice. Files without evidence, not analyzed yet, or in a
+group of fewer than three files (`MIN_CAPABILITY_FILES`: one import between two
+files is too little evidence) go to the **Unclassified** group. Directory components remain, under their folders, as
 inputs. Interim capability names come from their strongest shared concepts
 (`nameSource: "concepts"`); summaries come later (CORE-164).
 

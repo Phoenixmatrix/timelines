@@ -24,13 +24,18 @@
 // (CORE-164) and identity across snapshots (CORE-165) build on its output.
 
 /** Bump whenever the algorithm or its inputs change: snapshots record it. */
-export const GROUPING_VERSION = 1;
+export const GROUPING_VERSION = 2;
 export const MAX_NEIGHBORS = 32;
 const IMPORT_WEIGHT = 3;
 /** Cross-cutting: support for another capability relative to the primary one. */
 const CROSS_RATIO = 0.5;
 const MAX_CROSS = 3;
 const MAX_RATIONALE = 4;
+/**
+ * A capability needs at least this many files: a pair linked by a single
+ * import is too little evidence for a capability, so it stays unclassified.
+ */
+export const MIN_CAPABILITY_FILES = 3;
 const LOUVAIN_PASSES = 12;
 
 export interface GroupingInput {
@@ -60,7 +65,11 @@ export interface Membership {
   rationale: Evidence[];
   crossCutting: { capability: string; support: number }[];
   /** Why a file is unclassified. */
-  unclassified?: "no-evidence" | "isolated";
+  /**
+   * Why a file is unclassified: no evidence at all, alone in its area, or its
+   * group was too small to call a capability.
+   */
+  unclassified?: "no-evidence" | "isolated" | "weak-evidence";
 }
 
 export interface Area {
@@ -352,8 +361,18 @@ export function groupCapabilities(input: GroupingInput): Grouping {
   }
   const capabilities: Capability[] = [];
   const capabilityOfFile = new Map<number, Capability>();
+  const weak = new Set<number>();
+  const dropped = new Set<string>();
   for (const [, list] of [...capAreas].sort((x, y) => x[0] - y[0])) {
     const members = list.flatMap((area) => area.files.map((f) => index.get(f)!));
+    if (members.length < MIN_CAPABILITY_FILES) {
+      for (const area of list) dropped.add(area.id);
+      for (const i of members) {
+        weak.add(i);
+        areaOfFile.delete(i);
+      }
+      continue;
+    }
     const anchor = files[anchorOf(members)]!;
     const concepts = conceptWeight(members);
     const capability: Capability = {
@@ -373,7 +392,7 @@ export function groupCapabilities(input: GroupingInput): Grouping {
     for (const i of members) capabilityOfFile.set(i, capability);
   }
   capabilities.sort((a, b) => b.files - a.files || byId(a.id, b.id));
-  areas.sort((a, b) => byId(a.id, b.id));
+  const keptAreas = areas.filter((area) => !dropped.has(area.id)).sort((a, b) => byId(a.id, b.id));
 
   const members: Membership[] = files.map((file, i) => {
     const area = areaOfFile.get(i);
@@ -385,7 +404,8 @@ export function groupCapabilities(input: GroupingInput): Grouping {
         capability: null,
         rationale: [],
         crossCutting: [],
-        unclassified: adj[i]!.size === 0 ? "no-evidence" : "isolated",
+        unclassified:
+          adj[i]!.size === 0 ? "no-evidence" : weak.has(i) ? "weak-evidence" : "isolated",
       };
     const inArea = new Set(area.files.map((f) => index.get(f)!));
     const rationale: Evidence[] = [];
@@ -432,7 +452,7 @@ export function groupCapabilities(input: GroupingInput): Grouping {
   return {
     version: GROUPING_VERSION,
     capabilities,
-    areas,
+    areas: keptAreas,
     members,
     stats: {
       files: files.length,
