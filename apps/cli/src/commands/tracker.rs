@@ -2185,6 +2185,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     args.command,
                     IssueCommand::Claim { .. } | IssueCommand::Renew { .. }
                 ) && response["results"][0]["leaseToken"].as_str().is_none())
+                || (matches!(args.command, IssueCommand::Ask { .. })
+                    && response["results"][0]["id"].as_str() != Some(target.as_str()))
             {
                 return Err(GmError::new(
                     "uncertain_ack",
@@ -2198,8 +2200,22 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     drop_lease(&r.config, &target)
                 }
                 _ => {
-                    if let Some(token) = result["leaseToken"].as_str() {
-                        let issue = result["issueId"].as_str().unwrap_or(&target);
+                    let (issue, token, expires_at) =
+                        if matches!(args.command, IssueCommand::Ask { .. }) {
+                            // Parking keeps the submitted token, but removes its deadline.
+                            (
+                                mutation["data"]["issueId"].as_str().unwrap_or(&target),
+                                mutation["data"]["leaseToken"].as_str(),
+                                None,
+                            )
+                        } else {
+                            (
+                                result["issueId"].as_str().unwrap_or(&target),
+                                result["leaseToken"].as_str(),
+                                result["expiresAt"].as_str(),
+                            )
+                        };
+                    if let Some(token) = token {
                         let key = snapshot["issues"]
                             .as_array()
                             .into_iter()
@@ -2215,7 +2231,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                                 token: token.to_string(),
                                 identity: holder.clone().unwrap_or(current.clone()),
                                 issue: key.to_string(),
-                                expires_at: result["expiresAt"].as_str().map(str::to_string),
+                                expires_at: expires_at.map(str::to_string),
                             },
                         )?;
                     }

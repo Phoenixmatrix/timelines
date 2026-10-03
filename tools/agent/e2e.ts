@@ -786,6 +786,61 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     assert.equal(first.claimed?.issueId, waiting);
     assert.equal(first.intervention.mode, "autonomous");
     secrets.add(first.claimed!.leaseToken);
+    const leaseDirectory = join(
+      ctx.env.XDG_DATA_HOME!,
+      "gitmatrix",
+      "leases",
+      createHash("sha256").update(ctx.origin).digest("hex"),
+    );
+    const parkedPath = join(leaseDirectory, `${waiting}.json`);
+    const expiredPath = join(leaseDirectory, `expired-control-${randomUUID()}.json`);
+    const kept = JSON.parse(await readFile(parkedPath, "utf8")) as {
+      token: string;
+      identity: unknown;
+      issue: string;
+      expires_at: string | null;
+    };
+    // Model a long-expired local deadline without waiting a day or changing the
+    // server clock. An acknowledged park must remove that deadline before pruning.
+    kept.expires_at = "2000-01-01T00:00:00Z";
+    await writeFile(parkedPath, JSON.stringify(kept), { mode: 0o600 });
+    await writeFile(
+      expiredPath,
+      JSON.stringify({ ...kept, token: "expired-control", issue: "EXPIRED-CONTROL" }),
+      { mode: 0o600 },
+    );
+    await gm(
+      [
+        "issue",
+        "ask",
+        waiting,
+        "--kind",
+        "decision",
+        "--prompt",
+        "Invalid choice set",
+        "--choice",
+        "only",
+      ],
+      "marco",
+      directory,
+      /at least two choices/i,
+      { GM_TOKEN: token.secret },
+    );
+    await run([
+      "issue",
+      "ask",
+      waiting,
+      "--kind",
+      "question",
+      "--prompt",
+      "Preview only",
+      "--dry-run",
+    ]);
+    assert.equal(
+      JSON.parse(await readFile(parkedPath, "utf8")).expires_at,
+      kept.expires_at,
+      "Rejected and dry-run asks must not change the kept lease deadline",
+    );
     await run([
       "issue",
       "ask",
@@ -808,6 +863,12 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "--prompt",
       "Blocked by DNS ownership; please confirm the record is enabled.",
     ]);
+    await run(["auth", "status"]);
+    const parked = JSON.parse(await readFile(parkedPath, "utf8"));
+    assert.equal(parked.token, kept.token);
+    assert.deepEqual(parked.identity, kept.identity);
+    assert.equal(parked.expires_at, null);
+    await assert.rejects(stat(expiredPath), { code: "ENOENT" });
     const open = JSON.parse(await run(["request", "list", "--issue", waiting])) as Requests;
     assert.equal(open.requests.length, 2);
     assert(
@@ -861,6 +922,13 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       results: { leaseToken: string }[];
     };
     secrets.add(resumed.results[0]!.leaseToken);
+    const active = JSON.parse(await readFile(parkedPath, "utf8"));
+    assert.equal(active.token, resumed.results[0]!.leaseToken);
+    assert.notEqual(active.token, kept.token);
+    assert.deepEqual(active.identity, kept.identity);
+    assert(Date.parse(active.expires_at) > Date.now(), "Resume restores a finite active deadline");
+    await run(["auth", "status"]);
+    assert.equal(JSON.parse(await readFile(parkedPath, "utf8")).token, active.token);
     await run([
       "issue",
       "complete",
@@ -868,6 +936,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "--evidence",
       "Read both owner answers and resumed the parked lease.",
     ]);
+    await assert.rejects(stat(parkedPath), { code: "ENOENT" });
     await run(["agent", "setup", "--no-identity", "--intervention", "harness"]);
     const last = JSON.parse(await run(["issue", "next"])) as Pick;
     assert.equal(last.claimed?.issueId, dependent);
@@ -887,6 +956,9 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       partialAnswerKeptLeaseParked: true,
       answersReadableByIssue: true,
       resumedAfterAllAnswers: true,
+      parkedTokenSurvivedExpiryPruning: true,
+      expiredControlWasPruned: true,
+      resumeRestoredFiniteExpiry: true,
       dependentWorkStayedBlocked: true,
       harnessOverrideApplied: true,
     });

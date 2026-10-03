@@ -313,7 +313,10 @@ handing off, completing or releasing a lease taken earlier is sent as the
 identity that holds it (the output says `actedAs`). `gm auth status` lists
 previous identities while they still hold leases; a record goes when its lease
 ends, or a day after it expires, so an identity with no work left leaves no
-trace. Expired or superseded tokens are rejected even for the same human account.
+trace. An acknowledged `issue ask` that parks a held lease clears its kept expiry
+without changing its token or identity, so `auth status` cannot prune it during a
+long human wait. `issue resume` stores the fresh token and finite expiry again.
+Expired or superseded tokens are rejected even for the same human account.
 An ambiguous lease response is an error, not ownership: inspect the issue and do
 not start work without a received token.
 
