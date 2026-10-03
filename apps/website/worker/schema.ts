@@ -249,6 +249,36 @@ export interface Database {
     ended_at: string | null;
     ended_reason: "landed" | "abandoned" | "ended" | null;
   };
+  /** Atlas paid-synthesis calls, reserved then reconciled (worker/knowledge/budget.ts). */
+  atlas_spend: {
+    id: string;
+    account_id: string;
+    day: string;
+    scope: "build" | "grouping";
+    run_id: string;
+    repo_id: string | null;
+    purpose: string;
+    model: string;
+    status: "reserved" | "settled" | "failed" | "released";
+    input_tokens: number;
+    output_tokens: number;
+    cost_micro_usd: number;
+    reserved_input_tokens: number;
+    reserved_output_tokens: number;
+    reserved_micro_usd: number;
+    created_at: string;
+    settled_at: string | null;
+  };
+  atlas_budget_exhaustions: {
+    key: string;
+    account_id: string;
+    scope: "day" | "build" | "grouping";
+    run_id: string | null;
+    day: string | null;
+    cap: "daily_usd" | "calls" | "input_tokens" | "output_tokens";
+    exhausted_at: string;
+    resets_at: string | null;
+  };
   kg_overlay_changes: {
     repo_id: string;
     overlay_id: string;

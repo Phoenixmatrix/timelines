@@ -1108,6 +1108,29 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   Once a timeline's overlay has ended its sets are read-only: none is queued,
   and one being written stops as `ended`, keeping what it wrote.
 
+**Atlas paid-synthesis budgets** (`worker/knowledge/budget.ts`, CORE-162).
+Model calls the Semantic Code Atlas adds go through this module; upstream
+Knowledge inference, release notes and the assistant don't, so their spend
+stays where it was (build stats' `tokens`, `kg_synthesis`), and each build's
+stats carry Atlas spend separately as `atlasSpend`. Caps (`ATLAS_LIMITS`): per
+repository build 20 calls, 100,000 input and 10,000 output tokens; per account
+grouping pass 10 calls, 50,000 input and 5,000 output tokens; and **$10 per
+UTC day per owning account** (the repository owner), shared by every
+repository, scope and principal. Prices are `ATLAS_PRICES` (USD per million
+input/output tokens per model id, from `cf ai models list`); a model without one
+returns `disabled`. Each call is reserved before it runs at its maximum cost
+(input estimate + `max_tokens`) by one guarded `INSERT … SELECT` into
+`atlas_spend`, so concurrent callers can't overshoot, then reconciled to
+reported usage. The first cap reached is recorded in
+`atlas_budget_exhaustions` and stops that run (the ceiling: the account until
+UTC midnight); a failed call stays charged and nothing retries automatically.
+Integrate with `runAtlasCall(env.DB, {scope, purpose, model, maxInputTokens,
+maxOutputTokens}, call)` (or `reserveAtlasCall` then `settleAtlasCall`,
+`failAtlasCall` or `releaseAtlasCall`), passing `attempts: 1` to `chatJson`;
+on `exhausted` or `disabled`, publish structure and label summaries
+unavailable. Only build-time code may import it: browsing never authorizes
+inference (a test enforces it).
+
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
 `gitmatrix-knowledge`, AI Search namespace `gitmatrix` / instance `knowledge`.

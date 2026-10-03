@@ -20,6 +20,9 @@ export const EMBEDDING_DIMENSIONS = 1024;
 export interface Usage {
   model: string;
   tokens: number;
+  /** The provider's prompt/completion split, when it reports one (Atlas budgets reconcile with it). */
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 interface ChatChoice {
@@ -97,7 +100,15 @@ async function chat(
   const text =
     choice?.message?.content ?? (typeof result.response === "string" ? result.response : "");
   if (!text) throw new Error(`${model} returned no content (${choice?.finish_reason ?? "?"})`);
-  return { text, usage: { model, tokens: result.usage?.total_tokens ?? 0 } };
+  return {
+    text,
+    usage: {
+      model,
+      tokens: result.usage?.total_tokens ?? 0,
+      inputTokens: result.usage?.prompt_tokens,
+      outputTokens: result.usage?.completion_tokens,
+    },
+  };
 }
 
 /** Parse the first JSON object in a model reply, tolerating code fences and chatter. */
@@ -109,13 +120,16 @@ export function parseJsonReply<T>(text: string): T {
   return JSON.parse(unfenced.slice(start, end + 1)) as T;
 }
 
-/** A JSON answer, retried once if the model's reply doesn't parse. */
+/**
+ * A JSON answer, retried once if the model's reply doesn't parse. Atlas paid
+ * synthesis passes `attempts: 1`: its budgets allow no automatic paid retries.
+ */
 export async function chatJson<T>(
   env: Env,
   tier: "fast" | "reason",
   system: string,
   user: string,
-  options: { maxTokens?: number; think?: boolean } = {},
+  options: { maxTokens?: number; think?: boolean; attempts?: number } = {},
 ): Promise<{ value: T; usage: Usage }> {
   const messages = [
     { role: "system" as const, content: system },
@@ -123,7 +137,10 @@ export async function chatJson<T>(
   ];
   let lastError: unknown;
   let tokens = 0;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // Undefined once any attempt didn't report its split.
+  let inputTokens: number | undefined = 0;
+  let outputTokens: number | undefined = 0;
+  for (let attempt = 0; attempt < (options.attempts ?? 2); attempt++) {
     try {
       const { text, usage } = await chat(env, tier, messages, {
         json: true,
@@ -131,7 +148,18 @@ export async function chatJson<T>(
         think: options.think ?? false,
       });
       tokens += usage.tokens;
-      return { value: parseJsonReply<T>(text), usage: { model: usage.model, tokens } };
+      inputTokens =
+        inputTokens === undefined || usage.inputTokens === undefined
+          ? undefined
+          : inputTokens + usage.inputTokens;
+      outputTokens =
+        outputTokens === undefined || usage.outputTokens === undefined
+          ? undefined
+          : outputTokens + usage.outputTokens;
+      return {
+        value: parseJsonReply<T>(text),
+        usage: { model: usage.model, tokens, inputTokens, outputTokens },
+      };
     } catch (error) {
       lastError = error;
     }

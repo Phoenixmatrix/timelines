@@ -34,6 +34,7 @@ import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
+import { atlasRunSpend } from "./budget.ts";
 import {
   applyGraph,
   buildGraph,
@@ -756,12 +757,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           )
           .execute();
       }
+      // Atlas paid synthesis is attributed apart from upstream Knowledge tokens.
+      const atlasSpend = await atlasRunSpend(env.DB, "build", buildId);
       await db(env.DB)
         .updateTable("kg_builds")
         .set({
           status: "succeeded",
           phase: "done",
-          stats: patchStats(stats),
+          stats: patchStats({ ...stats, atlasSpend }),
           finished_at: nowIso(),
         })
         .where("id", "=", buildId)
