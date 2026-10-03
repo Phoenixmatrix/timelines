@@ -940,6 +940,11 @@ describe("agents", () => {
     });
     const issue = f.store.snapshot(f.access).issues.find((i) => i.id === "work")!;
     expect(issue.claim).toMatchObject({ actorId: "agt-bot", accountableId: "alice" });
+    expect(issue.assigneeId).toBe("agt-bot");
+    expect(f.reopen().snapshot(f.access).issues[0]!.assigneeId).toBe("agt-bot");
+    const audit = f.store.history(f.access, "work", null, 10).events[0]!;
+    expect(audit.before).toMatchObject({ assigneeId: null, claim: null });
+    expect(audit.entity).toMatchObject({ assigneeId: "agt-bot", claim: { actorId: "agt-bot" } });
     expect(claimed.events.at(-1)?.actorId).toBe("agt-bot");
     // The lease is the agent's: its human holds no claim on it.
     expect(() =>
@@ -952,6 +957,44 @@ describe("agents", () => {
     expect(
       f.store.snapshot(f.access).agents.map((a) => `${a.name} for ${a.accountable.slug}`),
     ).toEqual(["bot for alice"]);
+  });
+
+  test.each(["bob", "agt-bot"])("claiming preserves the existing assignee %s", (assigneeId) => {
+    const f = fixture();
+    f.mutate({
+      kind: "issue.create",
+      id: "assigned",
+      data: { teamId: "team", title: "Already assigned", assigneeId },
+    });
+    const claimed = f.mutate({ kind: "issue.claim", id: "assigned", data: { agent: "session" } });
+    expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+      assigneeId,
+      claim: { actorId: "alice" },
+    });
+    f.mutate({
+      kind: "issue.renew",
+      id: "assigned",
+      data: { leaseToken: String(claimed.results[0]!.leaseToken) },
+    });
+    expect(f.store.snapshot(f.access).issues[0]!.assigneeId).toBe(assigneeId);
+  });
+
+  test("assignment and claim roll back together when a later mutation fails", () => {
+    const f = fixture();
+    f.issue("work");
+    f.access.actorId = "agt-bot";
+    expect(() =>
+      f.mutate(
+        { kind: "issue.claim", id: "work", data: { agent: "session" } },
+        { kind: "issue.update", id: "missing", expectedVersion: 1, data: { title: "Invalid" } },
+      ),
+    ).toThrow();
+    expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+      assigneeId: null,
+      claim: null,
+      status: "todo",
+      version: 1,
+    });
   });
 
   test("an agent can be assigned when its human could be; unknown agents can't", () => {
@@ -1044,7 +1087,11 @@ describe("issue.next", () => {
       "b",
     ]);
     const claimed = b.store.snapshot(b.access).issues.find((i) => i.id === first.issueId)!;
-    expect(claimed).toMatchObject({ status: "in_progress", claim: { agent: "walker" } });
+    expect(claimed).toMatchObject({
+      status: "in_progress",
+      assigneeId: "alice",
+      claim: { agent: "walker" },
+    });
     // The token is a real lease on the issue it named.
     b.mutate({
       kind: "issue.complete",
@@ -1176,6 +1223,9 @@ describe("delegated leases", () => {
       accountableId: "alice",
       delegatedFrom: "project",
     });
+    expect(t.store.snapshot(t.access).issues.find((i) => i.id === "child")!.assigneeId).toBe(
+      "agt-bot",
+    );
     // The lead's token no longer speaks for the delegated child; the child's does, for its holder.
     expect(() =>
       t.mutate({
@@ -1268,6 +1318,9 @@ describe("delegated leases", () => {
     const own = pick({ underId: "project", underToken: t.lead, forActorId: "agt-bot" });
     expect(["grandchild", "sibling"]).toContain(own.issueId);
     expect(t.claimOf(own.issueId!)).toMatchObject({ actorId: "agt-bot", delegatedFrom: "project" });
+    expect(t.store.snapshot(t.access).issues.find((i) => i.id === own.issueId)!.assigneeId).toBe(
+      "agt-bot",
+    );
   });
 });
 
@@ -1476,6 +1529,7 @@ describe("handoff", () => {
       agent: "second",
     });
     expect(h.issue().handoff).toBeNull();
+    expect(h.issue().assigneeId).toBe("agt-bot");
     expect(() =>
       h.as(h.bot, { kind: "issue.renew", id: "work", data: { leaseToken: h.giver } }),
     ).toThrow(/belongs to another agent/);

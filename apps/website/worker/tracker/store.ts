@@ -637,6 +637,7 @@ export class TrackerStore {
           expiresAt,
           ...(delegatedFrom ? { delegatedFrom: delegatedFrom.id } : {}),
         };
+        issue.assigneeId ??= holder.actorId;
         issue.status = "in_progress";
         run(
           this.sql,

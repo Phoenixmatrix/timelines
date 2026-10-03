@@ -248,6 +248,11 @@ every blocker **done**. Canceled blockers still block. Parent hierarchy does not
 implicitly block. `ready` and `show` provide cursor, cached timestamp, bounded
 sections and advisory readiness; only an online claim grants exclusive work.
 
+The server automatically assigns an unassigned issue to the identity holding
+its claim, including `next` and delegated claims. For an authenticated agent,
+that is the agent—not its accountable person or the `--agent` session label.
+Existing assignees are preserved; ending a claim does not clear assignment.
+
 ```bash
 gm issue claim ENG-1 --agent search-agent --ttl 900
 gm issue renew ENG-1 --ttl 900

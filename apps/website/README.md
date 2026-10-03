@@ -451,6 +451,10 @@ subtasks or satisfy dependent issues' blockers.
   release and complete require the unexpired fencing token; completion also
   records evidence, rechecks blockers and refuses parents with open sub-issues.
   Tokens never appear in public snapshots or event feeds.
+  Granting a lease also assigns an unassigned issue to its holder's identity in
+  the same transaction and audit event. Delegated claims use the receiving
+  agent, not the delegator or session label. Existing assignees are preserved,
+  including on renewal, handoff and takeover; ending a lease does not clear assignment.
 - **Graph engineering (CORE-4):** agents work through issue graphs on their own.
   - _Agents_ are identities a person creates (Settings > Agents, `gm agent`); they
     act with their person's access but everything is attributed to the agent, and
