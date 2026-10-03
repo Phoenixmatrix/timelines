@@ -1,0 +1,6 @@
+participant,first_condition,first_variant,second_condition,second_variant
+P1,baseline,A,new,B
+P2,new,A,baseline,B
+P3,baseline,B,new,A
+P4,new,B,baseline,A
+P5,new,A,baseline,B
