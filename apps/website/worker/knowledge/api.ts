@@ -13,6 +13,11 @@
 //   GET  /overlays               every timeline's graph diff against main, in brief,
 //                                ended timelines' last ones included (read-only)
 //   GET  /overlay?ref=timeline/<slug>&limit=   one timeline's diff, with its changes
+//                                and its newest wiki page sets
+//   GET  /overlay/pages?ref=timeline/<slug>[&checkpoint=]   its wiki page sets (CORE-84)
+//   POST /overlay/pages?ref=timeline/<slug>[&checkpoint=]   write its pages now, at the
+//                                bookmark's tip (or retry a checkpoint's failed set) (write)
+//   GET  /overlay/page?ref=timeline/<slug>&slug=[&set=]     one timeline page in full
 
 import { Hono, type Context } from "hono";
 import { sql, type Selectable } from "kysely";
@@ -25,7 +30,9 @@ import type {
   KnowledgeOverlay,
   KnowledgeOverlayChange,
   KnowledgeOverlaySummary,
+  KnowledgePageSets,
   KnowledgeSearchResults,
+  KnowledgeTimelinePage,
   KnowledgeStatus,
   WikiCatalog,
   WikiPage,
@@ -37,10 +44,11 @@ import type { AppEnv } from "../auth.ts";
 import type { RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { db, type Database } from "../schema.ts";
-import { coordinator, notifyKnowledge } from "./coordinator.ts";
+import { coordinator, notifyKnowledge, requestPages } from "./coordinator.ts";
 import { PASSAGE_CANDIDATES, SEARCH_INSTANCE, selectPassages } from "./indexes.ts";
 import { embed } from "./models.ts";
 import { overlayRef, setEndReason, timelineEnd } from "./overlay.ts";
+import { commitKey, listSets, overlayEnded, timelinePage } from "./pages.ts";
 import { timelineSlugOf } from "../../shared/timelines.ts";
 
 export const knowledge = new Hono<AppEnv>();
@@ -151,7 +159,7 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
   };
 }
 
-async function repoOrFail(c: Context<AppEnv>, needed: "read" | "admin" = "read") {
+async function repoOrFail(c: Context<AppEnv>, needed: "read" | "write" | "admin" = "read") {
   const loaded = await loadRepo(c, needed);
   return loaded instanceof Response ? loaded : loaded.row;
 }
@@ -695,6 +703,112 @@ knowledge.get("/overlay", async (c) => {
     ...found.summary,
     changes: changes.slice(0, limit),
     truncated: changes.length > limit || totalChanges > found.stored,
+    pageSets: await listSets(c.env.DB, row.id, ref, { limit: 5 }),
+  };
+  return c.json(body);
+});
+
+// ---- timeline wiki pages (CORE-84) ---------------------------------------------
+
+knowledge.get("/overlay/pages", async (c) => {
+  const row = await repoOrFail(c);
+  if (row instanceof Response) return row;
+  const ref = overlayRef(c.req.query("ref") ?? "");
+  if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
+  const key = c.req.query("checkpoint") || undefined;
+  const [sets, ended] = await Promise.all([
+    listSets(c.env.DB, row.id, ref, { key }),
+    overlayEnded(c.env.DB, row.id, ref),
+  ]);
+  const body: KnowledgePageSets = {
+    ref: ref.replace(/^refs\/heads\//, ""),
+    timeline: timelineSlugOf(ref) ?? ref,
+    ended,
+    sets,
+  };
+  return c.json(body);
+});
+
+knowledge.post("/overlay/pages", async (c) => {
+  const row = await repoOrFail(c, "write");
+  if (row instanceof Response) return row;
+  if (!c.env.AI)
+    return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
+  const ref = overlayRef(c.req.query("ref") ?? "");
+  if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
+  if (await overlayEnded(c.env.DB, row.id, ref))
+    return fail(c, 409, "This timeline has ended: its pages are kept read-only.");
+  const checkpoint = c.req.query("checkpoint");
+  let request: Parameters<typeof requestPages>[1];
+  if (checkpoint) {
+    // A checkpoint's set is queued when the checkpoint is made; asking again retries a failed one.
+    const [set] = await listSets(c.env.DB, row.id, ref, { key: checkpoint, limit: 1 });
+    if (!set) return fail(c, 404, "No pages were asked for at that checkpoint.");
+    request = {
+      repoId: row.id,
+      ref,
+      key: set.key,
+      commit: set.commit,
+      checkpoint: set.checkpoint && { id: set.checkpoint.id, number: set.checkpoint.number ?? 0 },
+      requestedBy: c.get("actor")?.id ?? null,
+    };
+  } else {
+    const reader = new RepoReader(
+      c.env,
+      row.artifacts_name,
+      row.artifacts_remote,
+      c.get("timing"),
+      (w) => c.executionCtx.waitUntil(w),
+    );
+    const refs = await reader.refs().finally(() => reader.close());
+    const tip = refs.branches.find((b) => b.name === ref)?.oid;
+    if (!tip) return fail(c, 404, "No such timeline bookmark.");
+    request = {
+      repoId: row.id,
+      ref,
+      key: commitKey(tip),
+      commit: tip,
+      checkpoint: null,
+      requestedBy: c.get("actor")?.id ?? null,
+    };
+  }
+  await requestPages(c.env, request);
+  const [set] = await listSets(c.env.DB, row.id, ref, { key: request.key, limit: 1 });
+  return c.json(set, 202);
+});
+
+knowledge.get("/overlay/page", async (c) => {
+  const row = await repoOrFail(c);
+  if (row instanceof Response) return row;
+  const ref = overlayRef(c.req.query("ref") ?? "");
+  if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
+  const found = await timelinePage(
+    c.env.DB,
+    row.id,
+    ref,
+    c.req.query("slug") ?? "",
+    c.req.query("set") || undefined,
+  );
+  if (!found) return fail(c, 404, "This timeline has no such page.");
+  const { page, set } = found;
+  const { pages: _pages, counts: _counts, ...brief } = set;
+  const body: KnowledgeTimelinePage = {
+    slug: page.slug,
+    title: page.title,
+    section: page.section,
+    position: page.position,
+    nodeId: page.node_id,
+    updatedAt: page.updated_at,
+    body: page.body,
+    diagram: page.diagram,
+    sources: JSON.parse(page.sources) as string[],
+    generatedIn: set.commit,
+    model: page.model,
+    timeline: set.timeline,
+    set: brief,
+    kind: page.kind,
+    change: page.change,
+    outcome: page.outcome,
   };
   return c.json(body);
 });

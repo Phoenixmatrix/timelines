@@ -403,6 +403,78 @@ export interface KnowledgeOverlay extends KnowledgeOverlaySummary {
   changes: KnowledgeOverlayChange[];
   /** More changes are stored than were returned. */
   truncated: boolean;
+  /** The timeline's newest wiki page sets (CORE-84), newest first. */
+  pageSets: KnowledgePageSet[];
+}
+
+/**
+ * Where a timeline's wiki page set stands (CORE-84): `queued` and `writing`
+ * while pending; `ended` when the timeline ended before it was finished (what
+ * was written is kept, read-only).
+ */
+export type KnowledgePageSetState = "queued" | "writing" | "succeeded" | "failed" | "ended";
+
+/** One wiki page written for a timeline, in brief. */
+export interface KnowledgeTimelinePageSummary {
+  slug: string;
+  title: string;
+  section: string;
+  kind: "component" | "architecture" | "glossary";
+  /** Whether the timeline adds the page's subject or changes it. */
+  change: "added" | "changed";
+  /** `kept`: main's page still holds, so the timeline has no page of its own. */
+  outcome: "written" | "kept";
+  nodeId: string | null;
+  /** The page's opening, for a review card; empty when kept. */
+  excerpt: string;
+  model: string | null;
+  updatedAt: string;
+}
+
+/**
+ * The wiki pages a timeline affects, written for one checkpoint (or on
+ * demand at one commit), apart from main's wiki: what the timeline adds or
+ * changes in components and concepts.
+ */
+export interface KnowledgePageSet {
+  /** The bookmark, as `timeline/<slug>`. */
+  ref: string;
+  timeline: string;
+  /** What it was written for: a checkpoint's id, or `commit:<oid>` on demand. */
+  key: string;
+  checkpoint: { id: string; number: number | null } | null;
+  /** The timeline commit the pages describe. */
+  commit: string;
+  /** Main's indexed commit they were measured against. */
+  baseCommit: string | null;
+  state: KnowledgePageSetState;
+  /** The timeline's graph diff the pages were chosen from, per node kind. */
+  counts: Record<string, { added: number; changed: number; removed: number }>;
+  pages: KnowledgeTimelinePageSummary[];
+  /** Affected pages left out by the per-set caps. */
+  skipped: number;
+  error: string | null;
+  requestedAt: string;
+  finishedAt: string | null;
+}
+
+/** GET /knowledge/overlay/pages: a timeline's page sets, newest first. */
+export interface KnowledgePageSets {
+  ref: string;
+  timeline: string;
+  /** The timeline's overlay has ended: its pages are read-only and no new set starts. */
+  ended: boolean;
+  sets: KnowledgePageSet[];
+}
+
+/** GET /knowledge/overlay/page: one timeline page in full. */
+export interface KnowledgeTimelinePage extends WikiPage {
+  timeline: string;
+  /** The set it belongs to. */
+  set: Omit<KnowledgePageSet, "pages" | "counts">;
+  kind: KnowledgeTimelinePageSummary["kind"];
+  change: KnowledgeTimelinePageSummary["change"];
+  outcome: KnowledgeTimelinePageSummary["outcome"];
 }
 
 // ---- CI/CD ------------------------------------------------------------------

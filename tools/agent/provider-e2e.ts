@@ -1164,6 +1164,118 @@ export async function runProviderE2E(
         mainBefore,
         "A timeline push changed main's graph, wiki or builds",
       );
+
+      enter("knowledge-timeline-pages");
+      // CORE-84: a checkpoint writes the wiki pages a timeline affects, kept
+      // apart from main's wiki. A tracked timeline forked from main's tip.
+      const pagesSlug = "copper-pages";
+      const pagesRef = `timeline/${pagesSlug}`;
+      const forked = await api(
+        `/tracker/${owner}/timelines`,
+        "POST",
+        { slug: pagesSlug, repos: [`${owner}/${name}`] },
+        201,
+      );
+      assert(
+        (forked.bookmarks as { ok: boolean }[]).every((b) => b.ok),
+        "Forking the pages timeline did not create its bookmark",
+      );
+      await git(["checkout", "-q", "-b", pagesRef, cited]);
+      await writeFile(
+        join(work, "receipts.ts"),
+        "/** A signed receipt that a Copper Finch batch was delivered. */\nexport interface CopperFinchReceipt {\n  batch: string;\n  parcels: number;\n  signedBy: string;\n}\n\n/** Issue the delivery receipt for a verified Copper Finch batch. */\nexport function copperFinchReceipt(batch: string, parcels: number, signedBy: string): CopperFinchReceipt {\n  return { batch, parcels, signedBy };\n}\n",
+      );
+      await git(["add", "receipts.ts"]);
+      await git([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        "Receipts for Copper Finch batches",
+      ]);
+      await git(["push", "origin", `HEAD:refs/heads/${pagesRef}`], work, true);
+      const pagesHead = await git(["rev-parse", "HEAD"]);
+      const made = await api(
+        `/tracker/${owner}/timelines/${pagesSlug}/checkpoints`,
+        "POST",
+        { summary: "Copper Finch batches get delivery receipts." },
+        201,
+      );
+      const checkpointId = made.checkpoint.id as string;
+      type PageSet = {
+        key: string;
+        state: string;
+        commit: string;
+        baseCommit: string | null;
+        counts: Record<string, { added: number; changed: number; removed: number }>;
+        pages: { slug: string; outcome: string; change: string; model: string | null }[];
+        error: string | null;
+      };
+      let set: PageSet | undefined;
+      // Queued after the checkpoint's response; one model-written page or so.
+      await waitFor("knowledge-timeline-pages", 12 * 60_000, async () => {
+        const listed = await api(
+          `${base}/knowledge/overlay/pages?ref=${encodeURIComponent(pagesRef)}&checkpoint=${encodeURIComponent(checkpointId)}`,
+        );
+        set = (listed.sets as PageSet[])[0];
+        if (set?.state === "failed" || set?.state === "ended")
+          throw new Error(`Timeline pages ${set.state}; see provider evidence`);
+        return set?.state === "succeeded";
+      });
+      const pages = set!;
+      evidence.timelinePages = {
+        key: pages.key,
+        commit: pages.commit,
+        baseCommit: pages.baseCommit,
+        counts: pages.counts,
+        pages: pages.pages,
+      };
+      assert.equal(pages.key, checkpointId, "The page set must belong to the checkpoint");
+      assert.equal(pages.commit, pagesHead, "The pages must describe the checkpoint's commit");
+      assert.equal(pages.baseCommit, cited, "The pages must be measured against main's graph");
+      assert((pages.counts.file?.added ?? 0) >= 1, "The pages' diff lacks the timeline's new file");
+      const written = pages.pages.filter(
+        (p) =>
+          p.outcome === "written" && (p.slug.startsWith("components/") || p.slug === "glossary"),
+      );
+      assert(written.length > 0, "The checkpoint wrote no component or glossary page");
+      const shown = written.find((p) => p.slug.startsWith("components/")) ?? written[0]!;
+      const timelinePage = await api(
+        `${base}/knowledge/overlay/page?ref=${encodeURIComponent(pagesRef)}&slug=${encodeURIComponent(shown.slug)}&set=${encodeURIComponent(checkpointId)}`,
+      );
+      (evidence.timelinePages as Record<string, unknown>).page = {
+        slug: timelinePage.slug,
+        model: timelinePage.model,
+        generatedIn: timelinePage.generatedIn,
+        body: String(timelinePage.body).slice(0, 1200),
+      };
+      assert.equal(
+        timelinePage.generatedIn,
+        pagesHead,
+        "A timeline page must be written at its commit",
+      );
+      if (shown.slug.startsWith("components/")) {
+        assert(timelinePage.model, "A timeline component page must record its model");
+        assert.match(
+          String(timelinePage.body),
+          /receipt/i,
+          "The timeline's component page must describe its new receipts",
+        );
+      } else assert(String(timelinePage.body).trim(), "The timeline's glossary must not be empty");
+      // The approval card shows them: the checkpoint view carries the set.
+      const view = await api(`/tracker/${owner}/timelines/${pagesSlug}/checkpoints/1`);
+      assert(
+        (view.knowledge as { key: string; state: string }[]).some(
+          (k) => k.key === checkpointId && k.state === "succeeded",
+        ),
+        "The checkpoint view must show the timeline's pages",
+      );
+      const mainFinally = await mainView();
+      assert.deepEqual(
+        mainFinally,
+        mainBefore,
+        "Writing a timeline's pages changed main's graph, wiki or builds",
+      );
     }
     evidence.outcome = "passed";
   } catch (error) {

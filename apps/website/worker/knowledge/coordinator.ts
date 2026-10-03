@@ -16,6 +16,11 @@
 // bookmarks starts no main build. When a bookmark disappears its last overlay
 // is kept, read-only, as landed or abandoned (from the timeline's record in
 // the account's tracker) or just ended, and is never computed again (CORE-139).
+//
+// It also runs the queue of timeline wiki page sets (pages.ts, CORE-84): a
+// checkpoint, or someone asking, queues a set in D1 and pings it; it starts
+// the oldest queued sets, one per timeline and a couple per repository at a
+// time, and watches them like overlays. Page sets never wait for pushes.
 
 import { DurableObject } from "cloudflare:workers";
 import { timelineSlugOf } from "../../shared/timelines.ts";
@@ -33,6 +38,17 @@ import {
   type OverlayRun,
   type OverlayState,
 } from "./overlay.ts";
+import {
+  abandonSet,
+  claimSet,
+  queuedSets,
+  queueSet,
+  releaseSet,
+  schedulePages,
+  type PageRequest,
+  type PageRun,
+} from "./pages.ts";
+import type { Checkpoint } from "../../shared/timelines.ts";
 import { watchdog } from "./watchdog.ts";
 
 /** Quiet period after the last push before building. */
@@ -45,6 +61,8 @@ const WATCHDOG_MS = 60_000;
 const MAX_RETRIES = 1;
 /** An overlay is a few steps; one running longer than this is stopped. */
 const OVERLAY_MAX_MS = 2 * 60 * 60_000;
+/** A page set is a few model calls; one running longer than this is stopped. */
+const PAGES_MAX_MS = 2 * 60 * 60_000;
 
 interface Running {
   buildId: string;
@@ -63,6 +81,8 @@ export interface CoordinatorStatus {
   overlays: Record<string, { running: OverlayRun | null; lastError: string | null }>;
   /** Bookmarks not yet compared since the last push. */
   overlayScanPending: boolean;
+  /** Timeline wiki page sets being written (CORE-84). */
+  pages: PageRun[];
 }
 
 interface State {
@@ -78,6 +98,10 @@ interface State {
   /** Timeline bookmarks need comparing with their overlays. */
   scan: boolean;
   overlays: Record<string, OverlayState>;
+  /** Timeline wiki page sets being written, by build id. */
+  pages: Record<string, PageRun>;
+  /** Queued page sets may be waiting in D1. */
+  pagesDue: boolean;
 }
 
 const INITIAL: State = {
@@ -92,6 +116,8 @@ const INITIAL: State = {
   lastFinishedAt: null,
   scan: false,
   overlays: {},
+  pages: {},
+  pagesDue: false,
 };
 
 export class KnowledgeCoordinator extends DurableObject<Env> {
@@ -115,6 +141,17 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     await this.#save(state);
     // Even while a build runs: timeline overlays don't wait for main's build.
     const due = Math.min(now + DEBOUNCE_MS, state.burstStartedAt + MAX_WAIT_MS);
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+  }
+
+  /** A timeline page set was queued in D1 (a checkpoint, or someone asked). */
+  async pagesRequested(repoId: string): Promise<void> {
+    const state = await this.#state();
+    state.repoId = repoId;
+    state.pagesDue = true;
+    await this.#save(state);
+    const due = Date.now() + 250;
     const alarm = await this.ctx.storage.getAlarm();
     if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
   }
@@ -175,9 +212,73 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     state.burstStartedAt = null;
     // Without a ref listing the scan waits for the next ping.
     if (state.scan && refs && ownerId) await this.#scanOverlays(state, refs, indexed, ownerId);
+    await this.#watchPages(state);
+    if (state.pagesDue) await this.#startPages(state);
     await this.#save(state);
-    if (state.running || Object.values(state.overlays).some((o) => o.running))
-      await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+    if (this.#busy(state)) await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+  }
+
+  #busy(state: State) {
+    return (
+      Boolean(state.running) ||
+      Object.values(state.overlays).some((o) => o.running) ||
+      Object.keys(state.pages).length > 0
+    );
+  }
+
+  /** The page sets' watchdog: crashed, vanished or overdue ones fail (asking again retries). */
+  async #watchPages(state: State) {
+    for (const run of Object.values(state.pages)) {
+      const instance = await this.env.KNOWLEDGE_BUILD.get(run.buildId).catch(() => null);
+      const status = instance ? await instance.status().catch(() => null) : null;
+      const overdue = Date.now() - run.startedAt > PAGES_MAX_MS;
+      if (status?.status === "complete") delete state.pages[run.buildId];
+      else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
+        if (overdue) await instance?.terminate().catch(() => undefined);
+        const error = `Pages ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
+        await abandonSet(
+          this.env.DB,
+          { repoId: state.repoId!, ref: run.ref, key: run.key },
+          run.buildId,
+          error,
+        ).catch(() => undefined);
+        delete state.pages[run.buildId];
+        state.pagesDue = true;
+      }
+    }
+  }
+
+  /** Start the oldest queued page sets there's room for; none before main has a graph. */
+  async #startPages(state: State) {
+    const repoId = state.repoId!;
+    const kgState = await db(this.env.DB)
+      .selectFrom("kg_state")
+      .select("indexed_commit")
+      .where("repo_id", "=", repoId)
+      .executeTakeFirst();
+    // Main's first build ends with finished(), which looks again.
+    if (!kgState?.indexed_commit) return;
+    const queued = await queuedSets(this.env.DB, repoId);
+    const plan = schedulePages(Object.values(state.pages), queued);
+    for (const set of plan.start) {
+      const buildId = crypto.randomUUID();
+      if (!(await claimSet(this.env.DB, { repoId, ...set }, buildId))) continue;
+      try {
+        await this.env.KNOWLEDGE_BUILD.create({
+          id: buildId,
+          params: { repoId, buildId, pages: set },
+        });
+      } catch (error) {
+        // Left queued for the next wake-up rather than stuck as being written.
+        console.error("Knowledge: starting a page set failed", { repo: repoId, set, error });
+        await releaseSet(this.env.DB, { repoId, ...set }, buildId);
+        plan.more = true;
+        continue;
+      }
+      state.pages[buildId] = { buildId, ...set, startedAt: Date.now() };
+    }
+    // The rest start as these finish (pagesFinished), or at the next wake-up.
+    state.pagesDue = plan.more;
   }
 
   /** Watchdog: a build that crashed without reporting must not block forever. */
@@ -322,13 +423,26 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     state.retries = 0;
     state.lastError = ok ? null : error;
     state.lastFinishedAt = Date.now();
-    // Main's indexed commit moved: overlays are measured against it.
-    if (ok) state.scan = true;
+    // Main's indexed commit moved: overlays are measured against it, and
+    // page sets that waited for main's first graph can start.
+    if (ok) {
+      state.scan = true;
+      state.pagesDue = true;
+    }
     await this.#save(state);
     // Pushes that arrived during the build: build again now, for the latest HEAD.
     if (state.seq > state.builtSeq || state.scan) await this.ctx.storage.setAlarm(Date.now() + 250);
-    else if (!Object.values(state.overlays).some((o) => o.running))
-      await this.ctx.storage.deleteAlarm();
+    else if (!this.#busy(state)) await this.ctx.storage.deleteAlarm();
+  }
+
+  /** Called by the Workflow when a page set ends, however it ended. */
+  async pagesFinished(buildId: string): Promise<void> {
+    const state = await this.#state();
+    if (!state.pages[buildId]) return;
+    delete state.pages[buildId];
+    state.pagesDue = true;
+    await this.#save(state);
+    await this.ctx.storage.setAlarm(Date.now() + 250);
   }
 
   /** Called by the Workflow when an overlay ends; `base` is main's commit it measured against. */
@@ -362,6 +476,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
         ]),
       ),
       overlayScanPending: state.scan,
+      pages: Object.values(state.pages),
     };
   }
 }
@@ -379,4 +494,48 @@ export function notifyKnowledge(env: Env, repoId: string, options: { force?: boo
   // Automatic non-AI agent environments omit provider bindings altogether.
   if (!env.AI) return Promise.resolve();
   return coordinator(env, repoId).notify(repoId, options);
+}
+
+/**
+ * Queue a timeline's wiki page set (CORE-84) and wake the repository's
+ * coordinator. Idempotent per key; nothing is queued where knowledge AI is
+ * off (automatic non-AI test environments) or the timeline's overlay ended.
+ */
+export async function requestPages(env: Env, request: PageRequest) {
+  if (!env.AI) return null;
+  const result = await queueSet(env.DB, request);
+  if (result.queued) await coordinator(env, request.repoId).pagesRequested(request.repoId);
+  return result;
+}
+
+/**
+ * A checkpoint was made: queue the wiki pages of its timeline in each of its
+ * repositories, at the checkpoint's commits. Runs after the response
+ * (waitUntil), so it never slows making the checkpoint.
+ */
+export async function requestCheckpointPages(
+  env: Env,
+  checkpoint: Checkpoint,
+  slug: string,
+  requestedBy: string | null,
+) {
+  const ref = `refs/heads/timeline/${slug}`;
+  await Promise.all(
+    checkpoint.repos.map((repo) =>
+      requestPages(env, {
+        repoId: repo.id,
+        ref,
+        key: checkpoint.id,
+        commit: repo.commit,
+        checkpoint: { id: checkpoint.id, number: checkpoint.number },
+        requestedBy,
+      }).catch((error) =>
+        console.error("Knowledge: queueing a checkpoint's pages failed", {
+          checkpoint: checkpoint.id,
+          repo: repo.id,
+          error,
+        }),
+      ),
+    ),
+  );
 }

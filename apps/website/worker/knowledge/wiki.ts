@@ -129,7 +129,7 @@ e.g. [worker/auth.ts](apps/website/worker/auth.ts). Refer to other wiki pages as
 wiki: target, e.g. [Git Proxy](wiki:components/apps-website-worker-git). Use only page slugs you
 were given. Do not include Mermaid diagrams; they are added separately. Keep it under 900 words.`;
 
-interface PageInputs {
+export interface PageInputs {
   writer: string;
   kind: PlannedPage["kind"];
   [key: string]: unknown;
@@ -248,7 +248,7 @@ async function inputsFor(
   }
 }
 
-interface GlossaryEntry {
+export interface GlossaryEntry {
   name: string;
   definition: string;
   aliases: string[];
@@ -257,7 +257,7 @@ interface GlossaryEntry {
   files: string[];
 }
 
-function glossaryBody(inputs: PageInputs): string {
+export function glossaryBody(inputs: PageInputs): string {
   const concepts = inputs.concepts as GlossaryEntry[];
   if (!concepts.length) return "No recurring concepts yet.";
   return concepts
@@ -289,7 +289,7 @@ function stripTrailingDiagram(body: string): string {
 }
 
 /** A page's diagram, drawn from the graph on every build (empty when none applies). */
-function diagramFor(page: PlannedPage, graph: BuiltGraph, syntheses: Syntheses): string {
+export function diagramFor(page: PlannedPage, graph: BuiltGraph, syntheses: Syntheses): string {
   const fenced =
     page.kind === "architecture"
       ? componentDiagram(graph, syntheses)
@@ -305,14 +305,20 @@ const PAGE_TOKENS = 3500;
 /** Thinking counts against max_tokens, so pages that think get room for both. */
 const THINKING_TOKENS = 8000;
 
-async function write(env: Env, page: PlannedPage, inputs: PageInputs) {
+/**
+ * Write one page: the glossary from its inputs, every other page with the
+ * reasoning model. `also` adds to the instruction (a timeline's pages say
+ * what the timeline changes).
+ */
+export async function writePage(env: Env, page: PlannedPage, inputs: PageInputs, also = "") {
   if (page.kind === "glossary") return { body: glossaryBody(inputs), model: null, tokens: 0 };
-  const instruction =
+  const base =
     page.kind === "overview"
       ? "Write the Overview page: what the project is, what problems it solves, how the repository is organized (link each component page), and how to get started if the README says."
       : page.kind === "architecture"
         ? "Write the Architecture page: the major parts, how requests and data flow between them, and the key design decisions. Link component pages."
         : `Write the page for the component "${page.title}": its purpose, how it works step by step, its key files and functions, its interfaces with the rest of the system, and anything surprising.`;
+  const instruction = also ? `${base} ${also}` : base;
   const draft = (think: boolean) =>
     chatText(env, "reason", PAGE_SYSTEM, `${instruction}\n\nMaterial:\n${JSON.stringify(inputs)}`, {
       maxTokens: think ? THINKING_TOKENS : PAGE_TOKENS,
@@ -356,7 +362,8 @@ export interface WikiStats {
   errors: string[];
 }
 
-async function pageInputs(source: WikiSource, page: PlannedPage, pages: PlannedPage[]) {
+/** What a page is written from, and the hash that says whether it changed. */
+export async function pageInputs(source: WikiSource, page: PlannedPage, pages: PlannedPage[]) {
   const { graph, syntheses, files, analyses, reader, readme } = source;
   const inputs = await inputsFor(page, pages, graph, syntheses, files, analyses, reader, readme);
   return { inputs, hash: await sha256(JSON.stringify(inputs)) };
@@ -387,6 +394,46 @@ const keep = (d1: D1Database, source: WikiSource, page: PlannedPage, hash: strin
     })
     .where("repo_id", "=", source.repoId)
     .where("slug", "=", page.slug);
+
+/**
+ * Whether what changed (`changedNodes`, graph node ids) makes a written page
+ * wrong or incomplete, as clef judges it. Changes that don't touch the page's
+ * subject never ask.
+ */
+export async function isStale(
+  env: Env,
+  page: PlannedPage,
+  before: { title: string; body: string },
+  changedNodes: Set<string>,
+  graph: BuiltGraph,
+): Promise<boolean> {
+  const relevant = [...changedNodes]
+    .filter((id) =>
+      page.kind === "component"
+        ? (page.component?.files ?? []).some(
+            (p) => id === `file:${p}` || id.startsWith(`sym:${p}#`),
+          ) || id === page.nodeId
+        : id.startsWith("component:") || id === "repo",
+    )
+    .slice(0, 40)
+    .map((id) => {
+      const node = graph.nodes.find((n) => n.id === id);
+      return { node: id, now: node?.summary ?? "(removed)" };
+    });
+  if (relevant.length === 0) return false;
+  const answers = await decide(
+    env,
+    { page: { title: before.title, text: before.body.slice(0, 4000) }, changes: relevant },
+    {
+      stale: {
+        type: "noul",
+        instructions:
+          "Given what changed in the code (each change shows the element's current description), would this wiki page now be wrong, misleading or missing something important?",
+      },
+    },
+  );
+  return yes(answers.stale) >= 0.3;
+}
 
 /**
  * The cheap half of a wiki update: pages whose inputs are unchanged follow the
@@ -447,42 +494,13 @@ export async function updatePages(
       return;
     }
     if (before && page.kind !== "glossary") {
-      // Ask whether what changed makes the page wrong or incomplete.
-      const relevant = [...changedNodes]
-        .filter((id) =>
-          page.kind === "component"
-            ? (page.component?.files ?? []).some(
-                (p) => id === `file:${p}` || id.startsWith(`sym:${p}#`),
-              ) || id === page.nodeId
-            : id.startsWith("component:") || id === "repo",
-        )
-        .slice(0, 40)
-        .map((id) => {
-          const node = graph.nodes.find((n) => n.id === id);
-          return { node: id, now: node?.summary ?? "(removed)" };
-        });
-      let stale = false;
-      if (relevant.length > 0) {
-        const answers = await decide(
-          env,
-          { page: { title: before.title, text: before.body.slice(0, 4000) }, changes: relevant },
-          {
-            stale: {
-              type: "noul",
-              instructions:
-                "Given what changed in the code (each change shows the element's current description), would this wiki page now be wrong, misleading or missing something important?",
-            },
-          },
-        );
-        stale = yes(answers.stale) >= 0.3;
-      }
-      if (!stale) {
+      if (!(await isStale(env, page, before, changedNodes, graph))) {
         stats.kept++;
         await keep(env.DB, source, page, hash, before.body).execute();
         return;
       }
     }
-    const written = await write(env, page, inputs);
+    const written = await writePage(env, page, inputs);
     await db(env.DB)
       .insertInto("wiki_pages")
       .values({

@@ -1,7 +1,7 @@
 import { BookOpenTextIcon, MapTrifoldIcon } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, useLoaderData, useLocation, type LoaderFunctionArgs } from "react-router";
-import type { WikiCatalog, WikiPage } from "../../../shared/api.ts";
+import type { KnowledgeTimelinePage, WikiCatalog, WikiPage } from "../../../shared/api.ts";
 import { KnowledgeStatusPill, useKnowledgeStatus } from "../../components/KnowledgeStatus.tsx";
 import { Markdown, outline } from "../../components/Markdown.tsx";
 import { Mermaid } from "../../components/Mermaid.tsx";
@@ -9,19 +9,61 @@ import { FileRow, RailSection, railClass } from "../../components/Rail.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
+import { scopeOf, withScope } from "../../lib/timelineScope.ts";
+import { setLabel } from "../../components/TimelinePages.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
 export async function wikiLoader({ request, params }: LoaderFunctionArgs) {
   const base = `/repos/${params.owner}/${params.repo}/knowledge`;
   const slug = params["*"] || "overview";
-  const [catalog, page] = await Promise.all([
+  // Scoped to a timeline: its own version of the page, where it wrote one
+  // (CORE-84), from `set` or its newest set that has it.
+  const url = new URL(request.url);
+  const timeline = scopeOf(url.search);
+  const set = url.searchParams.get("set");
+  const missing = (error: unknown) => {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  };
+  const [catalog, page, timelinePage] = await Promise.all([
     load<WikiCatalog>(`${base}/wiki`, request),
-    api<WikiPage>(`${base}/wiki/page?slug=${encodeURIComponent(slug)}`).catch((error: unknown) => {
-      if (error instanceof ApiError && error.status === 404) return null;
-      throw error;
-    }),
+    api<WikiPage>(`${base}/wiki/page?slug=${encodeURIComponent(slug)}`).catch(missing),
+    timeline
+      ? api<KnowledgeTimelinePage>(
+          `${base}/overlay/page?ref=${encodeURIComponent(`timeline/${timeline}`)}&slug=${encodeURIComponent(slug)}${set ? `&set=${encodeURIComponent(set)}` : ""}`,
+        ).catch(missing)
+      : null,
   ]);
-  return { catalog, page, slug };
+  return { catalog, page, slug, timelinePage };
+}
+
+/** Which version of the page this is, when the timeline has its own. */
+function TimelineNote({
+  page,
+  owner,
+  name,
+}: {
+  page: KnowledgeTimelinePage;
+  owner: string;
+  name: string;
+}) {
+  const main = withScope(repoPath(owner, name, "wiki", page.slug), null);
+  return (
+    <p className="m-0 mb-4 rounded-plate border border-line-soft bg-raised px-3 py-2 text-body-sm text-ink-muted">
+      {page.outcome === "written" ? (
+        <>
+          Timeline <code className="mk-mono">{page.timeline}</code>'s version of this page, written
+          at {setLabel(page.set)}. It describes the code as the timeline leaves it.{" "}
+        </>
+      ) : (
+        <>
+          Timeline <code className="mk-mono">{page.timeline}</code> changes what this page covers,
+          but main's page still holds.{" "}
+        </>
+      )}
+      <Link to={main}>Main's page</Link>
+    </p>
+  );
 }
 
 function Sidebar({ catalog, owner, name }: { catalog: WikiCatalog; owner: string; name: string }) {
@@ -119,7 +161,8 @@ function PageRail({ page, owner, name }: { page: WikiPage; owner: string; name: 
 }
 
 export function Wiki() {
-  const { catalog, page } = useLoaderData<typeof wikiLoader>();
+  const { catalog, page: mainPage, timelinePage } = useLoaderData<typeof wikiLoader>();
+  const page: WikiPage | null = timelinePage?.outcome === "written" ? timelinePage : mainPage;
   const repo = useRepo();
   const status = useKnowledgeStatus(repo.owner.slug, repo.name, catalog.status);
   const { hash } = useLocation();
@@ -170,6 +213,9 @@ export function Wiki() {
             <KnowledgeStatusPill status={status} />
           </div>
         </div>
+        {timelinePage && (
+          <TimelineNote page={timelinePage} owner={repo.owner.slug} name={repo.name} />
+        )}
         {page ? (
           <Markdown
             text={page.body}

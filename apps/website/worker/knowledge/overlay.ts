@@ -40,6 +40,7 @@ import {
   type BuiltGraph,
   type GraphNode,
   type SnapshotFile,
+  type Syntheses,
 } from "./graph.ts";
 import { runBatched, type Statement } from "./util.ts";
 
@@ -313,6 +314,45 @@ export async function planOverlay(
   };
 }
 
+/** What an overlay compares: main's indexed graph, and main with a timeline's changes. */
+export interface OverlayGraphs {
+  main: BuiltGraph;
+  timeline: BuiltGraph;
+  /** Main's indexed files with the timeline's changes applied. */
+  files: SnapshotFile[];
+  analyses: Map<string, FileAnalysis>;
+  /** Main's stored syntheses: only the timeline's own changes differ. */
+  syntheses: Syntheses;
+}
+
+/**
+ * Both graphs, built in memory from cached analyses, main's concept model and
+ * main's stored syntheses. Nothing is written and no model is called.
+ */
+export async function overlayGraphs(
+  d1: D1Database,
+  repo: { id: string; full_name: string },
+  changes: FileChange[],
+): Promise<OverlayGraphs> {
+  const main = await loadSnapshot(d1, repo.id, "current");
+  const files = applyChanges(main, changes);
+  const analyses = await loadAnalyses(d1, [
+    ...main.map((f) => f.blob),
+    ...changes.flatMap((c) => (c.blob ? [c.blob] : [])),
+  ]);
+  const [concepts, syntheses] = await Promise.all([
+    loadConceptModel(d1, repo.id),
+    storedSyntheses(d1, repo.id),
+  ]);
+  return {
+    main: buildGraph(repo.full_name, main, analyses, syntheses, concepts),
+    timeline: buildGraph(repo.full_name, files, analyses, syntheses, concepts),
+    files,
+    analyses,
+    syntheses,
+  };
+}
+
 /**
  * Diff main's indexed graph against main plus the timeline's changes, and
  * store it as the timeline's current overlay. Returns the base it measured.
@@ -334,20 +374,8 @@ export async function computeOverlay(
     .where("repo_id", "=", repo.id)
     .executeTakeFirst();
   const base = state?.indexed_commit ?? null;
-  const main = await loadSnapshot(d1, repo.id, "current");
-  const timeline = applyChanges(main, plan.changes);
-  const analyses = await loadAnalyses(d1, [
-    ...main.map((f) => f.blob),
-    ...plan.changes.flatMap((c) => (c.blob ? [c.blob] : [])),
-  ]);
-  const [concepts, syntheses] = await Promise.all([
-    loadConceptModel(d1, repo.id),
-    storedSyntheses(d1, repo.id),
-  ]);
-  const changes = diffGraphs(
-    buildGraph(repo.full_name, main, analyses, syntheses, concepts),
-    buildGraph(repo.full_name, timeline, analyses, syntheses, concepts),
-  );
+  const graphs = await overlayGraphs(d1, repo, plan.changes);
+  const changes = diffGraphs(graphs.main, graphs.timeline);
   const counts = countChanges(changes);
   const kept = changes.slice(0, MAX_CHANGES);
   const k = db(d1);

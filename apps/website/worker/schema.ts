@@ -260,6 +260,43 @@ export interface Database {
     summary: Generated<string>;
     detail: Generated<string>;
   };
+  /** Wiki pages for a timeline at a checkpoint, or on demand (CORE-84). */
+  kg_page_sets: {
+    repo_id: string;
+    ref: string;
+    set_key: string;
+    checkpoint_id: string | null;
+    checkpoint_number: number | null;
+    commit_oid: string;
+    base_commit: string | null;
+    status: "queued" | "writing" | "succeeded" | "failed" | "ended";
+    build_id: string | null;
+    stats: Generated<string>;
+    error: string | null;
+    requested_by: string | null;
+    requested_at: Generated<string>;
+    finished_at: string | null;
+  };
+  kg_page_set_pages: {
+    repo_id: string;
+    ref: string;
+    set_key: string;
+    slug: string;
+    title: string;
+    section: string;
+    position: number;
+    node_id: string | null;
+    kind: "component" | "architecture" | "glossary";
+    change: "added" | "changed";
+    outcome: "written" | "kept";
+    body: Generated<string>;
+    diagram: Generated<string>;
+    sources: Generated<string>;
+    inputs_hash: string;
+    model: string | null;
+    tokens: Generated<number>;
+    updated_at: Generated<string>;
+  };
   wiki_pages: {
     repo_id: string;
     slug: string;

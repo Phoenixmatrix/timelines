@@ -18,6 +18,7 @@ import {
   type Timeline,
 } from "../../shared/timelines.ts";
 import { fail } from "../tracker/store.ts";
+import { checkpointSets } from "../knowledge/pages.ts";
 
 /** CI runs shown per commit: the newest. */
 const RUNS_PER_COMMIT = 3;
@@ -95,7 +96,10 @@ export async function mayWriteAll(env: Env, actor: Actor, checkpoint: Checkpoint
   }
 }
 
-/** A checkpoint with its commits' CI runs and its previews, as they are now. */
+/**
+ * A checkpoint with its commits' CI runs, its previews and the timeline's wiki
+ * pages written for it (CORE-84), as they are now.
+ */
 export async function view(
   env: Env,
   state: CheckpointState,
@@ -157,6 +161,12 @@ export async function view(
     .orderBy("id", "desc")
     .limit(PREVIEWS)
     .execute();
+  const knowledge = await checkpointSets(
+    env.DB,
+    checkpoint.id,
+    checkpoint.repos.map((repo) => repo.id),
+    `refs/heads/${timelineBookmark(timeline.slug)}`,
+  );
   return {
     ...state,
     timeline: {
@@ -179,6 +189,7 @@ export async function view(
       tornDownAt: p.torn_down_at,
       createdAt: p.created_at,
     })),
+    knowledge,
   };
 }
 

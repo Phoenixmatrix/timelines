@@ -1,6 +1,7 @@
 // A timeline checkpoint, as an approval request shows it (CORE-76): what the
 // agent says it holds, the commit per repository and the main commit it would
-// land on, its CI runs and previews, and the timeline's knowledge diff. An
+// land on, its CI runs and previews, the timeline's knowledge diff, and the
+// wiki pages written for it (CORE-84), pending while they're written. An
 // approval only counts while the checkpoint is still the timeline's head.
 // Any checkpoint's preview can be revived (CORE-79): a rebuild, marked so.
 
@@ -13,6 +14,7 @@ import type {
 } from "../../../shared/timelines.ts";
 import type { RequestCheckpoint } from "../../../shared/tracker.ts";
 import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
+import { PageSetSummary, pagesPending, useRefreshWhile } from "../../components/TimelinePages.tsx";
 import { api } from "../../lib/api.ts";
 import { fullDate, shortOid } from "../../lib/format.ts";
 import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
@@ -139,6 +141,7 @@ export function CheckpointPanel({
   tracker: string;
 }) {
   const { checkpoint, timeline } = view;
+  useRefreshWhile(view.knowledge.some(pagesPending));
   return (
     <section
       className="flex flex-col gap-2 rounded-pane border border-line-soft p-3"
@@ -243,6 +246,28 @@ export function CheckpointPanel({
       <div>
         <ReviveButton view={view} tracker={tracker} />
       </div>
+      {view.knowledge.map((set) => {
+        const repo = checkpoint.repos.find((r) => r.id === set.repoId);
+        if (!repo) return null;
+        return (
+          <section
+            key={set.repoId}
+            className="flex flex-col gap-1.5 border-t border-line-soft pt-2"
+            aria-label={`Wiki pages in ${repo.owner}/${repo.name}`}
+          >
+            <h4 className="m-0 text-body-sm font-semibold">
+              Wiki pages
+              {checkpoint.repos.length > 1 && (
+                <span className="font-normal text-ink-muted">
+                  {" "}
+                  in {repo.owner}/{repo.name}
+                </span>
+              )}
+            </h4>
+            <PageSetSummary set={set} owner={repo.owner} name={repo.name} />
+          </section>
+        );
+      })}
     </section>
   );
 }

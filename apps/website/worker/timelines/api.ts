@@ -9,7 +9,8 @@
 //   POST   /:slug/abandon     end it and delete its bookmarks (events stay)
 //   GET    /:slug/checkpoints       its checkpoints, newest first, each with its
 //                                   CI runs, previews and approval (CORE-76)
-//   POST   /:slug/checkpoints       {summary?}: record its bookmarks' commits now
+//   POST   /:slug/checkpoints       {summary?}: record its bookmarks' commits now,
+//                                   and queue the timeline's wiki pages for it (CORE-84)
 //   GET    /:slug/checkpoints/:ref  one checkpoint, by id or number
 //   POST   /:slug/checkpoints/:ref/revive  rebuild its preview (CORE-79): a
 //                                   preview `create` run per repository
@@ -51,6 +52,7 @@ import { trackerObject } from "../tracker/stub.ts";
 import { timelineSlug, timelineStatus } from "../tracker/timelines.ts";
 import { logPush } from "./activity.ts";
 import { measure, mayWriteAll, view } from "./checkpoints.ts";
+import { requestCheckpointPages } from "../knowledge/coordinator.ts";
 import { writeRefs, type RefWrite } from "./bookmarks.ts";
 
 /** Repositories one timeline may touch. */
@@ -365,6 +367,8 @@ timelines.post("/:slug/checkpoints", async (c) => {
   // The preview contract: each repository that opts in builds this checkpoint.
   const waitUntil = (work: Promise<unknown>) => c.executionCtx.waitUntil(work);
   waitUntil(previewCheckpoint(c.env, state.checkpoint, timeline, actor, waitUntil));
+  // The timeline's wiki pages (CORE-84), queued after the answer too.
+  waitUntil(requestCheckpointPages(c.env, state.checkpoint, timeline.slug, actor.id));
   return c.json<CheckpointView>(await view(c.env, state, timeline), 201);
 });
 

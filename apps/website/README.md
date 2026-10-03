@@ -878,8 +878,10 @@ the URL says. What each surface does with it:
   follows main's or the old bookmark to the new one.
 - **CI**: runs on the bookmark (`GET …/ci?ref=`), and Run starts one there.
 - **Packages**: the console's default query adds `branch:timeline/<slug>`.
-- **Knowledge**: the timeline's overlay; the tab's old `?timeline=` is
-  rewritten to `?tl=`.
+- **Knowledge**: the timeline's overlay and its wiki pages; the tab's old
+  `?timeline=` is rewritten to `?tl=`.
+- **Wiki**: the timeline's own version of a page where it wrote one (`&set=`
+  picks a checkpoint's), noted as such, with a link to main's.
 - **Release notes** cover landed work: entries the timeline landed are marked,
   and `timeline:<slug>` (a Timelines facet) narrows to them.
 
@@ -1086,6 +1088,25 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   pushed again; only an `ended` one whose timeline the tracker still doesn't
   end comes back to life. The API reports them with `state: "ended"` and
   `ended: {reason, at}`; the Knowledge tab lists them under "Ended".
+- **Timeline wiki pages** (`worker/knowledge/pages.ts`, CORE-84): written at
+  checkpoints and on demand, never on every push. Making a checkpoint queues a
+  page set per repository (`kg_page_sets`, keyed by the checkpoint, so asking
+  again is the same set) after the response; the coordinator starts the
+  oldest queued sets, one per timeline and two per repository. The Workflow
+  diffs the timeline at the set's commit against main as an overlay does, then
+  writes the component pages it adds or changes (at most 12, most changed
+  first), Architecture when components come or go, and a glossary of its
+  concepts (no model), with main's wiki code, into `kg_page_set_pages`, never
+  `wiki_pages`. A page is copied from the timeline's earlier set when its
+  material is unchanged, `kept` (no body) when clef finds main's page still
+  holds, and skipped once the set has spent 80k tokens. No indexing runs.
+  `GET|POST …/knowledge/overlay/pages?ref=timeline/<slug>` lists sets or asks
+  for one at the bookmark's tip (write access; `&checkpoint=` retries a failed
+  checkpoint set), `GET …/knowledge/overlay/page?ref=&slug=&set=` serves one;
+  checkpoint views (and so approval requests) carry `knowledge`, and
+  `gm timeline pages` lists, writes (`--write`) and prints (`--page`) them.
+  Once a timeline's overlay has ended its sets are read-only: none is queued,
+  and one being written stops as `ended`, keeping what it wrote.
 
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index

@@ -56,7 +56,36 @@ fn checkpoint_view(summary: &Value) -> Value {
         "approved": false,
         "timeline": {"id": "tl_search", "slug": "search", "name": "Search", "policy": "approval"},
         "runs": [{"repoId": "r1", "number": 4, "status": "succeeded", "commit": "a".repeat(40), "createdAt": "2026-10-03T00:00:00Z"}],
-        "previews": [{"repoId": "r1", "id": 1, "environment": "timeline/search", "url": "https://preview.example", "status": "active", "commit": "a".repeat(40)}]
+        "previews": [{"repoId": "r1", "id": 1, "environment": "timeline/search", "url": "https://preview.example", "status": "active", "commit": "a".repeat(40)}],
+        "knowledge": [page_set("cp_1", "succeeded")]
+    })
+}
+
+/// A timeline's wiki page set as the knowledge API returns it (CORE-84).
+fn page_set(key: &str, state: &str) -> Value {
+    let checkpoint = if key == "cp_1" {
+        json!({"id": "cp_1", "number": 1})
+    } else {
+        Value::Null
+    };
+    let pages = if state == "succeeded" {
+        json!([
+            {"slug": "components/src-web", "title": "Web", "section": "src", "kind": "component",
+             "change": "changed", "outcome": "written", "nodeId": "component:src/web",
+             "excerpt": "Serves refunds.", "model": "m", "updatedAt": "2026-10-03T00:00:00Z"},
+            {"slug": "glossary", "title": "Glossary", "section": "Reference", "kind": "glossary",
+             "change": "changed", "outcome": "written", "nodeId": null, "excerpt": "",
+             "model": null, "updatedAt": "2026-10-03T00:00:00Z"}
+        ])
+    } else {
+        json!([])
+    };
+    json!({
+        "repoId": "r1", "ref": "timeline/search", "timeline": "search", "key": key,
+        "checkpoint": checkpoint, "commit": "a".repeat(40), "baseCommit": "b".repeat(40),
+        "state": state, "counts": {"component": {"added": 0, "changed": 1, "removed": 0}},
+        "pages": pages, "skipped": 0, "error": null,
+        "requestedAt": "2026-10-03T00:00:00Z", "finishedAt": null
     })
 }
 
@@ -136,6 +165,33 @@ impl Api {
                         200,
                         json!({"checkpoints": [checkpoint_view(&json!("Ranking v2"))]}),
                     ),
+                    ("GET", "/api/tracker/orbit/timelines/search/checkpoints/1") => {
+                        (200, checkpoint_view(&json!("Ranking v2")))
+                    }
+                    (
+                        "GET",
+                        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch",
+                    ) => (
+                        200,
+                        json!({"ref": "timeline/search", "timeline": "search", "ended": false,
+                               "sets": [page_set("cp_1", "succeeded")]}),
+                    ),
+                    (
+                        "POST",
+                        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch",
+                    ) => (202, page_set(&format!("commit:{}", "a".repeat(40)), "queued")),
+                    ("GET", p)
+                        if p.starts_with(
+                            "/api/repos/orbit/engine/knowledge/overlay/page?ref=timeline%2Fsearch&slug=components%2Fsrc-web",
+                        ) =>
+                    {
+                        (
+                            200,
+                            json!({"slug": "components/src-web", "title": "Web", "body": "Serves refunds.",
+                                   "generatedIn": "a".repeat(40), "outcome": "written", "timeline": "search",
+                                   "set": {"key": "cp_1"}}),
+                        )
+                    }
                     ("POST", "/api/tracker/orbit/timelines/search/abandon") => {
                         git(&remote, &["update-ref", "-d", bookmark]);
                         status = "abandoned";
@@ -542,4 +598,68 @@ fn checkpoints_pin_the_pushed_commits_with_a_summary() {
     assert!(text.contains("[awaiting approval]"), "{text}");
     assert!(text.contains("CI #4 succeeded"), "{text}");
     assert!(text.contains("https://preview.example (active)"), "{text}");
+    assert!(
+        text.contains("wiki pages: succeeded: components/src-web, glossary"),
+        "{text}"
+    );
+}
+
+#[test]
+fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    // Every repository of the bound timeline, newest set first.
+    let listed = s.ok(&["timeline", "pages", "-O", "orbit"]);
+    assert_eq!(listed["timeline"], "search");
+    assert_eq!(listed["repos"][0]["repo"], "orbit/engine");
+    assert_eq!(
+        listed["repos"][0]["sets"][0]["pages"][0]["slug"],
+        "components/src-web"
+    );
+    let (code, value, _) = s.run_with(&["timeline", "pages", "-O", "orbit", "-o", "text"], &[]);
+    assert_eq!(code, 0);
+    let text = value.as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("orbit/engine · checkpoint #1 · succeeded"),
+        "{text}"
+    );
+    assert!(text.contains("Serves refunds."), "{text}");
+
+    // One checkpoint's pages come with the checkpoint.
+    let one = s.ok(&["timeline", "pages", "-O", "orbit", "--checkpoint", "1"]);
+    assert_eq!(one["checkpoint"], "cp_1");
+    assert_eq!(one["repos"][0]["sets"][0]["key"], "cp_1");
+
+    // A page in full, from the newest set that has it.
+    let page = s.ok(&[
+        "timeline",
+        "pages",
+        "-O",
+        "orbit",
+        "--page",
+        "components/src-web",
+    ]);
+    assert_eq!(page["body"], "Serves refunds.");
+    assert_eq!(page["repo"], "orbit/engine");
+
+    // Writing now: a dry run asks nothing; the real one queues a set per repository.
+    let before = s.api.requests("POST").len();
+    let dry = s.ok(&["timeline", "pages", "-O", "orbit", "--write", "--dry-run"]);
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(s.api.requests("POST").len(), before);
+    let wrote = s.ok(&["timeline", "pages", "-O", "orbit", "--write"]);
+    assert_eq!(wrote["repos"][0]["sets"][0]["state"], "queued");
+    let (path, _) = s.api.requests("POST").pop().unwrap();
+    assert_eq!(
+        path,
+        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch"
+    );
 }

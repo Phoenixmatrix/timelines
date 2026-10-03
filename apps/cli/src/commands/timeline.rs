@@ -20,6 +20,9 @@
 //! - `revive` rebuilds a checkpoint's preview (CORE-79): Gitmatrix starts a
 //!   preview `create` run in each repository whose ci.yml opts in, at the
 //!   checkpoint's commits, and what it records is marked rebuilt.
+//! - `pages` lists the wiki pages a timeline affects, written for each
+//!   checkpoint (CORE-84) in each of its repositories; `--write` asks for them
+//!   at the bookmarks' tips now, and `--page` prints one in full.
 //!
 //! `GM_TIMELINE` overrides the binding for one command (`profile::timeline`).
 
@@ -57,6 +60,8 @@ pub enum TimelineCommand {
     Checkpoints(CheckpointsArgs),
     /// Revive a checkpoint's preview (default: the newest): rebuild it from its commits in CI
     Revive(ReviveArgs),
+    /// The wiki pages a timeline affects, written at its checkpoints (or now, with --write)
+    Pages(PagesArgs),
     /// Rename a timeline (default: this checkout's), or flag it experimental or clear the flag
     #[command(visible_alias = "flag")]
     Update(UpdateArgs),
@@ -88,6 +93,23 @@ pub struct ReviveArgs {
 pub struct CheckpointsArgs {
     /// The timeline's slug (default: the one this checkout works in).
     pub slug: Option<String>,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct PagesArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    /// Only the pages written for this checkpoint (its number or id).
+    #[arg(long)]
+    pub checkpoint: Option<String>,
+    /// Write the pages at each bookmark's tip now (uses AI; asking twice at one commit is one set).
+    #[arg(long, conflicts_with_all = ["checkpoint", "page"])]
+    pub write: bool,
+    /// Print one page in full, by its wiki slug (e.g. components/src-web or glossary).
+    #[arg(long)]
+    pub page: Option<String>,
     #[command(flatten)]
     pub owner: Owner,
 }
@@ -233,6 +255,7 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Checkpoint(a) => checkpoint(ctx, a),
         TimelineCommand::Checkpoints(a) => checkpoints(ctx, a),
         TimelineCommand::Revive(a) => revive(ctx, a),
+        TimelineCommand::Pages(a) => pages(ctx, a),
         TimelineCommand::Update(a) => update(ctx, a),
     }
 }
@@ -638,8 +661,253 @@ pub fn checkpoint_text(v: &Value) -> String {
                 format!(" · {}", previews.join(", "))
             },
         ));
+        if let Some(set) = v["knowledge"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|k| k["repoId"] == *id)
+        {
+            out.push_str(&format!("    wiki pages: {}\n", set_brief(set)));
+        }
     }
     out
+}
+
+// ---- wiki pages (CORE-84) ------------------------------------------------------------
+
+/// Percent-encode a query value.
+fn query(value: &str) -> String {
+    let mut out = String::new();
+    super::semantic::encode_into(&mut out, value);
+    out
+}
+
+/// A page set in one line: its state and pages.
+fn set_brief(set: &Value) -> String {
+    let state = set["state"].as_str().unwrap_or("?");
+    let pages = set["pages"].as_array().cloned().unwrap_or_default();
+    match state {
+        "queued" | "writing" => format!("{state}…"),
+        "failed" => format!("failed: {}", set["error"].as_str().unwrap_or("?")),
+        _ if pages.is_empty() => format!("{state}, none affected"),
+        _ => format!(
+            "{state}: {}",
+            pages
+                .iter()
+                .map(|p| p["slug"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// A page set as text: what it was written for, then each page and its opening.
+fn set_text(repo: &str, set: &Value) -> String {
+    let at = match set["checkpoint"]["number"].as_u64() {
+        Some(n) => format!("checkpoint #{n}"),
+        None => format!("{} (on demand)", short(&set["commit"])),
+    };
+    let mut out = format!("{repo} · {at} · {}\n", set["state"].as_str().unwrap_or("?"));
+    if let Some(error) = set["error"].as_str() {
+        out.push_str(&format!("  error: {error}\n"));
+    }
+    for page in set["pages"].as_array().into_iter().flatten() {
+        let label = match (page["outcome"].as_str(), page["change"].as_str()) {
+            (Some("kept"), _) => "main's holds",
+            (_, Some("added")) => "new",
+            _ => "changed",
+        };
+        out.push_str(&format!(
+            "  {label:<12} {} ({})\n",
+            page["title"].as_str().unwrap_or("?"),
+            page["slug"].as_str().unwrap_or("?"),
+        ));
+        if let Some(excerpt) = page["excerpt"].as_str().filter(|e| !e.is_empty()) {
+            out.push_str(&format!("               {excerpt}\n"));
+        }
+    }
+    if let Some(n) = set["skipped"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!("  {n} more page(s) left out by the cost caps\n"));
+    }
+    out
+}
+
+fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let slug = named_or_current(&args.slug, "pages")?;
+    let reference = query(&format!("timeline/{slug}"));
+    // Pages for one checkpoint come with it.
+    if let Some(checkpoint) = &args.checkpoint {
+        let view = remote::api(
+            &config,
+            "GET",
+            &format!("{}/{slug}/checkpoints/{}", base(&owner), query(checkpoint)),
+            None,
+        )?;
+        let id = view["checkpoint"]["id"].as_str().unwrap_or("").to_string();
+        let repos = view["checkpoint"]["repos"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let name_of = |repo_id: &Value| {
+            repos
+                .iter()
+                .find(|r| r["id"] == *repo_id)
+                .map(|r| {
+                    format!(
+                        "{}/{}",
+                        r["owner"].as_str().unwrap_or("?"),
+                        r["name"].as_str().unwrap_or("?")
+                    )
+                })
+                .unwrap_or_else(|| "?".to_string())
+        };
+        if let Some(page) = &args.page {
+            let set = view["knowledge"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| {
+                    s["pages"]
+                        .as_array()
+                        .is_some_and(|p| p.iter().any(|p| p["slug"] == json!(page)))
+                })
+                .ok_or_else(|| {
+                    GmError::not_found(
+                        "not_found",
+                        format!("Checkpoint {checkpoint} of {slug} has no page {page}."),
+                    )
+                })?;
+            return one_page(
+                &config,
+                &name_of(&set["repoId"]),
+                &reference,
+                page,
+                Some(&id),
+            );
+        }
+        let sets = view["knowledge"].as_array().cloned().unwrap_or_default();
+        let text = if sets.is_empty() {
+            format!("No wiki pages were asked for at checkpoint {checkpoint} of {slug}.")
+        } else {
+            sets.iter()
+                .map(|set| set_text(&name_of(&set["repoId"]), set))
+                .collect::<String>()
+        };
+        let repos_out: Vec<Value> = sets
+            .iter()
+            .map(|set| json!({"repo": name_of(&set["repoId"]), "sets": [set]}))
+            .collect();
+        return Ok(Shown {
+            value: json!({"owner": owner, "timeline": slug, "checkpoint": id, "repos": repos_out}),
+            text,
+        });
+    }
+    let detail = remote::api(
+        &config,
+        "GET",
+        &format!("{}/{slug}?limit=1", base(&owner)),
+        None,
+    )?;
+    let names: Vec<String> = detail["timeline"]["repos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            format!(
+                "{}/{}",
+                r["owner"].as_str().unwrap_or("?"),
+                r["name"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    if let Some(page) = &args.page {
+        let mut last = None;
+        for name in &names {
+            match one_page(&config, name, &reference, page, None) {
+                Ok(shown) => return Ok(shown),
+                Err(e) if e.code == "not_found" => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        return Err(last.unwrap_or_else(|| {
+            GmError::not_found("not_found", format!("{slug} has no repositories."))
+        }));
+    }
+    if args.write && ctx.dry_run {
+        return Ok(Shown {
+            text: format!(
+                "dry run: nothing was changed\nWould write {slug}'s wiki pages at its bookmarks' tips in {}.",
+                names.join(", ")
+            ),
+            value: json!({"dry_run": true, "owner": owner, "timeline": slug, "repos": names}),
+        });
+    }
+    let mut repos = Vec::new();
+    let mut text = String::new();
+    for name in &names {
+        let path = format!("/repos/{name}/knowledge/overlay/pages?ref={reference}");
+        if args.write {
+            let set = remote::api(&config, "POST", &path, None)?;
+            text.push_str(&set_text(name, &set));
+            repos.push(json!({"repo": name, "sets": [set]}));
+        } else {
+            let listed = remote::api(&config, "GET", &path, None)?;
+            let sets = listed["sets"].as_array().cloned().unwrap_or_default();
+            if sets.is_empty() {
+                text.push_str(&format!("{name} · no wiki pages yet\n"));
+            }
+            for set in &sets {
+                text.push_str(&set_text(name, set));
+            }
+            repos.push(json!({"repo": name, "ended": listed["ended"], "sets": sets}));
+        }
+    }
+    let next = if args.write {
+        format!("gm timeline pages {slug}  # see them once written")
+    } else {
+        format!("gm timeline pages {slug} --page <slug>  # one page in full")
+    };
+    text.push_str(&format!("Next: {next}\n"));
+    let mut value = json!({"owner": owner, "timeline": slug, "repos": repos, "next": next});
+    if args.write {
+        value["dry_run"] = json!(false);
+    }
+    Ok(Shown { value, text })
+}
+
+/// One timeline page in full, from the repository's knowledge API.
+fn one_page(
+    config: &Config,
+    repo: &str,
+    reference: &str,
+    page: &str,
+    set: Option<&str>,
+) -> Result<Shown> {
+    let mut path = format!(
+        "/repos/{repo}/knowledge/overlay/page?ref={reference}&slug={}",
+        query(page)
+    );
+    if let Some(set) = set {
+        path.push_str(&format!("&set={}", query(set)));
+    }
+    let mut value = remote::api(config, "GET", &path, None)?;
+    let text = if value["outcome"] == "kept" {
+        format!(
+            "{} ({repo}): main's page still holds for this timeline.\n",
+            value["title"].as_str().unwrap_or("?")
+        )
+    } else {
+        format!(
+            "# {} ({repo}, at {})\n\n{}\n",
+            value["title"].as_str().unwrap_or("?"),
+            short(&value["generatedIn"]),
+            value["body"].as_str().unwrap_or("")
+        )
+    };
+    value["repo"] = json!(repo);
+    Ok(Shown { value, text })
 }
 
 fn summary(message: &[String]) -> Result<String> {

@@ -22,6 +22,11 @@
 // with `overlay`: plan (merge base, changed files), analyze-N for blobs
 // nothing has analyzed, then diff. Those steps write only kg_overlays,
 // kg_overlay_changes and the shared per-blob analysis cache.
+//
+// And a timeline's wiki page set (pages.ts, CORE-84), when started with
+// `pages`: plan the timeline's changes at the set's commit, analyze-N as for
+// an overlay, choose the affected pages, then write them a few per step.
+// Those steps write only kg_page_sets, kg_page_set_pages and the analysis cache.
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { sql } from "kysely";
@@ -49,6 +54,7 @@ import { syncSearchFiles, syncSearchPages, syncVectors } from "./indexes.ts";
 import { synthesize } from "./synthesize.ts";
 import { coordinator } from "./coordinator.ts";
 import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay.ts";
+import { runPageSet } from "./pages.ts";
 import { chunk } from "./util.ts";
 import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.ts";
 
@@ -59,6 +65,8 @@ export interface BuildParams {
   force?: boolean;
   /** Compute a timeline's overlay instead of building main's graph. */
   overlay?: { ref: string; commit: string };
+  /** Write a timeline's wiki page set (queued in kg_page_sets) instead. */
+  pages?: { ref: string; key: string };
 }
 
 interface RepoRow {
@@ -184,6 +192,12 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
   async run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
     if (event.payload.overlay) return this.#overlay(event.payload, step);
+    if (event.payload.pages)
+      return runPageSet(this.env, { ...event.payload, pages: event.payload.pages }, step, {
+        repo: (id) => repoRow(this.env.DB, id),
+        withReader: (row, work) => this.#withReader(row, work),
+        finished: (buildId) => coordinator(this.env, event.payload.repoId).pagesFinished(buildId),
+      });
     const { repoId, buildId, force } = event.payload;
     const env = this.env;
     // A durable step that shows its phase while it runs, and records when it

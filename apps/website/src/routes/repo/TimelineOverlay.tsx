@@ -2,6 +2,8 @@
 // adds, changes and removes compared with main's graph. Main's map stays as
 // it is; the nodes the timeline touches are outlined on it and listed here.
 // A landed or abandoned timeline keeps its last overlay, read-only (CORE-139).
+// Below the diff, the wiki pages written for the timeline at its checkpoints
+// or on demand (CORE-84); an ended timeline keeps those read-only too.
 
 import { useEffect, useState } from "react";
 import { Link, useRevalidator } from "react-router";
@@ -9,7 +11,15 @@ import type {
   KnowledgeOverlay,
   KnowledgeOverlayChange,
   KnowledgeOverlaySummary,
+  KnowledgePageSet,
 } from "../../../shared/api.ts";
+import {
+  PageSetSummary,
+  pagesPending,
+  setLabel,
+  useRefreshWhile,
+} from "../../components/TimelinePages.tsx";
+import { api, ApiError } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { blobUrl } from "../../lib/refs.ts";
 import { KIND_LABEL } from "./AtlasMap.tsx";
@@ -185,6 +195,86 @@ function Section({
   );
 }
 
+/** The wiki pages written for the timeline: the newest set, earlier ones folded away. */
+function TimelinePages({ overlay }: { overlay: KnowledgeOverlay }) {
+  const repo = useRepo();
+  const revalidator = useRevalidator();
+  const [asking, setAsking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [newest, ...earlier] = overlay.pageSets;
+  useRefreshWhile(overlay.pageSets.some(pagesPending));
+  // Pages are written at checkpoints; someone may ask for the bookmark's tip now.
+  const canAsk =
+    !overlay.ended &&
+    overlay.head !== null &&
+    overlay.state !== "waiting" &&
+    !(newest && newest.commit === overlay.head && newest.state !== "failed");
+  const ask = async () => {
+    setAsking(true);
+    setError(null);
+    try {
+      await api<KnowledgePageSet>(
+        `/repos/${repo.owner.slug}/${repo.name}/knowledge/overlay/pages?ref=${encodeURIComponent(overlay.ref)}`,
+        { method: "POST" },
+      );
+      void revalidator.revalidate();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Couldn't ask for the pages.");
+    } finally {
+      setAsking(false);
+    }
+  };
+  const heading = (set: KnowledgePageSet) => (
+    <span className="block text-micro text-ink-faint">
+      At {setLabel(set)} · {timeAgo(set.finishedAt ?? set.requestedAt)}
+    </span>
+  );
+  return (
+    <section className="border-t border-line-soft py-3" aria-label="Timeline wiki pages">
+      <h3 className="m-0 mb-1 text-body-sm font-semibold">Wiki pages</h3>
+      {newest ? (
+        <div className="flex flex-col gap-1.5">
+          {heading(newest)}
+          <PageSetSummary set={newest} owner={repo.owner.slug} name={repo.name} />
+        </div>
+      ) : (
+        <p className="m-0 text-body-sm text-ink-muted">
+          {overlay.ended
+            ? "None were written before this timeline ended."
+            : "Written at each checkpoint, or when asked."}
+        </p>
+      )}
+      {earlier.length > 0 && (
+        <details className="mt-2 text-body-sm">
+          <summary className="cursor-pointer text-ink-muted">
+            {earlier.length === 1 ? "1 earlier set" : `${earlier.length} earlier sets`}
+          </summary>
+          <div className="mt-2 flex flex-col gap-3">
+            {earlier.map((set) => (
+              <div key={set.key} className="flex flex-col gap-1.5">
+                {heading(set)}
+                <PageSetSummary set={set} owner={repo.owner.slug} name={repo.name} />
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {canAsk && (
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm -ml-2 mt-1"
+          disabled={asking}
+          onClick={() => void ask()}
+          title="Write the pages this timeline affects at its bookmark's tip (uses AI)"
+        >
+          {asking ? "Asking…" : "Write pages now"}
+        </button>
+      )}
+      {error && <p className="m-0 text-micro text-ink-faint">{error}</p>}
+    </section>
+  );
+}
+
 /** The selected timeline's diff against main, above the inspector. */
 export function OverlayPanel({
   overlay,
@@ -264,6 +354,7 @@ export function OverlayPanel({
           Showing the first {total.toLocaleString()} changes.
         </p>
       )}
+      <TimelinePages overlay={overlay} />
     </section>
   );
 }

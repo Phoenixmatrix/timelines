@@ -3,6 +3,7 @@
 // repository it touches. The records and their events live in the account's
 // tracker, next to the issues and leases later steps change with them.
 
+import type { KnowledgePageSet } from "./api.ts";
 import type { DoneIn, Issue } from "./tracker.ts";
 
 export type TimelinePolicy = "auto" | "approval";
@@ -235,6 +236,11 @@ export interface CheckpointView extends CheckpointState {
   timeline: { id: string; slug: string; name: string; policy: TimelinePolicy };
   runs: CheckpointRun[];
   previews: CheckpointPreview[];
+  /**
+   * The timeline's wiki pages written for this checkpoint, per repository
+   * (CORE-84); none for a repository whose pages were never asked for.
+   */
+  knowledge: (KnowledgePageSet & { repoId: string })[];
 }
 
 export interface CheckpointList {
