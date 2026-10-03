@@ -16,14 +16,20 @@
 // cached by blob like a build's, so the same blobs cost nothing when the
 // timeline lands. No concept alignment, synthesis, indexing or wiki: a concept
 // the timeline introduces shows as added under its own name, unaligned.
+//
+// When the bookmark disappears (the timeline landed or was abandoned), its last
+// overlay is kept, read-only (CORE-139): marked ended with the reason the
+// timeline's record in the tracker gives, and never computed again.
 
 import type {
   KnowledgeOverlayChange,
+  KnowledgeOverlayEndReason,
   KnowledgeOverlaySummary,
   OverlayLink,
 } from "../../shared/api.ts";
-import { timelineSlugOf } from "../../shared/timelines.ts";
+import { timelineSlugOf, type TimelineStatus } from "../../shared/timelines.ts";
 import { db, nowIso } from "../schema.ts";
+import { trackerObject } from "../tracker/stub.ts";
 import type { FileAnalysis, FileToAnalyze } from "./analyze.ts";
 import { loadAnalyses } from "./analyze.ts";
 import { loadConceptModel } from "./concepts.ts";
@@ -381,7 +387,7 @@ export async function computeOverlay(
     .where("ref", "=", ref)
     .executeTakeFirst();
   // Point at the new changes, then drop the old ones: readers never see half.
-  await k
+  const pointed = await k
     .insertInto("kg_overlays")
     .values({
       repo_id: repo.id,
@@ -397,19 +403,32 @@ export async function computeOverlay(
       error: null,
     })
     .onConflict((oc) =>
-      oc.columns(["repo_id", "ref"]).doUpdateSet((eb) => ({
-        overlay_id: eb.ref("excluded.overlay_id"),
-        head_commit: eb.ref("excluded.head_commit"),
-        base_commit: eb.ref("excluded.base_commit"),
-        merge_base: eb.ref("excluded.merge_base"),
-        stats: eb.ref("excluded.stats"),
-        updated_at: eb.ref("excluded.updated_at"),
-        status: eb.ref("excluded.status"),
-        attempted_commit: eb.ref("excluded.attempted_commit"),
-        error: eb.ref("excluded.error"),
-      })),
+      oc
+        .columns(["repo_id", "ref"])
+        .doUpdateSet((eb) => ({
+          overlay_id: eb.ref("excluded.overlay_id"),
+          head_commit: eb.ref("excluded.head_commit"),
+          base_commit: eb.ref("excluded.base_commit"),
+          merge_base: eb.ref("excluded.merge_base"),
+          stats: eb.ref("excluded.stats"),
+          updated_at: eb.ref("excluded.updated_at"),
+          status: eb.ref("excluded.status"),
+          attempted_commit: eb.ref("excluded.attempted_commit"),
+          error: eb.ref("excluded.error"),
+        }))
+        // An ended overlay is read-only: a late run leaves it as it was.
+        .where("kg_overlays.ended_at", "is", null),
     )
-    .execute();
+    .returning("overlay_id")
+    .executeTakeFirst();
+  if (!pointed) {
+    await k
+      .deleteFrom("kg_overlay_changes")
+      .where("repo_id", "=", repo.id)
+      .where("overlay_id", "=", overlayId)
+      .execute();
+    return { base, counts, stored: 0 };
+  }
   if (previous?.overlay_id && previous.overlay_id !== overlayId) {
     await k
       .deleteFrom("kg_overlay_changes")
@@ -439,40 +458,120 @@ export async function overlayFailed(
       updated_at: nowIso(),
     })
     .onConflict((oc) =>
-      oc.columns(["repo_id", "ref"]).doUpdateSet((eb) => ({
-        status: eb.ref("excluded.status"),
-        attempted_commit: eb.ref("excluded.attempted_commit"),
-        error: eb.ref("excluded.error"),
-      })),
+      oc
+        .columns(["repo_id", "ref"])
+        .doUpdateSet((eb) => ({
+          status: eb.ref("excluded.status"),
+          attempted_commit: eb.ref("excluded.attempted_commit"),
+          error: eb.ref("excluded.error"),
+        }))
+        .where("kg_overlays.ended_at", "is", null),
     )
     .execute();
 }
 
-/** Drop the overlays of bookmarks that no longer exist (abandoned or deleted). */
-export async function dropOverlays(d1: D1Database, repoId: string, refs: string[]) {
-  if (!refs.length) return;
+/** Why a timeline's overlay ended, from its status; null while the timeline goes on. */
+export function endReason(
+  status: TimelineStatus | null | undefined,
+): "landed" | "abandoned" | null {
+  return status === "landed" || status === "abandoned" ? status : null;
+}
+
+/**
+ * Whether the timeline behind a bookmark has landed or been abandoned, from
+ * its record in the account's tracker; null when it goes on, has no record,
+ * or the tracker can't be reached.
+ */
+export async function timelineEnd(
+  env: Env,
+  ownerId: string,
+  ref: string,
+): Promise<"landed" | "abandoned" | null> {
+  const slug = timelineSlugOf(ref);
+  if (!slug) return null;
+  try {
+    const reply = await trackerObject(env, ownerId).timeline(slug, 0, 1);
+    return reply.ok ? endReason(reply.value.timeline.status) : null;
+  } catch (error) {
+    console.warn("Knowledge: looking up a timeline failed", { slug, error });
+    return null;
+  }
+}
+
+/**
+ * The bookmarks are gone: keep each last overlay, read-only, with why it
+ * ended. A bookmark that never had an overlay leaves nothing behind.
+ */
+export async function endOverlays(
+  d1: D1Database,
+  repoId: string,
+  reasons: Map<string, KnowledgeOverlayEndReason>,
+) {
+  if (!reasons.size) return;
   const k = db(d1);
-  const rows = await k
-    .selectFrom("kg_overlays")
-    .select(["ref", "overlay_id"])
-    .where("repo_id", "=", repoId)
-    .where("ref", "in", refs)
-    .execute();
+  const at = nowIso();
   await runBatched(d1, [
-    ...rows.flatMap((row) =>
-      row.overlay_id
-        ? [
-            k
-              .deleteFrom("kg_overlay_changes")
-              .where("repo_id", "=", repoId)
-              .where("overlay_id", "=", row.overlay_id),
-          ]
-        : [],
+    ...[...reasons].map(([ref, reason]) =>
+      k
+        .updateTable("kg_overlays")
+        .set({ ended_at: at, ended_reason: reason })
+        .where("repo_id", "=", repoId)
+        .where("ref", "=", ref)
+        .where("overlay_id", "is not", null)
+        .where("ended_at", "is", null),
     ),
-    ...refs.map((ref) =>
-      k.deleteFrom("kg_overlays").where("repo_id", "=", repoId).where("ref", "=", ref),
+    ...[...reasons.keys()].map((ref) =>
+      k
+        .deleteFrom("kg_overlays")
+        .where("repo_id", "=", repoId)
+        .where("ref", "=", ref)
+        .where("overlay_id", "is", null),
     ),
   ]);
+}
+
+/** The repository's ended overlays, by bookmark, with why each ended. */
+export async function endedOverlays(
+  d1: D1Database,
+  repoId: string,
+): Promise<Map<string, KnowledgeOverlayEndReason>> {
+  const rows = await db(d1)
+    .selectFrom("kg_overlays")
+    .select(["ref", "ended_reason"])
+    .where("repo_id", "=", repoId)
+    .where("ended_at", "is not", null)
+    .execute();
+  return new Map(rows.map((r) => [r.ref, r.ended_reason ?? "ended"]));
+}
+
+/** Record a later answer about why an overlay ended. */
+export async function setEndReason(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  reason: "landed" | "abandoned",
+) {
+  await db(d1)
+    .updateTable("kg_overlays")
+    .set({ ended_reason: reason })
+    .where("repo_id", "=", repoId)
+    .where("ref", "=", ref)
+    .where("ended_at", "is not", null)
+    .execute();
+}
+
+/**
+ * A bookmark is back for a timeline the tracker never said had ended (it was
+ * deleted by hand, or isn't a tracked timeline): its overlay is live again.
+ */
+export async function reopenOverlay(d1: D1Database, repoId: string, ref: string) {
+  await db(d1)
+    .updateTable("kg_overlays")
+    .set({ ended_at: null, ended_reason: null })
+    .where("repo_id", "=", repoId)
+    .where("ref", "=", ref)
+    .where("ended_reason", "=", "ended")
+    .execute();
 }
 
 // ---- scheduling (the coordinator's state) ------------------------------------

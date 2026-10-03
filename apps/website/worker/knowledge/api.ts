@@ -10,7 +10,8 @@
 //   GET  /search?q=              entities (Vectorize) + passages (AI Search)
 //   GET  /wiki                   the catalog
 //   GET  /wiki/page?slug=        one page
-//   GET  /overlays               every timeline's graph diff against main, in brief
+//   GET  /overlays               every timeline's graph diff against main, in brief,
+//                                ended timelines' last ones included (read-only)
 //   GET  /overlay?ref=timeline/<slug>&limit=   one timeline's diff, with its changes
 
 import { Hono, type Context } from "hono";
@@ -39,7 +40,7 @@ import { db, type Database } from "../schema.ts";
 import { coordinator, notifyKnowledge } from "./coordinator.ts";
 import { PASSAGE_CANDIDATES, SEARCH_INSTANCE, selectPassages } from "./indexes.ts";
 import { embed } from "./models.ts";
-import { overlayRef } from "./overlay.ts";
+import { overlayRef, setEndReason, timelineEnd } from "./overlay.ts";
 import { timelineSlugOf } from "../../shared/timelines.ts";
 
 export const knowledge = new Hono<AppEnv>();
@@ -485,6 +486,49 @@ knowledge.get("/wiki/page", async (c) => {
 // ---- timeline overlays --------------------------------------------------------
 
 const OVERLAY_KINDS = ["component", "concept", "file", "symbol", "package"];
+/**
+ * An overlay that ended before the tracker said why (a landing that finished
+ * after its bookmark went) is asked again for this long, a few per request.
+ */
+const RECHECK_ENDED_MS = 2 * 24 * 60 * 60 * 1000;
+const RECHECK_ENDED = 5;
+
+type OverlayRow = Selectable<Database["kg_overlays"]>;
+
+/** Ask the tracker again why recently ended overlays ended, and keep the answer. */
+async function recheckEnded(c: Context<AppEnv>, row: RepoRow, rows: OverlayRow[]) {
+  const since = Date.now() - RECHECK_ENDED_MS;
+  const unsure = rows
+    .filter((r) => r.ended_reason === "ended" && Date.parse(r.ended_at ?? "") > since)
+    .slice(0, RECHECK_ENDED);
+  await Promise.all(
+    unsure.map(async (r) => {
+      const reason = await timelineEnd(c.env, row.owner_id, r.ref);
+      if (!reason) return;
+      r.ended_reason = reason;
+      await setEndReason(c.env.DB, row.id, r.ref, reason);
+    }),
+  );
+}
+
+/**
+ * Where one timeline's overlay stands, from its stored row (if any), the
+ * bookmark's tip now, main's indexed commit and a running computation.
+ */
+export function overlayState(
+  stored: OverlayRow | undefined,
+  head: string | null,
+  indexed: string | null,
+  running: boolean,
+): KnowledgeOverlaySummary["state"] {
+  // Ended overlays are kept as they were; nothing computes them again.
+  if (stored?.ended_at) return "ended";
+  if (!indexed) return "waiting";
+  if (running) return "building";
+  if (stored?.status === "failed" && stored.attempted_commit === head) return "failed";
+  if (stored?.head_commit === head && stored?.base_commit === indexed) return "up-to-date";
+  return "queued";
+}
 
 /** Where each timeline's overlay stands, for every bookmark or just `only`. */
 async function overlaySummaries(
@@ -512,6 +556,7 @@ async function overlaySummaries(
     c.env.AI ? coordinator(c.env, row.id).status() : null,
   ]);
   await reader.close();
+  await recheckEnded(c, row, rows);
   const indexed = state?.indexed_commit ?? null;
   const tips = new Map(
     (refs?.branches ?? [])
@@ -527,16 +572,8 @@ async function overlaySummaries(
       counts?: KnowledgeOverlaySummary["counts"];
       stored?: number;
     };
-    const running = coordination?.overlays[ref]?.running ?? null;
-    const state: KnowledgeOverlaySummary["state"] = !indexed
-      ? "waiting"
-      : running
-        ? "building"
-        : stored?.status === "failed" && stored.attempted_commit === head
-          ? "failed"
-          : stored?.head_commit === head && stored?.base_commit === indexed
-            ? "up-to-date"
-            : "queued";
+    const running = Boolean(coordination?.overlays[ref]?.running);
+    const state = overlayState(stored, head, indexed, running);
     if (state === "queued" && head) stale = true;
     return {
       overlayId: stored?.overlay_id ?? null,
@@ -552,6 +589,9 @@ async function overlaySummaries(
         counts: stats.counts ?? {},
         updatedAt: stored?.updated_at ?? null,
         error: stored?.status === "failed" ? stored.error : null,
+        ended: stored?.ended_at
+          ? { reason: stored.ended_reason ?? "ended", at: stored.ended_at }
+          : null,
       },
     };
   });

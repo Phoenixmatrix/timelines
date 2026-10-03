@@ -13,16 +13,23 @@
 // commit, moved since its last one: at most one per timeline in flight and a
 // few per repository, and a push during one runs it again when it ends.
 // Overlays never touch main's graph; a push that moved only timeline
-// bookmarks starts no main build.
+// bookmarks starts no main build. When a bookmark disappears its last overlay
+// is kept, read-only, as landed or abandoned (from the timeline's record in
+// the account's tracker) or just ended, and is never computed again (CORE-139).
 
 import { DurableObject } from "cloudflare:workers";
 import { timelineSlugOf } from "../../shared/timelines.ts";
 import { listRefs, type RepoRefs } from "../artifacts.ts";
 import { db, nowIso } from "../schema.ts";
+import type { KnowledgeOverlayEndReason } from "../../shared/api.ts";
 import {
-  dropOverlays,
+  endedOverlays,
+  endOverlays,
   overlayFailed,
+  reopenOverlay,
   scanOverlays,
+  setEndReason,
+  timelineEnd,
   type OverlayRun,
   type OverlayState,
 } from "./overlay.ts";
@@ -126,11 +133,12 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     const buildDue = !state.running && (state.seq > state.builtSeq || state.force);
     let refs: RepoRefs | null = null;
     let indexed: string | null = null;
+    let ownerId: string | null = null;
     if (buildDue || state.scan) {
       const [repo, kgState] = await Promise.all([
         db(this.env.DB)
           .selectFrom("repos")
-          .select(["artifacts_name", "artifacts_remote"])
+          .select(["artifacts_name", "artifacts_remote", "owner_id"])
           .where("id", "=", state.repoId)
           .executeTakeFirst(),
         db(this.env.DB)
@@ -140,6 +148,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
           .executeTakeFirst(),
       ]);
       indexed = kgState?.indexed_commit ?? null;
+      ownerId = repo?.owner_id ?? null;
       refs = repo
         ? await listRefs(this.env, repo.artifacts_name, repo.artifacts_remote).catch((error) => {
             console.error("Knowledge: listing refs failed", { repo: state.repoId, error });
@@ -165,7 +174,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     // Main's next build waits for its own run to end (finished() schedules it).
     state.burstStartedAt = null;
     // Without a ref listing the scan waits for the next ping.
-    if (state.scan && refs) await this.#scanOverlays(state, refs, indexed);
+    if (state.scan && refs && ownerId) await this.#scanOverlays(state, refs, indexed, ownerId);
     await this.#save(state);
     if (state.running || Object.values(state.overlays).some((o) => o.running))
       await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
@@ -256,21 +265,46 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     state.scan = true;
   }
 
-  /** Start overlays for bookmarks whose tip or base moved; forget bookmarks that are gone. */
-  async #scanOverlays(state: State, refs: RepoRefs, indexed: string | null) {
+  /**
+   * Start overlays for bookmarks whose tip or base moved; end the overlays of
+   * bookmarks that are gone, keeping them read-only.
+   */
+  async #scanOverlays(state: State, refs: RepoRefs, indexed: string | null, ownerId: string) {
+    const repoId = state.repoId!;
     const tips = new Map(
       refs.branches.filter((b) => timelineSlugOf(b.name)).map((b) => [b.name, b.oid]),
     );
+    // A bookmark this coordinator doesn't follow may be an ended overlay's,
+    // pushed again: an ended timeline's overlay is never computed again.
+    if ([...tips.keys()].some((ref) => !state.overlays[ref])) {
+      for (const [ref, reason] of await endedOverlays(this.env.DB, repoId)) {
+        if (!tips.has(ref) || state.overlays[ref]) continue;
+        if (reason === "ended") {
+          // The tracker never said it ended: it may have since, or it goes on.
+          const ended = await timelineEnd(this.env, ownerId, ref);
+          if (!ended) {
+            await reopenOverlay(this.env.DB, repoId, ref);
+            continue;
+          }
+          await setEndReason(this.env.DB, repoId, ref, ended);
+        }
+        tips.delete(ref);
+      }
+    }
     const scan = scanOverlays(state.overlays, tips, indexed);
-    for (const ref of scan.gone) delete state.overlays[ref];
-    await dropOverlays(this.env.DB, state.repoId!, scan.gone);
+    const reasons = new Map<string, KnowledgeOverlayEndReason>();
+    for (const ref of scan.gone) {
+      delete state.overlays[ref];
+      reasons.set(ref, (await timelineEnd(this.env, ownerId, ref)) ?? "ended");
+    }
+    await endOverlays(this.env.DB, repoId, reasons);
     // Over the limit: picked up when one of those in flight ends.
     state.scan = scan.deferred;
     for (const [ref, commit] of scan.start) {
       const buildId = crypto.randomUUID();
       await this.env.KNOWLEDGE_BUILD.create({
         id: buildId,
-        params: { repoId: state.repoId!, buildId, overlay: { ref, commit } },
+        params: { repoId, buildId, overlay: { ref, commit } },
       });
       state.overlays[ref] = {
         ...(state.overlays[ref] ?? { done: null, retries: 0, lastError: null }),

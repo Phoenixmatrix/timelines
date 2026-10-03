@@ -345,8 +345,23 @@ export interface OverlayLink {
   kind: string;
 }
 
-/** `waiting`: main has no graph yet to compare with. */
-export type KnowledgeOverlayState = "up-to-date" | "building" | "queued" | "failed" | "waiting";
+/**
+ * `waiting`: main has no graph yet to compare with; `ended`: the bookmark is
+ * gone and the last overlay is kept, read-only (see `ended`).
+ */
+export type KnowledgeOverlayState =
+  | "up-to-date"
+  | "building"
+  | "queued"
+  | "failed"
+  | "waiting"
+  | "ended";
+
+/**
+ * Why an overlay ended, from the timeline's record when its bookmark went:
+ * it `landed` or was `abandoned`; `ended` when the tracker did not say.
+ */
+export type KnowledgeOverlayEndReason = "landed" | "abandoned" | "ended";
 
 /** A timeline's knowledge graph diff against main, kept current on every push. */
 export interface KnowledgeOverlaySummary {
@@ -366,6 +381,11 @@ export interface KnowledgeOverlaySummary {
   counts: Record<string, { added: number; changed: number; removed: number }>;
   updatedAt: string | null;
   error: string | null;
+  /**
+   * Set once the timeline's bookmark is gone (CORE-139): the last overlay is
+   * kept read-only and never computed again. Null while the bookmark exists.
+   */
+  ended: { reason: KnowledgeOverlayEndReason; at: string } | null;
 }
 
 export interface KnowledgeOverlay extends KnowledgeOverlaySummary {

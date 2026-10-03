@@ -1019,6 +1019,13 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   and main's graph, wiki and builds are untouched. A push that moves only
   timeline bookmarks starts no main build. One overlay per timeline (three per
   repository) runs at a time; main's next build recomputes them against it.
+  When a bookmark disappears its last overlay is kept, read-only (CORE-139):
+  `ended_reason` is `landed` or `abandoned` from the timeline's record in the
+  tracker, or `ended` when the tracker did not say (rechecked for two days, on
+  read). Ended overlays are never computed again, even if the bookmark is
+  pushed again; only an `ended` one whose timeline the tracker still doesn't
+  end comes back to life. The API reports them with `state: "ended"` and
+  `ended: {reason, at}`; the Knowledge tab lists them under "Ended".
 
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index

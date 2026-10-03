@@ -6,9 +6,10 @@ import { applyGraph, buildGraph, saveSnapshot, type SnapshotFile } from "./graph
 import {
   applyChanges,
   computeOverlay,
+  overlayFailed,
   diffGraphs,
   diffTrees,
-  dropOverlays,
+  endOverlays,
   mergeBase,
   overlayRef,
   planOverlay,
@@ -366,9 +367,44 @@ describe("stored overlays", () => {
     ).not.toContain("file:a.ts");
     expect(mainGraph()).toEqual(before);
 
-    await dropOverlays(db, "repo", [ref]);
+    // The bookmark goes: the last overlay stays, read-only, with why it ended.
+    const changes = () => sqlite.prepare("SELECT * FROM kg_overlay_changes ORDER BY node_id").all();
+    const kept = changes();
+    await endOverlays(db, "repo", new Map([[ref, "abandoned"]]));
+    expect(
+      sqlite.prepare("SELECT overlay_id, head_commit, status, ended_reason FROM kg_overlays").all(),
+    ).toEqual([
+      { overlay_id: "o2", head_commit: "t2", status: "succeeded", ended_reason: "abandoned" },
+    ]);
+    expect(changes()).toEqual(kept);
+    const row = () => sqlite.prepare("SELECT * FROM kg_overlays").get();
+    const ended = row();
+    expect((ended as { ended_at: string | null }).ended_at).toBeTruthy();
+
+    // A run that was already under way, or a late failure, changes nothing.
+    const late = await computeOverlay(
+      db,
+      { id: "repo", full_name: "org/app" },
+      ref,
+      "o3",
+      "t3",
+      plan,
+      {},
+    );
+    expect(late.stored).toBe(0);
+    await overlayFailed(db, "repo", ref, "t3", "boom");
+    // Ending it again keeps the first answer.
+    await endOverlays(db, "repo", new Map([[ref, "ended"]]));
+    expect(row()).toEqual(ended);
+    expect(changes()).toEqual(kept);
+  });
+
+  test("a bookmark that never had an overlay leaves nothing behind", async () => {
+    const sqlite = setup();
+    const db = d1(sqlite);
+    await overlayFailed(db, "repo", "refs/heads/timeline/broken", "t1", "boom");
+    await endOverlays(db, "repo", new Map([["refs/heads/timeline/broken", "landed"]]));
     expect(sqlite.prepare("SELECT COUNT(*) AS n FROM kg_overlays").get()).toEqual({ n: 0 });
-    expect(sqlite.prepare("SELECT COUNT(*) AS n FROM kg_overlay_changes").get()).toEqual({ n: 0 });
   });
 
   test("planOverlay counts the timeline's changes from the merge base", async () => {

@@ -1,6 +1,7 @@
 // A timeline's knowledge overlay on the atlas (CORE-83): what the timeline
 // adds, changes and removes compared with main's graph. Main's map stays as
 // it is; the nodes the timeline touches are outlined on it and listed here.
+// A landed or abandoned timeline keeps its last overlay, read-only (CORE-139).
 
 import { useEffect, useState } from "react";
 import { Link, useRevalidator } from "react-router";
@@ -20,6 +21,13 @@ const STATE: Record<KnowledgeOverlaySummary["state"], string> = {
   queued: "Update queued",
   failed: "Last update failed",
   waiting: "Waits for main's first graph",
+  ended: "Ended",
+};
+
+const ENDED: Record<NonNullable<KnowledgeOverlay["ended"]>["reason"], string> = {
+  landed: "This timeline landed",
+  abandoned: "This timeline was abandoned",
+  ended: "This timeline ended",
 };
 
 const FIELD: Record<string, string> = {
@@ -48,6 +56,8 @@ export function TimelinePicker({
   value: string | null;
   onChange: (timeline: string | null) => void;
 }) {
+  const live = overlays.filter((o) => !o.ended);
+  const ended = overlays.filter((o) => o.ended);
   return (
     <label className="flex items-center gap-2 text-body-sm text-ink-muted">
       <span className="max-sm:sr-only">Timeline</span>
@@ -57,11 +67,20 @@ export function TimelinePicker({
         onChange={(event) => onChange(event.target.value || null)}
       >
         <option value="">Main</option>
-        {overlays.map((o) => (
+        {live.map((o) => (
           <option key={o.ref} value={o.timeline}>
             {o.ref}
           </option>
         ))}
+        {ended.length > 0 && (
+          <optgroup label="Ended">
+            {ended.map((o) => (
+              <option key={o.ref} value={o.timeline}>
+                {o.ref} ({o.ended!.reason})
+              </option>
+            ))}
+          </optgroup>
+        )}
       </select>
     </label>
   );
@@ -98,17 +117,19 @@ function ChangeRow({
   const row =
     "-mx-2 flex h-8 items-center gap-2 rounded-plate px-2 text-body-sm text-ink no-underline";
   const title = change.summary || change.path || change.name;
-  // Nodes main has open in the inspector; new files open at the timeline's bookmark.
+  // Nodes main has open in the inspector; new files open at the timeline's
+  // bookmark, or at its last overlay's commit once the bookmark is gone.
+  const at = overlay.ended ? overlay.commit : overlay.head ? overlay.ref : null;
   if (change.change !== "added" && inMap(change.id))
     return (
       <Link to={href(change.id)} className={`${row} hover:bg-raised`} title={title}>
         {label}
       </Link>
     );
-  if (change.path && (change.kind === "file" || change.kind === "symbol") && overlay.head)
+  if (change.path && (change.kind === "file" || change.kind === "symbol") && at)
     return (
       <Link
-        to={blobUrl(repo.owner.slug, repo.name, overlay.ref, change.path)}
+        to={blobUrl(repo.owner.slug, repo.name, at, change.path)}
         className={`${row} hover:bg-raised`}
         title={title}
       >
@@ -200,7 +221,19 @@ export function OverlayPanel({
           {overlay.updatedAt && <> · {timeAgo(overlay.updatedAt)}</>}
         </span>
       </header>
-      {overlay.commit && overlay.head && overlay.commit !== overlay.head && (
+      {overlay.ended && (
+        <p className="m-0 mb-2 rounded-plate border border-line-soft bg-raised px-2 py-1.5 text-body-sm text-ink-muted">
+          {ENDED[overlay.ended.reason]} {timeAgo(overlay.ended.at)}. This is its last overlay
+          {overlay.commit && (
+            <>
+              {" "}
+              at <span className="font-mono">{overlay.commit.slice(0, 7)}</span>
+            </>
+          )}
+          , kept read-only.
+        </p>
+      )}
+      {!overlay.ended && overlay.commit && overlay.head && overlay.commit !== overlay.head && (
         <p className="m-0 mb-2 text-micro text-ink-faint">
           Showing <span className="font-mono">{overlay.commit.slice(0, 7)}</span>; the bookmark is
           now at <span className="font-mono">{overlay.head.slice(0, 7)}</span>.
@@ -208,9 +241,11 @@ export function OverlayPanel({
       )}
       {total === 0 ? (
         <p className="m-0 text-body-sm text-ink-muted">
-          {overlay.commit
-            ? "This timeline changes nothing in the graph yet."
-            : "No overlay yet. It is computed after the next push."}
+          {overlay.ended
+            ? "This timeline changed nothing in the graph."
+            : overlay.commit
+              ? "This timeline changes nothing in the graph yet."
+              : "No overlay yet. It is computed after the next push."}
         </p>
       ) : (
         SECTIONS.map(([change, title]) => (

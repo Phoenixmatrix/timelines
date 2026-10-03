@@ -245,6 +245,9 @@ export interface Database {
     status: "succeeded" | "failed";
     attempted_commit: string;
     error: string | null;
+    /** Set when the bookmark disappeared (CORE-139): the overlay is kept read-only. */
+    ended_at: string | null;
+    ended_reason: "landed" | "abandoned" | "ended" | null;
   };
   kg_overlay_changes: {
     repo_id: string;
