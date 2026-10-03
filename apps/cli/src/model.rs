@@ -1,6 +1,7 @@
 //! The shapes gm prints. Each derives a JSON Schema, which `gm schema`
 //! serves so agents know the output before running a command.
 
+use crate::graph::{self, Node};
 use crate::output::{Render, style};
 use crate::repo::{Workspace, ids};
 use git2::Oid;
@@ -91,15 +92,23 @@ impl Change {
 
     /// One line, jj style: marker, change id, commit id, bookmarks, summary.
     pub fn line(&self) -> String {
-        let marker = if self.working_copy {
+        format!("{} {}", self.marker(), self.label())
+    }
+
+    /// `@` for the working copy, `◆` for immutable changes, `○` for the rest.
+    pub fn marker(&self) -> &'static str {
+        if self.working_copy {
             "@"
         } else if self.immutable {
             "◆"
         } else {
             "○"
-        };
+        }
+    }
+
+    /// The line without its marker: change id, commit id, bookmarks, summary.
+    pub fn label(&self) -> String {
         let mut parts = vec![
-            marker.to_string(),
             style::change(&self.change_id),
             style::commit(&self.commit_id),
         ];
@@ -279,26 +288,30 @@ pub struct Log {
 
 impl Render for Log {
     fn text(&self) -> String {
-        let mut lines: Vec<String> = Vec::new();
-        for (i, c) in self.changes.iter().enumerate() {
-            let mut line = c.line();
-            // Without a drawn graph, say so when a change doesn't sit on the next line.
-            let next = self.changes.get(i + 1).map(|n| n.change_id.as_str());
-            if !c.parents.is_empty()
-                && next.is_some()
-                && !c.parents.iter().any(|p| Some(p.as_str()) == next)
-            {
-                line.push_str(&style::dim(&format!("  (on {})", c.parents.join(", "))));
-            } else if c.parents.len() > 1 {
-                line.push_str(&style::dim(&format!(
-                    "  (merge of {})",
-                    c.parents.join(", ")
-                )));
-            }
-            lines.push(line);
-        }
+        let nodes: Vec<Node> = self
+            .changes
+            .iter()
+            .map(|c| Node {
+                id: &c.change_id,
+                parents: &c.parents,
+                glyph: c.marker(),
+                text: c.label(),
+            })
+            .collect();
+        let mut lines = graph::draw(&nodes);
         if self.truncated {
-            lines.push(style::dim("~ (more: raise --limit)"));
+            let hint = style::dim("(more: raise --limit)");
+            // Put the hint beside the `~` that already marks the elided history.
+            match lines.last_mut() {
+                Some(last)
+                    if last.contains('~')
+                        && last.chars().all(|ch| matches!(ch, '~' | '│' | ' ')) =>
+                {
+                    last.push_str("  ");
+                    last.push_str(&hint);
+                }
+                _ => lines.push(format!("~  {hint}")),
+            }
         }
         lines.join("\n")
     }

@@ -91,6 +91,21 @@ impl Sandbox {
         )
     }
 
+    /// Text output, as a person at a terminal would read it.
+    fn text(&self, args: &[&str]) -> String {
+        let mut args = args.to_vec();
+        args.extend(["--output", "text"]);
+        let output = Command::new(env!("CARGO_BIN_EXE_gm"))
+            .current_dir(self.work())
+            .args(&args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .output()
+            .expect("gm runs");
+        assert!(output.status.success(), "gm {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
     fn write(&self, path: &str, content: &str) {
         let full = self.work().join(path);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -170,6 +185,53 @@ fn change_ids_survive_rewrites_and_descendants_follow() {
         s.ok(&["file", "show", "b.txt", "-r", &b])["content"],
         "two\n"
     );
+}
+
+#[test]
+fn log_text_draws_forks_and_merges() {
+    let s = Sandbox::new();
+    s.write("a.txt", "one\n");
+    s.ok(&["commit", "-m", "Add a"]);
+    s.ok(&["new", "trunk", "-m", "Add b"]);
+    s.write("b.txt", "two\n");
+    let a = s.change("Add a");
+    let b = s.change("Add b");
+    s.ok(&["new", &a, &b, "-m", "Merge"]);
+
+    // JSON keeps listing each change with its parents.
+    let merge = &s.ok(&["log"])["changes"][0];
+    assert_eq!(merge["description"], "Merge");
+    assert_eq!(merge["parents"], serde_json::json!([a, b]));
+
+    // Text draws the merge's lanes splitting and the fork joining at trunk.
+    let text = s.text(&["log"]);
+    let rows: Vec<&str> = text.lines().collect();
+    // The two sides may be listed in either order; each keeps its own lane.
+    let (a_row, b_row) = (format!("○ │  {a} "), format!("│ ○  {b} "));
+    let sides = [(&*a_row, "Add a"), (&*b_row, "Add b")];
+    let expected = [
+        ("@  ", "Merge"),
+        ("├─╮", ""),
+        sides[0],
+        sides[1],
+        ("├─╯", ""),
+        ("◆  ", "Initial"),
+    ];
+    assert_eq!(rows.len(), expected.len(), "{text}");
+    let side = |row: &str| {
+        sides
+            .iter()
+            .any(|(graph, description)| row.starts_with(graph) && row.ends_with(description))
+    };
+    for (i, (row, (graph, description))) in rows.iter().zip(expected).enumerate() {
+        let ok = if i == 2 || i == 3 {
+            side(row)
+        } else {
+            row.starts_with(graph) && row.ends_with(description)
+        };
+        assert!(ok, "{row:?} in\n{text}");
+    }
+    assert_ne!(rows[2], rows[3], "{text}");
 }
 
 #[test]

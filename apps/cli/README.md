@@ -683,6 +683,4 @@ pnpm run check      # fmt + clippy with warnings as errors
 
 ## Known gaps
 
-- `gm log` text output lists changes without drawing a graph; JSON output has
-  every change's parents.
 - No interactive mode (`split -i`), tags, blame or submodules.

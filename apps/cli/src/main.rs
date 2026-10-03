@@ -1,6 +1,7 @@
 mod agent;
 mod cli;
 mod commands;
+mod graph;
 mod meta;
 mod model;
 mod output;
