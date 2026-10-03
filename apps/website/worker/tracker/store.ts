@@ -31,6 +31,7 @@ import type { ShippedIssue } from "../../shared/release-notes.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
 import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
+import { matchRank, matches, type MatchColumns, type SearchQuery } from "../search/query.ts";
 
 export type { SqlDatabase } from "./sql.ts";
 
@@ -278,6 +279,37 @@ export class TrackerStore {
       this.sql,
       tracker.selectFrom("issues").select("data").where(json("data", "$.key"), "in", keys),
     ).map((row) => this.shipped(JSON.parse(row.data) as Issue));
+  }
+  /**
+   * Issues matching a global search (worker/search), open and closed, best
+   * first: by match, then priority, most recently updated, ID. Keys are the
+   * exact identifiers; titles rank prefixes and words; descriptions only
+   * contain. Every member may read every issue, so the caller authorizes the
+   * tracker, not the rows.
+   */
+  searchIssues(query: SearchQuery, limit: number): { issue: Issue; rank: number }[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200)
+      fail("invalid_input", "limit must be 1–200.");
+    const key = json<string>("data", "$.key");
+    const title = json<string>("data", "$.title");
+    const columns: MatchColumns = {
+      identifiers: [key],
+      names: [title, key],
+      searched: [key, title, json<string>("data", "$.description")],
+    };
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("issues")
+        .select("data")
+        .select(matchRank(columns, query).as("rank"))
+        .where(matches(columns, query))
+        .orderBy("rank")
+        .orderBy(json("data", "$.priority"))
+        .orderBy(json("data", "$.updatedAt"), "desc")
+        .orderBy("id")
+        .limit(limit),
+    ).map((row) => ({ issue: JSON.parse(row.data) as Issue, rank: row.rank }));
   }
   /** Issues that became done in [since, until) and still are, oldest first. */
   completedBetween(since: string, until: string, limit: number): ShippedIssue[] {

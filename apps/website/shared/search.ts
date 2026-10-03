@@ -2,15 +2,18 @@
 // providers and the palette. Lookup is plain, permission-aware matching over
 // names and titles: no inference, embeddings or AI Search.
 
+import type { Issue, IssueStatus } from "./tracker.ts";
+
 /**
  * What can be found. Each category has one server-side provider
  * (worker/search/); a new kind of result adds a category here and a provider
  * there.
  */
-export type SearchCategory = "repositories" | "accounts" | "conversations";
+export type SearchCategory = "repositories" | "issues" | "accounts" | "conversations";
 
 export const SEARCH_CATEGORIES: readonly SearchCategory[] = [
   "repositories",
+  "issues",
   "accounts",
   "conversations",
 ];
@@ -32,6 +35,8 @@ export const SEARCH_LIMITS = {
   maxOffset: 100,
   /** A category that takes longer than this reports `unavailable`. */
   timeoutMs: 5_000,
+  /** Most trackers one issue search reads; past it the group is `incomplete`. */
+  trackers: 25,
 } as const;
 
 /**
@@ -66,6 +71,16 @@ export interface RepositoryResult extends ResultBase {
   visibility: "public" | "private";
 }
 
+export interface IssueResult extends ResultBase {
+  category: "issues";
+  key: string;
+  /** The tracker it's in: keys repeat across trackers, so this tells them apart. */
+  tracker: { slug: string; displayName: string };
+  status: IssueStatus;
+  priority: Issue["priority"];
+  updatedAt: string;
+}
+
 export interface AccountResult extends ResultBase {
   category: "accounts";
   kind: "user" | "org";
@@ -78,7 +93,7 @@ export interface ConversationResult extends ResultBase {
   updatedAt: string;
 }
 
-export type SearchResult = RepositoryResult | AccountResult | ConversationResult;
+export type SearchResult = RepositoryResult | IssueResult | AccountResult | ConversationResult;
 
 /**
  * One category's answer. A category that failed or timed out is `unavailable`,
@@ -93,6 +108,12 @@ export type SearchGroup =
       cursor: string | null;
       /** More matches exist past the deepest page: narrow the query to reach them. */
       truncated: boolean;
+      /**
+       * Set when only part of the category was searched (some trackers failed,
+       * or there were too many): what was missed. Absent matches aren't proof
+       * of none.
+       */
+      incomplete: string | null;
     }
   | { category: SearchCategory; status: "unavailable"; error: string };
 

@@ -2,16 +2,21 @@
 // limits, so nothing the viewer can't read reaches a row, an order or a cursor.
 
 import { sql } from "kysely";
-import type {
-  AccountResult,
-  ConversationResult,
-  RepositoryResult,
-  SearchCategory,
-  SearchResult,
+import {
+  SEARCH_LIMITS,
+  type AccountResult,
+  type ConversationResult,
+  type IssueResult,
+  type RepositoryResult,
+  type SearchCategory,
+  type SearchResult,
 } from "../../shared/search.ts";
+import type { Issue, TrackerOwner } from "../../shared/tracker.ts";
 import type { Actor } from "../db.ts";
 import { readableRepo, roleFor, selectRepos } from "../db.ts";
 import { db } from "../schema.ts";
+import { accessible } from "../tracker/api.ts";
+import { trackerObject } from "../tracker/stub.ts";
 import { matchOf, matchRank, matches, type MatchColumns, type SearchQuery } from "./query.ts";
 
 export interface SearchContext {
@@ -36,7 +41,12 @@ export interface SearchProvider<C extends SearchCategory = SearchCategory> {
     context: SearchContext,
     query: SearchQuery,
     page: SearchPage,
-  ) => Promise<{ results: Extract<SearchResult, { category: C }>[]; more: boolean }>;
+  ) => Promise<{
+    results: Extract<SearchResult, { category: C }>[];
+    more: boolean;
+    /** What part of the category wasn't searched, if any. */
+    incomplete?: string;
+  }>;
 }
 
 /** Any one category's provider. */
@@ -89,6 +99,105 @@ const repositories: SearchProvider<"repositories"> = {
     };
   },
 };
+
+/** How many trackers an issue search reads at once. */
+const TRACKER_CONCURRENCY = 6;
+
+/** `work` over `items`, at most `limit` at a time, results in input order. */
+async function pooled<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>) {
+  const results: R[] = [];
+  let next = 0;
+  const lane = async () => {
+    while (next < items.length) {
+      const at = next++;
+      results[at] = await work(items[at]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+  return results;
+}
+
+/**
+ * Issues in every tracker the viewer belongs to, open and closed. Each tracker
+ * ranks its own matches (TrackerStore.searchIssues); this merges them. A
+ * tracker that fails, or one past SEARCH_LIMITS.trackers, makes the group
+ * `incomplete` rather than silently absent.
+ */
+const issues: SearchProvider<"issues"> = {
+  category: "issues",
+  async search({ env, actor }, query, page) {
+    const owners = await accessible(env.DB, actor);
+    // Your own tracker first, then organizations by slug.
+    owners.sort((a, b) => Number(b.id === actor.id) - Number(a.id === actor.id));
+    const searched = owners.slice(0, SEARCH_LIMITS.trackers);
+    // Each tracker's best `want` are enough to fill this page and know if more follow.
+    const want = page.offset + page.limit + 1;
+    const answers = await pooled(searched, TRACKER_CONCURRENCY, async (owner) => {
+      try {
+        const reply = await trackerObject(env, owner.id).searchIssues(query, want);
+        if (reply.ok) return { owner, matches: reply.value };
+        console.error(`search: tracker ${owner.slug} refused`, reply.error);
+      } catch (error) {
+        console.error(`search: tracker ${owner.slug} failed`, error);
+      }
+      return { owner, matches: null };
+    });
+    const failed = answers.filter((answer) => answer.matches === null).map((a) => a.owner.slug);
+    if (searched.length && failed.length === searched.length)
+      throw new Error("Every tracker search failed.");
+
+    const merged = answers
+      .flatMap(({ owner, matches }) => (matches ?? []).map((match) => ({ owner, ...match })))
+      .sort(
+        (a, b) =>
+          a.rank - b.rank ||
+          a.issue.priority - b.issue.priority ||
+          b.issue.updatedAt.localeCompare(a.issue.updatedAt) ||
+          a.owner.slug.localeCompare(b.owner.slug) ||
+          a.issue.id.localeCompare(b.issue.id),
+      );
+    const rows = merged.slice(page.offset, page.offset + page.limit);
+    const notes = [
+      failed.length ? `Couldn't search ${failed.join(", ")}.` : "",
+      owners.length > searched.length
+        ? `Searched ${searched.length} of your ${owners.length} trackers.`
+        : "",
+    ].filter(Boolean);
+    return {
+      more: merged.length > page.offset + page.limit,
+      incomplete: notes.length ? notes.join(" ") : undefined,
+      results: rows.map(({ owner, issue, rank }) => issueResult(owner, issue, rank)),
+    };
+  },
+};
+
+const STATUS_LABEL: Record<Issue["status"], string> = {
+  backlog: "Backlog",
+  todo: "To do",
+  in_progress: "In progress",
+  done: "Done",
+  canceled: "Canceled",
+};
+
+function issueResult(owner: TrackerOwner, issue: Issue, rank: number): IssueResult {
+  return {
+    category: "issues",
+    id: `issues:${owner.id}:${issue.id}`,
+    title: issue.title,
+    subtitle: `${issue.key} · ${STATUS_LABEL[issue.status]}`,
+    breadcrumb: [owner.slug],
+    match: matchOf(rank),
+    target: {
+      kind: "path",
+      path: `/tracker/${encodeURIComponent(owner.slug)}/issues/${encodeURIComponent(issue.id)}`,
+    },
+    key: issue.key,
+    tracker: { slug: owner.slug, displayName: owner.displayName },
+    status: issue.status,
+    priority: issue.priority,
+    updatedAt: issue.updatedAt,
+  };
+}
 
 /** People and organizations. Every profile is public (GET /api/accounts/:slug), so all are searchable. */
 const accounts: SearchProvider<"accounts"> = {
@@ -170,4 +279,9 @@ const conversations: SearchProvider<"conversations"> = {
 };
 
 /** Every category, in the order groups are returned by default. */
-export const PROVIDERS: readonly AnySearchProvider[] = [repositories, accounts, conversations];
+export const PROVIDERS: readonly AnySearchProvider[] = [
+  repositories,
+  issues,
+  accounts,
+  conversations,
+];

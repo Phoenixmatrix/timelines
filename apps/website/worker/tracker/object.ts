@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
 import { TimelineStore, type NewTimeline, type PushActivity } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
+import type { SearchQuery } from "../search/query.ts";
 import type { TimelineStatus } from "../../shared/timelines.ts";
 
 export type TrackerReply<T> =
@@ -57,6 +58,9 @@ export class Tracker extends DurableObject<Env> {
   }
   workspaceSlugs() {
     return this.reply(() => this.store.workspaceSlugs());
+  }
+  searchIssues(query: SearchQuery, limit: number) {
+    return this.reply(() => this.store.searchIssues(query, limit));
   }
   issuesByKey(keys: string[]) {
     return this.reply(() => this.store.issuesByKey(keys));

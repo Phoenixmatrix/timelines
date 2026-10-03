@@ -7,11 +7,14 @@ import {
   ArrowRightIcon,
   BuildingsIcon,
   ChatCenteredDotsIcon,
+  CheckCircleIcon,
+  CircleDashedIcon,
   FolderSimpleIcon,
   GitBranchIcon,
   LightningIcon,
   MagnifyingGlassIcon,
   UserCircleIcon,
+  XCircleIcon,
 } from "@phosphor-icons/react";
 import {
   createContext,
@@ -99,6 +102,7 @@ export function SearchButton() {
 
 const CATEGORY_LABEL: Record<SearchCategory, string> = {
   repositories: "Repositories",
+  issues: "Issues",
   accounts: "People and organizations",
   conversations: "Conversations",
 };
@@ -143,9 +147,11 @@ function resultOption(result: SearchResult): Option {
   const detail =
     result.category === "repositories"
       ? result.subtitle
-      : result.category === "accounts"
-        ? `@${result.slug}`
-        : "Conversation";
+      : result.category === "issues"
+        ? `${result.subtitle} · ${result.tracker.slug}`
+        : result.category === "accounts"
+          ? `@${result.slug}`
+          : "Conversation";
   return {
     id: result.id,
     title: result.title,
@@ -153,6 +159,14 @@ function resultOption(result: SearchResult): Option {
     icon:
       result.category === "repositories" ? (
         <GitBranchIcon className={iconClass} aria-hidden />
+      ) : result.category === "issues" ? (
+        result.status === "done" ? (
+          <CheckCircleIcon className={iconClass} aria-hidden />
+        ) : result.status === "canceled" ? (
+          <XCircleIcon className={iconClass} aria-hidden />
+        ) : (
+          <CircleDashedIcon className={iconClass} aria-hidden />
+        )
       ) : result.category === "accounts" ? (
         result.kind === "org" ? (
           <BuildingsIcon className={iconClass} aria-hidden />
@@ -186,6 +200,8 @@ function announce(count: number, query: string, remote: RemoteState): string {
   if (remote.status === "done")
     for (const group of remote.response.groups)
       if (group.status === "unavailable") parts.push(group.error);
+      else if (group.incomplete)
+        parts.push(`${CATEGORY_LABEL[group.category]}: ${group.incomplete}`);
   return parts.filter(Boolean).join(". ");
 }
 
@@ -274,7 +290,9 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
     if (event.key !== "Escape" && event.key !== "Tab") event.stopPropagation();
     if (isPaletteKey(event)) {
       event.preventDefault();
-      onOpenChange(false);
+      // A toggle: the popup keeps focus while it animates closed, and ⌘K
+      // pressed then must reopen it, not close it again.
+      onOpenChange(!open);
       return;
     }
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
@@ -296,6 +314,14 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
   const unavailable =
     current && remote.status === "done"
       ? remote.response.groups.flatMap((group) => (group.status === "unavailable" ? [group] : []))
+      : [];
+  const incomplete =
+    current && remote.status === "done"
+      ? remote.response.groups.flatMap((group) =>
+          group.status === "ok" && group.incomplete
+            ? [{ category: group.category, note: group.incomplete }]
+            : [],
+        )
       : [];
 
   return (
@@ -393,6 +419,11 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
                   Search failed: {remote.error}
                 </p>
               )}
+              {incomplete.map((group) => (
+                <p key={group.category} className="m-0 px-2.5 py-2 text-body-sm text-ink-muted">
+                  {CATEGORY_LABEL[group.category]}: {group.note}
+                </p>
+              ))}
               {unavailable.map((group) => (
                 <p key={group.category} className="m-0 px-2.5 py-2 text-body-sm text-danger-text">
                   {group.error}

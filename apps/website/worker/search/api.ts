@@ -17,6 +17,7 @@ import { decodeCursor, encodeCursor, parseQuery, type SearchQuery } from "./quer
 
 const LABELS: Record<SearchCategory, string> = {
   repositories: "repositories",
+  issues: "issues",
   accounts: "people and organizations",
   conversations: "conversations",
 };
@@ -40,10 +41,11 @@ async function searchOne(
   // Never page past maxOffset: the last window ends there.
   const page = { offset, limit: Math.min(limit, SEARCH_LIMITS.maxOffset - offset) };
   try {
-    const { results, more } = await withTimeout<{ results: SearchResult[]; more: boolean }>(
-      provider.search(context, query, page),
-      SEARCH_LIMITS.timeoutMs,
-    );
+    const { results, more, incomplete } = await withTimeout<{
+      results: SearchResult[];
+      more: boolean;
+      incomplete?: string;
+    }>(provider.search(context, query, page), SEARCH_LIMITS.timeoutMs);
     const next = offset + page.limit;
     const pageable = more && next < SEARCH_LIMITS.maxOffset;
     return {
@@ -52,6 +54,7 @@ async function searchOne(
       results,
       cursor: pageable ? encodeCursor(category, query, next) : null,
       truncated: more && !pageable,
+      incomplete: incomplete ?? null,
     };
   } catch (error) {
     console.error(`search: ${category} failed`, error);

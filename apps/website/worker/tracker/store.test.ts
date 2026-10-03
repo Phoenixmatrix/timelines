@@ -1,4 +1,4 @@
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import {
   readiness,
@@ -8,6 +8,7 @@ import {
   type Mutation,
 } from "../../shared/tracker.ts";
 import { RESUME_WINDOW_SECONDS, TrackerStore, type Access, type SqlDatabase } from "./store.ts";
+import { trackerSql, transactional } from "../testing/tracker.ts";
 
 const databases: DatabaseSync[] = [];
 afterEach(() => {
@@ -17,39 +18,9 @@ afterEach(() => {
 function fixture() {
   const db = new DatabaseSync(":memory:");
   databases.push(db);
-  const sql: SqlDatabase = {
-    exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: SqlStorageValue[]) {
-      if (query.includes("CREATE TABLE")) {
-        db.exec(query);
-        return {
-          toArray: () => [] as T[],
-          one: (): T => {
-            throw new Error("DDL has no rows");
-          },
-        };
-      }
-      const rows = db.prepare(query).all(...(bindings as SQLInputValue[])) as T[];
-      return {
-        toArray: () => rows,
-        one: () => {
-          if (rows.length !== 1) throw new Error("Expected exactly one SQL row");
-          return rows[0]!;
-        },
-      };
-    },
-  };
+  const sql: SqlDatabase = trackerSql(db);
   let now = Date.parse("2026-10-01T00:00:00Z");
-  const transaction = <T>(fn: () => T): T => {
-    db.exec("BEGIN");
-    try {
-      const result = fn();
-      db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-  };
+  const transaction = transactional(db);
   const store = new TrackerStore(sql, transaction, () => now);
   const access: Access = {
     actorId: "alice",

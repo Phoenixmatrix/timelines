@@ -267,9 +267,9 @@ you were. It lists, in labelled groups:
 - **In owner/name**: the current repository's sections (the same list as its tabs);
 - **Go to**: the app's places (tracker, Needs you, packages, settings…);
 - **Actions**: things to do, such as opening the assistant;
-- **Repositories**, **People and organizations**, **Conversations**: from
-  `/api/search` as you type (debounced; signed-in only). Choosing a
-  conversation reopens it in the assistant.
+- **Repositories**, **Issues**, **People and organizations**, **Conversations**:
+  from `/api/search` as you type (debounced; signed-in only). Issues show their
+  key, status and tracker; choosing a conversation reopens it in the assistant.
 
 Local groups answer at once and keep working while remote ones load or fail;
 a category that can't be searched says so instead of looking empty. Selection
@@ -283,13 +283,14 @@ selection and race rules, with tests in `palette.test.ts`.
 `GET /api/search` (CORE-91) is the lookup behind the global palette: plain,
 permission-aware matching over names and titles, never inference, embeddings or
 AI Search. The contract is `shared/search.ts`; each category is a provider in
-`worker/search/providers.ts` (issues and packages join as their own providers).
+`worker/search/providers.ts` (packages will join as its own provider).
 
-| Category        | Matches                                                 | Leads to                    |
-| --------------- | ------------------------------------------------------- | --------------------------- |
-| `repositories`  | `owner/name` and description, readable repos only       | `/owner/name`               |
-| `accounts`      | Slug and display name; every profile is public          | `/slug`                     |
-| `conversations` | Titles of the viewer's own assistant chats, all of them | the chat (`{kind: "chat"}`) |
+| Category        | Matches                                                                     | Leads to                    |
+| --------------- | --------------------------------------------------------------------------- | --------------------------- |
+| `repositories`  | `owner/name` and description, readable repos only                           | `/owner/name`               |
+| `issues`        | Key, title and description, open and closed, in every tracker you belong to | `/tracker/owner/issues/id`  |
+| `accounts`      | Slug and display name; every profile is public                              | `/slug`                     |
+| `conversations` | Titles of the viewer's own assistant chats, all of them                     | the chat (`{kind: "chat"}`) |
 
 - **Signed in only.** `q` is trimmed and whitespace collapsed: 1–100
   characters, at most 6 words, each of which must match. Empty, oversized or
@@ -309,6 +310,15 @@ AI Search. The contract is `shared/search.ts`; each category is a provider in
   category alone. Continuation stops at 100 results per category; past that a
   group reports `truncated: true` and no cursor, so narrow the query. There are
   no totals.
+- **Issues across trackers.** Each tracker's Durable Object ranks its own
+  issues in SQL (`TrackerStore.searchIssues`: exact key, then title prefix and
+  words, then description; ties by priority, most recently updated, ID) and the
+  provider merges them. Only trackers from `accessible()` are asked, so losing
+  membership removes their issues at once; keys repeat across trackers, so
+  each result carries its tracker. At most 25 trackers (yours first) are read,
+  6 at a time; when some fail or are past that bound the group stays `ok` but
+  sets `incomplete` to what was missed, and only when every tracker fails is it
+  `unavailable`.
 - **Failures stay local.** A category that throws or takes over 5 seconds
   comes back `{status: "unavailable", error}`, which is not "no matches", and
   the other groups are unaffected.

@@ -1193,6 +1193,19 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       ).toBeVisible();
       await page.keyboard.press("Escape");
 
+      // Issues from the trackers marco belongs to, closed ones included, open their page.
+      await page.keyboard.press("Control+k");
+      await input.fill("Agent ready fixture");
+      const issues = page.getByRole("group", { name: "Issues" });
+      await expect(issues.getByRole("option").first()).toContainText("Agent ready fixture");
+      await expect(issues.getByRole("option").first()).toContainText(fixtures.tracker.owner);
+      await page.keyboard.press("Enter");
+      await page.waitForURL(
+        (url) =>
+          url.pathname === `/tracker/${fixtures.tracker.owner}/issues/${fixtures.tracker.ready}`,
+      );
+      await expect(page.getByText("Agent ready fixture", { exact: true }).first()).toBeVisible();
+
       // Signed out: navigation only, and no search requests.
       await context.clearCookies();
       let searched = 0;
