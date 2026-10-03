@@ -359,6 +359,22 @@ export interface AtlasError {
   current?: { id: string; seq: number | null } | null;
   /** With snapshot_expired: when and why retention expired it (in a workspace, the first one read). */
   expired?: { at: string; reason: "age" | "count" | "storage" };
+  /**
+   * With entity_unknown for a capability or area a build retired (CORE-165):
+   * what it was and where its members went, so an old link can explain the
+   * change rather than resolve to something unrelated.
+   */
+  lineage?: AtlasLineage;
+}
+
+export interface AtlasLineage {
+  id: string;
+  kind: string;
+  name: string;
+  /** The snapshot sequence that no longer has it. */
+  retiredSeq: number;
+  change: "split" | "merged" | "removed";
+  successors: { id: string; share: number }[];
 }
 
 // ---- workspace scope (CORE-161) ------------------------------------------------

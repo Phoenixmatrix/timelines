@@ -364,6 +364,15 @@ export interface Database {
     parent_id: string;
     data: string;
   };
+  atlas_lineage: {
+    scope: string;
+    entity_id: string;
+    retired_seq: number;
+    kind: string;
+    name: string;
+    change: string;
+    successors: string;
+  };
   atlas_current: {
     scope: string;
     snapshot_id: string;

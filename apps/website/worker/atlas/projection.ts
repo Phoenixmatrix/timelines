@@ -18,6 +18,7 @@
 import { batch, db, nowIso } from "../schema.ts";
 import { sha256 } from "../knowledge/util.ts";
 import { groupCapabilities, GROUPING_VERSION, type Grouping } from "./grouping.ts";
+import { cell, GRID_WIDTH, reconcile, type PriorGroup, type Reconciled } from "./identity.ts";
 
 /** Bump when the projected shape changes: snapshots record which one built them. */
 export const PROJECTION_VERSION = 3;
@@ -724,55 +725,76 @@ export async function groupRepoCapabilities(
   const areasOf = new Map(grouping.capabilities.map((c) => [c.id, c.areas]));
   const shownAreas = grouping.areas.filter((a) => (areasOf.get(a.capability)?.length ?? 0) > 1);
   const shown = new Set(shownAreas.map((a) => a.id));
+
+  // Public ids continue the previous snapshot's where membership does (CORE-165).
+  const identity = await reconcileIdentity(d1, scope, seq, grouping, shownAreas);
+  const capId = (key: string) => identity.capabilities.ids.get(key) ?? key;
+  const areaId = (key: string) => identity.areas.ids.get(key) ?? key;
+  const areaSlots = slotAreas(shownAreas, capId, areaId, identity.priorAreaSlots);
+
   const basis = { version: GROUPING_VERSION, evidence: ["imports", "concepts"] };
   const entities: AtlasEntity[] = [
-    ...grouping.capabilities.map((c) => ({
-      id: c.id,
-      kind: "capability",
-      parentId: "repo",
-      name: c.name,
-      path: null,
-      summary: "",
-      data: {
-        counts: { files: c.files, areas: c.areas.filter((id) => shown.has(id)).length },
-        concepts: c.concepts,
-        anchor: c.anchor,
-        nameSource: "concepts",
-        grouping: basis,
-      },
-    })),
-    ...shownAreas.map((a) => ({
-      id: a.id,
-      kind: "area",
-      parentId: a.capability,
-      name: a.concepts[0]?.name ?? a.anchor.split("/").pop() ?? a.anchor,
-      path: null,
-      summary: "",
-      data: {
-        counts: { files: a.files.length },
-        concepts: a.concepts,
-        anchor: a.anchor,
-        nameSource: a.concepts.length ? "concepts" : "anchor",
-        grouping: basis,
-      },
-    })),
+    ...grouping.capabilities.map((c) => {
+      const id = capId(c.id);
+      return {
+        id,
+        kind: "capability",
+        parentId: "repo",
+        name: c.name,
+        path: null,
+        summary: "",
+        data: {
+          counts: { files: c.files, areas: c.areas.filter((a) => shown.has(a)).length },
+          concepts: c.concepts,
+          anchor: c.anchor,
+          nameSource: "concepts",
+          grouping: basis,
+          layout: cell(identity.capabilities.slots.get(id) ?? 0, c.files, GRID_WIDTH.top),
+          lineage: identity.origins.get(id) ?? null,
+        },
+      };
+    }),
+    ...shownAreas.map((a) => {
+      const id = areaId(a.id);
+      return {
+        id,
+        kind: "area",
+        parentId: capId(a.capability),
+        name: a.concepts[0]?.name ?? a.anchor.split("/").pop() ?? a.anchor,
+        path: null,
+        summary: "",
+        data: {
+          counts: { files: a.files.length },
+          concepts: a.concepts,
+          anchor: a.anchor,
+          nameSource: a.concepts.length ? "concepts" : "anchor",
+          grouping: basis,
+          layout: cell(areaSlots.get(id) ?? 0, a.files.length, GRID_WIDTH.nested),
+          lineage: identity.origins.get(id) ?? null,
+        },
+      };
+    }),
   ];
   const bytes = await writeEntities(d1, scope, seq, entities, ["area:", "cap:~"], {
     final: false,
     owns: (id) => id.startsWith("cap:") || id.startsWith("area:"),
   });
 
-  const placements = grouping.members.map((m) => ({
-    id: m.file,
-    parent: m.area && shown.has(m.area) ? m.area : (m.capability ?? GROUPS.unclassified),
-    data: JSON.stringify({
-      capability: m.capability,
-      area: m.area && shown.has(m.area) ? m.area : null,
-      rationale: m.rationale,
-      crossCutting: m.crossCutting,
-      ...(m.unclassified ? { unclassified: m.unclassified } : {}),
-    }),
-  }));
+  const placements = grouping.members.map((m) => {
+    const area = m.area && shown.has(m.area) ? areaId(m.area) : null;
+    const capability = m.capability ? capId(m.capability) : null;
+    return {
+      id: m.file,
+      parent: area ?? capability ?? GROUPS.unclassified,
+      data: JSON.stringify({
+        capability,
+        area,
+        rationale: m.rationale,
+        crossCutting: m.crossCutting.map((x) => ({ ...x, capability: capId(x.capability) })),
+        ...(m.unclassified ? { unclassified: m.unclassified } : {}),
+      }),
+    };
+  });
   const statements: Statement[] = [
     raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq = ?", scope, seq),
   ];
@@ -787,6 +809,32 @@ export async function groupRepoCapabilities(
         JSON.stringify(placements.slice(i, i + ROWS_PER_STATEMENT)),
       ),
     );
+  statements.push(raw("DELETE FROM atlas_lineage WHERE scope = ? AND retired_seq = ?", scope, seq));
+  for (const [kind, retired] of [
+    ["capability", identity.capabilities.retired],
+    ["area", identity.areas.retired],
+  ] as const)
+    for (let i = 0; i < retired.length; i += ROWS_PER_STATEMENT)
+      statements.push(
+        raw(
+          `INSERT INTO atlas_lineage (scope, entity_id, retired_seq, kind, name, change, successors)
+           SELECT ?, json_extract(value, '$.id'), ?, ?, json_extract(value, '$.name'), json_extract(value, '$.change'),
+                  json_extract(value, '$.successors')
+           FROM json_each(?) WHERE true
+           ON CONFLICT (scope, entity_id, retired_seq) DO UPDATE SET successors = excluded.successors, change = excluded.change`,
+          scope,
+          seq,
+          kind,
+          JSON.stringify(
+            retired.slice(i, i + ROWS_PER_STATEMENT).map((r) => ({
+              id: r.id,
+              name: identity.priorNames.get(r.id) ?? r.id,
+              change: r.change,
+              successors: JSON.stringify(r.successors),
+            })),
+          ),
+        ),
+      );
   statements.push(
     raw(
       "UPDATE atlas_snapshots SET grouping_version = ?, bytes = bytes + ? WHERE id = ?",
@@ -801,6 +849,163 @@ export async function groupRepoCapabilities(
     capabilities: grouping.capabilities.length,
     areas: shownAreas.length,
   };
+}
+
+/**
+ * Reconcile this build's capabilities and areas with the published snapshot's
+ * (CORE-165): continuing ones keep their ids and slots, others get opaque ids
+ * minted from the scope, snapshot and anchor (so a retried step reuses them).
+ */
+async function reconcileIdentity(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  grouping: Grouping,
+  shownAreas: Grouping["areas"],
+): Promise<{
+  capabilities: Reconciled;
+  areas: Reconciled;
+  priorAreaSlots: Map<string, { slot: number | null; parent: string | null }>;
+  priorNames: Map<string, string>;
+  origins: Map<string, unknown>;
+}> {
+  const published = await db(d1)
+    .selectFrom("atlas_current")
+    .select("seq")
+    .where("scope", "=", scope)
+    .executeTakeFirst();
+  const priorSeq = published?.seq ?? null;
+  const capMembers = new Map<string, string[]>();
+  const areaMembers = new Map<string, string[]>();
+  const regions = new Map<
+    string,
+    { kind: string; slot: number | null; parent: string | null; name: string; lineage: unknown }
+  >();
+  if (priorSeq !== null && priorSeq < seq) {
+    const [files, groups] = await Promise.all([
+      d1
+        .prepare(
+          `SELECT entity_id, json_extract(data, '$.membership.capability') AS cap, json_extract(data, '$.membership.area') AS area
+           FROM atlas_entities WHERE scope = ? AND kind = 'file' AND ${VISIBLE}`,
+        )
+        .bind(scope, priorSeq, priorSeq)
+        .all<{ entity_id: string; cap: string | null; area: string | null }>(),
+      d1
+        .prepare(
+          `SELECT entity_id, kind, parent_id, name, json_extract(data, '$.layout.slot') AS slot,
+                  json_extract(data, '$.lineage') AS lineage
+           FROM atlas_entities WHERE scope = ? AND kind IN ('capability', 'area') AND ${VISIBLE}`,
+        )
+        .bind(scope, priorSeq, priorSeq)
+        .all<{
+          entity_id: string;
+          kind: string;
+          parent_id: string | null;
+          name: string;
+          slot: number | null;
+          lineage: string | null;
+        }>(),
+    ]);
+    for (const f of files.results) {
+      if (f.cap) capMembers.set(f.cap, [...(capMembers.get(f.cap) ?? []), f.entity_id]);
+      if (f.area) areaMembers.set(f.area, [...(areaMembers.get(f.area) ?? []), f.entity_id]);
+    }
+    for (const g of groups.results)
+      regions.set(g.entity_id, {
+        kind: g.kind,
+        slot: g.slot === null || g.slot === undefined ? null : Number(g.slot),
+        parent: g.parent_id,
+        name: g.name,
+        lineage: g.lineage ? JSON.parse(g.lineage) : null,
+      });
+  }
+  const prior = (kind: string, members: Map<string, string[]>): PriorGroup[] =>
+    [...regions]
+      .filter(([, r]) => r.kind === kind)
+      .map(([id, r]) => ({ id, members: members.get(id) ?? [], slot: r.slot }));
+
+  const filesOf = new Map<string, string[]>();
+  for (const m of grouping.members)
+    if (m.capability) filesOf.set(m.capability, [...(filesOf.get(m.capability) ?? []), m.file]);
+  const minted = new Map<string, string>();
+  const mint = async (prefix: string, key: string, anchor: string) =>
+    minted.set(
+      key,
+      `${prefix}:${(await sha256(`${scope}\u0000${seq}\u0000${prefix}\u0000${anchor}`)).slice(0, 12)}`,
+    );
+  for (const c of grouping.capabilities) await mint("cap", c.id, c.anchor);
+  for (const a of shownAreas) await mint("area", a.id, a.anchor);
+
+  const capabilities = reconcile(
+    prior("capability", capMembers),
+    grouping.capabilities.map((c) => ({ key: c.id, members: filesOf.get(c.id) ?? [] })),
+    (key) => minted.get(key)!,
+  );
+  const areas = reconcile(
+    prior("area", areaMembers),
+    shownAreas.map((a) => ({ key: a.id, members: a.files })),
+    (key) => minted.get(key)!,
+  );
+  const priorAreaSlots = new Map(
+    [...regions]
+      .filter(([, r]) => r.kind === "area")
+      .map(([id, r]) => [id, { slot: r.slot, parent: r.parent }]),
+  );
+  // What an entity records about its origin: a split or merge, from the
+  // snapshot that made it, carried unchanged while the id continues (so an
+  // unchanged rebuild rewrites nothing). Ids that are simply new or kept
+  // record nothing.
+  const origins = new Map<string, unknown>();
+  for (const result of [capabilities, areas])
+    for (const [id, lineage] of result.lineage) {
+      if (lineage.change === "kept") origins.set(id, regions.get(id)?.lineage ?? null);
+      else if (lineage.change === "split" || lineage.change === "merge")
+        origins.set(id, { ...lineage, since: seq });
+      else origins.set(id, null);
+    }
+  return {
+    capabilities,
+    areas,
+    priorAreaSlots,
+    priorNames: new Map([...regions].map(([id, r]) => [id, r.name])),
+    origins,
+  };
+}
+
+/**
+ * Slots for areas within their capability: an area that keeps its id and
+ * parent keeps its slot; the rest take the lowest free slot in their parent.
+ */
+function slotAreas(
+  areas: Grouping["areas"],
+  capId: (key: string) => string,
+  areaId: (key: string) => string,
+  prior: Map<string, { slot: number | null; parent: string | null }>,
+): Map<string, number> {
+  const slots = new Map<string, number>();
+  const byParent = new Map<string, string[]>();
+  for (const a of areas) {
+    const parent = capId(a.capability);
+    byParent.set(parent, [...(byParent.get(parent) ?? []), areaId(a.id)]);
+  }
+  for (const [parent, ids] of byParent) {
+    const taken = new Set<number>();
+    for (const id of ids) {
+      const before = prior.get(id);
+      if (before && before.parent === parent && before.slot !== null && !taken.has(before.slot)) {
+        slots.set(id, before.slot);
+        taken.add(before.slot);
+      }
+    }
+    let free = 0;
+    for (const id of [...ids].sort()) {
+      if (slots.has(id)) continue;
+      while (taken.has(free)) free++;
+      slots.set(id, free);
+      taken.add(free);
+    }
+  }
+  return slots;
 }
 
 // ---- edges -------------------------------------------------------------------

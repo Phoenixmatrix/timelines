@@ -1224,6 +1224,22 @@ capabilities keep their interim names and empty `summary`; `description`
 carries the previous snapshot's prose labelled `stale` with its original basis,
 or nothing (`unavailable`). List responses show it as `summaryState`.
 
+**Capability identity and layout** (`worker/atlas/identity.ts`, CORE-165).
+Grouping recomputes capabilities every build, so public ids come from
+reconciling with the previous snapshot by primary membership: a group keeps a
+prior id only on a unique reciprocal match with more than half of both sides in
+common. Any other group gets a new opaque id (from scope, snapshot and anchor,
+so a retried step reuses it, never from its title or member set) and records
+the split or merge it came from in `data.lineage`. A retired id is written to
+`atlas_lineage` with its successors, so `entity_unknown` for an old link
+carries `lineage` (where its members went, or `removed`) instead of resolving
+to something unrelated; links pinned to an older snapshot still read it as it
+was. Layout is local: each capability (and each area within its capability)
+has a slot in a fixed-width grid (`data.layout {slot, col, row, bucket,
+fill}`), kept while the id continues, with new regions taking the lowest free
+slot and size shown as a power-of-two bucket inside the cell, so regions
+appearing, growing or leaving never move another.
+
 **Atlas paid-synthesis budgets** (`worker/knowledge/budget.ts`, CORE-162).
 Model calls the Semantic Code Atlas adds go through this module; upstream
 Knowledge inference, release notes and the assistant don't, so their spend

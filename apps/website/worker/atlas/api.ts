@@ -76,6 +76,7 @@ import {
   type RegionKey,
   type RelationKey,
 } from "./projection.ts";
+import { lineageOf } from "./identity.ts";
 import { capacityFailure, cursorExpiresAt, pinnedSnapshot } from "./retention.ts";
 
 export const atlas = new Hono<AppEnv>();
@@ -307,7 +308,19 @@ async function page<T, K>(
 
 async function entityOr404<K>(c: C, ctx: Pinned<K>, id: string) {
   const entity = await entityAt(c.env.DB, ctx.scope, ctx.snapshot.seq, id);
-  return entity ?? failWith(c, 404, "entity_unknown", "That isn't in this Atlas snapshot.");
+  if (entity) return entity;
+  // A capability or area a later build retired: say where it went.
+  const lineage = await lineageOf(c.env.DB, ctx.scope, id, ctx.snapshot.seq);
+  return lineage
+    ? failWith(
+        c,
+        404,
+        "entity_unknown",
+        `"${lineage.name}" was ${lineage.change === "removed" ? "removed" : lineage.change} in a later build.`,
+        undefined,
+        { lineage },
+      )
+    : failWith(c, 404, "entity_unknown", "That isn't in this Atlas snapshot.");
 }
 
 // ---- routes --------------------------------------------------------------------
