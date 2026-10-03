@@ -91,6 +91,13 @@ another timeline.
   work in the timeline's view, so your checkpoints and edits are made there.
 - Merge main in only when a person asks: `gm timeline merge main` (or another
   timeline's slug), then `gm push`.
+- When the work is ready for review, push it, then record a checkpoint with a
+  summary of what it holds and why: `gm timeline checkpoint -m '…'`. In an
+  `approval` timeline, ask for approval of exactly that checkpoint:
+  `gm issue ask <issue> --kind approval --checkpoint <id> --prompt '…'`. Only a
+  person approves, and only while the checkpoint is the timeline's head: push
+  more and the open request is withdrawn (your lease unparks); make a new
+  checkpoint and ask again.
 - `gm timeline use main` goes back to main. `gm timeline abandon` ends a
   timeline you started, when a person asks or the attempt is dead.
 

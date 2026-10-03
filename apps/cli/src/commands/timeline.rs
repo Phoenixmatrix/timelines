@@ -12,6 +12,12 @@
 //! - `merge` merges main or another timeline into the bound one with
 //!   `gm merge`, so the merge is an ordinary change to push.
 //!
+//! - `checkpoint` records the timeline's commits now, with a summary, as an
+//!   immutable checkpoint (CORE-76); approval requests pin one
+//!   (`gm issue ask --kind approval --checkpoint`), and an approval only counts
+//!   while the checkpoint is still the timeline's head. `checkpoints` lists
+//!   them with their CI runs, previews and approvals.
+//!
 //! `GM_TIMELINE` overrides the binding for one command (`profile::timeline`).
 
 use super::{Ctx, local, network, server};
@@ -24,6 +30,7 @@ use crate::repo::Workspace;
 use clap::{Args, Subcommand};
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value, json};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
@@ -41,6 +48,29 @@ pub enum TimelineCommand {
     Merge(MergeArgs),
     /// End a timeline (default: this checkout's) and delete its bookmarks; its events stay
     Abandon(AbandonArgs),
+    /// Record a checkpoint: the timeline's pushed commits now, with a summary, for a person to approve
+    Checkpoint(CheckpointArgs),
+    /// List a timeline's checkpoints, newest first, with CI runs, previews and approvals
+    Checkpoints(CheckpointsArgs),
+}
+
+#[derive(Args)]
+pub struct CheckpointArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    /// Summary in Markdown: what it holds and why (repeat for paragraphs; '-' reads stdin, '@path' a file).
+    #[arg(short, long)]
+    pub message: Vec<String>,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct CheckpointsArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    #[command(flatten)]
+    pub owner: Owner,
 }
 
 #[derive(Args)]
@@ -159,6 +189,8 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Use(a) => use_timeline(ctx, &a.slug, a.owner.owner.clone()),
         TimelineCommand::Merge(a) => merge(ctx, a),
         TimelineCommand::Abandon(a) => abandon(ctx, a),
+        TimelineCommand::Checkpoint(a) => checkpoint(ctx, a),
+        TimelineCommand::Checkpoints(a) => checkpoints(ctx, a),
     }
 }
 
@@ -368,6 +400,16 @@ fn event_line(e: &Value) -> String {
                 .map(|c| &c[..c.len().min(12)])
                 .unwrap_or("?")
         ),
+        "checkpoint" => format!(
+            "checkpoint #{} {}",
+            e["number"],
+            e["checkpointId"].as_str().unwrap_or("?")
+        ),
+        "approval" => format!(
+            "checkpoint #{} {}",
+            e["number"],
+            e["outcome"].as_str().unwrap_or("?")
+        ),
         kind => kind.to_string(),
     };
     format!("  #{:<5} {at}  {what}", e["seq"])
@@ -458,6 +500,160 @@ fn show(ctx: &Ctx, args: &ShowArgs) -> Result<Shown> {
         text.push_str(&format!("More events: --after {next}\n"));
     }
     value["current"] = json!(current().as_deref() == Some(slug.as_str()));
+    Ok(Shown { value, text })
+}
+
+// ---- checkpoints -------------------------------------------------------------------
+
+fn short(oid: &Value) -> &str {
+    oid.as_str().map(|c| &c[..c.len().min(12)]).unwrap_or("?")
+}
+
+/// A checkpoint view (CORE-76) as text: number, state, summary, then per
+/// repository its commit, main's, changes, CI runs and previews.
+pub fn checkpoint_text(v: &Value) -> String {
+    let c = &v["checkpoint"];
+    let state = match (v["current"].as_bool(), v["approval"]["state"].as_str()) {
+        (Some(false), _) => "superseded: new commits since",
+        (_, Some("approved")) => "approved",
+        (_, Some("rejected")) => "rejected",
+        (_, Some("superseded")) => "superseded: its request was withdrawn",
+        (_, Some("pending")) => "awaiting approval",
+        _ => "not yet asked about",
+    };
+    let mut out = format!(
+        "Checkpoint #{} of {} ({}) {}  [{state}]\n",
+        c["number"],
+        v["timeline"]["slug"].as_str().unwrap_or("?"),
+        c["createdAt"].as_str().unwrap_or(""),
+        c["id"].as_str().unwrap_or("?"),
+    );
+    if let Some(summary) = c["summary"].as_str().filter(|s| !s.is_empty()) {
+        for line in summary.lines() {
+            out.push_str(&format!("    {line}\n"));
+        }
+    }
+    for repo in c["repos"].as_array().into_iter().flatten() {
+        let id = &repo["id"];
+        let runs: Vec<String> = v["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["repoId"] == *id)
+            .map(|r| {
+                format!(
+                    "CI #{} {}",
+                    r["number"],
+                    r["status"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        let previews: Vec<String> = v["previews"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["repoId"] == *id)
+            .map(|p| match p["url"].as_str() {
+                Some(url) => format!("{url} ({})", p["status"].as_str().unwrap_or("?")),
+                None => format!("preview {}", p["status"].as_str().unwrap_or("?")),
+            })
+            .collect();
+        out.push_str(&format!(
+            "  {}/{} {} onto main {} · {} change(s) · {}{}\n",
+            repo["owner"].as_str().unwrap_or("?"),
+            repo["name"].as_str().unwrap_or("?"),
+            short(&repo["commit"]),
+            short(&repo["base"]),
+            repo["changes"].as_array().map_or(0, Vec::len),
+            if runs.is_empty() {
+                "no CI run".to_string()
+            } else {
+                runs.join(", ")
+            },
+            if previews.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", previews.join(", "))
+            },
+        ));
+    }
+    out
+}
+
+fn summary(message: &[String]) -> Result<String> {
+    let parts = message
+        .iter()
+        .map(|m| match m.as_str() {
+            "-" => {
+                let mut s = String::new();
+                std::io::stdin().take(1_048_577).read_to_string(&mut s)?;
+                Ok(s)
+            }
+            m => match m.strip_prefix('@') {
+                Some(path) => Ok(std::fs::read_to_string(path)?),
+                None => Ok(m.to_string()),
+            },
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parts.join("\n\n").trim().to_string())
+}
+
+fn checkpoint(ctx: &Ctx, args: &CheckpointArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let slug = named_or_current(&args.slug, "checkpoint")?;
+    let summary = summary(&args.message)?;
+    let body = json!({ "summary": summary });
+    if ctx.dry_run {
+        return Ok(Shown {
+            text: format!(
+                "dry run: nothing was changed\nWould record a checkpoint of {slug}'s pushed commits."
+            ),
+            value: json!({"dry_run": true, "owner": owner, "timeline": slug, "request": body}),
+        });
+    }
+    let mut value = remote::api(
+        &config,
+        "POST",
+        &format!("{}/{slug}/checkpoints", base(&owner)),
+        Some(&body),
+    )?;
+    let id = value["checkpoint"]["id"]
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
+    let next = format!(
+        "gm issue ask <ISSUE> --kind approval --checkpoint {id} --prompt '…'  # a person approves exactly these commits"
+    );
+    let text = format!(
+        "{}Recorded from what's pushed: push first to include newer work.\nNext: {next}",
+        checkpoint_text(&value)
+    );
+    value["dry_run"] = json!(false);
+    value["next"] = json!(next);
+    Ok(Shown { value, text })
+}
+
+fn checkpoints(ctx: &Ctx, args: &CheckpointsArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let slug = named_or_current(&args.slug, "checkpoints")?;
+    let mut value = remote::api(
+        &config,
+        "GET",
+        &format!("{}/{slug}/checkpoints", base(&owner)),
+        None,
+    )?;
+    let text = match value["checkpoints"].as_array() {
+        Some(all) if !all.is_empty() => all
+            .iter()
+            .map(checkpoint_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => format!("{slug} has no checkpoints. Record one with `gm timeline checkpoint -m '…'`."),
+    };
+    value["owner"] = json!(owner);
+    value["timeline"] = json!(slug);
     Ok(Shown { value, text })
 }
 
@@ -1027,6 +1223,9 @@ mod tests {
         let merge = json!({"seq": 9, "kind": "merge", "fromId": null, "intoId": "tl_1",
             "commit": "0123456789abcdef0123", "createdAt": "2026-10-03"});
         assert!(event_line(&merge).contains("merge main -> tl_1 at 0123456789ab"));
+        let superseded = json!({"seq": 12, "kind": "approval", "number": 2,
+            "outcome": "superseded", "createdAt": "2026-10-03"});
+        assert!(event_line(&superseded).contains("checkpoint #2 superseded"));
     }
 
     #[test]

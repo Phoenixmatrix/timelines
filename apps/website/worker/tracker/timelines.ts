@@ -10,10 +10,15 @@
 // accountable person and the agent that started it may abandon it. The bookmarks
 // themselves are written by the Worker (timelines/api.ts), which asks here first.
 
-import type { TimelineFeedEvent } from "../../shared/tracker.ts";
+import type { HumanRequest, RequestCheckpoint, TimelineFeedEvent } from "../../shared/tracker.ts";
 import {
+  CHECKPOINT_CHANGES,
   TIMELINE_POLICIES,
   timelineBookmark,
+  type Checkpoint,
+  type CheckpointApproval,
+  type CheckpointRepo,
+  type CheckpointState,
   type Timeline,
   type TimelineDetail,
   type TimelineEvent,
@@ -64,6 +69,23 @@ export interface NewTimeline {
   commits: Record<string, string>;
 }
 
+/** A checkpoint as the Worker measured it: each repository's commits now. */
+export interface NewCheckpoint {
+  summary?: unknown;
+  repos: CheckpointRepo[];
+}
+
+/**
+ * Withdraw open requests (by id) as superseded, with the reason, inside the
+ * caller's transaction: the tracker's own `request.cancel`, which unparks the
+ * issue's lease once nothing else is open. Given by TrackerStore.
+ */
+export type WithdrawRequests = (ids: string[], reason: string, actorId: string | null) => void;
+
+/** Statuses a checkpoint's approval moves a timeline between; the rest belong to landing. */
+const SETTLED: readonly TimelineStatus[] = ["active", "idle", "waiting"];
+const OID = /^[0-9a-f]{40}$/;
+
 /** What one push did to timelines, worked out from the push log (timelines/merges.ts). */
 export interface PushActivity {
   repo: { id: string; owner: string; name: string };
@@ -72,6 +94,8 @@ export interface PushActivity {
   accountableId: string | null;
   /** Slugs of the timeline bookmarks the push created or moved. */
   pushed: string[];
+  /** Where each timeline bookmark it moved now points (null: deleted); omitted by older callers. */
+  heads?: { slug: string; commit: string | null }[];
   /** Merge commits it brought onto main or a bookmark. Each side is a slug, or null for main. */
   merges: {
     into: string | null;
@@ -93,14 +117,17 @@ export class TimelineStore {
   private sql: SqlDatabase;
   private transaction: <T>(fn: () => T) => T;
   private clock: () => number;
+  private withdraw: WithdrawRequests | null;
   constructor(
     sql: SqlDatabase,
     transaction: <T>(fn: () => T) => T,
     clock: () => number = Date.now,
+    withdraw: WithdrawRequests | null = null,
   ) {
     this.sql = sql;
     this.transaction = transaction;
     this.clock = clock;
+    this.withdraw = withdraw;
     sql.exec(TIMELINE_TABLES);
   }
   private now() {
@@ -431,6 +458,23 @@ export class TimelineStore {
           if (from && into) onMerge?.({ fromId: from.id, intoId: into.id, id });
         }
       }
+      // Each bookmark's new tip: a push past a checkpoint makes it no longer the head.
+      const moved = new Set<Timeline>();
+      for (const head of activity.heads ?? []) {
+        const timeline = lookup(head.slug);
+        if (!timeline || !timeline.repos.some((repo) => repo.id === activity.repo.id)) continue;
+        this.setHead(timeline.id, activity.repo.id, head.commit);
+        moved.add(timeline);
+      }
+      for (const timeline of moved) {
+        this.supersede(
+          timeline,
+          `Superseded by new commits on ${timelineBookmark(timeline.slug)}; make a new checkpoint and ask again.`,
+          activity.actorId,
+          activity.accountableId,
+        );
+        if (this.status(timeline) && !pushed.has(timeline)) pushed.add(timeline);
+      }
       for (const timeline of pushed) {
         timeline.version++;
         timeline.updatedAt = now;
@@ -438,5 +482,401 @@ export class TimelineStore {
       }
       return recorded;
     });
+  }
+
+  // ---- checkpoints (CORE-76) -------------------------------------------------
+
+  private byId(timelineId: string): Timeline {
+    const row = first(
+      this.sql,
+      tracker.selectFrom("timelines").select("data").where("id", "=", timelineId),
+    );
+    if (!row) fail("not_found", `No timeline ${timelineId}.`, 404);
+    return JSON.parse(row.data) as Timeline;
+  }
+  private setHead(timelineId: string, repoId: string, oid: string | null) {
+    run(
+      this.sql,
+      tracker
+        .insertInto("timeline_heads")
+        .values({ timeline_id: timelineId, repo_id: repoId, oid })
+        .onConflict((oc) =>
+          oc
+            .columns(["timeline_id", "repo_id"])
+            .doUpdateSet((eb) => ({ oid: eb.ref("excluded.oid") })),
+        ),
+    );
+  }
+  private latest(timelineId: string): Checkpoint | null {
+    const row = first(
+      this.sql,
+      tracker
+        .selectFrom("timeline_checkpoints")
+        .select("data")
+        .where("timeline_id", "=", timelineId)
+        .orderBy("number", "desc")
+        .limit(1),
+    );
+    return row ? (JSON.parse(row.data) as Checkpoint) : null;
+  }
+  /**
+   * Still its timeline's head: the newest checkpoint, and every bookmark tip
+   * known since is the commit it pins. A push recorded after it (even of a
+   * repository it doesn't have) moves the head past it.
+   */
+  private isCurrent(checkpoint: Checkpoint): boolean {
+    if (this.latest(checkpoint.timelineId)?.id !== checkpoint.id) return false;
+    const heads = all(
+      this.sql,
+      tracker
+        .selectFrom("timeline_heads")
+        .select(["repo_id", "oid"])
+        .where("timeline_id", "=", checkpoint.timelineId),
+    );
+    return heads.every(
+      (head) => checkpoint.repos.find((repo) => repo.id === head.repo_id)?.commit === head.oid,
+    );
+  }
+  /** Open approval requests that pin this checkpoint. */
+  private openApprovals(checkpointId: string): HumanRequest[] {
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("requests")
+        .select("data")
+        .where(json("data", "$.checkpoint.id"), "=", checkpointId)
+        .where(json("data", "$.status"), "=", "open"),
+    ).map((row) => JSON.parse(row.data) as HumanRequest);
+  }
+  /**
+   * A timeline is `waiting` while its head checkpoint has an open approval
+   * request, and back to `active` once it hasn't (answered, withdrawn, or new
+   * commits pushed past it). Landing's statuses aren't this one's to change.
+   * Returns whether it changed; the caller saves it.
+   */
+  private status(timeline: Timeline): boolean {
+    if (!SETTLED.includes(timeline.status)) return false;
+    const head = this.latest(timeline.id);
+    const awaiting = !!head && this.isCurrent(head) && this.openApprovals(head.id).length > 0;
+    const next: TimelineStatus = awaiting
+      ? "waiting"
+      : timeline.status === "waiting"
+        ? "active"
+        : timeline.status;
+    if (next === timeline.status) return false;
+    timeline.status = next;
+    return true;
+  }
+  /** Settle a timeline's status inside the caller's transaction (a request opened or answered). */
+  settle(timelineId: string, actorId: string | null) {
+    const timeline = this.byId(timelineId);
+    if (!this.status(timeline)) return;
+    timeline.version++;
+    timeline.updatedAt = this.now();
+    this.save(timeline, "timeline.status", actorId);
+  }
+  /**
+   * Withdraw the timeline's open approval requests whose checkpoint is no
+   * longer its head, each with an approval event (outcome `superseded`),
+   * inside the caller's transaction. The caller settles the status after.
+   */
+  private supersede(
+    timeline: Timeline,
+    reason: string,
+    actorId: string | null,
+    accountableId: string | null,
+  ) {
+    if (!this.withdraw) return;
+    const stale = all(
+      this.sql,
+      tracker
+        .selectFrom("requests")
+        .select("data")
+        .where(json("data", "$.checkpoint.timelineId"), "=", timeline.id)
+        .where(json("data", "$.status"), "=", "open"),
+    )
+      .map((row) => JSON.parse(row.data) as HumanRequest)
+      .filter((request) => {
+        const checkpoint = this.findCheckpoint(request.checkpoint!.id);
+        return !checkpoint || !this.isCurrent(checkpoint);
+      });
+    if (!stale.length) return;
+    const now = this.now();
+    for (const request of stale)
+      this.append(
+        {
+          id: `approval:${request.id}`,
+          timelineId: timeline.id,
+          kind: "approval",
+          checkpointId: request.checkpoint!.id,
+          number: request.checkpoint!.number,
+          requestId: request.id,
+          outcome: "superseded",
+          note: reason,
+          actorId,
+          accountableId,
+          createdAt: now,
+        },
+        [timeline.id],
+      );
+    this.withdraw(
+      stale.map((request) => request.id),
+      reason,
+      actorId,
+    );
+  }
+  private approval(checkpoint: Checkpoint): CheckpointApproval | null {
+    const answered = all(
+      this.sql,
+      tracker
+        .selectFrom("timeline_event_index as i")
+        .innerJoin("timeline_events as e", "e.seq", "i.seq")
+        .select("e.data")
+        .where("i.timeline_id", "=", checkpoint.timelineId)
+        .where(json("e.data", "$.kind"), "=", "approval")
+        .where(json("e.data", "$.checkpointId"), "=", checkpoint.id)
+        .orderBy("i.seq", "desc")
+        .limit(1),
+    ).map((row) => JSON.parse(row.data) as Extract<TimelineEvent, { kind: "approval" }>)[0];
+    const pending = this.openApprovals(checkpoint.id).sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt),
+    )[0];
+    if (pending && (!answered || pending.createdAt >= answered.createdAt))
+      return { requestId: pending.id, state: "pending", by: null, at: null, note: null };
+    if (!answered) return null;
+    return {
+      requestId: answered.requestId,
+      state: answered.outcome,
+      by: answered.actorId,
+      at: answered.createdAt,
+      note: answered.note,
+    };
+  }
+  private state(checkpoint: Checkpoint): CheckpointState {
+    const current = this.isCurrent(checkpoint);
+    const approval = this.approval(checkpoint);
+    return { checkpoint, current, approval, approved: current && approval?.state === "approved" };
+  }
+  /** A timeline's checkpoints, newest first. */
+  checkpoints(slug: string): CheckpointState[] {
+    const timeline = this.get(slug);
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("timeline_checkpoints")
+        .select("data")
+        .where("timeline_id", "=", timeline.id)
+        .orderBy("number", "desc"),
+    ).map((row) => this.state(JSON.parse(row.data) as Checkpoint));
+  }
+  private findCheckpoint(id: string): Checkpoint | null {
+    const row = first(
+      this.sql,
+      tracker.selectFrom("timeline_checkpoints").select("data").where("id", "=", id),
+    );
+    return row ? (JSON.parse(row.data) as Checkpoint) : null;
+  }
+  /** One checkpoint, by id or by its number in the timeline. */
+  checkpoint(slug: string, ref: string): CheckpointState {
+    const timeline = this.get(slug);
+    const row = /^\d+$/.test(ref)
+      ? first(
+          this.sql,
+          tracker
+            .selectFrom("timeline_checkpoints")
+            .select("data")
+            .where("timeline_id", "=", timeline.id)
+            .where("number", "=", Number(ref)),
+        )
+      : first(
+          this.sql,
+          tracker
+            .selectFrom("timeline_checkpoints")
+            .select("data")
+            .where("id", "=", ref)
+            .where("timeline_id", "=", timeline.id),
+        );
+    if (!row) fail("not_found", `${timeline.slug} has no checkpoint ${ref}.`, 404);
+    return this.state(JSON.parse(row.data) as Checkpoint);
+  }
+  /** Checkpoints by id, each with its timeline: what the request inbox shows. */
+  checkpointStates(ids: string[]): { state: CheckpointState; timeline: Timeline }[] {
+    return [...new Set(ids)].flatMap((id) => {
+      const checkpoint = this.findCheckpoint(id);
+      if (!checkpoint) return [];
+      return [{ state: this.state(checkpoint), timeline: this.byId(checkpoint.timelineId) }];
+    });
+  }
+  /**
+   * Record a checkpoint of a timeline's bookmarks as the Worker just read them.
+   * Any writer may; it needs work since the fork, and something new since the
+   * last checkpoint. The record never changes afterwards.
+   */
+  createCheckpoint(access: Access, slug: string, input: NewCheckpoint): CheckpointState {
+    return this.transaction(() => {
+      const timeline = this.get(slug);
+      if (ENDED.includes(timeline.status))
+        fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
+      const summary =
+        input.summary === undefined || input.summary === ""
+          ? ""
+          : text(input.summary, "summary", 20000);
+      const ids = new Set(input.repos.map((repo) => repo.id));
+      if (
+        ids.size !== input.repos.length ||
+        ids.size !== timeline.repos.length ||
+        timeline.repos.some((repo) => !ids.has(repo.id))
+      )
+        fail("timeline_changed", `${timeline.slug}'s repositories changed; try again.`, 409);
+      for (const repo of input.repos) {
+        if (!OID.test(repo.commit) || (repo.base !== null && !OID.test(repo.base)))
+          fail("invalid_input", `Commits for ${repo.owner}/${repo.name} must be full commit ids.`);
+        if (repo.changes.length > CHECKPOINT_CHANGES)
+          fail("invalid_input", `At most ${CHECKPOINT_CHANGES} changes per repository.`);
+      }
+      const commits = Object.fromEntries(input.repos.map((repo) => [repo.id, repo.commit]));
+      const previous = this.latest(timeline.id);
+      const same = (pinned: Record<string, string>) =>
+        input.repos.every((repo) => pinned[repo.id] === repo.commit);
+      if (previous && same(Object.fromEntries(previous.repos.map((r) => [r.id, r.commit]))))
+        fail(
+          "unchanged",
+          `Checkpoint #${previous.number} already pins these commits; push new work first.`,
+          409,
+        );
+      if (!previous && same(timeline.forkPoint.commits))
+        fail("no_work", `${timeline.slug} has no commits since it forked; push work first.`, 409);
+      const now = this.now();
+      const checkpoint: Checkpoint = {
+        id: `cp_${crypto.randomUUID()}`,
+        timelineId: timeline.id,
+        number: (previous?.number ?? 0) + 1,
+        repos: input.repos.map((repo) => ({
+          id: repo.id,
+          owner: repo.owner,
+          name: repo.name,
+          commit: repo.commit,
+          base: repo.base,
+          changes: repo.changes.map((c) => ({ changeId: c.changeId, commit: c.commit })),
+        })),
+        summary,
+        actorId: access.actorId,
+        accountableId: access.principalId,
+        createdAt: now,
+      };
+      run(
+        this.sql,
+        tracker.insertInto("timeline_checkpoints").values({
+          id: checkpoint.id,
+          timeline_id: timeline.id,
+          number: checkpoint.number,
+          data: JSON.stringify(checkpoint),
+        }),
+      );
+      // The checkpoint measured the bookmarks: those are the heads now.
+      run(this.sql, tracker.deleteFrom("timeline_heads").where("timeline_id", "=", timeline.id));
+      for (const repo of checkpoint.repos) this.setHead(timeline.id, repo.id, repo.commit);
+      this.append(
+        {
+          id: `checkpoint:${checkpoint.id}`,
+          timelineId: timeline.id,
+          kind: "checkpoint",
+          checkpointId: checkpoint.id,
+          number: checkpoint.number,
+          commits,
+          summary,
+          actorId: access.actorId,
+          accountableId: access.principalId,
+          createdAt: now,
+        },
+        [timeline.id],
+      );
+      // A new head leaves any approval of the old one behind.
+      this.supersede(
+        timeline,
+        `Superseded by checkpoint #${checkpoint.number} on ${timelineBookmark(timeline.slug)}; ask about that one instead.`,
+        access.actorId,
+        access.principalId,
+      );
+      if (this.status(timeline)) {
+        timeline.version++;
+        timeline.updatedAt = now;
+        this.save(timeline, "timeline.status", access.actorId);
+      }
+      return this.state(checkpoint);
+    });
+  }
+  /**
+   * The checkpoint an approval request will pin, inside the caller's
+   * transaction: it must be its timeline's head, and the timeline still open.
+   */
+  approvalTarget(checkpointId: string): RequestCheckpoint {
+    const checkpoint = this.findCheckpoint(checkpointId);
+    if (!checkpoint) fail("not_found", `No checkpoint ${checkpointId}.`, 404);
+    const timeline = this.byId(checkpoint.timelineId);
+    if (ENDED.includes(timeline.status))
+      fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
+    if (!this.isCurrent(checkpoint))
+      fail(
+        "checkpoint_stale",
+        `Checkpoint #${checkpoint.number} of ${timeline.slug} isn't its head any more; make a new checkpoint and ask about that.`,
+        409,
+      );
+    return {
+      id: checkpoint.id,
+      number: checkpoint.number,
+      timelineId: timeline.id,
+      timeline: timeline.slug,
+    };
+  }
+  /**
+   * A person answers a checkpoint's approval request, inside the caller's
+   * transaction. Approving needs write access to each of its repositories
+   * (`writableRepoIds`, from D1) and only works while it is still the head:
+   * new commits need a new checkpoint and a new approval. Records the
+   * approval event; the caller settles the status once the request is saved.
+   */
+  answerApproval(
+    access: Access,
+    request: HumanRequest,
+    approved: boolean,
+    note: string | null,
+    writableRepoIds: string[] | undefined,
+  ) {
+    const pinned = request.checkpoint!;
+    const checkpoint = this.findCheckpoint(pinned.id);
+    if (!checkpoint) fail("not_found", `No checkpoint ${pinned.id}.`, 404);
+    for (const repo of checkpoint.repos)
+      if (!writableRepoIds?.includes(repo.id))
+        fail(
+          "forbidden",
+          `Approving a checkpoint needs write access to ${repo.owner}/${repo.name}.`,
+          403,
+        );
+    const timeline = this.byId(checkpoint.timelineId);
+    if (approved && ENDED.includes(timeline.status))
+      fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
+    if (approved && !this.isCurrent(checkpoint))
+      fail(
+        "checkpoint_stale",
+        `${timeline.slug} has moved past checkpoint #${checkpoint.number}: it needs a new checkpoint and a new approval.`,
+        409,
+      );
+    this.append(
+      {
+        id: `approval:${request.id}`,
+        timelineId: timeline.id,
+        kind: "approval",
+        checkpointId: checkpoint.id,
+        number: checkpoint.number,
+        requestId: request.id,
+        outcome: approved ? "approved" : "rejected",
+        note,
+        actorId: access.actorId,
+        accountableId: access.principalId,
+        createdAt: this.now(),
+      },
+      [timeline.id],
+    );
   }
 }

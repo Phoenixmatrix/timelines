@@ -108,9 +108,134 @@ export type TimelineEvent = TimelineEventBase &
         /** Each bookmark's last commit when it was deleted (null if it was already gone). */
         lastCommits: Record<string, string | null>;
       }
-    // Recorded by later steps: checkpoints and approvals (CORE-76), landing (CORE-77).
-    | { kind: "checkpoint" | "approval" | "landing" }
+    | {
+        kind: "checkpoint";
+        checkpointId: string;
+        /** 1, 2, 3… within the timeline. */
+        number: number;
+        /** The commit per repository id it pins. */
+        commits: Record<string, string>;
+        summary: string;
+      }
+    | {
+        kind: "approval";
+        checkpointId: string;
+        number: number;
+        /** The approval request it closed. */
+        requestId: string;
+        /**
+         * A person approved or rejected it; or new commits (or a newer
+         * checkpoint) superseded it while the request was open, which
+         * withdrew the request.
+         */
+        outcome: ApprovalOutcome;
+        /** What the person added to their answer, or why it was superseded. */
+        note: string | null;
+      }
+    // Recorded by a later step: landing (CORE-77).
+    | { kind: "landing" }
   );
+
+/**
+ * One repository in a checkpoint: the timeline's commit there and the main
+ * commit landing would merge it onto, both as of the checkpoint.
+ */
+export interface CheckpointRepo {
+  id: string;
+  owner: string;
+  name: string;
+  /** The tip of the timeline's bookmark. */
+  commit: string;
+  /** Main's tip: what a landing would merge onto. Null when the repository has no main yet. */
+  base: string | null;
+  /**
+   * gm change ids the bookmark has reached (CORE-68's push log), newest first,
+   * each with the commit it last had; capped at CHECKPOINT_CHANGES.
+   */
+  changes: { changeId: string; commit: string }[];
+}
+
+/** Change ids kept per repository in a checkpoint. */
+export const CHECKPOINT_CHANGES = 200;
+
+/**
+ * An immutable record of a timeline at one point (TIMELINES-RESEARCH.md,
+ * "A timeline, concretely"). Its CI runs, previews and approval are found by
+ * its commits and its id, and read live: they change after it's made.
+ */
+export interface Checkpoint {
+  id: string;
+  timelineId: string;
+  /** 1, 2, 3… within the timeline. */
+  number: number;
+  repos: CheckpointRepo[];
+  /** Markdown, written by the agent (or person) that made it: what it holds and why. */
+  summary: string;
+  actorId: string;
+  accountableId: string;
+  createdAt: string;
+}
+
+export type ApprovalOutcome = "approved" | "rejected" | "superseded";
+
+/** Where a checkpoint's approval stands: its newest approval request, or how it closed. */
+export interface CheckpointApproval {
+  requestId: string;
+  state: "pending" | ApprovalOutcome;
+  /** Who answered (or pushed past it), and when; null while pending. */
+  by: string | null;
+  at: string | null;
+  note: string | null;
+}
+
+/** What tracks a checkpoint: whether it's still its timeline's head, and its approval. */
+export interface CheckpointState {
+  checkpoint: Checkpoint;
+  /**
+   * Still its timeline's head: the newest checkpoint, with no commits pushed
+   * since. Only a current checkpoint can be approved, and an approval counts
+   * only while it is.
+   */
+  current: boolean;
+  approval: CheckpointApproval | null;
+  /** Approved, and still current: what landing may merge. */
+  approved: boolean;
+}
+
+/** A CI run of one of a checkpoint's commits. */
+export interface CheckpointRun {
+  repoId: string;
+  number: number;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  commit: string;
+  createdAt: string;
+}
+
+/** A preview of a checkpoint (by its id) or of one of its commits in the timeline's environment. */
+export interface CheckpointPreview {
+  repoId: string;
+  id: number;
+  environment: string;
+  url: string | null;
+  status: "active" | "sleeping" | "expired" | "failed";
+  commit: string;
+}
+
+/** A checkpoint with what's known about it now: CI, previews, approval. */
+export interface CheckpointView extends CheckpointState {
+  timeline: { id: string; slug: string; name: string; policy: TimelinePolicy };
+  runs: CheckpointRun[];
+  previews: CheckpointPreview[];
+}
+
+export interface CheckpointList {
+  checkpoints: CheckpointView[];
+}
+
+/** POST /api/tracker/:owner/timelines/:slug/checkpoints. */
+export interface CreateCheckpoint {
+  summary?: string;
+}
 
 export interface TimelineList {
   timelines: Timeline[];

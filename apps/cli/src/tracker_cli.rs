@@ -336,6 +336,9 @@ pub enum IssueCommand {
         /// The issue's lease token, to park the lease; prefer GM_LEASE_TOKEN.
         #[arg(long, env = "GM_LEASE_TOKEN", hide_env_values = true)]
         lease_token: Option<String>,
+        /// For an approval: the timeline checkpoint to approve (its id, from `gm timeline checkpoint`). It must be the timeline's head; new commits need a new checkpoint.
+        #[arg(long)]
+        checkpoint: Option<String>,
     },
     /// Take a parked lease back up once its requests are answered; returns a fresh token.
     Resume {

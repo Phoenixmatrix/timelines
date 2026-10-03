@@ -3,10 +3,12 @@
 // tracker only ever hears where it went.
 
 import { useState } from "react";
+import type { CheckpointView } from "../../../shared/timelines.ts";
 import type { HumanRequest } from "../../../shared/tracker.ts";
 import { FormError } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, timeAgo } from "../../lib/format.ts";
+import { CheckpointPanel, CheckpointRef } from "./Checkpoint.tsx";
 import { MarkdownText } from "./ui.tsx";
 
 export type Answer = { answer?: string; choice?: string; approved?: boolean; stored?: boolean };
@@ -25,6 +27,7 @@ export function RequestCard({
   onAnswer,
   onCancel,
   heading,
+  checkpoint,
 }: {
   request: HumanRequest;
   /** How to name an actor id: a person, or "builder for Ann Lee". */
@@ -34,6 +37,8 @@ export function RequestCard({
   onCancel?: () => Promise<Outcome>;
   /** Extra context above the prompt, e.g. the issue it's about. */
   heading?: React.ReactNode;
+  /** For an approval of a timeline checkpoint: its details, and the tracker it's in. */
+  checkpoint?: { view: CheckpointView; tracker: string };
 }) {
   const open = request.status === "open";
   return (
@@ -59,12 +64,28 @@ export function RequestCard({
       <div className="max-w-[72ch] text-body">
         <MarkdownText text={request.prompt} />
       </div>
+      {checkpoint ? (
+        <CheckpointPanel view={checkpoint.view} tracker={checkpoint.tracker} />
+      ) : (
+        request.checkpoint && <CheckpointRef pinned={request.checkpoint} />
+      )}
       {open ? (
-        <AnswerForm request={request} onAnswer={onAnswer} onCancel={onCancel} />
+        <AnswerForm
+          request={request}
+          onAnswer={onAnswer}
+          onCancel={onCancel}
+          // A superseded checkpoint can only be rejected.
+          approvable={!checkpoint || checkpoint.view.current}
+        />
       ) : (
         <p className="m-0 text-body-sm text-ink-muted">
           {request.status === "canceled" ? (
-            "Canceled."
+            // The tracker says why when it withdrew one (a superseded checkpoint).
+            request.answer ? (
+              `Withdrawn: ${request.answer}`
+            ) : (
+              "Canceled."
+            )
           ) : (
             <>
               <strong className="text-ink">{request.answer}</strong>
@@ -85,8 +106,10 @@ function AnswerForm({
   request,
   onAnswer,
   onCancel,
+  approvable = true,
 }: {
   request: HumanRequest;
+  approvable?: boolean;
   onAnswer: (answer: Answer) => Promise<Outcome>;
   onCancel?: () => Promise<Outcome>;
 }) {
@@ -207,7 +230,8 @@ function AnswerForm({
             <button
               type="button"
               className="mk-btn mk-btn--primary mk-btn--sm"
-              disabled={busy}
+              disabled={busy || !approvable}
+              title={approvable ? undefined : "New commits since this checkpoint"}
               onClick={() =>
                 void send(() =>
                   onAnswer({ approved: true, ...(text.trim() ? { answer: text } : {}) }),

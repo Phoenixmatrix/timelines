@@ -42,6 +42,7 @@ export function NeedsYou() {
       key={item.request.id}
       request={item.request}
       name={name}
+      checkpoint={item.checkpoint && { view: item.checkpoint, tracker: item.tracker.slug }}
       heading={
         <Link
           to={`/tracker/${encodeURIComponent(item.tracker.slug)}/issues/${encodeURIComponent(item.issue.id)}`}
@@ -67,7 +68,8 @@ export function NeedsYou() {
       <h1 className="m-0 text-headline">Needs you</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Questions, approvals, decisions and credentials agents are waiting on. Their work stays
-        theirs while they wait; answering lets them pick it back up.
+        theirs while they wait; answering lets them pick it back up. Approving a timeline checkpoint
+        approves exactly those commits: new ones need a new approval.
       </p>
       <section className="mt-8" aria-labelledby="for-you">
         <h2 id="for-you" className="m-0 mb-3 text-title">

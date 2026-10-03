@@ -43,6 +43,23 @@ struct Api {
     worker: Option<JoinHandle<()>>,
 }
 
+/// A checkpoint view as the API returns it (CORE-76).
+fn checkpoint_view(summary: &Value) -> Value {
+    json!({
+        "checkpoint": {
+            "id": "cp_1", "timelineId": "tl_search", "number": 1, "summary": summary,
+            "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "commit": "a".repeat(40),
+                       "base": "b".repeat(40), "changes": [{"changeId": "kxyz", "commit": "a".repeat(40)}]}],
+            "actorId": "agt_bot", "accountableId": "ann", "createdAt": "2026-10-03T00:00:00Z"
+        },
+        "current": true, "approval": {"requestId": "req", "state": "pending", "by": null, "at": null, "note": null},
+        "approved": false,
+        "timeline": {"id": "tl_search", "slug": "search", "name": "Search", "policy": "approval"},
+        "runs": [{"repoId": "r1", "number": 4, "status": "succeeded", "commit": "a".repeat(40), "createdAt": "2026-10-03T00:00:00Z"}],
+        "previews": [{"repoId": "r1", "id": 1, "environment": "timeline/search", "url": "https://preview.example", "status": "active", "commit": "a".repeat(40)}]
+    })
+}
+
 fn record(status: &str) -> Value {
     json!({
         "id": "tl_search", "slug": "search", "name": "Search", "policy": "approval",
@@ -92,7 +109,7 @@ impl Api {
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 seen.lock()
                     .unwrap()
-                    .push((method.clone(), path.clone(), body));
+                    .push((method.clone(), path.clone(), body.clone()));
                 let bookmark = "refs/heads/timeline/search";
                 let (code, reply) = match (method.as_str(), path.as_str()) {
                     ("POST", "/api/tracker/orbit/timelines") => {
@@ -111,6 +128,13 @@ impl Api {
                         json!({"timeline": record(status), "events": [
                             {"id": "e1", "seq": 1, "kind": "fork", "timelineId": "tl_search", "parentId": null, "createdAt": "2026-10-02T00:00:00Z"}
                         ], "next": null}),
+                    ),
+                    ("POST", "/api/tracker/orbit/timelines/search/checkpoints") => {
+                        (201, checkpoint_view(&body["summary"]))
+                    }
+                    ("GET", "/api/tracker/orbit/timelines/search/checkpoints") => (
+                        200,
+                        json!({"checkpoints": [checkpoint_view(&json!("Ranking v2"))]}),
                     ),
                     ("POST", "/api/tracker/orbit/timelines/search/abandon") => {
                         git(&remote, &["update-ref", "-d", bookmark]);
@@ -465,4 +489,57 @@ fn a_bound_checkout_without_its_bookmark_refuses_to_push_or_sync() {
     assert_eq!(s.err(&["sync"]), "timeline_missing");
     assert_eq!(s.err(&["timeline", "merge", "main"]), "timeline_missing");
     assert_eq!(s.remote(&["rev-parse", "main"]), main);
+}
+
+#[test]
+fn checkpoints_pin_the_pushed_commits_with_a_summary() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    // The bound timeline is the default; paragraphs join with a blank line.
+    let made = s.ok(&[
+        "timeline",
+        "checkpoint",
+        "-O",
+        "orbit",
+        "-m",
+        "Ranking v2",
+        "-m",
+        "Ready for review.",
+    ]);
+    let posted = s.api.requests("POST");
+    let (path, body) = posted.last().unwrap();
+    assert_eq!(path, "/api/tracker/orbit/timelines/search/checkpoints");
+    assert_eq!(body, &json!({"summary": "Ranking v2\n\nReady for review."}));
+    assert_eq!(made["checkpoint"]["id"], "cp_1");
+    assert!(
+        made["next"]
+            .as_str()
+            .unwrap()
+            .contains("--kind approval --checkpoint cp_1"),
+        "{made}"
+    );
+
+    let listed = s.ok(&["timeline", "checkpoints", "-O", "orbit"]);
+    assert_eq!(listed["timeline"], "search");
+    assert_eq!(listed["checkpoints"][0]["runs"][0]["number"], 4);
+
+    // People read the same as text: commits, CI, preview, approval state.
+    let (code, value, _) = s.run_with(
+        &["timeline", "checkpoints", "-O", "orbit", "-o", "text"],
+        &[],
+    );
+    assert_eq!(code, 0);
+    let text = value.as_str().unwrap_or_default().to_string();
+    assert!(text.contains("Checkpoint #1 of search"), "{text}");
+    assert!(text.contains("[awaiting approval]"), "{text}");
+    assert!(text.contains("CI #4 succeeded"), "{text}");
+    assert!(text.contains("https://preview.example (active)"), "{text}");
 }

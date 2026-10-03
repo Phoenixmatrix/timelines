@@ -5,6 +5,10 @@
 //   GET    /:slug             the timeline and its events (?after=&limit= to page)
 //   PATCH  /:slug             rename it, or set or clear its experimental flag
 //   POST   /:slug/abandon     end it and delete its bookmarks (events stay)
+//   GET    /:slug/checkpoints       its checkpoints, newest first, each with its
+//                                   CI runs, previews and approval (CORE-76)
+//   POST   /:slug/checkpoints       {summary?}: record its bookmarks' commits now
+//   GET    /:slug/checkpoints/:ref  one checkpoint, by id or number
 //
 // Any tracker member (person or agent) with write access to the repositories
 // may fork; abandoning is checked by the tracker (timelines.ts). Bookmarks are
@@ -26,6 +30,8 @@ import {
   type TimelineDetail,
   type TimelineList,
   type TimelinePolicy,
+  type CheckpointList,
+  type CheckpointView,
 } from "../../shared/timelines.ts";
 import { authorize } from "../tracker/api.ts";
 import type { TrackerReply } from "../tracker/object.ts";
@@ -33,6 +39,7 @@ import { TrackerError, fail, text } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { timelineSlug, timelineStatus } from "../tracker/timelines.ts";
 import { logPush } from "./activity.ts";
+import { measure, view } from "./checkpoints.ts";
 import { writeRefs, type RefWrite } from "./bookmarks.ts";
 
 /** Repositories one timeline may touch. */
@@ -293,4 +300,46 @@ timelines.post("/:slug/abandon", async (c) => {
   );
   for (const { row } of live) c.executionCtx.waitUntil(logPush(c.env, row, actor));
   return c.json<TimelineChange>({ timeline: result.timeline, bookmarks });
+});
+
+timelines.get("/:slug/checkpoints", async (c) => {
+  const access = await authorize(c, false);
+  const tracker = trackerObject(c.env, access.owner.id);
+  const slug = c.req.param("slug");
+  const [states, detail] = await Promise.all([
+    tracker.checkpoints(slug),
+    tracker.timeline(slug, 0, 1),
+  ]);
+  const timeline = unwrap(detail).timeline;
+  return c.json<CheckpointList>({
+    checkpoints: await Promise.all(unwrap(states).map((state) => view(c.env, state, timeline))),
+  });
+});
+
+timelines.get("/:slug/checkpoints/:ref", async (c) => {
+  const access = await authorize(c, false);
+  const tracker = trackerObject(c.env, access.owner.id);
+  const slug = c.req.param("slug");
+  const ref = c.req.param("ref");
+  if (ref.length > 100) fail("invalid_input", "A checkpoint is its id or number.");
+  const [state, detail] = await Promise.all([
+    tracker.checkpoint(slug, ref),
+    tracker.timeline(slug, 0, 1),
+  ]);
+  return c.json<CheckpointView>(await view(c.env, unwrap(state), unwrap(detail).timeline));
+});
+
+timelines.post("/:slug/checkpoints", async (c) => {
+  const access = await authorize(c, false);
+  const actor = c.get("actor")!;
+  const data = await input(c, ["summary"]);
+  const tracker = trackerObject(c.env, access.owner.id);
+  const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
+  if (timeline.status === "landed" || timeline.status === "abandoned")
+    fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
+  const repos = await measure(c.env, actor, timeline);
+  const state = unwrap(
+    await tracker.createCheckpoint(access, timeline.slug, { summary: data.summary, repos }),
+  );
+  return c.json<CheckpointView>(await view(c.env, state, timeline), 201);
 });

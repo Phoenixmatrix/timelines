@@ -58,13 +58,19 @@ describe("timeline activity from the push log", () => {
     const t = setup();
     const m1 = t.commit();
     await t.push({ main: m1 });
-    expect(await t.push({ "timeline/search": m1 })).toBeNull();
+    // A fork only notes where the bookmark points.
+    expect(await t.push({ "timeline/search": m1 })).toMatchObject({
+      pushed: [],
+      heads: [{ slug: "search", commit: m1 }],
+      merges: [],
+    });
     const a1 = t.commit(m1);
     expect(await t.push({ "timeline/search": a1 })).toEqual({
       repo: { id: "repo", owner: "ann", name: "app" },
       actorId: "agt_builder",
       accountableId: "acc_ann",
       pushed: ["search"],
+      heads: [{ slug: "search", commit: a1 }],
       merges: [],
     });
   });

@@ -54,10 +54,13 @@ export async function timelineActivity(
 ): Promise<PushActivity | null> {
   const mainRef = `refs/heads/${repo.default_branch}`;
   const pushed = new Set<string>();
+  const heads: NonNullable<PushActivity["heads"]> = [];
   const pending: { update: LoggedUpdate; into: string | null; commit: string; parent: string }[] =
     [];
   for (const update of logged) {
     const into = lineOf(update.ref, mainRef);
+    // Where each bookmark points now: a move past a checkpoint ends its approval.
+    if (into) heads.push({ slug: into, commit: update.new });
     if (into === undefined || !update.new) continue;
     const line = ownLine(update);
     // A bookmark made where commits already were (a fork) isn't work in the timeline.
@@ -106,12 +109,13 @@ export async function timelineActivity(
       : candidates.sort((a, b) => b.at - a.at)[0]!.line;
     merges.push({ into, from, commit, parent, refUpdateId: update.id });
   }
-  if (!pushed.size && !merges.length) return null;
+  if (!pushed.size && !merges.length && !heads.length) return null;
   return {
     repo: { id: repo.id, owner: repo.owner_slug, name: repo.name },
     actorId: actor ? (actor.agent?.id ?? actor.id) : null,
     accountableId: actor?.id ?? null,
     pushed: [...pushed],
+    heads,
     merges,
   };
 }

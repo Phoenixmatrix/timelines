@@ -29,6 +29,7 @@ import {
   savePreferences,
 } from "./preferences.ts";
 import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
+import { view as checkpointView, writableRepoIds } from "../timelines/checkpoints.ts";
 
 export const tracker = new Hono<AppEnv>();
 
@@ -197,10 +198,28 @@ tracker.get("/requests", async (c) => {
   if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
   const requests: OpenRequest[] = [];
   for (const owner of await accessible(c.env.DB, actor)) {
-    const result = await trackerObject(c.env, owner.id).openRequests();
+    const stub = trackerObject(c.env, owner.id);
+    const result = await stub.openRequests();
     if (!result.ok) return response(c, result);
-    for (const item of result.value)
-      requests.push({ tracker: { slug: owner.slug, displayName: owner.displayName }, ...item });
+    // An approval of a timeline checkpoint shows its commits, CI runs, previews and summary.
+    const pinned = result.value.flatMap(({ request }) =>
+      request.checkpoint ? [request.checkpoint.id] : [],
+    );
+    const checkpoints = new Map<string, OpenRequest["checkpoint"]>();
+    if (pinned.length) {
+      const states = await stub.checkpointStates(pinned);
+      if (!states.ok) return response(c, states);
+      for (const { state, timeline } of states.value)
+        checkpoints.set(state.checkpoint.id, await checkpointView(c.env, state, timeline));
+    }
+    for (const item of result.value) {
+      const checkpoint = item.request.checkpoint && checkpoints.get(item.request.checkpoint.id);
+      requests.push({
+        tracker: { slug: owner.slug, displayName: owner.displayName },
+        ...item,
+        ...(checkpoint ? { checkpoint } : {}),
+      });
+    }
   }
   requests.sort(
     (a, b) =>
@@ -373,6 +392,9 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
       }
     }
   }
+  // Approving a checkpoint needs write access to its repositories, which D1 knows.
+  if (request.mutations.some((mutation) => mutation.kind === "request.answer"))
+    access.writableRepoIds = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
   const result = await trackerObject(c.env, access.owner.id).mutate(access, request);
   if (result.ok)
     c.executionCtx.waitUntil(

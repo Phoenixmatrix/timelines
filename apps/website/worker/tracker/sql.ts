@@ -48,6 +48,13 @@ export interface TrackerDatabase {
   timeline_events: { seq: Generated<number>; id: string; data: string };
   /** The timelines each event belongs to: a merge between two is listed by both. */
   timeline_event_index: { timeline_id: string; seq: number };
+  /** Checkpoints (CORE-76): written once, never changed. */
+  timeline_checkpoints: { id: string; timeline_id: string; number: number; data: string };
+  /**
+   * Each timeline bookmark's last known tip, per repository: from pushes
+   * (logged after they answer) and from checkpoints. Null once deleted.
+   */
+  timeline_heads: { timeline_id: string; repo_id: string; oid: string | null };
 }
 
 /**
@@ -57,7 +64,9 @@ export interface TrackerDatabase {
 export const TIMELINE_TABLES = `CREATE TABLE IF NOT EXISTS timelines (id TEXT PRIMARY KEY, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS timeline_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS timeline_event_index (timeline_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (timeline_id, seq));
-  CREATE UNIQUE INDEX IF NOT EXISTS timeline_slugs ON timelines(json_extract(data, '$.slug'));`;
+  CREATE UNIQUE INDEX IF NOT EXISTS timeline_slugs ON timelines(json_extract(data, '$.slug'));
+  CREATE TABLE IF NOT EXISTS timeline_checkpoints (id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, number INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE (timeline_id, number));
+  CREATE TABLE IF NOT EXISTS timeline_heads (timeline_id TEXT NOT NULL, repo_id TEXT NOT NULL, oid TEXT, PRIMARY KEY (timeline_id, repo_id));`;
 
 /** The storage surface the store needs: `ctx.storage.sql`, or a test double. */
 export interface SqlDatabase {

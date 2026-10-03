@@ -1,5 +1,5 @@
 import type { AgentCapabilities } from "./api.ts";
-import type { Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
+import type { CheckpointView, Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
 
 export interface TrackerIdentity {
   id: string;
@@ -11,6 +11,8 @@ export interface OpenRequest {
   tracker: { slug: string; displayName: string };
   request: HumanRequest;
   issue: { id: string; key: string; title: string };
+  /** For a checkpoint's approval: its commits, CI runs, previews and summary. */
+  checkpoint?: CheckpointView;
 }
 export interface OpenRequests {
   requests: OpenRequest[];
@@ -228,13 +230,30 @@ export interface HumanRequest {
   askedBy: string;
   /** The person it's for: the asker's accountable human, unless routed elsewhere. */
   routeTo: string;
-  /** The answer: text, the chosen option, approved/rejected, or where a secret went. */
+  /**
+   * The answer: text, the chosen option, approved/rejected, or where a secret
+   * went; for a withdrawn request, why, when a reason was given.
+   */
   answer: string | null;
   answeredBy: string | null;
   answeredAt: string | null;
   createdAt: string;
   /** Opened by the tracker after repeated failed attempts; answering resets the count. */
   escalation?: boolean;
+  /**
+   * For an approval: the timeline checkpoint it asks to approve (CORE-76).
+   * Approving needs write access to its repositories, and only counts while
+   * it is still the timeline's head.
+   */
+  checkpoint?: RequestCheckpoint;
+}
+/** The checkpoint an approval request pins. */
+export interface RequestCheckpoint {
+  id: string;
+  number: number;
+  timelineId: string;
+  /** The timeline's slug, which never changes. */
+  timeline: string;
 }
 export interface Comment {
   id: string;
@@ -471,6 +490,8 @@ export type Mutation =
         /** A member to ask instead of the asker's accountable human. */
         routeTo?: string;
         leaseToken?: string;
+        /** For an approval: the id of the timeline checkpoint to approve, its timeline's head. */
+        checkpoint?: string;
       };
     }
   /**

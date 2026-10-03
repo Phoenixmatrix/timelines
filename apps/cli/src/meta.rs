@@ -65,9 +65,9 @@ pub const COMMANDS: &[Meta] = &[
     meta!("issue evidence", git: "", kw: "verification evidence proof durable test result", mutates: true, out: Out::Other("{operationId,queued,entities:[Comment],cursor}"), ex: ["gm issue evidence ENG-1 'Verified with integration smoke'"]),
     meta!("issue batch", git: "", kw: "atomic graph dependency mutations offline batch json", mutates: true, out: Out::Other("{operationId,queued,entities:[Entity],cursor}; input array of {kind,id,expectedVersion?,data?}, max 100, canonical IDs"), ex: ["gm issue batch '@plan.json' --offline"]),
     meta!("issue next", git: "", kw: "next ready work pick claim agent graph autonomous loop lease", mutates: true, out: Out::Other("{claimed:{issueId,key,leaseToken,expiresAt}|null,timelineRule:{use:'agent_decides'|'required'|'never',policy:'auto'|'approval'|null,guidance},context,blockerEvidence,team:{key,source,why,change}}; flags default from .gitmatrix (gm agent setup), then your default team; gm keeps the lease token privately for this identity"), ex: ["gm issue next", "gm issue next --under CORE-4", "gm issue next --agent builder --team CORE", "gm issue next --timeline search"]),
-    meta!("issue ask", git: "", kw: "ask person human question approval decision credential blocked waiting intervention park lease", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["GM_LEASE_TOKEN=… gm issue ask ENG-3 --kind question --prompt \"Which region should this deploy to?\"", "gm issue ask ENG-3 --kind decision --prompt \"Which store?\" --choice D1 --choice R2"]),
+    meta!("issue ask", git: "", kw: "ask person human question approval decision credential blocked waiting intervention park lease", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["GM_LEASE_TOKEN=… gm issue ask ENG-3 --kind question --prompt \"Which region should this deploy to?\"", "gm issue ask ENG-3 --kind decision --prompt \"Which store?\" --choice D1 --choice R2", "gm issue ask ENG-3 --kind approval --checkpoint cp_… --prompt \"Land search-v2?\""]),
     meta!("issue resume", git: "", kw: "resume parked lease after answer continue", mutates: true, out: Out::Other("{cursor,events,results:[{id,leaseToken,expiresAt}]}; leaseToken is secret and is not cached"), ex: ["gm issue resume ENG-3"]),
-    meta!("request list", git: "", kw: "requests needs you waiting on person questions approvals", mutates: false, out: Out::Other("{requests:[{id,issueId,kind,prompt,choices,secret,status,askedBy,routeTo,issue,asker,for}]}"), ex: ["gm request list"]),
+    meta!("request list", git: "", kw: "requests needs you waiting on person questions approvals", mutates: false, out: Out::Other("{requests:[{id,issueId,kind,prompt,choices,secret,checkpoint?:{id,number,timelineId,timeline},status,askedBy,routeTo,issue,asker,for,checkpointView?:CheckpointView}]}"), ex: ["gm request list"]),
     meta!("request answer", git: "", kw: "answer request approve reject choose decision credential secret", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["gm request answer 3f2c --answer eu-west", "gm request answer 3f2c --approve", "gm request answer 3f2c   # a credential: prompts for the value"]),
     meta!("request cancel", git: "", kw: "withdraw cancel request", mutates: true, out: Out::Other("{cursor,events,results:[{id}]}"), ex: ["gm request cancel 3f2c"]),
     meta!("issue handoff", git: "", kw: "hand off give transfer lease agent offer code", mutates: true, out: Out::Other("{cursor,events,results:[{id,offerCode,expiresAt}]}; offerCode is single-use"), ex: ["GM_LEASE_TOKEN=… gm issue handoff ENG-3 --to reviewer"]),
@@ -115,6 +115,8 @@ pub const COMMANDS: &[Meta] = &[
     meta!("timeline show", git: "", kw: "timeline show events history fork merge landing which timeline am i in", mutates: false, out: Out::Other("{timeline:Timeline,events:[TimelineEvent],next,current}"), ex: ["gm timeline show", "gm timeline show search-v2 --after 40"]),
     meta!("timeline use", git: "git switch <branch> (and push there by default)", kw: "timeline use switch bind checkout work in timeline go back main unbind", mutates: true, out: Out::Other("OpResult & {timeline,previous,bookmark,file,record}"), ex: ["gm timeline use search-v2", "gm timeline use main"]),
     meta!("timeline merge", git: "git merge --no-ff origin/<main|timeline>", kw: "timeline merge main into timeline sync catch up bring in other timeline combine", mutates: true, out: Out::Other("OpResult & {timeline,from,merged}"), ex: ["gm timeline merge main", "gm timeline merge search-v2"]),
+    meta!("timeline checkpoint", git: "", kw: "timeline checkpoint snapshot record commits approval gate review summary preview ci ready for review", mutates: true, out: Out::Other("CheckpointView {checkpoint:{id,number,repos:[{id,owner,name,commit,base,changes}],summary,actorId,createdAt},current,approval,approved,timeline,runs,previews} & {dry_run,next}"), ex: ["gm timeline checkpoint -m 'Search v2 ranking is ready: …'", "gm timeline checkpoint search-v2 -m @summary.md"]),
+    meta!("timeline checkpoints", git: "", kw: "timeline checkpoints list approvals approved superseded ci previews", mutates: false, out: Out::Other("{checkpoints:[CheckpointView],owner,timeline}"), ex: ["gm timeline checkpoints", "gm timeline checkpoints search-v2"]),
     meta!("timeline abandon", git: "git push --delete origin timeline/<slug>", kw: "timeline abandon end prune discard drop delete timeline", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks,use?}; --dry-run: {dry_run,owner,timeline,unbind}"), ex: ["gm timeline abandon", "gm timeline abandon probe --dry-run"]),
     meta!("auth login", git: "git credential approve / ssh-add", kw: "login sign in authenticate token persona credentials ssh key agent 1password", mutates: true, out: Out::Other("{server,method,user:{slug},key?,scope?,sessionExpiresAt?}"), ex: ["gm auth login --ssh", "gm auth login --ssh --key ~/.ssh/id_ed25519", "gm auth login --persona jun", "gm auth login --token gmx_..."]),
     meta!("auth ssh-key add", git: "(GitHub: Settings > SSH keys)", kw: "add register upload ssh public key agent 1password", mutates: true, out: Out::Other("SshKey {id,title,type,fingerprint,scope}"), ex: ["gm auth ssh-key add", "gm auth ssh-key add --key SHA256:abc... --title Laptop"]),
@@ -576,13 +578,20 @@ timeline field, description or PRD) or a person asks; otherwise work on main.
     gm push                       # goes to timeline/search-v2, never main
     gm timeline merge main        # only when a person asks; then gm push
     gm timeline use main          # back to main (`use <slug>` to join one)
-    gm timeline list · gm timeline show · gm timeline abandon
+    gm timeline checkpoint -m 'What it holds and why'  # pins the pushed commits
+    gm issue ask CORE-5 --kind approval --checkpoint cp_… --prompt 'Land it?'
+    gm timeline list · gm timeline show · gm timeline checkpoints · gm timeline abandon
 `use` writes `timeline: <slug>` to .gitmatrix/agent.local.yml (worktrees copy
 it). While bound, the timeline's bookmark is this checkout's trunk: push, sync
 and immutability follow it, main stays reachable as `origin/main`, and pushing
 to main is refused. `gm issue` commands work in its view of the tracker.
 `GM_TIMELINE=<slug>` overrides the binding for one command.
 Only a timeline's accountable person or the agent that started it may abandon it.
+A checkpoint records each repository's pushed commit and main's, its changes and
+your summary; it never changes. An approval pins one checkpoint, is given by a
+person with write access (never an agent), and only counts while it is still the
+timeline's head: new commits withdraw an open request, and need a new
+checkpoint and a new approval.
 
 ## Distributed tracker (no Git repository required)
     gm tracker use orbit

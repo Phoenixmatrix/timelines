@@ -44,6 +44,7 @@ import {
   type TimelineEvent,
   type TimelineIssue,
 } from "../../shared/timelines.ts";
+import { TimelineStore } from "./timelines.ts";
 import {
   findTimeline,
   isScoped,
@@ -91,6 +92,8 @@ export interface Access {
   repos: { id: string; owner: string; name: string }[];
   /** D1-confirmed missing repositories; permits removing their orphan associations only. */
   deletedRepoIds?: string[];
+  /** Repositories the person may write to, from D1: checked when approving a checkpoint. */
+  writableRepoIds?: string[];
 }
 type Entity = Team | Workspace | Issue | Link | Comment | HumanRequest | Subscription;
 const tables = {
@@ -201,6 +204,13 @@ export class TrackerStore {
   private clock: () => number;
   /** While reading or changing a timeline's view: how it differs from main's tables. */
   private overlay: Overlay | null = null;
+  /**
+   * Timelines and the checkpoints approval requests pin (CORE-76), in the same
+   * storage; it withdraws superseded approvals through this store.
+   */
+  readonly timelines: TimelineStore;
+  /** While the tracker withdraws a superseded approval: why. */
+  private withdrawing: string | null = null;
   constructor(
     sql: SqlDatabase,
     transaction: <T>(fn: () => T) => T,
@@ -234,6 +244,52 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS event_times ON events(json_extract(data, '$.createdAt'));
       CREATE INDEX IF NOT EXISTS event_timelines ON events(json_extract(data, '$.timelineId'));`);
     initializeAudit(sql, transaction);
+    this.timelines = new TimelineStore(sql, transaction, clock, (ids, reason, actorId) =>
+      this.withdrawSuperseded(ids, reason, actorId),
+    );
+  }
+  /**
+   * Withdraw approval requests whose checkpoint the timeline moved past, inside
+   * the caller's transaction: each a `request.cancel` in the view it was asked
+   * in, so its issue's parked lease unparks as for any withdrawal. The reason
+   * becomes the request's answer; the actor is whoever moved the timeline.
+   */
+  private withdrawSuperseded(ids: string[], reason: string, actorId: string | null) {
+    const by = actorId ?? "gitmatrix";
+    const access: Access = {
+      actorId: by,
+      principalId: by,
+      source: "unknown",
+      agents: [],
+      owner: { id: "", slug: "", displayName: "" },
+      canAdmin: true,
+      members: [],
+      repos: [],
+    };
+    for (const requestId of ids) {
+      const opened = first(
+        this.sql,
+        tracker
+          .selectFrom("events")
+          .select("data")
+          .where(json("data", "$.entityId"), "=", requestId)
+          .where(json("data", "$.kind"), "=", "request.open")
+          .orderBy("cursor")
+          .limit(1),
+      );
+      const asked = opened ? (JSON.parse(opened.data) as TrackerEvent).timelineId : undefined;
+      const timeline = asked ? findTimeline(this.sql, asked) : null;
+      const request: MutationRequest = {
+        operationId: `superseded:${requestId}`,
+        mutations: [{ kind: "request.cancel", id: requestId }],
+      };
+      this.withdrawing = reason;
+      try {
+        this.within(timeline, () => this.apply(access, request, canonical(request), timeline));
+      } finally {
+        this.withdrawing = null;
+      }
+    }
   }
   private all<T extends Entity>(type: EntityType): T[] {
     const rows = all(this.sql, tracker.selectFrom(tables[type]).select("data").orderBy("id")).map(
@@ -1771,7 +1827,16 @@ export class TrackerStore {
           break;
         }
         case "request.open": {
-          keys(data, ["issueId", "kind", "prompt", "choices", "secret", "routeTo", "leaseToken"]);
+          keys(data, [
+            "issueId",
+            "kind",
+            "prompt",
+            "choices",
+            "secret",
+            "routeTo",
+            "leaseToken",
+            "checkpoint",
+          ]);
           unique("request", entityId);
           const issue = this.get<Issue>("issue", id(data.issueId));
           teamWritable(this.get("team", issue.teamId));
@@ -1798,6 +1863,13 @@ export class TrackerStore {
             secret = { repo, name };
           } else if (data.secret !== undefined)
             fail("invalid_input", "Only credential requests name a secret.");
+          // An approval may pin a timeline checkpoint: it must be the timeline's head.
+          if (data.checkpoint !== undefined && kind !== "approval")
+            fail("invalid_input", "Only approval requests name a checkpoint.");
+          const checkpoint =
+            data.checkpoint === undefined
+              ? undefined
+              : this.timelines.approvalTarget(id(data.checkpoint));
           const routeTo = data.routeTo === undefined ? access.principalId : id(data.routeTo);
           member(routeTo);
           // Asking with the issue's own lease parks it: it holds while the agent waits.
@@ -1822,10 +1894,12 @@ export class TrackerStore {
               answeredBy: null,
               answeredAt: null,
               createdAt: now,
+              ...(checkpoint ? { checkpoint } : {}),
             },
             mutation.kind,
           );
           settle(issue);
+          if (checkpoint) this.timelines.settle(checkpoint.timelineId, access.actorId);
           break;
         }
         case "request.answer":
@@ -1840,6 +1914,8 @@ export class TrackerStore {
             if (request.askedBy !== access.actorId && !access.canAdmin)
               fail("forbidden", "Only whoever asked can cancel a request.", 403);
             request.status = "canceled";
+            // Superseded by new commits: say why (the timeline settles its own status).
+            if (this.withdrawing !== null) request.answer = this.withdrawing;
           } else {
             keys(data, ["answer", "choice", "approved", "stored"]);
             // Requests are for people: an agent can't answer its own (or another's) question.
@@ -1854,9 +1930,16 @@ export class TrackerStore {
             } else if (request.kind === "approval") {
               if (typeof data.approved !== "boolean")
                 fail("invalid_input", "Approve or reject: approved must be true or false.");
-              const note =
-                data.answer === undefined ? "" : ` · ${text(data.answer, "answer", 20000)}`;
-              request.answer = `${data.approved ? "approved" : "rejected"}${note}`;
+              const note = data.answer === undefined ? null : text(data.answer, "answer", 20000);
+              request.answer = `${data.approved ? "approved" : "rejected"}${note === null ? "" : ` · ${note}`}`;
+              if (request.checkpoint)
+                this.timelines.answerApproval(
+                  access,
+                  request,
+                  data.approved,
+                  note,
+                  access.writableRepoIds,
+                );
             } else {
               // The value went to the secret store; the tracker only records where.
               if (data.stored !== true || data.answer !== undefined)
@@ -1874,6 +1957,8 @@ export class TrackerStore {
           }
           emit("request", entityId, request, mutation.kind);
           settle(issue);
+          if (request.checkpoint && this.withdrawing === null)
+            this.timelines.settle(request.checkpoint.timelineId, access.actorId);
           break;
         }
         case "issue.offer":

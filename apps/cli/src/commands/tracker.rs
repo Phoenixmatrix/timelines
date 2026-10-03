@@ -1377,6 +1377,17 @@ pub fn request(ctx: &Ctx, args: &RequestArgs) -> Result<Shown> {
                             json!(actor_name(&snapshot, q["askedBy"].as_str().unwrap_or("")));
                         q["for"] =
                             json!(actor_name(&snapshot, q["routeTo"].as_str().unwrap_or("")));
+                        // An approval of a timeline checkpoint: its commits, CI runs,
+                        // previews and summary, read live (best effort: offline, the reference).
+                        let pinned = q["checkpoint"]["timeline"]
+                            .as_str()
+                            .zip(q["checkpoint"]["id"].as_str())
+                            .map(|(tl, cp)| format!("timelines/{tl}/checkpoints/{cp}"));
+                        if let Some(Ok(view)) =
+                            pinned.map(|path| remote::api(&r.config, "GET", &r.path(&path), None))
+                        {
+                            q["checkpointView"] = view;
+                        }
                         q
                     })
                     .collect();
@@ -1974,8 +1985,15 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 secret,
                 route_to,
                 lease_token,
+                checkpoint,
             } => {
                 let mut data = json!({"issueId":id(&snapshot,"issues",issue)?,"kind":kind,"prompt":input(prompt)?});
+                if let Some(checkpoint) = checkpoint {
+                    if kind != "approval" {
+                        return Err(GmError::usage("Only --kind approval names a --checkpoint."));
+                    }
+                    data["checkpoint"] = json!(checkpoint);
+                }
                 if !choices.is_empty() {
                     data["choices"] = json!(choices);
                 }

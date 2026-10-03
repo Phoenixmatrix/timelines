@@ -1,12 +1,20 @@
 import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import type { TimelineChange, TimelineDetail, TimelineList } from "../../shared/timelines.ts";
+import type {
+  CheckpointList,
+  CheckpointView,
+  TimelineChange,
+  TimelineDetail,
+  TimelineList,
+} from "../../shared/timelines.ts";
+import type { OpenRequests } from "../../shared/tracker.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { durableStorage } from "../testing/durable.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { Tracker } from "../tracker/object.ts";
+import { tracker as trackerRoutes } from "../tracker/api.ts";
 import { timelines } from "./api.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
@@ -64,6 +72,7 @@ async function setup() {
     return next();
   });
   server.route("/api/tracker/:owner/timelines", timelines);
+  server.route("/api", trackerRoutes);
   const tokens = {
     ann: (await issueToken(env.DB, "ann", "t", "write")).secret,
     ben: (await issueToken(env.DB, "ben", "t", "write")).secret,
@@ -77,9 +86,9 @@ async function setup() {
     passThroughOnException() {},
     props: {},
   } as unknown as ExecutionContext;
-  const call = async (who: keyof typeof tokens, method: string, path: string, body?: unknown) => {
+  const raw = async (who: keyof typeof tokens, method: string, path: string, body?: unknown) => {
     const response = await server.request(
-      `/api/tracker/orbit/timelines${path}`,
+      `/api${path}`,
       {
         method,
         headers: {
@@ -94,7 +103,9 @@ async function setup() {
     await Promise.all(pending.splice(0));
     return { status: response.status, body: (await response.json()) as any };
   };
-  return { sqlite, git, app, lib, call };
+  const call = (who: keyof typeof tokens, method: string, path: string, body?: unknown) =>
+    raw(who, method, `/tracker/orbit/timelines${path}`, body);
+  return { sqlite, git, app, lib, call, raw };
 }
 
 describe("forking", () => {
@@ -271,5 +282,126 @@ describe("changing and abandoning", () => {
     const again = await t.call("bot", "POST", "/search/abandon");
     expect([again.status, again.body.bookmarks]).toEqual([200, []]);
     expect((await t.call("cat", "GET", "/search")).body.events).toHaveLength(2);
+  });
+});
+
+describe("checkpoints", () => {
+  test("pin each bookmark's commit and main's, with its CI runs and previews; writers only", async () => {
+    const t = await setup();
+    await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    expect((await t.call("bot", "POST", "/search/checkpoints", {})).body.code).toBe("no_work");
+
+    t.app.refs.set("refs/heads/timeline/search", oid(9));
+    t.sqlite.exec(`
+      INSERT INTO change_refs (repo_id, change_id, ref, first_commit_oid, first_update_id, last_commit_oid)
+        VALUES ('app', 'kxyz', 'refs/heads/timeline/search', '${oid(8)}', 1, '${oid(9)}');
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status)
+        VALUES ('run1', 'app', 4, '${oid(9)}', 'timeline/search', 'push', 'succeeded'),
+               ('run0', 'app', 3, '${oid(1)}', 'main', 'push', 'succeeded');
+    `);
+    // Cat can read the repository but not write to it.
+    expect((await t.call("cat", "POST", "/search/checkpoints", {})).status).toBe(403);
+    const created = await t.call("bot", "POST", "/search/checkpoints", { summary: "Ranking v2" });
+    expect(created.status).toBe(201);
+    const made = created.body as CheckpointView;
+    expect(made).toMatchObject({
+      timeline: { slug: "search", policy: "approval" },
+      checkpoint: {
+        number: 1,
+        summary: "Ranking v2",
+        actorId: "agt_bot",
+        accountableId: "ben",
+        repos: [
+          {
+            id: "app",
+            owner: "orbit",
+            name: "app",
+            commit: oid(9),
+            base: oid(1),
+            changes: [{ changeId: "kxyz", commit: oid(9) }],
+          },
+        ],
+      },
+      current: true,
+      approval: null,
+      runs: [{ repoId: "app", number: 4, status: "succeeded", commit: oid(9) }],
+      previews: [],
+    });
+    expect((await t.call("bot", "POST", "/search/checkpoints", {})).body.code).toBe("unchanged");
+
+    // A preview recorded for it afterwards shows up: read live, not stored.
+    t.sqlite.exec(`
+      INSERT INTO deployments (repo_id, environment, timeline_slug, checkpoint_id, commit_oid, url, status)
+        VALUES ('app', 'timeline/search', 'search', '${made.checkpoint.id}', '${oid(9)}', 'https://pr.example', 'active');
+    `);
+    const listed = (await t.call("cat", "GET", "/search/checkpoints")).body as CheckpointList;
+    expect(listed.checkpoints.map((c) => c.checkpoint.id)).toEqual([made.checkpoint.id]);
+    expect(listed.checkpoints[0]!.previews).toMatchObject([
+      { url: "https://pr.example", status: "active", commit: oid(9) },
+    ]);
+    const one = await t.call("cat", "GET", "/search/checkpoints/1");
+    expect(one.body.checkpoint).toEqual(made.checkpoint);
+    expect((await t.call("cat", "GET", "/search/checkpoints/2")).status).toBe(404);
+  });
+});
+
+describe("approving a checkpoint", () => {
+  test("the inbox shows the checkpoint; only a person with write access approves the head", async () => {
+    const t = await setup();
+    await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    t.app.refs.set("refs/heads/timeline/search", oid(9));
+    const made = (await t.call("bot", "POST", "/search/checkpoints", { summary: "Ready" }))
+      .body as CheckpointView;
+    const mutate = (who: "ann" | "ben" | "cat" | "bot", mutation: unknown) =>
+      t.raw(who, "POST", "/tracker/orbit/mutate", {
+        operationId: crypto.randomUUID(),
+        mutations: [mutation],
+      });
+    expect(
+      (
+        await mutate("ann", {
+          kind: "team.create",
+          id: "team",
+          data: { key: "ENG", name: "Engineering" },
+        })
+      ).status,
+    ).toBe(200);
+    await mutate("bot", {
+      kind: "issue.create",
+      id: "issue",
+      data: { teamId: "team", title: "S" },
+    });
+    const asked = await mutate("bot", {
+      kind: "request.open",
+      id: "req",
+      data: {
+        issueId: "issue",
+        kind: "approval",
+        prompt: "Land search?",
+        checkpoint: made.checkpoint.id,
+      },
+    });
+    expect(asked.status).toBe(200);
+    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("waiting");
+
+    const inbox = (await t.raw("ben", "GET", "/requests")).body as OpenRequests;
+    expect(inbox.requests).toHaveLength(1);
+    expect(inbox.requests[0]).toMatchObject({
+      request: { id: "req", checkpoint: { id: made.checkpoint.id, timeline: "search", number: 1 } },
+      checkpoint: {
+        checkpoint: { summary: "Ready", repos: [{ commit: oid(9), base: oid(1) }] },
+        current: true,
+        approval: { state: "pending" },
+      },
+    });
+
+    const answer = { kind: "request.answer", id: "req", data: { approved: true } };
+    // Cat is a member who can only read the repository; the agent is never a person.
+    expect((await mutate("cat", answer)).status).toBe(403);
+    expect((await mutate("bot", answer)).status).toBe(403);
+    expect((await mutate("ben", answer)).status).toBe(200);
+    const after = (await t.call("ben", "GET", "/search/checkpoints/1")).body as CheckpointView;
+    expect(after).toMatchObject({ approved: true, approval: { state: "approved", by: "ben" } });
+    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("active");
   });
 });

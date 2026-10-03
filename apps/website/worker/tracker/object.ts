@@ -1,6 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
-import { TimelineStore, type NewTimeline, type PushActivity } from "./timelines.ts";
+import {
+  type TimelineStore,
+  type NewCheckpoint,
+  type NewTimeline,
+  type PushActivity,
+} from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
 import type { SearchQuery } from "../search/query.ts";
 import type { TimelineStatus } from "../../shared/timelines.ts";
@@ -23,7 +28,8 @@ export class Tracker extends DurableObject<Env> {
     const transaction = <T>(fn: () => T) => ctx.storage.transactionSync(fn);
     this.transaction = transaction;
     this.store = new TrackerStore(ctx.storage.sql, transaction);
-    this.timelines = new TimelineStore(ctx.storage.sql, transaction);
+    // The tracker's own: superseding an approval withdraws its request there.
+    this.timelines = this.store.timelines;
   }
   private reply<T>(fn: () => T): TrackerReply<T> {
     try {
@@ -127,5 +133,17 @@ export class Tracker extends DurableObject<Env> {
         ),
       ),
     );
+  }
+  checkpoints(slug: string) {
+    return this.reply(() => this.timelines.checkpoints(slug));
+  }
+  checkpoint(slug: string, ref: string) {
+    return this.reply(() => this.timelines.checkpoint(slug, ref));
+  }
+  checkpointStates(ids: string[]) {
+    return this.reply(() => this.timelines.checkpointStates(ids));
+  }
+  createCheckpoint(access: Access, slug: string, input: NewCheckpoint) {
+    return this.reply(() => this.timelines.createCheckpoint(access, slug, input));
   }
 }
