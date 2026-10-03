@@ -43,6 +43,8 @@ import type {
   GraphLink,
   GraphNodeDetail,
   KnowledgeMap,
+  KnowledgeOverlay,
+  KnowledgeOverlaySummary,
   KnowledgeSearchResults,
   KnowledgeStatus,
   WikiCatalog,
@@ -54,6 +56,7 @@ import { timeAgo } from "../../lib/format.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
 import { AtlasMap, KIND_LABEL } from "./AtlasMap.tsx";
 import { useRepo } from "./RepoLayout.tsx";
+import { OverlayPanel, TimelinePicker } from "./TimelineOverlay.tsx";
 
 // The map and wiki catalog change only when a build lands: keep the parsed
 // copy for this repository and commit, so moving around never refetches it.
@@ -70,8 +73,9 @@ export async function knowledgeLoader({ request, params }: LoaderFunctionArgs) {
   const url = new URL(request.url);
   const q = url.searchParams.get("q")?.trim() ?? "";
   const nodeId = url.searchParams.get("node") ?? "repo";
+  const timeline = url.searchParams.get("timeline");
   const reuse = cached?.repo === repo ? cached : null;
-  const [status, fresh, search, detail] = await Promise.all([
+  const [status, fresh, search, detail, overlays, overlay] = await Promise.all([
     load<KnowledgeStatus>(`${base}/status`, request),
     reuse
       ? null
@@ -83,6 +87,16 @@ export async function knowledgeLoader({ request, params }: LoaderFunctionArgs) {
     load<GraphNodeDetail>(`${base}/graph/node?id=${encodeURIComponent(nodeId)}`, request).catch(
       () => null,
     ),
+    // Timelines' graph diffs against main (CORE-83).
+    load<{ overlays: KnowledgeOverlaySummary[] }>(`${base}/overlays`, request)
+      .then((r) => r.overlays)
+      .catch(() => [] as KnowledgeOverlaySummary[]),
+    timeline
+      ? load<KnowledgeOverlay>(
+          `${base}/overlay?ref=${encodeURIComponent(`timeline/${timeline}`)}`,
+          request,
+        ).catch(() => null)
+      : null,
   ]);
   let current = fresh
     ? { repo, version: fresh[0].version, map: fresh[0], wiki: fresh[1].pages }
@@ -100,7 +114,17 @@ export async function knowledgeLoader({ request, params }: LoaderFunctionArgs) {
   const shown = missing
     ? await load<GraphNodeDetail>(`${base}/graph/node?id=repo`, request).catch(() => null)
     : detail;
-  return { status, q, search, detail: shown, missing, map: current.map, wiki: current.wiki };
+  return {
+    status,
+    q,
+    search,
+    detail: shown,
+    missing,
+    map: current.map,
+    wiki: current.wiki,
+    overlays,
+    overlay,
+  };
 }
 
 function text(value: unknown): string {
@@ -584,6 +608,8 @@ export function Knowledge() {
     missing,
     map,
     wiki,
+    overlays,
+    overlay,
   } = useLoaderData<typeof knowledgeLoader>();
   const [sheetOpen, setSheetOpen] = useState(false);
   const repo = useRepo();
@@ -593,9 +619,14 @@ export function Knowledge() {
   const [params] = useSearchParams();
   const byId = useMemo(() => new Map(map.nodes.map((n, i) => [n[0], i])), [map]);
   const selected = detail ? (byId.get(detail.node.id) ?? null) : null;
+  // Search hits, and what the selected timeline changes or removes.
   const hits = useMemo(
-    () => new Set((search?.entities ?? []).flatMap((e) => byId.get(e.id) ?? [])),
-    [search, byId],
+    () =>
+      new Set([
+        ...(search?.entities ?? []).flatMap((e) => byId.get(e.id) ?? []),
+        ...(overlay?.changes ?? []).flatMap((c) => byId.get(c.id) ?? []),
+      ]),
+    [search, overlay, byId],
   );
   const base = repoPath(repo.owner.slug, repo.name, "knowledge");
   const href = (id: string) => {
@@ -634,6 +665,18 @@ export function Knowledge() {
             <span className="text-ink-faint"> · indexed {timeAgo(status.indexedAt)}</span>
           )}
         </p>
+        {(overlays.length > 0 || overlay) && (
+          <TimelinePicker
+            overlays={overlays}
+            value={params.get("timeline")}
+            onChange={(timeline) => {
+              const next = new URLSearchParams(params);
+              if (timeline) next.set("timeline", timeline);
+              else next.delete("timeline");
+              void navigate(`${base}?${next}`, { preventScrollReset: true });
+            }}
+          />
+        )}
         <Link
           className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
           to={repoPath(repo.owner.slug, repo.name, "wiki")}
@@ -691,6 +734,7 @@ export function Knowledge() {
           >
             {sheetOpen ? <CaretDownIcon weight="bold" /> : <CaretUpIcon weight="bold" />}
           </button>
+          {overlay && <OverlayPanel overlay={overlay} href={href} inMap={(id) => byId.has(id)} />}
           {missing && (
             <p className="m-0 mb-3 text-body-sm text-ink-muted">
               That entry isn't in the latest build. Here's the repository instead.

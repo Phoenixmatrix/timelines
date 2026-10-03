@@ -10,6 +10,8 @@
 //   GET  /search?q=              entities (Vectorize) + passages (AI Search)
 //   GET  /wiki                   the catalog
 //   GET  /wiki/page?slug=        one page
+//   GET  /overlays               every timeline's graph diff against main, in brief
+//   GET  /overlay?ref=timeline/<slug>&limit=   one timeline's diff, with its changes
 
 import { Hono, type Context } from "hono";
 import { sql, type Selectable } from "kysely";
@@ -19,6 +21,9 @@ import type {
   GraphNodeDetail,
   KnowledgeBuild,
   KnowledgeMap,
+  KnowledgeOverlay,
+  KnowledgeOverlayChange,
+  KnowledgeOverlaySummary,
   KnowledgeSearchResults,
   KnowledgeStatus,
   WikiCatalog,
@@ -34,6 +39,8 @@ import { db, type Database } from "../schema.ts";
 import { coordinator, notifyKnowledge } from "./coordinator.ts";
 import { PASSAGE_CANDIDATES, SEARCH_INSTANCE, selectPassages } from "./indexes.ts";
 import { embed } from "./models.ts";
+import { overlayRef } from "./overlay.ts";
+import { timelineSlugOf } from "../../shared/timelines.ts";
 
 export const knowledge = new Hono<AppEnv>();
 
@@ -471,6 +478,146 @@ knowledge.get("/wiki/page", async (c) => {
     sources: JSON.parse(page.sources) as string[],
     generatedIn: page.generated_in,
     model: page.model,
+  };
+  return c.json(body);
+});
+
+// ---- timeline overlays --------------------------------------------------------
+
+const OVERLAY_KINDS = ["component", "concept", "file", "symbol", "package"];
+
+/** Where each timeline's overlay stands, for every bookmark or just `only`. */
+async function overlaySummaries(
+  c: Context<AppEnv>,
+  row: RepoRow,
+  only?: string,
+): Promise<{ summary: KnowledgeOverlaySummary; overlayId: string | null; stored: number }[]> {
+  const reader = new RepoReader(
+    c.env,
+    row.artifacts_name,
+    row.artifacts_remote,
+    c.get("timing"),
+    (w) => c.executionCtx.waitUntil(w),
+  );
+  let query = db(c.env.DB).selectFrom("kg_overlays").selectAll().where("repo_id", "=", row.id);
+  if (only) query = query.where("ref", "=", only);
+  const [refs, rows, state, coordination] = await Promise.all([
+    reader.refs().catch(() => null),
+    query.execute(),
+    db(c.env.DB)
+      .selectFrom("kg_state")
+      .select("indexed_commit")
+      .where("repo_id", "=", row.id)
+      .executeTakeFirst(),
+    c.env.AI ? coordinator(c.env, row.id).status() : null,
+  ]);
+  await reader.close();
+  const indexed = state?.indexed_commit ?? null;
+  const tips = new Map(
+    (refs?.branches ?? [])
+      .filter((b) => timelineSlugOf(b.name) && (!only || b.name === only))
+      .map((b) => [b.name, b.oid]),
+  );
+  const byRef = new Map(rows.map((r) => [r.ref, r]));
+  let stale = false;
+  const out = [...new Set([...tips.keys(), ...byRef.keys()])].sort().map((ref) => {
+    const head = tips.get(ref) ?? null;
+    const stored = byRef.get(ref);
+    const stats = JSON.parse(stored?.stats ?? "{}") as {
+      counts?: KnowledgeOverlaySummary["counts"];
+      stored?: number;
+    };
+    const running = coordination?.overlays[ref]?.running ?? null;
+    const state: KnowledgeOverlaySummary["state"] = !indexed
+      ? "waiting"
+      : running
+        ? "building"
+        : stored?.status === "failed" && stored.attempted_commit === head
+          ? "failed"
+          : stored?.head_commit === head && stored?.base_commit === indexed
+            ? "up-to-date"
+            : "queued";
+    if (state === "queued" && head) stale = true;
+    return {
+      overlayId: stored?.overlay_id ?? null,
+      stored: stats.stored ?? 0,
+      summary: {
+        ref: ref.replace(/^refs\/heads\//, ""),
+        timeline: timelineSlugOf(ref) ?? ref,
+        head,
+        commit: stored?.head_commit ?? null,
+        baseCommit: stored?.base_commit ?? null,
+        mergeBase: stored?.merge_base ?? null,
+        state,
+        counts: stats.counts ?? {},
+        updatedAt: stored?.updated_at ?? null,
+        error: stored?.status === "failed" ? stored.error : null,
+      },
+    };
+  });
+  // A bookmark pushed before overlays existed, or a missed ping: compare it now.
+  if (stale && coordination && !coordination.overlayScanPending)
+    c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
+  return out;
+}
+
+knowledge.get("/overlays", async (c) => {
+  const row = await repoOrFail(c);
+  if (row instanceof Response) return row;
+  const list = await overlaySummaries(c, row);
+  return c.json({ overlays: list.map((o) => o.summary) });
+});
+
+knowledge.get("/overlay", async (c) => {
+  const row = await repoOrFail(c);
+  if (row instanceof Response) return row;
+  const ref = overlayRef(c.req.query("ref") ?? "");
+  if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
+  const limit = Math.min(2000, Math.max(1, Number(c.req.query("limit") ?? "500") || 500));
+  const [found] = await overlaySummaries(c, row, ref);
+  if (!found) return fail(c, 404, "No such timeline bookmark.");
+  const rows = found.overlayId
+    ? await db(c.env.DB)
+        .selectFrom("kg_overlay_changes")
+        .select(["node_id", "kind", "change", "name", "path", "summary", "detail"])
+        .where("repo_id", "=", row.id)
+        .where("overlay_id", "=", found.overlayId)
+        .execute()
+    : [];
+  const rank = (kind: string) => {
+    const i = OVERLAY_KINDS.indexOf(kind);
+    return i === -1 ? OVERLAY_KINDS.length : i;
+  };
+  const changes = rows
+    .map((r): KnowledgeOverlayChange => {
+      const detail = JSON.parse(r.detail) as Partial<
+        Pick<KnowledgeOverlayChange, "fields" | "links">
+      >;
+      return {
+        id: r.node_id,
+        kind: r.kind as KnowledgeOverlayChange["kind"],
+        change: r.change,
+        name: r.name,
+        path: r.path,
+        summary: r.summary,
+        fields: detail.fields ?? [],
+        links: detail.links ?? { added: [], removed: [] },
+      };
+    })
+    .sort(
+      (a, b) =>
+        rank(a.kind) - rank(b.kind) ||
+        (a.path ?? "").localeCompare(b.path ?? "") ||
+        a.name.localeCompare(b.name),
+    );
+  const totalChanges = Object.values(found.summary.counts).reduce(
+    (n, k) => n + k.added + k.changed + k.removed,
+    0,
+  );
+  const body: KnowledgeOverlay = {
+    ...found.summary,
+    changes: changes.slice(0, limit),
+    truncated: changes.length > limit || totalChanges > found.stored,
   };
   return c.json(body);
 });

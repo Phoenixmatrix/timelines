@@ -941,6 +941,18 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 - **Robustness:** model calls have deadlines and back off on Workers AI rate
   limits; a failed file is retried next build; the coordinator's watchdog
   stops a hung build and retries it once.
+- **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): every push to
+  a `timeline/<slug>` bookmark recomputes that timeline's graph diff against
+  main's indexed graph: the files it changed since its merge base with main,
+  applied over main's snapshot, both graphs built from cached analyses with
+  main's concepts and summaries, then diffed (`kg_overlays`,
+  `kg_overlay_changes`; `GET …/knowledge/overlays` and
+  `…/knowledge/overlay?ref=timeline/<slug>`; the Knowledge tab's timeline
+  picker). Only blobs nothing has analyzed cost model calls, and they are cached
+  for when the timeline lands; no alignment, synthesis, indexing or wiki runs,
+  and main's graph, wiki and builds are untouched. A push that moves only
+  timeline bookmarks starts no main build. One overlay per timeline (three per
+  repository) runs at a time; main's next build recomputes them against it.
 
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index

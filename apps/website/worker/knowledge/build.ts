@@ -17,6 +17,11 @@
 //   wiki-N      rewrite the listed pages that matter, a few per step
 //   wiki-search index the pages for AI Search
 //   finish      promote the snapshot, record stats, tell the coordinator
+//
+// The same Workflow computes timeline overlays (overlay.ts), when started
+// with `overlay`: plan (merge base, changed files), analyze-N for blobs
+// nothing has analyzed, then diff. Those steps write only kg_overlays,
+// kg_overlay_changes and the shared per-blob analysis cache.
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { sql } from "kysely";
@@ -29,7 +34,7 @@ import {
   buildGraph,
   loadSnapshot,
   saveSnapshot,
-  type ComponentSynthesis,
+  storedSyntheses,
   type SnapshotFile,
   type Syntheses,
 } from "./graph.ts";
@@ -43,6 +48,7 @@ import {
 import { syncSearchFiles, syncSearchPages, syncVectors } from "./indexes.ts";
 import { synthesize } from "./synthesize.ts";
 import { coordinator } from "./coordinator.ts";
+import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay.ts";
 import { chunk } from "./util.ts";
 import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.ts";
 
@@ -51,6 +57,8 @@ export interface BuildParams {
   buildId: string;
   /** Rebuild even when HEAD is already indexed. */
   force?: boolean;
+  /** Compute a timeline's overlay instead of building main's graph. */
+  overlay?: { ref: string; commit: string };
 }
 
 interface RepoRow {
@@ -101,37 +109,6 @@ async function recordStats(d1: D1Database, buildId: string, stats: Record<string
     .set({ stats: patchStats(stats) })
     .where("id", "=", buildId)
     .execute();
-}
-
-/** Fallback meaning from the stored graph, used until new syntheses land. */
-async function storedSyntheses(d1: D1Database, repoId: string): Promise<Syntheses> {
-  const results = await db(d1)
-    .selectFrom("kg_nodes")
-    .select(["id", "kind", "name", "summary", "data"])
-    .where("repo_id", "=", repoId)
-    .where("kind", "in", ["repository", "component", "concept"])
-    .execute();
-  const out: Syntheses = { components: new Map(), concepts: new Map() };
-  for (const row of results) {
-    const data = JSON.parse(row.data) as Record<string, unknown>;
-    if (row.kind === "repository" && row.summary) {
-      out.repo = {
-        title: row.name,
-        summary: row.summary,
-        techStack: (data.techStack as string[]) ?? [],
-      };
-    } else if (row.kind === "component" && row.summary) {
-      out.components.set(row.id, {
-        title: row.name,
-        summary: row.summary,
-        responsibilities: (data.responsibilities as string[]) ?? [],
-        keyFiles: (data.keyFiles as ComponentSynthesis["keyFiles"]) ?? [],
-      });
-    } else if (row.kind === "concept" && row.summary) {
-      out.concepts.set(row.id.slice(8), row.summary);
-    }
-  }
-  return out;
 }
 
 function merge(base: Syntheses, over: Syntheses): Syntheses {
@@ -206,6 +183,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
   }
 
   async run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
+    if (event.payload.overlay) return this.#overlay(event.payload, step);
     const { repoId, buildId, force } = event.payload;
     const env = this.env;
     // A durable step that shows its phase while it runs, and records when it
@@ -656,6 +634,71 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           .where("id", "=", buildId)
           .execute();
         await coordinator(env, repoId).finished(buildId, false, message);
+        return null;
+      });
+      throw error;
+    }
+  }
+
+  /** A timeline's overlay: its graph diff against main's indexed graph. */
+  async #overlay(params: BuildParams, step: WorkflowStep) {
+    const { repoId, buildId } = params;
+    const { ref, commit } = params.overlay!;
+    const env = this.env;
+    try {
+      const plan = await step.do("overlay-plan", STEP, async () => {
+        const row = await repoRow(env.DB, repoId);
+        const state = await db(env.DB)
+          .selectFrom("kg_state")
+          .select("indexed_commit")
+          .where("repo_id", "=", repoId)
+          .executeTakeFirst();
+        if (!row || !state?.indexed_commit) return null;
+        const base = state.indexed_commit;
+        const plan = await this.#withReader(row, (reader) => planOverlay(reader, commit, base));
+        const main = await loadSnapshot(env.DB, repoId, "current");
+        const known = await loadAnalyses(
+          env.DB,
+          plan.changes.flatMap((c) => (c.blob ? [c.blob] : [])),
+        );
+        return { row, plan, pending: toAnalyze(plan.changes, main, known) };
+      });
+      if (!plan) {
+        await step.do("overlay-finish", STEP, async () => {
+          await coordinator(env, repoId).overlayFinished(ref, buildId, true, null, null);
+          return null;
+        });
+        return { status: "waiting" };
+      }
+      const { row } = plan;
+      let analyzed = 0;
+      let reused = 0;
+      let failed = 0;
+      for (const [i, group] of chunk(plan.pending, ANALYZE_BATCH).entries()) {
+        const stats = await step.do(`overlay-analyze-${i}`, STEP, () =>
+          this.#withReader(row, (reader) => analyzeFiles(env, reader, group)),
+        );
+        analyzed += stats.analyzed;
+        reused += stats.reused;
+        failed += stats.failed;
+      }
+      const result = await step.do("overlay-diff", STEP, () =>
+        computeOverlay(env.DB, row, ref, buildId, commit, plan.plan, {
+          analyzed,
+          reused,
+          failed,
+        }),
+      );
+      await step.do("overlay-finish", STEP, async () => {
+        await coordinator(env, repoId).overlayFinished(ref, buildId, true, null, result.base);
+        return null;
+      });
+      return { status: "succeeded", commit, counts: result.counts };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await step.do("overlay-fail", async () => {
+        await overlayFailed(env.DB, repoId, ref, commit, message);
+        await coordinator(env, repoId).overlayFinished(ref, buildId, false, message, null);
         return null;
       });
       throw error;

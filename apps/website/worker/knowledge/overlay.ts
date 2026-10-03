@@ -1,0 +1,525 @@
+// Knowledge overlays (CORE-83): each timeline's graph diff against main.
+//
+// Every push to a `timeline/<slug>` bookmark recomputes that timeline's
+// overlay; main's graph (kg_nodes, kg_edges), concepts and wiki are never
+// written. An overlay is:
+//
+//   1. the files the timeline changed: its tree against the merge base with
+//      main's indexed commit, so work main did since the fork doesn't read as
+//      the timeline undoing it;
+//   2. main's indexed snapshot with those changes applied;
+//   3. both graphs built in memory from cached analyses, main's concept model
+//      and main's stored syntheses (so only the timeline's own changes differ),
+//      then diffed node by node.
+//
+// The only model calls are file analyses for blobs nothing has analyzed yet,
+// cached by blob like a build's, so the same blobs cost nothing when the
+// timeline lands. No concept alignment, synthesis, indexing or wiki: a concept
+// the timeline introduces shows as added under its own name, unaligned.
+
+import type {
+  KnowledgeOverlayChange,
+  KnowledgeOverlaySummary,
+  OverlayLink,
+} from "../../shared/api.ts";
+import { timelineSlugOf } from "../../shared/timelines.ts";
+import { db, nowIso } from "../schema.ts";
+import type { FileAnalysis, FileToAnalyze } from "./analyze.ts";
+import { loadAnalyses } from "./analyze.ts";
+import { loadConceptModel } from "./concepts.ts";
+import {
+  buildGraph,
+  loadSnapshot,
+  storedSyntheses,
+  type BuiltGraph,
+  type GraphNode,
+  type SnapshotFile,
+} from "./graph.ts";
+import { runBatched, type Statement } from "./util.ts";
+
+/** Commits read looking for the merge base before comparing trees directly. */
+export const MAX_HISTORY_READS = 2000;
+/** Changes stored per overlay; a timeline that rewrites more reports `truncated`. */
+export const MAX_CHANGES = 2000;
+/** Links listed per changed node. */
+const MAX_LINKS = 40;
+/** Overlays in flight per repository; the rest wait for one to finish. */
+export const MAX_OVERLAYS = 3;
+
+/** Kinds an overlay reports. Directories and the repository node only echo their files. */
+const REPORTED: readonly GraphNode["kind"][] = [
+  "component",
+  "concept",
+  "file",
+  "symbol",
+  "package",
+];
+
+/** `refs/heads/timeline/<slug>` from `timeline/<slug>` or the full name; null if it isn't one. */
+export function overlayRef(ref: string): string | null {
+  const full = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`;
+  return timelineSlugOf(full) ? full : null;
+}
+
+// ---- history and trees ------------------------------------------------------
+
+interface CommitReader {
+  commit(oid: string): Promise<ArtifactsCommitMetadata | null>;
+}
+
+interface TreeReader {
+  tree(oid: string): Promise<ArtifactsTreeEntry[] | null>;
+}
+
+const SIDE_A = 1;
+const SIDE_B = 2;
+
+/**
+ * The newest commit both `a` and `b` reach, found as git does: both sides are
+ * painted in committer-date order until a commit carries both colors. Null
+ * when they share no history, or `truncated` when it took too many reads.
+ */
+export async function mergeBase(
+  reader: CommitReader,
+  a: string,
+  b: string,
+  max = MAX_HISTORY_READS,
+): Promise<{ base: string | null; truncated: boolean }> {
+  if (a === b) return { base: a, truncated: false };
+  const flags = new Map<string, number>();
+  const loaded = new Map<string, ArtifactsCommitMetadata>();
+  // Oldest first, so pop() takes the newest.
+  const queue: ArtifactsCommitMetadata[] = [];
+  const paint = async (oid: string, flag: number) => {
+    const had = flags.get(oid) ?? 0;
+    if ((had & flag) === flag) return;
+    flags.set(oid, had | flag);
+    let commit = loaded.get(oid);
+    if (!commit) {
+      const read = await reader.commit(oid);
+      if (!read) return;
+      loaded.set(oid, (commit = read));
+    }
+    let at = queue.length;
+    while (at > 0 && queue[at - 1]!.committedAt > commit.committedAt) at--;
+    queue.splice(at, 0, commit);
+  };
+  await paint(a, SIDE_A);
+  await paint(b, SIDE_B);
+  let reads = 0;
+  while (queue.length) {
+    const commit = queue.pop()!;
+    const flag = flags.get(commit.hash)!;
+    if (flag === (SIDE_A | SIDE_B)) return { base: commit.hash, truncated: false };
+    if (reads++ >= max) return { base: null, truncated: true };
+    for (const parent of commit.parents) await paint(parent, flag);
+  }
+  return { base: null, truncated: false };
+}
+
+/** A path whose content differs between two trees. */
+export interface FileChange {
+  path: string;
+  /** The new blob; null when the path was deleted. */
+  blob: string | null;
+  /** The old blob; null when the path was added. */
+  before: string | null;
+  mode: string;
+}
+
+const isFile = (entry: ArtifactsTreeEntry) => entry.type === "blob" || entry.type === "exec";
+
+/** Files that differ between two trees, skipping subtrees whose ids match. */
+export async function diffTrees(
+  reader: TreeReader,
+  before: string | null,
+  after: string | null,
+  prefix = "",
+): Promise<FileChange[]> {
+  if (before === after) return [];
+  const read = async (oid: string | null) => {
+    if (!oid) return new Map<string, ArtifactsTreeEntry>();
+    const entries = await reader.tree(oid);
+    if (!entries) throw new Error(`Tree ${oid} not found`);
+    return new Map(entries.map((e) => [e.name, e]));
+  };
+  const [old, now] = await Promise.all([read(before), read(after)]);
+  const out: FileChange[] = [];
+  for (const name of [...new Set([...old.keys(), ...now.keys()])].sort()) {
+    const o = old.get(name);
+    const n = now.get(name);
+    const path = prefix ? `${prefix}/${name}` : name;
+    const oTree = o?.type === "tree" ? o.hash : null;
+    const nTree = n?.type === "tree" ? n.hash : null;
+    if (oTree !== nTree) out.push(...(await diffTrees(reader, oTree, nTree, path)));
+    const oBlob = o && isFile(o) ? o.hash : null;
+    const nBlob = n && isFile(n) ? n.hash : null;
+    if (oBlob !== nBlob) out.push({ path, blob: nBlob, before: oBlob, mode: (n ?? o)!.mode });
+  }
+  return out.sort((x, y) => (x.path < y.path ? -1 : x.path > y.path ? 1 : 0));
+}
+
+/** Main's snapshot with the timeline's file changes applied. */
+export function applyChanges(files: SnapshotFile[], changes: FileChange[]): SnapshotFile[] {
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  for (const change of changes) {
+    if (change.blob)
+      byPath.set(change.path, { path: change.path, blob: change.blob, mode: change.mode });
+    else byPath.delete(change.path);
+  }
+  return [...byPath.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/** Changed files whose content nothing has analyzed yet, with main's blob for cheap reuse. */
+export function toAnalyze(
+  changes: FileChange[],
+  main: SnapshotFile[],
+  known: Map<string, FileAnalysis>,
+): FileToAnalyze[] {
+  const previous = new Map(main.map((f) => [f.path, f.blob]));
+  const seen = new Set<string>();
+  const out: FileToAnalyze[] = [];
+  for (const change of changes) {
+    if (!change.blob || known.has(change.blob) || seen.has(change.blob)) continue;
+    seen.add(change.blob);
+    out.push({ path: change.path, blob: change.blob, previousBlob: previous.get(change.path) });
+  }
+  return out;
+}
+
+// ---- graph diff -------------------------------------------------------------
+
+/** What a node is, minus what moves with unrelated edits (a symbol's line). */
+function comparable(node: GraphNode): Record<string, unknown> {
+  const data = { ...node.data };
+  if (node.kind === "symbol") delete data.line;
+  return { name: node.name, path: node.path, summary: node.summary, ...data };
+}
+
+function changedFields(before: GraphNode, after: GraphNode): string[] {
+  const a = comparable(before);
+  const b = comparable(after);
+  return [...new Set([...Object.keys(a), ...Object.keys(b)])]
+    .filter((key) => JSON.stringify(a[key]) !== JSON.stringify(b[key]))
+    .sort();
+}
+
+/** Outgoing links per reported node: kind + target, weights ignored. */
+function linksOf(graph: BuiltGraph, reported: Set<string>): Map<string, Map<string, OverlayLink>> {
+  const out = new Map<string, Map<string, OverlayLink>>();
+  for (const edge of graph.edges) {
+    if (!reported.has(edge.src)) continue;
+    const links = out.get(edge.src) ?? new Map<string, OverlayLink>();
+    links.set(`${edge.kind}\u0000${edge.dst}`, { id: edge.dst, kind: edge.kind });
+    out.set(edge.src, links);
+  }
+  return out;
+}
+
+const KIND_RANK = new Map(REPORTED.map((kind, i) => [kind, i]));
+
+/** The nodes `head` adds, changes or removes compared with `base`. */
+export function diffGraphs(base: BuiltGraph, head: BuiltGraph): KnowledgeOverlayChange[] {
+  const kinds = new Set<string>(REPORTED);
+  const baseNodes = new Map(base.nodes.filter((n) => kinds.has(n.kind)).map((n) => [n.id, n]));
+  const headNodes = new Map(head.nodes.filter((n) => kinds.has(n.kind)).map((n) => [n.id, n]));
+  const baseLinks = linksOf(base, new Set(baseNodes.keys()));
+  const headLinks = linksOf(head, new Set(headNodes.keys()));
+  const none = new Map<string, OverlayLink>();
+  const out: KnowledgeOverlayChange[] = [];
+  const entry = (
+    node: GraphNode,
+    change: KnowledgeOverlayChange["change"],
+    fields: string[],
+    added: OverlayLink[],
+    removed: OverlayLink[],
+  ): KnowledgeOverlayChange => ({
+    id: node.id,
+    kind: node.kind,
+    change,
+    name: node.name,
+    path: node.path,
+    summary: node.summary,
+    fields,
+    links: { added: added.slice(0, MAX_LINKS), removed: removed.slice(0, MAX_LINKS) },
+  });
+  for (const [id, node] of headNodes) {
+    const before = baseNodes.get(id);
+    const now = headLinks.get(id) ?? none;
+    const then = baseLinks.get(id) ?? none;
+    const added = [...now].filter(([k]) => !then.has(k)).map(([, l]) => l);
+    const removed = [...then].filter(([k]) => !now.has(k)).map(([, l]) => l);
+    if (!before) {
+      out.push(entry(node, "added", [], added, []));
+      continue;
+    }
+    const fields = changedFields(before, node);
+    if (added.length || removed.length) fields.push("links");
+    if (fields.length) out.push(entry(node, "changed", fields, added, removed));
+  }
+  for (const [id, node] of baseNodes) {
+    if (!headNodes.has(id)) out.push(entry(node, "removed", [], [], []));
+  }
+  return out.sort(
+    (a, b) =>
+      KIND_RANK.get(a.kind)! - KIND_RANK.get(b.kind)! ||
+      (a.path ?? "").localeCompare(b.path ?? "") ||
+      a.name.localeCompare(b.name),
+  );
+}
+
+export function countChanges(changes: KnowledgeOverlayChange[]): KnowledgeOverlaySummary["counts"] {
+  const counts: KnowledgeOverlaySummary["counts"] = {};
+  for (const c of changes) {
+    const row = (counts[c.kind] ??= { added: 0, changed: 0, removed: 0 });
+    row[c.change] += 1;
+  }
+  return counts;
+}
+
+// ---- computing and storing --------------------------------------------------
+
+export interface OverlayPlan {
+  /** Main's indexed commit the overlay is measured against. */
+  base: string;
+  mergeBase: string | null;
+  historyTruncated: boolean;
+  changes: FileChange[];
+}
+
+/** The files a timeline commit changed relative to its merge base with main's indexed commit. */
+export async function planOverlay(
+  reader: CommitReader & TreeReader,
+  commit: string,
+  base: string,
+): Promise<OverlayPlan> {
+  const found = await mergeBase(reader, commit, base);
+  const head = await reader.commit(commit);
+  if (!head) throw new Error(`Commit ${commit} not found`);
+  // No shared history found: compare with main's indexed tree directly.
+  const from = await reader.commit(found.base ?? base);
+  if (!from) throw new Error(`Commit ${found.base ?? base} not found`);
+  return {
+    base,
+    mergeBase: found.base,
+    historyTruncated: found.truncated,
+    changes: await diffTrees(reader, from.treeHash, head.treeHash),
+  };
+}
+
+/**
+ * Diff main's indexed graph against main plus the timeline's changes, and
+ * store it as the timeline's current overlay. Returns the base it measured.
+ */
+export async function computeOverlay(
+  d1: D1Database,
+  repo: { id: string; full_name: string },
+  ref: string,
+  overlayId: string,
+  commit: string,
+  plan: OverlayPlan,
+  stats: Record<string, unknown>,
+): Promise<{ base: string | null; counts: KnowledgeOverlaySummary["counts"]; stored: number }> {
+  // The commit first, then its files: if a main build lands in between, the
+  // coordinator sees a newer base and computes the overlay again.
+  const state = await db(d1)
+    .selectFrom("kg_state")
+    .select("indexed_commit")
+    .where("repo_id", "=", repo.id)
+    .executeTakeFirst();
+  const base = state?.indexed_commit ?? null;
+  const main = await loadSnapshot(d1, repo.id, "current");
+  const timeline = applyChanges(main, plan.changes);
+  const analyses = await loadAnalyses(d1, [
+    ...main.map((f) => f.blob),
+    ...plan.changes.flatMap((c) => (c.blob ? [c.blob] : [])),
+  ]);
+  const [concepts, syntheses] = await Promise.all([
+    loadConceptModel(d1, repo.id),
+    storedSyntheses(d1, repo.id),
+  ]);
+  const changes = diffGraphs(
+    buildGraph(repo.full_name, main, analyses, syntheses, concepts),
+    buildGraph(repo.full_name, timeline, analyses, syntheses, concepts),
+  );
+  const counts = countChanges(changes);
+  const kept = changes.slice(0, MAX_CHANGES);
+  const k = db(d1);
+  const statements: Statement[] = [
+    // A retried step starts over.
+    k
+      .deleteFrom("kg_overlay_changes")
+      .where("repo_id", "=", repo.id)
+      .where("overlay_id", "=", overlayId),
+    ...kept.map((c) =>
+      k.insertInto("kg_overlay_changes").values({
+        repo_id: repo.id,
+        overlay_id: overlayId,
+        node_id: c.id,
+        kind: c.kind,
+        change: c.change,
+        name: c.name,
+        path: c.path,
+        summary: c.summary,
+        detail: JSON.stringify({ fields: c.fields, links: c.links }),
+      }),
+    ),
+  ];
+  await runBatched(d1, statements);
+  const allStats = {
+    ...stats,
+    filesChanged: plan.changes.length,
+    historyTruncated: plan.historyTruncated || undefined,
+    counts,
+    changes: changes.length,
+    stored: kept.length,
+  };
+  const previous = await k
+    .selectFrom("kg_overlays")
+    .select("overlay_id")
+    .where("repo_id", "=", repo.id)
+    .where("ref", "=", ref)
+    .executeTakeFirst();
+  // Point at the new changes, then drop the old ones: readers never see half.
+  await k
+    .insertInto("kg_overlays")
+    .values({
+      repo_id: repo.id,
+      ref,
+      overlay_id: overlayId,
+      head_commit: commit,
+      base_commit: base,
+      merge_base: plan.mergeBase,
+      stats: JSON.stringify(allStats),
+      updated_at: nowIso(),
+      status: "succeeded",
+      attempted_commit: commit,
+      error: null,
+    })
+    .onConflict((oc) =>
+      oc.columns(["repo_id", "ref"]).doUpdateSet((eb) => ({
+        overlay_id: eb.ref("excluded.overlay_id"),
+        head_commit: eb.ref("excluded.head_commit"),
+        base_commit: eb.ref("excluded.base_commit"),
+        merge_base: eb.ref("excluded.merge_base"),
+        stats: eb.ref("excluded.stats"),
+        updated_at: eb.ref("excluded.updated_at"),
+        status: eb.ref("excluded.status"),
+        attempted_commit: eb.ref("excluded.attempted_commit"),
+        error: eb.ref("excluded.error"),
+      })),
+    )
+    .execute();
+  if (previous?.overlay_id && previous.overlay_id !== overlayId) {
+    await k
+      .deleteFrom("kg_overlay_changes")
+      .where("repo_id", "=", repo.id)
+      .where("overlay_id", "=", previous.overlay_id)
+      .execute();
+  }
+  return { base, counts, stored: kept.length };
+}
+
+/** Record a failed attempt, keeping the last good overlay's changes. */
+export async function overlayFailed(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  commit: string,
+  error: string,
+) {
+  await db(d1)
+    .insertInto("kg_overlays")
+    .values({
+      repo_id: repoId,
+      ref,
+      status: "failed",
+      attempted_commit: commit,
+      error: error.slice(0, 2000),
+      updated_at: nowIso(),
+    })
+    .onConflict((oc) =>
+      oc.columns(["repo_id", "ref"]).doUpdateSet((eb) => ({
+        status: eb.ref("excluded.status"),
+        attempted_commit: eb.ref("excluded.attempted_commit"),
+        error: eb.ref("excluded.error"),
+      })),
+    )
+    .execute();
+}
+
+/** Drop the overlays of bookmarks that no longer exist (abandoned or deleted). */
+export async function dropOverlays(d1: D1Database, repoId: string, refs: string[]) {
+  if (!refs.length) return;
+  const k = db(d1);
+  const rows = await k
+    .selectFrom("kg_overlays")
+    .select(["ref", "overlay_id"])
+    .where("repo_id", "=", repoId)
+    .where("ref", "in", refs)
+    .execute();
+  await runBatched(d1, [
+    ...rows.flatMap((row) =>
+      row.overlay_id
+        ? [
+            k
+              .deleteFrom("kg_overlay_changes")
+              .where("repo_id", "=", repoId)
+              .where("overlay_id", "=", row.overlay_id),
+          ]
+        : [],
+    ),
+    ...refs.map((ref) =>
+      k.deleteFrom("kg_overlays").where("repo_id", "=", repoId).where("ref", "=", ref),
+    ),
+  ]);
+}
+
+// ---- scheduling (the coordinator's state) ------------------------------------
+
+export interface OverlayRun {
+  buildId: string;
+  /** The timeline commit it covers. */
+  commit: string;
+  /** Main's indexed commit when it started. */
+  base: string;
+  startedAt: number;
+}
+
+export interface OverlayState {
+  running: OverlayRun | null;
+  /** What the last finished attempt covered; a scan skips a bookmark still there. */
+  done: { commit: string; base: string | null } | null;
+  retries: number;
+  lastError: string | null;
+}
+
+/**
+ * Which timeline bookmarks need an overlay now: those whose tip or main's
+ * indexed commit moved since their last one, a few at a time; and which
+ * bookmarks are gone. Nothing starts before main has a graph to compare with.
+ */
+export function scanOverlays(
+  overlays: Record<string, OverlayState>,
+  tips: Map<string, string>,
+  indexed: string | null,
+  max = MAX_OVERLAYS,
+): { gone: string[]; start: [string, string][]; deferred: boolean } {
+  const gone = Object.keys(overlays).filter((ref) => !tips.has(ref) && !overlays[ref]!.running);
+  const start: [string, string][] = [];
+  let deferred = false;
+  if (!indexed) return { gone, start, deferred };
+  let inFlight = Object.values(overlays).filter((o) => o.running).length;
+  for (const [ref, commit] of tips) {
+    const overlay = overlays[ref];
+    if (overlay?.running) continue;
+    if (overlay?.done?.commit === commit && overlay.done.base === indexed) continue;
+    if (inFlight >= max) {
+      deferred = true;
+      continue;
+    }
+    start.push([ref, commit]);
+    inFlight += 1;
+  }
+  return { gone, start, deferred };
+}

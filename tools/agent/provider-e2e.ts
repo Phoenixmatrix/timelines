@@ -975,6 +975,117 @@ export async function runProviderE2E(
         ),
         "The team's release feed must include the shipped issue",
       );
+      enter("knowledge-timeline-overlay");
+      // CORE-83: a push to a timeline bookmark updates that timeline's graph
+      // diff against main, and leaves main's graph and wiki as they were.
+      await waitFor("knowledge-main-before-overlay", 12 * 60_000, async () => {
+        const status = await api(`${base}/knowledge/status`);
+        if (status.state === "failed")
+          throw new Error("Knowledge build of the cited commit failed; see provider evidence");
+        return status.state === "up-to-date" && status.indexedCommit === cited;
+      });
+      const mainView = async () => {
+        const [g, wiki, status] = await Promise.all([
+          api(`${base}/knowledge/graph/export`),
+          api(`${base}/knowledge/wiki`),
+          api(`${base}/knowledge/status`),
+        ]);
+        return {
+          indexedCommit: status.indexedCommit as string | null,
+          builds: (status.recent as { id: string }[]).map((b) => b.id).sort(),
+          nodes: (g.nodes as { id: string; changedIn: string; summary: string }[])
+            .map((n) => `${n.id}@${n.changedIn}:${n.summary}`)
+            .sort(),
+          edges: (g.edges as { src: string; dst: string; kind: string }[])
+            .map((e) => `${e.src}>${e.kind}>${e.dst}`)
+            .sort(),
+          wiki: (wiki.pages as { slug: string; updatedAt: string }[])
+            .map((p) => `${p.slug}@${p.updatedAt}`)
+            .sort(),
+        };
+      };
+      const mainBefore = await mainView();
+      // Forked before verify-all.ts landed on main: the overlay must count
+      // changes from the merge base, not report main's later file as removed.
+      const timelineRef = "timeline/copper-limits";
+      await git(["checkout", "-q", "-b", timelineRef, edited]);
+      await writeFile(
+        join(work, "limits.ts"),
+        "/** The most parcels one Copper Finch batch may carry. */\nexport function copperFinchBatchLimit(): number {\n  return 64;\n}\n",
+      );
+      await git(["add", "limits.ts"]);
+      await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Limit Copper Finch batches"]);
+      await git(["push", "origin", `HEAD:refs/heads/${timelineRef}`], work, true);
+      const timelineHead = await git(["rev-parse", "HEAD"]);
+      type Overlay = {
+        state: string;
+        commit: string | null;
+        baseCommit: string | null;
+        mergeBase: string | null;
+        changes: { id: string; change: string; kind: string }[];
+      };
+      const overlayAt = async (commit: string): Promise<Overlay> => {
+        let overlay: Overlay | undefined;
+        await waitFor("knowledge-overlay", 10 * 60_000, async () => {
+          overlay = await api(
+            `${base}/knowledge/overlay?ref=${encodeURIComponent(timelineRef)}&limit=2000`,
+          );
+          if (overlay!.state === "failed")
+            throw new Error("Timeline overlay failed; see provider evidence");
+          return overlay!.state === "up-to-date" && overlay!.commit === commit;
+        });
+        return overlay!;
+      };
+      const has = (o: Overlay, change: string, id: string) =>
+        o.changes.some((c) => c.change === change && c.id === id);
+      const first = await overlayAt(timelineHead);
+      evidence.overlay = { first };
+      assert.equal(first.baseCommit, cited, "The overlay must be measured against main's graph");
+      assert.equal(first.mergeBase, edited, "The overlay must count from the fork point");
+      assert(has(first, "added", "file:limits.ts"), "Overlay lacks the timeline's new file");
+      assert(
+        has(first, "added", "sym:limits.ts#copperFinchBatchLimit"),
+        "Overlay lacks the timeline's new symbol",
+      );
+      assert(
+        !first.changes.some((c) => c.id === "file:verify-all.ts" || c.id === "file:checksum.ts"),
+        "Main's own files must not appear in the timeline's overlay",
+      );
+      // A second push updates the overlay to the new head.
+      await writeFile(
+        join(work, "limits.ts"),
+        "/** The most parcels one Copper Finch batch may carry. */\nexport function copperFinchBatchLimit(): number {\n  return 64;\n}\n\n/** Whether a batch of parcels fits in one Copper Finch batch. */\nexport function copperFinchFitsBatch(count: number): boolean {\n  return count >= 0 && count <= copperFinchBatchLimit();\n}\n",
+      );
+      await git([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-am",
+        "Check Copper Finch batch size",
+      ]);
+      await git(["push", "origin", `HEAD:refs/heads/${timelineRef}`], work, true);
+      const timelineNext = await git(["rev-parse", "HEAD"]);
+      const second = await overlayAt(timelineNext);
+      evidence.overlay = { first, second };
+      assert(
+        has(second, "added", "sym:limits.ts#copperFinchFitsBatch"),
+        "The overlay did not follow the timeline's second push",
+      );
+      const listed = await api(`${base}/knowledge/overlays`);
+      assert(
+        listed.overlays.some(
+          (o: { ref: string; commit: string }) =>
+            o.ref === timelineRef && o.commit === timelineNext,
+        ),
+        "The overlay list must show the timeline at its head",
+      );
+      const mainAfter = await mainView();
+      evidence.overlayMain = { before: mainBefore.indexedCommit, after: mainAfter.indexedCommit };
+      assert.deepEqual(
+        mainAfter,
+        mainBefore,
+        "A timeline push changed main's graph, wiki or builds",
+      );
     }
     evidence.outcome = "passed";
   } catch (error) {

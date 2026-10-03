@@ -512,3 +512,34 @@ export async function saveSnapshot(
     ),
   );
 }
+
+/** Fallback meaning from the stored graph, used until new syntheses land. */
+export async function storedSyntheses(d1: D1Database, repoId: string): Promise<Syntheses> {
+  const results = await db(d1)
+    .selectFrom("kg_nodes")
+    .select(["id", "kind", "name", "summary", "data"])
+    .where("repo_id", "=", repoId)
+    .where("kind", "in", ["repository", "component", "concept"])
+    .execute();
+  const out: Syntheses = { components: new Map(), concepts: new Map() };
+  for (const row of results) {
+    const data = JSON.parse(row.data) as Record<string, unknown>;
+    if (row.kind === "repository" && row.summary) {
+      out.repo = {
+        title: row.name,
+        summary: row.summary,
+        techStack: (data.techStack as string[]) ?? [],
+      };
+    } else if (row.kind === "component" && row.summary) {
+      out.components.set(row.id, {
+        title: row.name,
+        summary: row.summary,
+        responsibilities: (data.responsibilities as string[]) ?? [],
+        keyFiles: (data.keyFiles as ComponentSynthesis["keyFiles"]) ?? [],
+      });
+    } else if (row.kind === "concept" && row.summary) {
+      out.concepts.set(row.id.slice(8), row.summary);
+    }
+  }
+  return out;
+}

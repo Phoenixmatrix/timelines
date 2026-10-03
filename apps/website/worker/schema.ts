@@ -233,6 +233,30 @@ export interface Database {
     score: number;
     inputs_hash: string;
   };
+  kg_overlays: {
+    repo_id: string;
+    ref: string;
+    overlay_id: string | null;
+    head_commit: string | null;
+    base_commit: string | null;
+    merge_base: string | null;
+    stats: Generated<string>;
+    updated_at: string | null;
+    status: "succeeded" | "failed";
+    attempted_commit: string;
+    error: string | null;
+  };
+  kg_overlay_changes: {
+    repo_id: string;
+    overlay_id: string;
+    node_id: string;
+    kind: string;
+    change: "added" | "changed" | "removed";
+    name: string;
+    path: string | null;
+    summary: Generated<string>;
+    detail: Generated<string>;
+  };
   wiki_pages: {
     repo_id: string;
     slug: string;

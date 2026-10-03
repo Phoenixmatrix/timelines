@@ -322,6 +322,58 @@ export interface WikiPage extends WikiPageSummary {
   model: string | null;
 }
 
+/**
+ * One entry of a timeline's graph overlay: a node the timeline adds, changes
+ * or removes compared with main's indexed graph.
+ */
+export interface KnowledgeOverlayChange {
+  id: string;
+  kind: GraphNode["kind"];
+  change: "added" | "changed" | "removed";
+  name: string;
+  path: string | null;
+  /** The timeline's description (main's for a removed node). */
+  summary: string;
+  /** What differs on a changed node: `name`, `summary`, data keys, or `links`. */
+  fields: string[];
+  /** Links from this node that the timeline adds or drops. */
+  links: { added: OverlayLink[]; removed: OverlayLink[] };
+}
+
+export interface OverlayLink {
+  id: string;
+  kind: string;
+}
+
+/** `waiting`: main has no graph yet to compare with. */
+export type KnowledgeOverlayState = "up-to-date" | "building" | "queued" | "failed" | "waiting";
+
+/** A timeline's knowledge graph diff against main, kept current on every push. */
+export interface KnowledgeOverlaySummary {
+  /** The bookmark, as `timeline/<slug>`. */
+  ref: string;
+  timeline: string;
+  /** The bookmark's tip now; null once it is gone. */
+  head: string | null;
+  /** The timeline commit the stored diff describes. */
+  commit: string | null;
+  /** Main's indexed commit it is measured against. */
+  baseCommit: string | null;
+  /** Where the timeline's own changes are counted from; null when no shared history was found. */
+  mergeBase: string | null;
+  state: KnowledgeOverlayState;
+  /** Per node kind: how many the timeline adds, changes and removes. */
+  counts: Record<string, { added: number; changed: number; removed: number }>;
+  updatedAt: string | null;
+  error: string | null;
+}
+
+export interface KnowledgeOverlay extends KnowledgeOverlaySummary {
+  changes: KnowledgeOverlayChange[];
+  /** More changes are stored than were returned. */
+  truncated: boolean;
+}
+
 // ---- CI/CD ------------------------------------------------------------------
 
 export type CiRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
