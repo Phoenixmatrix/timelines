@@ -20,6 +20,7 @@ import type {
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
+import { atlasBrowserScenario } from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 type Evidence = {
@@ -2008,6 +2009,19 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await context.close();
       await browser.close();
     }
+  });
+
+  await scenario("browser-atlas-deep-links-lookup-and-expiry", async () => {
+    // CORE-171: the repository Atlas's address restores its state; cold links
+    // read only the path; lookup and browsing never fan out paid search.
+    await atlasBrowserScenario({
+      ctx,
+      work,
+      token: ownerToken,
+      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
+      json,
+      record,
+    });
   });
 
   await scenario("browser-timeline-switcher-scopes-the-app", async () => {

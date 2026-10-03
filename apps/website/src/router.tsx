@@ -11,7 +11,7 @@ import { ciAction, ciLoader, CiRun, CiRuns, ciRunLoader } from "./routes/repo/Ci
 import { Code, codeLoader } from "./routes/repo/Code.tsx";
 import { Commits, commitsLoader } from "./routes/repo/Commits.tsx";
 import { Knowledge, knowledgeLoader } from "./routes/repo/Knowledge.tsx";
-import { Atlas, atlasLoader } from "./routes/repo/Atlas.tsx";
+import { Atlas, atlasLoader, atlasShouldRevalidate } from "./routes/repo/Atlas.tsx";
 import {
   WorkspaceAtlas,
   workspaceAtlasLoader,
@@ -177,7 +177,12 @@ export const router = createBrowserRouter([
               { path: "releases/*", loader: releasesLoader, Component: Releases },
               { path: "knowledge", loader: knowledgeLoader, Component: Knowledge },
               // The Semantic Code Atlas: unlinked until the Knowledge cutover (CORE-174).
-              { path: "atlas", loader: atlasLoader, Component: Atlas },
+              {
+                path: "atlas",
+                loader: atlasLoader,
+                shouldRevalidate: atlasShouldRevalidate,
+                Component: Atlas,
+              },
               { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
               { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
               { path: "ci/:number", loader: ciRunLoader, Component: CiRun },

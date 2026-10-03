@@ -3,6 +3,11 @@ import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
 import type { TokenScope } from "../../shared/api.ts";
 import { newArtifactsName } from "../artifacts.ts";
+import {
+  expireAtlasPriors,
+  publishAtlasFixture,
+  writeAtlasFixtureGraph,
+} from "../atlas/fixture.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { batch, db } from "../schema.ts";
@@ -58,7 +63,10 @@ export const dev = new Hono<AppEnv>();
 dev.use("*", async (c, next) => {
   if (Reflect.get(c.env, "DEV_MODE") !== "true") return fail(c, 404, "Not found.");
   const id = Reflect.get(c.env, "AGENT_ID");
-  if (id && ["/tokens", "/seed", "/environment"].some((path) => c.req.path.endsWith(path))) {
+  if (
+    id &&
+    ["/tokens", "/seed", "/environment", "/atlas"].some((path) => c.req.path.endsWith(path))
+  ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
     const supplied = c.req.header("Authorization")?.replace(/^Bearer /, "");
     if (typeof secret !== "string" || !secret || !supplied) return fail(c, 401, "Unauthorized.");
@@ -165,4 +173,39 @@ dev.post("/seed", async (c) => {
     }
   }
   return c.json({ created }, created ? 201 : 200);
+});
+
+/**
+ * An Atlas for a seeded repository without a Knowledge build or a model
+ * (worker/atlas/fixture.ts): `publish` writes the fixture graph at `commit`
+ * (the commit its files were pushed at) and publishes a snapshot; `expire`
+ * expires every prior snapshot, as retention does.
+ */
+dev.post("/atlas", async (c) => {
+  const body = await readJson<{
+    repo: string;
+    action: "publish" | "expire";
+    commit?: string;
+    variant?: "base" | "merged";
+    unavailable?: "disabled" | "budget_exhausted" | "provider_error" | "error";
+  }>(c);
+  const [owner, name] = (body.repo ?? "").split("/");
+  const account = owner ? await findAccountBySlug(c.env.DB, owner) : null;
+  const repo = account
+    ? await db(c.env.DB)
+        .selectFrom("repos")
+        .select(["id", "name"])
+        .where("owner_id", "=", account.id)
+        .where("name", "=", name ?? "")
+        .executeTakeFirst()
+    : undefined;
+  if (!repo) return fail(c, 404, "No such repository.");
+  if (body.action === "expire") return c.json(await expireAtlasPriors(c.env.DB, repo.id));
+  if (body.action !== "publish" || !body.commit || !/^[0-9a-f]{40}$/.test(body.commit))
+    return fail(c, 400, "Send {repo, action: publish, commit} or {repo, action: expire}.");
+  await writeAtlasFixtureGraph(c.env.DB, repo.id, repo.name, body.commit, body.variant ?? "base");
+  const published = await publishAtlasFixture(c.env, repo.id, body.commit, {
+    unavailable: body.unavailable ?? "disabled",
+  });
+  return c.json(published, 201);
 });

@@ -205,7 +205,7 @@ export function cellAt(territory: Territory, x: number, y: number): TerritoryCel
 export type Load =
   | { state: "loading" }
   | { state: "ready"; items: AtlasEntitySummary[]; next: string | null; total: number | null }
-  | { state: "error"; message: string };
+  | { state: "error"; message: string; cause?: unknown };
 
 /**
  * Children requests keyed by region, for one snapshot. A response is kept
@@ -265,6 +265,7 @@ export class ChildLoader {
       this.#onChange(id, {
         state: "error",
         message: error instanceof Error ? error.message : "Couldn't load this region.",
+        cause: error,
       });
     }
   }

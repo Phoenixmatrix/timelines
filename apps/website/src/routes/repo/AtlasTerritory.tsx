@@ -304,7 +304,7 @@ export function AtlasTerritory({
         ref={canvas}
         role="img"
         aria-label={label}
-        className="block touch-none select-none"
+        className="absolute inset-0 block touch-none select-none"
         onWheel={(event) => {
           const p = local(event);
           zoomBy(Math.exp(-event.deltaY * 0.0015), p.x, p.y);

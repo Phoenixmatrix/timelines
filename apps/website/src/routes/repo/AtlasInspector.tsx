@@ -16,11 +16,13 @@ import type {
   AtlasDetail,
   AtlasDirection,
   AtlasEntitySummary,
+  AtlasError,
   AtlasEvidence,
   AtlasRelation,
   AtlasSnapshotRef,
 } from "../../../shared/atlas.ts";
-import { atlasApi, type AtlasRepo } from "../../lib/atlas.ts";
+import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../../lib/atlas.ts";
+import type { AtlasLens } from "./atlasUrl.ts";
 import { lineAnchor } from "../../lib/lineAnchors.ts";
 import { blobUrl } from "../../lib/refs.ts";
 
@@ -120,17 +122,33 @@ export function AtlasInspector({
   snapshot,
   entity,
   contents,
+  lens,
+  autoFocus = false,
   onPick,
+  onLens,
+  onRestart,
 }: {
   repo: AtlasRepo;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
   /** What's inside it, as the map already loads it. */
   contents: ReactNode;
+  /** The relationship lens, kept in the address. */
+  lens: AtlasLens;
+  /** Move focus to its heading once shown (a restored link, Back or Forward). */
+  autoFocus?: boolean;
   onPick: (entity: AtlasEntitySummary) => void;
+  onLens: (lens: AtlasLens) => void;
+  /** The pinned snapshot can't be read any more. */
+  onRestart?: (error: AtlasError) => void;
 }) {
   const [detail, setDetail] = useState<AtlasDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (autoFocus) heading.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- on showing only
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
     setDetail(null);
@@ -139,8 +157,10 @@ export function AtlasInspector({
       .detail(repo, entity.id, { snapshot: snapshot.id, signal: controller.signal })
       .then(setDetail)
       .catch((error: unknown) => {
-        if (!controller.signal.aborted)
-          setDetailError(error instanceof Error ? error.message : "Couldn't load this.");
+        if (controller.signal.aborted) return;
+        const atlasError = atlasErrorOf(error);
+        if (atlasError && atlasNeedsRestart(error)) onRestart?.(atlasError);
+        setDetailError(error instanceof Error ? error.message : "Couldn't load this.");
       });
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -183,7 +203,9 @@ export function AtlasInspector({
             ))}
           </nav>
         )}
-        <h2 className="m-0 text-body font-semibold break-words">{entity.name}</h2>
+        <h2 ref={heading} tabIndex={-1} className="m-0 text-body font-semibold break-words">
+          {entity.name}
+        </h2>
         <p className="m-0 text-micro text-ink-faint">
           {KIND[entity.kind] ?? entity.kind}
           {entity.path && <span className="font-mono"> · {entity.path}</span>}
@@ -244,7 +266,15 @@ export function AtlasInspector({
       {contents}
 
       {detail && (
-        <Lens repo={repo} snapshot={snapshot} entity={entity} detail={detail} onPick={onPick} />
+        <Lens
+          repo={repo}
+          snapshot={snapshot}
+          entity={entity}
+          detail={detail}
+          lens={lens}
+          onLens={onLens}
+          onPick={onPick}
+        />
       )}
       <Evidence repo={repo} snapshot={snapshot} entity={entity} />
     </section>
@@ -256,21 +286,25 @@ function Lens({
   snapshot,
   entity,
   detail,
+  lens,
+  onLens,
   onPick,
 }: {
   repo: AtlasRepo;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
   detail: AtlasDetail;
+  lens: AtlasLens;
+  onLens: (lens: AtlasLens) => void;
   onPick: (entity: AtlasEntitySummary) => void;
 }) {
-  const [direction, setDirection] = useState<AtlasDirection>("out");
+  const direction = lens.direction;
+  const kind = lens.kind;
   const kinds = Object.entries(
     direction === "out" ? detail.counts.outgoing : detail.counts.incoming,
   )
     .filter(([kind]) => kind !== "contains")
     .sort((a, b) => b[1] - a[1]);
-  const [kind, setKind] = useState<string | null>(null);
   const active = kind && kinds.some(([k]) => k === kind) ? kind : (kinds[0]?.[0] ?? null);
   const list = usePaged<AtlasRelation>(
     active ? `${entity.id}|${direction}|${active}|${snapshot.id}` : null,
@@ -294,10 +328,7 @@ function Lens({
               type="button"
               aria-pressed={direction === d}
               className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink"
-              onClick={() => {
-                setDirection(d);
-                setKind(null);
-              }}
+              onClick={() => onLens({ direction: d, kind: null })}
             >
               {d === "out" ? "Uses" : "Used by"}
             </button>
@@ -319,7 +350,7 @@ function Lens({
                   type="button"
                   aria-pressed={active === k}
                   className="mk-chip cursor-pointer border-0"
-                  onClick={() => setKind(k)}
+                  onClick={() => onLens({ direction, kind: k })}
                 >
                   {VERB[direction][k] ?? k} {n.toLocaleString()}
                 </button>

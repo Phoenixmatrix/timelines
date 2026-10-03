@@ -167,6 +167,6 @@ describe("child loading", () => {
       (_, load) => seen.push(load),
     );
     await loader.load("cap:a");
-    expect(seen.at(-1)).toEqual({ state: "error", message: "boom" });
+    expect(seen.at(-1)).toMatchObject({ state: "error", message: "boom" });
   });
 });

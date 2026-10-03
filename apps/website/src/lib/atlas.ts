@@ -16,6 +16,7 @@ import type {
   AtlasDetail,
   AtlasDirection,
   AtlasEntitySummary,
+  AtlasError,
   AtlasErrorCode,
   AtlasEvidence,
   AtlasLinkState,
@@ -257,4 +258,22 @@ const RESTART: ReadonlySet<string> = new Set<AtlasErrorCode>([
 /** The pinned view can't continue: offer an explicit move to the current snapshot. */
 export function atlasNeedsRestart(error: unknown): boolean {
   return error instanceof ApiError && error.code !== undefined && RESTART.has(error.code);
+}
+
+/**
+ * The Atlas error behind a failed call: its code, message and, where the API
+ * gives them, the scope's current snapshot (for an explicit "open the current
+ * view"), when and why a snapshot expired, and a retired entity's lineage.
+ * Null for anything that isn't an Atlas API error.
+ */
+export function atlasErrorOf(error: unknown): AtlasError | null {
+  if (!(error instanceof ApiError) || !error.code) return null;
+  const body = (error.body ?? {}) as Partial<AtlasError>;
+  return {
+    error: error.message,
+    code: error.code as AtlasErrorCode,
+    current: body.current ?? null,
+    ...(body.expired ? { expired: body.expired } : {}),
+    ...(body.lineage ? { lineage: body.lineage } : {}),
+  };
 }

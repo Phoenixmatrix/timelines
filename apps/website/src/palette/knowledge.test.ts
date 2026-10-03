@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { KnowledgeSearchResults } from "../../shared/api.ts";
 import type { Viewer } from "../../shared/api.ts";
 import { COMMAND_SOURCES, type PaletteContext } from "./commands.ts";
-import { knowledgeResults, knowledgeSearch, type KnowledgeState } from "./knowledge.ts";
+import {
+  alignmentNote,
+  knowledgeResults,
+  knowledgeSearch,
+  type KnowledgeState,
+} from "./knowledge.ts";
 
 const repo = { owner: "orbit", name: "engine", defaultBranch: "main" };
 const results = (over: Partial<KnowledgeSearchResults> = {}): KnowledgeSearchResults => ({
@@ -58,6 +63,30 @@ describe("code and wiki results", () => {
       knowledgeResults(repo, results({ index: { state: "building", indexedCommit: "c1" } }))
         .notes[0],
     ).toMatch(/Indexing is running/);
+  });
+});
+
+describe("a search handed off from the Atlas", () => {
+  const atlas = { href: "/orbit/engine/atlas", commit: "c1" };
+  test("opens entities in the Atlas and code at the indexed commit", () => {
+    const { groups } = knowledgeResults(repo, results(), atlas);
+    expect(groups.map((g) => [g.label, g.options.map((o) => o.to)])).toEqual([
+      ["Entities", ["/orbit/engine/atlas?select=sym%3Athrottle.ts%23throttle"]],
+      ["Code", ["/orbit/engine/blob/c1/src/throttle.ts"]],
+      ["Wiki", ["/orbit/engine/wiki/components/engine"]],
+    ]);
+  });
+
+  test("says whether the index and the Atlas were built from the same commit", () => {
+    expect(knowledgeResults(repo, results(), atlas).notes).toEqual([
+      "The search index and the Atlas are both built from c1.",
+    ]);
+    expect(alignmentNote({ state: "ready", indexedCommit: "aaaaaaaaaa" }, "bbbbbbbbbb")).toBe(
+      "The search index is built from aaaaaaa, the Atlas from bbbbbbb: results may not match the map (not verified).",
+    );
+    expect(alignmentNote({ state: "building", indexedCommit: null }, "bbbbbbbbbb")).toMatch(
+      /isn't known, so results aren't verified/,
+    );
   });
 });
 

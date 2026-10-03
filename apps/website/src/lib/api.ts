@@ -3,11 +3,14 @@ import { data } from "react-router";
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | undefined;
+  /** The parsed error body, for APIs whose errors carry more than a message. */
+  readonly body: unknown;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, body?: unknown) {
     super(message);
     this.status = status;
     this.code = code;
+    this.body = body ?? null;
   }
 }
 
@@ -35,6 +38,7 @@ export async function api<T>(path: string, init?: RequestInit & { json?: unknown
       response.status,
       body?.error ?? body?.message ?? `Request failed (${response.status}).`,
       typeof body?.code === "string" ? body.code : undefined,
+      body,
     );
   }
   return body as T;

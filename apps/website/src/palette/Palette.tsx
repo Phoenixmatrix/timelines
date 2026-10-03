@@ -52,6 +52,7 @@ import {
   knowledgeResults,
   knowledgeSearch,
   repoKey,
+  type AtlasHandoff,
   type KnowledgeState,
   type PaletteScope,
   type ScopedRepo,
@@ -59,7 +60,19 @@ import {
 import { remoteSearch, type RemoteState } from "./remote.ts";
 import { edge, FRESH, move, reconcile, type Selection } from "./selection.ts";
 
-const Context = createContext<{ open(): void } | null>(null);
+/**
+ * Opening the palette already narrowed to one repository's code and wiki
+ * search, e.g. from the Atlas's lookup (CORE-171). `submit` searches at once:
+ * only for an opener that was itself an explicit search action.
+ */
+export interface PaletteRequest {
+  repo: ScopedRepo;
+  query?: string;
+  submit?: boolean;
+  atlas?: AtlasHandoff;
+}
+
+const Context = createContext<{ open(request?: PaletteRequest): void } | null>(null);
 
 export function usePalette() {
   const palette = useContext(Context);
@@ -79,20 +92,37 @@ function isPaletteKey(event: KeyboardEvent | React.KeyboardEvent) {
 
 export function PaletteProvider({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
+  const [request, setRequest] = useState<PaletteRequest | null>(null);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!isPaletteKey(event)) return;
       event.preventDefault();
+      setRequest(null);
       setOpen((o) => !o);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-  const value = useMemo(() => ({ open: () => setOpen(true) }), []);
+  const value = useMemo(
+    () => ({
+      open: (next?: PaletteRequest) => {
+        setRequest(next ?? null);
+        setOpen(true);
+      },
+    }),
+    [],
+  );
   return (
     <Context.Provider value={value}>
       {children}
-      <Palette open={open} onOpenChange={setOpen} />
+      <Palette
+        open={open}
+        request={request}
+        onOpenChange={(next) => {
+          if (!next) setRequest(null);
+          setOpen(next);
+        }}
+      />
     </Context.Provider>
   );
 }
@@ -257,7 +287,15 @@ const KNOWLEDGE_ICON = {
   wiki: <BookOpenTextIcon className={iconClass} aria-hidden />,
 };
 
-function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+function Palette({
+  open,
+  request,
+  onOpenChange,
+}: {
+  open: boolean;
+  request: PaletteRequest | null;
+  onOpenChange: (open: boolean) => void;
+}) {
   const viewer = useViewer();
   const { pathname } = useLocation();
   const repo = (useRouteLoaderData("repo") as RepoDetail | undefined) ?? null;
@@ -309,6 +347,20 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
     setRemote({ status: "idle", query: "" });
     setSelection(FRESH);
   }, [client, knowledgeClient, open]);
+  // Opened for one repository's code and wiki: narrow to it, fill in the
+  // query and, when the opener asked, search it.
+  const atlas = request?.atlas ?? null;
+  useEffect(() => {
+    if (!open || !request) return;
+    client?.dispose();
+    knowledgeClient.reset();
+    setScopeState({ kind: "repo", ...request.repo });
+    const q = request.query ?? "";
+    setQuery(q);
+    setSelection(FRESH);
+    if (request.submit && q.trim())
+      knowledgeClient.submit(request.repo, q.trim().replace(/\s+/g, " "));
+  }, [client, knowledgeClient, open, request]);
   const setScope = (next: PaletteScope | null) => {
     client?.dispose();
     knowledgeClient.reset();
@@ -393,7 +445,11 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
     knowledge.status === "done" &&
     knowledge.repo === repoKey(scopedRepo) &&
     knowledge.query === normalized
-      ? knowledgeResults(scopedRepo, knowledge.results)
+      ? knowledgeResults(
+          scopedRepo,
+          knowledge.results,
+          atlas && request && repoKey(request.repo) === repoKey(scopedRepo) ? atlas : null,
+        )
       : null;
   const submitted =
     scopedRepo && knowledge.status !== "idle" && knowledge.repo === repoKey(scopedRepo)
@@ -693,7 +749,7 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
                   : knowledge.status === "failed"
                     ? knowledge.message
                     : answered
-                      ? [`${found} result${found === 1 ? "" : "s"}`, ...answered.notes].join(". ")
+                      ? [`${found} result${found === 1 ? "" : "s"}.`, ...answered.notes].join(" ")
                       : ""
                 : announce(found, normalized, remote)}
             </div>

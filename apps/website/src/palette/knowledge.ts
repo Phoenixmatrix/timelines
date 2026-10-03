@@ -91,17 +91,50 @@ export interface KnowledgeGroup {
   options: KnowledgeOption[];
 }
 
+/**
+ * A search handed off from a repository's Atlas (CORE-171): entities open in
+ * the Atlas, and the results say whether the search index and the Atlas
+ * snapshot were built from the same commit.
+ */
+export interface AtlasHandoff {
+  /** The Atlas page, e.g. `/orbit/engine/atlas`; results add `?select=`. */
+  href: string;
+  /** The commit the Atlas snapshot on screen was built from. */
+  commit: string | null;
+}
+
+const short = (commit: string) => commit.slice(0, 7);
+
+/** Whether search results and the Atlas describe the same commit, in words. */
+export function alignmentNote(
+  index: KnowledgeSearchResults["index"],
+  atlasCommit: string | null,
+): string {
+  const indexed = index.indexedCommit;
+  if (indexed && atlasCommit && indexed === atlasCommit)
+    return `The search index and the Atlas are both built from ${short(indexed)}.`;
+  if (indexed && atlasCommit)
+    return `The search index is built from ${short(indexed)}, the Atlas from ${short(atlasCommit)}: results may not match the map (not verified).`;
+  return "The search index's commit isn't known, so results aren't verified against the Atlas.";
+}
+
 /** Labelled groups with their destinations, and what the results can't show. */
 export function knowledgeResults(
   repo: ScopedRepo,
   results: KnowledgeSearchResults,
+  atlas: AtlasHandoff | null = null,
 ): { groups: KnowledgeGroup[]; notes: string[] } {
   const where = repoKey(repo);
+  // From the Atlas, code opens at the commit the index was built from, so the
+  // passage is the one that was found.
+  const codeRef = (atlas && results.index.indexedCommit) || repo.defaultBranch;
   const entities = results.entities.map((entity): KnowledgeOption => ({
     id: `entity:${where}:${entity.id}`,
     title: entity.name,
     detail: [entity.kind, entity.path].filter(Boolean).join(" · "),
-    to: `${repoPath(repo.owner, repo.name, "knowledge")}?node=${encodeURIComponent(entity.id)}`,
+    to: atlas
+      ? `${atlas.href}?select=${encodeURIComponent(entity.id)}`
+      : `${repoPath(repo.owner, repo.name, "knowledge")}?node=${encodeURIComponent(entity.id)}`,
   }));
   const passages = (kind: "code" | "wiki") =>
     results.passages
@@ -113,7 +146,7 @@ export function knowledgeResults(
         to:
           kind === "wiki"
             ? repoPath(repo.owner, repo.name, "wiki", passage.path)
-            : blobUrl(repo.owner, repo.name, repo.defaultBranch, passage.path),
+            : blobUrl(repo.owner, repo.name, codeRef, passage.path),
       }));
   // A few of each, so Code and Wiki aren't pushed below a long list of
   // entities; the repository's Knowledge page shows everything.
@@ -122,5 +155,8 @@ export function knowledgeResults(
     { key: "code" as const, label: "Code", options: passages("code").slice(0, PER_GROUP) },
     { key: "wiki" as const, label: "Wiki", options: passages("wiki").slice(0, PER_GROUP) },
   ].filter((group) => group.options.length);
-  return { groups, notes: knowledgeSearchNotes(results) };
+  const notes = knowledgeSearchNotes(results);
+  if (atlas && results.index.state !== "none")
+    notes.push(alignmentNote(results.index, atlas.commit));
+  return { groups, notes };
 }
