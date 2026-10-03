@@ -704,6 +704,194 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
+  await scenario("agent-durable-interventions-and-resume", async () => {
+    const owner = fixtures.tracker.owner;
+    const directory = join(work, "autonomous-agent");
+    await mkdir(join(directory, ".gitmatrix"), { recursive: true, mode: 0o700 });
+    const { agent } = await json<{ agent: Agent }>(
+      "/api/agents",
+      ownerToken,
+      "POST",
+      { name: `autonomy-${randomUUID().slice(0, 8)}` },
+      [201],
+    );
+    const token = await json<CreatedAccessToken>(
+      `/api/agents/${agent.id}/tokens`,
+      ownerToken,
+      "POST",
+      { scope: "write" },
+      [201],
+    );
+    secrets.add(token.secret);
+    const run = (args: string[]) =>
+      gm(args, "marco", directory, undefined, { GM_TOKEN: token.secret });
+    await run([
+      "agent",
+      "setup",
+      "--no-identity",
+      "--harness",
+      "codex",
+      "--owner",
+      owner,
+      "--team",
+      "AUTO",
+      "--intervention",
+      "autonomous",
+    ]);
+    const team = randomUUID(),
+      waiting = randomUUID(),
+      independent = randomUUID(),
+      dependent = randomUUID();
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "team.create", id: team, data: { key: "AUTO", name: "Autonomy regression" } },
+        {
+          kind: "issue.create",
+          id: waiting,
+          data: { teamId: team, title: "Needs owner input", priority: 0 },
+        },
+        {
+          kind: "issue.create",
+          id: independent,
+          data: { teamId: team, title: "Independent scoped work", priority: 1 },
+        },
+        {
+          kind: "issue.create",
+          id: dependent,
+          data: { teamId: team, title: "Dependent scoped work", priority: 2 },
+        },
+        {
+          kind: "link.add",
+          id: randomUUID(),
+          data: { fromId: waiting, toId: dependent, kind: "blocks" },
+        },
+      ],
+    });
+    type Pick = {
+      claimed: { issueId: string; leaseToken: string } | null;
+      intervention: { mode: string };
+    };
+    type Requests = {
+      requests: {
+        id: string;
+        kind: string;
+        askedBy: string;
+        routeTo: string;
+        status: string;
+        answer: string | null;
+      }[];
+    };
+    const first = JSON.parse(await run(["issue", "next"])) as Pick;
+    assert.equal(first.claimed?.issueId, waiting);
+    assert.equal(first.intervention.mode, "autonomous");
+    secrets.add(first.claimed!.leaseToken);
+    await run([
+      "issue",
+      "ask",
+      waiting,
+      "--kind",
+      "decision",
+      "--prompt",
+      "Which region?",
+      "--choice",
+      "EU",
+      "--choice",
+      "US",
+    ]);
+    await run([
+      "issue",
+      "ask",
+      waiting,
+      "--kind",
+      "question",
+      "--prompt",
+      "Blocked by DNS ownership; please confirm the record is enabled.",
+    ]);
+    const open = JSON.parse(await run(["request", "list", "--issue", waiting])) as Requests;
+    assert.equal(open.requests.length, 2);
+    assert(
+      open.requests.every(
+        (request) => request.askedBy === agent.id && request.routeTo === "acc_marco",
+      ),
+    );
+    const decision = open.requests.find((request) => request.kind === "decision")!;
+    const question = open.requests.find((request) => request.kind === "question")!;
+    const next = JSON.parse(await run(["issue", "next"])) as Pick;
+    assert.equal(next.claimed?.issueId, independent);
+    secrets.add(next.claimed!.leaseToken);
+    await run([
+      "issue",
+      "complete",
+      independent,
+      "--evidence",
+      "Completed independent fixture while owner input was pending.",
+    ]);
+    assert.equal((JSON.parse(await run(["issue", "next"])) as Pick).claimed, null);
+    await gm(["request", "answer", decision.id, "--choice", "EU", "--owner", owner]);
+    const partial = JSON.parse(
+      await run(["request", "list", "--issue", waiting, "--status", "answered"]),
+    ) as Requests;
+    assert.deepEqual(
+      partial.requests.map((request) => [request.id, request.answer]),
+      [[decision.id, "EU"]],
+    );
+    await gm(["issue", "resume", waiting], "marco", directory, /request|waiting|answer/i, {
+      GM_TOKEN: token.secret,
+    });
+    await gm(["request", "answer", question.id, "--answer", "DNS enabled", "--owner", owner]);
+    const resolved = JSON.parse(
+      await run(["request", "list", "--issue", waiting, "--status", "all"]),
+    ) as Requests;
+    assert.equal(resolved.requests.length, 2);
+    assert(resolved.requests.every((request) => request.status === "answered"));
+    assert.equal(
+      resolved.requests.find((request) => request.id === question.id)?.answer,
+      "DNS enabled",
+    );
+    assert.equal(
+      (
+        JSON.parse(
+          await run(["request", "list", "--issue", independent, "--status", "all"]),
+        ) as Requests
+      ).requests.length,
+      0,
+    );
+    const resumed = JSON.parse(await run(["issue", "resume", waiting])) as {
+      results: { leaseToken: string }[];
+    };
+    secrets.add(resumed.results[0]!.leaseToken);
+    await run([
+      "issue",
+      "complete",
+      waiting,
+      "--evidence",
+      "Read both owner answers and resumed the parked lease.",
+    ]);
+    await run(["agent", "setup", "--no-identity", "--intervention", "harness"]);
+    const last = JSON.parse(await run(["issue", "next"])) as Pick;
+    assert.equal(last.claimed?.issueId, dependent);
+    assert.equal(last.intervention.mode, "harness");
+    secrets.add(last.claimed!.leaseToken);
+    await run([
+      "issue",
+      "complete",
+      dependent,
+      "--evidence",
+      "Dependency became ready after its prerequisite completed.",
+    ]);
+    await gm(["agent", "revoke", agent.id]);
+    record({
+      accountableHuman: "acc_marco",
+      independentWorkContinued: true,
+      partialAnswerKeptLeaseParked: true,
+      answersReadableByIssue: true,
+      resumedAfterAllAnswers: true,
+      dependentWorkStayedBlocked: true,
+      harnessOverrideApplied: true,
+    });
+  });
+
   await scenario("tracker-handoff-to-an-agent-created-after-sync", async () => {
     // marco's replica predates this agent: the handoff must still find it by name.
     const owner = fixtures.tracker.owner;

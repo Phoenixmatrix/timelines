@@ -1363,12 +1363,21 @@ pub fn request(ctx: &Ctx, args: &RequestArgs) -> Result<Shown> {
                 .ok_or_else(|| GmError::usage(format!("No request {id}; see `gm request list`.")))
         };
         let mutation = match &args.command {
-            RequestCommand::List => {
-                let mut open: Vec<Value> = snapshot["requests"]
+            RequestCommand::List { status, issue } => {
+                let issue_id = issue
+                    .as_deref()
+                    .map(|key| id(&snapshot, "issues", key))
+                    .transpose()?;
+                let mut requests: Vec<Value> = snapshot["requests"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|q| q["status"] == "open")
+                    .filter(|q| status == "all" || q["status"] == status.as_str())
+                    .filter(|q| {
+                        issue_id
+                            .as_ref()
+                            .is_none_or(|id| q["issueId"] == id.as_str())
+                    })
                     .map(|q| {
                         let mut q = q.clone();
                         let issue = find_issue(&snapshot, &q["issueId"]);
@@ -1391,9 +1400,9 @@ pub fn request(ctx: &Ctx, args: &RequestArgs) -> Result<Shown> {
                         q
                     })
                     .collect();
-                open.sort_by_key(|q| q["routeTo"] != me.as_str());
+                requests.sort_by_key(|q| q["routeTo"] != me.as_str());
                 return Ok(Shown(
-                    json!({"requests":open,"next":"Answer with `gm request answer ID`."}),
+                    json!({"requests":requests,"next":"People answer open requests with `gm request answer ID`. Inspect all requests for parked work with `gm request list --issue ISSUE --status all`, then `gm issue resume ISSUE` once none remain open."}),
                 ));
             }
             RequestCommand::Cancel { id } => {
@@ -2217,6 +2226,10 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             if let IssueCommand::Next { .. } = args.command {
                 let mut shown = next_result(&snapshot, &response);
+                shown.0["intervention"] = json!({
+                    "mode": defaults.intervention,
+                    "guidance": defaults.intervention.guidance(),
+                });
                 if let Some(team) = picked {
                     shown.0["team"] = team;
                 }
@@ -2226,6 +2239,17 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 && let Some(issue) = claimed_issue(&snapshot, &response, &target)
             {
                 response["timelineRule"] = timeline_guidance(&issue);
+            }
+            if matches!(
+                args.command,
+                IssueCommand::Claim { .. }
+                    | IssueCommand::Resume { .. }
+                    | IssueCommand::Accept { .. }
+            ) {
+                response["intervention"] = json!({
+                    "mode": defaults.intervention,
+                    "guidance": defaults.intervention.guidance(),
+                });
             }
             if !matches!(
                 args.command,
@@ -2861,6 +2885,7 @@ mod tests {
             },
             team_from: from,
             ttl: 900,
+            intervention: crate::profile::InterventionMode::Harness,
         };
         let mine = Some("CORE".to_owned());
         let pick =

@@ -25,8 +25,14 @@ pub struct RequestArgs {
 }
 #[derive(Subcommand)]
 pub enum RequestCommand {
-    /// Open requests to people in this tracker: yours first.
-    List,
+    /// Requests to people in this tracker: yours first. Include answers to resume parked work.
+    List {
+        #[arg(long, default_value="open", value_parser=["open","answered","canceled","all"])]
+        status: String,
+        /// Limit requests to an issue's canonical ID or key.
+        #[arg(long)]
+        issue: Option<String>,
+    },
     /// Answer a request: --answer for a question, --choice for a decision, --approve/--reject; a credential asks for its value (hidden) and stores it as its secret.
     Answer {
         id: String,

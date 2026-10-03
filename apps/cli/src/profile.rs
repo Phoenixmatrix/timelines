@@ -22,6 +22,75 @@ pub const LOCAL_FILE: &str = ".gitmatrix/agent.local.yml";
 pub const GRAPH_SKILL: &str = "gitmatrix-graph-work";
 pub const DEFAULT_TTL: u32 = 900;
 
+/// How gm guides an agent when work needs a human. Existing/unconfigured
+/// checkouts retain their harness's behavior; new setups opt into autonomy.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InterventionMode {
+    Autonomous,
+    #[default]
+    Harness,
+}
+
+impl std::str::FromStr for InterventionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "autonomous" => Ok(Self::Autonomous),
+            "harness" => Ok(Self::Harness),
+            other => Err(format!("{other} isn't one of autonomous, harness")),
+        }
+    }
+}
+
+impl std::fmt::Display for InterventionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Autonomous => "autonomous",
+            Self::Harness => "harness",
+        })
+    }
+}
+
+impl InterventionMode {
+    pub fn guidance(self) -> &'static str {
+        match self {
+            Self::Autonomous => concat!(
+                "Minimize interactive prompts. Resolve questions from available code, docs and issue context first; ",
+                "make safe, reversible decisions within the user's authorization. If human input is necessary, ",
+                "checkpoint what you tried and open a durable request on the issue with `gm issue ask`, ",
+                "rather than stopping the whole session for a chat reply. Use `--kind decision` with repeated ",
+                "`--choice` options for multiple choice, `--kind question` for an answer or blocker, ",
+                "`--kind approval` for permission, or `--kind credential --secret owner/repo:NAME` for a secret. ",
+                "Include the blocker, its impact, options/tradeoffs and the specific action needed; never include secrets. ",
+                "Check existing requests to avoid duplicate asks. Link dependency blockers with `gm issue link BLOCKER ISSUE`; ",
+                "a link alone does not request human action. Requests go to your accountable person's Needs you panel ",
+                "and park your held lease. Do not release that parked claim. Continue independent work only within ",
+                "the user's requested scope; do not widen it. At the next work boundary or later invocation, ",
+                "check `gm request list --status answered`; inspect all requests with ",
+                "`gm request list --issue ISSUE --status all` and `gm issue resume ISSUE` ",
+                "when all its requests are resolved. If nothing authorized is actionable, checkpoint and stop cleanly; ",
+                "do not busy-poll or repeatedly prompt. This mode never grants permissions or bypasses required approvals."
+            ),
+            Self::Harness => concat!(
+                "Use the agent or harness's normal human-intervention behavior, including its own interactive prompts ",
+                "or software-factory workflow. gm does not require asynchronous requests or continuing other work. ",
+                "Durable `gm issue ask` requests remain available when that workflow chooses them; they appear in the ",
+                "accountable person's Needs you panel and park a held lease until the requests are resolved. ",
+                "This setting never grants permissions or bypasses required approvals."
+            ),
+        }
+    }
+}
+
+pub fn intervention(project: &Project, local: &Local) -> InterventionMode {
+    local
+        .intervention
+        .or(project.intervention)
+        .unwrap_or_default()
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
@@ -59,6 +128,9 @@ pub struct Project {
     /// Seconds a lease lasts before it must be renewed (30 to 86400).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
+    /// Default human-intervention behavior; a checkout may override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervention: Option<InterventionMode>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub instructions: Instructions,
 }
@@ -145,6 +217,8 @@ pub struct Local {
     pub skills: SkillPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervention: Option<InterventionMode>,
     /// The timeline this checkout works in (`gm timeline use`): pushes go to
     /// its bookmark `timeline/<slug>`, never to trunk. Worktrees inherit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,6 +415,7 @@ pub struct Defaults {
     /// The file `scope.team` came from: [`LOCAL_FILE`] or [`PROJECT_FILE`].
     pub team_from: Option<&'static str>,
     pub ttl: u32,
+    pub intervention: InterventionMode,
 }
 
 pub fn defaults() -> Defaults {
@@ -372,6 +447,7 @@ fn resolve(project: &Project, local: &Local) -> Defaults {
             workspace: pick(&local.scope.workspace, &project.tracker.workspace),
         },
         ttl: local.ttl.or(project.ttl).unwrap_or(DEFAULT_TTL),
+        intervention: intervention(project, local),
     }
 }
 
@@ -411,6 +487,29 @@ mod tests {
         assert!(serde_yaml_ng::from_str::<Project>("tracker:\n  teem: CORE\n").is_err());
         let text = serde_yaml_ng::to_string(&local).unwrap();
         assert_eq!(serde_yaml_ng::from_str::<Local>(&text).unwrap(), local);
+    }
+
+    #[test]
+    fn intervention_overrides_do_not_change_other_checkouts() {
+        let project: Project = serde_yaml_ng::from_str("intervention: autonomous\n").unwrap();
+        let local: Local = serde_yaml_ng::from_str("intervention: harness\n").unwrap();
+        assert_eq!(
+            resolve(&project, &local).intervention,
+            InterventionMode::Harness
+        );
+        assert_eq!(
+            resolve(&project, &Local::default()).intervention,
+            InterventionMode::Autonomous
+        );
+        assert_eq!(
+            resolve(&Project::default(), &Local::default()).intervention,
+            InterventionMode::Harness
+        );
+        let text = serde_yaml_ng::to_string(&local).unwrap();
+        assert_eq!(serde_yaml_ng::from_str::<Local>(&text).unwrap(), local);
+        assert!(serde_yaml_ng::from_str::<Project>("intervention: interactive\n").is_err());
+        assert!(serde_yaml_ng::from_str::<Local>("intervention: unattended\n").is_err());
+        assert!("interactive".parse::<InterventionMode>().is_err());
     }
 
     #[test]

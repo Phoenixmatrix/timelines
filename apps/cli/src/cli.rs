@@ -762,6 +762,9 @@ pub enum AgentCommand {
         /// Lease seconds
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,
+        /// Human intervention: autonomous records requests and continues scoped work; harness keeps its own behavior. New projects default to autonomous; existing projects save an override for this checkout.
+        #[arg(long)]
+        intervention: Option<crate::profile::InterventionMode>,
         /// Only write the files; don't create the agent, keep a token or publish its profile
         #[arg(long)]
         no_identity: bool,

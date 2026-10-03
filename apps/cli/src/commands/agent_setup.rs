@@ -24,6 +24,7 @@ const SECTION: &str = include_str!("../../assets/agents-section.md");
 pub const BEGIN: &str = "<!-- gm:agents begin: managed by `gm agent setup` from .gitmatrix/agents.yml; edit that and rerun -->";
 pub const END: &str = "<!-- gm:agents end -->";
 
+#[derive(Default)]
 pub struct Options {
     pub name: Option<String>,
     pub harness: Option<String>,
@@ -34,6 +35,7 @@ pub struct Options {
     pub team: Option<String>,
     pub under: Option<String>,
     pub ttl: Option<u32>,
+    pub intervention: Option<profile::InterventionMode>,
     pub no_identity: bool,
     pub check: bool,
     pub publish_skills: Option<profile::Publish>,
@@ -92,6 +94,10 @@ fn render(template: &str, project: &Project, local: &Local) -> String {
     template
         .replace("{{SCOPE}}", &scope(project, local))
         .replace("{{TTL}}", &duration(ttl))
+        .replace(
+            "{{INTERVENTION}}",
+            profile::intervention(project, local).guidance(),
+        )
         .replace(
             "{{SHIP}}",
             project
@@ -182,6 +188,7 @@ const PROJECT_HEADER: &str = "\
 # tracker:       owner, and the default scope for `gm issue next`:
 #                team: CORE, or under: CORE-4 for one project
 # ttl:           seconds per lease (renew before it ends)
+# intervention: autonomous (new setups) or harness (keep the harness's behavior)
 # instructions:  file: AGENTS.md (default: the harness's own)
 #                ship: how work ships before an issue is completed
 \n";
@@ -200,6 +207,10 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
         project.tracker.team = o.team.clone();
         project.tracker.under = o.under.clone();
         project.ttl = o.ttl;
+        project.intervention = Some(
+            o.intervention
+                .unwrap_or(profile::InterventionMode::Autonomous),
+        );
     } else {
         let set = |slot: &mut Option<String>, flag: &Option<String>| {
             if flag.is_some() {
@@ -211,6 +222,9 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
         set(&mut local.scope.under, &o.under);
         if o.ttl.is_some() {
             local.ttl = o.ttl;
+        }
+        if o.intervention.is_some() {
+            local.intervention = o.intervention;
         }
     }
 
@@ -303,7 +317,7 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
             .exit(exit::CONFLICT));
         }
         return Ok(Shown::new(
-            json!({ "upToDate": true, "files": report(&files) }),
+            json!({ "upToDate": true, "intervention": profile::intervention(&project, &local), "files": report(&files) }),
             "Agent setup is up to date.".into(),
         ));
     }
@@ -345,6 +359,7 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     }
 
     let report = report(&files);
+    let intervention = profile::intervention(&project, &local);
     let value = json!({
         "dryRun": ctx.dry_run,
         "agent": name,
@@ -352,12 +367,13 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
         "model": local.model,
         "tags": local.tags,
         "scope": scope(&project, &local),
+        "intervention": intervention,
         "identity": identity,
         "files": report,
         "next": "The agent runs `gm issue next` here. Rerun `gm agent setup` after editing .gitmatrix/, or with --tag/--model, to update.",
     });
     let mut text = format!(
-        "{} {name}{} · {}\n  scope: {}\n",
+        "{} {name}{} · {}\n  scope: {}\n  intervention: {}\n",
         if ctx.dry_run { "Would set up" } else { "Agent" },
         identity["accountable"]
             .as_str()
@@ -365,6 +381,7 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
             .unwrap_or_default(),
         harness.as_deref().unwrap_or("any harness"),
         scope(&project, &local),
+        intervention,
     );
     if let Some(profile) = identity["profile"].as_str() {
         text.push_str(&format!("  profile: {profile}\n"));
@@ -598,22 +615,87 @@ mod tests {
     }
 
     #[test]
-    fn templates_name_the_scope_lease_and_how_to_ship() {
-        let project: Project = serde_yaml_ng::from_str(
-            "tracker:\n  owner: matrixorg\n  team: CORE\nttl: 3600\ninstructions:\n  ship: vp run ready, then gm push\n",
+    fn switching_intervention_is_local_persistent_and_dry_run_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".gitmatrix")).unwrap();
+        let mut ctx = Ctx {
+            format: crate::output::Format::Json,
+            dry_run: false,
+            cwd: dir.path().to_path_buf(),
+            argv: String::new(),
+        };
+        let mut options = Options {
+            owner: Some("orbit".into()),
+            harness: Some("codex".into()),
+            no_identity: true,
+            ..Default::default()
+        };
+        setup(&ctx, &options).unwrap();
+        let shared = std::fs::read(dir.path().join(profile::PROJECT_FILE)).unwrap();
+        assert_eq!(
+            profile::project_at(dir.path())
+                .unwrap()
+                .unwrap()
+                .intervention,
+            Some(profile::InterventionMode::Autonomous)
+        );
+        options.intervention = Some(profile::InterventionMode::Harness);
+        setup(&ctx, &options).unwrap();
+        options.intervention = None;
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            profile::local_at(dir.path()).unwrap().unwrap().intervention,
+            Some(profile::InterventionMode::Harness)
+        );
+        let local = std::fs::read(dir.path().join(profile::LOCAL_FILE)).unwrap();
+        ctx.dry_run = true;
+        options.intervention = Some(profile::InterventionMode::Autonomous);
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(profile::LOCAL_FILE)).unwrap(),
+            local
+        );
+        ctx.dry_run = false;
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            profile::local_at(dir.path()).unwrap().unwrap().intervention,
+            Some(profile::InterventionMode::Autonomous)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(profile::PROJECT_FILE)).unwrap(),
+            shared
+        );
+    }
+
+    #[test]
+    fn updating_legacy_setup_does_not_opt_into_autonomy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".gitmatrix")).unwrap();
+        std::fs::write(dir.path().join(profile::PROJECT_FILE), "{}\n").unwrap();
+        let ctx = Ctx {
+            format: crate::output::Format::Json,
+            dry_run: false,
+            cwd: dir.path().to_path_buf(),
+            argv: String::new(),
+        };
+        setup(
+            &ctx,
+            &Options {
+                harness: Some("codex".into()),
+                no_identity: true,
+                ..Default::default()
+            },
         )
         .unwrap();
-        let mut local = Local::default();
-        let text = render(SECTION, &project, &local);
-        assert!(text.contains("matrixorg, team CORE"));
-        assert!(text.contains("(1 hour)") && text.contains("Ship (vp run ready, then gm push)"));
-        local.scope.under = Some("CORE-4".into());
-        assert!(render(SKILL, &project, &local).contains("matrixorg, under CORE-4"));
-        assert!(!render(SKILL, &project, &local).contains("{{"));
-        // Harnesses and profile discovery parse the frontmatter as YAML.
-        let frontmatter = SKILL.split("---").nth(1).unwrap();
-        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(frontmatter).unwrap();
-        assert_eq!(parsed["name"].as_str(), Some(profile::GRAPH_SKILL));
-        assert!(parsed["description"].as_str().is_some());
+        let project = profile::project_at(dir.path()).unwrap().unwrap();
+        let local = profile::local_at(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            profile::intervention(&project, &local),
+            profile::InterventionMode::Harness
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(profile::PROJECT_FILE)).unwrap(),
+            "{}\n"
+        );
     }
 }

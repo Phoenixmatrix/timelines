@@ -346,6 +346,8 @@ with nothing but `gm issue next`. Run it in the repository, and again to update:
 ```bash
 gm agent setup                                   # detect the harness; do everything
 gm agent setup --model MODEL --tag rust --under ENG-4
+gm agent setup --intervention autonomous          # durable requests; continue authorized work
+gm agent setup --intervention harness             # retain the harness/factory's own behavior
 gm agent setup --check                           # exit 4 if instructions or skills are stale
 ```
 
@@ -354,9 +356,10 @@ gm agent setup --check                           # exit 4 if instructions or ski
   `gitmatrix-graph-work` skill where the harness loads skills (`.agents/skills`,
   plus `.claude/skills` for Claude Code). Text outside the markers is untouched.
 - **Configuration.** `.gitmatrix/agents.yml` is shared and committed: tracker
-  `owner`, default scope (`team` or `under`), lease `ttl`, and `instructions`
-  (`file`, and how work `ship`s). `.gitmatrix/agent.local.yml` (git-ignored) is
-  this checkout's agent: name, harness, model, tags and scope overrides.
+  `owner`, default scope (`team` or `under`), lease `ttl`, human `intervention`
+  mode, and `instructions` (`file`, and how work `ship`s).
+  `.gitmatrix/agent.local.yml` (git-ignored) is this checkout's agent: name,
+  harness, model, tags, scope and intervention overrides.
 - **Identity and profile.** As you, it creates the agent (default name: the
   harness), mints a token and keeps it with gm's credentials without printing
   it, and publishes the agent's capability profile (below) with this checkout's
@@ -372,6 +375,61 @@ gm agent setup --check                           # exit 4 if instructions or ski
   for `--offline`. Each reports the team it used and why (`team.source`:
   `flag`, `checkout`, `project`, `default`, `scope` or `none`); `--all-teams`
   ignores every default. `gm tracker status` shows `defaultTeam`.
+
+### Autonomous human interventions
+
+`gm agent setup --intervention autonomous` teaches the agent to minimize
+interactive interruptions: investigate first, make safe decisions within its
+authorization, and record unavoidable questions or blockers on the issue.
+`--intervention harness` leaves prompting and scheduling to the agent, harness
+or software factory; durable requests remain available without being mandated.
+These modes guide the agent; they do not grant permissions, bypass approvals,
+keep a harness running, or automatically restart one after an answer.
+
+New project setup defaults to `autonomous`. Existing projects with no
+`intervention` setting retain `harness` behavior. On a new project the flag seeds
+the shared `.gitmatrix/agents.yml`; on an existing project it saves an override in
+`.gitmatrix/agent.local.yml`, without changing other checkouts. Edit the shared
+`intervention: autonomous` or `intervention: harness` to choose a repository
+default, or remove the local override to inherit it. Rerun setup after editing
+either file. `--dry-run` previews the effective mode without persisting it.
+
+Setup refreshes the managed instructions and graph-work skill. `gm issue claim`,
+`next`, `resume` and `accept` also return the current
+`intervention: {mode, guidance}`, so an agent receives the effective policy when
+taking work even if its generated instructions are stale.
+
+```bash
+gm issue checkpoint ENG-3 'Checked requirements; need the owner to choose a region.'
+gm issue ask ENG-3 --kind decision \
+  --prompt 'EU meets latency requirements; US costs less. Recommend EU.' \
+  --choice EU --choice US
+gm issue ask ENG-3 --kind question \
+  --prompt 'Blocked by external DNS ownership. Please confirm the required record is enabled.'
+gm request list --issue ENG-3 --status all        # avoid duplicate asks; read answers
+gm request list --status answered                # discover resolved questions
+gm issue resume ENG-3                            # only once no requests remain open
+```
+
+Prompts should include what was tried, the blocker and impact, alternatives
+with tradeoffs, a recommendation, and the specific human action needed.
+Registered agents' requests appear in their accountable person's **Needs you**
+panel by default; `--route-to MEMBER` deliberately routes elsewhere. Use
+`--kind approval` for permission and `--kind credential --secret owner/repo:NAME`
+for secrets; never put credential values in a prompt or answer.
+
+The request parks a held lease without releasing it or requiring renewal.
+Continue independent work only within the user's requested scope; leave
+dependent issues blocked. At work boundaries or on the next invocation,
+inspect all requests for the issue before resuming: one answered request does
+not resolve another open one. If nothing authorized is actionable, checkpoint
+and stop cleanly rather than polling or repeatedly prompting.
+
+`gm issue link BLOCKER ISSUE` records a dependency, but a link alone does not
+request human intervention. When resolving that blocker needs a person, add
+an actionable request on the blocked issue. `gm request list` still defaults to
+open requests; `--status answered|canceled|all` includes resolved requests, and
+`--issue KEY_OR_ID` narrows any status to one issue.
 
 ### Agent capability profiles
 

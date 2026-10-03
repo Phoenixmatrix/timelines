@@ -129,10 +129,22 @@ Work is tracked in Gitmatrix: matrixorg, team CORE. The loop, in brief (the
 3. Work it: `gm issue checkpoint <issue> '<done; next>'` as you go, and
    `gm issue renew <issue>` before the lease (1 hour) ends.
 4. Need to find something out (where code lives, why CI failed, what an issue
-   depends on)? `gm ask "<question>"` asks the Gitmatrix assistant. Blocked on
-   a person? `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`.
-5. Ship (`vp run ready`, then `gm push && gm runs wait`), then `gm issue complete <issue> --evidence '…'`. Can't
-   finish: `gm issue release <issue>`.
+   depends on)? `gm ask "<question>"` asks the Gitmatrix assistant. For human
+   input, follow the current claim's `intervention` mode and guidance below.
+5. Ship (`vp run ready`, then `gm push && gm runs wait`), then `gm issue complete <issue> --evidence '…'`.
+   Abandoning active work? `gm issue release <issue>`. Keep parked request leases.
+
+## Human intervention
+
+`gm issue next` and `gm issue claim` return the effective `intervention` mode
+and guidance for this checkout. Follow that current policy if configuration
+has changed since these instructions were generated. At setup:
+
+Use the agent or harness's normal human-intervention behavior, including its own interactive prompts or software-factory workflow. gm does not require asynchronous requests or continuing other work. Durable `gm issue ask` requests remain available when that workflow chooses them; they appear in the accountable person's Needs you panel and park a held lease until the requests are resolved. This setting never grants permissions or bypasses required approvals.
+
+Choose with `gm agent setup --intervention autonomous|harness`. The repository's
+`intervention` default lives in `.gitmatrix/agents.yml`; existing repositories
+save the flag as this checkout's override in `.gitmatrix/agent.local.yml`.
 
 When the issue or a person asks for a timeline (a separate line of work that
 lands on main later), `gm timeline start <slug>` or `gm timeline use <slug>`

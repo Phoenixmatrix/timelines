@@ -39,16 +39,54 @@ record yours with `gm agent configure --model <model-id>`.
    links; follow up with `--chat <id>`. It's read-only unless `--write`.
 5. **Checkpoint** as you go: `gm issue checkpoint <issue> '<done; next>'`. The
    next agent (or you, after a restart) resumes from these.
-6. **Ask a person** when you need a decision, an approval, a credential or an
-   answer you can't find: `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`.
-   That parks your lease so you can exit. Never put a secret in a prompt; ask
-   for a credential with `--secret owner/repo:NAME` and read it from that secret.
-   When `gm request list` shows it answered, `gm issue resume <issue>`.
+6. **Handle human input** using the current claim's `intervention` policy (below).
+   When using durable requests, `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`
+   parks your lease. Never put a secret in a prompt; use a credential request
+   with `--secret owner/repo:NAME`. Read the responses with
+   `gm request list --issue <issue> --status all`; once all are resolved,
+   `gm issue resume <issue>` takes the lease back up.
 7. **Finish** with evidence a reviewer can check: ship first (`vp run ready`, then `gm push && gm runs wait`), then
    `gm issue complete <issue> --evidence 'Shipped in <commit>, CI run #N green; tests: …'`.
-   Complete only what is shipped and verified. If you can't finish,
+   Complete only what is shipped and verified. If abandoning active work,
    `gm issue release <issue>`: after the team's limit of releases, the issue asks
-   your person what to try next.
+   your person what to try next. Do not release a lease parked on a human request.
+
+## Human intervention
+
+The claim response (`gm issue next`, `claim`, `resume` or `accept`) includes
+`intervention: {mode, guidance}` from this checkout's current configuration.
+Follow that current policy if these generated instructions are stale. At setup:
+
+Use the agent or harness's normal human-intervention behavior, including its own interactive prompts or software-factory workflow. gm does not require asynchronous requests or continuing other work. Durable `gm issue ask` requests remain available when that workflow chooses them; they appear in the accountable person's Needs you panel and park a held lease until the requests are resolved. This setting never grants permissions or bypasses required approvals.
+
+Use `gm agent setup --intervention autonomous` for unattended issue chains, or
+`--intervention harness` to retain the harness or software factory's own behavior.
+New projects start autonomous; existing projects without a setting retain harness
+behavior. `.gitmatrix/agents.yml` sets the repository default; an
+`intervention` in `.gitmatrix/agent.local.yml` overrides it for this checkout.
+Rerun setup after editing either file.
+
+### Durable questions and blockers
+
+First read existing requests (`gm request list --issue <issue> --status all`)
+and issue context. Do not duplicate an unresolved ask. Keep prompts actionable:
+what you tried, the blocker and impact, alternatives with tradeoffs, your
+recommendation, and exactly what the person must answer or do.
+
+    gm issue ask CORE-5 --kind decision --prompt 'Which deployment region? EU meets the latency requirement; US is cheaper. Recommend EU.' --choice EU --choice US
+    gm issue ask CORE-5 --kind question --prompt 'Deployment is blocked by the expired signing credential. Please rotate it in the secret store; no secret values belong here.'
+    gm issue link CORE-2 CORE-5
+
+The last command records that CORE-2 blocks CORE-5; a dependency link alone
+does not appear in Needs you. If resolving that blocker needs a person, open
+a request on CORE-5 describing the required action. Requests route to your
+accountable human by default (`--route-to <member>` deliberately routes elsewhere).
+Parked claims remain yours without renewal while waiting. Continue only
+independent, explicitly authorized work; an issue waiting on this one is not ready.
+Check answers at work boundaries or on the next invocation, not in a polling loop.
+`gm request list --status answered` discovers answers; read all requests for the
+issue before resuming because another request may still be open. A returned
+`claimed: null` is a clean stop, not an instruction to retry or widen scope.
 
 ## Timeline or main
 
