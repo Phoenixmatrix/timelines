@@ -974,16 +974,27 @@ const visibleAs = (alias: string) =>
 /** The repository root every top-level region hangs from. */
 export const ROOT = "repo";
 
-/** Primary (deduplicated) files of a top-level region: a component's, or the unclassified group's members. */
+/**
+ * Primary (deduplicated) files of a top-level region: a capability's or
+ * component's `counts.files`, or the unclassified group's members (its
+ * members are files). Other structural groups hold no files directly.
+ */
 const PRIMARY_FILES = `coalesce(json_extract(data, '$.counts.files'), CASE WHEN entity_id = '${GROUPS.unclassified}' THEN json_extract(data, '$.members') END, 0)`;
-const MEMBERS = `coalesce(json_extract(data, '$.members'), json_extract(data, '$.counts.files'), 0)`;
+/**
+ * Direct members: a group's members, a capability's areas when it has them
+ * (its files then sit under the areas), else its files.
+ */
+const MEMBERS = `coalesce(json_extract(data, '$.members'), nullif(json_extract(data, '$.counts.areas'), 0), json_extract(data, '$.counts.files'), 0)`;
+/** Semantic regions (capabilities, or components before grouping) first, structural groups after. */
+const TIER = `CASE WHEN kind = 'group' OR json_extract(data, '$.structural') = 1 THEN 1 ELSE 0 END`;
 
-/** Where a ranked top-level page stopped: [files, members, sort_key]. */
-export type RegionKey = [number, number, string];
+/** Where a ranked top-level page stopped: [tier, files, members, sort_key]. */
+export type RegionKey = [number, number, number, string];
 
 /**
- * A page of the root's children (components and structural groups), largest
- * first: by primary files, then direct members, then name.
+ * A page of the root's children, ranked: semantic regions (capabilities, or
+ * components in an ungrouped projection) before structural groups, each by
+ * primary files, then direct members, then name.
  */
 export async function regionsAt(
   d1: D1Database,
@@ -996,25 +1007,26 @@ export async function regionsAt(
   next: RegionKey | null;
 }> {
   const keyset = after
-    ? "AND (files < ? OR (files = ? AND (members < ? OR (members = ? AND sort_key > ?))))"
+    ? `AND (tier > ? OR (tier = ? AND (files < ? OR (files = ? AND
+         (members < ? OR (members = ? AND sort_key > ?))))))`
     : "";
   const rows = await d1
     .prepare(
       `SELECT * FROM (
-         SELECT ${ENTITY_COLUMNS}, sort_key, ${PRIMARY_FILES} AS files, ${MEMBERS} AS members
+         SELECT ${ENTITY_COLUMNS}, sort_key, ${TIER} AS tier, ${PRIMARY_FILES} AS files, ${MEMBERS} AS members
          FROM atlas_entities WHERE scope = ? AND parent_id = ? AND ${VISIBLE}
        ) WHERE true ${keyset}
-       ORDER BY files DESC, members DESC, sort_key LIMIT ?`,
+       ORDER BY tier, files DESC, members DESC, sort_key LIMIT ?`,
     )
     .bind(
       scope,
       ROOT,
       seq,
       seq,
-      ...(after ? [after[0], after[0], after[1], after[1], after[2]] : []),
+      ...(after ? [after[0], after[0], after[1], after[1], after[2], after[2], after[3]] : []),
       limit + 1,
     )
-    .all<EntityRow & { sort_key: string; files: number; members: number }>();
+    .all<EntityRow & { sort_key: string; tier: number; files: number; members: number }>();
   const page = rows.results.slice(0, limit);
   const last = page.at(-1);
   return {
@@ -1025,7 +1037,7 @@ export async function regionsAt(
     })),
     next:
       rows.results.length > limit && last
-        ? [Number(last.files), Number(last.members), last.sort_key]
+        ? [Number(last.tier), Number(last.files), Number(last.members), last.sort_key]
         : null,
   };
 }
@@ -1174,13 +1186,21 @@ export async function relationsAt(
 }
 
 /**
- * Files backing an entity in snapshot `seq`, by file id: its member files, the
- * files it contains, and the files that mention or import it. Each file once.
+ * Files backing an entity in snapshot `seq`, by file id: its member files
+ * (a capability's include its areas' files), the files it contains, and the
+ * files that mention or import it. Each file once.
  */
 function evidenceSource(): string {
   return `SELECT entity_id AS id, 'member' AS via FROM atlas_entities
             WHERE scope = ?1 AND parent_id = ?2 AND kind = 'file' AND entity_id > ?4
               AND from_seq <= ?3 AND (to_seq IS NULL OR to_seq > ?3)
+          UNION ALL
+          SELECT f.entity_id, 'member' FROM atlas_entities a
+            JOIN atlas_entities f ON f.scope = a.scope AND f.parent_id = a.entity_id
+              AND f.kind = 'file' AND f.entity_id > ?4
+              AND f.from_seq <= ?3 AND (f.to_seq IS NULL OR f.to_seq > ?3)
+            WHERE a.scope = ?1 AND a.parent_id = ?2 AND a.kind = 'area'
+              AND a.from_seq <= ?3 AND (a.to_seq IS NULL OR a.to_seq > ?3)
           UNION ALL
           SELECT dst, kind FROM atlas_edges
             WHERE scope = ?1 AND src = ?2 AND kind = 'contains' AND dst > ?4

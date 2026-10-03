@@ -1259,7 +1259,11 @@ snapshots (`worker/atlas/projection.ts`) are bounded by `ATLAS_RETENTION`:
 reason, current}` or `{state: "unknown"}`; an expired snapshot is never
   served from current silently. Cursors expire **30 minutes** after issue or at
   their snapshot's expiry, whichever is first (`CURSOR_TTL_MS`,
-  `cursorExpiresAt`), and never hold off eviction.
+  `cursorExpiresAt`), and never hold off eviction. The Atlas read API
+  (`worker/atlas/api.ts`, `/api/repos/:owner/:name/atlas`) resolves every pinned
+  request and every cursor page this way before reading a row (410
+  `snapshot_expired` naming `current`), its cursors carry their issue time, and
+  its overview reports `capacityFailure` so the UI can show a stale snapshot.
 
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index

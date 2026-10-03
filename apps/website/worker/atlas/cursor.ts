@@ -4,7 +4,11 @@
 // A cursor is `<payload>.<mac>`, both base64url. The payload holds only what
 // the next page needs: the pinned snapshot, the keyset position, how many
 // records were loaded and the total counted on the first page, and when the
-// cursor expires. The MAC covers the payload *and* a binding the server
+// cursor was issued. Its expiry isn't stored: the route works it out on every
+// page with retention's `cursorExpiresAt(issuedAt, snapshot.expiresAt)`
+// (worker/atlas/retention.ts) against the snapshot as it is *now*, so a
+// cursor issued while its snapshot was current stops with that snapshot's
+// later expiry too. The MAC covers the payload *and* a binding the server
 // rebuilds from each request (route, scope, filters, principal), so a cursor
 // presented under another route, scope, filter or user fails verification
 // without the payload ever having to name them. Nothing in a cursor is trusted
@@ -17,16 +21,8 @@
 
 import { readSecret } from "../../registry/core/secrets.ts";
 
-/** Cursors expire 30 minutes after issue, or with their snapshot if sooner (PRD retention). */
-export const CURSOR_TTL_MS = 30 * 60 * 1000;
-
-/** When a cursor issued now for a snapshot expiring at `snapshotExpiresAt` stops working. */
-export function cursorExpiresAt(now: number, snapshotExpiresAt: string | null): number {
-  const ttl = now + CURSOR_TTL_MS;
-  if (!snapshotExpiresAt) return ttl;
-  const snapshot = Date.parse(snapshotExpiresAt);
-  return Number.isFinite(snapshot) ? Math.min(ttl, snapshot) : ttl;
-}
+/** Payload format; v1 cursors (which stored their expiry) no longer verify. */
+const VERSION = 2;
 
 export interface CursorState<K> {
   /** Snapshot id the traversal is pinned to. */
@@ -37,8 +33,8 @@ export interface CursorState<K> {
   loaded: number;
   /** Total counted on the first page (the snapshot is immutable, so it holds). */
   total: number | null;
-  /** Expiry, ms since the epoch. */
-  expires: number;
+  /** When the first page issued it, ms since the epoch: see retention's cursorExpiresAt. */
+  issuedAt: number;
 }
 
 /** What a cursor is bound to: rebuilt from each request, never read from the cursor. */
@@ -51,9 +47,7 @@ export interface CursorBinding {
   principal: string;
 }
 
-export type CursorResult<K> =
-  | { ok: true; state: CursorState<K> }
-  | { ok: false; reason: "invalid" | "expired" };
+export type CursorResult<K> = { ok: true; state: CursorState<K> } | { ok: false };
 
 const encoder = new TextEncoder();
 const keys = new Map<string, Promise<CryptoKey>>();
@@ -128,7 +122,14 @@ export async function signCursor<K>(
 ): Promise<string> {
   const payload = toBase64Url(
     encoder.encode(
-      JSON.stringify([1, state.snapshot, state.after, state.loaded, state.total, state.expires]),
+      JSON.stringify([
+        VERSION,
+        state.snapshot,
+        state.after,
+        state.loaded,
+        state.total,
+        state.issuedAt,
+      ]),
     ),
   );
   const mac = await crypto.subtle.sign(
@@ -140,37 +141,36 @@ export async function signCursor<K>(
 }
 
 /**
- * Check a cursor against the request it arrived with. Forged, tampered or
- * rebound cursors are "invalid"; authentic ones past their time "expired".
+ * Check a cursor against the request it arrived with: forged, tampered,
+ * outdated or rebound cursors fail. Whether an authentic one has expired is
+ * the caller's question, once it has resolved the cursor's snapshot.
  */
 export async function verifyCursor<K>(
   secret: string,
   binding: CursorBinding,
   cursor: string,
-  now: number,
 ): Promise<CursorResult<K>> {
-  if (cursor.length > 4096) return { ok: false, reason: "invalid" };
+  if (cursor.length > 4096) return { ok: false };
   const [payload, mac, extra] = cursor.split(".");
-  if (!payload || !mac || extra !== undefined) return { ok: false, reason: "invalid" };
+  if (!payload || !mac || extra !== undefined) return { ok: false };
   const macBytes = fromBase64Url(mac);
   const payloadBytes = fromBase64Url(payload);
-  if (!macBytes || !payloadBytes) return { ok: false, reason: "invalid" };
+  if (!macBytes || !payloadBytes) return { ok: false };
   const authentic = await crypto.subtle.verify(
     "HMAC",
     await cursorKey(secret),
     macBytes as BufferSource,
     signed(payload, binding) as BufferSource,
   );
-  if (!authentic) return { ok: false, reason: "invalid" };
+  if (!authentic) return { ok: false };
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(payloadBytes));
   } catch {
-    return { ok: false, reason: "invalid" };
+    return { ok: false };
   }
-  if (!Array.isArray(parsed) || parsed[0] !== 1 || parsed.length !== 6)
-    return { ok: false, reason: "invalid" };
-  const [, snapshot, after, loaded, total, expires] = parsed as [
+  if (!Array.isArray(parsed) || parsed[0] !== VERSION || parsed.length !== 6) return { ok: false };
+  const [, snapshot, after, loaded, total, issuedAt] = parsed as [
     number,
     unknown,
     K,
@@ -182,9 +182,8 @@ export async function verifyCursor<K>(
     typeof snapshot !== "string" ||
     typeof loaded !== "number" ||
     (total !== null && typeof total !== "number") ||
-    typeof expires !== "number"
+    typeof issuedAt !== "number"
   )
-    return { ok: false, reason: "invalid" };
-  if (now >= expires) return { ok: false, reason: "expired" };
-  return { ok: true, state: { snapshot, after, loaded, total, expires } };
+    return { ok: false };
+  return { ok: true, state: { snapshot, after, loaded, total, issuedAt } };
 }

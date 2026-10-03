@@ -93,7 +93,10 @@ export interface AtlasPage<T> extends AtlasEnvelope {
   next: string | null;
 }
 
-/** A top-level region: a component or a structural group. */
+/**
+ * A top-level region: a capability (or, in a projection built before
+ * grouping, a component), or a structural group.
+ */
 export interface AtlasRegion extends AtlasEntitySummary {
   /** Primary files (deduplicated) and direct members, for ranking and area. */
   size: { files: number; members: number };
@@ -104,12 +107,30 @@ export interface AtlasRegion extends AtlasEntitySummary {
 /** GET /overview */
 export interface AtlasOverview extends AtlasEnvelope {
   root: AtlasEntitySummary | null;
-  /** The largest top-level regions (≤ ATLAS_OVERVIEW_REGIONS), by primary files, then members. */
+  /**
+   * The first top-level regions (≤ ATLAS_OVERVIEW_REGIONS): capabilities by
+   * primary files, then direct members, then name; structural groups after
+   * every capability, ranked the same way.
+   */
   regions: AtlasRegion[];
   /** Every top-level region past `regions`, in the same order: first page, continued by GET /regions. */
   catalogue: AtlasPage<AtlasRegion>;
   /** Top-level regions in all. */
   totalRegions: number;
+  /**
+   * The newest build of this scope didn't fit its storage cap, so the current
+   * snapshot is stale (older than the latest build); null when it isn't.
+   */
+  capacityFailure: AtlasCapacityFailure | null;
+}
+
+/** A snapshot that failed to publish for want of projection storage (CORE-159). */
+export interface AtlasCapacityFailure {
+  snapshotId: string;
+  seq: number;
+  /** Says how much storage it needed against the cap. */
+  error: string;
+  failedAt: string;
 }
 
 /** GET /detail */
@@ -180,7 +201,7 @@ export type AtlasErrorCode =
   | "snapshot_expired"
   /** The cursor is forged, malformed or belongs to another request, scope, snapshot or user. */
   | "cursor_invalid"
-  /** The cursor outlived its 30 minutes (or its snapshot). */
+  /** The cursor outlived its 30 minutes (or its snapshot's retention). */
   | "cursor_expired"
   /** The entity isn't in this snapshot. */
   | "entity_unknown"
@@ -191,4 +212,6 @@ export interface AtlasError {
   code: AtlasErrorCode;
   /** The scope's current snapshot, for an explicit "go to current" action. */
   current?: { id: string; seq: number } | null;
+  /** With snapshot_expired: when and why retention expired it. */
+  expired?: { at: string; reason: "age" | "count" | "storage" };
 }

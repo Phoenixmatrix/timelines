@@ -15,6 +15,14 @@
 // model, no Vectorize, no AI Search. Every response names its snapshot; any
 // route takes `?snapshot=` to pin one, and every page's `next` cursor pins it
 // too (worker/atlas/cursor.ts). Pages hold at most ATLAS_PAGE_MAX records.
+//
+// Snapshots come and go under retention (worker/atlas/retention.ts), which
+// can expire a snapshot and delete part of its rows at any time, cursors open
+// or not. So every pinned request and every cursor page resolves its snapshot
+// with retention's `pinnedSnapshot` before reading a row, and an expired one
+// is an explicit `snapshot_expired` naming the current snapshot, never a
+// silent switch. A cursor expires at retention's `cursorExpiresAt` from its
+// issue time and its snapshot's expiry as it stands now.
 
 import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
@@ -41,14 +49,12 @@ import {
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
 import {
-  cursorExpiresAt,
   cursorSecret,
   signCursor,
   verifyCursor,
   type CursorBinding,
   type CursorState,
 } from "./cursor.ts";
-import { currentPinned, pinnedSnapshot } from "./pinned.ts";
 import {
   ancestorsAt,
   catalogueAt,
@@ -63,10 +69,13 @@ import {
   relationsAt,
   repoScope,
   ROOT,
+  currentSnapshot,
   type AtlasEntity as ProjectedEntity,
+  type AtlasSnapshot,
   type RegionKey,
   type RelationKey,
 } from "./projection.ts";
+import { capacityFailure, cursorExpiresAt, pinnedSnapshot } from "./retention.ts";
 
 export const atlas = new Hono<AppEnv>();
 
@@ -77,12 +86,24 @@ function failWith(
   status: ContentfulStatusCode,
   code: AtlasErrorCode,
   error: string,
-  current?: AtlasSnapshotRef | null,
+  current?: { id: string; seq: number } | null,
+  extra: Partial<AtlasError> = {},
 ) {
-  const body: AtlasError = { error, code };
+  const body: AtlasError = { error, code, ...extra };
   if (current !== undefined) body.current = current ? { id: current.id, seq: current.seq } : null;
   return c.json(body, status);
 }
+
+/** What a response says about its snapshot. */
+const refOf = (snapshot: AtlasSnapshot): AtlasSnapshotRef => ({
+  id: snapshot.id,
+  seq: snapshot.seq,
+  vector: snapshot.vector,
+  publishedAt: snapshot.publishedAt,
+  partial: snapshot.partial,
+  projectionVersion: snapshot.projectionVersion,
+  expiresAt: snapshot.expiresAt,
+});
 
 // ---- shaping -------------------------------------------------------------------
 
@@ -147,8 +168,11 @@ function principalOf(c: C): string {
 
 /**
  * Authorize, then work out which snapshot the request reads: its cursor's,
- * else `?snapshot=`, else the current one. Unknown and expired snapshots are
- * explicit errors. Nothing request-supplied is read before authorization.
+ * else `?snapshot=`, else the current one. A pinned snapshot (cursor or
+ * query) goes through retention's `pinnedSnapshot` on every request, so an
+ * eviction mid-traversal stops the next page with `snapshot_expired`.
+ * Unknown and expired snapshots are explicit errors. Nothing request-supplied
+ * is read before authorization.
  */
 async function pin<K>(
   c: C,
@@ -157,58 +181,36 @@ async function pin<K>(
 ): Promise<Pinned<K> | Response> {
   const loaded = await loadRepo(c, "read");
   if (loaded instanceof Response) return loaded;
+  const d1 = c.env.DB;
   const scope = repoScope(loaded.row.id);
   const secret = await cursorSecret(c.env);
   const binding: CursorBinding = { route, scope, filters, principal: principalOf(c) };
   const requested = c.req.query("snapshot") || null;
+  const restart = async (code: AtlasErrorCode, status: ContentfulStatusCode, error: string) =>
+    failWith(c, status, code, error, await currentSnapshot(d1, scope));
 
   let cursor: CursorState<K> | null = null;
   const raw = c.req.query("cursor");
   if (raw) {
-    const verified = await verifyCursor<K>(secret, binding, raw, Date.now());
-    if (!verified.ok) {
-      const current = await currentPinned(c.env.DB, scope);
-      return verified.reason === "expired"
-        ? failWith(c, 410, "cursor_expired", "This page link has expired. Start again.", current)
-        : failWith(
-            c,
-            400,
-            "cursor_invalid",
-            "This page link doesn't belong to this request. Start again.",
-            current,
-          );
-    }
-    cursor = verified.state;
-    if (requested && requested !== cursor.snapshot) {
-      return failWith(
-        c,
-        400,
+    const verified = await verifyCursor<K>(secret, binding, raw);
+    if (!verified.ok)
+      return restart(
         "cursor_invalid",
-        "This page link belongs to another snapshot. Start again.",
-        await currentPinned(c.env.DB, scope),
+        400,
+        "This page link doesn't belong to this request. Start again.",
       );
-    }
+    cursor = verified.state;
+    if (requested && requested !== cursor.snapshot)
+      return restart(
+        "cursor_invalid",
+        400,
+        "This page link belongs to another snapshot. Start again.",
+      );
   }
 
   const id = cursor?.snapshot ?? requested;
-  let snapshot: AtlasSnapshotRef;
-  if (id) {
-    const pinned = await pinnedSnapshot(c.env.DB, scope, id);
-    if (pinned.state !== "ok") {
-      const current = await currentPinned(c.env.DB, scope);
-      return pinned.state === "expired"
-        ? failWith(
-            c,
-            410,
-            "snapshot_expired",
-            "This Atlas snapshot has expired. Open the current one instead.",
-            current,
-          )
-        : failWith(c, 404, "snapshot_unknown", "There's no such Atlas snapshot here.", current);
-    }
-    snapshot = pinned.snapshot;
-  } else {
-    const current = await currentPinned(c.env.DB, scope);
+  if (!id) {
+    const current = await currentSnapshot(d1, scope);
     if (!current)
       return failWith(
         c,
@@ -217,9 +219,31 @@ async function pin<K>(
         "This repository has no Atlas yet. It appears after a Knowledge build.",
         null,
       );
-    snapshot = current;
+    return { scope, repoId: loaded.row.id, snapshot: refOf(current), cursor, binding, secret };
   }
-  return { scope, repoId: loaded.row.id, snapshot, cursor, binding, secret };
+  const now = Date.now();
+  const pinned = await pinnedSnapshot(d1, scope, id, new Date(now));
+  if (pinned.state === "unknown")
+    return restart("snapshot_unknown", 404, "There's no such Atlas snapshot here.");
+  if (pinned.state === "expired")
+    return failWith(
+      c,
+      410,
+      "snapshot_expired",
+      "This Atlas snapshot has expired. Open the current one instead.",
+      pinned.current,
+      { expired: { at: pinned.expiredAt, reason: pinned.reason } },
+    );
+  if (cursor && now >= cursorExpiresAt(cursor.issuedAt, pinned.snapshot.expiresAt))
+    return restart("cursor_expired", 410, "This page link has expired. Start again.");
+  return {
+    scope,
+    repoId: loaded.row.id,
+    snapshot: refOf(pinned.snapshot),
+    cursor,
+    binding,
+    secret,
+  };
 }
 
 function limitOf(c: C): number | Response {
@@ -264,7 +288,7 @@ async function page<T, K>(
             after: next,
             loaded,
             total: knownTotal,
-            expires: cursorExpiresAt(Date.now(), ctx.snapshot.expiresAt),
+            issuedAt: Date.now(),
           }),
   };
 }
@@ -281,10 +305,11 @@ atlas.get("/overview", async (c) => {
   if (ctx instanceof Response) return ctx;
   const d1 = c.env.DB;
   const seq = ctx.snapshot.seq;
-  const [root, top, totalRegions] = await Promise.all([
+  const [root, top, totalRegions, capacity] = await Promise.all([
     entityAt(d1, ctx.scope, seq, ROOT),
     regionsAt(d1, ctx.scope, seq, null, ATLAS_OVERVIEW_REGIONS),
     childCountAt(d1, ctx.scope, seq, ROOT),
+    capacityFailure(d1, ctx.scope),
   ]);
   const rest = top.next
     ? await regionsAt(d1, ctx.scope, seq, top.next, ATLAS_PAGE_DEFAULT)
@@ -305,6 +330,7 @@ atlas.get("/overview", async (c) => {
     regions: top.regions.map((r) => region(r, ATLAS_OVERVIEW_SUMMARY_CHARS)),
     catalogue,
     totalRegions,
+    capacityFailure: capacity,
   };
   return c.json(body);
 });

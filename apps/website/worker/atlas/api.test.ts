@@ -22,15 +22,16 @@ import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { atlasApi, atlasNeedsRestart } from "../../src/lib/atlas.ts";
 import { atlas } from "./api.ts";
-import { CURSOR_TTL_MS } from "./cursor.ts";
 import {
   beginRepoProjection,
+  groupRepoCapabilities,
   projectEdges,
   projectEntities,
   publishProjection,
   repoScope,
   type EdgeCursor,
 } from "./projection.ts";
+import { admitProjection, CURSOR_TTL_MS, enforceRetention } from "./retention.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {},
@@ -137,10 +138,11 @@ function edge(sqlite: DatabaseSync, repo: string, src: string, dst: string, kind
 }
 
 /** Project a repository's stored graph and publish it, the way the build does. */
-async function publish(db: D1Database, repo: string, commit: string) {
+async function publish(db: D1Database, repo: string, commit: string, { grouped = false } = {}) {
   const { snapshotId, seq } = await beginRepoProjection(db, repo, [
     { repoId: repo, commit, buildId: `b-${commit}` },
   ]);
+  if (grouped) await groupRepoCapabilities(db, repo, snapshotId, seq);
   let after: string | null = null;
   do ({ next: after } = await projectEntities(db, repo, snapshotId, seq, after, 500));
   while (after);
@@ -259,14 +261,18 @@ describe("Atlas read API", () => {
     }
     expect(new Set(all.map((r) => r.id)).size).toBe(43);
     expect(all).toHaveLength(43);
-    const files = all.map((r) => r.size.files);
+    // Components by primary files, then the structural groups, though the
+    // unclassified group (6 files) outweighs the smallest components (4).
+    const semantic = all.slice(0, 40);
+    expect(semantic.every((r) => !r.structural)).toBe(true);
+    const files = semantic.map((r) => r.size.files);
     expect(files).toEqual([...files].sort((a, b) => b - a));
-    const structural = all.filter((r) => r.structural).map((r) => r.id);
-    expect(structural.sort()).toEqual([
+    expect(all.slice(40).map((r) => r.id)).toEqual([
+      "group:unclassified",
       "group:concepts",
       "group:dependencies",
-      "group:unclassified",
     ]);
+    expect(overview.capacityFailure).toBeNull();
   });
 
   test("children, relations and evidence traverse completely while a newer snapshot publishes", async () => {
@@ -689,5 +695,202 @@ describe("Atlas read API", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+  test("retention evicting a snapshot mid-traversal stops its cursor and pins explicitly", async () => {
+    const scenarios = [
+      {
+        reason: "count",
+        evict: (db: D1Database) =>
+          enforceRetention(db, [repoScope("r1")], { policy: { maxPrior: 0 } }),
+      },
+      {
+        reason: "storage",
+        evict: (db: D1Database) =>
+          enforceRetention(db, [repoScope("r1")], { policy: { capBytes: 1 } }),
+      },
+      {
+        reason: "age",
+        // Stamped now, due in an hour; read past that, before any sweep marks it.
+        evict: async (db: D1Database) => {
+          await enforceRetention(db, [repoScope("r1")], { policy: { priorTtlMs: 60 * 60 * 1000 } });
+          const now = Date.now();
+          vi.spyOn(Date, "now").mockReturnValue(now + 61 * 60 * 1000);
+          return null;
+        },
+      },
+    ] as const;
+    for (const { reason, evict } of scenarios) {
+      const s = setup();
+      seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 30 });
+      const one = await publish(s.db, "r1", "c1");
+      const first = await s.get<AtlasPage<AtlasEntitySummary>>(
+        "children?id=component%3Ac0000&limit=10",
+      );
+      expect(first.snapshot).toMatchObject({ id: one.snapshotId, expiresAt: null });
+      // A push publishes a new snapshot: the cursor still reads its own.
+      s.sqlite.exec(`DELETE FROM kg_nodes WHERE repo_id = 'r1' AND id LIKE 'file:c0000/f001%'`);
+      const two = await publish(s.db, "r1", "c2");
+      const second = await s.get<AtlasPage<AtlasEntitySummary>>(
+        `children?id=component%3Ac0000&limit=10&cursor=${encodeURIComponent(first.next ?? "")}`,
+      );
+      expect(second.snapshot.id).toBe(one.snapshotId);
+      expect(second.items.map((e) => e.id)[0]).toBe("file:c0000/f0010.ts");
+
+      // Retention evicts it before the next page.
+      const result = await evict(s.db);
+      if (result) {
+        expect(result.expired).toEqual([
+          { id: one.snapshotId, scope: "repo:r1", seq: one.seq, reason },
+        ]);
+        // Its rows really are going: reading them would be wrong, not just stale.
+        expect(result.reclaimed.entities).toBeGreaterThan(0);
+      }
+      for (const path of [
+        `children?id=component%3Ac0000&limit=10&cursor=${encodeURIComponent(second.next ?? "")}`,
+        `children?id=component%3Ac0000&snapshot=${one.snapshotId}`,
+        `overview?snapshot=${one.snapshotId}`,
+        `catalogue?q=f00&snapshot=${one.snapshotId}`,
+      ]) {
+        const response = await s.call(path);
+        expect(response.status, `${reason} ${path}`).toBe(410);
+        const body = (await response.json()) as AtlasError;
+        expect(body, `${reason} ${path}`).toMatchObject({
+          code: "snapshot_expired",
+          current: { id: two.snapshotId, seq: two.seq },
+          expired: { reason },
+        });
+      }
+      // The current snapshot is unaffected.
+      expect((await s.get<AtlasOverview>("overview")).snapshot.id).toBe(two.snapshotId);
+      vi.restoreAllMocks();
+    }
+  });
+
+  test("cursors expire 30 minutes after issue by retention's rule, each page issuing anew", async () => {
+    const s = setup();
+    seed(s.sqlite, "r1", { components: 1, filesPerComponent: () => 30 });
+    await publish(s.db, "r1", "c1");
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    const first = await s.get<AtlasPage<unknown>>("children?id=component%3Ac0000&limit=10");
+    // Just inside its 30 minutes it works, and the page it returns issues a new cursor.
+    clock.mockReturnValue(start + CURSOR_TTL_MS - 1);
+    const second = await s.get<AtlasPage<unknown>>(
+      `children?id=component%3Ac0000&limit=10&cursor=${encodeURIComponent(first.next ?? "")}`,
+    );
+    clock.mockReturnValue(start + CURSOR_TTL_MS + 1);
+    const expired = await s.call(
+      `children?id=component%3Ac0000&limit=10&cursor=${encodeURIComponent(first.next ?? "")}`,
+    );
+    expect(expired.status).toBe(410);
+    expect(((await expired.json()) as AtlasError).code).toBe("cursor_expired");
+    const third = await s.get<AtlasPage<unknown>>(
+      `children?id=component%3Ac0000&limit=10&cursor=${encodeURIComponent(second.next ?? "")}`,
+    );
+    expect(third.counts.loaded).toBe(30);
+  });
+
+  test("the overview reports a capacity failure that left the current snapshot stale", async () => {
+    const s = setup();
+    seed(s.sqlite, "r1");
+    const one = await publish(s.db, "r1", "c1");
+    s.sqlite.exec(`UPDATE kg_nodes SET summary = 'v2' WHERE repo_id = 'r1' AND id = 'repo'`);
+    const { snapshotId, seq } = await beginRepoProjection(s.db, "r1", [
+      { repoId: "r1", commit: "c2", buildId: "b-c2" },
+    ]);
+    let after: string | null = null;
+    do ({ next: after } = await projectEntities(s.db, "r1", snapshotId, seq, after, 500));
+    while (after);
+    const admission = await admitProjection(s.db, repoScope("r1"), snapshotId, {
+      policy: { capBytes: 1 },
+    });
+    expect(admission.admitted).toBe(false);
+
+    const overview = await s.get<AtlasOverview>("overview");
+    expect(overview.snapshot.id).toBe(one.snapshotId);
+    expect(overview.root?.summary).toBe("The engine");
+    expect(overview.capacityFailure).toMatchObject({ snapshotId, seq });
+    expect(overview.capacityFailure?.error).toMatch(/Capacity/);
+
+    // The next build that fits clears it.
+    await publish(s.db, "r1", "c3");
+    expect((await s.get<AtlasOverview>("overview")).capacityFailure).toBeNull();
+  });
+
+  test("a grouped projection leads with capabilities, groups after, areas beneath", async () => {
+    const s = setup();
+    const sqlite = s.sqlite;
+    node(sqlite, "r1", "repo", "repository", "shop", null, "A shop");
+    const cluster = (dir: string, n: number) => {
+      const ids = Array.from({ length: n }, (_, i) => `file:${dir}/f${i}.ts`);
+      for (const id of ids) {
+        const path = id.slice(5);
+        node(sqlite, "r1", id, "file", path.split("/").pop()!, path, "", { blob: path, lines: 5 });
+      }
+      for (const a of ids) for (const b of ids) if (a !== b) edge(sqlite, "r1", a, b, "imports");
+      return ids;
+    };
+    // Two tight areas lightly linked form one capability; two more stand alone.
+    const pay = cluster("pay/a", 4);
+    const cart = cluster("pay/b", 4);
+    edge(sqlite, "r1", pay[0]!, cart[0]!, "imports");
+    edge(sqlite, "r1", cart[1]!, pay[1]!, "imports");
+    cluster("big", 6);
+    cluster("ops", 3);
+    // Ten files with no evidence: an unclassified group bigger than any capability.
+    for (let i = 0; i < 10; i++)
+      node(sqlite, "r1", `file:misc/n${i}.ts`, "file", `n${i}.ts`, `misc/n${i}.ts`);
+    await publish(s.db, "r1", "c1", { grouped: true });
+
+    const overview = await s.get<AtlasOverview>("overview");
+    expect(overview.regions.map((r) => [r.kind, r.size.files, r.size.members])).toEqual([
+      ["capability", 8, 2],
+      ["capability", 6, 6],
+      ["capability", 3, 3],
+      ["group", 10, 10],
+    ]);
+    expect(overview.regions[3]?.id).toBe("group:unclassified");
+    expect(overview.regions.map((r) => r.structural)).toEqual([false, false, false, true]);
+    expect(overview.totalRegions).toBe(4);
+    const payments = overview.regions[0]!;
+
+    // Its areas are its children; their files are theirs.
+    const areas = await s.get<AtlasPage<AtlasEntitySummary>>(
+      `children?id=${encodeURIComponent(payments.id)}`,
+    );
+    expect(areas.items.map((a) => [a.kind, a.counts.files])).toEqual([
+      ["area", 4],
+      ["area", 4],
+    ]);
+    const files = await Promise.all(
+      areas.items.map((a) =>
+        s.get<AtlasPage<AtlasEntitySummary>>(`children?id=${encodeURIComponent(a.id)}`),
+      ),
+    );
+    expect(files.flatMap((p) => p.items.map((f) => f.id)).sort()).toEqual([...pay, ...cart].sort());
+    const detail = await s.get<AtlasDetail>(`detail?id=${encodeURIComponent(pay[2]!)}`);
+    expect(detail.ancestors.map((a) => a.kind)).toEqual(["repository", "capability", "area"]);
+    expect(
+      (await s.get<AtlasDetail>(`detail?id=${encodeURIComponent(payments.id)}`)).counts.children,
+    ).toBe(2);
+
+    // A capability's evidence is its areas' files, each once.
+    const evidence = await s.get<AtlasPage<AtlasEvidence>>(
+      `evidence?id=${encodeURIComponent(payments.id)}`,
+    );
+    expect(evidence.items.map((e) => e.entityId).sort()).toEqual([...pay, ...cart].sort());
+    expect(evidence.items.every((e) => e.via === "member" && e.commit === "c1")).toBe(true);
+    expect(evidence.counts.knownTotal).toBe(8);
+
+    // The catalogue finds capabilities and areas by kind.
+    const caps = await s.get<AtlasPage<AtlasEntitySummary>>("catalogue?kind=capability");
+    expect(caps.items).toHaveLength(3);
+    expect(caps.counts.knownTotal).toBe(3);
+    const named = await s.get<AtlasPage<AtlasEntitySummary>>(
+      `catalogue?q=${encodeURIComponent(payments.name)}&kind=capability`,
+    );
+    expect(named.items.map((e) => e.id)).toContain(payments.id);
+    const areaHits = await s.get<AtlasPage<AtlasEntitySummary>>("catalogue?kind=area");
+    expect(areaHits.items.map((a) => a.id).sort()).toEqual(areas.items.map((a) => a.id).sort());
   });
 });
