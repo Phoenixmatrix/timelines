@@ -186,6 +186,9 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
             ttl,
             no_identity,
             check,
+            publish_skills,
+            allow_skills,
+            deny_skills,
         } => super::agent_setup::setup(
             ctx,
             &super::agent_setup::Options {
@@ -200,6 +203,9 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
                 ttl: *ttl,
                 no_identity: *no_identity,
                 check: *check,
+                publish_skills: *publish_skills,
+                allow_skills: allow_skills.clone(),
+                deny_skills: deny_skills.clone(),
             },
         ),
         AgentCommand::Detect { capabilities: args } => {

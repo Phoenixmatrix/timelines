@@ -761,6 +761,15 @@ pub enum AgentCommand {
         /// Report what's out of date without changing anything (exit 4 if stale)
         #[arg(long)]
         check: bool,
+        /// Which discovered skills its profile publishes: repo (default), all (adds your user-level skills) or none; saved for this checkout
+        #[arg(long = "publish-skills")]
+        publish_skills: Option<crate::profile::Publish>,
+        /// Publish this skill whatever the scope (repeat; saved)
+        #[arg(long = "allow-skill")]
+        allow_skills: Vec<String>,
+        /// Never publish this skill (repeat; saved)
+        #[arg(long = "deny-skill")]
+        deny_skills: Vec<String>,
     },
     /// Your agents and advisory capabilities, optionally from an owner's tracker
     List {
@@ -831,9 +840,19 @@ pub struct CapabilityArgs {
     /// Remove declared skills; detected skills are still refreshed
     #[arg(long)]
     pub clear_skills: bool,
-    /// Additional directory containing skill directories or a SKILL.md
+    /// Additional directory containing skill directories or a SKILL.md (always published)
     #[arg(long = "skill-dir")]
     pub skill_dirs: Vec<PathBuf>,
+    /// Which discovered skills to publish: repo (default), all (adds your user-level skills) or none;
+    /// otherwise .gitmatrix/agent.local.yml's skills.publish
+    #[arg(long = "publish-skills")]
+    pub publish_skills: Option<crate::profile::Publish>,
+    /// Publish this skill whatever the scope (repeat)
+    #[arg(long = "allow-skill")]
+    pub allow_skills: Vec<String>,
+    /// Never publish this skill (repeat)
+    #[arg(long = "deny-skill")]
+    pub deny_skills: Vec<String>,
 }
 
 #[derive(Args)]

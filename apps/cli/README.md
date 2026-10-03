@@ -351,12 +351,23 @@ for explicit declarations, including environments detection cannot identify.
 Runtime values are `host`, `container`, `vm`, `wsl`, `cloudflare-worker`, `unknown`.
 
 Skill discovery reads YAML `name` and `description` from `SKILL.md` frontmatter,
-not prompts. It scans repository/ancestor and user `.agents`, `.claude`, `.codex`,
-`.gemini`, `.opencode`, `.omp` and `.pi` skill directories, including user
-`.omp/agent/skills`, `.pi/agent/skills` and `.config/{opencode,omp}/skills`.
-Repeat `--skill-dir DIR` for additional roots. Traversal is bounded and
-cycle-safe; symlinked skill collections work. Reports contain no skill paths,
-prompt bodies, hostnames, tokens or environment-variable values.
+not prompts. It scans the repository's `.agents`, `.claude`, `.codex`, `.gemini`,
+`.opencode`, `.omp` and `.pi` skill directories (up to the checkout root) and the
+same directories in your home, plus `.omp/agent/skills`, `.pi/agent/skills` and
+`.config/{opencode,omp}/skills`. Traversal is bounded and cycle-safe; symlinked
+skill collections work. Reports contain no skill paths, prompt bodies,
+hostnames, tokens or environment-variable values.
+
+Profiles are visible to members of your trackers, and your own skills can say a
+lot about your private tools, so **only the repository's skills are published
+by default**. `--publish-skills all` adds your user-level skills, `none`
+publishes no discovered ones (declared `--skill`s still are), `--allow-skill
+NAME` publishes one skill whatever the scope and `--deny-skill NAME` never
+publishes it (deny wins). `gm agent setup` saves these choices in
+`.gitmatrix/agent.local.yml` (`skills: {publish, allow, deny}`), prints exactly
+what it publishes, and rerunning it drops skills no longer allowed; `configure`
+and `detect` follow the same file. `--skill-dir DIR` directories are published
+because you named them.
 
 Every refresh redetects environment, harness and installed skills. Omitted
 `--model`, `--tag` and `--skill` preserve previous declarations. Supplied tags

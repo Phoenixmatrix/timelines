@@ -63,6 +63,64 @@ pub struct Project {
     pub instructions: Instructions,
 }
 
+/// Which discovered skills an agent's profile publishes (CORE-104). Profiles
+/// are visible to members of your trackers, and skills in your home directory
+/// can say a lot about your private tools, so only the repository's skills are
+/// published unless you opt in.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Publish {
+    /// The repository's own skills (.agents/skills, .claude/skills… up to its root).
+    #[default]
+    Repo,
+    /// Those and your user-level skills (~/.claude/skills, ~/.agents/skills…).
+    All,
+    /// No discovered skills; declared ones (`--skill`) still are.
+    None,
+}
+
+impl std::str::FromStr for Publish {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "repo" => Ok(Publish::Repo),
+            "all" => Ok(Publish::All),
+            "none" => Ok(Publish::None),
+            other => Err(format!("{other} isn't one of repo, all, none")),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPolicy {
+    #[serde(default)]
+    pub publish: Publish,
+    /// Skills published whatever the scope (say, one personal skill worth sharing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Skills never published; wins over everything else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl SkillPolicy {
+    /// Whether a discovered skill is published: `user` when found outside the repository.
+    pub fn publishes(&self, name: &str, user: bool) -> bool {
+        if self.deny.iter().any(|d| d == name) {
+            return false;
+        }
+        if self.allow.iter().any(|a| a == name) {
+            return true;
+        }
+        match self.publish {
+            Publish::All => true,
+            Publish::Repo => !user,
+            Publish::None => false,
+        }
+    }
+}
+
 /// `.gitmatrix/agent.local.yml`.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +140,9 @@ pub struct Local {
     /// Overrides the project's scope for this checkout.
     #[serde(default, skip_serializing_if = "is_default")]
     pub scope: Scope,
+    /// Which discovered skills its profile publishes (default: the repository's).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub skills: SkillPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
 }

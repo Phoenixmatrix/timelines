@@ -280,32 +280,81 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Skill>> {
     Ok(skills.into_values().collect())
 }
 
-fn roots(cwd: &Path, home: Option<&Path>, extra: &[PathBuf]) -> Vec<PathBuf> {
-    let directories = [
-        ".agents/skills",
-        ".claude/skills",
-        ".codex/skills",
-        ".gemini/skills",
-        ".opencode/skills",
-        ".omp/skills",
-        ".pi/skills",
-    ];
+const SKILL_DIRECTORIES: [&str; 7] = [
+    ".agents/skills",
+    ".claude/skills",
+    ".codex/skills",
+    ".gemini/skills",
+    ".opencode/skills",
+    ".omp/skills",
+    ".pi/skills",
+];
+
+/// The repository's skill directories: cwd and its ancestors up to the checkout root.
+fn repo_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for ancestor in cwd.ancestors() {
-        roots.extend(directories.iter().map(|dir| ancestor.join(dir)));
+        roots.extend(SKILL_DIRECTORIES.iter().map(|dir| ancestor.join(dir)));
         if ancestor.join(".git").exists() {
             break;
         }
     }
-    if let Some(home) = home {
-        roots.extend(directories.iter().map(|dir| home.join(dir)));
-        roots.push(home.join(".omp/agent/skills"));
-        roots.push(home.join(".pi/agent/skills"));
-        roots.push(home.join(".config/opencode/skills"));
-        roots.push(home.join(".config/omp/skills"));
-    }
-    roots.extend_from_slice(extra);
     roots
+}
+
+/// Your own skill directories, in your home directory.
+fn user_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = SKILL_DIRECTORIES.iter().map(|dir| home.join(dir)).collect();
+    roots.push(home.join(".omp/agent/skills"));
+    roots.push(home.join(".pi/agent/skills"));
+    roots.push(home.join(".config/opencode/skills"));
+    roots.push(home.join(".config/omp/skills"));
+    roots
+}
+
+/// What may be published: this checkout's policy (.gitmatrix/agent.local.yml),
+/// then the flags.
+fn policy(args: &CapabilityArgs, cwd: &Path) -> crate::profile::SkillPolicy {
+    let mut policy = crate::profile::root_from(cwd)
+        .and_then(|root| crate::profile::local_at(&root).ok().flatten())
+        .map(|local| local.skills)
+        .unwrap_or_default();
+    if let Some(publish) = args.publish_skills {
+        policy.publish = publish;
+    }
+    policy.allow.extend(args.allow_skills.iter().cloned());
+    policy.deny.extend(args.deny_skills.iter().cloned());
+    policy
+}
+
+/// Discovered skills the policy publishes: the repository's (and any --skill-dir,
+/// named on purpose), then user-level ones it allows that the repository
+/// doesn't already have.
+fn published(
+    policy: &crate::profile::SkillPolicy,
+    cwd: &Path,
+    home: Option<&Path>,
+    extra: &[PathBuf],
+) -> Result<Vec<Skill>> {
+    let mut skills: Vec<Skill> = discover(&repo_roots(cwd))?
+        .into_iter()
+        .filter(|s| policy.publishes(&s.name, false))
+        .collect();
+    let deny = |name: &str| policy.deny.iter().any(|d| d == name);
+    for skill in discover(extra)? {
+        if !deny(&skill.name) && !skills.iter().any(|s| s.name == skill.name) {
+            skills.push(skill);
+        }
+    }
+    if let Some(home) = home {
+        for skill in discover(&user_roots(home))? {
+            if policy.publishes(&skill.name, true) && !skills.iter().any(|s| s.name == skill.name) {
+                skills.push(skill);
+            }
+        }
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(skills)
 }
 
 fn check(value: &str, max: usize, label: &str, empty: bool) -> Result<()> {
@@ -440,7 +489,7 @@ pub fn detect(
         model: None,
         environment: environment(),
         tags: vec![],
-        skills: discover(&roots(cwd, home.as_deref(), &extra))?,
+        skills: published(&policy(args, cwd), cwd, home.as_deref(), &extra)?,
     };
     merge(report, previous, args)
 }
@@ -448,6 +497,59 @@ pub fn detect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profiles_publish_the_repository_s_skills_unless_you_opt_in() {
+        use crate::profile::{Publish, SkillPolicy};
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        let skill = |dir: &Path, name: &str| {
+            let path = dir.join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: The {name} skill\n---\n\nBody\n"),
+            )
+            .unwrap();
+        };
+        skill(&repo.path().join(".agents/skills"), "graph-work");
+        skill(&home.path().join(".claude/skills"), "morning");
+        skill(&home.path().join(".claude/skills"), "deploy");
+        let names = |policy: &SkillPolicy| -> Vec<String> {
+            published(policy, repo.path(), Some(home.path()), &[])
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        // By default, only what the repository ships.
+        assert_eq!(names(&SkillPolicy::default()), ["graph-work"]);
+        // Opting in to one personal skill, or to all of them.
+        let one = SkillPolicy {
+            allow: vec!["deploy".into()],
+            ..Default::default()
+        };
+        assert_eq!(names(&one), ["deploy", "graph-work"]);
+        let all = SkillPolicy {
+            publish: Publish::All,
+            deny: vec!["morning".into()],
+            ..Default::default()
+        };
+        assert_eq!(names(&all), ["deploy", "graph-work"]);
+        // None publishes nothing discovered, and deny beats allow.
+        let none = SkillPolicy {
+            publish: Publish::None,
+            ..Default::default()
+        };
+        assert!(names(&none).is_empty());
+        let both = SkillPolicy {
+            allow: vec!["deploy".into()],
+            deny: vec!["deploy".into()],
+            ..Default::default()
+        };
+        assert_eq!(names(&both), ["graph-work"]);
+    }
+
     fn report() -> AgentCapabilities {
         AgentCapabilities {
             version: 1,

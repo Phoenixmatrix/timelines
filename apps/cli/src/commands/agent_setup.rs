@@ -36,6 +36,9 @@ pub struct Options {
     pub ttl: Option<u32>,
     pub no_identity: bool,
     pub check: bool,
+    pub publish_skills: Option<profile::Publish>,
+    pub allow_skills: Vec<String>,
+    pub deny_skills: Vec<String>,
 }
 
 /// A file setup manages, and what it should contain.
@@ -227,6 +230,13 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
         local.model = o.model.clone();
     }
     local.tags = merged(&local.tags, &o.tags, &o.drop_tags);
+    // Skill publishing, saved for this checkout: allowing a skill lifts a deny
+    // on it, and denying one drops it from the allow list.
+    if let Some(publish) = o.publish_skills {
+        local.skills.publish = publish;
+    }
+    local.skills.allow = merged(&local.skills.allow, &o.allow_skills, &o.deny_skills);
+    local.skills.deny = merged(&local.skills.deny, &o.deny_skills, &o.allow_skills);
     let mut name = o
         .name
         .clone()
@@ -365,6 +375,22 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     if let Some(profile) = identity["profile"].as_str() {
         text.push_str(&format!("  profile: {profile}\n"));
     }
+    if let Some(skills) = identity["skills"].as_array() {
+        let names: Vec<&str> = skills.iter().filter_map(Value::as_str).collect();
+        text.push_str(&format!(
+            "  skills published ({}): {}\n",
+            match local.skills.publish {
+                profile::Publish::Repo => "the repository's; --publish-skills all adds yours",
+                profile::Publish::All => "the repository's and yours",
+                profile::Publish::None => "declared only",
+            },
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        ));
+    }
     if let Some(token) = identity["token"].as_str() {
         text.push_str(&format!("  token: {token}\n"));
     }
@@ -406,9 +432,17 @@ fn profile_report(root: &Path, local: &Local, previous: &Value) -> Result<AgentC
         harness: local.harness.clone(),
         model: local.model.clone(),
         tags: local.tags.clone(),
+        publish_skills: Some(local.skills.publish),
+        allow_skills: local.skills.allow.clone(),
+        deny_skills: local.skills.deny.clone(),
         ..Default::default()
     };
     capabilities::detect(&args, previous.as_ref(), root)
+}
+
+/// The skill names a profile publishes, for setup's report.
+fn published_names(report: &AgentCapabilities) -> Vec<String> {
+    report.skills.iter().map(|s| s.name.clone()).collect()
 }
 
 /// The agent this checkout works as: created and given a kept token if
@@ -434,6 +468,7 @@ fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
         let own = agent["name"].as_str().unwrap_or(name).to_string();
         let current = remote::api(&config, "GET", "/agents/self", None)?["agent"].clone();
         let report = profile_report(root, local, &current["capabilities"])?;
+        let skills = published_names(&report);
         remote::api(
             &config,
             "PUT",
@@ -444,6 +479,7 @@ fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
             json!({
                 "id": agent["id"], "name": own, "accountable": person, "created": false,
                 "token": "in use (GM_TOKEN or this checkout's)", "profile": "published",
+                "skills": skills, "publishing": local.skills.publish,
             }),
             own,
         ));
@@ -467,7 +503,9 @@ fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
         .as_ref()
         .map(|a| a["capabilities"].clone())
         .unwrap_or(Value::Null);
-    let report = serde_json::to_value(profile_report(root, local, &previous)?)?;
+    let detected = profile_report(root, local, &previous)?;
+    let skills = published_names(&detected);
+    let report = serde_json::to_value(detected)?;
     let agent = match existing {
         Some(agent) => {
             remote::api(
@@ -521,6 +559,7 @@ fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
         json!({
             "id": id, "name": name, "accountable": person, "created": created,
             "token": token, "profile": "published",
+            "skills": skills, "publishing": local.skills.publish,
         }),
         name.to_string(),
     ))
