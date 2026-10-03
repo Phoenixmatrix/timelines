@@ -9,6 +9,8 @@
     "preview": "vp preview",
     "test": "vp test",
     "semantic-smoke": "node scripts/semantic-smoke.ts",
+    "atlas-bench": "ATLAS_SCALE=1 NODE_OPTIONS=--max-old-space-size=8192 vp test --disableConsoleIntercept worker/atlas/scale.bench.test.ts",
+    "atlas-bench-browser": "ATLAS_SCALE=1 ATLAS_SCALE_BROWSER=1 NODE_OPTIONS=--max-old-space-size=8192 vp test --disableConsoleIntercept worker/atlas/scale.bench.test.ts",
     "typecheck": "cf workers types && node ../../tools/agent/typecheck.ts -p tsconfig.app.json && node ../../tools/agent/typecheck.ts -p tsconfig.worker.json && node ../../tools/agent/typecheck.ts -p tsconfig.node.json",
     "cf-typegen": "cf workers types",
     "db:migrate": "cf d1 migrations apply 00000000000000000000000000000000 --local --persist-to .wrangler/state && cf d1 migrations apply 00000000000000000000000000000001 --local --persist-to .wrangler/state --dir registry/migrations",
@@ -56,6 +58,7 @@
   "devDependencies": {
     "@cloudflare/vite-plugin": "catalog:",
     "@gitmatrix/testing": "workspace:*",
+    "@playwright/test": "catalog:",
     "@tailwindcss/vite": "catalog:",
     "@types/node": "catalog:",
     "@types/react": "catalog:",

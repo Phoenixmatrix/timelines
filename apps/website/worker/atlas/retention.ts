@@ -472,7 +472,11 @@ export async function pinnedSnapshot(
 ): Promise<PinnedSnapshot> {
   const row = await db(d1)
     .selectFrom("atlas_snapshots as s")
-    .leftJoin("atlas_current as c", "c.snapshot_id", "s.id")
+    // By scope, atlas_current's key: joining on the snapshot id alone scanned
+    // every repository's pointer on each pinned page (CORE-177).
+    .leftJoin("atlas_current as c", (join) =>
+      join.onRef("c.scope", "=", "s.scope").onRef("c.snapshot_id", "=", "s.id"),
+    )
     .selectAll("s")
     .select("c.snapshot_id as current_id")
     .where("s.scope", "=", scope)

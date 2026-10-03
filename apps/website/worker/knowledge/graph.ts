@@ -340,7 +340,7 @@ export interface GraphDiff {
   removed: string[];
 }
 
-async function nodeHash(node: GraphNode): Promise<string> {
+export async function nodeHash(node: GraphNode): Promise<string> {
   return sha256(JSON.stringify([node.kind, node.name, node.path, node.summary, node.data]));
 }
 

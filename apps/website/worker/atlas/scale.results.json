@@ -1,0 +1,559 @@
+{
+  "measuredAt": "2026-10-03T12:22:41.973Z",
+  "boundary": "Server: the real app in-process over local node:sqlite D1 (no network, no D1 latency); request to body. Client: production build served from this process, headless Chromium with CDP throttling.",
+  "node": "v24.21.0",
+  "host": {
+    "cpu": "13th Gen Intel(R) Core(TM) i7-13700K",
+    "threads": 24,
+    "memoryGiB": 14.6
+  },
+  "knobs": {
+    "files": 20000,
+    "imports": 60,
+    "repositories": 50,
+    "samples": 30
+  },
+  "single": {
+    "workload": {
+      "repositories": 1,
+      "atlasEntities": 103051,
+      "atlasEdges": 1122440,
+      "graphNodes": 102537,
+      "graphEdges": 1119690
+    },
+    "graphMs": 8521,
+    "full": {
+      "incremental": false,
+      "totalMs": 22044.8,
+      "trips": 438,
+      "phases": {
+        "start": {
+          "ms": 3.1,
+          "trips": 7,
+          "steps": 1
+        },
+        "group": {
+          "ms": 2780,
+          "trips": 13,
+          "steps": 1
+        },
+        "describe": {
+          "ms": 772.4,
+          "trips": 70,
+          "steps": 1
+        },
+        "entities": {
+          "ms": 6013.4,
+          "trips": 132,
+          "steps": 11
+        },
+        "edges": {
+          "ms": 12436.6,
+          "trips": 204,
+          "steps": 23
+        },
+        "retain+admit": {
+          "ms": 1.2,
+          "trips": 7,
+          "steps": 1
+        },
+        "publish": {
+          "ms": 38.1,
+          "trips": 5,
+          "steps": 1
+        }
+      }
+    },
+    "push-1": {
+      "graphMs": 12274.6,
+      "projection": {
+        "incremental": true,
+        "totalMs": 1021.2,
+        "trips": 164,
+        "phases": {
+          "start": {
+            "ms": 42.7,
+            "trips": 7,
+            "steps": 1
+          },
+          "group": {
+            "ms": 24.8,
+            "trips": 5,
+            "steps": 1
+          },
+          "describe": {
+            "ms": 780.2,
+            "trips": 122,
+            "steps": 1
+          },
+          "entities": {
+            "ms": 69.8,
+            "trips": 14,
+            "steps": 1
+          },
+          "edges": {
+            "ms": 81.2,
+            "trips": 5,
+            "steps": 1
+          },
+          "retain+admit": {
+            "ms": 0.5,
+            "trips": 7,
+            "steps": 1
+          },
+          "publish": {
+            "ms": 22,
+            "trips": 4,
+            "steps": 1
+          }
+        }
+      }
+    },
+    "push-10": {
+      "graphMs": 11872.3,
+      "projection": {
+        "incremental": true,
+        "totalMs": 4657.6,
+        "trips": 177,
+        "phases": {
+          "start": {
+            "ms": 56.8,
+            "trips": 7,
+            "steps": 1
+          },
+          "group": {
+            "ms": 3047.6,
+            "trips": 14,
+            "steps": 1
+          },
+          "describe": {
+            "ms": 944,
+            "trips": 125,
+            "steps": 1
+          },
+          "entities": {
+            "ms": 148.2,
+            "trips": 14,
+            "steps": 1
+          },
+          "edges": {
+            "ms": 436.5,
+            "trips": 5,
+            "steps": 1
+          },
+          "retain+admit": {
+            "ms": 0.7,
+            "trips": 8,
+            "steps": 1
+          },
+          "publish": {
+            "ms": 23.8,
+            "trips": 4,
+            "steps": 1
+          }
+        }
+      }
+    },
+    "api": [
+      {
+        "scenario": "overview",
+        "path": "/api/repos/ann/big/atlas/overview",
+        "firstMs": 45,
+        "samples": 30,
+        "p50": 24.4,
+        "p95": 27.7,
+        "max": 27.7,
+        "d1RoundTrips": 9,
+        "records": 12,
+        "bytes": 21424,
+        "gzipBytes": 1953
+      },
+      {
+        "scenario": "catalogue page (regions)",
+        "path": "/api/repos/ann/big/atlas/regions?limit=100",
+        "firstMs": 25.6,
+        "samples": 30,
+        "p50": 24.3,
+        "p95": 25.7,
+        "max": 29,
+        "d1RoundTrips": 7,
+        "records": 44,
+        "bytes": 16409,
+        "gzipBytes": 1559
+      },
+      {
+        "scenario": "children, largest capability",
+        "path": "/api/repos/ann/big/atlas/children?id=cap%3Ac66814a89fad&limit=100",
+        "firstMs": 8.8,
+        "samples": 30,
+        "p50": 8.4,
+        "p95": 9.8,
+        "max": 10.7,
+        "d1RoundTrips": 7,
+        "records": 8,
+        "bytes": 2150,
+        "gzipBytes": 558
+      },
+      {
+        "scenario": "children, highest fan-out (773)",
+        "path": "/api/repos/ann/big/atlas/children?id=group%3Aconcepts&limit=100",
+        "firstMs": 12,
+        "samples": 30,
+        "p50": 8.3,
+        "p95": 9.8,
+        "max": 10.1,
+        "d1RoundTrips": 7,
+        "records": 100,
+        "bytes": 17623,
+        "gzipBytes": 1334
+      },
+      {
+        "scenario": "detail, capability",
+        "path": "/api/repos/ann/big/atlas/detail?id=cap%3Ac66814a89fad",
+        "firstMs": 32.5,
+        "samples": 30,
+        "p50": 37.2,
+        "p95": 40.4,
+        "max": 44.6,
+        "d1RoundTrips": 9,
+        "records": null,
+        "bytes": 1653,
+        "gzipBytes": 683
+      },
+      {
+        "scenario": "detail, symbol",
+        "path": "/api/repos/ann/big/atlas/detail?id=sym%3Asrc%2Fm0%2Fd2%2Ff10.ts%23symbol1",
+        "firstMs": 70.9,
+        "samples": 30,
+        "p50": 61.5,
+        "p95": 69,
+        "max": 70.4,
+        "d1RoundTrips": 9,
+        "records": null,
+        "bytes": 1530,
+        "gzipBytes": 666
+      },
+      {
+        "scenario": "ancestors, symbol (deep link)",
+        "path": "/api/repos/ann/big/atlas/ancestors?id=sym%3Asrc%2Fm0%2Fd2%2Ff10.ts%23symbol1",
+        "firstMs": 52.9,
+        "samples": 30,
+        "p50": 53.8,
+        "p95": 58.4,
+        "max": 58.9,
+        "d1RoundTrips": 6,
+        "records": null,
+        "bytes": 1402,
+        "gzipBytes": 604
+      },
+      {
+        "scenario": "relations in, most imported file (61)",
+        "path": "/api/repos/ann/big/atlas/relations?id=file%3Asrc%2Fm23%2Fd3%2Ff20.ts&direction=in&limit=100",
+        "firstMs": 49.3,
+        "samples": 30,
+        "p50": 50.1,
+        "p95": 56.1,
+        "max": 258.5,
+        "d1RoundTrips": 7,
+        "records": 63,
+        "bytes": 22251,
+        "gzipBytes": 1946
+      },
+      {
+        "scenario": "relations out, capability",
+        "path": "/api/repos/ann/big/atlas/relations?id=cap%3Ac66814a89fad&direction=out&limit=100",
+        "firstMs": 2.1,
+        "samples": 30,
+        "p50": 1.4,
+        "p95": 2.5,
+        "max": 3.4,
+        "d1RoundTrips": 7,
+        "records": 52,
+        "bytes": 21379,
+        "gzipBytes": 2060
+      },
+      {
+        "scenario": "evidence, capability",
+        "path": "/api/repos/ann/big/atlas/evidence?id=cap%3Ac66814a89fad&limit=100",
+        "firstMs": 145.8,
+        "samples": 30,
+        "p50": 149.7,
+        "p95": 156.4,
+        "max": 159.5,
+        "d1RoundTrips": 7,
+        "records": 100,
+        "bytes": 25021,
+        "gzipBytes": 1753
+      },
+      {
+        "scenario": "contributing imports, capability pair",
+        "path": "/api/repos/ann/big/atlas/contributing?id=cap%3A24be4ac48aa5&other=cap%3A44503a99a447&direction=out&limit=100",
+        "firstMs": 453.5,
+        "samples": 30,
+        "p50": 442.3,
+        "p95": 460.2,
+        "max": 467.3,
+        "d1RoundTrips": 7,
+        "records": 70,
+        "bytes": 9057,
+        "gzipBytes": 1173
+      },
+      {
+        "scenario": "catalogue lookup, common term",
+        "path": "/api/repos/ann/big/atlas/catalogue?q=topic&limit=50",
+        "firstMs": 28.8,
+        "samples": 30,
+        "p50": 26.5,
+        "p95": 29.9,
+        "max": 30.1,
+        "d1RoundTrips": 6,
+        "records": 50,
+        "bytes": 10324,
+        "gzipBytes": 1416
+      },
+      {
+        "scenario": "catalogue lookup, rare term",
+        "path": "/api/repos/ann/big/atlas/catalogue?q=f7.ts&limit=50",
+        "firstMs": 28.4,
+        "samples": 30,
+        "p50": 27.2,
+        "p95": 29.5,
+        "max": 30.5,
+        "d1RoundTrips": 6,
+        "records": 50,
+        "bytes": 13211,
+        "gzipBytes": 1487
+      },
+      {
+        "scenario": "snapshots",
+        "path": "/api/repos/ann/big/atlas/snapshots",
+        "firstMs": 1.5,
+        "samples": 30,
+        "p50": 0.7,
+        "p95": 1.8,
+        "max": 1.9,
+        "d1RoundTrips": 5,
+        "records": 3,
+        "bytes": 964,
+        "gzipBytes": 359
+      },
+      {
+        "scenario": "compare, full pass to two pushes later",
+        "path": "/api/repos/ann/big/atlas/compare?from=87f72c26-42e9-4636-81f3-4125e80b96fa&to=00813754-40d2-41f8-9e92-6abd73d5ed9b&limit=100",
+        "firstMs": 18.5,
+        "samples": 30,
+        "p50": 15.4,
+        "p95": 17,
+        "max": 17.1,
+        "d1RoundTrips": 12,
+        "records": 100,
+        "bytes": 82527,
+        "gzipBytes": 3637
+      }
+    ]
+  },
+  "aggregate": {
+    "workload": {
+      "repositories": 50,
+      "atlasEntities": 112268,
+      "atlasEdges": 949566,
+      "graphNodes": 106286,
+      "graphEdges": 937027
+    },
+    "buildMs": 21914.9,
+    "projectionPerRepository": {
+      "samples": 50,
+      "p50": 293.3,
+      "p95": 325.9,
+      "max": 348.1
+    },
+    "api": [
+      {
+        "scenario": "overview",
+        "path": "/api/accounts/ann/atlas/overview?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,w",
+        "firstMs": 44.1,
+        "samples": 30,
+        "p50": 39.8,
+        "p95": 51.4,
+        "max": 55,
+        "d1RoundTrips": 157,
+        "records": 12,
+        "bytes": 59064,
+        "gzipBytes": 4641
+      },
+      {
+        "scenario": "catalogue page (regions)",
+        "path": "/api/accounts/ann/atlas/regions?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,w3",
+        "firstMs": 62.4,
+        "samples": 30,
+        "p50": 63.5,
+        "p95": 77.9,
+        "max": 78,
+        "d1RoundTrips": 156,
+        "records": 100,
+        "bytes": 56000,
+        "gzipBytes": 5240
+      },
+      {
+        "scenario": "children, largest capability",
+        "path": "/api/accounts/ann/atlas/children?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,w",
+        "firstMs": 2,
+        "samples": 30,
+        "p50": 1.4,
+        "p95": 4.3,
+        "max": 14.2,
+        "d1RoundTrips": 9,
+        "records": 2,
+        "bytes": 1151,
+        "gzipBytes": 499
+      },
+      {
+        "scenario": "detail, capability",
+        "path": "/api/accounts/ann/atlas/detail?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,w30",
+        "firstMs": 3,
+        "samples": 30,
+        "p50": 2.8,
+        "p95": 4.3,
+        "max": 5.5,
+        "d1RoundTrips": 11,
+        "records": null,
+        "bytes": 1983,
+        "gzipBytes": 782
+      },
+      {
+        "scenario": "ancestors, symbol (deep link)",
+        "path": "/api/accounts/ann/atlas/ancestors?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,",
+        "firstMs": 3,
+        "samples": 30,
+        "p50": 3,
+        "p95": 5,
+        "max": 13.6,
+        "d1RoundTrips": 8,
+        "records": null,
+        "bytes": 1820,
+        "gzipBytes": 679
+      },
+      {
+        "scenario": "relations out, capability",
+        "path": "/api/accounts/ann/atlas/relations?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,",
+        "firstMs": 3.2,
+        "samples": 30,
+        "p50": 1.8,
+        "p95": 3.3,
+        "max": 3.4,
+        "d1RoundTrips": 9,
+        "records": 15,
+        "bytes": 7075,
+        "gzipBytes": 1013
+      },
+      {
+        "scenario": "evidence, capability",
+        "path": "/api/accounts/ann/atlas/evidence?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,w",
+        "firstMs": 5.9,
+        "samples": 30,
+        "p50": 8.3,
+        "p95": 15.7,
+        "max": 15.8,
+        "d1RoundTrips": 9,
+        "records": 48,
+        "bytes": 12552,
+        "gzipBytes": 1082
+      },
+      {
+        "scenario": "catalogue lookup, common term",
+        "path": "/api/accounts/ann/atlas/catalogue?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,",
+        "firstMs": 89.7,
+        "samples": 30,
+        "p50": 59.8,
+        "p95": 87.5,
+        "max": 98.1,
+        "d1RoundTrips": 106,
+        "records": 50,
+        "bytes": 29793,
+        "gzipBytes": 3975
+      },
+      {
+        "scenario": "composition",
+        "path": "/api/accounts/ann/atlas/composition?repos=w00,w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w2",
+        "firstMs": 33.2,
+        "samples": 30,
+        "p50": 1.2,
+        "p95": 1.8,
+        "max": 1.9,
+        "d1RoundTrips": 7,
+        "records": 0,
+        "bytes": 23308,
+        "gzipBytes": 2575
+      }
+    ]
+  },
+  "client": {
+    "profile": {
+      "chromium": "153.0.8010.12",
+      "host": {
+        "cpu": "13th Gen Intel(R) Core(TM) i7-13700K",
+        "threads": 24,
+        "memoryGiB": 14.6
+      },
+      "throttling": {
+        "latencyMs": 50,
+        "throughputMbps": 20,
+        "cpuSlowdown": 4
+      },
+      "viewport": "1280x900"
+    },
+    "results": [
+      {
+        "scenario": "repository overview, cold navigation",
+        "samples": 30,
+        "p50": 863.5,
+        "p95": 949,
+        "max": 1032.7
+      },
+      {
+        "scenario": "repository overview, reload (shell cached)",
+        "samples": 30,
+        "p50": 332.7,
+        "p95": 374.7,
+        "max": 403.3
+      },
+      {
+        "scenario": "child page (expand a region)",
+        "samples": 30,
+        "p50": 56.9,
+        "p95": 142.2,
+        "max": 204.4
+      },
+      {
+        "scenario": "detail (select an entity)",
+        "samples": 30,
+        "p50": 416.1,
+        "p95": 475.4,
+        "max": 481.9
+      },
+      {
+        "scenario": "pan/zoom frames per second",
+        "samples": 30,
+        "p50": 60,
+        "p95": 60,
+        "max": 60
+      },
+      {
+        "scenario": "pan/zoom longest frame (ms)",
+        "samples": 30,
+        "p50": 16.8,
+        "p95": 16.8,
+        "max": 16.8
+      },
+      {
+        "scenario": "workspace overview, navigation (shell cached)",
+        "samples": 30,
+        "p50": 429.7,
+        "p95": 472.6,
+        "max": 540.7
+      }
+    ],
+    "overviewTransferBytes": 4656,
+    "fullMapFetches": 0
+  }
+}

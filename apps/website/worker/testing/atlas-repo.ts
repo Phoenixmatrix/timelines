@@ -5,7 +5,13 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { ANALYZER, type FileAnalysis } from "../knowledge/analyze.ts";
-import { applyGraph, buildGraph, type GraphDiff, type SnapshotFile } from "../knowledge/graph.ts";
+import {
+  applyGraph,
+  buildGraph,
+  nodeHash,
+  type GraphDiff,
+  type SnapshotFile,
+} from "../knowledge/graph.ts";
 import {
   describeRepoCapabilities,
   type AtlasInfer,
@@ -51,6 +57,8 @@ const DIRS_PER_MODULE = 16;
 const MODULE_CONCEPTS = 14;
 const GLOBAL_CONCEPTS = 40;
 const PACKAGES = 30;
+/** Imports drawn per file by default; a scale workload asks for more (CORE-177). */
+const IMPORTS = 3;
 
 const pathOf = (i: number) => {
   const dir = Math.floor(i / FILES_PER_DIR);
@@ -59,7 +67,13 @@ const pathOf = (i: number) => {
 };
 
 /** A file's analysis: symbols, two or three concepts and a few imports, mostly nearby. */
-function analysisFor(path: string, count: number, next: () => number, version = 0): FileAnalysis {
+function analysisFor(
+  path: string,
+  count: number,
+  next: () => number,
+  version = 0,
+  fanOut = IMPORTS,
+): FileAnalysis {
   const [, m, d] = /^src\/m(\d+)\/d(\d+)\//.exec(path) ?? [];
   const module = Number(m ?? 0);
   const dir = Number(d ?? 0);
@@ -69,7 +83,7 @@ function analysisFor(path: string, count: number, next: () => number, version = 
   if (next() < 0.5) concepts.push(`shared topic ${pick(GLOBAL_CONCEPTS)}`);
   const modules = Math.max(1, Math.ceil(count / (FILES_PER_DIR * DIRS_PER_MODULE)));
   const imports: string[] = [];
-  for (let k = 0; k < 3; k++) {
+  for (let k = 0; k < fanOut; k++) {
     const r = next();
     let target: number;
     const base = (module * DIRS_PER_MODULE + dir) * FILES_PER_DIR;
@@ -99,10 +113,16 @@ function analysisFor(path: string, count: number, next: () => number, version = 
   };
 }
 
-export function syntheticRepo(count: number, seed = 1): SyntheticRepo {
+/**
+ * `count` files; `imports` draws per file (duplicates collapse in the graph),
+ * which sets the edge density: the default gives about 11 graph edges a file,
+ * 60 about 50 (the CORE-177 scale workload's 1,000,000 edges over 100,000 entities).
+ */
+export function syntheticRepo(count: number, seed = 1, { imports = IMPORTS } = {}): SyntheticRepo {
   const next = random(seed);
   const files = new Map<string, FileAnalysis>();
-  for (let i = 0; i < count; i++) files.set(pathOf(i), analysisFor(pathOf(i), count, next));
+  for (let i = 0; i < count; i++)
+    files.set(pathOf(i), analysisFor(pathOf(i), count, next, 0, imports));
   return { files, versions: new Map(), pending: new Set(), next };
 }
 
@@ -176,6 +196,71 @@ export async function storeGraph(
     concepts: new Map(),
   });
   return applyGraph(d1, repoId, buildId, `commit-${buildId}`, graph);
+}
+
+/**
+ * A repository's first graph written straight to SQLite (CORE-177): the rows
+ * applyGraph writes into an empty repository, with the same content hashes,
+ * but without a statement builder per row, which at a million edges don't fit
+ * in memory, and with the single `full` feed row applyGraph records when more
+ * changed than the feed lists. Later pushes go through storeGraph as a
+ * build's would, and project incrementally.
+ */
+export async function storeGraphRows(
+  sqlite: DatabaseSync,
+  repo: SyntheticRepo,
+  repoId: string,
+  buildId: string,
+): Promise<{ nodes: number; edges: number }> {
+  const files: SnapshotFile[] = [];
+  const analyses = new Map<string, FileAnalysis>();
+  for (const [path, analysis] of repo.files) {
+    const blob = blobOf(repo, path);
+    files.push({ path, blob, mode: "100644" });
+    if (!repo.pending.has(path)) analyses.set(blob, analysis);
+  }
+  const graph = buildGraph("synthetic", files, analyses, {
+    components: new Map(),
+    concepts: new Map(),
+  });
+  const hashes = await Promise.all(graph.nodes.map((node) => nodeHash(node)));
+  const commit = `commit-${buildId}`;
+  const card = sqlite.prepare(
+    `INSERT INTO kg_blob_analysis (blob_oid, analyzer, language, data, model) VALUES (?, ?, 'typescript', ?, 'fast')
+     ON CONFLICT DO NOTHING`,
+  );
+  const node = sqlite.prepare(
+    `INSERT INTO kg_nodes (repo_id, id, kind, name, path, summary, data, content_hash, changed_in)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const edge = sqlite.prepare(
+    `INSERT INTO kg_edges (repo_id, src, dst, kind, weight) VALUES (?, ?, ?, ?, ?)`,
+  );
+  sqlite.exec("BEGIN");
+  // What applyGraph records when more changed than the feed lists: one `full` row.
+  sqlite.prepare(`INSERT INTO atlas_feed (repo_id, kind) VALUES (?, 'full')`).run(repoId);
+  for (const [blob, analysis] of analyses) card.run(blob, ANALYZER, JSON.stringify(analysis));
+  for (const [i, n] of graph.nodes.entries())
+    node.run(
+      repoId,
+      n.id,
+      n.kind,
+      n.name,
+      n.path,
+      n.summary,
+      JSON.stringify(n.data),
+      hashes[i]!,
+      commit,
+    );
+  for (const e of graph.edges) edge.run(repoId, e.src, e.dst, e.kind, e.weight);
+  sqlite
+    .prepare(
+      `INSERT INTO kg_state (repo_id, graph_at) VALUES (?, ?)
+       ON CONFLICT (repo_id) DO UPDATE SET graph_at = excluded.graph_at`,
+    )
+    .run(repoId, new Date().toISOString());
+  sqlite.exec("COMMIT");
+  return { nodes: graph.nodes.length, edges: graph.edges.length };
 }
 
 /** Every file that mentions `from` now says `to`: the same concept, under a new name. */

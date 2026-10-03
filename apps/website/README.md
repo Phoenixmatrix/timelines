@@ -1390,6 +1390,75 @@ touches a model, Vectorize or AI Search (those bindings throw). The browser
 E2E `browser-atlas-revocation-clears-the-open-view` removes a collaborator
 while their Knowledge tab is open.
 
+**Atlas scale gates and benchmark** (CORE-177, PRD gate 18). Two layers.
+`worker/atlas/scale.test.ts` runs in every `vp test` and holds what is
+deterministic: on repositories built by the real graph builder and projection,
+every repository read route makes the same number of D1 round trips at 8x the
+repository; a workspace's grow only with the repositories selected; every
+statement a read route sends finds Atlas rows through an index (`EXPLAIN QUERY
+PLAN`, no full scan); pages stay within 100 records and the overview within 12
+regions and 256 KiB compressed. Timings are measured on demand, never in CI:
+`vp run website#atlas-bench` (projection and API) and
+`vp run website#atlas-bench-browser` (adds Chromium; run
+`vp run website#build` first), from `worker/atlas/scale.bench.test.ts`
+(knobs `ATLAS_SCALE_FILES`, `_IMPORTS`, `_REPOS`, `_SAMPLES`, `_CPU`, `_OUT`).
+The last run's raw results are `worker/atlas/scale.results.json`.
+
+Recorded 2026-10-03, i7-13700K (24 threads, 14.6 GiB), Node 24, 30 samples per
+scenario after a first request. Workloads: one repository of 20,000 synthetic
+files (103,051 Atlas entities, 1,122,440 edges), and the same scale across 50
+repositories (112,268 entities, 949,566 edges). **Boundaries:** server times
+are the real app (token auth, routing, handlers) in-process over local
+node:sqlite D1, request to body, with no network and no D1 latency, so
+production adds round trips x D1 latency (round trips are recorded; most run
+in parallel). Client times are the production build served by the benchmark
+(gzipped), headless Chromium 153 with CDP throttling: 50 ms latency, 20 Mbps
+each way, CPU slowed 4x. That approximates, and does not reproduce, the PRD's
+4-core / 8 GiB client.
+
+| Single repository, server             | p50 ms | p95 ms | D1 trips | records | gzip bytes |
+| ------------------------------------- | ------ | ------ | -------- | ------- | ---------- |
+| overview (12 regions)                 | 24.4   | 27.7   | 9        | 12      | 1,953      |
+| catalogue page                        | 24.3   | 25.7   | 7        | 44      | 1,559      |
+| children, highest fan-out (773)       | 8.3    | 9.8    | 7        | 100     | 1,334      |
+| detail, symbol                        | 61.5   | 69.0   | 9        |         | 666        |
+| ancestors, symbol (deep link)         | 53.8   | 58.4   | 6        |         | 604        |
+| relations in, most imported file      | 50.1   | 56.1   | 7        | 63      | 1,946      |
+| evidence, capability                  | 149.7  | 156.4  | 7        | 100     | 1,753      |
+| contributing imports, capability pair | 442.3  | 460.2  | 7        | 70      | 1,173      |
+| catalogue lookup                      | 26.5   | 29.9   | 6        | 50      | 1,416      |
+| compare, two pushes apart             | 15.4   | 17.0   | 12       | 100     | 3,637      |
+
+| 50 repositories, server       | p50 ms          | p95 ms          | D1 trips | records | gzip bytes |
+| ----------------------------- | --------------- | --------------- | -------- | ------- | ---------- |
+| overview                      | 39.8            | 51.4            | 157      | 12      | 4,641      |
+| catalogue page                | 63.5            | 77.9            | 156      | 100     | 5,240      |
+| children / detail / ancestors | 1.4 / 2.8 / 3.0 | 4.3 / 4.3 / 5.0 | 8 to 11  |         | under 800  |
+| catalogue lookup              | 59.8            | 87.5            | 106      | 50      | 3,975      |
+
+| Client (Chromium, throttled)                          | p50 ms                        | p95 ms |
+| ----------------------------------------------------- | ----------------------------- | ------ |
+| repository overview, cold navigation (shell included) | 863.5                         | 949.0  |
+| repository overview, reload (shell cached)            | 332.7                         | 374.7  |
+| child page (expand a region, request verified)        | 56.9                          | 142.2  |
+| detail (select an entity)                             | 416.1                         | 475.4  |
+| workspace overview of 50 repositories (shell cached)  | 429.7                         | 472.6  |
+| pan/zoom                                              | 60 fps, longest frame 16.8 ms |        |
+
+Projection: the full pass took 22.0 s locally (438 round trips); incremental
+pushes of 1 and 10 files 1.0 s and 4.7 s (164 and 177 trips; 10 files
+regroup), after the graph write; 50 repositories 293 ms each (p50). No browse
+request read the whole graph. **Against gate 18** at these workloads: ≤12
+overview regions, ≤100 records per page, an overview of 2 to 5 KiB
+compressed, no full-map fetch, p95 overview under 1 s and child/detail under
+0.5 s on the client, and frames at the headless 60 Hz cap during pan and zoom.
+**Gaps:** server numbers exclude D1 latency, so a 50-repository workspace
+overview (157 trips, parallel) and the 1,122,440-edge repository's
+`contributing` (442 ms, it reads every import of the source capability) and
+`evidence` (150 ms) are the routes to watch in production; the client profile
+is a throttled fast host, not a 4-core / 8 GiB machine; and headless frame
+timing can't show rates above 60 fps.
+
 **Main snapshot comparisons** (`worker/atlas/compare.ts`, CORE-175).
 `GET …/atlas/snapshots` lists a repository's published snapshots newest first
 (current, retained, or expired with its reason); `GET
