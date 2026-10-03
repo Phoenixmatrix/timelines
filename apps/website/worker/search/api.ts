@@ -18,6 +18,7 @@ import { decodeCursor, encodeCursor, parseQuery, type SearchQuery } from "./quer
 const LABELS: Record<SearchCategory, string> = {
   repositories: "repositories",
   issues: "issues",
+  packages: "packages",
   accounts: "people and organizations",
   conversations: "conversations",
 };
@@ -104,7 +105,18 @@ export function searchApi(providers: readonly AnySearchProvider[] = PROVIDERS) {
       offset = resumed;
     }
 
-    const context: SearchContext = { env: c.env, actor };
+    const context: SearchContext = {
+      env: c.env,
+      actor,
+      request: c.req.raw,
+      waitUntil: (promise) => {
+        try {
+          c.executionCtx.waitUntil(promise);
+        } catch {
+          // No execution context (tests): let it run.
+        }
+      },
+    };
     const groups = await Promise.all(
       categories.map((name) =>
         searchOne(byCategory.get(name as SearchCategory)!, context, query, offset, limit),

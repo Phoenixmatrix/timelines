@@ -7,6 +7,15 @@ export type { FeedVisibility, FormatId, RepoKind };
 export type PublishStatus = "active" | "yanked" | "deprecated" | "deleted";
 export type PackageAccess = "read" | "write" | "admin";
 
+export function packagesPath(owner: string): string {
+  return `/${owner}/-/packages`;
+}
+
+/** Package names keep their slashes in the page URL (`@scope/name`, `team/image`). */
+export function packagePath(owner: string, format: FormatId, name: string): string {
+  return `${packagesPath(owner)}/${format}/${name.split("/").map(encodeURIComponent).join("/")}`;
+}
+
 export interface PackageSummary {
   id: string;
   format: FormatId;

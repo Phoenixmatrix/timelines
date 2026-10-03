@@ -13,8 +13,10 @@ const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann Lee", isSiteAdmin
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben Ito", isSiteAdmin: false };
 const admin: Actor = { id: "root", slug: "root", displayName: "Root", isSiteAdmin: true };
 
-// Issues search trackers (Durable Objects) and has its own tests: issues.test.ts.
-const D1_PROVIDERS = PROVIDERS.filter((provider) => provider.category !== "issues");
+// Issues (tracker Durable Objects) and packages (the registry) have their own tests.
+const D1_PROVIDERS = PROVIDERS.filter(
+  (provider) => provider.category !== "issues" && provider.category !== "packages",
+);
 
 function setup(providers: readonly AnySearchProvider[] = D1_PROVIDERS) {
   const sqlite = migratedDatabase();

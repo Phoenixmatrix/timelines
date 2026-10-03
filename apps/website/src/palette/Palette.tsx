@@ -13,6 +13,7 @@ import {
   GitBranchIcon,
   LightningIcon,
   MagnifyingGlassIcon,
+  PackageIcon,
   UserCircleIcon,
   XCircleIcon,
 } from "@phosphor-icons/react";
@@ -103,6 +104,7 @@ export function SearchButton() {
 const CATEGORY_LABEL: Record<SearchCategory, string> = {
   repositories: "Repositories",
   issues: "Issues",
+  packages: "Packages",
   accounts: "People and organizations",
   conversations: "Conversations",
 };
@@ -149,9 +151,11 @@ function resultOption(result: SearchResult): Option {
       ? result.subtitle
       : result.category === "issues"
         ? `${result.subtitle} · ${result.tracker.slug}`
-        : result.category === "accounts"
-          ? `@${result.slug}`
-          : "Conversation";
+        : result.category === "packages"
+          ? result.subtitle
+          : result.category === "accounts"
+            ? `@${result.slug}`
+            : "Conversation";
   return {
     id: result.id,
     title: result.title,
@@ -167,6 +171,8 @@ function resultOption(result: SearchResult): Option {
         ) : (
           <CircleDashedIcon className={iconClass} aria-hidden />
         )
+      ) : result.category === "packages" ? (
+        <PackageIcon className={iconClass} aria-hidden />
       ) : result.category === "accounts" ? (
         result.kind === "org" ? (
           <BuildingsIcon className={iconClass} aria-hidden />

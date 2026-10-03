@@ -17,11 +17,15 @@ import { readableRepo, roleFor, selectRepos } from "../db.ts";
 import { db } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
 import { trackerObject } from "../tracker/stub.ts";
+import { packages } from "./packages.ts";
 import { matchOf, matchRank, matches, type MatchColumns, type SearchQuery } from "./query.ts";
 
 export interface SearchContext {
   env: Env;
   actor: Actor;
+  /** The incoming request, for subsystems that authenticate it themselves (the registry). */
+  request: Request;
+  waitUntil: (promise: Promise<unknown>) => void;
 }
 
 /** The slice of a category's ranked matches to return. */
@@ -282,6 +286,7 @@ const conversations: SearchProvider<"conversations"> = {
 export const PROVIDERS: readonly AnySearchProvider[] = [
   repositories,
   issues,
+  packages,
   accounts,
   conversations,
 ];

@@ -2,6 +2,7 @@
 // providers and the palette. Lookup is plain, permission-aware matching over
 // names and titles: no inference, embeddings or AI Search.
 
+import type { FormatId } from "./packages.ts";
 import type { Issue, IssueStatus } from "./tracker.ts";
 
 /**
@@ -9,11 +10,12 @@ import type { Issue, IssueStatus } from "./tracker.ts";
  * (worker/search/); a new kind of result adds a category here and a provider
  * there.
  */
-export type SearchCategory = "repositories" | "issues" | "accounts" | "conversations";
+export type SearchCategory = "repositories" | "issues" | "packages" | "accounts" | "conversations";
 
 export const SEARCH_CATEGORIES: readonly SearchCategory[] = [
   "repositories",
   "issues",
+  "packages",
   "accounts",
   "conversations",
 ];
@@ -81,6 +83,14 @@ export interface IssueResult extends ResultBase {
   updatedAt: string;
 }
 
+export interface PackageResult extends ResultBase {
+  category: "packages";
+  /** Owner, format and name together identify a package: the same name repeats across them. */
+  owner: string;
+  format: FormatId;
+  name: string;
+}
+
 export interface AccountResult extends ResultBase {
   category: "accounts";
   kind: "user" | "org";
@@ -93,7 +103,12 @@ export interface ConversationResult extends ResultBase {
   updatedAt: string;
 }
 
-export type SearchResult = RepositoryResult | IssueResult | AccountResult | ConversationResult;
+export type SearchResult =
+  | RepositoryResult
+  | IssueResult
+  | PackageResult
+  | AccountResult
+  | ConversationResult;
 
 /**
  * One category's answer. A category that failed or timed out is `unavailable`,

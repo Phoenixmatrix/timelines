@@ -1,19 +1,10 @@
 import { FORMATS, type FormatId } from "@gitmatrix/formats/info";
-import type { PackageSummary } from "../../shared/packages.ts";
+import { packagePath, packagesPath, type PackageSummary } from "../../shared/packages.ts";
 
-export { FORMATS };
-
-export function packagesPath(owner: string): string {
-  return `/${owner}/-/packages`;
-}
+export { FORMATS, packagePath, packagesPath };
 
 export function feedsPath(owner: string): string {
   return `/${owner}/-/feeds`;
-}
-
-/** Package names keep their slashes in the page URL (`@scope/name`, `team/image`). */
-export function packagePath(owner: string, format: FormatId, name: string): string {
-  return `${packagesPath(owner)}/${format}/${name.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 /** …and travel as one encoded segment in the API's. */

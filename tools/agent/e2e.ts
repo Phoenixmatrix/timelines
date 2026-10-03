@@ -1206,6 +1206,17 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       );
       await expect(page.getByText("Agent ready fixture", { exact: true }).first()).toBeVisible();
 
+      // The package published earlier, by its qualified name, opens its console page.
+      await page.keyboard.press("Control+k");
+      await input.fill(`${repo.owner}/${packageName}`);
+      const packages = page.getByRole("group", { name: "Packages" });
+      await expect(packages.getByRole("option").first()).toContainText(packageName);
+      await page.keyboard.press("Enter");
+      await page.waitForURL(
+        (url) => url.pathname === `/${repo.owner}/-/packages/generic/${packageName}`,
+      );
+      await expect(page.getByRole("heading", { name: packageName, exact: true })).toBeVisible();
+
       // Signed out: navigation only, and no search requests.
       await context.clearCookies();
       let searched = 0;
