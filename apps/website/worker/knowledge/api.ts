@@ -426,11 +426,48 @@ knowledge.get("/search", async (c) => {
     }));
   })();
 
-  const [e, p] = await Promise.allSettled([entities, passages]);
+  // The index's state, read directly: status() would also start a build.
+  const index = (async () => {
+    const [state, running] = await Promise.all([
+      db(c.env.DB)
+        .selectFrom("kg_state")
+        .select("indexed_commit")
+        .where("repo_id", "=", row.id)
+        .executeTakeFirst(),
+      db(c.env.DB)
+        .selectFrom("kg_builds")
+        .select("id")
+        .where("repo_id", "=", row.id)
+        .where("status", "=", "running")
+        .executeTakeFirst(),
+    ]);
+    const indexedCommit = state?.indexed_commit ?? null;
+    return {
+      state: running
+        ? ("building" as const)
+        : indexedCommit
+          ? ("ready" as const)
+          : ("none" as const),
+      indexedCommit,
+    };
+  })();
+
+  const [e, p, i] = await Promise.allSettled([entities, passages, index]);
+  for (const [name, result] of [
+    ["entities", e],
+    ["passages", p],
+  ] as const)
+    if (result.status === "rejected")
+      console.error(`knowledge search: ${name} failed`, result.reason);
   const body: KnowledgeSearchResults = {
     query,
     entities: e.status === "fulfilled" ? e.value : [],
     passages: p.status === "fulfilled" ? p.value : [],
+    providers: {
+      entities: e.status === "fulfilled" ? "ok" : "failed",
+      passages: p.status === "fulfilled" ? "ok" : "failed",
+    },
+    index: i.status === "fulfilled" ? i.value : { state: "ready", indexedCommit: null },
   };
   return c.json(body);
 });

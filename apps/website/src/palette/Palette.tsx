@@ -5,18 +5,22 @@
 import { Dialog } from "@base-ui/react/dialog";
 import {
   ArrowRightIcon,
+  BookOpenTextIcon,
   BuildingsIcon,
   ChatCenteredDotsIcon,
   CheckCircleIcon,
   CircleDashedIcon,
+  FileCodeIcon,
   FolderSimpleIcon,
   GitBranchIcon,
   LightningIcon,
   MagnifyingGlassIcon,
   PackageIcon,
   PlusCircleIcon,
+  TreeStructureIcon,
   UserCircleIcon,
   XCircleIcon,
+  XIcon,
 } from "@phosphor-icons/react";
 import {
   createContext,
@@ -44,6 +48,14 @@ import {
   type PaletteContext,
   type PaletteEnv,
 } from "./commands.ts";
+import {
+  knowledgeResults,
+  knowledgeSearch,
+  repoKey,
+  type KnowledgeState,
+  type PaletteScope,
+  type ScopedRepo,
+} from "./knowledge.ts";
 import { remoteSearch, type RemoteState } from "./remote.ts";
 import { edge, FRESH, move, reconcile, type Selection } from "./selection.ts";
 
@@ -118,6 +130,13 @@ interface Option {
   detail: string;
   icon: ReactNode;
   activate(env: PaletteEnv): void;
+  /** Narrows the palette instead of leaving it. */
+  keepOpen?: boolean;
+  /**
+   * Moves focus somewhere else (the assistant's composer), so closing the
+   * palette mustn't hand it back to whatever opened it.
+   */
+  takesFocus?: boolean;
 }
 
 interface Section {
@@ -134,7 +153,9 @@ function commandOption(command: Command): Option {
     id: command.id,
     title: command.title,
     detail: command.hint ?? "",
-    icon: command.id.startsWith("create") ? (
+    icon: command.id.startsWith("knowledge") ? (
+      <FileCodeIcon className={iconClass} aria-hidden />
+    ) : command.id.startsWith("create") ? (
       <PlusCircleIcon className={iconClass} aria-hidden />
     ) : command.id === "ask" ? (
       <ChatCenteredDotsIcon className={iconClass} aria-hidden />
@@ -146,7 +167,13 @@ function commandOption(command: Command): Option {
       <ArrowRightIcon className={iconClass} aria-hidden />
     ),
     activate: (env) =>
-      run.kind === "navigate" ? env.navigate(run.to, run.state) : run.perform(env),
+      run.kind === "navigate"
+        ? env.navigate(run.to, run.state)
+        : run.kind === "scope"
+          ? env.scope(run.scope)
+          : run.perform(env),
+    keepOpen: run.kind === "scope",
+    takesFocus: command.id === "ask" || command.id === "action:assistant",
   };
 }
 
@@ -195,6 +222,7 @@ function resultOption(result: SearchResult): Option {
         env.assistant.show();
       }
     },
+    takesFocus: target.kind === "chat",
   };
 }
 
@@ -217,11 +245,17 @@ function announce(count: number, query: string, remote: RemoteState): string {
   return parts.filter(Boolean).join(". ");
 }
 
-function fetchSearch(query: string, signal: AbortSignal) {
-  return api<SearchResponse>(`/search?${new URLSearchParams({ q: query }).toString()}`, {
-    signal,
-  });
+function fetchSearch(query: string, signal: AbortSignal, categories?: SearchCategory[]) {
+  const params = new URLSearchParams({ q: query });
+  if (categories) params.set("categories", categories.join(","));
+  return api<SearchResponse>(`/search?${params.toString()}`, { signal });
 }
+
+const KNOWLEDGE_ICON = {
+  entities: <TreeStructureIcon className={iconClass} aria-hidden />,
+  code: <FileCodeIcon className={iconClass} aria-hidden />,
+  wiki: <BookOpenTextIcon className={iconClass} aria-hidden />,
+};
 
 function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const viewer = useViewer();
@@ -236,20 +270,54 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
   const [query, setQuery] = useState("");
   const [remote, setRemote] = useState<RemoteState>({ status: "idle", query: "" });
   const [selection, setSelection] = useState<Selection>(FRESH);
+  // Narrowed to picking a repository, or to one repository's code and wiki.
+  const [scope, setScopeState] = useState<PaletteScope | null>(null);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
+  const [knowledge, setKnowledge] = useState<KnowledgeState>({ status: "idle" });
+  const knowledgeClient = useMemo(() => knowledgeSearch(setKnowledge), []);
 
-  // Only a signed-in viewer searches the server; signed out, the palette is navigation.
-  const client = useMemo(() => (viewer ? remoteSearch(fetchSearch, setRemote) : null), [viewer]);
+  // Only a signed-in viewer searches the server; signed out, the palette is
+  // navigation. Picking a repository searches repositories alone.
+  const client = useMemo(
+    () =>
+      viewer
+        ? remoteSearch(
+            (q, signal) =>
+              fetchSearch(
+                q,
+                signal,
+                scopeRef.current?.kind === "pick" ? ["repositories"] : undefined,
+              ),
+            setRemote,
+          )
+        : null,
+    [viewer],
+  );
   useEffect(() => () => client?.dispose(), [client]);
   useEffect(() => {
-    if (open) client?.search(query);
-  }, [client, open, query]);
+    if (!open) return;
+    // Code and wiki search waits for Enter; nothing goes out while typing.
+    client?.search(scope?.kind === "repo" ? "" : query);
+  }, [client, open, query, scope]);
   useEffect(() => {
     if (open) return;
     client?.dispose();
+    knowledgeClient.reset();
+    setQuery("");
+    setScopeState(null);
+    setRemote({ status: "idle", query: "" });
+    setSelection(FRESH);
+  }, [client, knowledgeClient, open]);
+  const setScope = (next: PaletteScope | null) => {
+    client?.dispose();
+    knowledgeClient.reset();
+    setScopeState(next);
     setQuery("");
     setRemote({ status: "idle", query: "" });
     setSelection(FRESH);
-  }, [client, open]);
+    input.current?.focus();
+  };
 
   // The trackers create-issue can target, fetched once per opening.
   const [trackers, setTrackers] = useState<TrackerList | null>(null);
@@ -271,7 +339,7 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
     defaultTrackerId: trackers?.defaultOwnerId ?? null,
     query,
   };
-  const commands = COMMAND_SOURCES.flatMap((source) => source(context));
+  const commands = scope ? [] : COMMAND_SOURCES.flatMap((source) => source(context));
   const local = matchCommands(commands, query);
   const sections: Section[] = [];
   // Commands that act on the query itself ("Create issue “…”") are fallbacks:
@@ -299,8 +367,50 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
         sections.push({
           key: group.category,
           label: CATEGORY_LABEL[group.category],
-          options: group.results.map(resultOption),
+          options: group.results.map((result) =>
+            // Picking a repository narrows to it instead of opening it.
+            scope?.kind === "pick" && result.category === "repositories"
+              ? {
+                  ...resultOption(result),
+                  keepOpen: true,
+                  activate: (env: PaletteEnv) =>
+                    env.scope({
+                      kind: "repo",
+                      owner: result.owner,
+                      name: result.name,
+                      defaultBranch: result.defaultBranch,
+                    }),
+                }
+              : resultOption(result),
+          ),
         });
+
+  // One repository's code and wiki: only the answer to what was submitted, in
+  // this scope, ever shows.
+  const scopedRepo: ScopedRepo | null = scope?.kind === "repo" ? scope : null;
+  const answered =
+    scopedRepo &&
+    knowledge.status === "done" &&
+    knowledge.repo === repoKey(scopedRepo) &&
+    knowledge.query === normalized
+      ? knowledgeResults(scopedRepo, knowledge.results)
+      : null;
+  const submitted =
+    scopedRepo && knowledge.status !== "idle" && knowledge.repo === repoKey(scopedRepo)
+      ? knowledge.query
+      : null;
+  for (const group of answered?.groups ?? [])
+    sections.push({
+      key: group.key,
+      label: group.label,
+      options: group.options.map((option) => ({
+        id: option.id,
+        title: option.title,
+        detail: option.detail,
+        icon: KNOWLEDGE_ICON[group.key],
+        activate: (env: PaletteEnv) => env.navigate(option.to),
+      })),
+    });
 
   const found = sections.reduce((count, section) => count + section.options.length, 0);
   if (fallbacks.length)
@@ -328,9 +438,16 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
       openChat: (id) => assistant.openChat(id),
       ask: (prompt) => assistant.ask(prompt),
     },
+    scope: (next) => setScope(next),
   };
+  // Whether closing returns focus to whatever opened the palette.
+  const restoreFocus = useRef(true);
+  useEffect(() => {
+    if (open) restoreFocus.current = true;
+  }, [open]);
   const activate = (option: Option) => {
-    onOpenChange(false);
+    if (option.takesFocus) restoreFocus.current = false;
+    if (!option.keepOpen) onOpenChange(false);
     option.activate(env);
   };
 
@@ -360,8 +477,18 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
       setSelection(edge(ids, event.key === "Home" ? "first" : "last"));
     } else if (event.key === "Enter") {
       event.preventDefault();
+      // Code and wiki search runs only when submitted: Enter on new text
+      // searches, Enter on results already shown opens the selected one.
+      if (scopedRepo && normalized !== submitted) {
+        knowledgeClient.submit(scopedRepo, normalized);
+        setSelection(FRESH);
+        return;
+      }
       const option = activeIndex >= 0 ? options[activeIndex] : undefined;
       if (option) activate(option);
+    } else if (event.key === "Backspace" && scope && !query) {
+      event.preventDefault();
+      setScope(null);
     }
   };
 
@@ -387,10 +514,35 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
         <Dialog.Viewport className="fixed inset-0 z-50 flex items-start justify-center p-3 pt-[max(0.75rem,10dvh)]">
           <Dialog.Popup
             initialFocus={input}
+            finalFocus={() => restoreFocus.current}
             className={`flex max-h-[min(36rem,calc(100dvh-1.5rem))] w-full max-w-xl flex-col overflow-hidden rounded-pane bg-pane shadow-[var(--shadow-float),0_0_0_1px_var(--line-soft)] ${dialogMotion}`}
             onKeyDown={onKeyDown}
           >
             <Dialog.Title className="sr-only">Search</Dialog.Title>
+            {scope && (
+              <div className="flex items-center gap-2 border-b border-line-soft px-4 py-2 text-body-sm">
+                <FileCodeIcon className="size-4 shrink-0 text-ink-muted" aria-hidden />
+                <span className="min-w-0 flex-1 truncate text-ink-muted">
+                  {scope.kind === "pick" ? (
+                    "Code and wiki search: choose a repository"
+                  ) : (
+                    <>
+                      Code and wiki in{" "}
+                      <span className="font-semibold text-ink">{repoKey(scope)}</span>
+                      <span className="text-ink-faint"> · searches when you press Enter</span>
+                    </>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost mk-btn--sm"
+                  aria-label="Leave code and wiki search"
+                  onClick={() => setScope(null)}
+                >
+                  <XIcon className="size-3.5" aria-hidden />
+                </button>
+              </div>
+            )}
             <div className="relative border-b border-line-soft">
               <MagnifyingGlassIcon
                 className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-ink-faint"
@@ -405,8 +557,24 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
                 aria-autocomplete="list"
                 aria-activedescendant={activeIndex >= 0 ? optionId(activeIndex) : undefined}
                 aria-describedby={helpId}
-                aria-label={viewer ? "Search or go to" : "Go to"}
-                placeholder={viewer ? "Search or go to…" : "Go to…"}
+                aria-label={
+                  scope?.kind === "repo"
+                    ? `Search code and wiki in ${repoKey(scope)}`
+                    : scope?.kind === "pick"
+                      ? "Choose a repository"
+                      : viewer
+                        ? "Search or go to"
+                        : "Go to"
+                }
+                placeholder={
+                  scope?.kind === "repo"
+                    ? "A name, or describe the behavior, then Enter"
+                    : scope?.kind === "pick"
+                      ? "Find a repository…"
+                      : viewer
+                        ? "Search or go to…"
+                        : "Go to…"
+                }
                 value={query}
                 autoComplete="off"
                 autoCorrect="off"
@@ -464,7 +632,25 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
                   });
                 })()}
               </div>
-              {normalized && !found && !loading && (
+              {scopedRepo && knowledge.status === "loading" && knowledge.query === normalized && (
+                <p className="m-0 px-2.5 py-2 text-body-sm text-ink-faint">
+                  Searching code and wiki…
+                </p>
+              )}
+              {scopedRepo && knowledge.status === "failed" && knowledge.query === normalized && (
+                <p className="m-0 px-2.5 py-2 text-body-sm text-danger-text">{knowledge.message}</p>
+              )}
+              {answered?.notes.map((note) => (
+                <p key={note} className="m-0 px-2.5 py-2 text-body-sm text-ink-muted">
+                  {note}
+                </p>
+              ))}
+              {scopedRepo && normalized && normalized !== submitted && (
+                <p className="m-0 px-2.5 py-2 text-body-sm text-ink-faint">
+                  Press Enter to search {repoKey(scopedRepo)}.
+                </p>
+              )}
+              {!scopedRepo && normalized && !found && !loading && (
                 <p className="m-0 px-2.5 py-6 text-center text-body-sm text-ink-muted">
                   Nothing matches “{normalized}”.
                 </p>
@@ -501,7 +687,15 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
               </span>
             </div>
             <div role="status" className="sr-only">
-              {announce(found, normalized, remote)}
+              {scopedRepo
+                ? knowledge.status === "loading"
+                  ? "Searching code and wiki"
+                  : knowledge.status === "failed"
+                    ? knowledge.message
+                    : answered
+                      ? [`${found} result${found === 1 ? "" : "s"}`, ...answered.notes].join(". ")
+                      : ""
+                : announce(found, normalized, remote)}
             </div>
           </Dialog.Popup>
         </Dialog.Viewport>

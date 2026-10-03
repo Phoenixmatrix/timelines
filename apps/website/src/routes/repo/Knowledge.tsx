@@ -53,6 +53,7 @@ import { KnowledgeStatusPill, useKnowledgeStatus } from "../../components/Knowle
 import { link } from "../../components/ui.tsx";
 import { load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
+import { knowledgeSearchNotes } from "../../lib/knowledgeSearch.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
 import { scopeOf, withScope } from "../../lib/timelineScope.ts";
 import { AtlasMap, KIND_LABEL } from "./AtlasMap.tsx";
@@ -521,11 +522,11 @@ function SearchPanel({
         </button>
       </header>
       <div className="min-h-0 overflow-y-auto p-1">
-        {search.entities.length === 0 && search.passages.length === 0 && (
-          <p className="m-0 p-3 text-body-sm text-ink-muted">
-            Nothing matches. Try a name, or describe the behavior.
+        {knowledgeSearchNotes(search).map((note) => (
+          <p key={note} className="m-0 p-3 text-body-sm text-ink-muted" role="status">
+            {note}
           </p>
-        )}
+        ))}
         {search.entities.length > 0 && (
           <ul className="m-0 list-none p-0">
             {search.entities.map((e) => {

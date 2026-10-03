@@ -71,6 +71,8 @@ export interface RepositoryResult extends ResultBase {
   owner: string;
   name: string;
   visibility: "public" | "private";
+  /** Where code links point, e.g. a code passage found in this repository. */
+  defaultBranch: string;
 }
 
 export interface IssueResult extends ResultBase {

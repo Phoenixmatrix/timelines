@@ -297,6 +297,17 @@ export interface KnowledgeSearchResults {
   entities: (Pick<GraphNode, "id" | "kind" | "name" | "path" | "summary"> & { score: number })[];
   /** Matching passages from source files and wiki pages (AI Search, hybrid). */
   passages: { kind: "code" | "wiki"; path: string; text: string; score: number }[];
+  /**
+   * Which lookups answered. A failed one leaves its list empty, so an empty
+   * list is "no matches" only when its provider is "ok".
+   */
+  providers: { entities: "ok" | "failed"; passages: "ok" | "failed" };
+  /**
+   * The index the results come from: "none" before the first build (nothing
+   * is searchable yet), "building" while a build runs (results may be from an
+   * older commit, or missing), "ready" otherwise. Searching never starts a build.
+   */
+  index: { state: "none" | "building" | "ready"; indexedCommit: string | null };
 }
 
 export interface WikiPageSummary {

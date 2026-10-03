@@ -99,6 +99,7 @@ const repositories: SearchProvider<"repositories"> = {
           owner: row.owner_slug,
           name: row.name,
           visibility: row.visibility,
+          defaultBranch: row.default_branch,
         })),
     };
   },

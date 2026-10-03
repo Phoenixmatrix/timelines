@@ -121,6 +121,7 @@ describe("global search", () => {
         owner: "orbit",
         name: "engine",
         visibility: "public",
+        defaultBranch: "main",
       },
     ]);
 

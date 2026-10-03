@@ -72,7 +72,7 @@ describe("commands", () => {
   });
 
   test("include the current repository's sections from its tab list", () => {
-    const inRepo = commands({ repo }).filter((c) => c.group === "repository");
+    const inRepo = commands({ repo }).filter((c) => c.id.startsWith("repo:"));
     expect(inRepo.map((c) => c.title)).toEqual([
       "Code",
       "Commits",
@@ -186,6 +186,7 @@ describe("ask", () => {
       command.run.perform({
         navigate: () => {},
         assistant: { show: () => {}, openChat: () => {}, ask: (p) => calls.push(p) },
+        scope: () => {},
       });
     expect(calls).toEqual(["why is CI slow?"]);
   });

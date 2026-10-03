@@ -303,6 +303,25 @@ earlier conversation keeps its history, pending approvals and unsent draft
 search result reopens that chat without sending anything. While the palette
 animates closed it ignores keys, so a quick second Enter can't run an option twice.
 
+**Code and wiki search** (CORE-97) is a mode, not part of instant search: it
+is semantic, paid (an embedding plus a Vectorize query and an AI Search
+retrieval per submission) and per repository. **Search code and wiki** scopes
+the palette to the current repository; elsewhere, **Search code and wiki in a
+repository…** first offers repositories only. The scope shows above the input
+(× or Backspace on an empty query leaves it). Typing and choosing a repository
+send nothing; **Enter** submits to `GET /api/repos/:o/:n/knowledge/search` with
+the viewer's read access, and a new query or scope drops the previous answer
+until it's submitted. Results come in **Entities** (open the Knowledge map at
+that node), **Code** (the file at the default branch) and **Wiki** (the page),
+six of each; the repository's Knowledge page shows them all. Only indexed
+files and generated pages are searchable (not every file is indexed, binary and
+oversized ones aren't), and searching never starts a build. The response says
+which lookups answered (`providers`) and which index it read (`index.state`:
+`none`, `building`, `ready`), so the palette and the Knowledge page say "isn't
+indexed yet", "indexing is running" or "couldn't search …" rather than
+"nothing matches"; where AI is off the endpoint answers 503 and the palette says
+code search is off there. Instant entity search keeps working either way.
+
 Local groups answer at once and keep working while remote ones load or fail;
 a category that can't be searched says so instead of looking empty. Selection
 follows the option you picked, so results arriving never move it, and only the

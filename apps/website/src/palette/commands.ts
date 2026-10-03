@@ -6,6 +6,7 @@ import type { RepoDetail, Viewer } from "../../shared/api.ts";
 import { MATCH_RANK, matchFields, type SearchMatch } from "../../shared/search.ts";
 import type { TrackerOwner } from "../../shared/tracker.ts";
 import { createIntent } from "./intents.ts";
+import type { PaletteScope } from "./knowledge.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { repoSections } from "../lib/repoSections.ts";
 
@@ -28,6 +29,8 @@ export interface PaletteEnv {
   /** In-app navigation; `state` carries one-shot intents (palette/intents.ts). */
   navigate(to: string, state?: unknown): void;
   assistant: { show(): void; openChat(id: string): void; ask(prompt: string): void };
+  /** Narrows the palette, which stays open. */
+  scope(next: PaletteScope): void;
 }
 
 export type CommandGroup = "pages" | "repository" | "actions";
@@ -44,7 +47,9 @@ export interface Command {
   always?: boolean;
   run:
     | { kind: "navigate"; to: string; state?: unknown }
-    | { kind: "action"; perform(env: PaletteEnv): void };
+    | { kind: "action"; perform(env: PaletteEnv): void }
+    /** Narrows the palette itself (it stays open), e.g. to one repository's code. */
+    | { kind: "scope"; scope: PaletteScope };
 }
 
 export type CommandSource = (context: PaletteContext) => Command[];
@@ -199,7 +204,51 @@ const createIssue: CommandSource = (context) => {
   ];
 };
 
-export const COMMAND_SOURCES: readonly CommandSource[] = [pages, repository, createIssue, actions];
+/**
+ * Code and wiki search: semantic, paid and per repository, so it's a mode the
+ * person enters and submits, never part of instant search. The current
+ * repository directly; elsewhere, pick one first.
+ */
+const knowledge: CommandSource = ({ viewer, repo }) => {
+  if (!viewer) return [];
+  const keywords = ["code", "wiki", "knowledge", "semantic", "find in files", "grep"];
+  return repo
+    ? [
+        {
+          id: "knowledge:here",
+          group: "repository",
+          title: "Search code and wiki",
+          hint: `${repo.owner.slug}/${repo.name}`,
+          keywords,
+          run: {
+            kind: "scope",
+            scope: {
+              kind: "repo",
+              owner: repo.owner.slug,
+              name: repo.name,
+              defaultBranch: repo.defaultBranch,
+            },
+          },
+        },
+      ]
+    : [
+        {
+          id: "knowledge:pick",
+          group: "actions",
+          title: "Search code and wiki in a repository…",
+          keywords,
+          run: { kind: "scope", scope: { kind: "pick" } },
+        },
+      ];
+};
+
+export const COMMAND_SOURCES: readonly CommandSource[] = [
+  pages,
+  repository,
+  knowledge,
+  createIssue,
+  actions,
+];
 
 export interface MatchedCommand {
   command: Command;

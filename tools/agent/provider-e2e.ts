@@ -454,6 +454,84 @@ export async function runProviderE2E(
       }).finally(() => {
         evidence.indexVisibility = visibility.attempts;
       });
+      enter("palette-knowledge");
+      // CORE-97: the search says which providers answered and which index it
+      // read, so an empty list can be told from a failure or a missing index.
+      const answered = evidence.search as {
+        providers: { entities: string; passages: string };
+        index: { state: string; indexedCommit: string | null };
+      };
+      assert.deepEqual(answered.providers, { entities: "ok", passages: "ok" });
+      assert.equal(answered.index.indexedCommit, final, "Search must report the indexed commit");
+      // The same discriminating query in another repository never returns this one's results.
+      const elsewhere = await api(
+        `/repos/orbit/website/knowledge/search?q=${encodeURIComponent("Copper Finch copperFinchChecksum parcel checksum modulo 65521")}`,
+      );
+      evidence.paletteKnowledgeIsolation = {
+        index: elsewhere.index,
+        providers: elsewhere.providers,
+        entities: elsewhere.entities.map((e: { id: string }) => e.id),
+        passages: elsewhere.passages.map((p: { path: string }) => p.path),
+      };
+      assert(
+        !elsewhere.entities.some((e: { name: string }) => /copperFinch/i.test(e.name)) &&
+          !elsewhere.passages.some((p: { path: string; text: string }) =>
+            /checksum\.ts|copperFinch/i.test(`${p.path} ${p.text}`),
+          ),
+        "Another repository's search returned the fixture's results",
+      );
+      {
+        // The palette's code and wiki mode, against these real providers:
+        // nothing is searched until Enter, and the code result opens the file.
+        const browser = await chromium.launch({ headless: true });
+        const context = await browser.newContext({ baseURL: ctx.origin });
+        const page = await context.newPage();
+        const expect = playwrightExpect.configure({ timeout: 120_000 });
+        page.setDefaultTimeout(120_000);
+        const searches: string[] = [];
+        page.on("request", (request) => {
+          if (request.url().includes("/knowledge/search")) searches.push(request.url());
+        });
+        try {
+          await page.goto("/signin");
+          await page.getByRole("button", { name: /Continue as Priya/i }).click();
+          await page.waitForURL((url) => url.pathname !== "/signin");
+          await page.goto(`/${owner}/${name}`);
+          await page.waitForLoadState("networkidle");
+          await page.keyboard.press("Control+k");
+          await page
+            .getByRole("combobox", { name: "Search or go to" })
+            .fill("search code and wiki");
+          await page.getByRole("option", { name: /^Search code and wiki/ }).click();
+          const box = page.getByRole("combobox", {
+            name: `Search code and wiki in ${owner}/${name}`,
+          });
+          await box.fill("Copper Finch copperFinchChecksum parcel checksum modulo 65521");
+          await delay(1_000);
+          assert.equal(searches.length, 0, "Typing in code and wiki search must not search");
+          await box.press("Enter");
+          const code = page.getByRole("group", { name: "Code" });
+          await expect(code.getByRole("option", { name: /checksum\.ts/ })).toBeVisible();
+          assert.equal(searches.length, 1, "One submission, one search");
+          await expect(page.getByRole("group", { name: "Entities" })).toBeVisible();
+          evidence.paletteKnowledge = {
+            groups: await page.getByRole("listbox").getByRole("group").allInnerTexts(),
+            searches: searches.length,
+          };
+          await code.getByRole("option", { name: /checksum\.ts/ }).click();
+          await page.waitForURL((url) => url.pathname.endsWith("/checksum.ts"));
+          assert.match(new URL(page.url()).pathname, new RegExp(`^/${owner}/${name}/blob/`));
+          await expect(page.getByText("copperFinchChecksum").first()).toBeVisible();
+        } catch (error) {
+          await page
+            .screenshot({ path: join(ctx.artifacts, "palette-knowledge-failure.png") })
+            .catch(() => {});
+          throw error;
+        } finally {
+          await context.close();
+          await browser.close();
+        }
+      }
       enter("assistant");
       // The assistant (CORE-25/26): one real turn through clef routing, the
       // orchestrator model and its tools, answered from the indexed fixture.
