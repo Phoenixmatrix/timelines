@@ -1,5 +1,12 @@
 import { describe, expect, test } from "vite-plus/test";
-import { attributionText, claimAttribution, claimHolder, type IssueClaim } from "./tracker.ts";
+import {
+  attributionText,
+  claimAttribution,
+  claimHolder,
+  fallbackTeam,
+  type IssueClaim,
+  type Snapshot,
+} from "./tracker.ts";
 
 const ann = { id: "ann", slug: "ann", displayName: "Ann Lee" };
 const people = {
@@ -36,5 +43,40 @@ describe("who's accountable", () => {
     expect(attributionText(laptop)).toBe("Ann Lee (ann-laptop)");
     // A label that is just their name or slug adds nothing.
     expect(claimHolder(people, claim("ann", "ann"))).toBe("Ann Lee");
+  });
+});
+
+describe("the fallback team for quick capture", () => {
+  const team = (id: string, memberIds: string[] = [], archived = false) =>
+    ({ id, memberIds, archived }) as Snapshot["teams"][number];
+  const filed = (teamId: string, by: string, createdAt: string) =>
+    ({
+      teamId,
+      createdAt,
+      createdBy: { id: by, kind: "user", name: by },
+    }) as unknown as Snapshot["issues"][number];
+  const agents = [{ id: "bot", accountable: { id: "ann" } }] as unknown as Snapshot["agents"];
+  test("is your team when you're on exactly one", () => {
+    expect(
+      fallbackTeam({ teams: [team("a"), team("b", ["ann"])], issues: [], agents }, "ann"),
+    ).toBe("b");
+  });
+  test("is the team you or your agents last filed into, among your teams", () => {
+    const teams = [team("a", ["ann"]), team("b", ["ann"]), team("c")];
+    const issues = [
+      filed("a", "ann", "2026-01-01"),
+      filed("c", "ann", "2026-03-01"),
+      filed("b", "bot", "2026-02-01"),
+      filed("a", "ben", "2026-04-01"),
+    ];
+    expect(fallbackTeam({ teams, issues, agents }, "ann")).toBe("b");
+  });
+  test("is the last team you filed into when you're on none, else the first open team", () => {
+    const teams = [team("a", [], true), team("b"), team("c")];
+    expect(fallbackTeam({ teams, issues: [filed("c", "ann", "2026-01-01")], agents }, "ann")).toBe(
+      "c",
+    );
+    expect(fallbackTeam({ teams, issues: [], agents }, "ann")).toBe("b");
+    expect(fallbackTeam({ teams: [team("a", [], true)], issues: [], agents }, "ann")).toBeNull();
   });
 });

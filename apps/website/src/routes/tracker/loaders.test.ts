@@ -49,6 +49,14 @@ describe("tracker navigation", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fetch.mock.calls[0]![0]).toBe("/api/tracker");
   });
+  test("opens the tracker whose defaults were saved on the server, over this browser's", async () => {
+    reply({ viewerId: "ann", trackers: owners, defaultOwnerId: "ann" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => JSON.stringify({ ownerId: "org", view: "list", query: "is:open", teamId: "" }),
+    });
+    const result = await trackerIndexLoader(args("/tracker")).catch((e) => e);
+    expect(result.headers.get("location")).toBe("/tracker/ann");
+  });
   test("falls back to an accessible owner when a saved membership has been removed", async () => {
     reply({ viewerId: "ann", trackers: owners });
     vi.stubGlobal("localStorage", {

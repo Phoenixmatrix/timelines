@@ -332,6 +332,12 @@ gm agent setup --check                           # exit 4 if instructions or ski
   own profile. `--no-identity` writes only the files.
 - **Defaults.** `gm issue next` and `claim` take the session label, scope and
   lease length from these files, and the tracker owner when none is selected.
+- **Your default team.** When neither a flag nor these files name a team,
+  `gm issue next`, `create`, `list` and `ready` use the default team you set in
+  the web tracker (the star beside a team), synced with the replica and cached
+  for `--offline`. Each reports the team it used and why (`team.source`:
+  `flag`, `checkout`, `project`, `default`, `scope` or `none`); `--all-teams`
+  ignores every default. `gm tracker status` shows `defaultTeam`.
 
 ### Agent capability profiles
 

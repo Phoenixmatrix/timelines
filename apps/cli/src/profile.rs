@@ -292,6 +292,8 @@ pub fn acting_agent() -> Option<String> {
 pub struct Defaults {
     pub agent: Option<String>,
     pub scope: Scope,
+    /// The file `scope.team` came from: [`LOCAL_FILE`] or [`PROJECT_FILE`].
+    pub team_from: Option<&'static str>,
     pub ttl: u32,
 }
 
@@ -302,7 +304,15 @@ pub fn defaults() -> Defaults {
 
 fn resolve(project: &Project, local: &Local) -> Defaults {
     let pick = |mine: &Option<String>, shared: &Option<String>| mine.clone().or(shared.clone());
+    let team_from = if local.scope.team.is_some() {
+        Some(LOCAL_FILE)
+    } else if local.scope.under.is_none() && project.tracker.team.is_some() {
+        Some(PROJECT_FILE)
+    } else {
+        None
+    };
     Defaults {
+        team_from,
         agent: local.name.clone(),
         scope: Scope {
             owner: pick(&local.scope.owner, &project.tracker.owner),
@@ -339,6 +349,13 @@ mod tests {
             (d.scope.under.as_deref(), d.scope.team),
             (Some("CORE-4"), None)
         );
+        assert_eq!(d.team_from, None);
+        assert_eq!(
+            resolve(&project, &Local::default()).team_from,
+            Some(PROJECT_FILE)
+        );
+        let pinned: Local = serde_yaml_ng::from_str("scope:\n  team: WEB\n").unwrap();
+        assert_eq!(resolve(&project, &pinned).team_from, Some(LOCAL_FILE));
         assert_eq!(d.ttl, 3600);
         assert_eq!(
             resolve(&Project::default(), &Local::default()).ttl,

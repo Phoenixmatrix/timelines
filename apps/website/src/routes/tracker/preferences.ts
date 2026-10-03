@@ -1,4 +1,5 @@
-import type { Snapshot } from "../../../shared/tracker.ts";
+import type { Snapshot, TrackerPreferences } from "../../../shared/tracker.ts";
+import { api } from "../../lib/api.ts";
 import { DEFAULT_QUERY, filterToken, VIEWS } from "./query.ts";
 
 export const VIEW_LABEL = { list: "List", board: "Board", graph: "Graph" } as const;
@@ -15,7 +16,11 @@ function storageKey(viewerId: string): string {
   return `gitmatrix:tracker-defaults:${viewerId}`;
 }
 
-export function readTrackerDefaults(viewerId: string): TrackerDefaults | null {
+/**
+ * Defaults this browser kept before they moved to the server (CORE-119): read
+ * once to carry them over, and as a fallback until then.
+ */
+export function readLegacyDefaults(viewerId: string): TrackerDefaults | null {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(storageKey(viewerId)) ?? "null");
     if (typeof value !== "object" || value === null) return null;
@@ -40,10 +45,48 @@ export function readTrackerDefaults(viewerId: string): TrackerDefaults | null {
   }
 }
 
-/** Let the caller show a failed write instead of claiming the defaults were saved. */
-export function saveTrackerDefaults(viewerId: string, defaults: TrackerDefaults | null): void {
-  if (defaults) localStorage.setItem(storageKey(viewerId), JSON.stringify(defaults));
-  else localStorage.removeItem(storageKey(viewerId));
+export function forgetLegacyDefaults(viewerId: string): void {
+  try {
+    localStorage.removeItem(storageKey(viewerId));
+  } catch {
+    // Nothing to forget without site storage.
+  }
+}
+
+/** The tracker view's saved preferences, as the defaults the page applies. */
+export function defaultsFromServer(
+  preferences: TrackerPreferences | null,
+  ownerId: string,
+): TrackerDefaults | null {
+  return preferences
+    ? {
+        ownerId,
+        view: preferences.view,
+        query: preferences.query,
+        teamId: preferences.teamId ?? "",
+      }
+    : null;
+}
+
+/**
+ * Save (or, with null, reset) the person's defaults for a tracker on the
+ * server, where every browser and gm read them. Throws so the caller can say
+ * the save failed instead of claiming it worked.
+ */
+export async function saveTrackerDefaults(
+  owner: string,
+  defaults: TrackerDefaults | null,
+): Promise<TrackerDefaults | null> {
+  const path = `/tracker/${encodeURIComponent(owner)}/preferences`;
+  if (!defaults) {
+    await api(path, { method: "DELETE" });
+    return null;
+  }
+  await api(path, {
+    method: "PUT",
+    json: { teamId: defaults.teamId || null, view: defaults.view, query: defaults.query },
+  });
+  return defaults;
 }
 
 /** Explicit URL state wins, including an empty query and legacy filter links. */

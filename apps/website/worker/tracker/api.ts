@@ -21,6 +21,13 @@ import type {
 import { TrackerError, validateRequest, type Access } from "./store.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
+import {
+  clearPreferences,
+  defaultOwner,
+  parsePreferences,
+  preferencesFor,
+  savePreferences,
+} from "./preferences.ts";
 import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
 
 export const tracker = new Hono<AppEnv>();
@@ -170,7 +177,11 @@ tracker.onError((error, c) => {
 tracker.get("/tracker", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
-  return c.json<TrackerList>({ viewerId: actor.id, trackers: await accessible(c.env.DB, actor) });
+  const [trackers, defaultOwnerId] = await Promise.all([
+    accessible(c.env.DB, actor),
+    defaultOwner(c.env.DB, actor.id),
+  ]);
+  return c.json<TrackerList>({ viewerId: actor.id, trackers, defaultOwnerId });
 });
 /** Open requests to people across every tracker you're in: yours first, then the rest. */
 tracker.get("/requests", async (c) => {
@@ -210,14 +221,54 @@ tracker.get("/requests", async (c) => {
 tracker.get("/tracker/:owner/view", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
-  const [result, trackers] = await Promise.all([
-    authorize(c).then(
-      async (access) => await trackerObject(c.env, access.owner.id).snapshot(access),
-    ),
+  const [view, trackers] = await Promise.all([
+    authorize(c).then(async (access) => ({
+      result: await trackerObject(c.env, access.owner.id).snapshot(access),
+      // An agent sees its person's defaults: they're whose work it does.
+      preferences: await preferencesFor(c.env.DB, actor.id, access.owner.id),
+    })),
     accessible(c.env.DB, actor),
   ]);
-  if (!result.ok) return response(c, result);
-  return c.json<TrackerView>({ snapshot: result.value, trackers });
+  if (!view.result.ok) return response(c, view.result);
+  return c.json<TrackerView>({
+    snapshot: view.result.value,
+    trackers,
+    preferences: view.preferences,
+  });
+});
+/** Your defaults for this tracker (CORE-119); an agent reads its person's. */
+tracker.get("/tracker/:owner/preferences", async (c) => {
+  const access = await authorize(c, false);
+  return c.json({
+    preferences: await preferencesFor(c.env.DB, c.get("actor")!.id, access.owner.id),
+  });
+});
+tracker.put("/tracker/:owner/preferences", async (c) => {
+  const access = await authorize(c, false);
+  const actor = c.get("actor")!;
+  if (actor.agent)
+    throw new TrackerError(
+      403,
+      "forbidden",
+      "Defaults are your person's to set; agents follow them.",
+    );
+  const parsed = parsePreferences(await body(c));
+  if (typeof parsed === "string") throw new TrackerError(400, "invalid_input", parsed);
+  return c.json({
+    preferences: await savePreferences(c.env.DB, actor.id, access.owner.id, parsed),
+  });
+});
+tracker.delete("/tracker/:owner/preferences", async (c) => {
+  const access = await authorize(c, false);
+  const actor = c.get("actor")!;
+  if (actor.agent)
+    throw new TrackerError(
+      403,
+      "forbidden",
+      "Defaults are your person's to set; agents follow them.",
+    );
+  await clearPreferences(c.env.DB, actor.id, access.owner.id);
+  return c.body(null, 204);
 });
 tracker.get("/tracker/:owner/snapshot", async (c) => {
   const access = await authorize(c);

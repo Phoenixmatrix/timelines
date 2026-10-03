@@ -146,8 +146,9 @@ pub enum WorkspaceCommand {
 #[derive(Args)]
 pub struct IssueCreate {
     pub title: String,
+    /// Defaults to this checkout's or the project's team, then your default team (set on the web).
     #[arg(long)]
-    pub team: String,
+    pub team: Option<String>,
     #[arg(long, conflicts_with = "description_file")]
     pub description: Option<String>,
     /// Markdown file, or '-' for stdin.
@@ -178,8 +179,12 @@ pub struct IssueCreate {
 }
 #[derive(Args)]
 pub struct ListIssues {
-    #[arg(long)]
+    /// Defaults to this checkout's or the project's team, then your default team (set on the web).
+    #[arg(long, conflicts_with = "all_teams")]
     pub team: Option<String>,
+    /// Ignore every default team and list across all teams.
+    #[arg(long)]
+    pub all_teams: bool,
     #[arg(long)]
     pub workspace: Option<String>,
     #[arg(long)]
@@ -332,9 +337,12 @@ pub enum IssueCommand {
         /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
         #[arg(long)]
         agent: Option<String>,
-        /// Defaults to the scope in .gitmatrix/agents.toml (or this checkout's).
-        #[arg(long)]
+        /// Defaults to this checkout's scope, then the project's (.gitmatrix/agents.yml), then your default team (set on the web).
+        #[arg(long, conflicts_with = "all_teams")]
         team: Option<String>,
+        /// Ignore every default team and pick from all teams.
+        #[arg(long)]
+        all_teams: bool,
         #[arg(long)]
         workspace: Option<String>,
         /// Only work under this issue (a project or other parent).

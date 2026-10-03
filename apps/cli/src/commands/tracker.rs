@@ -296,12 +296,12 @@ fn root(config: &Config) -> Result<PathBuf> {
         .join("tracker")
         .join(digest(&format!("{}\n{auth}", config.server()))))
 }
-/// The tracker account to act on: explicit, else `gm tracker use`, else agents.toml.
+/// The tracker account to act on: explicit, else `gm tracker use`, else .gitmatrix/agents.yml.
 pub(crate) fn selected_owner(config: &Config, explicit: Option<String>) -> Result<String> {
     let owner = explicit
         .or_else(|| fs::read_to_string(root(config).ok()?.join("selected")).ok())
         .or_else(|| crate::profile::defaults().scope.owner)
-        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER`, pass --owner OWNER, or set [tracker] owner in .gitmatrix/agents.toml."))?;
+        .ok_or_else(|| GmError::usage("Select `gm tracker use OWNER`, pass --owner OWNER, or set tracker.owner in .gitmatrix/agents.yml."))?;
     safe_owner(&owner)?;
     Ok(owner)
 }
@@ -524,7 +524,35 @@ impl Replica {
                 }
             }
         }
-        self.pull()
+        self.pull()?;
+        self.pull_preferences();
+        Ok(())
+    }
+    /// Your defaults for this tracker, set on the web, kept for offline use.
+    /// Best effort: an older server or a failed fetch keeps what gm had.
+    fn pull_preferences(&self) {
+        if let Ok(reply) = remote::api(&self.config, "GET", &self.path("preferences"), None)
+            && let Ok(text) = serde_json::to_string(&reply["preferences"])
+        {
+            let _ = self.set("preferences", &text);
+        }
+    }
+    /// Your default team here (CORE-119), if it's still an open team.
+    fn preferred_team(&self, snapshot: &Value) -> Result<Option<String>> {
+        let Some(raw) = self.meta("preferences")? else {
+            return Ok(None);
+        };
+        let preferences: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        let Some(team) = preferences["teamId"].as_str() else {
+            return Ok(None);
+        };
+        Ok(snapshot["teams"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| t["id"] == team && t["archived"] != true)
+            .and_then(|t| t["key"].as_str())
+            .map(str::to_owned))
     }
     fn submit(&self, ctx: &Ctx, offline: bool, mutations: Vec<Value>) -> Result<Shown> {
         validate_batch(&mutations)?;
@@ -888,9 +916,22 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
                 json!({"dryRun":ctx.dry_run,"cursor":r.snapshot()?["cursor"],"pending":r.queued()?.len()}),
             ))
         }
-        TrackerCommand::Status => Ok(Shown(
-            json!({"owner":r.owner,"identity":r.meta("actor")?,"cursor":r.snapshot()?["cursor"],"operations":r.queued()?,"replica":root(&r.config)?.join(format!("{}.sqlite",r.owner)),"credentialPartitions":root(&r.config)?.parent(),"credentialRotation":"Old credential partitions remain intact. To reconnect a rotated token to its old outbox, use tracker recover with the old replica path after verifying the same identity."}),
-        )),
+        TrackerCommand::Status => {
+            if !args.scope.offline {
+                r.pull_preferences();
+            }
+            let snapshot = r.view()?;
+            let choice = choose_team(
+                None,
+                false,
+                Some(&crate::profile::defaults()),
+                false,
+                r.preferred_team(&snapshot)?,
+            );
+            Ok(Shown(
+                json!({"owner":r.owner,"identity":r.meta("actor")?,"defaultTeam":choice.describe(&r.owner, false),"cursor":r.snapshot()?["cursor"],"operations":r.queued()?,"replica":root(&r.config)?.join(format!("{}.sqlite",r.owner)),"credentialPartitions":root(&r.config)?.parent(),"credentialRotation":"Old credential partitions remain intact. To reconnect a rotated token to its old outbox, use tracker recover with the old replica path after verifying the same identity."}),
+            ))
+        }
         TrackerCommand::Recover { replica: source } => {
             if args.scope.offline {
                 return Err(GmError::usage(
@@ -1322,8 +1363,15 @@ fn named(snapshot: &Value, issue: &Value) -> Value {
     });
     out
 }
-fn listing(snapshot: &Value, args: &ListIssues, only_ready: bool, offline: bool) -> Result<Shown> {
-    let team = args
+fn listing(
+    snapshot: &Value,
+    args: &ListIssues,
+    choice: &TeamChoice,
+    owner: &str,
+    only_ready: bool,
+    offline: bool,
+) -> Result<Shown> {
+    let team = choice
         .team
         .as_deref()
         .map(|v| id(snapshot, "teams", v))
@@ -1366,7 +1414,7 @@ fn listing(snapshot: &Value, args: &ListIssues, only_ready: bool, offline: bool)
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
     Ok(Shown(
-        json!({"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"next":"Acquire an online claim before starting exclusive work."}),
+        json!({"team":choice.describe(owner, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"next":"Acquire an online claim before starting exclusive work."}),
     ))
 }
 fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Result<Shown> {
@@ -1544,9 +1592,27 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
         let snapshot = r.view()?;
         // The identity holding a kept lease this command uses, if gm has switched since.
         let mut holder: Option<remote::Identity> = None;
+        // The team a command picked for you, reported with its result.
+        let mut picked: Option<Value> = None;
         let mutation = match &args.command {
-            IssueCommand::List(a) => return listing(&snapshot, a, false, args.scope.offline),
-            IssueCommand::Ready(a) => return listing(&snapshot, a, true, args.scope.offline),
+            IssueCommand::List(a) | IssueCommand::Ready(a) => {
+                let choice = choose_team(
+                    a.team.as_deref(),
+                    a.all_teams,
+                    a.workspace.is_none().then_some(&defaults),
+                    a.workspace.is_some(),
+                    r.preferred_team(&snapshot)?,
+                );
+                let only_ready = matches!(args.command, IssueCommand::Ready(_));
+                return listing(
+                    &snapshot,
+                    a,
+                    &choice,
+                    &r.owner,
+                    only_ready,
+                    args.scope.offline,
+                );
+            }
             IssueCommand::Show { issue, limit } => {
                 return context(&snapshot, issue, *limit as usize, args.scope.offline);
             }
@@ -1557,9 +1623,25 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 {
                     return Err(GmError::usage("Only one field can read stdin."));
                 }
+                let choice = choose_team(
+                    a.team.as_deref(),
+                    false,
+                    Some(&defaults),
+                    false,
+                    r.preferred_team(&snapshot)?,
+                );
+                let Some(team) = choice.team.as_deref() else {
+                    return Err(GmError::usage("Pass --team KEY for the new issue.").hint(
+                        "Or set a default team: star a team in the web tracker, or set tracker.team in .gitmatrix/agents.yml.",
+                    ));
+                };
+                let team = id(&snapshot, "teams", team)?;
+                if choice.source != TeamSource::Flag {
+                    picked = Some(choice.describe(&r.owner, false));
+                }
                 create(
                     "issue",
-                    json!({"teamId":id(&snapshot,"teams",&a.team)?,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
+                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
                 )
             }
             IssueCommand::Update(p) => patch(&snapshot, "issue", p)?,
@@ -1684,6 +1766,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             IssueCommand::Next {
                 agent,
                 team,
+                all_teams,
                 workspace,
                 under,
                 ttl,
@@ -1692,18 +1775,23 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 let mut data =
                     json!({"agent":session(agent)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 delegate(&snapshot, delegation, &mut data)?;
-                // No scope given: this checkout's, else the project's (.gitmatrix/agents.toml).
-                let (team, workspace, under) =
-                    if team.is_none() && workspace.is_none() && under.is_none() {
-                        (
-                            &defaults.scope.team,
-                            &defaults.scope.workspace,
-                            &defaults.scope.under,
-                        )
-                    } else {
-                        (team, workspace, under)
-                    };
-                if let Some(t) = team {
+                // No scope given: this checkout's, else the project's (.gitmatrix/agents.yml),
+                // else your default team.
+                let configured = team.is_none() && workspace.is_none() && under.is_none();
+                let (workspace, under) = if configured {
+                    (&defaults.scope.workspace, &defaults.scope.under)
+                } else {
+                    (workspace, under)
+                };
+                let choice = choose_team(
+                    team.as_deref(),
+                    *all_teams,
+                    configured.then_some(&defaults),
+                    workspace.is_some() || under.is_some(),
+                    r.preferred_team(&snapshot)?,
+                );
+                picked = Some(choice.describe(&r.owner, true));
+                if let Some(t) = &choice.team {
                     data["teamId"] = json!(id(&snapshot, "teams", t)?);
                 }
                 if let Some(w) = workspace {
@@ -1816,7 +1904,11 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 response["actedAs"] = json!(identity.describe());
             }
             if let IssueCommand::Next { .. } = args.command {
-                return Ok(next_result(&snapshot, &response));
+                let mut shown = next_result(&snapshot, &response);
+                if let Some(team) = picked {
+                    shown.0["team"] = team;
+                }
+                return Ok(shown);
             }
             if !matches!(
                 args.command,
@@ -1829,8 +1921,110 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             return Ok(Shown(response));
         }
-        r.submit(ctx, args.scope.offline, vec![mutation])
+        let mut shown = r.submit(ctx, args.scope.offline, vec![mutation])?;
+        if let Some(team) = picked {
+            shown.0["team"] = team;
+        }
+        Ok(shown)
     })
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum TeamSource {
+    Flag,
+    AllTeams,
+    Checkout,
+    Project,
+    /// A workspace or parent narrows the command instead.
+    Narrowed,
+    Default,
+    None,
+}
+
+/// The team a command works in, and why.
+#[derive(Debug)]
+struct TeamChoice {
+    team: Option<String>,
+    source: TeamSource,
+}
+
+/// Which team a command uses (CORE-119), most specific first: `--team`, this
+/// checkout's scope, the project's, then your default team from the web, else
+/// all teams. `configured` is the .gitmatrix scope when it applies; a command
+/// already narrowed by a workspace or parent doesn't take your default team.
+fn choose_team(
+    flag: Option<&str>,
+    all_teams: bool,
+    configured: Option<&crate::profile::Defaults>,
+    narrowed: bool,
+    preferred: Option<String>,
+) -> TeamChoice {
+    let choice = |team: Option<String>, source| TeamChoice { team, source };
+    if all_teams {
+        return choice(None, TeamSource::AllTeams);
+    }
+    if let Some(team) = flag {
+        return choice(Some(team.to_owned()), TeamSource::Flag);
+    }
+    if let Some(d) = configured
+        && let Some(team) = &d.scope.team
+    {
+        let source = if d.team_from == Some(crate::profile::LOCAL_FILE) {
+            TeamSource::Checkout
+        } else {
+            TeamSource::Project
+        };
+        return choice(Some(team.clone()), source);
+    }
+    if narrowed {
+        return choice(None, TeamSource::Narrowed);
+    }
+    match preferred {
+        Some(team) => choice(Some(team), TeamSource::Default),
+        None => choice(None, TeamSource::None),
+    }
+}
+
+impl TeamChoice {
+    /// `widen`: the command takes --all-teams.
+    fn describe(&self, owner: &str, widen: bool) -> Value {
+        let (source, why) = match self.source {
+            TeamSource::Flag => ("flag", "--team".to_owned()),
+            TeamSource::AllTeams => ("all-teams", "--all-teams".to_owned()),
+            TeamSource::Checkout => (
+                "checkout",
+                format!("this checkout's scope ({})", crate::profile::LOCAL_FILE),
+            ),
+            TeamSource::Project => (
+                "project",
+                format!("the project's scope ({})", crate::profile::PROJECT_FILE),
+            ),
+            TeamSource::Narrowed => (
+                "scope",
+                "all teams: a workspace or parent scope narrows this instead".to_owned(),
+            ),
+            TeamSource::Default => (
+                "default",
+                format!("your default team in {owner}, set in the web tracker"),
+            ),
+            TeamSource::None => (
+                "none",
+                format!("all teams: no team given and no default team in {owner}"),
+            ),
+        };
+        let flags = if widen {
+            "Pass --team KEY or --all-teams"
+        } else {
+            "Pass --team KEY"
+        };
+        let change = match self.source {
+            TeamSource::Default | TeamSource::None => {
+                format!("{flags}; star a team in the web tracker to change your default.")
+            }
+            _ => format!("{flags} to choose another."),
+        };
+        json!({"key":self.team,"source":source,"why":why,"change":change})
+    }
 }
 
 #[cfg(test)]
@@ -2128,6 +2322,88 @@ mod tests {
         apply_event(&mut s,&json!({"entityType":"issue","entityId":"a","entity":{"id":"a","claim":{"agent":"worker","leaseToken":"secret"}}})).unwrap();
         assert_eq!(s["issues"][0]["claim"]["agent"], "worker");
         assert!(s["issues"][0]["claim"].get("leaseToken").is_none());
+    }
+    #[test]
+    fn the_team_comes_from_the_most_specific_source() {
+        use crate::profile::{Defaults, LOCAL_FILE, PROJECT_FILE, Scope as Configured};
+        let scoped = |team: Option<&str>, from, under: Option<&str>| Defaults {
+            agent: None,
+            scope: Configured {
+                team: team.map(str::to_owned),
+                under: under.map(str::to_owned),
+                ..Default::default()
+            },
+            team_from: from,
+            ttl: 900,
+        };
+        let mine = Some("CORE".to_owned());
+        let pick =
+            |flag, all, configured: Option<&Defaults>, narrowed, preferred: Option<String>| {
+                let c = choose_team(flag, all, configured, narrowed, preferred);
+                (c.team, c.source)
+            };
+        let checkout = scoped(Some("WEB"), Some(LOCAL_FILE), None);
+        let project = scoped(Some("OPS"), Some(PROJECT_FILE), None);
+        let nothing = scoped(None, None, None);
+        let under = scoped(None, None, Some("CORE-4"));
+        assert_eq!(
+            pick(Some("API"), false, Some(&checkout), false, mine.clone()),
+            (Some("API".into()), TeamSource::Flag)
+        );
+        assert_eq!(
+            pick(None, false, Some(&checkout), false, mine.clone()),
+            (Some("WEB".into()), TeamSource::Checkout)
+        );
+        assert_eq!(
+            pick(None, false, Some(&project), false, mine.clone()),
+            (Some("OPS".into()), TeamSource::Project)
+        );
+        assert_eq!(
+            pick(None, false, Some(&nothing), false, mine.clone()),
+            (Some("CORE".into()), TeamSource::Default)
+        );
+        // A parent scope narrows instead; --all-teams ignores every default.
+        assert_eq!(
+            pick(None, false, Some(&under), true, mine.clone()),
+            (None, TeamSource::Narrowed)
+        );
+        assert_eq!(
+            pick(None, true, Some(&checkout), false, mine.clone()),
+            (None, TeamSource::AllTeams)
+        );
+        assert_eq!(
+            pick(None, false, None, false, None),
+            (None, TeamSource::None)
+        );
+        let said = choose_team(None, false, None, false, mine).describe("orbit", false);
+        assert_eq!(said["key"], "CORE");
+        assert_eq!(said["source"], "default");
+        assert!(said["why"].as_str().unwrap().contains("web tracker"));
+    }
+    #[test]
+    fn the_default_team_is_read_from_the_cached_preferences() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);")
+            .unwrap();
+        let r = Replica {
+            db,
+            config: Config::default(),
+            owner: "orbit".into(),
+        };
+        let snapshot =
+            json!({"teams":[{"id":"t1","key":"CORE"},{"id":"t2","key":"OLD","archived":true}]});
+        assert_eq!(r.preferred_team(&snapshot).unwrap(), None);
+        r.set("preferences", "null").unwrap();
+        assert_eq!(r.preferred_team(&snapshot).unwrap(), None);
+        r.set("preferences", r#"{"teamId":"t1","view":"list","query":""}"#)
+            .unwrap();
+        assert_eq!(
+            r.preferred_team(&snapshot).unwrap().as_deref(),
+            Some("CORE")
+        );
+        // An archived or deleted team is no default at all.
+        r.set("preferences", r#"{"teamId":"t2"}"#).unwrap();
+        assert_eq!(r.preferred_team(&snapshot).unwrap(), None);
     }
     #[test]
     fn outbox_retains_uncertain_request_and_independent_later_edits() {

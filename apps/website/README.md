@@ -569,15 +569,30 @@ subtasks or satisfy dependent issues' blockers.
   Legacy attribution/source gaps are labeled unknown; current-directory identity
   resolution is labeled separately from mutation-time snapshots.
 - **Startup defaults:** in **Tracker settings → Default view and team**, choose
-  List/Board/Graph, an issue-view preset, and an active team or all teams. Saving
-  also makes this tracker the destination of the global **Issues** link. Defaults
-  belong to the signed-in user in this browser, not to the whole organization.
-  The chosen team filters the initial view and supplies the new-issue team.
-  Explicit URL filters, layouts and capture teams override defaults, including an
-  empty query. Unavailable trackers fall back to the first accessible tracker;
-  archived or unavailable default teams fall back to all teams. **Reset defaults**
-  restores the built-in startup behavior. Browsers that refuse storage show an
-  error without dismissing the preference form.
+  List/Board/Graph, an issue-view preset, and an active team or all teams.
+  Defaults are saved on the server per person and per tracker, so they follow
+  you across browsers and devices, and each tracker keeps its own. Saving also
+  makes this tracker the destination of the global **Issues** link. A default
+  saved by an older version in this browser is carried over once, on the next
+  visit. The chosen team filters the initial view and supplies the new-issue
+  team. Explicit URL filters, layouts and capture teams override defaults,
+  including an empty query. Unavailable trackers fall back to the first
+  accessible tracker; archived or unavailable default teams fall back to all
+  teams. **Reset defaults** restores the built-in startup behavior.
+- **Default team in one click:** the star next to each team in the facet
+  column makes it your default; the filled star marks the current one, and
+  clicking it clears the default. Under the query bar a note names the default
+  team, says that gm and your agents use it too, and offers **Show all teams**
+  and **Change**; quick capture marks it with ★. Without a default, quick
+  capture picks your only team, else the team you or your agents last filed
+  into, else the first open team.
+- **gm uses your default team** when nothing more specific names one. Most
+  specific first: `--team` (or `--all-teams`), this checkout's
+  `.gitmatrix/agent.local.yml`, the project's `.gitmatrix/agents.yml`, your
+  default team, then all teams. `gm issue next`, `create`, `list` and `ready`
+  report the team they used and why in `team`; `gm tracker status` shows
+  `defaultTeam`. Agents read their person's default but can't change it, and a
+  `next` scoped to a workspace or parent doesn't add it.
 - **Inline editing:** click an issue title or its description/acceptance text to
   edit just that field in place. Each text section also has a keyboard-accessible
   **Edit** button, and empty sections offer an **Add** action. Markdown preview

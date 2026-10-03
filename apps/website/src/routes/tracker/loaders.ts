@@ -1,7 +1,7 @@
 import { data, redirect, type LoaderFunctionArgs } from "react-router";
 import type { TrackerList, TrackerView } from "../../../shared/tracker.ts";
 import { api, ApiError } from "../../lib/api.ts";
-import { readTrackerDefaults } from "./preferences.ts";
+import { readLegacyDefaults } from "./preferences.ts";
 
 /** These endpoints authenticate the request themselves; avoid a serial session preflight. */
 async function loadTracker<T>(path: string, request: Request): Promise<T> {
@@ -20,9 +20,13 @@ async function loadTracker<T>(path: string, request: Request): Promise<T> {
 }
 
 export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
-  const { viewerId, trackers } = await loadTracker<TrackerList>("/tracker", request);
-  const defaults = readTrackerDefaults(viewerId);
-  const tracker = trackers.find((entry) => entry.id === defaults?.ownerId) ?? trackers[0];
+  const { viewerId, trackers, defaultOwnerId } = await loadTracker<TrackerList>(
+    "/tracker",
+    request,
+  );
+  // Server defaults first; a default this browser kept from before still counts.
+  const preferred = defaultOwnerId ?? readLegacyDefaults(viewerId)?.ownerId;
+  const tracker = trackers.find((entry) => entry.id === preferred) ?? trackers[0];
   if (tracker) throw redirect(`/tracker/${tracker.slug}${new URL(request.url).search}`);
   return { trackers };
 }

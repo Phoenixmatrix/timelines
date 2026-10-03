@@ -30,6 +30,7 @@ import {
   DotsThreeIcon,
   FunnelSimpleIcon,
   MagnifyingGlassIcon,
+  StarIcon,
   XIcon,
 } from "@phosphor-icons/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -41,16 +42,31 @@ import {
   useParams,
   useSearchParams,
 } from "react-router";
-import type { Mutation, MutationRequest, Snapshot, TrackerView } from "../../../shared/tracker.ts";
+import {
+  fallbackTeam,
+  type Mutation,
+  type MutationRequest,
+  type Snapshot,
+  type TrackerView,
+} from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
-import { FormError, popMotion, SelectField, Tip } from "../../components/ui.tsx";
+import { FormError, popMotion, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
 import type { trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { TrackerDefaultsForm } from "./Defaults.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
-import { readTrackerDefaults, VIEW_LABEL, withTrackerDefaults, type View } from "./preferences.ts";
+import {
+  defaultsFromServer,
+  forgetLegacyDefaults,
+  initialTrackerDefaults,
+  readLegacyDefaults,
+  saveTrackerDefaults,
+  VIEW_LABEL,
+  withTrackerDefaults,
+  type View,
+} from "./preferences.ts";
 import { RelationLens } from "./Lens.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
 import { IssueLog } from "./Log.tsx";
@@ -166,14 +182,38 @@ function Workbench({ data }: { data: TrackerView }) {
   const navigate = useNavigate();
   const navigation = useNavigation();
   const viewer = useViewer();
-  const [defaults, setDefaults] = useState(() => readTrackerDefaults(viewer?.id ?? ""));
+  // Defaults live on the server (CORE-119); a default this browser kept from
+  // before applies until it has been carried over, once, below.
+  const [defaults, setDefaults] = useState(() => {
+    const saved = defaultsFromServer(data.preferences, data.snapshot.owner.id);
+    if (saved) return saved;
+    const legacy = viewer ? readLegacyDefaults(viewer.id) : null;
+    return legacy?.ownerId === data.snapshot.owner.id ? legacy : null;
+  });
   const [defaultsOpen, setDefaultsOpen] = useState(false);
+  const toast = useToast();
+  useEffect(() => {
+    if (!viewer || data.preferences) return;
+    const legacy = readLegacyDefaults(viewer.id);
+    if (legacy?.ownerId !== data.snapshot.owner.id) return;
+    saveTrackerDefaults(data.snapshot.owner.slug, legacy)
+      .then(() => forgetLegacyDefaults(viewer.id))
+      .catch(() => {
+        // Still applied from this browser; the next visit tries again.
+      });
+  }, [viewer, data.preferences, data.snapshot.owner]);
   const params = useMemo(
     () => withTrackerDefaults(urlParams, defaults, snapshot),
     [urlParams, defaults, snapshot],
   );
   const [title, setTitle] = useState("");
-  const defaultTeam = snapshot.teams.find((team) => !team.archived)?.id ?? "";
+  const defaultTeam =
+    (viewer ? fallbackTeam(snapshot, viewer.id) : null) ??
+    snapshot.teams.find((team) => !team.archived)?.id ??
+    "";
+  const defaultTeamEntry = snapshot.teams.find(
+    (team) => team.id === defaults?.teamId && !team.archived,
+  );
   const requestedTeam = params.get("captureTeam") ?? defaultTeam;
   const createTeam = snapshot.teams.some((team) => team.id === requestedTeam && !team.archived)
     ? requestedTeam
@@ -560,11 +600,35 @@ function Workbench({ data }: { data: TrackerView }) {
     />
   );
 
+  /** One click from the team facets: the default here, and gm's when no team is given. */
+  const makeDefaultTeam = async (key: string | null) => {
+    const team = key ? snapshot.teams.find((t) => t.key.toLowerCase() === key.toLowerCase()) : null;
+    const next = { ...initialTrackerDefaults(defaults, snapshot), teamId: team?.id ?? "" };
+    try {
+      await saveTrackerDefaults(owner, next);
+      setDefaults(next);
+      if (viewer) forgetLegacyDefaults(viewer.id);
+      toast.add({
+        title: team ? `${team.key} is your default team` : "No default team",
+        description: team
+          ? "Here, and for gm and your agents when no team is given."
+          : "The tracker opens on all teams, and gm uses no team unless one is given.",
+      });
+    } catch {
+      toast.add({
+        title: "Couldn't save your default team",
+        description: "Check your connection and try again.",
+        type: "error",
+      });
+    }
+  };
   const facetColumn = (
     <FacetColumn
       facets={facets}
       query={query}
       onToggle={(v) => setQuery(toggleToken(query, v.token.key, v.token.value))}
+      defaultTeam={defaultTeamEntry?.key.toLowerCase() ?? null}
+      onMakeDefault={(key) => void makeDefaultTeam(key)}
     />
   );
 
@@ -696,12 +760,12 @@ function Workbench({ data }: { data: TrackerView }) {
       )}
       {defaultsOpen && viewer && (
         <TrackerDefaultsForm
-          viewerId={viewer.id}
           snapshot={snapshot}
           defaults={defaults}
           onCancel={() => setDefaultsOpen(false)}
           onSaved={(next) => {
             setDefaults(next);
+            forgetLegacyDefaults(viewer.id);
             setDefaultsOpen(false);
             void navigate(base, { replace: true });
           }}
@@ -837,6 +901,18 @@ function Workbench({ data }: { data: TrackerView }) {
                 ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, label:, type:, p:, since:, until:, parent:.`
                 : "is:ready is:blocked · status: · team: · ws: · assignee:me · label: · type: · p:1 · since:7d · parent:KEY · words match key and title; - excludes"}
             </p>
+            {defaultTeamEntry && (
+              <DefaultTeamNote
+                team={defaultTeamEntry.key}
+                showing={tokenize(query).some(
+                  (t) =>
+                    t.toLowerCase() ===
+                    filterToken("team", defaultTeamEntry.key.toLowerCase()).toLowerCase(),
+                )}
+                onShowAll={() => setQuery(withoutKeys(query, ["team"]))}
+                onChange={() => setDefaultsOpen(true)}
+              />
+            )}
             <div className="flex items-center gap-2">
               <div
                 className="flex min-w-0 flex-1 gap-1.5 overflow-x-auto [mask-image:linear-gradient(to_right,black_calc(100%-2rem),transparent)] pr-6 [scrollbar-width:none]"
@@ -953,5 +1029,40 @@ function Workbench({ data }: { data: TrackerView }) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Says when the view is filtered by your default team, and that gm and your
+ * agents use it too, so the preference never acts out of sight.
+ */
+function DefaultTeamNote({
+  team,
+  showing,
+  onShowAll,
+  onChange,
+}: {
+  team: string;
+  showing: boolean;
+  onShowAll: () => void;
+  onChange: () => void;
+}) {
+  const action =
+    "ml-2 cursor-pointer border-0 bg-transparent p-0 text-micro font-semibold whitespace-nowrap text-ink-muted underline decoration-line underline-offset-2 hover:text-ink";
+  return (
+    <p className="m-0 text-micro text-ink-faint">
+      <StarIcon weight="fill" className="mr-1.5 inline size-3 align-[-1px]" aria-hidden />
+      {showing ? "Showing your default team, " : "Your default team is "}
+      <span className="font-mono text-ink-muted">{team}</span>, also used by gm and your agents when
+      no team is given.
+      {showing && (
+        <button type="button" className={action} onClick={onShowAll}>
+          Show all teams
+        </button>
+      )}
+      <button type="button" className={action} onClick={onChange}>
+        Change
+      </button>
+    </p>
   );
 }

@@ -1,6 +1,7 @@
 // Facet counts beside the log, and the board: status lanes, each its own
 // virtualized scroll, closed lanes folded to a count until opened.
 
+import { StarIcon } from "@phosphor-icons/react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
@@ -25,16 +26,24 @@ const FACET_GROUPS: { key: keyof Facets; title: string }[] = [
   { key: "label", title: "Label" },
 ];
 
+/** The team facet's default: which team key is it, and how to change it. */
+interface TeamDefault {
+  current: string | null;
+  onPick: (key: string | null) => void;
+}
+
 function FacetGroup({
   title,
   values,
   query,
   onToggle,
+  teamDefault,
 }: {
   title: string;
   values: FacetValue[];
   query: string;
   onToggle: (v: FacetValue) => void;
+  teamDefault?: TeamDefault;
 }) {
   const [all, setAll] = useState(false);
   if (values.length === 0) return null;
@@ -46,7 +55,10 @@ function FacetGroup({
       <h3 className="m-0 mb-1 text-label text-ink-faint">{title}</h3>
       <ul className="m-0 flex list-none flex-col p-0">
         {shown.map((v) => (
-          <li key={`${v.token.key}:${v.token.value}`}>
+          <li
+            key={`${v.token.key}:${v.token.value}`}
+            className="group/row flex items-center gap-0.5"
+          >
             <button
               type="button"
               className="group relative flex min-h-7 w-full cursor-pointer items-center gap-2 overflow-hidden rounded-plate border-0 bg-transparent px-2 text-left text-body-sm text-ink hover:bg-raised aria-pressed:bg-signal-wash aria-pressed:font-semibold"
@@ -63,6 +75,7 @@ function FacetGroup({
                 {v.count.toLocaleString()}
               </span>
             </button>
+            {teamDefault && <DefaultStar value={v} teamDefault={teamDefault} />}
           </li>
         ))}
       </ul>
@@ -79,14 +92,47 @@ function FacetGroup({
   );
 }
 
+/**
+ * Make a team your default in one click. The label says what that does beyond
+ * this page: gm and your agents use it when no team is given.
+ */
+function DefaultStar({ value, teamDefault }: { value: FacetValue; teamDefault: TeamDefault }) {
+  const key = String(value.token.value);
+  const isDefault = teamDefault.current === key.toLowerCase();
+  const label = isDefault
+    ? `${value.label} is your default team (also gm's and your agents' when no team is given). Click to clear it.`
+    : `Make ${value.label} your default team, here and for gm and your agents when no team is given`;
+  return (
+    <button
+      type="button"
+      aria-pressed={isDefault}
+      aria-label={label}
+      title={label}
+      onClick={() => teamDefault.onPick(isDefault ? null : key)}
+      className={`grid size-7 shrink-0 cursor-pointer place-items-center rounded-plate border-0 bg-transparent hover:bg-raised hover:text-ink max-sm:size-11 ${
+        isDefault
+          ? "text-ink-muted"
+          : "text-ink-faint opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100 max-sm:opacity-100"
+      }`}
+    >
+      <StarIcon weight={isDefault ? "fill" : "regular"} className="size-3.5" aria-hidden />
+    </button>
+  );
+}
+
 export function FacetColumn({
   facets,
   query,
   onToggle,
+  defaultTeam,
+  onMakeDefault,
 }: {
   facets: Facets;
   query: string;
   onToggle: (v: FacetValue) => void;
+  /** The default team's key (lowercase), if any. */
+  defaultTeam?: string | null;
+  onMakeDefault?: (key: string | null) => void;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -97,6 +143,11 @@ export function FacetColumn({
           values={facets[g.key]}
           query={query}
           onToggle={onToggle}
+          teamDefault={
+            g.key === "team" && onMakeDefault
+              ? { current: defaultTeam ?? null, onPick: onMakeDefault }
+              : undefined
+          }
         />
       ))}
     </div>

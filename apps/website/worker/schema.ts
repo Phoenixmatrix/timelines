@@ -96,6 +96,14 @@ export interface Database {
     capabilities: Generated<string | null>;
     capabilities_updated_at: Generated<string | null>;
   };
+  tracker_preferences: {
+    user_id: string;
+    owner_id: string;
+    team_id: string | null;
+    view: Generated<string>;
+    query: Generated<string>;
+    updated_at: Generated<string>;
+  };
   assistant_chats: {
     id: string;
     user_id: string;

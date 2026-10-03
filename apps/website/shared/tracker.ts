@@ -186,10 +186,53 @@ export interface Snapshot {
 export interface TrackerView {
   snapshot: Snapshot;
   trackers: TrackerOwner[];
+  /** The viewer's saved defaults for this tracker, if any. */
+  preferences: TrackerPreferences | null;
 }
 export interface TrackerList {
   viewerId: string;
   trackers: TrackerOwner[];
+  /** The tracker whose defaults the viewer saved most recently: where /tracker opens. */
+  defaultOwnerId: string | null;
+}
+export const TRACKER_LAYOUTS = ["list", "board", "graph"] as const;
+/**
+ * A person's defaults for one tracker (CORE-119), saved on the server so they
+ * follow them everywhere. The team is also gm's default when nothing more
+ * specific (a flag, the checkout, the project) names one, for the person and
+ * their agents.
+ */
+export interface TrackerPreferences {
+  teamId: string | null;
+  view: (typeof TRACKER_LAYOUTS)[number];
+  query: string;
+  updatedAt: string;
+}
+
+/**
+ * The team to file into when no default is saved: the person's own team; with
+ * several, the one they (or their agents) filed into most recently; then any
+ * team they filed into; then the first open team.
+ */
+export function fallbackTeam(
+  snapshot: Pick<Snapshot, "teams" | "issues" | "agents">,
+  personId: string,
+): string | null {
+  const open = snapshot.teams.filter((team) => !team.archived);
+  const mine = open.filter((team) => team.memberIds.includes(personId));
+  if (mine.length === 1) return mine[0]!.id;
+  const agents = new Set(
+    snapshot.agents.filter((a) => a.accountable.id === personId).map((a) => a.id),
+  );
+  const filed = snapshot.issues
+    .filter(
+      (issue) =>
+        issue.createdBy && (issue.createdBy.id === personId || agents.has(issue.createdBy.id)),
+    )
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map((issue) => issue.teamId);
+  const pool = mine.length ? mine : open;
+  return filed.find((id) => pool.some((team) => team.id === id)) ?? pool[0]?.id ?? null;
 }
 export type EntityType =
   | "team"

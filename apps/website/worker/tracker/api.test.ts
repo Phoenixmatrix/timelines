@@ -27,7 +27,11 @@ function setup(actor: Actor | null = ann) {
     await next();
   });
   app.route("/api", tracker);
-  return { call: (path: string) => app.request(`/api${path}`, {}, env), snapshot, getByName };
+  return {
+    call: (path: string, init: RequestInit = {}) => app.request(`/api${path}`, init, env),
+    snapshot,
+    getByName,
+  };
 }
 
 describe("tracker browser data", () => {
@@ -71,5 +75,57 @@ describe("tracker browser data", () => {
       canAdmin: true,
       issues: [],
     });
+  });
+});
+
+describe("tracker preferences", () => {
+  const put = (json: unknown): RequestInit => ({
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(json),
+  });
+  test("are saved per person and tracker, and open the last tracker set", async () => {
+    const { call } = setup();
+    expect(await (await call("/tracker/orbit/preferences")).json()).toEqual({ preferences: null });
+    await call("/tracker/ann/preferences", put({ teamId: "t-ann", view: "list", query: "" }));
+    const saved = await call(
+      "/tracker/orbit/preferences",
+      put({ teamId: "t-core", view: "board", query: "is:ready" }),
+    );
+    expect(saved.status).toBe(200);
+    expect(await (await call("/tracker/orbit/view")).json()).toMatchObject({
+      preferences: { teamId: "t-core", view: "board", query: "is:ready" },
+    });
+    expect(await (await call("/tracker/ann/preferences")).json()).toMatchObject({
+      preferences: { teamId: "t-ann" },
+    });
+    expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "orbit" });
+    expect((await call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(204);
+    expect(await (await call("/tracker/orbit/preferences")).json()).toEqual({ preferences: null });
+    expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "ann" });
+  });
+  test("reject malformed values and trackers the person can't open", async () => {
+    const { call } = setup();
+    for (const body of [
+      { teamId: 1, view: "list", query: "" },
+      { teamId: null, view: "table", query: "" },
+      { teamId: null, view: "list", query: "x".repeat(501) },
+      { teamId: null, view: "list", query: "", extra: true },
+    ])
+      expect((await call("/tracker/orbit/preferences", put(body))).status).toBe(400);
+    expect(
+      (await call("/tracker/private/preferences", put({ teamId: null, view: "list", query: "" })))
+        .status,
+    ).toBe(403);
+  });
+  test("are read by the person's agents but only set by the person", async () => {
+    const agent = setup({ ...ann, agent: { id: "agent-1", name: "claude" } });
+    const write = await agent.call(
+      "/tracker/orbit/preferences",
+      put({ teamId: null, view: "list", query: "" }),
+    );
+    expect(write.status).toBe(403);
+    expect((await agent.call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(403);
+    expect((await agent.call("/tracker/orbit/preferences")).status).toBe(200);
   });
 });
