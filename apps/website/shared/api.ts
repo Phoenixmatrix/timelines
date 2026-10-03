@@ -10,6 +10,16 @@ export interface AccountSummary {
   kind: "user" | "org";
   slug: string;
   displayName: string;
+  /** A person's profile picture; null shows their initials. Orgs have none. */
+  avatarUrl: string | null;
+}
+
+/** A person's generated avatar options (CORE-116): made once, never more. */
+export interface AvatarOptions {
+  /** "none" until they ask; "failed" (nothing made) may be asked again. */
+  status: "none" | "generating" | "ready" | "failed";
+  /** URLs of the options, in order; only their owner can load them. */
+  options: string[];
 }
 
 export interface Viewer extends AccountSummary {

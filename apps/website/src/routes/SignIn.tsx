@@ -275,7 +275,7 @@ function Personas({ personas, hasRepos }: { personas: Persona[]; hasRepos: boole
                   disabled={pendingId === persona.id || current}
                   title={persona.bio}
                 >
-                  <Monogram name={persona.displayName} />
+                  <Monogram name={persona.displayName} src={persona.avatarUrl} />
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-1.5 text-body-sm font-semibold">
                       <bdi>{persona.displayName}</bdi>

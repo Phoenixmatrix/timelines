@@ -2,6 +2,7 @@
 // (api.ts authorize), or by the Worker finishing work on someone's behalf
 // later, like a landing (timelines/landing.ts).
 
+import { avatarUrl } from "../avatars/api.ts";
 import type { AccountRow } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type { TrackerAgent, TrackerIdentity } from "../../shared/tracker.ts";
@@ -35,6 +36,7 @@ export async function accessFor(
     id: m.id,
     slug: m.slug,
     displayName: m.display_name,
+    avatarUrl: avatarUrl(m.avatar_key),
   }));
   return {
     // An agent's actions are its own; its human's memberships let it in.

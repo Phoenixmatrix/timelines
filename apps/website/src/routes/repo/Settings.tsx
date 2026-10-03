@@ -91,7 +91,7 @@ function CollaboratorRow({ collaborator }: { collaborator: Collaborator }) {
   if (removing) return null;
   return (
     <li className="flex items-center gap-3 py-2.5">
-      <Monogram name={collaborator.displayName} size="sm" />
+      <Monogram name={collaborator.displayName} size="sm" src={collaborator.avatarUrl} />
       <div className="min-w-0 flex-1">
         <div className="truncate font-semibold">
           <bdi>{collaborator.displayName}</bdi>

@@ -5,6 +5,11 @@ export interface TrackerIdentity {
   id: string;
   slug: string;
   displayName: string;
+  /**
+   * A person's profile picture, on live member lists only; never stored in
+   * tracker history, where it would go stale.
+   */
+  avatarUrl?: string | null;
 }
 /** An open request on the Needs you page: which tracker and issue it's about. */
 export interface OpenRequest {

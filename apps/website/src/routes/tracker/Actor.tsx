@@ -36,7 +36,7 @@ export function Actor({
       className={`inline-flex max-w-full min-w-0 items-center gap-1 align-middle ${className}`}
       title={described(who)}
     >
-      <Monogram name={person} size="xs" />
+      <Monogram name={person} size="xs" src={who.person?.avatarUrl} />
       {who.kind === "agent" && (
         <RobotIcon weight="bold" className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
       )}

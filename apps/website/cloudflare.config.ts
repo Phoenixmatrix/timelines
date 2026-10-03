@@ -238,6 +238,10 @@ export default defineConfig(({ mode, isPreview }) => {
             (dev ? "00000000000000000000000000000001" : PRODUCTION.registryDb),
         }),
         REGISTRY_BLOBS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-registry-blobs" }),
+        // People's profile pictures and their generated options (CORE-116). A
+        // preview shares its one bucket: avatar keys (avatars/, avatar-options/)
+        // never meet the registry's (b/, c/, d/).
+        AVATARS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-avatars" }),
         REGISTRY_REPO: bindings.durableObject({ worker: "gitmatrix", exportName: "RegistryRepo" }),
         REGISTRY_UPLOAD: bindings.durableObject({
           worker: "gitmatrix",

@@ -149,6 +149,30 @@ flight on a branch, a push's run is held; when one finishes, the newest held run
 starts and covers the older ones (`covered_by`), and `gm runs wait` follows the
 covering run.
 
+## Profile pictures
+
+People can set a picture (CORE-116) on **Settings → Profile**: upload one or
+drop it on the card, then crop it to a square (drag or arrow keys to move, the
+slider or +/− to zoom). The browser renders every picture to 256×256 WebP
+before it leaves, so the Worker (`worker/avatars/api.ts`) only checks and
+stores bytes: `PUT /api/account/avatar` takes a PNG, JPEG or WebP body up to
+256 KiB (by its signature, not its content type), stores it in the `AVATARS`
+R2 bucket (`gitmatrix-avatars`) under a content-hashed key, and replaces the
+previous one; `DELETE` goes back to initials. Pictures are as public as
+profiles and served from `/api/avatars/<user>/<hash>.<ext>` with immutable
+caching. Only the person can change theirs: agents acting for them get 403.
+`avatarUrl` rides on `AccountSummary` (and live tracker members, never tracker
+history), and `Monogram` shows it with the initials as a fallback.
+
+**Generated pictures** cost inference, so they're bounded: on request (and a
+confirmation), the Worker makes **four** images with FLUX.1 schnell from fixed
+abstract style presets, colored by a seed from the account id. Nobody can
+prompt it and there are no rerolls: `avatar_generations` is claimed before any
+model call, so a double click or second tab pays once, and once any image is
+made the set is final. A generation that produced nothing can be tried again.
+Options are private to their owner (`/api/account/avatar/options/:n`); picking
+one opens the same cropper. Where AI is off, generation answers 503.
+
 ## Personas (dev sign-in)
 
 Development data (the personas below, Orbit Labs, the owner account) lives in

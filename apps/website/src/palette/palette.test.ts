@@ -11,6 +11,7 @@ const viewer: Viewer = {
   kind: "user",
   slug: "ann",
   displayName: "Ann Lee",
+  avatarUrl: null,
   isSiteAdmin: false,
   email: null,
   canCreateIn: [],

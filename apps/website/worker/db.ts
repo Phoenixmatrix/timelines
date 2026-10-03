@@ -7,6 +7,7 @@ import type {
   Visibility,
 } from "../shared/api.ts";
 import { sql } from "kysely";
+import { avatarUrl } from "./avatars/api.ts";
 import { repoRole } from "./permissions.ts";
 import { db } from "./schema.ts";
 
@@ -31,6 +32,7 @@ export interface AccountRow {
   bio: string;
   is_site_admin: number;
   member_repo_role: "none" | "read" | "write" | null;
+  avatar_key: string | null;
 }
 
 export interface RepoRow {
@@ -48,6 +50,7 @@ export interface RepoRow {
   owner_slug: string;
   owner_kind: "user" | "org";
   owner_display_name: string;
+  owner_avatar_key: string | null;
   member_repo_role: "none" | "read" | "write" | null;
   org_role: "owner" | "member" | null;
   collaborator_role: "read" | "write" | "admin" | null;
@@ -67,6 +70,7 @@ export function selectRepos(d1: D1Database, viewerId: string) {
       "o.slug as owner_slug",
       "o.kind as owner_kind",
       "o.display_name as owner_display_name",
+      "o.avatar_key as owner_avatar_key",
       "o.member_repo_role",
       eb
         .selectFrom("org_members as m")
@@ -84,7 +88,13 @@ export function selectRepos(d1: D1Database, viewerId: string) {
 }
 
 export function accountSummary(row: AccountRow): AccountSummary {
-  return { id: row.id, kind: row.kind, slug: row.slug, displayName: row.display_name };
+  return {
+    id: row.id,
+    kind: row.kind,
+    slug: row.slug,
+    displayName: row.display_name,
+    avatarUrl: avatarUrl(row.avatar_key),
+  };
 }
 
 export function actorFromRow(row: AccountRow): Actor {
@@ -154,6 +164,7 @@ export function repoSummary(row: RepoRow, actor: Actor | null): RepoSummary {
       kind: row.owner_kind,
       slug: row.owner_slug,
       displayName: row.owner_display_name,
+      avatarUrl: avatarUrl(row.owner_avatar_key),
     },
     name: row.name,
     description: row.description,
@@ -209,17 +220,18 @@ export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
         .where("m.user_id", "=", actor.id)
         .orderBy("a.slug")
         .execute();
+  const { email, avatar_key } = (await db(d1)
+    .selectFrom("accounts")
+    .select(["email", "avatar_key"])
+    .where("id", "=", actor.id)
+    .executeTakeFirst()) ?? { email: null, avatar_key: null };
   const self: AccountSummary = {
     id: actor.id,
     kind: "user",
     slug: actor.slug,
     displayName: actor.displayName,
+    avatarUrl: avatarUrl(avatar_key),
   };
-  const { email } = (await db(d1)
-    .selectFrom("accounts")
-    .select("email")
-    .where("id", "=", actor.id)
-    .executeTakeFirst()) ?? { email: null };
   return {
     ...self,
     agent: actor.agent ?? null,

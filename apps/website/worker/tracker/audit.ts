@@ -10,7 +10,16 @@ import type { Access } from "./store.ts";
 
 export function auditActor(access: Access, id = access.actorId): AuditActor {
   const agent = access.agents.find((candidate) => candidate.id === id);
-  if (agent) return { id, kind: "agent", name: agent.name, accountable: agent.accountable };
+  if (agent) {
+    // History keeps who, not how they looked: no profile picture URLs.
+    const { id: personId, slug, displayName } = agent.accountable;
+    return {
+      id,
+      kind: "agent",
+      name: agent.name,
+      accountable: { id: personId, slug, displayName },
+    };
+  }
   const person = access.members.find((candidate) => candidate.id === id);
   return {
     id,

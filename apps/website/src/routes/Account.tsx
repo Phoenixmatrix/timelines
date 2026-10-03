@@ -18,7 +18,12 @@ export function Account() {
   return (
     <Page>
       <header className="flex items-center gap-4">
-        <Monogram name={account.displayName} shape={isOrg ? "place" : "person"} size="lg" />
+        <Monogram
+          name={account.displayName}
+          shape={isOrg ? "place" : "person"}
+          size="lg"
+          src={account.avatarUrl}
+        />
         <div className="min-w-0">
           <h1 className="m-0 text-headline">
             <bdi>{account.displayName}</bdi>
@@ -61,7 +66,7 @@ export function Account() {
                     to={`/${member.slug}`}
                     className="flex items-center gap-3 rounded-control px-2 py-1.5 text-ink no-underline hover:bg-pane"
                   >
-                    <Monogram name={member.displayName} size="sm" />
+                    <Monogram name={member.displayName} size="sm" src={member.avatarUrl} />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-semibold">
                         <bdi>{member.displayName}</bdi>

@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 
 // Ported from MatrixKit's bundle.js so React renders the same tints.
 export function monogramHue(name: string): number {
@@ -26,9 +26,18 @@ interface MonogramProps {
   shape?: "person" | "place";
   size?: "xs" | "sm" | "md" | "lg";
   className?: string;
+  /** A person's profile picture; the initials show until it loads, or if it can't. */
+  src?: string | null;
 }
 
-export function Monogram({ name, shape = "person", size = "md", className = "" }: MonogramProps) {
+export function Monogram({
+  name,
+  shape = "person",
+  size = "md",
+  className = "",
+  src,
+}: MonogramProps) {
+  const [failed, setFailed] = useState<string | null>(null);
   const classes = [
     "mk-monogram",
     shape === "place" && "mk-monogram--squircle",
@@ -43,7 +52,18 @@ export function Monogram({ name, shape = "person", size = "md", className = "" }
       style={{ "--hue": monogramHue(name) } as CSSProperties}
       aria-hidden="true"
     >
-      {monogramInitials(name)}
+      {src && failed !== src ? (
+        <img
+          src={src}
+          alt=""
+          className="size-full rounded-[inherit] object-cover"
+          loading="lazy"
+          decoding="async"
+          onError={() => setFailed(src)}
+        />
+      ) : (
+        monogramInitials(name)
+      )}
     </span>
   );
 }

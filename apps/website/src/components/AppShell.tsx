@@ -100,7 +100,7 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
           className="grid size-12 place-items-center rounded-full"
           aria-label={`${viewer.displayName}, account menu`}
         >
-          <Monogram name={viewer.displayName} />
+          <Monogram name={viewer.displayName} src={viewer.avatarUrl} />
         </Menu.Trigger>
       </Tip>
       <Menu.Portal>

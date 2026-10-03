@@ -1824,6 +1824,46 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
+  await scenario("profile-picture-upload-serve-and-remove", async () => {
+    // CORE-116: a person's picture, stored in the AVATARS bucket.
+    const token = fixtures.tokens.jun;
+    const put = (bytes: Uint8Array, type: string) =>
+      fetch(`${ctx.origin}/api/account/avatar`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": type },
+        body: new Uint8Array(bytes),
+        signal: AbortSignal.timeout(30_000),
+      });
+    const png = Uint8Array.from(
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        "base64",
+      ),
+    );
+    const refused = await put(new TextEncoder().encode("<svg/>"), "image/svg+xml");
+    assert.equal(refused.status, 415, "Only PNG, JPEG and WebP pictures are accepted");
+    const saved = await put(png, "image/png");
+    assert.equal(saved.status, 200, `upload: HTTP ${saved.status}`);
+    const url = ((await saved.json()) as { viewer: { avatarUrl: string | null } }).viewer.avatarUrl;
+    assert.match(url ?? "", /^\/api\/avatars\/[\w-]+\/[0-9a-f]{32}\.png$/);
+    // Public, like the profile it belongs to, and cached for good.
+    const served = await fetch(`${ctx.origin}${url}`, { signal: AbortSignal.timeout(30_000) });
+    assert.equal(served.status, 200);
+    assert.equal(served.headers.get("cache-control"), "public, max-age=31536000, immutable");
+    assert.deepEqual(new Uint8Array(await served.arrayBuffer()), png);
+    const page = await json<{ avatarUrl: string | null }>("/api/accounts/jun", null);
+    assert.equal(page.avatarUrl, url, "The profile shows the picture");
+    // Generated options need AI, which this environment doesn't have: it says so.
+    await request("/api/account/avatar/options", token, "POST", undefined, [503]);
+    const removed = await json<{ viewer: { avatarUrl: string | null } }>(
+      "/api/account/avatar",
+      token,
+      "DELETE",
+    );
+    assert.equal(removed.viewer.avatarUrl, null);
+    record({ avatar: url, removed: true });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

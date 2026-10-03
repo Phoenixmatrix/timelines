@@ -26,6 +26,7 @@ export function RepoList({
               name={repo.owner.displayName}
               shape={repo.owner.kind === "org" ? "place" : "person"}
               size="sm"
+              src={repo.owner.avatarUrl}
             />
             <span className="min-w-0 flex-1">
               <span className="flex flex-wrap items-center gap-x-2 gap-y-1">

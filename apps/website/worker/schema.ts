@@ -21,6 +21,8 @@ export interface Database {
     /** Users who sign in by email; null for orgs and seed personas. */
     email: string | null;
     created_at: Generated<string>;
+    /** People's profile picture in the AVATARS bucket; null shows initials. */
+    avatar_key: string | null;
   };
   // Better Auth's tables (worker/better-auth.ts): only what Gitmatrix reads.
   auth_users: {
@@ -660,6 +662,15 @@ export interface Database {
     teardown_run_id: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
+  /** A person's one set of generated avatar options (CORE-116). */
+  avatar_generations: {
+    user_id: string;
+    status: "generating" | "ready" | "failed";
+    /** JSON array of AVATARS keys, in display order. */
+    options: Generated<string>;
+    created_at: Generated<string>;
+    finished_at: string | null;
+  };
   account_settings: {
     account_id: string;
     preview_ended_days: Generated<number>;
