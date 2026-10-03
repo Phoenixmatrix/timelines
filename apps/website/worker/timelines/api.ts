@@ -249,6 +249,7 @@ timelines.patch("/:slug", async (c) => {
         c.req.param("slug"),
         data,
         expectedVersion,
+        access,
       ),
     ),
   );

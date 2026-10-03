@@ -36,7 +36,7 @@ export interface RangeCommit extends CommitSummary {
  * whose other parent was the timeline's checkpoint.
  */
 export interface LandedTimeline {
-  /** The timeline's record; null until timelines are recorded (CORE-69). */
+  /** The timeline record a `timeline/<slug>` branch names; null for other branches or none. */
   id: string | null;
   /** The branch it merged, like `timeline/search`, when git or the push log name it. */
   branch: string | null;

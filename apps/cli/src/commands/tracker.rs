@@ -318,7 +318,8 @@ fn safe_owner(owner: &str) -> Result<()> {
     Ok(())
 }
 // Version 1 includes creator backfill, which did not produce change-feed events.
-const SNAPSHOT_SCHEMA: &str = "1";
+// Version 2 includes timelines and their events (asked for with `timelines=1`).
+const SNAPSHOT_SCHEMA: &str = "2";
 
 struct Replica {
     db: Connection,
@@ -416,7 +417,12 @@ impl Replica {
         if self.meta("snapshot")?.is_none()
             || self.meta("snapshot_schema")?.as_deref() != Some(SNAPSHOT_SCHEMA)
         {
-            let mut snapshot = remote::api(&self.config, "GET", &self.path("snapshot"), None)?;
+            let mut snapshot = remote::api(
+                &self.config,
+                "GET",
+                &self.path("snapshot?timelines=1"),
+                None,
+            )?;
             redact(&mut snapshot);
             if !snapshot["issues"].is_array() || !snapshot["cursor"].is_u64() {
                 return Err(GmError::new("protocol_error", "Invalid tracker snapshot."));
@@ -438,7 +444,7 @@ impl Replica {
                 &self.config,
                 "GET",
                 &self.path(&format!(
-                    "changes?after={before}&limit=200{}",
+                    "changes?after={before}&limit=200&timelines=1{}",
                     if directory { "&directory=1" } else { "" }
                 )),
                 None,
@@ -684,6 +690,24 @@ fn with_replica(
     }
     f(&replica)
 }
+/// The replica's timelines in brief, newest first: slug, name, status and parent.
+fn timelines(snapshot: &Value) -> Value {
+    let all = snapshot["timelines"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let slug = |id: &Value| {
+        all.iter()
+            .find(|t| t["id"] == *id)
+            .map_or(Value::Null, |t| t["slug"].clone())
+    };
+    let mut out: Vec<Value> = all
+        .iter()
+        .map(|t| json!({"slug":t["slug"],"name":t["name"],"status":t["status"],"parent":slug(&t["parentId"]),"experimental":t["experimental"],"createdAt":t["createdAt"]}))
+        .collect();
+    out.sort_by(|a, b| b["createdAt"].as_str().cmp(&a["createdAt"].as_str()));
+    json!(out)
+}
 /// Whether a queued request shows in a view: main's changes show everywhere.
 fn in_view(request: &Value, timeline: Option<&str>) -> bool {
     match request["timeline"].as_str() {
@@ -703,9 +727,28 @@ fn collection(kind: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+/// Timelines and their events: not tracker entities, kept for listing offline.
+fn timeline_collection(kind: &str) -> Option<&'static str> {
+    match kind {
+        "timeline" => Some("timelines"),
+        "timelineEvent" => Some("timelineEvents"),
+        _ => None,
+    }
+}
 fn apply_event(snapshot: &mut Value, event: &Value) -> Result<()> {
-    let table = collection(event["entityType"].as_str().unwrap_or(""))
-        .ok_or_else(|| GmError::new("protocol_error", "Unknown tracker entity type."))?;
+    let kind = event["entityType"].as_str().unwrap_or("");
+    let table = if let Some(table) = collection(kind) {
+        table
+    } else if let Some(table) = timeline_collection(kind) {
+        // A snapshot from before the server kept timelines starts the collection.
+        if !snapshot[table].is_array() {
+            snapshot[table] = json!([]);
+        }
+        table
+    } else {
+        // Entity types newer than this gm: skip them, so older binaries keep syncing.
+        return Ok(());
+    };
     let rows = snapshot[table]
         .as_array_mut()
         .ok_or_else(|| GmError::new("protocol_error", "Missing tracker entity collection."))?;
@@ -988,7 +1031,7 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
                 r.preferred_team(&snapshot)?,
             );
             Ok(Shown(
-                json!({"owner":r.owner,"identity":r.meta("actor")?,"defaultTeam":choice.describe(&r.owner, false),"cursor":r.snapshot()?["cursor"],"operations":r.queued()?,"replica":root(&r.config)?.join(format!("{}.sqlite",r.owner)),"credentialPartitions":root(&r.config)?.parent(),"credentialRotation":"Old credential partitions remain intact. To reconnect a rotated token to its old outbox, use tracker recover with the old replica path after verifying the same identity."}),
+                json!({"owner":r.owner,"identity":r.meta("actor")?,"defaultTeam":choice.describe(&r.owner, false),"cursor":r.snapshot()?["cursor"],"timelines":timelines(&r.snapshot()?),"operations":r.queued()?,"replica":root(&r.config)?.join(format!("{}.sqlite",r.owner)),"credentialPartitions":root(&r.config)?.parent(),"credentialRotation":"Old credential partitions remain intact. To reconnect a rotated token to its old outbox, use tracker recover with the old replica path after verifying the same identity."}),
             ))
         }
         TrackerCommand::Recover { replica: source } => {
@@ -2090,6 +2133,29 @@ impl TeamChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_entity_types_are_skipped_and_timelines_kept() {
+        let mut s = snapshot();
+        let before = s.clone();
+        apply_event(
+            &mut s,
+            &json!({"entityType":"discussion","entityId":"d","entity":{"id":"d"}}),
+        )
+        .unwrap();
+        assert_eq!(s, before, "an entity type newer than gm changes nothing");
+        apply_event(&mut s,&json!({"entityType":"timeline","entityId":"tl_1","entity":{"id":"tl_1","slug":"search","name":"Search","status":"active","parentId":null,"createdAt":"2026-10-03T00:00:00Z"}})).unwrap();
+        apply_event(&mut s,&json!({"entityType":"timeline","entityId":"tl_2","entity":{"id":"tl_2","slug":"ranking","name":"Ranking","status":"active","parentId":"tl_1","createdAt":"2026-10-03T01:00:00Z"}})).unwrap();
+        apply_event(&mut s,&json!({"entityType":"timelineEvent","entityId":"fork:tl_1","entity":{"id":"fork:tl_1","seq":1,"kind":"fork"}})).unwrap();
+        apply_event(&mut s,&json!({"entityType":"timeline","entityId":"tl_1","entity":{"id":"tl_1","slug":"search","name":"Search","status":"abandoned","parentId":null,"createdAt":"2026-10-03T00:00:00Z"}})).unwrap();
+        assert_eq!(s["timelineEvents"][0]["kind"], "fork");
+        assert_eq!(
+            timelines(&s),
+            json!([
+                {"slug":"ranking","name":"Ranking","status":"active","parent":"search","experimental":null,"createdAt":"2026-10-03T01:00:00Z"},
+                {"slug":"search","name":"Search","status":"abandoned","parent":null,"experimental":null,"createdAt":"2026-10-03T00:00:00Z"},
+            ])
+        );
+    }
     #[test]
     fn timeline_changes_show_in_their_own_view_and_mains_everywhere() {
         let main = json!({"mutations":[]});

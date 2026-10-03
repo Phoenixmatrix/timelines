@@ -1,4 +1,5 @@
 import type { AgentCapabilities } from "./api.ts";
+import type { Timeline, TimelineEvent } from "./timelines.ts";
 
 export interface TrackerIdentity {
   id: string;
@@ -216,6 +217,9 @@ export interface Snapshot {
    * (and its ancestors') changes on top. Absent for main's view.
    */
   timeline?: TimelineScope;
+  /** With `timelines=1`: every timeline, and every timeline event (by `seq`). */
+  timelines?: Timeline[];
+  timelineEvents?: TimelineEvent[];
 }
 /** Initial browser data; repository choices are loaded only in management. */
 export interface TrackerView {
@@ -481,8 +485,25 @@ export interface MutationResult {
   }[];
   serverTime: string;
 }
+/**
+ * A timeline record or timeline event, in the change feed for replicas that
+ * ask for them (`timelines=1`): older replicas fail on entity types they
+ * don't know, so they never see these.
+ */
+export interface TimelineFeedEvent {
+  cursor: number;
+  operationId: string;
+  /** Who made the change, when known. */
+  actorId: string | null;
+  kind: string;
+  entityType: "timeline" | "timelineEvent";
+  entityId: string;
+  entity: Timeline | TimelineEvent;
+  createdAt: string;
+}
+export const TIMELINE_FEED_TYPES = ["timeline", "timelineEvent"] as const;
 export interface Changes {
-  events: TrackerEvent[];
+  events: (TrackerEvent | TimelineFeedEvent)[];
   cursor: number;
   hasMore: boolean;
   serverTime: string;

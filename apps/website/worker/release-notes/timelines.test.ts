@@ -1,7 +1,7 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, test, vi } from "vite-plus/test";
 import { mergedBranch } from "../../shared/landings.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { landedTimelines } from "./timelines.ts";
+import { landedTimelines, ownerTimelines } from "./timelines.ts";
 
 const merge = (hash: string, message: string, parents = ["main", `${hash}-tip`]) =>
   ({ hash, message, parents }) as unknown as ArtifactsCommitMetadata;
@@ -42,5 +42,40 @@ describe("landed timelines", () => {
       C: { id: null, branch: "fix", landing: "C" },
       D: { id: null, branch: null, landing: "D" },
     });
+    // With timeline records, a timeline branch names its record.
+    const asked: string[][] = [];
+    const named = await landedTimelines(
+      d1(sqlite),
+      "repo",
+      "main",
+      [merge("A", "Merge wip"), merge("B", "Land timeline/ranking"), merge("C", "Merge fix")],
+      async (slugs) => {
+        asked.push(slugs);
+        return new Map([["search", "tl_search"]]);
+      },
+    );
+    expect(asked).toEqual([["search", "ranking"]]);
+    expect(Object.fromEntries(named)).toEqual({
+      A: { id: "tl_search", branch: "timeline/search", landing: "A" },
+      B: { id: null, branch: "timeline/ranking", landing: "B" },
+      C: { id: null, branch: "fix", landing: "C" },
+    });
+  });
+
+  test("timeline ids come from the tracker of the repository's owner", async () => {
+    const getByName = vi.fn(() => ({
+      listTimelines: async () => ({
+        ok: true,
+        value: [
+          { id: "tl_search", slug: "search" },
+          { id: "tl_other", slug: "other" },
+        ],
+      }),
+    }));
+    const env = { TRACKER: { getByName } } as unknown as Env;
+    expect(await ownerTimelines(env, "acc")(["search", "missing"])).toEqual(
+      new Map([["search", "tl_search"]]),
+    );
+    expect(getByName).toHaveBeenCalledWith("acc");
   });
 });

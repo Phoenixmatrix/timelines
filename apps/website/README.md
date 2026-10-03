@@ -672,6 +672,7 @@ subtasks or satisfy dependent issues' blockers.
 | `GET /api/tracker`                                                | Trackers accessible to the authenticated account                                                        |
 | `GET /api/tracker/:owner/snapshot`                                | Complete authorized replica snapshot and cursor                                                         |
 | `GET /api/tracker/:owner/changes?after=N&limit=200`               | Ordered event page; resume from the returned cursor                                                     |
+| `…/snapshot?timelines=1`, `…/changes?…&timelines=1`               | Also timelines and their events (entity types `timeline`, `timelineEvent`), for replicas that know them |
 | `GET /api/tracker/:owner/issues/:issue/history?before=N&limit=50` | Authorized issue audit; ID or key, newest first, exclusive cursor, default 50 / maximum 100 events      |
 | `POST /api/tracker/:owner/mutate`                                 | `{operationId, mutations:[{kind,id,expectedVersion?,data?}]}`; 1–100 ordered operations, all or nothing |
 | `GET /api/repos/:owner/:name/tracker`                             | Accessible subscribed workspaces for repository navigation                                              |
@@ -695,9 +696,12 @@ execution loop is not included.
 A timeline (`TIMELINES-RESEARCH.md`) is an account-wide line of work with a
 bookmark `timeline/<slug>` in each repository it touches. Records and their
 events live in the tracker's Durable Object, beside the issues and leases that
-landing and abandoning will change with them, but outside the tracker's event
-log, so replicas that don't know them keep syncing. `shared/timelines.ts`
-defines the wire types.
+landing and abandoning will change with them. Every change to either is also
+logged in the tracker's event log, which the snapshot and change feed include
+only with `timelines=1`, because older gm binaries fail on entity types they
+don't know (gm now skips them). gm asks for timelines and keeps them in its
+replica; `gm tracker status` lists them offline. `shared/timelines.ts` defines the
+wire types.
 
 | Route                                                   | Contract                                                                                       |
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |

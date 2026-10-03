@@ -263,4 +263,34 @@ describe("timeline views of the tracker", () => {
     expect(t.view()).not.toHaveProperty("timeline");
     expect((t.issue(t.view("search"), "a") as Issue).title).toBe("Main work");
   });
+
+  test("timelines reach the change feed and snapshot only for replicas that ask", () => {
+    const t = setup();
+    const search = t.fork("search");
+    t.timelines.update("search", { name: "Search" }, undefined, t.access);
+    t.mutate("search", { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
+    const kinds = (withTimelines: boolean) =>
+      t.store.changes(0, 100, withTimelines).events.map((e) => [e.entityType, e.kind]);
+    expect(kinds(false)).toEqual([
+      ["team", "team.create"],
+      ["issue", "issue.create"],
+    ]);
+    expect(kinds(true)).toEqual([
+      ["team", "team.create"],
+      ["timeline", "timeline.create"],
+      ["timelineEvent", "fork"],
+      ["timeline", "timeline.update"],
+      ["issue", "issue.create"],
+    ]);
+    expect(t.store.changes(0, 100, true).events[2]).toMatchObject({
+      entityId: `fork:${search.id}`,
+      actorId: "ann",
+      entity: { kind: "fork", seq: 1, timelineId: search.id },
+    });
+    expect(t.view()).not.toHaveProperty("timelines");
+    expect(t.store.snapshot(t.access, undefined, true)).toMatchObject({
+      timelines: [{ id: search.id, name: "Search", version: 2 }],
+      timelineEvents: [{ seq: 1, kind: "fork" }],
+    });
+  });
 });

@@ -282,7 +282,11 @@ tracker.get("/tracker/:owner/snapshot", async (c) => {
   const access = await authorize(c);
   return response(
     c,
-    await trackerObject(c.env, access.owner.id).snapshot(access, timelineParam(c)),
+    await trackerObject(c.env, access.owner.id).snapshot(
+      access,
+      timelineParam(c),
+      c.req.query("timelines") === "1",
+    ),
   );
 });
 tracker.get("/tracker/:owner/changes", async (c) => {
@@ -294,7 +298,12 @@ tracker.get("/tracker/:owner/changes", async (c) => {
   const limit = c.req.query("limit") ?? "200";
   if (!/^\d+$/.test(after) || !/^\d+$/.test(limit))
     throw new TrackerError(400, "invalid_input", "after and limit must be integers.");
-  const changes = await trackerObject(c.env, access.owner.id).changes(Number(after), Number(limit));
+  // Timeline records and events only for replicas that know them (timelines=1).
+  const changes = await trackerObject(c.env, access.owner.id).changes(
+    Number(after),
+    Number(limit),
+    c.req.query("timelines") === "1",
+  );
   return response(
     c,
     directory && changes.ok

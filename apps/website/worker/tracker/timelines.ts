@@ -1,13 +1,16 @@
 // Timeline records and their events, in the tracker's Durable Object next to
 // the issues and leases that landing and abandoning will change with them in
-// one transaction. They stay out of the tracker's issue event log: replicas
-// (gm's offline copy) reject entity types they don't know.
+// one transaction. Each change to either also goes into the tracker's event
+// log (entity types `timeline` and `timelineEvent`), which the change feed
+// and snapshot give only to replicas that ask for them: older gm binaries
+// reject entity types they don't know.
 //
 // Permissions (TIMELINES-RESEARCH.md, Decisions): any writer, person or agent,
 // creates a timeline, merges into one and sets its experimental flag; only its
 // accountable person and the agent that started it may abandon it. The bookmarks
 // themselves are written by the Worker (timelines/api.ts), which asks here first.
 
+import type { TimelineFeedEvent } from "../../shared/tracker.ts";
 import {
   TIMELINE_POLICIES,
   timelineBookmark,
@@ -110,7 +113,8 @@ export class TimelineStore {
     );
     return row ? (JSON.parse(row.data) as Timeline) : null;
   }
-  private save(timeline: Timeline) {
+  private save(timeline: Timeline, kind: string, actorId: string | null) {
+    this.feed(`timeline:${timeline.id}:v${timeline.version}`, kind, "timeline", timeline, actorId);
     run(
       this.sql,
       tracker
@@ -120,6 +124,25 @@ export class TimelineStore {
           oc.column("id").doUpdateSet((eb) => ({ data: eb.ref("excluded.data") })),
         ),
     );
+  }
+  /** Log a record or event in the tracker's change feed (`timelines=1`). */
+  private feed(
+    operationId: string,
+    kind: string,
+    entityType: TimelineFeedEvent["entityType"],
+    entity: Timeline | TimelineEvent,
+    actorId: string | null,
+  ) {
+    const event: Omit<TimelineFeedEvent, "cursor"> = {
+      operationId,
+      actorId,
+      kind,
+      entityType,
+      entityId: entity.id,
+      entity,
+      createdAt: "updatedAt" in entity ? entity.updatedAt : entity.createdAt,
+    };
+    run(this.sql, tracker.insertInto("events").values({ data: JSON.stringify(event) }));
   }
   /** Append an event, listed by each of `timelineIds`; an id already recorded is skipped. */
   private append(event: EventInput, timelineIds: string[]): boolean {
@@ -138,6 +161,8 @@ export class TimelineStore {
         .insertInto("timeline_event_index")
         .values([...new Set(timelineIds)].map((timeline_id) => ({ timeline_id, seq: row.seq }))),
     );
+    const recorded = { ...event, seq: row.seq } as TimelineEvent;
+    this.feed(`timelineEvent:${event.id}`, event.kind, "timelineEvent", recorded, event.actorId);
     return true;
   }
   /** Every timeline, newest first; ended ones included unless a status is asked for. */
@@ -222,7 +247,7 @@ export class TimelineStore {
         updatedAt: now,
         pushedAt: null,
       };
-      this.save(timeline);
+      this.save(timeline, "timeline.create", access.actorId);
       this.append(
         {
           id: `fork:${timeline.id}`,
@@ -252,7 +277,12 @@ export class TimelineStore {
     return value as boolean | undefined;
   }
   /** Rename it, or set or clear its experimental flag: any writer may. */
-  update(slug: string, data: Record<string, unknown>, expectedVersion?: unknown): Timeline {
+  update(
+    slug: string,
+    data: Record<string, unknown>,
+    expectedVersion?: unknown,
+    access?: Access,
+  ): Timeline {
     for (const key of Object.keys(data))
       if (key !== "name" && key !== "experimental") fail("invalid_input", `Unknown field: ${key}.`);
     return this.transaction(() => {
@@ -264,7 +294,7 @@ export class TimelineStore {
       if (experimental !== undefined) timeline.experimental = experimental;
       timeline.version++;
       timeline.updatedAt = this.now();
-      this.save(timeline);
+      this.save(timeline, "timeline.update", access?.actorId ?? null);
       return timeline;
     });
   }
@@ -297,7 +327,7 @@ export class TimelineStore {
       timeline.status = "abandoned";
       timeline.version++;
       timeline.updatedAt = now;
-      this.save(timeline);
+      this.save(timeline, "timeline.abandon", access.actorId);
       this.append(
         {
           id: `abandon:${timeline.id}`,
@@ -376,7 +406,7 @@ export class TimelineStore {
       for (const timeline of pushed) {
         timeline.version++;
         timeline.updatedAt = now;
-        this.save(timeline);
+        this.save(timeline, "timeline.push", activity.actorId);
       }
       return recorded;
     });

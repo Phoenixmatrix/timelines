@@ -49,10 +49,10 @@ impl Server {
                 seen.lock().push(request.clone());
                 let body = if request == "GET /api/session HTTP/1.1" {
                     json!({"viewer":{"id":"person-a"}})
-                } else if request == "GET /api/tracker/orbit/snapshot HTTP/1.1" {
+                } else if request == "GET /api/tracker/orbit/snapshot?timelines=1 HTTP/1.1" {
                     state.lock().clone()
                 } else if request
-                    == "GET /api/tracker/orbit/changes?after=468&limit=200&directory=1 HTTP/1.1"
+                    == "GET /api/tracker/orbit/changes?after=468&limit=200&timelines=1&directory=1 HTTP/1.1"
                 {
                     json!({"events":[],"cursor":468,"hasMore":false,"serverTime":"2026-10-03T01:00:00Z"})
                 } else {
@@ -221,7 +221,7 @@ fn legacy_replica_refreshes_creators_once_without_rewriting_outbox() {
     assert_eq!(outbox(), before);
     let requests = server.requests.lock();
     assert_eq!(
-        requests.iter().filter(|r| r.contains("/snapshot ")).count(),
+        requests.iter().filter(|r| r.contains("/snapshot?")).count(),
         2
     );
     assert_eq!(

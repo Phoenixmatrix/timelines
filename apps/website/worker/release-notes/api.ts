@@ -10,7 +10,7 @@ import { accessible } from "../tracker/api.ts";
 import { FeedError, releaseFeed } from "./feed.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
-import { landedTimelines } from "./timelines.ts";
+import { landedTimelines, ownerTimelines } from "./timelines.ts";
 import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
 import { issuesFrom } from "./trackers.ts";
 import { ensureReleaseNotes } from "./queue.ts";
@@ -108,7 +108,17 @@ releaseNotes.get("/range", async (c) => {
         : null,
       commits,
       timelines: merges.length
-        ? [...(await landedTimelines(c.env.DB, row.id, refs.headBranch, merges)).values()]
+        ? [
+            ...(
+              await landedTimelines(
+                c.env.DB,
+                row.id,
+                refs.headBranch,
+                merges,
+                ownerTimelines(c.env, row.owner_id),
+              )
+            ).values(),
+          ]
         : [],
       truncated: walk.truncated,
       issues: await linkedIssues(c.env, c.get("actor"), row, keys),

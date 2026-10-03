@@ -10,7 +10,7 @@ import { RepoReader } from "../objects.ts";
 import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
-import { landedTimelines } from "./timelines.ts";
+import { landedTimelines, ownerTimelines } from "./timelines.ts";
 import { affectedRepos, issuesFrom, subscribedOwners } from "./trackers.ts";
 
 export interface ReleaseNotesJob {
@@ -108,7 +108,13 @@ async function source(
       log: (oid, limit, offset) => reader.log(oid, limit, offset),
       commit: (oid) => reader.commit(oid),
       timelines: async (merges) =>
-        landedTimelines(env.DB, row.id, (await reader.refs()).headBranch, merges),
+        landedTimelines(
+          env.DB,
+          row.id,
+          (await reader.refs()).headBranch,
+          merges,
+          ownerTimelines(env, row.owner_id),
+        ),
       issues: async (keys) => issuesFrom(env, await subscribedOwners(env, row), row.id, keys),
       async changes(oid) {
         try {

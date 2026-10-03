@@ -38,11 +38,11 @@ export class Tracker extends DurableObject<Env> {
       throw error;
     }
   }
-  snapshot(access: Access, timeline?: string) {
-    return this.reply(() => this.store.snapshot(access, timeline));
+  snapshot(access: Access, timeline?: string, withTimelines = false) {
+    return this.reply(() => this.store.snapshot(access, timeline, withTimelines));
   }
-  changes(after: number, limit: number) {
-    return this.reply(() => this.store.changes(after, limit));
+  changes(after: number, limit: number, withTimelines = false) {
+    return this.reply(() => this.store.changes(after, limit, withTimelines));
   }
   history(access: Access, issueId: string, before: number | null, limit: number) {
     return this.reply(() => this.store.history(access, issueId, before, limit));
@@ -83,8 +83,13 @@ export class Tracker extends DurableObject<Env> {
   createTimeline(access: Access, input: NewTimeline) {
     return this.reply(() => this.timelines.create(access, input));
   }
-  updateTimeline(slug: string, data: Record<string, unknown>, expectedVersion?: unknown) {
-    return this.reply(() => this.timelines.update(slug, data, expectedVersion));
+  updateTimeline(
+    slug: string,
+    data: Record<string, unknown>,
+    expectedVersion?: unknown,
+    access?: Access,
+  ) {
+    return this.reply(() => this.timelines.update(slug, data, expectedVersion, access));
   }
   mayAbandonTimeline(access: Access, slug: string) {
     return this.reply(() => this.timelines.mayAbandon(access, slug));
