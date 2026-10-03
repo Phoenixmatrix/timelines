@@ -356,7 +356,7 @@ describe("release note generation", () => {
       expect(r.release(DAY)!.format_version).toBe(1);
 
       // Changed drafts with no remaining budget must retain their previous output.
-      const log = r.source.log;
+      const log = r.source.log.bind(r.source);
       r.source.log = async (...args) =>
         (await log(...args)).map((commit) => ({ ...commit, message: `Updated ${commit.message}` }));
       const previous = r.entries(DAY);
@@ -372,7 +372,7 @@ describe("release note generation", () => {
         );
       expect((await r.run()).more).toBe(false);
       const entries = r.entries(DAY);
-      expect(entries.map((e) => e.subject).sort()).toEqual(
+      expect(entries.map((e) => e.subject)).toEqual(
         [...commits.slice(110).map((hash) => `commit:${hash}`), "issue:acc:ENG-1"].sort(),
       );
       expect(JSON.parse(entries.find((e) => e.subject === "issue:acc:ENG-1")!.commits!)).toEqual(

@@ -794,6 +794,11 @@ authorship, retained earlier-day provenance, a named tag containing both changes
 and daily/tag tracker feeds without duplicate default entries. This is separate
 from the non-AI readiness gate.
 
+For the generator's local regressions, run
+`vp test worker/release-notes/generate.test.ts` from `apps/website`, followed by
+`vp check`. The suite covers large daily-group convergence, retention when the
+model budget is exhausted, and stale-subject pruning within D1 binding limits.
+
 ## Knowledge graph and wiki
 
 Every repository has a knowledge graph that stays current as it changes; the
