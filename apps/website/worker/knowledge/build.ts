@@ -41,6 +41,7 @@ import {
   repoScope,
   type EdgeCursor,
 } from "../atlas/projection.ts";
+import { admitProjection, enforceRetention } from "../atlas/retention.ts";
 import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
@@ -96,6 +97,8 @@ const STEP = {
 const ANALYZE_BATCH = 32;
 /** Wiki pages per step: a few model calls, far inside the step timeout. */
 const WIKI_BATCH = 6;
+/** Atlas retention passes around a publication; each is bounded (worker/atlas/retention.ts). */
+const ATLAS_RETENTION_STEPS = 20;
 
 async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> {
   const row = await db(d1)
@@ -793,10 +796,29 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         edges = batch.next;
         if (!edges) break;
       }
+      // Retention (CORE-159): make room by expiring priors, oldest first, then
+      // publish only if the snapshot fits; otherwise it fails for capacity and
+      // the previous snapshot stays current (stale).
+      await this.#retain(progress, scope, "atlas-retain");
+      const admission = await progress("atlas-admit", "atlas", () =>
+        admitProjection(env.DB, scope, begun.snapshotId),
+      );
+      if (!admission.admitted)
+        return {
+          atlasError: admission.error.slice(0, 500),
+          atlasCapacity: { storedBytes: admission.storedBytes, capBytes: admission.capBytes },
+        };
       await progress("atlas-publish", "atlas", async () => {
         await publishProjection(env.DB, scope, begun.snapshotId, begun.seq);
         return null;
       });
+      // The superseded snapshot becomes a prior: stamp its expiry, and drop
+      // what falls outside the 20. Never fails the build; the sweep resumes.
+      try {
+        await this.#retain(progress, scope, "atlas-retained");
+      } catch (error) {
+        console.error("Atlas retention after publication failed", scope, error);
+      }
       return {
         atlasSnapshot: begun.snapshotId,
         atlasSeq: begun.seq,
@@ -810,6 +832,16 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return null;
       });
       return { atlasError: message.slice(0, 500) };
+    }
+  }
+
+  /** Retention passes for a scope until done, at most ATLAS_RETENTION_STEPS (the sweep resumes). */
+  async #retain(progress: Progress, scope: string, name: string) {
+    for (let i = 0; i < ATLAS_RETENTION_STEPS; i++) {
+      const result = await progress(`${name}-${i}`, "atlas", () =>
+        enforceRetention(this.env.DB, [scope]),
+      );
+      if (!result.more) return;
     }
   }
 

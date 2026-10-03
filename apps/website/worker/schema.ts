@@ -333,6 +333,8 @@ export interface Database {
     kind: "repo";
     repo_id: string | null;
     created_at: Generated<string>;
+    /** CORE-159: 1 while retention has work left for the scope. */
+    retention_pending: Generated<number>;
   };
   atlas_snapshots: {
     id: string;
@@ -350,6 +352,10 @@ export interface Database {
     created_at: Generated<string>;
     published_at: string | null;
     expires_at: string | null;
+    /** CORE-159: age | count | storage, once expired. */
+    expired_reason: "age" | "count" | "storage" | null;
+    /** CORE-159: `capacity` when a snapshot didn't fit its storage cap. */
+    failure: "capacity" | null;
   };
   atlas_assignments: {
     scope: string;

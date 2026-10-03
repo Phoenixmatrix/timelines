@@ -1226,6 +1226,40 @@ on `exhausted` or `disabled`, publish structure and label summaries
 unavailable. Only build-time code may import it: browsing never authorizes
 inference (a test enforces it).
 
+**Atlas projection retention** (`worker/atlas/retention.ts`, CORE-159). Atlas
+snapshots (`worker/atlas/projection.ts`) are bounded by `ATLAS_RETENTION`:
+
+- **Count:** per scope, the current snapshot plus at most **20 prior** published
+  ones; the oldest beyond that expire (`expired_reason = count`).
+- **Age:** a prior expires **7 days** after it was superseded (`expires_at`,
+  stamped by the retention pass after the next publication; `age`).
+- **Storage:** **2 GiB per repository** scope. A scope's storage is the sum of
+  its snapshots' `bytes`, the estimated size of the rows each opened that still
+  exist (UTF-8 length of every column plus 160 bytes per entity row and 96 per
+  edge row for keys and indexes). Over the cap, the oldest prior is evicted
+  first (`storage`), one at a time, its rows reclaimed before measuring again.
+  Account-level composition (workspace scopes, not built yet) gets **2 GiB per
+  account** across all its scopes and principals, lineage and provenance
+  included: `enforceRetention` takes a pool of scopes with
+  `ACCOUNT_COMPOSITION_RETENTION`, so changing scope can't multiply the allowance.
+- **Never current:** a new snapshot that doesn't fit with every prior gone
+  fails before publication (`status = failed`, `failure = capacity`, a
+  readable `error`); the previous snapshot stays current, stale, and
+  `capacityFailure(scope)` reports it.
+- **Reclaiming:** expiring a snapshot deletes the entity and edge rows no
+  retained (published or building) snapshot sees; rows a retained snapshot
+  still sees stay. Each pass is bounded (5,000 rows per table per round, 10
+  rounds) and idempotent. The Knowledge build runs passes before admission and
+  after publication; the hourly cron (`17 * * * *`) resumes leftover work and
+  expires priors that came due. Expired records answer as expired while rows
+  they opened survive and for 30 days after, then as unknown.
+- **Reads and cursors:** `pinnedSnapshot(scope, id)` answers
+  `{state: "ok", snapshot}`, `{state: "expired", snapshotId, seq, expiredAt,
+reason, current}` or `{state: "unknown"}`; an expired snapshot is never
+  served from current silently. Cursors expire **30 minutes** after issue or at
+  their snapshot's expiry, whichever is first (`CURSOR_TTL_MS`,
+  `cursorExpiresAt`), and never hold off eviction.
+
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
 `gitmatrix-knowledge`, AI Search namespace `gitmatrix` / instance `knowledge`.

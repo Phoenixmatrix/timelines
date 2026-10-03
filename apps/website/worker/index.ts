@@ -1,4 +1,5 @@
 import { app } from "./app.ts";
+import { sweepAtlasRetention } from "./atlas/retention.ts";
 import { sweepPreviews } from "./deployments/sweep.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
@@ -33,12 +34,21 @@ export default {
       }
     }
   },
-  /** Hourly: package sweeps, and tearing down expired timeline previews (CORE-79). */
+  /**
+   * Hourly: package sweeps, tearing down expired timeline previews (CORE-79)
+   * and Atlas projection retention (CORE-159).
+   */
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduleSweeps(env));
     ctx.waitUntil(
       sweepPreviews(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>
         console.error("Previews: the sweep failed", error),
+      ),
+    );
+    // Atlas retention: priors due to expire, and reclaiming left over (CORE-159).
+    ctx.waitUntil(
+      sweepAtlasRetention(env.DB).catch((error) =>
+        console.error("Atlas: the retention sweep failed", error),
       ),
     );
     // Landings a CI run's end didn't move on (CORE-77).

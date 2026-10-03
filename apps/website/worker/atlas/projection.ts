@@ -68,6 +68,13 @@ export interface AtlasSnapshot {
   edges: number;
   bytes: number;
   publishedAt: string | null;
+  /**
+   * When a prior snapshot expires (or, once `expired`, when it did); null while
+   * current. See worker/atlas/retention.ts.
+   */
+  expiresAt: string | null;
+  /** Why an `expired` snapshot expired: age, count or storage. */
+  expiredReason: "age" | "count" | "storage" | null;
 }
 
 export interface AtlasEntity {
@@ -84,6 +91,34 @@ type Statement = { compile(): { sql: string; parameters: readonly unknown[] } };
 const raw = (sql: string, ...parameters: unknown[]): Statement => ({
   compile: () => ({ sql, parameters }),
 });
+
+/**
+ * Estimated stored size of a row, for retention's storage caps (CORE-159): the
+ * UTF-8 length of every text column plus a fixed overhead for the scope, keys,
+ * sequence numbers and index entries. A snapshot's `bytes` is the sum over the
+ * rows it opened that still exist, so a scope's storage is the sum of its
+ * snapshots' `bytes`. The JS and SQL forms must agree: retention subtracts the
+ * SQL form for every row it deletes.
+ */
+export const ENTITY_ROW_OVERHEAD = 160;
+export const EDGE_ROW_OVERHEAD = 96;
+const utf8 = new TextEncoder();
+const len = (s: string | null) => (s === null ? 0 : utf8.encode(s).length);
+const sqlLen = (column: string) => `coalesce(length(CAST(${column} AS BLOB)), 0)`;
+export const ENTITY_BYTES_SQL = `(${[
+  "entity_id",
+  "kind",
+  "parent_id",
+  "sort_key",
+  "name",
+  "path",
+  "summary",
+  "data",
+  "content_hash",
+]
+  .map(sqlLen)
+  .join(" + ")} + ${ENTITY_ROW_OVERHEAD})`;
+export const EDGE_BYTES_SQL = `(${["src", "dst", "kind"].map(sqlLen).join(" + ")} + ${EDGE_ROW_OVERHEAD})`;
 
 /** Rows valid in snapshot `seq`. */
 const VISIBLE = "from_seq <= ? AND (to_seq IS NULL OR to_seq > ?)";
@@ -113,6 +148,12 @@ async function rollBackUnpublished(d1: D1Database, scope: string) {
     raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq > ?", scope, published),
     raw(
       "UPDATE atlas_snapshots SET status = 'failed', error = coalesce(error, 'Superseded before publication.') WHERE scope = ? AND seq > ? AND status = 'building'",
+      scope,
+      published,
+    ),
+    // Their rows are gone, so they no longer count toward storage.
+    raw(
+      "UPDATE atlas_snapshots SET bytes = 0 WHERE scope = ? AND seq > ? AND status = 'failed'",
       scope,
       published,
     ),
@@ -327,12 +368,23 @@ async function writeEntities(
     // A row this snapshot already opened (a retried step) is replaced in place.
     if (before && before.from_seq !== seq) close.push(entity.id);
     const data = JSON.stringify(entity.data);
-    bytes += data.length + entity.summary.length + entity.name.length + (entity.path?.length ?? 0);
+    const sort = sortKey(entity.name, entity.id);
+    bytes +=
+      len(entity.id) +
+      len(entity.kind) +
+      len(entity.parentId) +
+      len(sort) +
+      len(entity.name) +
+      len(entity.path) +
+      len(entity.summary) +
+      len(data) +
+      len(hash) +
+      ENTITY_ROW_OVERHEAD;
     rows.push({
       id: entity.id,
       kind: entity.kind,
       parent: entity.parentId,
-      sort: sortKey(entity.name, entity.id),
+      sort,
       name: entity.name,
       path: entity.path,
       summary: entity.summary,
@@ -752,7 +804,10 @@ export async function projectEdges(
     );
   }
   for (let i = 0; i < statements.length; i += 50) await batch(d1, statements.slice(i, i + 50));
-  const bytes = insert.reduce((n, e) => n + e.src.length + e.dst.length + e.kind.length + 8, 0);
+  const bytes = insert.reduce(
+    (n, e) => n + len(e.src) + len(e.dst) + len(e.kind) + EDGE_ROW_OVERHEAD,
+    0,
+  );
   await db(d1)
     .updateTable("atlas_snapshots")
     .set((eb) => ({ bytes: eb("bytes", "+", bytes) }))
@@ -763,7 +818,7 @@ export async function projectEdges(
 
 // ---- reads -------------------------------------------------------------------
 
-function toSnapshot(row: {
+export function toSnapshot(row: {
   id: string;
   scope: string;
   seq: number;
@@ -775,6 +830,8 @@ function toSnapshot(row: {
   edges: number;
   bytes: number;
   published_at: string | null;
+  expires_at: string | null;
+  expired_reason: string | null;
 }): AtlasSnapshot {
   return {
     id: row.id,
@@ -788,6 +845,8 @@ function toSnapshot(row: {
     edges: Number(row.edges),
     bytes: Number(row.bytes),
     publishedAt: row.published_at,
+    expiresAt: row.expires_at,
+    expiredReason: row.expired_reason as AtlasSnapshot["expiredReason"],
   };
 }
 
