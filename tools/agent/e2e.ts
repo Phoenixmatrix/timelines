@@ -17,6 +17,7 @@ import type {
   HistoryPage,
   RepoDetail,
 } from "../../apps/website/shared/api.ts";
+import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
@@ -972,6 +973,75 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     assert.equal(blocked?.status, "skipped");
     assert.equal(blocked?.claimedBy, null);
     record({ run });
+  });
+
+  await scenario("ci-job-records-and-updates-a-deployment", async () => {
+    // The job runs this environment's gm, never a globally installed one.
+    const number = await pushPipeline(
+      {
+        deploy: {
+          env: { AGENT_GM: ctx.gm },
+          steps: [
+            {
+              run: '"$AGENT_GM" deploy record --url "https://agent-e2e.example.com/run-$GITMATRIX_RUN_NUMBER" --environment staging --expires 2d',
+            },
+          ],
+        },
+      },
+      "agent-ci-deploy",
+    );
+    const run = await poll(() => runDetail(number), terminal, "deploying run");
+    assert.equal(run.status, "succeeded");
+    const listed = await json<DeploymentList>(`${api}/deployments?run=${number}`, ownerToken);
+    assert.equal(listed.deployments.length, 1, "The job records exactly one deployment");
+    const deployment = listed.deployments[0]!;
+    assert.equal(deployment.environment, "staging");
+    assert.equal(deployment.url, `https://agent-e2e.example.com/run-${number}`);
+    assert.equal(deployment.status, "active");
+    assert.equal(deployment.run, number);
+    assert.equal(deployment.job, "deploy");
+    assert.equal(deployment.commit, run.commit);
+    assert(deployment.expiresAt, "--expires sets the expiry");
+    record({ deployment });
+
+    // Outside CI: a person records for an explicit commit, and marks the
+    // preview expired; the record stays.
+    const recorded = JSON.parse(
+      await gm([
+        "deploy",
+        "record",
+        "--url",
+        "https://agent-e2e.example.com/preview",
+        "--timeline",
+        "agent-e2e",
+        "--commit",
+        run.commit,
+        "-R",
+        fullName,
+      ]),
+    ) as Deployment;
+    assert.equal(recorded.environment, "timeline/agent-e2e");
+    assert.equal(recorded.run, null);
+    await gm(["deploy", "update", String(recorded.id), "--status", "expired", "-R", fullName]);
+    const kept = await json<Deployment>(`${api}/deployments/${recorded.id}`, ownerToken);
+    assert.equal(kept.status, "expired");
+    assert.equal(kept.url, "https://agent-e2e.example.com/preview");
+    await gm(
+      [
+        "deploy",
+        "record",
+        "--url",
+        "https://x.example.com",
+        "--commit",
+        run.commit,
+        "-R",
+        fullName,
+      ],
+      "read",
+      work,
+      /403|read.only|write access/i,
+    );
+    record({ recorded: kept });
   });
 
   await scenario("ci-cancellation-and-job-token-lifetime", async () => {

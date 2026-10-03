@@ -417,6 +417,33 @@ export interface Database {
     job_id: string;
     expires_at: string;
   };
+  /** Where a repository's code is deployed (CORE-78); rows outlive their previews. */
+  deployments: {
+    id: Generated<number>;
+    repo_id: string;
+    environment: string;
+    timeline_slug: string | null;
+    timeline_id: string | null;
+    checkpoint_id: string | null;
+    commit_oid: string;
+    url: string | null;
+    status: "active" | "sleeping" | "expired" | "failed";
+    run_id: string | null;
+    job_id: string | null;
+    actor_id: string | null;
+    agent_id: string | null;
+    expires_at: string | null;
+    created_at: Generated<string>;
+    updated_at: Generated<string>;
+  };
+  /** Per-account settings; a missing row means the defaults. */
+  account_settings: {
+    account_id: string;
+    preview_ended_days: Generated<number>;
+    preview_idle_days: Generated<number>;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
 }
 
 export type DB = Kysely<Database>;

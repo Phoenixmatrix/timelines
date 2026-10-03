@@ -125,6 +125,9 @@ pub enum Command {
     Runs(RunsCommand),
     /// Run queued CI jobs on this machine (how CI runs against the dev server)
     Runner(RunnerArgs),
+    /// Deployment records: where commits are deployed (production, timeline previews)
+    #[command(subcommand)]
+    Deploy(crate::commands::deploy::DeployCommand),
     /// Secrets that CI jobs can read as environment variables
     #[command(subcommand)]
     Secret(SecretCommand),

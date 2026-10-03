@@ -140,7 +140,7 @@ fn number_or_latest(config: &Config, repo: &str, number: Option<i64>) -> Result<
 }
 
 /// A commit id from a revision in the local workspace, or a full hash as is.
-fn commit_of(ctx: &Ctx, spec: &str) -> Result<String> {
+pub(crate) fn commit_of(ctx: &Ctx, spec: &str) -> Result<String> {
     if spec.len() == 40 && spec.chars().all(|c| c.is_ascii_hexdigit()) {
         return Ok(spec.to_string());
     }

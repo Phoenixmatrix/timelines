@@ -89,6 +89,25 @@ JSON summaries expose `kind: daily|tag`; entries expose `releaseKind`. Both use
 `lastCommitAt` for the latest Git committer timestamp in the group. Stored legacy
 notes regenerate lazily on read; check the index's status while generation runs.
 
+## Deployments
+
+Gitmatrix deploys nothing; whatever deploys tells it where code went. Inside a CI
+job, `gm deploy record` acts as the job (`GITMATRIX_TOKEN`): the server fills in
+the repository, run, job and commit, and the environment from the branch
+(`production` on the default branch, `timeline/<slug>` on a timeline bookmark).
+Elsewhere it records as you and needs `--commit`. Records outlive their
+previews: tearing one down marks it `expired`.
+
+```sh
+gm deploy record --url "$PREVIEW_URL"                      # in a CI job
+gm deploy record --url https://app.example.com --commit @- -R orbit/engine
+gm deploy list --run 12
+gm deploy update 42 --status expired
+```
+
+See [deployments and previews](../website/README.md#deployments-and-previews)
+for the API.
+
 ## Distributed issue tracker
 
 Tracker commands work anywhere, without `gm init` or a Git repository. Accounts and

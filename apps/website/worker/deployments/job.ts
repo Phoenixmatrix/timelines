@@ -1,0 +1,67 @@
+// A CI job's credential (gmj_…, worker/ci/registry.ts) on the JSON API. The
+// API otherwise takes only personal and agent tokens; a job may record and
+// update its own repository's deployments (`gm deploy record` in CI), as the
+// run: its commit and branch, and the person and agent who started it.
+
+import type { Context } from "hono";
+import type { AppEnv } from "../auth.ts";
+import { hashToken } from "../auth.ts";
+import { db, nowIso } from "../schema.ts";
+
+export const JOB_TOKEN_PREFIX = "gmj_";
+
+/** Paths a job's credential may call: its repository's deployments and environments. */
+const JOB_PATHS = /^\/api\/repos\/[^/]+\/[^/]+\/(?:deployments|environments)(?:\/|$)/;
+
+export interface JobCaller {
+  jobId: string;
+  jobName: string;
+  runId: string;
+  runNumber: number;
+  repoId: string;
+  commit: string;
+  /** The run's branch, without refs/heads/. */
+  ref: string;
+  defaultBranch: string;
+  /** Who pushed or started the run, and the agent that did it for them. */
+  actorId: string | null;
+  agentId: string | null;
+}
+
+/** The bearer secret, when it is a CI job's credential. */
+export function jobSecret(header: string | undefined): string | null {
+  const [scheme, value] = (header ?? "").split(" ", 2);
+  if (scheme?.toLowerCase() !== "bearer" || !value?.startsWith(JOB_TOKEN_PREFIX)) return null;
+  return value;
+}
+
+/** Whether the API should let this request's job credential through to the route. */
+export function jobRoute(c: Context<AppEnv>): boolean {
+  return jobSecret(c.req.header("authorization")) !== null && JOB_PATHS.test(c.req.path);
+}
+
+/** The job behind a credential, while the job runs; null for anything else. */
+export async function jobCaller(d1: D1Database, secret: string): Promise<JobCaller | null> {
+  const row = await db(d1)
+    .selectFrom("ci_job_tokens as t")
+    .innerJoin("ci_jobs as j", "j.id", "t.job_id")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
+    .innerJoin("repos as p", "p.id", "j.repo_id")
+    .select([
+      "j.id as jobId",
+      "j.name as jobName",
+      "r.id as runId",
+      "r.number as runNumber",
+      "r.commit_oid as commit",
+      "r.ref",
+      "r.actor_id as actorId",
+      "r.agent_id as agentId",
+      "p.id as repoId",
+      "p.default_branch as defaultBranch",
+    ])
+    .where("t.token_hash", "=", await hashToken(secret))
+    .where("t.expires_at", ">", nowIso())
+    .where("j.status", "in", ["queued", "running"])
+    .executeTakeFirst();
+  return row ?? null;
+}

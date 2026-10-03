@@ -1009,6 +1009,40 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
 API: `/api/repos/:o/:n/ci` (runs, run detail, logs with `?after=`, cancel,
 re-run, commit statuses, secrets) and `/api/ci/runner` (claim, report).
 
+### Deployments and previews
+
+Gitmatrix deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not
+hosting"): a job that deploys records where it went, and the run page and the
+commit list show it. An environment is a name per repository: `production`,
+`timeline/<slug>` for a timeline's previews, or any name a project uses
+(`staging`). Records keep the environment, timeline, checkpoint, commit, URL,
+status (`active`, `sleeping`, `expired`, `failed`), the run and job that
+recorded them, the person and agent accountable, and an expiry. Expiring a
+preview changes its status; the record stays. `shared/deployments.ts` defines
+the wire types (`worker/deployments/`).
+
+| Route                                                | Contract                                                                                                                             |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /api/repos/:o/:n/deployments`                   | Newest first; filters `environment`, `timeline`, `commit` (up to 80, comma-separated), `run`, `status`; pages with `before`, `limit` |
+| `POST /api/repos/:o/:n/deployments`                  | `{url, commit?, environment?, timeline?, checkpoint?, status?, expiresAt?}`                                                          |
+| `GET`, `PATCH /api/repos/:o/:n/deployments/:id`      | One record; `PATCH {status?, url?, expiresAt?}`                                                                                      |
+| `GET /api/repos/:o/:n/environments`                  | `production` and each recorded environment, with its newest deployment                                                               |
+| `GET`, `PATCH /api/accounts/:slug/settings/previews` | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                |
+
+- **Who records.** Anyone with write access, with a personal or agent token
+  (systems outside Gitmatrix too), or a CI job with its own credential
+  (`GITMATRIX_TOKEN`, `gmj_…`), which the API accepts only on these routes and
+  only for the job's repository while it runs. A job's record takes its run,
+  job, commit and accountable person from the run, and its environment from
+  the branch: `production` on the default branch, `timeline/<slug>` on a
+  timeline bookmark; other branches name one.
+- **`gm deploy record --url <url>`** in a job; outside CI add `--commit`.
+  `gm deploy list` and `gm deploy update <id> --status expired` read and
+  change records.
+- **Expiry.** A timeline preview expires after the account's idle period
+  unless the recorder says otherwise; other records don't expire unless told.
+  Teardown and revival follow the account's settings (CORE-79).
+
 ## Packages
 
 Every owner gets a package registry in each format the first time something is

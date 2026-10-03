@@ -27,6 +27,9 @@ import { tracker } from "./tracker/api.ts";
 import { timelines } from "./timelines/api.ts";
 import { assistant } from "./api/assistant.ts";
 import { search } from "./search/api.ts";
+import { deployments } from "./deployments/api.ts";
+import { jobRoute } from "./deployments/job.ts";
+import { previewSettingsApi } from "./deployments/settings.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -53,7 +56,9 @@ api.use(async (c, next) => {
   if (
     c.req.path === "/api/dev" ||
     c.req.path.startsWith("/api/dev/") ||
-    c.req.path === "/api/tokens/device"
+    c.req.path === "/api/tokens/device" ||
+    // A CI job's credential reaches only its deployments, which check it.
+    jobRoute(c)
   ) {
     c.set("actor", null);
     return next();
@@ -77,6 +82,7 @@ api.use(async (c, next) => {
   );
   return next();
 });
+api.route("/accounts/:slug/settings/previews", previewSettingsApi);
 api.route("/", accounts);
 api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
 api.route("/tracker/:owner/timelines", timelines);
@@ -85,6 +91,7 @@ api.route("/repos/:owner/:name/knowledge", knowledge);
 api.route("/repos/:owner/:name/release-notes", releaseNotes);
 api.route("/repos/:owner/:name/ci", ci);
 api.route("/repos/:owner/:name", refLog);
+api.route("/repos/:owner/:name", deployments);
 api.route("/ci/runner", runner);
 api.route("/repos", repos);
 api.route("/repos", mirrors);

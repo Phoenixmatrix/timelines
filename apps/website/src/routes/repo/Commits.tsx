@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { CiCommitStatuses, HistoryPage, RepoDetail } from "../../../shared/api.ts";
 import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
+import { DeploymentMark, useCommitDeployments } from "../../components/Deployments.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
@@ -53,6 +54,11 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
     repo.name,
     history.commits.slice(-100).map((commit) => commit.oid),
   );
+  const deployed = useCommitDeployments(
+    repo.owner.slug,
+    repo.name,
+    history.commits.slice(-80).map((commit) => commit.oid),
+  );
   return (
     <div className="flex flex-col gap-4">
       <RefBar
@@ -85,6 +91,7 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
                 <CiStatusIcon status={ci[commit.oid]!.status} />
               </PrefetchLink>
             )}
+            {deployed[commit.oid] && <DeploymentMark deployment={deployed[commit.oid]!} />}
             <PrefetchLink
               to={treeUrl(repo.owner.slug, repo.name, commit.oid)}
               className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
