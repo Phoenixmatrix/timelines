@@ -106,6 +106,21 @@ never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
 
 The job's `CLOUDFLARE_API_TOKEN` is a repository CI secret (`gm secret set`).
 
+**Adding a migration.** Name it by the current UTC time,
+`YYYYMMDDHHMMSS_snake_case_description.sql` (for example
+`20261003021500_ref_updates.sql`, from `date -u +%Y%m%d%H%M%S`), in
+`migrations/`, `registry/migrations/` or `seed/`; don't use
+`cf d1 migrations create`, which numbers the next file. D1 records applied
+migrations by file name, and parallel work picking the same next number
+collided once (the two `0016_` files). `cf d1 migrations apply` orders by the
+integer before the first `_`, so timestamps apply after the frozen
+`0001`–`0020` files; the test harnesses' sorted `readdir` agrees.
+`worker/migrations.test.ts` (in `vp test`, so CI and `vp run ready`) fails on
+a shared prefix, a new four-digit name or an invalid timestamp. A migration
+merged after a newer one still applies, since D1 diffs by name, so write each
+one to stand on its own. Update `worker/schema.ts` or `registry/core/db.ts` in
+the same change.
+
 **Parallel pushes.** The deploy job has `concurrency: production`: one deploy per
 repository at a time, and a deploy still waiting when a newer push's run reaches
 (or passes) its own deploy is skipped as superseded, so a burst of pushes deploys

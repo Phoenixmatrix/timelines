@@ -103,6 +103,10 @@ Workers AI and so on). Don't run `wrangler` commands or add wrangler configs.
   `cf schema <command>`; don't crawl `--help` trees.
 - The `wrangler` package stays installed only because `@cloudflare/vite-plugin`
   depends on it.
+- Name new D1 migrations (`apps/website/migrations`, `registry/migrations`,
+  `seed`) by UTC timestamp: `YYYYMMDDHHMMSS_snake_case_description.sql`, from
+  `date -u +%Y%m%d%H%M%S`. Never add a four-digit name or reuse a prefix;
+  `vp test` refuses both. See "Adding a migration" in `apps/website/README.md`.
 
 <!-- gm:agents begin: managed by `gm agent setup` from .gitmatrix/agents.yml; edit that and rerun -->
 
