@@ -393,7 +393,7 @@ function Workbench({ data }: { data: TrackerView }) {
       if (cause instanceof ApiError) {
         pending.current = null;
         setUncertain(false);
-        if (cause.status === 409) await refresh();
+        if (cause.status === 409) void refresh();
       } else {
         setUncertain(true);
         setError("The change could not be confirmed. Retry the pending change below.");
@@ -676,7 +676,7 @@ function Workbench({ data }: { data: TrackerView }) {
   );
 
   const inspector = selected ? (
-    <fieldset className="m-0 min-w-0 border-0 p-0" disabled={uncertain}>
+    <fieldset className="m-0 min-w-0 border-0 p-0">
       <IssueDetail
         key={selected.id}
         issue={selected}

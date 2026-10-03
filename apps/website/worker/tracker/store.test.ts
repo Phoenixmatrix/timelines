@@ -940,6 +940,123 @@ describe("graph readiness", () => {
     g.claim("b", "other");
   });
 
+  test("text edits under an ancestor lease preserve attribution, versions, replay and the lease", () => {
+    const g = graph();
+    g.claim("project", "lead");
+    const before = g.store.snapshot(g.access);
+    const parent = before.issues.find((issue) => issue.id === "project")!;
+    const version = g.version("a");
+    const access: Access = {
+      ...g.access,
+      actorId: "bob",
+      principalId: "bob",
+      canAdmin: false,
+      source: "web",
+    };
+    const request = {
+      operationId: "text-under-lease",
+      mutations: [
+        {
+          kind: "issue.update",
+          id: "a",
+          expectedVersion: version,
+          data: {
+            title: "Clarified task",
+            description: "The revised plan",
+            acceptance: "The observable outcome",
+            status: "todo",
+            parentId: "project",
+          },
+        },
+      ],
+    };
+    const result = g.store.mutate(access, request);
+    expect(result.events[0]).toMatchObject({
+      actorId: "bob",
+      actor: { id: "bob", kind: "person", name: "Bob" },
+      source: "web",
+      before: { version, title: "a" },
+      entity: { ...request.mutations[0]!.data, version: version + 1 },
+    });
+    expect(g.store.mutate(access, request)).toEqual(result);
+    expect(g.store.snapshot(g.access).issues.find((issue) => issue.id === "project")).toEqual(
+      parent,
+    );
+    expect(() =>
+      g.store.mutate(access, {
+        ...request,
+        operationId: "stale-text-edit",
+      }),
+    ).toThrow(/changed since it was read/);
+    g.mutate({
+      kind: "team.update",
+      id: "team",
+      expectedVersion: 1,
+      data: { memberIds: ["alice"] },
+    });
+    expect(() =>
+      g.store.mutate(access, {
+        operationId: "nonmember-text-edit",
+        mutations: [
+          {
+            ...request.mutations[0]!,
+            expectedVersion: version + 1,
+            data: { description: "Not allowed" },
+          },
+        ],
+      }),
+    ).toThrow(/Only team members/);
+  });
+
+  test("later batch transitions see ancestor leases introduced by an earlier parent change", () => {
+    const g = graph();
+    const token = g.claim("project", "lead");
+    g.issue("branch");
+    g.issue("child");
+    g.mutate({
+      kind: "issue.update",
+      id: "child",
+      expectedVersion: 1,
+      data: { parentId: "branch" },
+    });
+    const before = g.store.snapshot(g.access);
+    for (const data of [{ status: "in_progress" }, { parentId: null }] as const) {
+      expect(() =>
+        g.mutate(
+          {
+            kind: "issue.update",
+            id: "branch",
+            expectedVersion: 1,
+            data: { parentId: "project" },
+          },
+          { kind: "issue.update", id: "child", expectedVersion: 2, data },
+        ),
+      ).toThrow(/needs that lease's token/);
+      expect(g.store.snapshot(g.access)).toEqual(before);
+    }
+    // Changing the ancestor's status ends its lease before the later transition.
+    g.mutate(
+      {
+        kind: "issue.update",
+        id: "project",
+        expectedVersion: g.version("project"),
+        data: { status: "todo", leaseToken: token },
+      },
+      {
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: g.version("a"),
+        data: { status: "in_progress" },
+      },
+    );
+    const after = g.store.snapshot(g.access);
+    expect(after.issues.find((issue) => issue.id === "project")).toMatchObject({
+      status: "todo",
+      claim: null,
+    });
+    expect(after.issues.find((issue) => issue.id === "a")?.status).toBe("in_progress");
+  });
+
   test("an expired lease no longer covers its subtree", () => {
     const g = graph();
     g.claim("project", "lead", 30);

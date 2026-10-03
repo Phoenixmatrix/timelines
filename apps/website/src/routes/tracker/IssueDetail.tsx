@@ -162,10 +162,10 @@ export function IssueDetail({
   const savingRef = useRef(false);
   const [saved, setSaved] = useState(false);
   const [finishRequested, setFinishRequested] = useState<"explicit" | "blur" | null>(null);
-  const [updatedField, setUpdatedField] = useState<Exclude<EditMode, "all"> | null>(null);
+  const [updatedField, setUpdatedField] = useState<EditMode | null>(null);
   const discardButtonRef = useRef<HTMLButtonElement>(null);
   const dirty = fieldKeys.some((key) => !same(draft.fields[key], draft.base?.[key]));
-  const hasUnsavedChanges = editing && (dirty || saving || pendingFields.length > 0);
+  const hasUnsavedChanges = dirty || saving || pendingFields.length > 0;
   const navigation = useBlocker(hasUnsavedChanges);
   const enqueue = (keys: (keyof IssueFields)[]) => {
     setPendingFields((previous) => [...new Set([...previous, ...keys])]);
@@ -218,15 +218,13 @@ export function IssueDetail({
     }
   }, [busy]);
   useEffect(() => {
-    if (editing) {
-      try {
-        if (dirty) sessionStorage.setItem(storageKey, JSON.stringify(draft));
-        else sessionStorage.removeItem(storageKey);
-      } catch {
-        /* The in-memory draft remains usable when storage is unavailable. */
-      }
+    try {
+      if (hasUnsavedChanges) sessionStorage.setItem(storageKey, JSON.stringify(draft));
+      else sessionStorage.removeItem(storageKey);
+    } catch {
+      /* The in-memory draft remains usable when storage is unavailable. */
     }
-  }, [draft, editing, dirty, storageKey]);
+  }, [draft, hasUnsavedChanges, storageKey]);
   useEffect(() => {
     if (!hasUnsavedChanges) return;
     const onUnload = (event: BeforeUnloadEvent) => {
@@ -299,22 +297,28 @@ export function IssueDetail({
   ];
   const beginEdit = (mode: EditMode = "all") => {
     setClosing(false);
-    setDraft({ ...initial, mode });
+    setDraft((previous) =>
+      hasUnsavedChanges || previous.version > issue.version
+        ? { ...previous, mode }
+        : { ...initial, mode },
+    );
     setPreview(false);
     setNotice("");
     setActionError("");
-    setLocalError("");
+    if (!hasUnsavedChanges) setLocalError("");
     setEditing(true);
-    setPendingFields([]);
+    if (!hasUnsavedChanges) setPendingFields([]);
     setSaved(false);
     setFinishRequested(null);
     setUpdatedField(null);
   };
-  const finishEdit = (restoreFocus = true, showUpdated = false) => {
+  const discardEdit = () => {
     setEditing(false);
     setDraft(initial);
     setNotice("");
-    if (showUpdated && mode !== "all") setUpdatedField(mode);
+    setLocalError("");
+    setSaved(false);
+    setUpdatedField(null);
     setPendingFields([]);
     setFinishRequested(null);
     try {
@@ -322,27 +326,32 @@ export function IssueDetail({
     } catch {
       /* Storage can be disabled. */
     }
+    requestAnimationFrame(() =>
+      detailRef.current?.querySelector<HTMLElement>(`[data-edit-field="${mode}"]`)?.focus(),
+    );
+  };
+  const requestFinish = (restoreFocus = true) => {
+    if (localError) return;
+    enqueue(fieldKeys);
+    setUpdatedField(null);
+    // Invalid work stays open for correction; a failed save requires explicit retry.
+    if (!draft.fields.title.trim() || invalidStatus || invalidCloseReason) return;
+    setFinishRequested(restoreFocus ? "explicit" : "blur");
+    setEditing(false);
     if (restoreFocus)
       requestAnimationFrame(() =>
         detailRef.current?.querySelector<HTMLElement>(`[data-edit-field="${mode}"]`)?.focus(),
       );
   };
-  const requestFinish = () => {
-    enqueue(fieldKeys);
-    setFinishRequested("explicit");
-  };
   const retrySave = () => {
     enqueue(fieldKeys);
-    if (mode !== "all") setFinishRequested("blur");
+    if (!editing) setFinishRequested("blur");
   };
   useEffect(() => {
-    if (
-      finishRequested &&
-      !hasUnsavedChanges &&
-      !localError &&
-      (!saved || draft.version === issue.version)
-    )
-      finishEdit(finishRequested === "explicit", saved);
+    if (finishRequested && !hasUnsavedChanges && !localError) {
+      if (saved) setUpdatedField(mode);
+      setFinishRequested(null);
+    }
   });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -500,7 +509,7 @@ export function IssueDetail({
     retrySave();
   };
   useEffect(() => {
-    if (!editing || busy || savingRef.current || localError || !pendingFields.length) return;
+    if (busy || savingRef.current || localError || !pendingFields.length) return;
     const fields = {
       ...draft.fields,
       closeReason: draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
@@ -578,80 +587,35 @@ export function IssueDetail({
       }
     })();
   });
-  const updatedNotice = updatedField && (
+  const optimisticFields =
+    !editing && (hasUnsavedChanges || draft.version > issue.version)
+      ? draft.fields
+      : initial.fields;
+  const updating = !editing && !localError && (saving || pendingFields.length > 0);
+  const needsReview = !saving && hasUnsavedChanges && draft.version < issue.version;
+  const updatingNotice = updating && (
+    <span
+      className="mk-chip mk-chip--tag"
+      role="status"
+      aria-label={`${mode === "all" ? "Issue" : fieldNames[mode]} updating`}
+    >
+      Updating…
+    </span>
+  );
+  const updatedNotice = updatedField && !hasUnsavedChanges && !localError && (
     <span
       className="mk-chip mk-chip--tag gap-1"
       role="status"
-      aria-label={`${fieldNames[updatedField]} updated`}
+      aria-label={`${updatedField === "all" ? "Issue" : fieldNames[updatedField]} updated`}
     >
       <CheckIcon className="size-3 text-online" weight="bold" aria-hidden />
       Updated
     </span>
   );
-  const editor = editing && (
-    <form
-      className="space-y-4"
-      data-issue-editor
-      aria-label={mode === "all" ? "Edit issue" : `Edit ${fieldNames[mode]}`}
-      onFocusCapture={() => {
-        if (finishRequested === "blur") setFinishRequested(null);
-      }}
-      onBlur={(event) => {
-        // Preview/recovery controls stay usable; leaving the inline editor waits
-        // for its save, then restores read-only content without moving focus.
-        if (
-          mode !== "all" &&
-          !(
-            event.relatedTarget instanceof Element &&
-            event.currentTarget.contains(event.relatedTarget)
-          )
-        )
-          setFinishRequested("blur");
-      }}
-      onKeyDown={(event) => {
-        if (event.defaultPrevented || event.nativeEvent.isComposing) return;
-        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-          event.preventDefault();
-          event.currentTarget.requestSubmit();
-        } else if (
-          event.key === "Escape" &&
-          !(
-            event.target instanceof Element &&
-            event.target.closest("select, [role=combobox], [role=listbox]")
-          )
-        ) {
-          event.preventDefault();
-          event.stopPropagation();
-          requestFinish();
-        }
-      }}
-      onSubmit={(event) => {
-        event.preventDefault();
-        requestFinish();
-      }}
-    >
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          {mode === "all" && <h3 className={HEADING}>Edit issue</h3>}
-          <p className="mk-hint m-0" role="status" aria-live="polite">
-            {saving
-              ? "Saving…"
-              : localError
-                ? "Not saved"
-                : dirty
-                  ? "Unsaved changes"
-                  : saved
-                    ? "Saved"
-                    : "Changes save automatically"}
-          </p>
-        </div>
-        <button className="mk-btn mk-btn--ghost mk-btn--sm" type="submit">
-          Done
-        </button>
-      </div>
-      <p className="mk-hint m-0">Text saves when you leave a field. Selections save immediately.</p>
+  const recovery = (
+    <div className="space-y-3">
       <FormError message={localError} />
-      {localError && (
+      {(localError || needsReview) && (
         <div className="flex flex-wrap gap-2">
           <button
             className="mk-btn mk-btn--sm"
@@ -666,10 +630,19 @@ export function IssueDetail({
             className="mk-btn mk-btn--ghost mk-btn--sm"
             type="button"
             disabled={busy || saving}
-            onClick={() => finishEdit()}
+            onClick={discardEdit}
           >
             Discard unsaved changes
           </button>
+          {!editing && (
+            <button
+              className="mk-btn mk-btn--ghost mk-btn--sm"
+              type="button"
+              onClick={() => beginEdit(mode)}
+            >
+              Review draft
+            </button>
+          )}
         </div>
       )}
       {navigation.state === "blocked" && (
@@ -680,7 +653,7 @@ export function IssueDetail({
           </button>
         </p>
       )}
-      {!saving && draft.version < issue.version && (
+      {needsReview && (
         <section className="rounded-control bg-danger-wash p-3 text-body-sm" role="alert">
           <h4 className="m-0 font-semibold">This issue changed while you were editing</h4>
           <p className="mt-1 mb-0 max-w-[48ch]">
@@ -751,6 +724,73 @@ export function IssueDetail({
           </button>
         </section>
       )}
+      {!editing && (localError || needsReview) && (
+        <p className="mk-hint m-0" role="status">
+          Not saved
+        </p>
+      )}
+    </div>
+  );
+  const editor = editing && (
+    <form
+      className="space-y-4"
+      data-issue-editor
+      aria-label={mode === "all" ? "Edit issue" : `Edit ${fieldNames[mode]}`}
+      onFocusCapture={() => setUpdatedField(null)}
+      onBlur={(event) => {
+        // Dismiss the form immediately; the detail owns its submitted save queue.
+        if (
+          mode !== "all" &&
+          !(
+            event.relatedTarget instanceof Element &&
+            event.currentTarget.contains(event.relatedTarget)
+          )
+        )
+          requestFinish(false);
+      }}
+      onKeyDown={(event) => {
+        if (event.defaultPrevented || event.nativeEvent.isComposing) return;
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          event.preventDefault();
+          event.currentTarget.requestSubmit();
+        } else if (
+          event.key === "Escape" &&
+          !(
+            event.target instanceof Element &&
+            event.target.closest("select, [role=combobox], [role=listbox]")
+          )
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          requestFinish();
+        }
+      }}
+      onSubmit={(event) => {
+        event.preventDefault();
+        requestFinish();
+      }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          {mode === "all" && <h3 className={HEADING}>Edit issue</h3>}
+          <p className="mk-hint m-0" role="status" aria-live="polite">
+            {saving || (!localError && pendingFields.length > 0)
+              ? "Updating…"
+              : localError
+                ? "Not saved"
+                : dirty
+                  ? "Unsaved changes"
+                  : saved
+                    ? "Updated"
+                    : "Changes save automatically"}
+          </p>
+        </div>
+        <button className="mk-btn mk-btn--ghost mk-btn--sm" type="submit">
+          Done
+        </button>
+      </div>
+      <p className="mk-hint m-0">Text saves when you leave a field. Selections save immediately.</p>
+      {recovery}
       {(mode === "all" || mode === "title") && (
         <TextField
           label="Title"
@@ -915,7 +955,9 @@ export function IssueDetail({
           )}
         </Field>
       )}
-      <p className="mk-hint m-0">Ctrl/Cmd+Enter or Esc finishes editing after saving.</p>
+      <p className="mk-hint m-0">
+        Ctrl/Cmd+Enter or Esc finishes editing. Saving continues after closing.
+      </p>
     </form>
   );
 
@@ -949,11 +991,13 @@ export function IssueDetail({
               disabled={busy || editing}
               onClick={() => beginEdit("title")}
             >
-              {issue.title}
+              {optimisticFields.title}
             </button>
           </h2>
         )}
-        {updatedField === "title" && <div className="mt-1 flex justify-end">{updatedNotice}</div>}
+        {(mode === "title" || mode === "all") && (updating || updatedField === mode) && (
+          <div className="mt-1 flex justify-end">{updatingNotice || updatedNotice}</div>
+        )}
         <DoneInTimelineCallout issue={issue} snapshot={snapshot} />
         <dl className={`${META} mt-3`}>
           <dt className="text-ink-faint">Created by</dt>
@@ -1250,6 +1294,11 @@ export function IssueDetail({
         </section>
       )}
       {editing && mode === "all" && <section className={SECTION}>{editor}</section>}
+      {!editing && (localError || needsReview || navigation.state === "blocked") && (
+        <section className={SECTION} aria-label="Save recovery">
+          {recovery}
+        </section>
+      )}
       {/* Keep Markdown mounted across edits so saving reconciles existing prose
           instead of rebuilding a large description's entire DOM. */}
       {(["description", "acceptance"] as const).map((field) => (
@@ -1265,6 +1314,7 @@ export function IssueDetail({
               <h3 className={HEADING}>{fieldNames[field]}</h3>
               <div className="flex shrink-0 items-center gap-2">
                 {updatedField === field && updatedNotice}
+                {mode === field && updatingNotice}
                 <button
                   type="button"
                   className="mk-btn mk-btn--ghost mk-btn--sm"
@@ -1277,7 +1327,7 @@ export function IssueDetail({
                 </button>
               </div>
             </div>
-            {issue[field] ? (
+            {optimisticFields[field] ? (
               <div
                 className={
                   !busy && !editing ? "cursor-text rounded-control hover:bg-sunken" : undefined
@@ -1296,7 +1346,7 @@ export function IssueDetail({
                   beginEdit(field);
                 }}
               >
-                <MarkdownText text={issue[field]} />
+                <MarkdownText text={optimisticFields[field]} />
               </div>
             ) : (
               <button

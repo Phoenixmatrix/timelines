@@ -713,21 +713,25 @@ read as `agent_decides`.
   edit just that field in place. Each text section also has a keyboard-accessible
   **Edit** button, and empty sections offer an **Add** action. Markdown preview
   remains available; links in rendered Markdown still navigate normally.
-  Leaving an inline title, description, or acceptance editor returns it to read-only
-  display after the save is confirmed, with a nearby **Updated** check for four
-  seconds. Unchanged fields close without claiming an update; failed saves keep
-  their editor and draft. Preview controls remain usable, and refocusing during a
-  pending save keeps editing active without losing newer text. The complete
-  **Edit issue** form stays open while moving between fields.
+  Leaving a valid inline title, description, or acceptance editor returns it to
+  read-only display immediately, showing the submitted text optimistically with
+  **Updating** until the server acknowledges every queued edit. A nearby **Updated**
+  check then appears for four seconds. Unchanged fields do not claim an update.
+  Failed saves keep a recoverable draft with retry, review, and discard controls,
+  even after the editor closes. Preview controls remain usable, and typing during
+  a pending save keeps newer text until its own versioned save completes.
+  The complete **Edit issue** form stays open while moving between fields.
   Text fields (including labels) save on blur; selects, the parent picker, and
   workspace checkboxes save immediately. Saves are serialized, preserving edits
-  made while an earlier request is running. The editor shows Saving, Saved, or
+  made while an earlier request is running, including when **Done** closes the
+  form before either request finishes. The editor shows Updating, Updated, or
   an error with retry/discard controls; closing an issue waits for a close reason.
   **Discard unsaved changes** closes the draft without autosaving the focused
   field; previously saved values remain unchanged.
-  **Done**, **Ctrl/Cmd+Enter**, or **Esc** saves remaining changes and finishes
-  editing; Enter does the same in a title. Navigation waits for pending edits to
-  save, and unsaved drafts survive a reload in the same tab. **Edit issue** (or
+  **Done**, **Ctrl/Cmd+Enter**, or **Esc** queues remaining changes and finishes
+  editing without canceling persistence; Enter does the same in a title.
+  Navigation still waits for pending edits, and unsaved or uncertain drafts
+  survive a reload in the same tab. **Edit issue** (or
   `e`) and **Create and edit** open the complete autosaving form. Issue creation,
   comments, and new relationships retain explicit submit actions.
   A confirmed save applies the server's committed entities immediately; the
@@ -735,12 +739,17 @@ read as `agent_decides`.
   acknowledgement with an older snapshot. Rendered descriptions and acceptance
   criteria stay mounted while editing, avoiding a full Markdown rebuild when
   finishing unchanged text or saving other fields on a large issue.
+  Text-only mutations do not rebuild the tracker dependency graph; changed
+  status and parent relationships still resolve and enforce covering leases.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
   fields are retained. Labels and workspace membership compare as sets, so
   reordering does not overwrite another person's changes. Errors remain beside
-  the failed action. An uncertain write freezes mutation fields and retries its
-  original operation ID; confirmation acknowledges the original save without duplicates.
+  the failed action. A known conflict is reported immediately, without waiting
+  for the background refresh that supplies newer comparison fields.
+  An uncertain write blocks new server mutations and retries
+  its original operation ID; local editing and form dismissal remain available,
+  and confirmation acknowledges the original save before sending queued edits.
 - **Keyboard:** single-key shortcuts are off by default; enable or disable them
   through **Shortcuts** in the account actions. The preference persists locally.
   `c` or `n` focuses capture, `/` focuses search, `j`/`k` selects adjacent issues,

@@ -1675,13 +1675,15 @@ export class TrackerStore {
               data.status !== issue.status
             )
               lockedStatus(issue);
-            const covering = coveringLease(issue);
+            // Text edits do not need the issue/link graph. Resolve coverage only
+            // for transitions, using this transaction's current hierarchy.
             if (
-              covering &&
-              (("status" in data && data.status !== issue.status) ||
-                ("parentId" in data && data.parentId !== issue.parentId))
-            )
-              lease(covering, data.leaseToken, issue);
+              ("status" in data && data.status !== issue.status) ||
+              ("parentId" in data && data.parentId !== issue.parentId)
+            ) {
+              const covering = coveringLease(issue);
+              if (covering) lease(covering, data.leaseToken, issue);
+            }
           }
           const previous = issue.status;
           fields(data, issue, creating);

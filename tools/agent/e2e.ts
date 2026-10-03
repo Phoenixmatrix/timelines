@@ -1903,8 +1903,8 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
               singlePointerClick: true,
               reloadAssertions: true,
             });
-            // A durable save must finish before a slow whole-tracker refresh.
-            // Hold its real response, save again, then release the older view.
+            // Hold actual server responses, never synthesize successful mutation echoes.
+            // The editor must close optimistically, but acknowledgement waits for delivery.
             const description = `${"Large issue save regression. ".repeat(4000)}\n\nCORE-137 saved description`;
             const acceptance = "Both edits survive a delayed older snapshot.";
             let releaseSnapshot!: () => void;
@@ -1913,6 +1913,38 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
             });
             let snapshotHeld = false;
             const snapshotPath = `/api/tracker/${fixtures.tracker.owner}/snapshot`;
+            const mutationPath = `/api/tracker/${fixtures.tracker.owner}/mutate`;
+            const descriptionEditor = page.getByRole("form", { name: "Edit Description / PRD" });
+            const descriptionInput = descriptionEditor.getByRole("textbox", {
+              name: "Description / PRD",
+            });
+            const descriptionEdit = page.locator('[data-edit-field="description"]');
+            const descriptionView = page.locator('section[aria-label="Description / PRD"]');
+            const updating = page.getByRole("status", {
+              name: "Description / PRD updating",
+              exact: true,
+            });
+            const updated = page.getByRole("status", {
+              name: "Description / PRD updated",
+              exact: true,
+            });
+            const mutationRelease = Promise.withResolvers<void>();
+            let mutationHeld = false;
+            let mutationStatus = 0;
+            let mutationElapsedMs = 0;
+            await page.route(
+              `**${mutationPath}`,
+              async (route) => {
+                const started = performance.now();
+                const response = await route.fetch();
+                mutationElapsedMs = performance.now() - started;
+                mutationStatus = response.status();
+                mutationHeld = true;
+                await mutationRelease.promise;
+                await route.fulfill({ response });
+              },
+              { times: 1 },
+            );
             await page.route(
               `**${snapshotPath}*`,
               async (route) => {
@@ -1924,14 +1956,29 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
               { times: 1 },
             );
             try {
-              await page.locator('[data-edit-field="description"]').click();
-              const descriptionEditor = page.getByRole("form", { name: "Edit Description / PRD" });
-              await descriptionEditor
-                .getByRole("textbox", { name: "Description / PRD" })
-                .fill(description);
+              await descriptionEdit.click();
+              await descriptionInput.fill(description);
+              const closeStarted = performance.now();
               await descriptionEditor.getByRole("button", { name: "Done", exact: true }).click();
-              await expect.poll(() => snapshotHeld).toBe(true);
               await expect(descriptionEditor).toBeHidden();
+              await expect(descriptionView).toContainText("CORE-137 saved description");
+              await expect(updating).toBeVisible();
+              await expect(updated).toHaveCount(0);
+              const optimisticCloseMs = performance.now() - closeStarted;
+              await expect.poll(() => mutationHeld).toBe(true);
+              assert.equal(mutationStatus, 200);
+              // Even a committed write is not Updated until its real response arrives.
+              await expect(updating).toBeVisible();
+              await expect(updated).toHaveCount(0);
+              mutationRelease.resolve();
+              await expect(updated).toBeVisible();
+              await expect(updating).toHaveCount(0);
+              await expect.poll(() => snapshotHeld).toBe(true);
+              record({
+                optimisticCloseMs,
+                mutationElapsedMs,
+                responseHeldUntilOptimisticClose: true,
+              });
               await page.locator('[data-edit-field="acceptance"]').click();
               const acceptanceEditor = page.getByRole("form", { name: "Edit Acceptance criteria" });
               await acceptanceEditor
@@ -1939,7 +1986,11 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
                 .fill(acceptance);
               await acceptanceEditor.getByRole("button", { name: "Done", exact: true }).click();
               await expect(acceptanceEditor).toBeHidden();
+              await expect(
+                page.getByRole("status", { name: "Acceptance criteria updated", exact: true }),
+              ).toBeVisible();
             } finally {
+              mutationRelease.resolve();
               releaseSnapshot();
               await page.unrouteAll({ behavior: "wait" });
             }
@@ -1951,12 +2002,177 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
             assert.equal(savedIssue?.description, description);
             assert.equal(savedIssue?.acceptance, acceptance);
             await page.reload();
+            await expect(descriptionView).toContainText("CORE-137 saved description");
             await expect(page.getByText(acceptance, { exact: true })).toBeVisible();
             record({
               largeDescriptionBytes: Buffer.byteLength(description),
               saveFinishedBeforeRefresh: true,
               delayedSnapshotPreservedNewerSave: true,
               reloadAssertions: true,
+            });
+            // Blur commits the first edit; Done must retain a newer edit queued
+            // behind it even though the form is no longer mounted.
+            const blurDescription = "CORE-191 blur save already in flight.";
+            const latestDescription = "CORE-191 latest queued description survives Done.";
+            const queuedReleases = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+            const queuedStatuses: number[] = [];
+            let queuedRequests = 0;
+            await page.route(
+              `**${mutationPath}`,
+              async (route) => {
+                const index = queuedRequests++;
+                const response = await route.fetch();
+                queuedStatuses[index] = response.status();
+                await queuedReleases[index]!.promise;
+                await route.fulfill({ response });
+              },
+              { times: 2 },
+            );
+            try {
+              await descriptionEdit.click();
+              await descriptionInput.fill(blurDescription);
+              await descriptionEditor.getByRole("button", { name: "Done", exact: true }).focus();
+              await expect.poll(() => queuedStatuses[0]).toBe(200);
+              await expect(descriptionEditor).toBeVisible();
+              await descriptionInput.fill(latestDescription);
+              await descriptionEditor.getByRole("button", { name: "Done", exact: true }).click();
+              await expect(descriptionEditor).toBeHidden();
+              await expect(descriptionView).toContainText(latestDescription);
+              await expect(updating).toBeVisible();
+              await expect(updated).toHaveCount(0);
+              queuedReleases[0]!.resolve();
+              await expect.poll(() => queuedStatuses[1]).toBe(200);
+              await expect(descriptionView).toContainText(latestDescription);
+              await expect(updating).toBeVisible();
+              await expect(updated).toHaveCount(0);
+              queuedReleases[1]!.resolve();
+              await expect(updated).toBeVisible();
+              await expect(updating).toHaveCount(0);
+            } finally {
+              for (const release of queuedReleases) release.resolve();
+              await page.unrouteAll({ behavior: "wait" });
+            }
+            const queuedSnapshot = await json<Snapshot>(snapshotPath, fixtures.tokens.marco);
+            assert.equal(
+              queuedSnapshot.issues.find((issue) => issue.id === fixtures.tracker.ready)
+                ?.description,
+              latestDescription,
+            );
+            await page.reload();
+            await expect(descriptionView).toContainText(latestDescription);
+            record({ blurThenDoneQueuedSavePersisted: true, realMutationStatuses: queuedStatuses });
+
+            // Delay sending the browser's write until a real competing write has
+            // advanced its expectedVersion. The eventual 409 must not lose the draft
+            // or advertise success, including when the user has already closed it.
+            const failedDescription = "CORE-191 recover this conflicted local draft.";
+            const competingDescription = "CORE-191 server-side competing description.";
+            const conflictRelease = Promise.withResolvers<void>();
+            const conflictRefreshRelease = Promise.withResolvers<void>();
+            let conflictRefreshHeld = false;
+            let conflictingRequestHeld = false;
+            let conflictStatus = 0;
+            await page.route(
+              `**${mutationPath}`,
+              async (route) => {
+                conflictingRequestHeld = true;
+                await conflictRelease.promise;
+                const response = await route.fetch();
+                conflictStatus = response.status();
+                await route.fulfill({ response });
+              },
+              { times: 1 },
+            );
+            try {
+              await descriptionEdit.click();
+              await descriptionInput.fill(failedDescription);
+              await descriptionEditor.getByRole("button", { name: "Done", exact: true }).click();
+              await expect(descriptionEditor).toBeHidden();
+              await expect(descriptionView).toContainText(failedDescription);
+              await expect(updating).toBeVisible();
+              await expect(updated).toHaveCount(0);
+              await expect.poll(() => conflictingRequestHeld).toBe(true);
+              const current = await json<Snapshot>(snapshotPath, fixtures.tokens.marco);
+              const beforeConflict = current.issues.find(
+                (issue) => issue.id === fixtures.tracker.ready,
+              );
+              assert.ok(beforeConflict);
+              await mutateTracker(fixtures.tokens.marco, [
+                {
+                  kind: "issue.update",
+                  id: beforeConflict.id,
+                  expectedVersion: beforeConflict.version,
+                  data: { description: competingDescription },
+                },
+              ]);
+              // Rejection is already authoritative; refreshing conflict details must
+              // not leave a known failed write looking like it is still Updating.
+              await page.route(
+                `**${snapshotPath}*`,
+                async (route) => {
+                  conflictRefreshHeld = true;
+                  await conflictRefreshRelease.promise;
+                  await route.continue();
+                },
+                { times: 1 },
+              );
+              conflictRelease.resolve();
+              await expect.poll(() => conflictStatus).toBe(409);
+              await expect.poll(() => conflictRefreshHeld).toBe(true);
+              await expect(
+                page.getByRole("button", { name: "Review draft", exact: true }),
+              ).toBeVisible();
+              await expect(descriptionEditor).toBeHidden();
+              await expect(updating).toHaveCount(0);
+              await expect(updated).toHaveCount(0);
+              await expect(
+                page
+                  .getByRole("region", { name: "Save recovery", exact: true })
+                  .getByRole("status")
+                  .filter({ hasText: /^Not saved$/ }),
+              ).toBeVisible();
+              await page.getByRole("button", { name: "Review draft", exact: true }).click();
+              await expect(descriptionInput).toHaveValue(failedDescription);
+              const refreshedConflict = page.waitForResponse(
+                (response) => new URL(response.url()).pathname === snapshotPath,
+              );
+              conflictRefreshRelease.resolve();
+              const conflictRefreshResponse = await refreshedConflict;
+              assert.equal(conflictRefreshResponse.status(), 200);
+              assert.equal(await conflictRefreshResponse.finished(), null);
+              await expect(descriptionInput).toHaveValue(failedDescription);
+            } finally {
+              conflictRelease.resolve();
+              conflictRefreshRelease.resolve();
+              await page.unrouteAll({ behavior: "wait" });
+            }
+            const conflictingSnapshot = await json<Snapshot>(snapshotPath, fixtures.tokens.marco);
+            assert.equal(
+              conflictingSnapshot.issues.find((issue) => issue.id === fixtures.tracker.ready)
+                ?.description,
+              competingDescription,
+              "A failed optimistic write must not overwrite the competing server version",
+            );
+            // Reload proves draft recovery is durable, not just hidden textarea state.
+            page.once("dialog", async (dialog) => {
+              await dialog.accept();
+            });
+            await page.reload();
+            await expect(descriptionInput).toHaveValue(failedDescription);
+            await expect(updated).toHaveCount(0);
+            await descriptionEditor.getByRole("button", { name: "Done", exact: true }).focus();
+            await descriptionEditor
+              .getByRole("button", { name: "Discard unsaved changes" })
+              .click();
+            await expect(descriptionEditor).toBeHidden();
+            await expect(descriptionView).toContainText(competingDescription);
+            await page.reload();
+            await expect(descriptionView).toContainText(competingDescription);
+            record({
+              rejectedOptimisticCloseStatus: conflictStatus,
+              knownRejectionVisibleBeforeConflictRefresh: true,
+              competingWritePreserved: true,
+              recoverableDraftAfterReload: true,
             });
             await persistent(`/${repo.owner}/-/packages/generic/${packageName}`, async () => {
               await expect(
