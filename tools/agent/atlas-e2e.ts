@@ -1279,27 +1279,51 @@ export async function atlasTimelineScenario(t: AtlasE2E) {
     await expect(facts).toContainText(`Merge base${head.slice(0, 7)}`);
     await expect(facts).toContainText(`This map${head.slice(0, 7)}`);
 
-    // 2. The capabilities it touches, and its files placed in them.
+    // 2. The capabilities it touches, and its files placed in them: the new
+    // file by the timeline's regrouping (CORE-186), computed when its overlay
+    // was stored over the capabilities it touches, and said to be.
     const touched = panel.getByRole("region", { name: "Capabilities it touches" });
     await expect(touched.getByRole("button", { name: search.name, exact: true })).toBeVisible();
-    await expect(touched).toContainText(`1 new, 1 changed files; 1 placed here provisionally`);
-    await expect(touched).toContainText(`New imports reach ${reached}`);
+    await expect(touched).toContainText(`1 new, 1 changed files`);
+    await expect(touched).not.toContainText("provisionally");
+    await expect(touched).toContainText(`New imports reach ${reached}.`);
     await expect(touched.getByRole("button", { name: "Unclassified", exact: true })).toBeVisible();
     const files = panel.getByRole("region", { name: "Files it changes" });
     const suggest = files.getByRole("listitem").filter({ hasText: "search/suggest.ts" });
-    await expect(suggest).toContainText(`Provisionally in ${search.name}: 6 files of 6 in search/`);
+    await expect(suggest).toContainText(
+      `New: the timeline's regrouping puts it in ${search.name}.`,
+    );
     await expect(files.getByRole("listitem").filter({ hasText: "notify/email.ts" })).toContainText(
-      "Unclassified: nothing in the map places its folder yet.",
+      "Unclassified: the timeline's regrouping finds nothing to place it by.",
     );
     await expect(files.getByRole("listitem").filter({ hasText: "search/rank.ts" })).toContainText(
       `Now imports from ${reached}`,
     );
-    await expect(panel).toContainText("Regrouping isn't computed for timelines");
+    await expect(panel).toContainText(
+      "Regrouping was computed for this timeline over the 2 capabilities it touches (13 files), not the whole repository, against main's build #1, this map.",
+    );
     await expect(panel).toContainText("Syntax changes cover all 4 changed files");
+    // The capabilities it touches, marked on the map and in the outline, in words.
+    const marked = `touched by timeline ${slug}`;
+    await expect(
+      page.getByRole("img", { name: new RegExp(`1 outlined with a dashed line: ${marked}`) }),
+    ).toBeVisible();
+    const outline = page.getByRole("tree", { name: `Outline of ${owner}/${name}` });
+    await expect(
+      outline.getByRole("treeitem", { name: new RegExp(`^${escape(search.name)}.*${marked}`) }),
+    ).toHaveCount(1);
+    await expect(outline.getByRole("treeitem", { name: new RegExp(marked) })).toHaveCount(1);
     await page.waitForLoadState("networkidle");
     assert(timelineReads(mark).length > 0, "The panel read GET /atlas/timeline");
     assertBounded(mark, "timeline panel");
     await page.screenshot({ path: join(t.ctx.artifacts, "browser-atlas-timeline.png") });
+    // Without the timeline, nothing is marked.
+    await page.goto(base);
+    await expect(page.getByRole("img", { name: /Capability map/ })).toBeVisible();
+    await expect(page.getByRole("img", { name: new RegExp(marked) })).toHaveCount(0);
+    await expect(outline.getByRole("treeitem", { name: new RegExp(marked) })).toHaveCount(0);
+    await page.goto(`${base}?tl=${slug}`);
+    await expect(outline.getByRole("treeitem", { name: new RegExp(marked) })).toHaveCount(1);
 
     // 3. Its capability on the map, then only the timeline's changes there.
     mark = seen.length;
@@ -1330,6 +1354,41 @@ export async function atlasTimelineScenario(t: AtlasE2E) {
     await page.waitForURL((url) => url.href === filtered);
     await expect(panel).toContainText(`Only in ${search.name}: 2 files`);
     assertBounded(mark, "filter and handoff");
+
+    // 4b. Across repositories (CORE-186): the workspace Atlas reads the same
+    // timeline in each selected repository, each part on its own; engine has
+    // no such timeline and says so. Its capabilities are marked there too.
+    mark = seen.length;
+    await page.goto(`/${owner}/-/atlas?repos=${name},engine&tl=${slug}`);
+    const wsPanel = page.getByRole("region", { name: `Timeline ${slug}` });
+    await expect(
+      wsPanel.getByRole("region", { name: `${owner}/${name} on ${bookmark}` }),
+    ).toContainText("Up to date");
+    await expect(
+      wsPanel.getByRole("region", { name: `${owner}/engine on ${bookmark}` }),
+    ).toContainText("Not in this repository");
+    const wsFiles = wsPanel.getByRole("region", { name: "Files it changes" });
+    await expect(wsFiles.getByRole("listitem")).toHaveCount(4);
+    await expect(
+      wsFiles.getByRole("listitem").filter({ hasText: `${name}: search/suggest.ts` }),
+    ).toContainText(`New: the timeline's regrouping puts it in ${search.name}.`);
+    await expect(
+      page
+        .getByRole("tree", { name: new RegExp(`^Outline of ${escape(name)}`) })
+        .getByRole("treeitem", { name: new RegExp(`touched by timeline ${slug}`) }),
+    ).toHaveCount(1);
+    await page.waitForLoadState("networkidle");
+    for (const { url } of since(mark))
+      if (url.pathname.includes("/atlas/"))
+        assert(
+          url.pathname.startsWith(`/api/accounts/${owner}/atlas/`),
+          `workspace timeline: ${url.pathname}`,
+        );
+    assert(
+      since(mark).some(({ url }) => url.pathname === `/api/accounts/${owner}/atlas/timeline`),
+      "The workspace panel read GET /api/accounts/:owner/atlas/timeline",
+    );
+    await page.screenshot({ path: join(t.ctx.artifacts, "browser-atlas-workspace-timeline.png") });
 
     // 5. The timeline lands: its overlay is kept read-only, and reading it
     // asks for nothing (no write, no page writing offered).

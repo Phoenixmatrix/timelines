@@ -36,6 +36,7 @@ import type {
   AtlasWorkspaceDetail,
   AtlasWorkspaceOverview,
   AtlasWorkspacePage,
+  AtlasWorkspaceTimeline,
 } from "../../shared/atlas.ts";
 import { api, ApiError } from "./api.ts";
 
@@ -300,6 +301,21 @@ export const atlasWorkspaceApi = {
       workspace,
       "catalogue",
       { q, kind: request.kind, ...paged(request) },
+      request,
+    ),
+  /**
+   * A timeline (`timeline/<slug>`) across the selected repositories (CORE-186):
+   * each one's own overlay placed in its own snapshot, each part independent.
+   */
+  timeline: (
+    workspace: AtlasWorkspace,
+    ref: string,
+    request: AtlasPageRequest & { within?: string | null } = {},
+  ) =>
+    getIn<AtlasWorkspaceTimeline>(
+      workspace,
+      "timeline",
+      { ref, within: request.within, ...paged(request) },
       request,
     ),
   /** Capabilities spanning the selected repositories, largest first; `id` reads just that one. */

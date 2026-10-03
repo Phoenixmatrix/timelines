@@ -2,8 +2,10 @@
 // timeline view (GET /atlas/timeline, AtlasTimeline.tsx) says about where
 // each changed file sits, how fresh the overlay is against the map on screen,
 // and how wiki pages relate to it. Every sentence says what the data says:
-// placements are main's, a new file's is an inference, and an overlay or a
-// page measured against another main says so.
+// placements are main's; where the timeline's regrouping (CORE-186) puts a
+// file is computed over the capabilities it touches, and said to be; a new
+// file's place without it is an inference; and an overlay or a page measured
+// against another main says so.
 //
 // The view's one address key, beside the app-wide `?tl`:
 //
@@ -38,8 +40,14 @@ export function placementText(file: AtlasTimelineFile): string {
   const capability = placement.capability?.name ?? "a capability this map doesn't name";
   const where = placement.area?.name ? `${placement.area.name} (in ${capability})` : capability;
   switch (placement.state) {
-    case "projected":
-      return file.change === "removed" ? `Was in ${where}.` : `In ${where}.`;
+    case "projected": {
+      const here = file.change === "removed" ? `Was in ${where}.` : `In ${where}.`;
+      return file.regrouping?.moved ? `${here} ${regroupedText(file)}` : here;
+    }
+    case "computed":
+      return placement.capability
+        ? `New: the timeline's regrouping puts it in ${where}.`
+        : `New: ${regroupedText(file)}`;
     case "provisional":
       return `Provisionally in ${capability}: ${
         placement.basis
@@ -48,7 +56,9 @@ export function placementText(file: AtlasTimelineFile): string {
       }. Main's next build places it.`;
     case "unclassified":
       return file.change === "added"
-        ? "Unclassified: nothing in the map places its folder yet."
+        ? file.regrouping
+          ? "Unclassified: the timeline's regrouping finds nothing to place it by."
+          : "Unclassified: nothing in the map places its folder yet."
         : file.change === "removed"
           ? "Was unclassified in this map."
           : "Unclassified in this map.";
@@ -62,6 +72,17 @@ const RELATION: Record<AtlasMainRelation, string> = {
   unknown: "a main this map can't place",
 };
 
+/** Where the timeline's regrouping would put a file, in words. */
+export function regroupedText(file: AtlasTimelineFile): string {
+  const r = file.regrouping;
+  if (!r) return "";
+  if (!r.capability) return "The timeline's regrouping leaves it unclassified.";
+  const name = r.capability.name ?? "a capability this map doesn't name";
+  if (r.capability.proposed)
+    return `The timeline's regrouping puts it in a capability main doesn't have, ${name}.`;
+  return `The timeline's regrouping would move it to ${r.area?.name ? `${r.area.name} (in ${name})` : name}.`;
+}
+
 /** Where some main commit sits relative to the map, in words. */
 export const relationText = (relation: AtlasMainRelation) => RELATION[relation];
 
@@ -73,6 +94,7 @@ const STATE: Record<AtlasTimelineRepo["state"], string> = {
   waiting: "Waits for main's first graph",
   ended: "Ended",
   unavailable: "Unavailable: Knowledge isn't computing overlays here",
+  none: "Not in this repository: no such bookmark, and no overlay of one kept",
 };
 
 export const stateText = (state: AtlasTimelineRepo["state"]) => STATE[state];
@@ -111,7 +133,23 @@ export function coverageText(repo: AtlasTimelineRepo): string {
 export function timelineCaveatText(caveat: AtlasTimelineCaveat): string {
   switch (caveat.code) {
     case "regrouping":
-      return "Regrouping isn't computed for timelines: files sit where main's map put them, and new ones are placed provisionally until main's next build groups them.";
+      switch (caveat.state) {
+        case "computed":
+          return `Regrouping was computed for this timeline over the ${plural(caveat.capabilities, "capability", "capabilities")} it touches (${plural(caveat.files, "file")}), not the whole repository, against main's build #${caveat.seq}${
+            caveat.basis === "same"
+              ? ", this map"
+              : `, ${caveat.basis === "older" ? "older" : "newer"} than this map`
+          }. Main's own next build may still group differently.`;
+        case "pending":
+          return "Regrouping isn't computed for this overlay yet: files sit where main's map put them, and new ones are placed provisionally.";
+        case "skipped":
+          return caveat.reason === "too-large"
+            ? "Regrouping wasn't computed: the timeline touches too many capabilities. Files sit where main's map put them, and new ones are placed provisionally."
+            : caveat.reason === "no-snapshot"
+              ? "Regrouping wasn't computed: there was no map of main when the overlay was. Files sit where main's map put them, and new ones are placed provisionally."
+              : "Regrouping couldn't be computed for this overlay: files sit where main's map put them, and new ones are placed provisionally.";
+      }
+      break;
     case "base":
       return `The overlay was computed against main at ${short(caveat.baseCommit)}, ${relationText(caveat.relation)} (${short(caveat.projectionCommit)}): main's own changes in between can show here.`;
     case "truncated":
@@ -124,6 +162,8 @@ export function timelineCaveatText(caveat: AtlasTimelineCaveat): string {
       return `Showing the overlay of ${short(caveat.commit)}; the bookmark has since moved to ${short(caveat.head)}.`;
     case "imports-partial":
       return "Only the first imports and new folders were resolved to capabilities: some may be missing.";
+    case "no-map":
+      return "This repository has no Atlas yet, so its files aren't placed or listed here.";
   }
 }
 

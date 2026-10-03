@@ -44,6 +44,7 @@ import {
   type Syntheses,
 } from "./graph.ts";
 import { runBatched, type Statement } from "./util.ts";
+import { dropTimelineRegrouping, storeTimelineRegrouping } from "../atlas/timelineGrouping.ts";
 
 /** Commits read looking for the merge base before comparing trees directly. */
 export const MAX_HISTORY_READS = 2000;
@@ -377,7 +378,21 @@ export async function computeOverlay(
   const base = state?.indexed_commit ?? null;
   const graphs = await overlayGraphs(d1, repo, plan.changes);
   const changes = diffGraphs(graphs.main, graphs.timeline);
-  return storeOverlay(d1, repo.id, ref, overlayId, commit, base, plan, changes, stats);
+  const stored = await storeOverlay(
+    d1,
+    repo.id,
+    ref,
+    overlayId,
+    commit,
+    base,
+    plan,
+    changes,
+    stats,
+  );
+  // How grouping would place the timeline's files, kept with the overlay
+  // (CORE-186): from the graphs already in memory, never on browse.
+  if (stored.kept) await storeTimelineRegrouping(d1, repo.id, overlayId, graphs, changes);
+  return stored;
 }
 
 /**
@@ -395,7 +410,13 @@ export async function storeOverlay(
   plan: Pick<OverlayPlan, "mergeBase" | "historyTruncated" | "changes">,
   changes: KnowledgeOverlayChange[],
   stats: Record<string, unknown>,
-): Promise<{ base: string | null; counts: KnowledgeOverlaySummary["counts"]; stored: number }> {
+): Promise<{
+  base: string | null;
+  counts: KnowledgeOverlaySummary["counts"];
+  stored: number;
+  /** It's the timeline's overlay now (false: the overlay had ended, so nothing was kept). */
+  kept: boolean;
+}> {
   const counts = countChanges(changes);
   const kept = changes.slice(0, MAX_CHANGES);
   const k = db(d1);
@@ -475,7 +496,7 @@ export async function storeOverlay(
       .where("repo_id", "=", repoId)
       .where("overlay_id", "=", overlayId)
       .execute();
-    return { base, counts, stored: 0 };
+    return { base, counts, stored: 0, kept: false };
   }
   if (previous?.overlay_id && previous.overlay_id !== overlayId) {
     await k
@@ -483,8 +504,10 @@ export async function storeOverlay(
       .where("repo_id", "=", repoId)
       .where("overlay_id", "=", previous.overlay_id)
       .execute();
+    // Its regrouping (CORE-186) goes with it.
+    await dropTimelineRegrouping(d1, repoId, previous.overlay_id);
   }
-  return { base, counts, stored: kept.length };
+  return { base, counts, stored: kept.length, kept: true };
 }
 
 /**

@@ -50,6 +50,8 @@ import { timeAgo } from "../../lib/format.ts";
 import { useMediaQuery } from "../../lib/useMediaQuery.ts";
 import { useViewer } from "../../lib/session.ts";
 import { AtlasInspector } from "../repo/AtlasInspector.tsx";
+import { AtlasTimeline } from "../repo/AtlasTimeline.tsx";
+import { scopeOf } from "../../lib/timelineScope.ts";
 import { AtlasOutline, KIND_LABEL } from "../repo/AtlasOutline.tsx";
 import { AtlasContents, AtlasGone, AtlasLookup } from "../repo/AtlasPanels.tsx";
 import { FocusResolver, OPENS, type Focus } from "../repo/atlasNavigation.ts";
@@ -535,6 +537,11 @@ function WorkspaceView({
     navigate({ select: entity.id, snapshot: snapshotId || null });
   };
   const selected = focus.state === "ready" ? focus.entity : null;
+  // A timeline (`?tl`) across the selection (CORE-186): its panel, and the
+  // capabilities it touches marked on the map and in the outline.
+  const timeline = scopeOf(params);
+  const [touched, setTouched] = useState<ReadonlySet<string>>(() => new Set());
+  const touchedNote = timeline && touched.size ? `touched by timeline ${timeline}` : null;
   const mapFocus = useMemo(() => {
     if (focus.state !== "ready") return null;
     if (territory.byId.has(focus.id)) return focus.id;
@@ -703,6 +710,8 @@ function WorkspaceView({
       path={path}
       seq={seqOf}
       note={noteOf}
+      emphasis={touched}
+      emphasisNote={touchedNote}
       onOpen={(id) => session?.ensure(id)}
       onRetry={(id) => session?.expand(id)}
       onMore={(id) => {
@@ -740,6 +749,18 @@ function WorkspaceView({
   );
   const inspector = (
     <>
+      {timeline && overview && (
+        <AtlasTimeline
+          key={timeline}
+          workspace={workspace}
+          snapshot={{ id: snapshotId }}
+          timeline={timeline}
+          selected={selected}
+          onSelect={(id) => navigate({ select: id, snapshot: snapshotId || null })}
+          onCurrent={openCurrent}
+          onTouched={setTouched}
+        />
+      )}
       {(focus.state === "resolving" || compositeFocus.state === "resolving") && (
         <p className="m-0 text-body-sm text-ink-faint">Opening the selection…</p>
       )}
@@ -937,6 +958,8 @@ function WorkspaceView({
                   ties={ties}
                   selected={mapFocus}
                   loading={loading}
+                  emphasis={timeline ? touched : undefined}
+                  emphasisNote={touchedNote}
                   onSelect={(cell: TerritoryCell) => select(cell.entity)}
                   origin={(cell) => {
                     const name = nameOf.get(repoOf(cell.id));
@@ -950,7 +973,11 @@ function WorkspaceView({
                     composites.length
                       ? `, with lines joining the ${composites.length} that span repositories`
                       : ""
-                  }. The outline beside it has the same regions, and more.`}
+                  }.${
+                    touchedNote
+                      ? ` ${touched.size} outlined with a dashed line: ${touchedNote}.`
+                      : ""
+                  } The outline beside it has the same regions, and more.`}
                 />
               </div>
               <aside
@@ -1277,6 +1304,15 @@ function Legend() {
         <li>
           <strong className="text-ink">Dashed regions</strong> are structural groups (unclassified
           files, concepts, dependencies, folders), not capabilities.
+        </li>
+        <li>
+          <span
+            aria-hidden
+            className="mr-1 inline-block size-2.5 rounded-sm border-2 border-dashed align-middle"
+            style={{ borderColor: "var(--data-teal)" }}
+          />
+          <strong className="text-ink">A dashed outline</strong>, with a timeline selected: the
+          capabilities it touches in each repository; the outline says “touched by timeline …”.
         </li>
         <li>
           <strong className="text-ink">Lines between columns</strong> join the capabilities of one

@@ -145,6 +145,8 @@ export function AtlasOutline({
   note,
   arrival,
   placeRef,
+  emphasis,
+  emphasisNote = null,
   onOpen,
   onRetry,
   onMore,
@@ -177,6 +179,10 @@ export function AtlasOutline({
   arrival?: () => OutlinePlace | null;
   /** Kept up to date with what's open and current, for the next arrival. */
   placeRef?: RefObject<OutlinePlace | null>;
+  /** Entries marked, in words and a rule, e.g. the capabilities a timeline touches (CORE-186). */
+  emphasis?: ReadonlySet<string>;
+  /** What the mark says, e.g. "touched by timeline x". */
+  emphasisNote?: string | null;
   onOpen: (id: string) => void;
   onRetry: (id: string) => void;
   onMore: (id: string) => void;
@@ -399,10 +405,16 @@ export function AtlasOutline({
           );
         }
         const { entity } = row;
+        const marked = Boolean(emphasisNote && emphasis?.has(entity.id));
         return (
           <div
             key={row.key}
             {...common}
+            style={
+              marked
+                ? { ...common.style, boxShadow: "inset 3px 0 0 var(--data-teal)" }
+                : common.style
+            }
             aria-selected={entity.id === selected}
             aria-expanded={row.expandable ? row.expanded : undefined}
             aria-setsize={row.setsize}
@@ -435,7 +447,11 @@ export function AtlasOutline({
                 {entity.name}
               </span>
               <span className="text-micro text-ink-faint">
-                {[rowDetail(entity, typeof seq === "number" ? seq : seq(entity)), note?.(entity)]
+                {[
+                  rowDetail(entity, typeof seq === "number" ? seq : seq(entity)),
+                  note?.(entity),
+                  marked ? emphasisNote : null,
+                ]
                   .filter(Boolean)
                   .join(" · ")}
               </span>

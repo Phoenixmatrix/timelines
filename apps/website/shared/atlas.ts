@@ -865,9 +865,14 @@ export interface AtlasSnapshotList {
 // evidence, not a main snapshot comparison:
 //
 //   - placements are main's: a changed or removed file sits where the snapshot
-//     put it; a new file has no placement yet, so it is provisional (likely the
-//     capability most of its folder's files are in, said as an inference) or
-//     unclassified. Regrouping is not computed for timelines.
+//     put it. Where grouping would place the timeline's files is computed when
+//     the overlay is stored, over the capabilities it touches (CORE-186,
+//     worker/atlas/timelineGrouping.ts): a new file's placement is computed
+//     from it, a changed file says where it would move (class `regrouping`),
+//     and a capability the timeline would split or merge says so. Until it's
+//     computed, or where it can't be (too large, no map), a new file is
+//     provisional (likely the capability most of its folder's files are in,
+//     said as an inference) or unclassified.
 //   - the overlay was computed against main's indexed commit at the time, which
 //     may be older or newer than the snapshot on screen: `repos[].base` says so.
 //   - an ended timeline's overlay is kept read-only (CORE-139); reading it never
@@ -892,9 +897,18 @@ export interface AtlasTimelineRepo {
   ref: string;
   /**
    * The overlay's state (KnowledgeOverlayState), or `unavailable`: no overlay
-   * is stored and none can be (Knowledge is off here).
+   * is stored and none can be (Knowledge is off here); `none`: in a workspace,
+   * this repository has neither the bookmark nor a kept overlay of it.
    */
-  state: "up-to-date" | "building" | "queued" | "failed" | "waiting" | "ended" | "unavailable";
+  state:
+    | "up-to-date"
+    | "building"
+    | "queued"
+    | "failed"
+    | "waiting"
+    | "ended"
+    | "unavailable"
+    | "none";
   /** The bookmark's tip now: null once it's gone, or `headKnown` false when it couldn't be read. */
   head: string | null;
   headKnown: boolean;
@@ -923,10 +937,11 @@ export interface AtlasTimelineRepo {
 /** Where a timeline's file sits in the snapshot on screen. */
 export interface AtlasTimelinePlacement {
   /**
-   * projected: the snapshot places it (main's placement); provisional: new,
-   * placed by inference from its folder; unclassified: no evidence either way.
+   * projected: the snapshot places it (main's placement); computed: new, placed
+   * by the timeline's regrouping; provisional: new, placed by inference from
+   * its folder; unclassified: no evidence either way.
    */
-  state: "projected" | "provisional" | "unclassified";
+  state: "projected" | "computed" | "provisional" | "unclassified";
   capability: AtlasChangeRef | null;
   area: AtlasChangeRef | null;
   /** For a provisional placement: how many of its folder's files the capability holds. */
@@ -943,8 +958,22 @@ export interface AtlasTimelineFile {
   /** What the overlay recorded differently on a changed file (blob, summary, links…). */
   fields: string[];
   placement: AtlasTimelinePlacement;
+  /**
+   * Where the timeline's regrouping puts it (null: not computed, or a removed
+   * file). `capability` may be a group main doesn't have (`proposed`).
+   */
+  regrouping: AtlasTimelineRegrouped | null;
   /** Capabilities its added or dropped imports reach, other than its own. */
   imports: { added: AtlasChangeRef[]; removed: AtlasChangeRef[] };
+}
+
+/** Where the timeline's regrouping puts a file (CORE-186). */
+export interface AtlasTimelineRegrouped {
+  /** null: unclassified. */
+  capability: (AtlasChangeRef & { proposed: boolean }) | null;
+  area: AtlasChangeRef | null;
+  /** A changed file it puts elsewhere than main's grouping of the same files does. */
+  moved: boolean;
 }
 
 /** A timeline wiki page (CORE-84), linked from the capabilities it's about. */
@@ -970,13 +999,31 @@ export interface AtlasMainPageRef {
 
 /** A capability (or unclassified group) the timeline touches. */
 export interface AtlasTimelineRegion {
-  /** A capability id, `group:unclassified`, or `provisional` (new files with no likely place). */
+  /**
+   * A capability id, `group:unclassified`, or a group the timeline's
+   * regrouping proposes (`proposed`: not on the map).
+   */
   id: string;
   name: string;
+  /** A group main doesn't have: the timeline's files would form it. */
+  proposed: {
+    change: "split" | "merge" | "new";
+    /** Main capabilities its files come from, with the share of each. */
+    from: (AtlasChangeRef & { share: number })[];
+  } | null;
+  /**
+   * The timeline's regrouping wouldn't keep this capability as it is: split,
+   * merged into another, or emptied; with where its files would go.
+   */
+  regrouping: {
+    change: "split" | "merged" | "removed";
+    into: (AtlasChangeRef & { share: number; proposed: boolean })[];
+  } | null;
   files: { added: number; changed: number; removed: number };
   /** New files placed here by inference only. */
   provisional: number;
-  classes: { source: number; summary: number; other: number };
+  /** Files by class; `regrouping`: changed files the timeline's regrouping would move. */
+  classes: { source: number; summary: number; other: number; regrouping: number };
   /** Areas within it the changes fall in, by name. */
   areas: AtlasChangeRef[];
   /** Capabilities the timeline's imports newly reach from here, or stop reaching. */
@@ -1000,8 +1047,22 @@ export interface AtlasTimelineWiki {
 
 /** Something that limits what a timeline view can say. */
 export type AtlasTimelineCaveat =
-  /** Regrouping isn't computed for a timeline: placements are main's, new files provisional. */
-  | { code: "regrouping" }
+  /**
+   * The timeline's regrouping (CORE-186). computed: over `capabilities`
+   * capabilities and `files` files, against main snapshot `seq` (`basis`: where
+   * that sits against the snapshot on screen); pending: not computed yet for
+   * this overlay; skipped: not computed (too large, no map then, or it failed).
+   */
+  | {
+      code: "regrouping";
+      state: "computed";
+      seq: number;
+      basis: AtlasMainRelation;
+      capabilities: number;
+      files: number;
+    }
+  | { code: "regrouping"; state: "pending" }
+  | { code: "regrouping"; state: "skipped"; reason: "too-large" | "no-snapshot" | "error" }
   /** The overlay was measured against another main than the snapshot on screen. */
   | {
       code: "base";
@@ -1016,7 +1077,9 @@ export type AtlasTimelineCaveat =
   /** The bookmark moved since the overlay: it shows an earlier commit. */
   | { code: "behind"; commit: string; head: string }
   /** Only the first imports of each file were resolved to capabilities. */
-  | { code: "imports-partial" };
+  | { code: "imports-partial" }
+  /** In a workspace: this repository has no Atlas, so its files aren't placed or listed. */
+  | { code: "no-map" };
 
 /** GET /timeline?ref=timeline/<slug>[&within=]: a timeline in Atlas terms, files a page at a time. */
 export interface AtlasTimeline extends AtlasPage<AtlasTimelineFile> {
@@ -1030,4 +1093,29 @@ export interface AtlasTimeline extends AtlasPage<AtlasTimelineFile> {
   regionCount: number | null;
   wiki: AtlasTimelineWiki | null;
   caveats: AtlasTimelineCaveat[];
+}
+
+/**
+ * GET /api/accounts/:owner/atlas/timeline?repos=…&ref=timeline/<slug>[&within=]:
+ * a timeline across a workspace (CORE-186). Each selected repository's own
+ * overlay of the bookmark, read against its own snapshot in the composite, as
+ * a repository's /timeline reads it: every repository's part is independent
+ * (state `none` where it has no such timeline), ids are namespaced
+ * `<repoId>/<id>` like every workspace entity, files page by repository then
+ * path, and caveats and wiki sets say which repository they're about.
+ */
+export interface AtlasWorkspaceTimeline extends AtlasWorkspacePage<
+  AtlasTimelineFile & { repoId: string }
+> {
+  ref: string;
+  timeline: string;
+  /** Every selected repository's part, in the scope's order. */
+  repos: AtlasTimelineRepo[];
+  within: AtlasEntitySummary | null;
+  /** The first page's: touched capabilities across repositories, most files first. */
+  regions: (AtlasTimelineRegion & { repoId: string })[] | null;
+  regionCount: number | null;
+  /** Each repository's newest timeline wiki set, by repository id. */
+  wiki: Record<string, AtlasTimelineWiki | null>;
+  caveats: (AtlasTimelineCaveat & { repoId: string })[];
 }

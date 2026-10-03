@@ -13,9 +13,13 @@
 // one doesn't start one either (the Knowledge tab's overlay route does that).
 //
 // Placement is main's. A file the timeline changes or removes sits where the
-// snapshot put it; a new one has no placement until main's next build groups
-// it, so it is provisional (the capability most of its folder's files are in,
-// as an inference) or unclassified. Regrouping is never computed here.
+// snapshot put it. Where grouping would put the timeline's files is the
+// timeline's regrouping (CORE-186, timelineGrouping.ts), computed when the
+// overlay was stored and read here: it places a new file, says where a
+// changed one would move, and which touched capabilities would split or
+// merge. Without it (not computed yet, or not computable) a new file is
+// provisional (the capability most of its folder's files are in, as an
+// inference) or unclassified. Nothing is computed here.
 
 import type { Selectable } from "kysely";
 import type { KnowledgeOverlayChange, KnowledgePageSet } from "../../shared/api.ts";
@@ -40,6 +44,7 @@ import { coordinator } from "../knowledge/coordinator.ts";
 import { overlayState } from "../knowledge/overlay.ts";
 import { listSets } from "../knowledge/pages.ts";
 import { RepoReader } from "../objects.ts";
+import { readTimelineRegrouping, type StoredRegrouping } from "./timelineGrouping.ts";
 import { db, type Database } from "../schema.ts";
 import type { Timing } from "../timing.ts";
 
@@ -291,11 +296,6 @@ export async function timelineView(
 ): Promise<TimelineView> {
   const { row } = state;
   const overlayId = row?.overlay_id ?? null;
-  const stats = JSON.parse(row?.stats ?? "{}") as Stats;
-  const counts = stats.counts ?? {};
-  const total =
-    stats.changes ?? Object.values(counts).reduce((n, k) => n + k.added + k.changed + k.removed, 0);
-
   const stored: KnowledgeOverlayChange[] = overlayId
     ? (
         await db(d1)
@@ -324,7 +324,8 @@ export async function timelineView(
     .filter((c) => c.kind === "file" && c.path)
     .sort((a, b) => (a.path! < b.path! ? -1 : a.path! > b.path! ? 1 : 0));
 
-  // Placements: main's where the snapshot has the file, else inferred from its folder.
+  // Placements: main's where the snapshot has the file, else the timeline's
+  // regrouping's, else inferred from its folder.
   const seq = snapshot.seq;
   const placed = await placementsAt(
     d1,
@@ -332,8 +333,21 @@ export async function timelineView(
     seq,
     fileChanges.map((c) => c.id),
   );
+  const kept: StoredRegrouping | null = overlayId
+    ? await readTimelineRegrouping(d1, repo.id, overlayId)
+    : null;
+  const regrouped = kept?.state === "computed" ? kept.data : null;
+  const proposed = (id: string | null | undefined) => Boolean(id && regrouped?.groups[id]);
+  const computed = (id: string) => {
+    const r = regrouped?.files[id];
+    return r && !placed.has(id) && !proposed(r.capability) ? r : null;
+  };
   const unplacedFolders = [
-    ...new Set(fileChanges.filter((c) => !placed.has(c.id)).map((c) => folderOf(c.path!))),
+    ...new Set(
+      fileChanges
+        .filter((c) => !placed.has(c.id) && !regrouped?.files[c.id])
+        .map((c) => folderOf(c.path!)),
+    ),
   ].sort();
   const guesses = new Map<string, Awaited<ReturnType<typeof folderGuess>>>();
   for (const folder of unplacedFolders.slice(0, MAX_FOLDERS))
@@ -345,6 +359,7 @@ export async function timelineView(
   >();
   for (const c of fileChanges) {
     const p = placed.get(c.id);
+    const r = computed(c.id);
     if (p)
       placementOf.set(c.id, {
         state: p.capability ? "projected" : "unclassified",
@@ -352,6 +367,16 @@ export async function timelineView(
         area: p.area,
         basis: null,
       });
+    else if (r)
+      placementOf.set(c.id, {
+        state: r.capability ? "computed" : "unclassified",
+        capability: r.capability,
+        area: r.area,
+        basis: null,
+      });
+    else if (regrouped?.files[c.id])
+      // A new file the regrouping puts in a group main doesn't have.
+      placementOf.set(c.id, { state: "computed", capability: null, area: null, basis: null });
     else {
       const folder = folderOf(c.path!);
       const guess = guesses.get(folder);
@@ -389,8 +414,21 @@ export async function timelineView(
     if (p.area) ids.add(p.area);
   }
   for (const p of targetPlaced.values()) if (p.capability) ids.add(p.capability);
+  for (const r of Object.values(regrouped?.files ?? {})) {
+    if (r.capability && !proposed(r.capability)) ids.add(r.capability);
+    if (r.area) ids.add(r.area);
+  }
+  for (const r of regrouped?.regions ?? []) {
+    ids.add(r.id);
+    for (const into of r.into) if (!proposed(into.id)) ids.add(into.id);
+  }
+  for (const g of Object.values(regrouped?.groups ?? {}))
+    for (const from of g.from) ids.add(from.id);
   const named = await regionsAt(d1, scope, seq, [...ids]);
-  const ref = (id: string): AtlasChangeRef => ({ id, name: named.get(id)?.name ?? null });
+  const ref = (id: string): AtlasChangeRef => ({
+    id,
+    name: named.get(id)?.name ?? regrouped?.groups[id]?.name ?? null,
+  });
 
   const files: AtlasTimelineFile[] = fileChanges.map((c) => {
     const p = placementOf.get(c.id)!;
@@ -404,11 +442,22 @@ export async function timelineView(
         }),
       ),
     ];
+    const r = regrouped?.files[c.id];
+    const regrouping = r
+      ? {
+          capability: r.capability
+            ? { ...ref(r.capability), proposed: proposed(r.capability) }
+            : null,
+          area: r.area ? ref(r.area) : null,
+          moved: r.moved,
+        }
+      : null;
+    const classes = classesOf(c);
     return {
       id: c.id,
       path: c.path!,
       change: c.change,
-      classes: classesOf(c),
+      classes: r?.moved ? [...classes, "regrouping" as const] : classes,
       fields: c.change === "changed" ? c.fields : [],
       placement: {
         state: p.state,
@@ -416,16 +465,23 @@ export async function timelineView(
         area: p.area ? ref(p.area) : null,
         basis: p.basis,
       },
+      regrouping,
       imports: { added: reach(c.links.added).map(ref), removed: reach(c.links.removed).map(ref) },
     };
   });
 
-  // The capabilities touched.
+  // The capabilities touched: those its files are in (or would form), and
+  // those its regrouping wouldn't keep as they are.
   const byRegion = new Map<string, AtlasTimelineFile[]>();
   for (const f of files) {
-    const id = f.placement.capability?.id ?? UNCLASSIFIED;
+    const id =
+      f.placement.capability?.id ??
+      (f.regrouping?.capability?.proposed && f.change === "added"
+        ? f.regrouping.capability.id
+        : UNCLASSIFIED);
     byRegion.set(id, [...(byRegion.get(id) ?? []), f]);
   }
+  for (const r of regrouped?.regions ?? []) if (!byRegion.has(r.id)) byRegion.set(r.id, []);
 
   // Wiki: the newest timeline page set, and main's pages about changed nodes.
   const [newest] = await listSets(d1, repo.id, state.ref, { limit: 1 });
@@ -503,7 +559,7 @@ export async function timelineView(
 
   const regions: AtlasTimelineRegion[] = [...byRegion].map(([id, members]) => {
     const tally = { added: 0, changed: 0, removed: 0 };
-    const classes = { source: 0, summary: 0, other: 0 };
+    const classes = { source: 0, summary: 0, other: 0, regrouping: 0 };
     const areas = new Map<string, AtlasChangeRef>();
     const added = new Map<string, number>();
     const removed = new Map<string, number>();
@@ -519,9 +575,27 @@ export async function timelineView(
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
         .slice(0, 5)
         .map(([cap]) => ref(cap));
+    const group = regrouped?.groups[id];
+    const verdict = regrouped?.regions.find((r) => r.id === id);
     return {
       id,
-      name: id === UNCLASSIFIED ? "Unclassified" : (named.get(id)?.name ?? id),
+      name: id === UNCLASSIFIED ? "Unclassified" : (named.get(id)?.name ?? group?.name ?? id),
+      proposed: group
+        ? {
+            change: group.change,
+            from: group.from.map((f) => ({ ...ref(f.id), share: f.share })),
+          }
+        : null,
+      regrouping: verdict
+        ? {
+            change: verdict.change,
+            into: verdict.into.map((t) => ({
+              ...ref(t.id),
+              share: t.share,
+              proposed: proposed(t.id),
+            })),
+          }
+        : null,
       files: tally,
       provisional: members.filter((f) => f.placement.state === "provisional").length,
       classes,
@@ -542,42 +616,14 @@ export async function timelineView(
   // The repository's part, each value as known.
   const projectionCommit = snapshot.vector.find((v) => v.repoId === repo.id)?.commit ?? null;
   const base = await relationOf(row?.base_commit ?? null);
-  const graph = Object.fromEntries(Object.entries(counts).filter(([kind]) => kind !== "file"));
-  const repoPart: AtlasTimelineRepo = {
-    repoId: repo.id,
-    owner: repo.owner_slug,
-    name: repo.name,
-    ref: state.ref.replace(/^refs\/heads\//, ""),
-    state:
-      !row && !knowledgeOn
-        ? "unavailable"
-        : overlayState(row, state.head, state.indexed, state.running),
-    head: state.head,
-    headKnown: state.headKnown,
-    commit: row?.head_commit ?? null,
-    baseCommit: row?.base_commit ?? null,
-    mergeBase: row?.merge_base ?? null,
-    mergeBaseState: row?.merge_base
-      ? "found"
-      : stats.historyTruncated
-        ? "truncated"
-        : overlayId
-          ? "none"
-          : "unknown",
-    updatedAt: row?.updated_at ?? null,
-    error: row?.status === "failed" ? row.error : null,
-    ended: row?.ended_at ? { reason: row.ended_reason ?? "ended", at: row.ended_at } : null,
+  const repoPart = factsOf(repo, state, knowledgeOn, {
     projectionCommit,
     base,
-    changes: { total, stored: stats.stored ?? stored.length },
-    coverage: {
-      files: files.length,
-      syntax: files.filter((f) => SYNTAX.has(extensionOf(f.path))).length,
-    },
-    graph,
-  };
+    stored: stored.length,
+    paths: files.map((f) => f.path),
+  });
 
-  const caveats: AtlasTimelineCaveat[] = [{ code: "regrouping" }];
+  const caveats: AtlasTimelineCaveat[] = [regroupingCaveat(kept, snapshot)];
   if (row?.base_commit && base !== "same")
     caveats.push({
       code: "base",
@@ -610,6 +656,141 @@ export async function timelineView(
     wiki,
     caveats,
     overlayId,
+  };
+}
+
+/** What the view can say about the timeline's regrouping. */
+function regroupingCaveat(
+  kept: StoredRegrouping | null,
+  snapshot: AtlasSnapshotRef,
+): AtlasTimelineCaveat {
+  if (!kept) return { code: "regrouping", state: "pending" };
+  if (kept.state !== "computed" || !kept.data || kept.seq === null)
+    return {
+      code: "regrouping",
+      state: "skipped",
+      reason: kept.reason === "too-large" || kept.reason === "no-snapshot" ? kept.reason : "error",
+    };
+  return {
+    code: "regrouping",
+    state: "computed",
+    seq: kept.seq,
+    basis: kept.seq === snapshot.seq ? "same" : kept.seq < snapshot.seq ? "older" : "newer",
+    capabilities: kept.data.neighbourhood.capabilities.length,
+    files: kept.data.neighbourhood.files,
+  };
+}
+
+/** One repository's part in a timeline, each value as known. */
+function factsOf(
+  repo: RepoRow,
+  state: TimelineState,
+  knowledgeOn: boolean,
+  read: {
+    projectionCommit: string | null;
+    base: AtlasMainRelation;
+    /** Changes read from the overlay. */
+    stored: number;
+    /** The changed files' paths. */
+    paths: string[];
+  },
+): AtlasTimelineRepo {
+  const { row } = state;
+  const stats = JSON.parse(row?.stats ?? "{}") as Stats;
+  const counts = stats.counts ?? {};
+  const total =
+    stats.changes ?? Object.values(counts).reduce((n, k) => n + k.added + k.changed + k.removed, 0);
+  return {
+    repoId: repo.id,
+    owner: repo.owner_slug,
+    name: repo.name,
+    ref: state.ref.replace(/^refs\/heads\//, ""),
+    state:
+      !row && !knowledgeOn
+        ? "unavailable"
+        : overlayState(row, state.head, state.indexed, state.running),
+    head: state.head,
+    headKnown: state.headKnown,
+    commit: row?.head_commit ?? null,
+    baseCommit: row?.base_commit ?? null,
+    mergeBase: row?.merge_base ?? null,
+    mergeBaseState: row?.merge_base
+      ? "found"
+      : stats.historyTruncated
+        ? "truncated"
+        : row?.overlay_id
+          ? "none"
+          : "unknown",
+    updatedAt: row?.updated_at ?? null,
+    error: row?.status === "failed" ? row.error : null,
+    ended: row?.ended_at ? { reason: row.ended_reason ?? "ended", at: row.ended_at } : null,
+    projectionCommit: read.projectionCommit,
+    base: read.base,
+    changes: { total, stored: stats.stored ?? read.stored },
+    coverage: {
+      files: read.paths.length,
+      syntax: read.paths.filter((path) => SYNTAX.has(extensionOf(path))).length,
+    },
+    graph: Object.fromEntries(Object.entries(counts).filter(([kind]) => kind !== "file")),
+  };
+}
+
+/**
+ * A repository's part in a timeline where it has no Atlas to place files in
+ * (a workspace member without a published map): the facts, no placements.
+ */
+export async function timelineFacts(
+  d1: D1Database,
+  repo: RepoRow,
+  state: TimelineState,
+  knowledgeOn: boolean,
+): Promise<AtlasTimelineRepo> {
+  const overlayId = state.row?.overlay_id ?? null;
+  const paths = overlayId
+    ? (
+        await db(d1)
+          .selectFrom("kg_overlay_changes")
+          .select("path")
+          .where("repo_id", "=", repo.id)
+          .where("overlay_id", "=", overlayId)
+          .where("kind", "=", "file")
+          .execute()
+      ).flatMap((r) => (r.path ? [r.path] : []))
+    : [];
+  return factsOf(repo, state, knowledgeOn, {
+    projectionCommit: null,
+    base: "unknown",
+    stored: paths.length,
+    paths,
+  });
+}
+
+/** A repository with neither the timeline's bookmark nor a kept overlay of it. */
+export function timelineAbsent(
+  repo: Pick<RepoRow, "id" | "owner_slug" | "name">,
+  ref: string,
+  projectionCommit: string | null,
+): AtlasTimelineRepo {
+  return {
+    repoId: repo.id,
+    owner: repo.owner_slug,
+    name: repo.name,
+    ref: ref.replace(/^refs\/heads\//, ""),
+    state: "none",
+    head: null,
+    headKnown: true,
+    commit: null,
+    baseCommit: null,
+    mergeBase: null,
+    mergeBaseState: "unknown",
+    updatedAt: null,
+    error: null,
+    ended: null,
+    projectionCommit,
+    base: "unknown",
+    changes: { total: 0, stored: 0 },
+    coverage: { files: 0, syntax: 0 },
+    graph: {},
   };
 }
 

@@ -60,6 +60,7 @@ export interface MapTie {
 }
 
 const NO_TIES: readonly MapTie[] = [];
+const NO_EMPHASIS: ReadonlySet<string> = new Set();
 
 const fileLabel = (n: number) => `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
 
@@ -72,6 +73,8 @@ export function AtlasTerritory({
   bands = NO_BANDS,
   ties = NO_TIES,
   origin,
+  emphasis = NO_EMPHASIS,
+  emphasisNote = null,
 }: {
   territory: Territory;
   selected: string | null;
@@ -86,6 +89,10 @@ export function AtlasTerritory({
   ties?: readonly MapTie[];
   /** Where a cell comes from, for its hover card (e.g. its repository). */
   origin?: (cell: TerritoryCell) => string | null;
+  /** Regions outlined as well as drawn, e.g. the capabilities a timeline touches (CORE-186). */
+  emphasis?: ReadonlySet<string>;
+  /** What the outline means, for the hover card. */
+  emphasisNote?: string | null;
 }) {
   const wrap = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -201,6 +208,7 @@ export function AtlasTerritory({
       faint: cssVar("--ink-faint"),
       signal: cssVar("--signal-line"),
       changed: cssVar("--data-berry"),
+      emphasis: cssVar("--data-teal"),
     };
     const font = getComputedStyle(document.body).fontFamily;
     const fitText = (text: string, max: number): string | null => {
@@ -273,6 +281,16 @@ export function AtlasTerritory({
       if (c.structural) ctx.setLineDash([4, 4]);
       ctx.stroke();
       ctx.setLineDash([]);
+      if (emphasis.has(c.id)) {
+        // Outside the selection's ring, dashed so it reads without colour.
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = color.emphasis;
+        ctx.setLineDash([7, 4]);
+        ctx.beginPath();
+        ctx.roundRect(x - 4, y - 4, cw + 8, ch + 8, radius + 4);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
       if (c.id === selected) {
         ctx.lineWidth = 2;
         ctx.strokeStyle = color.signal;
@@ -351,7 +369,7 @@ export function AtlasTerritory({
         ctx.stroke();
       }
     }
-  }, [frame, territory, selected, loading, bands, ties]);
+  }, [frame, territory, selected, loading, bands, ties, emphasis]);
 
   const local = (event: { clientX: number; clientY: number }) => {
     const rect = canvas.current!.getBoundingClientRect();
@@ -464,6 +482,7 @@ export function AtlasTerritory({
               ? fileLabel(hover.cell.entity.counts.files)
               : (hover.cell.entity.path ?? hover.cell.entity.kind)}
             {hover.cell.changed && " · changed in this build"}
+            {emphasisNote && emphasis.has(hover.cell.id) && ` · ${emphasisNote}`}
           </div>
           {origin?.(hover.cell) && (
             <div className="truncate text-micro text-ink-muted">{origin(hover.cell)}</div>

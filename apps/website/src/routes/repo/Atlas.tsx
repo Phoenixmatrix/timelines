@@ -445,6 +445,10 @@ function Territory({
 
   const commit = snapshot.vector[0]?.commit ?? null;
   const capabilities = overview.regions.filter((r) => !r.structural).length;
+  // The capabilities a selected timeline touches, marked on the map and in the
+  // outline while `?tl` is set (CORE-186).
+  const [touched, setTouched] = useState<ReadonlySet<string>>(() => new Set());
+  const touchedNote = timeline && touched.size ? `touched by timeline ${timeline}` : null;
 
   // ---- the outline's top level: the overview's regions, then the catalogue ----------
   const [catalogue, setCatalogue] = useState<{
@@ -569,6 +573,8 @@ function Territory({
       seq={snapshot.seq}
       arrival={landed ? () => arrival()?.outline ?? null : undefined}
       placeRef={outlinePlace}
+      emphasis={touched}
+      emphasisNote={touchedNote}
       onOpen={open}
       onRetry={(id) => void loader.load(id)}
       onMore={(id) => {
@@ -609,6 +615,7 @@ function Territory({
           selected={selected}
           onSelect={(id) => navigate({ select: id, snapshot: snapshot.id })}
           onCurrent={() => navigate({ snapshot: null })}
+          onTouched={setTouched}
         />
       )}
       {focus.state === "resolving" && (
@@ -730,9 +737,13 @@ function Territory({
               selected={mapFocus}
               loading={loading}
               onSelect={(cell: TerritoryCell) => select(cell.entity)}
+              emphasis={timeline ? touched : undefined}
+              emphasisNote={touchedNote}
               label={`Capability map: ${capabilities} capabilities${
                 overview.regions.length > capabilities ? " and structural groups" : ""
-              }. The outline beside it has the same regions, and more.`}
+              }.${
+                touchedNote ? ` ${touched.size} outlined with a dashed line: ${touchedNote}.` : ""
+              } The outline beside it has the same regions, and more.`}
             />
           </div>
           <aside
@@ -1029,6 +1040,15 @@ function Legend() {
           />
           <strong className="text-ink">A dot in a region's corner</strong>: it changed in the build
           this map shows; the outline says “changed in this build”.
+        </li>
+        <li>
+          <span
+            aria-hidden
+            className="mr-1 inline-block size-2.5 rounded-sm border-2 border-dashed align-middle"
+            style={{ borderColor: "var(--data-teal)" }}
+          />
+          <strong className="text-ink">A dashed outline</strong>, with a timeline selected: the
+          capabilities it touches; the outline says “touched by timeline …”.
         </li>
         <li>
           <strong className="text-ink">The outline</strong> holds everything the map draws, and

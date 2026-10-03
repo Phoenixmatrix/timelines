@@ -15,6 +15,7 @@ import {
 import type { KnowledgeOverlayEndReason } from "../../shared/api.ts";
 import type { BuiltGraph, GraphEdge, GraphNode } from "../knowledge/graph.ts";
 import { diffGraphs, endOverlays, storeOverlay, type FileChange } from "../knowledge/overlay.ts";
+import { storeTimelineRegrouping } from "./timelineGrouping.ts";
 import type { AtlasUnavailableReason } from "../../shared/atlas.ts";
 import { describeRepoCapabilities } from "./describe.ts";
 import {
@@ -288,7 +289,7 @@ export async function writeAtlasFixtureOverlay(
     .run();
   const overlayId = `fixture-overlay-${crypto.randomUUID()}`;
   const full = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`;
-  const { stored } = await storeOverlay(
+  const { stored, kept } = await storeOverlay(
     d1,
     repoId,
     full,
@@ -299,6 +300,8 @@ export async function writeAtlasFixtureOverlay(
     changes,
     { fixture: true },
   );
+  // As computeOverlay does: the timeline's regrouping, kept with the overlay.
+  if (kept) await storeTimelineRegrouping(d1, repoId, overlayId, { main, timeline }, changes);
   return { overlayId, stored };
 }
 

@@ -1,27 +1,38 @@
 // A timeline on the Knowledge tab, in Atlas terms (CORE-176): with `?tl=` set,
 // the Selection pane says what the timeline changes against main as the
 // capabilities and areas it touches, each file placed where main's map puts
-// it (or provisionally, for a new file), the capabilities its new imports
-// reach, and the wiki pages about each; with every repository's bookmark,
+// it, where the timeline's regrouping (CORE-186) would put it, and which
+// touched capabilities that would split or merge (or, until that's computed,
+// a new file placed provisionally), the capabilities its new imports reach,
+// and the wiki pages about each; with every repository's bookmark,
 // overlay, main base and merge base shown, each known or said not to be.
 // Everything is one bounded, paged read (GET /atlas/timeline) of what the
 // overlay already stored: nothing here computes an overlay, so an ended
 // timeline is read exactly as it was kept (CORE-139). Source, history and
-// syntax changes open on the timeline's commit with the timeline scope.
+// syntax changes open on the timeline's commit with the timeline scope. The
+// capabilities it touches are handed up (`onTouched`) so the map and the
+// outline can mark them while `?tl` is set.
 
 import { ArrowClockwiseIcon } from "@phosphor-icons/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import type {
+  AtlasCounts,
   AtlasEntitySummary,
   AtlasError,
-  AtlasSnapshotRef,
-  AtlasTimeline as Timeline,
+  AtlasTimelineCaveat,
   AtlasTimelineFile,
   AtlasTimelineRegion,
   AtlasTimelineRepo,
+  AtlasTimelineWiki,
 } from "../../../shared/atlas.ts";
-import { atlasApi, atlasErrorOf, type AtlasRepo } from "../../lib/atlas.ts";
+import {
+  atlasApi,
+  atlasErrorOf,
+  atlasWorkspaceApi,
+  type AtlasRepo,
+  type AtlasWorkspace,
+} from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, repoPath } from "../../lib/refs.ts";
 import { withScope } from "../../lib/timelineScope.ts";
@@ -56,28 +67,61 @@ const CLASS: Record<string, string> = {
   source: "Source",
   summary: "Summary only",
   other: "Links only",
+  regrouping: "Would move",
 };
+
+const PROPOSED: Record<"split" | "merge" | "new", string> = {
+  split: "split off",
+  merge: "merged",
+  new: "new",
+};
+
+const share = (n: number) => `${Math.round(n * 100)}%`;
 
 const plural = (n: number, one: string, many = `${one}s`) =>
   `${n.toLocaleString()} ${n === 1 ? one : many}`;
 
+/** A file, from a repository's timeline or (with its repository) a workspace's. */
+type Item = AtlasTimelineFile & { repoId?: string };
+
+/** What the panel shows, from either scope's response. */
+interface Head {
+  repos: AtlasTimelineRepo[];
+  regions: (AtlasTimelineRegion & { repoId?: string })[] | null;
+  regionCount: number | null;
+  within: AtlasEntitySummary | null;
+  counts: AtlasCounts;
+  /** Each repository's newest timeline wiki set, by repository id. */
+  wiki: Record<string, AtlasTimelineWiki | null>;
+  caveats: (AtlasTimelineCaveat & { repoId?: string })[];
+}
+
 interface Loaded {
-  head: Timeline;
-  items: AtlasTimelineFile[];
+  head: Head;
+  items: Item[];
   next: string | null;
 }
 
+/**
+ * A timeline in Atlas terms, for a repository (`repo`) or across a
+ * workspace's selected repositories (`workspace`, CORE-186): there each
+ * repository's part is its own, files and capabilities say whose they are,
+ * and their handoffs open in their own repository.
+ */
 export function AtlasTimeline({
   repo,
+  workspace,
   snapshot,
   timeline,
   selected,
   onSelect,
   onCurrent,
+  onTouched,
 }: {
-  repo: AtlasRepo;
-  /** The snapshot on screen: placements are read in it. */
-  snapshot: AtlasSnapshotRef;
+  repo?: AtlasRepo;
+  workspace?: AtlasWorkspace;
+  /** The snapshot on screen (a workspace's composite): placements are read in it. */
+  snapshot: { id: string };
   /** The timeline's slug (`?tl=`). */
   timeline: string;
   /** What's selected, offered as a filter. */
@@ -86,6 +130,8 @@ export function AtlasTimeline({
   onSelect: (id: string) => void;
   /** Leave a snapshot that expired for the current one (the timeline stays). */
   onCurrent: () => void;
+  /** The map's capabilities the timeline touches, as read (empty when it's gone). */
+  onTouched?: (ids: ReadonlySet<string>) => void;
 }) {
   const [params, setParams] = useSearchParams();
   const within = readTimelineWithin(params);
@@ -95,16 +141,35 @@ export function AtlasTimeline({
   const [more, setMore] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const latest = useRef(0);
-  // By value: the parent passes a new object on every render.
-  const { owner, name } = repo;
+  // By value: the parent passes new objects on every render.
+  const scopeKey = workspace
+    ? `ws\n${workspace.owner}\n${workspace.repos.join(",")}`
+    : `repo\n${repo?.owner ?? ""}\n${repo?.name ?? ""}`;
+
+  const read = useCallback(
+    (cursor: string | null, signal?: AbortSignal): Promise<Loaded> => {
+      const [kind, owner = "", names = ""] = scopeKey.split("\n");
+      const request = { snapshot: snapshot.id, within, cursor, signal };
+      if (kind === "ws")
+        return atlasWorkspaceApi
+          .timeline({ owner, repos: names.split(",") }, ref, request)
+          .then((r) => ({ head: r, items: r.items, next: r.next }));
+      return atlasApi.timeline({ owner, name: names }, ref, request).then((r) => ({
+        head: { ...r, wiki: r.repos[0] ? { [r.repos[0].repoId]: r.wiki } : {} },
+        items: r.items,
+        next: r.next,
+      }));
+    },
+    [scopeKey, ref, snapshot.id, within],
+  );
 
   const load = useCallback(
     (signal: AbortSignal) => {
       const asked = ++latest.current;
-      atlasApi.timeline({ owner, name }, ref, { snapshot: snapshot.id, within, signal }).then(
-        (head) => {
+      read(null, signal).then(
+        (page) => {
           if (asked !== latest.current) return;
-          setLoaded({ head, items: head.items, next: head.next });
+          setLoaded(page);
           setFailed(null);
         },
         (error: unknown) => {
@@ -118,7 +183,7 @@ export function AtlasTimeline({
         },
       );
     },
-    [owner, name, ref, snapshot.id, within],
+    [read],
   );
   useEffect(() => {
     const controller = new AbortController();
@@ -142,8 +207,7 @@ export function AtlasTimeline({
   const loadMore = () => {
     if (!loaded?.next || more) return;
     setMore(true);
-    atlasApi
-      .timeline(repo, ref, { snapshot: snapshot.id, within, cursor: loaded.next })
+    read(loaded.next)
       .then(
         (page) =>
           setLoaded((now) =>
@@ -166,7 +230,25 @@ export function AtlasTimeline({
     );
 
   const head = loaded?.head;
-  const part = head?.repos[0];
+  // The repositories with the timeline (all of them, for a repository's tab).
+  const parts = head?.repos.filter((r) => r.state !== "none") ?? [];
+  const part = parts[0] ?? head?.repos[0];
+  const many = (head?.repos.length ?? 0) > 1;
+  const partOf = (repoId: string | undefined) =>
+    head?.repos.find((r) => r.repoId === repoId) ?? part!;
+  // The regions on the map it touches: not the unclassified group, not a
+  // group only its regrouping proposes.
+  const touchedKey = (head?.regions ?? [])
+    .filter((r) => !r.proposed && !r.id.endsWith("group:unclassified"))
+    .map((r) => r.id)
+    .join("\n");
+  const report = useRef(onTouched);
+  report.current = onTouched;
+  useEffect(() => {
+    report.current?.(new Set(touchedKey ? touchedKey.split("\n") : []));
+  }, [touchedKey]);
+  useEffect(() => () => report.current?.(new Set()), []);
+  const computed = head?.caveats.some((c) => c.code === "regrouping" && c.state === "computed");
   const offerWithin =
     !within && selected && (selected.kind === "capability" || selected.kind === "area");
 
@@ -175,7 +257,9 @@ export function AtlasTimeline({
       <header>
         <h2 className="m-0 text-title break-words">{ref}</h2>
         <span className="block text-micro text-ink-faint">
-          What it changes against main, in this map's capabilities.
+          {many
+            ? "What it changes against main in each selected repository, in its own map's capabilities."
+            : "What it changes against main, in this map's capabilities."}
         </span>
       </header>
 
@@ -214,22 +298,35 @@ export function AtlasTimeline({
       {head && part && (
         <>
           {head.repos.map((r) => (
-            <RepoFacts key={r.repoId} part={r} many={head.repos.length > 1} />
+            <RepoFacts key={r.repoId} part={r} many={many} />
           ))}
-          {part.ended && (
-            <p className="m-0 rounded-plate border border-line-soft bg-raised px-2 py-1.5 text-body-sm text-ink-muted">
-              {ENDED[part.ended.reason]} {timeAgo(part.ended.at)}. This is its last overlay
-              {part.commit && (
-                <>
-                  {" "}
-                  at <span className="font-mono">{short(part.commit)}</span>
-                </>
-              )}
-              , kept read-only: nothing here computes it again.
-            </p>
-          )}
+          {parts
+            .filter((p) => p.ended)
+            .map((p) => (
+              <p
+                key={p.repoId}
+                className="m-0 rounded-plate border border-line-soft bg-raised px-2 py-1.5 text-body-sm text-ink-muted"
+              >
+                {many && `${p.name}: `}
+                {ENDED[p.ended!.reason]} {timeAgo(p.ended!.at)}. This is its last overlay
+                {p.commit && (
+                  <>
+                    {" "}
+                    at <span className="font-mono">{short(p.commit)}</span>
+                  </>
+                )}
+                , kept read-only: nothing here computes it again.
+              </p>
+            ))}
 
-          <Regions head={head} repo={repo} timeline={timeline} onSelect={onSelect} />
+          <Regions
+            head={head}
+            repoOf={(repoId) => partOf(repoId)}
+            many={many}
+            timeline={timeline}
+            computed={Boolean(computed)}
+            onSelect={onSelect}
+          />
 
           {within ? (
             <p className="m-0 flex flex-wrap items-center gap-2 text-body-sm">
@@ -269,16 +366,24 @@ export function AtlasTimeline({
               <p className="m-0 text-body-sm text-ink-muted" role="status">
                 {within
                   ? "This timeline changes no file here."
-                  : part.ended
-                    ? "This timeline changed no file."
-                    : part.commit
-                      ? "This timeline changes no file yet."
-                      : "No overlay yet. It is computed after the next push."}
+                  : parts.length === 0
+                    ? "None of the selected repositories has this timeline."
+                    : part.ended
+                      ? "This timeline changed no file."
+                      : part.commit
+                        ? "This timeline changes no file yet."
+                        : "No overlay yet. It is computed after the next push."}
               </p>
             ) : (
               <ul className="m-0 flex list-none flex-col gap-2 p-0">
                 {loaded.items.map((file) => (
-                  <FileItem key={file.id} file={file} part={part} repo={repo} timeline={timeline} />
+                  <FileItem
+                    key={file.id}
+                    file={file}
+                    part={partOf(file.repoId)}
+                    many={many}
+                    timeline={timeline}
+                  />
                 ))}
               </ul>
             )}
@@ -296,62 +401,68 @@ export function AtlasTimeline({
             )}
           </section>
 
-          <p className="m-0 flex flex-wrap gap-x-3 gap-y-1 text-body-sm">
-            <Link
-              to={withScope(
-                `${repoPath(repo.owner, repo.name, "changes")}?ref=${encodeURIComponent(part.ended ? (part.commit ?? ref) : ref)}`,
-                timeline,
-              )}
-              className="text-ink underline"
-            >
-              Syntax changes on this timeline
-            </Link>
-            <Link
-              to={withScope(
-                commitsUrl(repo.owner, repo.name, part.ended ? (part.commit ?? ref) : ref),
-                timeline,
-              )}
-              className="text-ink underline"
-            >
-              Its commits
-            </Link>
-          </p>
-          <ul className="m-0 flex list-none flex-col gap-0.5 p-0 text-micro text-ink-faint">
-            <li>{coverageText(part)}</li>
-            {Object.keys(part.graph).length > 0 && (
-              <li>
-                Also in the graph:{" "}
-                {Object.entries(part.graph)
-                  .map(
-                    ([kind, n]) =>
-                      `${kind} ${[
-                        n.added && `${n.added} new`,
-                        n.changed && `${n.changed} changed`,
-                        n.removed && `${n.removed} removed`,
-                      ]
-                        .filter(Boolean)
-                        .join(", ")}`,
-                  )
-                  .join("; ")}
-                .
-              </li>
-            )}
-            {head.caveats.map((c) => (
-              <li key={c.code}>{timelineCaveatText(c)}</li>
-            ))}
-          </ul>
-
-          <TimelineWikiPages
-            repo={repo}
-            ref={ref}
-            ended={Boolean(part.ended)}
-            canAsk={part.head !== null && part.state !== "waiting" && part.state !== "unavailable"}
-            note={
-              head.wiki
-                ? `Measured against main at ${short(head.wiki.baseCommit)}, ${relationText(head.wiki.base)}.`
-                : null
-            }
-          />
+          {parts.map((p) => {
+            const at = p.ended ? (p.commit ?? ref) : ref;
+            return (
+              <div key={p.repoId} className="flex flex-col gap-1">
+                <p className="m-0 flex flex-wrap gap-x-3 gap-y-1 text-body-sm">
+                  {many && <span className="font-semibold text-ink">{p.name}</span>}
+                  <Link
+                    to={withScope(
+                      `${repoPath(p.owner, p.name, "changes")}?ref=${encodeURIComponent(at)}`,
+                      timeline,
+                    )}
+                    className="text-ink underline"
+                  >
+                    Syntax changes on this timeline
+                  </Link>
+                  <Link
+                    to={withScope(commitsUrl(p.owner, p.name, at), timeline)}
+                    className="text-ink underline"
+                  >
+                    Its commits
+                  </Link>
+                </p>
+                <ul className="m-0 flex list-none flex-col gap-0.5 p-0 text-micro text-ink-faint">
+                  <li>{coverageText(p)}</li>
+                  {Object.keys(p.graph).length > 0 && (
+                    <li>
+                      Also in the graph:{" "}
+                      {Object.entries(p.graph)
+                        .map(
+                          ([kind, n]) =>
+                            `${kind} ${[
+                              n.added && `${n.added} new`,
+                              n.changed && `${n.changed} changed`,
+                              n.removed && `${n.removed} removed`,
+                            ]
+                              .filter(Boolean)
+                              .join(", ")}`,
+                        )
+                        .join("; ")}
+                      .
+                    </li>
+                  )}
+                  {head.caveats
+                    .filter((c) => !c.repoId || c.repoId === p.repoId)
+                    .map((c) => (
+                      <li key={c.code}>{timelineCaveatText(c)}</li>
+                    ))}
+                </ul>
+                <TimelineWikiPages
+                  repo={{ owner: p.owner, name: p.name }}
+                  ref={ref}
+                  ended={Boolean(p.ended)}
+                  canAsk={p.head !== null && p.state !== "waiting" && p.state !== "unavailable"}
+                  note={
+                    head.wiki[p.repoId]
+                      ? `Measured against main at ${short(head.wiki[p.repoId]!.baseCommit)}, ${relationText(head.wiki[p.repoId]!.base)}.`
+                      : null
+                  }
+                />
+              </div>
+            );
+          })}
         </>
       )}
     </section>
@@ -373,21 +484,29 @@ function RepoFacts({ part, many }: { part: AtlasTimelineRepo; many: boolean }) {
           {stateText(part.state)}
           {part.updatedAt && <span className="text-ink-faint"> · {timeAgo(part.updatedAt)}</span>}
         </dd>
-        <dt className="text-ink-faint">Bookmark</dt>
-        <dd className="m-0 font-mono text-mono">{headText(part)}</dd>
-        <dt className="text-ink-faint">Overlay of</dt>
-        <dd className="m-0 font-mono text-mono">{part.commit ? short(part.commit) : "none yet"}</dd>
-        <dt className="text-ink-faint">Main base</dt>
-        <dd className="m-0">
-          <span className="font-mono text-mono">
-            {part.baseCommit ? short(part.baseCommit) : "unknown"}
-          </span>
-          {part.baseCommit && <span className="text-ink-faint"> · {relationText(part.base)}</span>}
-        </dd>
-        <dt className="text-ink-faint">Merge base</dt>
-        <dd className="m-0 font-mono text-mono">{mergeBaseText(part)}</dd>
-        <dt className="text-ink-faint">This map</dt>
-        <dd className="m-0 font-mono text-mono">{short(part.projectionCommit)}</dd>
+        {part.state !== "none" && (
+          <>
+            <dt className="text-ink-faint">Bookmark</dt>
+            <dd className="m-0 font-mono text-mono">{headText(part)}</dd>
+            <dt className="text-ink-faint">Overlay of</dt>
+            <dd className="m-0 font-mono text-mono">
+              {part.commit ? short(part.commit) : "none yet"}
+            </dd>
+            <dt className="text-ink-faint">Main base</dt>
+            <dd className="m-0">
+              <span className="font-mono text-mono">
+                {part.baseCommit ? short(part.baseCommit) : "unknown"}
+              </span>
+              {part.baseCommit && (
+                <span className="text-ink-faint"> · {relationText(part.base)}</span>
+              )}
+            </dd>
+            <dt className="text-ink-faint">Merge base</dt>
+            <dd className="m-0 font-mono text-mono">{mergeBaseText(part)}</dd>
+            <dt className="text-ink-faint">This map</dt>
+            <dd className="m-0 font-mono text-mono">{short(part.projectionCommit)}</dd>
+          </>
+        )}
       </dl>
     </section>
   );
@@ -396,13 +515,19 @@ function RepoFacts({ part, many }: { part: AtlasTimelineRepo; many: boolean }) {
 /** The capabilities the timeline touches, most files first. */
 function Regions({
   head,
-  repo,
+  repoOf,
+  many,
   timeline,
+  computed,
   onSelect,
 }: {
-  head: Timeline;
-  repo: AtlasRepo;
+  head: Head;
+  /** The repository a region is in. */
+  repoOf: (repoId: string | undefined) => AtlasTimelineRepo;
+  many: boolean;
   timeline: string;
+  /** Its regrouping was computed: what imports reach is already accounted for. */
+  computed: boolean;
   onSelect: (id: string) => void;
 }) {
   const regions = head.regions ?? [];
@@ -420,8 +545,10 @@ function Regions({
           <RegionItem
             key={region.id}
             region={region}
-            repo={repo}
+            part={repoOf(region.repoId)}
+            many={many}
             timeline={timeline}
+            computed={computed}
             onSelect={onSelect}
           />
         ))}
@@ -438,13 +565,18 @@ function Regions({
 
 function RegionItem({
   region,
-  repo,
+  part,
+  many,
   timeline,
+  computed,
   onSelect,
 }: {
   region: AtlasTimelineRegion;
-  repo: AtlasRepo;
+  /** The repository it's in. */
+  part: AtlasTimelineRepo;
+  many: boolean;
   timeline: string;
+  computed: boolean;
   onSelect: (id: string) => void;
 }) {
   const parts = [
@@ -452,26 +584,65 @@ function RegionItem({
     region.files.changed && `${region.files.changed} changed`,
     region.files.removed && `${region.files.removed} removed`,
   ].filter(Boolean);
+  const named = (r: { name: string | null; proposed?: boolean }) =>
+    r.name ? (r.proposed ? `a new ${r.name}` : r.name) : "a capability";
+  const fileCount = region.files.added + region.files.changed + region.files.removed;
+  const repo = { owner: part.owner, name: part.name };
   return (
     <li className="flex flex-col gap-0.5">
-      <button
-        type="button"
-        onClick={() => onSelect(region.id)}
-        className="min-w-0 cursor-pointer self-start border-0 bg-transparent p-0 text-left text-body-sm text-ink underline-offset-2 hover:underline pointer-coarse:min-h-11"
-      >
-        {region.name}
-      </button>
+      {many && <span className="text-micro text-ink-faint">{part.name}</span>}
+      {region.proposed ? (
+        // Not on the map: only the timeline's regrouping makes it.
+        <span className="text-body-sm text-ink">
+          {region.name}{" "}
+          <span className="mk-chip text-micro">
+            Would be a {PROPOSED[region.proposed.change]} capability
+          </span>
+        </span>
+      ) : (
+        <button
+          type="button"
+          onClick={() => onSelect(region.id)}
+          className="min-w-0 cursor-pointer self-start border-0 bg-transparent p-0 text-left text-body-sm text-ink underline-offset-2 hover:underline pointer-coarse:min-h-11"
+        >
+          {region.name}
+        </button>
+      )}
       <span className="text-micro text-ink-muted">
-        {parts.join(", ")} file
-        {region.files.added + region.files.changed + region.files.removed === 1 ? "" : "s"}
+        {fileCount === 0
+          ? "No changed file here"
+          : `${parts.join(", ")} file${fileCount === 1 ? "" : "s"}`}
+        {region.classes.regrouping > 0 && `; ${region.classes.regrouping} would move`}
         {region.provisional > 0 && `; ${region.provisional} placed here provisionally`}
         {region.areas.length > 0 &&
           ` · in ${region.areas.map((a) => a.name ?? "an unnamed area").join(", ")}`}
       </span>
+      {region.proposed && region.proposed.from.length > 0 && (
+        <span className="text-micro text-ink-muted">
+          The timeline's regrouping would form it from{" "}
+          {region.proposed.from
+            .map((f) => `${f.name ?? "a capability"} (${share(f.share)})`)
+            .join(", ")}
+          .
+        </span>
+      )}
+      {region.regrouping && (
+        <span className="text-micro text-ink">
+          {region.regrouping.change === "split"
+            ? `The timeline's regrouping would split it: ${region.regrouping.into
+                .map((t) => `${share(t.share)} to ${named(t)}`)
+                .join(", ")}.`
+            : region.regrouping.change === "merged"
+              ? `The timeline's regrouping would merge it into ${region.regrouping.into
+                  .map((t) => named(t))
+                  .join(", ")}.`
+              : "The timeline's regrouping would leave none of its files grouped here."}
+        </span>
+      )}
       {region.imports.added.length > 0 && (
         <span className="text-micro text-ink-muted">
-          New imports reach {region.imports.added.map((r) => r.name ?? "a capability").join(", ")}:
-          it may be regrouped once main builds it.
+          New imports reach {region.imports.added.map((r) => r.name ?? "a capability").join(", ")}
+          {computed ? "." : ": it may be regrouped once main builds it."}
         </span>
       )}
       {region.imports.removed.length > 0 && (
@@ -513,21 +684,26 @@ function RegionItem({
 function FileItem({
   file,
   part,
-  repo,
+  many,
   timeline,
 }: {
   file: AtlasTimelineFile;
+  /** The repository it's in. */
   part: AtlasTimelineRepo;
-  repo: AtlasRepo;
+  many: boolean;
   timeline: string;
 }) {
+  const repo = { owner: part.owner, name: part.name };
   // An ended timeline's bookmark is gone: its kept commit is the evidence.
   const at = part.commit;
   const scoped = (href: string) => withScope(href, timeline);
   return (
     <li className="flex flex-col gap-0.5 border-b border-line-soft pb-2 last:border-b-0">
       <span className="flex flex-wrap items-baseline gap-x-2">
-        <span className="font-mono text-mono break-all text-ink">{file.path}</span>
+        <span className="font-mono text-mono break-all text-ink">
+          {many && `${part.name}: `}
+          {file.path}
+        </span>
         <span className="mk-chip mk-chip--tag">{CHANGE[file.change]}</span>
         {file.classes
           .filter((c) => c !== "source")

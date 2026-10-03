@@ -9,6 +9,7 @@
 //   GET /catalogue?repos=…&q=[&kind=]                   lookup across every selected repository
 //   GET /composition?repos=…[&id=xcap:…]                capabilities spanning repositories (CORE-167)
 //   GET /links?repos=…&id=&state=[&direction=]          a capability's cross-repository links (CORE-167)
+//   GET /timeline?repos=…&ref=timeline/<slug>[&within=]  a timeline across the selected repositories (CORE-186)
 //
 // The scope. A workspace scope is the set of repositories the caller selected
 // (`repos`, names under :owner, at most ATLAS_WORKSPACE_MAX_REPOS) intersected
@@ -78,6 +79,12 @@ import {
   type AtlasWorkspaceOverview,
   type AtlasWorkspacePage,
   type AtlasWorkspaceRepo,
+  type AtlasWorkspaceTimeline,
+  ATLAS_TIMELINE_REGIONS,
+  type AtlasChangeRef,
+  type AtlasTimelineFile,
+  type AtlasTimelineRegion,
+  type AtlasTimelineRepo,
 } from "../../shared/atlas.ts";
 import type { AppEnv } from "../auth.ts";
 import { findAccountBySlug, readableRepo, selectRepos } from "../db.ts";
@@ -128,6 +135,14 @@ import {
   type ScopeComposition,
 } from "./compose.ts";
 import { readableFeeds } from "./publishers.ts";
+import { overlayRef } from "../knowledge/overlay.ts";
+import {
+  readTimelineState,
+  timelineAbsent,
+  timelineFacts,
+  timelineView,
+  type TimelineView,
+} from "./timeline.ts";
 
 export const workspaceAtlas = new Hono<AppEnv>();
 
@@ -1209,4 +1224,223 @@ workspaceAtlas.get("/links", async (c) => {
     rest.length > limit ? (items.at(-1)?.id ?? null) : null,
     async () => all.length,
   );
+});
+
+// ---- timelines (CORE-186) ------------------------------------------------------
+
+type TimelineKey = [string, string, string];
+
+/**
+ * A timeline across the workspace: each selected repository's own overlay of
+ * the bookmark, read against its own snapshot in this composite exactly as
+ * its repository's /timeline reads it (timeline.ts), side by side. Each
+ * repository's bookmark, overlay, main base and merge base is its own; one
+ * without the timeline says so (`none`), one without an Atlas gives its facts
+ * and a `no-map` caveat, and neither fails the others. Files page by
+ * repository name then path, with namespaced ids; the cursor is bound to every
+ * repository's overlay, so a push to any of them stops the traversal
+ * (`timeline_changed`). Nothing is computed: no overlay, no regrouping.
+ */
+workspaceAtlas.get("/timeline", async (c) => {
+  const raw = c.req.query("ref") ?? "";
+  const within = c.req.query("within") || null;
+  const pinned = await pin<TimelineKey>(c, "timeline", { ref: raw, within });
+  if (pinned instanceof Response) return pinned;
+  const ref = raw.length <= 512 ? overlayRef(raw) : null;
+  if (!ref) return failWith(c, 400, "bad_request", "Pass ref=timeline/<slug>.");
+  const limit = limitOf(c);
+  if (limit instanceof Response) return limit;
+  const { ctx } = pinned;
+  const d1 = c.env.DB;
+
+  let withinEntity: AtlasEntitySummary | null = null;
+  if (within) {
+    const split = splitId(within, ctx.members);
+    const member = split && ctx.read.find((r) => r.id === split.member.id);
+    const entity =
+      split && member?.snapshot
+        ? await entityAt(d1, member.scope, member.snapshot.seq, split.id)
+        : null;
+    if (!entity || !member) return failWith(c, 404, "entity_unknown", ENTITY_UNKNOWN);
+    if (entity.kind !== "capability" && entity.kind !== "area")
+      return failWith(c, 400, "bad_request", "within names a capability or an area.");
+    withinEntity = inRepo(member.id, lean(entity));
+  }
+
+  // Each member's row, read as the caller again.
+  const actor = c.get("actor");
+  const rows = new Map(
+    (
+      await selectRepos(d1, actor?.id ?? "")
+        .where(
+          "r.id",
+          "in",
+          ctx.members.map((m) => m.id),
+        )
+        .where(readableRepo(actor))
+        .execute()
+    ).map((r) => [r.id, r]),
+  );
+  const knowledgeOn = Boolean(c.env.AI);
+  const parts: {
+    member: Read;
+    repo: AtlasTimelineRepo;
+    view: TimelineView | null;
+    /** The overlay its part was read from: every one binds the cursor. */
+    overlay: string | null;
+  }[] = [];
+  // Each repository's bookmarks are read at once; its rows one repository at a time.
+  const states = await Promise.all(
+    ctx.read.map(async (member) => {
+      const row = rows.get(member.id);
+      if (!row) return null;
+      return readTimelineState(c.env, row, ref, c.get("timing"), (work) =>
+        c.executionCtx.waitUntil(work),
+      );
+    }),
+  );
+  for (const [i, member] of ctx.read.entries()) {
+    const row = rows.get(member.id);
+    if (!row) continue;
+    const state = states[i] ?? null;
+    const snapshot = member.snapshot ? refOf(member.snapshot) : null;
+    if (!state) {
+      const projection = snapshot?.vector.find((v) => v.repoId === member.id)?.commit ?? null;
+      parts.push({
+        member,
+        repo: timelineAbsent(row, ref, projection),
+        view: null,
+        overlay: null,
+      });
+    } else if (!snapshot)
+      parts.push({
+        member,
+        repo: await timelineFacts(d1, row, state, knowledgeOn),
+        view: null,
+        overlay: state.row?.overlay_id ?? null,
+      });
+    else {
+      const view = await timelineView(d1, member.scope, snapshot, row, state, knowledgeOn);
+      parts.push({ member, repo: view.repo, view, overlay: view.overlayId });
+    }
+  }
+
+  const overlays = (await sha256(parts.map((p) => p.overlay ?? "-").join(","))).slice(0, 16);
+  const after = ctx.cursor?.after ?? null;
+  if (after && after[0] !== overlays)
+    return failWith(
+      c,
+      409,
+      "timeline_changed",
+      "The timeline was pushed again since this list started, so its changes were computed again. Start again.",
+    );
+
+  const ns = (repoId: string, r: AtlasChangeRef): AtlasChangeRef => ({
+    ...r,
+    id: qualify(repoId, r.id),
+  });
+  const repoName = new Map(ctx.members.map((m) => [m.id, m.name]));
+  const nameOf = (f: { repoId: string }) => repoName.get(f.repoId) ?? "";
+  const files: (AtlasTimelineFile & { repoId: string })[] = [];
+  for (const { member, view } of parts)
+    for (const f of view?.files ?? [])
+      files.push({
+        ...f,
+        id: qualify(member.id, f.id),
+        repoId: member.id,
+        placement: {
+          ...f.placement,
+          capability: f.placement.capability && ns(member.id, f.placement.capability),
+          area: f.placement.area && ns(member.id, f.placement.area),
+        },
+        regrouping: f.regrouping && {
+          ...f.regrouping,
+          capability: f.regrouping.capability && {
+            ...ns(member.id, f.regrouping.capability),
+            proposed: f.regrouping.capability.proposed,
+          },
+          area: f.regrouping.area && ns(member.id, f.regrouping.area),
+        },
+        imports: {
+          added: f.imports.added.map((r) => ns(member.id, r)),
+          removed: f.imports.removed.map((r) => ns(member.id, r)),
+        },
+      });
+  files.sort((a, b) => compareText(nameOf(a), nameOf(b)) || compareText(a.path, b.path));
+  const matching = within
+    ? files.filter((f) => f.placement.capability?.id === within || f.placement.area?.id === within)
+    : files;
+  const from = after
+    ? matching.findIndex(
+        (f) =>
+          compareText(nameOf(f), after[1]) > 0 ||
+          (nameOf(f) === after[1] && compareText(f.path, after[2]) > 0),
+      )
+    : 0;
+  const start = from === -1 ? matching.length : from;
+  const items = matching.slice(start, start + limit);
+  const last = matching[start + items.length - 1];
+
+  const regions: (AtlasTimelineRegion & { repoId: string })[] = parts.flatMap(({ member, view }) =>
+    (view?.regions ?? []).map((r) => ({
+      ...r,
+      id: qualify(member.id, r.id),
+      repoId: member.id,
+      proposed: r.proposed && {
+        ...r.proposed,
+        from: r.proposed.from.map((x) => ({ ...ns(member.id, x), share: x.share })),
+      },
+      regrouping: r.regrouping && {
+        ...r.regrouping,
+        into: r.regrouping.into.map((x) => ({
+          ...ns(member.id, x),
+          share: x.share,
+          proposed: x.proposed,
+        })),
+      },
+      areas: r.areas.map((a) => ns(member.id, a)),
+      imports: {
+        added: r.imports.added.map((x) => ns(member.id, x)),
+        removed: r.imports.removed.map((x) => ns(member.id, x)),
+      },
+    })),
+  );
+  const size = (r: AtlasTimelineRegion) => r.files.added + r.files.changed + r.files.removed;
+  regions.sort(
+    (a, b) =>
+      Number(a.id.endsWith("/group:unclassified")) - Number(b.id.endsWith("/group:unclassified")) ||
+      size(b) - size(a) ||
+      compareText(a.name, b.name) ||
+      compareText(a.id, b.id),
+  );
+
+  const paged = await page(
+    c,
+    ctx,
+    ctx.read,
+    items,
+    last && start + limit < matching.length
+      ? ([overlays, nameOf(last), last.path] as TimelineKey)
+      : null,
+    async () => matching.length,
+  );
+  const body: AtlasWorkspaceTimeline = {
+    ...paged,
+    counts: { ...paged.counts, unknownTotal: false },
+    ref: ref.replace(/^refs\/heads\//, ""),
+    timeline: ref.replace(/^refs\/heads\/timeline\//, ""),
+    repos: parts.map((p) => p.repo),
+    within: withinEntity,
+    regions: ctx.cursor ? null : regions.slice(0, ATLAS_TIMELINE_REGIONS),
+    regionCount: ctx.cursor ? null : parts.reduce((n, p) => n + (p.view?.regionCount ?? 0), 0),
+    wiki: Object.fromEntries(parts.map((p) => [p.member.id, p.view?.wiki ?? null])),
+    caveats: parts.flatMap(({ member, repo, view }) =>
+      view
+        ? view.caveats.map((caveat) => ({ ...caveat, repoId: member.id }))
+        : !member.snapshot && repo.state !== "none"
+          ? [{ code: "no-map" as const, repoId: member.id }]
+          : [],
+    ),
+  };
+  return c.json(body);
 });

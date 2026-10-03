@@ -1,8 +1,9 @@
 // Timelines in Atlas terms (CORE-176) against real D1 projections of the
 // Atlas fixture and a stored knowledge overlay of the fixture timeline,
 // through the Atlas API and its browser client: changed files placed in
-// capabilities (main's placement, provisional for new files, unclassified
-// with nothing to go by), imports that reach another capability, per-repo
+// capabilities (main's placement, provisional for new files until the
+// timeline's regrouping is computed, unclassified with nothing to go by;
+// computed placements in timelineGrouping.test.ts), imports that reach another capability, per-repo
 // base/head/merge-base and freshness against the snapshot on screen, exact
 // capability filtering and paging, an ended overlay read without being
 // recomputed, and wiki pages reachable from the capabilities they're about.
@@ -47,6 +48,15 @@ const C1 = "1".repeat(40);
 const C2 = "2".repeat(40);
 const TIP = "7".repeat(40);
 const REF = "refs/heads/timeline/plan";
+/** The fixture timeline's regrouping: over search and billing's ledger, against #1. */
+const COMPUTED = {
+  code: "regrouping",
+  state: "computed",
+  seq: 1,
+  basis: "same",
+  capabilities: 2,
+  files: 13,
+} as const;
 
 function forbidden(name: string, touched: string[]) {
   return new Proxy(
@@ -140,6 +150,9 @@ describe("Timelines in the Atlas", () => {
   test("a timeline's files are placed in capabilities, with what's inferred said so", async () => {
     const s = setup();
     const { main } = await planned(s);
+    // An overlay whose regrouping isn't computed yet (as one kept before
+    // CORE-186): new files are placed by inference, and that's said.
+    s.sqlite.exec("DELETE FROM atlas_timeline_regroupings");
     const { first, items } = await all();
 
     expect(first.snapshot.id).toBe(main.snapshotId);
@@ -167,7 +180,7 @@ describe("Timelines in the Atlas", () => {
         graph: { symbol: { added: 1, changed: 0, removed: 0 } },
       }),
     ]);
-    expect(first.caveats).toEqual([{ code: "regrouping" }]);
+    expect(first.caveats).toEqual([{ code: "regrouping", state: "pending" }]);
 
     const byPath = new Map(items.map((f) => [f.path, f]));
     expect([...byPath.keys()]).toEqual([
@@ -238,7 +251,7 @@ describe("Timelines in the Atlas", () => {
         name: search.name,
         files: { added: 1, changed: 1, removed: 0 },
         provisional: 1,
-        classes: { source: 2, summary: 0, other: 0 },
+        classes: { source: 2, summary: 0, other: 0, regrouping: 0 },
         imports: { added: [billing], removed: [] },
       }),
       expect.objectContaining({
@@ -296,7 +309,9 @@ describe("Timelines in the Atlas", () => {
     // Pinned to the snapshot it was measured against, it's the same main.
     const then = await atlasApi.timeline(repo, "timeline/plan", { snapshot: main.snapshotId });
     expect(then.repos[0]).toMatchObject({ projectionCommit: C1, base: "same" });
-    expect(then.caveats).toEqual([{ code: "regrouping" }]);
+    expect(then.caveats).toEqual([COMPUTED]);
+    // Against the newer map, its regrouping says it was computed on an older one.
+    expect(now.caveats).toContainEqual({ ...COMPUTED, basis: "older" });
   });
 
   test("an ended timeline is read as kept, and reading it changes nothing", async () => {
@@ -322,9 +337,11 @@ describe("Timelines in the Atlas", () => {
       ended: { reason: "landed" },
     });
     expect(items).toHaveLength(4);
-    expect(first.caveats).toEqual([{ code: "regrouping" }]);
+    expect(first.caveats).toEqual([COMPUTED]);
+    const regrouping = s.sqlite.prepare("SELECT * FROM atlas_timeline_regroupings").all();
     await all({ limit: 1 });
     expect(kept()).toEqual(before);
+    expect(s.sqlite.prepare("SELECT * FROM atlas_timeline_regroupings").all()).toEqual(regrouping);
     expect(s.sqlite.prepare("SELECT count(*) AS n FROM kg_overlay_changes").get()).toEqual(changes);
     expect(s.touched).toEqual([]);
   });

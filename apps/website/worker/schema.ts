@@ -290,6 +290,19 @@ export interface Database {
     summary: Generated<string>;
     detail: Generated<string>;
   };
+  /** A timeline overlay's computed regrouping (CORE-186, atlas/timelineGrouping.ts). */
+  atlas_timeline_regroupings: {
+    repo_id: string;
+    overlay_id: string;
+    snapshot_id: string | null;
+    seq: number | null;
+    version: number;
+    grouping_version: number;
+    state: "computed" | "skipped";
+    reason: string | null;
+    data: string | null;
+    created_at: string;
+  };
   /** Wiki pages for a timeline at a checkpoint, or on demand (CORE-84). */
   kg_page_sets: {
     repo_id: string;
