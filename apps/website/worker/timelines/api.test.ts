@@ -58,6 +58,9 @@ async function setup() {
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
+    // Landing (CORE-77) starts merge runs: their Workflow is a no-op here.
+    CI_RUNNER: "local",
+    CI_RUN: { create: async () => ({}) },
     TRACKER: {
       getByName: (id: string) => {
         if (!trackers.has(id)) {
@@ -333,6 +336,7 @@ describe("checkpoints", () => {
     await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
     expect((await t.call("bot", "POST", "/search/checkpoints", {})).body.code).toBe("no_work");
 
+    t.git.commits.add(oid(9));
     t.app.refs.set("refs/heads/timeline/search", oid(9));
     t.sqlite.exec(`
       INSERT INTO change_refs (repo_id, change_id, ref, first_commit_oid, first_update_id, last_commit_oid)
@@ -480,6 +484,7 @@ describe("approving a checkpoint", () => {
   test("the inbox shows the checkpoint; only a person with write access approves the head", async () => {
     const t = await setup();
     await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    t.git.commits.add(oid(9));
     t.app.refs.set("refs/heads/timeline/search", oid(9));
     const made = (await t.call("bot", "POST", "/search/checkpoints", { summary: "Ready" }))
       .body as CheckpointView;
@@ -533,6 +538,7 @@ describe("approving a checkpoint", () => {
     expect((await mutate("ben", answer)).status).toBe(200);
     const after = (await t.call("ben", "GET", "/search/checkpoints/1")).body as CheckpointView;
     expect(after).toMatchObject({ approved: true, approval: { state: "approved", by: "ben" } });
-    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("active");
+    // Approved while it's the head: the approval timeline enters the landing queue (CORE-77).
+    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("landing");
   });
 });

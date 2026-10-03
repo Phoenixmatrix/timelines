@@ -781,6 +781,8 @@ wire types.
 | `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                        |
 | `POST /api/tracker/:owner/timelines/:slug/abandon`      | Record the abandon event with each bookmark's last commit, then delete the bookmarks              |
 | `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data       |
+| `POST /api/tracker/:owner/timelines/:slug/land`         | Queue the head checkpoint to land (`LandResult`), or 409 with why not                             |
+| `GET /api/tracker/:owner/timelines/:slug/landing`       | `{landing}`: its newest landing, or null                                                          |
 
 - **Forking** needs tracker membership and write access to each repository,
   which must belong to the tracker's account. Each bookmark starts at the
@@ -814,6 +816,59 @@ wire types.
 - **Abandoning** is for the timeline's accountable person, acting as
   themselves, and the agent that started it. Abandoning again retries the
   bookmarks still there and records nothing new.
+- **Landing** (CORE-77, `worker/timelines/landing.ts`) merges the head
+  checkpoint into each repository's current main, tests the merge, and only
+  then advances main to it. An `auto` timeline queues itself when its
+  checkpoint is green (each repository's newest CI run of its commit on the
+  bookmark succeeded; a repository with no run has nothing to wait for), an
+  `approval` one when a person approves the checkpoint while it's still the
+  head; `gm timeline land`, the inspector's Land button and `POST …/land`
+  queue it by hand (write access to every repository) or say why not
+  (`needs_approval`, `not_green`, `checkpoint_stale`, `no_checkpoint`). The
+  experimental flag changes nothing. A landing (`Landing` in
+  `shared/timelines.ts`) lives in the tracker beside its timeline, which is
+  `landing` meanwhile. Per repository:
+  1. The Worker points `refs/heads/gitmatrix/landing/<slug>` at the
+     checkpoint's commit and starts a merge run there: one Gitmatrix job
+     (`land`, `worker/ci/landing.ts`), not the repository's ci.yml. It asks
+     `POST /api/repos/:o/:n/landing/credential` with its job credential for
+     the landing credential (a short-lived Artifacts write token for that
+     repository, given only to a running landing merge job), fetches main,
+     merges the checkpoint with `--no-ff` into the main commit the landing
+     pinned, and force-pushes the merge to the landing branch. A conflict
+     exits 42 and lists the files.
+  2. The Worker checks the merge's parents (main's pinned commit, then the
+     checkpoint's), then runs the repository's pipeline on it: jobs see
+     `trigger == "landing"` and `branch == "gitmatrix/landing/<slug>"`, so
+     `branch == "main"` deploys don't run. Like a preview run, it is stored as
+     `manual` with its landing (`ci_runs.landing_id`, as is the merge run),
+     and the API, the CI pages and `GITMATRIX_TRIGGER` report it as
+     `landing`; no ci.yml, or no job for it, means nothing gates it.
+  3. Only once every repository's merge passed does any main move: one
+     repository at a time, a compare-and-swap from the pinned commit to the
+     merge, then what a push to main sets off (`git/effects.ts`: the push log
+     and timeline activity, CI on main, the mirror, knowledge, release notes).
+     A main that moved since is merged and tested again (five tries); once
+     another repository advanced, the timeline is `partly_landed`.
+  4. When every main advanced, the tracker folds the timeline's view into
+     main and records it `landed` (with `endedAt`) in one transaction: its
+     issues are done and their retained leases released. Its bookmarks and
+     landing branches are deleted after that, so knowledge overlays end as
+     landed.
+
+  There is no automatic sync: a conflict stops the landing (`conflict`, with
+  the timeline back to `active`) and asks for one in its reason and the
+  timeline's events: merge main into the timeline, push, make a new
+  checkpoint, and land that. Failing gates stop it too (`failed`); main never
+  advances to a merge that wasn't tested. A green checkpoint doesn't retry a
+  stopped landing on its own; landing again by hand does. Each step reads the
+  landing's version, its runs and the refs afresh and acts idempotently: the
+  end of each CI run moves it on (`CiRun`'s `landing` step), and so do the
+  hourly cron and `gm timeline land`. Landings proceed in parallel and
+  serialize at the compare-and-swap: one that lost the race merges onto the
+  new main and tests again. Timeline events record `landing` outcomes
+  (`queued`, `conflict`, `failed`, `partly_landed`, `landed`); abandoning a
+  timeline that is landing stops the landing.
 
 **Views.** Issues have a view per timeline, projected from the one event log
 (`worker/tracker/views.ts`). A mutation request with `timeline: <slug>` is
@@ -1172,7 +1227,7 @@ jobs:
       - run: vp test
   deploy:
     needs: [test] # runs only if test succeeded
-    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger, commit, runner, action
+    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger (push, manual, preview, landing), commit, runner, action
     secrets: [CLOUDFLARE_API_TOKEN] # `gm secret set`, masked in logs
     timeout_minutes: 15 # default 20
     instance: standard-2 # sandbox size (default standard-1)

@@ -1,24 +1,17 @@
 import { Hono, type Context } from "hono";
 import type { AppEnv } from "../auth.ts";
-import {
-  findAccountBySlug,
-  findRepo,
-  roleFor,
-  visibleRepos,
-  type AccountRow,
-  type Actor,
-} from "../db.ts";
+import { findAccountBySlug, findRepo, roleFor, visibleRepos, type Actor } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type {
+  HumanRequest,
   OpenRequest,
   OpenRequests,
-  TrackerAgent,
-  TrackerIdentity,
   TrackerList,
   TrackerView,
   TrackerOwner,
 } from "../../shared/tracker.ts";
 import { TrackerError, validateRequest, type Access } from "./store.ts";
+import { accessFor } from "./access.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
 import {
@@ -76,62 +69,7 @@ export async function authorize(c: Context<AppEnv>, includeMembers = true): Prom
       throw new TrackerError(403, "forbidden", "Tracker access requires account membership.");
     canAdmin = membership.role === "owner";
   }
-  const members: AccountRow[] = !includeMembers
-    ? []
-    : owner.kind === "user"
-      ? [owner]
-      : await gitmatrixDb(c.env.DB)
-          .selectFrom("accounts as a")
-          .innerJoin("org_members as m", "m.user_id", "a.id")
-          .selectAll("a")
-          .where("m.org_id", "=", owner.id)
-          .orderBy("a.slug")
-          .execute();
-  const identities = members.map((m): TrackerIdentity => ({
-    id: m.id,
-    slug: m.slug,
-    displayName: m.display_name,
-  }));
-  return {
-    // An agent's actions are its own; its human's memberships let it in.
-    actorId: actor.agent?.id ?? actor.id,
-    principalId: actor.id,
-    owner: { id: owner.id, slug: owner.slug, displayName: owner.display_name },
-    canAdmin,
-    members: identities,
-    agents: await agentsOf(c.env.DB, identities),
-    repos: [],
-  };
-}
-/** Every agent accountable to these members, revoked ones included so history still names them. */
-async function agentsOf(d1: D1Database, members: TrackerIdentity[]): Promise<TrackerAgent[]> {
-  if (!members.length) return [];
-  const byId = new Map(members.map((m) => [m.id, m]));
-  const rows = await gitmatrixDb(d1)
-    .selectFrom("agents")
-    .select([
-      "id",
-      "name",
-      "accountable_id",
-      "capabilities",
-      "capabilities_updated_at",
-      "revoked_at",
-    ])
-    .where(
-      "accountable_id",
-      "in",
-      members.map((m) => m.id),
-    )
-    .orderBy("name")
-    .execute();
-  return rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    accountable: byId.get(row.accountable_id)!,
-    capabilities: row.capabilities === null ? null : JSON.parse(row.capabilities),
-    capabilitiesUpdatedAt: row.capabilities_updated_at,
-    revokedAt: row.revoked_at,
-  }));
+  return accessFor(c.env.DB, owner, actor.id, actor.agent?.id ?? null, canAdmin, includeMembers);
 }
 /** `?timeline=<slug>`: a timeline's view instead of main's. */
 function timelineParam(c: Context<AppEnv>): string | undefined {
@@ -396,10 +334,38 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
   if (request.mutations.some((mutation) => mutation.kind === "request.answer"))
     access.writableRepoIds = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
   const result = await trackerObject(c.env, access.owner.id).mutate(access, request);
-  if (result.ok)
+  if (result.ok) {
     c.executionCtx.waitUntil(
       refreshAfterTrackerMutation(c.env, access.owner.id, result.value, removedRepoIds),
     );
+    // A person approved a checkpoint: an approval timeline lands it (CORE-77).
+    const approved = new Set(
+      request.mutations
+        .filter((m) => m.kind === "request.answer" && m.data.approved === true)
+        .map((m) => m.id),
+    );
+    const slugs = new Set(
+      result.value.events.flatMap((event) => {
+        const entity = event.entity as HumanRequest | null;
+        return event.entityType === "request" && approved.has(event.entityId) && entity?.checkpoint
+          ? [entity.checkpoint.timeline]
+          : [];
+      }),
+    );
+    // Loaded only then: the queue reaches CI, git and knowledge.
+    if (slugs.size)
+      c.executionCtx.waitUntil(
+        import("../timelines/landing.ts").then(async ({ maybeLand, settled }) => {
+          for (const slug of slugs)
+            await settled(c.env, (deps) =>
+              maybeLand(c.env, deps, access.owner.id, slug, "approval", {
+                principalId: access.principalId,
+                agentId: null,
+              }),
+            );
+        }),
+      );
+  }
   return response(c, result);
 });
 tracker.get("/repos/:owner/:name/tracker", async (c) => {

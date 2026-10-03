@@ -47,6 +47,16 @@ describe("previewExpiry", () => {
     expect(at(null, ago(5))).toBe(ago(-2));
   });
 
+  test("an ended timeline counts from when it ended, not its later changes", () => {
+    // Landed 3 days ago, renamed yesterday: two days after landing has passed.
+    const landed = { ...timeline("a", "landed", 5, 1), endedAt: ago(3) };
+    expect(at(landed)).toBe(ago(1));
+    const abandoned = { ...timeline("a", "abandoned", 5, 0), endedAt: ago(1) };
+    expect(at(abandoned)).toBe(ago(-1));
+    // A record from before endedAt ended at its last change.
+    expect(at({ ...timeline("a", "landed", 5, 1), endedAt: null })).toBe(ago(-1));
+  });
+
   test("a revived preview counts from its revival", () => {
     expect(at(timeline("a", "landed", 20, 10), ago(1), true)).toBe(ago(-1));
     expect(at(timeline("a", "active", 20), ago(1), true)).toBe(ago(-6));

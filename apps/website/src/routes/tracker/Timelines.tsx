@@ -45,6 +45,7 @@ import {
 import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./TimelineLanes.tsx";
 import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
+import { LandingPanel } from "./Landing.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -681,6 +682,8 @@ function TimelineDetails({
       </ul>
 
       <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} />
+
+      <LandingPanel owner={data.owner.slug} timeline={timeline} onChange={onChange} />
 
       <TimelineIssues timeline={timeline} data={data} />
 

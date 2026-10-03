@@ -176,3 +176,40 @@ describe("preview runs", () => {
     expect(env.GITMATRIX_PREVIEW_ACTION).toBeUndefined();
   });
 });
+
+describe("landing runs", () => {
+  test("the gates on a landing's merge are stored as manual with their landing, and say landing", async () => {
+    const t = setup();
+    files.ciYml = `
+jobs:
+  test:
+    steps: [vp test]
+  gate:
+    if: trigger == "landing"
+    steps: [./gate.sh]
+  deploy:
+    if: branch == "main"
+    steps: [./deploy.sh]
+`;
+    const started = await t.start({
+      branch: "gitmatrix/landing/search",
+      trigger: "landing",
+      preview: undefined,
+      landingId: "ld_1",
+    });
+    if (!("runId" in started)) throw new Error(started.skipped);
+    expect(
+      t.sqlite
+        .prepare("SELECT trigger, landing_id, preview_action FROM ci_runs WHERE id = ?")
+        .get(started.runId),
+    ).toEqual({ trigger: "manual", landing_id: "ld_1", preview_action: null });
+    expect(t.jobs(started.runId).map((j) => [j.name, j.status])).toEqual([
+      ["deploy", "skipped"],
+      ["gate", "pending"],
+      ["test", "pending"],
+    ]);
+    const job = await loadJob(t.env.DB, t.jobs(started.runId).find((j) => j.name === "gate")!.id);
+    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
+  });
+});

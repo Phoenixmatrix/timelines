@@ -10,8 +10,12 @@ import { db, nowIso } from "../schema.ts";
 
 export const JOB_TOKEN_PREFIX = "gmj_";
 
-/** Paths a job's credential may call: its repository's deployments and environments. */
-const JOB_PATHS = /^\/api\/repos\/[^/]+\/[^/]+\/(?:deployments|environments)(?:\/|$)/;
+/**
+ * Paths a job's credential may call: its repository's deployments and
+ * environments, and a landing's merge job its landing credential (ci/landing.ts).
+ */
+const JOB_PATHS =
+  /^\/api\/repos\/[^/]+\/[^/]+\/(?:deployments|environments|landing\/credential)(?:\/|$)/;
 
 export interface JobCaller {
   jobId: string;

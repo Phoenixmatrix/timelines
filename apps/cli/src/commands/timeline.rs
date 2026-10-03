@@ -24,6 +24,11 @@
 //!   checkpoint (CORE-84) in each of its repositories; `--write` asks for them
 //!   at the bookmarks' tips now, and `--page` prints one in full.
 //!
+//! - `land` queues the head checkpoint to land (CORE-77): a CI job merges it
+//!   into each repository's current main, the repository's gates run on the
+//!   merge, and only then does main advance to it. It says why not when the
+//!   timeline can't land yet (no approval, not green, new commits).
+//!
 //! `GM_TIMELINE` overrides the binding for one command (`profile::timeline`).
 
 use super::{Ctx, local, network, server};
@@ -62,6 +67,8 @@ pub enum TimelineCommand {
     Revive(ReviveArgs),
     /// The wiki pages a timeline affects, written at its checkpoints (or now, with --write)
     Pages(PagesArgs),
+    /// Land a timeline (default: this checkout's): merge its head checkpoint into main, test the merge, then advance main; or say why it can't land yet
+    Land(LandArgs),
     /// Rename a timeline (default: this checkout's), or flag it experimental or clear the flag
     #[command(visible_alias = "flag")]
     Update(UpdateArgs),
@@ -110,6 +117,14 @@ pub struct PagesArgs {
     /// Print one page in full, by its wiki slug (e.g. components/src-web or glossary).
     #[arg(long)]
     pub page: Option<String>,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct LandArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
     #[command(flatten)]
     pub owner: Owner,
 }
@@ -256,6 +271,7 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Checkpoints(a) => checkpoints(ctx, a),
         TimelineCommand::Revive(a) => revive(ctx, a),
         TimelineCommand::Pages(a) => pages(ctx, a),
+        TimelineCommand::Land(a) => land(ctx, a),
         TimelineCommand::Update(a) => update(ctx, a),
     }
 }
@@ -476,6 +492,15 @@ fn event_line(e: &Value) -> String {
             e["number"],
             e["outcome"].as_str().unwrap_or("?")
         ),
+        "landing" => format!(
+            "landing checkpoint #{}: {}{}",
+            e["number"],
+            e["outcome"].as_str().unwrap_or("?").replace('_', " "),
+            e["note"]
+                .as_str()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default()
+        ),
         kind => kind.to_string(),
     };
     format!("  #{:<5} {at}  {what}", e["seq"])
@@ -576,8 +601,123 @@ fn show(ctx: &Ctx, args: &ShowArgs) -> Result<Shown> {
     if let Some(next) = value["next"].as_u64() {
         text.push_str(&format!("More events: --after {next}\n"));
     }
+    // Its newest landing (CORE-77); a server without the landing queue has none.
+    if let Ok(landing) = remote::api(
+        &config,
+        "GET",
+        &format!("{}/{slug}/landing", base(&owner)),
+        None,
+    ) && landing["landing"].is_object()
+    {
+        text.push_str(&landing_text(&landing["landing"]));
+        value["landing"] = landing["landing"].clone();
+    }
     value["current"] = json!(current().as_deref() == Some(slug.as_str()));
     Ok(Shown { value, text })
+}
+
+// ---- landing -----------------------------------------------------------------------
+
+/// A landing (CORE-77) as text: its state, each repository's merge, and why it stopped.
+fn landing_text(l: &Value) -> String {
+    let state = match l["state"].as_str().unwrap_or("?") {
+        "merging" => "merging into main",
+        "testing" => "testing the merge",
+        "advancing" => "advancing main",
+        "conflict" => "stopped: conflicts with main, needs a sync",
+        "failed" => "stopped",
+        "landed" => "landed",
+        other => other,
+    };
+    let mut out = format!(
+        "Landing  : checkpoint #{} ({}), {state}\n",
+        l["checkpointNumber"],
+        l["trigger"].as_str().unwrap_or("?")
+    );
+    for r in l["repos"].as_array().into_iter().flatten() {
+        let runs = [("merge", &r["mergeRun"]), ("gates", &r["gateRun"])]
+            .iter()
+            .filter_map(|(what, run)| {
+                run["number"]
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .map(|n| format!("{what} run #{n}"))
+            })
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "  {}/{:<20} {:<9} {} onto {}{}{}\n",
+            r["owner"].as_str().unwrap_or("?"),
+            r["name"].as_str().unwrap_or("?"),
+            r["state"].as_str().unwrap_or("?"),
+            short(&r["commit"]),
+            short(&r["base"]),
+            if r["merge"].is_string() {
+                format!(" as {}", short(&r["merge"]))
+            } else {
+                String::new()
+            },
+            if runs.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", runs.join(", "))
+            },
+        ));
+    }
+    if let Some(reason) = l["reason"].as_str() {
+        out.push_str(&format!("  {reason}\n"));
+    }
+    out
+}
+
+fn land(ctx: &Ctx, args: &LandArgs) -> Result<Shown> {
+    let slug = named_or_current(&args.slug, "land")?;
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    if ctx.dry_run {
+        let record = fetch_record(&config, &owner, &slug)?;
+        if let Some(status) = ended(&record) {
+            return Err(GmError::new(
+                "timeline_ended",
+                format!("Timeline {slug} is already {status}."),
+            )
+            .exit(exit::CONFLICT));
+        }
+        return Ok(Shown {
+            text: format!(
+                "dry run: nothing was changed\nWould queue timeline {slug}'s head checkpoint to land in {}: merge it into main, test the merge, then advance main.\nThe server checks it can land ({} policy).",
+                repo_names(Some(&record)),
+                record["policy"].as_str().unwrap_or("?")
+            ),
+            value: json!({"dry_run": true, "owner": owner, "timeline": record}),
+        });
+    }
+    let result = remote::api(
+        &config,
+        "POST",
+        &format!("{}/{slug}/land", base(&owner)),
+        Some(&json!({})),
+    )?;
+    let landing = &result["landing"];
+    let mut text = if result["queued"].as_bool() == Some(true) {
+        format!("Queued timeline {slug} to land.\n")
+    } else if landing["state"] == "landed" {
+        format!("Timeline {slug} landed.\n")
+    } else {
+        format!("Timeline {slug} is already landing.\n")
+    };
+    text.push_str(&landing_text(landing));
+    if matches!(
+        landing["state"].as_str(),
+        Some("merging" | "testing" | "advancing")
+    ) {
+        text.push_str(&format!(
+            "Main moves once every merge passes its gates; follow it with `gm timeline show {slug}`.\n"
+        ));
+    }
+    Ok(Shown {
+        value: json!({"owner": owner, "landing": landing, "queued": result["queued"]}),
+        text,
+    })
 }
 
 // ---- checkpoints -------------------------------------------------------------------
@@ -1699,6 +1839,32 @@ mod tests {
         let text = checkpoint_text(&view);
         assert!(text.contains("https://p.example (active, rebuilt)"));
         assert!(text.contains("preview expired"));
+    }
+
+    #[test]
+    fn landings_read_as_their_state_and_merges() {
+        let l = json!({
+            "checkpointNumber": 3, "trigger": "approval", "state": "conflict",
+            "reason": "Checkpoint #3 conflicts with orbit/app's main.",
+            "repos": [{
+                "owner": "orbit", "name": "app", "state": "conflict",
+                "commit": "a".repeat(40), "base": "b".repeat(40), "merge": null,
+                "mergeRun": {"id": "r", "number": 12}, "gateRun": null,
+            }],
+        });
+        let text = landing_text(&l);
+        assert!(
+            text.starts_with("Landing  : checkpoint #3 (approval), stopped: conflicts with main"),
+            "{text}"
+        );
+        assert!(text.contains("orbit/app"), "{text}");
+        assert!(
+            text.contains("aaaaaaaaaaaa onto bbbbbbbbbbbb  (merge run #12)"),
+            "{text}"
+        );
+        assert!(text.contains("conflicts with orbit/app's main"));
+        let e = json!({"kind": "landing", "seq": 9, "number": 3, "outcome": "partly_landed", "note": null, "createdAt": "t"});
+        assert!(event_line(&e).ends_with("landing checkpoint #3: partly landed"));
     }
 
     #[test]

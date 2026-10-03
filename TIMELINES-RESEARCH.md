@@ -435,6 +435,11 @@ returns:
   merged result). If it conflicts, landing stops and asks for a sync: a person
   merges main into the timeline, or asks an agent to. That creates a new
   checkpoint, which needs approval again.
+- **As built (CORE-77):** the merge job pushes to
+  `gitmatrix/landing/<slug>`, where the repository's own pipeline runs with
+  `trigger == "landing"`; landings run in parallel and serialize at each
+  main's compare-and-swap, so one that lost the race merges onto the new main
+  and is tested again. `apps/website/README.md` ("Landing") has the details.
 
 ### Tracker
 

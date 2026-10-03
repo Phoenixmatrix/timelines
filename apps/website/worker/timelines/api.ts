@@ -17,6 +17,9 @@
 //
 // A new checkpoint starts a preview `create` run in each of its repositories
 // whose ci.yml opts in with `on: preview` (worker/deployments/previews.ts).
+//   POST   /:slug/land        queue a landing of its head checkpoint (CORE-77),
+//                             or say why it can't land yet
+//   GET    /:slug/landing     its newest landing, if any
 //
 // Any tracker member (person or agent) with write access to the repositories
 // may fork; abandoning is checked by the tracker (timelines.ts). Bookmarks are
@@ -42,6 +45,8 @@ import {
   type CheckpointList,
   type CheckpointView,
   type PreviewRevival,
+  type Landing,
+  type LandResult,
 } from "../../shared/timelines.ts";
 import { previewCheckpoint, reviveCheckpoint } from "../deployments/previews.ts";
 import { previewSettings } from "../deployments/settings.ts";
@@ -51,8 +56,9 @@ import { TrackerError, fail, text } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { timelineSlug, timelineStatus } from "../tracker/timelines.ts";
 import { logPush } from "./activity.ts";
-import { measure, mayWriteAll, view } from "./checkpoints.ts";
+import { measure, mayWriteAll, view, writableRepoIds } from "./checkpoints.ts";
 import { requestCheckpointPages } from "../knowledge/coordinator.ts";
+import { maybeLand, requestLanding, settled, workerDeps } from "./landing.ts";
 import { writeRefs, type RefWrite } from "./bookmarks.ts";
 
 /** Repositories one timeline may touch. */
@@ -369,6 +375,11 @@ timelines.post("/:slug/checkpoints", async (c) => {
   waitUntil(previewCheckpoint(c.env, state.checkpoint, timeline, actor, waitUntil));
   // The timeline's wiki pages (CORE-84), queued after the answer too.
   waitUntil(requestCheckpointPages(c.env, state.checkpoint, timeline.slug, actor.id));
+  // Green already? An auto timeline lands it (CORE-77).
+  if (timeline.policy === "auto")
+    waitUntil(
+      settled(c.env, (deps) => maybeLand(c.env, deps, access.owner.id, timeline.slug, "auto")),
+    );
   return c.json<CheckpointView>(await view(c.env, state, timeline), 201);
 });
 
@@ -394,4 +405,30 @@ timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
     { checkpoint: await view(c.env, state, timeline), runs },
     runs.some((run) => "number" in run) ? 201 : 200,
   );
+});
+
+timelines.post("/:slug/land", async (c) => {
+  const access = await authorize(c, true);
+  const actor = c.get("actor")!;
+  const tracker = trackerObject(c.env, access.owner.id);
+  const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
+  // Landing moves main: it needs write access to every repository it lands in.
+  const writable = await writableRepoIds(c.env.DB, actor, access.owner.id);
+  for (const repo of timeline.repos)
+    if (!writable.includes(repo.id))
+      fail("forbidden", `Landing needs write access to ${repo.owner}/${repo.name}.`, 403);
+  const result = await requestLanding(
+    c.env,
+    workerDeps(c.env, (work) => c.executionCtx.waitUntil(work)),
+    access,
+    timeline.slug,
+    "request",
+  );
+  return c.json<LandResult>(result, result.queued ? 202 : 200);
+});
+
+timelines.get("/:slug/landing", async (c) => {
+  const access = await authorize(c, false);
+  const landing = unwrap(await trackerObject(c.env, access.owner.id).landing(c.req.param("slug")));
+  return c.json<{ landing: Landing | null }>({ landing });
 });

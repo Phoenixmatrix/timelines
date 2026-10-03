@@ -22,6 +22,8 @@ async function setup() {
       ('run2', 'repo', 2, '${oid(2)}', 'timeline/fast-search', 'push', 'failed'),
       ('run3', 'repo', 3, '${oid(3)}', 'topic', 'push', 'succeeded'),
       ('run4', 'repo', 4, '${oid(4)}', 'timeline/fast-search', 'push', 'succeeded');
+    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, landing_id) VALUES
+      ('run5', 'repo', 5, '${oid(5)}', 'gitmatrix/landing/fast-search', 'manual', 'running', 'ld_1');
   `);
   const env = { DB: d1(sqlite) } as unknown as Env;
   const app = new Hono<AppEnv>();
@@ -46,7 +48,14 @@ describe("CI runs list", () => {
   test("lists every branch's runs, newest first", async () => {
     const get = await setup();
     const { json } = await get("/api/repos/ann/app/ci");
-    expect(json.runs.map((run) => run.number)).toEqual([4, 3, 2, 1]);
+    expect(json.runs.map((run) => run.number)).toEqual([5, 4, 3, 2, 1]);
+    // A landing's run (CORE-77) is stored as manual and reported as a landing.
+    expect(json.runs[0]).toMatchObject({
+      trigger: "landing",
+      landing: { id: "ld_1", timeline: "fast-search" },
+      preview: null,
+    });
+    expect(json.runs[1]).toMatchObject({ trigger: "push", landing: null });
   });
 
   test("?ref= lists one branch's runs: a timeline's bookmark in its scope", async () => {

@@ -229,9 +229,11 @@ const previewLabel = (preview: NonNullable<CiRunSummary["preview"]>) =>
 const trigger = (run: CiRunSummary) =>
   run.preview
     ? `${previewLabel(run.preview)}${run.actor ? ` for ${runBy(run)}` : ""}`
-    : run.trigger === "manual"
-      ? `started by ${runBy(run) ?? "someone"}`
-      : `pushed${run.actor ? ` by ${runBy(run)}` : ""}`;
+    : run.landing
+      ? `landing${run.landing.timeline ? ` ${run.landing.timeline}` : ""}${run.actor ? ` for ${runBy(run)}` : ""}`
+      : run.trigger === "manual"
+        ? `started by ${runBy(run) ?? "someone"}`
+        : `pushed${run.actor ? ` by ${runBy(run)}` : ""}`;
 
 function RunRow({ run }: { run: CiRunSummary }) {
   const repo = useRepo();
@@ -682,6 +684,11 @@ export function CiRun() {
                 <>
                   {previewLabel(run.preview).replace(/^p/, "P")}
                   {run.preview.timeline && <> of {run.preview.timeline}</>}
+                  {run.actor ? ` for ${runBy(run)}` : " by Gitmatrix"}{" "}
+                </>
+              ) : run.landing ? (
+                <>
+                  Landing{run.landing.timeline && <> of {run.landing.timeline}</>}
                   {run.actor ? ` for ${runBy(run)}` : " by Gitmatrix"}{" "}
                 </>
               ) : (

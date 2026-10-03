@@ -173,6 +173,13 @@ export function CheckpointPanel({
           needs to make a new checkpoint and ask again.
         </p>
       )}
+      {view.current && !view.approved && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          {timeline.policy === "approval"
+            ? "Approving lands it: the checkpoint is merged into main and tested, and main moves only if that passes."
+            : "It lands once its CI is green; the merge into main is tested before main moves."}
+        </p>
+      )}
       {checkpoint.summary && (
         <div className="max-w-[72ch] text-body">
           <MarkdownText text={checkpoint.summary} />

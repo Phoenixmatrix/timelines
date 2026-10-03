@@ -20,6 +20,7 @@ import { stages, type JobSpec } from "./config.ts";
 import { doneEvent, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
 import { startWorkflow, type RunParams } from "./trigger.ts";
+import { afterRun, settled } from "../timelines/landing.ts";
 
 interface PlannedJob {
   id: string;
@@ -132,6 +133,12 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .where("id", "=", runId)
         .executeTakeFirstOrThrow();
       return releaseHeld(this.env.DB, run.repo_id, run.ref, (id) => startWorkflow(this.env, id));
+    });
+
+    // A landing's merge or gates move the landing on; a timeline's own run may
+    // make its checkpoint green (CORE-77). Never throws.
+    await step.do("landing", DB_STEP, async () => {
+      await settled(this.env, (deps) => afterRun(this.env, deps, runId));
     });
   }
 

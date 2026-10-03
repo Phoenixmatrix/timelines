@@ -2,13 +2,14 @@ import { DurableObject } from "cloudflare:workers";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
 import {
   type TimelineStore,
+  type LandingRequest,
   type NewCheckpoint,
   type NewTimeline,
   type PushActivity,
 } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
 import type { SearchQuery } from "../search/query.ts";
-import type { TimelineStatus } from "../../shared/timelines.ts";
+import type { Landing, TimelineStatus } from "../../shared/timelines.ts";
 
 export type TrackerReply<T> =
   | { ok: true; value: T }
@@ -145,5 +146,41 @@ export class Tracker extends DurableObject<Env> {
   }
   createCheckpoint(access: Access, slug: string, input: NewCheckpoint) {
     return this.reply(() => this.timelines.createCheckpoint(access, slug, input));
+  }
+  // ---- landing (CORE-77) -----------------------------------------------------
+  landing(slug: string) {
+    return this.reply(() => this.timelines.landing(slug));
+  }
+  landingForRun(slug: string, runId: string) {
+    return this.reply(() => this.timelines.landingForRun(slug, runId));
+  }
+  activeLandings() {
+    return this.reply(() => this.timelines.activeLandings());
+  }
+  beginLanding(access: Access, slug: string, request: LandingRequest) {
+    return this.reply(() => this.timelines.beginLanding(access, slug, request));
+  }
+  saveLanding(next: Landing, expectedVersion: number, actorId: string | null) {
+    return this.reply(() => this.timelines.saveLanding(next, expectedVersion, actorId));
+  }
+  /**
+   * Every main advanced: in one transaction, fold the timeline's tracker view
+   * into main (its issues done, their retained leases released) and record it
+   * landed, before the Worker deletes its bookmarks.
+   */
+  completeLanding(access: Access, next: Landing, expectedVersion: number) {
+    return this.reply(() =>
+      this.transaction(() => {
+        const timeline = this.timelines.get(next.slug);
+        if (timeline.status === "abandoned" || timeline.status === "landed")
+          return this.timelines.saveLanding(next, expectedVersion, access.actorId);
+        this.store.landTimeline(access, next.slug);
+        return this.timelines.saveLanding(
+          { ...next, state: "landed" },
+          expectedVersion,
+          access.actorId,
+        );
+      }),
+    );
   }
 }

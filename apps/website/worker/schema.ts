@@ -517,6 +517,11 @@ export interface Database {
     preview_revived: Generated<number>;
     /** The deployment record a revival rebuilds, when there was one. */
     preview_rebuilt_from: Generated<number | null>;
+    /**
+     * A landing run (CORE-77): its merge job or the gates on its merge, stored
+     * with trigger 'manual' like a preview run and reported as 'landing'.
+     */
+    landing_id: Generated<string | null>;
   };
   ci_jobs: {
     id: string;

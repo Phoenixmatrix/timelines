@@ -261,7 +261,8 @@ export function branchMatches(branch: string, patterns: string[] | null): boolea
 
 export interface ConditionContext {
   branch: string;
-  trigger: "push" | "manual" | "preview";
+  /** `landing`: the gates on a timeline's merge into main, before main moves (CORE-77). */
+  trigger: "push" | "manual" | "preview" | "landing";
   commit: string;
   /** Where jobs run: "local" (gm runner under vp dev) or "sandbox" (deployed). */
   runner: "local" | "sandbox";

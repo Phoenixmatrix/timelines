@@ -3,6 +3,7 @@ import { sweepPreviews } from "./deployments/sweep.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
+import { settled, sweepLandings } from "./timelines/landing.ts";
 
 export default {
   fetch: app.fetch,
@@ -38,6 +39,12 @@ export default {
     ctx.waitUntil(
       sweepPreviews(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>
         console.error("Previews: the sweep failed", error),
+      ),
+    );
+    // Landings a CI run's end didn't move on (CORE-77).
+    ctx.waitUntil(
+      settled(env, (deps) => sweepLandings(env, deps)).catch((error) =>
+        console.error("Landing: sweep failed", error),
       ),
     );
   },

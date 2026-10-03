@@ -129,6 +129,12 @@ another timeline.
   work in the timeline's view, so your checkpoints and edits are made there.
 - Merge main in only when a person asks: `gm timeline merge main` (or another
   timeline's slug), then `gm push`.
+- Landing is automatic once it's allowed: an `auto` timeline lands when its
+  checkpoint's CI is green, an `approval` one when a person approves the
+  checkpoint. `gm timeline land` queues it by hand or says why it can't land
+  yet. Main only moves to a merge that passed the gates. If the merge with main
+  conflicts, landing stops and asks for a sync: merge main in when asked
+  (`gm timeline merge main`), push, and make a new checkpoint.
 - `gm timeline use main` goes back to main. `gm timeline abandon` ends a
   timeline you started, when a person asks or the attempt is dead.
 

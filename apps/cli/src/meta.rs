@@ -121,6 +121,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("timeline revive", git: "", kw: "timeline preview revive rebuild regenerate restore expired torn down checkpoint deploy again investigate old", mutates: true, out: Out::Other("{checkpoint:CheckpointView,runs:[{repoId,number,runId}|{repoId,skipped}],owner,dry_run}; each started run is a preview `create` (trigger preview) at the checkpoint's commit; the deployment it records is marked revived (rebuilt, not the original)"), ex: ["gm timeline revive", "gm timeline revive search-v2 --checkpoint 3", "gm timeline revive search-v2 -c cp_…"]),
     meta!("timeline pages", git: "", kw: "timeline wiki pages knowledge docs review checkpoint gate components concepts glossary what changes write on demand", mutates: true, out: Out::Other("{owner,timeline,repos:[{repo,ended?,sets:[{ref,timeline,key,checkpoint:{id,number}|null,commit,baseCommit,state:'queued'|'writing'|'succeeded'|'failed'|'ended',counts,pages:[{slug,title,section,kind,change:'added'|'changed',outcome:'written'|'kept',excerpt,model}],skipped,error}]}],next}; --checkpoint: {owner,timeline,checkpoint,repos}; --page: the page in full {slug,title,body,generatedIn,outcome,set,repo}; --write queues them at the bookmarks' tips (AI; idempotent per commit; refused once the timeline ended)"), ex: ["gm timeline pages", "gm timeline pages search-v2 --checkpoint 2", "gm timeline pages --page components/apps-website-worker-knowledge", "gm timeline pages --write"]),
     meta!("timeline update", git: "git branch -m (the name only)", kw: "timeline update rename flag experimental unflag not expected to land marker", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline}; --dry-run: {dry_run,owner,timeline,request}"), ex: ["gm timeline flag probe --experimental", "gm timeline update probe --no-experimental", "gm timeline update --name \"Search v2\""]),
+    meta!("timeline land", git: "git merge --no-ff + CI + git push origin main (server-side, compare-and-swap)", kw: "timeline land landing queue merge into main ship release gates approve green partly landed conflict sync why can't land", mutates: true, out: Out::Other("{owner,queued,landing:Landing {id,slug,checkpointId,checkpointNumber,state:'merging'|'testing'|'advancing'|'conflict'|'failed'|'landed',repos:[{id,owner,name,commit,base,merge,attempt,state,mergeRun,gateRun,reason}],reason,trigger:'auto'|'approval'|'request',requestedBy}}; refused with needs_approval, not_green, checkpoint_stale or no_checkpoint saying why; --dry-run: {dry_run,owner,timeline}"), ex: ["gm timeline land", "gm timeline land search-v2"]),
     meta!("timeline abandon", git: "git push --delete origin timeline/<slug>", kw: "timeline abandon end prune discard drop delete timeline", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks,use?}; --dry-run: {dry_run,owner,timeline,unbind}"), ex: ["gm timeline abandon", "gm timeline abandon probe --dry-run"]),
     meta!("auth login", git: "git credential approve / ssh-add", kw: "login sign in authenticate token persona credentials ssh key agent 1password", mutates: true, out: Out::Other("{server,method,user:{slug},key?,scope?,sessionExpiresAt?}"), ex: ["gm auth login --ssh", "gm auth login --ssh --key ~/.ssh/id_ed25519", "gm auth login --persona jun", "gm auth login --token gmx_..."]),
     meta!("auth ssh-key add", git: "(GitHub: Settings > SSH keys)", kw: "add register upload ssh public key agent 1password", mutates: true, out: Out::Other("SshKey {id,title,type,fingerprint,scope}"), ex: ["gm auth ssh-key add", "gm auth ssh-key add --key SHA256:abc... --title Laptop"]),
@@ -585,6 +586,7 @@ timeline field, description or PRD) or a person asks; otherwise work on main.
     gm timeline use main          # back to main (`use <slug>` to join one)
     gm timeline checkpoint -m 'What it holds and why'  # pins the pushed commits
     gm issue ask CORE-5 --kind approval --checkpoint cp_… --prompt 'Land it?'
+    gm timeline land              # queue the head checkpoint, or say why it can't land yet
     gm timeline list · gm timeline show · gm timeline checkpoints · gm timeline abandon
     gm timeline revive search-v2 -c 3   # rebuild an expired checkpoint's preview
     gm timeline flag <slug> --experimental   # not expected to land; --no-experimental clears it
@@ -599,6 +601,11 @@ your summary; it never changes. An approval pins one checkpoint, is given by a
 person with write access (never an agent), and only counts while it is still the
 timeline's head: new commits withdraw an open request, and need a new
 checkpoint and a new approval.
+Landing merges the checkpoint into each repository's current main in a CI job,
+runs the repository's gates on the merge, and only then advances main to it:
+`auto` timelines queue when the checkpoint's CI is green, `approval` ones when
+a person approves it. A conflict stops landing and asks for a sync (merge main
+in, push, checkpoint again); a main that moved is merged and tested again.
 
 ## Distributed tracker (no Git repository required)
     gm tracker use orbit

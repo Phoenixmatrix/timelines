@@ -40,6 +40,7 @@ import { batch, db, nowIso, type DB } from "../schema.ts";
 import { claim, jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { startRun } from "./trigger.ts";
+import { landingSlugOf } from "../../shared/timelines.ts";
 
 const PAGE = 30;
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
@@ -59,7 +60,8 @@ const toRun = (row: RunRow): CiRunSummary => ({
   number: row.number,
   commit: row.commit_oid,
   ref: row.ref,
-  trigger: row.preview_action ? "preview" : row.trigger,
+  trigger: row.preview_action ? "preview" : row.landing_id ? "landing" : row.trigger,
+  landing: row.landing_id ? { id: row.landing_id, timeline: landingSlugOf(row.ref) } : null,
   preview: row.preview_action
     ? {
         action: row.preview_action,

@@ -60,6 +60,8 @@ export interface Timeline {
   updatedAt: string;
   /** The last push to one of its bookmarks. */
   pushedAt: string | null;
+  /** When it landed or was abandoned; absent on older records and open timelines. */
+  endedAt?: string | null;
 }
 
 export type TimelineEventKind =
@@ -133,9 +135,27 @@ export type TimelineEvent = TimelineEventBase &
         /** What the person added to their answer, or why it was superseded. */
         note: string | null;
       }
-    // Recorded by a later step: landing (CORE-77).
-    | { kind: "landing" }
+    | {
+        kind: "landing";
+        /** The landing (CORE-77) and the checkpoint it lands. */
+        landingId: string;
+        checkpointId: string;
+        number: number;
+        /**
+         * - `queued`: it entered the landing queue;
+         * - `conflict`: a merge with main conflicts: it needs a sync;
+         * - `failed`: the gates failed on the merge, or something else stopped it;
+         * - `partly_landed`: some repositories' mains advanced, the rest retry;
+         * - `landed`: every repository's main advanced to its merge.
+         */
+        outcome: LandingOutcome;
+        /** The merge commit per repository id that main advanced to, so far. */
+        merges: Record<string, string>;
+        note: string | null;
+      }
   );
+
+export type LandingOutcome = "queued" | "conflict" | "failed" | "partly_landed" | "landed";
 
 /**
  * One repository in a checkpoint: the timeline's commit there and the main
@@ -316,6 +336,83 @@ export interface CreateTimeline {
 export interface UpdateTimeline {
   name?: string;
   experimental?: boolean;
+}
+
+/**
+ * A landing (CORE-77, TIMELINES-RESEARCH.md "Landing"): the queue merging a
+ * checkpoint into each repository's current main, running the gates on each
+ * merge, and only then advancing each main to its merge with a
+ * compare-and-swap. Kept in the tracker with the timeline it lands.
+ *
+ * - `merging`: CI jobs merge the checkpoint into main (refs/heads/gitmatrix/landing/<slug>);
+ * - `testing`: the gates (the repository's pipeline) run on the merges;
+ * - `advancing`: every merge passed; mains advance one repository at a time;
+ * - `conflict`: a merge conflicts: no automatic sync, a person or an agent
+ *   merges main into the timeline and makes a new checkpoint;
+ * - `failed`: the gates failed, the checkpoint moved on, or it ran out of retries;
+ * - `landed`: every main advanced; the timeline is landed.
+ */
+export type LandingState = "merging" | "testing" | "advancing" | "conflict" | "failed" | "landed";
+
+/** One repository of a landing. */
+export interface LandingRepo {
+  id: string;
+  owner: string;
+  name: string;
+  /** The checkpoint's commit. */
+  commit: string;
+  /** Main's tip this attempt merges onto. */
+  base: string | null;
+  /** The merge commit, once the merge job pushed it. */
+  merge: string | null;
+  /** Merges tried: a main that moved before it advanced is merged again. */
+  attempt: number;
+  state: "merging" | "testing" | "tested" | "advanced" | "conflict" | "failed";
+  /** The CI runs that merged and tested this attempt. */
+  mergeRun: { id: string; number: number } | null;
+  gateRun: { id: string; number: number } | null;
+  /** Why it stopped (conflicting files, failing jobs, a main that moved). */
+  reason: string | null;
+}
+
+export interface Landing {
+  id: string;
+  timelineId: string;
+  slug: string;
+  checkpointId: string;
+  checkpointNumber: number;
+  state: LandingState;
+  repos: LandingRepo[];
+  /** Why it stopped, for people. */
+  reason: string | null;
+  /** How it was queued: a green checkpoint (`auto`), an approval, or someone asking. */
+  trigger: "auto" | "approval" | "request";
+  /** Who queued it: main's moves and the timeline's events are theirs. */
+  requestedBy: { actorId: string; accountableId: string; agentId: string | null };
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Landings still at work, as opposed to stopped or done. */
+export const LANDING_ACTIVE: readonly LandingState[] = ["merging", "testing", "advancing"];
+
+/** The branch a landing's merge is pushed to and tested on, before main moves. */
+export function landingBranch(slug: string): string {
+  return `gitmatrix/landing/${slug}`;
+}
+
+/** The slug a landing branch (short name, without refs/heads/) belongs to. */
+export function landingSlugOf(branch: string): string | null {
+  const match = /^gitmatrix\/landing\/([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(branch);
+  return match ? match[1]! : null;
+}
+
+/** POST /api/tracker/:owner/timelines/:slug/land: queued, or why not. */
+export interface LandResult {
+  landing: Landing;
+  /** False when a landing of this checkpoint was already under way. */
+  queued: boolean;
 }
 
 /** The branch a timeline's work lives on. */

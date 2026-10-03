@@ -497,9 +497,11 @@ export interface CiRunSummary {
   commit: string;
   /** Branch name, without refs/heads/. */
   ref: string;
-  trigger: "push" | "manual" | "preview";
+  trigger: "push" | "manual" | "preview" | "landing";
   /** A preview run's action, timeline and checkpoint (CORE-79); null for other runs. */
   preview: CiRunPreview | null;
+  /** A landing run's landing and timeline (CORE-77): its merge, or the gates on it; else null. */
+  landing: { id: string; timeline: string | null } | null;
   title: string;
   status: CiRunStatus;
   actor: string | null;

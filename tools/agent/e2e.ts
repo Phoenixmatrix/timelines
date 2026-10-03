@@ -1408,6 +1408,244 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  // CORE-77: a timeline lands through the queue. The merge job and the gates
+  // run on the local runner `vp dev` starts per job: the merge job fetches
+  // its landing credential with its job token, merges the checkpoint into
+  // main and pushes the merge to gitmatrix/landing/<slug>; the repository's
+  // own pipeline tests it there (trigger == "landing"); only then does main
+  // advance, with a compare-and-swap.
+  const timelinesApi = `/api/tracker/${fixtures.tracker.owner}/timelines`;
+  const mutateTracker = (token: string, mutations: unknown[], timeline?: string) =>
+    json<{ results: { leaseToken?: string }[] }>(
+      `/api/tracker/${fixtures.tracker.owner}/mutate`,
+      token,
+      "POST",
+      { operationId: randomUUID(), mutations, ...(timeline ? { timeline } : {}) },
+    );
+  const trackerIssue = async (id: string) =>
+    (
+      await json<Snapshot>(`/api/tracker/${fixtures.tracker.owner}/snapshot`, fixtures.tokens.jun)
+    ).issues.find((issue) => issue.id === id);
+  const branchTip = async (name: string) =>
+    (await json<RepoDetail>(api, ownerToken)).branches.find((b) => b.shortName === name)?.oid;
+  type LandingRecord = {
+    id: string;
+    state: string;
+    reason: string | null;
+    repos: {
+      commit: string;
+      base: string | null;
+      merge: string | null;
+      state: string;
+      mergeRun: { number: number } | null;
+      gateRun: { number: number } | null;
+    }[];
+  };
+  /** Wait for a landing to stop working; its runs' logs go into the evidence on a stop. */
+  async function settledLanding(slug: string): Promise<LandingRecord> {
+    const landing = await poll(
+      async () =>
+        (
+          await json<{ landing: LandingRecord | null }>(
+            `${timelinesApi}/${slug}/landing`,
+            ownerToken,
+          )
+        ).landing,
+      (value) => !!value && ["landed", "conflict", "failed"].includes(value.state),
+      `timeline ${slug} to land or stop`,
+      300_000,
+    );
+    record({ landing });
+    if (landing!.state !== "landed")
+      for (const repo of landing!.repos)
+        for (const run of [repo.mergeRun, repo.gateRun])
+          if (run?.number) await runDetail(run.number);
+    return landing!;
+  }
+  /** Start an auto timeline in a fresh clone bound to it. */
+  async function landingTimeline(slug: string) {
+    const clone = join(work, `landing-${slug}`);
+    await gm(["clone", fullName, clone], "jun");
+    await gm(
+      ["timeline", "start", slug, "--owner", fixtures.tracker.owner, "--policy", "auto"],
+      "jun",
+      clone,
+    );
+    return clone;
+  }
+  /** Push the clone's work to its bookmark, then checkpoint it: an auto timeline queues itself. */
+  async function pushAndCheckpoint(clone: string, slug: string, message: string) {
+    const before = await branchTip(`timeline/${slug}`);
+    await gm(["commit", "-m", message], "jun", clone);
+    await gm(["push"], "jun", clone);
+    await poll(
+      () => branchTip(`timeline/${slug}`),
+      (tip) => !!tip && tip !== before,
+      "the pushed timeline bookmark",
+    );
+    const checkpoint = JSON.parse(
+      await gm(
+        ["timeline", "checkpoint", "-m", message, "--owner", fixtures.tracker.owner],
+        "jun",
+        clone,
+      ),
+    ) as { checkpoint: { id: string; number: number; repos: { commit: string; base: string }[] } };
+    return checkpoint.checkpoint;
+  }
+
+  await scenario("timeline-lands-merge-gates-and-advance-main", async () => {
+    const slug = `land-e2e-${randomUUID().slice(0, 8)}`;
+    const marker = `landing-e2e/${slug}.txt`;
+    const clone = await landingTimeline(slug);
+    const mainBefore = await branchTip("main");
+    assert(mainBefore, "main must exist");
+
+    // An issue done in the timeline: done there, its lease retained (CORE-75).
+    const issueId = randomUUID();
+    await mutateTracker(fixtures.tokens.jun, [
+      {
+        kind: "issue.create",
+        id: issueId,
+        data: { teamId: fixtures.tracker.team, title: `Land ${slug}` },
+      },
+    ]);
+    const claimed = await mutateTracker(
+      fixtures.tokens.jun,
+      [{ kind: "issue.claim", id: issueId, data: { agent: "landing-e2e" } }],
+      slug,
+    );
+    const lease = claimed.results[0]?.leaseToken;
+    assert(lease, "Claim must return a lease token");
+    secrets.add(lease);
+    await mutateTracker(
+      fixtures.tokens.jun,
+      [{ kind: "issue.complete", id: issueId, data: { leaseToken: lease, evidence: "Landed" } }],
+      slug,
+    );
+    const doneInTimeline = await trackerIssue(issueId);
+    assert.equal(doneInTimeline?.status, "done_in_timeline");
+    assert.equal(doneInTimeline?.claim?.retainedIn?.slug, slug, "Finishing retains the lease");
+
+    // The work, and gates that only a landing runs: they check the merge itself.
+    await mkdir(join(clone, "landing-e2e"), { recursive: true });
+    await writeFile(join(clone, marker), `${slug}\n`);
+    await mkdir(join(clone, ".gitmatrix"), { recursive: true });
+    await writeFile(
+      join(clone, ".gitmatrix", "ci.yml"),
+      JSON.stringify({
+        on: { push: { branches: ["never-agent-auto"] } },
+        jobs: {
+          gate: {
+            if: 'trigger == "landing"',
+            steps: [
+              {
+                run: `test -f ${marker} && test "$(git log -1 --format=%P | wc -w)" = 2 && echo LANDING_GATE_OK`,
+              },
+            ],
+          },
+        },
+      }),
+    );
+    const checkpoint = await pushAndCheckpoint(clone, slug, `Landing E2E ${slug}`);
+    const checkpointCommit = checkpoint.repos[0]!.commit;
+    // Asking by hand finds it queued already, or queues it: never two landings.
+    const asked = JSON.parse(
+      await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone),
+    ) as { landing: { id: string } };
+    const landing = await settledLanding(slug);
+    assert.equal(landing.id, asked.landing.id);
+    assert.equal(landing.state, "landed", `Landing stopped: ${landing.reason}`);
+    const [landed] = landing.repos;
+    assert(landed?.gateRun?.number, "The gates ran on the merge");
+    const gates = await runDetail(landed.gateRun.number);
+    assert.equal(gates.status, "succeeded");
+    assert.equal(gates.ref, `gitmatrix/landing/${slug}`);
+    assert.equal(gates.trigger, "landing", "Landing runs report their trigger");
+
+    // Main advanced to a merge of [old main, checkpoint].
+    const mainAfter = await branchTip("main");
+    assert.equal(mainAfter, landed.merge);
+    const [merge] = (
+      await json<{ commits: { oid: string; parents: string[] }[] }>(
+        `${api}/commits?ref=${mainAfter}`,
+        ownerToken,
+      )
+    ).commits;
+    assert.equal(merge?.oid, mainAfter);
+    assert.deepEqual(
+      merge?.parents,
+      [mainBefore, checkpointCommit],
+      "main is a merge of old main and the checkpoint",
+    );
+
+    const timeline = await json<{ timeline: { status: string; endedAt?: string } }>(
+      `${timelinesApi}/${slug}`,
+      ownerToken,
+    );
+    assert.equal(timeline.timeline.status, "landed");
+    assert(timeline.timeline.endedAt, "A landed timeline records when it ended");
+    const doneOnMain = await trackerIssue(issueId);
+    assert.equal(doneOnMain?.status, "done", "The issue done in the timeline is done on main");
+    assert.equal(doneOnMain?.claim, null, "Landing releases the retained lease");
+    await poll(
+      async () => [
+        await branchTip(`timeline/${slug}`),
+        await branchTip(`gitmatrix/landing/${slug}`),
+      ],
+      (tips) => tips.every((tip) => tip === undefined),
+      "the landed timeline's bookmark and landing branch to go",
+    );
+    await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
+    record({
+      timeline: slug,
+      mainBefore,
+      merge: mainAfter,
+      checkpoint: checkpointCommit,
+      gates: gates.number,
+    });
+  });
+
+  await scenario("timeline-landing-conflict-asks-for-a-sync", async () => {
+    const slug = `clash-e2e-${randomUUID().slice(0, 8)}`;
+    const file = `landing-e2e/${slug}.txt`;
+    const clone = await landingTimeline(slug);
+    // Main changes the same file after the fork.
+    const mainClone = join(work, `main-${slug}`);
+    await gm(["clone", fullName, mainClone], "marco");
+    await mkdir(join(mainClone, "landing-e2e"), { recursive: true });
+    await writeFile(join(mainClone, file), "main's version\n");
+    await gm(["commit", "-m", `Main clashes with ${slug}`], "marco", mainClone);
+    await gm(["push", "-b", "main"], "marco", mainClone);
+    const mainTip = await poll(
+      () => branchTip("main"),
+      (tip) => !!tip,
+      "main after the clashing push",
+    );
+    await mkdir(join(clone, "landing-e2e"), { recursive: true });
+    await writeFile(join(clone, file), "the timeline's version\n");
+    try {
+      await pushAndCheckpoint(clone, slug, `Clashing E2E ${slug}`);
+      const landing = await settledLanding(slug);
+      assert.equal(landing.state, "conflict", `Expected a conflict, got: ${landing.reason}`);
+      assert.match(landing.reason ?? "", /needs a sync/);
+      assert.equal(landing.repos[0]?.gateRun, null, "A conflicting merge is never tested");
+      assert.equal(await branchTip("main"), mainTip, "Main never moves on a conflict");
+      const timeline = await json<{
+        timeline: { status: string };
+        events: { kind: string; outcome?: string }[];
+      }>(`${timelinesApi}/${slug}`, ownerToken);
+      assert.equal(timeline.timeline.status, "active");
+      assert.equal(timeline.events.at(-1)?.outcome, "conflict");
+      const shown = JSON.parse(
+        await gm(["timeline", "show", slug, "--owner", fixtures.tracker.owner], "jun", clone),
+      ) as { landing?: { state: string; reason: string } };
+      assert.equal(shown.landing?.state, "conflict", "gm timeline show reports the landing");
+      record({ timeline: slug, main: mainTip, conflict: landing.reason });
+    } finally {
+      await request(`${timelinesApi}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
+    }
+  });
+
   await scenario("agent-identity-provisioned-on-first-use", async () => {
     // A harness drives gm in a checkout set up for an agent, but this machine
     // holds no token for it: gm must act as the agent, never quietly as its person.

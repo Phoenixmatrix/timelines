@@ -21,6 +21,7 @@ import {
 } from "./config.ts";
 import { activeRun, anyHeld, inFlight, lastPassed, releaseHeld, UNCHANGED } from "./coalesce.ts";
 import type { StoredJob } from "./jobs.ts";
+import { landingSlugOf } from "../../shared/timelines.ts";
 
 export interface CiRepo {
   id: string;
@@ -78,12 +79,21 @@ export async function startRun(
   options: {
     branch: string;
     commit: string;
-    trigger: "push" | "manual" | "preview";
+    /**
+     * `landing`: the gates on a landing's merge (CORE-77). Jobs see
+     * `trigger == "landing"`; the run is stored as manual with its landing
+     * (`landing_id`), as previews are.
+     */
+    trigger: "push" | "manual" | "preview" | "landing";
     /** With trigger "preview": its action, timeline and checkpoint. */
     preview?: PreviewRun;
+    /** With trigger "landing": the landing whose merge it tests. */
+    landingId?: string;
     /** Who pushed or started it: a person, or an agent acting for one. */
     actor: Pick<Actor, "id" | "agent"> | null;
     waitUntil: Waiter;
+    /** The run's id, when the caller recorded it before starting it (a landing does). */
+    runId?: string;
   },
 ): Promise<{ runId: string; number: number } | { skipped: string }> {
   const preview = options.trigger === "preview" ? (options.preview ?? null) : null;
@@ -124,7 +134,9 @@ export async function startRun(
       return { skipped: `${options.branch} is not in on.push.branches.` };
     }
 
-    const runId = crypto.randomUUID().replaceAll("-", "");
+    const runId = options.runId ?? crypto.randomUUID().replaceAll("-", "");
+    const stored =
+      options.trigger === "preview" || options.trigger === "landing" ? "manual" : options.trigger;
     const context = {
       branch: options.branch,
       trigger: options.trigger,
@@ -157,6 +169,7 @@ export async function startRun(
           "checkpoint_id",
           "preview_revived",
           "preview_rebuilt_from",
+          "landing_id",
         ])
         .expression((eb) =>
           eb
@@ -167,8 +180,8 @@ export async function startRun(
               eb(eb.fn.coalesce(eb.fn.max("number"), eb.lit(0)), "+", eb.lit(1)).as("number"),
               eb.val(options.commit).as("commit_oid"),
               eb.val(options.branch).as("ref"),
-              // ci_runs.trigger's CHECK predates previews: see the migration.
-              eb.val(preview ? ("manual" as const) : options.trigger).as("trigger"),
+              // ci_runs.trigger's CHECK predates previews and landings: see the migrations.
+              eb.val(stored).as("trigger"),
               eb.val(options.actor?.id ?? null).as("actor_id"),
               eb.val(options.actor?.agent?.id ?? null).as("agent_id"),
               eb.val(title).as("title"),
@@ -180,6 +193,9 @@ export async function startRun(
               eb.val(preview?.checkpoint ?? null).as("checkpoint_id"),
               eb.val(preview?.revived ? 1 : 0).as("preview_revived"),
               eb.val(preview?.rebuiltFrom ?? null).as("preview_rebuilt_from"),
+              eb
+                .val(options.trigger === "landing" ? (options.landingId ?? null) : null)
+                .as("landing_id"),
             ])
             .where("repo_id", "=", repo.id),
         ),
@@ -346,6 +362,8 @@ export async function onPush(
     // The first time CI sees a repository, every branch looks new; only the
     // default branch gets a run then.
     if (known.size === 0 && row.ref !== refs.headBranch) continue;
+    // A landing's merge is tested by the landing itself (timelines/landing.ts).
+    if (landingSlugOf(row.ref)) continue;
     try {
       await startRun(env, repo, {
         branch: row.ref,

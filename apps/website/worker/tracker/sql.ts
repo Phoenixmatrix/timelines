@@ -55,6 +55,8 @@ export interface TrackerDatabase {
    * (logged after they answer) and from checkpoints. Null once deleted.
    */
   timeline_heads: { timeline_id: string; repo_id: string; oid: string | null };
+  /** Landings (CORE-77), whole as JSON; a timeline's newest is its current one. */
+  timeline_landings: { id: string; timeline_id: string; created_at: string; data: string };
 }
 
 /**
@@ -66,7 +68,9 @@ export const TIMELINE_TABLES = `CREATE TABLE IF NOT EXISTS timelines (id TEXT PR
   CREATE TABLE IF NOT EXISTS timeline_event_index (timeline_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (timeline_id, seq));
   CREATE UNIQUE INDEX IF NOT EXISTS timeline_slugs ON timelines(json_extract(data, '$.slug'));
   CREATE TABLE IF NOT EXISTS timeline_checkpoints (id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, number INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE (timeline_id, number));
-  CREATE TABLE IF NOT EXISTS timeline_heads (timeline_id TEXT NOT NULL, repo_id TEXT NOT NULL, oid TEXT, PRIMARY KEY (timeline_id, repo_id));`;
+  CREATE TABLE IF NOT EXISTS timeline_heads (timeline_id TEXT NOT NULL, repo_id TEXT NOT NULL, oid TEXT, PRIMARY KEY (timeline_id, repo_id));
+  CREATE TABLE IF NOT EXISTS timeline_landings (id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, created_at TEXT NOT NULL, data TEXT NOT NULL);
+  CREATE INDEX IF NOT EXISTS timeline_landings_by_timeline ON timeline_landings(timeline_id, created_at);`;
 
 /** The storage surface the store needs: `ctx.storage.sql`, or a test double. */
 export interface SqlDatabase {

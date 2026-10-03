@@ -166,8 +166,10 @@ export interface PreviewClock {
     status: string;
     createdAt: string;
     pushedAt: string | null;
-    /** For a landed or abandoned timeline: when it ended (its last change). */
+    /** Its last change: when it ended, for a record older than `endedAt`. */
     updatedAt: string;
+    /** For a landed or abandoned timeline: when it ended (CORE-77). */
+    endedAt?: string | null;
   } | null;
   /** When the preview was recorded. */
   createdAt: string;
@@ -196,7 +198,10 @@ export function previewExpiry(
       : timeline.createdAt;
   const since = (time: number) => (clock.revived ? Math.max(time, created) : time);
   let expiry = since(Date.parse(pushed)) + settings.idleDays * DAY;
-  if (timeline.status === "landed" || timeline.status === "abandoned")
-    expiry = Math.min(expiry, since(Date.parse(timeline.updatedAt)) + settings.endedDays * DAY);
+  // When it ended; older records, which don't say, ended at their last change.
+  if (timeline.status === "landed" || timeline.status === "abandoned") {
+    const ended = Date.parse(timeline.endedAt ?? timeline.updatedAt);
+    expiry = Math.min(expiry, since(ended) + settings.endedDays * DAY);
+  }
   return new Date(expiry).toISOString();
 }

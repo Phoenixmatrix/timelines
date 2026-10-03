@@ -13,12 +13,16 @@
 import type { HumanRequest, RequestCheckpoint, TimelineFeedEvent } from "../../shared/tracker.ts";
 import {
   CHECKPOINT_CHANGES,
+  LANDING_ACTIVE,
   TIMELINE_POLICIES,
   timelineBookmark,
   type Checkpoint,
   type CheckpointApproval,
   type CheckpointRepo,
   type CheckpointState,
+  type Landing,
+  type LandingOutcome,
+  type LandingRepo,
   type Timeline,
   type TimelineDetail,
   type TimelineEvent,
@@ -81,6 +85,18 @@ export interface NewCheckpoint {
  * issue's lease once nothing else is open. Given by TrackerStore.
  */
 export type WithdrawRequests = (ids: string[], reason: string, actorId: string | null) => void;
+
+/** How a landing is being queued (CORE-77), as the Worker found things. */
+export interface LandingRequest {
+  trigger: Landing["trigger"];
+  /**
+   * For an `auto` timeline: whether the head checkpoint is green (its CI runs
+   * succeeded), and why not. The Worker reads that from D1.
+   */
+  green: { ok: boolean; why: string | null };
+  /** The agent asking, when an agent asks (the access's actor otherwise). */
+  agentId: string | null;
+}
 
 /** Statuses a checkpoint's approval moves a timeline between; the rest belong to landing. */
 const SETTLED: readonly TimelineStatus[] = ["active", "idle", "waiting"];
@@ -373,6 +389,7 @@ export class TimelineStore {
       if (timeline.status === "abandoned") return { timeline, abandoned: false };
       const now = this.now();
       timeline.status = "abandoned";
+      timeline.endedAt = now;
       timeline.version++;
       timeline.updatedAt = now;
       this.save(timeline, "timeline.abandon", access.actorId);
@@ -878,5 +895,282 @@ export class TimelineStore {
       },
       [timeline.id],
     );
+  }
+
+  // ---- landing (CORE-77) -----------------------------------------------------
+
+  /** A timeline's newest landing, if it was ever queued. */
+  landing(slug: string): Landing | null {
+    const timeline = this.get(slug);
+    const row = first(
+      this.sql,
+      tracker
+        .selectFrom("timeline_landings")
+        .select("data")
+        .where("timeline_id", "=", timeline.id)
+        .orderBy("created_at", "desc")
+        .orderBy("id", "desc")
+        .limit(1),
+    );
+    return row ? (JSON.parse(row.data) as Landing) : null;
+  }
+  private landingById(id: string): Landing {
+    const row = first(
+      this.sql,
+      tracker.selectFrom("timeline_landings").select("data").where("id", "=", id),
+    );
+    if (!row) fail("not_found", `No landing ${id}.`, 404);
+    return JSON.parse(row.data) as Landing;
+  }
+  /** Every landing still at work, oldest first: what a sweep moves on. */
+  activeLandings(): Landing[] {
+    return all(
+      this.sql,
+      tracker.selectFrom("timeline_landings").select("data").orderBy("created_at"),
+    )
+      .map((row) => JSON.parse(row.data) as Landing)
+      .filter((landing) => LANDING_ACTIVE.includes(landing.state));
+  }
+  /** The landing a CI run belongs to: a merge or the gates of one of its repositories. */
+  landingForRun(slug: string, runId: string): Landing | null {
+    const landing = this.find(slug) ? this.landing(slug) : null;
+    if (!landing) return null;
+    return landing.repos.some((r) => r.mergeRun?.id === runId || r.gateRun?.id === runId)
+      ? landing
+      : null;
+  }
+  /**
+   * Queue a landing of the timeline's head checkpoint, or say why not
+   * (TIMELINES-RESEARCH.md, "Landing"): an `approval` timeline needs that
+   * checkpoint approved while it is still the head, an `auto` one needs it
+   * green. The experimental flag doesn't matter. A landing already under way
+   * is returned as it is (`queued: false`). After a landing of the same
+   * checkpoint stopped partway, mains that advanced stay advanced.
+   */
+  beginLanding(
+    access: Access,
+    slug: string,
+    request: LandingRequest,
+  ): { landing: Landing; queued: boolean } {
+    return this.transaction(() => {
+      const timeline = this.get(slug);
+      if (ENDED.includes(timeline.status))
+        fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
+      const previous = this.landing(slug);
+      if (previous && LANDING_ACTIVE.includes(previous.state))
+        return { landing: previous, queued: false };
+      const head = this.latest(timeline.id);
+      if (!head)
+        fail(
+          "no_checkpoint",
+          `${timeline.slug} has no checkpoint to land; make one with gm timeline checkpoint.`,
+          409,
+        );
+      const state = this.state(head);
+      if (!state.current)
+        fail(
+          "checkpoint_stale",
+          `${timeline.slug} has commits since checkpoint #${head.number}; make a new checkpoint to land them.`,
+          409,
+        );
+      if (timeline.policy === "approval" && !state.approved)
+        fail(
+          "needs_approval",
+          state.approval?.state === "pending"
+            ? `Checkpoint #${head.number} of ${timeline.slug} is waiting for a person's approval; it lands once approved.`
+            : state.approval?.state === "rejected"
+              ? `Checkpoint #${head.number} of ${timeline.slug} was rejected; push fixes, make a new checkpoint and ask again.`
+              : `Checkpoint #${head.number} of ${timeline.slug} needs a person's approval to land; ask for it with gm issue ask --kind approval --checkpoint ${head.id}.`,
+          409,
+        );
+      if (timeline.policy === "auto" && !request.green.ok)
+        fail(
+          "not_green",
+          request.green.why ??
+            `Checkpoint #${head.number} of ${timeline.slug} isn't green yet; it lands once its CI runs succeed.`,
+          409,
+        );
+      // A green checkpoint doesn't retry on its own a landing that stopped.
+      if (
+        request.trigger === "auto" &&
+        previous?.checkpointId === head.id &&
+        (previous.state === "conflict" || previous.state === "failed")
+      )
+        fail(
+          "landing_stopped",
+          `Landing checkpoint #${head.number} of ${timeline.slug} stopped: ${previous.reason ?? previous.state}.`,
+          409,
+        );
+      const now = this.now();
+      // Mains an earlier landing of this checkpoint advanced stay advanced.
+      const advanced = new Map(
+        (previous?.checkpointId === head.id ? previous.repos : [])
+          .filter((repo) => repo.state === "advanced")
+          .map((repo) => [repo.id, repo]),
+      );
+      const landing: Landing = {
+        id: `ld_${crypto.randomUUID()}`,
+        timelineId: timeline.id,
+        slug: timeline.slug,
+        checkpointId: head.id,
+        checkpointNumber: head.number,
+        state: "merging",
+        repos: head.repos.map(
+          (repo): LandingRepo =>
+            advanced.get(repo.id) ?? {
+              id: repo.id,
+              owner: repo.owner,
+              name: repo.name,
+              commit: repo.commit,
+              base: null,
+              merge: null,
+              attempt: 0,
+              state: "merging",
+              mergeRun: null,
+              gateRun: null,
+              reason: null,
+            },
+        ),
+        reason: null,
+        trigger: request.trigger,
+        requestedBy: {
+          actorId: access.actorId,
+          accountableId: access.principalId,
+          agentId: request.agentId,
+        },
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      run(
+        this.sql,
+        tracker.insertInto("timeline_landings").values({
+          id: landing.id,
+          timeline_id: timeline.id,
+          created_at: now,
+          data: JSON.stringify(landing),
+        }),
+      );
+      this.landingEvent(landing, "queued", null);
+      this.landingStatus(timeline, landing, access.actorId);
+      return { landing, queued: true };
+    });
+  }
+  /**
+   * Store a landing's next state (the Worker moves it on as its CI runs end
+   * and mains advance), if nobody moved it since `expectedVersion`. The
+   * timeline's status follows, and its events record a stop or an advance.
+   * Moving to `advancing` needs the checkpoint to still be the head.
+   */
+  saveLanding(next: Landing, expectedVersion: number, actorId: string | null): Landing {
+    return this.transaction(() => {
+      const current = this.landingById(next.id);
+      if (current.version !== expectedVersion)
+        fail("version_conflict", "The landing changed since it was read.", 409);
+      if (!LANDING_ACTIVE.includes(current.state))
+        fail(
+          "landing_ended",
+          `That landing already ${current.state === "landed" ? "landed" : "stopped"}.`,
+          409,
+        );
+      const timeline = this.byId(current.timelineId);
+      // Abandoned while it was landing: it stops, and the timeline stays abandoned.
+      if (timeline.status === "abandoned")
+        next = {
+          ...next,
+          state: "failed",
+          reason: `${timeline.slug} was abandoned while it was landing.`,
+        };
+      else if (next.state === "advancing" && current.state !== "advancing") {
+        const checkpoint = this.findCheckpoint(current.checkpointId);
+        if (!checkpoint || !this.isCurrent(checkpoint))
+          fail(
+            "checkpoint_stale",
+            `${timeline.slug} has commits since checkpoint #${current.checkpointNumber}; make a new checkpoint to land them.`,
+            409,
+          );
+      }
+      const saved: Landing = {
+        ...next,
+        // What the landing is stays as it was queued.
+        timelineId: current.timelineId,
+        slug: current.slug,
+        checkpointId: current.checkpointId,
+        checkpointNumber: current.checkpointNumber,
+        trigger: current.trigger,
+        requestedBy: current.requestedBy,
+        createdAt: current.createdAt,
+        version: current.version + 1,
+        updatedAt: this.now(),
+      };
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_landings")
+          .set({ data: JSON.stringify(saved) })
+          .where("id", "=", saved.id),
+      );
+      const advanced = (l: Landing) => l.repos.filter((r) => r.state === "advanced").length;
+      const outcome: LandingOutcome | null =
+        saved.state === "landed"
+          ? "landed"
+          : saved.state === "conflict" || saved.state === "failed"
+            ? saved.state
+            : advanced(saved) > advanced(current) && advanced(saved) < saved.repos.length
+              ? "partly_landed"
+              : null;
+      if (outcome) this.landingEvent(saved, outcome, saved.reason);
+      if (timeline.status !== "abandoned") this.landingStatus(timeline, saved, actorId);
+      return saved;
+    });
+  }
+  private landingEvent(landing: Landing, outcome: LandingOutcome, note: string | null) {
+    const by = landing.requestedBy;
+    this.append(
+      {
+        id: `landing:${landing.id}:${outcome}:${landing.version}`,
+        timelineId: landing.timelineId,
+        kind: "landing",
+        landingId: landing.id,
+        checkpointId: landing.checkpointId,
+        number: landing.checkpointNumber,
+        outcome,
+        merges: Object.fromEntries(
+          landing.repos
+            .filter((r) => r.state === "advanced" && r.merge)
+            .map((r) => [r.id, r.merge!]),
+        ),
+        note,
+        actorId: by.agentId ?? by.actorId,
+        accountableId: by.accountableId,
+        createdAt: this.now(),
+      },
+      [landing.timelineId],
+    );
+  }
+  /**
+   * The timeline's status as its landing stands: `landing` while it works,
+   * `partly_landed` once some main advanced and others haven't, `landed` at
+   * the end; a stop with nothing advanced hands it back to its own statuses.
+   */
+  private landingStatus(timeline: Timeline, landing: Landing, actorId: string | null) {
+    const advanced = landing.repos.filter((r) => r.state === "advanced").length;
+    const partly = advanced > 0 && advanced < landing.repos.length;
+    const next: TimelineStatus =
+      landing.state === "landed"
+        ? "landed"
+        : partly
+          ? "partly_landed"
+          : LANDING_ACTIVE.includes(landing.state)
+            ? "landing"
+            : "active";
+    if (next === timeline.status) return;
+    timeline.status = next;
+    // Back to its own statuses: waiting again if its head still awaits a person.
+    if (next === "active") this.status(timeline);
+    if (next === "landed") timeline.endedAt = this.now();
+    timeline.version++;
+    timeline.updatedAt = this.now();
+    this.save(timeline, "timeline.status", actorId);
   }
 }
