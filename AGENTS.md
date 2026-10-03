@@ -47,6 +47,10 @@ release. Add a tool name to select part of the graph. For example, run
   `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run
   `vp run agent test-ai`. Also exercise the specific changed consumer path.
   Missing required services, browser dependencies or credentials are failures.
+- After a change to gm (`apps/cli`) deploys, install the new release for
+  every agent on this machine: follow
+  `.agents/skills/gitmatrix-gm-install/SKILL.md`. Never install a feature
+  build of gm machine-wide.
 - Keep the E2E artifacts and inspect failures before changing assertions.
   Sandbox/deployment changes (`apps/website/ci/`, `worker/ci/sandbox.ts`,
   `cloudflare.config.ts`) need their own deployment-boundary check: push and
