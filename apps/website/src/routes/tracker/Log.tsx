@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
 import { timeAgo } from "../../lib/format.ts";
-import { DoneInTimelineIcon, typeLabel } from "./ui.tsx";
+import { ClaimIcon, DoneInTimelineIcon, typeLabel } from "./ui.tsx";
 import {
   claimLabel,
   STATE_LABEL,
@@ -23,43 +23,41 @@ const OVERSCAN = 12;
 /**
  * One grid for header and rows; columns join as the log gets room, and the
  * title keeps its width first: team and priority at 42rem, type at 56rem,
- * assignee at 64rem. State is a dot alone on narrow logs, while an issue is
+ * assignee at 64rem. State is a mark alone on narrow logs, while an issue is
  * open beside the log, or when the query already pins one state.
  */
 const GRID_WORDS =
-  "grid items-center gap-x-3 px-3 grid-cols-[0.5rem_4.5rem_minmax(0,1fr)_3.5rem] " +
+  "grid items-center gap-x-3 px-3 grid-cols-[0.75rem_4.5rem_minmax(0,1fr)_3.5rem] " +
   "@lg:grid-cols-[7.5rem_5.5rem_minmax(0,1fr)_4.5rem] " +
   "@2xl:grid-cols-[7.5rem_5.5rem_minmax(0,1fr)_4rem_2rem_4.5rem] " +
   "@4xl:grid-cols-[7.5rem_5.5rem_minmax(0,1fr)_4rem_4rem_2rem_4.5rem] " +
   "@5xl:grid-cols-[7.5rem_5.5rem_minmax(0,1fr)_4rem_4rem_8rem_2rem_4.5rem]";
 const GRID_DOTS =
-  "grid items-center gap-x-3 px-3 grid-cols-[0.5rem_4.5rem_minmax(0,1fr)_3.5rem] " +
-  "@lg:grid-cols-[0.5rem_5.5rem_minmax(0,1fr)_4.5rem] " +
-  "@2xl:grid-cols-[0.5rem_5.5rem_minmax(0,1fr)_4rem_2rem_4.5rem] " +
-  "@4xl:grid-cols-[0.5rem_5.5rem_minmax(0,1fr)_4rem_4rem_2rem_4.5rem] " +
-  "@5xl:grid-cols-[0.5rem_5.5rem_minmax(0,1fr)_4rem_4rem_8rem_2rem_4.5rem]";
+  "grid items-center gap-x-3 px-3 grid-cols-[0.75rem_4.5rem_minmax(0,1fr)_3.5rem] " +
+  "@lg:grid-cols-[0.75rem_5.5rem_minmax(0,1fr)_4.5rem] " +
+  "@2xl:grid-cols-[0.75rem_5.5rem_minmax(0,1fr)_4rem_2rem_4.5rem] " +
+  "@4xl:grid-cols-[0.75rem_5.5rem_minmax(0,1fr)_4rem_4rem_2rem_4.5rem] " +
+  "@5xl:grid-cols-[0.75rem_5.5rem_minmax(0,1fr)_4rem_4rem_8rem_2rem_4.5rem]";
 const TEAM = "hidden @2xl:block";
 const TYPE = "hidden @4xl:block";
 const ASSIGNEE = "hidden @5xl:block";
 
-export const STATE_DOT: Record<IssueState, string> = {
+const STATE_DOT: Record<Exclude<IssueState, "claimed" | "leased" | "done_in_timeline">, string> = {
   waiting: "bg-signal",
   ready: "bg-online",
-  claimed: "bg-transparent ring-[1.5px] ring-inset ring-ink",
-  leased: "bg-transparent ring-[1.5px] ring-inset ring-ink-faint",
   blocked: "bg-danger-text",
   in_progress: "bg-ink",
   todo: "bg-ink-muted",
   backlog: "bg-ink-faint",
   done: "bg-line",
-  // Drawn as DoneInTimelineIcon by StateDot.
-  done_in_timeline: "",
   canceled: "bg-line",
 };
 
-/** A state's mark: a dot by shape and colour, or done in a timeline's own icon. */
+/** Ordinary states use dots; ownership and done-in-timeline have distinct icons. */
 export function StateDot({ state, className = "" }: { state: IssueState; className?: string }) {
   if (state === "done_in_timeline") return <DoneInTimelineIcon className={`size-3 ${className}`} />;
+  if (state === "claimed" || state === "leased")
+    return <ClaimIcon inherited={state === "leased"} className={`size-3 ${className}`} />;
   return (
     <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]} ${className}`} aria-hidden />
   );

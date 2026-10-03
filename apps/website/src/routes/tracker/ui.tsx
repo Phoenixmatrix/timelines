@@ -1,5 +1,6 @@
 import { memo, useId, useMemo, type ReactNode } from "react";
 import { Combobox } from "@base-ui/react/combobox";
+import { FlagIcon } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -21,6 +22,23 @@ import { TIMELINE_POLICIES, type TimelinePolicy } from "../../../shared/timeline
 import { popMotion, SelectField } from "../../components/ui.tsx";
 import type { IssueIndex } from "./query.ts";
 import { Actor } from "./Actor.tsx";
+
+/** Exclusive ownership uses a flag; an outline means the lease is inherited. */
+export function ClaimIcon({
+  inherited = false,
+  className = "size-3",
+}: {
+  inherited?: boolean;
+  className?: string;
+}) {
+  return (
+    <FlagIcon
+      weight={inherited ? "bold" : "fill"}
+      className={`shrink-0 ${inherited ? "text-ink-faint" : "text-ink"} ${className}`}
+      aria-hidden
+    />
+  );
+}
 
 /**
  * Done in a timeline (CORE-74): a branch whose tip is a done check, in the
@@ -250,8 +268,6 @@ export function blockers(issue: Issue, snapshot: Snapshot, index?: IssueIndex) {
 const STATE_DOT: Record<string, string> = {
   waiting: "bg-signal",
   ready: "bg-online",
-  claimed: "bg-transparent ring-[1.5px] ring-inset ring-ink",
-  leased: "bg-transparent ring-[1.5px] ring-inset ring-ink-faint",
   blocked: "bg-danger-text",
 };
 function StateBadge({
@@ -271,6 +287,8 @@ function StateBadge({
     >
       {state === "done_in_timeline" ? (
         <DoneInTimelineIcon />
+      ) : state === "claimed" || state === "leased" ? (
+        <ClaimIcon inherited={state === "leased"} />
       ) : (
         <span
           className={`size-2 shrink-0 rounded-full ${(state && STATE_DOT[state]) ?? "bg-ink-faint"}`}

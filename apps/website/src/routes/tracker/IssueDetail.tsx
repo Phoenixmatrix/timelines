@@ -27,6 +27,7 @@ import {
 } from "../../components/ui.tsx";
 import {
   blockers,
+  ClaimIcon,
   CloseReasonField,
   Field,
   IssuePicker,
@@ -1031,10 +1032,7 @@ export function IssueDetail({
             data-kind="checkpoint"
             id="tracker-claim-reason"
           >
-            <span
-              className="mt-1.5 size-2 shrink-0 rounded-full ring-[1.5px] ring-inset ring-ink"
-              aria-hidden
-            />
+            <ClaimIcon inherited={covering !== issue} className="mt-1 size-3" />
             <span>
               <Actor
                 who={claimAttribution(snapshot, covering!.claim!)}
@@ -1234,10 +1232,7 @@ export function IssueDetail({
       {latestCheckpoint && (
         <section className={SECTION} data-kind="checkpoint" aria-label="Latest checkpoint">
           <h3 className={`${HEADING} flex items-center gap-2`}>
-            <span
-              className="size-2 shrink-0 rounded-full ring-[1.5px] ring-inset ring-ink"
-              aria-hidden
-            />
+            <ClaimIcon />
             Latest checkpoint
           </h3>
           <p className="mk-hint mt-0.5 mb-2 flex flex-wrap items-center gap-x-1">
@@ -1547,12 +1542,11 @@ export function IssueDetail({
                   className="[&>span:last-child]:font-semibold [&>span:last-child]:text-ink"
                 />
                 <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>
-                  {comment.kind !== "comment" && (
-                    <span
-                      className={`size-1.5 rounded-full ${comment.kind === "checkpoint" ? "ring-[1.5px] ring-inset ring-ink" : "bg-online"}`}
-                      aria-hidden
-                    />
-                  )}
+                  {comment.kind === "checkpoint" ? (
+                    <ClaimIcon />
+                  ) : comment.kind === "evidence" ? (
+                    <span className="size-1.5 rounded-full bg-online" aria-hidden />
+                  ) : null}
                   {comment.kind[0]!.toUpperCase() + comment.kind.slice(1)}
                 </span>
                 <time

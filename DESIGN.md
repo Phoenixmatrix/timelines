@@ -428,7 +428,7 @@ The Knowledge tab is the Semantic Code Atlas: the repository as capability terri
 
 ### Status by shape
 
-When a state can't take a status hue, it takes a shape. A claimed issue (an agent holds a lease) is a hollow ink ring, in progress a filled ink dot, ready green, blocked red, waiting faint ink; agent checkpoints use the same ring. Data hues never mark a status.
+When a state can't take a status hue, it takes a shape. A claimed issue (an agent holds a lease) uses a filled ink flag; an inherited lease uses an outlined faint-ink flag. In progress remains a filled ink dot, ready green, blocked red, waiting faint ink; agent checkpoints use the same filled flag. The shared claim mark appears in lists, boards, the relationship lens, legends and issue details. Compact state columns reserve 12px for icons, and hidden state words and tooltips retain ownership context. Data hues never mark a status.
 
 ## Do's and Don'ts
 
@@ -452,7 +452,7 @@ When a state can't take a status hue, it takes a shape. A claimed issue (an agen
 - **Don't** put borders or shadows on panes, cards or tables; separate them by tone and spacing.
 - **Don't** put a shadow on anything that doesn't float (The Float-Only Shadow Rule).
 - **Don't** use amber to mean warning or status; failure is red, success is green, waiting is faint ink.
-- **Don't** use the data hues outside charts and their legend keys, and never for a status (a claim is a hollow ring, not violet).
+- **Don't** use the data hues outside charts and their legend keys, and never for a status (a claim is an ink flag, not violet).
 - **Don't** draw a whole dependency graph as a hairball, a force layout or a flame-graph mosaic; centre an issue and show its neighbours as lists.
 - **Don't** stack separate cards for list items, or nest a card inside a card.
 - **Don't** set text in uppercase with letter-spacing, or add small labels above headings; headings stand on their own.

@@ -120,13 +120,13 @@ Timelines are a first-class place, so they get a mark of their own in the rail i
 
 ### Secondary
 
-**Ready green** identifies actionable work and completion evidence. Ready labels mix the online token with 20% ink for readable contrast in both themes; the verified light ready label measures 4.95:1 against its pane. **Claim violet** identifies exclusive agent ownership and checkpoints. These are semantic state channels, not competing brand accents. Labels accompany color.
+**Ready green** identifies actionable work and completion evidence. Ready labels mix the online token with 20% ink for readable contrast in both themes; the verified light ready label measures 4.95:1 against its pane. Claims and checkpoints use neutral ink flags rather than a separate status hue. Labels accompany state marks.
 
 ### Neutral
 
 Warm charcoal steps separate the stage, rail, recessed fields, detail panes and raised controls. Bright ink carries content; muted ink carries metadata; faint ink carries hints. Use the established line tokens for separators rather than introducing independent gray values.
 
-**The State Meaning Rule.** Amber means action or selection, green means ready/evidence, violet means claim/checkpoint, and danger tokens mean blocked work or a conflict requiring attention.
+**The State Meaning Rule.** Amber means action or selection, green means ready/evidence, neutral flags mean claim/checkpoint, and danger tokens mean blocked work or a conflict requiring attention.
 
 ## Typography
 
@@ -158,7 +158,7 @@ Navigation uses links; view toggles use pressed buttons. Workspace names are und
 
 ### Issue selection and handoff
 
-A selected issue row uses a subtle amber wash. Readiness combines a text label and a state dot (a hollow ink ring for a claim; see "Status by shape" in the root DESIGN.md). Parent hierarchy, blockers and related links are separately labelled. Checkpoints carry the same ink ring and evidence a green dot; the latest checkpoint sits near the issue header. The list, relationship lens and Atlas are recorded in the root DESIGN.md.
+A selected issue row uses a subtle amber wash. Readiness combines a text label and a state mark: a filled ink flag for a direct claim, an outlined faint-ink flag for an inherited lease (see "Status by shape" in the root DESIGN.md). Parent hierarchy, blockers and related links are separately labelled. Checkpoints carry the same filled flag and evidence a green dot; the latest checkpoint sits near the issue header. The list, relationship lens and Atlas are recorded in the root DESIGN.md.
 
 ### Conflict comparison
 
