@@ -10,6 +10,7 @@
 // accountable person and the agent that started it may abandon it. The bookmarks
 // themselves are written by the Worker (timelines/api.ts), which asks here first.
 
+import { sql } from "kysely";
 import type { HumanRequest, RequestCheckpoint, TimelineFeedEvent } from "../../shared/tracker.ts";
 import {
   CHECKPOINT_CHANGES,
@@ -910,6 +911,25 @@ export class TimelineStore {
         .where("timeline_id", "=", timeline.id)
         .orderBy("created_at", "desc")
         .orderBy("id", "desc")
+        .limit(1),
+    );
+    return row ? (JSON.parse(row.data) as Landing) : null;
+  }
+  /** Exact repository advance, including older attempts of a partly landed timeline. */
+  landingForCommit(repoId: string, commit: string): Landing | null {
+    const row = first(
+      this.sql,
+      tracker
+        .selectFrom("timeline_landings")
+        .select("data")
+        .where(sql<boolean>`exists (
+          select 1 from json_each(timeline_landings.data, '$.repos') as repo
+          where json_extract(repo.value, '$.id') = ${repoId}
+            and json_extract(repo.value, '$.merge') = ${commit}
+            and json_extract(repo.value, '$.state') = 'advanced'
+        )`)
+        .orderBy("created_at")
+        .orderBy("id")
         .limit(1),
     );
     return row ? (JSON.parse(row.data) as Landing) : null;

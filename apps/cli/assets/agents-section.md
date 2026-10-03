@@ -17,6 +17,27 @@ Work is tracked in Gitmatrix: {{SCOPE}}. The loop, in brief (the
 5. Ship ({{SHIP}}), then `gm issue complete <issue> --evidence '…'`.
    Abandoning active work? `gm issue release <issue>`. Keep parked request leases.
 
+## Creating issues
+
+Classify the expertise needed by the actual scope and acceptance criteria, not
+by the intended agent. Use a small relevant set of issue labels, reusing the
+team's spelling. Without a team convention, use lowercase `ux` (usability and
+interaction design), `frontend` (client UI), `backend` (server logic), `data`
+(schemas and pipelines), `architecture` (system design), `api` (contracts and
+integrations), `security` (auth and threat mitigation), `testing` (test strategy
+and infrastructure), `infrastructure` (CI/CD and operations), or `documentation`
+(user and developer docs). Avoid synonyms and speculative labels; ordinary
+verification alone does not need `testing`.
+
+    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --label ux --label frontend
+
+Substitute the actual team. Repeat `--label` for each area, then read back the
+returned issue key with `gm issue show <issue> --json` and check `labels`.
+These are suggested defaults for free-form issue labels, not an enforced
+catalog. They describe work, not agent capabilities. Agent profile tags and
+skills are self-reported, advisory delegation hints, not proof of expertise or
+claim restrictions; do not declare capabilities from issue labels.
+
 ## Human intervention
 
 `gm issue next` and `gm issue claim` return the effective `intervention` mode

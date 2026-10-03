@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
-import type { CheckpointState, Timeline, TimelineEvent } from "../../shared/timelines.ts";
+import type { CheckpointState, Landing, Timeline, TimelineEvent } from "../../shared/timelines.ts";
 import type { WhyResponse } from "../../shared/why.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
@@ -176,6 +176,35 @@ async function setup() {
     },
   ];
   const issue = { id: "iss_7", key: "CORE-7", title: "Rank search by title", status: "done" };
+  const queued: Landing = {
+    id: "ld_search",
+    timelineId: timeline.id,
+    slug: timeline.slug,
+    checkpointId: "cp_2",
+    checkpointNumber: 2,
+    state: "landed",
+    repos: [
+      {
+        id: "app",
+        owner: "orbit",
+        name: "app",
+        commit: x2,
+        base: m1,
+        merge: landing,
+        attempt: 1,
+        state: "advanced",
+        mergeRun: { id: "run_merge", number: 4 },
+        gateRun: { id: "run_gates", number: 5 },
+        reason: null,
+      },
+    ],
+    reason: null,
+    trigger: "approval",
+    requestedBy: { actorId: "ann", accountableId: "ann", agentId: "agt_bot" },
+    version: 5,
+    createdAt: "2026-10-03T02:30:00.000Z",
+    updatedAt: "2026-10-03T03:00:00.000Z",
+  };
   const tracker = {
     listTimelines: async () => ({ ok: true, value: [timeline] }),
     timeline: async (slug: string) =>
@@ -186,6 +215,15 @@ async function setup() {
           }
         : { ok: false, status: 404, error: "No timeline", code: "not_found" },
     checkpoints: async () => ({ ok: true, value: checkpoints }),
+    landingForCommit: async (repoId: string, commit: string) => ({
+      ok: true,
+      value: queued.repos.some(
+        (repo) => repo.id === repoId && repo.merge === commit && repo.state === "advanced",
+      )
+        ? queued
+        : null,
+    }),
+    checkpoint: async () => ({ ok: true, value: checkpoints[0]! }),
     subscribedWorkspaces: async () => ({ ok: true, value: ["ws"] }),
     issuesByKey: async (keys: string[]) => ({
       ok: true,
@@ -223,7 +261,15 @@ async function setup() {
     );
     return { status: response.status, body: (await response.json()) as WhyResponse };
   };
-  return { get, commits: { m0, x1, m1, x2, landing }, landingUpdate };
+  return {
+    get,
+    commits: { m0, x1, m1, x2, landing },
+    landingUpdate,
+    queued,
+    checkpoints,
+    events,
+    push,
+  };
 }
 
 describe("GET /why", () => {
@@ -277,10 +323,18 @@ describe("GET /why", () => {
     expect(chain.landing).toMatchObject({
       ref: "refs/heads/main",
       commit: x2,
-      via: "merge",
+      via: "queue",
       timeline: "search",
       update: { id: t.landingUpdate },
-      merge: { commit: landing },
+      queue: {
+        id: "ld_search",
+        checkpointId: "cp_2",
+        checkpointNumber: 2,
+        trigger: "approval",
+        requestedBy: { actorId: "ann", accountableId: "ann", agentId: "agt_bot" },
+        mergeRun: { id: "run_merge", number: 4 },
+        gateRun: { id: "run_gates", number: 5 },
+      },
     });
     expect(body.people).toEqual({
       ann: { name: "Ann", kind: "person" },
@@ -295,7 +349,7 @@ describe("GET /why", () => {
     // Main's own commit: pushed straight there, no timeline.
     const tidy = body.chains[1]!;
     expect(tidy).toMatchObject({ changeId: "mmmmone1", timelines: [], checkpoints: [] });
-    expect(tidy.landing).toMatchObject({ via: "push", timeline: null, merge: null, commit: m1 });
+    expect(tidy.landing).toMatchObject({ via: "push", timeline: null, queue: null, commit: m1 });
     // The rebase carried it into the timeline afterwards: listed, but not where it came from.
     expect(tidy.refs.map((r) => [r.ref, r.afterLanding])).toEqual([
       ["refs/heads/main", false],
@@ -319,7 +373,7 @@ describe("GET /why", () => {
     });
     expect(chain.checkpoints.map((c) => c.number)).toEqual([1, 2]);
     expect(chain.approval).toMatchObject({ state: "approved", number: 2 });
-    expect(chain.landing).toMatchObject({ via: "merge", timeline: "search", commit: t.commits.x2 });
+    expect(chain.landing).toMatchObject({ via: "queue", timeline: "search", commit: t.commits.x2 });
     // Issue keys come from the change's commits on the server.
     expect(chain.issues.map((i) => i.key)).toEqual(["CORE-7"]);
   });
@@ -345,7 +399,81 @@ describe("GET /why", () => {
     ]);
     expect(chain).toMatchObject({ timelines: [], merges: [], checkpoints: [], issues: [] });
     expect(chain.approval).toBeNull();
-    expect(chain.landing).toMatchObject({ via: "unknown", timeline: null });
+    expect(chain.landing).toMatchObject({ via: "unknown", timeline: null, queue: null });
+    expect(body.people).toEqual({});
+  });
+
+  test("a queue landing needs no merge event, and survives a subsequent main rewrite", async () => {
+    const t = await setup();
+    t.events.length = 0;
+    await t.push({ "refs/heads/main": t.commits.x1 });
+    const { body } = await t.get("ann", `commit=${t.commits.x1}`);
+    expect(body.chains[0]!.landing).toMatchObject({
+      commit: t.commits.x2,
+      update: { new: t.commits.landing },
+      via: "queue",
+      queue: { id: "ld_search", checkpointId: "cp_2" },
+    });
+  });
+
+  test("an exact queue advance does not depend on the checkpoint's bounded change index", async () => {
+    const t = await setup();
+    t.checkpoints[0]!.checkpoint.repos[0]!.changes = [];
+    const { body } = await t.get("ann", `commit=${t.commits.x2}`);
+    expect(body.chains[0]!.landing).toMatchObject({
+      via: "queue",
+      timeline: "search",
+      update: { new: t.commits.landing },
+      queue: { id: "ld_search", checkpointId: "cp_2" },
+    });
+  });
+
+  test.each(["failed", "conflict", "testing"] as const)(
+    "an unadvanced %s attempt is not a landing",
+    async (state) => {
+      const t = await setup();
+      t.queued.repos[0]!.state = state;
+      const { body } = await t.get("ann", `commit=${t.commits.x2}`);
+      expect(body.chains[0]!.landing).toMatchObject({ via: "push", timeline: null, queue: null });
+    },
+  );
+
+  test.each(["repo", "checkpoint", "checkpoint repo", "checkpoint timeline", "tip"] as const)(
+    "does not attribute an unrelated %s",
+    async (mismatch) => {
+      const t = await setup();
+      if (mismatch === "repo") t.queued.repos[0]!.id = "other";
+      if (mismatch === "checkpoint") t.queued.checkpointId = "cp_unrelated";
+      if (mismatch === "checkpoint repo")
+        t.checkpoints[0]!.checkpoint.repos[0]!.commit = t.commits.m1;
+      if (mismatch === "checkpoint timeline")
+        t.checkpoints[0]!.checkpoint.timelineId = "tl_unrelated";
+      if (mismatch === "tip") t.queued.repos[0]!.merge = t.commits.m1;
+      const { body } = await t.get("ann", `commit=${t.commits.x2}`);
+      expect(body.chains[0]!.landing).toMatchObject({ via: "push", timeline: null, queue: null });
+    },
+  );
+
+  test("a partly landed attempt proves only this advanced repository and discloses only its runs", async () => {
+    const t = await setup();
+    t.queued.state = "failed";
+    t.queued.repos.push({
+      ...t.queued.repos[0]!,
+      id: "private-lib",
+      name: "private-lib",
+      state: "failed",
+      gateRun: { id: "private-run", number: 99 },
+    });
+    const { body } = await t.get("ann", `commit=${t.commits.x2}`);
+    expect(body.chains[0]!.landing?.queue).toEqual({
+      id: "ld_search",
+      checkpointId: "cp_2",
+      checkpointNumber: 2,
+      trigger: "approval",
+      requestedBy: { actorId: "ann", accountableId: "ann", agentId: "agt_bot" },
+      mergeRun: { id: "run_merge", number: 4 },
+      gateRun: { id: "run_gates", number: 5 },
+    });
   });
 
   test("rejects requests it can't answer", async () => {

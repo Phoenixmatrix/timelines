@@ -147,23 +147,27 @@ fn origin_owner(root: &Path) -> Option<String> {
     parts.next().filter(|o| !o.is_empty()).map(str::to_string)
 }
 
-/// Agent names are lowercase letters, digits and single hyphens, up to 39.
-fn agent_name(raw: &str) -> String {
-    let mut name = String::new();
-    for c in raw.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            name.push(c);
-        } else if !name.is_empty() && !name.ends_with('-') {
-            name.push('-');
-        }
-    }
-    let name: String = name.trim_end_matches('-').chars().take(39).collect();
-    let name = name.trim_end_matches('-').to_string();
-    if name.is_empty() {
-        "agent".into()
-    } else {
-        name
-    }
+/// Memorable names, independent of the harness. Registration checks the person's
+/// namespace as well: a random collision must never adopt an existing identity.
+fn agent_name() -> String {
+    const ADJECTIVES: &[&str] = &[
+        "able", "agile", "amber", "bold", "brave", "bright", "calm", "clever", "cosmic", "crisp",
+        "curious", "daring", "eager", "gentle", "golden", "happy", "jolly", "kind", "lively",
+        "lucky", "merry", "nimble", "patient", "quiet", "rapid", "sharp", "silver", "steady",
+        "sunny", "swift", "vivid", "wise",
+    ];
+    const NOUNS: &[&str] = &[
+        "badger", "bear", "beaver", "bison", "crane", "deer", "dolphin", "eagle", "falcon",
+        "finch", "fox", "gecko", "heron", "ibis", "jaguar", "koala", "lark", "lemur", "lynx",
+        "marten", "otter", "owl", "panda", "puffin", "raven", "robin", "seal", "sparrow", "tiger",
+        "turtle", "whale", "wolf",
+    ];
+    let [adjective, noun] = rand::random::<[u8; 2]>();
+    format!(
+        "{}-{}",
+        ADJECTIVES[adjective as usize % ADJECTIVES.len()],
+        NOUNS[noun as usize % NOUNS.len()]
+    )
 }
 
 fn merged(base: &[String], add: &[String], drop: &[String]) -> Vec<String> {
@@ -245,11 +249,12 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     }
     local.skills.allow = merged(&local.skills.allow, &o.allow_skills, &o.deny_skills);
     local.skills.deny = merged(&local.skills.deny, &o.deny_skills, &o.allow_skills);
+    let generated = o.name.is_none() && local.name.is_none();
     let mut name = o
         .name
         .clone()
         .or(local.name.clone())
-        .unwrap_or_else(|| agent_name(harness.as_deref().unwrap_or("agent")));
+        .unwrap_or_else(agent_name);
 
     // The files.
     let layout = profile::layout(harness.as_deref().unwrap_or(""));
@@ -342,7 +347,7 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     let identity = if o.no_identity || ctx.dry_run {
         Value::Null
     } else {
-        let (identity, resolved) = identity(&root, &name, &local)?;
+        let (identity, resolved) = identity(&root, &name, generated, &local)?;
         name = resolved;
         identity
     };
@@ -458,7 +463,7 @@ fn published_names(report: &AgentCapabilities) -> Vec<String> {
 
 /// The agent this checkout works as: created and given a kept token if
 /// needed, with its capability profile republished. Returns it and its name.
-fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
+fn identity(root: &Path, name: &str, generated: bool, local: &Local) -> Result<(Value, String)> {
     let mut config = Config::load();
     let session = remote::api(&config, "GET", "/session", None).map_err(|e| {
         e.hint("Sign in first (`gm auth login`), or pass --no-identity to only write the files.")
@@ -496,13 +501,14 @@ fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
         ));
     }
 
-    // A person: find or create the agent, publish its profile, keep a working token.
+    // A person may reuse an explicit or saved name, but generated names always
+    // create a new identity. /agents lists only this authenticated person's agents.
     config.acting = Acting::Person;
     let agents = remote::api(&config, "GET", "/agents", None)?["agents"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let existing = agents.into_iter().find(|a| a["name"] == name);
+    let existing = agents.iter().find(|a| !generated && a["name"] == name);
     if existing.as_ref().is_some_and(|a| !a["revokedAt"].is_null()) {
         return Err(
             GmError::new("revoked", format!("Your agent {name} was revoked."))
@@ -528,16 +534,47 @@ fn identity(root: &Path, name: &str, local: &Local) -> Result<(Value, String)> {
                 ),
                 Some(&report),
             )?;
-            agent
+            agent.clone()
         }
-        None => remote::api(
-            &config,
-            "POST",
-            "/agents",
-            Some(&json!({ "name": name, "capabilities": report })),
-        )?["agent"]
-            .clone(),
+        None => {
+            let mut candidate = name.to_string();
+            let mut registered = None;
+            for _ in 0..64 {
+                if generated && agents.iter().any(|a| a["name"] == candidate) {
+                    candidate = format!("{}-{:08x}", agent_name(), rand::random::<u32>());
+                    continue;
+                }
+                match remote::api(
+                    &config,
+                    "POST",
+                    "/agents",
+                    Some(&json!({ "name": candidate, "capabilities": report })),
+                ) {
+                    Ok(response) => {
+                        registered = Some(response["agent"].clone());
+                        break;
+                    }
+                    // Another checkout may have registered this name since the
+                    // list was read. Try a new name, never adopt that identity.
+                    Err(error) if generated && error.code == "conflict" => {
+                        candidate = format!("{}-{:08x}", agent_name(), rand::random::<u32>());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            registered.ok_or_else(|| {
+                GmError::new("conflict", "Couldn't find an unused memorable agent name.")
+                    .hint("Choose a name with --name, or run setup again.")
+                    .exit(exit::CONFLICT)
+            })?
+        }
     };
+    let name = agent["name"].as_str().ok_or_else(|| {
+        GmError::new(
+            "protocol_error",
+            "The server didn't return the agent's name.",
+        )
+    })?;
     let id = agent["id"].as_str().unwrap_or_default().to_string();
     let kept = config.agent_tokens().get(name).cloned();
     let works = kept.as_ref().is_some_and(|token| {
@@ -601,9 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn names_and_lists_are_normalized() {
-        assert_eq!(agent_name("Claude Code!"), "claude-code");
-        assert_eq!(agent_name("--"), "agent");
+    fn lists_are_normalized() {
         assert_eq!(
             merged(
                 &["rust".into(), "web".into()],
@@ -611,6 +646,74 @@ mod tests {
                 &["web".into()]
             ),
             ["linux", "rust"]
+        );
+    }
+
+    #[test]
+    fn setup_keeps_its_generated_name_until_explicitly_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".gitmatrix")).unwrap();
+        let mut ctx = Ctx {
+            format: crate::output::Format::Json,
+            dry_run: false,
+            cwd: dir.path().to_path_buf(),
+            argv: String::new(),
+        };
+        let mut options = Options {
+            harness: Some("codex".into()),
+            no_identity: true,
+            ..Default::default()
+        };
+        setup(&ctx, &options).unwrap();
+        let first = profile::local_at(dir.path())
+            .unwrap()
+            .unwrap()
+            .name
+            .unwrap();
+        let words: Vec<_> = first.split('-').collect();
+        assert_eq!(words.len(), 2);
+        assert!(
+            words
+                .iter()
+                .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()))
+        );
+        assert_ne!(first, "codex");
+        options.harness = Some("claude-code".into());
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            profile::local_at(dir.path())
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some(first.as_str())
+        );
+
+        let local = std::fs::read(dir.path().join(profile::LOCAL_FILE)).unwrap();
+        options.name = Some("deliberate-name".into());
+        options.check = true;
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(profile::LOCAL_FILE)).unwrap(),
+            local
+        );
+        options.check = false;
+        ctx.dry_run = true;
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(profile::LOCAL_FILE)).unwrap(),
+            local
+        );
+
+        ctx.dry_run = false;
+        setup(&ctx, &options).unwrap();
+        assert_eq!(
+            profile::local_at(dir.path())
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("deliberate-name")
         );
     }
 

@@ -151,6 +151,9 @@ export class Tracker extends DurableObject<Env> {
   landing(slug: string) {
     return this.reply(() => this.timelines.landing(slug));
   }
+  landingForCommit(repoId: string, commit: string) {
+    return this.reply(() => this.timelines.landingForCommit(repoId, commit));
+  }
   landingForRun(slug: string, runId: string) {
     return this.reply(() => this.timelines.landingForRun(slug, runId));
   }

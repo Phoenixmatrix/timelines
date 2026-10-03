@@ -15,6 +15,7 @@ import { durableStorage } from "../testing/durable.ts";
 import { fakeRemotes, type FakeRemote } from "../testing/remote.ts";
 import { Tracker } from "../tracker/object.ts";
 import { tracker as trackerRoutes } from "../tracker/api.ts";
+import { trackerObject } from "../tracker/stub.ts";
 import { logPush } from "./activity.ts";
 import { timelines } from "./api.ts";
 import { afterRun, progress, workerDeps, type LandingDeps } from "./landing.ts";
@@ -325,6 +326,10 @@ describe("the landing queue", () => {
     const searchMerge = await t.merged("search", "app");
     expect(await t.repoOf("search", "app")).toMatchObject({ state: "testing", merge: searchMerge });
     expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(oid(1));
+    expect(await trackerObject(t.env, "orbit").landingForCommit("app", searchMerge)).toEqual({
+      ok: true,
+      value: null,
+    });
     await t.gates("search", "app");
     expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(searchMerge);
     expect(await t.landing("search")).toMatchObject({ state: "landed" });
@@ -344,6 +349,15 @@ describe("the landing queue", () => {
     await t.gates("ui", "app");
     expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(uiMerge);
     expect(await t.landing("ui")).toMatchObject({ state: "landed" });
+    // Exact repository advances remain discoverable after a later landing.
+    expect(await trackerObject(t.env, "orbit").landingForCommit("app", searchMerge)).toEqual({
+      ok: true,
+      value: await t.landing("search"),
+    });
+    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", searchMerge)).toEqual({
+      ok: true,
+      value: null,
+    });
 
     // Both landed: bookmarks and landing branches gone, issues done, leases released.
     for (const slug of ["search", "ui"]) {
@@ -460,6 +474,13 @@ describe("the landing queue", () => {
     const { timeline, events } = await t.detail("wide");
     expect(timeline.status).toBe("partly_landed");
     expect(events.at(-1)).toMatchObject({ kind: "landing", outcome: "partly_landed" });
+    expect(
+      await trackerObject(t.env, "orbit").landingForCommit("app", partly.repos[0]!.merge!),
+    ).toEqual({ ok: true, value: partly });
+    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", libMerge)).toEqual({
+      ok: true,
+      value: null,
+    });
     // lib retries onto its new main, and the timeline lands.
     const retried = await t.merged("wide", "lib");
     await t.gates("wide", "lib");
@@ -468,6 +489,14 @@ describe("the landing queue", () => {
     expect(await t.landing("wide")).toMatchObject({
       state: "landed",
       repos: [{ state: "advanced" }, { state: "advanced", attempt: 2 }],
+    });
+    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", retried)).toEqual({
+      ok: true,
+      value: await t.landing("wide"),
+    });
+    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", libMerge)).toEqual({
+      ok: true,
+      value: null,
     });
   });
 

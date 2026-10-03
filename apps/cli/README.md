@@ -89,6 +89,22 @@ JSON summaries expose `kind: daily|tag`; entries expose `releaseKind`. Both use
 `lastCommitAt` for the latest Git committer timestamp in the group. Stored legacy
 notes regenerate lazily on read; check the index's status while generation runs.
 
+## Why a line changed
+
+`gm why src/app.ts:42` follows local blame through the change's timeline,
+issues, checkpoints, approval and landing. JSON preserves the complete chain;
+`-o text` prints its evidence. Change IDs keep the chain connected across
+rebases and amendments.
+
+Queue landings are matched to the exact repository advance and checkpoint.
+Their evidence includes the landing ID, checkpoint ID and number, requester
+and accountable person, plus this repository's merge and gate run IDs and
+numbers. `landing.via` is `queue`, `push` or `unknown`; `landing.queue` is null
+without authoritative queue evidence. A `push` means a recorded main ref
+update, not proof of a queue landing. Tracker-inaccessible readers get no
+tracker provenance. Failed or unfinished advances do not become landings;
+in a partially landed timeline, only repositories already advanced qualify.
+
 ## Deployments
 
 Gitmatrix deploys nothing; whatever deploys tells it where code went. Inside a CI
@@ -128,7 +144,7 @@ gm tracker use orbit
 gm team create ENG --name Engineering
 gm workspace create launch --name Launch
 gm issue create 'Search redesign' --team ENG --type prd \
-  --description-file design.md --acceptance-file acceptance.md --workspace launch
+  --description-file design.md --acceptance-file acceptance.md --workspace launch --label ux --label frontend
 gm issue ready --limit 10
 gm issue show ENG-1 --limit 20
 gm issue update ENG-1 --data '{"priority":1,"labels":["search"]}'
@@ -146,6 +162,15 @@ accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` 
 `--dry-run` previews intent without sending/enqueuing mutations. Local preview is not
 an authoritative permission, graph or lease validation. Tracker changes are **not**
 reversed by `gm undo`.
+
+Label issues by the expertise their scope requires, using repeated `--label`
+flags. Follow the team's vocabulary; otherwise use the defaults explained by
+`gm cli guide` and the installed graph-work skill: `ux`, `frontend`, `backend`,
+`data`, `architecture`, `api`, `security`, `testing`, `infrastructure` and
+`documentation`. Pick only relevant areas, not every area touched by routine
+verification. These are suggested free-form issue labels, not a registered
+catalog or claim restrictions. Agent profile tags and skills remain separate,
+self-reported capability hints. Updating `labels` replaces the whole list.
 
 ### Creator and audit history
 
@@ -370,13 +395,16 @@ gm agent setup --check                           # exit 4 if instructions or ski
   mode, and `instructions` (`file`, and how work `ship`s).
   `.gitmatrix/agent.local.yml` (git-ignored) is this checkout's agent: name,
   harness, model, tags, scope and intervention overrides.
-- **Identity and profile.** As you, it creates the agent (default name: the
-  harness), mints a token and keeps it with gm's credentials without printing
-  it, and publishes the agent's capability profile (below) with this checkout's
-  harness, model and tags. When an agent harness drives gm in that checkout, gm
-  acts as the agent (`gm auth status` shows `actingAs`); in your own terminal you
-  stay yourself, and `GM_TOKEN` always wins. Run by the agent, it refreshes its
-  own profile. `--no-identity` writes only the files.
+- **Identity and profile.** A new unnamed checkout gets a memorable
+  adjective-noun name, kept on reruns; collisions get a random suffix rather
+  than reusing an existing identity. `--name` chooses or reuses one of your
+  named agents. You remain the accountable person. Setup mints a token and
+  keeps it with gm's credentials without printing it, and publishes the agent's
+  capability profile (below) with this checkout's harness, model and tags.
+  When an agent harness drives gm in that checkout, gm acts as the agent
+  (`gm auth status` shows `actingAs`); in your own terminal you stay yourself,
+  and `GM_TOKEN` always wins. Run by the agent, it refreshes its own profile.
+  `--no-identity` writes only the files.
 - **Defaults.** `gm issue next` and `claim` take the session label, scope and
   lease length from these files, and the tracker owner when none is selected.
 - **Your default team.** When neither a flag nor these files name a team,

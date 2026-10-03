@@ -193,6 +193,9 @@ pub struct IssueCreate {
     pub assignee: Option<String>,
     #[arg(long)]
     pub workspace: Vec<String>,
+    /// Work-area label; repeat for each area (e.g. --label ux --label frontend).
+    /// Reuse team spelling; `gm cli guide` lists suggested defaults. Labels describe
+    /// the issue, not agent capabilities, and do not restrict claims.
     #[arg(long)]
     pub label: Vec<String>,
 }

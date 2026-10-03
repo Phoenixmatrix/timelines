@@ -70,7 +70,7 @@ export function WhyPanel({
     error?: string;
   } | null>(null);
   useEffect(() => {
-    if (!open || state?.request === request) return;
+    if (!open) return;
     let live = true;
     setState({ request });
     api<WhyResponse>(request).then(
@@ -80,7 +80,7 @@ export function WhyPanel({
     return () => {
       live = false;
     };
-  }, [open, request, state?.request]);
+  }, [open, request]);
   const current = state?.request === request ? state : null;
   const label = start === end ? `line ${start}` : `lines ${start}–${end}`;
 
@@ -327,7 +327,7 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
         <Step title="Landing">
           {chain.landing ? (
             <span>
-              {chain.landing.via === "merge" ? "Landed on " : "Reached "}
+              {chain.landing.via === "queue" ? "Landed on " : "Reached "}
               <code className="mk-mono">{refName(chain.landing.ref)}</code>
               {chain.landing.timeline && (
                 <>
@@ -338,10 +338,27 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
                 </>
               )}{" "}
               <time title={fullDate(chain.landing.at)}>{timeAgo(chain.landing.at)}</time>
-              {chain.landing.merge && (
+              {chain.landing.queue && (
                 <span className="text-ink-muted">
-                  {" "}
-                  · merge <code className="mk-mono">{shortOid(chain.landing.merge.commit)}</code>
+                  {" · landing "}
+                  <code className="mk-mono">{chain.landing.queue.id}</code>
+                  {" · checkpoint #"}
+                  {chain.landing.queue.checkpointNumber}
+                  {" ("}
+                  {chain.landing.queue.checkpointId}
+                  {")"}
+                  {" · requested by "}
+                  {who(
+                    chain.landing.queue.requestedBy.agentId ??
+                      chain.landing.queue.requestedBy.actorId,
+                  )}
+                  {" for "}
+                  {who(chain.landing.queue.requestedBy.accountableId)}
+                  {chain.landing.queue.mergeRun &&
+                    ` · merge run #${chain.landing.queue.mergeRun.number} (${chain.landing.queue.mergeRun.id})`}
+                  {chain.landing.queue.gateRun
+                    ? ` · gates #${chain.landing.queue.gateRun.number} (${chain.landing.queue.gateRun.id})`
+                    : " · no gates run"}
                 </span>
               )}
             </span>

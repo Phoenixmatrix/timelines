@@ -9,7 +9,13 @@
 // GET /api/repos/:owner/:name/why serves it to the web app and to `gm why`.
 
 import type { RefUpdate } from "./api.ts";
-import type { ApprovalOutcome, TimelinePolicy, TimelineStatus } from "./timelines.ts";
+import type {
+  ApprovalOutcome,
+  Landing,
+  LandingRepo,
+  TimelinePolicy,
+  TimelineStatus,
+} from "./timelines.ts";
 import type { IssueStatus } from "./tracker.ts";
 
 /** Lines a single request may ask about. */
@@ -143,19 +149,22 @@ export interface WhyCheckpoint {
 /** How the change reached the default branch. */
 export interface WhyLanding {
   ref: string;
-  /** The change's commit on the default branch. */
+  /** The change's commit when it first reached the default branch. */
   commit: string;
   at: string;
   update: RefUpdate;
   /**
-   * `merge`: a landing merge recorded in the timeline events brought it.
-   * `push`: pushed straight to the default branch, or merged without a recorded event.
-   * `unknown`: the caller can't read the tracker that records merges.
+   * `queue`: the landing queue recorded this repository advancing to this exact merge.
+   * `push`: a ref update without matching queue provenance; not necessarily a direct push.
+   * `unknown`: the caller can't read the tracker that records landings.
    */
-  via: "merge" | "push" | "unknown";
-  /** The timeline it landed with: from the landing merge, else the last timeline it reached first. */
+  via: "queue" | "push" | "unknown";
+  /** Only set by an authoritative queue landing, never inferred from a nearby push. */
   timeline: string | null;
-  merge: WhyMerge | null;
+  queue:
+    | (Pick<Landing, "id" | "checkpointId" | "checkpointNumber" | "trigger" | "requestedBy"> &
+        Pick<LandingRepo, "mergeRun" | "gateRun">)
+    | null;
 }
 
 /**
@@ -219,6 +228,9 @@ export function mentionedIds(chain: WhyChain): string[] {
     ...chain.checkpoints.flatMap((c) => [c.actorId, c.approval?.by]),
     ...chain.merges.map((m) => m.actorId),
     chain.approval?.by,
+    chain.landing?.queue?.requestedBy.actorId,
+    chain.landing?.queue?.requestedBy.accountableId,
+    chain.landing?.queue?.requestedBy.agentId,
   ];
   return [...new Set(ids.filter((id): id is string => !!id))];
 }

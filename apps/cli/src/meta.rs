@@ -101,7 +101,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("bookmark set", git: "git branch -f", kw: "create branch move branch name tag point", mutates: true, out: OP, ex: ["gm bookmark set feature-x", "gm bookmark set feature-x -r @-"]),
     meta!("bookmark delete", git: "git branch -D / git push --delete", kw: "delete remove branch", mutates: true, out: OP, ex: ["gm bookmark delete feature-x", "gm bookmark delete feature-x --remote"]),
     meta!("file show", git: "git show <rev>:<path>", kw: "cat read print file contents at revision", mutates: false, out: Out::Typed(schema_of::<crate::commands::local::FileShow>), ex: ["gm file show src/main.rs -r trunk"]),
-    meta!("why", git: "git blame -L", kw: "why blame provenance history reason line annotate who changed explain change id timeline issue checkpoint approval landing merged rebase", mutates: false, out: Out::Other("WhyResponse {repo:{owner,name,defaultBranch},tracker:{owner,readable},blame:{source:'local',path,rev,head,start,end,lines:[{line,commit,originalLine}],truncated},chains:[{oid,onServer,commit:{oid,message,authorName,authorEmail,authoredAt,parents},lines:[number],changeId:string|null,changeSource:'client'|'push-log'|'header'|null,refs:[{ref,kind:'main'|'timeline'|'branch'|'tag',timeline:WhyTimeline|null,firstCommit,firstSeenAt,firstUpdate:{id,ref,old,new,forced,actor,agent,createdAt},lastCommit,lastSeenAt,rewritten,afterLanding}],timelines:[{id,slug,name,status,policy,experimental}],merges:[{from:string|null,into:string|null,commit,parent,at,actorId}],issues:[{id,key,title,status,trackerOwner,source:'commit'|'timeline'}],checkpoints:[{id,timeline,number,commit,summary,createdAt,actorId,current,approval:{requestId,state,by,at,note}|null}],approval:{requestId,state,by,at,note,checkpointId,timeline,number}|null,landing:{ref,commit,at,update,via:'merge'|'push'|'unknown',timeline:string|null,merge}|null,discussions:{available:false,reason,threads:[]}}],people:{[id]:{name,kind:'person'|'agent'}}}; one chain per commit blame names, in line order. Blame runs locally; the chain after the commit follows the change id, so it survives rebases. Without tracker access, tracker records are empty and tracker.readable is false."), ex: ["gm why src/app.ts:42", "gm why src/app.ts -L 40-48 --rev trunk", "gm why apps/cli/src/main.rs:10 -o text"]),
+    meta!("why", git: "git blame -L", kw: "why blame provenance history reason line annotate who changed explain change id timeline issue checkpoint approval landing merged rebase", mutates: false, out: Out::Other("WhyResponse {repo:{owner,name,defaultBranch},tracker:{owner,readable},blame:{source:'local',path,rev,head,start,end,lines:[{line,commit,originalLine}],truncated},chains:[{oid,onServer,commit:{oid,message,authorName,authorEmail,authoredAt,parents},lines:[number],changeId:string|null,changeSource:'client'|'push-log'|'header'|null,refs:[{ref,kind:'main'|'timeline'|'branch'|'tag',timeline:WhyTimeline|null,firstCommit,firstSeenAt,firstUpdate:{id,ref,old,new,forced,actor,agent,createdAt},lastCommit,lastSeenAt,rewritten,afterLanding}],timelines:[{id,slug,name,status,policy,experimental}],merges:[{from:string|null,into:string|null,commit,parent,at,actorId}],issues:[{id,key,title,status,trackerOwner,source:'commit'|'timeline'}],checkpoints:[{id,timeline,number,commit,summary,createdAt,actorId,current,approval:{requestId,state,by,at,note}|null}],approval:{requestId,state,by,at,note,checkpointId,timeline,number}|null,landing:{ref,commit,at,update,via:'queue'|'push'|'unknown',timeline:string|null,queue:{id,checkpointId,checkpointNumber,trigger:'auto'|'approval'|'request',requestedBy:{actorId,accountableId,agentId},mergeRun:{id,number}|null,gateRun:{id,number}|null}|null}|null,discussions:{available:false,reason,threads:[]}}],people:{[id]:{name,kind:'person'|'agent'}}}; one chain per commit blame names, in line order. Blame runs locally; the chain after the commit follows the change id, so it survives rebases. Queue provenance identifies the exact advanced repository and checkpoint; a plain push observation does not prove queue landing. Without tracker access, tracker records are empty and tracker.readable is false."), ex: ["gm why src/app.ts:42", "gm why src/app.ts -L 40-48 --rev trunk", "gm why apps/cli/src/main.rs:10 -o text"]),
     meta!("file list", git: "git ls-tree -r --name-only", kw: "ls files tree list paths", mutates: false, out: Out::Typed(schema_of::<crate::commands::local::FileList>), ex: ["gm file list", "gm file list src -r trunk"]),
     meta!("worktree add", git: "git worktree add --detach", kw: "parallel agent isolated checkout workspace create worktree include env ignored setup", mutates: true, out: Out::Typed(schema_of::<crate::commands::worktree::WorktreeResult>), ex: ["gm worktree add ../feature", "gm worktree add ../feature -r trunk --include"]),
     meta!("worktree list", git: "git worktree list", kw: "worktrees workspaces checkouts list parallel", mutates: false, out: Out::Typed(schema_of::<crate::commands::worktree::WorktreeResult>), ex: ["gm worktree list"]),
@@ -610,7 +610,7 @@ in, push, checkpoint again); a main that moved is merged and tested again.
 ## Distributed tracker (no Git repository required)
     gm tracker use orbit
     gm team create ENG --name Engineering
-    gm issue create 'Fix search' --team ENG
+    gm issue create 'Fix search' --team ENG --label frontend --label backend
     gm issue ready --limit 10
     gm issue show ENG-1 --limit 20
     gm issue history ENG-1 --owner orbit --limit 50
@@ -633,6 +633,35 @@ actor/agent, accountable person, source, time, operation and full before/after s
 Repeat with `--before NEXT_BEFORE` until `hasMore` is false; `--limit` is 1..100
 (default 50). `--json` preserves the complete response. The source is a provenance
 hint, not authentication; gm's transport declares `cli`.
+
+## Tagging issues on creation
+Label the expertise needed by the issue's actual scope and acceptance criteria,
+not the intended agent. Use a small relevant set; reuse the team's spelling.
+Without a team convention, use these lowercase work-area defaults:
+- `ux`: user research, interaction design and usability.
+- `frontend`: browser UI, styling and client-side behavior.
+- `backend`: server logic, services and background jobs.
+- `data`: schemas, migrations, queries and data pipelines.
+- `architecture`: system boundaries, cross-cutting design and major tradeoffs.
+- `api`: public interfaces, contracts and integrations.
+- `security`: authentication, authorization and threat mitigation.
+- `testing`: test strategy, test infrastructure and regression coverage.
+- `infrastructure`: deployment, CI/CD, networking and runtime operations.
+- `documentation`: user or developer documentation.
+These are suggested free-form issue `labels`, not a registered or enforced
+catalog. Reuse project-specific labels when needed; avoid synonyms, case variants
+and speculative areas. Do not add `architecture` to every code change or `testing`
+merely because all work needs verification. Label each child by its own scope.
+Repeat `--label` (not `--tag`) for each area:
+    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --label ux --label frontend
+    gm issue show ENG-1 --json
+Use the actual team and returned issue key; check the returned `labels`.
+`gm issue update ENG-1 --data '{"labels":["ux","frontend"]}'` replaces the whole
+list: preserve any unrelated labels still needed.
+Issue labels describe work; agent profile tags and skills describe self-reported
+capabilities. Profiles are advisory delegation hints, not proof of expertise or
+claim restrictions. Compare them with the work and available evidence; do not
+infer or publish capabilities just because an agent created or claimed an issue.
 
 ## Working through a graph (agents)
 An agent has its own identity, accountable to a person. `gm agent setup` (run

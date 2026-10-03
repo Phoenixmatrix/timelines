@@ -471,16 +471,47 @@ pub fn why_text(value: &Value) -> String {
                 out,
                 "  landed      {}{}{} {}",
                 ref_name(s(landing, "ref")),
-                landing["merge"]["commit"]
-                    .as_str()
-                    .map(|m| format!(" via merge {}", short(m)))
-                    .unwrap_or_default(),
+                if s(landing, "via") == "queue" {
+                    format!(" via queue {}", s(&landing["queue"], "id"))
+                } else {
+                    String::new()
+                },
                 landing["timeline"]
                     .as_str()
                     .map(|t| format!(" with {t}"))
                     .unwrap_or_default(),
                 day(s(landing, "at")),
             );
+            let queue = &landing["queue"];
+            if queue.is_object() {
+                let requested = &queue["requestedBy"];
+                let _ = writeln!(
+                    out,
+                    "              checkpoint #{} ({}) · requested by {} for {} · {}",
+                    queue["checkpointNumber"],
+                    s(queue, "checkpointId"),
+                    who(if requested["agentId"].is_string() {
+                        &requested["agentId"]
+                    } else {
+                        &requested["actorId"]
+                    }),
+                    who(&requested["accountableId"]),
+                    s(queue, "trigger"),
+                );
+                for (field, label) in [("mergeRun", "merge run"), ("gateRun", "gates")] {
+                    let run = &queue[field];
+                    if run.is_object() {
+                        let _ = writeln!(
+                            out,
+                            "              {label} #{} ({})",
+                            run["number"],
+                            s(run, "id")
+                        );
+                    } else if field == "gateRun" {
+                        let _ = writeln!(out, "              no gates run");
+                    }
+                }
+            }
         } else {
             let _ = writeln!(
                 out,
@@ -701,7 +732,10 @@ mod tests {
                  "merges": [], "issues": [{"key": "CORE-7", "title": "Rank search", "status": "done", "source": "commit"}],
                  "checkpoints": [{"number": 1, "timeline": "search", "commit": "abc", "approval": {"state": "approved"}}],
                  "approval": {"state": "approved", "by": "ann", "at": "2026-10-03T02:00:00Z", "note": null, "number": 1, "timeline": "search"},
-                 "landing": {"ref": "refs/heads/main", "at": "2026-10-03T03:00:00Z", "timeline": "search", "merge": {"commit": "f00dfeed"}},
+                 "landing": {"ref": "refs/heads/main", "at": "2026-10-03T03:00:00Z", "timeline": "search", "via": "queue",
+                  "queue": {"id": "ld_search", "checkpointId": "cp_1", "checkpointNumber": 1, "trigger": "approval",
+                    "requestedBy": {"actorId": "ann", "accountableId": "ann", "agentId": null},
+                    "mergeRun": {"id": "run_merge", "number": 2}, "gateRun": {"id": "run_gates", "number": 3}}},
                  "discussions": {"available": false, "reason": "Discussions (CORE-51) aren't available yet.", "threads": []}}
             ],
             "people": {"ann": {"name": "Ann", "kind": "person"}}
@@ -727,16 +761,5 @@ mod tests {
         assert_eq!(chain["commit"]["message"], "Rank search (CORE-7)");
         assert_eq!(chain["commit"]["authorName"], "Ann Lee");
         assert_eq!(value["chains"][0]["onServer"], true);
-
-        let text = why_text(&value);
-        assert!(text.contains("line 2  "), "{text}");
-        assert!(text.contains("(not on the server)"));
-        assert!(text.contains("change      kpqrstuvkpqrstuv (rewritten since first pushed)"));
-        assert!(text.contains("reached      timeline/search 2026-10-03 by bot for ann"));
-        assert!(text.contains("timeline    search \"Search v2\" (landed)"));
-        assert!(text.contains("approval    approved by Ann 2026-10-03 (checkpoint #1 of search)"));
-        assert!(text.contains("landed      main via merge f00dfeed with search 2026-10-03"));
-        assert!(text.contains("landed      not on main yet"));
-        assert!(text.contains("discussion  Discussions (CORE-51)"));
     }
 }

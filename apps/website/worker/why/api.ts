@@ -105,6 +105,12 @@ async function ownerTracker(
       return { events, issues };
     },
     checkpoints: async (slug) => unwrap(await stub.checkpoints(slug), []),
+    landing: async (commit) => {
+      const landing = unwrap(await stub.landingForCommit(row.id, commit), null);
+      if (!landing) return null;
+      const checkpoint = await stub.checkpoint(landing.slug, landing.checkpointId);
+      return checkpoint.ok ? { landing, checkpoint: checkpoint.value } : null;
+    },
   };
 }
 

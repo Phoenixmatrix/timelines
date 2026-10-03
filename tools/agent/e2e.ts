@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -20,6 +20,8 @@ import type {
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
+import type { Landing } from "../../apps/website/shared/timelines.ts";
+import type { WhyResponse } from "../../apps/website/shared/why.ts";
 import {
   atlasAccessibleScenario,
   atlasBrowserScenario,
@@ -1435,19 +1437,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     ).issues.find((issue) => issue.id === id);
   const branchTip = async (name: string) =>
     (await json<RepoDetail>(api, ownerToken)).branches.find((b) => b.shortName === name)?.oid;
-  type LandingRecord = {
-    id: string;
-    state: string;
-    reason: string | null;
-    repos: {
-      commit: string;
-      base: string | null;
-      merge: string | null;
-      state: string;
-      mergeRun: { number: number } | null;
-      gateRun: { number: number } | null;
-    }[];
-  };
+  type LandingRecord = Landing;
   /** Wait for a landing to stop working; its runs' logs go into the evidence on a stop. */
   async function settledLanding(slug: string): Promise<LandingRecord> {
     const landing = await poll(
@@ -1603,6 +1593,31 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "the landed timeline's bookmark and landing branch to go",
     );
     await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
+    const why = JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse;
+    record({ why, checkpoint });
+    const provenance = why.chains.find((chain) => chain.oid === checkpointCommit)?.landing;
+    assert.equal(provenance?.via, "queue", "gm why reads authoritative queue provenance");
+    assert.equal(provenance.timeline, slug);
+    assert.equal(provenance.commit, checkpointCommit);
+    assert.equal(provenance.update.new, mainAfter);
+    assert.equal(provenance.queue?.id, landing.id);
+    assert.equal(provenance.queue.checkpointId, checkpoint.id);
+    assert.equal(provenance.queue.checkpointNumber, checkpoint.number);
+    assert.deepEqual(provenance.queue.requestedBy, {
+      actorId: "acc_jun",
+      accountableId: "acc_jun",
+      agentId: null,
+    });
+    assert.equal(provenance.queue.mergeRun?.number, landed.mergeRun?.number);
+    assert.equal(provenance.queue.gateRun?.number, gates.number);
+    const readerWhy = await json<WhyResponse>(
+      `${api}/why?commit=${checkpointCommit}`,
+      fixtures.tokens.sam,
+    );
+    assert.equal(readerWhy.tracker.readable, false);
+    assert.equal(readerWhy.chains[0]?.landing?.via, "unknown");
+    assert.equal(readerWhy.chains[0]?.landing?.queue, null);
+    record({ whyLanding: provenance, trackerRestricted: true });
     record({
       timeline: slug,
       mainBefore,
@@ -1651,6 +1666,86 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     } finally {
       await request(`${timelinesApi}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
     }
+  });
+
+  await scenario("agent-setup-memorable-persistent-identities", async () => {
+    const home = join(work, "setup-names-home");
+    const first = join(work, "setup-names-first");
+    const second = join(work, "setup-names-second");
+    const explicit = join(work, "setup-names-explicit");
+    for (const dir of [first, second, explicit])
+      await mkdir(join(dir, ".gitmatrix"), { recursive: true });
+    const machine = {
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: join(home, "config"),
+      GM_TOKEN: "",
+      GM_AGENT: "0",
+    };
+    await gm(["auth", "login", "--token", ownerToken], "marco", first, undefined, machine);
+    const list = async () => (await json<{ agents: Agent[] }>("/api/agents", ownerToken)).agents;
+    const before = await list();
+    const args = ["agent", "setup", "--harness", "codex", "--owner", fixtures.tracker.owner];
+    await gm([...args, "--check"], "marco", first, /"stale"/, machine);
+    assert.deepEqual(await readdir(first), [".gitmatrix"]);
+    assert.deepEqual(await readdir(join(first, ".gitmatrix")), []);
+    assert.deepEqual(await list(), before, "Checking a fresh checkout never registers an identity");
+    type Setup = {
+      agent: string;
+      identity: { id: string; name: string; created: boolean; accountable: string };
+    };
+    const setup = async (dir: string, extra: string[] = [], env = machine) =>
+      JSON.parse(await gm([...args, ...extra], "marco", dir, undefined, env)) as Setup;
+    const a = await setup(first);
+    assert.match(a.agent, /^[a-z]+-[a-z]+(?:-[0-9a-f]{8})?$/);
+    assert(!["agent", "codex", "claude-code"].includes(a.agent));
+    assert.equal(a.identity.created, true);
+    const b = await setup(second);
+    assert.match(b.agent, /^[a-z]+-[a-z]+(?:-[0-9a-f]{8})?$/);
+    assert.notEqual(b.agent, a.agent);
+    assert.notEqual(b.identity.id, a.identity.id);
+    assert.equal(b.identity.created, true);
+    const afterNew = await list();
+    assert.equal(afterNew.length, before.length + 2);
+    for (const result of [a, b]) {
+      const registered = afterNew.find((agent) => agent.id === result.identity.id);
+      assert(registered);
+      assert.equal(registered.accountable.id, "acc_marco");
+      assert.equal(registered.tokens.length, 1);
+    }
+    const rerun = await setup(first);
+    assert.equal(rerun.agent, a.agent);
+    assert.equal(rerun.identity.id, a.identity.id);
+    assert.equal(rerun.identity.created, false);
+    const asAgent = await setup(first, [], { ...machine, GM_AGENT: "1" });
+    assert.equal(asAgent.identity.id, a.identity.id);
+    assert.equal(asAgent.identity.accountable, a.identity.accountable);
+    const afterRerun = await list();
+    assert.equal(afterRerun.length, afterNew.length);
+    assert.deepEqual(
+      afterRerun.find((agent) => agent.id === a.identity.id)?.tokens.map((token) => token.id),
+      afterNew.find((agent) => agent.id === a.identity.id)?.tokens.map((token) => token.id),
+      "Rerunning setup keeps the existing token",
+    );
+    const local = await readFile(join(first, ".gitmatrix", "agent.local.yml"), "utf8");
+    await gm([...args, "--check"], "marco", first, undefined, machine);
+    assert.equal(await readFile(join(first, ".gitmatrix", "agent.local.yml"), "utf8"), local);
+    assert.deepEqual(await list(), afterRerun);
+    const chosen = `chosen-${randomUUID().slice(0, 8)}`;
+    const named = await setup(explicit, ["--name", chosen]);
+    assert.equal(named.agent, chosen);
+    assert.equal(named.identity.created, true);
+    const namedAgain = await setup(explicit, ["--name", chosen]);
+    assert.equal(namedAgain.identity.id, named.identity.id);
+    assert.equal(namedAgain.identity.created, false);
+    const namedAgent = (await list()).find((agent) => agent.id === named.identity.id);
+    assert.equal(namedAgent?.accountable.id, "acc_marco");
+    assert.equal(namedAgent?.tokens.length, 1);
+    record({
+      generated: [a.agent, b.agent],
+      explicit: chosen,
+      accountable: a.identity.accountable,
+    });
   });
 
   await scenario("agent-identity-provisioned-on-first-use", async () => {

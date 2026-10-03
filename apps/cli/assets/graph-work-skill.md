@@ -51,6 +51,48 @@ record yours with `gm agent configure --model <model-id>`.
    `gm issue release <issue>`: after the team's limit of releases, the issue asks
    your person what to try next. Do not release a lease parked on a human request.
 
+## Creating properly tagged issues
+
+When creating an issue, read its scope and acceptance criteria and label the
+expertise needed to implement and verify it, not the agent you hope will take it.
+Use a small, relevant set of work-area labels; do not copy every label from its
+parent onto each child. Reuse the team's established spelling. Where the team
+has no convention, use these lowercase defaults:
+
+- `ux`: user research, interaction design and usability.
+- `frontend`: browser UI, styling and client-side behavior.
+- `backend`: server-side logic, services and background jobs.
+- `data`: schemas, migrations, queries and data pipelines.
+- `architecture`: system boundaries, cross-cutting design and major tradeoffs.
+- `api`: public interfaces, contracts and integrations.
+- `security`: authentication, authorization and threat mitigation.
+- `testing`: test strategy, test infrastructure and regression coverage.
+- `infrastructure`: deployment, CI/CD, networking and runtime operations.
+- `documentation`: user or developer documentation.
+
+These are suggested values for the existing issue `labels` field, not a
+registered catalog or an enforced list. Use an established project-specific
+label when needed; avoid synonyms, case variants and speculative areas. For
+example, a keyboard-navigation fix needs `ux` and `frontend`; a service schema
+migration needs `backend` and `data`. Do not add `architecture` to every code
+change or `testing` merely because every issue should be verified.
+
+Repeat `--label` when creating an issue (it is not `--tag`):
+
+    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --label ux --label frontend
+    gm issue show ENG-1 --json
+
+Replace `ENG` with the actual team, and `ENG-1` with the returned issue key;
+check the returned `labels` before handing off. For existing issues,
+`gm issue update ENG-1 --data '{"labels":["ux","frontend"]}'` replaces the whole
+label list, so preserve unrelated labels you still need.
+
+Issue labels describe work. Agent profile tags and skills describe self-reported
+capabilities: they are separate, advisory hints for delegation, not verified
+expertise or claim restrictions. Compare the required work with the agent's
+profile and available evidence; never infer or publish an agent capability just
+because it created or claimed a labeled issue.
+
 ## Human intervention
 
 The claim response (`gm issue next`, `claim`, `resume` or `accept`) includes

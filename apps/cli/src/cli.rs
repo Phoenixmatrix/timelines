@@ -752,7 +752,7 @@ pub enum SecretCommand {
 pub enum AgentCommand {
     /// Set up this checkout for a coding agent: instructions, skills, identity and profile. Rerun to update.
     Setup {
-        /// The agent's name; defaults to this checkout's, else the harness (claude-code…)
+        /// Agent name (default: a memorable generated name; kept on reruns)
         #[arg(long)]
         name: Option<String>,
         /// claude-code, codex, cursor-agent, gemini-agent, opencode…; detected when an agent runs this

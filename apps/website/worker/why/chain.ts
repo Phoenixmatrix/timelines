@@ -1,15 +1,15 @@
 // The rest of the "why" chain once blame has named a commit (CORE-85): its
 // change id, the refs and timelines the change reached (CORE-68's push log),
 // the merges that carried it, its issues, the checkpoints that pinned it and
-// their approvals (CORE-76), and its landing on the default branch.
+// their approvals (CORE-76), and the queue landing that advanced main (CORE-77).
 //
-// Everything after the commit is found through the change id, never the
-// commit id: a rebase or amend makes a new commit of the same change, and the
-// push log, checkpoints and merges all still name it.
+// Change ids join rewritten commits to their history. An exact main ref
+// update joins the authoritative landing and its pinned checkpoint.
 
 import type { ChangeRef } from "../../shared/api.ts";
 import type {
   CheckpointState,
+  Landing,
   Timeline,
   TimelineEvent,
   TimelineIssue,
@@ -62,6 +62,8 @@ export interface WhyTracker {
   /** A timeline's events, oldest first, and its issues. */
   timeline(slug: string): Promise<{ events: TimelineEvent[]; issues: TimelineIssue[] } | null>;
   checkpoints(slug: string): Promise<CheckpointState[]>;
+  /** Historical queue advance of this repository to an exact main tip. */
+  landing(commit: string): Promise<{ landing: Landing; checkpoint: CheckpointState } | null>;
 }
 
 /** Memoize a one-argument async lookup for the length of a request. */
@@ -92,6 +94,7 @@ export function shared(sources: WhySources): WhySources {
       timelines: () => timelines!(undefined),
       timeline: once((slug) => tracker.timeline(slug)),
       checkpoints: once((slug) => tracker.checkpoints(slug)),
+      landing: once((commit) => tracker.landing(commit)),
     },
   };
 }
@@ -165,6 +168,32 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
   for (const ref of refs)
     if (ref.timeline && !ref.afterLanding && !timelines.some((t) => t.id === ref.timeline!.id))
       timelines.push(ref.timeline);
+
+  // Main's first update identifies the operation that introduced this change,
+  // not a later rewrite or a nearby timeline push. Match that exact advance
+  // and the queue's pinned checkpoint, not its bounded, asynchronously collected
+  // change index: omission there does not contradict the recorded main advance.
+  const queued =
+    tracker && landed?.firstUpdate.new ? await tracker.landing(landed.firstUpdate.new) : null;
+  const queueRepo = queued?.landing.repos.find(
+    (repo) =>
+      repo.id === sources.repoId &&
+      repo.state === "advanced" &&
+      repo.merge === landed?.firstUpdate.new,
+  );
+  const pinnedRepo = queued?.checkpoint.checkpoint.repos.find((repo) => repo.id === sources.repoId);
+  const queueTimeline = queued && byId.get(queued.landing.timelineId);
+  const authoritative =
+    queued &&
+    queueRepo &&
+    queueTimeline &&
+    queued.checkpoint.checkpoint.id === queued.landing.checkpointId &&
+    queued.checkpoint.checkpoint.timelineId === queueTimeline.id &&
+    pinnedRepo?.commit === queueRepo.commit
+      ? { ...queued, repo: queueRepo, timeline: queueTimeline }
+      : null;
+  if (authoritative && !timelines.some((timeline) => timeline.id === authoritative.timeline.id))
+    timelines.push(whyTimeline(authoritative.timeline));
 
   // Merges: a merge event whose push first brought the change to its target.
   const refOf = (id: string | null) =>
@@ -243,16 +272,26 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
   let landing: WhyLanding | null = null;
   const main = refs.find((ref) => ref.ref === mainRef);
   if (main) {
-    const merge = merges.find((m) => m.into === null) ?? null;
-    const before = refs.filter((r) => r.timeline && !r.afterLanding && r !== main).at(-1);
+    const queue = authoritative?.landing;
     landing = {
       ref: main.ref,
-      commit: main.lastCommit,
+      commit: main.firstCommit,
       at: main.firstSeenAt,
       update: main.firstUpdate,
-      via: merge ? "merge" : tracker ? "push" : "unknown",
-      timeline: merge?.from ?? before?.timeline?.slug ?? null,
-      merge,
+      via: queue ? "queue" : tracker ? "push" : "unknown",
+      timeline: authoritative?.timeline.slug ?? null,
+      queue:
+        queue && authoritative
+          ? {
+              id: queue.id,
+              checkpointId: queue.checkpointId,
+              checkpointNumber: queue.checkpointNumber,
+              trigger: queue.trigger,
+              requestedBy: queue.requestedBy,
+              mergeRun: authoritative.repo.mergeRun,
+              gateRun: authoritative.repo.gateRun,
+            }
+          : null,
     };
   }
 
