@@ -641,6 +641,109 @@ export async function runProviderE2E(
       assert(tagFeed.entries.every((entry) => entry.releaseKind === "tag"));
       evidence.taggedNotes = tagged;
       evidence.releaseFeeds = { daily: feed.entries, tag: tagFeed.entries };
+      enter("release-issue-tracker");
+      // A tracker issue, completed with evidence in a workspace subscribed to
+      // the fixture, that the next commit cites by key.
+      const repo = await api(base);
+      const operation = () => `provider-${randomBytes(8).toString("hex")}`;
+      await api(`/tracker/${owner}/mutate`, "POST", {
+        operationId: operation(),
+        mutations: [
+          { kind: "team.create", id: "copper-team", data: { key: "CF", name: "Copper Finch" } },
+          { kind: "workspace.create", id: "copper-ws", data: { slug: "copper", name: "Copper" } },
+          {
+            kind: "subscription.add",
+            id: "copper-sub",
+            data: { workspaceId: "copper-ws", repoId: repo.id },
+          },
+          {
+            kind: "issue.create",
+            id: "copper-issue",
+            data: {
+              teamId: "copper-team",
+              title: "Let receivers verify a batch of Copper Finch parcels",
+              description:
+                "Receivers check many parcels at once. Add copperFinchVerifyAll, which is true only when every parcel matches its expected checksum.",
+            },
+          },
+        ],
+      });
+      const claim = await api(`/tracker/${owner}/mutate`, "POST", {
+        operationId: operation(),
+        mutations: [{ kind: "issue.claim", id: "copper-issue", data: { agent: "provider-e2e" } }],
+      });
+      await api(`/tracker/${owner}/mutate`, "POST", {
+        operationId: operation(),
+        mutations: [
+          {
+            kind: "issue.complete",
+            id: "copper-issue",
+            data: {
+              leaseToken: claim.results[0].leaseToken,
+              evidence: "copperFinchVerifyAll checks every parcel against its checksum.",
+            },
+          },
+        ],
+      });
+      enter("release-issue-entry");
+      await writeFile(
+        join(work, "verify-all.ts"),
+        'import { copperFinchVerify } from "./checksum.ts";\n\n/** Whether every parcel matches its expected Copper Finch checksum. */\nexport function copperFinchVerifyAll(parcels: [string, number][]): boolean {\n  return parcels.every(([parcel, expected]) => copperFinchVerify(parcel, expected));\n}\n',
+      );
+      env.GIT_COMMITTER_DATE = "2026-01-03T00:00:00Z";
+      await git(["add", "verify-all.ts"]);
+      await git([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        "Verify a batch of Copper Finch parcels (CF-1)",
+      ]);
+      await git(["push", "origin", "main"], work, true);
+      const cited = await git(["rev-parse", "HEAD"]);
+      await waitForNotes(["@day:2026-01-01", "@day:2026-01-02", "@day:2026-01-03", "provider-v1"]);
+      const thirdDay = await notesFor("day:2026-01-03");
+      const issueEntry = thirdDay.entries.find((entry) => entry.issue?.key === "CF-1");
+      evidence.issueNotes = thirdDay;
+      assert(
+        issueEntry,
+        "A commit citing a completed tracker issue must become that issue's entry",
+      );
+      assert.equal(issueEntry.kind, "issue");
+      assert.equal(issueEntry.issue!.trackerOwner, owner);
+      assert.equal(issueEntry.issue!.team.key, "CF");
+      assert.deepEqual(issueEntry.commits, [cited], "The issue entry must cite the commit");
+      assert(issueEntry.model, "The issue entry must record its real generation model");
+      assert.notEqual(
+        issueEntry.category,
+        "internal",
+        "A new verification function is not internal work",
+      );
+      assert.match(
+        `${issueEntry.title} ${issueEntry.summary}`,
+        /verif|check|match/i,
+        "The issue entry must describe verifying parcels against checksums",
+      );
+      assert.match(
+        `${issueEntry.title} ${issueEntry.summary}`,
+        /batch|all|every|multiple|several|many/i,
+        "The issue entry must describe checking several parcels at once",
+      );
+      assert.deepEqual(
+        (await notesFor("provider-v1")).entries.flatMap((entry) => entry.commits).sort(),
+        [final, edited].sort(),
+        "Work after a named tag must not change that tag's notes",
+      );
+      const teamFeed: ReleaseFeed = await api(
+        `/tracker/${owner}/release-notes?q=${encodeURIComponent("team:cf")}`,
+      );
+      evidence.teamFeed = teamFeed.entries;
+      assert(
+        teamFeed.entries.some(
+          (entry) => entry.issue?.key === "CF-1" && entry.commits.includes(cited),
+        ),
+        "The team's release feed must include the shipped issue",
+      );
     }
     evidence.outcome = "passed";
   } catch (error) {
