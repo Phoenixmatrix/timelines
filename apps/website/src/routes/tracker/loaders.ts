@@ -19,7 +19,8 @@ async function loadTracker<T>(path: string, request: Request): Promise<T> {
   }
 }
 
-export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
+/** Open a page of your default tracker; with none to open, list the trackers. */
+async function intoDefaultTracker(request: Request, page: string) {
   const { viewerId, trackers, defaultOwnerId } = await loadTracker<TrackerList>(
     "/tracker",
     request,
@@ -27,8 +28,21 @@ export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
   // Server defaults first; a default this browser kept from before still counts.
   const preferred = defaultOwnerId ?? readLegacyDefaults(viewerId)?.ownerId;
   const tracker = trackers.find((entry) => entry.id === preferred) ?? trackers[0];
-  if (tracker) throw redirect(`/tracker/${tracker.slug}${new URL(request.url).search}`);
+  if (tracker) throw redirect(`/tracker/${tracker.slug}${page}${new URL(request.url).search}`);
   return { trackers };
+}
+
+export function trackerIndexLoader({ request }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, "");
+}
+
+/** `/timelines` and `/release-notes`, the rail's places: your default tracker's. */
+export function timelinesIndexLoader({ request }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, "/timelines");
+}
+
+export function releaseNotesIndexLoader({ request }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, "/releases");
 }
 
 /** `?tl=<slug>` selects a timeline's view; main's is the default. */

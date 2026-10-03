@@ -69,6 +69,11 @@
   --ink-muted: oklch(0.76 0.012 75);
   --ink-faint: oklch(0.64 0.012 75);
   --brand: #91f5be;
+  /* The Timelines mark's ribbons: its own identity colors, like --brand. */
+  --timelines-mint: #91f5be;
+  --timelines-amber: #f2b84b;
+  --timelines-violet: #b49cff;
+  --timelines-sky: #7cc7ff;
   --signal: oklch(0.81 0.145 76);
   --signal-hover: oklch(0.85 0.13 80);
   --signal-ink: oklch(0.23 0.035 65);
@@ -110,6 +115,10 @@
   --ink-muted: oklch(0.42 0.015 70);
   --ink-faint: oklch(0.5 0.014 70);
   --brand: #10251c;
+  --timelines-mint: #178a56;
+  --timelines-amber: #b5780a;
+  --timelines-violet: #7a5bd6;
+  --timelines-sky: #2a86cf;
   --signal: oklch(0.77 0.155 72);
   --signal-hover: oklch(0.72 0.155 68);
   --signal-ink: oklch(0.2 0.03 65);

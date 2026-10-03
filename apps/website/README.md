@@ -952,8 +952,8 @@ shown only to viewers who can read every tracker that shaped it.
 | `GET /api/tracker/:owner/release-notes?q=`                  | `ReleaseFeed`: a tracker account's entries |
 
 **Team and organization views** (`worker/release-notes/feed.ts`): a tracker
-account's **Release notes** page (`/tracker/:owner/releases`, linked from the
-tracker header) defaults to daily changes in its repositories and changes citing
+account's **Release notes** page (`/tracker/:owner/releases`, a place in the
+navigation rail; `/release-notes` opens your default tracker's) defaults to daily changes in its repositories and changes citing
 its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Named
 tags do not duplicate entries in the default feed. An explicit `kind:tag` or
 positive `release:` filter selects named snapshots when requested; `kind:daily`

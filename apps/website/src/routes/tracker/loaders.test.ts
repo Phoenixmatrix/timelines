@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { RouterContextProvider, type LoaderFunctionArgs } from "react-router";
-import { trackerIndexLoader, trackerLoader } from "./loaders.ts";
+import {
+  releaseNotesIndexLoader,
+  timelinesIndexLoader,
+  trackerIndexLoader,
+  trackerLoader,
+} from "./loaders.ts";
 
 const owners = [
   { id: "ann", slug: "ann", displayName: "Ann", canAdmin: true },
@@ -73,6 +78,17 @@ describe("tracker navigation", () => {
     });
     const result = await trackerIndexLoader(args("/tracker")).catch((e) => e);
     expect(result.headers.get("location")).toBe("/tracker/ann");
+  });
+  test("the rail's Timelines and Release notes open your default tracker's pages", async () => {
+    for (const [loader, path, location] of [
+      [timelinesIndexLoader, "/timelines", "/tracker/ann/timelines"],
+      [releaseNotesIndexLoader, "/release-notes?q=fix", "/tracker/ann/releases?q=fix"],
+    ] as const) {
+      reply({ viewerId: "ann", trackers: owners, defaultOwnerId: "ann" });
+      vi.stubGlobal("localStorage", { getItem: () => null });
+      const result = await loader(args(path)).catch((e) => e);
+      expect(result.headers.get("location")).toBe(location);
+    }
   });
   test("handles an empty owner list", async () => {
     reply({ viewerId: "ann", trackers: [] });

@@ -13,6 +13,7 @@ import {
   PackageIcon,
   PlusIcon,
   RobotIcon,
+  ScrollIcon,
   SignInIcon,
   SignOutIcon,
   SlidersHorizontalIcon,
@@ -38,7 +39,7 @@ import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
 import { scopeOf } from "../lib/timelineScope.ts";
 import { Monogram } from "./Monogram.tsx";
-import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
+import { GitmatrixLogo, TimelinesMark } from "./GitmatrixLogo.tsx";
 import { TimelineBanner, TimelineSwitcher } from "./TimelineScope.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
@@ -224,6 +225,10 @@ export function AppShell() {
   const tracker = useMatch("/tracker/:owner/*");
   const params = new URLSearchParams(location.search);
   const managingTracker = Boolean(tracker) && params.get("manage") === "true";
+  // Timelines and release notes are their own places, though they live under a tracker.
+  const trackerPage = tracker?.params["*"]?.split("/")[0];
+  const onTimelines = trackerPage === "timelines" || location.pathname === "/timelines";
+  const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
   const owner =
     tracker?.params.owner ??
     (location.pathname === "/settings/preferences" ? params.get("tracker") : null);
@@ -262,12 +267,32 @@ export function AppShell() {
             {viewer && <TimelineSwitcher variant="rail" />}
             {viewer && (
               <Place
-                to="/tracker"
+                to={owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}
                 label="Issue tracker"
-                active={managingTracker ? false : undefined}
+                active={managingTracker || onTimelines || onReleaseNotes ? false : undefined}
               >
                 {(active) => (
                   <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                )}
+              </Place>
+            )}
+            {viewer && (
+              <Place
+                to={owner ? `/tracker/${encodeURIComponent(owner)}/timelines` : "/timelines"}
+                label="Timelines"
+                active={onTimelines}
+              >
+                {() => <TimelinesMark className="size-7" />}
+              </Place>
+            )}
+            {viewer && (
+              <Place
+                to={owner ? `/tracker/${encodeURIComponent(owner)}/releases` : "/release-notes"}
+                label="Release notes"
+                active={onReleaseNotes}
+              >
+                {(active) => (
+                  <ScrollIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
                 )}
               </Place>
             )}

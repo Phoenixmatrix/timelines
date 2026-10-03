@@ -106,6 +106,12 @@ The cat was generated with `openai-codex/gpt-image-2-codex` and vector-traced fr
 
 `public/favicon.svg` uses the same Pounce paths in mint (`#91f5be`) on a deep-forest (`#10251c`) rounded tile. Paths are embedded rather than externally referenced so the favicon works independently. Derive the 32px PNG, 180px Apple touch icon and 16/32/48px ICO from this favicon artwork; the PNGs also carry generation provenance. The component and `index.html` version every logo/icon URL with `v=pounce` so cached G artwork is replaced in SVG, raster and touch-icon consumers.
 
+### Timelines mark
+
+Timelines are a first-class place, so they get a mark of their own in the rail instead of a Phosphor glyph: a mint trunk forks into amber, violet and sky lines that run in parallel and merge back into mint (fork, work alongside, land). It was generated with `openai-codex/gpt-image-2-codex` through the Codex CLI. Eight candidates over two rounds; the second round asked for a compact, square composition with heavy ribbons so every color reads at 28px. The selected artwork was snapped to its four flat colors and vector-traced (cutout mode, no white shapes), not redrawn.
+
+`public/brand/timelines.svg` holds the paths in a `mark` group, with the generation prompt, selection and conversion in its metadata; `TimelinesMark` in `src/components/GitmatrixLogo.tsx` references it at 28px in the 48px rail tile. Its fills read the `--timelines-mint/amber/violet/sky` tokens: the generated pastels on dark, and deeper shades on light (each at least 3:1 against the rail) the way the Pounce cat switches to forest. Like `--brand`, these colors belong to the mark alone and never style interface state. Bump `?v=` on the reference when the artwork changes.
+
 ## Colors
 
 ### Primary

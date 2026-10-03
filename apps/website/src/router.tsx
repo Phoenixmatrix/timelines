@@ -34,7 +34,12 @@ import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Agents, agentsAction, agentsLoader } from "./routes/Agents.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
 import { Tracker, TrackerIndex } from "./routes/tracker/Tracker.tsx";
-import { trackerLoader, trackerIndexLoader } from "./routes/tracker/loaders.ts";
+import {
+  releaseNotesIndexLoader,
+  timelinesIndexLoader,
+  trackerIndexLoader,
+  trackerLoader,
+} from "./routes/tracker/loaders.ts";
 import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
 
 export const router = createBrowserRouter([
@@ -57,6 +62,8 @@ export const router = createBrowserRouter([
           { path: "device", loader: deviceLoader, action: deviceAction, Component: Device },
           { path: "new", loader: newRepoLoader, action: newRepoAction, Component: NewRepo },
           { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
+          { path: "timelines", loader: timelinesIndexLoader, Component: TrackerIndex },
+          { path: "release-notes", loader: releaseNotesIndexLoader, Component: TrackerIndex },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
           { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
           {

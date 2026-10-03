@@ -14,9 +14,11 @@ export const RESERVED_SLUGS = new Set([
   "needs-you",
   "new",
   "packages",
+  "release-notes",
   "settings",
   "signin",
   "signout",
+  "timelines",
   "tracker",
   // Package protocols (registry/app.ts).
   "v2",
