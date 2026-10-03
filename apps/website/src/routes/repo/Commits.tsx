@@ -54,7 +54,7 @@ export function Commits() {
 
 function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) {
   const navigate = useNavigate();
-  const state = useHistory(repo, initial.head, initial.path, false, initial);
+  const state = useHistory(repo, initial.head, initial.path, undefined, initial);
   const history = state.history!;
   const ci = useCiStatuses(
     repo.owner.slug,

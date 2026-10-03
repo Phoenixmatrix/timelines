@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router";
-import type { CommitSummary, HistoryPage, RepoDetail } from "../../../shared/api.ts";
+import type { CommitSummary, HistoryPage, RepoDetail, TreeEntry } from "../../../shared/api.ts";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, treeUrl } from "../../lib/refs.ts";
@@ -31,7 +31,7 @@ export function useHistory(
   repo: RepoDetail,
   head: string | null,
   path: string,
-  entries = false,
+  entries?: readonly TreeEntry[],
   initial?: HistoryPage,
 ) {
   const seeded = initial !== undefined;
@@ -40,13 +40,21 @@ export function useHistory(
   const [attempt, setAttempt] = useState(0);
   const [loading, setLoading] = useState(!initial);
   const [error, setError] = useState(false);
+  const withEntries = entries !== undefined;
+  // Resolve the whole directory with shared, bounded history pages, not one
+  // walk per row. Stop as soon as every visible entry has its newest change.
+  const next = history?.next;
+  const seeking = !!next && entries?.some((entry) => !Object.hasOwn(history!.entries, entry.path));
+  useEffect(() => {
+    if (seeking && !loading && !error && next) setCursor(next);
+  }, [seeking, loading, error, next]);
   useEffect(() => {
     if (!head || (seeded && !cursor)) return;
     let current = true;
     setLoading(true);
     setError(false);
     repoData
-      .history(repo.owner.slug, repo.name, `${head}${path ? `/${path}` : ""}`, entries, cursor)
+      .history(repo.owner.slug, repo.name, `${head}${path ? `/${path}` : ""}`, withEntries, cursor)
       .then(
         (page) => {
           if (current) {
@@ -64,10 +72,10 @@ export function useHistory(
     return () => {
       current = false;
     };
-  }, [repo.owner.slug, repo.name, head, path, entries, cursor, attempt, seeded]);
+  }, [repo.owner.slug, repo.name, head, path, withEntries, cursor, attempt, seeded]);
   return {
     history,
-    loading,
+    loading: loading || (!!seeking && !error),
     error,
     more: () => setCursor(history?.next ?? ""),
     retry: () => setAttempt((n) => n + 1),

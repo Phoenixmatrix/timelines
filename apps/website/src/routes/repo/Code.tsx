@@ -132,11 +132,9 @@ function EntryRow({
             {subject}
           </Link>
         ) : (
-          !loading && (
-            <Link to={history} className="text-ink-faint no-underline hover:underline">
-              View history
-            </Link>
-          )
+          <span className="text-ink-faint">
+            {loading ? "Finding last change…" : "Last change unavailable"}
+          </span>
         )}
       </span>
       {authors && (
@@ -199,7 +197,7 @@ function useAuthorsView() {
 }
 
 function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
-  const state = useHistory(repo, tree.commit.oid, tree.path, true);
+  const state = useHistory(repo, tree.commit.oid, tree.path, tree.entries);
   const history = state.history;
   const latest = history?.commits[0] ?? (!tree.path ? tree.commit : null);
   const [authors, toggleAuthors] = useAuthorsView();

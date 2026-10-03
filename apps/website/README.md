@@ -58,10 +58,15 @@ commit trailers, not verified account identities.
 `GET /api/repos/:owner/:name/history` accepts `at=<ref>/<path>` or `ref` and
 `path`, plus `entries=true` for immediate-child metadata. Each request scans at
 most 100 commits. `next` is the next commit to scan; pass it as `cursor` and pin
-`ref` to the returned `head` for subsequent pages. The UI loads this separately
-from files, labels partial counts with `+`, and offers **Load older history**
-until counts are exact. It reuses immutable commit/tree caches and never reads
-file contents to calculate history.
+`ref` to the returned `head` for subsequent pages. The file list loads this
+separately from files and automatically follows pages until every displayed file
+and folder has its latest change, then stops. One sequential scan serves the
+whole directory, not a request per row; immutable history pages and commit/tree
+objects are reused. Older pages never replace a newer last-change message.
+Pending rows say **Finding last change…**; a failed page preserves resolved rows
+and offers **Retry history**. Leaving the directory stops further pagination.
+Counts remain partial (labelled with `+`) until **Load older history** reaches the
+end. No file contents are read to calculate history.
 
 ## Sign-in
 
