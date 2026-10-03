@@ -12,6 +12,18 @@ export interface TrackerDefaults {
   teamId: string;
 }
 
+export function readTrackerShortcuts(): boolean {
+  try {
+    return localStorage.getItem("gitmatrix:tracker-shortcuts") === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function saveTrackerShortcuts(enabled: boolean): void {
+  localStorage.setItem("gitmatrix:tracker-shortcuts", String(enabled));
+}
+
 function storageKey(viewerId: string): string {
   return `gitmatrix:tracker-defaults:${viewerId}`;
 }

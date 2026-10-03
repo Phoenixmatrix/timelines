@@ -4,6 +4,7 @@ import {
   ChatCenteredDotsIcon,
   EnvelopeSimpleIcon,
   FingerprintIcon,
+  GearSixIcon,
   HandWavingIcon,
   GitBranchIcon,
   KeyIcon,
@@ -14,12 +15,21 @@ import {
   RobotIcon,
   SignInIcon,
   SignOutIcon,
+  SlidersHorizontalIcon,
   SunIcon,
   UserCircleIcon,
   UserSwitchIcon,
 } from "@phosphor-icons/react";
 import { useState } from "react";
-import { Link, NavLink, Outlet, useFetcher, useLocation, useNavigation } from "react-router";
+import {
+  Link,
+  NavLink,
+  Outlet,
+  useFetcher,
+  useLocation,
+  useMatch,
+  useNavigation,
+} from "react-router";
 import { AssistantDock } from "../assistant/Dock.tsx";
 import { AssistantProvider, useAssistant } from "../assistant/state.tsx";
 import { PaletteProvider, SearchButton } from "../palette/Palette.tsx";
@@ -35,22 +45,30 @@ function Place({
   label,
   end,
   also,
+  active,
   children,
 }: {
   to: string;
   label: string;
   end?: boolean;
+  active?: boolean;
   /** Other pages that belong to this place and light it up too. */
   also?: RegExp;
   children: (active: boolean) => React.ReactNode;
 }) {
   const { pathname } = useLocation();
   const className = "mk-place max-sm:before:hidden";
+  const current = active ?? (also?.test(pathname) ? true : undefined);
   return (
     <Tip label={label} side="right">
-      {also?.test(pathname) ? (
-        <Link to={to} className={className} aria-current="page" aria-label={label}>
-          {children(true)}
+      {current !== undefined ? (
+        <Link
+          to={to}
+          className={className}
+          aria-current={current ? "page" : undefined}
+          aria-label={label}
+        >
+          {children(current)}
         </Link>
       ) : (
         <NavLink to={to} end={end} className={className} aria-label={label}>
@@ -61,7 +79,7 @@ function Place({
   );
 }
 
-function AccountMenu() {
+function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
   const viewer = useViewer();
   const signOut = useFetcher();
   const [theme, setTheme] = useState<Theme>(storedTheme);
@@ -102,6 +120,14 @@ function AccountMenu() {
             >
               <UserCircleIcon className="size-4" aria-hidden />
               Profile
+            </Menu.LinkItem>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
+              render={<Link to={preferencesPath} />}
+            >
+              <SlidersHorizontalIcon className="size-4" aria-hidden />
+              Preferences
             </Menu.LinkItem>
             <Menu.LinkItem
               closeOnClick
@@ -193,6 +219,18 @@ export function AppShell() {
   const viewer = useViewer();
   const navigation = useNavigation();
   const location = useLocation();
+  const tracker = useMatch("/tracker/:owner/*");
+  const params = new URLSearchParams(location.search);
+  const managingTracker = Boolean(tracker) && params.get("manage") === "true";
+  const owner =
+    tracker?.params.owner ??
+    (location.pathname === "/settings/preferences" ? params.get("tracker") : null);
+  const settingsParams = tracker ? new URLSearchParams(location.search) : new URLSearchParams();
+  settingsParams.set("manage", "true");
+  const settingsPath = `${owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}?${settingsParams}`;
+  const preferencesPath = owner
+    ? `/settings/preferences?tracker=${encodeURIComponent(owner)}`
+    : "/settings/preferences";
   const places = viewer?.canCreateIn.slice(1) ?? [];
 
   // Sign-in and device approval are their own focused pages, outside the shell.
@@ -210,14 +248,18 @@ export function AppShell() {
         <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
           <nav
             aria-label="Places"
-            className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2 sm:fixed sm:inset-y-0 sm:left-0"
+            className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:flex-wrap max-sm:gap-1 max-sm:px-3 max-sm:py-2 max-sm:[--size-dock:44px] sm:fixed sm:inset-y-0 sm:left-0"
           >
             <Place to="/" label="Home" end>
               {() => <GitmatrixLogo markOnly className="size-8" />}
             </Place>
             <SearchButton />
             {viewer && (
-              <Place to="/tracker" label="Issue tracker">
+              <Place
+                to="/tracker"
+                label="Issue tracker"
+                active={managingTracker ? false : undefined}
+              >
                 {(active) => (
                   <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
                 )}
@@ -267,8 +309,15 @@ export function AppShell() {
             )}
             <div className="flex-1" />
             {viewer && <AskButton />}
+            {viewer && (
+              <Place to={settingsPath} label="Settings" active={managingTracker}>
+                {(active) => (
+                  <GearSixIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                )}
+              </Place>
+            )}
             {viewer ? (
-              <AccountMenu />
+              <AccountMenu preferencesPath={preferencesPath} />
             ) : (
               <Place to={`/signin?next=${encodeURIComponent(location.pathname)}`} label="Sign in">
                 {() => <SignInIcon size={22} aria-hidden />}

@@ -24,10 +24,8 @@
  *              raster carrying its provenance
  */
 
-import { Menu } from "@base-ui/react/menu";
 import {
   ArrowClockwiseIcon,
-  DotsThreeIcon,
   FunnelSimpleIcon,
   MagnifyingGlassIcon,
   StarIcon,
@@ -51,18 +49,18 @@ import {
   type TrackerView,
 } from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
-import { FormError, popMotion, SelectField, Tip, useToast } from "../../components/ui.tsx";
+import { FormError, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
 import type { trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
-import { TrackerDefaultsForm } from "./Defaults.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
 import {
   defaultsFromServer,
   forgetLegacyDefaults,
   initialTrackerDefaults,
   readLegacyDefaults,
+  readTrackerShortcuts,
   saveTrackerDefaults,
   VIEW_LABEL,
   withTrackerDefaults,
@@ -171,13 +169,7 @@ function Workbench({ data }: { data: TrackerView }) {
   const [uncertain, setUncertain] = useState(false);
   const pending = useRef<MutationRequest | null>(null);
   const pendingCompletions = useRef<((outcome: MutationOutcome) => void)[]>([]);
-  const [shortcuts, setShortcuts] = useState(() => {
-    try {
-      return localStorage.getItem("gitmatrix:tracker-shortcuts") === "true";
-    } catch {
-      return false;
-    }
-  });
+  const [shortcuts] = useState(readTrackerShortcuts);
   const [urlParams, setParams] = useSearchParams();
   const route = useParams();
   const navigate = useNavigate();
@@ -191,7 +183,6 @@ function Workbench({ data }: { data: TrackerView }) {
     const legacy = viewer ? readLegacyDefaults(viewer.id) : null;
     return legacy?.ownerId === data.snapshot.owner.id ? legacy : null;
   });
-  const [defaultsOpen, setDefaultsOpen] = useState(false);
   const toast = useToast();
   useEffect(() => {
     if (!viewer || data.preferences) return;
@@ -705,43 +696,11 @@ function Workbench({ data }: { data: TrackerView }) {
               <ArrowClockwiseIcon weight="bold" className={refreshing ? "animate-spin" : ""} />
             </button>
           </Tip>
-          <Menu.Root>
-            <Tip label="Tracker settings">
-              <Menu.Trigger
-                className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm"
-                aria-label="Tracker settings"
-              >
-                <DotsThreeIcon weight="bold" />
-              </Menu.Trigger>
-            </Tip>
-            <Menu.Portal>
-              <Menu.Positioner align="end" sideOffset={6} className="z-50">
-                <Menu.Popup className={`mk-popup ${popMotion}`}>
-                  <Menu.LinkItem className="mk-menu-item" render={<Link to={managementHref} />}>
-                    {admin ? "Back to issues" : "Teams and workspaces"}
-                  </Menu.LinkItem>
-                  <Menu.Item className="mk-menu-item" onClick={() => setDefaultsOpen(true)}>
-                    Default view and team
-                  </Menu.Item>
-                  <Menu.CheckboxItem
-                    className="mk-menu-item"
-                    checked={shortcuts}
-                    onCheckedChange={(on) => {
-                      setShortcuts(on);
-                      try {
-                        localStorage.setItem("gitmatrix:tracker-shortcuts", String(on));
-                      } catch {
-                        // Still applies for this page when storage is unavailable.
-                      }
-                    }}
-                  >
-                    <span className="flex-1">Keyboard shortcuts</span>
-                    <span className="text-micro text-ink-faint">{shortcuts ? "On" : "Off"}</span>
-                  </Menu.CheckboxItem>
-                </Menu.Popup>
-              </Menu.Positioner>
-            </Menu.Portal>
-          </Menu.Root>
+          {admin && (
+            <Link className="mk-btn mk-btn--ghost mk-btn--sm no-underline" to={managementHref}>
+              Back to issues
+            </Link>
+          )}
         </div>
       </header>
       {createOpen && (
@@ -757,19 +716,6 @@ function Workbench({ data }: { data: TrackerView }) {
           onCancel={() => {
             setCreateOpen(false);
             requestAnimationFrame(() => titleRef.current?.focus());
-          }}
-        />
-      )}
-      {defaultsOpen && viewer && (
-        <TrackerDefaultsForm
-          snapshot={snapshot}
-          defaults={defaults}
-          onCancel={() => setDefaultsOpen(false)}
-          onSaved={(next) => {
-            setDefaults(next);
-            forgetLegacyDefaults(viewer.id);
-            setDefaultsOpen(false);
-            void navigate(base, { replace: true });
           }}
         />
       )}
@@ -912,7 +858,11 @@ function Workbench({ data }: { data: TrackerView }) {
                     filterToken("team", defaultTeamEntry.key.toLowerCase()).toLowerCase(),
                 )}
                 onShowAll={() => setQuery(withoutKeys(query, ["team"]))}
-                onChange={() => setDefaultsOpen(true)}
+                onChange={() =>
+                  void navigate(
+                    `/settings/preferences?tracker=${encodeURIComponent(snapshot.owner.slug)}`,
+                  )
+                }
               />
             )}
             <div className="flex items-center gap-2">

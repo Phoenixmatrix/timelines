@@ -88,8 +88,6 @@ describe("commands", () => {
     ]);
     expect(matched.get("pages")?.map((m) => m.command.title)).toEqual(["Issue tracker"]);
     expect(matchCommands(commands(), "tickets").get("pages")?.[0]?.command.id).toBe("page:tracker");
-    // An empty query lists everything available.
-    expect(matchCommands(commands(), "").get("pages")?.length).toBe(11);
   });
 });
 

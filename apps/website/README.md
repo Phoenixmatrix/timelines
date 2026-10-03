@@ -599,7 +599,7 @@ subtasks or satisfy dependent issues' blockers.
   on issue/account changes. Activity & handoff remains the comments workspace.
   Legacy attribution/source gaps are labeled unknown; current-directory identity
   resolution is labeled separately from mutation-time snapshots.
-- **Startup defaults:** in **Tracker settings → Default view and team**, choose
+- **Startup defaults:** in **Account menu → Preferences → Default view and team**, choose
   List/Board/Graph, an issue-view preset, and an active team or all teams.
   Defaults are saved on the server per person and per tracker, so they follow
   you across browsers and devices, and each tracker keeps its own. Saving also
@@ -610,6 +610,14 @@ subtasks or satisfy dependent issues' blockers.
   including an empty query. Unavailable trackers fall back to the first
   accessible tracker; archived or unavailable default teams fall back to all
   teams. **Reset defaults** restores the built-in startup behavior.
+- **Keyboard shortcuts:** enable them in **Account menu → Preferences**. This
+  opt-in applies only to the current browser: `c`/`n` captures an issue, `/`
+  filters, `j`/`k` moves between issues, and Escape closes the issue.
+- **Tracker administration:** the **Settings** gear at the bottom of the
+  navigation rail opens **Teams and workspaces** for the current tracker, or
+  your default tracker when outside a tracker. Manage teams, workspaces and
+  repository subscriptions there; existing permissions still apply. **Back
+  to issues** returns to the current filters and layout.
 - **Default team in one click:** the star next to each team in the facet
   column makes it your default; the filled star marks the current one, and
   clicking it clears the default. Under the query bar a note names the default

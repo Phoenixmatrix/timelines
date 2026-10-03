@@ -14,12 +14,10 @@ export function TrackerDefaultsForm({
   snapshot,
   defaults,
   onSaved,
-  onCancel,
 }: {
   snapshot: Snapshot;
   defaults: TrackerDefaults | null;
   onSaved: (defaults: TrackerDefaults | null) => void;
-  onCancel: () => void;
 }) {
   const [draft, setDraft] = useState(() => initialTrackerDefaults(defaults, snapshot));
   const [error, setError] = useState("");
@@ -36,6 +34,7 @@ export function TrackerDefaultsForm({
       setBusy(false);
     }
     onSaved(next);
+    setDraft(initialTrackerDefaults(next, snapshot));
   };
 
   return (
@@ -98,8 +97,13 @@ export function TrackerDefaultsForm({
           <button type="submit" className="mk-btn mk-btn--primary" disabled={busy}>
             Save defaults
           </button>
-          <button type="button" className="mk-btn mk-btn--ghost" onClick={onCancel}>
-            Cancel
+          <button
+            type="button"
+            className="mk-btn mk-btn--ghost"
+            disabled={busy}
+            onClick={() => setDraft(initialTrackerDefaults(defaults, snapshot))}
+          >
+            Discard changes
           </button>
           {defaults && (
             <button

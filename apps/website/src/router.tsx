@@ -27,6 +27,7 @@ import { SignIn, signInAction, signInLoader } from "./routes/SignIn.tsx";
 import { Device, deviceAction, deviceLoader } from "./routes/Device.tsx";
 import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
+import { Preferences, preferencesLoader } from "./routes/Preferences.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Agents, agentsAction, agentsLoader } from "./routes/Agents.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
@@ -95,6 +96,11 @@ export const router = createBrowserRouter([
             loader: profileLoader,
             action: profileAction,
             Component: Profile,
+          },
+          {
+            path: "settings/preferences",
+            loader: preferencesLoader,
+            Component: Preferences,
           },
           {
             path: "settings/invites",
