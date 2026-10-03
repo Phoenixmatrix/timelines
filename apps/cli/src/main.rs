@@ -129,6 +129,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Diff(a) => out(f, local::diff(ctx, &a)),
         Command::Describe(a) => out(f, local::describe(ctx, &a)),
         Command::New(a) => out(f, local::new(ctx, &a)),
+        Command::Merge(a) => out(f, local::merge(ctx, &a)),
         Command::Commit(a) => out(f, local::commit(ctx, &a)),
         Command::Squash(a) => out(f, local::squash(ctx, &a)),
         Command::Split(a) => out(f, local::split(ctx, &a)),

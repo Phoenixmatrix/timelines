@@ -84,6 +84,7 @@ pub const COMMANDS: &[Meta] = &[
     meta!("diff", git: "git diff", kw: "difference patch compare changes lines edits", mutates: false, out: Out::Typed(schema_of::<model::Diff>), ex: ["gm diff", "gm diff --stat", "gm diff --from trunk --to @", "gm diff src/"]),
     meta!("describe", git: "git commit --amend -m (message only)", kw: "message rename reword edit description amend commit message title", mutates: true, out: OP, ex: ["gm describe -m \"Fix login redirect\"", "gm describe @- -m \"Better message\""]),
     meta!("new", git: "git switch -c / git stash / git merge --no-commit", kw: "start begin fresh empty change branch off checkout switch merge stash", mutates: true, out: OP, ex: ["gm new", "gm new trunk -m \"Try another approach\"", "gm new kxyz lmno"]),
+    meta!("merge", git: "git merge --no-ff", kw: "merge branch bookmark timeline main trunk into combine join integrate two parents merge commit", mutates: true, out: OP, ex: ["gm merge trunk", "gm merge feature-x -m \"Merge feature-x\"", "gm merge kxyz lmno"]),
     meta!("commit", git: "git commit -am", kw: "save checkpoint snapshot record work commit finish done message", mutates: true, out: OP, ex: ["gm commit -m \"Add retry to fetch\"", "gm commit -m \"Only the docs\" docs/"]),
     meta!("squash", git: "git commit --amend / git rebase -i fixup", kw: "amend fold fixup combine merge into parent meld absorb", mutates: true, out: OP, ex: ["gm squash", "gm squash -r kxyz --into lmno", "gm squash src/a.rs"]),
     meta!("split", git: "git add -p && git commit (partial)", kw: "separate break apart divide partial files into two changes", mutates: true, out: OP, ex: ["gm split -m \"Extract parser\" src/parser.rs"]),
@@ -524,7 +525,7 @@ edit files and run `gm squash --into <change id>`, or `gm edit <change id>`
 then `gm new` to come back on top.
 
 ## Revisions
-`@` working copy · `@-` its parent · `@--` grandparent · `trunk` · a change id
+`@` working copy · `@-` its (first) parent · `@--` grandparent · `trunk` · a change id
 prefix (`kxmq`) · a commit id prefix (`1a2b3c`) · a bookmark name.
 Ranges for `gm log -r`: `trunk..@`, `all`.
 
@@ -535,6 +536,7 @@ Ranges for `gm log -r`: `trunk..@`, `all`.
 - `gm squash` (amend/fixup) · `gm split -m msg <paths>` (partial commit)
 - `gm restore [paths]` (discard edits) · `gm abandon <rev>` (drop a change)
 - `gm rebase -d trunk` · `gm backout -r <rev>` (revert) · `gm duplicate <rev>` (cherry-pick)
+- `gm merge <rev>` (git merge --no-ff: a merge change below @, e.g. `gm merge trunk`)
 - `gm sync` (pull --rebase) · `gm push` (land on trunk) · `gm push -b name` (push a bookmark)
 - `gm undo` · `gm op log`
 
@@ -647,7 +649,14 @@ Existing files require --force. No archives are unpacked or installer scripts ru
 Rebases never stop halfway. A conflicted change gets conflict markers in its
 files and shows up in `gm status` under `conflicts`. Edit the markers away
 in `@` (or `gm edit <change>` first); the next gm command records the fix.
+A conflict in a change below `@` (a `gm merge`, or a rebased stack): fix the
+files in `@`, then `gm squash --into <change>` (plain `gm squash` for `@-`).
 `gm push` refuses changes that still have conflicts.
+
+## Merges
+`gm merge <rev>` makes a merge change with parents `@-` and `<rev>`, below
+`@`; push it like any change. Rewrites (describe, rebase, sync, abandon) keep
+every parent. A merge's diff is what it adds on top of its parents merged.
 
 ## For agents
 - Output is compact JSON when an agent or a pipe is detected; `-o text` for prose.
@@ -710,5 +719,6 @@ mod tests {
         assert_eq!(top("create a branch"), "gm bookmark set");
         assert_eq!(top("discard my edits to a file"), "gm restore");
         assert_eq!(top("open a pull request"), "gm push");
+        assert_eq!(top("merge a branch into mine"), "gm merge");
     }
 }

@@ -225,12 +225,25 @@ impl Workspace {
         String::from_utf8_lossy(commit.message_bytes()).into_owned()
     }
 
-    /// A change is empty when it makes no difference to its (first) parent.
+    /// A change is empty when it makes no difference to its parent, or for a
+    /// merge, to its parents merged.
     pub fn is_empty(&self, commit: &Commit) -> Result<bool> {
         Ok(match commit.parent_count() {
             0 => commit.tree_id() == trees::empty_tree(&self.repo)?,
-            _ => commit.parent(0)?.tree_id() == commit.tree_id(),
+            1 => commit.parent(0)?.tree_id() == commit.tree_id(),
+            _ => {
+                let parents: Vec<Oid> = commit.parent_ids().collect();
+                self.merged_parent_tree(&parents)?.0 == commit.tree_id()
+            }
         })
+    }
+
+    /// An empty, undescribed change that merges nothing: a placeholder for
+    /// edits to come. A merge always counts, even when empty.
+    pub fn is_untouched(&self, commit: &Commit) -> Result<bool> {
+        Ok(commit.parent_count() <= 1
+            && Workspace::description(commit).trim().is_empty()
+            && self.is_empty(commit)?)
     }
 
     pub fn conflicts_of(&self, change_id: &str) -> Vec<String> {
@@ -471,17 +484,18 @@ impl Workspace {
         )
     }
 
-    /// The tree a set of parents adds up to.
+    /// The tree a set of parents adds up to: what a merge's own edits apply
+    /// on top of. Each later parent is merged in against its merge base with
+    /// the first.
     pub fn merged_parent_tree(&self, parents: &[Oid]) -> Result<(Oid, Vec<String>)> {
         match parents {
             [] => Ok((trees::empty_tree(&self.repo)?, Vec::new())),
             [only] => Ok((self.commit(*only)?.tree_id(), Vec::new())),
             [first, rest @ ..] => {
                 let mut tree = self.commit(*first)?.tree_id();
-                let mut acc = *first;
                 let mut conflicts = Vec::new();
                 for other in rest {
-                    let base = self.repo.merge_base(acc, *other).ok();
+                    let base = self.repo.merge_base(*first, *other).ok();
                     let base_tree = match base {
                         Some(b) => self.commit(b)?.tree_id(),
                         None => trees::empty_tree(&self.repo)?,
@@ -490,8 +504,9 @@ impl Workspace {
                         trees::merge(&self.repo, base_tree, tree, self.commit(*other)?.tree_id())?;
                     tree = merged;
                     conflicts.extend(c);
-                    acc = *other;
                 }
+                conflicts.sort();
+                conflicts.dedup();
                 Ok((tree, conflicts))
             }
         }
@@ -571,17 +586,7 @@ impl Workspace {
         let Some(paths) = self.view.conflicts.get(change_id).cloned() else {
             return Ok(());
         };
-        let tree = self.repo.find_tree(tree)?;
-        let remaining: Vec<String> = paths
-            .into_iter()
-            .filter(|p| {
-                tree.get_path(Path::new(p))
-                    .ok()
-                    .and_then(|e| self.repo.find_blob(e.id()).ok())
-                    .map(|b| trees::has_conflict_markers(b.content()))
-                    .unwrap_or(false)
-            })
-            .collect();
+        let remaining = self.still_conflicted(tree, paths)?;
         if remaining.is_empty() {
             self.view.conflicts.remove(change_id);
         } else {
@@ -590,10 +595,24 @@ impl Workspace {
         Ok(())
     }
 
-    /// An empty, undescribed change nothing depends on: safe to drop when `@` moves away.
+    /// Of `paths`, those whose file in `tree` still has conflict markers.
+    pub fn still_conflicted(&self, tree: Oid, paths: Vec<String>) -> Result<Vec<String>> {
+        let tree = self.repo.find_tree(tree)?;
+        Ok(paths
+            .into_iter()
+            .filter(|p| {
+                tree.get_path(Path::new(p))
+                    .ok()
+                    .and_then(|e| self.repo.find_blob(e.id()).ok())
+                    .map(|b| trees::has_conflict_markers(b.content()))
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    /// An untouched change nothing depends on: safe to drop when `@` moves away.
     fn is_discardable(&self, oid: Oid) -> Result<bool> {
-        let commit = self.commit(oid)?;
-        if !Workspace::description(&commit).trim().is_empty() || !self.is_empty(&commit)? {
+        if !self.is_untouched(&self.commit(oid)?)? {
             return Ok(false);
         }
         let s = oid.to_string();
@@ -671,6 +690,53 @@ impl Workspace {
 
     // ---- rewriting -------------------------------------------------------
 
+    /// Whether one of `parents` is already an ancestor of another.
+    fn has_redundant_parent(&self, parents: &[Oid]) -> Result<bool> {
+        Ok(self.without_redundant_parents(parents)?.len() < parents.len())
+    }
+
+    /// `parents` without those another of them already contains.
+    fn without_redundant_parents(&self, parents: &[Oid]) -> Result<Vec<Oid>> {
+        let mut kept = Vec::new();
+        for p in parents {
+            let mut contained = false;
+            for q in parents {
+                if q != p && self.repo.graph_descendant_of(*q, *p)? {
+                    contained = true;
+                    break;
+                }
+            }
+            if !contained {
+                kept.push(*p);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The parents a change gets when it moves onto `dest`: `dest` takes the
+    /// first parent's place, and whatever a merge brought in stays, unless
+    /// `dest` already contains it.
+    pub fn parents_onto(&self, oid: Oid, dest: Oid) -> Result<Vec<Oid>> {
+        let mut parents = vec![dest];
+        for p in self.commit(oid)?.parent_ids().skip(1) {
+            if !parents.contains(&p) && !self.repo.graph_descendant_of(dest, p)? {
+                parents.push(p);
+            }
+        }
+        Ok(parents)
+    }
+
+    /// A change's tree moved onto new parents, and the paths left conflicted.
+    /// A conflict between a merge's parents only counts while its markers are
+    /// still there: the merge may have resolved it.
+    pub fn rebased_tree(&self, commit: &Commit, parents: &[Oid]) -> Result<(Oid, Vec<String>)> {
+        let (old_base, _) = self.merged_parent_tree(&commit.parent_ids().collect::<Vec<_>>())?;
+        let (new_base, base_conflicts) = self.merged_parent_tree(parents)?;
+        let (tree, mut conflicts) = trees::merge(&self.repo, old_base, new_base, commit.tree_id())?;
+        conflicts.extend(self.still_conflicted(tree, base_conflicts)?);
+        Ok((tree, conflicts))
+    }
+
     /// After some changes were rewritten (`rewritten`: old -> new) or dropped
     /// (`abandoned`: old -> the parents its children should move to), rebase
     /// every descendant and move `@`, bookmarks and heads along.
@@ -683,6 +749,7 @@ impl Workspace {
         let mut outcome = Rebased::default();
         let explicit: HashSet<Oid> = rewritten.keys().copied().collect();
         let mut fresh: HashSet<String> = HashSet::new();
+        let wc = self.wc();
 
         fn resolve(
             oid: Oid,
@@ -713,15 +780,33 @@ impl Workspace {
                     }
                 }
             }
+            // A merge keeps every parent, except one the rewrite made
+            // redundant (its side is now in another parent's history). A merge
+            // that was redundant to begin with, like `git merge --no-ff`, stays.
+            if new_parents.len() > 1 && !self.has_redundant_parent(&old_parents)? {
+                new_parents = self.without_redundant_parents(&new_parents)?;
+            }
             if new_parents == old_parents {
                 continue;
             }
-            let (old_base, _) = self.merged_parent_tree(&old_parents)?;
-            let (new_base, mut conflicts) = self.merged_parent_tree(&new_parents)?;
-            let (tree, more) = trees::merge(&self.repo, old_base, new_base, commit.tree_id())?;
-            conflicts.extend(more);
-            let new_oid = self.rewrite_commit(&commit, &new_parents, tree, None)?;
+            let (tree, mut conflicts) = self.rebased_tree(&commit, &new_parents)?;
             let change_id = self.change_id(&commit);
+            // A merge left with one parent and nothing of its own only recorded
+            // bringing in what that parent now has (a `gm merge trunk` that
+            // sync rebased past): drop it.
+            if old_parents.len() > 1
+                && new_parents.len() == 1
+                && conflicts.is_empty()
+                && *oid != wc
+                && !explicit.contains(oid)
+                && tree == self.commit(new_parents[0])?.tree_id()
+            {
+                drop(commit);
+                self.view.conflicts.remove(&change_id);
+                rewritten.insert(*oid, new_parents[0]);
+                continue;
+            }
+            let new_oid = self.rewrite_commit(&commit, &new_parents, tree, None)?;
             drop(commit);
             if !conflicts.is_empty() {
                 conflicts.sort();
@@ -740,7 +825,6 @@ impl Workspace {
 
         // Move @, bookmarks and heads to the new commits.
         let move_to = |oid: Oid| resolve(oid, &rewritten, &abandoned);
-        let wc = self.wc();
         let new_wc = if abandoned.contains_key(&wc) {
             let parents = move_to(wc);
             let (tree, _) = self.merged_parent_tree(&parents)?;

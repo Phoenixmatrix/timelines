@@ -59,6 +59,8 @@ pub enum Command {
     Describe(DescribeArgs),
     /// Start a new empty change on top of one or more revisions (several = a merge)
     New(NewArgs),
+    /// Merge revisions (main, a bookmark, a change) into a new merge change below the working copy
+    Merge(MergeArgs),
     /// Describe the working-copy change and start a new one on top: the "save my work" step
     #[command(visible_alias = "ci")]
     Commit(CommitArgs),
@@ -227,6 +229,16 @@ pub struct NewArgs {
 }
 
 #[derive(Args)]
+pub struct MergeArgs {
+    /// Revisions to merge into `@-`, e.g. `trunk` or a bookmark. Several make an octopus merge.
+    #[arg(required = true)]
+    pub revisions: Vec<String>,
+    /// Description for the merge (default "Merge <revisions>").
+    #[arg(short, long)]
+    pub message: Vec<String>,
+}
+
+#[derive(Args)]
 pub struct CommitArgs {
     /// Description for the change being committed (the current working copy).
     #[arg(short, long, required = true)]
@@ -288,7 +300,9 @@ pub struct RestoreArgs {
 }
 
 #[derive(Args)]
-#[group(id = "what", multiple = false)]
+// Declared on the command, not the struct: a struct-level group would take in
+// --destination too and refuse `-s X -d Y`.
+#[command(group(clap::ArgGroup::new("what").multiple(false)))]
 pub struct RebaseArgs {
     /// Rebase this change and its descendants.
     #[arg(short, long, group = "what")]

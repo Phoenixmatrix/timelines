@@ -7,7 +7,7 @@ use crate::cli;
 use crate::model::{Change, Json, OpResult};
 use crate::output::{GmError, Render, Result, exit};
 use crate::remote::{self, Config};
-use crate::repo::{Rebased, Workspace, revset, trees};
+use crate::repo::{Graph, Rebased, Workspace, revset};
 use git2::Oid;
 use serde::Serialize;
 use serde_json::json;
@@ -193,24 +193,19 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
         }
         let commit = ws.commit(root)?;
         let parents: Vec<Oid> = commit.parent_ids().collect();
-        if parents == [new_trunk] {
+        let onto = ws.parents_onto(root, new_trunk)?;
+        if parents == onto {
             continue;
         }
         // Only stacks that were built on trunk's history follow trunk.
         let on_trunk = parents.iter().all(|p| {
             *p == new_trunk || ws.repo.graph_descendant_of(new_trunk, *p).unwrap_or(false)
         });
-        if !on_trunk {
+        if !on_trunk || merged_trunk(ws, &graph, root, new_trunk)? {
             continue;
         }
-        let (old_base, _) = ws.merged_parent_tree(&parents)?;
-        let (tree, conflicts) = trees::merge(
-            &ws.repo,
-            old_base,
-            ws.commit(new_trunk)?.tree_id(),
-            commit.tree_id(),
-        )?;
-        let new = ws.rewrite_commit(&commit, &[new_trunk], tree, None)?;
+        let (tree, conflicts) = ws.rebased_tree(&commit, &onto)?;
+        let new = ws.rewrite_commit(&commit, &onto, tree, None)?;
         let change_id = ws.change_id(&commit);
         drop(commit);
         if !conflicts.is_empty() {
@@ -266,6 +261,27 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
         .map(|o| revset::resolve(ws, &short(ws, *o)).unwrap_or(*o))
         .collect();
     Ok((message, moved, rebased))
+}
+
+/// Whether every line built on `root` already merged `trunk` in (`gm merge
+/// trunk`): such a stack is up to date, and sync leaves its merges alone.
+fn merged_trunk(ws: &Workspace, graph: &Graph, root: Oid, trunk: Oid) -> Result<bool> {
+    let mut queue = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(oid) = queue.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        match graph.children.get(&oid).filter(|c| !c.is_empty()) {
+            Some(children) => queue.extend(children),
+            None => {
+                if !ws.repo.graph_descendant_of(oid, trunk)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub fn sync(ctx: &Ctx) -> Result<OpResult> {
@@ -340,8 +356,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         Some(spec) => revset::resolve(&ws, spec)?,
         None => {
             let c = ws.commit(wc)?;
-            let wc_untouched = ws.is_empty(&c)? && Workspace::description(&c).trim().is_empty();
-            match (wc_untouched, c.parent_id(0)) {
+            match (ws.is_untouched(&c)?, c.parent_id(0)) {
                 (true, Ok(parent)) => parent,
                 _ => wc,
             }

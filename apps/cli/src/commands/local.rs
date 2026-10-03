@@ -87,9 +87,18 @@ pub fn file_changes(
     Ok((files, patch))
 }
 
+/// The tree a change's edits apply on top of: its parent's or, for a merge,
+/// its parents merged. A merge's diff is then what it adds to that merge
+/// (conflict resolutions, say), not everything the other side brought in.
 fn parent_tree(ws: &Workspace, oid: Oid) -> Result<Oid> {
-    let commit = ws.commit(oid)?;
-    Ok(match commit.parent(0) {
+    let parents: Vec<Oid> = ws.commit(oid)?.parent_ids().collect();
+    Ok(ws.merged_parent_tree(&parents)?.0)
+}
+
+/// The first parent's tree: a merge seen from the line it was merged into,
+/// as `git revert -m 1` and `git cherry-pick -m 1` see it.
+fn first_parent_tree(ws: &Workspace, oid: Oid) -> Result<Oid> {
+    Ok(match ws.commit(oid)?.parent(0) {
         Ok(p) => p.tree_id(),
         Err(_) => trees::empty_tree(&ws.repo)?,
     })
@@ -120,14 +129,9 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             let graph = ws.graph()?;
             let mut ahead = 0;
             for oid in &graph.topo {
-                if *oid == wc || ws.repo.graph_descendant_of(wc, *oid)? {
-                    let c = ws.commit(*oid)?;
-                    if !(*oid == wc
-                        && ws.is_empty(&c)?
-                        && Workspace::description(&c).trim().is_empty())
-                    {
-                        ahead += 1;
-                    }
+                let below = *oid != wc && ws.repo.graph_descendant_of(wc, *oid)?;
+                if below || (*oid == wc && !ws.is_untouched(&ws.commit(wc)?)?) {
+                    ahead += 1;
                 }
             }
             Some(TrunkInfo {
@@ -334,6 +338,66 @@ pub fn new(ctx: &Ctx, args: &cli::NewArgs) -> Result<OpResult> {
     })
 }
 
+/// Merge revisions in below the working copy: a merge change with parents
+/// `@-` and the revisions goes between `@` and its parent, the way `gm commit`
+/// leaves a change below `@`. Edits in progress stay in `@`, on top. Conflicts
+/// are recorded on the merge; resolve them in `@`, then `gm squash`.
+pub fn merge(ctx: &Ctx, args: &cli::MergeArgs) -> Result<OpResult> {
+    mutate(ctx, |ws| {
+        let wc = ws.wc();
+        let base = wc_base(ws)?;
+        let mut parents = vec![base];
+        let mut names = Vec::new();
+        for spec in &args.revisions {
+            let rev = revset::resolve(ws, spec)?;
+            if rev == wc || ws.repo.graph_descendant_of(rev, wc)? {
+                return Err(GmError::usage(format!(
+                    "`{spec}` is the working copy or built on it, so it can't be merged below it."
+                ))
+                .hint(
+                    "Start from the change to merge into instead: `gm new <rev>`, then `gm merge`.",
+                ));
+            }
+            if parents.contains(&rev) || ws.repo.graph_descendant_of(base, rev)? {
+                continue;
+            }
+            parents.push(rev);
+            names.push(match (spec.as_str(), &ws.trunk) {
+                ("trunk" | "trunk()", Some(trunk)) => trunk.name.clone(),
+                _ => spec.clone(),
+            });
+        }
+        if names.is_empty() {
+            return Ok(Outcome::new(
+                format!(
+                    "Nothing to merge: {} already contains {}.",
+                    short(ws, base),
+                    args.revisions.join(", ")
+                ),
+                Vec::new(),
+                Rebased::default(),
+            ));
+        }
+        let (tree, conflicts) = ws.merged_parent_tree(&parents)?;
+        let msg = if args.message.is_empty() {
+            format!("Merge {}\n", names.join(", "))
+        } else {
+            message(&args.message)
+        };
+        let (new, rebased) = insert_below(ws, &parents, tree, conflicts, &msg)?;
+        let mut text = format!(
+            "Merged {} into {} as change {}, below the working copy.",
+            names.join(", "),
+            short(ws, base),
+            short(ws, new)
+        );
+        if !rebased.conflicts.is_empty() {
+            text.push_str(" It has conflicts: resolve the markers in @, then `gm squash`.");
+        }
+        Ok(Outcome::new(text, vec![new], rebased))
+    })
+}
+
 pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
     mutate(ctx, |ws| {
         let wc = ws.wc();
@@ -401,7 +465,7 @@ pub fn squash(ctx: &Ctx, args: &cli::SquashArgs) -> Result<OpResult> {
                 "Squash from the descendant instead: `gm squash -r <child> --into <parent>`.",
             ));
         }
-        let p_tree = ws.commit(parent)?.tree_id();
+        let p_tree = parent_tree(ws, rev)?;
         let s_tree = src.tree_id();
         let selected = trees::with_paths(&ws.repo, p_tree, s_tree, &args.paths)?;
         if selected == p_tree {
@@ -592,10 +656,7 @@ pub fn restore(ctx: &Ctx, args: &cli::RestoreArgs) -> Result<OpResult> {
 /// Rebase one commit onto new parents, keeping its change id.
 fn rebase_onto(ws: &Workspace, oid: Oid, parents: &[Oid]) -> Result<(Oid, Vec<String>)> {
     let commit = ws.commit(oid)?;
-    let (old_base, _) = ws.merged_parent_tree(&commit.parent_ids().collect::<Vec<_>>())?;
-    let (new_base, mut conflicts) = ws.merged_parent_tree(parents)?;
-    let (tree, more) = trees::merge(&ws.repo, old_base, new_base, commit.tree_id())?;
-    conflicts.extend(more);
+    let (tree, conflicts) = ws.rebased_tree(&commit, parents)?;
     Ok((ws.rewrite_commit(&commit, parents, tree, None)?, conflicts))
 }
 
@@ -649,7 +710,7 @@ pub fn rebase(ctx: &Ctx, args: &cli::RebaseArgs) -> Result<OpResult> {
                     "Can't rebase a change onto itself or its descendant.",
                 ));
             }
-            let (new, conflicts) = rebase_onto(ws, rev, &[dest])?;
+            let (new, conflicts) = rebase_onto(ws, rev, &ws.parents_onto(rev, dest)?)?;
             let has_children = ws
                 .graph()?
                 .children
@@ -685,10 +746,11 @@ pub fn rebase(ctx: &Ctx, args: &cli::RebaseArgs) -> Result<OpResult> {
                         "Can't rebase a change onto itself or its descendant.",
                     ));
                 }
-                if ws.commit(*root)?.parent_ids().collect::<Vec<_>>() == vec![dest] {
+                let parents = ws.parents_onto(*root, dest)?;
+                if ws.commit(*root)?.parent_ids().collect::<Vec<_>>() == parents {
                     continue;
                 }
-                let (new, conflicts) = rebase_onto(ws, *root, &[dest])?;
+                let (new, conflicts) = rebase_onto(ws, *root, &parents)?;
                 rewritten.insert(*root, new);
                 root_conflicts.push((new, conflicts));
                 moved.push(new);
@@ -700,7 +762,17 @@ pub fn rebase(ctx: &Ctx, args: &cli::RebaseArgs) -> Result<OpResult> {
                     rebased,
                 ));
             }
+            // The changes a root moved away from (a merge's first parent, say)
+            // stay visible.
+            let left: Vec<Oid> = rewritten
+                .keys()
+                .map(|root| ws.commit(*root).map(|c| c.parent_ids().collect::<Vec<_>>()))
+                .collect::<Result<Vec<_>>>()?
+                .concat();
             rebased = ws.rebase_descendants(rewritten, HashMap::new())?;
+            for parent in left {
+                ws.add_head(parent)?;
+            }
             for (new, conflicts) in root_conflicts {
                 record_conflicts(ws, new, conflicts, &mut rebased)?;
             }
@@ -721,20 +793,36 @@ pub fn rebase(ctx: &Ctx, args: &cli::RebaseArgs) -> Result<OpResult> {
     })
 }
 
+/// The working copy's (first) parent, which changes inserted below it build on.
+fn wc_base(ws: &Workspace) -> Result<Oid> {
+    ws.commit(ws.wc())?
+        .parent_id(0)
+        .map_err(|_| GmError::usage("The working copy has no parent to insert below."))
+}
+
 /// Put a new change between `@` and its parent; `@` is rebased on top.
 fn insert_below_wc(
     ws: &mut Workspace,
     tree_for: impl FnOnce(&Workspace, Oid) -> Result<(Oid, Vec<String>)>,
     msg: &str,
 ) -> Result<(Oid, Rebased)> {
-    let wc = ws.wc();
-    let base = ws
-        .commit(wc)?
-        .parent_id(0)
-        .map_err(|_| GmError::usage("The working copy has no parent to insert below."))?;
+    let base = wc_base(ws)?;
     let (tree, conflicts) = tree_for(ws, ws.commit(base)?.tree_id())?;
-    let new = ws.new_commit(&[base], tree, msg)?;
-    let (new_wc, wc_conflicts) = rebase_onto(ws, wc, &[new])?;
+    insert_below(ws, &[base], tree, conflicts, msg)
+}
+
+/// Put a new change with these parents below `@`, which moves on top of it,
+/// keeping any other parents `@` has.
+fn insert_below(
+    ws: &mut Workspace,
+    parents: &[Oid],
+    tree: Oid,
+    conflicts: Vec<String>,
+    msg: &str,
+) -> Result<(Oid, Rebased)> {
+    let wc = ws.wc();
+    let new = ws.new_commit(parents, tree, msg)?;
+    let (new_wc, wc_conflicts) = rebase_onto(ws, wc, &ws.parents_onto(wc, new)?)?;
     let mut rebased = ws.rebase_descendants(HashMap::from([(wc, new_wc)]), HashMap::new())?;
     record_conflicts(ws, new, conflicts, &mut rebased)?;
     record_conflicts(ws, new_wc, wc_conflicts, &mut rebased)?;
@@ -746,7 +834,7 @@ pub fn backout(ctx: &Ctx, args: &cli::BackoutArgs) -> Result<OpResult> {
         let rev = revset::resolve(ws, &args.revision)?;
         let target = ws.commit(rev)?;
         let t_tree = target.tree_id();
-        let p_tree = parent_tree(ws, rev)?;
+        let p_tree = first_parent_tree(ws, rev)?;
         let summary = Workspace::description(&target)
             .lines()
             .next()
@@ -777,7 +865,7 @@ pub fn duplicate(ctx: &Ctx, args: &cli::DuplicateArgs) -> Result<OpResult> {
         let rev = revset::resolve(ws, &args.revision)?;
         let src = ws.commit(rev)?;
         let s_tree = src.tree_id();
-        let p_tree = parent_tree(ws, rev)?;
+        let p_tree = first_parent_tree(ws, rev)?;
         let msg = Workspace::description(&src);
         drop(src);
         match &args.destination {

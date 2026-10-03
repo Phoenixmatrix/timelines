@@ -384,6 +384,15 @@ null capabilities rather than invented defaults.
   change in a stack; everything above it is rebased automatically.
   Conflicts never stop a command: they become conflict markers in the
   affected change, listed by `gm status`, and `gm push` refuses them.
+- **Merges keep every parent.** `gm merge <rev>` puts a merge of `@-` and
+  `<rev>` (trunk, a bookmark, any change) below `@`, as `gm commit` would;
+  edits in progress stay in `@`. A merge's diff is what it adds to its parents
+  merged. Its conflicts are recorded like any change's: fix them in `@`, then
+  `gm squash`. Rebasing a merge replaces its first parent and keeps the rest; a
+  parent a rewrite made redundant is dropped, and so is a merge left with
+  nothing of its own. `gm sync` leaves a stack alone while it has merged the
+  latest trunk. `gm backout` and `gm duplicate` see a merge from its first
+  parent, like `git revert -m 1`.
 - **Workspace changes are operations.** `gm undo` reverses the last one (repeat
   to go further back), `gm op log` lists them, `gm op restore <id>` jumps to any.
 - **Trunk is immutable; there are no PRs.** `gm push` fast-forwards trunk to
@@ -676,5 +685,4 @@ pnpm run check      # fmt + clippy with warnings as errors
 
 - `gm log` text output lists changes without drawing a graph; JSON output has
   every change's parents.
-- Merge commits are rebased by their first parent's changes only.
 - No interactive mode (`split -i`), tags, blame or submodules.
