@@ -1,6 +1,8 @@
 // The Atlas read API (CORE-160): bounded, snapshot-pinned pages over a
 // repository's published Atlas projection. Served by worker/atlas/api.ts under
-// /api/repos/:owner/:name/atlas, read by src/lib/atlas.ts.
+// /api/repos/:owner/:name/atlas, read by src/lib/atlas.ts. The same pages over
+// an explicit workspace scope (CORE-161) are served by worker/atlas/workspace.ts
+// under /api/accounts/:owner/atlas (the Atlas Workspace types below).
 //
 // Every response names the snapshot it was read from. A request may pin one
 // (`?snapshot=<id>`); continuation cursors always do. A pinned snapshot that is
@@ -19,6 +21,8 @@ export const ATLAS_OVERVIEW_MAX_BYTES = 256 * 1024;
 export const ATLAS_OVERVIEW_SUMMARY_CHARS = 2000;
 /** Summary characters a region catalogue entry carries. */
 export const ATLAS_CATALOGUE_SUMMARY_CHARS = 280;
+/** Repositories one workspace scope can select. */
+export const ATLAS_WORKSPACE_MAX_REPOS = 50;
 
 /** One repository's place in a snapshot: there is no common HEAD across repositories. */
 export interface AtlasVectorEntry {
@@ -72,6 +76,12 @@ export interface AtlasEntitySummary {
    * the stale prose with its original basis in `data.description`.
    */
   summaryState?: { status: AtlasDescriptionStatus; reason?: AtlasUnavailableReason };
+  /**
+   * In a workspace scope, the repository it belongs to: ids (and parentId)
+   * are then `<repoId>/<repository-local id>`. Ids inside `data` stay
+   * repository-local. Absent in a repository scope.
+   */
+  repoId?: string;
 }
 
 /** An entity in full, as `detail` shows it. */
@@ -332,13 +342,96 @@ export type AtlasErrorCode =
   | "cursor_expired"
   /** The entity isn't in this snapshot. */
   | "entity_unknown"
+  /**
+   * Workspace scope: no selected repository is one the caller can read (or
+   * exists). Unreadable and nonexistent repositories are indistinguishable.
+   */
+  | "scope_empty"
   | "bad_request";
 
 export interface AtlasError {
   error: string;
   code: AtlasErrorCode;
-  /** The scope's current snapshot, for an explicit "go to current" action. */
-  current?: { id: string; seq: number } | null;
-  /** With snapshot_expired: when and why retention expired it. */
+  /**
+   * The scope's current snapshot, for an explicit "go to current" action. In
+   * a workspace scope it's the current composite id, and `seq` is null.
+   */
+  current?: { id: string; seq: number | null } | null;
+  /** With snapshot_expired: when and why retention expired it (in a workspace, the first one read). */
   expired?: { at: string; reason: "age" | "count" | "storage" };
 }
+
+// ---- workspace scope (CORE-161) ------------------------------------------------
+//
+// A workspace scope is an explicit selection of one account's repositories
+// (`?repos=a,b`), re-authorized on every request: the server keeps only the
+// selected repositories the caller can read now, and a response never says
+// anything about the rest, not even how many. Composition is virtual: each
+// response reads every selected repository's own published projection, so
+// each item belongs to exactly one repository (`repoId`) and there is no
+// common HEAD, only each repository's own snapshot.
+
+/**
+ * A selected repository's Atlas: `ready` (a published snapshot), `building`
+ * (none yet, a Knowledge build is running), `unavailable` (Knowledge has run
+ * but published no Atlas, e.g. it failed) or `not-enabled` (Knowledge has
+ * never built it). Selecting a repository never starts a build.
+ */
+export type AtlasRepoState = "ready" | "building" | "unavailable" | "not-enabled";
+
+/** One selected, readable repository and its own place in the composite. */
+export interface AtlasWorkspaceRepo {
+  id: string;
+  owner: string;
+  name: string;
+  visibility: "public" | "private";
+  state: AtlasRepoState;
+  /** The snapshot this view reads, with its own commit and build; null unless ready. */
+  snapshot: AtlasSnapshotRef | null;
+  /** A Knowledge build is running, so a ready snapshot may lag the repository. */
+  building: boolean;
+  /** Overview only: a newer build didn't fit its storage cap (the snapshot is stale). */
+  capacityFailure?: AtlasCapacityFailure | null;
+}
+
+/** The composite snapshot a workspace response was read from. */
+export interface AtlasWorkspaceSnapshot {
+  /**
+   * Pins every selected repository's snapshot; pass it back as `?snapshot=`.
+   * Only meaningful with the same scope: when what the caller can read
+   * changes, it's `snapshot_unknown`.
+   */
+  id: string;
+  /**
+   * The selected repositories this response read: all of them for overview,
+   * regions and catalogue, the entity's own repository otherwise.
+   */
+  repos: AtlasWorkspaceRepo[];
+}
+
+/** What every workspace response carries. */
+export interface AtlasWorkspaceEnvelope {
+  /** "ws:<ownerId>:<hash>": names exactly the authorized repository set. */
+  scope: string;
+  owner: { id: string; slug: string };
+  snapshot: AtlasWorkspaceSnapshot;
+}
+
+type InWorkspace<T> = Omit<T, "scope" | "snapshot"> & AtlasWorkspaceEnvelope;
+
+export type AtlasWorkspacePage<T> = InWorkspace<AtlasPage<T>>;
+
+/** GET /api/accounts/:owner/atlas/overview */
+export interface AtlasWorkspaceOverview extends AtlasWorkspaceEnvelope {
+  /**
+   * The first top-level regions of every ready repository, ranked together:
+   * capabilities by primary files, then members, name and repository;
+   * structural groups after them.
+   */
+  regions: AtlasRegion[];
+  catalogue: AtlasWorkspacePage<AtlasRegion>;
+  totalRegions: number;
+}
+
+export type AtlasWorkspaceDetail = InWorkspace<AtlasDetail>;
+export type AtlasWorkspaceAncestors = InWorkspace<AtlasAncestors>;

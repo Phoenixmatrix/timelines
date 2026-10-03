@@ -1080,7 +1080,8 @@ export type RegionKey = [number, number, number, string];
 /**
  * A page of the root's children, ranked: semantic regions (capabilities, or
  * components in an ungrouped projection) before structural groups, each by
- * primary files, then direct members, then name.
+ * primary files, then direct members, then name. `inclusive` starts at
+ * `after` itself rather than past it (for merging several scopes' pages).
  */
 export async function regionsAt(
   d1: D1Database,
@@ -1088,13 +1089,14 @@ export async function regionsAt(
   seq: number,
   after: RegionKey | null,
   limit: number,
+  inclusive = false,
 ): Promise<{
-  regions: (AtlasEntity & { files: number; members: number })[];
+  regions: (AtlasEntity & { files: number; members: number; key: RegionKey })[];
   next: RegionKey | null;
 }> {
   const keyset = after
     ? `AND (tier > ? OR (tier = ? AND (files < ? OR (files = ? AND
-         (members < ? OR (members = ? AND sort_key > ?))))))`
+         (members < ? OR (members = ? AND sort_key ${inclusive ? ">=" : ">"} ?))))))`
     : "";
   const rows = await d1
     .prepare(
@@ -1120,6 +1122,7 @@ export async function regionsAt(
       ...toEntity(r),
       files: Number(r.files),
       members: Number(r.members),
+      key: [Number(r.tier), Number(r.files), Number(r.members), r.sort_key] as RegionKey,
     })),
     next:
       rows.results.length > limit && last
@@ -1349,7 +1352,8 @@ const containsPattern = (q: string) => `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}
 /**
  * A page of snapshot `seq`'s entities whose name or path contains `q`
  * (case-insensitive for ASCII), optionally of one kind, in stable name order.
- * A lookup over the projection, not a search engine.
+ * A lookup over the projection, not a search engine. `inclusive` starts at
+ * `after` itself (for merging several scopes' pages).
  */
 export async function catalogueAt(
   d1: D1Database,
@@ -1359,12 +1363,13 @@ export async function catalogueAt(
   kind: string | null,
   after: string | null,
   limit: number,
-): Promise<{ entities: AtlasEntity[]; next: string | null }> {
+  inclusive = false,
+): Promise<{ entities: (AtlasEntity & { sortKey: string })[]; next: string | null }> {
   const pattern = containsPattern(q);
   const rows = await d1
     .prepare(
       `SELECT ${ENTITY_COLUMNS}, sort_key FROM atlas_entities
-       WHERE scope = ? AND ${VISIBLE} AND sort_key > ?
+       WHERE scope = ? AND ${VISIBLE} AND sort_key ${inclusive ? ">=" : ">"} ?
          AND (name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\') ${kind === null ? "" : "AND kind = ?"}
        ORDER BY sort_key LIMIT ?`,
     )
@@ -1381,7 +1386,7 @@ export async function catalogueAt(
     .all<EntityRow & { sort_key: string }>();
   const page = rows.results.slice(0, limit);
   return {
-    entities: page.map(toEntity),
+    entities: page.map((r) => ({ ...toEntity(r), sortKey: r.sort_key })),
     next: rows.results.length > limit ? (page.at(-1)?.sort_key ?? null) : null,
   };
 }

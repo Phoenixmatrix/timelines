@@ -1285,6 +1285,33 @@ reason, current}` or `{state: "unknown"}`; an expired snapshot is never
   `snapshot_expired` naming `current`), its cursors carry their issue time, and
   its overview reports `capacityFailure` so the UI can show a stale snapshot.
 
+**Atlas workspace scope** (`worker/atlas/workspace.ts`, CORE-161). The same
+read API over several repositories of one account lives at
+`/api/accounts/:owner/atlas/{overview,regions,children,detail,ancestors,relations,evidence,catalogue}?repos=a,b`
+(at most 50; `src/lib/atlas.ts` `atlasWorkspaceApi`). The selection is
+explicit and re-authorized on every request, cursor pages included: one SQL
+query keeps the selected repositories the caller can read now (`readableRepo`),
+so an unreadable repository looks exactly like a missing one, is never counted,
+and changes nothing in the response. The scope id, `ws:<ownerId>:<hash>`, names
+that authorized set; cursors are bound to it, so revoking access (or a
+visibility change) turns open cursors and pinned composites into
+`cursor_invalid` / `snapshot_unknown` before any row is read. Selecting a
+repository stores nothing, subscribes to nothing and never starts a Knowledge
+build (a tracker workspace's repositories can seed the selection client-side).
+
+Composition is virtual: responses read each repository's own published
+snapshot, ranked together (capabilities across repositories by primary files,
+groups after), with entity ids namespaced `<repoId>/<id>`. Each response lists
+the repositories it read with their own state (`ready`, `building`,
+`unavailable`, `not-enabled`) and snapshot vector, never a common HEAD; the
+composite id `ws1.<tag>.<seq per repository>` pins them all and each is
+resolved through retention on every page. Nothing composed mixes repositories:
+every name, summary and count comes from one repository's projection, so
+narrowing the scope can't leave a hidden repository's labels behind.
+Materialized composites (cross-repository capabilities, CORE-167) must keep
+that property, recomputing from readable inputs, and would draw on the 2 GiB
+account composition pool; virtual composition stores nothing.
+
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
 `gitmatrix-knowledge`, AI Search namespace `gitmatrix` / instance `knowledge`.

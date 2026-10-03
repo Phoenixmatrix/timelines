@@ -22,6 +22,7 @@ import { refLog } from "./ref-log/api.ts";
 import { why } from "./why/api.ts";
 import { knowledge } from "./knowledge/api.ts";
 import { atlas } from "./atlas/api.ts";
+import { workspaceAtlas } from "./atlas/workspace.ts";
 import { releaseNotes, trackerReleaseNotes } from "./release-notes/api.ts";
 import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
@@ -87,6 +88,7 @@ api.use(async (c, next) => {
   return next();
 });
 api.route("/accounts/:slug/settings/previews", previewSettingsApi);
+api.route("/accounts/:owner/atlas", workspaceAtlas);
 api.route("/", accounts);
 api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
 api.route("/tracker/:owner/timelines", timelines);

@@ -1,4 +1,6 @@
-// A typed client for the Atlas read API (worker/atlas/api.ts, CORE-160).
+// A typed client for the Atlas read API (worker/atlas/api.ts, CORE-160), and
+// for the same pages over an explicit workspace scope (worker/atlas/workspace.ts,
+// CORE-161) as `atlasWorkspaceApi`.
 //
 // Every call can pin a snapshot; continuing a page passes its `next` cursor,
 // which pins its own. Failures throw an ApiError whose `code` is an
@@ -17,6 +19,10 @@ import type {
   AtlasPage,
   AtlasRegion,
   AtlasRelation,
+  AtlasWorkspaceAncestors,
+  AtlasWorkspaceDetail,
+  AtlasWorkspaceOverview,
+  AtlasWorkspacePage,
 } from "../../shared/atlas.ts";
 import { api, ApiError } from "./api.ts";
 
@@ -89,6 +95,91 @@ export const atlasApi = {
   catalogue: (repo: AtlasRepo, q: string, request: AtlasPageRequest & { kind?: string } = {}) =>
     get<AtlasPage<AtlasEntitySummary>>(
       repo,
+      "catalogue",
+      { q, kind: request.kind, ...paged(request) },
+      request,
+    ),
+};
+
+/**
+ * An explicit workspace selection: repository names under one owning account.
+ * The server re-authorizes it on every call and silently keeps only what the
+ * caller can read; `snapshot.repos` in each response says which, and their
+ * states. A tracker workspace's repositories can seed `repos`.
+ */
+export interface AtlasWorkspace {
+  owner: string;
+  repos: string[];
+}
+
+function workspacePath(
+  workspace: AtlasWorkspace,
+  route: string,
+  query: Record<string, string | number | null | undefined>,
+) {
+  const params = new URLSearchParams();
+  params.set("repos", [...new Set(workspace.repos)].sort().join(","));
+  for (const [key, value] of Object.entries(query))
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+  return `/accounts/${encodeURIComponent(workspace.owner)}/atlas/${route}?${params.toString()}`;
+}
+
+const getIn = <T>(
+  workspace: AtlasWorkspace,
+  route: string,
+  query: Record<string, string | number | null | undefined>,
+  request: AtlasRequest,
+) =>
+  api<T>(workspacePath(workspace, route, { ...query, snapshot: request.snapshot }), {
+    signal: request.signal,
+  });
+
+/**
+ * The Atlas across a workspace. Entity ids are `<repoId>/<id>` as the
+ * responses give them; `snapshot` pins the composite id from a response.
+ */
+export const atlasWorkspaceApi = {
+  overview: (workspace: AtlasWorkspace, request: AtlasRequest = {}) =>
+    getIn<AtlasWorkspaceOverview>(workspace, "overview", {}, request),
+  regions: (workspace: AtlasWorkspace, request: AtlasPageRequest = {}) =>
+    getIn<AtlasWorkspacePage<AtlasRegion>>(workspace, "regions", paged(request), request),
+  children: (workspace: AtlasWorkspace, id: string, request: AtlasPageRequest = {}) =>
+    getIn<AtlasWorkspacePage<AtlasEntitySummary>>(
+      workspace,
+      "children",
+      { id, ...paged(request) },
+      request,
+    ),
+  detail: (workspace: AtlasWorkspace, id: string, request: AtlasRequest = {}) =>
+    getIn<AtlasWorkspaceDetail>(workspace, "detail", { id }, request),
+  ancestors: (workspace: AtlasWorkspace, id: string, request: AtlasRequest = {}) =>
+    getIn<AtlasWorkspaceAncestors>(workspace, "ancestors", { id }, request),
+  relations: (
+    workspace: AtlasWorkspace,
+    id: string,
+    direction: AtlasDirection,
+    request: AtlasPageRequest & { kind?: string } = {},
+  ) =>
+    getIn<AtlasWorkspacePage<AtlasRelation>>(
+      workspace,
+      "relations",
+      { id, direction, kind: request.kind, ...paged(request) },
+      request,
+    ),
+  evidence: (workspace: AtlasWorkspace, id: string, request: AtlasPageRequest = {}) =>
+    getIn<AtlasWorkspacePage<AtlasEvidence>>(
+      workspace,
+      "evidence",
+      { id, ...paged(request) },
+      request,
+    ),
+  catalogue: (
+    workspace: AtlasWorkspace,
+    q: string,
+    request: AtlasPageRequest & { kind?: string } = {},
+  ) =>
+    getIn<AtlasWorkspacePage<AtlasEntitySummary>>(
+      workspace,
       "catalogue",
       { q, kind: request.kind, ...paged(request) },
       request,

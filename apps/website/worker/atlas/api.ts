@@ -82,12 +82,12 @@ export const atlas = new Hono<AppEnv>();
 
 type C = Context<AppEnv>;
 
-function failWith(
+export function failWith(
   c: C,
   status: ContentfulStatusCode,
   code: AtlasErrorCode,
   error: string,
-  current?: { id: string; seq: number } | null,
+  current?: { id: string; seq: number | null } | null,
   extra: Partial<AtlasError> = {},
 ) {
   const body: AtlasError = { error, code, ...extra };
@@ -96,7 +96,7 @@ function failWith(
 }
 
 /** What a response says about its snapshot. */
-const refOf = (snapshot: AtlasSnapshot): AtlasSnapshotRef => ({
+export const refOf = (snapshot: AtlasSnapshot): AtlasSnapshotRef => ({
   id: snapshot.id,
   seq: snapshot.seq,
   vector: snapshot.vector,
@@ -121,7 +121,7 @@ function countsOf(data: Record<string, unknown>): Record<string, number> {
   );
 }
 
-function lean(entity: ProjectedEntity): AtlasEntitySummary {
+export function lean(entity: ProjectedEntity): AtlasEntitySummary {
   return {
     id: entity.id,
     kind: entity.kind,
@@ -142,9 +142,12 @@ function summaryStateOf(data: Record<string, unknown>): Pick<AtlasEntitySummary,
   return { summaryState: d.reason ? { status: d.status, reason: d.reason } : { status: d.status } };
 }
 
-const full = (entity: ProjectedEntity): AtlasEntity => ({ ...lean(entity), data: entity.data });
+export const full = (entity: ProjectedEntity): AtlasEntity => ({
+  ...lean(entity),
+  data: entity.data,
+});
 
-function region(
+export function region(
   entity: ProjectedEntity & { files: number; members: number },
   summaryChars: number,
 ): AtlasRegion {
@@ -169,7 +172,7 @@ interface Pinned<K> {
   secret: string;
 }
 
-function principalOf(c: C): string {
+export function principalOf(c: C): string {
   const actor = c.get("actor");
   if (!actor) return "anonymous";
   return actor.agent ? `user:${actor.id}/agent:${actor.agent.id}` : `user:${actor.id}`;
@@ -255,7 +258,7 @@ async function pin<K>(
   };
 }
 
-function limitOf(c: C): number | Response {
+export function limitOf(c: C): number | Response {
   const raw = c.req.query("limit");
   if (!raw) return ATLAS_PAGE_DEFAULT;
   const n = Number(raw);
@@ -473,7 +476,7 @@ atlas.get("/relations", async (c) => {
   );
 });
 
-function analysisOf(data: Record<string, unknown>): AtlasEvidence["analysis"] {
+export function analysisOf(data: Record<string, unknown>): AtlasEvidence["analysis"] {
   if (data.pending) return "pending";
   if (data.skipped) return "skipped";
   return "analyzed";
