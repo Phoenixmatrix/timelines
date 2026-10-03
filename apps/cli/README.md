@@ -99,11 +99,18 @@ the repository, run, job and commit, and the environment from the branch
 Elsewhere it records as you and needs `--commit`. Records outlive their
 previews: tearing one down marks it `expired`.
 
+In a preview run (CORE-79), `GITMATRIX_TIMELINE` and `GITMATRIX_CHECKPOINT`
+name the timeline and checkpoint, so `gm deploy record --url "$URL"` files the
+preview under them; a revival's record is marked rebuilt. A timeline preview's
+expiry follows the org's retention unless `--expires` pins one. `gm deploy list`
+shows `(rebuilt)` on revived previews.
+
 ```sh
 gm deploy record --url "$PREVIEW_URL"                      # in a CI job
 gm deploy record --url https://app.example.com --commit @- -R orbit/engine
 gm deploy list --run 12
 gm deploy update 42 --status expired
+gm timeline revive search-v2 -c 3                           # rebuild an expired preview
 ```
 
 See [deployments and previews](../website/README.md#deployments-and-previews)
@@ -586,6 +593,13 @@ gm timeline use main                            # back to main
 - **`abandon [<slug>]`** ends it and deletes its bookmarks; its events stay. The
   server allows only its accountable person or the agent that started it. A
   checkout bound to it goes back to main.
+- **`revive [<slug>] [--checkpoint <number|id>]`** rebuilds a checkpoint's
+  preview (default: the newest checkpoint), for example to look into last
+  week's work after its preview expired: Gitmatrix starts a preview `create`
+  run in each repository whose ci.yml opts in (`on: preview`), at the
+  checkpoint's commits, landed and abandoned timelines included. The record it
+  makes is marked rebuilt (`revived`, `rebuiltFrom`), since the toolchain or
+  seed may have changed. Needs write access to every repository.
 
 `--owner` picks the tracker account; by default it's `.gitmatrix/agents.yml`'s,
 else origin's owner. Every command takes `--dry-run` and prints JSON for agents.

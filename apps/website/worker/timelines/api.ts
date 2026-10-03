@@ -11,6 +11,11 @@
 //                                   CI runs, previews and approval (CORE-76)
 //   POST   /:slug/checkpoints       {summary?}: record its bookmarks' commits now
 //   GET    /:slug/checkpoints/:ref  one checkpoint, by id or number
+//   POST   /:slug/checkpoints/:ref/revive  rebuild its preview (CORE-79): a
+//                                   preview `create` run per repository
+//
+// A new checkpoint starts a preview `create` run in each of its repositories
+// whose ci.yml opts in with `on: preview` (worker/deployments/previews.ts).
 //
 // Any tracker member (person or agent) with write access to the repositories
 // may fork; abandoning is checked by the tracker (timelines.ts). Bookmarks are
@@ -35,7 +40,9 @@ import {
   type TimelinePolicy,
   type CheckpointList,
   type CheckpointView,
+  type PreviewRevival,
 } from "../../shared/timelines.ts";
+import { previewCheckpoint, reviveCheckpoint } from "../deployments/previews.ts";
 import { previewSettings } from "../deployments/settings.ts";
 import { authorize } from "../tracker/api.ts";
 import type { TrackerReply } from "../tracker/object.ts";
@@ -43,7 +50,7 @@ import { TrackerError, fail, text } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { timelineSlug, timelineStatus } from "../tracker/timelines.ts";
 import { logPush } from "./activity.ts";
-import { measure, view } from "./checkpoints.ts";
+import { measure, mayWriteAll, view } from "./checkpoints.ts";
 import { writeRefs, type RefWrite } from "./bookmarks.ts";
 
 /** Repositories one timeline may touch. */
@@ -355,5 +362,32 @@ timelines.post("/:slug/checkpoints", async (c) => {
   const state = unwrap(
     await tracker.createCheckpoint(access, timeline.slug, { summary: data.summary, repos }),
   );
+  // The preview contract: each repository that opts in builds this checkpoint.
+  const waitUntil = (work: Promise<unknown>) => c.executionCtx.waitUntil(work);
+  waitUntil(previewCheckpoint(c.env, state.checkpoint, timeline, actor, waitUntil));
   return c.json<CheckpointView>(await view(c.env, state, timeline), 201);
+});
+
+timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
+  const access = await authorize(c, false);
+  const actor = c.get("actor")!;
+  const tracker = trackerObject(c.env, access.owner.id);
+  const slug = c.req.param("slug");
+  const ref = c.req.param("ref");
+  if (ref.length > 100) fail("invalid_input", "A checkpoint is its id or number.");
+  const [found, detail] = await Promise.all([
+    tracker.checkpoint(slug, ref),
+    tracker.timeline(slug, 0, 1),
+  ]);
+  const state = unwrap(found);
+  const timeline = unwrap(detail).timeline;
+  // Starting runs needs write access to every repository, as checkpoints do.
+  await mayWriteAll(c.env, actor, state.checkpoint);
+  const runs = await reviveCheckpoint(c.env, state.checkpoint, timeline, actor, (work) =>
+    c.executionCtx.waitUntil(work),
+  );
+  return c.json<PreviewRevival>(
+    { checkpoint: await view(c.env, state, timeline), runs },
+    runs.some((run) => "number" in run) ? 201 : 200,
+  );
 });

@@ -26,6 +26,12 @@ export interface JobCaller {
   /** Who pushed or started the run, and the agent that did it for them. */
   actorId: string | null;
   agentId: string | null;
+  /** A preview run's timeline (slug) and checkpoint (CORE-79). */
+  timelineSlug: string | null;
+  checkpointId: string | null;
+  /** A preview revival: what it records is rebuilt (1), standing in for that record. */
+  revived: number;
+  rebuiltFrom: number | null;
 }
 
 /** The bearer secret, when it is a CI job's credential. */
@@ -56,6 +62,10 @@ export async function jobCaller(d1: D1Database, secret: string): Promise<JobCall
       "r.ref",
       "r.actor_id as actorId",
       "r.agent_id as agentId",
+      "r.timeline_slug as timelineSlug",
+      "r.checkpoint_id as checkpointId",
+      "r.preview_revived as revived",
+      "r.preview_rebuilt_from as rebuiltFrom",
       "p.id as repoId",
       "p.default_branch as defaultBranch",
     ])

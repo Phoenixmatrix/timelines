@@ -1,7 +1,9 @@
 // Starting runs. After every push through the proxy, onPush() compares the
 // repository's branches with the ones CI last saw (ci_refs); each branch that
 // moved gets a run of the pipeline in .gitmatrix/ci.yml at its new commit.
-// Runs can also be started by hand for any branch.
+// Runs can also be started by hand for any branch, and Gitmatrix starts
+// preview runs for projects that opt in with `on: preview` (CORE-79,
+// worker/deployments/previews.ts).
 
 import type { InferResult } from "kysely";
 import { listRefs } from "../artifacts.ts";
@@ -13,7 +15,7 @@ import {
   branchMatches,
   CONFIG_PATH,
   ConfigError,
-  evaluate,
+  jobRuns,
   parsePipeline,
   type Pipeline,
 } from "./config.ts";
@@ -28,6 +30,18 @@ export interface CiRepo {
 
 export interface RunParams {
   runId: string;
+}
+
+/** What a preview run (trigger "preview") is for. */
+export interface PreviewRun {
+  action: "create" | "teardown";
+  /** The timeline's slug. */
+  timeline: string;
+  checkpoint: string | null;
+  /** A `create` that revives a checkpoint's preview: what it records is marked rebuilt. */
+  revived?: boolean;
+  /** The record the revival stands in for, when there was one. */
+  rebuiltFrom?: number | null;
 }
 
 type Waiter = (work: Promise<unknown>) => void;
@@ -64,12 +78,17 @@ export async function startRun(
   options: {
     branch: string;
     commit: string;
-    trigger: "push" | "manual";
+    trigger: "push" | "manual" | "preview";
+    /** With trigger "preview": its action, timeline and checkpoint. */
+    preview?: PreviewRun;
     /** Who pushed or started it: a person, or an agent acting for one. */
     actor: Pick<Actor, "id" | "agent"> | null;
     waitUntil: Waiter;
   },
 ): Promise<{ runId: string; number: number } | { skipped: string }> {
+  const preview = options.trigger === "preview" ? (options.preview ?? null) : null;
+  if (options.trigger === "preview" && !preview)
+    throw new Error("A preview run needs its action and timeline.");
   const reader = new RepoReader(
     env,
     repo.artifacts_name,
@@ -79,11 +98,24 @@ export async function startRun(
   );
   try {
     // A run of this commit already in flight on the branch answers for it.
-    const existing = await activeRun(env.DB, repo.id, options.branch, options.commit);
+    const existing = await activeRun(
+      env.DB,
+      repo.id,
+      options.branch,
+      options.commit,
+      preview && { action: preview.action, checkpoint: preview.checkpoint },
+    );
     if (existing) return { runId: existing.id, number: existing.number };
     const found = await pipelineAt(reader, options.commit);
     if (!found) return { skipped: `No ${CONFIG_PATH} at ${options.commit.slice(0, 12)}.` };
     const { pipeline, error, title } = found;
+    // Previews are opt-in, and a broken ci.yml already failed the push's run.
+    if (preview && !pipeline)
+      return { skipped: `${CONFIG_PATH} at ${options.commit.slice(0, 12)} has errors: ${error}` };
+    if (preview && !pipeline?.preview)
+      return {
+        skipped: `${CONFIG_PATH} at ${options.commit.slice(0, 12)} doesn't opt in to previews (on: preview).`,
+      };
     if (
       pipeline &&
       options.trigger === "push" &&
@@ -98,7 +130,11 @@ export async function startRun(
       trigger: options.trigger,
       commit: options.commit,
       runner: env.CI_RUNNER,
+      action: preview?.action ?? "",
     };
+    // A project may opt in and handle only one action: no run for the other.
+    if (preview && !pipeline!.jobs.some((job) => jobRuns(job, context)))
+      return { skipped: `No job in ${CONFIG_PATH} runs for preview ${preview.action}.` };
     const kdb = db(env.DB);
     const statements: Parameters<typeof batch>[1] = [
       kdb
@@ -116,6 +152,11 @@ export async function startRun(
           "status",
           "config_error",
           "finished_at",
+          "preview_action",
+          "timeline_slug",
+          "checkpoint_id",
+          "preview_revived",
+          "preview_rebuilt_from",
         ])
         .expression((eb) =>
           eb
@@ -126,13 +167,19 @@ export async function startRun(
               eb(eb.fn.coalesce(eb.fn.max("number"), eb.lit(0)), "+", eb.lit(1)).as("number"),
               eb.val(options.commit).as("commit_oid"),
               eb.val(options.branch).as("ref"),
-              eb.val(options.trigger).as("trigger"),
+              // ci_runs.trigger's CHECK predates previews: see the migration.
+              eb.val(preview ? ("manual" as const) : options.trigger).as("trigger"),
               eb.val(options.actor?.id ?? null).as("actor_id"),
               eb.val(options.actor?.agent?.id ?? null).as("agent_id"),
               eb.val(title).as("title"),
               eb.val(error ? "failed" : "queued").as("status"),
               eb.val(error).as("config_error"),
               eb.val(error === null ? null : nowIso()).as("finished_at"),
+              eb.val(preview?.action ?? null).as("preview_action"),
+              eb.val(preview?.timeline ?? null).as("timeline_slug"),
+              eb.val(preview?.checkpoint ?? null).as("checkpoint_id"),
+              eb.val(preview?.revived ? 1 : 0).as("preview_revived"),
+              eb.val(preview?.rebuiltFrom ?? null).as("preview_rebuilt_from"),
             ])
             .where("repo_id", "=", repo.id),
         ),
@@ -140,7 +187,7 @@ export async function startRun(
     const tree = (await reader.commit(options.commit))?.treeHash;
     for (const job of pipeline?.jobs ?? []) {
       const jobId = crypto.randomUUID().replaceAll("-", "");
-      let run = job.if === null || evaluate(job.if, context);
+      let run = jobRuns(job, context);
       let unchanged: string | null = null;
       const spec: StoredJob = {
         needs: job.needs,

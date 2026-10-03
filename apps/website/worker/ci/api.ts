@@ -59,7 +59,15 @@ const toRun = (row: RunRow): CiRunSummary => ({
   number: row.number,
   commit: row.commit_oid,
   ref: row.ref,
-  trigger: row.trigger,
+  trigger: row.preview_action ? "preview" : row.trigger,
+  preview: row.preview_action
+    ? {
+        action: row.preview_action,
+        timeline: row.timeline_slug,
+        checkpoint: row.checkpoint_id,
+        revived: row.preview_revived === 1,
+      }
+    : null,
   title: row.title,
   status: row.status,
   actor: row.actor,
@@ -215,15 +223,35 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
   if (repo instanceof Response) return repo;
   const run = await db(c.env.DB)
     .selectFrom("ci_runs")
-    .select(["commit_oid", "ref"])
+    .select([
+      "commit_oid",
+      "ref",
+      "preview_action",
+      "timeline_slug",
+      "checkpoint_id",
+      "preview_revived",
+      "preview_rebuilt_from",
+    ])
     .where("repo_id", "=", repo.row.id)
     .where("number", "=", Number(c.req.param("number")))
     .executeTakeFirst();
   if (!run) return fail(c, 404, "No such run.");
+  // Re-running a preview run repeats its action for the same checkpoint.
+  const preview =
+    run.preview_action && run.timeline_slug
+      ? {
+          action: run.preview_action,
+          timeline: run.timeline_slug,
+          checkpoint: run.checkpoint_id,
+          revived: run.preview_revived === 1,
+          rebuiltFrom: run.preview_rebuilt_from,
+        }
+      : undefined;
   const started = await startRun(c.env, repo.row, {
     branch: run.ref,
     commit: run.commit_oid,
-    trigger: "manual",
+    trigger: preview ? "preview" : "manual",
+    ...(preview ? { preview } : {}),
     actor: c.get("actor") ?? null,
     waitUntil: (work) => c.executionCtx.waitUntil(work),
   });

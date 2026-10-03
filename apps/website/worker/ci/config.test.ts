@@ -1,7 +1,15 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vite-plus/test";
-import { branchMatches, ConfigError, evaluate, parsePipeline, stages } from "./config.ts";
+import {
+  branchMatches,
+  ConfigError,
+  evaluate,
+  jobRuns,
+  parsePipeline,
+  stages,
+  type ConditionContext,
+} from "./config.ts";
 
 const ok = `
 on:
@@ -79,6 +87,81 @@ test("conditions", () => {
   expect(() => evaluate('owner == "x"', ctx)).toThrow(/Unknown name/);
   expect(evaluate('runner == "local"', ctx)).toBe(true);
   expect(evaluate('runner == "local"', { ...ctx, runner: "sandbox" })).toBe(false);
+});
+
+describe("the preview contract (CORE-79)", () => {
+  const previews = `
+on:
+  push: {}
+  preview: {}
+jobs:
+  test:
+    steps: [vp test]
+  preview:
+    if: trigger == "preview" && action == "create"
+    steps: [cf previews deploy "timeline-$GITMATRIX_TIMELINE"]
+  preview-teardown:
+    if: trigger == "preview" && action == "teardown"
+    steps: [./scripts/preview-teardown.sh]
+`;
+  const push: ConditionContext = {
+    branch: "timeline/x",
+    trigger: "push",
+    commit: "c",
+    runner: "sandbox",
+  };
+  const create: ConditionContext = { ...push, trigger: "preview", action: "create" };
+  const teardown: ConditionContext = { ...push, trigger: "preview", action: "teardown" };
+
+  test("a project opts in with on: preview, in any of its spellings", () => {
+    expect(parsePipeline(previews).preview).toBe(true);
+    expect(parsePipeline("on:\n  preview:\njobs:\n  a:\n    steps: [x]").preview).toBe(true);
+    expect(parsePipeline("on: preview\njobs:\n  a:\n    steps: [x]").preview).toBe(true);
+    expect(parsePipeline("on: [push, preview]\njobs:\n  a:\n    steps: [x]").preview).toBe(true);
+    expect(parsePipeline(ok).preview).toBe(false);
+    expect(parsePipeline("jobs:\n  a:\n    steps: [x]").preview).toBe(false);
+    expect(() =>
+      parsePipeline("on:\n  preview:\n    branches: [x]\njobs:\n  a:\n    steps: [x]"),
+    ).toThrow(/takes no options/);
+    expect(() => parsePipeline("on: [1]\njobs:\n  a:\n    steps: [x]")).toThrow(ConfigError);
+  });
+
+  test("jobs pick an action with if:, and only jobs that ask run in a preview run", () => {
+    const jobs = parsePipeline(previews).jobs;
+    const running = (context: ConditionContext) =>
+      jobs.filter((job) => jobRuns(job, context)).map((job) => job.name);
+    expect(running(push)).toEqual(["test"]);
+    expect(running(create)).toEqual(["preview"]);
+    expect(running(teardown)).toEqual(["preview-teardown"]);
+    expect(running({ ...push, trigger: "manual" })).toEqual(["test"]);
+  });
+
+  test("the README's worked example opts in and splits create from teardown", () => {
+    const readme = readFileSync(
+      fileURLToPath(new URL("../../README.md", import.meta.url).href),
+      "utf8",
+    );
+    const section = readme.slice(readme.indexOf("#### The preview contract"));
+    const example = /```yaml\n([\s\S]*?)```/.exec(section)![1]!;
+    const pipeline = parsePipeline(example);
+    expect(pipeline.preview).toBe(true);
+    const running = (context: ConditionContext) =>
+      pipeline.jobs.filter((job) => jobRuns(job, context)).map((job) => job.name);
+    expect([running(push), running(create), running(teardown)]).toEqual([
+      ["test"],
+      ["preview"],
+      ["preview-teardown"],
+    ]);
+  });
+
+  test("action is empty outside preview runs, and conditions can name it", () => {
+    expect(evaluate('action == ""', push)).toBe(true);
+    expect(evaluate('trigger != "preview" || action == "create"', create)).toBe(true);
+    expect(evaluate('trigger != "preview" || action == "create"', teardown)).toBe(false);
+    expect(() => evaluate('event == "x"', push)).toThrow(
+      /branch, trigger, commit, runner or action/,
+    );
+  });
 });
 
 test("this repository's pipeline is set up to run in Sandbox containers", () => {

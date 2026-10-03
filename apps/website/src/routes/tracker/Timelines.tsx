@@ -4,7 +4,7 @@
 // timelineGraph.ts and the drawing in TimelineLanes.tsx.
 
 import { ArrowClockwiseIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   data as routeData,
   Link,
@@ -19,6 +19,7 @@ import type { TimelineGraphData } from "../../../shared/timeline-graph.ts";
 import {
   DEFAULT_IDLE_DAYS,
   isStalled,
+  type CheckpointList,
   type Timeline,
   type TimelineEvent,
   type TimelineStatus,
@@ -43,6 +44,7 @@ import {
 } from "./timelineGraph.ts";
 import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./TimelineLanes.tsx";
 import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
+import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -678,6 +680,8 @@ function TimelineDetails({
         })}
       </ul>
 
+      <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} />
+
       <TimelineIssues timeline={timeline} data={data} />
 
       <h3 id="events" className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">
@@ -722,6 +726,75 @@ function TimelineDetails({
               </li>
             );
           })}
+        </ol>
+      )}
+    </>
+  );
+}
+
+/**
+ * The timeline's checkpoints with their previews (CORE-79): any checkpoint's
+ * preview can be revived from here, landed and abandoned timelines included.
+ */
+function TimelineCheckpoints({ owner, timeline }: { owner: string; timeline: Timeline }) {
+  const [list, setList] = useState<CheckpointList | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    api<CheckpointList>(
+      `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}/checkpoints`,
+      { signal: controller.signal },
+    )
+      .then((loaded) => {
+        setList(loaded);
+        setError(null);
+      })
+      .catch((failure: unknown) => {
+        if (!controller.signal.aborted)
+          setError(failure instanceof Error ? failure.message : String(failure));
+      });
+    return () => controller.abort();
+  }, [owner, timeline.slug, version]);
+  const checkpoints = list?.checkpoints ?? [];
+  return (
+    <>
+      <h3 className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">Checkpoints</h3>
+      {error ? (
+        <p className="mk-error m-0 text-body-sm" role="alert">
+          {error}
+        </p>
+      ) : !list ? (
+        <p className="m-0 text-body-sm text-ink-faint">Loading…</p>
+      ) : checkpoints.length === 0 ? (
+        <p className="m-0 text-body-sm text-ink-faint">None yet.</p>
+      ) : (
+        <ol className="m-0 max-h-72 list-none overflow-y-auto p-0">
+          {checkpoints.map((view) => (
+            <li
+              key={view.checkpoint.id}
+              className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-t border-line-soft py-1.5 text-body-sm first:border-t-0"
+            >
+              <span className="font-semibold">#{view.checkpoint.number}</span>
+              <time
+                className="text-micro text-ink-faint tabular-nums"
+                dateTime={view.checkpoint.createdAt}
+                title={fullDate(view.checkpoint.createdAt)}
+              >
+                {timeAgo(view.checkpoint.createdAt)}
+              </time>
+              {view.previews.length === 0 ? (
+                <span className="text-ink-faint">No preview</span>
+              ) : (
+                view.previews.map((preview) => <PreviewLink key={preview.id} preview={preview} />)
+              )}
+              <ReviveButton
+                view={view}
+                tracker={owner}
+                onRevived={() => setVersion((v) => v + 1)}
+              />
+            </li>
+          ))}
         </ol>
       )}
     </>

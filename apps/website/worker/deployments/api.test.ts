@@ -143,6 +143,53 @@ describe("recording deployments", () => {
     expect(days).toBeLessThanOrEqual(7);
   });
 
+  test("a revival's preview run records a rebuilt preview of its checkpoint (CORE-79)", async () => {
+    const t = await setup();
+    t.sqlite.exec(`
+      INSERT INTO deployments (id, repo_id, environment, timeline_slug, checkpoint_id, commit_oid, url, status)
+        VALUES (40, 'repo', 'timeline/fast-search', 'fast-search', 'cp_2', '${oid(11)}', 'https://old.example', 'expired');
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status,
+                           preview_action, timeline_slug, checkpoint_id, preview_revived, preview_rebuilt_from)
+        VALUES ('run5', 'repo', 11, '${oid(11)}', 'timeline/fast-search', 'manual', 'acc_ann', 'running',
+                'create', 'fast-search', 'cp_2', 1, 40),
+               ('run6', 'repo', 12, '${oid(12)}', 'timeline/fast-search', 'manual', 'acc_ann', 'running',
+                'create', 'fast-search', 'cp_3', 0, NULL);
+      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
+        ('job6', 'run5', 'repo', 'preview', '{}', 'running', 'sandbox'),
+        ('job7', 'run6', 'repo', 'preview', '{}', 'running', 'sandbox');
+    `);
+    const path = "/api/repos/orbit/app/deployments";
+    const url = "https://fast-search.preview.example.com";
+    const rebuilt = await t.call(await mintJobToken(t.env.DB, "job6", 30), "POST", path, { url });
+    expect(rebuilt.status).toBe(201);
+    expect(rebuilt.json as Deployment).toMatchObject({
+      environment: "timeline/fast-search",
+      checkpoint: "cp_2",
+      commit: oid(11),
+      revived: true,
+      rebuiltFrom: 40,
+      expiryPinned: false,
+    });
+    // A first build is the original; an explicit expiry is pinned.
+    const original = await t.call(await mintJobToken(t.env.DB, "job7", 30), "POST", path, {
+      url,
+      expiresAt: "2030-01-01T00:00:00Z",
+    });
+    expect(original.json as Deployment).toMatchObject({
+      checkpoint: "cp_3",
+      revived: false,
+      rebuiltFrom: null,
+      expiryPinned: true,
+      expiresAt: "2030-01-01T00:00:00.000Z",
+    });
+    // So is one changed by hand; the earlier record is still there.
+    const id = (rebuilt.json as Deployment).id;
+    const patched = await t.call(t.tokens.ann, "PATCH", `${path}/${id}`, { expiresAt: null });
+    expect(patched.json as Deployment).toMatchObject({ expiresAt: null, expiryPinned: true });
+    const old = await t.call(t.tokens.ann, "GET", `${path}/40`);
+    expect(old.json as Deployment).toMatchObject({ status: "expired", revived: false });
+  });
+
   test("a job on another branch records into branch/<name> unless it names one", async () => {
     const t = await setup();
     const path = "/api/repos/orbit/app/deployments";

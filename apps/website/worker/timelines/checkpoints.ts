@@ -11,6 +11,7 @@ import { db } from "../schema.ts";
 import {
   CHECKPOINT_CHANGES,
   timelineBookmark,
+  type Checkpoint,
   type CheckpointRepo,
   type CheckpointState,
   type CheckpointView,
@@ -71,6 +72,29 @@ export async function measure(
   );
 }
 
+/**
+ * Whether the actor may start runs in every repository of a checkpoint (to
+ * revive its preview, CORE-79): write access, as making a checkpoint needs.
+ */
+export async function mayWriteAll(env: Env, actor: Actor, checkpoint: Checkpoint): Promise<void> {
+  const ids = checkpoint.repos.map((repo) => repo.id);
+  const rows = ids.length
+    ? await selectRepos(env.DB, actor.id).where("r.id", "in", ids).execute()
+    : [];
+  for (const repo of checkpoint.repos) {
+    const row = rows.find((r) => r.id === repo.id);
+    const role = row ? roleFor(row, actor) : "none";
+    if (!row || !atLeast(role, "read"))
+      fail("not_found", `No repository ${repo.owner}/${repo.name}.`, 404);
+    if (!atLeast(role, "write"))
+      fail(
+        "forbidden",
+        `Reviving a preview needs write access to ${row.owner_slug}/${row.name}.`,
+        403,
+      );
+  }
+}
+
 /** A checkpoint with its commits' CI runs and its previews, as they are now. */
 export async function view(
   env: Env,
@@ -84,7 +108,7 @@ export async function view(
       checkpoint.repos.map((repo) =>
         kdb
           .selectFrom("ci_runs")
-          .select(["repo_id", "number", "status", "commit_oid", "created_at"])
+          .select(["repo_id", "number", "status", "commit_oid", "created_at", "preview_action"])
           .where("repo_id", "=", repo.id)
           .where("commit_oid", "=", repo.commit)
           .orderBy("number", "desc")
@@ -100,13 +124,26 @@ export async function view(
       status: run.status,
       commit: run.commit_oid,
       createdAt: run.created_at,
+      preview: run.preview_action,
     }));
   // Recorded for this checkpoint, or for one of its commits in the timeline's
   // environment before checkpoints were named (the preview contract, CORE-79).
   const commits = checkpoint.repos.map((repo) => repo.commit);
   const previews = await kdb
     .selectFrom("deployments")
-    .select(["id", "repo_id", "environment", "url", "status", "commit_oid"])
+    .select([
+      "id",
+      "repo_id",
+      "environment",
+      "url",
+      "status",
+      "commit_oid",
+      "revived",
+      "rebuilt_from",
+      "expires_at",
+      "torn_down_at",
+      "created_at",
+    ])
     .where((eb) =>
       eb.or([
         eb("checkpoint_id", "=", checkpoint.id),
@@ -136,6 +173,11 @@ export async function view(
       url: p.url,
       status: p.status,
       commit: p.commit_oid,
+      revived: p.revived === 1,
+      rebuiltFrom: p.rebuilt_from,
+      expiresAt: p.expires_at,
+      tornDownAt: p.torn_down_at,
+      createdAt: p.created_at,
     })),
   };
 }

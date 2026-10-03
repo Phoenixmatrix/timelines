@@ -4,6 +4,7 @@
 //     push:
 //       branches: [main, "release/*"]   # globs; omit to run on every branch
 //       coalesce_after: 4   # with 4 runs in flight on a branch, later pushes share one run
+//     preview: {}   # opt in to preview runs (CORE-79): create and teardown
 //   env:
 //     CI: "true"
 //   jobs:
@@ -60,6 +61,11 @@ export interface JobSpec {
 
 export interface Pipeline {
   branches: string[] | null;
+  /**
+   * Opted in to the preview contract with `on: preview`: Gitmatrix starts
+   * preview runs (trigger "preview", action "create" or "teardown").
+   */
+  preview: boolean;
   /** Runs in flight on a branch before further pushes coalesce into one held run. */
   coalesceAfter: number | null;
   env: Record<string, string>;
@@ -105,6 +111,19 @@ function stringList(value: unknown, where: string): string[] {
   });
 }
 
+/** `on:` as a mapping; `on: preview` and `on: [push, preview]` name triggers with no options. */
+function triggers(value: unknown): Record<string, unknown> {
+  if (typeof value === "string") return { [value]: {} };
+  if (Array.isArray(value))
+    return Object.fromEntries(
+      value.map((name) => {
+        if (typeof name !== "string") throw new ConfigError("on must list trigger names.");
+        return [name, {}];
+      }),
+    );
+  return record(value, "on");
+}
+
 /** Parse and validate ci.yml; throws ConfigError with a message for people. */
 export function parsePipeline(source: string): Pipeline {
   let doc: unknown;
@@ -116,8 +135,12 @@ export function parsePipeline(source: string): Pipeline {
     );
   }
   const root = record(doc, CONFIG_PATH);
-  const on = record(root.on, "on");
+  const on = triggers(root.on);
   const push = record(on.push, "on.push");
+  // `preview:` with nothing after it is null: still an opt-in.
+  const preview = "preview" in on;
+  if (preview && Object.keys(record(on.preview, "on.preview")).length)
+    throw new ConfigError("on.preview takes no options; jobs choose an action with if:.");
   const branches =
     push.branches === undefined ? null : stringList(push.branches, "on.push.branches");
   let coalesceAfter: number | null = null;
@@ -196,7 +219,7 @@ export function parsePipeline(source: string): Pipeline {
     if (job.if) evaluate(job.if, { branch: "", trigger: "push", commit: "", runner: "local" });
   }
   stages(jobs);
-  return { branches, coalesceAfter, env, jobs };
+  return { branches, preview, coalesceAfter, env, jobs };
 }
 
 /** Jobs grouped into stages: each stage only needs jobs from earlier stages. */
@@ -238,15 +261,31 @@ export function branchMatches(branch: string, patterns: string[] | null): boolea
 
 export interface ConditionContext {
   branch: string;
-  trigger: "push" | "manual";
+  trigger: "push" | "manual" | "preview";
   commit: string;
   /** Where jobs run: "local" (gm runner under vp dev) or "sandbox" (deployed). */
   runner: "local" | "sandbox";
+  /** A preview run's action ("create" or "teardown"); empty (the default) on any other run. */
+  action?: string;
+}
+
+/** The names a condition can compare. */
+const CONDITION_NAMES = new Set(["branch", "trigger", "commit", "runner", "action"]);
+
+/**
+ * Whether a job runs in a run: its `if:` holds. A preview run is only for the
+ * jobs that ask for it, so there a job without an `if:` doesn't run (pushes'
+ * checks and deploys stay out of previews, and teardowns stay cheap).
+ */
+export function jobRuns(job: Pick<JobSpec, "if">, context: ConditionContext): boolean {
+  if (job.if === null) return context.trigger !== "preview";
+  return evaluate(job.if, context);
 }
 
 /**
- * Evaluate a job's `if:` — comparisons of `branch`, `trigger`, `commit` or `runner`
- * with quoted strings using == and !=, joined by && and ||, with parentheses.
+ * Evaluate a job's `if:` — comparisons of `branch`, `trigger`, `commit`,
+ * `runner` or `action` with quoted strings using == and !=, joined by && and
+ * ||, with parentheses.
  */
 export function evaluate(expression: string, context: ConditionContext): boolean {
   const tokens = expression
@@ -262,9 +301,9 @@ export function evaluate(expression: string, context: ConditionContext): boolean
     const token = next();
     if (!token) throw new ConfigError(`Condition "${expression}" ends early.`);
     if (/^["']/.test(token)) return token.slice(1, -1);
-    if (token in context) return context[token as keyof ConditionContext];
+    if (CONDITION_NAMES.has(token)) return context[token as keyof ConditionContext] ?? "";
     throw new ConfigError(
-      `Unknown name "${token}" in condition; use branch, trigger, commit or runner.`,
+      `Unknown name "${token}" in condition; use branch, trigger, commit, runner or action.`,
     );
   };
   const comparison = (): boolean => {

@@ -18,12 +18,16 @@ import { tracker as trackerRoutes } from "../tracker/api.ts";
 import { timelines } from "./api.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+// Preview runs (CORE-79) are started through CI's startRun: seen here, not run.
+const startRun = vi.hoisted(() => vi.fn());
+vi.mock(import("../ci/trigger.ts"), async (original) => ({ ...(await original()), startRun }));
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 const ZERO = "0".repeat(40);
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  startRun.mockReset();
 });
 
 async function setup() {
@@ -380,6 +384,95 @@ describe("checkpoints", () => {
     const one = await t.call("cat", "GET", "/search/checkpoints/1");
     expect(one.body.checkpoint).toEqual(made.checkpoint);
     expect((await t.call("cat", "GET", "/search/checkpoints/2")).status).toBe(404);
+  });
+});
+
+describe("previews (CORE-79)", () => {
+  async function checkpointed() {
+    const t = await setup();
+    startRun.mockResolvedValue({ runId: "run-p", number: 12 });
+    await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app", "orbit/lib"] });
+    t.app.refs.set("refs/heads/timeline/search", oid(9));
+    t.lib.refs.set("refs/heads/timeline/search", oid(10));
+    const made = (await t.call("bot", "POST", "/search/checkpoints", { summary: "v2" }))
+      .body as CheckpointView;
+    return { ...t, made };
+  }
+
+  test("a new checkpoint starts a preview create run in each repository, at its commit", async () => {
+    const t = await checkpointed();
+    expect(startRun).toHaveBeenCalledTimes(2);
+    const calls = startRun.mock.calls.map(([, repo, options]) => ({ repo: repo.id, ...options }));
+    expect(calls).toEqual(
+      ["app", "lib"].map((repo, i) =>
+        expect.objectContaining({
+          repo,
+          branch: "timeline/search",
+          commit: oid(9 + i),
+          trigger: "preview",
+          preview: { action: "create", timeline: "search", checkpoint: t.made.checkpoint.id },
+          actor: expect.objectContaining({
+            id: "ben",
+            agent: expect.objectContaining({ id: "agt_bot" }),
+          }),
+        }),
+      ),
+    );
+  });
+
+  test("any checkpoint's preview revives as a rebuild of its record, even after abandoning", async () => {
+    const t = await checkpointed();
+    startRun.mockClear();
+    t.sqlite.exec(`
+      INSERT INTO deployments (id, repo_id, environment, timeline_slug, checkpoint_id, commit_oid, url, status)
+        VALUES (5, 'app', 'timeline/search', 'search', '${t.made.checkpoint.id}', '${oid(9)}', 'https://pr.example', 'expired');
+    `);
+    await t.call("ben", "POST", "/search/abandon");
+    // Cat may read the repositories, not start runs in them.
+    expect((await t.call("cat", "POST", "/search/checkpoints/1/revive")).status).toBe(403);
+    startRun
+      .mockResolvedValueOnce({ runId: "run-a", number: 13 })
+      .mockResolvedValueOnce({ skipped: "no on: preview" });
+    const revived = await t.call(
+      "bot",
+      "POST",
+      `/search/checkpoints/${t.made.checkpoint.id}/revive`,
+    );
+    expect(revived.status).toBe(201);
+    expect(revived.body.runs).toEqual([
+      { repoId: "app", number: 13, runId: "run-a" },
+      { repoId: "lib", skipped: "no on: preview" },
+    ]);
+    expect(revived.body.checkpoint.previews).toMatchObject([{ id: 5, status: "expired" }]);
+    // The bookmarks are gone: the runs check out main and fetch the commit by id.
+    expect(startRun.mock.calls.map(([, , options]) => [options.branch, options.commit])).toEqual([
+      ["main", oid(9)],
+      ["main", oid(10)],
+    ]);
+    const previews = startRun.mock.calls.map(([, repo, options]) => [repo.id, options.preview]);
+    expect(previews).toEqual([
+      [
+        "app",
+        {
+          action: "create",
+          timeline: "search",
+          checkpoint: t.made.checkpoint.id,
+          revived: true,
+          rebuiltFrom: 5,
+        },
+      ],
+      [
+        "lib",
+        {
+          action: "create",
+          timeline: "search",
+          checkpoint: t.made.checkpoint.id,
+          revived: true,
+          rebuiltFrom: null,
+        },
+      ],
+    ]);
+    expect((await t.call("bot", "POST", "/search/checkpoints/7/revive")).status).toBe(404);
   });
 });
 

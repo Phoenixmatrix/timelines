@@ -385,6 +385,18 @@ export interface Database {
     held_at: Generated<string | null>;
     /** The run (by number) that covered this one's commit instead of running it. */
     covered_by: Generated<number | null>;
+    /**
+     * A preview run (CORE-79): its action. Such a run is stored with trigger
+     * 'manual' (the CHECK can't widen) and reported as trigger 'preview'.
+     */
+    preview_action: Generated<"create" | "teardown" | null>;
+    /** The timeline (slug) and checkpoint a preview run is for. */
+    timeline_slug: Generated<string | null>;
+    checkpoint_id: Generated<string | null>;
+    /** 1 for a `create` run started by reviving a checkpoint's preview. */
+    preview_revived: Generated<number>;
+    /** The deployment record a revival rebuilds, when there was one. */
+    preview_rebuilt_from: Generated<number | null>;
   };
   ci_jobs: {
     id: string;
@@ -462,6 +474,15 @@ export interface Database {
     expires_at: string | null;
     created_at: Generated<string>;
     updated_at: Generated<string>;
+    /** 1 for a preview rebuilt by a revival (CORE-79), not the original. */
+    revived: Generated<number>;
+    /** The earlier record of the same checkpoint a revival stands in for. */
+    rebuilt_from: Generated<number | null>;
+    /** 1 when the recorder set expires_at; otherwise the account's retention moves it. */
+    expiry_pinned: Generated<number>;
+    /** When the preview sweep expired it, and the teardown run it started. */
+    torn_down_at: Generated<string | null>;
+    teardown_run_id: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
   account_settings: {

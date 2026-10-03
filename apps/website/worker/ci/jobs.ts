@@ -4,6 +4,7 @@
 
 import { sql } from "kysely";
 import type { CiClaimedJob, CiJobReport } from "../../shared/api.ts";
+import { timelineSlugOf } from "../../shared/timelines.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import type { JobSpec } from "./config.ts";
 import { registrySetup, revokeJobTokens } from "./registry.ts";
@@ -28,8 +29,12 @@ export async function loadJob(d1: D1Database, jobId: string) {
     .selectAll("j")
     .select([
       "r.number",
+      "r.trigger",
       "r.commit_oid",
       "r.ref",
+      "r.timeline_slug",
+      "r.checkpoint_id",
+      "r.preview_action",
       sql<string>`o.slug || '/' || p.name`.as("full_name"),
       "p.artifacts_name",
       "p.artifacts_remote",
@@ -62,6 +67,9 @@ export async function jobPayload(
   const spec = JSON.parse(job.spec) as StoredJob;
   const secrets = await secretsFor(d1, job.repo_id, spec.secrets);
   const setup = registrySetup(registry.origin, job.full_name.split("/")[0] ?? "", registry.token);
+  // The preview contract (CORE-79): a preview run names its timeline,
+  // checkpoint and action; a push to a timeline's bookmark names the timeline.
+  const timeline = job.timeline_slug ?? timelineSlugOf(`refs/heads/${job.ref}`);
   return {
     id: job.id,
     runId: job.run_id,
@@ -79,6 +87,10 @@ export async function jobPayload(
       GITMATRIX_COMMIT: job.commit_oid,
       GITMATRIX_RUN_NUMBER: String(job.number),
       GITMATRIX_JOB: job.name,
+      GITMATRIX_TRIGGER: job.preview_action ? "preview" : job.trigger,
+      ...(timeline ? { GITMATRIX_TIMELINE: timeline } : {}),
+      ...(job.checkpoint_id ? { GITMATRIX_CHECKPOINT: job.checkpoint_id } : {}),
+      ...(job.preview_action ? { GITMATRIX_PREVIEW_ACTION: job.preview_action } : {}),
       ...setup.env,
       ...spec.env,
       ...secrets,

@@ -2,12 +2,19 @@
 // agent says it holds, the commit per repository and the main commit it would
 // land on, its CI runs and previews, and the timeline's knowledge diff. An
 // approval only counts while the checkpoint is still the timeline's head.
+// Any checkpoint's preview can be revived (CORE-79): a rebuild, marked so.
 
+import { useState } from "react";
 import { Link } from "react-router";
-import type { CheckpointView } from "../../../shared/timelines.ts";
+import type {
+  CheckpointPreview,
+  CheckpointView,
+  PreviewRevival,
+} from "../../../shared/timelines.ts";
 import type { RequestCheckpoint } from "../../../shared/tracker.ts";
 import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
-import { shortOid } from "../../lib/format.ts";
+import { api } from "../../lib/api.ts";
+import { fullDate, shortOid } from "../../lib/format.ts";
 import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
 import { MarkdownText } from "./ui.tsx";
 
@@ -19,6 +26,107 @@ export function CheckpointRef({ pinned }: { pinned: RequestCheckpoint }) {
       <code className="mk-mono">{pinned.timeline}</code>; Needs you shows its commits, CI and
       previews.
     </p>
+  );
+}
+
+const REBUILT =
+  "Rebuilt by reviving this checkpoint's preview, not the original: it can differ if the toolchain or seed changed since.";
+
+/** One preview of a checkpoint: a link while it's up, its state otherwise. */
+export function PreviewLink({ preview }: { preview: CheckpointPreview }) {
+  const label = preview.revived ? "Preview (rebuilt)" : "Preview";
+  const title = [
+    preview.revived ? REBUILT : null,
+    preview.tornDownAt ? `Torn down ${fullDate(preview.tornDownAt)}` : null,
+    !preview.tornDownAt && preview.expiresAt ? `Expires ${fullDate(preview.expiresAt)}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return preview.url && (preview.status === "active" || preview.status === "sleeping") ? (
+    <a href={preview.url} target="_blank" rel="noreferrer" title={title || undefined}>
+      {label}
+    </a>
+  ) : (
+    <span className="text-ink-faint" title={title || undefined}>
+      {label} {preview.status}
+    </span>
+  );
+}
+
+/**
+ * Revive a checkpoint's preview: Gitmatrix starts a preview `create` run in
+ * each repository whose ci.yml opts in, at the checkpoint's commits.
+ */
+export function ReviveButton({
+  view,
+  tracker,
+  onRevived,
+}: {
+  view: CheckpointView;
+  tracker: string;
+  onRevived?: (revival: PreviewRevival) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const live = view.previews.some((p) => p.status === "active" || p.status === "sleeping");
+  const revive = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const revival = await api<PreviewRevival>(
+        `/tracker/${encodeURIComponent(tracker)}/timelines/${encodeURIComponent(view.timeline.slug)}/checkpoints/${encodeURIComponent(view.checkpoint.id)}/revive`,
+        { method: "POST" },
+      );
+      const name = (repoId: string) => {
+        const repo = view.checkpoint.repos.find((r) => r.id === repoId);
+        return repo ? `${repo.owner}/${repo.name}` : repoId;
+      };
+      const started = revival.runs.filter((run) => "number" in run);
+      setMessage({
+        error: started.length === 0,
+        text: revival.runs
+          .map((run) =>
+            "number" in run
+              ? `${name(run.repoId)}: building in CI #${run.number}`
+              : `${name(run.repoId)}: ${run.skipped}`,
+          )
+          .join(" · "),
+      });
+      onRevived?.(revival);
+    } catch (failure) {
+      setMessage({
+        error: true,
+        text: failure instanceof Error ? failure.message : String(failure),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <span className="inline-flex flex-wrap items-baseline gap-x-2 gap-y-1">
+      <button
+        type="button"
+        className="mk-btn mk-btn--ghost mk-btn--sm"
+        disabled={busy}
+        aria-busy={busy || undefined}
+        title={
+          live
+            ? "A preview is up; reviving rebuilds it from this checkpoint's commits."
+            : "Rebuild this checkpoint's preview from its commits (migrations plus seed)."
+        }
+        onClick={() => void revive()}
+      >
+        {busy ? "Reviving…" : "Revive preview"}
+      </button>
+      {message && (
+        <span
+          className={message.error ? "mk-error text-body-sm" : "text-body-sm text-ink-muted"}
+          role={message.error ? "alert" : "status"}
+        >
+          {message.text}
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -119,17 +227,9 @@ export function CheckpointPanel({
                   </Link>
                 ))
               )}
-              {previews.map((preview) =>
-                preview.url && preview.status === "active" ? (
-                  <a key={preview.id} href={preview.url} target="_blank" rel="noreferrer">
-                    Preview
-                  </a>
-                ) : (
-                  <span key={preview.id} className="text-ink-faint">
-                    Preview {preview.status}
-                  </span>
-                ),
-              )}
+              {previews.map((preview) => (
+                <PreviewLink key={preview.id} preview={preview} />
+              ))}
               <Link
                 to={`${repoPath(repo.owner, repo.name, "knowledge")}?timeline=${encodeURIComponent(timeline.slug)}`}
                 className="text-ink-muted"
@@ -140,6 +240,9 @@ export function CheckpointPanel({
           );
         })}
       </ul>
+      <div>
+        <ReviveButton view={view} tracker={tracker} />
+      </div>
     </section>
   );
 }

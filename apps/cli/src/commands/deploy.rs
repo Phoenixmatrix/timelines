@@ -197,7 +197,7 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
 
 fn line(d: &Value) -> String {
     format!(
-        "#{:<5} {:<9} {:<24} {}  {}{}",
+        "#{:<5} {:<9} {:<24} {}  {}{}{}",
         d["id"],
         s(d, "status"),
         s(d, "environment"),
@@ -207,6 +207,11 @@ fn line(d: &Value) -> String {
             .as_i64()
             .map(|n| format!("  run #{n}"))
             .unwrap_or_default(),
+        if d["revived"].as_bool() == Some(true) {
+            "  (rebuilt)"
+        } else {
+            ""
+        },
     )
 }
 
@@ -329,9 +334,15 @@ fn record(ctx: &Ctx, config: &Config, args: &RecordArgs) -> Result<Shown> {
     };
     put("url", args.url.clone());
     put("environment", args.environment.clone());
+    // CI names the job's timeline; an explicit environment overrides it.
     put(
         "timeline",
-        args.timeline.clone().or_else(|| env("GITMATRIX_TIMELINE")),
+        args.timeline.clone().or_else(|| {
+            args.environment
+                .is_none()
+                .then(|| env("GITMATRIX_TIMELINE"))
+                .flatten()
+        }),
     );
     put(
         "checkpoint",

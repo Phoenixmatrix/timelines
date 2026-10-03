@@ -218,10 +218,20 @@ const WIDER = "hidden @4xl:block";
 const runBy = (run: CiRunSummary) =>
   run.agent && run.actor ? `${run.agent} for ${run.actor}` : run.actor;
 
+/** A preview run (CORE-79): what it does, and for whom when someone asked. */
+const previewLabel = (preview: NonNullable<CiRunSummary["preview"]>) =>
+  preview.action === "teardown"
+    ? "preview teardown"
+    : preview.revived
+      ? "preview revival"
+      : "preview";
+
 const trigger = (run: CiRunSummary) =>
-  run.trigger === "manual"
-    ? `started by ${runBy(run) ?? "someone"}`
-    : `pushed${run.actor ? ` by ${runBy(run)}` : ""}`;
+  run.preview
+    ? `${previewLabel(run.preview)}${run.actor ? ` for ${runBy(run)}` : ""}`
+    : run.trigger === "manual"
+      ? `started by ${runBy(run) ?? "someone"}`
+      : `pushed${run.actor ? ` by ${runBy(run)}` : ""}`;
 
 function RunRow({ run }: { run: CiRunSummary }) {
   const repo = useRepo();
@@ -668,7 +678,18 @@ export function CiRun() {
             )}
             <span>·</span>
             <span>
-              {run.trigger === "manual" ? "Started by" : "Pushed by"} {runBy(run) ?? "someone"}{" "}
+              {run.preview ? (
+                <>
+                  {previewLabel(run.preview).replace(/^p/, "P")}
+                  {run.preview.timeline && <> of {run.preview.timeline}</>}
+                  {run.actor ? ` for ${runBy(run)}` : " by Gitmatrix"}{" "}
+                </>
+              ) : (
+                <>
+                  {run.trigger === "manual" ? "Started by" : "Pushed by"}{" "}
+                  {runBy(run) ?? "someone"}{" "}
+                </>
+              )}
               <span title={fullDate(run.createdAt)}>{timeAgo(run.createdAt)}</span>
             </span>
             {run.startedAt && (

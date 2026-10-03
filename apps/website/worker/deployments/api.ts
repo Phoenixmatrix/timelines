@@ -31,8 +31,9 @@ import {
   type DeploymentStatus,
   type Environment,
   type EnvironmentList,
+  previewExpiry,
 } from "../../shared/deployments.ts";
-import { timelineSlugOf } from "../../shared/timelines.ts";
+import { timelineSlugOf, type Timeline } from "../../shared/timelines.ts";
 import { fail } from "../api/http.ts";
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
@@ -54,7 +55,6 @@ const BRANCH = "branch/";
 const TIMELINE_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CHECKPOINT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const MAX_URL = 2048;
-const DAY = 24 * 60 * 60 * 1000;
 
 class Invalid extends Error {
   readonly status: 400 | 403 | 404 | 409;
@@ -69,10 +69,17 @@ const selectDeployments = (kdb: DB) =>
     .selectFrom("deployments as d")
     .leftJoin("ci_runs as r", "r.id", "d.run_id")
     .leftJoin("ci_jobs as j", "j.id", "d.job_id")
+    .leftJoin("ci_runs as t", "t.id", "d.teardown_run_id")
     .leftJoin("accounts as a", "a.id", "d.actor_id")
     .leftJoin("agents as g", "g.id", "d.agent_id")
     .selectAll("d")
-    .select(["r.number as run_number", "j.name as job_name", "a.slug as actor", "g.name as agent"]);
+    .select([
+      "r.number as run_number",
+      "j.name as job_name",
+      "t.number as teardown_run_number",
+      "a.slug as actor",
+      "g.name as agent",
+    ]);
 
 type DeploymentRow = InferResult<ReturnType<typeof selectDeployments>>[number];
 
@@ -90,6 +97,11 @@ const toDeployment = (row: DeploymentRow): Deployment => ({
   actor: row.actor,
   agent: row.agent,
   expiresAt: row.expires_at,
+  expiryPinned: row.expiry_pinned === 1,
+  revived: row.revived === 1,
+  rebuiltFrom: row.rebuilt_from,
+  tornDownAt: row.torn_down_at,
+  teardownRun: row.teardown_run_number,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
@@ -244,11 +256,11 @@ export function placement(
   );
 }
 
-/** The timeline's id in its account's tracker, when it exists there. */
-async function timelineId(env: Env, ownerId: string, slug: string): Promise<string | null> {
+/** The timeline in its account's tracker, when it exists there. */
+async function timelineRecord(env: Env, ownerId: string, slug: string): Promise<Timeline | null> {
   try {
     const reply = await trackerObject(env, ownerId).timeline(slug, 0, 1);
-    return reply.ok ? reply.value.timeline.id : null;
+    return reply.ok ? reply.value.timeline : null;
   } catch (error) {
     console.warn("Deployments: looking up a timeline failed", { slug, error });
     return null;
@@ -317,10 +329,13 @@ deployments.post("/deployments", async (c) => {
   const commit = optionalString(data.commit, "commit")?.toLowerCase() ?? job?.commit;
   if (!commit) throw new Invalid("Name the commit that was deployed (commit: a full commit id).");
   if (!OID.test(commit)) throw new Invalid("commit must be a full 40-character commit id.");
+  const environment = optionalString(data.environment, "environment");
+  const givenTimeline = timelineName(data.timeline);
   const where = placement(
     {
-      environment: optionalString(data.environment, "environment"),
-      timeline: timelineName(data.timeline),
+      environment,
+      // A preview run names its timeline (CORE-79); otherwise the branch does.
+      timeline: givenTimeline !== undefined || environment ? givenTimeline : job?.timelineSlug,
     },
     job,
   );
@@ -328,17 +343,23 @@ deployments.post("/deployments", async (c) => {
   const address = url(data.url) ?? null;
   if (!address && state !== "failed")
     throw new Invalid("Give the deployment's url (only a failed deployment may have none).");
-  const checkpoint = optionalString(data.checkpoint, "checkpoint") ?? null;
+  const checkpoint = optionalString(data.checkpoint, "checkpoint") ?? job?.checkpointId ?? null;
   if (checkpoint && !CHECKPOINT.test(checkpoint))
     throw new Invalid("checkpoint is an id of up to 128 letters, digits and . _ : / -.");
+  // A revival's run records a rebuilt preview of the same checkpoint.
+  const revived = Boolean(job?.revived) && checkpoint === job?.checkpointId;
+  const now = nowIso();
+  const timeline = where.timeline
+    ? await timelineRecord(c.env, who.repo.owner_id, where.timeline)
+    : null;
   let expiresAt = expiry(data.expiresAt);
-  // A timeline's preview expires after the account's idle period unless told
-  // otherwise; CORE-79 tears it down and moves the expiry as work goes on.
+  const pinned = expiresAt !== undefined;
+  // A timeline's preview follows the account's retention unless told
+  // otherwise; the preview sweep (sweep.ts) moves it as work goes on.
   if (expiresAt === undefined && where.timeline && state !== "failed") {
     const settings = await previewSettings(c.env.DB, who.repo.owner_id);
-    expiresAt = new Date(Date.now() + settings.idleDays * DAY).toISOString();
+    expiresAt = previewExpiry({ timeline, createdAt: now, revived }, settings);
   }
-  const now = nowIso();
   const kdb = db(c.env.DB);
   const inserted = await kdb
     .insertInto("deployments")
@@ -346,9 +367,7 @@ deployments.post("/deployments", async (c) => {
       repo_id: who.repo.id,
       environment: where.environment,
       timeline_slug: where.timeline,
-      timeline_id: where.timeline
-        ? await timelineId(c.env, who.repo.owner_id, where.timeline)
-        : null,
+      timeline_id: timeline?.id ?? null,
       checkpoint_id: checkpoint,
       commit_oid: commit,
       url: address,
@@ -358,6 +377,9 @@ deployments.post("/deployments", async (c) => {
       actor_id: job ? job.actorId : who.kind === "person" ? who.actorId : null,
       agent_id: job ? job.agentId : who.kind === "person" ? who.agentId : null,
       expires_at: expiresAt ?? null,
+      expiry_pinned: pinned ? 1 : 0,
+      revived: revived ? 1 : 0,
+      rebuilt_from: revived ? (job?.rebuiltFrom ?? null) : null,
       created_at: now,
       updated_at: now,
     })
@@ -382,14 +404,19 @@ deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
   const id = Number(c.req.param("id"));
   const existing = await findDeployment(kdb, who.repo.id, id);
   if (!existing) return fail(c, 404, "No such deployment.");
-  const changes: { status?: DeploymentStatus; url?: string | null; expires_at?: string | null } =
-    {};
+  const changes: {
+    status?: DeploymentStatus;
+    url?: string | null;
+    expires_at?: string | null;
+    expiry_pinned?: number;
+  } = {};
   const state = status(data.status);
   if (state) changes.status = state;
   const address = url(data.url);
   if (address !== undefined) changes.url = address;
   const expiresAt = expiry(data.expiresAt);
-  if (expiresAt !== undefined) changes.expires_at = expiresAt;
+  // An expiry given by hand stays: retention no longer moves it.
+  if (expiresAt !== undefined) Object.assign(changes, { expires_at: expiresAt, expiry_pinned: 1 });
   if (!Object.keys(changes).length) throw new Invalid("Change status, url or expiresAt.");
   const nextUrl = "url" in changes ? changes.url : existing.url;
   if (!nextUrl && (changes.status ?? existing.status) !== "failed")

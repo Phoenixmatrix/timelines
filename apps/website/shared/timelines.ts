@@ -209,6 +209,8 @@ export interface CheckpointRun {
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   commit: string;
   createdAt: string;
+  /** A preview run's action (CORE-79); null for a push or manual run. */
+  preview: "create" | "teardown" | null;
 }
 
 /** A preview of a checkpoint (by its id) or of one of its commits in the timeline's environment. */
@@ -219,6 +221,13 @@ export interface CheckpointPreview {
   url: string | null;
   status: "active" | "sleeping" | "expired" | "failed";
   commit: string;
+  /** Rebuilt by a revival, not the original: it can differ if the toolchain or seed changed. */
+  revived: boolean;
+  rebuiltFrom: number | null;
+  expiresAt: string | null;
+  /** When Gitmatrix expired it and asked for a teardown. */
+  tornDownAt: string | null;
+  createdAt: string;
 }
 
 /** A checkpoint with what's known about it now: CI, previews, approval. */
@@ -230,6 +239,16 @@ export interface CheckpointView extends CheckpointState {
 
 export interface CheckpointList {
   checkpoints: CheckpointView[];
+}
+
+/**
+ * POST /api/tracker/:owner/timelines/:slug/checkpoints/:ref/revive: the
+ * checkpoint, and per repository the preview run started (its number) or
+ * why none was (its ci.yml doesn't opt in, say).
+ */
+export interface PreviewRevival {
+  checkpoint: CheckpointView;
+  runs: ({ repoId: string; number: number } | { repoId: string; skipped: string })[];
 }
 
 /** POST /api/tracker/:owner/timelines/:slug/checkpoints. */

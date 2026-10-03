@@ -16,19 +16,31 @@ export const UNCHANGED = "Unchanged since run #";
 /** A run in flight longer than this is presumed stuck and no longer counts. */
 const STALE_HOURS = 3;
 
-/** A run of this commit still in flight on the branch, if any. */
-export async function activeRun(d1: D1Database, repoId: string, ref: string, commit: string) {
-  return (
-    (await db(d1)
-      .selectFrom("ci_runs")
-      .select(["id", "number"])
-      .where("repo_id", "=", repoId)
-      .where("ref", "=", ref)
-      .where("commit_oid", "=", commit)
-      .where("status", "in", ["queued", "running"])
-      .orderBy("number", "desc")
-      .executeTakeFirst()) ?? null
-  );
+/**
+ * A run of this commit still in flight on the branch, if any. Preview runs
+ * (CORE-79) only answer for the same action and checkpoint, and never for a
+ * push or manual run.
+ */
+export async function activeRun(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  commit: string,
+  preview: { action: "create" | "teardown"; checkpoint: string | null } | null = null,
+) {
+  let query = db(d1)
+    .selectFrom("ci_runs")
+    .select(["id", "number"])
+    .where("repo_id", "=", repoId)
+    .where("ref", "=", ref)
+    .where("commit_oid", "=", commit)
+    .where("status", "in", ["queued", "running"]);
+  query = preview
+    ? query
+        .where("preview_action", "=", preview.action)
+        .where("checkpoint_id", preview.checkpoint === null ? "is" : "=", preview.checkpoint)
+    : query.where("preview_action", "is", null);
+  return (await query.orderBy("number", "desc").executeTakeFirst()) ?? null;
 }
 
 /** Runs actually in flight on the branch: started (not held), and not presumed stuck. */
@@ -47,6 +59,7 @@ export async function inFlight(
     .where("id", "<>", except)
     .where("status", "in", ["queued", "running"])
     .where("held_at", "is", null)
+    .where("preview_action", "is", null)
     .where("created_at", ">", since)
     .executeTakeFirst();
   return Number(row?.n ?? 0);

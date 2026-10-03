@@ -1094,7 +1094,8 @@ Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 ## CI/CD
 
 Repositories declare a pipeline in `.gitmatrix/ci.yml`; every push that moves
-a matching branch starts a run (also: the Run button, `gm runs start`, re-runs).
+a matching branch starts a run (also: the Run button, `gm runs start`, re-runs,
+and [preview runs](#the-preview-contract) for projects that opt in).
 
 ```yaml
 on:
@@ -1109,7 +1110,7 @@ jobs:
       - run: vp test
   deploy:
     needs: [test] # runs only if test succeeded
-    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger, commit, runner
+    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger, commit, runner, action
     secrets: [CLOUDFLARE_API_TOKEN] # `gm secret set`, masked in logs
     timeout_minutes: 15 # default 20
     instance: standard-2 # sandbox size (default standard-1)
@@ -1159,6 +1160,11 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   process group.
 - **Agents** push, then `gm runs wait`: it blocks on the commit's run and exits
   non-zero with the failing job named; `gm runs logs --job <name>` has the output.
+- **Job variables.** `CI`, `GITMATRIX`, `GITMATRIX_REPOSITORY`, `GITMATRIX_BRANCH`,
+  `GITMATRIX_COMMIT`, `GITMATRIX_RUN_NUMBER`, `GITMATRIX_JOB`, `GITMATRIX_TRIGGER`
+  (`push`, `manual` or `preview`) and `GITMATRIX_TOKEN`; `GITMATRIX_TIMELINE` on a
+  timeline's bookmark and in preview runs, which also get `GITMATRIX_CHECKPOINT`
+  and `GITMATRIX_PREVIEW_ACTION`. A job's `env:` and secrets come after them.
 
 API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
 logs with `?after=`, cancel, re-run, commit statuses, secrets) and
@@ -1176,13 +1182,14 @@ recorded them, the person and agent accountable, and an expiry. Expiring a
 preview changes its status; the record stays. `shared/deployments.ts` defines
 the wire types (`worker/deployments/`).
 
-| Route                                                | Contract                                                                                                                             |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /api/repos/:o/:n/deployments`                   | Newest first; filters `environment`, `timeline`, `commit` (up to 80, comma-separated), `run`, `status`; pages with `before`, `limit` |
-| `POST /api/repos/:o/:n/deployments`                  | `{url, commit?, environment?, timeline?, checkpoint?, status?, expiresAt?}`                                                          |
-| `GET`, `PATCH /api/repos/:o/:n/deployments/:id`      | One record; `PATCH {status?, url?, expiresAt?}`                                                                                      |
-| `GET /api/repos/:o/:n/environments`                  | `production` and each recorded environment, with its newest deployment                                                               |
-| `GET`, `PATCH /api/accounts/:slug/settings/previews` | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                |
+| Route                                                          | Contract                                                                                                                               |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/repos/:o/:n/deployments`                             | Newest first; filters `environment`, `timeline`, `commit` (up to 80, comma-separated), `run`, `status`; pages with `before`, `limit`   |
+| `POST /api/repos/:o/:n/deployments`                            | `{url, commit?, environment?, timeline?, checkpoint?, status?, expiresAt?}`                                                            |
+| `GET`, `PATCH /api/repos/:o/:n/deployments/:id`                | One record; `PATCH {status?, url?, expiresAt?}`                                                                                        |
+| `GET /api/repos/:o/:n/environments`                            | `production` and each recorded environment, with its newest deployment                                                                 |
+| `GET`, `PATCH /api/accounts/:slug/settings/previews`           | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                  |
+| `POST /api/tracker/:o/timelines/:slug/checkpoints/:ref/revive` | Rebuild a checkpoint's preview: `{checkpoint, runs: [{repoId, number, runId} \| {repoId, skipped}]}`; write access to every repository |
 
 - **Who records.** Anyone with write access, with a personal or agent token
   (systems outside Gitmatrix too), or a CI job with its own credential
@@ -1198,9 +1205,89 @@ the wire types (`worker/deployments/`).
 - **`gm deploy record --url <url>`** in a job; outside CI add `--commit`.
   `gm deploy list` and `gm deploy update <id> --status expired` read and
   change records.
-- **Expiry.** A timeline preview expires after the account's idle period
-  unless the recorder says otherwise; other records don't expire unless told.
-  Teardown and revival follow the account's settings (CORE-79).
+- **Expiry.** A timeline preview follows the account's retention (below)
+  unless the recorder pins an `expiresAt` (on record or by `PATCH`); other
+  records don't expire unless told.
+
+#### The preview contract
+
+Projects implement previews in their own CI (CORE-79; `TIMELINES-RESEARCH.md`,
+"Previews: primitives, not hosting"). A repository opts in with `on: preview`
+(also `on: [push, preview]` or `preview:` under `on:`; pushes start runs either
+way, as before). Gitmatrix then starts **preview runs**: `trigger` is
+`"preview"`, and `action` is `"create"` or `"teardown"` (empty in every other
+run). Jobs choose an action with `if:` like any other condition, and a preview
+run runs only the jobs whose `if:` holds: a job without `if:` (tests, deploys)
+stays out of it. A job a preview job `needs` must say so in its own `if:`.
+
+```yaml
+on:
+  push: {}
+  preview: {}
+
+jobs:
+  test: # no if: push and manual runs only
+    steps:
+      - run: pnpm install --frozen-lockfile && vp test
+  preview:
+    if: trigger == "preview" && action == "create"
+    secrets: [CLOUDFLARE_API_TOKEN]
+    steps:
+      - run: pnpm install --frozen-lockfile && vp build
+      # GITMATRIX_TIMELINE is the slug; GITMATRIX_CHECKPOINT and GITMATRIX_COMMIT
+      # name what to build (one preview per timeline here; per checkpoint works too).
+      - run: |
+          url=$(./scripts/preview-deploy.sh "timeline-$GITMATRIX_TIMELINE")
+          gm deploy record --url "$url"   # files it under the timeline and checkpoint
+  preview-teardown:
+    if: trigger == "preview" && action == "teardown"
+    secrets: [CLOUDFLARE_API_TOKEN]
+    steps:
+      - run: ./scripts/preview-teardown.sh "timeline-$GITMATRIX_TIMELINE"
+```
+
+| Gitmatrix starts | When                                                                                                   | Run                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `create`         | A checkpoint is made (`gm timeline checkpoint`), in each of its repositories                           | At that repository's checkpoint commit, on `timeline/<slug>`      |
+| `teardown`       | The hourly sweep finds a timeline's previews in a repository all due (expiry below)                    | At the newest preview's commit, with its checkpoint, by Gitmatrix |
+| `create` again   | Someone revives a checkpoint's preview: the button on the checkpoint, `gm timeline revive`, or the API | At the checkpoint's commit; what it records is marked rebuilt     |
+
+Each preview run's jobs get `GITMATRIX_TRIGGER=preview`,
+`GITMATRIX_PREVIEW_ACTION`, `GITMATRIX_TIMELINE`, `GITMATRIX_CHECKPOINT` (unset
+for a teardown of previews recorded without one) and `GITMATRIX_COMMIT`. A
+repository whose ci.yml at that commit doesn't opt in, or has no job for the
+action, gets no run; neither does one with a broken ci.yml (its push run
+already failed). A run checks out from `timeline/<slug>` while the bookmark
+exists; after the timeline lands or is abandoned it names the default branch,
+and the runners fetch the commit by id. In flight, the same action for the same checkpoint is one
+run; re-running a preview run repeats it. Preview runs don't count toward
+`coalesce_after`, and a push's run is never answered by a preview run.
+
+Preview runs are stored as `manual` runs with `preview_action`, `timeline_slug`
+and `checkpoint_id` set (`ci_runs.trigger`'s CHECK can't widen without
+rebuilding a table that every job, step and log cascades from), and the API
+reports them as trigger `preview` with a `preview: {action, timeline,
+checkpoint, revived}`.
+
+**Expiry** (`worker/deployments/sweep.ts`, on the hourly cron). A timeline
+preview is torn down `endedDays` after its timeline lands or is abandoned
+(the timeline's last change) and `idleDays` after the timeline's last push,
+whichever comes first: 2 and 7 by default, set per account with `PATCH
+/api/accounts/:slug/settings/previews` (`shared/deployments.ts`,
+`previewExpiry`). The sweep keeps each preview's `expiresAt` to these rules
+unless it's pinned. A timeline's previews in one repository are torn down
+together once every one is due: they're marked `expired` with `tornDownAt`
+(and `teardownRun` when a run started), and the records stay. If the account's
+tracker can't answer, nothing is torn down until the next hour.
+
+**Revival.** Any checkpoint's preview can be rebuilt in one action, whatever
+became of its timeline, for example to look into last week's work. The run's
+deployment record is `revived: true`, with `rebuiltFrom` naming the earlier
+record of the checkpoint, and the UI says "Preview (rebuilt)": it is rebuilt
+from the commit with migrations plus seed and can differ from the original if
+the toolchain or seed changed. A revived preview's clock starts at the
+revival: it lasts `endedDays` after it for an ended timeline, `idleDays`
+otherwise.
 
 ## Packages
 

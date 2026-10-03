@@ -425,7 +425,9 @@ export interface CiRunSummary {
   commit: string;
   /** Branch name, without refs/heads/. */
   ref: string;
-  trigger: "push" | "manual";
+  trigger: "push" | "manual" | "preview";
+  /** A preview run's action, timeline and checkpoint (CORE-79); null for other runs. */
+  preview: CiRunPreview | null;
   title: string;
   status: CiRunStatus;
   actor: string | null;
@@ -438,6 +440,14 @@ export interface CiRunSummary {
   heldAt: string | null;
   /** The run that covered this one's commit instead of running it. */
   coveredBy: number | null;
+}
+
+/** What a preview run is for: `create` (a revival when `revived`) or `teardown`. */
+export interface CiRunPreview {
+  action: "create" | "teardown";
+  timeline: string | null;
+  checkpoint: string | null;
+  revived: boolean;
 }
 
 export interface CiRunList {

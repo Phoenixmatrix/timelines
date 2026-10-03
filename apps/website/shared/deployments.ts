@@ -72,7 +72,23 @@ export interface Deployment {
   /** The person accountable for it, and the agent that acted for them. */
   actor: string | null;
   agent: string | null;
+  /**
+   * When it is due to be torn down. A timeline preview follows the account's
+   * retention (see {@link previewExpiry}) unless `expiryPinned`.
+   */
   expiresAt: string | null;
+  /** The recorder set `expiresAt`; retention doesn't move it. */
+  expiryPinned: boolean;
+  /**
+   * Rebuilt by reviving its checkpoint's preview (CORE-79), not the original:
+   * it can differ if the toolchain or seed changed since.
+   */
+  revived: boolean;
+  /** The earlier record of the same checkpoint it stands in for, when there was one. */
+  rebuiltFrom: number | null;
+  /** When Gitmatrix expired it, and the run (number) that tore it down. */
+  tornDownAt: string | null;
+  teardownRun: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -101,8 +117,8 @@ export interface RecordDeployment {
   /** Default: active. */
   status?: DeploymentStatus;
   /**
-   * An ISO time, or null for none. Default: none, except for timeline
-   * previews, which expire after the account's idle period.
+   * An ISO time, or null for none; giving it pins it. Default: none, except
+   * for timeline previews, which follow the account's retention.
    */
   expiresAt?: string | null;
 }
@@ -140,3 +156,47 @@ export interface PreviewSettings {
 }
 
 export const DEFAULT_PREVIEW_SETTINGS = { endedDays: 2, idleDays: 7 } as const;
+
+const DAY = 24 * 60 * 60 * 1000;
+
+/** What a timeline preview's expiry depends on. */
+export interface PreviewClock {
+  /** The timeline as the tracker has it now; null when it has no record. */
+  timeline: {
+    status: string;
+    createdAt: string;
+    pushedAt: string | null;
+    /** For a landed or abandoned timeline: when it ended (its last change). */
+    updatedAt: string;
+  } | null;
+  /** When the preview was recorded. */
+  createdAt: string;
+  /** A revival: its clock starts no earlier than the revival. */
+  revived: boolean;
+}
+
+/**
+ * When a timeline preview is torn down (TIMELINES-RESEARCH.md, Decisions):
+ * `endedDays` after its timeline lands or is abandoned, and `idleDays` after
+ * the timeline's last push, whichever comes first. A revived preview counts
+ * from its revival too, so reviving last week's checkpoint gives it the same
+ * time again. A preview of a timeline with no record counts from its own
+ * recording.
+ */
+export function previewExpiry(
+  clock: PreviewClock,
+  settings: Pick<PreviewSettings, "endedDays" | "idleDays">,
+): string {
+  const created = Date.parse(clock.createdAt);
+  const { timeline } = clock;
+  if (!timeline) return new Date(created + settings.idleDays * DAY).toISOString();
+  const pushed =
+    timeline.pushedAt && timeline.pushedAt > timeline.createdAt
+      ? timeline.pushedAt
+      : timeline.createdAt;
+  const since = (time: number) => (clock.revived ? Math.max(time, created) : time);
+  let expiry = since(Date.parse(pushed)) + settings.idleDays * DAY;
+  if (timeline.status === "landed" || timeline.status === "abandoned")
+    expiry = Math.min(expiry, since(Date.parse(timeline.updatedAt)) + settings.endedDays * DAY);
+  return new Date(expiry).toISOString();
+}

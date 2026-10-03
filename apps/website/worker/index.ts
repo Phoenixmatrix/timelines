@@ -1,4 +1,5 @@
 import { app } from "./app.ts";
+import { sweepPreviews } from "./deployments/sweep.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
@@ -31,8 +32,14 @@ export default {
       }
     }
   },
+  /** Hourly: package sweeps, and tearing down expired timeline previews (CORE-79). */
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(scheduleSweeps(env));
+    ctx.waitUntil(
+      sweepPreviews(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>
+        console.error("Previews: the sweep failed", error),
+      ),
+    );
   },
 } satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob>;
 export { KnowledgeBuild } from "./knowledge/build.ts";

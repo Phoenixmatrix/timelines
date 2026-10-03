@@ -17,6 +17,9 @@
 //!   (`gm issue ask --kind approval --checkpoint`), and an approval only counts
 //!   while the checkpoint is still the timeline's head. `checkpoints` lists
 //!   them with their CI runs, previews and approvals.
+//! - `revive` rebuilds a checkpoint's preview (CORE-79): Gitmatrix starts a
+//!   preview `create` run in each repository whose ci.yml opts in, at the
+//!   checkpoint's commits, and what it records is marked rebuilt.
 //!
 //! `GM_TIMELINE` overrides the binding for one command (`profile::timeline`).
 
@@ -52,6 +55,8 @@ pub enum TimelineCommand {
     Checkpoint(CheckpointArgs),
     /// List a timeline's checkpoints, newest first, with CI runs, previews and approvals
     Checkpoints(CheckpointsArgs),
+    /// Revive a checkpoint's preview (default: the newest): rebuild it from its commits in CI
+    Revive(ReviveArgs),
     /// Rename a timeline (default: this checkout's), or flag it experimental or clear the flag
     #[command(visible_alias = "flag")]
     Update(UpdateArgs),
@@ -64,6 +69,17 @@ pub struct CheckpointArgs {
     /// Summary in Markdown: what it holds and why (repeat for paragraphs; '-' reads stdin, '@path' a file).
     #[arg(short, long)]
     pub message: Vec<String>,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct ReviveArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    /// The checkpoint: its number in the timeline or its id (default: the newest).
+    #[arg(short, long)]
+    pub checkpoint: Option<String>,
     #[command(flatten)]
     pub owner: Owner,
 }
@@ -216,6 +232,7 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Abandon(a) => abandon(ctx, a),
         TimelineCommand::Checkpoint(a) => checkpoint(ctx, a),
         TimelineCommand::Checkpoints(a) => checkpoints(ctx, a),
+        TimelineCommand::Revive(a) => revive(ctx, a),
         TimelineCommand::Update(a) => update(ctx, a),
     }
 }
@@ -590,9 +607,17 @@ pub fn checkpoint_text(v: &Value) -> String {
             .into_iter()
             .flatten()
             .filter(|p| p["repoId"] == *id)
-            .map(|p| match p["url"].as_str() {
-                Some(url) => format!("{url} ({})", p["status"].as_str().unwrap_or("?")),
-                None => format!("preview {}", p["status"].as_str().unwrap_or("?")),
+            .map(|p| {
+                let status = p["status"].as_str().unwrap_or("?");
+                let rebuilt = if p["revived"].as_bool() == Some(true) {
+                    ", rebuilt"
+                } else {
+                    ""
+                };
+                match p["url"].as_str() {
+                    Some(url) => format!("{url} ({status}{rebuilt})"),
+                    None => format!("preview {status}{rebuilt}"),
+                }
             })
             .collect();
         out.push_str(&format!(
@@ -691,6 +716,91 @@ fn checkpoints(ctx: &Ctx, args: &CheckpointsArgs) -> Result<Shown> {
     };
     value["owner"] = json!(owner);
     value["timeline"] = json!(slug);
+    Ok(Shown { value, text })
+}
+
+/// What a revival started, per repository, as text.
+fn revival_text(value: &Value) -> String {
+    let view = &value["checkpoint"];
+    let name = |id: &Value| {
+        view["checkpoint"]["repos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["id"] == *id)
+            .map(|r| {
+                format!(
+                    "{}/{}",
+                    r["owner"].as_str().unwrap_or("?"),
+                    r["name"].as_str().unwrap_or("?")
+                )
+            })
+            .unwrap_or_else(|| id.as_str().unwrap_or("?").to_string())
+    };
+    let mut out = format!(
+        "Reviving the preview of checkpoint #{} of {}:\n",
+        view["checkpoint"]["number"],
+        view["timeline"]["slug"].as_str().unwrap_or("?"),
+    );
+    for run in value["runs"].as_array().into_iter().flatten() {
+        match run["number"].as_u64() {
+            Some(n) => out.push_str(&format!(
+                "  {}: CI #{n} builds it (gm runs wait, then gm deploy list --timeline {})\n",
+                name(&run["repoId"]),
+                view["timeline"]["slug"].as_str().unwrap_or("?"),
+            )),
+            None => out.push_str(&format!(
+                "  {}: not started: {}\n",
+                name(&run["repoId"]),
+                run["skipped"].as_str().unwrap_or("?")
+            )),
+        }
+    }
+    out.push_str("The preview it records is marked rebuilt: it can differ from the original if the toolchain or seed changed since.\n");
+    out
+}
+
+fn revive(ctx: &Ctx, args: &ReviveArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let slug = named_or_current(&args.slug, "revive")?;
+    let checkpoint = match &args.checkpoint {
+        Some(reference) => reference.trim().to_string(),
+        None => {
+            let list = remote::api(
+                &config,
+                "GET",
+                &format!("{}/{slug}/checkpoints", base(&owner)),
+                None,
+            )?;
+            list["checkpoints"][0]["checkpoint"]["id"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    GmError::usage(format!("{slug} has no checkpoints to revive.")).hint(
+                        "Record one with `gm timeline checkpoint -m '…'`; it builds a preview on its own.",
+                    )
+                })?
+        }
+    };
+    if checkpoint.is_empty() || checkpoint.contains('/') {
+        return Err(GmError::usage(format!(
+            "`{checkpoint}` isn't a checkpoint: use its number or id (`gm timeline checkpoints`)."
+        )));
+    }
+    let path = format!("{}/{slug}/checkpoints/{checkpoint}/revive", base(&owner));
+    if ctx.dry_run {
+        return Ok(Shown {
+            text: format!(
+                "dry run: nothing was changed\nWould revive the preview of checkpoint {checkpoint} of {slug}."
+            ),
+            value: json!({"dry_run": true, "owner": owner, "timeline": slug, "checkpoint": checkpoint, "path": path}),
+        });
+    }
+    let mut value = remote::api(&config, "POST", &path, None)?;
+    let text = revival_text(&value);
+    value["dry_run"] = json!(false);
+    value["owner"] = json!(owner);
     Ok(Shown { value, text })
 }
 
@@ -1281,6 +1391,47 @@ fn update(ctx: &Ctx, args: &UpdateArgs) -> Result<Shown> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revivals_say_what_started_and_that_it_is_a_rebuild() {
+        let value = json!({
+            "checkpoint": {
+                "checkpoint": {
+                    "number": 3,
+                    "repos": [
+                        {"id": "r1", "owner": "orbit", "name": "app"},
+                        {"id": "r2", "owner": "orbit", "name": "lib"}
+                    ]
+                },
+                "timeline": {"slug": "search-v2"}
+            },
+            "runs": [
+                {"repoId": "r1", "number": 41, "runId": "x"},
+                {"repoId": "r2", "skipped": "doesn't opt in to previews (on: preview)."}
+            ]
+        });
+        let text = revival_text(&value);
+        assert!(text.starts_with("Reviving the preview of checkpoint #3 of search-v2:"));
+        assert!(text.contains("orbit/app: CI #41 builds it"));
+        assert!(text.contains("orbit/lib: not started: doesn't opt in"));
+        assert!(text.contains("marked rebuilt"));
+    }
+
+    #[test]
+    fn checkpoints_mark_rebuilt_previews() {
+        let view = json!({
+            "checkpoint": {"number": 1, "id": "cp_1", "repos": [{"id": "r1", "owner": "o", "name": "a", "commit": "abc", "base": null, "changes": []}]},
+            "timeline": {"slug": "s"},
+            "runs": [],
+            "previews": [
+                {"repoId": "r1", "url": "https://p.example", "status": "active", "revived": true},
+                {"repoId": "r1", "url": null, "status": "expired", "revived": false}
+            ]
+        });
+        let text = checkpoint_text(&view);
+        assert!(text.contains("https://p.example (active, rebuilt)"));
+        assert!(text.contains("preview expired"));
+    }
 
     #[test]
     fn lists_mark_the_current_timeline() {

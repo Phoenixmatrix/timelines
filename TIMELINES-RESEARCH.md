@@ -501,7 +501,9 @@ claiming optimistic and short-lived, and don't add locks on files or areas.
   ```
 
   Jobs also get `GITMATRIX_TIMELINE`, `GITMATRIX_CHECKPOINT` and
-  `GITMATRIX_COMMIT`. Gitmatrix runs:
+  `GITMATRIX_COMMIT` (and `GITMATRIX_PREVIEW_ACTION`); a job without `if:`
+  doesn't run in a preview run (CORE-79, `apps/website/README.md`, "The
+  preview contract"). Gitmatrix runs:
   - `create` for each new checkpoint of the timeline;
   - `teardown` when a preview expires;
   - `create` again when someone revives an expired checkpoint's preview.
