@@ -5,6 +5,7 @@ import type {
   SemanticFeedEntry,
   SemanticFeedResponse,
 } from "../../shared/semantic/types.ts";
+import { mergedBranch } from "../../shared/landings.ts";
 import { isCommitId, type RepoReader } from "../objects.ts";
 import { isArtifactsError } from "../artifacts.ts";
 
@@ -400,6 +401,10 @@ export async function semanticFeed(
           message: commit.message,
           authorName: commit.author.name,
           authoredAt: new Date(commit.authoredAt * 1000).toISOString(),
+          landing:
+            commit.parents.length > 1
+              ? { merged: commit.parents.slice(1), branch: mergedBranch(commit.message) }
+              : null,
         },
         links: {
           commit: `${base}/commits/${commit.hash}`,

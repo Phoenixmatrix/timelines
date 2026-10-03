@@ -115,6 +115,14 @@ export interface SemanticCommit {
   message: string;
   authorName: string;
   authoredAt: string;
+  /**
+   * Set when the commit is a merge, such as a timeline landing: the other
+   * parents it merged, and the branch its message names. Its changes are the
+   * diff against `parent`, its first parent: all the work it landed, as one
+   * step. The feed follows first parents, so the merged commits aren't
+   * listed again.
+   */
+  landing: { merged: string[]; branch: string | null } | null;
 }
 
 export interface SemanticFeedEntry extends SemanticChange {

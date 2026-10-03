@@ -326,3 +326,100 @@ fn sync_keeps_a_merge_of_trunk_until_trunk_moves_past_it() {
     s.ok(&["push"]);
     assert_eq!(s.remote_main_parents(), 1);
 }
+
+#[test]
+fn sync_treats_a_landing_merge_as_landing_the_timeline() {
+    let s = Sandbox::new();
+    s.write("a.txt", "a\n");
+    s.ok(&["commit", "-m", "Add a"]);
+    s.write("b.txt", "b\n");
+    s.ok(&["commit", "-m", "Add b"]);
+    s.ok(&["push", "-b", "timeline/feature"]);
+    // Work after the checkpoint stays in the timeline, not yet landed.
+    s.write("c.txt", "c\n");
+    s.ok(&["commit", "-m", "Add c"]);
+
+    // Main moves, then the checkpoint lands as a real merge.
+    s.teammate_pushes("t.txt", "teammate\n", "Teammate");
+    let seed = s.root.join("seed");
+    git(&seed, &["fetch", "-q", "origin"]);
+    git(
+        &seed,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Land timeline/feature",
+            "origin/timeline/feature",
+        ],
+    );
+    git(&seed, &["push", "-q", "origin", "main"]);
+
+    // Sync sees the merge's second parent as landed: the checkpoint's
+    // changes are part of trunk, and the work after it follows trunk.
+    s.ok(&["sync"]);
+    assert_eq!(s.descriptions(), vec!["", "Add c", "Land timeline/feature"]);
+    assert_eq!(s.parents("Add c"), vec![s.change("Land timeline/feature")]);
+    assert_eq!(s.read("t.txt"), "teammate\n");
+    assert_eq!(s.read("c.txt"), "c\n");
+
+    // It pushes as one more commit on top of the landing.
+    s.ok(&["push"]);
+    assert_eq!(
+        git(
+            &s.root.join("remote.git"),
+            &["log", "-1", "--format=%s", "main"]
+        )
+        .trim(),
+        "Add c"
+    );
+}
+
+#[test]
+fn sync_drops_changes_a_landing_merged_as_rewritten_copies() {
+    let s = Sandbox::new();
+    s.write("a.txt", "a\n");
+    s.ok(&["commit", "-m", "Add a"]);
+    let a = s.change("Add a");
+    s.ok(&["push", "-b", "timeline/feature"]);
+    // Here, the timeline is reworded after the checkpoint was pushed, and our
+    // copy keeps the old commit: same change, another commit id.
+    s.ok(&["describe", &a, "-m", "Add a, reworded"]);
+    s.ok(&["push", "-b", "timeline/feature"]);
+    s.ok(&["describe", &a, "-m", "Add a, local wording"]);
+
+    s.teammate_pushes("t.txt", "teammate\n", "Teammate");
+    let seed = s.root.join("seed");
+    git(&seed, &["fetch", "-q", "origin"]);
+    git(
+        &seed,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Land timeline/feature",
+            "origin/timeline/feature",
+        ],
+    );
+    git(&seed, &["push", "-q", "origin", "main"]);
+
+    // The landed copy arrived through the merge's second parent; ours is a
+    // duplicate of it, so sync drops it and @ follows trunk.
+    let synced = s.ok(&["sync"]);
+    assert!(
+        synced["message"]
+            .as_str()
+            .unwrap()
+            .contains("Dropped 1 change(s) that already landed")
+    );
+    assert!(
+        !s.descriptions()
+            .contains(&"Add a, local wording".to_string())
+    );
+    assert_eq!(
+        s.ok(&["status"])["parents"][0]["change_id"],
+        s.change("Land timeline/feature")
+    );
+}

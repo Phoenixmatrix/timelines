@@ -9,8 +9,9 @@ import {
   runReleaseNotesJob,
   type ReleaseNotesJob,
 } from "./queue.ts";
-import { releaseIndex, releaseNotesFor } from "./read.ts";
+import { releaseIndex, releaseNotesFor, toEntry, type EntryRow } from "./read.ts";
 import { RepoReader } from "../objects.ts";
+import { landedTimelines } from "./timelines.ts";
 import * as semantic from "../semantic/feed.ts";
 
 const DAY = `@day:${new Date(1_790_000_000_000).toISOString().slice(0, 10)}`;
@@ -82,21 +83,32 @@ function setup() {
     return statement;
   };
 
-  // Oldest first; the newest commit is the head.
-  const history: { hash: string; message: string; committedAt: number; authoredAt: number }[] = [];
+  // Every commit, oldest first; `head` is the default branch.
+  const history = new Map<string, ArtifactsCommitMetadata>();
+  let head: string | null = null;
   const tags = new Map<string, string>();
   const issues = new Map<string, LinkedIssue>();
+  /** A commit off `parents` (default: the head) that moves the head unless `branch` is set. */
   const commit = (
     message: string,
-    committedAt = 1_790_000_000 + history.length,
+    committedAt = 1_790_000_000 + history.size,
     authoredAt = committedAt,
+    { parents = head ? [head] : [], branch = false }: { parents?: string[]; branch?: boolean } = {},
   ) => {
-    history.push({ hash: `c${history.length}`, message, committedAt, authoredAt });
-    return `c${history.length - 1}`;
+    const hash = `c${history.size}`;
+    history.set(hash, {
+      hash,
+      message,
+      author: { name: "A", email: "a@example.com" },
+      authoredAt,
+      committedAt,
+      parents,
+    } as unknown as ArtifactsCommitMetadata);
+    if (!branch) head = hash;
+    return hash;
   };
   const source: GeneratorSource = {
     async refs(): Promise<RepoRefs> {
-      const head = history.at(-1)?.hash ?? null;
       return {
         headBranch: "main",
         head,
@@ -114,23 +126,14 @@ function setup() {
       };
     },
     async log(oid, limit, offset) {
-      const index = history.findIndex((c) => c.hash === oid);
-      return history
-        .slice(0, index + 1)
-        .reverse()
-        .slice(offset, offset + limit)
-        .map(
-          (c) =>
-            ({
-              hash: c.hash,
-              message: c.message,
-              author: { name: "A", email: "a@example.com" },
-              authoredAt: c.authoredAt,
-              committedAt: c.committedAt,
-              parents: [],
-            }) as unknown as ArtifactsCommitMetadata,
-        );
+      const line: ArtifactsCommitMetadata[] = [];
+      for (let at = history.get(oid); at; at = history.get(at.parents[0] ?? "")) line.push(at);
+      return line.slice(offset, offset + limit);
     },
+    async commit(oid) {
+      return history.get(oid) ?? null;
+    },
+    timelines: (merges) => landedTimelines(env.DB, "repo", "main", merges),
     async issues(keys) {
       return keys.flatMap((key) => (issues.has(key) ? [issues.get(key)!] : []));
     },
@@ -149,7 +152,7 @@ function setup() {
   const entries = (release: string) =>
     sqlite
       .prepare(
-        "SELECT subject, kind, category, title, issue_key, team_key, commits, changes, shipped_at FROM release_note_entries WHERE release = ? ORDER BY subject",
+        "SELECT subject, kind, category, title, issue_key, team_key, commits, changes, shipped_at, landing_oid, timeline_id, timeline_branch FROM release_note_entries WHERE release = ? ORDER BY subject",
       )
       .all(release) as Record<string, string>[];
   const release = (name: string) =>
@@ -210,6 +213,66 @@ describe("release note generation", () => {
       .all()
       .map((row) => row.issue_key);
     expect(mentions).toEqual(["ENG-1", "UTF-8"]);
+  });
+
+  test("a landing's work joins its issues' entries, labelled with its timeline; the rest is one landing entry", async () => {
+    const r = setup();
+    r.issues.set("ENG-1", issue("ENG-1"));
+    const base = r.commit("Initial import");
+    const side = (message: string, parents: string[]) =>
+      r.commit(message, undefined, undefined, { parents, branch: true });
+    const start = side("Start search (ENG-1)", [base]);
+    const tidy = side("Tidy fixtures", [start]);
+    const main = r.commit("Decode UTF-8 names");
+    const synced = side("Merge main", [tidy, main]);
+    const finish = side("Finish search, ENG-1", [synced]);
+    // The push log saw the checkpoint on the timeline's branch.
+    r.sqlite.exec(
+      `INSERT INTO ref_updates (repo_id, ref, old_oid, new_oid) VALUES ('repo', 'refs/heads/timeline/search', NULL, '${finish}')`,
+    );
+    const landing = r.commit("Land checkpoint", undefined, undefined, {
+      parents: [main, finish],
+    });
+    const polish = side("Polish styles", [landing]);
+    const second = r.commit("Merge branch 'timeline/polish'", undefined, undefined, {
+      parents: [landing, polish],
+    });
+
+    const run = await r.run();
+    expect(run.more).toBe(false);
+    const entries = r.entries(DAY);
+    expect(
+      entries.map((e) => [e.subject, e.kind, JSON.parse(e.commits!), e.timeline_branch]),
+    ).toEqual([
+      [`commit:${base}`, "commit", [base], null],
+      [`commit:${main}`, "commit", [main], null],
+      ["issue:acc:ENG-1", "issue", [finish, start], "timeline/search"],
+      // The timeline's sync with main is no one's work; the landing heads its entry.
+      [`landing:${landing}`, "landing", [landing, tidy], "timeline/search"],
+      [`landing:${second}`, "landing", [second, polish], "timeline/polish"],
+    ]);
+    const search = entries[2]!;
+    expect(search).toMatchObject({ landing_oid: landing, timeline_id: null });
+    // Landed work shipped when it landed.
+    expect(search.shipped_at).toBe(new Date(1_790_000_006_000).toISOString());
+    // A merge's own diff is everything it landed: entries use their commits'.
+    expect(JSON.parse(entries[3]!.changes!).map((c: { name: string }) => c.name)).toEqual([
+      `fn_${tidy}`,
+    ]);
+
+    const row = r.sqlite
+      .prepare("SELECT * FROM release_note_entries WHERE subject = 'issue:acc:ENG-1'")
+      .get() as EntryRow;
+    expect(toEntry(row, new Map([["acc", "org"]]))!.timeline).toEqual({
+      id: null,
+      branch: "timeline/search",
+      landing,
+    });
+    // Commits on the default branch carry no timeline.
+    const direct = r.sqlite
+      .prepare(`SELECT * FROM release_note_entries WHERE subject = 'commit:${main}'`)
+      .get() as EntryRow;
+    expect(toEntry(direct, new Map())!.timeline).toBeNull();
   });
 
   test("same-day pushes reuse unchanged entries; tags coexist without rewriting them", async () => {
@@ -459,6 +522,7 @@ describe("release note scheduling", () => {
     vi.spyOn(RepoReader.prototype, "log").mockImplementation((oid, limit, offset) =>
       r.source.log(oid, limit, offset),
     );
+    vi.spyOn(RepoReader.prototype, "commit").mockImplementation((oid) => r.source.commit(oid));
     vi.spyOn(semantic, "semanticFeed").mockResolvedValue({
       version: 1,
       ref: "HEAD",

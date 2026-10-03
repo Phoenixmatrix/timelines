@@ -2,9 +2,12 @@
 // issues they cite into stored entries, plus a short introduction per
 // release. Entries whose inputs are unchanged are reused, wherever in the
 // repository they were written, so a push only pays for what is new and
-// tag snapshots can reuse entries without another model call.
+// tag snapshots can reuse entries without another model call. Timelines land
+// as merges (CORE-72): a merge brings the commits it landed into its release,
+// and entries record the timeline their work landed with.
 
 import type {
+  LandedTimeline,
   LinkedIssue,
   ReleaseCategory,
   ReleaseNoteChange,
@@ -14,7 +17,7 @@ import type { RepoRefs } from "../artifacts.ts";
 import { chatJson, chatText } from "../knowledge/models.ts";
 import { batch, db } from "../schema.ts";
 import { issueKeys } from "./keys.ts";
-import { walkRange } from "./range.ts";
+import { walkRange, type HistoryReader } from "./range.ts";
 
 /** Bump when prompts change, so entries are rewritten. */
 const PROMPT_VERSION = 2;
@@ -24,13 +27,14 @@ export const MAX_TAGS = 10;
 export const MAX_MODEL_CALLS = 40;
 const CATEGORIES: ReleaseCategory[] = ["feature", "fix", "improvement", "internal"];
 
-export interface GeneratorSource {
+export interface GeneratorSource extends HistoryReader {
   refs(): Promise<RepoRefs>;
-  log(oid: string, limit: number, offset: number): Promise<ArtifactsCommitMetadata[]>;
   /** Issues cited by key, from the trackers subscribed to the repository. */
   issues(keys: string[]): Promise<LinkedIssue[]>;
   /** Syntax-level code changes a commit made. */
   changes(oid: string): Promise<ReleaseNoteChange[]>;
+  /** The timeline each landing merge landed, by merge commit id. */
+  timelines(merges: ArtifactsCommitMetadata[]): Promise<Map<string, LandedTimeline>>;
 }
 
 export interface GenerateResult {
@@ -43,9 +47,11 @@ export interface GenerateResult {
 interface Draft {
   release: string;
   subject: string;
-  kind: "issue" | "commit";
+  kind: "issue" | "commit" | "landing";
   issue: LinkedIssue | null;
   commits: ArtifactsCommitMetadata[];
+  /** The newest merge that landed some of the commits; null when none did. */
+  landing: string | null;
   inputsHash: string;
 }
 
@@ -65,6 +71,7 @@ async function sha256(value: unknown): Promise<string> {
 
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
 const firstLine = (message: string) => message.split("\n", 1)[0]!.trim();
+const isMerge = (commit: ArtifactsCommitMetadata) => commit.parents.length > 1;
 
 function issueInputs(issue: LinkedIssue) {
   return {
@@ -124,7 +131,8 @@ function entryPrompt(draft: Draft, changes: ReleaseNoteChange[]): string {
 
 async function write(env: Env, source: GeneratorSource, draft: Draft): Promise<Written> {
   const changes: ReleaseNoteChange[] = [];
-  for (const commit of draft.commits.slice(0, 10)) {
+  // A merge's own diff is everything it landed, other entries' work included.
+  for (const commit of draft.commits.filter((c) => !isMerge(c)).slice(0, 10)) {
     if (changes.length >= 30) break;
     changes.push(...(await source.changes(commit.hash)).slice(0, 30 - changes.length));
   }
@@ -163,17 +171,30 @@ async function ranges(
     release: string;
     toOid: string;
     commits: ArtifactsCommitMetadata[];
+    landings: Map<string, string>;
     base: string | null;
     truncated: boolean;
   }[] = [];
   if (refs.head) {
     const walk = await walkRange(source, refs.head, () => false);
     const days = new Map<string, (typeof result)[number]>();
+    const byHash = new Map<string, ArtifactsCommitMetadata>();
     for (const commit of walk.commits) {
-      const release = `${DAILY_RELEASE_PREFIX}${iso(commit.committedAt).slice(0, 10)}`;
+      byHash.set(commit.hash, commit);
+      // Landed work belongs to the day it landed: its merge precedes it.
+      const landing = walk.landings.get(commit.hash);
+      const at = (landing ? byHash.get(landing)! : commit).committedAt;
+      const release = `${DAILY_RELEASE_PREFIX}${iso(at).slice(0, 10)}`;
       let day = days.get(release);
       if (!day) {
-        day = { release, toOid: commit.hash, commits: [], base: null, truncated: walk.truncated };
+        day = {
+          release,
+          toOid: commit.hash,
+          commits: [],
+          landings: walk.landings,
+          base: null,
+          truncated: walk.truncated,
+        };
         days.set(release, day);
       }
       day.commits.push(commit);
@@ -232,20 +253,43 @@ export async function generateReleaseNotes(
     ),
   ]);
 
-  // Drafts: an issue gathers the release's commits citing it; other commits stand alone.
+  // The timeline each merge on the line landed.
+  const merges = new Map<string, ArtifactsCommitMetadata>();
+  for (const release of releases)
+    for (const commit of release.commits)
+      if (isMerge(commit) && !release.landings.has(commit.hash)) merges.set(commit.hash, commit);
+  const timelines: Map<string, LandedTimeline> = merges.size
+    ? await source.timelines([...merges.values()])
+    : new Map();
+
+  // Drafts: an issue gathers the release's commits citing it; other commits
+  // stand alone, except a landing's, which share one entry for the landing.
   const drafts: Draft[] = [];
   for (const release of releases) {
     const bySubject = new Map<string, Omit<Draft, "inputsHash">>();
+    const landingOf = (commit: ArtifactsCommitMetadata) =>
+      release.landings.get(commit.hash) ?? (merges.has(commit.hash) ? commit.hash : null);
+    const uncitedMerges: ArtifactsCommitMetadata[] = [];
     for (const commit of release.commits) {
       const cited = issueKeys(commit.message).flatMap((key) => byKey.get(key) ?? []);
+      const landing = landingOf(commit);
       if (!cited.length) {
-        bySubject.set(`commit:${commit.hash}`, {
+        // Merges are how work arrives, not work: a timeline's syncs drop out.
+        if (isMerge(commit)) {
+          if (merges.has(commit.hash)) uncitedMerges.push(commit);
+          continue;
+        }
+        const subject = landing ? `landing:${landing}` : `commit:${commit.hash}`;
+        const draft = bySubject.get(subject) ?? {
           release: release.release,
-          subject: `commit:${commit.hash}`,
-          kind: "commit",
+          subject,
+          kind: landing ? ("landing" as const) : ("commit" as const),
           issue: null,
-          commits: [commit],
-        });
+          commits: [],
+          landing,
+        };
+        draft.commits.push(commit);
+        bySubject.set(subject, draft);
         continue;
       }
       for (const issue of cited) {
@@ -256,11 +300,17 @@ export async function generateReleaseNotes(
           kind: "issue" as const,
           issue,
           commits: [],
+          landing: null,
         };
         draft.commits.push(commit);
+        draft.landing ??= landing;
         bySubject.set(subject, draft);
       }
     }
+    // A merge citing nothing heads its landing's entry, when the landing
+    // brought anything that cites nothing either.
+    for (const merge of uncitedMerges)
+      bySubject.get(`landing:${merge.hash}`)?.commits.unshift(merge);
     for (const draft of bySubject.values())
       drafts.push({
         ...draft,
@@ -298,6 +348,10 @@ export async function generateReleaseNotes(
   const stamp = now();
   for (const release of releases) {
     const releasedAt = iso(Math.max(...release.commits.map((c) => c.committedAt)));
+    const byHash = new Map(release.commits.map((c) => [c.hash, c]));
+    // Landed work shipped when its landing did.
+    const shippedAt = (commit: ArtifactsCommitMetadata) =>
+      (byHash.get(release.landings.get(commit.hash) ?? "") ?? commit).committedAt;
     await d
       .insertInto("release_notes")
       .values({
@@ -339,7 +393,8 @@ export async function generateReleaseNotes(
         reusable.set(draft.inputsHash, written);
       }
       const issue = draft.issue;
-      const lastCommitAt = iso(Math.max(...draft.commits.map((c) => c.committedAt)));
+      const lastCommitAt = iso(Math.max(...draft.commits.map(shippedAt)));
+      const timeline = draft.landing ? timelines.get(draft.landing) : undefined;
       const values = {
         kind: draft.kind,
         category: written.category,
@@ -355,6 +410,9 @@ export async function generateReleaseNotes(
         workspace_ids: JSON.stringify(issue?.workspaceIds ?? []),
         commits: JSON.stringify(draft.commits.map((c) => c.hash)),
         changes: JSON.stringify(written.changes),
+        landing_oid: draft.landing,
+        timeline_id: timeline?.id ?? null,
+        timeline_branch: timeline?.branch ?? null,
         shipped_at: lastCommitAt,
         model: written.model,
         inputs_hash: draft.inputsHash,

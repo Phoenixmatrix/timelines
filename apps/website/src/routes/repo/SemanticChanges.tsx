@@ -278,6 +278,15 @@ export function SemanticChanges() {
                               {shortOid(entry.commit.oid)} {firstLine(entry.commit.message)}
                             </span>
                           )}
+                          {entry.commit.landing && (
+                            <>
+                              {" · landed "}
+                              <span className="font-mono">
+                                {entry.commit.landing.branch ??
+                                  entry.commit.landing.merged.map(shortOid).join(", ")}
+                              </span>
+                            </>
+                          )}
                           {" · "}
                           <bdi>{entry.commit.authorName}</bdi>
                           {" · "}

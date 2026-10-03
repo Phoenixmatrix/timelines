@@ -112,6 +112,24 @@ fn feed_text(value: &Value) -> String {
             s(&entry["commit"], "oid"),
             s(&entry["links"], "commit")
         );
+        // A merge's changes are everything it landed, against its first parent.
+        let landing = &entry["commit"]["landing"];
+        if landing.is_object() {
+            let merged: Vec<&str> = landing["merged"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let _ = writeln!(
+                out,
+                "  landed {}",
+                landing["branch"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| merged.join(", "))
+            );
+        }
         for label in ["before", "after"] {
             if let Some(link) = entry["links"][label].as_str() {
                 let _ = writeln!(out, "  {label} {link}");
@@ -228,5 +246,24 @@ mod tests {
         assert!(!text.contains("End of feed."));
         page["nextCursor"] = Value::Null;
         assert!(feed_text(&page).contains("End of feed."));
+    }
+
+    #[test]
+    fn a_landing_merge_names_what_it_landed() {
+        let entry = |landing: Value| {
+            json!({"kind": "symbol.added", "language": "rust", "summary": "Added f",
+                   "after": {"path": "src/a.rs", "start": {"line": 1}}, "id": "x",
+                   "commit": {"oid": "m1", "landing": landing}, "links": {"commit": "/c/m1"}})
+        };
+        let page = |landing: Value| json!({"ref": "main", "head": "m1", "entries": [entry(landing)], "coverage": [], "nextCursor": null});
+        let text = feed_text(&page(
+            json!({"merged": ["t1"], "branch": "timeline/search"}),
+        ));
+        assert!(text.contains("  commit m1  /c/m1\n  landed timeline/search\n"));
+        assert!(
+            feed_text(&page(json!({"merged": ["t1", "t2"], "branch": null})))
+                .contains("  landed t1, t2\n")
+        );
+        assert!(!feed_text(&page(Value::Null)).contains("landed"));
     }
 }

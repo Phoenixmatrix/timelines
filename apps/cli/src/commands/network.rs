@@ -137,7 +137,8 @@ pub fn fetch(ctx: &Ctx) -> Result<Json> {
 }
 
 /// Fetch, then move every stack of changes that was built on trunk onto the
-/// new trunk. Changes that landed in trunk meanwhile are dropped.
+/// new trunk. Changes that landed in trunk meanwhile are dropped, including
+/// the ones a landing merge brought in through its other parents.
 fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Rebased)> {
     let old_trunk = ws.trunk.as_ref().map(|t| t.oid);
     let old_graph = ws.graph()?;
@@ -176,11 +177,29 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
     }
 
     let mut abandoned = HashMap::new();
+    let mut roots = roots;
     let graph = ws.graph()?;
     for oid in &graph.topo {
         let commit = ws.commit(*oid)?;
+        let parents: Vec<Oid> = commit.parent_ids().collect();
+        let root = parents.iter().all(|p| !graph.topo.contains(p));
         if landed.contains(&ws.change_id(&commit)) && *oid != ws.wc() {
-            abandoned.insert(*oid, commit.parent_ids().collect::<Vec<_>>());
+            // What was built on a landed root of trunk's history follows trunk
+            // to where the change landed, not back to the base it started from.
+            let on_trunk = parents
+                .iter()
+                .all(|p| ws.repo.graph_descendant_of(new_trunk, *p).unwrap_or(false));
+            let onto = if root && on_trunk {
+                ws.parents_onto(*oid, new_trunk)?
+            } else {
+                parents
+            };
+            abandoned.insert(*oid, onto);
+        } else if root && !roots.contains(oid) {
+            // A landing merge brings a timeline's commits into trunk as they
+            // are, so they turn immutable: what was built on them is a stack
+            // on trunk's history now, like any other.
+            roots.push(*oid);
         }
     }
 

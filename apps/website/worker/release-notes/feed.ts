@@ -59,7 +59,8 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     if (!includeTags && entry.releaseKind !== "daily") continue;
     const repo = `${row.repo_owner}/${row.repo_name}`.toLowerCase();
     const slugs = entry.workspaceIds.flatMap((id) => context.workspaces.get(id) ?? []);
-    const text = `${entry.title}\n${entry.summary}\n${entry.issue?.key ?? ""}`.toLowerCase();
+    const text =
+      `${entry.title}\n${entry.summary}\n${entry.issue?.key ?? ""}\n${entry.timeline?.branch ?? ""}`.toLowerCase();
     const matches = (key: string, value: string): boolean => {
       switch (key) {
         case "team":

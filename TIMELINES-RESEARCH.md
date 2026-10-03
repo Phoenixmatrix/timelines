@@ -180,7 +180,7 @@ to be designed later.
 | Deploy (`tools/agent/deploy.ts`)                         | One production Worker, deployed only from main                                                                                                                                                                                                     | Nothing parameterizes a second deployed instance                                                   |
 | Registry (`registry/`)                                   | Provenance records the ref, run and commit; branch filters; only default-branch publishes become `latest` (CORE-63)                                                                                                                                | Clients that read a full index (Go `@v/list`, pip, cargo) can still pick a branch version          |
 | Knowledge (`worker/knowledge`)                           | Default branch HEAD only; analyses cached by blob; a change feed per build; a per-ref semantic feed                                                                                                                                                | One graph per repository; no overlays                                                              |
-| Release notes (`worker/release-notes`)                   | Default branch and tags, walking first-parent history                                                                                                                                                                                              | No per-timeline drafts; landing merges change what first-parent history shows                      |
+| Release notes (`worker/release-notes`)                   | Default branch and tags, walking first-parent history; each merge brings the commits it landed, and entries name the timeline they landed with (CORE-72)                                                                                           | No per-timeline drafts; timelines are named by branch until CORE-69 records them                   |
 | Mirror (`worker/mirror`)                                 | The default branch and tags only (CORE-65)                                                                                                                                                                                                         | Done                                                                                               |
 | Identity (CORE-52)                                       | Agents act as themselves, accountable to a person; CI runs record the agent                                                                                                                                                                        | Already in place                                                                                   |
 | Isolated environments (`tools/agent/environment.ts`)     | Isolated local instances using remote Artifacts, Vectorize and AI Search; 24-hour expiry; four per user                                                                                                                                            | Local only, not previews                                                                           |
@@ -398,10 +398,18 @@ returns:
     merged into;
   - the timeline events listed above.
 - **Main's history gains merge commits.** Code that walks first-parent history
-  must treat a landing merge's second parent as the timeline's work:
-  - release notes;
-  - `gm sync`'s detection of changes that landed;
-  - knowledge change feeds.
+  must treat a landing merge's second parent as the timeline's work (CORE-72):
+  - release notes: a range includes what each merge landed (the commits only
+    its other parents reach), issue keys come from those commits too, and each
+    entry records its landing merge and the timeline branch git or the push
+    log names; a landing's commits that cite no issue share one entry;
+  - `gm sync`'s detection of changes that landed: it walks every parent, drops
+    rewritten copies of landed changes, and moves work built on a landed
+    checkpoint onto main;
+  - knowledge change feeds: the semantic feed follows first parents, so a
+    merge is one step whose changes are its diff against its first parent,
+    marked with what it merged; the knowledge build diffs snapshots of
+    successive heads and needs no change.
 
 ### Landing
 

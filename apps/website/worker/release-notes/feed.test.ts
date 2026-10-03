@@ -30,6 +30,9 @@ function row(overrides: Partial<FeedRow> & { subject: string }): FeedRow {
     model: "m",
     inputs_hash: "h",
     updated_at: "2026-10-01T00:00:00.000Z",
+    landing_oid: null,
+    timeline_id: null,
+    timeline_branch: null,
     ...overrides,
   };
 }
@@ -110,6 +113,42 @@ describe("release feed query", () => {
 });
 
 describe("release feed", () => {
+  test("entries show the timeline they landed with, and searches match its branch", () => {
+    const landed = (q: string, trackers = new Map([["orbit", "orbit"]])) =>
+      buildFeed(
+        [
+          row({
+            subject: "landing:l1",
+            kind: "landing",
+            title: "Polish styles",
+            landing_oid: "l1",
+            timeline_branch: "timeline/polish",
+          }),
+          row({
+            subject: "issue:orbit:ENG-1",
+            title: "Faster search",
+            landing_oid: "l2",
+            timeline_branch: "timeline/search",
+          }),
+        ],
+        {
+          trackers,
+          visibleRepoIds: new Set(["engine"]),
+          workspaces: new Map(),
+          query: parseReleaseQuery(q),
+          now: Date.parse("2026-10-01T00:00:00Z"),
+          limit: 50,
+        },
+      ).entries;
+    expect(landed("timeline/search").map((e) => [e.title, e.timeline])).toEqual([
+      ["Faster search", { id: null, branch: "timeline/search", landing: "l2" }],
+    ]);
+    // A landing's own entry cites no issue, so any reader of the repository sees it.
+    expect(landed("", new Map()).map((e) => [e.kind, e.title])).toEqual([
+      ["landing", "Polish styles"],
+    ]);
+  });
+
   test("lists each daily update newest first, within the viewer's access, with facets", () => {
     const all = feed("");
     expect(all.entries.map((e) => [e.title, e.repos[0]!.name, e.release])).toEqual([

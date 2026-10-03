@@ -264,7 +264,7 @@ export interface Database {
     repo_id: string;
     release: string;
     subject: string;
-    kind: "issue" | "commit";
+    kind: "issue" | "commit" | "landing";
     category: "feature" | "fix" | "improvement" | "internal";
     title: string;
     summary: string;
@@ -282,6 +282,9 @@ export interface Database {
     model: string | null;
     inputs_hash: string;
     updated_at: string;
+    landing_oid: string | null;
+    timeline_id: string | null;
+    timeline_branch: string | null;
   };
   release_note_mentions: {
     repo_id: string;

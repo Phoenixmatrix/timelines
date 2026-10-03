@@ -151,6 +151,32 @@ describe("semantic repository feed", () => {
     expect([...new Set(page.coverage.map((item) => item.commit))]).toEqual([merge, first]);
   });
 
+  test("a landing merge is one step: its diff against the first parent, attributed to the landing", async () => {
+    const f = fixture();
+    const base = f.add(1, { "config.json": '{"a":1}' });
+    const timeline = f.add(2, { "config.json": '{"a":1}', "feature.json": '{"feature":1}' }, [
+      base,
+    ]);
+    const main = f.add(3, { "config.json": '{"a":1,"b":2}' }, [base]);
+    const landing = f.add(4, { "config.json": '{"a":1,"b":2}', "feature.json": '{"feature":1}' }, [
+      main,
+      timeline,
+    ]);
+    f.commits.get(landing)!.message = "Merge branch 'timeline/feature'";
+    const page = await semanticFeed(f.reader, f.cache, "repo", "/owner/repo", parseFeedQuery({}));
+    const landed = page.entries.filter((entry) => entry.commit.oid === landing);
+    // What the timeline brought, not what main did meanwhile.
+    expect(landed.length).toBeGreaterThan(0);
+    expect(landed.every((entry) => entry.after?.path === "feature.json")).toBe(true);
+    expect(landed[0]!.commit).toMatchObject({
+      parent: main,
+      landing: { merged: [timeline], branch: "timeline/feature" },
+    });
+    // The timeline's own commits aren't walked again.
+    expect([...new Set(page.coverage.map((item) => item.commit))]).toEqual([landing, main, base]);
+    expect(page.entries.find((entry) => entry.commit.oid === main)?.commit.landing).toBeNull();
+  });
+
   test("reports oversized and binary content and fails on missing objects", async () => {
     const f = fixture();
     f.add(1, { "large.json": "x".repeat(262145), "binary.json": "\0", "invalid.json": "{" });

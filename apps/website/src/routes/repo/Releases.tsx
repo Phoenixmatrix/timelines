@@ -2,6 +2,7 @@ import { RocketLaunchIcon } from "@phosphor-icons/react";
 import { Link, useLoaderData, useRevalidator, type LoaderFunctionArgs } from "react-router";
 import {
   releaseLabel,
+  timelineLabel,
   type ReleaseCategory,
   type ReleaseNoteEntry,
   type ReleaseNotesIndex,
@@ -56,6 +57,17 @@ function Entry({ entry, owner, name }: { entry: ReleaseNoteEntry; owner: string;
           >
             {entry.issue.key}
           </Link>
+        )}
+        {entry.timeline && (
+          <span>
+            landed with{" "}
+            <Link
+              className="mk-mono text-ink-muted"
+              to={commitsUrl(owner, name, entry.timeline.landing)}
+            >
+              {timelineLabel(entry.timeline)}
+            </Link>
+          </span>
         )}
         {entry.commits.slice(0, 3).map((oid) => (
           <Link key={oid} className="mk-mono text-ink-faint" to={commitsUrl(owner, name, oid)}>

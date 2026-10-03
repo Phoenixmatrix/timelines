@@ -52,6 +52,9 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
     labels: JSON.parse(row.labels) as string[],
     workspaceIds: JSON.parse(row.workspace_ids) as string[],
     commits: JSON.parse(row.commits) as string[],
+    timeline: row.landing_oid
+      ? { id: row.timeline_id, branch: row.timeline_branch, landing: row.landing_oid }
+      : null,
     changes: JSON.parse(row.changes) as ReleaseNoteChange[],
     lastCommitAt: row.shipped_at,
     model: row.model,
@@ -97,7 +100,7 @@ export async function releaseIndex(
   ]);
   const counts = new Map<string, number>();
   for (const entry of entries)
-    if (entry.kind === "commit" || trackers.has(entry.tracker_owner_id ?? ""))
+    if (entry.kind !== "issue" || trackers.has(entry.tracker_owner_id ?? ""))
       counts.set(entry.release, (counts.get(entry.release) ?? 0) + 1);
   let stateName: ReleaseNotesState = "idle";
   if (!aiEnabled) stateName = "disabled";

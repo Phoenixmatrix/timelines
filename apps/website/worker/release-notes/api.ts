@@ -10,6 +10,7 @@ import { accessible } from "../tracker/api.ts";
 import { FeedError, releaseFeed } from "./feed.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange } from "./range.ts";
+import { landedTimelines } from "./timelines.ts";
 import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
 import { issuesFrom } from "./trackers.ts";
 import { ensureReleaseNotes } from "./queue.ts";
@@ -46,7 +47,8 @@ export async function linkedIssues(
  * The commits of one release and the issues they mention. `to` names a tag
  * (or any ref) and includes its own commit; without it, the range is the
  * default branch's unreleased work. It starts after `from`, or after the
- * nearest tagged commit in first-parent history.
+ * nearest tagged commit in first-parent history. Each merge on the way brings
+ * the commits it landed, and the timeline it landed as far as it's known.
  */
 releaseNotes.get("/range", async (c) => {
   const loaded = await loadRepo(c);
@@ -75,6 +77,7 @@ releaseNotes.get("/range", async (c) => {
       to: null,
       from: null,
       commits: [],
+      timelines: [],
       truncated: false,
       issues: [],
     };
@@ -92,7 +95,11 @@ releaseNotes.get("/range", async (c) => {
     const commits: RangeCommit[] = walk.commits.map((commit) => ({
       ...summary(commit),
       issueKeys: issueKeys(commit.message),
+      landing: walk.landings.get(commit.hash) ?? null,
     }));
+    const merges = walk.commits.filter(
+      (commit) => commit.parents.length > 1 && !walk.landings.has(commit.hash),
+    );
     const keys = [...new Set(commits.flatMap((commit) => commit.issueKeys))];
     const body: ReleaseRangeResponse = {
       to: { ref: toRef, oid: toOid },
@@ -100,6 +107,9 @@ releaseNotes.get("/range", async (c) => {
         ? { tag: fromParam || tagged.get(walk.base) || walk.base, oid: walk.base }
         : null,
       commits,
+      timelines: merges.length
+        ? [...(await landedTimelines(c.env.DB, row.id, refs.headBranch, merges)).values()]
+        : [],
       truncated: walk.truncated,
       issues: await linkedIssues(c.env, c.get("actor"), row, keys),
     };

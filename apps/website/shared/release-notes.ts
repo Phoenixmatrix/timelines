@@ -27,6 +27,21 @@ export interface LinkedIssue extends ShippedIssue {
 export interface RangeCommit extends CommitSummary {
   /** Issue keys the message mentions, in order; resolved ones appear in `issues`. */
   issueKeys: string[];
+  /** The merge on the first-parent line that landed this commit; null on the line itself. */
+  landing: string | null;
+}
+
+/**
+ * The timeline a piece of work landed with: a merge into the default branch,
+ * whose other parent was the timeline's checkpoint.
+ */
+export interface LandedTimeline {
+  /** The timeline's record; null until timelines are recorded (CORE-69). */
+  id: string | null;
+  /** The branch it merged, like `timeline/search`, when git or the push log name it. */
+  branch: string | null;
+  /** The landing merge commit. */
+  landing: string;
 }
 
 export interface ReleaseRangeResponse {
@@ -34,12 +49,19 @@ export interface ReleaseRangeResponse {
   to: { ref: string; oid: string } | null;
   /** The tag the range starts after (exclusive); null when history has none. */
   from: { tag: string; oid: string } | null;
-  /** First-parent commits, newest first. */
+  /** First-parent commits, newest first, each merge followed by the commits it landed. */
   commits: RangeCommit[];
+  /** What each merge in the range landed, as far as it is known. */
+  timelines: LandedTimeline[];
   /** The walk stopped at its limit before reaching `from` or the root. */
   truncated: boolean;
   /** Issues the commits mention, from trackers subscribed to this repository that the caller can read. */
   issues: LinkedIssue[];
+}
+
+/** How an entry names its timeline: the branch, else the landing merge. */
+export function timelineLabel(timeline: LandedTimeline): string {
+  return timeline.branch ?? `merge ${timeline.landing.slice(0, 7)}`;
 }
 
 /** Colons cannot occur in Git tag names, so daily update IDs cannot collide with tags. */
@@ -69,12 +91,15 @@ export interface ReleaseNoteChange {
   summary: string;
 }
 
-/** A code update: a tracker issue with its commits, or a commit citing none. */
+/**
+ * A code update: a tracker issue with its commits, a commit citing none, or a
+ * landing's commits that cite none.
+ */
 export interface ReleaseNoteEntry {
   id: string;
   release: string;
   releaseKind: ReleaseKind;
-  kind: "issue" | "commit";
+  kind: "issue" | "commit" | "landing";
   category: ReleaseCategory;
   title: string;
   summary: string;
@@ -88,6 +113,8 @@ export interface ReleaseNoteEntry {
   labels: string[];
   workspaceIds: string[];
   commits: string[];
+  /** The timeline the work landed with; null when it was committed to the default branch. */
+  timeline: LandedTimeline | null;
   changes: ReleaseNoteChange[];
   /** Latest Git committer timestamp among this entry's commits; not a deployment time. */
   lastCommitAt: string;

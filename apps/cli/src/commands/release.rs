@@ -40,6 +40,25 @@ fn s<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 
+/// The timeline an entry's work landed with: its branch, else the landing merge.
+fn landed(entry: &Value) -> Option<String> {
+    let timeline = entry["timeline"].as_object()?;
+    let label = match timeline.get("branch").and_then(Value::as_str) {
+        Some(branch) => branch.to_string(),
+        None => format!(
+            "merge {}",
+            timeline
+                .get("landing")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(7)
+                .collect::<String>()
+        ),
+    };
+    Some(format!("landed with {label}"))
+}
+
 fn title(name: &str, kind: &str) -> String {
     if kind == "daily" {
         format!(
@@ -189,6 +208,7 @@ fn notes_text(value: &Value, internal: bool) -> String {
             if let Some(key) = entry["issue"]["key"].as_str() {
                 refs.push(key.to_string());
             }
+            refs.extend(landed(entry));
             for oid in entry["commits"].as_array().into_iter().flatten().take(3) {
                 refs.push(oid.as_str().unwrap_or("").chars().take(7).collect());
             }
@@ -254,6 +274,7 @@ fn feed_text(value: &Value, internal: bool) -> String {
         if let Some(key) = entry["issue"]["key"].as_str() {
             refs.push(key.to_string());
         }
+        refs.extend(landed(entry));
         for repo in entry["repos"].as_array().into_iter().flatten() {
             let releases: Vec<String> = repo["releases"]
                 .as_array()
@@ -382,14 +403,17 @@ mod tests {
             "release": {"name": "v2", "kind": "tag", "fromTag": "v1", "intro": "Faster search.", "lastCommitAt": "2026-10-02T12:00:00Z"},
             "entries": [
                 {"category": "internal", "title": "Bump deps", "summary": "", "issue": null, "commits": ["abcdef0123"]},
-                {"category": "fix", "title": "Fix ranking", "summary": "Results sort by relevance.", "issue": {"key": "ENG-2"}, "commits": ["1234567890", "2345678901"]},
-                {"category": "feature", "title": "Add search", "summary": "Find anything.", "issue": null, "commits": ["9876543210"]}
+                {"category": "fix", "title": "Fix ranking", "summary": "Results sort by relevance.", "issue": {"key": "ENG-2"}, "commits": ["1234567890", "2345678901"],
+                 "timeline": {"id": null, "branch": "timeline/ranking", "landing": "fedcba9876"}},
+                {"category": "feature", "title": "Add search", "summary": "Find anything.", "issue": null, "commits": ["9876543210"],
+                 "timeline": {"id": null, "branch": null, "landing": "0011223344"}}
             ]
         });
         let text = notes_text(&value, false);
         assert!(text.contains("## New\n- **Add search**"));
+        assert!(text.contains("(landed with merge 0011223, 9876543)"));
         assert!(text.contains("## Fixed\n- **Fix ranking**"));
-        assert!(text.contains("ENG-2, 1234567, 2345678"));
+        assert!(text.contains("ENG-2, landed with timeline/ranking, 1234567, 2345678"));
         assert!(!text.contains("Bump deps"));
         assert!(notes_text(&value, true).contains("## Internal\n- **Bump deps** (abcdef0)"));
     }

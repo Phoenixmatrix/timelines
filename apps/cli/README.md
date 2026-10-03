@@ -421,7 +421,10 @@ null capabilities rather than invented defaults.
   parent a rewrite made redundant is dropped, and so is a merge left with
   nothing of its own. `gm sync` leaves a stack alone while it has merged the
   latest trunk. `gm backout` and `gm duplicate` see a merge from its first
-  parent, like `git revert -m 1`.
+  parent, like `git revert -m 1`. When trunk lands a bookmark as a merge,
+  `gm sync` counts the merged side as landed: changes it brought in (as they
+  are, or as rewritten copies) leave the stack, and what was built on them
+  moves onto trunk.
 - **Workspace changes are operations.** `gm undo` reverses the last one (repeat
   to go further back), `gm op log` lists them, `gm op restore <id>` jumps to any.
 - **Trunk is immutable; there are no PRs.** `gm push` fast-forwards trunk to

@@ -11,6 +11,7 @@ import {
 import {
   releaseKind,
   releaseLabel,
+  timelineLabel,
   type ReleaseCategory,
   type ReleaseFeed,
   type ReleaseFeedEntry,
@@ -20,7 +21,7 @@ import type { TrackerOwner } from "../../../shared/tracker.ts";
 import { SelectField } from "../../components/ui.tsx";
 import { api, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
-import { repoPath } from "../../lib/refs.ts";
+import { commitsUrl, repoPath } from "../../lib/refs.ts";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
   const q = new URL(request.url).searchParams.get("q") ?? "";
@@ -120,6 +121,17 @@ function Entry({ entry }: { entry: ReleaseFeedEntry }) {
               {entry.issue.key}
             </Link>
           </>
+        )}
+        {entry.timeline && entry.repos[0] && (
+          <span>
+            landed with{" "}
+            <Link
+              className="mk-mono text-ink-muted"
+              to={commitsUrl(entry.repos[0].owner, entry.repos[0].name, entry.timeline.landing)}
+            >
+              {timelineLabel(entry.timeline)}
+            </Link>
+          </span>
         )}
         {entry.repos.map((repo) => (
           <span key={`${repo.owner}/${repo.name}`}>
