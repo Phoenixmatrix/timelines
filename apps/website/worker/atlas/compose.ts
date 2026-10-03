@@ -30,7 +30,8 @@
 // Materialized or computed? Computed at read, cached per isolate, keyed by the
 // authorized input set: the workspace scope id (which hashes the readable
 // repository ids), the composite snapshot id (each repository's pinned seq)
-// and the readable feeds. Against the PRD's bounds:
+// and the readable feeds; and by principal, so no reader's warm answer is
+// another's (its timing would show someone else looked). Against the PRD's bounds:
 // - The inputs are already materialized and bounded per repository: at most
 //   COMPOSE_CAPABILITIES_PER_REPO capabilities and COMPOSE_DEPENDENCIES_PER_REPO
 //   (capability, package) rows each, read with indexed queries, so a 50
@@ -660,8 +661,8 @@ const CACHE_ENTRIES = 16;
 const cache = new Map<string, Promise<ScopeComposition>>();
 
 /**
- * The composition for a key naming exactly its authorized inputs (scope id,
- * composite snapshot id, readable feeds), computed once per isolate.
+ * The composition for a key naming its principal and exactly its authorized
+ * inputs (scope id, composite snapshot id, readable feeds), computed once per isolate.
  */
 export function cachedComposition(
   key: string,

@@ -67,7 +67,44 @@ const get = <T>(
   query: Record<string, string | number | null | undefined>,
   request: AtlasRequest,
 ) =>
-  api<T>(path(repo, route, { ...query, snapshot: request.snapshot }), { signal: request.signal });
+  api<T>(path(repo, route, { ...query, snapshot: request.snapshot }), {
+    signal: request.signal,
+  }).catch((error: unknown) => {
+    if (atlasAccessLost(error))
+      for (const listener of lostListeners.get(repoKey(repo)) ?? []) listener();
+    throw error;
+  });
+
+// ---- access lost (CORE-178) ----------------------------------------------------
+
+const repoKey = (repo: AtlasRepo) => `${repo.owner}/${repo.name}`.toLowerCase();
+const lostListeners = new Map<string, Set<() => void>>();
+
+/**
+ * The repository itself can't be read any more: access was revoked, it was
+ * made private or deleted, or the session ended. The server answers every
+ * Atlas route for it as a missing repository (a 404 or 401 with no Atlas
+ * code), where Atlas errors about a snapshot, cursor or entity carry a code.
+ */
+export function atlasAccessLost(error: unknown): boolean {
+  return error instanceof ApiError && !error.code && (error.status === 404 || error.status === 401);
+}
+
+/**
+ * Call `listener` whenever an Atlas request for `repo` finds it unreadable,
+ * so an open view can discard what it holds instead of keeping content its
+ * viewer may no longer see. Returns the unsubscribe.
+ */
+export function onAtlasAccessLost(repo: AtlasRepo, listener: () => void): () => void {
+  const key = repoKey(repo);
+  const set = lostListeners.get(key) ?? new Set();
+  set.add(listener);
+  lostListeners.set(key, set);
+  return () => {
+    set.delete(listener);
+    if (set.size === 0) lostListeners.delete(key);
+  };
+}
 
 const paged = (request: AtlasPageRequest) => ({ cursor: request.cursor, limit: request.limit });
 

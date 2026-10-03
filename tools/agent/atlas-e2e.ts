@@ -664,3 +664,109 @@ export async function atlasAccessibleScenario(t: AtlasE2E) {
     await browser.close();
   }
 }
+
+/**
+ * CORE-178: revocation reaches an open Knowledge tab. sam reads a private
+ * repository's Atlas as a collaborator; its owner removes him. His next Atlas
+ * read finds the repository gone, and the whole view gives way to "Nothing
+ * here": what he had on screen doesn't outlive his access, a reload shows the
+ * same, and his still-valid page link and pinned snapshot answer exactly as a
+ * repository that never existed.
+ */
+export async function atlasRevocationScenario(t: AtlasE2E & { readerToken: string }) {
+  const browserTimeout = 15_000;
+  const expect = playwrightExpect.configure({ timeout: browserTimeout });
+  const { owner, name, api } = await atlasFixtureRepo(t);
+  const base = `/${owner}/${name}/knowledge`;
+  const ghost = `/api/repos/${owner}/ghost-${randomUUID().slice(0, 8)}`;
+  await t.json(api, t.token, "PATCH", { visibility: "private" });
+  // sam isn't in orbit: only the collaboration lets him read it.
+  await t.json(api, t.readerToken, "GET", undefined, [404]);
+  await t.json(`${api}/collaborators/sam`, t.token, "PUT", { role: "read" });
+  const overview = await t.json<{ snapshot: { id: string }; catalogue: { next: string | null } }>(
+    `${api}/atlas/overview`,
+    t.readerToken,
+  );
+  const cursor = overview.catalogue.next;
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    baseURL: t.ctx.origin,
+    viewport: { width: 1280, height: 900 },
+  });
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+  const page = await context.newPage();
+  page.setDefaultTimeout(browserTimeout);
+  const answers: { route: string; status: number }[] = [];
+  page.on("response", (response) => {
+    const route = ATLAS_ROUTE.exec(new URL(response.url()).pathname)?.[1];
+    if (route) answers.push({ route, status: response.status() });
+  });
+  try {
+    await page.goto("/signin");
+    await page.getByRole("button", { name: /Continue as sam/i }).click();
+    await page.waitForURL((url) => url.pathname !== "/signin");
+    const file = "file:billing/ledger/ledger.ts";
+    await page.goto(`${base}?select=${encodeURIComponent(file)}`);
+    const selected = page.getByRole("heading", { name: "ledger.ts", exact: true, level: 2 });
+    await expect(selected).toBeVisible();
+    const lookup = page.getByRole("searchbox", { name: "Find a capability, file or symbol" });
+    await expect(lookup).toBeVisible();
+    await page.waitForLoadState("networkidle");
+
+    // The owner removes sam while his view is open.
+    const removed = await fetch(`${t.ctx.origin}${api}/collaborators/sam`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${t.token}` },
+    });
+    assert.equal(removed.status, 204, "Removing the collaborator");
+    const mark = answers.length;
+
+    // His next Atlas read (a lookup) finds the repository gone: the view goes with it.
+    await lookup.focus();
+    await page.keyboard.type("search", { delay: 40 });
+    await expect(page.getByRole("heading", { name: "Nothing here", level: 1 })).toBeVisible();
+    await expect(selected).toHaveCount(0);
+    await expect(lookup).toHaveCount(0);
+    await expect(page.getByText("ledger.ts")).toHaveCount(0);
+    const after = answers.slice(mark);
+    assert(after.length > 0, "The lookup made no Atlas read after revocation");
+    for (const a of after) assert.equal(a.status, 404, `${a.route} answered ${a.status}`);
+    await page.screenshot({ path: join(t.ctx.artifacts, "browser-atlas-revoked.png") });
+
+    // A reload (a cold start) says the same.
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Nothing here", level: 1 })).toBeVisible();
+    await expect(page.getByText("ledger.ts")).toHaveCount(0);
+
+    // His still-valid page link and pinned snapshot read like a missing repository.
+    for (const path of [
+      `/atlas/regions?cursor=${encodeURIComponent(cursor ?? "")}`,
+      `/atlas/overview?snapshot=${encodeURIComponent(overview.snapshot.id)}`,
+      `/atlas/detail?id=${encodeURIComponent(file)}`,
+      "/knowledge/status",
+    ]) {
+      const hidden = await fetch(`${t.ctx.origin}${api}${path}`, {
+        headers: { authorization: `Bearer ${t.readerToken}` },
+      });
+      const missing = await fetch(`${t.ctx.origin}${ghost}${path}`, {
+        headers: { authorization: `Bearer ${t.readerToken}` },
+      });
+      assert.equal(hidden.status, 404, path);
+      assert.equal(await hidden.text(), await missing.text(), path);
+    }
+    await context.tracing.stop();
+    t.record({ repo: `${owner}/${name}`, afterRevocation: after });
+  } catch (error) {
+    await page
+      .screenshot({ path: join(t.ctx.artifacts, "browser-atlas-revoked-failure.png") })
+      .catch(() => {});
+    await context.tracing
+      .stop({ path: join(t.ctx.artifacts, "browser-atlas-revoked-failure.zip") })
+      .catch(() => {});
+    throw error;
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close();
+  }
+}

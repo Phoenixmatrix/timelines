@@ -872,8 +872,13 @@ async function composition(c: C, ctx: Scope<unknown>): Promise<ScopeComposition>
   );
   const readable = await readableFeeds(c.env, c.get("actor"), feedIds);
   // Names exactly the authorized inputs: the readable repositories (scope),
-  // their pinned snapshots (composite id) and the readable feeds.
-  const key = [ctx.scope, ctx.snapshotId, [...readable].sort().join(",")].join("\u0000");
+  // their pinned snapshots (composite id) and the readable feeds. And the
+  // principal (CORE-178): another reader with the same access would get the
+  // same content, but a warm answer would tell them, by its timing, that
+  // someone else just looked at this selection.
+  const key = [principalOf(c), ctx.scope, ctx.snapshotId, [...readable].sort().join(",")].join(
+    "\u0000",
+  );
   return cachedComposition(key, () =>
     composeScope(c.env.DB, sources, limitToFeeds(recorded, readable)),
   );

@@ -1365,7 +1365,30 @@ old map's `?node=<id>` becomes `?select=<id>` (entities keep graph node ids;
 timeline's overlay (CORE-83) sit beside the inspector, a change of `?tl`
 reads the overview again, and an entity with a wiki page links to it. The
 palette's entity results, the file view's knowledge rail and wiki pages open
-the Atlas with `?select=`.
+the Atlas with `?select=`. When any Atlas read finds the repository itself
+unreadable (access revoked, made private or deleted: a 404 or 401 without an
+Atlas `code`; `atlasAccessLost`, `onAtlasAccessLost` in `src/lib/atlas.ts`),
+the tab reads its route again, so the not-found page replaces the whole view
+rather than leaving what was read before on screen.
+
+**Atlas authorization suite** (`worker/atlas/authorization.test.ts`,
+CORE-178). One D1-backed suite drives the real application (`worker/app.ts`:
+token authentication, route mounting) through every Atlas surface, repository
+and workspace, fresh, pinned and mid-cursor, plus the Knowledge page's other
+reads (status, wiki catalog, overlays) and the graph export, as separate
+people, an agent, an organization member and anonymous readers. It holds that
+an unreadable private repository is a 404 byte-identical to a missing one
+(never a 403); that revocation (collaborator removed, made private,
+organization membership or default access ended, agent revoked) takes effect on
+the next request, warm or cold, with cursors and pinned snapshots disclosing
+nothing; that cursors are bound to principal, repository, route and filters;
+that a workspace never shows a lost repository through composition, related
+links, lineage, lookup or totals; that a deleted repository leaves no Atlas
+rows and nothing for a namesake; that building and failed projections are never
+readable while pinned pages keep their snapshot; and that no browse path
+touches a model, Vectorize or AI Search (those bindings throw). The browser
+E2E `browser-atlas-revocation-clears-the-open-view` removes a collaborator
+while their Knowledge tab is open.
 
 **Workspace Atlas page** (`src/routes/atlas/`, CORE-172), at
 `/:owner/-/atlas?repos=a,b`, linked as **Knowledge** from the account page. Pick the
@@ -1413,7 +1436,9 @@ so pinned pages resolve against the same facts; snapshots from before it say
 when read, not materialized: inputs are each readable repository's pinned
 snapshot (at most 200 capabilities and 5,000 package-import rows each, with
 coverage reported), and a per-isolate cache is keyed by the scope id, composite
-snapshot id and readable feeds, i.e. exactly the authorized inputs. A denied
+snapshot id and readable feeds, i.e. exactly the authorized inputs, and by
+principal: a reader with the same access gets the same content, but never
+another's warm answer, whose timing would tell them someone else just looked. A denied
 repository is never read, so every response is byte-identical to a selection
 without it. Materializing would multiply snapshots per selection and principal
 policy inside the one 2 GiB account composition pool and need invalidation on

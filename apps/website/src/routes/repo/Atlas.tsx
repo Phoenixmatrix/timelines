@@ -15,10 +15,12 @@
 import { ArrowClockwiseIcon, CaretRightIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  data as routeResponse,
   Link,
   redirect,
   useLoaderData,
   useNavigationType,
+  useRevalidator,
   useSearchParams,
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
@@ -37,8 +39,15 @@ import type {
   AtlasSnapshotRef,
 } from "../../../shared/atlas.ts";
 import { useKnowledgeStatus } from "../../components/KnowledgeStatus.tsx";
-import { api } from "../../lib/api.ts";
-import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../../lib/atlas.ts";
+import { api, ApiError } from "../../lib/api.ts";
+import {
+  atlasAccessLost,
+  atlasApi,
+  atlasErrorOf,
+  atlasNeedsRestart,
+  onAtlasAccessLost,
+  type AtlasRepo,
+} from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 import { useViewer } from "../../lib/session.ts";
@@ -115,6 +124,9 @@ export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
     // A link to a snapshot that's gone: explain, and offer the current one.
     if (atlasError && snapshot && atlasNeedsRestart(error))
       return { overview: null, pinned: atlasError, ...(await around), status: null };
+    // The repository itself is gone for this viewer (CORE-178): its 404, not a crash.
+    if (atlasAccessLost(error) && error instanceof ApiError)
+      throw routeResponse({ message: error.message }, { status: error.status });
     throw error;
   }
 }
@@ -183,10 +195,31 @@ function useAtlasBase() {
 
 export function Atlas() {
   const data = useLoaderData<typeof atlasLoader>();
+  useAccessLost();
   const { overview, pinned, status } = data;
   if (pinned) return <PinnedGone error={pinned} />;
   if (!overview) return <NotBuilt status={status} overlays={data.overlays} />;
   return <Territory key={overview.snapshot.id} overview={overview} data={data} />;
+}
+
+/**
+ * When any Atlas read finds the repository unreadable (access revoked, made
+ * private, deleted; CORE-178), read the route again: its 404 replaces the
+ * whole view, so nothing already on screen outlives the access it was read with.
+ */
+function useAccessLost() {
+  const { owner, name } = useAtlasBase().ref;
+  const revalidator = useRevalidator();
+  const latest = useRef(revalidator);
+  latest.current = revalidator;
+  useEffect(
+    () =>
+      onAtlasAccessLost({ owner, name }, () => {
+        // Once: the route's own reads fail the same way while it reloads.
+        if (latest.current.state === "idle") void latest.current.revalidate();
+      }),
+    [owner, name],
+  );
 }
 
 /** Polls a running build; the hook revalidates, and so reloads the map, when it lands. */

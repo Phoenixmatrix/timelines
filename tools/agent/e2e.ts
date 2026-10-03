@@ -20,7 +20,11 @@ import type {
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
-import { atlasAccessibleScenario, atlasBrowserScenario } from "./atlas-e2e.ts";
+import {
+  atlasAccessibleScenario,
+  atlasBrowserScenario,
+  atlasRevocationScenario,
+} from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 type Evidence = {
@@ -2031,6 +2035,20 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       ctx,
       work,
       token: ownerToken,
+      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
+      json,
+      record,
+    });
+  });
+
+  await scenario("browser-atlas-revocation-clears-the-open-view", async () => {
+    // CORE-178: removing a collaborator reaches their open Knowledge tab; the
+    // view, a reload, their cursor and pinned snapshot all disclose nothing.
+    await atlasRevocationScenario({
+      ctx,
+      work,
+      token: ownerToken,
+      readerToken: fixtures.tokens.sam,
       gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
       json,
       record,
