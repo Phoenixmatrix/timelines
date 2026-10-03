@@ -243,6 +243,7 @@ never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 | `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                    |
 | `GET /api/session`                                                                        | Who the token or cookie belongs to                                |
 | `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                   |
+| `GET /api/search?q=&categories=&limit=&cursor=`                                           | Global search: see [Global search](#global-search)                |
 | `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                            |
 | `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                     |
 | `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                             |
@@ -255,6 +256,41 @@ never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 | `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)              |
 | `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                    |
 | `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                         |
+
+## Global search
+
+`GET /api/search` (CORE-91) is the lookup behind the global palette: plain,
+permission-aware matching over names and titles, never inference, embeddings or
+AI Search. The contract is `shared/search.ts`; each category is a provider in
+`worker/search/providers.ts` (issues and packages join as their own providers).
+
+| Category        | Matches                                                 | Leads to                    |
+| --------------- | ------------------------------------------------------- | --------------------------- |
+| `repositories`  | `owner/name` and description, readable repos only       | `/owner/name`               |
+| `accounts`      | Slug and display name; every profile is public          | `/slug`                     |
+| `conversations` | Titles of the viewer's own assistant chats, all of them | the chat (`{kind: "chat"}`) |
+
+- **Signed in only.** `q` is trimmed and whitespace collapsed: 1–100
+  characters, at most 6 words, each of which must match. Empty, oversized or
+  malformed requests get 400; nothing enumerates a directory.
+- **Ranking.** `exact` (an identifier equals the query: `owner/name`, a repo
+  name, a slug, a title), then `prefix`, `word` (a word in a name starts with
+  it; `-`, `_`, `.` and `/` separate words) and `contains`; ties go to the most
+  recently pushed or updated, then name, then ID. Every result says its `match`.
+- **Authorization first.** Repositories are filtered in SQL by `readableRepo`
+  (`worker/db.ts`, held to `permissions.ts` by the tests) before ranking,
+  limits or cursors, so private repositories and other people's chats never
+  reach a row, an order or a page. Responses are `private, no-store`; there is
+  no server cache, so revoked access applies at once.
+- **Bounds and continuation.** `categories` is a comma list (default: all, in
+  the order above); `limit` is 1–20 per category (default 5). A group's
+  `cursor` continues that category: pass it back with the same `q` and that
+  category alone. Continuation stops at 100 results per category; past that a
+  group reports `truncated: true` and no cursor, so narrow the query. There are
+  no totals.
+- **Failures stay local.** A category that throws or takes over 5 seconds
+  comes back `{status: "unavailable", error}`, which is not "no matches", and
+  the other groups are unaffected.
 
 ## Semantic changes
 
@@ -1067,6 +1103,7 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
   jobs); `registry/manage/`: the packages API behind the console, feeds and gm
 - `packages/formats` (repo root): IO-free protocol libraries for every package format
 - `worker/tracker/*`: account-level authority, transactional graph store and sync API
+- `worker/search/*`, `shared/search.ts`: global search providers, ranking and `/api/search`
 - `shared/tracker.ts`: shared tracker entities, mutations and readiness semantics
 - `src/routes/tracker/*`: issue workbench, graph and tracker administration
 - `scripts/git-login.ts`: points the git CLI at Gitmatrix as a persona

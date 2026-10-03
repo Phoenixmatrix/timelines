@@ -25,6 +25,7 @@ import { Timing } from "./timing.ts";
 import { buildRegistry } from "../registry/app.ts";
 import { tracker } from "./tracker/api.ts";
 import { assistant } from "./api/assistant.ts";
+import { search } from "./search/api.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -92,6 +93,7 @@ api.route("/ssh-keys", sshKeys);
 api.route("/auth/ssh", sshAuth);
 api.route("/dev", dev);
 api.route("/assistant", assistant);
+api.route("/search", search);
 api.notFound((c) => c.json({ error: "Not found." }, 404));
 api.onError((error, c) => {
   if (

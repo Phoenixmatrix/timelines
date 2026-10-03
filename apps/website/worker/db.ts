@@ -58,7 +58,7 @@ export const sqlNow = sql<string>`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`;
 
 // The viewer's account id is "" when signed out, so the per-viewer columns
 // come back null for anonymous requests.
-function selectRepos(d1: D1Database, viewerId: string) {
+export function selectRepos(d1: D1Database, viewerId: string) {
   return db(d1)
     .selectFrom("repos as r")
     .innerJoin("accounts as o", "o.id", "r.owner_id")
@@ -125,6 +125,25 @@ export function roleFor(row: RepoRow, actor: Actor | null): RepoRole {
     orgRole: row.org_role,
     collaboratorRole: row.collaborator_role,
   });
+}
+
+/**
+ * `roleFor(row, actor) !== "none"` as SQL over selectRepos' `r` and `o`, so a
+ * query can authorize before it ranks, counts or limits. permissions.ts is the
+ * rule; search tests hold this to it.
+ */
+export function readableRepo(actor: Actor | null) {
+  if (actor?.isSiteAdmin) return sql<boolean>`1`;
+  const viewerId = actor?.id ?? "";
+  return sql<boolean>`(
+    r.visibility = 'public'
+    OR (o.kind = 'user' AND r.owner_id = ${viewerId})
+    OR (o.kind = 'org' AND EXISTS (
+      SELECT 1 FROM org_members m WHERE m.org_id = r.owner_id AND m.user_id = ${viewerId}
+        AND (m.role = 'owner' OR (m.role = 'member' AND o.member_repo_role IN ('read', 'write')))
+    ))
+    OR EXISTS (SELECT 1 FROM repo_collaborators c WHERE c.repo_id = r.id AND c.user_id = ${viewerId})
+  )`;
 }
 
 export function repoSummary(row: RepoRow, actor: Actor | null): RepoSummary {
