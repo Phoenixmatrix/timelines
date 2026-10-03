@@ -12,6 +12,11 @@ import { Code, codeLoader } from "./routes/repo/Code.tsx";
 import { Commits, commitsLoader } from "./routes/repo/Commits.tsx";
 import { Knowledge, knowledgeLoader } from "./routes/repo/Knowledge.tsx";
 import { Atlas, atlasLoader } from "./routes/repo/Atlas.tsx";
+import {
+  WorkspaceAtlas,
+  workspaceAtlasLoader,
+  workspaceAtlasShouldRevalidate,
+} from "./routes/atlas/WorkspaceAtlas.tsx";
 import { RepoPackages, repoPackagesLoader } from "./routes/repo/Packages.tsx";
 import { Feeds, feedsAction, feedsLoader } from "./routes/packages/Feeds.tsx";
 import { NpmLogin, npmLoginAction, npmLoginLoader } from "./routes/packages/NpmLogin.tsx";
@@ -143,6 +148,13 @@ export const router = createBrowserRouter([
             Component: PackageConsole,
           },
           { path: ":owner/-/feeds", loader: feedsLoader, action: feedsAction, Component: Feeds },
+          // The Atlas across selected repositories: unlinked until the Knowledge cutover (CORE-174).
+          {
+            path: ":owner/-/atlas",
+            loader: workspaceAtlasLoader,
+            shouldRevalidate: workspaceAtlasShouldRevalidate,
+            Component: WorkspaceAtlas,
+          },
           {
             path: "cli-auth/npm/:id",
             loader: npmLoginLoader,

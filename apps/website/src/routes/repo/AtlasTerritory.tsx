@@ -31,6 +31,23 @@ function fitView(t: Territory, w: number, h: number): View {
   return { k, x: (w - t.width * k) / 2, y: pad + 40 + (h - pad * 2 - 40 - t.height * k) / 2 };
 }
 
+/**
+ * A labelled frame drawn behind cells: in a workspace, one repository's
+ * territory (CORE-172). `header` is the world height of its label strip.
+ */
+export interface MapBand {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  header: number;
+  label: string;
+  note?: string;
+}
+
+const NO_BANDS: readonly MapBand[] = [];
+
 const fileLabel = (n: number) => `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
 
 export function AtlasTerritory({
@@ -39,6 +56,8 @@ export function AtlasTerritory({
   loading,
   onSelect,
   label,
+  bands = NO_BANDS,
+  origin,
 }: {
   territory: Territory;
   selected: string | null;
@@ -47,6 +66,10 @@ export function AtlasTerritory({
   onSelect: (cell: TerritoryCell) => void;
   /** What the picture shows, for assistive tech. */
   label: string;
+  /** Frames drawn behind the cells, e.g. one per repository in a workspace. */
+  bands?: readonly MapBand[];
+  /** Where a cell comes from, for its hover card (e.g. its repository). */
+  origin?: (cell: TerritoryCell) => string | null;
 }) {
   const wrap = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -169,6 +192,34 @@ export function AtlasTerritory({
       return !!parent && Math.min(parent.w, parent.h) * k >= SHOW.children && visibleParent(parent);
     };
 
+    for (const b of bands) {
+      const x = b.x * k + tx;
+      const y = b.y * k + ty;
+      const bw = b.w * k;
+      const bh = b.h * k;
+      if (x > w || y > h || x + bw < 0 || y + bh < 0) continue;
+      ctx.beginPath();
+      ctx.roundRect(x, y, bw, bh, Math.min(14, bw / 10));
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = color.soft;
+      ctx.stroke();
+      const strip = b.header * k;
+      if (strip < 12 || bw < 48) continue;
+      const titleSize = Math.min(16, Math.max(11, strip * 0.4));
+      ctx.font = `650 ${titleSize}px ${font}`;
+      ctx.fillStyle = color.ink;
+      ctx.textBaseline = "top";
+      const title = fitText(b.label, bw - 24);
+      const top = y + Math.max(4, Math.min(14, strip * 0.18));
+      if (title) ctx.fillText(title, x + 12, top);
+      if (b.note && strip >= 30) {
+        ctx.font = `450 ${Math.max(10, titleSize - 3)}px ${font}`;
+        ctx.fillStyle = color.faint;
+        const note = fitText(b.note, bw - 24);
+        if (note) ctx.fillText(note, x + 12, top + titleSize + 5);
+      }
+    }
+
     for (const c of territory.cells) {
       if (!visibleParent(c)) continue;
       const x = c.x * k + tx;
@@ -227,7 +278,7 @@ export function AtlasTerritory({
         if (text) ctx.fillText(text, x + 10, y + 10 + size + 6);
       }
     }
-  }, [frame, territory, selected, loading]);
+  }, [frame, territory, selected, loading, bands]);
 
   const local = (event: { clientX: number; clientY: number }) => {
     const rect = canvas.current!.getBoundingClientRect();
@@ -341,6 +392,9 @@ export function AtlasTerritory({
               : (hover.cell.entity.path ?? hover.cell.entity.kind)}
             {hover.cell.changed && " · changed in this build"}
           </div>
+          {origin?.(hover.cell) && (
+            <div className="truncate text-micro text-ink-muted">{origin(hover.cell)}</div>
+          )}
         </div>
       )}
     </div>

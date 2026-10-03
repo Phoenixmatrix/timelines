@@ -1326,6 +1326,24 @@ every name, summary and count comes from one repository's projection, so
 narrowing the scope can't leave a hidden repository's labels behind.
 Virtual composition stores nothing.
 
+**Workspace Atlas page** (`src/routes/atlas/`, CORE-172), at
+`/:owner/-/atlas?repos=a,b`, unlinked until the Knowledge cutover. Pick the
+account, then repositories you can read (or fill the selection from a tracker
+workspace's subscribed repositories, read once on request); the URL keeps the
+selection in pick order. Coverage lists every selected name with its own
+commit, build and state (ready, partial, lagging, building, unavailable, not
+enabled, unavailable to you) and whether its published packages are recorded
+for cross-repository resolution; never a common HEAD, and selecting a
+repository without Knowledge starts nothing. The map draws each ready
+repository's own territory in its own fixed-width column, in pick order, from
+its own layout slots (`workspace.ts` `buildWorkspaceTerritory`), so shared slot
+numbers never collide and a repository growing never moves another. Changing
+the selection or account remounts the view (`WorkspaceSession`): in-flight
+requests are aborted and late answers dropped. When a pinned request reports
+the authorized set changed (revocation mid-view), the page re-reads the scope,
+discards everything from repositories no longer readable and offers the
+current view.
+
 **Cross-repository composition** (`worker/atlas/compose.ts`, CORE-167,
 `COMPOSITION_VERSION`). Over a workspace scope,
 `/api/accounts/:owner/atlas/composition?repos=…` pages capabilities spanning
