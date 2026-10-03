@@ -356,6 +356,8 @@ export interface Database {
     expired_reason: "age" | "count" | "storage" | null;
     /** CORE-159: `capacity` when a snapshot didn't fit its storage cap. */
     failure: "capacity" | null;
+    /** CORE-167: packages the repository publishes, frozen at build (worker/atlas/publishers.ts). */
+    packages: string | null;
   };
   atlas_assignments: {
     scope: string;

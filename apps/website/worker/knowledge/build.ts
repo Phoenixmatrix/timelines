@@ -48,6 +48,7 @@ import {
 } from "../atlas/projection.ts";
 import { describeRepoCapabilities, type DescribeStats } from "../atlas/describe.ts";
 import { admitProjection, enforceRetention } from "../atlas/retention.ts";
+import { recordPublishedPackages, recordsPackages } from "../atlas/publishers.ts";
 import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
@@ -280,12 +281,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       }
       const { row, head } = start;
       if (head === start.previous && !force) {
-        // Repositories indexed before the Atlas existed get their first projection now.
-        const missing = await step.do(
-          "atlas-check",
-          STEP,
-          async () => !(await currentSnapshot(env.DB, repoScope(repoId))),
-        );
+        // Repositories indexed before the Atlas existed get their first
+        // projection now, and snapshots built before they recorded what the
+        // repository publishes (CORE-167) a fresh one (unchanged rows are reused).
+        const missing = await step.do("atlas-check", STEP, async () => {
+          const current = await currentSnapshot(env.DB, repoScope(repoId));
+          return !current || !(await recordsPackages(env.DB, current.id));
+        });
         const atlas = missing ? await this.#project(step, progress, repoId, buildId, head) : {};
         await this.#finish(step, repoId, buildId, head, { upToDate: true, ...atlas });
         return { status: "up-to-date" };
@@ -780,6 +782,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       beginRepoProjection(env.DB, repoId, [{ repoId, commit: head, buildId }]),
     );
     try {
+      // What the repository publishes, frozen into the snapshot for resolving
+      // cross-repository dependencies (CORE-167). Never fails the projection.
+      const packages = await progress("atlas-packages", "atlas", () =>
+        recordPublishedPackages(env, repoId, begun.snapshotId),
+      );
       // Capabilities first: the entity batches place files by them.
       const grouping = await progress("atlas-group", "atlas", () =>
         groupRepoCapabilities(env.DB, repoId, begun.snapshotId, begun.seq),
@@ -864,6 +871,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         atlasCapabilities: grouping.capabilities,
         atlasUnclassified: grouping.unclassified,
         atlasDescribed: described,
+        atlasPackages: packages,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

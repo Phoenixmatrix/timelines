@@ -472,3 +472,167 @@ export interface AtlasWorkspaceOverview extends AtlasWorkspaceEnvelope {
 
 export type AtlasWorkspaceDetail = InWorkspace<AtlasDetail>;
 export type AtlasWorkspaceAncestors = InWorkspace<AtlasAncestors>;
+
+// ---- cross-repository composition (CORE-167) -----------------------------------
+//
+// Over a workspace scope, capabilities can span repositories, and a capability
+// can depend on another selected repository. Both come only from the selected,
+// readable repositories' own snapshots (worker/atlas/compose.ts), computed when
+// read: nothing is re-extracted and no model runs.
+//
+// A dependency across repositories is `resolved` only with concrete evidence:
+// files of the capability import a package (the knowledge graph's static
+// imports, `pkg:<ecosystem>:<name>`) that the registry's CI publish provenance
+// says exactly one other selected repository publishes, in a feed the caller
+// can read. Anything else is `unresolved` (no selected repository publishes it,
+// or several do), and capabilities that only share canonical concepts are
+// `related`: similarity, never an import, call or dependency.
+
+/** The knowledge graph's view of an imported package: `pkg:<ecosystem>:<name>`. */
+export interface AtlasPackageRef {
+  /** npm, crates, pypi or go: the importing language's ecosystem. */
+  ecosystem: string;
+  name: string;
+}
+
+/** How an import was matched to a registry package (each a fixed, documented rule). */
+export type AtlasResolutionRule =
+  /** npm: the import's package name equals the registry package name. */
+  | "npm-name"
+  /** Rust: `use foo_bar::…` and the cargo crate `foo-bar`/`foo_bar` (Cargo's lib-name rule). */
+  | "cargo-crate"
+  /** Python: the top-level module equals the PEP 503 name with `-` as `_`. */
+  | "pypi-module"
+  /** Go: the import path is the module path or inside it. */
+  | "go-module";
+
+/** The repository that publishes a package, from the registry's CI publish provenance. */
+export interface AtlasPublisher {
+  /** A selected, readable repository: the package names it a source. */
+  repoId: string;
+  /** The registry package: its format, feed (owner key) and name. */
+  registry: { format: string; feed: string; name: string };
+  /** Its latest publish from that repository when the snapshot was built, if any. */
+  publish: {
+    version: string;
+    commit: string | null;
+    ref: string | null;
+    runNumber: number | null;
+    at: string;
+  } | null;
+  rule: AtlasResolutionRule;
+}
+
+/** A source file at a snapshot's commit (inspectable, immutable). */
+export interface AtlasFileRef {
+  repoId: string;
+  commit: string;
+  path: string;
+  blob: string | null;
+}
+
+/** Why a resolved dependency is one. */
+export interface AtlasDependencyEvidence {
+  package: AtlasPackageRef;
+  publisher: AtlasPublisher;
+  /** Files of the source capability that import the package: how many, and the first few by path. */
+  importers: { total: number; files: AtlasFileRef[] };
+  /**
+   * The manifest governing the first importing file (the nearest package.json,
+   * Cargo.toml, pyproject.toml/setup.cfg/setup.py/requirements.txt or go.mod
+   * above it in that snapshot); null when there's none. Located by path only:
+   * the Atlas doesn't read its contents, so it isn't proof of a declaration.
+   */
+  manifest: AtlasFileRef | null;
+}
+
+/**
+ * `resolved`: a dependency with evidence. `unresolved`: an imported package no
+ * selected repository publishes (`no-publisher`: maybe external, maybe outside
+ * this scope; nothing more is known) or several do (`ambiguous`). `related`:
+ * shared canonical concepts only.
+ */
+export type AtlasLinkState = "resolved" | "unresolved" | "related";
+
+export interface AtlasCrossLink {
+  state: AtlasLinkState;
+  /** depends_on (resolved), imports (unresolved package import) or related. */
+  kind: "depends_on" | "imports" | "related";
+  /** A capability (or a repository's unclassified group), namespaced `<repoId>/<id>`. */
+  src: string;
+  /**
+   * resolved: the publishing repository's root (`<repoId>/repo`), since a
+   * package is published by a repository, not a capability. unresolved: the
+   * package entity in the source's snapshot. related: the other capability.
+   */
+  dst: string;
+  package: AtlasPackageRef | null;
+  /** The entity at `dst` (related), or the source (`direction=in`). */
+  neighbor: AtlasEntitySummary | null;
+  /** resolved only. */
+  evidence: AtlasDependencyEvidence | null;
+  /** unresolved only. */
+  unresolved: { reason: "no-publisher" | "ambiguous"; candidates: string[]; files: number } | null;
+  /** related only: the canonical concepts both capabilities share (never a dependency). */
+  concepts: { id: string; name: string }[] | null;
+}
+
+/** A capability spanning repositories, composed from repository capabilities. */
+export interface AtlasCompositeCapability {
+  /** `xcap:<hash of its anchor member's id>`: stable while its anchor stays a member. */
+  id: string;
+  kind: "composite-capability";
+  /** From the concepts its members share; never model prose. */
+  name: string;
+  nameSource: "concepts" | "anchor";
+  /** The largest member (by files, then id), namespaced. */
+  anchor: string;
+  /** Repository ids it spans (at least two). */
+  repos: string[];
+  /**
+   * Its repository capabilities, largest first: each keeps its own name and
+   * prose (summaries are repository-separated, never merged across repositories).
+   */
+  members: AtlasEntitySummary[];
+  /** Files are each counted once: every file has one primary capability in its own repository. */
+  counts: { files: number; capabilities: number; repos: number };
+  /** Concepts shared by at least two members: id, name and how many members have it. */
+  concepts: { id: string; name: string; members: number }[];
+  /**
+   * Why its members belong together: each link pairs a resolved dependency
+   * (`from` imports packages `to`'s repository publishes) with the canonical
+   * concepts both share. Evidence for a dependency: GET /links.
+   */
+  rationale: {
+    from: string;
+    to: string;
+    publisher: string;
+    packages: AtlasPackageRef[];
+    concepts: { id: string; name: string }[];
+  }[];
+  composition: { producer: "atlas/compose"; version: number; evidence: string[] };
+}
+
+/** What a composition read from each selected repository. */
+export interface AtlasCompositionCoverage {
+  repoId: string;
+  /** Capabilities composed (the largest first), of how many the snapshot has. */
+  capabilities: { composed: number; total: number };
+  /**
+   * What the snapshot records the repository publishes: recorded, error (the
+   * registry couldn't be read at build), unrecorded (built before it was
+   * recorded) or none (no Atlas snapshot). Only recorded can resolve.
+   */
+  packages: "recorded" | "error" | "unrecorded" | "none";
+  /** Imported packages considered for resolution, and whether there were more. */
+  imports: { considered: number; truncated: boolean };
+}
+
+/** GET /api/accounts/:owner/atlas/composition */
+export interface AtlasWorkspaceComposition extends AtlasWorkspacePage<AtlasCompositeCapability> {
+  coverage: AtlasCompositionCoverage[];
+  /** Resolved cross-repository dependencies (capability, package) in the scope. */
+  resolved: number;
+  /** Browsing composes with deterministic rules only. */
+  inference: "none";
+}

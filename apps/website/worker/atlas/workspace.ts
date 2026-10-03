@@ -6,6 +6,8 @@
 //   GET /children?repos=…&id=<repoId>/<entity>          one entity's children, as /api/repos/…/atlas
 //   GET /detail | /ancestors | /relations | /evidence   the same, by namespaced id
 //   GET /catalogue?repos=…&q=[&kind=]                   lookup across every selected repository
+//   GET /composition?repos=…                            capabilities spanning repositories (CORE-167)
+//   GET /links?repos=…&id=&state=[&direction=]          a capability's cross-repository links (CORE-167)
 //
 // The scope. A workspace scope is the set of repositories the caller selected
 // (`repos`, names under :owner, at most ATLAS_WORKSPACE_MAX_REPOS) intersected
@@ -28,9 +30,10 @@
 // repository's ids, namespaced `<repoId>/<entity id>`; ids inside `data` stay
 // repository-local. Because every name, summary, count and rationale comes from
 // exactly one repository's projection, no composed prose ever mixes inputs:
-// narrowing the scope just stops reading a repository. Cross-repository
-// capabilities that would need merged prose are CORE-167's, and must recompute
-// from readable inputs or stay repository-separated.
+// narrowing the scope just stops reading a repository. Capabilities spanning
+// repositories and resolved cross-repository dependencies (CORE-167,
+// /composition and /links) are composed from the same readable snapshots by
+// worker/atlas/compose.ts, which keeps prose repository-separated.
 //
 // Why not materialize? A materialized composite would be a cache keyed by the
 // authorized set and principal policy, multiply storage per selection (against
@@ -56,7 +59,10 @@ import {
   ATLAS_OVERVIEW_SUMMARY_CHARS,
   ATLAS_PAGE_DEFAULT,
   ATLAS_WORKSPACE_MAX_REPOS,
+  type AtlasCompositeCapability,
+  type AtlasCompositionCoverage,
   type AtlasCounts,
+  type AtlasCrossLink,
   type AtlasEntitySummary,
   type AtlasErrorCode,
   type AtlasEvidence,
@@ -64,6 +70,7 @@ import {
   type AtlasRelation,
   type AtlasRepoState,
   type AtlasWorkspaceAncestors,
+  type AtlasWorkspaceComposition,
   type AtlasWorkspaceDetail,
   type AtlasWorkspaceEnvelope,
   type AtlasWorkspaceOverview,
@@ -102,6 +109,21 @@ import {
   type RelationKey,
 } from "./projection.ts";
 import { capacityFailure, cursorExpiresAt, pinnedSnapshot } from "./retention.ts";
+import {
+  cachedComposition,
+  composeScope,
+  entitiesAt,
+  importerSamples,
+  limitToFeeds,
+  nearestManifests,
+  packageOf,
+  recordedPackages,
+  unresolvedCount,
+  unresolvedImports,
+  type ResolvedDependency,
+  type ScopeComposition,
+} from "./compose.ts";
+import { readableFeeds } from "./publishers.ts";
 
 export const workspaceAtlas = new Hono<AppEnv>();
 
@@ -826,5 +848,309 @@ workspaceAtlas.get("/catalogue", async (c) => {
         return counts.reduce((a, b) => a + b, 0);
       },
     ),
+  );
+});
+
+// ---- cross-repository composition (CORE-167) -----------------------------------
+
+/**
+ * The scope's composition (worker/atlas/compose.ts) from the snapshots this
+ * request pinned, using only packages in feeds the caller can read now.
+ */
+async function composition(c: C, ctx: Scope<unknown>): Promise<ScopeComposition> {
+  const sources = ctx.read.flatMap((r) =>
+    r.snapshot
+      ? [{ repoId: r.id, scope: r.scope, seq: r.snapshot.seq, snapshotId: r.snapshot.id }]
+      : [],
+  );
+  const recorded = await recordedPackages(
+    c.env.DB,
+    sources.map((s) => s.snapshotId),
+  );
+  const feedIds = [...recorded.values()].flatMap((v) =>
+    v?.status === "recorded" ? v.packages.map((p) => p.feedId) : [],
+  );
+  const readable = await readableFeeds(c.env, c.get("actor"), feedIds);
+  // Names exactly the authorized inputs: the readable repositories (scope),
+  // their pinned snapshots (composite id) and the readable feeds.
+  const key = [ctx.scope, ctx.snapshotId, [...readable].sort().join(",")].join("\u0000");
+  return cachedComposition(key, () =>
+    composeScope(c.env.DB, sources, limitToFeeds(recorded, readable)),
+  );
+}
+
+function coverageOf(ctx: Scope<unknown>, composed: ScopeComposition): AtlasCompositionCoverage[] {
+  const byRepo = new Map(composed.coverage.map((c) => [c.repoId, c]));
+  return ctx.read.map(
+    (r) =>
+      byRepo.get(r.id) ?? {
+        repoId: r.id,
+        capabilities: { composed: 0, total: 0 },
+        packages: "none",
+        imports: { considered: 0, truncated: false },
+      },
+  );
+}
+
+/** Where a composition page stopped: [files, composite id]. */
+type CompositeKey = [number, string];
+
+workspaceAtlas.get("/composition", async (c) => {
+  const limit = limitOf(c);
+  const pinned = await pin<CompositeKey>(c, "composition", {});
+  if (pinned instanceof Response) return pinned;
+  if (limit instanceof Response) return limit;
+  const { ctx } = pinned;
+  const composed = await composition(c, ctx as Scope<unknown>);
+  const after = ctx.cursor?.after ?? null;
+  const rest = after
+    ? composed.composites.filter(
+        (x) => x.counts.files < after[0] || (x.counts.files === after[0] && x.id > after[1]),
+      )
+    : composed.composites;
+  const items = rest.slice(0, limit);
+  const last = items.at(-1);
+  const shaped: AtlasCompositeCapability[] = items.map(({ memberIds, ...x }) => ({
+    ...x,
+    members: memberIds.map((ns) => {
+      const member = composed.capabilities.get(ns)!;
+      return inRepo(member.repoId, lean(member.cap.entity));
+    }),
+  }));
+  const body: AtlasWorkspaceComposition = {
+    ...(await page(
+      c,
+      ctx,
+      ctx.read,
+      shaped,
+      rest.length > limit && last ? ([last.counts.files, last.id] as CompositeKey) : null,
+      async () => composed.composites.length,
+    )),
+    coverage: coverageOf(ctx as Scope<unknown>, composed),
+    resolved: composed.resolved.length,
+    inference: "none",
+  };
+  return c.json(body);
+});
+
+const LINK_STATES = ["resolved", "unresolved", "related"] as const;
+
+/** The importing files and manifest behind resolved dependencies of one source capability. */
+async function dependencyEvidence(
+  d1: D1Database,
+  source: Read & { snapshot: AtlasSnapshot },
+  capability: string | null,
+  deps: ResolvedDependency[],
+): Promise<Map<string, AtlasCrossLink["evidence"]>> {
+  const commit = source.snapshot.vector.find((v) => v.repoId === source.id)?.commit ?? "";
+  const pin = { scope: source.scope, seq: source.snapshot.seq };
+  const samples = await importerSamples(
+    d1,
+    pin,
+    capability,
+    deps.map((d) => d.pkg),
+  );
+  const manifests = await nearestManifests(
+    d1,
+    pin,
+    deps.flatMap((d) => {
+      const first = samples.get(d.pkg)?.[0];
+      const ref = packageOf(d.pkg);
+      return first && ref ? [{ path: first.path, ecosystem: ref.ecosystem }] : [];
+    }),
+  );
+  const out = new Map<string, AtlasCrossLink["evidence"]>();
+  for (const d of deps) {
+    const ref = packageOf(d.pkg)!;
+    const files = samples.get(d.pkg) ?? [];
+    const manifest = files[0] ? manifests.get(`${ref.ecosystem}\u0000${files[0].path}`) : null;
+    out.set(d.pkg, {
+      package: ref,
+      publisher: {
+        repoId: d.publisher.repoId,
+        registry: {
+          format: d.publisher.pkg.format,
+          feed: d.publisher.pkg.feed,
+          name: d.publisher.pkg.name,
+        },
+        publish: d.publisher.pkg.publish,
+        rule: d.publisher.rule,
+      },
+      importers: {
+        total: d.files,
+        files: files.map((f) => ({ repoId: source.id, commit, path: f.path, blob: f.blob })),
+      },
+      manifest: manifest ? { repoId: source.id, commit, ...manifest } : null,
+    });
+  }
+  return out;
+}
+
+workspaceAtlas.get("/links", async (c) => {
+  const raw = c.req.query("id") ?? "";
+  const state = c.req.query("state") || "resolved";
+  const direction = c.req.query("direction") || "out";
+  const limit = limitOf(c);
+  // Every member's snapshot is read, so no single member is "involved".
+  const pinned = await pin<string>(c, "links", { id: raw, state, direction });
+  if (pinned instanceof Response) return pinned;
+  if (!raw) return failWith(c, 400, "bad_request", "Name an entity with ?id=.");
+  if (!(LINK_STATES as readonly string[]).includes(state))
+    return failWith(c, 400, "bad_request", "state is resolved, unresolved or related.");
+  if (direction !== "in" && direction !== "out")
+    return failWith(c, 400, "bad_request", "direction is in or out.");
+  if (limit instanceof Response) return limit;
+  const { ctx } = pinned;
+  const d1 = c.env.DB;
+  const split = splitId(raw, ctx.members);
+  const target = split ? ctx.read.find((r) => r.id === split.member.id) : undefined;
+  if (!split || !target?.snapshot) return failWith(c, 404, "entity_unknown", ENTITY_UNKNOWN);
+  const source = target as Read & { snapshot: AtlasSnapshot };
+  const entity = await entityAt(d1, source.scope, source.snapshot.seq, split.id);
+  if (!entity) return failWith(c, 404, "entity_unknown", ENTITY_UNKNOWN);
+  const isSource = entity.kind === "capability" || entity.id === "group:unclassified";
+  if (direction === "in" ? state !== "resolved" || entity.kind !== "repository" : !isSource)
+    return failWith(
+      c,
+      400,
+      "bad_request",
+      direction === "in"
+        ? "Incoming links are resolved dependencies on a repository (?id=<repoId>/repo)."
+        : "Links start at a capability or a repository's unclassified files.",
+    );
+  if (state === "related" && entity.kind !== "capability")
+    return failWith(c, 400, "bad_request", "Only capabilities have related capabilities.");
+
+  const composed = await composition(c, ctx as Scope<unknown>);
+  const after = ctx.cursor?.after ?? null;
+  const ns = qualify(source.id, entity.id);
+  const capability = entity.kind === "capability" ? entity.id : null;
+  const readOf = (repoId: string) =>
+    ctx.read.find((r) => r.id === repoId && r.snapshot) as
+      | (Read & { snapshot: AtlasSnapshot })
+      | undefined;
+  const respond = (items: AtlasCrossLink[], next: string | null, total: () => Promise<number>) =>
+    page(c, ctx, ctx.read, items, next, total).then((body) => c.json(body));
+
+  if (state === "resolved" && direction === "out") {
+    const all = composed.resolved.filter((d) => d.src === ns);
+    const rest = after ? all.filter((d) => d.pkg > after) : all;
+    const items = rest.slice(0, limit);
+    const evidence = await dependencyEvidence(d1, source, capability, items);
+    const roots = new Map<string, AtlasCrossLink["neighbor"]>();
+    for (const repoId of new Set(items.map((d) => d.publisher.repoId))) {
+      const publisher = readOf(repoId);
+      const root = publisher
+        ? (
+            await entitiesAt(d1, { scope: publisher.scope, seq: publisher.snapshot.seq }, ["repo"])
+          ).get("repo")
+        : undefined;
+      roots.set(repoId, root ? inRepo(repoId, lean(root)) : null);
+    }
+    return respond(
+      items.map((d) => ({
+        state: "resolved",
+        kind: "depends_on",
+        src: ns,
+        dst: qualify(d.publisher.repoId, "repo"),
+        package: packageOf(d.pkg),
+        neighbor: roots.get(d.publisher.repoId) ?? null,
+        evidence: evidence.get(d.pkg) ?? null,
+        unresolved: null,
+        concepts: null,
+      })),
+      rest.length > limit ? (items.at(-1)?.pkg ?? null) : null,
+      async () => all.length,
+    );
+  }
+
+  if (state === "resolved") {
+    // Incoming: capabilities of other repositories depending on this one's packages.
+    const key = (d: ResolvedDependency) => `${d.src}\u0000${d.pkg}`;
+    const all = composed.resolved.filter((d) => d.publisher.repoId === source.id);
+    const rest = after ? all.filter((d) => key(d) > after) : all;
+    const items = rest.slice(0, limit);
+    const groups = new Map<string, ResolvedDependency[]>();
+    for (const d of items) groups.set(d.src, [...(groups.get(d.src) ?? []), d]);
+    const evidence = new Map<string, AtlasCrossLink["evidence"]>();
+    const neighbors = new Map<string, AtlasCrossLink["neighbor"]>();
+    for (const [src, deps] of groups) {
+      const importer = readOf(deps[0]!.repoId);
+      if (!importer) continue;
+      for (const [pkg, e] of await dependencyEvidence(d1, importer, deps[0]!.capability, deps))
+        evidence.set(`${src}\u0000${pkg}`, e);
+      const local = src.slice(importer.id.length + 1);
+      const found = (
+        await entitiesAt(d1, { scope: importer.scope, seq: importer.snapshot.seq }, [local])
+      ).get(local);
+      neighbors.set(src, found ? inRepo(importer.id, lean(found)) : null);
+    }
+    return respond(
+      items.map((d) => ({
+        state: "resolved",
+        kind: "depends_on",
+        src: d.src,
+        dst: ns,
+        package: packageOf(d.pkg),
+        neighbor: neighbors.get(d.src) ?? null,
+        evidence: evidence.get(key(d)) ?? null,
+        unresolved: null,
+        concepts: null,
+      })),
+      rest.length > limit && items.length ? key(items.at(-1)!) : null,
+      async () => all.length,
+    );
+  }
+
+  if (state === "unresolved") {
+    const exclude = [...(composed.settled.get(source.id) ?? [])].sort();
+    const pin = { scope: source.scope, seq: source.snapshot.seq };
+    const result = await unresolvedImports(d1, pin, entity.id, exclude, after, limit);
+    return respond(
+      result.rows.map((r) => {
+        const resolution = composed.index.resolve(r.pkg, source.id);
+        return {
+          state: "unresolved",
+          kind: "imports",
+          src: ns,
+          dst: qualify(source.id, r.pkg),
+          package: packageOf(r.pkg),
+          neighbor: null,
+          evidence: null,
+          unresolved:
+            resolution.state === "ambiguous"
+              ? { reason: "ambiguous", candidates: resolution.candidates, files: r.files }
+              : { reason: "no-publisher", candidates: [], files: r.files },
+          concepts: null,
+        };
+      }),
+      result.next,
+      () => unresolvedCount(d1, pin, entity.id, exclude),
+    );
+  }
+
+  // Related: shared canonical concepts, never a dependency. Strongest first;
+  // the list is fixed for the pinned snapshot, so a page continues after its
+  // last neighbor.
+  const all = composed.related.get(ns) ?? [];
+  const rest = after ? all.slice(all.findIndex((r) => r.id === after) + 1) : all;
+  const items = rest.slice(0, limit);
+  return respond(
+    items.map((r) => {
+      const other = composed.capabilities.get(r.id)!;
+      return {
+        state: "related",
+        kind: "related",
+        src: ns,
+        dst: r.id,
+        package: null,
+        neighbor: inRepo(other.repoId, lean(other.cap.entity)),
+        evidence: null,
+        unresolved: null,
+        concepts: r.concepts,
+      };
+    }),
+    rest.length > limit ? (items.at(-1)?.id ?? null) : null,
+    async () => all.length,
   );
 });

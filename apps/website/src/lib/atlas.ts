@@ -1,6 +1,7 @@
 // A typed client for the Atlas read API (worker/atlas/api.ts, CORE-160), and
 // for the same pages over an explicit workspace scope (worker/atlas/workspace.ts,
-// CORE-161) as `atlasWorkspaceApi`.
+// CORE-161) as `atlasWorkspaceApi`, with capabilities spanning repositories and
+// their cross-repository links (CORE-167).
 //
 // Every call can pin a snapshot; continuing a page passes its `next` cursor,
 // which pins its own. Failures throw an ApiError whose `code` is an
@@ -10,16 +11,19 @@
 
 import type {
   AtlasAncestors,
+  AtlasCrossLink,
   AtlasDetail,
   AtlasDirection,
   AtlasEntitySummary,
   AtlasErrorCode,
   AtlasEvidence,
+  AtlasLinkState,
   AtlasOverview,
   AtlasPage,
   AtlasRegion,
   AtlasRelation,
   AtlasWorkspaceAncestors,
+  AtlasWorkspaceComposition,
   AtlasWorkspaceDetail,
   AtlasWorkspaceOverview,
   AtlasWorkspacePage,
@@ -97,6 +101,27 @@ export const atlasApi = {
       repo,
       "catalogue",
       { q, kind: request.kind, ...paged(request) },
+      request,
+    ),
+  /** Capabilities spanning the selected repositories, largest first. */
+  composition: (workspace: AtlasWorkspace, request: AtlasPageRequest = {}) =>
+    getIn<AtlasWorkspaceComposition>(workspace, "composition", paged(request), request),
+  /**
+   * A capability's (or a repository's unclassified files') cross-repository
+   * links: `resolved` dependencies with evidence, `unresolved` package
+   * imports, or `related` capabilities (shared concepts, not a dependency).
+   * `direction: "in"` lists resolved dependencies on a repository (`<repoId>/repo`).
+   */
+  links: (
+    workspace: AtlasWorkspace,
+    id: string,
+    state: AtlasLinkState,
+    request: AtlasPageRequest & { direction?: AtlasDirection } = {},
+  ) =>
+    getIn<AtlasWorkspacePage<AtlasCrossLink>>(
+      workspace,
+      "links",
+      { id, state, direction: request.direction, ...paged(request) },
       request,
     ),
 };
@@ -182,6 +207,27 @@ export const atlasWorkspaceApi = {
       workspace,
       "catalogue",
       { q, kind: request.kind, ...paged(request) },
+      request,
+    ),
+  /** Capabilities spanning the selected repositories, largest first. */
+  composition: (workspace: AtlasWorkspace, request: AtlasPageRequest = {}) =>
+    getIn<AtlasWorkspaceComposition>(workspace, "composition", paged(request), request),
+  /**
+   * A capability's (or a repository's unclassified files') cross-repository
+   * links: `resolved` dependencies with evidence, `unresolved` package
+   * imports, or `related` capabilities (shared concepts, not a dependency).
+   * `direction: "in"` lists resolved dependencies on a repository (`<repoId>/repo`).
+   */
+  links: (
+    workspace: AtlasWorkspace,
+    id: string,
+    state: AtlasLinkState,
+    request: AtlasPageRequest & { direction?: AtlasDirection } = {},
+  ) =>
+    getIn<AtlasWorkspacePage<AtlasCrossLink>>(
+      workspace,
+      "links",
+      { id, state, direction: request.direction, ...paged(request) },
       request,
     ),
 };

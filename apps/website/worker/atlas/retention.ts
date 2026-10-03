@@ -11,7 +11,9 @@
 //   not built yet) must share ONE 2 GiB pool per account, lineage and
 //   provenance included, so changing scope can't multiply the allowance: pass
 //   all of an account's composition scopes to `enforceRetention` together with
-//   ACCOUNT_COMPOSITION_RETENTION. The pool is the hook; nothing calls it yet.
+//   ACCOUNT_COMPOSITION_RETENTION. The pool is the hook; nothing calls it yet:
+//   cross-repository composition (CORE-167, compose.ts) is computed at read
+//   from repository snapshots and stores nothing.
 // - Under pressure the oldest prior (by publication) is evicted first, one at a
 //   time, and its rows reclaimed before the pool is measured again. Current is
 //   never evicted: a snapshot that doesn't fit even with every prior gone fails

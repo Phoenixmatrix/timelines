@@ -1324,9 +1324,42 @@ composite id `ws1.<tag>.<seq per repository>` pins them all and each is
 resolved through retention on every page. Nothing composed mixes repositories:
 every name, summary and count comes from one repository's projection, so
 narrowing the scope can't leave a hidden repository's labels behind.
-Materialized composites (cross-repository capabilities, CORE-167) must keep
-that property, recomputing from readable inputs, and would draw on the 2 GiB
-account composition pool; virtual composition stores nothing.
+Virtual composition stores nothing.
+
+**Cross-repository composition** (`worker/atlas/compose.ts`, CORE-167,
+`COMPOSITION_VERSION`). Over a workspace scope,
+`/api/accounts/:owner/atlas/composition?repos=…` pages capabilities spanning
+repositories, and `/links?repos=…&id=<repoId>/<capability>&state=resolved|unresolved|related`
+(`direction=in` with `id=<repoId>/repo` for dependents of a repository) pages
+one capability's cross-repository links (`atlasWorkspaceApi.composition` and
+`.links`). A dependency is **resolved** only with concrete evidence: files of
+the capability import a package (the graph's static `pkg:<ecosystem>:<name>`
+imports) that the registry's CI publish provenance (`package_sources`, latest
+`publishes` row) says exactly one other selected repository publishes, in a
+feed the caller can read, matched by a fixed per-format rule (npm name, cargo
+crate, PyPI module, Go module path). Each carries its package, publisher (feed,
+version, commit, run), importing files at the indexed commit and the nearest
+manifest above them (located by path, not read). Otherwise an import is
+**unresolved** (`no-publisher`, or `ambiguous` with the candidates), and
+capabilities sharing canonical concepts without a dependency are only
+**related**. A capability depending on another repository is linked to that
+repository's capability sharing the most concepts; linked capabilities form a
+composite (`xcap:<hash of its anchor>`), named from shared concepts, with each
+member keeping its own prose (never merged across repositories). No model runs.
+
+What a repository publishes is frozen into each repository snapshot at build
+(`atlas-packages` step, `atlas_snapshots.packages`, `worker/atlas/publishers.ts`),
+so pinned pages resolve against the same facts; snapshots from before it say
+`unrecorded` (an up-to-date build re-projects them). The composition is computed
+when read, not materialized: inputs are each readable repository's pinned
+snapshot (at most 200 capabilities and 5,000 package-import rows each, with
+coverage reported), and a per-isolate cache is keyed by the scope id, composite
+snapshot id and readable feeds, i.e. exactly the authorized inputs. A denied
+repository is never read, so every response is byte-identical to a selection
+without it. Materializing would multiply snapshots per selection and principal
+policy inside the one 2 GiB account composition pool and need invalidation on
+every visibility change; computing needs neither, so the pool stays unused and
+no account grouping budget is drawn.
 
 Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
