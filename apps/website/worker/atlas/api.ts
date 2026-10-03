@@ -38,6 +38,7 @@ import {
   type AtlasEntity,
   type AtlasDescription,
   type AtlasEntitySummary,
+  type AtlasLayout,
   type AtlasError,
   type AtlasErrorCode,
   type AtlasEvidence,
@@ -133,7 +134,15 @@ export function lean(entity: ProjectedEntity): AtlasEntitySummary {
     counts: countsOf(entity.data),
     structural: entity.kind === "group" || entity.data.structural === true,
     ...summaryStateOf(entity.data),
+    ...(entity.since === undefined ? {} : { since: entity.since }),
+    ...layoutOf(entity.data),
   };
+}
+
+function layoutOf(data: Record<string, unknown>): Pick<AtlasEntitySummary, "layout"> {
+  const l = data.layout as AtlasLayout | undefined;
+  if (!l || typeof l !== "object" || typeof l.slot !== "number") return {};
+  return { layout: { slot: l.slot, col: l.col, row: l.row, bucket: l.bucket, fill: l.fill } };
 }
 
 /** A described entity's summary state (CORE-164), so lists can label stale or missing prose. */

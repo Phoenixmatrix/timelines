@@ -86,6 +86,8 @@ export interface AtlasEntity {
   path: string | null;
   summary: string;
   data: Record<string, unknown>;
+  /** The snapshot this entity's row was written in (reads only). */
+  since?: number;
 }
 
 type Statement = { compile(): { sql: string; parameters: readonly unknown[] } };
@@ -1178,6 +1180,7 @@ function toEntity(row: {
   path: string | null;
   summary: string;
   data: string;
+  from_seq?: number;
 }): AtlasEntity {
   return {
     id: row.entity_id,
@@ -1187,6 +1190,9 @@ function toEntity(row: {
     path: row.path,
     summary: row.summary,
     data: JSON.parse(row.data) as Record<string, unknown>,
+    // The snapshot its current row was written in: equal to the snapshot
+    // read, it changed in that build.
+    ...(row.from_seq === undefined ? {} : { since: Number(row.from_seq) }),
   };
 }
 
@@ -1199,7 +1205,7 @@ export async function entityAt(
 ): Promise<AtlasEntity | null> {
   const row = await d1
     .prepare(
-      `SELECT entity_id, kind, parent_id, name, path, summary, data FROM atlas_entities
+      `SELECT entity_id, kind, parent_id, name, path, summary, data, from_seq FROM atlas_entities
        WHERE scope = ? AND entity_id = ? AND ${VISIBLE}`,
     )
     .bind(scope, id, seq, seq)
@@ -1218,7 +1224,7 @@ export async function childrenAt(
 ): Promise<{ entities: AtlasEntity[]; next: string | null }> {
   const rows = await d1
     .prepare(
-      `SELECT entity_id, kind, parent_id, name, path, summary, data, sort_key FROM atlas_entities
+      `SELECT entity_id, kind, parent_id, name, path, summary, data, from_seq, sort_key FROM atlas_entities
        WHERE scope = ? AND parent_id = ? AND sort_key > ? AND ${VISIBLE}
        ORDER BY sort_key LIMIT ?`,
     )
@@ -1257,7 +1263,7 @@ export async function edgesAt(
 // reading what its snapshot published whatever has been written since.
 
 type EntityRow = Parameters<typeof toEntity>[0];
-const ENTITY_COLUMNS = "entity_id, kind, parent_id, name, path, summary, data";
+const ENTITY_COLUMNS = "entity_id, kind, parent_id, name, path, summary, data, from_seq";
 /** VISIBLE for a joined table. */
 const visibleAs = (alias: string) =>
   `${alias}.from_seq <= ? AND (${alias}.to_seq IS NULL OR ${alias}.to_seq > ?)`;
@@ -1373,7 +1379,7 @@ export async function ancestorsAt(
            ON e.scope = ?1 AND e.entity_id = up.id AND e.from_seq <= ?3 AND (e.to_seq IS NULL OR e.to_seq > ?3)
          WHERE up.depth <= ?4
        )
-       SELECT e.entity_id, e.kind, e.parent_id, e.name, e.path, e.summary, e.data, up.depth
+       SELECT e.entity_id, e.kind, e.parent_id, e.name, e.path, e.summary, e.data, e.from_seq, up.depth
        FROM up JOIN atlas_entities e
          ON e.scope = ?1 AND e.entity_id = up.id AND e.from_seq <= ?3 AND (e.to_seq IS NULL OR e.to_seq > ?3)
        ORDER BY up.depth DESC`,

@@ -58,6 +58,20 @@ export interface AtlasCountsData {
   [key: string]: number | undefined;
 }
 
+/**
+ * A region's cell in its parent's fixed-width grid: kept while its id
+ * continues, so regions appearing, growing or leaving never move another.
+ * `fill` (0..1) is the share of the cell its size covers, from a power-of-two
+ * `bucket` of its primary file count.
+ */
+export interface AtlasLayout {
+  slot: number;
+  col: number;
+  row: number;
+  bucket: number;
+  fill: number;
+}
+
 /** An entity as lists show it. */
 export interface AtlasEntitySummary {
   id: string;
@@ -76,6 +90,13 @@ export interface AtlasEntitySummary {
    * the stale prose with its original basis in `data.description`.
    */
   summaryState?: { status: AtlasDescriptionStatus; reason?: AtlasUnavailableReason };
+  /**
+   * The snapshot sequence this entity last changed in: equal to the snapshot
+   * being read, it changed in that build (the map's change marker).
+   */
+  since?: number;
+  /** Stable grid placement under its parent (CORE-165); capabilities and areas. */
+  layout?: AtlasLayout;
   /**
    * In a workspace scope, the repository it belongs to: ids (and parentId)
    * are then `<repoId>/<repository-local id>`. Ids inside `data` stay
