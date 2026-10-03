@@ -18,6 +18,7 @@ import { sql } from "kysely";
 import type { AppEnv } from "../auth.ts";
 import { upstreamToken } from "../artifacts.ts";
 import { jobCaller, jobSecret } from "../deployments/job.ts";
+import { PreviewModeError, productionOnly } from "../preview.ts";
 import { batch, db } from "../schema.ts";
 import type { StoredJob } from "./jobs.ts";
 import { startWorkflow } from "./trigger.ts";
@@ -83,6 +84,9 @@ export async function startMergeRun(
     actor: { id: string; agentId: string | null } | null;
   },
 ): Promise<{ number: number }> {
+  // CI_RUN is production's Workflow: a preview can't run the merge, so it can't land.
+  if (!productionOnly(env, "workflow", `the merge run of landing ${options.landingId}`))
+    throw new PreviewModeError("workflow", "Previews don't run CI, so nothing lands in one.");
   const kdb = db(env.DB);
   const spec: LandingJobSpec = {
     needs: [],

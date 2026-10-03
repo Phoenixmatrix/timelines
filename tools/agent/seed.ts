@@ -65,10 +65,71 @@ export async function seed(ctx: HarnessContext): Promise<SeedManifest> {
     ctx.env.XDG_CONFIG_HOME !== join(directory, "config")
   )
     throw new Error("Seed paths must belong to this exact worktree environment.");
+  const { tokens, readToken } = await seedFixtures({
+    id,
+    secret,
+    origin: ctx.origin,
+    gm: ctx.gm,
+    dir: ctx.dir,
+    work: ctx.work,
+    env: ctx.env,
+  });
+  const manifest: SeedManifest = {
+    version: 1,
+    origin: ctx.origin,
+    tokens,
+    readToken,
+    repos,
+    tracker,
+  };
+  await privateJson(join(ctx.dir, "seed.json"), manifest);
+  const configDirectory = join(directory, "config", "gitmatrix");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await privateJson(join(configDirectory, "gm.json"), {
+    server: ctx.origin,
+    token: tokens.priya,
+    user: "priya",
+  });
+  return manifest;
+}
+
+/**
+ * A server to reconcile the fixtures against: one that runs with DEV_MODE and
+ * reports `id` from /api/dev/environment, which it guards with `secret` (its
+ * AGENT_ID and AGENT_SECRET). The agent harness's loopback environments are
+ * one; timeline previews (tools/preview) are the other.
+ */
+export interface FixtureTarget {
+  id: string;
+  secret: string;
+  origin: string;
+  /** The gm executable that clones and pushes the fixture repositories. */
+  gm: string;
+  /** Private state: the token journal, and gm's config, cache and data. */
+  dir: string;
+  /** Where disposable clones go. */
+  work: string;
+  env: NodeJS.ProcessEnv;
+  /** Sent with every API request, e.g. a preview's access key (worker/preview-gate.ts). */
+  headers?: Record<string, string>;
+}
+
+/**
+ * Reconcile the deterministic fixtures, idempotently: persona tokens, the
+ * sample repositories with their pinned contents, and the tracker fixtures.
+ */
+export async function seedFixtures(
+  ctx: FixtureTarget,
+): Promise<{ tokens: Record<Persona, string>; readToken: string }> {
+  const { id, secret } = ctx;
   async function request<T>(path: string, token: string, body?: unknown): Promise<T> {
     const response = await fetch(`${ctx.origin}/api${path}`, {
       method: body === undefined ? "GET" : "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: {
+        ...ctx.headers,
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(120_000),
       redirect: "error",
@@ -240,21 +301,5 @@ export async function seed(ctx: HarnessContext): Promise<SeedManifest> {
   };
   // The tracker applies the batch atomically and deduplicates this exact receipt.
   await request("/tracker/orbit/mutate", tokens.marco, mutation);
-  const manifest: SeedManifest = {
-    version: 1,
-    origin: ctx.origin,
-    tokens,
-    readToken: journal.readToken,
-    repos,
-    tracker,
-  };
-  await privateJson(join(ctx.dir, "seed.json"), manifest);
-  const configDirectory = join(directory, "config", "gitmatrix");
-  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
-  await privateJson(join(configDirectory, "gm.json"), {
-    server: ctx.origin,
-    token: tokens.priya,
-    user: "priya",
-  });
-  return manifest;
+  return { tokens, readToken: journal.readToken };
 }

@@ -388,6 +388,7 @@ async function gates(): Promise<void> {
     ["check", "vp", ["check"]],
     ["cli-check", "vp", ["run", "--no-cache", "cli#check"]],
     ["types", "vp", ["run", "--no-cache", "@gitmatrix/agent#typecheck"]],
+    ["preview-types", "vp", ["run", "--no-cache", "@gitmatrix/preview#typecheck"]],
     ["website-types", "vp", ["run", "--no-cache", "website#typecheck"]],
     ["tests", "vp", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "test"]],
     ["build", "vp", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "build"]],

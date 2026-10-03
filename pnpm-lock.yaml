@@ -556,6 +556,15 @@ importers:
         specifier: 'catalog:'
         version: 7.0.2
 
+  tools/preview:
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.19.0
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+
 packages:
 
   '@ai-sdk/gateway@4.0.103':

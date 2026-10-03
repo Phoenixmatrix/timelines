@@ -30,6 +30,7 @@ export default defineConfig({
       "registry/**/*.test.ts",
       "src/**/*.test.ts",
       "shared/**/*.test.ts",
+      "vite/**/*.test.ts",
     ],
   },
 });

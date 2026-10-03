@@ -17,9 +17,15 @@
 # `vp run ready` gates work before it lands; `instance` is ignored there. The
 # live gate provisions dedicated resources; its finally cleanup and the hourly
 # janitor both apply.
+#
+# Previews (CORE-80): each checkpoint of a timeline gets a preview of the app
+# (`on: preview`, the preview and preview-teardown jobs below), the reference
+# implementation of the preview contract; apps/website/README.md, "Gitmatrix's
+# own previews". Preview runs run only those two jobs.
 on:
   push:
     coalesce_after: 4
+  preview: {}
 
 # Four independent jobs must not each launch 24 compiler workers on this host.
 # Leave CPU capacity for JavaScript tests and the live server during cold builds.
@@ -38,7 +44,9 @@ jobs:
       - name: Format, lint, type check
         run: vp check
       - name: All application and harness type contracts
-        run: vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
+        run: >-
+          vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
+          && vp run --no-cache @gitmatrix/preview#typecheck
 
   test:
     instance: standard-4
@@ -78,7 +86,7 @@ jobs:
         run: vp run --no-cache cli#test
 
   e2e:
-    if: runner == "local"
+    if: runner == "local" && trigger != "preview"
     timeout_minutes: 30
     steps:
       - name: Install
@@ -92,7 +100,8 @@ jobs:
   # rest has shipped; deploy it from a machine with Docker (`vp run deploy`).
   deploy:
     needs: [check, test, build, cli]
-    if: branch == "main" && runner == "sandbox"
+    # A preview run on main (a landed timeline's teardown or revival) must never deploy.
+    if: branch == "main" && runner == "sandbox" && trigger != "preview"
     # One deploy at a time, and a waiting deploy gives way to a newer push's: a
     # burst of pushes deploys once, from the newest commit.
     concurrency: production
@@ -112,3 +121,37 @@ jobs:
         run: node tools/agent/publish-cli.ts
       - name: Deploy what changed
         run: node tools/agent/deploy.ts
+
+  # A timeline's preview, at each checkpoint and on revival: one Worker Preview
+  # per timeline (timeline-<slug>), rebuilt from the checkpoint's commit on
+  # fresh D1s (migrations plus seed), its own bucket and Artifacts namespace,
+  # and the agent fixtures; then recorded with `gm deploy record`. Sandbox
+  # only: a local server's previews would deploy from a development machine.
+  # One create at a time per repository; a waiting create gives way to the
+  # timeline's newer one. See tools/preview/preview.ts.
+  preview:
+    if: trigger == "preview" && action == "create" && runner == "sandbox"
+    concurrency: preview
+    instance: standard-4
+    timeout_minutes: 40
+    secrets: [CLOUDFLARE_API_TOKEN]
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Deploy the timeline's preview
+        run: node tools/preview/preview.ts create
+
+  # When a timeline's previews expire: delete the Preview, its D1s, bucket and
+  # Artifacts namespace. Gitmatrix has already marked the records expired.
+  preview-teardown:
+    if: trigger == "preview" && action == "teardown" && runner == "sandbox"
+    secrets: [CLOUDFLARE_API_TOKEN]
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Delete the timeline's preview
+        run: node tools/preview/preview.ts teardown

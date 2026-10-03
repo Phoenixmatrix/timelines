@@ -18,6 +18,7 @@ import { deviceAuthorization } from "better-auth/plugins/device-authorization";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import { readSecret } from "../registry/core/secrets.ts";
 import { RESERVED_SLUGS } from "./names.ts";
+import { isPreview, productionOnly } from "./preview.ts";
 import { db } from "./schema.ts";
 
 /** The only device client: the gm CLI. */
@@ -156,7 +157,12 @@ export async function recordFailure(env: Env, keys: string[]) {
 /** Sign-in paths whose failures count: wrong codes and wrong device codes. */
 const GUARDED = new Set(["/sign-in/email-otp", "/device", "/device/approve", "/device/deny"]);
 
-async function sendCode(env: Env, email: string, otp: string) {
+/** Email a sign-in code. A preview sends none: its people are the seeded personas. */
+export async function sendCode(env: Env, email: string, otp: string) {
+  if (!productionOnly(env, "email", "a sign-in code"))
+    throw new APIError("BAD_REQUEST", {
+      message: "Previews send no email. Sign in as one of the personas instead.",
+    });
   if (Reflect.get(env, "DEV_MODE") === "true")
     console.log(`[auth] sign-in code for ${email}: ${otp}`);
   await env.EMAIL.send({
@@ -203,8 +209,9 @@ export function authOptions(env: Env, secret: string, origin?: string) {
         expiresIn: 600,
         allowedAttempts: 5,
         async sendVerificationOTP({ email, otp }) {
-          // Unknown addresses get the same answer as known ones.
-          if (await mayJoin(env, email)) await sendCode(env, email, otp);
+          // Unknown addresses get the same answer as known ones (and in a
+          // preview, every address hears that it sends no email).
+          if (isPreview(env) || (await mayJoin(env, email))) await sendCode(env, email, otp);
         },
       }),
       deviceAuthorization({

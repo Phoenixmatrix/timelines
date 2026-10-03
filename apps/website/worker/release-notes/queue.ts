@@ -7,6 +7,7 @@ import type { MutationResult } from "../../shared/tracker.ts";
 import { semanticFeed } from "../semantic/feed.ts";
 import { semanticCache } from "../semantic/api.ts";
 import { RepoReader } from "../objects.ts";
+import { productionOnly } from "../preview.ts";
 import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
@@ -23,7 +24,7 @@ const LEASE_MS = 14 * 60_000;
 
 /** Lazily rebuild old derived data; the dirty mark coalesces concurrent reads. */
 export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void> {
-  if (!env.AI) return;
+  if (!env.AI || !productionOnly(env, "queue", "release notes")) return;
   const claimed = await db(env.DB)
     .insertInto("release_note_state")
     .values({ repo_id: repoId, dirty: 1, status: "generating" })
@@ -55,7 +56,7 @@ export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void
 /** Something a repository's release notes depend on changed. */
 export async function notifyReleaseNotes(env: Env, repoId: string): Promise<void> {
   // Automatic non-AI agent environments omit provider bindings altogether.
-  if (!env.AI) return;
+  if (!env.AI || !productionOnly(env, "queue", "release notes")) return;
   await db(env.DB)
     .insertInto("release_note_state")
     .values({ repo_id: repoId, dirty: 1 })

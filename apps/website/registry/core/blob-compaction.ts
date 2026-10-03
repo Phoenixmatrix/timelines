@@ -8,6 +8,7 @@ import {
   type BlobFrame,
   type BlobManifest,
 } from "./blob-storage.ts";
+import { productionOnly } from "../../worker/preview.ts";
 import type { Services } from "./context.ts";
 
 const LEASE_MS = 5 * 60_000;
@@ -39,6 +40,8 @@ export function chooseFullSnapshot(
 }
 
 export async function requestCompaction(services: Services): Promise<void> {
+  // gitmatrix-registry-jobs is production's queue; a preview leaves blobs uncompacted.
+  if (!productionOnly(services.env, "queue", "blob compaction")) return;
   // Publication state is already committed by attachment triggers. Cron recovers failed sends.
   try {
     await services.env.REGISTRY_JOBS.send({ type: "compact-sweep" });

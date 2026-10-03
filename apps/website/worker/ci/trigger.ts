@@ -9,6 +9,7 @@ import type { InferResult } from "kysely";
 import { listRefs } from "../artifacts.ts";
 import type { Actor } from "../db.ts";
 import { RepoReader } from "../objects.ts";
+import { PreviewModeError, productionOnly } from "../preview.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import {
@@ -69,6 +70,8 @@ async function pipelineAt(
 
 /** Start a recorded run's Workflow. */
 export async function startWorkflow(env: Env, runId: string) {
+  if (!productionOnly(env, "workflow", `CI run ${runId}`))
+    throw new PreviewModeError("workflow", "Previews don't run CI.");
   await env.CI_RUN.create({ id: runId, params: { runId } satisfies RunParams });
 }
 
@@ -96,6 +99,9 @@ export async function startRun(
     runId?: string;
   },
 ): Promise<{ runId: string; number: number } | { skipped: string }> {
+  // CI_RUN is production's Workflow: a preview records no runs at all.
+  if (!productionOnly(env, "workflow", `a ${options.trigger} run of ${options.branch}`))
+    return { skipped: "Previews don't run CI." };
   const preview = options.trigger === "preview" ? (options.preview ?? null) : null;
   if (options.trigger === "preview" && !preview)
     throw new Error("A preview run needs its action and timeline.");

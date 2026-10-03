@@ -1604,6 +1604,8 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   `runner == "local"` (it is too expensive per push), so `vp run ready` is its
   gate. No job consumes another's artifacts, and keeping them in one stage avoids
   a scheduler barrier. Real AI verification is an explicit agent command.
+  Checkpoints of a timeline get a preview of the app
+  ([Gitmatrix's own previews](#gitmatrixs-own-previews)).
 - **Both runners report the same way** (`worker/ci/jobs.ts`): batched log
   chunks, step transitions, the end. Secret values are masked server-side; a
   cancelled job is told so in the reply to its next report and kills its
@@ -1738,6 +1740,145 @@ from the commit with migrations plus seed and can differ from the original if
 the toolchain or seed changed. A revived preview's clock starts at the
 revival: it lasts `endedDays` after it for an ended timeline, `idleDays`
 otherwise.
+
+#### Gitmatrix's own previews
+
+This repository implements the contract for itself (CORE-80;
+`TIMELINES-RESEARCH.md`, "Gitmatrix's own previews: the reference
+implementation"), as a worked example any project could copy. It uses only
+what every project has: `on: preview`, the job variables and credential, a
+repository secret, `cf`, and `gm deploy record`.
+
+**Asking for a preview.** A Gitmatrix timeline asks by making a checkpoint
+(`gm timeline checkpoint`). Gitmatrix then starts a `create` run, and the
+`preview` job in `.gitmatrix/ci.yml` builds a preview of that checkpoint. There
+is nothing else to switch on: checkpoints are what reviewers approve, so a
+timeline that never makes one never pays for a preview. Revival works the same way.
+
+```
+checkpoint ─▶ preview run (create) ─▶ preview job ─▶ node tools/preview/preview.ts create
+   1. tear down whatever an earlier create left (as below)
+   2. fresh D1s: gitmatrix-preview-<slug> (migrations, then seed/) and
+      gitmatrix-preview-registry-<slug> (registry/migrations)
+   3. an R2 bucket and an Artifacts namespace: gitmatrix-preview-<slug>
+   4. cf previews deploy timeline-<slug>, in preview mode, bound to 2–3
+   5. the agent fixtures (tools/agent/seed.ts) through the preview's own API
+   6. gm deploy record --url <URL>/?preview_key=<key>   → timeline/<slug>, at the checkpoint
+expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … preview.ts teardown
+   delete the Preview (Cloudflare API: `cf previews` can only deploy),
+   then the D1s, the bucket (emptied first) and the namespace (repositories first)
+```
+
+- **One preview per timeline.** The Worker Preview is named
+  `timeline-<slug>`, so its URL stays the same from one checkpoint to the next
+  and shows the newest. Every name derives from the slug alone (long slugs are
+  shortened and given a hash to fit Cloudflare's 63-character limits), so a
+  create after an expiry, a revival or a failed run finds and replaces what an
+  earlier run left, and teardown deletes exactly what create made.
+- **Fresh data every time.** Each create starts with a teardown. A preview is
+  the checkpoint's code on migrations plus seed: the personas, Orbit Labs,
+  their sample repositories and tracker fixtures, the same ones `agent seed`
+  makes (`seedFixtures` in `tools/agent/seed.ts`). Nothing carries over from an
+  earlier checkpoint, including the Preview's own Durable Objects. Email is
+  off, so people sign in as a persona (`DEV_MODE`), as in development, once
+  they are past the access gate (below).
+- **Only in production CI.** Both jobs require `runner == "sandbox"`, so a
+  local server's preview runs deploy nothing. Creates share the `preview`
+  concurrency group: one at a time per repository, and a waiting create gives
+  way to a newer one for the same timeline. The jobs use the deploy job's
+  `CLOUDFLARE_API_TOKEN` (D1, R2, Artifacts and Workers edit). `gm` comes from
+  the job owner's generic registry (the newest gm main published, checked
+  against its SHA-256) unless `GITMATRIX_PREVIEW_GM` names one.
+- **A failed create** records the checkpoint's preview as `failed`, and the
+  job fails. Re-run it, or revive the checkpoint.
+
+**The access link.** Persona sign-in needs no password, so a preview's URL
+alone opens nothing. Every request, static assets included, passes the gate
+in `worker/preview-gate.ts` first, or gets a 401 page ("This preview needs its
+access link; open it from the deployment in Gitmatrix."). It passes with the
+preview's access key, which tools/preview derives from the secret it generates
+for each create (`previewKey` in `vite/preview.ts`; the key is never the
+secret itself), presented in one of three ways:
+
+- `?preview_key=<key>` on a page visit, which sets the `gm_preview` cookie
+  (HttpOnly, Secure, SameSite=Lax, this host only) and redirects to the same
+  page without the key;
+- the `gm_preview` cookie;
+- the `x-preview-key` header, which tools/preview's seeding sends.
+
+Keys compare in constant time. A request with a live personal access token
+passes too: tokens are only ever minted behind the gate (persona sign-in, the
+`/api/dev` routes), and gm, which pushes the fixture repositories, can't send
+other headers. The API, git, persona sign-in and `/api/dev/environment` all
+sit behind the gate. A preview without a key lets nothing through.
+
+**The recorded link is a capability.** tools/preview records the preview as
+`<URL>/?preview_key=<key>`, so the link on the checkpoint and in `gm deploy
+list` is what opens it. matrixorg/gitmatrix is a private repository, so its
+deployment records are visible only to people with access to it: **anyone with
+read access to the repository can open its previews** and sign in as any
+persona there, with the fixtures only. The key changes with every create, so a
+new checkpoint (or teardown) retires old links. The script never prints the
+key or the secret: what it echoes is masked, and it reports the recorded
+deployment's id, not its URL.
+
+**Production prerequisites.** Before the first preview:
+
+- The repository secret `CLOUDFLARE_API_TOKEN` can edit Workers (Worker
+  Previews), D1, R2 (buckets and objects) and Artifacts (namespaces and their
+  repositories), on the account the jobs name.
+- Worker Previews are served on the `gitmatrix` Worker's workers.dev subdomain
+  (`<preview>-gitmatrix.<subdomain>.workers.dev`), so previews must be enabled
+  there. `cloudflare.config.ts` does it: deployed, the Worker sets
+  `previewUrls: true` and `workersDev: false`, and each production deploy
+  sets the subdomain to `enabled: false`, `previews_enabled: true` (before
+  previews: both false). Production itself still answers only on
+  gitmatrix.fward.dev. The trade-off, approved on 2026-10-03: each production
+  version is also reachable at its own version preview URL,
+  `<version>-gitmatrix.<subdomain>.workers.dev`, with production's bindings;
+  sign-in there doesn't share production's cookies, since Better Auth trusts
+  only `PUBLIC_URL`.
+- The Worker's `previews_base_config` stays empty (it was null on
+  2026-10-03): bindings set there would be inherited by every preview,
+  production's included. Check with `cf workers get gitmatrix`.
+
+**Preview mode.** Worker Previews isolate Durable Objects and nothing else:
+Workflows, queues and their consumers, cron and every named resource are the
+account's, shared with production. So when cf builds a Preview
+(`isPreview` in `cloudflare.config.ts`), the config reads the resources
+tools/preview made from `GITMATRIX_PREVIEW_*` (`vite/preview.ts`; a missing
+one fails the build rather than falling back to production's) and:
+
+| Production                                       | In a preview                                               |
+| ------------------------------------------------ | ---------------------------------------------------------- |
+| `DB`, `REGISTRY_DB`                              | The timeline's own D1s                                     |
+| `REGISTRY_BLOBS` (`gitmatrix-registry-blobs`)    | The timeline's own bucket                                  |
+| `ARTIFACTS` (`gitmatrix`)                        | The timeline's own namespace                               |
+| `CI_RUN`, `KNOWLEDGE_BUILD` and their Workflows  | Left out: Workflow names are the account's                 |
+| `JOBS`, `REGISTRY_JOBS`, queue consumers, cron   | Left out: no mirror syncs, release notes or package sweeps |
+| `EMAIL`                                          | Left out: persona sign-in instead                          |
+| `AI`, `VECTORS`, `SEARCH`                        | Left out: no knowledge builds, wiki or assistant           |
+| Secrets Store (auth secret, registry key)        | Text bindings from a secret generated for each create      |
+| `gitmatrix.fward.dev`, `PUBLIC_URL`, `OWNER_ORG` | Left out: a preview answers at its own URL                 |
+| CI Sandbox container                             | Left out: previews run no CI                               |
+| `AUTH_FAILURES` namespace 4401                   | 4402                                                       |
+
+Behind that, the build binds `PREVIEW_MODE=true`, and `worker/preview.ts`
+guards each effect that would leave the preview, in case a binding ever
+slipped back in: sign-in codes (`sendCode` refuses with "Previews send no
+email"), mirroring (`queueMirror` skips and `syncMirror` refuses), enqueuing
+(release notes, blob compaction, package sweeps), starting Workflows
+(`startRun` records no run and answers "Previews don't run CI", a landing's
+merge run refuses, so nothing lands in a preview; knowledge
+builds and wiki pages are never requested), and the queue and cron handlers.
+So in a preview, pushes and the UI work against the fixtures, but CI,
+knowledge, release notes and mirrors don't run. `AGENT_ID` and `AGENT_SECRET`
+(the Preview's name and the generated secret) guard the `/api/dev` routes
+tools/preview seeds through, behind the access gate, as they do for agent
+environments. A preview also binds `PREVIEW_KEY` and `ASSETS`, and runs the
+Worker first for every path (`runWorkerFirst: true`): the gate hands the app
+its routes (`shared/worker-first.ts`, the same list production uses) and
+`ASSETS` the rest.
 
 ## Packages
 

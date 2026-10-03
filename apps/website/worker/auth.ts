@@ -89,10 +89,8 @@ export type TokenCredential =
  * username is ignored and the token alone identifies the person. `Bearer token`
  * works too.
  */
-export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredential> {
-  const header = c.req.header("authorization");
-  if (!header) return { kind: "anonymous" };
-
+/** The personal access token an Authorization header carries (Bearer, or Basic's password), if any. */
+export function accessTokenSecret(header: string): string | undefined {
   let secret: string | undefined;
   const [scheme, value = ""] = header.split(" ", 2);
   if (scheme?.toLowerCase() === "basic") {
@@ -100,7 +98,7 @@ export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredenti
     try {
       decoded = atob(value);
     } catch {
-      return { kind: "invalid" };
+      return undefined;
     }
     const separator = decoded.indexOf(":");
     const username = separator === -1 ? decoded : decoded.slice(0, separator);
@@ -109,7 +107,15 @@ export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredenti
   } else if (scheme?.toLowerCase() === "bearer") {
     secret = value;
   }
-  if (!secret?.startsWith(TOKEN_PREFIX)) return { kind: "invalid" };
+  return secret?.startsWith(TOKEN_PREFIX) ? secret : undefined;
+}
+
+export async function tokenCredential(c: Context<AppEnv>): Promise<TokenCredential> {
+  const header = c.req.header("authorization");
+  if (!header) return { kind: "anonymous" };
+
+  const secret = accessTokenSecret(header);
+  if (!secret) return { kind: "invalid" };
 
   const row = await db(c.env.DB)
     .selectFrom("access_tokens as t")

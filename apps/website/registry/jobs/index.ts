@@ -3,6 +3,7 @@ import { repoObject, Services } from "../core/context.ts";
 import { compactBlob, sweepCompactions } from "../core/blob-compaction.ts";
 import { collectGarbage } from "./gc.ts";
 import { applyRetention } from "./retention.ts";
+import { productionOnly } from "../../worker/preview.ts";
 
 export type Job =
   | { type: "gc" }
@@ -42,6 +43,7 @@ export async function runJob(env: Env, job: Job): Promise<void> {
 }
 
 export async function scheduleSweeps(env: Env): Promise<void> {
+  if (!productionOnly(env, "queue", "package sweeps")) return;
   // Retention first: the versions it prunes free blobs for a later GC pass.
   await env.REGISTRY_JOBS.send({ type: "retention" });
   await env.REGISTRY_JOBS.send({ type: "gc" });

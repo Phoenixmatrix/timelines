@@ -8,6 +8,7 @@
 import { seal, unseal } from "../../registry/core/seal.ts";
 import { upstreamToken } from "../artifacts.ts";
 import { lsRefsRequest, parseLsRefs } from "../git/pktline.ts";
+import { productionOnly } from "../preview.ts";
 import { db, nowIso } from "../schema.ts";
 import {
   fetchRequest,
@@ -207,6 +208,8 @@ export async function mirrorRepository(
  * sync holds the lease; the caller retries later.
  */
 export async function syncMirror(env: Env, repoId: string): Promise<MirrorResult> {
+  if (!productionOnly(env, "mirror", `a mirror sync of ${repoId}`))
+    throw new MirrorError("Previews don't mirror: this one never pushes anywhere.");
   const k = db(env.DB);
   const now = nowIso();
   const leased = await k

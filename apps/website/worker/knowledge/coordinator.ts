@@ -25,6 +25,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { timelineSlugOf } from "../../shared/timelines.ts";
 import { listRefs, type RepoRefs } from "../artifacts.ts";
+import { productionOnly } from "../preview.ts";
 import { db, nowIso } from "../schema.ts";
 import type { KnowledgeOverlayEndReason } from "../../shared/api.ts";
 import {
@@ -491,8 +492,9 @@ export function coordinator(env: Env, repoId: string): DurableObjectStub<Knowled
 
 /** Tell a repository's coordinator that something changed. */
 export function notifyKnowledge(env: Env, repoId: string, options: { force?: boolean } = {}) {
-  // Automatic non-AI agent environments omit provider bindings altogether.
-  if (!env.AI) return Promise.resolve();
+  // Automatic non-AI agent environments omit provider bindings altogether,
+  // and a preview never starts the (production) KnowledgeBuild Workflow.
+  if (!env.AI || !productionOnly(env, "workflow", "a knowledge build")) return Promise.resolve();
   return coordinator(env, repoId).notify(repoId, options);
 }
 
@@ -502,7 +504,7 @@ export function notifyKnowledge(env: Env, repoId: string, options: { force?: boo
  * off (automatic non-AI test environments) or the timeline's overlay ended.
  */
 export async function requestPages(env: Env, request: PageRequest) {
-  if (!env.AI) return null;
+  if (!env.AI || !productionOnly(env, "workflow", "wiki pages")) return null;
   const result = await queueSet(env.DB, request);
   if (result.queued) await coordinator(env, request.repoId).pagesRequested(request.repoId);
   return result;

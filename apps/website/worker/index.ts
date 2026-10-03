@@ -1,5 +1,7 @@
 import { app } from "./app.ts";
 import { sweepAtlasRetention } from "./atlas/retention.ts";
+import { isPreview } from "./preview.ts";
+import { previewFetch } from "./preview-gate.ts";
 import { sweepPreviews } from "./deployments/sweep.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
@@ -7,13 +9,18 @@ import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 import { settled, sweepLandings } from "./timelines/landing.ts";
 
 export default {
-  fetch: app.fetch,
+  // A timeline preview answers only through its access gate (worker/preview-gate.ts).
+  fetch: (request, env, ctx) =>
+    isPreview(env) ? previewFetch(request, env, ctx, app) : app.fetch(request, env, ctx),
   /**
    * Work queued off the request path: repository mirrors and release notes
    * (gitmatrix-jobs), and registry index rebuilds, retention and GC
    * (gitmatrix-registry-jobs).
    */
   async queue(batch, env, ctx) {
+    // A preview has no consumers (cloudflare.config.ts); if one were attached,
+    // it would be consuming production's messages, so leave them be.
+    if (isPreview(env)) return batch.retryAll();
     if (batch.queue === "gitmatrix-jobs") {
       for (const message of batch.messages as readonly Message<MirrorJob | ReleaseNotesJob>[]) {
         if (message.body.type === "release-notes")
@@ -39,6 +46,7 @@ export default {
    * and Atlas projection retention (CORE-159).
    */
   async scheduled(_controller, env, ctx) {
+    if (isPreview(env)) return;
     ctx.waitUntil(scheduleSweeps(env));
     ctx.waitUntil(
       sweepPreviews(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>

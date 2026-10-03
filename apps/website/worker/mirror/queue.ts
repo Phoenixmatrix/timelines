@@ -2,6 +2,7 @@
 // consumer syncs it, and failures retry with backoff. Duplicate messages are
 // harmless: every sync converges on the repository's current refs.
 
+import { productionOnly } from "../preview.ts";
 import { db } from "../schema.ts";
 import { MirrorError, syncMirror } from "./sync.ts";
 
@@ -12,6 +13,7 @@ export interface MirrorJob {
 
 /** After a push: enqueue a sync if the repository has an enabled mirror. */
 export async function queueMirror(env: Env, repoId: string): Promise<void> {
+  if (!productionOnly(env, "mirror", `a mirror sync of ${repoId}`)) return;
   const mirror = await db(env.DB)
     .selectFrom("repo_mirrors")
     .select("enabled")
