@@ -690,6 +690,12 @@ function Workbench({ data }: { data: TrackerView }) {
         <div className="ml-auto flex items-center gap-1">
           <Link
             className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+            to={`/tracker/${encodeURIComponent(owner)}/timelines`}
+          >
+            Timelines
+          </Link>
+          <Link
+            className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
             to={`/tracker/${encodeURIComponent(owner)}/releases`}
           >
             Release notes

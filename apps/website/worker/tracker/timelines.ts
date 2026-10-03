@@ -200,6 +200,27 @@ export class TimelineStore {
     return { timeline, events, next: rows.length > limit ? events.at(-1)!.seq : null };
   }
   /**
+   * Every timeline and the newest `limit` events across all of them, oldest
+   * first, each once: what the timeline graph draws (CORE-81).
+   */
+  graph(limit: number): { timelines: Timeline[]; events: TimelineEvent[]; truncated: boolean } {
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      fail("invalid_input", "limit must be a positive integer.");
+    const rows = all(
+      this.sql,
+      tracker
+        .selectFrom("timeline_events")
+        .select(["seq", "data"])
+        .orderBy("seq", "desc")
+        .limit(limit + 1),
+    );
+    const events = rows
+      .slice(0, limit)
+      .reverse()
+      .map((row) => ({ ...JSON.parse(row.data), seq: row.seq }) as TimelineEvent);
+    return { timelines: this.list(), events, truncated: rows.length > limit };
+  }
+  /**
    * Check a fork before its bookmarks are written: the slug is free and the
    * parent can be forked. Returns the parent (null for main).
    */

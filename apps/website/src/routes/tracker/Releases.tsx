@@ -205,6 +205,12 @@ export function TrackerReleases() {
         >
           Issues
         </Link>
+        <Link
+          className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+          to={`/tracker/${encodeURIComponent(owner)}/timelines`}
+        >
+          Timelines
+        </Link>
       </header>
       <p className="m-0 max-w-[52rem] text-body-sm text-ink-muted">
         Daily updates group default-branch first-parent commits by UTC Git commit date. Named tags

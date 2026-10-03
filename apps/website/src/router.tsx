@@ -20,6 +20,7 @@ import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageC
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { Releases, releasesLoader } from "./routes/repo/Releases.tsx";
 import { TrackerReleases, trackerReleasesLoader } from "./routes/tracker/Releases.tsx";
+import { TrackerTimelines, trackerTimelinesLoader } from "./routes/tracker/Timelines.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
 import { SemanticChanges } from "./routes/repo/SemanticChanges.tsx";
@@ -59,6 +60,11 @@ export const router = createBrowserRouter([
             path: "tracker/:owner/releases",
             loader: trackerReleasesLoader,
             Component: TrackerReleases,
+          },
+          {
+            path: "tracker/:owner/timelines",
+            loader: trackerTimelinesLoader,
+            Component: TrackerTimelines,
           },
           {
             path: "tracker/:owner",

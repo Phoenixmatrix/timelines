@@ -717,6 +717,7 @@ wire types.
 | `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                 |
 | `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                     |
 | `POST /api/tracker/:owner/timelines/:slug/abandon`      | Record the abandon event with each bookmark's last commit, then delete the bookmarks           |
+| `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data    |
 
 - **Forking** needs tracker membership and write access to each repository,
   which must belong to the tracker's account. Each bookmark starts at the
@@ -725,6 +726,14 @@ wire types.
   receive-pack request to Artifacts (ref commands and an empty pack); if any
   repository refuses, or the record can't be made, the bookmarks already
   written are removed.
+- **The graph** (`/tracker/:owner/timelines`, linked from Issues and Release
+  notes; CORE-81) draws main down the middle and a lane per timeline, newest
+  first: forks, merges between timelines, landings on main, abandoned lanes
+  ending with a mark and experimental lanes dashed. It centres on `?tl=<slug>`
+  (the selection, its parents and what depends on it) or, with main selected,
+  the ten most recently active timelines; landed timelines fold into one node
+  on main, and the rest are listed by status, workspace, agent or person. The
+  layout is in `src/routes/tracker/timelineGraph.ts`.
 - **Merges** are found after each push (`waitUntil`), from the push log: a
   commit on the pushed line's own first-parent chain whose other parent has
   been the tip of main or another timeline bookmark. Each is one event,

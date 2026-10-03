@@ -77,6 +77,9 @@ export class Tracker extends DurableObject<Env> {
   timeline(slug: string, after: number, limit: number) {
     return this.reply(() => this.timelines.detail(slug, after, limit));
   }
+  timelineGraph(limit: number) {
+    return this.reply(() => this.timelines.graph(limit));
+  }
   prepareTimeline(slug: string, parent: string | null) {
     return this.reply(() => this.timelines.prepare(slug, parent));
   }
