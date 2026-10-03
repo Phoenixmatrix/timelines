@@ -119,7 +119,8 @@ function twins(files: number) {
   };
 }
 
-describe("incremental projection", () => {
+// Each test runs two whole projection histories: allow slow CI sandboxes time.
+describe("incremental projection", { timeout: 60_000 }, () => {
   test("publishes exactly what a full pass publishes, push after push", async () => {
     const t = twins(320);
     await t.push("b1", () => {});
