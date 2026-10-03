@@ -48,6 +48,7 @@ import {
 } from "../../core/derived.ts";
 import { RegistryError } from "../../core/errors.ts";
 import { jsonError, loadRepo } from "../../core/http.ts";
+import { offDefaultVersions } from "../../core/provenance.ts";
 import { cachedArtifact, cachedMetadata, upstreamFetch, upstreamUrl } from "../../core/remote.ts";
 import type { Repository } from "../../core/repos.ts";
 import { deployTarget, firstMatch, isPinned, memberAllows, members } from "../../core/virtual.ts";
@@ -436,8 +437,8 @@ async function getRemoteChart(c: AppContext): Promise<Response> {
 // ChartMuseum API
 // ---------------------------------------------------------------------------
 
-async function apiEntries(c: AppContext): Promise<HelmIndex["entries"]> {
-  const repo = await readableRepo(c);
+async function apiEntries(c: AppContext, repo?: Repository): Promise<HelmIndex["entries"]> {
+  repo ??= await readableRepo(c);
   const text = await indexText(services(c), repo);
   return text ? parseIndex(text).entries : {};
 }
@@ -452,10 +453,34 @@ async function apiGetChart(c: AppContext): Promise<Response> {
   return c.json(versions);
 }
 
+/** Chart versions a CI job published off its repository's default branch: never `latest`. */
+async function offDefaultCharts(svc: Services, repo: Repository, name: string) {
+  const local =
+    repo.kind === "virtual"
+      ? (await members(svc, repo)).map((m) => m.repo).filter((r) => r.kind === "local")
+      : repo.kind === "local"
+        ? [repo]
+        : [];
+  const ids: string[] = [];
+  for (const feed of local) {
+    const pkg = await getPackage(svc.db, feed.id, name);
+    if (pkg) ids.push(pkg.id);
+  }
+  return offDefaultVersions(svc.db, ids);
+}
+
 async function apiGetVersion(c: AppContext): Promise<Response> {
-  const versions = (await apiEntries(c))[c.req.param("name") ?? ""] ?? [];
+  const repo = await readableRepo(c);
+  const name = c.req.param("name") ?? "";
+  const versions = (await apiEntries(c, repo))[name] ?? [];
   const wanted = c.req.param("version");
-  const found = wanted === "latest" ? versions[0] : versions.find((v) => v.version === wanted);
+  let found;
+  if (wanted === "latest") {
+    const offDefault = await offDefaultCharts(services(c), repo, name);
+    found = versions.find((v) => !offDefault.has(v.version));
+  } else {
+    found = versions.find((v) => v.version === wanted);
+  }
   if (!found) return c.json({ error: "chart version not found" }, 404);
   return c.json(found);
 }

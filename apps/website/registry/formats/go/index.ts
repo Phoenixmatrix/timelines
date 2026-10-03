@@ -43,6 +43,7 @@ import {
 import { services, type AppContext, type AppEnv } from "../../core/context.ts";
 import { RegistryError } from "../../core/errors.ts";
 import { jsonError, loadRepo, restPath, textError } from "../../core/http.ts";
+import { offDefaultVersions } from "../../core/provenance.ts";
 import { cachedArtifact, cachedMetadata, upstreamFetch, upstreamUrl } from "../../core/remote.ts";
 import type { Repository } from "../../core/repos.ts";
 import { allMatches, deployTarget, firstMatch, members } from "../../core/virtual.ts";
@@ -162,7 +163,10 @@ async function resolve(
   }
   if (req.kind === "latest") {
     const versions = await versionsOf(c, repo, req.module);
-    const latest = versions && latestVersion(versions);
+    // Versions a CI job published off its repository's default branch never answer `@latest`.
+    const pkg = versions && (await getPackage(svc.db, repo.id, req.module));
+    const offDefault = pkg ? await offDefaultVersions(svc.db, [pkg.id]) : new Set<string>();
+    const latest = versions && latestVersion(versions.filter((v) => !offDefault.has(v)));
     const info = latest ? await localInfo(c, repo, req.module, latest) : null;
     return info ? textResponse(c, JSON.stringify(info), "application/json") : null;
   }

@@ -13,6 +13,7 @@ import {
   pluginPrefix,
   snapshotTimestamp,
   sortMavenVersions,
+  versioningFor,
   writeMetadataXml,
 } from "./index.ts";
 
@@ -200,6 +201,25 @@ describe("maven-metadata.xml", () => {
       lastUpdated: "20260101000000",
     });
     expect(merged?.plugins).toEqual([{ prefix: "x", artifactId: "x-maven-plugin" }]);
+  });
+
+  it("lists versions kept from latest without making them latest or release", () => {
+    const docs = [
+      { versioning: { versions: ["1.0", "1.2"], lastUpdated: "20250101000000" } },
+      { versioning: { versions: ["1.1", "2.0-SNAPSHOT"], lastUpdated: "20260101000000" } },
+    ];
+    expect(mergeMetadata(docs, new Set(["1.2", "2.0-SNAPSHOT"]))?.versioning).toEqual({
+      latest: "1.1",
+      release: "1.1",
+      versions: ["1.0", "1.1", "1.2", "2.0-SNAPSHOT"],
+      lastUpdated: "20260101000000",
+    });
+    expect(versioningFor(["1.0"], "20260101000000", new Set(["1.0"]))).toEqual({
+      latest: undefined,
+      release: undefined,
+      versions: ["1.0"],
+      lastUpdated: "20260101000000",
+    });
   });
 
   it("escapes XML", () => {

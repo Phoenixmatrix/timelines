@@ -570,15 +570,20 @@ export function parseMetadataXml(xml: string): MavenMetadata {
   return meta;
 }
 
-/** Artifact-level versioning from a set of versions. */
+/**
+ * Artifact-level versioning from a set of versions. Versions in `notLatest`
+ * are listed but never become `latest` or `release`.
+ */
 export function versioningFor(
   versions: Iterable<string>,
   lastUpdated: string,
+  notLatest: ReadonlySet<string> = new Set(),
 ): NonNullable<MavenMetadata["versioning"]> {
   const sorted = sortMavenVersions(versions);
-  const releases = sorted.filter((v) => !isSnapshot(v));
+  const candidates = sorted.filter((v) => !notLatest.has(v));
+  const releases = candidates.filter((v) => !isSnapshot(v));
   return {
-    latest: sorted[sorted.length - 1],
+    latest: candidates[candidates.length - 1],
     release: releases[releases.length - 1],
     versions: sorted,
     lastUpdated,
@@ -587,10 +592,13 @@ export function versioningFor(
 
 /**
  * Unions artifact- and group-level metadata from several repositories (a
- * virtual repository): versions merge, latest/release are recomputed, and the
- * first repository to declare a plugin prefix keeps it.
+ * virtual repository): versions merge, latest/release are recomputed (never
+ * from `notLatest`), and the first repository to declare a plugin prefix keeps it.
  */
-export function mergeMetadata(docs: MavenMetadata[]): MavenMetadata | null {
+export function mergeMetadata(
+  docs: MavenMetadata[],
+  notLatest: ReadonlySet<string> = new Set(),
+): MavenMetadata | null {
   if (docs.length === 0) return null;
   const out: MavenMetadata = {};
   const versions = new Set<string>();
@@ -612,7 +620,9 @@ export function mergeMetadata(docs: MavenMetadata[]): MavenMetadata | null {
       if (!plugins.has(plugin.prefix)) plugins.set(plugin.prefix, plugin);
     }
   }
-  if (hasVersioning && versions.size > 0) out.versioning = versioningFor(versions, lastUpdated);
+  if (hasVersioning && versions.size > 0) {
+    out.versioning = versioningFor(versions, lastUpdated, notLatest);
+  }
   if (plugins.size > 0) out.plugins = [...plugins.values()];
   return out.versioning || out.plugins ? out : null;
 }

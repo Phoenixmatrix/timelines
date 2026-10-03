@@ -28,7 +28,7 @@ import { loginObject, type Services } from "../core/context.ts";
 import { nowIso } from "../core/db.ts";
 import { RegistryError } from "../core/errors.ts";
 import { audit } from "../core/audit.ts";
-import { authorizePublish } from "../core/provenance.ts";
+import { authorizePublish, requireMovesLatest } from "../core/provenance.ts";
 import { principalOf } from "../core/auth/actor.ts";
 import type { PackageRow } from "../core/catalog.ts";
 import {
@@ -156,11 +156,12 @@ async function packageSummaries(
       "p.id",
       "p.name",
       "p.repo_id",
-      // What `latest` points at where the format has tags, else the newest installable.
+      // What `latest` points at where the format has tags, else the newest
+      // installable that wasn't published from a non-default branch.
       sql<string | null>`coalesce(
         (select t.version from dist_tags t where t.package_id = p.id and t.tag = 'latest'),
         (select x.version from publishes x where x.package_id = p.id and x.status = 'active'
-         order by x.at desc limit 1))`.as("latest"),
+         and x.off_default_branch = 0 order by x.at desc limit 1))`.as("latest"),
       (eb) =>
         eb
           .selectFrom("publishes as x")
@@ -426,6 +427,7 @@ export async function bulkAction(
     await access.require(feed, "write");
     // Changing a package is publishing it: its sources' writers, or owner admins.
     await authorizePublish(services.db, { id: pkg.id, name: pkg.name, repoId: feed.id });
+    if (request.action === "tag" && request.tag === "latest") requireMovesLatest(access.actor);
   }
   let versions: string[];
   let remaining = 0;

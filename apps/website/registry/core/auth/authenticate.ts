@@ -64,6 +64,7 @@ async function fromJobToken(db: DB, secret: string): Promise<Actor | null> {
       "p.id as repo_id",
       "p.owner_id",
       "p.name",
+      "p.default_branch",
       "o.slug as owner_slug",
     ])
     .where("t.token_hash", "=", await hashSecret(secret))
@@ -82,6 +83,7 @@ async function fromJobToken(db: DB, secret: string): Promise<Actor | null> {
     repo: fullName,
     commit: row.commit_oid,
     ref: row.ref,
+    defaultBranch: row.default_branch,
   };
   return {
     kind: "job",

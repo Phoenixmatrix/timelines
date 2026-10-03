@@ -224,6 +224,7 @@ export interface Database {
     git_repo_id: string | null;
     commit_oid: string | null;
     ref: string | null;
+    off_default_branch: Generated<number>;
     ci_run_id: string | null;
     ci_job_id: string | null;
     run_number: number | null;

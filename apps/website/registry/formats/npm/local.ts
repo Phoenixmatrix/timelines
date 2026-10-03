@@ -41,6 +41,7 @@ import { services, type AppContext, type Services } from "../../core/context.ts"
 import { nowIso } from "../../core/db.ts";
 import { RegistryError } from "../../core/errors.ts";
 import { safePath } from "../../core/http.ts";
+import { movesLatest, offDefaultVersions, requireMovesLatest } from "../../core/provenance.ts";
 import type { Repository } from "../../core/repos.ts";
 import { serveBlob } from "../../core/blobs.ts";
 import {
@@ -246,6 +247,8 @@ interface PublishPayload {
   blob: { digest: string; size: number };
   publisher: { name: string; email?: string };
   principal: string | null;
+  /** False for a CI job off its repository's default branch: `latest` stays put. */
+  movesLatest: boolean;
 }
 
 /**
@@ -358,7 +361,10 @@ async function publish(
       tags[tag] = version;
     }
   }
-  if (Object.keys(tags).length === 0) tags.latest = version;
+  // npm sends `latest` unless told otherwise; a branch build keeps any other tags.
+  const moves = movesLatest(actor);
+  if (!moves) delete tags.latest;
+  else if (Object.keys(tags).length === 0) tags.latest = version;
 
   // Refuse early so a duplicate publish never commits its blob.
   const existing = await getPackage(svc.db, repo.id, name);
@@ -411,6 +417,7 @@ async function publish(
     blob: { digest: blob.digest, size: blob.size },
     publisher: publisherOf(actor),
     principal: principalOf(actor),
+    movesLatest: moves,
   };
   const result = await runMutation<{ rev: string }>(svc, repo, "publish", payload);
   await audit(svc.db, actor, "npm.publish", {
@@ -453,7 +460,7 @@ async function applyPublish(
   }
   for (const [tag, v] of Object.entries(p.distTags)) await setDistTag(svc.db, pkg.id, tag, v);
   const tags = await getDistTags(svc.db, pkg.id);
-  if (!tags.latest) await setDistTag(svc.db, pkg.id, "latest", p.version);
+  if (!tags.latest && p.movesLatest) await setDistTag(svc.db, pkg.id, "latest", p.version);
 
   const maintainers = meta.maintainers ?? [];
   if (!maintainers.some((m) => m.name === p.publisher.name)) maintainers.push(p.publisher);
@@ -522,6 +529,8 @@ export async function updatePackument(
       }
       distTags[tag] = value;
     }
+    // A branch build can't move `latest` this way either: it stays where it is.
+    if (!movesLatest(access.actor)) delete distTags.latest;
   }
   const payload: UpdatePayload = {
     name,
@@ -597,14 +606,18 @@ async function requirePackage(svc: Services, repo: Repository, name: string, rev
   return pkg;
 }
 
-/** Keeps `latest` pointing at a live version. */
+/**
+ * Keeps `latest` pointing at a live version, never one published from a
+ * non-default branch: with none left, the package has no `latest`.
+ */
 async function repairLatest(svc: Services, pkgId: string, live: string[]): Promise<void> {
   const tags = await getDistTags(svc.db, pkgId);
   for (const [tag, version] of Object.entries(tags)) {
     if (!live.includes(version)) await deleteDistTag(svc.db, pkgId, tag);
   }
   if (!tags.latest || !live.includes(tags.latest)) {
-    const latest = highestVersion(live);
+    const offDefault = await offDefaultVersions(svc.db, [pkgId]);
+    const latest = highestVersion(live.filter((v) => !offDefault.has(v)));
     if (latest) await setDistTag(svc.db, pkgId, "latest", latest);
   }
 }
@@ -766,6 +779,7 @@ export async function changeDistTag(
   if (version === null && tag === "latest") {
     throw RegistryError.badRequest("The latest tag cannot be removed");
   }
+  if (tag === "latest") requireMovesLatest(access.actor);
   await runMutation(svc, repo, "distTag", { name, tag, version });
   await audit(svc.db, access.actor, version ? "npm.dist-tag.add" : "npm.dist-tag.rm", {
     repoId: repo.id,

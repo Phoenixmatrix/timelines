@@ -30,6 +30,11 @@ export interface JobIdentity {
   commit: string;
   /** Branch the run built. */
   ref: string;
+  /**
+   * The repository's default branch when the job started. Only its publishes
+   * move `latest`; absent on registry tokens minted before it was recorded.
+   */
+  defaultBranch?: string;
 }
 
 /** Who is calling, after authentication and before authorization. */

@@ -182,18 +182,27 @@ async function toDtos(ctx: Ctx, releases: ReleaseRow[], latestId: string | null)
 }
 
 async function latestRow(ctx: Ctx, project: string): Promise<ReleaseRow | null> {
+  const pkg = await getPackage(ctx.services.db, ctx.repo.id, project.toLowerCase());
   // Publication-time ties are rare; a small window is enough for the semver tie-break.
-  const rows = await ctx.services.db
+  let query = ctx.services.db
     .selectFrom("releases")
     .selectAll()
     .where("repo_id", "=", ctx.repo.id)
     .where("project", "=", project)
     .where("draft", "=", 0)
     .where("prerelease", "=", 0)
-    .where("published_at", "is not", null)
-    .orderBy("published_at", "desc")
-    .limit(25)
-    .execute();
+    .where("published_at", "is not", null);
+  if (pkg) {
+    // Releases a CI job created off its repository's default branch are never latest.
+    query = query.where("tag", "not in", (eb) =>
+      eb
+        .selectFrom("publishes")
+        .select("version")
+        .where("package_id", "=", pkg.id)
+        .where("off_default_branch", "=", 1),
+    );
+  }
+  const rows = await query.orderBy("published_at", "desc").limit(25).execute();
   const latest = selectLatest(
     rows.map((row) => ({
       row,

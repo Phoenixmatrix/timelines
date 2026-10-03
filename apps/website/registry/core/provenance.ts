@@ -11,6 +11,11 @@
 //                     That stream is each package's history and what the
 //                     console queries.
 //
+// Only a repository's default branch moves `latest`. A CI job building any
+// other branch still publishes its versions, with their branch, but they never
+// become `latest`, whether by tag or as the newest publish (`movesLatest`,
+// `offDefaultVersions`). People publishing by hand keep moving it.
+//
 // Catalog formats reach both through catalog.ts; OCI, releases and generic,
 // which keep their own tables, call them where they publish.
 
@@ -27,6 +32,44 @@ export interface PackageRef {
   id: string;
   name: string;
   repoId: string;
+}
+
+const branchName = (ref: string) => ref.replace(/^refs\/heads\//, "");
+
+/**
+ * Whether what this caller publishes may become `latest`: everything but a CI
+ * job building a branch other than its repository's default.
+ */
+export function movesLatest(actor: Actor): boolean {
+  const job = actor.kind === "job" ? actor.job : undefined;
+  // Registry tokens minted before jobs knew their default branch: as before.
+  if (!job?.defaultBranch) return true;
+  return branchName(job.ref) === branchName(job.defaultBranch);
+}
+
+/** Refuses to let a CI job off its repository's default branch point `latest` anywhere. */
+export function requireMovesLatest(actor: Actor): void {
+  if (movesLatest(actor)) return;
+  const job = actor.job!;
+  throw RegistryError.denied(
+    `Only ${job.repo}'s default branch (${job.defaultBranch}) moves latest; this job built ${job.ref}.`,
+  );
+}
+
+/** Versions of these packages published from a non-default branch: never `latest`. */
+export async function offDefaultVersions(db: DB, packageIds: string[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (let i = 0; i < packageIds.length; i += 90) {
+    const rows = await db
+      .selectFrom("publishes")
+      .select("version")
+      .distinct()
+      .where("package_id", "in", packageIds.slice(i, i + 90))
+      .where("off_default_branch", "=", 1)
+      .execute();
+    for (const row of rows) out.add(row.version);
+  }
+  return out;
 }
 
 async function feedOf(db: DB, repoId: string): Promise<Repository | null> {
@@ -192,6 +235,7 @@ export async function recordPublish(db: DB, record: PublishRecord): Promise<void
       git_repo_id: job?.repoId ?? null,
       commit_oid: job?.commit ?? null,
       ref: job?.ref ?? null,
+      off_default_branch: movesLatest(actor) ? 0 : 1,
       ci_run_id: job?.runId ?? null,
       ci_job_id: job?.jobId ?? null,
       run_number: job?.runNumber ?? null,

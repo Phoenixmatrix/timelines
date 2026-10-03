@@ -27,7 +27,7 @@ import { getBlob, PART_SIZE, serveBlob, storeBlob, type StoredBlob } from "../..
 import { services, type AppContext, type AppEnv } from "../../core/context.ts";
 import { RegistryError } from "../../core/errors.ts";
 import { ensurePackage, getPackage } from "../../core/catalog.ts";
-import { markPublishes, recordPublish } from "../../core/provenance.ts";
+import { markPublishes, movesLatest, recordPublish } from "../../core/provenance.ts";
 import { getRepoByKey, resolveFeed, listRepos, type Repository } from "../../core/repos.ts";
 import { candidates, deployTarget, firstMatch } from "../../core/virtual.ts";
 import type { FormatModule } from "../types.ts";
@@ -586,7 +586,10 @@ async function putManifestHandler(c: AppContext, route: Extract<Route, { kind: "
   const pkg = await ensurePackage(svc.db, repo.id, name.image, name.image.toLowerCase(), {
     kind: "image",
   });
-  if (!byDigest && repo.config.immutable === true) {
+  // A branch build may push `latest`, but only the default branch moves it: the
+  // manifest is stored and stays reachable by digest, the tag stays put.
+  const tagged = !byDigest && (reference !== "latest" || movesLatest((await svc.access()).actor));
+  if (tagged && repo.config.immutable === true) {
     const current = await store.tagDigest(svc.db, repo.id, name.image, reference);
     if (current && current !== digest) {
       throw new OciError("DENIED", `Tag ${reference} is immutable in ${repo.key}`, { status: 409 });
@@ -609,13 +612,13 @@ async function putManifestHandler(c: AppContext, route: Extract<Route, { kind: "
     refs: referencedDigests(manifest),
   });
   let pruned: string[] = [];
-  if (!byDigest) {
+  if (tagged) {
     const previous = await store.setTag(svc.db, repo.id, name.image, reference, digest);
     if (previous && previous !== digest && repo.config.retention?.deleteUntagged) {
       pruned = await store.pruneUntagged(svc.db, repo.id, name.image, previous);
     }
   }
-  if (!byDigest) {
+  if (tagged) {
     // A tag is a version in the package's history; children of a multi-arch
     // index arrive by digest and stay out of it.
     const size = bytes.length + requiredBlobs(manifest).reduce((n, d) => n + d.size, 0);

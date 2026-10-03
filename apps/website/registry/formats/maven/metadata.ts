@@ -21,6 +21,7 @@ import {
 import type { Services } from "../../core/context.ts";
 import { nowIso, type DB } from "../../core/db.ts";
 import { deleteDerived, listDerived, putDerived } from "../../core/derived.ts";
+import { offDefaultVersions } from "../../core/provenance.ts";
 import type { Repository } from "../../core/repos.ts";
 
 /**
@@ -160,7 +161,9 @@ async function artifactLevel(
     }
   }
   if (present.length === 0) return null;
-  return { groupId, artifactId, versioning: versioningFor(present, lastUpdated) };
+  // Versions a CI job published off its repository's default branch are listed but never latest.
+  const offDefault = await offDefaultVersions(db, [pkg.id]);
+  return { groupId, artifactId, versioning: versioningFor(present, lastUpdated, offDefault) };
 }
 
 async function groupLevel(db: DB, repo: Repository, groupId: string): Promise<PluginEntry[]> {

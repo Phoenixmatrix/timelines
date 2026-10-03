@@ -851,6 +851,13 @@ gitmatrix`, `mvn deploy` (server id `gitmatrix`), `helm push`, Go modules
   who can write to a source may publish it. Owner admins grant more
   repositories, cross-owner ones included (`package_sources`). People without
   write access to a source get a 403 naming the sources.
+- **Only the default branch moves `latest`.** A CI job building any other
+  branch still publishes its versions, with the branch in their history, but
+  they never become `latest`: not npm's dist-tag, an OCI `:latest` push (the
+  image is stored, the tag stays), a release, Go's `@latest`, Helm's latest
+  chart, Maven's `<latest>`/`<release>`, or the newest-publish fallback the
+  console and `gm pkg download …/latest` use (`publishes.off_default_branch`).
+  People publishing by hand move it as before.
 - **Access follows the owner.**
   - The owner and org owners are admins. Org members get read, or write when
     the org gives members write. Collaborators who can write one of the

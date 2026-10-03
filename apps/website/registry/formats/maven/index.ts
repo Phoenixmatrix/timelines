@@ -36,6 +36,7 @@ import {
   deleteFile,
   ensurePackage,
   getFile,
+  getPackage,
   getVersion,
   listFiles,
   updateVersion,
@@ -47,6 +48,7 @@ import type { DB } from "../../core/db.ts";
 import { getDerived, listDerived, readDerivedText, serveDerived } from "../../core/derived.ts";
 import { RegistryError } from "../../core/errors.ts";
 import { loadRepo, restPath, safePath, textError } from "../../core/http.ts";
+import { offDefaultVersions } from "../../core/provenance.ts";
 import { cachedArtifact, cachedMetadata } from "../../core/remote.ts";
 import type { Repository } from "../../core/repos.ts";
 import { candidates, deployTarget, isPinned } from "../../core/virtual.ts";
@@ -339,17 +341,24 @@ async function readVirtual(
     return docs.get(member.id) ?? null;
   };
   const parts: MavenMetadata[] = [];
+  const offDefault = new Set<string>();
   for (const member of forArtifact) {
     const doc = await load(member);
     if (doc?.versioning) {
       parts.push({ groupId: doc.groupId, artifactId: doc.artifactId, versioning: doc.versioning });
     }
+    // A local member's branch-only versions stay out of the merged latest/release too.
+    const pkg =
+      doc?.versioning && member.kind === "local"
+        ? await getPackage(svc.db, member.id, `${artifactGroup}:${last}`)
+        : null;
+    if (pkg) for (const v of await offDefaultVersions(svc.db, [pkg.id])) offDefault.add(v);
   }
   for (const member of forGroup) {
     const doc = await load(member);
     if (doc?.plugins?.length) parts.push({ plugins: doc.plugins });
   }
-  const merged = mergeMetadata(parts);
+  const merged = mergeMetadata(parts, offDefault);
   if (!merged) return null;
   const xml = writeMetadataXml(merged);
   return checksum
