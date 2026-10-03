@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router";
+import { Link, useBlocker } from "react-router";
 import {
   actorName,
   attribution,
@@ -13,6 +13,7 @@ import {
   type IssueFields,
   type Mutation,
   type Snapshot,
+  type TrackerEvent,
 } from "../../../shared/tracker.ts";
 import {
   ConfirmDialog,
@@ -39,7 +40,9 @@ import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
 
-export type MutationOutcome = { ok: true } | { ok: false; error: string; code?: string };
+export type MutationOutcome =
+  | { ok: true; events: TrackerEvent[] }
+  | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
 type EditMode = "all" | "title" | "description" | "acceptance";
 type Draft = { version: number; fields: IssueFields; base?: IssueFields; mode?: EditMode };
@@ -57,6 +60,20 @@ const fieldNames: Record<keyof IssueFields, string> = {
   labels: "Labels",
 };
 const fieldKeys = Object.keys(fieldNames) as (keyof IssueFields)[];
+const textFields = new Set<keyof IssueFields>(["title", "description", "acceptance", "labels"]);
+const fieldsOf = (issue: Issue): IssueFields => ({
+  title: issue.title,
+  description: issue.description,
+  acceptance: issue.acceptance,
+  type: issue.type,
+  status: issue.status,
+  closeReason: issue.closeReason ?? null,
+  priority: issue.priority,
+  assigneeId: issue.assigneeId,
+  parentId: issue.parentId,
+  workspaceIds: issue.workspaceIds,
+  labels: issue.labels,
+});
 
 // The detail renders in a narrow inspector: hairline-split sections, small headings.
 const SECTION = "border-t border-line-soft py-4";
@@ -108,19 +125,7 @@ export function IssueDetail({
   const storageKey = `gitmatrix:issue-draft:${snapshot.owner.id}:${issue.id}`;
   const initial: Draft = {
     version: issue.version,
-    fields: {
-      title: issue.title,
-      description: issue.description,
-      acceptance: issue.acceptance,
-      type: issue.type,
-      status: issue.status,
-      closeReason: issue.closeReason ?? null,
-      priority: issue.priority,
-      assigneeId: issue.assigneeId,
-      parentId: issue.parentId,
-      workspaceIds: issue.workspaceIds,
-      labels: issue.labels,
-    },
+    fields: fieldsOf(issue),
   };
   initial.base = initial.fields;
   const [draft, setDraft] = useState<Draft>(() => {
@@ -141,6 +146,18 @@ export function IssueDetail({
   });
   const [preview, setPreview] = useState(false);
   const [localError, setLocalError] = useState("");
+  const [pendingFields, setPendingFields] = useState<(keyof IssueFields)[]>([]);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [saved, setSaved] = useState(false);
+  const [finishRequested, setFinishRequested] = useState(false);
+  const dirty = fieldKeys.some((key) => !same(draft.fields[key], draft.base?.[key]));
+  const hasUnsavedChanges = editing && (dirty || saving || pendingFields.length > 0);
+  const navigation = useBlocker(hasUnsavedChanges);
+  const enqueue = (keys: (keyof IssueFields)[]) => {
+    setPendingFields((previous) => [...new Set([...previous, ...keys])]);
+    setLocalError("");
+  };
   const [body, setBody] = useState("");
   const [kind, setKind] = useState<Comment["kind"]>("comment");
   const [relation, setRelation] = useState("blocks");
@@ -177,15 +194,33 @@ export function IssueDetail({
   useEffect(() => {
     if (editing) {
       try {
-        sessionStorage.setItem(storageKey, JSON.stringify(draft));
+        if (dirty) sessionStorage.setItem(storageKey, JSON.stringify(draft));
+        else sessionStorage.removeItem(storageKey);
       } catch {
         /* The in-memory draft remains usable when storage is unavailable. */
       }
     }
-  }, [draft, editing, storageKey]);
-  const change = <K extends keyof IssueFields>(key: K, value: IssueFields[K]) => {
+  }, [draft, editing, dirty, storageKey]);
+  useEffect(() => {
+    if (!hasUnsavedChanges) return;
+    const onUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, [hasUnsavedChanges]);
+  useEffect(() => {
+    if (navigation.state === "blocked" && !hasUnsavedChanges) navigation.proceed();
+  }, [navigation, hasUnsavedChanges]);
+  const change = <K extends keyof IssueFields>(
+    key: K,
+    value: IssueFields[K],
+    autosave = !textFields.has(key),
+  ) => {
     setNotice("");
     setLocalError("");
+    setSaved(false);
     setDraft((previous) => ({
       ...previous,
       fields: {
@@ -194,6 +229,11 @@ export function IssueDetail({
         ...(key === "status" && value !== "canceled" ? { closeReason: null } : {}),
       },
     }));
+    // Editing a queued/failed text value makes it a draft again until its next blur.
+    if (textFields.has(key))
+      setPendingFields((previous) => previous.filter((field) => field !== key));
+    if (autosave)
+      enqueue(key === "status" || key === "closeReason" ? ["status", "closeReason"] : [key]);
   };
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
@@ -231,11 +271,16 @@ export function IssueDetail({
     setActionError("");
     setLocalError("");
     setEditing(true);
+    setPendingFields([]);
+    setSaved(false);
+    setFinishRequested(false);
   };
   const finishEdit = (message = "") => {
     setEditing(false);
     setDraft(initial);
     setNotice(message);
+    setPendingFields([]);
+    setFinishRequested(false);
     try {
       sessionStorage.removeItem(storageKey);
     } catch {
@@ -245,6 +290,13 @@ export function IssueDetail({
       detailRef.current?.querySelector<HTMLElement>(`[data-edit-field="${mode}"]`)?.focus(),
     );
   };
+  const requestFinish = () => {
+    enqueue(fieldKeys);
+    setFinishRequested(true);
+  };
+  useEffect(() => {
+    if (finishRequested && !hasUnsavedChanges && !localError) finishEdit();
+  });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (
@@ -393,15 +445,94 @@ export function IssueDetail({
       }
       return { ...previous, version: issue.version, base: initial.fields, fields };
     });
-    setLocalError("");
+    enqueue(fieldKeys);
   };
+  useEffect(() => {
+    if (!editing || busy || savingRef.current || localError || !pendingFields.length) return;
+    const fields = {
+      ...draft.fields,
+      closeReason: draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
+      labels: normalizedSet(draft.fields.labels),
+      workspaceIds: normalizedSet(draft.fields.workspaceIds),
+    };
+    const changes = Object.fromEntries(
+      pendingFields
+        .filter((key) => !same(fields[key], (draft.base ?? initial.fields)[key]))
+        .map((key) => [key, fields[key]]),
+    ) as Partial<IssueFields>;
+    // An old canceled issue can retain its missing reason until explicitly reopened.
+    if (fields.status === "canceled" && !fields.closeReason) delete changes.closeReason;
+    if (!Object.keys(changes).length) {
+      setPendingFields([]);
+      return;
+    }
+    if (draft.version < issue.version) {
+      setLocalError("Review the newer version before saving.");
+      return;
+    }
+    if (!fields.title.trim()) {
+      setLocalError("Give this issue a title.");
+      return;
+    }
+    if (invalidStatus) {
+      setLocalError("Resolve the blockers or active claim before changing this status.");
+      return;
+    }
+    if (invalidCloseReason) {
+      setLocalError("Choose a reason for closing this issue.");
+      return;
+    }
+    // Only committed field gestures enter this queue. Typing in another field
+    // during a request stays local until that field blurs.
+    const submitted = draft;
+    const attempted = pendingFields;
+    savingRef.current = true;
+    setSaving(true);
+    setSaved(false);
+    setPendingFields([]);
+    void (async () => {
+      try {
+        const result = await mutate([
+          { kind: "issue.update", id: issue.id, expectedVersion: submitted.version, data: changes },
+        ]);
+        if (!result.ok) throw new Error(result.error);
+        const acknowledged = result.events.findLast(
+          (event) => event.entityType === "issue" && event.entityId === issue.id,
+        )?.entity as Issue | undefined;
+        if (!acknowledged)
+          throw new Error("The saved issue could not be confirmed. Refresh and retry.");
+        const base = fieldsOf(acknowledged);
+        setDraft((previous) => {
+          const next = { ...base };
+          for (const key of fieldKeys) {
+            const unchanged = same(
+              previous.fields[key],
+              key in changes ? submitted.fields[key] : (submitted.base ?? initial.fields)[key],
+            );
+            if (!unchanged) Object.assign(next, { [key]: previous.fields[key] });
+          }
+          return { ...previous, version: acknowledged.version, base, fields: next };
+        });
+        setSaved(true);
+      } catch (cause) {
+        setLocalError(
+          cause instanceof Error ? cause.message : "Could not save. Your draft is kept.",
+        );
+        setPendingFields((previous) => [...new Set([...attempted, ...previous])]);
+        setFinishRequested(false);
+      } finally {
+        savingRef.current = false;
+        setSaving(false);
+      }
+    })();
+  });
   const editor = editing && (
     <form
       className="space-y-4"
       data-issue-editor
       aria-label={mode === "all" ? "Edit issue" : `Edit ${fieldNames[mode]}`}
       onKeyDown={(event) => {
-        if (busy || event.defaultPrevented || event.nativeEvent.isComposing) return;
+        if (event.defaultPrevented || event.nativeEvent.isComposing) return;
         if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
           event.preventDefault();
           event.currentTarget.requestSubmit();
@@ -414,58 +545,64 @@ export function IssueDetail({
         ) {
           event.preventDefault();
           event.stopPropagation();
-          finishEdit();
+          requestFinish();
         }
       }}
-      onSubmit={async (event) => {
+      onSubmit={(event) => {
         event.preventDefault();
-        if (busy || invalidStatus) return;
-        setLocalError("");
-        setNotice("");
-        if (draft.version !== issue.version) {
-          setLocalError("Review the newer version before saving.");
-          return;
-        }
-        if (!draft.fields.title.trim()) {
-          setLocalError("Give this issue a title.");
-          return;
-        }
-        if (invalidCloseReason) {
-          setLocalError("Choose a reason for closing this issue.");
-          return;
-        }
-        const fields = {
-          ...draft.fields,
-          closeReason:
-            draft.fields.status === "canceled" ? (draft.fields.closeReason ?? null) : null,
-          labels: normalizedSet(draft.fields.labels),
-          workspaceIds: normalizedSet(draft.fields.workspaceIds),
-        };
-        const changes = Object.fromEntries(
-          Object.entries(fields).filter(
-            ([key, value]) =>
-              !same(value, (draft.base ?? initial.fields)[key as keyof IssueFields]),
-          ),
-        ) as Partial<IssueFields>;
-        // Legacy canceled issues may keep their missing reason, but never send an
-        // explicit null while canceled: the API reserves that for reopening.
-        if (fields.status === "canceled" && !fields.closeReason) delete changes.closeReason;
-        const result: MutationOutcome = !Object.keys(changes).length
-          ? { ok: true }
-          : await mutate([
-              {
-                kind: "issue.update",
-                id: issue.id,
-                expectedVersion: draft.version,
-                data: changes,
-              },
-            ]);
-        if (result.ok) finishEdit(mode === "all" ? "Issue saved." : `${fieldNames[mode]} saved.`);
-        else setLocalError(result.error);
+        requestFinish();
       }}
     >
-      {mode === "all" && <h3 className={HEADING}>Edit issue</h3>}
-      {draft.version !== issue.version && (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          {mode === "all" && <h3 className={HEADING}>Edit issue</h3>}
+          <p className="mk-hint m-0" role="status" aria-live="polite">
+            {saving
+              ? "Saving…"
+              : localError
+                ? "Not saved"
+                : dirty
+                  ? "Unsaved changes"
+                  : saved
+                    ? "Saved"
+                    : "Changes save automatically"}
+          </p>
+        </div>
+        <button className="mk-btn mk-btn--ghost mk-btn--sm" type="submit">
+          Done
+        </button>
+      </div>
+      <p className="mk-hint m-0">Text saves when you leave a field. Selections save immediately.</p>
+      <FormError message={localError} />
+      {localError && (
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="mk-btn mk-btn--sm"
+            type="button"
+            disabled={busy || saving}
+            onClick={() => enqueue(fieldKeys)}
+          >
+            Retry saving
+          </button>
+          <button
+            className="mk-btn mk-btn--ghost mk-btn--sm"
+            type="button"
+            disabled={busy || saving}
+            onClick={() => finishEdit()}
+          >
+            Discard unsaved changes
+          </button>
+        </div>
+      )}
+      {navigation.state === "blocked" && (
+        <p className="mk-hint m-0" role="status">
+          Finish saving before leaving this issue.{" "}
+          <button className={LINK} type="button" onClick={() => navigation.reset()}>
+            Keep editing
+          </button>
+        </p>
+      )}
+      {!saving && draft.version < issue.version && (
         <section className="rounded-control bg-danger-wash p-3 text-body-sm" role="alert">
           <h4 className="m-0 font-semibold">This issue changed while you were editing</h4>
           <p className="mt-1 mb-0 max-w-[48ch]">
@@ -517,7 +654,7 @@ export function IssueDetail({
                           <button
                             type="button"
                             className="mk-btn mk-btn--sm"
-                            onClick={() => change(key, initial.fields[key])}
+                            onClick={() => change(key, initial.fields[key], false)}
                           >
                             Use theirs for {fieldNames[key]}
                           </button>
@@ -543,6 +680,7 @@ export function IssueDetail({
           required
           maxLength={500}
           onChange={(event) => change("title", event.target.value)}
+          onBlur={() => enqueue(["title"])}
         />
       )}
       {mode === "all" && (
@@ -617,6 +755,7 @@ export function IssueDetail({
               label="Labels (comma separated)"
               value={draft.fields.labels.join(",")}
               onChange={(event) => change("labels", event.target.value.split(","))}
+              onBlur={() => enqueue(["labels"])}
             />
           </div>
           <MultiCheck
@@ -653,6 +792,7 @@ export function IssueDetail({
               rows={12}
               value={draft.fields.description}
               onChange={(event) => change("description", event.target.value)}
+              onBlur={() => enqueue(["description"])}
               placeholder="Describe the outcome, context, and approach. Markdown supported."
             />
           )}
@@ -671,36 +811,13 @@ export function IssueDetail({
               rows={6}
               value={draft.fields.acceptance}
               onChange={(event) => change("acceptance", event.target.value)}
+              onBlur={() => enqueue(["acceptance"])}
               placeholder="- [ ] What must be true when this is done?"
             />
           )}
         </Field>
       )}
-      <FormError message={localError} />
-      <div className="flex flex-wrap gap-2">
-        <button
-          className="mk-btn mk-btn--primary mk-btn--sm"
-          disabled={busy || draft.version !== issue.version || invalidStatus || invalidCloseReason}
-          aria-describedby={invalidStatus ? statusReason : undefined}
-          aria-keyshortcuts="Control+Enter Meta+Enter"
-        >
-          {busy
-            ? "Saving…"
-            : mode === "all"
-              ? "Save issue"
-              : `Save ${mode === "acceptance" ? "acceptance criteria" : mode}`}
-        </button>
-        <button
-          className="mk-btn mk-btn--ghost mk-btn--sm"
-          type="button"
-          disabled={busy}
-          aria-keyshortcuts="Escape"
-          onClick={() => finishEdit()}
-        >
-          {mode === "all" ? "Discard draft" : "Cancel"}
-        </button>
-      </div>
-      <p className="mk-hint m-0">Ctrl/Cmd+Enter saves. Esc cancels.</p>
+      <p className="mk-hint m-0">Ctrl/Cmd+Enter or Esc finishes editing after saving.</p>
     </form>
   );
 

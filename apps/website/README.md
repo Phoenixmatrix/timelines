@@ -628,15 +628,21 @@ subtasks or satisfy dependent issues' blockers.
   edit just that field in place. Each text section also has a keyboard-accessible
   **Edit** button, and empty sections offer an **Add** action. Markdown preview
   remains available; links in rendered Markdown still navigate normally.
-  **Ctrl/Cmd+Enter** saves, **Esc** cancels, and Enter saves a title. The focused
-  field and its draft survive a reload. **Edit issue** (or `e`) still opens the
-  complete form for grouped changes, as does **Create and edit**.
+  Text fields (including labels) save on blur; selects, the parent picker, and
+  workspace checkboxes save immediately. Saves are serialized, preserving edits
+  made while an earlier request is running. The editor shows Saving, Saved, or
+  an error with retry/discard controls; closing an issue waits for a close reason.
+  **Done**, **Ctrl/Cmd+Enter**, or **Esc** saves remaining changes and finishes
+  editing; Enter does the same in a title. Navigation waits for pending edits to
+  save, and unsaved drafts survive a reload in the same tab. **Edit issue** (or
+  `e`) and **Create and edit** open the complete autosaving form. Issue creation,
+  comments, and new relationships retain explicit submit actions.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
   fields are retained. Labels and workspace membership compare as sets, so
   reordering does not overwrite another person's changes. Errors remain beside
   the failed action. An uncertain write freezes mutation fields and retries its
-  original operation ID; confirmation completes the original form without duplicates.
+  original operation ID; confirmation acknowledges the original save without duplicates.
 - **Keyboard:** single-key shortcuts are off by default; enable or disable them
   through **Shortcuts** in the account actions. The preference persists locally.
   `c` or `n` focuses capture, `/` focuses search, `j`/`k` selects adjacent issues,

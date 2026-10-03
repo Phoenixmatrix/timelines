@@ -46,6 +46,7 @@ import {
   fallbackTeam,
   type Mutation,
   type MutationRequest,
+  type MutationResult,
   type Snapshot,
   type TrackerView,
 } from "../../../shared/tracker.ts";
@@ -339,16 +340,17 @@ function Workbench({ data }: { data: TrackerView }) {
     setError("");
     pending.current ??= { operationId: crypto.randomUUID(), mutations };
     try {
-      await api(`/tracker/${encodeURIComponent(owner)}/mutate`, {
+      const result = await api<MutationResult>(`/tracker/${encodeURIComponent(owner)}/mutate`, {
         method: "POST",
         json: pending.current,
       });
       pending.current = null;
       setUncertain(false);
       await refresh();
-      for (const complete of pendingCompletions.current) complete({ ok: true });
+      const outcome: MutationOutcome = { ok: true, events: result.events };
+      for (const complete of pendingCompletions.current) complete(outcome);
       pendingCompletions.current.length = 0;
-      return { ok: true };
+      return outcome;
     } catch (cause) {
       if (cause instanceof ApiError) {
         pending.current = null;
@@ -633,7 +635,7 @@ function Workbench({ data }: { data: TrackerView }) {
   );
 
   const inspector = selected ? (
-    <fieldset className="m-0 min-w-0 border-0 p-0" disabled={busy || uncertain}>
+    <fieldset className="m-0 min-w-0 border-0 p-0" disabled={uncertain}>
       <IssueDetail
         key={selected.id}
         issue={selected}
