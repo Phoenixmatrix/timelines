@@ -683,6 +683,11 @@ read as `agent_decides`.
   save, and unsaved drafts survive a reload in the same tab. **Edit issue** (or
   `e`) and **Create and edit** open the complete autosaving form. Issue creation,
   comments, and new relationships retain explicit submit actions.
+  A confirmed save applies the server's committed entities immediately; the
+  whole-tracker refresh runs in the background and cannot replace a newer
+  acknowledgement with an older snapshot. Rendered descriptions and acceptance
+  criteria stay mounted while editing, avoiding a full Markdown rebuild when
+  finishing unchanged text or saving other fields on a large issue.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
   fields are retained. Labels and workspace membership compare as sets, so

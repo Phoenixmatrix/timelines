@@ -1229,67 +1229,68 @@ export function IssueDetail({
           <MarkdownText text={latestCheckpoint.body} />
         </section>
       )}
-      {editing && mode === "all" ? (
-        <section className={SECTION}>{editor}</section>
-      ) : (
-        (["description", "acceptance"] as const).map((field) => (
-          <section className={SECTION} key={field} aria-label={fieldNames[field]}>
-            {editing && mode === field ? (
-              editor
+      {editing && mode === "all" && <section className={SECTION}>{editor}</section>}
+      {/* Keep Markdown mounted across edits so saving reconciles existing prose
+          instead of rebuilding a large description's entire DOM. */}
+      {(["description", "acceptance"] as const).map((field) => (
+        <section
+          className={SECTION}
+          key={field}
+          aria-label={fieldNames[field]}
+          hidden={editing && mode === "all"}
+        >
+          {editing && mode === field && editor}
+          <div hidden={editing && mode === field}>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <h3 className={HEADING}>{fieldNames[field]}</h3>
+              <div className="flex shrink-0 items-center gap-2">
+                {updatedField === field && updatedNotice}
+                <button
+                  type="button"
+                  className="mk-btn mk-btn--ghost mk-btn--sm"
+                  aria-label={`Edit ${field === "description" ? "description" : "acceptance criteria"}`}
+                  data-edit-field={field}
+                  disabled={busy || editing}
+                  onClick={() => beginEdit(field)}
+                >
+                  Edit
+                </button>
+              </div>
+            </div>
+            {issue[field] ? (
+              <div
+                className={
+                  !busy && !editing ? "cursor-text rounded-control hover:bg-sunken" : undefined
+                }
+                onPointerUp={(event) => {
+                  // The Edit button is the keyboard entry point; prose also accepts a click.
+                  if (
+                    busy ||
+                    editing ||
+                    event.button !== 0 ||
+                    !window.getSelection()?.isCollapsed ||
+                    (event.target instanceof Element &&
+                      event.target.closest("a, button, input, textarea, select, [role=button]"))
+                  )
+                    return;
+                  beginEdit(field);
+                }}
+              >
+                <MarkdownText text={issue[field]} />
+              </div>
             ) : (
-              <>
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <h3 className={HEADING}>{fieldNames[field]}</h3>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {updatedField === field && updatedNotice}
-                    <button
-                      type="button"
-                      className="mk-btn mk-btn--ghost mk-btn--sm"
-                      aria-label={`Edit ${field === "description" ? "description" : "acceptance criteria"}`}
-                      data-edit-field={field}
-                      disabled={busy || editing}
-                      onClick={() => beginEdit(field)}
-                    >
-                      Edit
-                    </button>
-                  </div>
-                </div>
-                {issue[field] ? (
-                  <div
-                    className={
-                      !busy && !editing ? "cursor-text rounded-control hover:bg-sunken" : undefined
-                    }
-                    onPointerUp={(event) => {
-                      // The Edit button is the keyboard entry point; prose also accepts a click.
-                      if (
-                        busy ||
-                        editing ||
-                        event.button !== 0 ||
-                        !window.getSelection()?.isCollapsed ||
-                        (event.target instanceof Element &&
-                          event.target.closest("a, button, input, textarea, select, [role=button]"))
-                      )
-                        return;
-                      beginEdit(field);
-                    }}
-                  >
-                    <MarkdownText text={issue[field]} />
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    className="min-h-11 w-full rounded-control text-left text-body-sm text-ink-muted hover:bg-sunken disabled:bg-transparent"
-                    disabled={busy || editing}
-                    onClick={() => beginEdit(field)}
-                  >
-                    {field === "description" ? "Add a description…" : "Add acceptance criteria…"}
-                  </button>
-                )}
-              </>
+              <button
+                type="button"
+                className="min-h-11 w-full rounded-control text-left text-body-sm text-ink-muted hover:bg-sunken disabled:bg-transparent"
+                disabled={busy || editing}
+                onClick={() => beginEdit(field)}
+              >
+                {field === "description" ? "Add a description…" : "Add acceptance criteria…"}
+              </button>
             )}
-          </section>
-        ))
-      )}
+          </div>
+        </section>
+      ))}
       <section className={SECTION}>
         <h3 className={HEADING}>Dependencies & hierarchy</h3>
         <p className="mk-hint mt-0.5 mb-0 max-w-[48ch]">

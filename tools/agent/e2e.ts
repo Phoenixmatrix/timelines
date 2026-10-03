@@ -19,6 +19,7 @@ import type {
 } from "../../apps/website/shared/api.ts";
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
+import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 type Evidence = {
@@ -1284,6 +1285,61 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
             record({
               discardedInvalidDraft: true,
               singlePointerClick: true,
+              reloadAssertions: true,
+            });
+            // A durable save must finish before a slow whole-tracker refresh.
+            // Hold its real response, save again, then release the older view.
+            const description = `${"Large issue save regression. ".repeat(4000)}\n\nCORE-137 saved description`;
+            const acceptance = "Both edits survive a delayed older snapshot.";
+            let releaseSnapshot!: () => void;
+            const released = new Promise<void>((resolve) => {
+              releaseSnapshot = resolve;
+            });
+            let snapshotHeld = false;
+            const snapshotPath = `/api/tracker/${fixtures.tracker.owner}/snapshot`;
+            await page.route(
+              `**${snapshotPath}*`,
+              async (route) => {
+                const response = await route.fetch();
+                snapshotHeld = true;
+                await released;
+                await route.fulfill({ response });
+              },
+              { times: 1 },
+            );
+            try {
+              await page.locator('[data-edit-field="description"]').click();
+              const descriptionEditor = page.getByRole("form", { name: "Edit Description / PRD" });
+              await descriptionEditor
+                .getByRole("textbox", { name: "Description / PRD" })
+                .fill(description);
+              await descriptionEditor.getByRole("button", { name: "Done", exact: true }).click();
+              await expect.poll(() => snapshotHeld).toBe(true);
+              await expect(descriptionEditor).toBeHidden();
+              await page.locator('[data-edit-field="acceptance"]').click();
+              const acceptanceEditor = page.getByRole("form", { name: "Edit Acceptance criteria" });
+              await acceptanceEditor
+                .getByRole("textbox", { name: "Acceptance criteria" })
+                .fill(acceptance);
+              await acceptanceEditor.getByRole("button", { name: "Done", exact: true }).click();
+              await expect(acceptanceEditor).toBeHidden();
+            } finally {
+              releaseSnapshot();
+              await page.unrouteAll({ behavior: "wait" });
+            }
+            await expect(page.getByText(acceptance, { exact: true })).toBeVisible();
+            const savedSnapshot = await json<Snapshot>(snapshotPath, fixtures.tokens.marco);
+            const savedIssue = savedSnapshot.issues.find(
+              (issue) => issue.id === fixtures.tracker.ready,
+            );
+            assert.equal(savedIssue?.description, description);
+            assert.equal(savedIssue?.acceptance, acceptance);
+            await page.reload();
+            await expect(page.getByText(acceptance, { exact: true })).toBeVisible();
+            record({
+              largeDescriptionBytes: Buffer.byteLength(description),
+              saveFinishedBeforeRefresh: true,
+              delayedSnapshotPreservedNewerSave: true,
               reloadAssertions: true,
             });
             await persistent(`/${repo.owner}/-/packages/generic/${packageName}`, async () => {

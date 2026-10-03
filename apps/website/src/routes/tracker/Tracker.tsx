@@ -68,6 +68,7 @@ import {
   withTrackerDefaults,
   type View,
 } from "./preferences.ts";
+import { acknowledge } from "./snapshot.ts";
 import { RelationLens } from "./Lens.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
 import { IssueLog } from "./Log.tsx";
@@ -375,7 +376,9 @@ function Workbench({ data }: { data: TrackerView }) {
       });
       pending.current = null;
       setUncertain(false);
-      await refresh();
+      const acknowledged = acknowledge(latestSnapshot.current, result);
+      if (acknowledged !== latestSnapshot.current) accept(acknowledged);
+      void refresh();
       const outcome: MutationOutcome = { ok: true, events: result.events };
       for (const complete of pendingCompletions.current) complete(outcome);
       pendingCompletions.current.length = 0;
