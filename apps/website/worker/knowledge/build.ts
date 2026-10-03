@@ -30,6 +30,16 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { sql } from "kysely";
+import {
+  beginRepoProjection,
+  currentSnapshot,
+  failProjection,
+  projectEdges,
+  projectEntities,
+  publishProjection,
+  repoScope,
+  type EdgeCursor,
+} from "../atlas/projection.ts";
 import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
@@ -119,6 +129,13 @@ async function recordStats(d1: D1Database, buildId: string, stats: Record<string
     .where("id", "=", buildId)
     .execute();
 }
+
+/** A durable step that records its phase and progress (see `run`). */
+type Progress = <T extends Rpc.Serializable<T>>(
+  name: string,
+  phase: string,
+  work: () => Promise<T>,
+) => Promise<T>;
 
 function merge(base: Syntheses, over: Syntheses): Syntheses {
   return {
@@ -249,7 +266,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       }
       const { row, head } = start;
       if (head === start.previous && !force) {
-        await this.#finish(step, repoId, buildId, head, { upToDate: true });
+        // Repositories indexed before the Atlas existed get their first projection now.
+        const missing = await step.do(
+          "atlas-check",
+          STEP,
+          async () => !(await currentSnapshot(env.DB, repoScope(repoId))),
+        );
+        const atlas = missing ? await this.#project(step, progress, repoId, buildId, head) : {};
+        await this.#finish(step, repoId, buildId, head, { upToDate: true, ...atlas });
         return { status: "up-to-date" };
       }
 
@@ -510,6 +534,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           return null;
         }),
       );
+      const atlas = await this.#project(step, progress, repoId, buildId, head);
 
       await progress("index", "index", () =>
         this.#withReader(row, async (reader) => {
@@ -627,6 +652,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       });
 
       await this.#finish(step, repoId, buildId, head, {
+        ...atlas,
         analyzed,
         reused,
         graph: firstPass,
@@ -717,6 +743,63 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return null;
       });
       throw error;
+    }
+  }
+
+  /**
+   * Materialize the stored graph (complete after `graph-final`) as an immutable
+   * Atlas snapshot and publish it (CORE-158). Batches are idempotent, so step
+   * retries are safe. A failure is rolled back and recorded in the build's
+   * stats; it never fails the knowledge build, and the published snapshot
+   * stays current.
+   */
+  async #project(
+    step: WorkflowStep,
+    progress: Progress,
+    repoId: string,
+    buildId: string,
+    head: string,
+  ): Promise<Record<string, unknown>> {
+    const env = this.env;
+    const scope = repoScope(repoId);
+    const begun = await progress("atlas-start", "atlas", () =>
+      beginRepoProjection(env.DB, repoId, [{ repoId, commit: head, buildId }]),
+    );
+    try {
+      let after: string | null = null;
+      for (let i = 0; ; i++) {
+        const cursor: string | null = after;
+        const batch: { next: string | null; written: number } = await progress(
+          `atlas-entities-${i}`,
+          "atlas",
+          () => projectEntities(env.DB, repoId, begun.snapshotId, begun.seq, cursor),
+        );
+        after = batch.next;
+        if (!after) break;
+      }
+      let edges: EdgeCursor = null;
+      for (let i = 0; ; i++) {
+        const cursor: EdgeCursor = edges;
+        const batch: { next: EdgeCursor; written: number } = await progress(
+          `atlas-edges-${i}`,
+          "atlas",
+          () => projectEdges(env.DB, repoId, begun.snapshotId, begun.seq, cursor),
+        );
+        edges = batch.next;
+        if (!edges) break;
+      }
+      await progress("atlas-publish", "atlas", async () => {
+        await publishProjection(env.DB, scope, begun.snapshotId, begun.seq);
+        return null;
+      });
+      return { atlasSnapshot: begun.snapshotId, atlasSeq: begun.seq };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await step.do("atlas-fail", STEP, async () => {
+        await failProjection(env.DB, scope, begun.snapshotId, message);
+        return null;
+      });
+      return { atlasError: message.slice(0, 500) };
     }
   }
 

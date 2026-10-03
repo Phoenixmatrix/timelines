@@ -11,6 +11,7 @@ const PHASES: Record<string, string> = {
   graph: "Updating the graph",
   align: "Linking concepts",
   synthesize: "Summarizing components",
+  atlas: "Mapping the atlas",
   index: "Updating search indexes",
   wiki: "Rewriting affected pages",
 };

@@ -327,6 +327,59 @@ export interface Database {
     tokens: Generated<number>;
     updated_at: Generated<string>;
   };
+  /** Atlas projections (CORE-158): see migrations/*_atlas_projections.sql. */
+  atlas_scopes: {
+    scope: string;
+    kind: "repo";
+    repo_id: string | null;
+    created_at: Generated<string>;
+  };
+  atlas_snapshots: {
+    id: string;
+    scope: string;
+    seq: number;
+    status: Generated<"building" | "published" | "failed" | "expired">;
+    partial: Generated<number>;
+    projection_version: number;
+    grouping_version: number | null;
+    vector: string;
+    entities: Generated<number>;
+    edges: Generated<number>;
+    bytes: Generated<number>;
+    error: string | null;
+    created_at: Generated<string>;
+    published_at: string | null;
+    expires_at: string | null;
+  };
+  atlas_current: {
+    scope: string;
+    snapshot_id: string;
+    seq: number;
+    published_at: string;
+  };
+  atlas_entities: {
+    scope: string;
+    entity_id: string;
+    from_seq: number;
+    to_seq: number | null;
+    kind: string;
+    parent_id: string | null;
+    sort_key: string;
+    name: string;
+    path: string | null;
+    summary: Generated<string>;
+    data: string;
+    content_hash: string;
+  };
+  atlas_edges: {
+    scope: string;
+    src: string;
+    dst: string;
+    kind: string;
+    from_seq: number;
+    to_seq: number | null;
+    weight: Generated<number>;
+  };
   wiki_pages: {
     repo_id: string;
     slug: string;
