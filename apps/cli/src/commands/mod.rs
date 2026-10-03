@@ -11,6 +11,7 @@ pub mod semantic;
 pub mod server;
 pub mod timeline;
 pub mod tracker;
+pub mod why;
 pub mod worktree;
 mod worktree_include;
 

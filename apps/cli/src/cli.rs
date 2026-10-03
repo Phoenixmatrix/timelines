@@ -91,6 +91,8 @@ pub enum Command {
     /// Read files at any revision without touching the working copy
     #[command(subcommand)]
     File(FileCommand),
+    /// Why did these lines change? Blame, then the change's timelines, issues, checkpoints, approval and landing
+    Why(WhyArgs),
     /// Manage isolated working copies sharing this repository's objects and bookmarks
     #[command(subcommand)]
     Worktree(WorktreeCommand),
@@ -389,6 +391,21 @@ pub enum FileCommand {
         #[arg(short, long, default_value = "@")]
         revision: String,
     },
+}
+
+#[derive(Args)]
+pub struct WhyArgs {
+    /// A file and line: `src/app.ts:12` or `src/app.ts:12-20`; or just the file, with --line.
+    pub target: String,
+    /// The line or range (12, 12-20), when the target names only the file.
+    #[arg(short = 'L', long)]
+    pub line: Option<String>,
+    /// Revision to blame at (default: the working copy).
+    #[arg(short, long = "rev", visible_alias = "revision", default_value = "@")]
+    pub revision: String,
+    /// Repository on the server as owner/name (default: this repository's origin).
+    #[arg(short = 'R', long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Args)]

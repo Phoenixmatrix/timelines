@@ -158,6 +158,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::File(FileCommand::List { path, revision }) => {
             out(f, local::file_list(ctx, path.as_deref(), &revision))
         }
+        Command::Why(a) => out(f, commands::why::run(ctx, &a)),
         Command::Worktree(c) => out(f, worktree::run(ctx, &c)),
         Command::Init => out(f, local::init(ctx)),
         Command::Clone(a) => out(f, network::clone(ctx, &a)),

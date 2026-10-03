@@ -15,7 +15,7 @@ import { db, type DB } from "../schema.ts";
 const PAGE = 50;
 const CHANGE_ID = /^[0-9a-z]{4,64}$/;
 
-const selectUpdates = (kdb: DB) =>
+export const selectUpdates = (kdb: DB) =>
   kdb
     .selectFrom("ref_updates as u")
     .leftJoin("accounts as a", "a.id", "u.actor_id")
@@ -25,7 +25,7 @@ const selectUpdates = (kdb: DB) =>
 
 type UpdateRow = InferResult<ReturnType<typeof selectUpdates>>[number];
 
-const toUpdate = (row: UpdateRow): RefUpdate => ({
+export const toUpdate = (row: UpdateRow): RefUpdate => ({
   id: row.id,
   ref: row.ref,
   old: row.old_oid,

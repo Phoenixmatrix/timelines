@@ -1,6 +1,7 @@
 import {
   CopyIcon,
   LinkSimpleIcon,
+  QuestionIcon,
   MapTrifoldIcon,
   PackageIcon,
   XIcon,
@@ -35,6 +36,7 @@ import { useSourceHighlight } from "../../lib/useSourceHighlight.ts";
 import { FileHistory } from "./History.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
+import { WhyPanel } from "./WhyPanel.tsx";
 
 export async function blobLoader({ params }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
@@ -62,6 +64,7 @@ export function Blob() {
   const anchor = useRef<{ file: string; hash: string; line: number } | null>(null);
   const file = `${repo.id}:${blob.ref}:${blob.path}`;
   const [rangeOrigin, setRangeOrigin] = useState<{ file: string; hash: string } | null>(null);
+  const [whyOpen, setWhyOpen] = useState(false);
   const extending = rangeOrigin?.file === file && rangeOrigin.hash === hash;
   const selectedHash = selection ? lineAnchor(selection.start, selection.end) : "";
   const lineLabel = start === end ? `line ${start}` : `lines ${start}–${end}`;
@@ -113,11 +116,13 @@ export function Blob() {
 
   // Y copies the permalink (to the selected lines, or the file); Escape clears
   // the selection. Typing in a field is left alone.
-  const keys = useRef({ copyLink, clearSelection, selected: !!selection });
-  keys.current = { copyLink, clearSelection, selected: !!selection };
+  const keys = useRef({ copyLink, clearSelection, selected: !!selection, whyOpen, setWhyOpen });
+  keys.current = { copyLink, clearSelection, selected: !!selection, whyOpen, setWhyOpen };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // The why panel is a dialog with its own keys.
       if (event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
+      if (keys.current.whyOpen) return;
       const target = event.target as HTMLElement | null;
       if (
         target?.closest("input, textarea, select, [contenteditable=''], [contenteditable='true']")
@@ -126,6 +131,9 @@ export function Blob() {
       if (event.key === "y" || event.key === "Y") {
         event.preventDefault();
         void keys.current.copyLink(true);
+      } else if ((event.key === "w" || event.key === "W") && keys.current.selected) {
+        event.preventDefault();
+        keys.current.setWhyOpen(true);
       } else if (event.key === "Escape" && keys.current.selected) {
         keys.current.clearSelection();
       }
@@ -208,6 +216,15 @@ export function Blob() {
                 </span>
                 <button
                   type="button"
+                  className="mk-btn mk-btn--sm max-sm:h-11"
+                  onClick={() => setWhyOpen(true)}
+                  title={`Why did ${lineLabel} change? Commit, timeline, issue, approval and landing (W)`}
+                >
+                  <QuestionIcon aria-hidden />
+                  Why?
+                </button>
+                <button
+                  type="button"
                   className="mk-btn mk-btn--ghost mk-btn--sm max-sm:h-11"
                   aria-pressed={extending}
                   onClick={() => setRangeOrigin(extending ? null : { file, hash })}
@@ -227,7 +244,8 @@ export function Blob() {
             ) : (
               !blob.binary && (
                 <span className="text-ink-faint">
-                  Select a line number to link to it; shift-click another for a range.
+                  Select a line number to link to it or ask why it changed; shift-click another for
+                  a range.
                 </span>
               )
             )}
@@ -285,16 +303,37 @@ export function Blob() {
                 )}
               </div>
               {selection && pinTop !== null && (
-                <button
-                  type="button"
-                  className="absolute right-2 inline-flex h-6 cursor-pointer items-center gap-1.5 rounded-plate border-0 bg-raised px-2 font-sans text-micro font-semibold text-ink-muted transition-colors hover:bg-pressed hover:text-ink focus-visible:outline-2 focus-visible:outline-signal-line"
-                  style={{ top: pinTop }}
-                  onClick={() => void copyLink(true)}
-                  title={`Copy a permalink to ${lineLabel} (Y)`}
-                >
-                  <LinkSimpleIcon aria-hidden />
-                  Permalink
-                </button>
+                <div className="absolute right-2 flex gap-1" style={{ top: pinTop }}>
+                  <button
+                    type="button"
+                    className="inline-flex h-6 cursor-pointer items-center gap-1.5 rounded-plate border-0 bg-raised px-2 font-sans text-micro font-semibold text-ink-muted transition-colors hover:bg-pressed hover:text-ink focus-visible:outline-2 focus-visible:outline-signal-line"
+                    onClick={() => setWhyOpen(true)}
+                    title={`Why did ${lineLabel} change? (W)`}
+                  >
+                    <QuestionIcon aria-hidden />
+                    Why?
+                  </button>
+                  <button
+                    type="button"
+                    className="inline-flex h-6 cursor-pointer items-center gap-1.5 rounded-plate border-0 bg-raised px-2 font-sans text-micro font-semibold text-ink-muted transition-colors hover:bg-pressed hover:text-ink focus-visible:outline-2 focus-visible:outline-signal-line"
+                    onClick={() => void copyLink(true)}
+                    title={`Copy a permalink to ${lineLabel} (Y)`}
+                  >
+                    <LinkSimpleIcon aria-hidden />
+                    Permalink
+                  </button>
+                </div>
+              )}
+              {selection && (
+                <WhyPanel
+                  repo={repo}
+                  path={blob.path}
+                  rev={blob.commitOid}
+                  start={selection.start}
+                  end={selection.end}
+                  open={whyOpen}
+                  onOpenChange={setWhyOpen}
+                />
               )}
             </div>
           )}
