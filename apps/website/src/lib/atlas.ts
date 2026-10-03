@@ -11,6 +11,8 @@
 
 import type {
   AtlasAncestors,
+  AtlasChangeClass,
+  AtlasComparison,
   AtlasContribution,
   AtlasCrossLink,
   AtlasDetail,
@@ -24,6 +26,7 @@ import type {
   AtlasPage,
   AtlasRegion,
   AtlasRelation,
+  AtlasSnapshotList,
   AtlasWorkspaceAncestors,
   AtlasWorkspaceComposition,
   AtlasWorkspaceDetail,
@@ -155,6 +158,30 @@ export const atlasApi = {
       "catalogue",
       { q, kind: request.kind, ...paged(request) },
       request,
+    ),
+  /** Published snapshots, newest first, and which are still readable (what a comparison can name). */
+  snapshots: (repo: AtlasRepo, request: Omit<AtlasPageRequest, "snapshot"> = {}) =>
+    get<AtlasSnapshotList>(repo, "snapshots", paged(request), { signal: request.signal }),
+  /**
+   * What changed from snapshot `from` to the newer `to` (CORE-175): change
+   * records classed source, regrouping, summary or other. An expired side is
+   * a `snapshot_expired` error naming its `side`: the comparison is
+   * unavailable, which never means "no changes".
+   */
+  compare: (
+    repo: AtlasRepo,
+    from: string,
+    to: string,
+    request: Omit<AtlasPageRequest, "snapshot"> & {
+      class?: AtlasChangeClass | null;
+      within?: string | null;
+    } = {},
+  ) =>
+    get<AtlasComparison>(
+      repo,
+      "compare",
+      { from, to, class: request.class, within: request.within, ...paged(request) },
+      { signal: request.signal },
     ),
   /** Capabilities spanning the selected repositories, largest first. */
   composition: (workspace: AtlasWorkspace, request: AtlasPageRequest = {}) =>
@@ -312,5 +339,6 @@ export function atlasErrorOf(error: unknown): AtlasError | null {
     current: body.current ?? null,
     ...(body.expired ? { expired: body.expired } : {}),
     ...(body.lineage ? { lineage: body.lineage } : {}),
+    ...(body.side ? { side: body.side } : {}),
   };
 }

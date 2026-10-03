@@ -283,9 +283,69 @@ export async function atlasBrowserScenario(t: AtlasE2E) {
     await successor.click();
     await expect(heading(page, successorName)).toBeVisible();
 
+    // 7b. Main snapshot comparison (CORE-175): both snapshots named, the
+    // merge's regrouping apart from source and summary-only changes, a class
+    // and capability filter in the address, and a history handoff that Back
+    // returns from with the comparison intact. Bounded reads of this
+    // repository only.
+    mark = seen.length;
+    await page.goto(`${base}?snapshot=${second.snapshotId}`);
+    await page.getByText("Compare with an earlier snapshot", { exact: true }).click();
+    await page
+      .getByRole("list", { name: "Earlier snapshots" })
+      .getByRole("button", { name: new RegExp(`^#${first.seq} `) })
+      .click();
+    await page.waitForURL(
+      (url) =>
+        url.searchParams.get("compare") === first.snapshotId &&
+        url.searchParams.get("snapshot") === second.snapshotId,
+    );
+    const comparison = page.getByRole("region", { name: "Changes between snapshots" });
+    await expect(comparison).toContainText(`From #${first.seq} (${head.slice(0, 7)}`);
+    await expect(comparison).toContainText(`to #${second.seq} (${head.slice(0, 7)}`);
+    const changeList = comparison.getByRole("list", { name: "Changes", exact: true });
+    const retired = changeList
+      .getByRole("listitem")
+      .filter({ hasText: `Merged into “${successorName}”` });
+    await expect(retired.getByText(opsCapability.name, { exact: true })).toBeVisible();
+    await expect(retired).toContainText("Capability · gone");
+    await expect(comparison).toContainText("Source: 3 edited files");
+    await comparison.getByRole("button", { name: /^Regrouping \d+$/ }).click();
+    await page.waitForURL((url) => url.searchParams.get("changes") === "regrouping");
+    const deploy = changeList.getByRole("listitem").filter({ hasText: "ops/deploy.ts" });
+    await expect(deploy).toContainText(`Moved from ${opsCapability.name} to ${successorName}`);
+    await expect(deploy).toContainText("Its source changed");
+    await comparison.getByRole("button", { name: /^Summary only 0$/ }).click();
+    await expect(comparison.getByText("No summary only changes.")).toBeVisible();
+    await comparison.getByRole("button", { name: /^Regrouping \d+$/ }).click();
+    await changeList.getByRole("button", { name: successorName, exact: true }).click();
+    await expect(heading(page, successorName)).toBeVisible();
+    await comparison.getByRole("button", { name: `Only changes in ${successorName}` }).click();
+    await page.waitForURL((url) => url.searchParams.has("within"));
+    await expect(comparison).toContainText(`Only in ${successorName}`);
+    await expect(deploy).toBeVisible();
+    await expect(changeList).not.toContainText("billing/");
+    const compared = page.url();
+    await page.screenshot({ path: join(t.ctx.artifacts, "browser-atlas-compare.png") });
+    await deploy.getByRole("link", { name: "History", exact: true }).click();
+    await page.waitForURL((url) => url.pathname.startsWith(`/${owner}/${name}/commits/${head}/`));
+    await page.goBack();
+    await page.waitForURL((url) => url.href === compared);
+    await expect(deploy).toContainText(`Moved from ${opsCapability.name} to ${successorName}`);
+    assertNoPaidFanOut(mark, "comparison");
+    const compareCalls = atlasCalls(mark).filter((c) => c.route === "compare");
+    assert(compareCalls.length > 0, "The comparison read GET /atlas/compare");
+    t.record({ comparison: { reads: compareCalls.length, url: compared } });
+
     // 8. Retention expires the first snapshot: its link explains, and only an
     // explicit action opens the current view.
     await dev({ action: "expire" });
+    // The comparison it named is unavailable, said as such: not "no changes".
+    await page.goto(compared);
+    await expect(comparison.getByRole("alert")).toContainText(
+      "Comparison unavailable. The older snapshot has expired",
+    );
+    await expect(comparison).toContainText("That doesn't mean nothing changed.");
     await page.goto(
       `${base}?select=${encodeURIComponent(opsCapability.id)}&snapshot=${first.snapshotId}`,
     );

@@ -53,6 +53,7 @@ import { scopeOf } from "../../lib/timelineScope.ts";
 import { useViewer } from "../../lib/session.ts";
 import { usePalette } from "../../palette/Palette.tsx";
 import { useMediaQuery } from "../../lib/useMediaQuery.ts";
+import { AtlasCompare } from "./AtlasCompare.tsx";
 import { AtlasInspector } from "./AtlasInspector.tsx";
 import { AtlasOutline } from "./AtlasOutline.tsx";
 import {
@@ -528,6 +529,13 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
   );
   const selection = (
     <>
+      <AtlasCompare
+        repo={ref}
+        base={base}
+        snapshot={snapshot}
+        selected={selected}
+        onPick={select}
+      />
       {data.overlay && (
         <OverlayPanel
           overlay={data.overlay}

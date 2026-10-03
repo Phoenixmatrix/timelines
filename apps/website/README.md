@@ -1390,6 +1390,29 @@ touches a model, Vectorize or AI Search (those bindings throw). The browser
 E2E `browser-atlas-revocation-clears-the-open-view` removes a collaborator
 while their Knowledge tab is open.
 
+**Main snapshot comparisons** (`worker/atlas/compare.ts`, CORE-175).
+`GET …/atlas/snapshots` lists a repository's published snapshots newest first
+(current, retained, or expired with its reason); `GET
+…/atlas/compare?from=<older>&to=<newer>[&class=&within=]` pages change records
+for capabilities, areas and files, each classed **source** (files added,
+removed or with another blob; a region's files added or removed),
+**regrouping** (a file's capability or area moved; a region appeared, was
+retired with its lineage, or had files move in or out), **summary** (only
+names or descriptions changed, with the same blob or the same members) or
+**other** (`fields` names what differs). It reads only rows opened or closed
+between the two sequences (indexed by `atlas_entities_opened` and
+`atlas_entities_open`), classes them in SQL so a class filter pages and counts
+exactly, runs no model, and carries caveats (different projection/grouping
+versions, partial sides, builds in between, same commit; relations aren't
+compared). `to` pins the pages; cursors are bound to `from`, the class and
+`within`. Either side past retention is 410 `snapshot_expired` (404
+`snapshot_unknown`) with `side`: the comparison is unavailable, never empty.
+The Knowledge tab's **Compare with an earlier snapshot** panel
+(`AtlasCompare.tsx`) keeps `compare=<older id>`, `changes=<class>` and
+`within=<capability>` in the address beside the pinned `snapshot`, filters by
+the selected capability, and hands off to source at either commit, history and
+syntax changes; Back returns to the same comparison.
+
 **Workspace Atlas page** (`src/routes/atlas/`, CORE-172), at
 `/:owner/-/atlas?repos=a,b`, linked as **Knowledge** from the account page. Pick the
 account, then repositories you can read (or fill the selection from a tracker

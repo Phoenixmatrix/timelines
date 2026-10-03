@@ -394,6 +394,12 @@ export interface AtlasError {
    * change rather than resolve to something unrelated.
    */
   lineage?: AtlasLineage;
+  /**
+   * A comparison (GET /compare): which of its two snapshots the error is
+   * about. An expired or unknown one makes the comparison unavailable, which
+   * says nothing about whether anything changed.
+   */
+  side?: "from" | "to";
 }
 
 export interface AtlasLineage {
@@ -643,4 +649,190 @@ export interface AtlasWorkspaceComposition extends AtlasWorkspacePage<AtlasCompo
   resolved: number;
   /** Browsing composes with deterministic rules only. */
   inference: "none";
+}
+
+// ---- snapshot comparisons (CORE-175) -------------------------------------------
+//
+// What changed between two retained snapshots of one repository's main Atlas,
+// `from` (older) and `to` (newer), both named explicitly. Each change record
+// is a capability, area or file whose recorded state differs between them,
+// classed by what kind of change it is; a record can be in several classes:
+//
+//   source      the code changed: a file added, removed or with another blob;
+//               for a region, member files added or removed
+//   regrouping  grouping placed things differently: a file's primary
+//               capability/area moved, a region appeared, was retired (split,
+//               merged, removed) or had files move in or out
+//   summary     only the words changed: a file's summary with the same blob,
+//               a region's name, summary or description state with the same
+//               members (summary-only)
+//   other       recorded differently with none of the above (analysis
+//               details, concepts, layout, provenance…): `fields` says which
+//
+// Comparisons read only the rows that changed between the two snapshots
+// (worker/atlas/compare.ts), are deterministic, and run no model. A snapshot
+// past retention makes a comparison unavailable (`snapshot_expired`, with
+// `side`), never an empty one. The model is the same whatever the two sides
+// are, so a timeline-versus-main comparison can reuse it.
+
+/** What kind of change a record is. */
+export type AtlasChangeClass = "source" | "regrouping" | "summary" | "other";
+
+export const ATLAS_CHANGE_CLASSES: readonly AtlasChangeClass[] = [
+  "source",
+  "regrouping",
+  "summary",
+  "other",
+];
+
+/** Which recorded parts of an entity differ between the two snapshots. */
+export type AtlasChangeField =
+  /** Its parent, primary capability or area. */
+  | "placement"
+  /** A file's blob. */
+  | "source"
+  | "name"
+  | "summary"
+  /** A region's model description (prose, or its current/stale/unavailable state). */
+  | "description"
+  /** Deduplicated counts. */
+  | "counts"
+  /** A file's membership evidence (rationale, cross-cutting references). */
+  | "membership"
+  /** A file's analysis (pending, skipped, language, role, lines, responsibilities). */
+  | "analysis"
+  | "concepts"
+  | "layout"
+  | "lineage"
+  | "provenance";
+
+/** One side of a change record: the entity as that snapshot recorded it. */
+export interface AtlasChangeSide {
+  name: string;
+  path: string | null;
+  parentId: string | null;
+  /** A file's primary capability and area (null: unclassified, or not a file). */
+  capability: string | null;
+  area: string | null;
+  /** A file's blob at that snapshot's commit. */
+  blob: string | null;
+  /** Cut to ATLAS_CATALOGUE_SUMMARY_CHARS. */
+  summary: string;
+  summaryTruncated: boolean;
+  summaryState?: { status: AtlasDescriptionStatus; reason?: AtlasUnavailableReason };
+  /** A region's primary files. */
+  files: number | null;
+}
+
+/** An entity a record refers to, with its name in the snapshot it's from (null: not there). */
+export interface AtlasChangeRef {
+  id: string;
+  share?: number;
+  name: string | null;
+}
+
+export interface AtlasChange {
+  id: string;
+  kind: "capability" | "area" | "file";
+  /** added: only in `to`; removed: only in `from`; changed: in both. */
+  presence: "added" | "removed" | "changed";
+  /** Never empty. */
+  classes: AtlasChangeClass[];
+  fields: AtlasChangeField[];
+  from: AtlasChangeSide | null;
+  to: AtlasChangeSide | null;
+  /**
+   * Names for the ids the sides mention (parents, capabilities, areas), each
+   * read in the snapshot that mentions it.
+   */
+  names: Record<string, string>;
+  /**
+   * A region only in `to`: what the build that made it recorded (CORE-165).
+   * Lineage is recorded build to build, so with builds between the two
+   * snapshots a predecessor may itself be newer than `from` (its name is null then).
+   */
+  origin: {
+    change: "split" | "merge" | "new";
+    /** The snapshot sequence that recorded it; null when none was recorded. */
+    since: number | null;
+    predecessors: AtlasChangeRef[];
+  } | null;
+  /** A region only in `from`: its retirement between the two (successor names as `to` has them). */
+  retired: {
+    seq: number;
+    change: "split" | "merged" | "removed";
+    successors: AtlasChangeRef[];
+  } | null;
+  /**
+   * A region: its member files between the two snapshots (moved in or out by
+   * grouping; added or removed with the source). Null for files.
+   */
+  members: { movedIn: number; movedOut: number; added: number; removed: number } | null;
+}
+
+/** One side of a comparison: its snapshot, and the grouping version that built it. */
+export interface AtlasComparisonSide {
+  snapshot: AtlasSnapshotRef;
+  groupingVersion: number | null;
+}
+
+/** Something that limits what a comparison can say. */
+export type AtlasComparisonCaveat =
+  /** Built by different projection or grouping versions: some regrouping is the algorithm's, not the code's. */
+  | {
+      code: "versions";
+      from: { projection: number; grouping: number | null };
+      to: { projection: number; grouping: number | null };
+    }
+  /** A side's upstream analysis was incomplete. */
+  | { code: "partial"; side: "from" | "to" }
+  /** Builds between the two: lineage was recorded build to build. */
+  | { code: "between"; builds: number }
+  /** Both sides were built from the same commit: nothing in the code changed. */
+  | { code: "same-commit" }
+  /** Capability relations aren't compared; read the lens on either snapshot. */
+  | { code: "relations" };
+
+/** Counts over the whole comparison (within its `within` filter, across classes). */
+export interface AtlasComparisonSummary {
+  /** Records in each class; a record can count in several. */
+  classes: Record<AtlasChangeClass, number>;
+  total: number;
+  kinds: { capability: number; area: number; file: number };
+  /** Source-level file changes. */
+  files: { added: number; removed: number; modified: number };
+  /**
+   * Other entities (symbols, folders, components, concepts, packages) with
+   * rows written between the two, which the records don't itemize: an upper
+   * bound (a value changed and changed back counts). Null with `within`.
+   */
+  others: number | null;
+}
+
+/** GET /compare?from=&to=[&class=&within=] : a page of change records. `snapshot` is `to`. */
+export interface AtlasComparison extends AtlasPage<AtlasChange> {
+  from: AtlasComparisonSide;
+  to: AtlasComparisonSide;
+  /** The capability or area the records are limited to, as `to` (else `from`) has it. */
+  within: AtlasEntitySummary | null;
+  class: AtlasChangeClass | null;
+  /** The first page's; null on continuation pages (it can't change: both sides are immutable). */
+  summary: AtlasComparisonSummary | null;
+  caveats: AtlasComparisonCaveat[];
+}
+
+/** A snapshot a comparison can name, as GET /snapshots lists it. */
+export interface AtlasSnapshotListing extends AtlasSnapshotRef {
+  /** current; retained (a readable prior); expired (past retention: unavailable to compare). */
+  state: "current" | "retained" | "expired";
+  groupingVersion: number | null;
+  expiredReason: "age" | "count" | "storage" | null;
+}
+
+/** GET /snapshots: the scope's published snapshots, newest first. */
+export interface AtlasSnapshotList {
+  scope: string;
+  current: string | null;
+  items: AtlasSnapshotListing[];
+  next: string | null;
 }

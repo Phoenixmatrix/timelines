@@ -9,6 +9,9 @@
 //   GET /relations?id=&direction=in|out[&kind=]    one-hop edges with their other ends
 //   GET /evidence?id=                              source locations backing an entity
 //   GET /catalogue?q=[&kind=]                      entities whose name or path contains q
+//   GET /snapshots[?cursor=]                       published snapshots, newest first
+//   GET /compare?from=&to=[&class=&within=]        what changed between two retained
+//                                                  snapshots (worker/atlas/compare.ts)
 //
 // Every route authorizes the repository first (unreadable looks like missing),
 // then reads only the published projection (worker/atlas/projection.ts): no
@@ -48,6 +51,12 @@ import {
   type AtlasRegion,
   type AtlasRelation,
   type AtlasSnapshotRef,
+  ATLAS_CHANGE_CLASSES,
+  type AtlasChangeClass,
+  type AtlasComparison,
+  type AtlasComparisonCaveat,
+  type AtlasSnapshotList,
+  type AtlasSnapshotListing,
 } from "../../shared/atlas.ts";
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
@@ -79,8 +88,10 @@ import {
   type RelationKey,
   contributingAt,
   edgesAt,
+  toSnapshot,
 } from "./projection.ts";
 import { lineageOf } from "./identity.ts";
+import { comparePage, compareSummary, type CompareKey } from "./compare.ts";
 import { capacityFailure, cursorExpiresAt, pinnedSnapshot } from "./retention.ts";
 
 export const atlas = new Hono<AppEnv>();
@@ -203,6 +214,8 @@ async function pin<K>(
   c: C,
   route: string,
   filters: Record<string, string | null>,
+  /** A comparison pins its `to` snapshot (not `?snapshot=`), and says so in errors. */
+  options: { snapshot?: string; side?: "to" } = {},
 ): Promise<Pinned<K> | Response> {
   const loaded = await loadRepo(c, "read");
   if (loaded instanceof Response) return loaded;
@@ -210,9 +223,10 @@ async function pin<K>(
   const scope = repoScope(loaded.row.id);
   const secret = await cursorSecret(c.env);
   const binding: CursorBinding = { route, scope, filters, principal: principalOf(c) };
-  const requested = c.req.query("snapshot") || null;
+  const requested = (options.snapshot ?? c.req.query("snapshot")) || null;
+  const side = options.side ? { side: options.side } : {};
   const restart = async (code: AtlasErrorCode, status: ContentfulStatusCode, error: string) =>
-    failWith(c, status, code, error, await currentSnapshot(d1, scope));
+    failWith(c, status, code, error, await currentSnapshot(d1, scope), side);
 
   let cursor: CursorState<K> | null = null;
   const raw = c.req.query("cursor");
@@ -257,7 +271,7 @@ async function pin<K>(
       "snapshot_expired",
       "This Atlas snapshot has expired. Open the current one instead.",
       pinned.current,
-      { expired: { at: pinned.expiredAt, reason: pinned.reason } },
+      { expired: { at: pinned.expiredAt, reason: pinned.reason }, ...side },
     );
   if (cursor && now >= cursorExpiresAt(cursor.issuedAt, pinned.snapshot.expiresAt))
     return restart("cursor_expired", 410, "This page link has expired. Start again.");
@@ -629,3 +643,221 @@ atlas.get("/catalogue", async (c) => {
     ),
   );
 });
+
+// ---- snapshots and comparisons (CORE-175) --------------------------------------
+
+/**
+ * The scope's published snapshots, newest first, with which are still
+ * readable: what a comparison can name. Expired ones stay listed (while
+ * retention keeps their record) so a person sees why one can't be compared.
+ */
+atlas.get("/snapshots", async (c) => {
+  const loaded = await loadRepo(c, "read");
+  if (loaded instanceof Response) return loaded;
+  const limit = limitOf(c);
+  if (limit instanceof Response) return limit;
+  const d1 = c.env.DB;
+  const scope = repoScope(loaded.row.id);
+  const secret = await cursorSecret(c.env);
+  const binding: CursorBinding = {
+    route: "snapshots",
+    scope,
+    filters: {},
+    principal: principalOf(c),
+  };
+  let before = Number.MAX_SAFE_INTEGER;
+  const raw = c.req.query("cursor");
+  if (raw) {
+    const verified = await verifyCursor<number>(secret, binding, raw);
+    if (!verified.ok || typeof verified.state.after !== "number")
+      return failWith(
+        c,
+        400,
+        "cursor_invalid",
+        "This page link doesn't belong to this request. Start again.",
+      );
+    if (Date.now() >= cursorExpiresAt(verified.state.issuedAt, null))
+      return failWith(c, 410, "cursor_expired", "This page link has expired. Start again.");
+    before = verified.state.after;
+  }
+  const rows = await d1
+    .prepare(
+      `SELECT s.*, c.snapshot_id AS current_id FROM atlas_snapshots s
+       LEFT JOIN atlas_current c ON c.snapshot_id = s.id
+       WHERE s.scope = ? AND s.status IN ('published', 'expired') AND s.seq < ?
+       ORDER BY s.seq DESC LIMIT ?`,
+    )
+    .bind(scope, before, limit + 1)
+    .all<
+      Parameters<typeof toSnapshot>[0] & {
+        grouping_version: number | null;
+        current_id: string | null;
+      }
+    >();
+  const now = new Date().toISOString();
+  const page = rows.results.slice(0, limit);
+  const items: AtlasSnapshotListing[] = page.map((row) => ({
+    ...refOf(toSnapshot(row)),
+    // As retention's pinnedSnapshot decides: a prior past its expiry is expired already.
+    state: row.current_id
+      ? "current"
+      : row.status === "expired" || (row.expires_at !== null && row.expires_at <= now)
+        ? "expired"
+        : "retained",
+    groupingVersion: row.grouping_version,
+    expiredReason: (row.expired_reason as AtlasSnapshotListing["expiredReason"]) ?? null,
+  }));
+  const current = await currentSnapshot(d1, scope);
+  const last = page.at(-1);
+  const body: AtlasSnapshotList = {
+    scope,
+    current: current?.id ?? null,
+    items,
+    next:
+      rows.results.length > limit && last
+        ? await signCursor(secret, binding, {
+            snapshot: "",
+            after: Number(last.seq),
+            loaded: 0,
+            total: null,
+            issuedAt: Date.now(),
+          })
+        : null,
+  };
+  return c.json(body);
+});
+
+/**
+ * What changed between two retained snapshots, `from` older than `to`, both
+ * named: change records classed source / regrouping / summary / other,
+ * optionally only one class or within one capability or area. `to` pins the
+ * pages as `?snapshot=` does elsewhere, and the cursor is bound to `from`,
+ * the class and `within` too. Either snapshot past retention makes the
+ * comparison unavailable (an explicit error naming the side), never empty.
+ */
+atlas.get("/compare", async (c) => {
+  const from = c.req.query("from") ?? "";
+  const to = c.req.query("to") ?? "";
+  const cls = c.req.query("class") || null;
+  const within = c.req.query("within") || null;
+  if (!from || !to || from.length > 2048 || to.length > 2048) {
+    // Still authorize first: an unreadable repository looks missing whatever was asked.
+    const loaded = await loadRepo(c, "read");
+    if (loaded instanceof Response) return loaded;
+    return failWith(c, 400, "bad_request", "Name both snapshots: ?from=<older>&to=<newer>.");
+  }
+  const ctx = await pin<CompareKey>(
+    c,
+    "compare",
+    { from, to, class: cls, within },
+    { snapshot: to, side: "to" },
+  );
+  if (ctx instanceof Response) return ctx;
+  if (cls !== null && !(ATLAS_CHANGE_CLASSES as readonly string[]).includes(cls))
+    return failWith(c, 400, "bad_request", "class is source, regrouping, summary or other.");
+  if (within !== null && within.length > 2048)
+    return failWith(c, 400, "bad_request", "That capability id is too long.");
+  const limit = limitOf(c);
+  if (limit instanceof Response) return limit;
+  const d1 = c.env.DB;
+  const older = await pinnedSnapshot(d1, ctx.scope, from);
+  if (older.state === "unknown")
+    return failWith(
+      c,
+      404,
+      "snapshot_unknown",
+      "The earlier snapshot isn't one this repository has, so this comparison is unavailable.",
+      await currentSnapshot(d1, ctx.scope),
+      { side: "from" },
+    );
+  if (older.state === "expired")
+    return failWith(
+      c,
+      410,
+      "snapshot_expired",
+      "The earlier snapshot has expired, so this comparison is unavailable. That isn't the same as no changes.",
+      older.current,
+      { expired: { at: older.expiredAt, reason: older.reason }, side: "from" },
+    );
+  const fromRef = refOf(older.snapshot);
+  if (fromRef.seq >= ctx.snapshot.seq)
+    return failWith(c, 400, "bad_request", "from must be an older snapshot than to.");
+
+  const toSeq = ctx.snapshot.seq;
+  let withinEntity: ProjectedEntity | null = null;
+  if (within) {
+    withinEntity =
+      (await entityAt(d1, ctx.scope, toSeq, within)) ??
+      (await entityAt(d1, ctx.scope, fromRef.seq, within));
+    if (!withinEntity)
+      return failWith(
+        c,
+        404,
+        "entity_unknown",
+        "That isn't in either snapshot of this comparison.",
+      );
+    if (withinEntity.kind !== "capability" && withinEntity.kind !== "area")
+      return failWith(c, 400, "bad_request", "within names a capability or an area.");
+  }
+  const filter = { within, class: cls as AtlasChangeClass | null };
+  const [result, summary, versions, between] = await Promise.all([
+    comparePage(d1, ctx.scope, fromRef.seq, toSeq, filter, ctx.cursor?.after ?? null, limit),
+    ctx.cursor ? null : compareSummary(d1, ctx.scope, fromRef.seq, toSeq, within),
+    d1
+      .prepare("SELECT id, grouping_version FROM atlas_snapshots WHERE scope = ? AND id IN (?, ?)")
+      .bind(ctx.scope, fromRef.id, ctx.snapshot.id)
+      .all<{ id: string; grouping_version: number | null }>(),
+    d1
+      .prepare(
+        `SELECT count(*) AS n FROM atlas_snapshots
+         WHERE scope = ? AND seq > ? AND seq < ? AND status IN ('published', 'expired')`,
+      )
+      .bind(ctx.scope, fromRef.seq, toSeq)
+      .first<{ n: number }>(),
+  ]);
+  const grouping = new Map(versions.results.map((v) => [v.id, v.grouping_version]));
+  const fromSide = { snapshot: fromRef, groupingVersion: grouping.get(fromRef.id) ?? null };
+  const toSide = { snapshot: ctx.snapshot, groupingVersion: grouping.get(ctx.snapshot.id) ?? null };
+  const paged = await page(ctx, result.changes, result.next, async () =>
+    summary ? (filter.class ? summary.classes[filter.class] : summary.total) : 0,
+  );
+  const body: AtlasComparison = {
+    ...paged,
+    counts: { ...paged.counts, unknownTotal: fromRef.partial || ctx.snapshot.partial },
+    from: fromSide,
+    to: toSide,
+    within: withinEntity ? lean(withinEntity) : null,
+    class: filter.class,
+    summary,
+    caveats: caveatsOf(fromSide, toSide, Number(between?.n ?? 0)),
+  };
+  return c.json(body);
+});
+
+function caveatsOf(
+  from: AtlasComparison["from"],
+  to: AtlasComparison["to"],
+  between: number,
+): AtlasComparisonCaveat[] {
+  const caveats: AtlasComparisonCaveat[] = [];
+  if (
+    from.snapshot.projectionVersion !== to.snapshot.projectionVersion ||
+    from.groupingVersion !== to.groupingVersion
+  )
+    caveats.push({
+      code: "versions",
+      from: { projection: from.snapshot.projectionVersion, grouping: from.groupingVersion },
+      to: { projection: to.snapshot.projectionVersion, grouping: to.groupingVersion },
+    });
+  if (from.snapshot.partial) caveats.push({ code: "partial", side: "from" });
+  if (to.snapshot.partial) caveats.push({ code: "partial", side: "to" });
+  if (between > 0) caveats.push({ code: "between", builds: between });
+  const commits = (s: AtlasSnapshotRef) =>
+    s.vector
+      .map((v) => `${v.repoId}@${v.commit}`)
+      .sort()
+      .join(",");
+  if (commits(from.snapshot) === commits(to.snapshot)) caveats.push({ code: "same-commit" });
+  caveats.push({ code: "relations" });
+  return caveats;
+}
