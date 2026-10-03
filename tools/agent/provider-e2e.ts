@@ -14,6 +14,7 @@ import type {
 } from "../../apps/website/shared/release-notes.ts";
 import { waitForIndexVisibility, type VisibilityReport } from "./index-visibility.ts";
 import { searchItemStatus } from "./search-item-status.ts";
+import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 
 // Real git http-backend provides the target; all state belongs to this invocation.
 interface MirrorTarget {
@@ -244,6 +245,20 @@ export async function runProviderE2E(
     }
     throw new Error(`${label}: deadline exceeded after ${attempts} observations`);
   };
+  // The Atlas against the real providers (CORE-179) runs beside the Copper
+  // Finch scenario in its own repositories; its evidence is `atlas` here.
+  const atlasEvidence: Record<string, unknown> = { outcome: "running" };
+  // It starts once the assistant's turns are done (or that part failed).
+  let searchable = () => {};
+  const visible = new Promise<void>((resolve) => (searchable = resolve));
+  const atlas =
+    mode === "ai"
+      ? runAtlasProviderE2E(ctx, fixtures, atlasEvidence, visible).then(
+          () => undefined,
+          (error: unknown) => error ?? new Error("Atlas provider verification failed"),
+        )
+      : Promise.resolve(undefined);
+  if (mode === "ai") evidence.atlas = atlasEvidence;
   let failure: unknown;
   try {
     if (mode === "mirror") {
@@ -821,6 +836,9 @@ export async function runProviderE2E(
       };
       const notesFor = async (name: string): Promise<ReleaseNotesRelease> =>
         api(`${base}/release-notes/release?name=${encodeURIComponent(name)}`);
+      // The interactive assistant is done: the Atlas fixtures' model load can't
+      // rate-limit its turns now (Knowledge and release notes back off).
+      searchable();
       enter("release-daily-initial");
       await waitForNotes(["@day:2026-01-01"]);
       const firstDay = await notesFor("day:2026-01-01");
@@ -1279,6 +1297,7 @@ export async function runProviderE2E(
     }
     evidence.outcome = "passed";
   } catch (error) {
+    searchable();
     evidence.outcome = "failed";
     evidence.failedStage = stage;
     evidence.error = error instanceof Error ? error.message : "Unknown provider failure";
@@ -1291,6 +1310,18 @@ export async function runProviderE2E(
       elapsedMs: Date.now() - stageStarted,
       outcome: String(evidence.outcome),
     });
+    const atlasFailure = await atlas;
+    if (atlasFailure) {
+      const wrapped = new Error(
+        `Atlas provider verification failed at ${String(atlasEvidence.failedStage)}; inspect ${mode}-e2e.json (atlas)`,
+        { cause: atlasFailure },
+      );
+      failure = failure
+        ? new AggregateError([failure, wrapped], "Provider verifications failed")
+        : wrapped;
+      evidence.outcome = "failed";
+      evidence.failedStage ??= `atlas:${String(atlasEvidence.failedStage)}`;
+    }
     if (target) evidence.mirrorRequests = target.counts;
     try {
       await target?.close();

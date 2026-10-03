@@ -86,9 +86,9 @@ async function chat(
   env: Env,
   tier: "fast" | "reason",
   messages: { role: "system" | "user"; content: string }[],
-  options: { json: boolean; maxTokens: number; think: boolean },
+  options: { json: boolean; maxTokens: number; think: boolean; model?: string | undefined },
 ): Promise<{ text: string; usage: Usage }> {
-  const model = MODELS[tier];
+  const model = options.model ?? MODELS[tier];
   const result = (await ai(env).run(model, {
     messages,
     max_tokens: options.maxTokens,
@@ -122,14 +122,15 @@ export function parseJsonReply<T>(text: string): T {
 
 /**
  * A JSON answer, retried once if the model's reply doesn't parse. Atlas paid
- * synthesis passes `attempts: 1`: its budgets allow no automatic paid retries.
+ * synthesis passes `attempts: 1`: its budgets allow no automatic paid retries,
+ * and `model` when its configuration names another model than the tier's.
  */
 export async function chatJson<T>(
   env: Env,
   tier: "fast" | "reason",
   system: string,
   user: string,
-  options: { maxTokens?: number; think?: boolean; attempts?: number } = {},
+  options: { maxTokens?: number; think?: boolean; attempts?: number; model?: string } = {},
 ): Promise<{ value: T; usage: Usage }> {
   const messages = [
     { role: "system" as const, content: system },
@@ -146,6 +147,7 @@ export async function chatJson<T>(
         json: true,
         maxTokens: options.maxTokens ?? 2000,
         think: options.think ?? false,
+        model: options.model,
       });
       tokens += usage.tokens;
       inputTokens =

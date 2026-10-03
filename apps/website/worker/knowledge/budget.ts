@@ -41,13 +41,25 @@ import type { Insertable } from "kysely";
 import { MODELS } from "./models.ts";
 import { db, nowIso, type Database } from "../schema.ts";
 
+export interface RunLimits {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface AtlasLimits {
+  build: RunLimits;
+  grouping: RunLimits;
+  /** Shared by every repository, scope and principal of one owning account. */
+  dailyUsdPerAccount: number;
+}
+
 /** Per-run caps and the daily ceiling, from the CORE-155 PRD. */
-export const ATLAS_LIMITS = {
+export const ATLAS_LIMITS: Readonly<AtlasLimits> = {
   build: { calls: 20, inputTokens: 100_000, outputTokens: 10_000 },
   grouping: { calls: 10, inputTokens: 50_000, outputTokens: 5_000 },
-  /** Shared by every repository, scope and principal of one owning account. */
   dailyUsdPerAccount: 10,
-} as const;
+};
 
 export interface ModelPrice {
   /** USD per million input tokens (uncached: reservations stay conservative). */
@@ -130,8 +142,10 @@ export type ReportedUsage = { inputTokens?: number | undefined; outputTokens?: n
 export interface BudgetOptions {
   /** The clock (tests move it across midnight). */
   now?: Date;
-  /** The price table (tests use their own; production uses ATLAS_PRICES). */
+  /** The price table (tests and configured accounts use their own; else ATLAS_PRICES). */
   prices?: PriceTable;
+  /** The caps (configured accounts may set their own; else ATLAS_LIMITS). */
+  limits?: Readonly<AtlasLimits>;
 }
 
 const MICRO = 1_000_000;
@@ -207,8 +221,9 @@ export async function reserveAtlasCall(
   const outputTokens = tokens(request.maxOutputTokens);
   const cost = costMicroUsd(price, inputTokens, outputTokens);
   const run = await resolveScope(d1, request.scope);
-  const limits = ATLAS_LIMITS[run.scope];
-  const dailyMicroUsd = ATLAS_LIMITS.dailyUsdPerAccount * MICRO;
+  const caps = options.limits ?? ATLAS_LIMITS;
+  const limits = caps[run.scope];
+  const dailyMicroUsd = caps.dailyUsdPerAccount * MICRO;
 
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = crypto.randomUUID();
@@ -265,7 +280,7 @@ export async function reserveAtlasCall(
           reservedUsd: cost / MICRO,
         },
       };
-    const exhausted = await recordExhaustion(d1, run, day, now, {
+    const exhausted = await recordExhaustion(d1, run, day, now, caps, {
       calls: 1,
       inputTokens,
       outputTokens,
@@ -286,6 +301,7 @@ async function recordExhaustion(
   run: ResolvedScope,
   day: string,
   now: Date,
+  caps: Readonly<AtlasLimits>,
   wanted: { calls: number; inputTokens: number; outputTokens: number; cost: number },
 ): Promise<AtlasExhausted | null> {
   const k = db(d1);
@@ -328,7 +344,7 @@ async function recordExhaustion(
       .where("day", "=", day)
       .executeTakeFirstOrThrow(),
   ]);
-  const limits = ATLAS_LIMITS[run.scope];
+  const limits = caps[run.scope];
   // A run's own caps first: they stop only that run.
   const cap: AtlasCap | null =
     Number(runTotals.calls) + wanted.calls > limits.calls
@@ -337,7 +353,7 @@ async function recordExhaustion(
         ? "input_tokens"
         : Number(runTotals.output) + wanted.outputTokens > limits.outputTokens
           ? "output_tokens"
-          : Number(dayTotals.cost) + wanted.cost > ATLAS_LIMITS.dailyUsdPerAccount * MICRO
+          : Number(dayTotals.cost) + wanted.cost > caps.dailyUsdPerAccount * MICRO
             ? "daily_usd"
             : null;
   if (!cap) return null;
@@ -535,7 +551,7 @@ export async function atlasRunSpend(
 export async function atlasDailySpend(
   d1: D1Database,
   accountId: string,
-  options: { now?: Date } = {},
+  options: { now?: Date; limits?: Readonly<AtlasLimits> } = {},
 ): Promise<{ day: string; usd: number; limitUsd: number; resetsAt: string; exhausted: boolean }> {
   const now = options.now ?? new Date();
   const day = utcDay(now);
@@ -556,7 +572,7 @@ export async function atlasDailySpend(
   return {
     day,
     usd: Number(spent.cost) / MICRO,
-    limitUsd: ATLAS_LIMITS.dailyUsdPerAccount,
+    limitUsd: (options.limits ?? ATLAS_LIMITS).dailyUsdPerAccount,
     resetsAt: nextUtcMidnight(now),
     exhausted: Boolean(exhaustion),
   };
@@ -584,4 +600,164 @@ export function atlasInfer(d1: D1Database, scope: AtlasScope, options: BudgetOpt
       () => call(),
       options,
     );
+}
+
+// ---- configuration --------------------------------------------------------------
+//
+// What a build's Atlas calls run with: the model that writes capability prose,
+// the prices it may spend at and the caps, for the repository's owning account.
+// Deployed, these are the built-in defaults (MODELS.reason, ATLAS_PRICES,
+// ATLAS_LIMITS). An environment can configure them with the ATLAS_CONFIG text
+// binding (only development environments declare it, cloudflare.config.ts):
+//
+//   { "model"?, "prices"?, "limits"?,            the environment's defaults
+//     "accounts"?: { "<owner slug>": { … } } }  per owning account, over them
+//
+// `prices` replaces the table (an empty one leaves every model unpriced, so
+// paid synthesis is disabled); `limits` overrides only the caps it names.
+// The live provider verification (tools/agent/provider-e2e.ts) runs one
+// account with Atlas disabled, one whose model the provider refuses and one
+// with a one-call build cap through exactly this, against the real provider.
+
+export interface AtlasConfigEntry {
+  model?: string;
+  prices?: Record<string, ModelPrice>;
+  limits?: {
+    build?: Partial<RunLimits>;
+    grouping?: Partial<RunLimits>;
+    dailyUsdPerAccount?: number;
+  };
+}
+
+export interface AtlasConfig extends AtlasConfigEntry {
+  accounts?: Record<string, AtlasConfigEntry>;
+}
+
+export interface AtlasSettings {
+  model: string;
+  prices: PriceTable;
+  limits: Readonly<AtlasLimits>;
+  /** Built-in defaults, the environment's configuration, or its entry for the owning account. */
+  source: "default" | "configured" | "account";
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+const amount = (v: unknown, where: string): number => {
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0)
+    throw new Error(`ATLAS_CONFIG: ${where} must be a non-negative number`);
+  return v;
+};
+
+function parseEntry(raw: unknown, where: string): AtlasConfigEntry {
+  if (!isRecord(raw)) throw new Error(`ATLAS_CONFIG: ${where} must be an object`);
+  const entry: AtlasConfigEntry = {};
+  if (raw.model !== undefined) {
+    if (typeof raw.model !== "string" || !raw.model)
+      throw new Error(`ATLAS_CONFIG: ${where}.model must be a model id`);
+    entry.model = raw.model;
+  }
+  if (raw.prices !== undefined) {
+    if (!isRecord(raw.prices)) throw new Error(`ATLAS_CONFIG: ${where}.prices must be an object`);
+    entry.prices = {};
+    for (const [model, price] of Object.entries(raw.prices)) {
+      if (!isRecord(price))
+        throw new Error(`ATLAS_CONFIG: ${where}.prices.${model} must be an object`);
+      entry.prices[model] = {
+        input: amount(price.input, `${where}.prices.${model}.input`),
+        output: amount(price.output, `${where}.prices.${model}.output`),
+      };
+    }
+  }
+  if (raw.limits !== undefined) {
+    if (!isRecord(raw.limits)) throw new Error(`ATLAS_CONFIG: ${where}.limits must be an object`);
+    const limits: NonNullable<AtlasConfigEntry["limits"]> = {};
+    for (const scope of ["build", "grouping"] as const) {
+      const run = raw.limits[scope];
+      if (run === undefined) continue;
+      if (!isRecord(run))
+        throw new Error(`ATLAS_CONFIG: ${where}.limits.${scope} must be an object`);
+      limits[scope] = {};
+      for (const cap of ["calls", "inputTokens", "outputTokens"] as const)
+        if (run[cap] !== undefined)
+          limits[scope][cap] = amount(run[cap], `${where}.limits.${scope}.${cap}`);
+    }
+    if (raw.limits.dailyUsdPerAccount !== undefined)
+      limits.dailyUsdPerAccount = amount(
+        raw.limits.dailyUsdPerAccount,
+        `${where}.limits.dailyUsdPerAccount`,
+      );
+    entry.limits = limits;
+  }
+  return entry;
+}
+
+/** Parse ATLAS_CONFIG; null when it isn't set. Throws on a malformed one (never silently default). */
+export function parseAtlasConfig(raw: unknown): AtlasConfig | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ATLAS_CONFIG must be JSON text");
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    throw new Error("ATLAS_CONFIG is not valid JSON");
+  }
+  const config: AtlasConfig = parseEntry(json, "config");
+  const accounts = (json as Record<string, unknown>).accounts;
+  if (accounts !== undefined) {
+    if (!isRecord(accounts)) throw new Error("ATLAS_CONFIG: accounts must be an object");
+    config.accounts = {};
+    for (const [slug, entry] of Object.entries(accounts))
+      config.accounts[slug.toLowerCase()] = parseEntry(entry, `accounts.${slug}`);
+  }
+  return config;
+}
+
+function apply(base: AtlasSettings, entry: AtlasConfigEntry): Omit<AtlasSettings, "source"> {
+  const run = (scope: "build" | "grouping"): RunLimits => ({
+    ...base.limits[scope],
+    ...entry.limits?.[scope],
+  });
+  return {
+    model: entry.model ?? base.model,
+    prices: entry.prices ?? base.prices,
+    limits: {
+      build: run("build"),
+      grouping: run("grouping"),
+      dailyUsdPerAccount: entry.limits?.dailyUsdPerAccount ?? base.limits.dailyUsdPerAccount,
+    },
+  };
+}
+
+/** The settings for one owning account (its slug), under a parsed configuration. */
+export function resolveAtlasSettings(
+  config: AtlasConfig | null,
+  accountSlug: string | null,
+): AtlasSettings {
+  let settings: AtlasSettings = {
+    model: MODELS.reason,
+    prices: ATLAS_PRICES,
+    limits: ATLAS_LIMITS,
+    source: "default",
+  };
+  if (!config) return settings;
+  if (config.model !== undefined || config.prices !== undefined || config.limits !== undefined)
+    settings = { ...apply(settings, config), source: "configured" };
+  const own = accountSlug ? config.accounts?.[accountSlug.toLowerCase()] : undefined;
+  return own ? { ...apply(settings, own), source: "account" } : settings;
+}
+
+/** What a build of `repoId` runs its Atlas calls with (its owning account's settings). */
+export async function atlasSettings(env: Env, repoId: string): Promise<AtlasSettings> {
+  const config = parseAtlasConfig(Reflect.get(env, "ATLAS_CONFIG"));
+  if (!config) return resolveAtlasSettings(null, null);
+  const owner = config.accounts
+    ? await db(env.DB)
+        .selectFrom("repos")
+        .innerJoin("accounts", "accounts.id", "repos.owner_id")
+        .select("accounts.slug")
+        .where("repos.id", "=", repoId)
+        .executeTakeFirst()
+    : undefined;
+  return resolveAtlasSettings(config, owner?.slug ?? null);
 }

@@ -26,6 +26,7 @@ import { installMaintenance, maintenanceStatus, uninstallMaintenance } from "./m
 import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
 import { runProviderE2E } from "./provider-e2e.ts";
+import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
 
 const root = await realpath(join(dirname(fileURLToPath(import.meta.url)), "../.."));
 const args = process.argv.slice(2);
@@ -288,6 +289,8 @@ async function liveTest(ai = false): Promise<void> {
     await timed("prepare", prepare);
     env = await timed("provision", () => createEnvironment(root, true, ai));
     const ctx = await context(env);
+    // Atlas settings per owning account: the degraded providers test-ai verifies.
+    if (ai) ctx.env.GITMATRIX_ATLAS_CONFIG = JSON.stringify(ATLAS_PROVIDER_CONFIG);
     artifacts = ctx.artifacts;
     supervisor = superviseEnvironment(env);
     await timed("migrate", () => migrate(env!));

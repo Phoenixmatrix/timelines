@@ -478,6 +478,39 @@ describe("capability names and summaries", () => {
     expect(count(sqlite, "kg_synthesis")).toBe(0);
   });
 
+  test("a configured model writes the prose, prices it and keys its cache apart", async () => {
+    const { DB } = setup();
+    const other = "test/configured-model";
+    const ai = fakeAi();
+    const prices = { ...PRICES, [other]: { input: 1, output: 1 } };
+    const first = await build(DB, ai, "b1", { model: other, prices });
+    expect(ai.calls.map((c) => c.model)).toEqual([other, other]);
+    expect(first.described).toMatchObject({ current: 2, inferred: 2 });
+    expect(provenanceOf(first.capabilities[0]!).inferred!.model).toBe(other);
+    // The same inputs under the default model are not the configured model's prose.
+    const second = await build(DB, ai, "b2", { prices });
+    expect(second.described).toMatchObject({ cached: 0, inferred: 2 });
+    expect(ai.calls.slice(2).map((c) => c.model)).toEqual([MODELS.reason, MODELS.reason]);
+  });
+
+  test("a model the provider refuses is a provider error, charged once per call", async () => {
+    const { sqlite, DB } = setup();
+    const ai = fakeAi(undefined, new Error("5007: No such model test/unserved or task"));
+    const model = "test/unserved";
+    const { described, capabilities } = await build(DB, ai, "b1", {
+      model,
+      prices: { [model]: { input: 0.45, output: 3.2 } },
+    });
+    expect(described.reasons).toEqual({ provider_error: 2 });
+    expect(ai.calls.every((c) => c.model === model)).toBe(true);
+    const spend = sqlite.prepare("SELECT status, model FROM atlas_spend").all();
+    expect(spend).toEqual(ai.calls.map(() => ({ status: "failed", model })));
+    expect(descriptionOf(capabilities[0]!)).toMatchObject({
+      status: "unavailable",
+      reason: "provider_error",
+    });
+  });
+
   test("a reply without a summary is invalid and cached nowhere", async () => {
     const { sqlite, DB } = setup();
     const ai = fakeAi(() => ({ name: "Only a name" }));

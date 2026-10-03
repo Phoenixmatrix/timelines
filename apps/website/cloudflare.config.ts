@@ -212,6 +212,13 @@ export default defineConfig(({ mode, isPreview }) => {
         ...(dev && env.GITMATRIX_CI_DISPATCH_SECRET
           ? { CI_DISPATCH_SECRET: bindings.text(env.GITMATRIX_CI_DISPATCH_SECRET) }
           : {}),
+        // Development only: the Atlas model, prices and caps, per owning account
+        // (worker/knowledge/budget.ts `atlasSettings`). `agent test-ai` runs its
+        // disabled, refused and exhausted providers through it; deployed
+        // Workers always use the built-in defaults.
+        ...(dev && env.GITMATRIX_ATLAS_CONFIG
+          ? { ATLAS_CONFIG: bindings.text(env.GITMATRIX_ATLAS_CONFIG) }
+          : {}),
         ...(preview
           ? {}
           : {

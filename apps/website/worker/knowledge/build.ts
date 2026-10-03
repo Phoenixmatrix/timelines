@@ -53,7 +53,7 @@ import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
-import { atlasInfer, atlasRunSpend } from "./budget.ts";
+import { atlasInfer, atlasRunSpend, atlasSettings } from "./budget.ts";
 import {
   applyGraph,
   buildGraph,
@@ -818,10 +818,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         seq: begun.seq,
         commit: head,
       };
-      let described: DescribeStats | { error: string; fallback: DescribeStats };
+      // The model, prices and caps the owning account's Atlas calls run with,
+      // and where they came from (built-in defaults unless configured).
+      type Described = DescribeStats & { model?: string; settings?: string };
+      let described: Described | { error: string; fallback: Described };
       let describeMs = 0;
       // Describe's own time rides along in its stats (steps recorded before had none).
-      const timed = async (work: () => Promise<DescribeStats>) => {
+      const timed = async (work: () => Promise<Described>) => {
         const started = Date.now();
         const stats = await work();
         return { ...stats, ms: Date.now() - started };
@@ -831,11 +834,18 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           "atlas-describe",
           "atlas",
           () =>
-            timed(() =>
-              describeRepoCapabilities(env, context, {
-                infer: atlasInfer(env.DB, { kind: "build", repoId, buildId }),
-              }),
-            ),
+            timed(async () => {
+              const settings = await atlasSettings(env, repoId);
+              const stats = await describeRepoCapabilities(env, context, {
+                model: settings.model,
+                infer: atlasInfer(
+                  env.DB,
+                  { kind: "build", repoId, buildId },
+                  { prices: settings.prices, limits: settings.limits },
+                ),
+              });
+              return { ...stats, model: settings.model, settings: settings.source };
+            }),
           PAID_STEP,
         );
         described = result;
@@ -901,6 +911,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         projectMs: publishedAt - from,
         // The model's share of it, with what it couldn't keep current.
         describeMs,
+        model: summaries.model ?? null,
         modelCalls: summaries.inferred,
         staleSummaries: summaries.stale,
         unavailableSummaries: summaries.unavailable,

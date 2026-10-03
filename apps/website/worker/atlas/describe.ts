@@ -104,6 +104,8 @@ export interface DescribeContext {
 export interface DescribeOptions {
   /** Null: make no model calls (cached prose is still used). */
   infer: AtlasInfer | null;
+  /** The model that writes the prose (the build's Atlas settings); MODELS.reason by default. */
+  model?: string;
   /** Why prose is unavailable when `infer` is null. */
   unavailable?: AtlasUnavailableReason;
   now?: () => Date;
@@ -203,7 +205,7 @@ function parseData(raw: string): Record<string, unknown> {
 }
 
 /** Load every capability of snapshot `seq` with what describing it needs. */
-async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
+async function prepare(env: Env, ctx: DescribeContext, model: string): Promise<Prepared[]> {
   const d1 = env.DB;
   const scope = repoScope(ctx.repoId);
   const [capRows, areaRows, assignments, imports, componentEdges] = await Promise.all([
@@ -458,7 +460,7 @@ async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
       membership,
       input,
       inputsHash: await sha256(
-        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${MODELS.reason}:${ctx.repoId}:${JSON.stringify(input)}`,
+        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${model}:${ctx.repoId}:${JSON.stringify(input)}`,
       ),
     });
   }
@@ -602,7 +604,8 @@ export async function describeRepoCapabilities(
   options: DescribeOptions,
 ): Promise<DescribeStats> {
   const now = options.now ?? (() => new Date());
-  const prepared = await prepare(env, ctx);
+  const model = options.model ?? MODELS.reason;
+  const prepared = await prepare(env, ctx, model);
   const stats: DescribeStats = {
     capabilities: prepared.length,
     current: 0,
@@ -628,7 +631,7 @@ export async function describeRepoCapabilities(
       result = await options.infer(
         {
           purpose: DESCRIBE_PURPOSE,
-          model: MODELS.reason,
+          model,
           prompt: [SYSTEM, user],
           maxOutputTokens: DESCRIBE_MAX_OUTPUT_TOKENS,
         },
@@ -637,6 +640,7 @@ export async function describeRepoCapabilities(
           const { value, usage } = await chatJson<Reply>(env, "reason", SYSTEM, user, {
             maxTokens: DESCRIBE_MAX_OUTPUT_TOKENS,
             attempts: 1,
+            model,
           });
           return {
             value: { reply: value, model: usage.model, tokens: usage.tokens },

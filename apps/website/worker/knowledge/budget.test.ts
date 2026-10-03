@@ -9,10 +9,13 @@ import {
   ATLAS_PRICES,
   atlasDailySpend,
   atlasRunSpend,
+  atlasSettings,
   costMicroUsd,
   estimateTokens,
+  parseAtlasConfig,
   releaseAtlasCall,
   reserveAtlasCall,
+  resolveAtlasSettings,
   runAtlasCall,
   settleAtlasCall,
   type AtlasCallRequest,
@@ -407,6 +410,83 @@ describe("attribution", () => {
     await expect(
       reserveAtlasCall(DB, call(build("nope", "b1"), 1, 1), { prices: CHEAP }),
     ).rejects.toThrow("unknown repository");
+  });
+});
+
+describe("configuration", () => {
+  const CONFIG = JSON.stringify({
+    limits: { dailyUsdPerAccount: 5 },
+    accounts: {
+      Acme: { model: MODEL, prices: CHEAP, limits: { build: { calls: 1 } } },
+      ann: { prices: {} },
+    },
+  });
+
+  test("without ATLAS_CONFIG a build runs with the built-in model, prices and caps", async () => {
+    const { DB } = setup();
+    expect(await atlasSettings({ DB } as unknown as Env, "r1")).toEqual({
+      model: MODELS.reason,
+      prices: ATLAS_PRICES,
+      limits: ATLAS_LIMITS,
+      source: "default",
+    });
+  });
+
+  test("the owning account's entry overrides the environment's, cap by cap", async () => {
+    const { DB } = setup();
+    const env = { DB, ATLAS_CONFIG: CONFIG } as unknown as Env;
+    const acme = await atlasSettings(env, "r2");
+    expect(acme).toEqual({
+      model: MODEL,
+      prices: CHEAP,
+      limits: {
+        build: { ...ATLAS_LIMITS.build, calls: 1 },
+        grouping: ATLAS_LIMITS.grouping,
+        dailyUsdPerAccount: 5,
+      },
+      source: "account",
+    });
+    // ann's empty price table leaves the default model unpriced: disabled.
+    const ann = await atlasSettings(env, "r3");
+    expect(ann).toMatchObject({ model: MODELS.reason, prices: {}, source: "account" });
+    expect(
+      await reserveAtlasCall(DB, { ...call(build("r3", "b1"), 10, 10), model: ann.model }, ann),
+    ).toEqual({ status: "disabled", reason: "unpriced", model: MODELS.reason });
+    // An account without an entry gets the environment's settings.
+    expect(resolveAtlasSettings(parseAtlasConfig(CONFIG), "zed")).toMatchObject({
+      model: MODELS.reason,
+      source: "configured",
+      limits: { dailyUsdPerAccount: 5 },
+    });
+  });
+
+  test("configured caps are enforced like the built-in ones", async () => {
+    const { DB } = setup();
+    const acme = await atlasSettings({ DB, ATLAS_CONFIG: CONFIG } as unknown as Env, "r1");
+    const first = await reserveAtlasCall(DB, call(build("r1", "b1"), 10, 10), acme);
+    expect(first.status).toBe("reserved");
+    expect(await reserveAtlasCall(DB, call(build("r1", "b1"), 10, 10), acme)).toMatchObject({
+      status: "exhausted",
+      cap: "calls",
+      resetsAt: null,
+    });
+    // The next build starts fresh, under the same one-call cap.
+    expect((await reserveAtlasCall(DB, call(build("r1", "b2"), 10, 10), acme)).status).toBe(
+      "reserved",
+    );
+    expect((await atlasDailySpend(DB, "acme", acme)).limitUsd).toBe(5);
+  });
+
+  test("a malformed configuration is an error, never a silent default", () => {
+    expect(parseAtlasConfig(undefined)).toBeNull();
+    expect(() => parseAtlasConfig("{")).toThrow("not valid JSON");
+    expect(() => parseAtlasConfig('{"limits":{"build":{"calls":-1}}}')).toThrow(
+      "limits.build.calls",
+    );
+    expect(() => parseAtlasConfig('{"accounts":{"a":{"prices":{"m":{"input":"1"}}}}}')).toThrow(
+      "accounts.a.prices.m.input",
+    );
+    expect(() => parseAtlasConfig('{"model":""}')).toThrow("config.model");
   });
 });
 
