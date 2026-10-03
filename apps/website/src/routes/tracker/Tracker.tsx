@@ -276,6 +276,12 @@ function Workbench({ data }: { data: TrackerView }) {
     setParams(next, { replace: true, preventScrollReset: true });
   };
   const setQuery = (q: string) => setParam("q", q);
+  const resetSearch = () => {
+    const defaultQuery =
+      withTrackerDefaults(new URLSearchParams(), defaults, snapshot).get("q") ?? DEFAULT_QUERY;
+    setDraft(defaultQuery);
+    setQuery(defaultQuery);
+  };
 
   // Materialize defaults in links; explicit and legacy URL filters always win.
   useEffect(() => {
@@ -811,7 +817,9 @@ function Workbench({ data }: { data: TrackerView }) {
                 className="relative flex min-w-0 flex-1 basis-72 items-center"
                 onSubmit={(event) => {
                   event.preventDefault();
-                  setQuery(draft.trim());
+                  const q = draft.trim();
+                  if (q) setQuery(q);
+                  else resetSearch();
                 }}
               >
                 <MagnifyingGlassIcon
@@ -845,8 +853,7 @@ function Workbench({ data }: { data: TrackerView }) {
                         className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm min-h-11 min-w-11 sm:min-h-0 sm:min-w-0"
                         aria-label="Clear search"
                         onClick={() => {
-                          setDraft("");
-                          setQuery("");
+                          resetSearch();
                           queryRef.current?.focus();
                         }}
                       >

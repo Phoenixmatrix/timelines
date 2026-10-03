@@ -682,6 +682,11 @@ read as `agent_decides`.
   including an empty query. Unavailable trackers fall back to the first
   accessible tracker; archived or unavailable default teams fall back to all
   teams. **Reset defaults** restores the built-in startup behavior.
+- **Clear search:** the button and an empty or whitespace-only search submission
+  restore your saved issue-view preset and active default team (`is:open` when
+  no defaults are saved). **Everything** remains a valid saved default.
+  Choosing **Everything**, **Show everything**, or an explicit empty `q=` URL
+  still requests all issues; clearing search does not change saved preferences.
 - **Keyboard shortcuts:** enable them in **Account menu → Preferences**. This
   opt-in applies only to the current browser: `c`/`n` captures an issue, `/`
   filters, `j`/`k` moves between issues, and Escape closes the issue.
