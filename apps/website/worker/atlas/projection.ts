@@ -20,7 +20,7 @@ import { sha256 } from "../knowledge/util.ts";
 import { groupCapabilities, GROUPING_VERSION, type Grouping } from "./grouping.ts";
 
 /** Bump when the projected shape changes: snapshots record which one built them. */
-export const PROJECTION_VERSION = 2;
+export const PROJECTION_VERSION = 3;
 export const ENTITY_BATCH = 10_000;
 export const EDGE_BATCH = 50_000;
 /** Rows per write statement: one JSON parameter each, well inside D1's limits. */
@@ -344,16 +344,28 @@ async function writeEntities(
   seq: number,
   entities: AtlasEntity[],
   range: [string | null, string | null],
-  options: { final: boolean; owns?: (id: string) => boolean },
+  options: {
+    final: boolean;
+    owns?: (id: string) => boolean;
+    /** Only these ids' open rows are considered (a pass revising some entities). */
+    only?: string[];
+  },
 ): Promise<number> {
   const [after, upTo] = range;
+  const bounded = upTo !== null && !options.final;
   const open = await d1
     .prepare(
-      `SELECT entity_id, from_seq, content_hash FROM atlas_entities
-       WHERE scope = ? AND to_seq IS NULL AND entity_id > ? ${upTo !== null && !options.final ? "AND entity_id <= ?" : ""}`,
+      `SELECT entity_id, from_seq, content_hash, ${ENTITY_BYTES_SQL} AS size FROM atlas_entities
+       WHERE scope = ? AND to_seq IS NULL AND entity_id > ? ${bounded ? "AND entity_id <= ?" : ""}
+       ${options.only ? "AND entity_id IN (SELECT value FROM json_each(?))" : ""}`,
     )
-    .bind(scope, after ?? "", ...(upTo !== null && !options.final ? [upTo] : []))
-    .all<{ entity_id: string; from_seq: number; content_hash: string }>();
+    .bind(
+      scope,
+      after ?? "",
+      ...(bounded ? [upTo] : []),
+      ...(options.only ? [JSON.stringify(options.only)] : []),
+    )
+    .all<{ entity_id: string; from_seq: number; content_hash: string; size: number }>();
   const existing = new Map(open.results.map((r) => [r.entity_id, r]));
 
   const rows: Record<string, unknown>[] = [];
@@ -365,8 +377,10 @@ async function writeEntities(
     const hash = await entityHash(entity);
     const before = existing.get(entity.id);
     if (before?.content_hash === hash) continue;
-    // A row this snapshot already opened (a retried step) is replaced in place.
+    // A row this snapshot already opened (a retried step, or a later pass
+    // revising it) is replaced in place: its old size no longer counts.
     if (before && before.from_seq !== seq) close.push(entity.id);
+    if (before && before.from_seq === seq) bytes -= Number(before.size);
     const data = JSON.stringify(entity.data);
     const sort = sortKey(entity.name, entity.id);
     bytes +=
@@ -398,6 +412,9 @@ async function writeEntities(
     // group pass touches nothing else.
     if (options.owns ? !options.owns(id) : isSynthetic(id)) continue;
     close.push(id);
+    // Rows this snapshot opened are deleted, not closed.
+    const before = existing.get(id);
+    if (before && before.from_seq === seq) bytes -= Number(before.size);
   }
 
   const statements: Statement[] = [];
@@ -581,6 +598,75 @@ export async function projectEntities(
     .where("id", "=", snapshotId)
     .execute();
   return { next: final ? null : last, written: entities.length };
+}
+
+/**
+ * Replace some of snapshot `seq`'s entities by id: a later pass revising what
+ * an earlier one wrote in the same snapshot (capability names and summaries,
+ * CORE-164). Touches no other entity. An entity revised back to exactly the
+ * row the snapshot closed (a capability described as before) reopens that row
+ * instead, so unchanged entities stay stored once.
+ */
+export async function reviseEntities(
+  d1: D1Database,
+  scope: string,
+  snapshotId: string,
+  seq: number,
+  entities: AtlasEntity[],
+): Promise<void> {
+  if (!entities.length) return;
+  const ids = JSON.stringify(entities.map((e) => e.id));
+  const closed = await d1
+    .prepare(
+      `SELECT entity_id, content_hash FROM atlas_entities
+       WHERE scope = ? AND to_seq = ? AND entity_id IN (SELECT value FROM json_each(?))`,
+    )
+    .bind(scope, seq, ids)
+    .all<{ entity_id: string; content_hash: string }>();
+  const closedHash = new Map(closed.results.map((r) => [r.entity_id, r.content_hash]));
+  const restore: string[] = [];
+  const write: AtlasEntity[] = [];
+  for (const entity of entities) {
+    if (closedHash.get(entity.id) === (await entityHash(entity))) restore.push(entity.id);
+    else write.push(entity);
+  }
+  let bytes = 0;
+  if (restore.length) {
+    const list = JSON.stringify(restore);
+    const opened = await d1
+      .prepare(
+        `SELECT coalesce(sum(${ENTITY_BYTES_SQL}), 0) AS size FROM atlas_entities
+         WHERE scope = ? AND from_seq = ? AND entity_id IN (SELECT value FROM json_each(?))`,
+      )
+      .bind(scope, seq, list)
+      .first<{ size: number }>();
+    bytes -= Number(opened?.size ?? 0);
+    await batch(d1, [
+      raw(
+        `DELETE FROM atlas_entities WHERE scope = ? AND from_seq = ? AND entity_id IN (SELECT value FROM json_each(?))`,
+        scope,
+        seq,
+        list,
+      ),
+      raw(
+        `UPDATE atlas_entities SET to_seq = NULL WHERE scope = ? AND to_seq = ? AND entity_id IN (SELECT value FROM json_each(?))`,
+        scope,
+        seq,
+        list,
+      ),
+    ]);
+  }
+  if (write.length)
+    bytes += await writeEntities(d1, scope, seq, write, [null, null], {
+      final: true,
+      owns: () => false,
+      only: write.map((e) => e.id),
+    });
+  await db(d1)
+    .updateTable("atlas_snapshots")
+    .set((eb) => ({ bytes: eb("bytes", "+", bytes) }))
+    .where("id", "=", snapshotId)
+    .execute();
 }
 
 // ---- capabilities --------------------------------------------------------------

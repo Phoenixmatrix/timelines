@@ -28,7 +28,12 @@
 // an overlay, choose the affected pages, then write them a few per step.
 // Those steps write only kg_page_sets, kg_page_set_pages and the analysis cache.
 
-import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
+import {
+  WorkflowEntrypoint,
+  type WorkflowEvent,
+  type WorkflowStep,
+  type WorkflowStepConfig,
+} from "cloudflare:workers";
 import { sql } from "kysely";
 import {
   beginRepoProjection,
@@ -41,12 +46,13 @@ import {
   repoScope,
   type EdgeCursor,
 } from "../atlas/projection.ts";
+import { describeRepoCapabilities, type DescribeStats } from "../atlas/describe.ts";
 import { admitProjection, enforceRetention } from "../atlas/retention.ts";
 import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
-import { atlasRunSpend } from "./budget.ts";
+import { atlasInfer, atlasRunSpend } from "./budget.ts";
 import {
   applyGraph,
   buildGraph,
@@ -94,6 +100,8 @@ const STEP = {
   retries: { limit: 4, delay: "20 seconds", backoff: "exponential" },
   timeout: "15 minutes",
 } as const;
+/** Steps that make Atlas paid calls run once: budgets allow no automatic paid retries. */
+const PAID_STEP = { ...STEP, retries: { ...STEP.retries, limit: 0 } } as const;
 const ANALYZE_BATCH = 32;
 /** Wiki pages per step: a few model calls, far inside the step timeout. */
 const WIKI_BATCH = 6;
@@ -139,6 +147,7 @@ type Progress = <T extends Rpc.Serializable<T>>(
   name: string,
   phase: string,
   work: () => Promise<T>,
+  config?: WorkflowStepConfig,
 ) => Promise<T>;
 
 function merge(base: Syntheses, over: Syntheses): Syntheses {
@@ -228,8 +237,9 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       name: string,
       phase: string,
       work: () => Promise<T>,
+      config: WorkflowStepConfig = STEP,
     ) =>
-      step.do(name, STEP, async () => {
+      step.do(name, config, async () => {
         await setPhase(env.DB, buildId, phase);
         const result = await work();
         await db(env.DB)
@@ -774,6 +784,35 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       const grouping = await progress("atlas-group", "atlas", () =>
         groupRepoCapabilities(env.DB, repoId, begun.snapshotId, begun.seq),
       );
+      // Names and summaries (CORE-164): never block structure. The paid step
+      // runs once; if it fails, a free pass labels prose unavailable (or keeps
+      // the previous snapshot's, marked stale) and the projection goes on.
+      const context = {
+        repoId,
+        buildId,
+        snapshotId: begun.snapshotId,
+        seq: begun.seq,
+        commit: head,
+      };
+      let described: DescribeStats | { error: string };
+      try {
+        described = await progress(
+          "atlas-describe",
+          "atlas",
+          () =>
+            describeRepoCapabilities(env, context, {
+              infer: atlasInfer(env.DB, { kind: "build", repoId, buildId }),
+            }),
+          PAID_STEP,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("Atlas capability descriptions failed", repoId, error);
+        await progress("atlas-describe-fallback", "atlas", () =>
+          describeRepoCapabilities(env, context, { infer: null, unavailable: "error" }),
+        );
+        described = { error: message.slice(0, 500) };
+      }
       let after: string | null = null;
       for (let i = 0; ; i++) {
         const cursor: string | null = after;
@@ -824,6 +863,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         atlasSeq: begun.seq,
         atlasCapabilities: grouping.capabilities,
         atlasUnclassified: grouping.unclassified,
+        atlasDescribed: described,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

@@ -1202,7 +1202,27 @@ that never count twice. Files without evidence, not analyzed yet, or in a
 group of fewer than three files (`MIN_CAPABILITY_FILES`: one import between two
 files is too little evidence) go to the **Unclassified** group. Directory components remain, under their folders, as
 inputs. Interim capability names come from their strongest shared concepts
-(`nameSource: "concepts"`); summaries come later (CORE-164).
+(`nameSource: "concepts"`, kept as `interimName`).
+
+**Capability names and summaries** (`worker/atlas/describe.ts`, CORE-164,
+`DESCRIBE_VERSION`). The `atlas-describe` step, after grouping and before the
+entity batches, names each capability and writes a 2-3 sentence summary and a
+membership rationale, from source-backed inputs only: member files' cards, the
+directory components' syntheses and the shared concepts, never other
+capabilities' prose. It never moves a member or changes an id, so a change in
+wording can't change membership. Results are cached in `kg_synthesis` under a
+hash of exactly those inputs (and the repository), so identical inputs are
+never inferred twice. A miss is one paid call through the Atlas budget
+(`atlasInfer`), in a step that doesn't retry. Capabilities' `data` keeps three
+kinds apart (types in `shared/atlas.ts`): `description` (`status` current,
+stale or unavailable, with `reason`), `provenance.structural` (grouping),
+`provenance.inferred` (model, versions, inputs hash, the source version it was
+written from, what it was derived from, and the cited files at their commit
+and blob, with ranges or `unavailable`) and `provenance.curated` (none yet).
+With a cap reached, an unpriced model, a provider error or a failed step,
+capabilities keep their interim names and empty `summary`; `description`
+carries the previous snapshot's prose labelled `stale` with its original basis,
+or nothing (`unavailable`). List responses show it as `summaryState`.
 
 **Atlas paid-synthesis budgets** (`worker/knowledge/budget.ts`, CORE-162).
 Model calls the Semantic Code Atlas adds go through this module; upstream

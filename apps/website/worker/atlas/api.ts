@@ -36,6 +36,7 @@ import {
   type AtlasCounts,
   type AtlasDetail,
   type AtlasEntity,
+  type AtlasDescription,
   type AtlasEntitySummary,
   type AtlasError,
   type AtlasErrorCode,
@@ -130,7 +131,15 @@ function lean(entity: ProjectedEntity): AtlasEntitySummary {
     summary: entity.summary,
     counts: countsOf(entity.data),
     structural: entity.kind === "group" || entity.data.structural === true,
+    ...summaryStateOf(entity.data),
   };
+}
+
+/** A described entity's summary state (CORE-164), so lists can label stale or missing prose. */
+function summaryStateOf(data: Record<string, unknown>): Pick<AtlasEntitySummary, "summaryState"> {
+  const d = data.description as AtlasDescription | undefined;
+  if (!d || typeof d !== "object" || typeof d.status !== "string") return {};
+  return { summaryState: d.reason ? { status: d.status, reason: d.reason } : { status: d.status } };
 }
 
 const full = (entity: ProjectedEntity): AtlasEntity => ({ ...lean(entity), data: entity.data });

@@ -16,7 +16,8 @@ import type {
 import { chatJson } from "./models.ts";
 import { chunk, pool, sha256 } from "./util.ts";
 
-async function cached<T>(d1: D1Database, key: string): Promise<T | null> {
+/** A synthesis cached under `key` (a hash of exactly what it was written from). */
+export async function cached<T>(d1: D1Database, key: string): Promise<T | null> {
   const row = await db(d1)
     .selectFrom("kg_synthesis")
     .select("data")
@@ -25,7 +26,8 @@ async function cached<T>(d1: D1Database, key: string): Promise<T | null> {
   return row ? (JSON.parse(row.data) as T) : null;
 }
 
-async function remember(
+/** Cache a synthesis under the hash of its inputs, with the model that wrote it. */
+export async function remember(
   d1: D1Database,
   key: string,
   value: unknown,

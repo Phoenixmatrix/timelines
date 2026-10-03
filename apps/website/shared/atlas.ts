@@ -66,6 +66,12 @@ export interface AtlasEntitySummary {
   counts: AtlasCountsData;
   /** A structural group (unclassified, concepts, dependencies, folders), not a capability. */
   structural: boolean;
+  /**
+   * For described entities (capabilities): whether `summary` is current model
+   * prose. "stale" and "unavailable" leave `summary` empty; `detail` carries
+   * the stale prose with its original basis in `data.description`.
+   */
+  summaryState?: { status: AtlasDescriptionStatus; reason?: AtlasUnavailableReason };
 }
 
 /** An entity in full, as `detail` shows it. */
@@ -189,6 +195,127 @@ export interface AtlasEvidence {
   via: string;
   /** analyzed, pending (not analyzed yet) or skipped (generated, binary, oversized…). */
   analysis: "analyzed" | "pending" | "skipped";
+}
+
+// ---- names, summaries and provenance (CORE-164) ---------------------------------
+//
+// A capability's `data` keeps three kinds of statement apart:
+//   structural facts  membership and counts from grouping (imports, concepts)
+//   model inference   name, summary and rationale (`data.description`), each
+//                     traced to the file cards, syntheses and concepts it was
+//                     written from, and through them to immutable sources
+//   curated           assertions a person made, with author and basis (none yet)
+// No numeric confidence is ever given, and prose never cites only other prose.
+
+/** current: written from this snapshot's inputs; stale: an earlier snapshot's prose; unavailable: none. */
+export type AtlasDescriptionStatus = "current" | "stale" | "unavailable";
+
+/** Why prose is stale or unavailable. */
+export type AtlasUnavailableReason =
+  /** A per-build cap or the account's daily Atlas ceiling was reached (see `exhausted`). */
+  | "budget_exhausted"
+  /** Atlas paid synthesis is off (the model has no configured price). */
+  | "disabled"
+  /** The model call failed; it is not retried automatically. */
+  | "provider_error"
+  /** The model replied with nothing usable. */
+  | "invalid_reply"
+  /** The naming step itself failed; structure was published without it. */
+  | "error";
+
+/** An immutable source location: a file at an indexed commit, with what's known of its range. */
+export interface AtlasSourceRef {
+  repoId: string;
+  commit: string;
+  path: string;
+  blob: string | null;
+  range: AtlasRange;
+  /** Symbols the file card lists for it, each with what's known of its range. */
+  symbols: { name: string; range: AtlasRange }[];
+}
+
+/** What a piece of model inference was written from (never another capability's prose). */
+export type AtlasDerivation =
+  /** A file's analysis card (per blob). */
+  | {
+      kind: "file-card";
+      path: string;
+      blob: string;
+      producer: "knowledge/analyze";
+      analyzer: string;
+      /** The model that wrote the card; null for structure-only cards. */
+      model: string | null;
+    }
+  /** A directory component's synthesis, itself written from its files' cards. */
+  | {
+      kind: "component-synthesis";
+      id: string;
+      producer: "knowledge/synthesize";
+      analyzer: string;
+      /** Not recorded for component syntheses. */
+      model: "unavailable";
+      /** The component's files among this capability's sources. */
+      paths: string[];
+    }
+  /** A canonical concept the members share, with how many members mention it. */
+  | { kind: "concept"; id: string; name: string; producer: "knowledge/concepts"; files: number }
+  /** The grouping evidence that put the members together. */
+  | {
+      kind: "membership";
+      producer: "atlas/grouping";
+      version: number;
+      files: number;
+      /** Import links between members. */
+      importLinks: number;
+    };
+
+/** Model-derived statements, traced to their inputs and immutable sources. */
+export interface AtlasInference {
+  /** Which fields of `description` are model-derived. */
+  fields: ("name" | "summary" | "rationale")[];
+  producer: "atlas/describe";
+  /** The naming algorithm/prompt version. */
+  version: number;
+  model: string;
+  /** Hash of exactly what the model was given; identical inputs are never re-inferred. */
+  inputsHash: string;
+  /** The source version the prose was written from (the original one, when stale). */
+  basis: { repoId: string; commit: string; buildId: string };
+  inferredAt: string;
+  derivedFrom: AtlasDerivation[];
+  /** The member files the prose rests on, at `basis.commit`. */
+  sources: AtlasSourceRef[];
+}
+
+/** A person's assertion consumed by the Atlas: it keeps its author and source basis. */
+export interface AtlasCuratedAssertion {
+  field: string;
+  value: string;
+  author: { id: string; kind: "user" | "agent" };
+  at: string;
+  basis: AtlasSourceRef[];
+}
+
+/** `data.description` of a capability. */
+export interface AtlasDescription {
+  status: AtlasDescriptionStatus;
+  reason?: AtlasUnavailableReason;
+  /** The cap that stopped paid work, when `reason` is budget_exhausted. */
+  exhausted?: { cap: string; resetsAt: string | null };
+  /** The model's name for it (the entity's `name` only while current). */
+  name: string | null;
+  summary: string | null;
+  /** Why the members belong together, in words (the structural evidence is on each file's membership). */
+  rationale: string | null;
+}
+
+/** `data.provenance` of a capability. */
+export interface AtlasProvenance {
+  /** Membership and counts: deterministic, from the snapshot's graph. */
+  structural: { producer: "atlas/grouping"; version: number; evidence: string[] };
+  /** Present when `description` is current or stale. */
+  inferred: AtlasInference | null;
+  curated: AtlasCuratedAssertion[];
 }
 
 /** A recoverable Atlas failure: the client restarts or moves explicitly. */

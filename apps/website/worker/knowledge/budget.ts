@@ -561,3 +561,27 @@ export async function atlasDailySpend(
     exhausted: Boolean(exhaustion),
   };
 }
+
+/**
+ * A runner for one scope's Atlas calls (the `AtlasInfer` that
+ * atlas/describe.ts takes): reserve the call at its prompt's estimated size
+ * and its output cap, make it once, and reconcile (see `runAtlasCall`).
+ */
+export function atlasInfer(d1: D1Database, scope: AtlasScope, options: BudgetOptions = {}) {
+  return <T>(
+    request: { purpose: string; model: string; prompt: string[]; maxOutputTokens: number },
+    call: () => Promise<{ value: T; usage: ReportedUsage }>,
+  ): Promise<AtlasCallOutcome<T>> =>
+    runAtlasCall(
+      d1,
+      {
+        scope,
+        purpose: request.purpose,
+        model: request.model,
+        maxInputTokens: estimateTokens(...request.prompt),
+        maxOutputTokens: request.maxOutputTokens,
+      },
+      () => call(),
+      options,
+    );
+}
