@@ -97,7 +97,7 @@ export interface KnowledgeGroup {
  * snapshot were built from the same commit.
  */
 export interface AtlasHandoff {
-  /** The Atlas page, e.g. `/orbit/engine/atlas`; results add `?select=`. */
+  /** The Atlas page, e.g. `/orbit/engine/knowledge`; results add `?select=`. */
   href: string;
   /** The commit the Atlas snapshot on screen was built from. */
   commit: string | null;
@@ -134,7 +134,7 @@ export function knowledgeResults(
     detail: [entity.kind, entity.path].filter(Boolean).join(" · "),
     to: atlas
       ? `${atlas.href}?select=${encodeURIComponent(entity.id)}`
-      : `${repoPath(repo.owner, repo.name, "knowledge")}?node=${encodeURIComponent(entity.id)}`,
+      : `${repoPath(repo.owner, repo.name, "knowledge")}?select=${encodeURIComponent(entity.id)}`,
   }));
   const passages = (kind: "code" | "wiki") =>
     results.passages

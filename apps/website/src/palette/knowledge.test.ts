@@ -37,7 +37,7 @@ describe("code and wiki results", () => {
   test("are grouped and lead to the entity, the file at the default branch, and the wiki page", () => {
     const { groups, notes } = knowledgeResults(repo, results());
     expect(groups.map((g) => [g.label, g.options.map((o) => o.to)])).toEqual([
-      ["Entities", ["/orbit/engine/knowledge?node=sym%3Athrottle.ts%23throttle"]],
+      ["Entities", ["/orbit/engine/knowledge?select=sym%3Athrottle.ts%23throttle"]],
       ["Code", ["/orbit/engine/blob/main/src/throttle.ts"]],
       ["Wiki", ["/orbit/engine/wiki/components/engine"]],
     ]);
@@ -67,11 +67,11 @@ describe("code and wiki results", () => {
 });
 
 describe("a search handed off from the Atlas", () => {
-  const atlas = { href: "/orbit/engine/atlas", commit: "c1" };
+  const atlas = { href: "/orbit/engine/knowledge", commit: "c1" };
   test("opens entities in the Atlas and code at the indexed commit", () => {
     const { groups } = knowledgeResults(repo, results(), atlas);
     expect(groups.map((g) => [g.label, g.options.map((o) => o.to)])).toEqual([
-      ["Entities", ["/orbit/engine/atlas?select=sym%3Athrottle.ts%23throttle"]],
+      ["Entities", ["/orbit/engine/knowledge?select=sym%3Athrottle.ts%23throttle"]],
       ["Code", ["/orbit/engine/blob/c1/src/throttle.ts"]],
       ["Wiki", ["/orbit/engine/wiki/components/engine"]],
     ]);

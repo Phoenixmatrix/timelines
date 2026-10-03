@@ -22,8 +22,17 @@ import {
 import { api, ApiError } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { blobUrl } from "../../lib/refs.ts";
-import { KIND_LABEL } from "./AtlasMap.tsx";
 import { useRepo } from "./RepoLayout.tsx";
+
+const KIND_LABEL: Record<string, string> = {
+  repository: "Repository",
+  directory: "Folder",
+  file: "File",
+  symbol: "Symbol",
+  package: "Package",
+  concept: "Concept",
+  component: "Component",
+};
 
 const STATE: Record<KnowledgeOverlaySummary["state"], string> = {
   "up-to-date": "Up to date",

@@ -204,7 +204,7 @@ export function Wiki() {
             {page?.nodeId && (
               <Link
                 className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
-                to={`${repoPath(repo.owner.slug, repo.name, "knowledge")}?node=${encodeURIComponent(page.nodeId)}`}
+                to={`${repoPath(repo.owner.slug, repo.name, "knowledge")}?select=${encodeURIComponent(page.nodeId)}`}
               >
                 <MapTrifoldIcon weight="bold" aria-hidden />
                 Show on the map

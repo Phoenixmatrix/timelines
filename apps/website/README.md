@@ -311,13 +311,13 @@ repository…** first offers repositories only. The scope shows above the input
 (× or Backspace on an empty query leaves it). Typing and choosing a repository
 send nothing; **Enter** submits to `GET /api/repos/:o/:n/knowledge/search` with
 the viewer's read access, and a new query or scope drops the previous answer
-until it's submitted. Results come in **Entities** (open the Knowledge map at
-that node), **Code** (the file at the default branch) and **Wiki** (the page),
-six of each; the repository's Knowledge page shows them all. Only indexed
+until it's submitted. Results come in **Entities** (open the Knowledge Atlas
+with that entity selected), **Code** (the file at the default branch) and
+**Wiki** (the page), six of each. Only indexed
 files and generated pages are searchable (not every file is indexed, binary and
 oversized ones aren't), and searching never starts a build. The response says
 which lookups answered (`providers`) and which index it read (`index.state`:
-`none`, `building`, `ready`), so the palette and the Knowledge page say "isn't
+`none`, `building`, `ready`), so the palette says "isn't
 indexed yet", "indexing is running" or "couldn't search …" rather than
 "nothing matches"; where AI is off the endpoint answers 503 and the palette says
 code search is off there. Instant entity search keeps working either way.
@@ -1351,8 +1351,24 @@ every name, summary and count comes from one repository's projection, so
 narrowing the scope can't leave a hidden repository's labels behind.
 Virtual composition stores nothing.
 
+**The Knowledge tab is the Atlas** (`src/routes/repo/Atlas.tsx`, CORE-174).
+`/:owner/:repo/knowledge` reads only bounded `/atlas/*` pages (overview,
+children, detail, relations, evidence, ancestors, catalogue) plus the build
+status, the wiki catalog and timelines' overlays; nothing in normal navigation
+reads the whole graph. The old eager `GET …/knowledge/graph/map`, its
+module-level cache and the client-side whole-map search are gone. The whole
+graph is still available as JSON from `GET …/knowledge/graph/export`, which the
+page calls only from its **Export graph** button. Old links keep working: the
+pre-cutover `/atlas` address redirects to `/knowledge` with its query, and the
+old map's `?node=<id>` becomes `?select=<id>` (entities keep graph node ids;
+`node=repo` opens the overview). The timeline picker and the selected
+timeline's overlay (CORE-83) sit beside the inspector, a change of `?tl`
+reads the overview again, and an entity with a wiki page links to it. The
+palette's entity results, the file view's knowledge rail and wiki pages open
+the Atlas with `?select=`.
+
 **Workspace Atlas page** (`src/routes/atlas/`, CORE-172), at
-`/:owner/-/atlas?repos=a,b`, unlinked until the Knowledge cutover. Pick the
+`/:owner/-/atlas?repos=a,b`, linked as **Knowledge** from the account page. Pick the
 account, then repositories you can read (or fill the selection from a tracker
 workspace's subscribed repositories, read once on request); the URL keeps the
 selection in pick order. Coverage lists every selected name with its own

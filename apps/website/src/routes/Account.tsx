@@ -39,9 +39,15 @@ export function Account() {
         <section>
           <div className="mb-3 flex items-baseline justify-between gap-3">
             <h2 className="m-0 text-title">Repositories</h2>
-            <Link to={packagesPath(account.slug)} className={`${link} text-body-sm`}>
-              Packages
-            </Link>
+            <span className="flex gap-4">
+              {/* The Atlas across repositories you pick (CORE-172). */}
+              <Link to={`/${account.slug}/-/atlas`} className={`${link} text-body-sm`}>
+                Knowledge
+              </Link>
+              <Link to={packagesPath(account.slug)} className={`${link} text-body-sm`}>
+                Packages
+              </Link>
+            </span>
           </div>
           <RepoList repos={account.repos} showOwner={false} empty="No repositories you can see." />
         </section>

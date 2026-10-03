@@ -1,5 +1,5 @@
 // The Semantic Code Atlas across an account's repositories (CORE-172), at
-// /:owner/-/atlas?repos=a,b. Unlinked until the Knowledge cutover (CORE-174).
+// /:owner/-/atlas?repos=a,b, linked as Knowledge from the account page.
 //
 // You pick the account, then the repositories, explicitly; the URL holds the
 // selection, so a copied link reproduces it. Every selected repository is

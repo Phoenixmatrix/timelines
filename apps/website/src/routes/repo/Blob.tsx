@@ -386,7 +386,7 @@ function FileKnowledge({
   }
   const { node, outgoing, incoming } = detail;
   const mapUrl = (id: string) =>
-    `${repoPath(owner, repo.name, "knowledge")}?node=${encodeURIComponent(id)}`;
+    `${repoPath(owner, repo.name, "knowledge")}?select=${encodeURIComponent(id)}`;
   const uses = outgoing.filter((l) => l.kind === "imports");
   const usedBy = incoming.filter((l) => l.kind === "imports" && l.node.path);
   const parts = incoming.filter((l) => l.kind === "contains" && l.node.kind === "component");

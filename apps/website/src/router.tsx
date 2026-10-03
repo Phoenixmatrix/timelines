@@ -1,4 +1,4 @@
-import { createBrowserRouter } from "react-router";
+import { createBrowserRouter, redirect } from "react-router";
 import { AppShell } from "./components/AppShell.tsx";
 import { rootLoader } from "./lib/session.ts";
 import { scopeLinks, timelineScopeMiddleware } from "./lib/timelineScope.ts";
@@ -10,7 +10,6 @@ import { Blob, blobLoader } from "./routes/repo/Blob.tsx";
 import { ciAction, ciLoader, CiRun, CiRuns, ciRunLoader } from "./routes/repo/Ci.tsx";
 import { Code, codeLoader } from "./routes/repo/Code.tsx";
 import { Commits, commitsLoader } from "./routes/repo/Commits.tsx";
-import { Knowledge, knowledgeLoader } from "./routes/repo/Knowledge.tsx";
 import { Atlas, atlasLoader, atlasShouldRevalidate } from "./routes/repo/Atlas.tsx";
 import {
   WorkspaceAtlas,
@@ -148,7 +147,7 @@ export const router = createBrowserRouter([
             Component: PackageConsole,
           },
           { path: ":owner/-/feeds", loader: feedsLoader, action: feedsAction, Component: Feeds },
-          // The Atlas across selected repositories: unlinked until the Knowledge cutover (CORE-174).
+          // The Atlas across selected repositories (CORE-172).
           {
             path: ":owner/-/atlas",
             loader: workspaceAtlasLoader,
@@ -175,13 +174,22 @@ export const router = createBrowserRouter([
               { path: "changes", Component: SemanticChanges },
               { path: "wiki/*", loader: wikiLoader, Component: Wiki },
               { path: "releases/*", loader: releasesLoader, Component: Releases },
-              { path: "knowledge", loader: knowledgeLoader, Component: Knowledge },
-              // The Semantic Code Atlas: unlinked until the Knowledge cutover (CORE-174).
+              // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
               {
-                path: "atlas",
+                path: "knowledge",
                 loader: atlasLoader,
                 shouldRevalidate: atlasShouldRevalidate,
                 Component: Atlas,
+              },
+              // Links from before the cutover keep their view.
+              {
+                path: "atlas",
+                loader: ({ request }) => {
+                  const url = new URL(request.url);
+                  return redirect(
+                    `${url.pathname.replace(/\/atlas\/?$/, "/knowledge")}${url.search}`,
+                  );
+                },
               },
               { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
               { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },

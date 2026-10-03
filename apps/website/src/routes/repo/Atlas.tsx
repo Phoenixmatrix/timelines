@@ -1,7 +1,8 @@
 // The Semantic Code Atlas for a repository (CORE-168): capability territory
-// from the bounded Atlas API, never the whole graph. It lives at
-// /:owner/:repo/atlas, unlinked, until the Knowledge cutover makes it the
-// default.
+// from the bounded Atlas API, never the whole graph. Since the Knowledge
+// cutover (CORE-174) it is the Knowledge tab, /:owner/:repo/knowledge (the
+// old /atlas address and `?node=` links redirect here), with the timeline
+// overlay, the wiki and an explicit whole-graph export around it.
 //
 // The address holds the view (CORE-171, atlasUrl.ts): the selection, the
 // snapshot it was read from, the relationship lens and the catalogue lookup,
@@ -15,13 +16,19 @@ import { ArrowClockwiseIcon, CaretRightIcon, MagnifyingGlassIcon } from "@phosph
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Link,
+  redirect,
   useLoaderData,
   useNavigationType,
   useSearchParams,
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
-import type { KnowledgeStatus } from "../../../shared/api.ts";
+import type {
+  KnowledgeOverlay,
+  KnowledgeOverlaySummary,
+  KnowledgeStatus,
+  WikiCatalog,
+} from "../../../shared/api.ts";
 import type {
   AtlasEntitySummary,
   AtlasError,
@@ -33,6 +40,7 @@ import { useKnowledgeStatus } from "../../components/KnowledgeStatus.tsx";
 import { api } from "../../lib/api.ts";
 import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
+import { scopeOf } from "../../lib/timelineScope.ts";
 import { useViewer } from "../../lib/session.ts";
 import { usePalette } from "../../palette/Palette.tsx";
 import { useMediaQuery } from "../../lib/useMediaQuery.ts";
@@ -56,33 +64,62 @@ import {
 } from "./atlasUrl.ts";
 import { scopeNotices, type AtlasNotice } from "./atlasStates.ts";
 import { AtlasTerritory } from "./AtlasTerritory.tsx";
+import { KnowledgeBar } from "./KnowledgeBar.tsx";
 import { useRepo } from "./RepoLayout.tsx";
+import { OverlayPanel } from "./TimelineOverlay.tsx";
 import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./territory.ts";
 
 export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
   const repo = { owner: params.owner ?? "", name: params.repo ?? "" };
-  const snapshot = readAtlasUrl(new URL(request.url).search).snapshot ?? undefined;
+  const url = new URL(request.url);
+  // Links from the old Knowledge map named a graph node: the Atlas entity has
+  // the same id.
+  if (url.searchParams.has("node")) {
+    const node = url.searchParams.get("node");
+    url.searchParams.delete("node");
+    if (node && node !== "repo" && !url.searchParams.has("select"))
+      url.searchParams.set("select", node);
+    throw redirect(`${url.pathname}${url.search}`);
+  }
+  const snapshot = readAtlasUrl(url.search).snapshot ?? undefined;
+  const base = `/repos/${repo.owner}/${repo.name}/knowledge`;
+  const quiet = <T,>(path: string, fallback: T) =>
+    api<T>(path, { signal: request.signal }).catch(() => fallback);
   // Build state says whether the map is behind, rebuilding or failed; the
-  // map still renders without it.
-  const status = api<KnowledgeStatus>(`/repos/${repo.owner}/${repo.name}/knowledge/status`, {
-    signal: request.signal,
-  }).catch(() => null);
+  // map still renders without it. The wiki catalog links entities to their
+  // pages; timelines' overlays (CORE-83) are what the timeline picker offers.
+  const timeline = scopeOf(url.search);
+  const around = Promise.all([
+    quiet<KnowledgeStatus | null>(`${base}/status`, null),
+    quiet<WikiCatalog | null>(`${base}/wiki`, null).then((w) => w?.pages ?? []),
+    quiet<{ overlays: KnowledgeOverlaySummary[] }>(`${base}/overlays`, { overlays: [] }).then(
+      (r) => r.overlays,
+    ),
+    timeline
+      ? quiet<KnowledgeOverlay | null>(
+          `${base}/overlay?ref=${encodeURIComponent(`timeline/${timeline}`)}`,
+          null,
+        )
+      : null,
+  ]).then(([status, wiki, overlays, overlay]) => ({ status, wiki, overlays, overlay }));
   try {
     return {
       overview: await atlasApi.overview(repo, { snapshot, signal: request.signal }),
       pinned: null,
-      status: await status,
+      ...(await around),
     };
   } catch (error) {
     const atlasError = atlasErrorOf(error);
     if (atlasError?.code === "atlas_unavailable")
-      return { overview: null, pinned: null, status: await status };
+      return { overview: null, pinned: null, ...(await around) };
     // A link to a snapshot that's gone: explain, and offer the current one.
     if (atlasError && snapshot && atlasNeedsRestart(error))
-      return { overview: null, pinned: atlasError, status: null };
+      return { overview: null, pinned: atlasError, ...(await around), status: null };
     throw error;
   }
 }
+
+export type AtlasLoaderData = Awaited<ReturnType<typeof atlasLoader>>;
 
 /**
  * Only a different snapshot (or repository) reads the overview again; the rest
@@ -98,7 +135,10 @@ export function atlasShouldRevalidate({
 }: ShouldRevalidateFunctionArgs) {
   if (formMethod || currentUrl.pathname !== nextUrl.pathname) return defaultShouldRevalidate;
   if (currentUrl.href === nextUrl.href) return defaultShouldRevalidate;
-  return currentUrl.searchParams.get("snapshot") !== nextUrl.searchParams.get("snapshot");
+  return (
+    currentUrl.searchParams.get("snapshot") !== nextUrl.searchParams.get("snapshot") ||
+    scopeOf(currentUrl.search) !== scopeOf(nextUrl.search)
+  );
 }
 
 const KIND_LABEL: Record<string, string> = {
@@ -136,16 +176,17 @@ function useAtlasBase() {
   const repo = useRepo();
   return {
     ref: { owner: repo.owner.slug, name: repo.name } satisfies AtlasRepo,
-    base: `/${repo.owner.slug}/${repo.name}/atlas`,
+    base: `/${repo.owner.slug}/${repo.name}/knowledge`,
     repo,
   };
 }
 
 export function Atlas() {
-  const { overview, pinned, status } = useLoaderData<typeof atlasLoader>();
+  const data = useLoaderData<typeof atlasLoader>();
+  const { overview, pinned, status } = data;
   if (pinned) return <PinnedGone error={pinned} />;
-  if (!overview) return <NotBuilt status={status} />;
-  return <Territory key={overview.snapshot.id} overview={overview} status={status} />;
+  if (!overview) return <NotBuilt status={status} overlays={data.overlays} />;
+  return <Territory key={overview.snapshot.id} overview={overview} data={data} />;
 }
 
 /** Polls a running build; the hook revalidates, and so reloads the map, when it lands. */
@@ -157,20 +198,30 @@ function useBuildStatus(initial: KnowledgeStatus | null): KnowledgeStatus | null
 }
 const IDLE = { state: "empty" } as KnowledgeStatus;
 
-function NotBuilt({ status: initial }: { status: KnowledgeStatus | null }) {
+function NotBuilt({
+  status: initial,
+  overlays,
+}: {
+  status: KnowledgeStatus | null;
+  overlays: KnowledgeOverlaySummary[];
+}) {
   const status = useBuildStatus(initial);
+  const { ref, base } = useAtlasBase();
   const busy = status?.state === "building" || status?.state === "queued";
   return (
-    <div className="mk-empty" role="status">
-      The Atlas for this repository isn't built yet.
-      <br />
-      <span className="text-body-sm text-ink-faint">
-        {busy
-          ? `The first Knowledge build is ${status?.state === "queued" ? "queued" : "running"}; the map appears here when it lands.`
-          : status?.state === "failed"
-            ? "The last Knowledge build failed. It retries on the next push; the code, tree and history are all still available."
-            : "It's made by the next Knowledge build, after a push."}
-      </span>
+    <div className="flex flex-col gap-3">
+      <KnowledgeBar repo={ref} base={base} status={status} overlays={overlays} />
+      <div className="mk-empty" role="status">
+        The Atlas for this repository isn't built yet.
+        <br />
+        <span className="text-body-sm text-ink-faint">
+          {busy
+            ? `The first Knowledge build is ${status?.state === "queued" ? "queued" : "running"}; the map appears here when it lands.`
+            : status?.state === "failed"
+              ? "The last Knowledge build failed. It retries on the next push; the code, tree and history are all still available."
+              : "It's made by the next Knowledge build, after a push."}
+        </span>
+      </div>
     </div>
   );
 }
@@ -218,14 +269,8 @@ function PinnedGone({ error }: { error: AtlasError }) {
   );
 }
 
-function Territory({
-  overview,
-  status: initial,
-}: {
-  overview: AtlasOverview;
-  status: KnowledgeStatus | null;
-}) {
-  const status = useBuildStatus(initial);
+function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoaderData }) {
+  const status = useBuildStatus(data.status);
   const notices = useMemo(() => scopeNotices(status, overview), [status, overview]);
   const { ref, base } = useAtlasBase();
   const snapshot = overview.snapshot;
@@ -450,6 +495,13 @@ function Territory({
   );
   const selection = (
     <>
+      {data.overlay && (
+        <OverlayPanel
+          overlay={data.overlay}
+          href={(id) => atlasHref(base, { select: id }, params)}
+          inMap={() => true}
+        />
+      )}
       {focus.state === "resolving" && (
         <p className="m-0 text-body-sm text-ink-faint">Opening the selection…</p>
       )}
@@ -466,6 +518,7 @@ function Territory({
         <AtlasInspector
           key={selected.id}
           repo={ref}
+          wiki={wikiPageFor(data.wiki, selected)}
           snapshot={snapshot}
           entity={selected}
           lens={url.lens}
@@ -522,6 +575,7 @@ function Territory({
               </button>
             ))}
           </div>
+          <KnowledgeBar repo={ref} base={base} status={status} overlays={data.overlays} />
         </div>
       </div>
       {notices.length > 0 && (
@@ -1101,5 +1155,14 @@ function Legend() {
         </li>
       </ul>
     </details>
+  );
+}
+
+/** The wiki page written for an entity, if any; the repository's is the wiki's first page. */
+function wikiPageFor(pages: WikiCatalog["pages"], entity: AtlasEntitySummary) {
+  return (
+    pages.find((p) => p.nodeId === entity.id) ??
+    (entity.kind === "repository" ? pages[0] : undefined) ??
+    null
   );
 }

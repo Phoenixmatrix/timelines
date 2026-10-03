@@ -61,7 +61,7 @@ export async function atlasBrowserScenario(t: AtlasE2E) {
   const browserTimeout = 15_000;
   const expect = playwrightExpect.configure({ timeout: browserTimeout });
   const { owner, name, api, head, dev, first } = await atlasFixtureRepo(t);
-  const base = `/${owner}/${name}/atlas`;
+  const base = `/${owner}/${name}/knowledge`;
   const target = "sym:billing/ledger/ledger.ts#post";
   const ancestry = await t.json<AtlasAncestors>(
     `${api}/atlas/ancestors?id=${encodeURIComponent(target)}`,
@@ -129,6 +129,30 @@ export async function atlasBrowserScenario(t: AtlasE2E) {
       assert(routes.includes(needed), `A cold link didn't read ${needed}`);
     assertNoPaidFanOut(mark, "cold link");
     t.record({ coldLink: cold.map((c) => `${c.route}${c.id ? ` ${c.id}` : ""}`) });
+
+    // 1b. Links from before the Knowledge cutover (CORE-174) keep their view:
+    // the old /atlas address and the old map's `?node=` both land here, and
+    // the whole graph is never read.
+    mark = seen.length;
+    await page.goto(`/${owner}/${name}/atlas?select=${encodeURIComponent(target)}&tl=main`);
+    await page.waitForURL(
+      (url) =>
+        url.pathname === base &&
+        url.searchParams.get("select") === target &&
+        url.searchParams.get("tl") === "main",
+    );
+    await expect(heading(page, "post")).toBeVisible();
+    await page.goto(`${base}?node=${encodeURIComponent(target)}&tl=main`);
+    await page.waitForURL(
+      (url) =>
+        url.searchParams.get("select") === target &&
+        !url.searchParams.has("node") &&
+        url.searchParams.get("tl") === "main",
+    );
+    await expect(heading(page, "post")).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    assertNoPaidFanOut(mark, "pre-cutover links");
+    await expect(page.getByRole("button", { name: "Export graph" })).toBeVisible();
 
     // 2. Typing in the lookup reads only this repository's catalogue.
     mark = seen.length;
@@ -367,7 +391,7 @@ export async function atlasAccessibleScenario(t: AtlasE2E) {
   const browserTimeout = 15_000;
   const expect = playwrightExpect.configure({ timeout: browserTimeout });
   const { owner, name, api, head, dev } = await atlasFixtureRepo(t);
-  const base = `/${owner}/${name}/atlas`;
+  const base = `/${owner}/${name}/knowledge`;
   const chain = await t.json<AtlasAncestors>(
     `${api}/atlas/ancestors?id=${encodeURIComponent("sym:billing/ledger/ledger.ts#post")}`,
     t.token,

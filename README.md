@@ -45,13 +45,14 @@ On 64-bit Raspberry Pi OS (Bookworm or newer), the installer selects
 `linux-aarch64/gm` automatically. A 32-bit OS cannot run this ARM64 binary.
 See [CLI installation and bootstrap](apps/cli/README.md#downloading-artifacts-and-installing-unix-clis).
 
-## Knowledge map labels
+## Knowledge Atlas
 
-The Knowledge view reveals component, folder, file and symbol labels as you zoom
-in. Long names wrap or end in an ellipsis instead of leaving readable tiles blank;
-hover a tile or select it to see the complete name in the tooltip or inspector.
-Hover names wrap within the map, including near its edges. Tiny tiles remain
-unlabeled until there is enough room to read them.
+The Knowledge tab shows the repository as capability territory: groups of files
+that work together, found from imports and shared concepts rather than folders.
+Open a region to see its areas and files, select anything to read why it is
+grouped, what it uses and what uses it, and jump to its source. Labels appear
+as you zoom in; a name is drawn whole or not at all. The account page's
+Knowledge link opens the same view across the repositories you pick.
 
 ## Release note evidence
 

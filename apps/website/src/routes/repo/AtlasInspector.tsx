@@ -10,6 +10,8 @@
 import { CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
+import type { WikiPageSummary } from "../../../shared/api.ts";
+import { repoPath } from "../../lib/refs.ts";
 import type {
   AtlasContribution,
   AtlasCounts,
@@ -128,6 +130,7 @@ export function AtlasInspector({
   onPick,
   onLens,
   onRestart,
+  wiki = null,
 }: {
   repo: AtlasRepo;
   snapshot: AtlasSnapshotRef;
@@ -142,6 +145,8 @@ export function AtlasInspector({
   onLens: (lens: AtlasLens) => void;
   /** The pinned snapshot can't be read any more. */
   onRestart?: (error: AtlasError) => void;
+  /** The wiki page written about it, if any. */
+  wiki?: Pick<WikiPageSummary, "slug" | "title"> | null;
 }) {
   const [detail, setDetail] = useState<AtlasDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -234,6 +239,14 @@ export function AtlasInspector({
         {inferred?.model &&
           ` Summary written by ${inferred.model}${inferred.basis?.commit ? ` from ${inferred.basis.commit.slice(0, 7)}` : ""}, a model's reading, not verified behavior.`}
       </p>
+      {wiki && (
+        <Link
+          to={repoPath(repo.owner, repo.name, "wiki", wiki.slug)}
+          className="self-start text-body-sm text-ink underline"
+        >
+          Wiki: {wiki.title}
+        </Link>
+      )}
       {detailError && (
         <p className="m-0 text-body-sm text-danger-text" role="alert">
           {detailError}
