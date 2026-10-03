@@ -285,7 +285,7 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
   return (
     <Card
       title="Mirror"
-      description="Every push here is pushed on to another git host, so it always holds a backup. One way only: anything pushed there directly is overwritten."
+      description="The default branch and tags are pushed on to another git host after every push here, so it always holds a backup. Other branches stay here. One way only: anything pushed to those refs there directly is overwritten."
     >
       <div className="mk-card-body">
         <TextField
@@ -324,8 +324,8 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
             <span>
               Delete what's gone here
               <span className="block text-body-sm text-ink-faint">
-                Off: branches and tags deleted here stay on the target, so a backup never loses
-                anything.
+                Off: the default branch and tags deleted here stay on the target, so a backup never
+                loses anything. Other branches on the target are never deleted.
               </span>
             </span>
           </label>

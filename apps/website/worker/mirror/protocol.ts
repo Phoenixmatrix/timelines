@@ -10,9 +10,13 @@ export const ZERO_OID = "0".repeat(40);
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
-/** Branches and tags are mirrored; everything else (notes, PR refs, gm's own) is not. */
-export function isMirroredRef(name: string): boolean {
-  return name.startsWith("refs/heads/") || name.startsWith("refs/tags/");
+/**
+ * The default branch (e.g. `refs/heads/main`) and tags are mirrored. Other
+ * branches (timelines, experiments) stay here, as does everything else
+ * (notes, PR refs, gm's own).
+ */
+export function isMirroredRef(name: string, defaultBranch: string | null): boolean {
+  return name === defaultBranch || name.startsWith("refs/tags/");
 }
 
 export interface Advertisement {
@@ -55,24 +59,28 @@ export interface RefUpdate {
 }
 
 /**
- * The commands that make the target's branches and tags match the source.
- * Updates may rewind (a mirror follows force-pushes). Refs only the target has
- * are deleted only when `prune` is set: a backup never loses data by default.
+ * The commands that make the target's default branch and tags match the
+ * source. Updates may rewind (a mirror follows force-pushes). Refs only the
+ * target has are deleted only when `prune` is set, and only within that set:
+ * a backup never loses data by default, and other branches already on the
+ * target are left as they are.
  */
 export function planMirror(
   source: Map<string, string>,
   target: Map<string, string>,
+  defaultBranch: string | null,
   prune: boolean,
 ): RefUpdate[] {
   const updates: RefUpdate[] = [];
   for (const [ref, oid] of source) {
-    if (!isMirroredRef(ref)) continue;
+    if (!isMirroredRef(ref, defaultBranch)) continue;
     const current = target.get(ref) ?? ZERO_OID;
     if (current !== oid) updates.push({ ref, old: current, new: oid });
   }
   if (prune) {
     for (const [ref, oid] of target) {
-      if (isMirroredRef(ref) && !source.has(ref)) updates.push({ ref, old: oid, new: ZERO_OID });
+      if (isMirroredRef(ref, defaultBranch) && !source.has(ref))
+        updates.push({ ref, old: oid, new: ZERO_OID });
     }
   }
   return updates.sort((a, b) => a.ref.localeCompare(b.ref));

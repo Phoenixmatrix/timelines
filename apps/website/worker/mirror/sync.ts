@@ -1,4 +1,4 @@
-// One-way mirroring: make another git host's branches and tags match a
+// One-way mirroring: make another git host's default branch and tags match a
 // repository's, after every push. Workers can't run git, so this speaks the
 // wire protocol: read the target's refs, fetch exactly the missing objects
 // from Artifacts as a pack, and stream that pack into the target's
@@ -11,7 +11,6 @@ import { lsRefsRequest, parseLsRefs } from "../git/pktline.ts";
 import { db, nowIso } from "../schema.ts";
 import {
   fetchRequest,
-  isMirroredRef,
   needsPack,
   packFromFetchResponse,
   parsePushReport,
@@ -68,7 +67,10 @@ function basic(username: string, token: string): string {
   return `Basic ${btoa(`${username}:${token}`)}`;
 }
 
-/** The source's branches and tags, tag objects unpeeled (a mirror pushes them as they are). */
+/**
+ * The source's branches and tags, tag objects unpeeled (a mirror pushes them
+ * as they are), and the branch HEAD points at: the default branch.
+ */
 async function sourceRefs(env: Env, artifactsName: string, remote: string) {
   const token = await upstreamToken(env, artifactsName, "read");
   const response = await fetch(`${remote}/git-upload-pack`, {
@@ -86,7 +88,7 @@ async function sourceRefs(env: Env, artifactsName: string, remote: string) {
   let head: string | null = null;
   for (const ref of parseLsRefs(new Uint8Array(await response.arrayBuffer()))) {
     if (ref.name === "HEAD") head = ref.symrefTarget ?? null;
-    else if (ref.oid && isMirroredRef(ref.name)) refs.set(ref.name, ref.oid);
+    else if (ref.oid && /^refs\/(heads|tags)\//.test(ref.name)) refs.set(ref.name, ref.oid);
   }
   return { refs, head };
 }
@@ -126,10 +128,13 @@ function pushBody(commands: Uint8Array, pack: AsyncGenerator<Uint8Array> | null)
   });
 }
 
-/** Push the source's refs to the target. Throws MirrorError with a readable reason. */
+/**
+ * Push the source's default branch and tags to the target. Throws MirrorError
+ * with a readable reason.
+ */
 export async function mirrorRepository(
   env: Env,
-  source: { artifactsName: string; remote: string },
+  source: { artifactsName: string; remote: string; defaultBranch: string },
   target: Target,
   prune: boolean,
 ): Promise<{ updates: RefUpdate[]; head: string | null }> {
@@ -137,8 +142,11 @@ export async function mirrorRepository(
     sourceRefs(env, source.artifactsName, source.remote),
     advertisement(target),
   ]);
-  const updates = planMirror(from.refs, to.refs, prune);
-  const head = from.head ? (from.refs.get(from.head) ?? null) : null;
+  // Git's HEAD is the source of truth (imports keep theirs); the recorded
+  // default branch covers a HEAD the listing didn't name.
+  const defaultBranch = from.head ?? `refs/heads/${source.defaultBranch}`;
+  const updates = planMirror(from.refs, to.refs, defaultBranch, prune);
+  const head = from.refs.get(defaultBranch) ?? null;
   if (updates.length === 0) return { updates, head };
   if (updates.some((u) => u.new === ZERO_OID) && !to.capabilities.has("delete-refs")) {
     throw new MirrorError("The mirror target doesn't allow deleting refs; turn pruning off.");
@@ -234,6 +242,7 @@ export async function syncMirror(env: Env, repoId: string): Promise<MirrorResult
         "m.prune",
         "r.artifacts_name",
         "r.artifacts_remote",
+        "r.default_branch",
       ])
       .where("m.repo_id", "=", repoId)
       .executeTakeFirstOrThrow();
@@ -241,7 +250,11 @@ export async function syncMirror(env: Env, repoId: string): Promise<MirrorResult
     const token = await unseal(env, row.token_sealed);
     const { updates, head } = await mirrorRepository(
       env,
-      { artifactsName: row.artifacts_name, remote: row.artifacts_remote },
+      {
+        artifactsName: row.artifacts_name,
+        remote: row.artifacts_remote,
+        defaultBranch: row.default_branch,
+      },
       { url: row.url, authorization: basic(row.username, token) },
       row.prune === 1,
     );

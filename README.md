@@ -157,7 +157,7 @@ environment. Its checks include:
 | Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance |
 | CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                               |
 | Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries                                         |
-| Mirror                         | Authenticated Git mirror update/tag/prune, rejected credentials and recovery against a real local HTTP target                                      |
+| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target        |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation

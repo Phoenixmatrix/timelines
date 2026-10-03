@@ -506,7 +506,7 @@ pub enum MirrorCommand {
         /// Username sent with the token (GitHub accepts any).
         #[arg(long)]
         username: Option<String>,
-        /// Also delete branches and tags on the target that are gone here.
+        /// Also delete tags (and the default branch) on the target that are gone here.
         #[arg(long, overrides_with = "no_prune")]
         prune: bool,
         #[arg(long)]

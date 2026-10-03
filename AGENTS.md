@@ -71,9 +71,10 @@ This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
   works (gm adopts the commits), but never `git push`: gm pushes with the
   right credentials and keeps its own view of trunk. Git shows a detached
   HEAD here; that's gm's working copy, not a problem.
-- **GitHub is a backup, written only by the mirror.** Every push to
-  Gitmatrix is mirrored to GitHub (the `github` remote) one way. Don't push
-  there: the mirror overwrites it. Use `gh` only to read GitHub.
+- **GitHub is a backup, written only by the mirror.** Pushes to `main` and
+  tags are mirrored to GitHub (the `github` remote) one way; other branches
+  stay on Gitmatrix. Don't push there: the mirror overwrites it. Use `gh` only
+  to read GitHub.
 - **Every push runs the quality gates** in `.gitmatrix/ci.yml` on production,
   in Cloudflare Sandbox containers: check, test and build, independently;
   all must pass. On main, a `deploy` job then ships what changed (migrations,

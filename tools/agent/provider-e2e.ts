@@ -314,13 +314,11 @@ export async function runProviderE2E(
         return result;
       };
       await waitFor(stage, 120_000, async () => (await refs()).get("refs/heads/main") === initial);
-      await git([
-        "--git-dir",
-        join(root, "target.git"),
-        "update-ref",
-        "refs/heads/stale-fixture",
-        initial,
-      ]);
+      // Pruning covers only what is mirrored: the stale tag goes, the stale
+      // branch (not the default) stays.
+      for (const ref of ["refs/heads/stale-fixture", "refs/tags/stale-fixture"]) {
+        await git(["--git-dir", join(root, "target.git"), "update-ref", ref, initial]);
+      }
       enter("mirror-update-tag-prune");
       await git([
         "-c",
@@ -333,15 +331,18 @@ export async function runProviderE2E(
       await git(["tag", "-a", "provider-v1", "-m", "Provider fixture tag"]);
       final = await git(["rev-parse", "HEAD"]);
       const tag = await git(["rev-parse", "refs/tags/provider-v1"]);
-      await git(["push", "origin", "main", "refs/tags/provider-v1"], work, true);
-      await waitFor(stage, 120_000, async () => {
-        const actual = await refs();
-        return (
-          actual.size === 2 &&
-          actual.get("refs/heads/main") === final &&
-          actual.get("refs/tags/provider-v1") === tag
-        );
-      });
+      // Only the default branch and tags are mirrored; the timeline stays here.
+      await git(
+        ["push", "origin", "main", "refs/tags/provider-v1", "HEAD:refs/heads/timeline-fixture"],
+        work,
+        true,
+      );
+      const mirrored = (actual: Map<string, string>) =>
+        actual.size === 3 &&
+        actual.get("refs/heads/main") === final &&
+        actual.get("refs/tags/provider-v1") === tag &&
+        actual.get("refs/heads/stale-fixture") === initial;
+      await waitFor(stage, 120_000, async () => mirrored(await refs()));
       evidence.mirrorRefs = { main: final, tag };
       // Observe the persisted queue result before attempting synchronous auth checks.
       await waitFor("mirror-queue-settled", 30_000, async () => {
@@ -361,6 +362,7 @@ export async function runProviderE2E(
       assert.equal(recovered.status, "ok");
       assert.equal(recovered.lastSyncedCommit, final);
       assert.equal(recovered.lastError, null);
+      assert(mirrored(await refs()), "A sync mirrored a non-default branch or pruned too much");
       evidence.mirrorRequests = target.counts;
       enter("non-ai-boundary");
       const status = await api(`${base}/knowledge/status`);

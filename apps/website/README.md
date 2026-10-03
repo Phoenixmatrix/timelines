@@ -1015,9 +1015,10 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
 
 ## Mirrors
 
-A repository can mirror every push on to another git host: Settings → Mirror,
-`gm repo mirror set <url> --token-stdin`, or `PUT /api/repos/:o/:n/mirror`.
-Gitmatrix's own repository mirrors to GitHub this way, as a backup.
+A repository can mirror its default branch and tags on to another git host
+after every push: Settings → Mirror, `gm repo mirror set <url> --token-stdin`,
+or `PUT /api/repos/:o/:n/mirror`. Gitmatrix's own repository mirrors `main` to
+GitHub this way, as a backup.
 
 ```
 push ─▶ git proxy ─▶ queueMirror ─▶ JOBS queue (gitmatrix-jobs) ─▶ syncMirror
@@ -1026,10 +1027,16 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
             ─▶ stream that pack into the target's receive-pack ─▶ report-status
 ```
 
-- **One way, and safe by default.** Branches and tags are pushed (force, so
-  rewinds follow); anything pushed to the target directly is overwritten.
-  Refs that disappear here stay on the target unless pruning is on, so a
-  backup never loses data on its own.
+- **Default branch and tags only.** The default branch (the one HEAD names,
+  falling back to `repos.default_branch`) and every tag are pushed. Other
+  branches, timelines and experiments among them, stay on Gitmatrix; pushing
+  one doesn't reach the target. Branches already on the target are left as
+  they are.
+- **One way, and safe by default.** Mirrored refs are force-pushed, so rewinds
+  follow; anything pushed to them on the target directly is overwritten. A
+  mirrored ref that disappears here stays on the target unless pruning is on,
+  so a backup never loses data on its own. Pruning only ever deletes the
+  default branch or tags, never another branch.
 - **Off the push path.** A push enqueues its repository; the consumer syncs
   it and retries failures with exponential backoff. A lease in `repo_mirrors`
   keeps one sync per repository at a time, and every sync converges on the

@@ -69,26 +69,48 @@ describe("mirror protocol", () => {
   it("plans creations, force-updates and (only when pruning) deletions", () => {
     const source = new Map([
       ["refs/heads/main", A],
-      ["refs/heads/new", B],
       ["refs/tags/v1", C],
+      ["refs/tags/v2", B],
     ]);
     const target = new Map([
       ["refs/heads/main", B],
-      ["refs/heads/gone", C],
       ["refs/tags/v1", C],
+      ["refs/tags/gone", C],
       ["refs/pull/1/head", A],
     ]);
-    expect(planMirror(source, target, false)).toEqual([
+    expect(planMirror(source, target, "refs/heads/main", false)).toEqual([
       { ref: "refs/heads/main", old: B, new: A },
-      { ref: "refs/heads/new", old: ZERO_OID, new: B },
+      { ref: "refs/tags/v2", old: ZERO_OID, new: B },
     ]);
-    // Pruning deletes only branches and tags, never a host's own refs.
-    expect(planMirror(source, target, true)).toContainEqual({
-      ref: "refs/heads/gone",
-      old: C,
-      new: ZERO_OID,
-    });
-    expect(planMirror(source, target, true).map((u) => u.ref)).not.toContain("refs/pull/1/head");
+    // Pruning deletes only mirrored refs, never a host's own.
+    const pruned = planMirror(source, target, "refs/heads/main", true);
+    expect(pruned).toContainEqual({ ref: "refs/tags/gone", old: C, new: ZERO_OID });
+    expect(pruned.map((u) => u.ref)).not.toContain("refs/pull/1/head");
+  });
+
+  it("mirrors only the default branch and tags", () => {
+    const source = new Map([
+      ["refs/heads/trunk", A],
+      ["refs/heads/main", B],
+      ["refs/heads/timeline/x", C],
+      ["refs/tags/v1", C],
+    ]);
+    const target = new Map([
+      ["refs/heads/main", A],
+      ["refs/heads/old-feature", C],
+    ]);
+    // Other branches never reach the target, and those already there stay,
+    // even when pruning: it applies only to the default branch and tags.
+    for (const prune of [false, true]) {
+      expect(planMirror(source, target, "refs/heads/trunk", prune)).toEqual([
+        { ref: "refs/heads/trunk", old: ZERO_OID, new: A },
+        { ref: "refs/tags/v1", old: ZERO_OID, new: C },
+      ]);
+    }
+    // A default branch gone here is pruned like any mirrored ref.
+    expect(planMirror(new Map(), target, "refs/heads/main", true)).toEqual([
+      { ref: "refs/heads/main", old: A, new: ZERO_OID },
+    ]);
   });
 
   it("writes commands with only the capabilities the target offers", () => {
