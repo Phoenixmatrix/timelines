@@ -21,6 +21,7 @@ import type {
   AtlasRelation,
   AtlasSnapshotRef,
 } from "../../../shared/atlas.ts";
+import { fileNote, summaryNote } from "./atlasStates.ts";
 import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../../lib/atlas.ts";
 import type { AtlasLens } from "./atlasUrl.ts";
 import { lineAnchor } from "../../lib/lineAnchors.ts";
@@ -215,13 +216,14 @@ export function AtlasInspector({
 
       {entity.summary ? (
         <p className="m-0 text-body-sm text-ink-muted">{entity.summary}</p>
-      ) : entity.summaryState?.status === "stale" ? (
+      ) : summaryNote(entity.summaryState) ? (
         <p className="m-0 text-body-sm text-ink-faint">
-          Summary out of date: it describes an earlier build.
+          {summaryNote(entity.summaryState, inferred?.basis?.commit)}
         </p>
-      ) : entity.summaryState?.status === "unavailable" ? (
-        <p className="m-0 text-body-sm text-ink-faint">Summary unavailable for this build.</p>
       ) : null}
+      {entity.kind === "file" && fileNote(data) && (
+        <p className="m-0 text-body-sm text-ink-faint">{fileNote(data)}</p>
+      )}
 
       <p className="m-0 text-micro text-ink-faint">
         {entity.structural

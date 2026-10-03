@@ -21,6 +21,7 @@ import {
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
+import type { KnowledgeStatus } from "../../../shared/api.ts";
 import type {
   AtlasEntitySummary,
   AtlasError,
@@ -28,6 +29,8 @@ import type {
   AtlasRegion,
   AtlasSnapshotRef,
 } from "../../../shared/atlas.ts";
+import { useKnowledgeStatus } from "../../components/KnowledgeStatus.tsx";
+import { api } from "../../lib/api.ts";
 import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { useViewer } from "../../lib/session.ts";
@@ -48,6 +51,7 @@ import {
   type AtlasLens,
   type AtlasUrlState,
 } from "./atlasUrl.ts";
+import { scopeNotices, summaryNote, type AtlasNotice } from "./atlasStates.ts";
 import { AtlasTerritory } from "./AtlasTerritory.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./territory.ts";
@@ -55,22 +59,34 @@ import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./te
 export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
   const repo = { owner: params.owner ?? "", name: params.repo ?? "" };
   const snapshot = readAtlasUrl(new URL(request.url).search).snapshot ?? undefined;
+  // Build state says whether the map is behind, rebuilding or failed; the
+  // map still renders without it.
+  const status = api<KnowledgeStatus>(`/repos/${repo.owner}/${repo.name}/knowledge/status`, {
+    signal: request.signal,
+  }).catch(() => null);
   try {
     return {
       overview: await atlasApi.overview(repo, { snapshot, signal: request.signal }),
       pinned: null,
+      status: await status,
     };
   } catch (error) {
     const atlasError = atlasErrorOf(error);
-    if (atlasError?.code === "atlas_unavailable") return { overview: null, pinned: null };
+    if (atlasError?.code === "atlas_unavailable")
+      return { overview: null, pinned: null, status: await status };
     // A link to a snapshot that's gone: explain, and offer the current one.
     if (atlasError && snapshot && atlasNeedsRestart(error))
-      return { overview: null, pinned: atlasError };
+      return { overview: null, pinned: atlasError, status: null };
     throw error;
   }
 }
 
-/** Only a different snapshot (or repository) reads the overview again; the rest is the view's. */
+/**
+ * Only a different snapshot (or repository) reads the overview again; the rest
+ * is the view's. An explicit revalidation (the same address, as when a
+ * Knowledge build lands) reads it again too: an unpinned view moves to the new
+ * map, a pinned one re-reads its own snapshot.
+ */
 export function atlasShouldRevalidate({
   currentUrl,
   nextUrl,
@@ -78,6 +94,7 @@ export function atlasShouldRevalidate({
   defaultShouldRevalidate,
 }: ShouldRevalidateFunctionArgs) {
   if (formMethod || currentUrl.pathname !== nextUrl.pathname) return defaultShouldRevalidate;
+  if (currentUrl.href === nextUrl.href) return defaultShouldRevalidate;
   return currentUrl.searchParams.get("snapshot") !== nextUrl.searchParams.get("snapshot");
 }
 
@@ -119,20 +136,44 @@ function useAtlasBase() {
 }
 
 export function Atlas() {
-  const { overview, pinned } = useLoaderData<typeof atlasLoader>();
+  const { overview, pinned, status } = useLoaderData<typeof atlasLoader>();
   if (pinned) return <PinnedGone error={pinned} />;
-  if (!overview)
-    return (
-      <div className="mk-empty">
-        The Atlas for this repository isn't built yet.
-        <br />
-        <span className="text-body-sm text-ink-faint">
-          It's made by the next Knowledge build, after a push.
-        </span>
-      </div>
-    );
-  return <Territory key={overview.snapshot.id} overview={overview} />;
+  if (!overview) return <NotBuilt status={status} />;
+  return <Territory key={overview.snapshot.id} overview={overview} status={status} />;
 }
+
+/** Polls a running build; the hook revalidates, and so reloads the map, when it lands. */
+function useBuildStatus(initial: KnowledgeStatus | null): KnowledgeStatus | null {
+  const repo = useRepo();
+  const fallback = useMemo(() => initial ?? IDLE, [initial]);
+  const status = useKnowledgeStatus(repo.owner.slug, repo.name, fallback);
+  return initial ? status : null;
+}
+const IDLE = { state: "empty" } as KnowledgeStatus;
+
+function NotBuilt({ status: initial }: { status: KnowledgeStatus | null }) {
+  const status = useBuildStatus(initial);
+  const busy = status?.state === "building" || status?.state === "queued";
+  return (
+    <div className="mk-empty" role="status">
+      The Atlas for this repository isn't built yet.
+      <br />
+      <span className="text-body-sm text-ink-faint">
+        {busy
+          ? `The first Knowledge build is ${status?.state === "queued" ? "queued" : "running"}; the map appears here when it lands.`
+          : status?.state === "failed"
+            ? "The last Knowledge build failed. It retries on the next push; the code, tree and history are all still available."
+            : "It's made by the next Knowledge build, after a push."}
+      </span>
+    </div>
+  );
+}
+
+const TONE: Record<AtlasNotice["tone"], string> = {
+  info: "text-ink-muted",
+  warn: "text-ink",
+  error: "text-danger-text",
+};
 
 /** A link's snapshot is gone: say why, keep the rest of the link, and let the person choose. */
 function PinnedGone({ error }: { error: AtlasError }) {
@@ -171,7 +212,15 @@ function PinnedGone({ error }: { error: AtlasError }) {
   );
 }
 
-function Territory({ overview }: { overview: AtlasOverview }) {
+function Territory({
+  overview,
+  status: initial,
+}: {
+  overview: AtlasOverview;
+  status: KnowledgeStatus | null;
+}) {
+  const status = useBuildStatus(initial);
+  const notices = useMemo(() => scopeNotices(status, overview), [status, overview]);
   const { ref, base } = useAtlasBase();
   const snapshot = overview.snapshot;
   const [params, setParams] = useSearchParams();
@@ -283,6 +332,26 @@ function Territory({ overview }: { overview: AtlasOverview }) {
   return (
     <div className="flex flex-col gap-3">
       <SnapshotLine overview={overview} pinned={url.snapshot !== null} />
+      {notices.length > 0 && (
+        <ul aria-label="Map state" className="m-0 flex list-none flex-col gap-0.5 p-0 text-body-sm">
+          {notices.map((n) => (
+            <li key={n.id} className={TONE[n.tone]} role={n.tone === "error" ? "alert" : undefined}>
+              {n.text}
+              {n.current && (
+                <>
+                  {" "}
+                  <Link
+                    to={atlasHref(base, { snapshot: null }, params)}
+                    className="text-ink underline"
+                  >
+                    Open the current view
+                  </Link>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
       {gone && <Expired error={gone} base={base} />}
       <p role="status" className="sr-only">
         {focus.state === "resolving"
@@ -395,17 +464,11 @@ function SnapshotLine({ overview, pinned }: { overview: AtlasOverview; pinned: b
       <span className="text-ink-faint">
         Built from {commit ? <span className="font-mono">{commit}</span> : "the indexed commit"}
         {snapshot.publishedAt && ` · ${timeAgo(snapshot.publishedAt)}`}
-        {snapshot.partial && " · some files not analyzed yet, so counts are a floor"}
       </span>
       {snapshot.expiresAt && (
         <span className="text-ink-faint">
           {pinned ? "A linked earlier snapshot" : "An earlier snapshot"}, kept until{" "}
           {new Date(snapshot.expiresAt).toLocaleDateString()}
-        </span>
-      )}
-      {overview.capacityFailure && (
-        <span className="text-danger-text">
-          The newest build didn't fit the Atlas storage limit; this is the previous one.
         </span>
       )}
     </div>
@@ -767,15 +830,7 @@ function Lookup({
 }
 
 function summaryLine(entity: AtlasEntitySummary): string {
-  if (entity.summary) return entity.summary;
-  switch (entity.summaryState?.status) {
-    case "stale":
-      return "Summary out of date: it describes an earlier build.";
-    case "unavailable":
-      return "Summary unavailable for this build.";
-    default:
-      return "";
-  }
+  return entity.summary || summaryNote(entity.summaryState) || "";
 }
 
 function RegionList({
