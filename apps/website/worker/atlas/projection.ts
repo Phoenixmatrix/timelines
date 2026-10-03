@@ -720,3 +720,344 @@ export async function edgesAt(
     .all<{ src: string; dst: string; kind: string; weight: number }>();
   return rows.results.map((r) => ({ ...r, weight: Number(r.weight) }));
 }
+
+// ---- bounded reads (CORE-160) --------------------------------------------------
+//
+// Keyset pages over one snapshot for the Atlas read API. Each reads only rows
+// visible at `seq` (the same [from_seq, to_seq) rule as above), so a page keeps
+// reading what its snapshot published whatever has been written since.
+
+type EntityRow = Parameters<typeof toEntity>[0];
+const ENTITY_COLUMNS = "entity_id, kind, parent_id, name, path, summary, data";
+/** VISIBLE for a joined table. */
+const visibleAs = (alias: string) =>
+  `${alias}.from_seq <= ? AND (${alias}.to_seq IS NULL OR ${alias}.to_seq > ?)`;
+
+/** The repository root every top-level region hangs from. */
+export const ROOT = "repo";
+
+/** Primary (deduplicated) files of a top-level region: a component's, or the unclassified group's members. */
+const PRIMARY_FILES = `coalesce(json_extract(data, '$.counts.files'), CASE WHEN entity_id = '${GROUPS.unclassified}' THEN json_extract(data, '$.members') END, 0)`;
+const MEMBERS = `coalesce(json_extract(data, '$.members'), json_extract(data, '$.counts.files'), 0)`;
+
+/** Where a ranked top-level page stopped: [files, members, sort_key]. */
+export type RegionKey = [number, number, string];
+
+/**
+ * A page of the root's children (components and structural groups), largest
+ * first: by primary files, then direct members, then name.
+ */
+export async function regionsAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  after: RegionKey | null,
+  limit: number,
+): Promise<{
+  regions: (AtlasEntity & { files: number; members: number })[];
+  next: RegionKey | null;
+}> {
+  const keyset = after
+    ? "AND (files < ? OR (files = ? AND (members < ? OR (members = ? AND sort_key > ?))))"
+    : "";
+  const rows = await d1
+    .prepare(
+      `SELECT * FROM (
+         SELECT ${ENTITY_COLUMNS}, sort_key, ${PRIMARY_FILES} AS files, ${MEMBERS} AS members
+         FROM atlas_entities WHERE scope = ? AND parent_id = ? AND ${VISIBLE}
+       ) WHERE true ${keyset}
+       ORDER BY files DESC, members DESC, sort_key LIMIT ?`,
+    )
+    .bind(
+      scope,
+      ROOT,
+      seq,
+      seq,
+      ...(after ? [after[0], after[0], after[1], after[1], after[2]] : []),
+      limit + 1,
+    )
+    .all<EntityRow & { sort_key: string; files: number; members: number }>();
+  const page = rows.results.slice(0, limit);
+  const last = page.at(-1);
+  return {
+    regions: page.map((r) => ({
+      ...toEntity(r),
+      files: Number(r.files),
+      members: Number(r.members),
+    })),
+    next:
+      rows.results.length > limit && last
+        ? [Number(last.files), Number(last.members), last.sort_key]
+        : null,
+  };
+}
+
+/** How many children an entity has in snapshot `seq`. */
+export async function childCountAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  parentId: string,
+): Promise<number> {
+  const row = await d1
+    .prepare(
+      `SELECT count(*) AS n FROM atlas_entities WHERE scope = ? AND parent_id = ? AND ${VISIBLE}`,
+    )
+    .bind(scope, parentId, seq, seq)
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * An entity's ancestors in snapshot `seq`, root first, up to `maxDepth` of
+ * them; `truncated` when the chain goes further (or loops).
+ */
+export async function ancestorsAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  id: string,
+  maxDepth = 64,
+): Promise<{ ancestors: AtlasEntity[]; truncated: boolean }> {
+  const rows = await d1
+    .prepare(
+      `WITH RECURSIVE up (id, depth) AS (
+         SELECT parent_id, 1 FROM atlas_entities
+         WHERE scope = ?1 AND entity_id = ?2 AND from_seq <= ?3 AND (to_seq IS NULL OR to_seq > ?3)
+         UNION ALL
+         SELECT e.parent_id, up.depth + 1 FROM up JOIN atlas_entities e
+           ON e.scope = ?1 AND e.entity_id = up.id AND e.from_seq <= ?3 AND (e.to_seq IS NULL OR e.to_seq > ?3)
+         WHERE up.depth <= ?4
+       )
+       SELECT e.entity_id, e.kind, e.parent_id, e.name, e.path, e.summary, e.data, up.depth
+       FROM up JOIN atlas_entities e
+         ON e.scope = ?1 AND e.entity_id = up.id AND e.from_seq <= ?3 AND (e.to_seq IS NULL OR e.to_seq > ?3)
+       ORDER BY up.depth DESC`,
+    )
+    .bind(scope, id, seq, maxDepth)
+    .all<EntityRow & { depth: number }>();
+  const within = rows.results.filter((r) => Number(r.depth) <= maxDepth);
+  return {
+    ancestors: within.map(toEntity),
+    truncated: within.length < rows.results.length,
+  };
+}
+
+/** Edges per kind leaving (or, with `incoming`, arriving at) an entity in snapshot `seq`. */
+export async function edgeCountsAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  entityId: string,
+  incoming: boolean,
+  kind: string | null = null,
+): Promise<Record<string, number>> {
+  const rows = await d1
+    .prepare(
+      `SELECT kind, count(*) AS n FROM atlas_edges
+       WHERE scope = ? AND ${incoming ? "dst" : "src"} = ? AND ${VISIBLE} ${kind === null ? "" : "AND kind = ?"}
+       GROUP BY kind ORDER BY kind`,
+    )
+    .bind(scope, entityId, seq, seq, ...(kind === null ? [] : [kind]))
+    .all<{ kind: string; n: number }>();
+  return Object.fromEntries(rows.results.map((r) => [r.kind, Number(r.n)]));
+}
+
+/** Where a relation page stopped: [the other end's id, kind]. */
+export type RelationKey = [string, string];
+
+/**
+ * A page of an entity's edges in snapshot `seq`, ordered by the other end then
+ * kind, each with the entity at its other end (null when the snapshot has none).
+ */
+export async function relationsAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  entityId: string,
+  incoming: boolean,
+  kind: string | null,
+  after: RelationKey | null,
+  limit: number,
+): Promise<{
+  relations: {
+    src: string;
+    dst: string;
+    kind: string;
+    weight: number;
+    neighbor: AtlasEntity | null;
+  }[];
+  next: RelationKey | null;
+}> {
+  const [self, other] = incoming ? ["dst", "src"] : ["src", "dst"];
+  const rows = await d1
+    .prepare(
+      `SELECT g.src, g.dst, g.kind, g.weight,
+              n.entity_id, n.kind AS n_kind, n.parent_id, n.name, n.path, n.summary, n.data
+       FROM atlas_edges g
+       LEFT JOIN atlas_entities n ON n.scope = g.scope AND n.entity_id = g.${other} AND ${visibleAs("n")}
+       WHERE g.scope = ? AND g.${self} = ? AND ${visibleAs("g")}
+         ${kind === null ? "" : "AND g.kind = ?"}
+         AND (g.${other}, g.kind) > (?, ?)
+       ORDER BY g.${other}, g.kind LIMIT ?`,
+    )
+    .bind(
+      seq,
+      seq,
+      scope,
+      entityId,
+      seq,
+      seq,
+      ...(kind === null ? [] : [kind]),
+      ...(after ?? ["", ""]),
+      limit + 1,
+    )
+    .all<
+      { src: string; dst: string; kind: string; weight: number; n_kind: string | null } & Omit<
+        EntityRow,
+        "kind" | "entity_id"
+      > & { entity_id: string | null }
+    >();
+  const page = rows.results.slice(0, limit);
+  const last = page.at(-1);
+  return {
+    relations: page.map((r) => ({
+      src: r.src,
+      dst: r.dst,
+      kind: r.kind,
+      weight: Number(r.weight),
+      neighbor:
+        r.entity_id === null || r.n_kind === null
+          ? null
+          : toEntity({ ...r, entity_id: r.entity_id, kind: r.n_kind }),
+    })),
+    next: rows.results.length > limit && last ? [incoming ? last.src : last.dst, last.kind] : null,
+  };
+}
+
+/**
+ * Files backing an entity in snapshot `seq`, by file id: its member files, the
+ * files it contains, and the files that mention or import it. Each file once.
+ */
+function evidenceSource(): string {
+  return `SELECT entity_id AS id, 'member' AS via FROM atlas_entities
+            WHERE scope = ?1 AND parent_id = ?2 AND kind = 'file' AND entity_id > ?4
+              AND from_seq <= ?3 AND (to_seq IS NULL OR to_seq > ?3)
+          UNION ALL
+          SELECT dst, kind FROM atlas_edges
+            WHERE scope = ?1 AND src = ?2 AND kind = 'contains' AND dst > ?4
+              AND from_seq <= ?3 AND (to_seq IS NULL OR to_seq > ?3)
+          UNION ALL
+          SELECT src, kind FROM atlas_edges
+            WHERE scope = ?1 AND dst = ?2 AND kind IN ('mentions', 'imports') AND src > ?4
+              AND from_seq <= ?3 AND (to_seq IS NULL OR to_seq > ?3)`;
+}
+
+/** A page of the files backing a (non-file) entity; see evidenceSource. */
+export async function evidenceFilesAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  entityId: string,
+  after: string | null,
+  limit: number,
+): Promise<{ files: (AtlasEntity & { via: string })[]; next: string | null }> {
+  const rows = await d1
+    .prepare(
+      `SELECT f.entity_id, f.kind, f.parent_id, f.name, f.path, f.summary, f.data,
+              min(CASE c.via WHEN 'member' THEN 0 WHEN 'contains' THEN 1 WHEN 'mentions' THEN 2 ELSE 3 END) AS rank
+       FROM (${evidenceSource()}) c
+       JOIN atlas_entities f ON f.scope = ?1 AND f.entity_id = c.id AND f.kind = 'file'
+         AND f.from_seq <= ?3 AND (f.to_seq IS NULL OR f.to_seq > ?3)
+       GROUP BY f.entity_id ORDER BY f.entity_id LIMIT ?5`,
+    )
+    .bind(scope, entityId, seq, after ?? "", limit + 1)
+    .all<EntityRow & { rank: number }>();
+  const page = rows.results.slice(0, limit);
+  const via = ["member", "contains", "mentions", "imports"];
+  return {
+    files: page.map((r) => ({ ...toEntity(r), via: via[Number(r.rank)] ?? "imports" })),
+    next: rows.results.length > limit ? (page.at(-1)?.entity_id ?? null) : null,
+  };
+}
+
+/** How many files back an entity in snapshot `seq` (see evidenceFilesAt). */
+export async function evidenceCountAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  entityId: string,
+): Promise<number> {
+  const row = await d1
+    .prepare(
+      `SELECT count(DISTINCT f.entity_id) AS n FROM (${evidenceSource()}) c
+       JOIN atlas_entities f ON f.scope = ?1 AND f.entity_id = c.id AND f.kind = 'file'
+         AND f.from_seq <= ?3 AND (f.to_seq IS NULL OR f.to_seq > ?3)`,
+    )
+    .bind(scope, entityId, seq, "")
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
+
+/** `q` as a LIKE pattern matching it anywhere, wildcards escaped. */
+const containsPattern = (q: string) => `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+
+/**
+ * A page of snapshot `seq`'s entities whose name or path contains `q`
+ * (case-insensitive for ASCII), optionally of one kind, in stable name order.
+ * A lookup over the projection, not a search engine.
+ */
+export async function catalogueAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  q: string,
+  kind: string | null,
+  after: string | null,
+  limit: number,
+): Promise<{ entities: AtlasEntity[]; next: string | null }> {
+  const pattern = containsPattern(q);
+  const rows = await d1
+    .prepare(
+      `SELECT ${ENTITY_COLUMNS}, sort_key FROM atlas_entities
+       WHERE scope = ? AND ${VISIBLE} AND sort_key > ?
+         AND (name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\') ${kind === null ? "" : "AND kind = ?"}
+       ORDER BY sort_key LIMIT ?`,
+    )
+    .bind(
+      scope,
+      seq,
+      seq,
+      after ?? "",
+      pattern,
+      pattern,
+      ...(kind === null ? [] : [kind]),
+      limit + 1,
+    )
+    .all<EntityRow & { sort_key: string }>();
+  const page = rows.results.slice(0, limit);
+  return {
+    entities: page.map(toEntity),
+    next: rows.results.length > limit ? (page.at(-1)?.sort_key ?? null) : null,
+  };
+}
+
+/** How many entities catalogueAt would list in all. */
+export async function catalogueCountAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  q: string,
+  kind: string | null,
+): Promise<number> {
+  const pattern = containsPattern(q);
+  const row = await d1
+    .prepare(
+      `SELECT count(*) AS n FROM atlas_entities
+       WHERE scope = ? AND ${VISIBLE}
+         AND (name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\') ${kind === null ? "" : "AND kind = ?"}`,
+    )
+    .bind(scope, seq, seq, pattern, pattern, ...(kind === null ? [] : [kind]))
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
