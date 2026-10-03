@@ -448,11 +448,64 @@ null capabilities rather than invented defaults.
 - **Workspace changes are operations.** `gm undo` reverses the last one (repeat
   to go further back), `gm op log` lists them, `gm op restore <id>` jumps to any.
 - **Trunk is immutable; there are no PRs.** `gm push` fast-forwards trunk to
-  your change; `gm push -b <name>` pushes a bookmark (git branch) instead.
+  your change; `gm push -b <name>` pushes a bookmark (git branch) instead. In a
+  checkout working in a timeline, trunk is the timeline's bookmark (below).
 
 It stays a normal git repository. Bookmarks are branches, HEAD sits on `@`'s
 parent (so `git status` and `git diff` show the change in progress), and change
 ids live in a `change-id` commit header, the same one jj uses.
+
+## Timelines
+
+A timeline is a separate line of work that lands on main later, automatically
+(`auto`) or after a person approves a checkpoint (`approval`)
+(`TIMELINES-RESEARCH.md`). It's an account-wide record in the tracker with a
+bookmark `timeline/<slug>` in each repository it touches. Timelines are
+optional: work in one when the issue or a person asks for it.
+
+```bash
+gm timeline start search-v2 --policy approval   # fork from main, then work in it here
+gm commit -m "Rank by recency"
+gm push                                         # to timeline/search-v2, never main
+gm timeline merge main && gm push               # bring main in, when a person asks
+gm timeline use main                            # back to main
+```
+
+- **`start <slug>`** forks one through the API: from main, or from another
+  timeline with `--from <slug>`. `--name`, `--policy auto|approval`,
+  `--experimental` (a marker for timelines not expected to land) and
+  `--repo owner/name` (repeatable; default this checkout's repository, or the
+  parent timeline's) shape it. The server creates the bookmarks, then the
+  checkout is bound to it as by `use` (`--no-use` to skip that).
+- **`use <slug>`** binds the checkout: `timeline: <slug>` in
+  `.gitmatrix/agent.local.yml`, which `gm worktree add` copies, so new
+  worktrees work in the same timeline. It fetches and moves `@` onto the
+  bookmark, unless `@` is already built on it. `use main` unbinds and starts
+  `@` on main; work elsewhere stays where it was.
+- **A bound checkout treats the timeline's bookmark as trunk.** `gm push` goes to
+  `timeline/<slug>` (a fast-forward, like trunk), `gm sync` follows the
+  timeline, `trunk` names its head, and what's pushed there is immutable. Main
+  stays immutable and reachable as `origin/main`. Pushing to main
+  (`gm push -b main`) is refused (`timeline_bound`); work reaches main when the
+  timeline lands. If origin has no `timeline/<slug>` (abandoned, or not
+  fetched), push and sync stop with `timeline_missing`.
+- **`merge <main|slug>`** fetches and runs `gm merge` with `origin/main` or
+  `origin/timeline/<slug>`: a merge change below `@`, pushed with `gm push`.
+  Main is merged in only by a person, or an agent asked to.
+- **`list`**, **`show [<slug>]`** read the records and events (fork, merge,
+  checkpoint, approval, landing, abandon); `*` and `current` mark this
+  checkout's timeline.
+- **`abandon [<slug>]`** ends it and deletes its bookmarks; its events stay. The
+  server allows only its accountable person or the agent that started it. A
+  checkout bound to it goes back to main.
+
+`--owner` picks the tracker account; by default it's `.gitmatrix/agents.yml`'s,
+else origin's owner. Every command takes `--dry-run` and prints JSON for agents.
+`GM_TIMELINE=<slug>` works in a timeline for one command, over the binding
+(`GM_TIMELINE=main` for main); `profile::timeline()` is what other commands
+read to know the timeline they act in. Tracker commands (`gm issue …`) default
+`--timeline` to it, so a bound checkout reads the timeline's view and its
+changes are made in the timeline.
 
 ## Built for agents, like `cf`
 
@@ -525,6 +578,7 @@ not numbers in progress counters or repository URLs. An interrupted pack transfe
 | History     | `undo`, `op log`, `op restore`                                                                                                            |
 | Bookmarks   | `bookmark list`, `bookmark set`, `bookmark delete [--remote]`                                                                             |
 | Remote      | `clone`, `init`, `fetch`, `sync` (pull), `push [--sync] [-b name]`                                                                        |
+| Timelines   | `timeline start/list/show/use/merge/abandon`                                                                                              |
 | Worktrees   | `worktree add <path> [-r revision] [--include]`, `worktree list`, `worktree remove <path> [--force]`                                      |
 | Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `repo mirror show/set/sync/remove`, `api`                             |
 | SSH keys    | `auth ssh-key add/list/remove`, `auth git-credential` (git helper)                                                                        |
@@ -714,7 +768,7 @@ instead of replacing a shared/global binary.
   in the checkout's Git administrative directory under `gm/` (`.git/gm/` for
   the main checkout, `.git/worktrees/<name>/gm/` for linked worktrees).
 - `src/commands/`: local commands, worktree lifecycle/include copying,
-  network commands (clone, sync, push) and server commands.
+  network commands (clone, sync, push), timelines and server commands.
 - `src/meta.rs`, `src/cli.rs`: the manifest, search, schema and guide.
 - `tests/flow.rs`: end-to-end tests against a local bare remote.
 

@@ -51,16 +51,21 @@ impl Change {
             .filter(|(_, t)| **t == s)
             .map(|(n, _)| n.clone())
             .collect();
-        if let Some(trunk) = &ws.trunk
-            && trunk.oid == oid
-            && trunk.refname.starts_with("refs/remotes/")
-        {
-            bookmarks.push(
-                trunk
+        // Trunk, and main too in a checkout bound to a timeline.
+        let lines = ws
+            .trunk
+            .iter()
+            .flat_map(|t| std::iter::once(t).chain(t.main.as_deref()));
+        for trunk in lines {
+            if trunk.oid == oid && trunk.refname.starts_with("refs/remotes/") {
+                let name = trunk
                     .refname
                     .trim_start_matches("refs/remotes/")
-                    .to_string(),
-            );
+                    .to_string();
+                if !bookmarks.contains(&name) {
+                    bookmarks.push(name);
+                }
+            }
         }
         let parents = commit
             .parents()

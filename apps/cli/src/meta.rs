@@ -110,6 +110,12 @@ pub const COMMANDS: &[Meta] = &[
     meta!("fetch", git: "git fetch", kw: "download remote update refresh get latest", mutates: true, out: Out::Other("{trunk:{before,after}|null,updated_refs:[name]}"), ex: ["gm fetch"]),
     meta!("sync", git: "git pull --rebase", kw: "pull update rebase onto latest trunk catch up refresh", mutates: true, out: OP, ex: ["gm sync"]),
     meta!("push", git: "git push", kw: "upload publish land ship merge deploy send pull request pr", mutates: true, out: Out::Typed(schema_of::<crate::commands::network::Pushed>), ex: ["gm push", "gm push --sync", "gm push -b feature-x"]),
+    meta!("timeline start", git: "git switch -c (shared, server-side)", kw: "timeline start create fork parallel line work branch experiment approval policy agent separate", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks:[{repoId,ref,ok,reason?}],use:<timeline use result>}; --dry-run: {dry_run,owner,request,use}"), ex: ["gm timeline start search-v2", "gm timeline start search-v2 --policy approval --name \"Search v2\"", "gm timeline start probe --experimental --from search-v2", "gm timeline start shared --repo orbit/engine --repo orbit/web"]),
+    meta!("timeline list", git: "git branch -r --list 'origin/timeline/*'", kw: "timelines list parallel lines status landed abandoned", mutates: false, out: Out::Other("{timelines:[Timeline],owner,current}"), ex: ["gm timeline list", "gm timeline list --status active"]),
+    meta!("timeline show", git: "", kw: "timeline show events history fork merge landing which timeline am i in", mutates: false, out: Out::Other("{timeline:Timeline,events:[TimelineEvent],next,current}"), ex: ["gm timeline show", "gm timeline show search-v2 --after 40"]),
+    meta!("timeline use", git: "git switch <branch> (and push there by default)", kw: "timeline use switch bind checkout work in timeline go back main unbind", mutates: true, out: Out::Other("OpResult & {timeline,previous,bookmark,file,record}"), ex: ["gm timeline use search-v2", "gm timeline use main"]),
+    meta!("timeline merge", git: "git merge --no-ff origin/<main|timeline>", kw: "timeline merge main into timeline sync catch up bring in other timeline combine", mutates: true, out: Out::Other("OpResult & {timeline,from,merged}"), ex: ["gm timeline merge main", "gm timeline merge search-v2"]),
+    meta!("timeline abandon", git: "git push --delete origin timeline/<slug>", kw: "timeline abandon end prune discard drop delete timeline", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks,use?}; --dry-run: {dry_run,owner,timeline,unbind}"), ex: ["gm timeline abandon", "gm timeline abandon probe --dry-run"]),
     meta!("auth login", git: "git credential approve / ssh-add", kw: "login sign in authenticate token persona credentials ssh key agent 1password", mutates: true, out: Out::Other("{server,method,user:{slug},key?,scope?,sessionExpiresAt?}"), ex: ["gm auth login --ssh", "gm auth login --ssh --key ~/.ssh/id_ed25519", "gm auth login --persona jun", "gm auth login --token gmx_..."]),
     meta!("auth ssh-key add", git: "(GitHub: Settings > SSH keys)", kw: "add register upload ssh public key agent 1password", mutates: true, out: Out::Other("SshKey {id,title,type,fingerprint,scope}"), ex: ["gm auth ssh-key add", "gm auth ssh-key add --key SHA256:abc... --title Laptop"]),
     meta!("auth ssh-key list", git: "ssh-add -l", kw: "list ssh keys registered agent local fingerprints", mutates: false, out: Out::Other("{registered:[SshKey],local:[{fingerprint,type,comment,source,registered}],unreachableAgents}"), ex: ["gm auth ssh-key list"]),
@@ -510,7 +516,8 @@ gm is change-based (like jj), not commit-and-stage based (like git).
 - Workspace changes are operations; `gm undo` reverses the last one (repeat
   to go further back). Worktree creation/removal is not undoable.
 - `trunk` is the server's main line. Changes in trunk are immutable.
-- There are no pull requests. `gm push` lands your changes on trunk.
+- There are no pull requests. `gm push` lands your changes on trunk (in a
+  timeline, on the timeline's bookmark; see Timelines).
 
 ## The loop (commit early, commit often)
     gm status                      # where am I, what changed
@@ -538,6 +545,7 @@ Ranges for `gm log -r`: `trunk..@`, `all`.
 - `gm rebase -d trunk` · `gm backout -r <rev>` (revert) · `gm duplicate <rev>` (cherry-pick)
 - `gm merge <rev>` (git merge --no-ff: a merge change below @, e.g. `gm merge trunk`)
 - `gm sync` (pull --rebase) · `gm push` (land on trunk) · `gm push -b name` (push a bookmark)
+- `gm timeline start|use|merge|abandon` (work on a separate line that lands later)
 - `gm undo` · `gm op log`
 
 ## Worktrees
@@ -557,6 +565,22 @@ Removal refuses dirty/ignored files unless --force, and always refuses locks,
 the main checkout and your current checkout. Recorded gm history is archived;
 unsnapshotted edits and ignored files are discarded with --force.
 
+## Timelines
+A timeline is a separate line of work on `timeline/<slug>` that lands on main
+later, automatically or after a person approves. Use one when the issue (its
+timeline field, description or PRD) or a person asks; otherwise work on main.
+    gm timeline start search-v2 --policy approval  # fork from main; work in it here
+    gm push                       # goes to timeline/search-v2, never main
+    gm timeline merge main        # only when a person asks; then gm push
+    gm timeline use main          # back to main (`use <slug>` to join one)
+    gm timeline list · gm timeline show · gm timeline abandon
+`use` writes `timeline: <slug>` to .gitmatrix/agent.local.yml (worktrees copy
+it). While bound, the timeline's bookmark is this checkout's trunk: push, sync
+and immutability follow it, main stays reachable as `origin/main`, and pushing
+to main is refused. `gm issue` commands work in its view of the tracker.
+`GM_TIMELINE=<slug>` overrides the binding for one command.
+Only a timeline's accountable person or the agent that started it may abandon it.
+
 ## Distributed tracker (no Git repository required)
     gm tracker use orbit
     gm team create ENG --name Engineering
@@ -574,7 +598,7 @@ Explicit `--offline` queues durable SQLite edits; online commands never mask err
 Offline readiness is advisory, never a lease. Lease operations require online access.
 Tracker writes are not restored by `gm undo`. `gm schema issue batch` describes atomic
 graph input. `gm tracker status` exposes private replica paths for credential recovery.
-`--timeline <slug>` (or GM_TIMELINE) works in a timeline's view: main's issues with
+`--timeline <slug>` (default: GM_TIMELINE, then the checkout's timeline) works in a timeline's view: main's issues with
 the timeline's changes on top. Reads show that view (cached for `--offline`), `next`
 picks from it, and changes and new issues stay in the timeline until it lands.
 `gm issue show` displays the immutable creator; unavailable legacy/offline attribution
@@ -736,5 +760,8 @@ mod tests {
         assert_eq!(top("discard my edits to a file"), "gm restore");
         assert_eq!(top("open a pull request"), "gm push");
         assert_eq!(top("merge a branch into mine"), "gm merge");
+        assert_eq!(top("start a timeline"), "gm timeline start");
+        assert_eq!(top("merge main into my timeline"), "gm timeline merge");
+        assert_eq!(top("switch to timeline"), "gm timeline use");
     }
 }

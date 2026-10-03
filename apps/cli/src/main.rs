@@ -48,6 +48,8 @@ fn build_command(agent: bool) -> clap::Command {
                         extra.push_str("\nSupports --dry-run.\n");
                         if ["tracker ", "team ", "workspace ", "issue "].iter().any(|p| m.path.starts_with(p)) {
                             extra.push_str("Tracker changes are not reversed by `gm undo`; use an explicit versioned edit.\n");
+                        } else if m.path.starts_with("timeline ") {
+                            extra.push_str("`gm undo` reverses only the local part (working copy, merges), not timeline records on the server or this checkout's binding.\n");
                         } else if m.path.starts_with("worktree ") {
                             extra.push_str(
                                 "Worktree creation/removal is not reversed by `gm undo`.\n",
@@ -162,6 +164,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Fetch => out(f, network::fetch(ctx)),
         Command::Sync => out(f, network::sync(ctx)),
         Command::Push(a) => out(f, network::push(ctx, &a)),
+        Command::Timeline(c) => out(f, commands::timeline::run(ctx, &c)),
         Command::Auth(cli::AuthCommand::GitCredential { operation }) => {
             // Git reads this helper's stdout in its own key=value format.
             server::git_credential(&operation);

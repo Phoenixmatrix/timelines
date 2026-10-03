@@ -17,6 +17,11 @@ Work is tracked in Gitmatrix: {{SCOPE}}. The loop, in brief (the
 5. Ship ({{SHIP}}), then `gm issue complete <issue> --evidence '…'`. Can't
    finish: `gm issue release <issue>`.
 
+When the issue or a person asks for a timeline (a separate line of work that
+lands on main later), `gm timeline start <slug>` or `gm timeline use <slug>`
+binds this checkout to it: `gm push` then goes to `timeline/<slug>`, never to
+main. `gm timeline use main` goes back.
+
 When an agent harness drives gm here, gm acts as this checkout's agent
 (`gm auth status` shows `actingAs`) and keeps lease tokens for it. If gm says
 the agent's profile has no model, or you run a different model than

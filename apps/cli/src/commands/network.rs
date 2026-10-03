@@ -42,6 +42,25 @@ fn fetch_origin(ws: &Workspace, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// A checkout bound to a timeline works on its bookmark. If origin doesn't
+/// have it (abandoned, landed and removed, or not fetched yet), syncing or
+/// pushing would aim at main instead, so both stop and say why.
+fn require_timeline(ws: &Workspace) -> Result<()> {
+    if let Some(slug) = &ws.timeline
+        && !ws.on_timeline()
+    {
+        return Err(GmError::new(
+            "timeline_missing",
+            format!("This checkout works in timeline {slug}, but origin has no timeline/{slug}."),
+        )
+        .hint(format!(
+            "`gm fetch` if it's new. Otherwise it may have been abandoned: `gm timeline show {slug}`. Go back to main with `gm timeline use main`."
+        ))
+        .exit(exit::CONFLICT));
+    }
+    Ok(())
+}
+
 // ---- clone ------------------------------------------------------------------
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -154,6 +173,7 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
         .collect();
     fetch_origin(ws, config)?;
     ws.refresh_trunk()?;
+    require_timeline(ws)?;
     let Some(trunk) = ws.trunk.as_ref().map(|t| (t.oid, t.name.clone())) else {
         return Ok((
             "Fetched; the remote has no trunk yet.".into(),
@@ -362,6 +382,9 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         }
         sync_note = format!("{msg} ");
     }
+    // In a checkout bound to a timeline, trunk is the timeline's bookmark:
+    // a plain `gm push` goes there, and main is never pushed to directly.
+    require_timeline(&ws)?;
     let trunk_name = ws
         .trunk
         .as_ref()
@@ -369,6 +392,19 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         .unwrap_or_else(|| "main".into());
     let bookmark = args.bookmark.clone().unwrap_or_else(|| trunk_name.clone());
     let to_trunk = bookmark == trunk_name;
+    if let Some(slug) = &ws.timeline {
+        let main = ws.main().map(|m| m.name.as_str()).unwrap_or("main");
+        if bookmark == main {
+            return Err(GmError::new(
+                "timeline_bound",
+                format!("This checkout works in timeline {slug}, so it never pushes to {main}."),
+            )
+            .hint(format!(
+                "`gm push` sends your changes to timeline/{slug}; they reach {main} when the timeline lands. To work on {main} instead, `gm timeline use main`."
+            ))
+            .exit(exit::CONFLICT));
+        }
+    }
 
     let wc = ws.wc();
     let rev = match &args.revision {
@@ -389,6 +425,9 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
     walk.push(rev)?;
     if let Some(t) = &ws.trunk {
         walk.hide(t.oid)?;
+        if let Some(main) = &t.main {
+            walk.hide(main.oid)?;
+        }
     }
     for oid in walk.take(1000) {
         outgoing.push(oid?);
@@ -503,7 +542,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
     }
 
     ws.repo.reference(&remote_tracking, rev, true, "gm push")?;
-    if ws.repo.find_reference("refs/remotes/origin/HEAD").is_err() && to_trunk {
+    if ws.repo.find_reference("refs/remotes/origin/HEAD").is_err() && to_trunk && !ws.on_timeline()
+    {
         let _ = ws.repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
             &remote_tracking,

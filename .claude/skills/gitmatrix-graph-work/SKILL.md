@@ -77,6 +77,23 @@ say why you worked on main:
     gm issue checkpoint <issue> 'Timeline: <slug> (approval): touches the billing schema'
     gm issue checkpoint <issue> 'Timeline: main, because it is a one-line copy fix'
 
+## Working in a timeline
+
+A timeline is a separate line of work on `timeline/<slug>`, forked from main or
+another timeline.
+
+- `gm timeline start <slug> [--policy auto|approval] [--experimental]` forks one
+  from main (`--from <timeline>` forks another) and binds this checkout to it;
+  `gm timeline use <slug>` joins an existing one.
+- While bound (`timeline:` in .gitmatrix/agent.local.yml; new worktrees copy
+  it), `gm push` goes to `timeline/<slug>` and `gm sync` follows it. gm refuses
+  to push to main: the timeline gets there when it lands. `gm issue` commands
+  work in the timeline's view, so your checkpoints and edits are made there.
+- Merge main in only when a person asks: `gm timeline merge main` (or another
+  timeline's slug), then `gm push`.
+- `gm timeline use main` goes back to main. `gm timeline abandon` ends a
+  timeline you started, when a person asks or the attempt is dead.
+
 ## Projects and other agents
 
 - Claiming a parent leases its whole subtree. Delegate a sub-issue to another of

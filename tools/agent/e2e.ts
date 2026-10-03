@@ -431,6 +431,83 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ timeline: slug, forked, abandoned: true });
   });
 
+  await scenario("gm-timeline-start-push-and-abandon", async () => {
+    // gm forks a timeline through the API and binds a fresh clone to it: a
+    // plain `gm push` lands on timeline/<slug>, main is refused, and
+    // abandoning puts the checkout back on main.
+    const owner = fixtures.tracker.owner;
+    const slug = `gm-e2e-${randomUUID().slice(0, 8)}`;
+    const bookmark = `timeline/${slug}`;
+    const clone = join(work, "timeline-checkout");
+    await gm(["clone", fullName, clone], "jun");
+    const binding = () =>
+      readFile(join(clone, ".gitmatrix/agent.local.yml"), "utf8").catch(() => "");
+    const mainTip = async () => {
+      const detail = await json<RepoDetail>(api, ownerToken);
+      return detail.branches.find((b) => b.shortName === detail.defaultBranch)?.oid;
+    };
+    const main = await mainTip();
+
+    const dry = JSON.parse(
+      await gm(["timeline", "start", slug, "--owner", owner, "--dry-run"], "jun", clone),
+    ) as { dry_run: boolean; request: { slug: string; repos: string[] } };
+    assert.equal(dry.dry_run, true);
+    assert.deepEqual(dry.request.repos, [fullName], "The checkout's repository is the default");
+    assert.equal(await binding(), "", "A dry run binds nothing");
+
+    const started = JSON.parse(
+      await gm(["timeline", "start", slug, "--owner", owner, "--policy", "approval"], "jun", clone),
+    ) as { timeline: { slug: string; policy: string }; use: { timeline: string } };
+    assert.equal(started.timeline.slug, slug);
+    assert.equal(started.timeline.policy, "approval");
+    assert.equal(started.use.timeline, slug, "Starting binds the checkout");
+    assert.match(await binding(), new RegExp(`timeline: ${slug}`));
+
+    await writeFile(join(clone, "timeline-e2e.txt"), "timeline work\n");
+    await gm(["commit", "-m", "Timeline work from gm"], "jun", clone);
+    const pushed = JSON.parse(await gm(["push"], "jun", clone)) as { bookmark: string };
+    assert.equal(pushed.bookmark, bookmark, "A bound checkout pushes to its timeline");
+    const tip = await poll(
+      () => json<RepoDetail>(api, ownerToken),
+      (detail) => detail.branches.some((b) => b.shortName === bookmark && b.oid !== main),
+      "the pushed timeline bookmark",
+    );
+    await gm(["push", "-b", "main"], "jun", clone, /timeline_bound/);
+    assert.equal(await mainTip(), main, "Main never moves from a bound checkout");
+    await gm(["timeline", "merge", "main", "--dry-run"], "jun", clone);
+
+    const list = JSON.parse(await gm(["timeline", "list", "--owner", owner], "jun", clone)) as {
+      timelines: { slug: string }[];
+      current: string;
+    };
+    assert(list.timelines.some((t) => t.slug === slug));
+    assert.equal(list.current, slug);
+    const shown = JSON.parse(await gm(["timeline", "show", "--owner", owner], "jun", clone)) as {
+      events: { kind: string }[];
+    };
+    assert.equal(shown.events[0]?.kind, "fork");
+
+    // Only its accountable person (or the agent that started it) abandons it.
+    await gm(["timeline", "abandon", "--owner", owner], "marco", clone, /"forbidden"/);
+    const abandoned = JSON.parse(
+      await gm(["timeline", "abandon", "--owner", owner], "jun", clone),
+    ) as { timeline: { status: string }; use: { previous: string } };
+    assert.equal(abandoned.timeline.status, "abandoned");
+    assert.equal(abandoned.use.previous, slug, "Abandoning unbinds the checkout");
+    assert.doesNotMatch(await binding(), /timeline:/);
+    await poll(
+      () => json<RepoDetail>(api, ownerToken),
+      (detail) => !detail.branches.some((b) => b.shortName === bookmark),
+      "the abandoned bookmark's deletion",
+    );
+    record({
+      timeline: slug,
+      pushed: tip.branches.find((b) => b.shortName === bookmark)?.oid,
+      mainUnchanged: true,
+      abandoned: true,
+    });
+  });
+
   await scenario("agent-capabilities-self-reporting-and-claim-identity", async () => {
     const name = `capabilities-${randomUUID().slice(0, 8)}`;
     const skillDir = join(work, "capability-skills");

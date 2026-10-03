@@ -1,0 +1,984 @@
+//! `gm timeline`: parallel lines of work (TIMELINES-RESEARCH.md).
+//!
+//! A timeline is an account-wide record in the tracker with a bookmark
+//! `timeline/<slug>` in each repository it touches (CORE-69's API under
+//! /api/tracker/:owner/timelines). This module starts, lists, shows and
+//! abandons them, and binds a checkout to one:
+//!
+//! - `use` writes `timeline: <slug>` to `.gitmatrix/agent.local.yml` (which new
+//!   worktrees copy) and moves `@` onto the timeline's bookmark. A bound
+//!   checkout treats that bookmark as its trunk: `gm push` goes there, `gm sync`
+//!   follows it, and pushing to main is refused (network.rs).
+//! - `merge` merges main or another timeline into the bound one with
+//!   `gm merge`, so the merge is an ordinary change to push.
+//!
+//! `GM_TIMELINE` overrides the binding for one command (`profile::timeline`).
+
+use super::{Ctx, local, network, server};
+use crate::cli;
+use crate::model::OpResult;
+use crate::output::{GmError, Render, Result, exit};
+use crate::profile;
+use crate::remote::{self, Config};
+use crate::repo::Workspace;
+use clap::{Args, Subcommand};
+use serde::{Serialize, Serializer};
+use serde_json::{Map, Value, json};
+use std::path::{Path, PathBuf};
+
+#[derive(Subcommand)]
+pub enum TimelineCommand {
+    /// Start a timeline forked from main (or another timeline), then work in it here
+    Start(StartArgs),
+    /// List the tracker's timelines, newest first
+    #[command(visible_alias = "ls")]
+    List(ListArgs),
+    /// Show a timeline (default: this checkout's) and its events
+    Show(ShowArgs),
+    /// Work in a timeline here: pushes go to its bookmark, never to main (`use main` to go back)
+    Use(UseArgs),
+    /// Merge main or another timeline into this checkout's timeline, below the working copy
+    Merge(MergeArgs),
+    /// End a timeline (default: this checkout's) and delete its bookmarks; its events stay
+    Abandon(AbandonArgs),
+}
+
+#[derive(Args)]
+pub struct Owner {
+    /// Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`).
+    #[arg(long, short = 'O')]
+    pub owner: Option<String>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Policy {
+    /// Lands when its gates pass.
+    Auto,
+    /// Lands after a person approves a checkpoint.
+    Approval,
+}
+
+#[derive(Args)]
+pub struct StartArgs {
+    /// Lowercase letters and digits joined by hyphens; its bookmark is timeline/<slug>.
+    pub slug: String,
+    /// A readable name (default: the slug).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// How it lands: auto (when gates pass) or approval (after a person approves).
+    #[arg(long, value_enum)]
+    pub policy: Option<Policy>,
+    /// Mark it as not expected to land (a marker, not a restriction).
+    #[arg(long)]
+    pub experimental: bool,
+    /// What it forks from: main, or another timeline's slug.
+    #[arg(long, default_value = "main")]
+    pub from: String,
+    /// Repositories it touches, owner/name (repeatable). Default: this checkout's
+    /// repository, or the parent timeline's repositories with --from <timeline>.
+    #[arg(long = "repo")]
+    pub repos: Vec<String>,
+    /// Only create it; don't bind this checkout to it.
+    #[arg(long)]
+    pub no_use: bool,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct ListArgs {
+    /// Only timelines with this status (active, idle, waiting, landing, partly_landed, landed, abandoned).
+    #[arg(long)]
+    pub status: Option<String>,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct ShowArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    /// Events after this sequence number (page with the `next` of the previous answer).
+    #[arg(long, default_value_t = 0)]
+    pub after: u64,
+    /// Events per page.
+    #[arg(long, default_value_t = 200)]
+    pub limit: u32,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct UseArgs {
+    /// The timeline's slug, or `main` to stop working in a timeline.
+    pub slug: String,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct MergeArgs {
+    /// `main`, or the slug of another timeline to bring into this one.
+    pub from: String,
+    /// Description for the merge (default "Merge <from> into timeline/<slug>").
+    #[arg(short, long)]
+    pub message: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct AbandonArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
+/// JSON for agents, text for people.
+pub struct Shown {
+    value: Value,
+    text: String,
+}
+
+impl Serialize for Shown {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.value.serialize(s)
+    }
+}
+
+impl Render for Shown {
+    fn text(&self) -> String {
+        self.text.clone()
+    }
+}
+
+pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
+    match command {
+        TimelineCommand::Start(a) => start(ctx, a),
+        TimelineCommand::List(a) => list(ctx, a),
+        TimelineCommand::Show(a) => show(ctx, a),
+        TimelineCommand::Use(a) => use_timeline(ctx, &a.slug, a.owner.owner.clone()),
+        TimelineCommand::Merge(a) => merge(ctx, a),
+        TimelineCommand::Abandon(a) => abandon(ctx, a),
+    }
+}
+
+// ---- where -------------------------------------------------------------------
+
+fn slug_arg(slug: &str) -> Result<&str> {
+    if profile::is_timeline_slug(slug) {
+        return Ok(slug);
+    }
+    Err(GmError::usage(format!(
+        "`{slug}` isn't a timeline slug: lowercase letters and digits joined by hyphens."
+    ))
+    .hint(if slug == "main" {
+        "`main` names main, not a timeline."
+    } else {
+        "For example `gm timeline start search-v2`."
+    }))
+}
+
+/// The checkout gm was run in: its working directory, where the binding lives.
+fn checkout(ctx: &Ctx) -> Option<PathBuf> {
+    git2::Repository::discover(&ctx.cwd)
+        .ok()?
+        .workdir()
+        .map(Path::to_path_buf)
+}
+
+fn require_checkout(ctx: &Ctx, what: &str) -> Result<PathBuf> {
+    checkout(ctx).ok_or_else(|| {
+        GmError::usage(format!(
+            "{what} works on a checkout; run it inside one (or pass -C <dir>)."
+        ))
+    })
+}
+
+/// The tracker account timelines live in: explicit, the checkout's
+/// configured tracker, origin's owner (a timeline touches its own account's
+/// repositories), else the selected tracker.
+fn owner(ctx: &Ctx, config: &Config, explicit: Option<String>) -> Result<String> {
+    let found = explicit
+        .or_else(|| profile::defaults().scope.owner)
+        .or_else(|| {
+            server::current_repo(ctx)
+                .ok()
+                .and_then(|repo| repo.split_once('/').map(|(owner, _)| owner.to_string()))
+        });
+    match found {
+        Some(owner) => {
+            if owner.is_empty()
+                || !owner
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(GmError::usage(format!(
+                    "`{owner}` isn't an account slug; pass --owner OWNER."
+                )));
+            }
+            Ok(owner)
+        }
+        None => super::tracker::selected_owner(config, None),
+    }
+}
+
+fn base(owner: &str) -> String {
+    format!("/tracker/{owner}/timelines")
+}
+
+/// The timeline gm works in here (binding or GM_TIMELINE).
+fn current() -> Option<String> {
+    profile::timeline()
+}
+
+fn named_or_current(slug: &Option<String>, command: &str) -> Result<String> {
+    match slug {
+        Some(slug) => Ok(slug_arg(slug)?.to_string()),
+        None => current().ok_or_else(|| {
+            GmError::usage("This checkout doesn't work in a timeline; name one.").hint(format!(
+                "`gm timeline {command} <slug>`; `gm timeline list` shows them."
+            ))
+        }),
+    }
+}
+
+fn fetch_record(config: &Config, owner: &str, slug: &str) -> Result<Value> {
+    let detail = remote::api(
+        config,
+        "GET",
+        &format!("{}/{slug}?limit=1", base(owner)),
+        None,
+    )?;
+    Ok(detail["timeline"].clone())
+}
+
+fn ended(record: &Value) -> Option<&str> {
+    record["status"]
+        .as_str()
+        .filter(|s| matches!(*s, "landed" | "abandoned"))
+}
+
+// ---- text ----------------------------------------------------------------------
+
+fn line(t: &Value, bound: Option<&str>) -> String {
+    let slug = t["slug"].as_str().unwrap_or("?");
+    let mark = if Some(slug) == bound { "*" } else { " " };
+    let mut flags = vec![t["policy"].as_str().unwrap_or("?").to_string()];
+    if t["experimental"].as_bool() == Some(true) {
+        flags.push("experimental".into());
+    }
+    let repos = t["repos"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .map(|r| {
+                    format!(
+                        "{}/{}",
+                        r["owner"].as_str().unwrap_or("?"),
+                        r["name"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let name = t["name"].as_str().filter(|n| *n != slug);
+    format!(
+        "{mark} {slug:<24} {:<13} {:<22} {}{}",
+        t["status"].as_str().unwrap_or("?"),
+        flags.join(", "),
+        repos,
+        name.map(|n| format!("  ({n})")).unwrap_or_default()
+    )
+}
+
+fn describe(t: &Value) -> String {
+    let slug = t["slug"].as_str().unwrap_or("?");
+    let mut out = format!(
+        "Timeline {slug}: {}\nStatus   : {}{}\nPolicy   : {}\n",
+        t["name"].as_str().unwrap_or(slug),
+        t["status"].as_str().unwrap_or("?"),
+        if t["experimental"].as_bool() == Some(true) {
+            " (experimental)"
+        } else {
+            ""
+        },
+        t["policy"].as_str().unwrap_or("?"),
+    );
+    for repo in t["repos"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "Repo     : {}/{} on {}\n",
+            repo["owner"].as_str().unwrap_or("?"),
+            repo["name"].as_str().unwrap_or("?"),
+            repo["bookmark"].as_str().unwrap_or("?")
+        ));
+    }
+    if let Some(pushed) = t["pushedAt"].as_str() {
+        out.push_str(&format!("Pushed   : {pushed}\n"));
+    }
+    out
+}
+
+fn event_line(e: &Value) -> String {
+    let at = e["createdAt"].as_str().unwrap_or("");
+    let what = match e["kind"].as_str().unwrap_or("?") {
+        "fork" => format!(
+            "fork from {}",
+            e["parentId"]
+                .as_str()
+                .map_or("main".to_string(), |p| format!("timeline {p}"))
+        ),
+        "merge" => format!(
+            "merge {} -> {} at {}",
+            e["fromId"].as_str().unwrap_or("main"),
+            e["intoId"].as_str().unwrap_or("main"),
+            e["commit"]
+                .as_str()
+                .map(|c| &c[..c.len().min(12)])
+                .unwrap_or("?")
+        ),
+        kind => kind.to_string(),
+    };
+    format!("  #{:<5} {at}  {what}", e["seq"])
+}
+
+/// The bookmark results of a fork or an abandon, as text.
+fn bookmarks_text(bookmarks: &Value) -> String {
+    bookmarks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["ok"].as_bool() != Some(true))
+        .map(|b| {
+            format!(
+                "  {} in {}: {}\n",
+                b["ref"].as_str().unwrap_or("?"),
+                b["repoId"].as_str().unwrap_or("?"),
+                b["reason"].as_str().unwrap_or("failed")
+            )
+        })
+        .collect()
+}
+
+/// An OpResult with this command's own fields next to it.
+fn with(op: &OpResult, extra: Value) -> Result<Value> {
+    let mut value = serde_json::to_value(op)?;
+    if let (Some(map), Value::Object(more)) = (value.as_object_mut(), extra) {
+        map.extend(more);
+    }
+    Ok(value)
+}
+
+// ---- list / show ------------------------------------------------------------------
+
+fn list(ctx: &Ctx, args: &ListArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let mut path = base(&owner);
+    if let Some(status) = &args.status {
+        if !status.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            return Err(GmError::usage(format!(
+                "`{status}` isn't a timeline status."
+            )));
+        }
+        path.push_str(&format!("?status={status}"));
+    }
+    let mut value = remote::api(&config, "GET", &path, None)?;
+    let bound = current();
+    let text = match value["timelines"].as_array() {
+        Some(all) if !all.is_empty() => all
+            .iter()
+            .map(|t| line(t, bound.as_deref()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => format!("{owner} has no timelines. Start one with `gm timeline start <slug>`."),
+    };
+    value["owner"] = json!(owner);
+    value["current"] = json!(bound);
+    Ok(Shown { value, text })
+}
+
+fn show(ctx: &Ctx, args: &ShowArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let slug = named_or_current(&args.slug, "show")?;
+    let mut value = remote::api(
+        &config,
+        "GET",
+        &format!(
+            "{}/{slug}?after={}&limit={}",
+            base(&owner),
+            args.after,
+            args.limit
+        ),
+        None,
+    )?;
+    let mut text = describe(&value["timeline"]);
+    let events = value["events"].as_array().cloned().unwrap_or_default();
+    if !events.is_empty() {
+        text.push_str("Events   :\n");
+        for e in &events {
+            text.push_str(&event_line(e));
+            text.push('\n');
+        }
+    }
+    if let Some(next) = value["next"].as_u64() {
+        text.push_str(&format!("More events: --after {next}\n"));
+    }
+    value["current"] = json!(current().as_deref() == Some(slug.as_str()));
+    Ok(Shown { value, text })
+}
+
+// ---- start -----------------------------------------------------------------------
+
+fn start(ctx: &Ctx, args: &StartArgs) -> Result<Shown> {
+    let slug = slug_arg(&args.slug)?.to_string();
+    let parent = if args.from == "main" {
+        None
+    } else {
+        Some(slug_arg(&args.from)?.to_string())
+    };
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let here = server::current_repo(ctx).ok();
+    let repos: Vec<String> = if !args.repos.is_empty() {
+        args.repos.clone()
+    } else if parent.is_none() {
+        vec![here.clone().ok_or_else(|| {
+            GmError::usage("Name the repositories it touches: --repo owner/name.")
+                .hint("Inside a checkout, its own repository is the default.")
+        })?]
+    } else {
+        Vec::new()
+    };
+    let mut body = Map::new();
+    body.insert("slug".into(), json!(slug));
+    if let Some(name) = &args.name {
+        body.insert("name".into(), json!(name));
+    }
+    if let Some(policy) = args.policy {
+        body.insert(
+            "policy".into(),
+            json!(match policy {
+                Policy::Auto => "auto",
+                Policy::Approval => "approval",
+            }),
+        );
+    }
+    if args.experimental {
+        body.insert("experimental".into(), json!(true));
+    }
+    if let Some(parent) = &parent {
+        body.insert("parent".into(), json!(parent));
+    }
+    if !repos.is_empty() {
+        body.insert("repos".into(), json!(repos));
+    }
+    let body = Value::Object(body);
+    let binds = !args.no_use && checkout(ctx).is_some();
+    let from = parent
+        .as_deref()
+        .map_or("main".to_string(), |p| format!("timeline {p}"));
+
+    if ctx.dry_run {
+        let text = format!(
+            "dry run: nothing was changed\nWould start timeline {slug} in {owner}, forked from {from}{}{}.",
+            if repos.is_empty() {
+                String::new()
+            } else {
+                format!(" in {}", repos.join(", "))
+            },
+            if binds { ", and work in it here" } else { "" }
+        );
+        return Ok(Shown {
+            value: json!({
+                "dry_run": true,
+                "owner": owner,
+                "request": body,
+                "use": binds,
+            }),
+            text,
+        });
+    }
+
+    let created = remote::api(&config, "POST", &base(&owner), Some(&body))?;
+    let mut text = format!(
+        "Started timeline {slug} in {owner}, forked from {from}.\n{}",
+        bookmarks_text(&created["bookmarks"])
+    );
+    let mut value = json!({
+        "dry_run": false,
+        "owner": owner,
+        "timeline": created["timeline"],
+        "bookmarks": created["bookmarks"],
+    });
+    if binds {
+        // This checkout's repository may not be one of the timeline's (--repo
+        // elsewhere): then there's nothing to bind, which isn't a failure.
+        match use_timeline(ctx, &slug, Some(owner.clone())) {
+            Ok(used) => {
+                text.push_str(&used.text);
+                value["use"] = used.value;
+            }
+            Err(e) => {
+                text.push_str(&format!("Not working in it here: {}", e.message));
+                value["use"] = json!({ "error": e });
+            }
+        }
+    } else {
+        text.push_str(&format!("Work in it with `gm timeline use {slug}`."));
+    }
+    Ok(Shown { value, text })
+}
+
+// ---- use -----------------------------------------------------------------------
+
+/// Main's name as a revision gm resolves (`origin/main`).
+fn main_revision(ws: &Workspace) -> Result<String> {
+    let main = ws.main().ok_or_else(|| {
+        GmError::not_found(
+            "no_trunk",
+            "This repository has no main line yet (no origin/main).",
+        )
+    })?;
+    Ok(main
+        .refname
+        .trim_start_matches("refs/remotes/")
+        .trim_start_matches("refs/heads/")
+        .to_string())
+}
+
+/// Bind (or unbind) the checkout in its local file.
+fn bind(root: &Path, slug: Option<&str>) -> Result<()> {
+    let mut local = profile::local_at(root)?.unwrap_or_default();
+    local.timeline = slug.map(str::to_string);
+    if local == profile::Local::default() {
+        // Nothing else in it: no file is the same as an empty one.
+        let path = root.join(profile::LOCAL_FILE);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(root.join(".gitmatrix"))?;
+    keep_out_of_changes(root)?;
+    profile::write_local(root, &local)
+}
+
+/// The local file is this checkout's, never part of a change: where no
+/// .gitignore says so (`gm agent setup` adds that line), the repository's own
+/// exclude file does, for every worktree.
+fn keep_out_of_changes(root: &Path) -> Result<()> {
+    let repo = git2::Repository::discover(root)?;
+    if repo.status_should_ignore(Path::new(profile::LOCAL_FILE))? {
+        return Ok(());
+    }
+    let exclude = repo.commondir().join("info").join("exclude");
+    std::fs::create_dir_all(exclude.parent().expect("info/exclude has a parent"))?;
+    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "# This checkout's agent and timeline (gm timeline use)\n/{}\n",
+        profile::LOCAL_FILE
+    ));
+    std::fs::write(exclude, text)?;
+    Ok(())
+}
+
+/// Bind the checkout to `slug` (or `main`) and move `@` onto its line.
+fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result<Shown> {
+    let root = require_checkout(ctx, "`gm timeline use`")?;
+    let to_main = slug == "main";
+    let slug = if to_main {
+        None
+    } else {
+        Some(slug_arg(slug)?.to_string())
+    };
+    let previous = profile::bound_timeline(&root);
+    let config = Config::load();
+    let record = match &slug {
+        Some(slug) => {
+            let owner = owner(ctx, &config, explicit_owner)?;
+            let record = fetch_record(&config, &owner, slug)?;
+            if let Some(status) = ended(&record) {
+                return Err(GmError::new(
+                    "timeline_ended",
+                    format!("Timeline {slug} is {status}; it takes no new work."),
+                )
+                .hint("Start another with `gm timeline start <slug>`, or `gm timeline use main`.")
+                .exit(exit::CONFLICT));
+            }
+            Some(record)
+        }
+        None => None,
+    };
+
+    // What the timeline being left had on origin, before a fetch can prune it:
+    // that work lives there, not in this checkout's own stacks.
+    let leaving = previous
+        .as_ref()
+        .filter(|prev| slug.as_ref() != Some(*prev))
+        .and_then(|prev| {
+            let repo = git2::Repository::discover(&ctx.cwd).ok()?;
+            let tip = repo
+                .find_reference(&format!("refs/remotes/origin/timeline/{prev}"))
+                .ok()?
+                .peel_to_commit()
+                .ok()?
+                .id();
+            Some((format!("timeline/{prev}"), tip))
+        });
+
+    // Fetch, so the bookmark (and main) are current, then find where @ goes.
+    network::fetch(ctx)?;
+    let (target, target_name, old_wc) = {
+        let ws = Workspace::open(&ctx.cwd)?;
+        let (target, name) = match &slug {
+            Some(slug) => {
+                let name = format!("timeline/{slug}");
+                let refname = format!("refs/remotes/origin/{name}");
+                let oid = ws
+                    .repo
+                    .find_reference(&refname)
+                    .ok()
+                    .and_then(|r| r.peel_to_commit().ok())
+                    .map(|c| c.id())
+                    .ok_or_else(|| {
+                        GmError::not_found(
+                            "timeline_not_here",
+                            format!("This repository has no {name} on origin."),
+                        )
+                        .hint(format!(
+                            "Timeline {slug} touches {}; work in it from one of those checkouts.",
+                            repo_names(record.as_ref())
+                        ))
+                    })?;
+                (oid, format!("origin/{name}"))
+            }
+            None => {
+                let main = main_revision(&ws)?;
+                (crate::repo::revset::resolve(&ws, &main)?, main)
+            }
+        };
+        let wc = ws.wc();
+        let commit = ws.commit(wc)?;
+        let untouched = ws.is_untouched(&commit)?;
+        // Already there. Work built on a timeline's head stays where it is and
+        // goes to the timeline with the next push (a timeline just forked
+        // from main's tip takes the work started on it). Going back to main,
+        // only a fresh @ on main's head stays: anything else may hold the
+        // timeline's work, which must not reach main by a plain push.
+        let here = match &slug {
+            Some(_) => wc == target || ws.repo.graph_descendant_of(wc, target)?,
+            None => untouched && commit.parent_ids().eq([target]),
+        };
+        let kept = (!here && !untouched).then(|| super::short(&ws, wc));
+        (if here { None } else { Some(target) }, name, kept)
+    };
+
+    if !ctx.dry_run {
+        bind(&root, slug.as_deref())?;
+    }
+    let op = match target {
+        Some(target) => super::mutate(ctx, |ws| {
+            let tree = ws.commit(target)?.tree_id();
+            let new = ws.new_commit(&[target], tree, "")?;
+            ws.set_wc(new)?;
+            if let Some((bookmark, tip)) = &leaving {
+                forget_pushed(ws, bookmark, *tip)?;
+            }
+            Ok(super::Outcome::new(
+                format!("Started change {} on {target_name}.", super::short(ws, new)),
+                vec![new],
+                Default::default(),
+            ))
+        })?,
+        None => {
+            let ws = Workspace::open(&ctx.cwd)?;
+            crate::commands::report(
+                &ws,
+                super::Outcome::new("", Vec::new(), Default::default()),
+                None,
+                ctx.dry_run,
+            )?
+        }
+    };
+
+    let mut message = match (&slug, &previous) {
+        (Some(slug), Some(prev)) if prev == slug => format!(
+            "This checkout already works in timeline {slug}; `gm push` goes to timeline/{slug}."
+        ),
+        (Some(slug), _) => format!(
+            "This checkout works in timeline {slug} now: `gm push` goes to timeline/{slug}, never to main."
+        ),
+        (None, Some(prev)) => {
+            format!("This checkout works on main again (it was in timeline {prev}).")
+        }
+        (None, None) => "This checkout works on main.".to_string(),
+    };
+    message.push(' ');
+    message.push_str(&match target {
+        Some(_) => format!("Started a new working copy on {target_name}."),
+        None => format!("The working copy is already on {target_name}."),
+    });
+    if let Some(kept) = &old_wc {
+        message.push_str(&match &slug {
+            Some(_) => format!(
+                " Your previous working copy {kept} stays where it was; bring it along with `gm rebase -s {kept} -d @-` if it belongs in the timeline."
+            ),
+            None => format!(" Your previous working copy {kept} stays where it was."),
+        });
+    }
+    let env = std::env::var(profile::TIMELINE_ENV).ok();
+    if let Some(env) = env.as_deref()
+        && env != slug.as_deref().unwrap_or("main")
+    {
+        message.push_str(&format!(
+            " Note: {} is set to `{env}`, which overrides this checkout's binding while it's set.",
+            profile::TIMELINE_ENV
+        ));
+    }
+    if ctx.dry_run {
+        message = format!("Would bind: {message}");
+    }
+    let op = OpResult { message, ..op };
+    let value = with(
+        &op,
+        json!({
+            "timeline": slug,
+            "previous": previous,
+            "bookmark": slug.as_ref().map(|s| format!("timeline/{s}")),
+            "file": root.join(profile::LOCAL_FILE),
+            "record": record,
+        }),
+    )?;
+    Ok(Shown {
+        text: op.text(),
+        value,
+    })
+}
+
+/// After leaving a timeline, what was pushed to it (up to `tip`) stays on its
+/// bookmark rather than showing up here as local work: the local bookmark
+/// `gm push` left and heads inside it go, while anything built on top stays.
+fn forget_pushed(ws: &mut Workspace, bookmark: &str, tip: git2::Oid) -> Result<()> {
+    let inside = |ws: &Workspace, oid: &str| -> bool {
+        git2::Oid::from_str(oid)
+            .is_ok_and(|oid| oid == tip || ws.repo.graph_descendant_of(tip, oid).unwrap_or(false))
+    };
+    if let Some(target) = ws.view.bookmarks.get(bookmark).cloned()
+        && inside(ws, &target)
+    {
+        ws.view.bookmarks.remove(bookmark);
+    }
+    let pushed: Vec<String> = ws
+        .view
+        .heads
+        .iter()
+        .filter(|head| inside(ws, head))
+        .cloned()
+        .collect();
+    for head in pushed {
+        ws.view.heads.remove(&head);
+    }
+    ws.normalize_heads()
+}
+
+fn repo_names(record: Option<&Value>) -> String {
+    let names: Vec<String> = record
+        .and_then(|r| r["repos"].as_array())
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            format!(
+                "{}/{}",
+                r["owner"].as_str().unwrap_or("?"),
+                r["name"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    if names.is_empty() {
+        "other repositories".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+// ---- merge ---------------------------------------------------------------------
+
+fn merge(ctx: &Ctx, args: &MergeArgs) -> Result<Shown> {
+    require_checkout(ctx, "`gm timeline merge`")?;
+    let slug = current().ok_or_else(|| {
+        GmError::usage(
+            "This checkout doesn't work in a timeline, so there's nothing to merge into.",
+        )
+        .hint("`gm timeline use <slug>` first, or `gm merge <rev>` for a plain merge.")
+    })?;
+    let from_main = args.from == "main";
+    if !from_main {
+        slug_arg(&args.from)?;
+        if args.from == slug {
+            return Err(
+                GmError::usage(format!("This checkout already works in timeline {slug}."))
+                    .hint("Name main or another timeline to merge in."),
+            );
+        }
+    }
+    network::fetch(ctx)?;
+    let (revision, label) = {
+        let ws = Workspace::open(&ctx.cwd)?;
+        if !ws.on_timeline() {
+            return Err(GmError::new(
+                "timeline_missing",
+                format!("Origin has no timeline/{slug}."),
+            )
+            .hint(format!(
+                "It may have been abandoned: `gm timeline show {slug}`. Go back to main with `gm timeline use main`."
+            ))
+            .exit(exit::CONFLICT));
+        }
+        if from_main {
+            let main = main_revision(&ws)?;
+            let name = ws.main().map(|m| m.name.clone()).unwrap_or("main".into());
+            (main, name)
+        } else {
+            let name = format!("timeline/{}", args.from);
+            if ws
+                .repo
+                .find_reference(&format!("refs/remotes/origin/{name}"))
+                .is_err()
+            {
+                return Err(GmError::not_found(
+                    "timeline_not_here",
+                    format!("This repository has no {name} on origin."),
+                )
+                .hint("`gm timeline list` shows the timelines and the repositories they touch."));
+            }
+            (format!("origin/{name}"), name)
+        }
+    };
+    let message = if args.message.is_empty() {
+        vec![format!("Merge {label} into timeline/{slug}")]
+    } else {
+        args.message.clone()
+    };
+    let op = local::merge(
+        ctx,
+        &cli::MergeArgs {
+            revisions: vec![revision],
+            message,
+        },
+    )?;
+    let mut text = op.text();
+    if !op.changes.is_empty() && !ctx.dry_run {
+        text.push_str(&format!(
+            "\nPush it to the timeline with `gm push` (timeline/{slug})."
+        ));
+    }
+    let value = with(
+        &op,
+        json!({ "timeline": slug, "from": args.from, "merged": label }),
+    )?;
+    Ok(Shown { value, text })
+}
+
+// ---- abandon ---------------------------------------------------------------------
+
+fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
+    let slug = named_or_current(&args.slug, "abandon")?;
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let root = checkout(ctx);
+    let bound_here = root
+        .as_deref()
+        .and_then(profile::bound_timeline)
+        .is_some_and(|b| b == slug);
+    if ctx.dry_run {
+        let record = fetch_record(&config, &owner, &slug)?;
+        if let Some(status) = ended(&record) {
+            return Err(GmError::new(
+                "timeline_ended",
+                format!("Timeline {slug} is already {status}."),
+            )
+            .exit(exit::CONFLICT));
+        }
+        let text = format!(
+            "dry run: nothing was changed\nWould abandon timeline {slug} and delete timeline/{slug} in {}{}.\nOnly its accountable person or the agent that started it may; the server checks.",
+            repo_names(Some(&record)),
+            if bound_here {
+                ", then work on main here"
+            } else {
+                ""
+            }
+        );
+        return Ok(Shown {
+            value: json!({
+                "dry_run": true,
+                "owner": owner,
+                "timeline": record,
+                "unbind": bound_here,
+            }),
+            text,
+        });
+    }
+    let result = remote::api(
+        &config,
+        "POST",
+        &format!("{}/{slug}/abandon", base(&owner)),
+        Some(&json!({})),
+    )?;
+    let mut text = format!(
+        "Abandoned timeline {slug}; its events stay.\n{}",
+        bookmarks_text(&result["bookmarks"])
+    );
+    let mut value = json!({
+        "dry_run": false,
+        "owner": owner,
+        "timeline": result["timeline"],
+        "bookmarks": result["bookmarks"],
+    });
+    // A checkout left bound to it would refuse to push or sync: back to main.
+    if bound_here {
+        let used = use_timeline(ctx, "main", None)?;
+        text.push_str(&used.text);
+        value["use"] = used.value;
+    }
+    Ok(Shown { value, text })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_mark_the_current_timeline() {
+        let t = json!({
+            "slug": "search-v2", "name": "Search v2", "status": "active", "policy": "approval",
+            "experimental": true, "repos": [{"owner": "orbit", "name": "engine", "bookmark": "timeline/search-v2"}],
+        });
+        let text = line(&t, Some("search-v2"));
+        assert!(text.starts_with("* search-v2"), "{text}");
+        assert!(text.contains("approval, experimental"));
+        assert!(text.contains("orbit/engine") && text.contains("(Search v2)"));
+        assert!(line(&t, None).starts_with("  search-v2"));
+        assert!(describe(&t).contains("Repo     : orbit/engine on timeline/search-v2"));
+    }
+
+    #[test]
+    fn events_read_as_a_history() {
+        let fork = json!({"seq": 3, "kind": "fork", "parentId": null, "createdAt": "2026-10-02"});
+        assert!(event_line(&fork).contains("fork from main"));
+        let merge = json!({"seq": 9, "kind": "merge", "fromId": null, "intoId": "tl_1",
+            "commit": "0123456789abcdef0123", "createdAt": "2026-10-03"});
+        assert!(event_line(&merge).contains("merge main -> tl_1 at 0123456789ab"));
+    }
+
+    #[test]
+    fn slugs_follow_the_servers_rule() {
+        assert!(slug_arg("search-v2").is_ok());
+        assert_eq!(slug_arg("main").unwrap_err().code, "invalid_argument");
+        assert!(slug_arg("Search").is_err());
+    }
+}

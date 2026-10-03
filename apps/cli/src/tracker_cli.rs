@@ -65,16 +65,20 @@ pub struct Scope {
     #[arg(long, global = true)]
     pub offline: bool,
     /// Work in a timeline (its slug): read its view of the issues, and make changes in it.
-    /// `main` (the default) is main's view.
-    #[arg(long, global = true, env = "GM_TIMELINE")]
+    /// Defaults to GM_TIMELINE, then this checkout's timeline (`gm timeline use`);
+    /// `main` is main's view.
+    #[arg(long, global = true)]
     pub timeline: Option<String>,
 }
 impl Scope {
-    /// The timeline selected, if any: None for main.
+    /// The timeline selected, if any: None for main. Without `--timeline`, the
+    /// one gm works in here (`profile::timeline`: GM_TIMELINE, then the checkout's
+    /// binding), so a checkout bound to a timeline tags its tracker changes too.
     pub fn timeline(&self) -> Option<String> {
-        self.timeline
-            .clone()
-            .filter(|slug| !slug.is_empty() && slug != "main")
+        match &self.timeline {
+            Some(slug) => Some(slug.clone()).filter(|slug| !slug.is_empty() && slug != "main"),
+            None => crate::profile::timeline(),
+        }
     }
 }
 #[derive(Subcommand)]

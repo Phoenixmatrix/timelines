@@ -145,6 +145,10 @@ pub struct Local {
     pub skills: SkillPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
+    /// The timeline this checkout works in (`gm timeline use`): pushes go to
+    /// its bookmark `timeline/<slug>`, never to trunk. Worktrees inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<String>,
 }
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
@@ -281,6 +285,48 @@ pub fn current() -> (Project, Local) {
     )
 }
 
+/// Whether `slug` names a timeline: lowercase letters and digits joined by
+/// single hyphens (the server's rule). `main` names main, not a timeline.
+pub fn is_timeline_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug != "main"
+        && slug.len() <= 64
+        && slug.split('-').all(|w| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// The timeline gm works in for the checkout at `root`: `GM_TIMELINE` when
+/// set (`main` or empty: none), else the checkout's binding in
+/// `.gitmatrix/agent.local.yml`. Everything timeline-aware (pushes, trunk,
+/// tracker tagging) reads it from here.
+pub fn timeline_at(root: Option<&Path>) -> Option<String> {
+    if let Ok(value) = std::env::var(TIMELINE_ENV) {
+        let value = value.trim().to_string();
+        return is_timeline_slug(&value).then_some(value);
+    }
+    bound_timeline(root?)
+}
+
+/// The variable that names the timeline for one command, over the checkout's binding.
+pub const TIMELINE_ENV: &str = "GM_TIMELINE";
+
+/// The timeline this checkout is bound to in its local file, ignoring `GM_TIMELINE`.
+pub fn bound_timeline(root: &Path) -> Option<String> {
+    local_at(root)
+        .ok()
+        .flatten()
+        .and_then(|local| local.timeline)
+        .filter(|slug| is_timeline_slug(slug))
+}
+
+/// The timeline gm works in here (see [`timeline_at`]).
+pub fn timeline() -> Option<String> {
+    timeline_at(root().as_deref())
+}
+
 /// The agent gm acts as here: only when a harness is driving and this checkout
 /// was set up for an agent.
 pub fn acting_agent() -> Option<String> {
@@ -365,6 +411,16 @@ mod tests {
         assert!(serde_yaml_ng::from_str::<Project>("tracker:\n  teem: CORE\n").is_err());
         let text = serde_yaml_ng::to_string(&local).unwrap();
         assert_eq!(serde_yaml_ng::from_str::<Local>(&text).unwrap(), local);
+    }
+
+    #[test]
+    fn a_checkout_names_its_timeline() {
+        let local: Local = serde_yaml_ng::from_str("name: builder\ntimeline: search-v2\n").unwrap();
+        assert_eq!(local.timeline.as_deref(), Some("search-v2"));
+        assert!(is_timeline_slug("search-v2") && is_timeline_slug("a1"));
+        for bad in ["main", "", "Search", "a--b", "-a", "a-", "a/b", "a_b"] {
+            assert!(!is_timeline_slug(bad), "{bad:?}");
+        }
     }
 
     #[test]

@@ -25,11 +25,16 @@ use std::path::Path;
 use view::{Operation, Store, View};
 
 pub struct Trunk {
-    /// Bookmark name on the remote, e.g. "main".
+    /// Bookmark name on the remote, e.g. "main", or "timeline/<slug>" in a
+    /// checkout bound to a timeline.
     pub name: String,
     /// The ref that decides what is immutable, e.g. refs/remotes/origin/main.
     pub refname: String,
     pub oid: Oid,
+    /// In a checkout bound to a timeline, the timeline's bookmark is trunk
+    /// (pushes, `gm sync` and `trunk` follow it) and this is main, which
+    /// stays immutable too.
+    pub main: Option<Box<Trunk>>,
 }
 
 /// The mutable part of the history: everything reachable from `@`, bookmarks
@@ -62,6 +67,9 @@ pub struct Workspace {
     /// The tree the files on disk currently match.
     disk_tree: Oid,
     pub trunk: Option<Trunk>,
+    /// The timeline this checkout works in (`gm timeline use`, or
+    /// GM_TIMELINE), whether or not its bookmark has been fetched.
+    pub timeline: Option<String>,
     immutable_cache: std::cell::RefCell<HashMap<Oid, bool>>,
     /// Set when the opening snapshot recorded an operation.
     pub snapshot_op: Option<String>,
@@ -112,8 +120,10 @@ impl Workspace {
         repo.set_index(&mut index)?;
         let view = store.load_view()?;
         let disk_tree = repo.find_commit(Oid::from_str(&view.wc)?)?.tree_id();
+        let timeline = crate::profile::timeline_at(repo.workdir());
         let mut ws = Workspace {
             trunk: None,
+            timeline,
             repo,
             store,
             _lock: lock,
@@ -254,7 +264,38 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    /// Trunk: the bound timeline's remote bookmark when it has one, else main.
     fn find_trunk(&self) -> Result<Option<Trunk>> {
+        let main = self.find_main()?;
+        if let Some(slug) = &self.timeline {
+            let name = format!("timeline/{slug}");
+            let refname = format!("refs/remotes/origin/{name}");
+            if let Ok(reference) = self.repo.find_reference(&refname)
+                && let Ok(commit) = reference.peel_to_commit()
+            {
+                return Ok(Some(Trunk {
+                    name,
+                    refname,
+                    oid: commit.id(),
+                    main: main.map(Box::new),
+                }));
+            }
+        }
+        Ok(main)
+    }
+
+    /// Whether trunk is the bound timeline's bookmark (it was fetched).
+    pub fn on_timeline(&self) -> bool {
+        self.trunk.as_ref().is_some_and(|t| t.main.is_some())
+    }
+
+    /// Main: the server's main line, whatever this checkout is bound to.
+    pub fn main(&self) -> Option<&Trunk> {
+        let trunk = self.trunk.as_ref()?;
+        Some(trunk.main.as_deref().unwrap_or(trunk))
+    }
+
+    fn find_main(&self) -> Result<Option<Trunk>> {
         let repo = &self.repo;
         if let Ok(configured) = repo.config()?.get_string("gm.trunk")
             && let Ok(reference) = repo.find_reference(&configured)
@@ -269,6 +310,7 @@ impl Workspace {
                 name,
                 refname: configured,
                 oid,
+                main: None,
             }));
         }
         let mut candidates = Vec::new();
@@ -292,6 +334,7 @@ impl Workspace {
                     name,
                     refname,
                     oid: commit.id(),
+                    main: None,
                 }));
             }
         }
@@ -312,7 +355,10 @@ impl Workspace {
         if let Some(known) = self.immutable_cache.borrow().get(&oid) {
             return Ok(*known);
         }
-        let result = oid == trunk.oid || self.repo.graph_descendant_of(trunk.oid, oid)?;
+        let mut result = oid == trunk.oid || self.repo.graph_descendant_of(trunk.oid, oid)?;
+        if !result && let Some(main) = &trunk.main {
+            result = oid == main.oid || self.repo.graph_descendant_of(main.oid, oid)?;
+        }
         self.immutable_cache.borrow_mut().insert(oid, result);
         Ok(result)
     }
@@ -320,12 +366,24 @@ impl Workspace {
     pub fn ensure_mutable(&self, oid: Oid) -> Result<()> {
         if self.is_immutable(oid)? {
             let commit = self.commit(oid)?;
+            // Named after the line that has it: the bound timeline, or main.
+            let line = match &self.trunk {
+                Some(trunk)
+                    if oid == trunk.oid || self.repo.graph_descendant_of(trunk.oid, oid)? =>
+                {
+                    trunk.name.as_str()
+                }
+                Some(trunk) => trunk
+                    .main
+                    .as_ref()
+                    .map_or(trunk.name.as_str(), |m| m.name.as_str()),
+                None => "trunk",
+            };
             return Err(GmError::new(
                 "immutable_change",
                 format!(
-                    "Change {} is already part of {}, so it can't be rewritten.",
+                    "Change {} is already part of {line}, so it can't be rewritten.",
                     &self.change_id(&commit)[..ids::SHORT_CHANGE],
-                    self.trunk.as_ref().map(|t| t.name.as_str()).unwrap_or("trunk")
                 ),
             )
             .hint("Make a new change on top instead: `gm new <rev>`, or undo it with `gm backout -r <rev>`.")

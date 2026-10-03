@@ -105,6 +105,9 @@ pub enum Command {
     Sync,
     /// Land changes on trunk (or a bookmark) on Gitmatrix. There are no pull requests.
     Push(PushArgs),
+    /// Timelines: parallel lines of work on `timeline/<slug>` that land on main later
+    #[command(subcommand, visible_alias = "tl")]
+    Timeline(crate::commands::timeline::TimelineCommand),
     /// Sign in to a Gitmatrix server
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -401,7 +404,8 @@ pub struct PushArgs {
     /// Change to push (default `@`, or `@-` when `@` is empty). Its ancestors go too.
     #[arg(short, long)]
     pub revision: Option<String>,
-    /// Push to this bookmark instead of trunk, creating or moving it.
+    /// Push to this bookmark instead of trunk, creating or moving it. In a checkout
+    /// working in a timeline, trunk is `timeline/<slug>` and main is refused.
     #[arg(short, long)]
     pub bookmark: Option<String>,
     /// Fetch and rebase onto the latest trunk first.
