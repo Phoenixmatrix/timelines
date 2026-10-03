@@ -8,8 +8,13 @@
 import {
   atlasFixtureFiles,
   atlasFixtureSource,
+  atlasFixtureTimelineFiles,
+  type AtlasFixtureFile,
   type AtlasFixtureVariant,
 } from "../../shared/atlasFixture.ts";
+import type { KnowledgeOverlayEndReason } from "../../shared/api.ts";
+import type { BuiltGraph, GraphEdge, GraphNode } from "../knowledge/graph.ts";
+import { diffGraphs, endOverlays, storeOverlay, type FileChange } from "../knowledge/overlay.ts";
 import type { AtlasUnavailableReason } from "../../shared/atlas.ts";
 import { describeRepoCapabilities } from "./describe.ts";
 import {
@@ -196,4 +201,114 @@ export async function registerFixturePackage(
     )
     .bind(pkg.id, repoId, now)
     .run();
+}
+
+/** The fixture's files as a knowledge graph: files, their symbols and concepts, imports and mentions. */
+async function fixtureGraph(files: AtlasFixtureFile[]): Promise<BuiltGraph> {
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+  const concepts = new Set<string>();
+  for (const file of files) {
+    const id = `file:${file.path}`;
+    const source = atlasFixtureSource(file);
+    nodes.push({
+      id,
+      kind: "file",
+      name: file.path.split("/").pop()!,
+      path: file.path,
+      summary: "",
+      data: {
+        blob: await gitBlob(source.text),
+        lines: source.text.split("\n").length - 1,
+        language: "typescript",
+      },
+    });
+    for (const target of file.imports)
+      edges.push({ src: id, dst: `file:${target}`, kind: "imports", weight: 1 });
+    for (const concept of file.concepts) {
+      concepts.add(concept);
+      edges.push({ src: id, dst: `concept:${concept}`, kind: "mentions", weight: 1 });
+    }
+    for (const name of file.symbols ?? []) {
+      const symbol = `sym:${file.path}#${name}`;
+      nodes.push({ id: symbol, kind: "symbol", name, path: file.path, summary: "", data: {} });
+      edges.push({ src: id, dst: symbol, kind: "defines", weight: 1 });
+    }
+  }
+  for (const concept of concepts)
+    nodes.push({
+      id: `concept:${concept}`,
+      kind: "concept",
+      name: title(concept),
+      path: null,
+      summary: "",
+      data: {},
+    });
+  return { nodes, edges, components: [], componentDeps: new Map(), conceptFiles: new Map() };
+}
+
+/**
+ * A timeline's knowledge overlay as the overlay step would store it, without
+ * a build: the fixture timeline's graph diffed against the base fixture's
+ * (diffGraphs) and stored as the bookmark's current overlay (storeOverlay),
+ * measured against main's `base` commit, which becomes main's indexed commit.
+ * `commit` is the timeline commit its files were pushed at.
+ */
+export async function writeAtlasFixtureOverlay(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  commit: string,
+  base: string,
+): Promise<{ overlayId: string; stored: number }> {
+  const before = atlasFixtureFiles("base");
+  const after = atlasFixtureTimelineFiles();
+  const [main, timeline] = await Promise.all([fixtureGraph(before), fixtureGraph(after)]);
+  const changes = diffGraphs(main, timeline);
+  const blobs = (graph: BuiltGraph) =>
+    new Map(
+      graph.nodes.filter((n) => n.kind === "file").map((n) => [n.path!, String(n.data.blob)]),
+    );
+  const [old, now] = [blobs(main), blobs(timeline)];
+  const files: FileChange[] = [...new Set([...old.keys(), ...now.keys()])]
+    .filter((path) => old.get(path) !== now.get(path))
+    .sort()
+    .map((path) => ({
+      path,
+      blob: now.get(path) ?? null,
+      before: old.get(path) ?? null,
+      mode: "100644",
+    }));
+  await d1
+    .prepare(
+      `INSERT INTO kg_state (repo_id, indexed_commit) VALUES (?, ?)
+       ON CONFLICT (repo_id) DO UPDATE SET indexed_commit = excluded.indexed_commit`,
+    )
+    .bind(repoId, base)
+    .run();
+  const overlayId = `fixture-overlay-${crypto.randomUUID()}`;
+  const full = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`;
+  const { stored } = await storeOverlay(
+    d1,
+    repoId,
+    full,
+    overlayId,
+    commit,
+    base,
+    { mergeBase: base, historyTruncated: false, changes: files },
+    changes,
+    { fixture: true },
+  );
+  return { overlayId, stored };
+}
+
+/** The bookmark is gone: keep its overlay read-only, as the coordinator does (CORE-139). */
+export async function endAtlasFixtureOverlay(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  reason: KnowledgeOverlayEndReason,
+) {
+  const full = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`;
+  await endOverlays(d1, repoId, new Map([[full, reason]]));
 }

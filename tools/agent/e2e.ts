@@ -23,6 +23,7 @@ import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import {
   atlasAccessibleScenario,
   atlasBrowserScenario,
+  atlasTimelineScenario,
   atlasRevocationScenario,
   atlasWorkspaceScenario,
 } from "./atlas-e2e.ts";
@@ -2033,6 +2034,20 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     // CORE-170: every Atlas journey by keyboard alone and by touch at 320px,
     // never through the canvas; light and dark; reduced motion.
     await atlasAccessibleScenario({
+      ctx,
+      work,
+      token: ownerToken,
+      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
+      json,
+      record,
+    });
+  });
+
+  await scenario("browser-atlas-timeline-in-capabilities-ended-and-expired", async () => {
+    // CORE-176: a timeline read in Atlas terms with its per-repo facts, a
+    // capability filter and source handoff; ended read-only; the overlay's
+    // route kept when the map's snapshot expires.
+    await atlasTimelineScenario({
       ctx,
       work,
       token: ownerToken,

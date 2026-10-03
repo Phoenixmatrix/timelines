@@ -376,6 +376,10 @@ export type AtlasErrorCode =
    * exists). Unreadable and nonexistent repositories are indistinguishable.
    */
   | "scope_empty"
+  /** Timelines (CORE-176): no such bookmark, and no kept overlay of one. */
+  | "timeline_unknown"
+  /** Timelines: the overlay was recomputed (a push) since the cursor's first page. */
+  | "timeline_changed"
   | "bad_request";
 
 export interface AtlasError {
@@ -850,4 +854,180 @@ export interface AtlasSnapshotList {
   current: string | null;
   items: AtlasSnapshotListing[];
   next: string | null;
+}
+
+// ---- timeline change understanding (CORE-176) ----------------------------------
+//
+// What a timeline (a `timeline/<slug>` bookmark) changes, in Atlas terms: its
+// knowledge overlay (CORE-83, the timeline's graph diff against main) read
+// against a main snapshot, so each changed file is placed in a capability and
+// area and the capabilities it touches are counted. It is timeline-versus-main
+// evidence, not a main snapshot comparison:
+//
+//   - placements are main's: a changed or removed file sits where the snapshot
+//     put it; a new file has no placement yet, so it is provisional (likely the
+//     capability most of its folder's files are in, said as an inference) or
+//     unclassified. Regrouping is not computed for timelines.
+//   - the overlay was computed against main's indexed commit at the time, which
+//     may be older or newer than the snapshot on screen: `repos[].base` says so.
+//   - an ended timeline's overlay is kept read-only (CORE-139); reading it never
+//     recomputes anything, and reading a live one doesn't start a computation.
+//
+// Every list is bounded: the overlay keeps at most 2,000 changes (`truncated`
+// says when there were more), file records page by path, and the capability
+// summary lists at most ATLAS_TIMELINE_REGIONS regions.
+
+/** Capabilities a timeline summary lists, at most (the rest are counted). */
+export const ATLAS_TIMELINE_REGIONS = 40;
+
+/** Where some main commit sits relative to the snapshot on screen. */
+export type AtlasMainRelation = "same" | "older" | "newer" | "unknown";
+
+/** One repository's part in a timeline, each value independently known or not. */
+export interface AtlasTimelineRepo {
+  repoId: string;
+  owner: string;
+  name: string;
+  /** The bookmark, `timeline/<slug>`. */
+  ref: string;
+  /**
+   * The overlay's state (KnowledgeOverlayState), or `unavailable`: no overlay
+   * is stored and none can be (Knowledge is off here).
+   */
+  state: "up-to-date" | "building" | "queued" | "failed" | "waiting" | "ended" | "unavailable";
+  /** The bookmark's tip now: null once it's gone, or `headKnown` false when it couldn't be read. */
+  head: string | null;
+  headKnown: boolean;
+  /** The timeline commit the overlay describes. */
+  commit: string | null;
+  /** Main's indexed commit the overlay was measured against. */
+  baseCommit: string | null;
+  mergeBase: string | null;
+  /** found; none (no shared history: compared with main's tree); truncated (history too long); unknown (no overlay). */
+  mergeBaseState: "found" | "none" | "truncated" | "unknown";
+  updatedAt: string | null;
+  error: string | null;
+  ended: { reason: "landed" | "abandoned" | "ended"; at: string } | null;
+  /** This repository's commit in the snapshot on screen. */
+  projectionCommit: string | null;
+  /** Where `baseCommit` sits relative to that snapshot. */
+  base: AtlasMainRelation;
+  /** Changes the overlay found and kept: `stored` < `total` when it was cut. */
+  changes: { total: number; stored: number };
+  /** Of the changed files, those in a language the syntax-change feed analyzes. */
+  coverage: { files: number; syntax: number };
+  /** Changed nodes that aren't files (concepts, packages, symbols, components), per kind. */
+  graph: Record<string, { added: number; changed: number; removed: number }>;
+}
+
+/** Where a timeline's file sits in the snapshot on screen. */
+export interface AtlasTimelinePlacement {
+  /**
+   * projected: the snapshot places it (main's placement); provisional: new,
+   * placed by inference from its folder; unclassified: no evidence either way.
+   */
+  state: "projected" | "provisional" | "unclassified";
+  capability: AtlasChangeRef | null;
+  area: AtlasChangeRef | null;
+  /** For a provisional placement: how many of its folder's files the capability holds. */
+  basis: { folder: string; files: number; of: number } | null;
+}
+
+/** A file the timeline adds, changes or removes, placed in the Atlas. */
+export interface AtlasTimelineFile {
+  id: string;
+  path: string;
+  change: "added" | "changed" | "removed";
+  /** source: added, removed or another blob; summary: only its description; other: links only. */
+  classes: AtlasChangeClass[];
+  /** What the overlay recorded differently on a changed file (blob, summary, links…). */
+  fields: string[];
+  placement: AtlasTimelinePlacement;
+  /** Capabilities its added or dropped imports reach, other than its own. */
+  imports: { added: AtlasChangeRef[]; removed: AtlasChangeRef[] };
+}
+
+/** A timeline wiki page (CORE-84), linked from the capabilities it's about. */
+export interface AtlasTimelinePageRef {
+  slug: string;
+  title: string;
+  /** The page set it belongs to (`set=` on the wiki route). */
+  set: string;
+  change: "added" | "changed";
+  outcome: "written" | "kept";
+}
+
+/** Main's wiki page about something the timeline changes, with its own commit. */
+export interface AtlasMainPageRef {
+  slug: string;
+  title: string;
+  nodeId: string;
+  generatedIn: string;
+  updatedAt: string;
+  /** Where the commit it was written from sits relative to the snapshot on screen. */
+  relation: AtlasMainRelation;
+}
+
+/** A capability (or unclassified group) the timeline touches. */
+export interface AtlasTimelineRegion {
+  /** A capability id, `group:unclassified`, or `provisional` (new files with no likely place). */
+  id: string;
+  name: string;
+  files: { added: number; changed: number; removed: number };
+  /** New files placed here by inference only. */
+  provisional: number;
+  classes: { source: number; summary: number; other: number };
+  /** Areas within it the changes fall in, by name. */
+  areas: AtlasChangeRef[];
+  /** Capabilities the timeline's imports newly reach from here, or stop reaching. */
+  imports: { added: AtlasChangeRef[]; removed: AtlasChangeRef[] };
+  pages: AtlasTimelinePageRef[];
+  mainPages: AtlasMainPageRef[];
+}
+
+/** The newest wiki page set written for the timeline, in brief. */
+export interface AtlasTimelineWiki {
+  key: string;
+  checkpoint: { id: string; number: number | null } | null;
+  /** The timeline commit the pages describe, and the main they were measured against. */
+  commit: string;
+  baseCommit: string | null;
+  base: AtlasMainRelation;
+  state: "queued" | "writing" | "succeeded" | "failed" | "ended";
+  finishedAt: string | null;
+  pages: number;
+}
+
+/** Something that limits what a timeline view can say. */
+export type AtlasTimelineCaveat =
+  /** Regrouping isn't computed for a timeline: placements are main's, new files provisional. */
+  | { code: "regrouping" }
+  /** The overlay was measured against another main than the snapshot on screen. */
+  | {
+      code: "base";
+      relation: AtlasMainRelation;
+      baseCommit: string;
+      projectionCommit: string | null;
+    }
+  /** The overlay kept only its first `stored` of `total` changes. */
+  | { code: "truncated"; stored: number; total: number }
+  /** History was too long to find the merge base, or there's none: compared with main's tree. */
+  | { code: "merge-base"; state: "none" | "truncated" }
+  /** The bookmark moved since the overlay: it shows an earlier commit. */
+  | { code: "behind"; commit: string; head: string }
+  /** Only the first imports of each file were resolved to capabilities. */
+  | { code: "imports-partial" };
+
+/** GET /timeline?ref=timeline/<slug>[&within=]: a timeline in Atlas terms, files a page at a time. */
+export interface AtlasTimeline extends AtlasPage<AtlasTimelineFile> {
+  ref: string;
+  timeline: string;
+  repos: AtlasTimelineRepo[];
+  within: AtlasEntitySummary | null;
+  /** The first page's: touched capabilities, most files first; null on continuation pages. */
+  regions: AtlasTimelineRegion[] | null;
+  /** Touched capabilities in all (`regions` lists at most ATLAS_TIMELINE_REGIONS). */
+  regionCount: number | null;
+  wiki: AtlasTimelineWiki | null;
+  caveats: AtlasTimelineCaveat[];
 }

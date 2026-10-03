@@ -4,10 +4,12 @@ import type { AppEnv } from "../auth.ts";
 import type { TokenScope } from "../../shared/api.ts";
 import { newArtifactsName } from "../artifacts.ts";
 import {
+  endAtlasFixtureOverlay,
   expireAtlasPriors,
   publishAtlasFixture,
   registerFixturePackage,
   writeAtlasFixtureGraph,
+  writeAtlasFixtureOverlay,
 } from "../atlas/fixture.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
@@ -183,12 +185,18 @@ dev.post("/seed", async (c) => {
  * expires every prior snapshot, as retention does. `publishes` first records
  * in the registry that the repository publishes that npm package, and the
  * snapshot records it, so a workspace can resolve imports of it (CORE-167).
+ * `overlay` stores the fixture timeline's knowledge overlay for bookmark
+ * `ref` at `commit`, measured against main's `base`; `end` keeps it
+ * read-only with `reason`, as the coordinator does when the bookmark goes.
  */
 dev.post("/atlas", async (c) => {
   const body = await readJson<{
     repo: string;
-    action: "publish" | "expire";
+    action: "publish" | "expire" | "overlay" | "end";
     commit?: string;
+    base?: string;
+    ref?: string;
+    reason?: "landed" | "abandoned" | "ended";
     variant?: "base" | "merged" | "consumer";
     unavailable?: "disabled" | "budget_exhausted" | "provider_error" | "error";
     publishes?: string;
@@ -205,6 +213,25 @@ dev.post("/atlas", async (c) => {
     : undefined;
   if (!repo) return fail(c, 404, "No such repository.");
   if (body.action === "expire") return c.json(await expireAtlasPriors(c.env.DB, repo.id));
+  const oid = /^[0-9a-f]{40}$/;
+  if (body.action === "overlay") {
+    if (
+      !body.ref?.startsWith("timeline/") ||
+      !oid.test(body.commit ?? "") ||
+      !oid.test(body.base ?? "")
+    )
+      return fail(c, 400, "Send {repo, action: overlay, ref: timeline/<slug>, commit, base}.");
+    return c.json(
+      await writeAtlasFixtureOverlay(c.env.DB, repo.id, body.ref, body.commit!, body.base!),
+      201,
+    );
+  }
+  if (body.action === "end") {
+    if (!body.ref?.startsWith("timeline/"))
+      return fail(c, 400, "Send {repo, action: end, ref: timeline/<slug>, reason}.");
+    await endAtlasFixtureOverlay(c.env.DB, repo.id, body.ref, body.reason ?? "landed");
+    return c.json({ ended: body.ref });
+  }
   if (body.action !== "publish" || !body.commit || !/^[0-9a-f]{40}$/.test(body.commit))
     return fail(c, 400, "Send {repo, action: publish, commit} or {repo, action: expire}.");
   if (body.publishes !== undefined && !/^[a-z0-9][a-z0-9._-]{0,100}$/.test(body.publishes))

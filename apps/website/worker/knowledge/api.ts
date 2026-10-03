@@ -45,7 +45,7 @@ import { db, type Database } from "../schema.ts";
 import { coordinator, notifyKnowledge, requestPages } from "./coordinator.ts";
 import { PASSAGE_CANDIDATES, SEARCH_INSTANCE, selectPassages } from "./indexes.ts";
 import { embed } from "./models.ts";
-import { overlayRef, setEndReason, timelineEnd } from "./overlay.ts";
+import { overlayRef, overlayState, setEndReason, timelineEnd } from "./overlay.ts";
 import { commitKey, listSets, overlayEnded, timelinePage } from "./pages.ts";
 import { timelineSlugOf } from "../../shared/timelines.ts";
 
@@ -421,7 +421,7 @@ knowledge.get("/search", async (c) => {
 
 type PageRow = Pick<
   Selectable<Database["wiki_pages"]>,
-  "slug" | "title" | "section" | "position" | "node_id" | "updated_at"
+  "slug" | "title" | "section" | "position" | "node_id" | "updated_at" | "generated_in"
 >;
 
 const toSummary = (r: PageRow): WikiPageSummary => ({
@@ -431,6 +431,7 @@ const toSummary = (r: PageRow): WikiPageSummary => ({
   position: r.position,
   nodeId: r.node_id,
   updatedAt: r.updated_at,
+  generatedIn: r.generated_in,
 });
 
 knowledge.get("/wiki", async (c) => {
@@ -438,7 +439,7 @@ knowledge.get("/wiki", async (c) => {
   if (row instanceof Response) return row;
   const results = await db(c.env.DB)
     .selectFrom("wiki_pages")
-    .select(["slug", "title", "section", "position", "node_id", "updated_at"])
+    .select(["slug", "title", "section", "position", "node_id", "updated_at", "generated_in"])
     .where("repo_id", "=", row.id)
     .orderBy("position")
     .execute();
@@ -493,25 +494,6 @@ async function recheckEnded(c: Context<AppEnv>, row: RepoRow, rows: OverlayRow[]
       await setEndReason(c.env.DB, row.id, r.ref, reason);
     }),
   );
-}
-
-/**
- * Where one timeline's overlay stands, from its stored row (if any), the
- * bookmark's tip now, main's indexed commit and a running computation.
- */
-export function overlayState(
-  stored: OverlayRow | undefined,
-  head: string | null,
-  indexed: string | null,
-  running: boolean,
-): KnowledgeOverlaySummary["state"] {
-  // Ended overlays are kept as they were; nothing computes them again.
-  if (stored?.ended_at) return "ended";
-  if (!indexed) return "waiting";
-  if (running) return "building";
-  if (stored?.status === "failed" && stored.attempted_commit === head) return "failed";
-  if (stored?.head_commit === head && stored?.base_commit === indexed) return "up-to-date";
-  return "queued";
 }
 
 /** Where each timeline's overlay stands, for every bookmark or just `only`. */

@@ -28,7 +28,8 @@ import type {
   OverlayLink,
 } from "../../shared/api.ts";
 import { timelineSlugOf, type TimelineStatus } from "../../shared/timelines.ts";
-import { db, nowIso } from "../schema.ts";
+import type { Selectable } from "kysely";
+import { db, nowIso, type Database } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import type { FileAnalysis, FileToAnalyze } from "./analyze.ts";
 import { loadAnalyses } from "./analyze.ts";
@@ -376,6 +377,25 @@ export async function computeOverlay(
   const base = state?.indexed_commit ?? null;
   const graphs = await overlayGraphs(d1, repo, plan.changes);
   const changes = diffGraphs(graphs.main, graphs.timeline);
+  return storeOverlay(d1, repo.id, ref, overlayId, commit, base, plan, changes, stats);
+}
+
+/**
+ * Store a timeline's diff as its current overlay: its first MAX_CHANGES
+ * changes, then the pointer to them, then drop the previous ones. An ended
+ * overlay is read-only: a late run leaves it as it was (and stores nothing).
+ */
+export async function storeOverlay(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  overlayId: string,
+  commit: string,
+  base: string | null,
+  plan: Pick<OverlayPlan, "mergeBase" | "historyTruncated" | "changes">,
+  changes: KnowledgeOverlayChange[],
+  stats: Record<string, unknown>,
+): Promise<{ base: string | null; counts: KnowledgeOverlaySummary["counts"]; stored: number }> {
   const counts = countChanges(changes);
   const kept = changes.slice(0, MAX_CHANGES);
   const k = db(d1);
@@ -383,11 +403,11 @@ export async function computeOverlay(
     // A retried step starts over.
     k
       .deleteFrom("kg_overlay_changes")
-      .where("repo_id", "=", repo.id)
+      .where("repo_id", "=", repoId)
       .where("overlay_id", "=", overlayId),
     ...kept.map((c) =>
       k.insertInto("kg_overlay_changes").values({
-        repo_id: repo.id,
+        repo_id: repoId,
         overlay_id: overlayId,
         node_id: c.id,
         kind: c.kind,
@@ -411,14 +431,14 @@ export async function computeOverlay(
   const previous = await k
     .selectFrom("kg_overlays")
     .select("overlay_id")
-    .where("repo_id", "=", repo.id)
+    .where("repo_id", "=", repoId)
     .where("ref", "=", ref)
     .executeTakeFirst();
   // Point at the new changes, then drop the old ones: readers never see half.
   const pointed = await k
     .insertInto("kg_overlays")
     .values({
-      repo_id: repo.id,
+      repo_id: repoId,
       ref,
       overlay_id: overlayId,
       head_commit: commit,
@@ -452,7 +472,7 @@ export async function computeOverlay(
   if (!pointed) {
     await k
       .deleteFrom("kg_overlay_changes")
-      .where("repo_id", "=", repo.id)
+      .where("repo_id", "=", repoId)
       .where("overlay_id", "=", overlayId)
       .execute();
     return { base, counts, stored: 0 };
@@ -460,11 +480,30 @@ export async function computeOverlay(
   if (previous?.overlay_id && previous.overlay_id !== overlayId) {
     await k
       .deleteFrom("kg_overlay_changes")
-      .where("repo_id", "=", repo.id)
+      .where("repo_id", "=", repoId)
       .where("overlay_id", "=", previous.overlay_id)
       .execute();
   }
   return { base, counts, stored: kept.length };
+}
+
+/**
+ * Where one timeline's overlay stands, from its stored row (if any), the
+ * bookmark's tip now, main's indexed commit and a running computation.
+ */
+export function overlayState(
+  stored: Selectable<Database["kg_overlays"]> | undefined,
+  head: string | null,
+  indexed: string | null,
+  running: boolean,
+): KnowledgeOverlaySummary["state"] {
+  // Ended overlays are kept as they were; nothing computes them again.
+  if (stored?.ended_at) return "ended";
+  if (!indexed) return "waiting";
+  if (running) return "building";
+  if (stored?.status === "failed" && stored.attempted_commit === head) return "failed";
+  if (stored?.head_commit === head && stored?.base_commit === indexed) return "up-to-date";
+  return "queued";
 }
 
 /** Record a failed attempt, keeping the last good overlay's changes. */

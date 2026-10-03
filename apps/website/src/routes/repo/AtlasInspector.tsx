@@ -161,8 +161,8 @@ export function AtlasInspector({
   onLens: (lens: AtlasLens) => void;
   /** The pinned snapshot can't be read any more. */
   onRestart?: (error: AtlasError) => void;
-  /** The wiki page written about it, if any. */
-  wiki?: Pick<WikiPageSummary, "slug" | "title"> | null;
+  /** The wiki page written about it, if any, and where its commit sits against this map. */
+  wiki?: (Pick<WikiPageSummary, "slug" | "title"> & { note?: string | null }) | null;
 }) {
   const read = reader ?? repoReader(repo);
   const [detail, setDetail] = useState<AtlasDetail | null>(null);
@@ -264,6 +264,7 @@ export function AtlasInspector({
           Wiki: {wiki.title}
         </Link>
       )}
+      {wiki?.note && <p className="m-0 text-micro text-ink-faint">{wiki.note}</p>}
       {detailError && (
         <p className="m-0 text-body-sm text-danger-text" role="alert">
           {detailError}

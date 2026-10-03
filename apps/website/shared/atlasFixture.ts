@@ -90,6 +90,31 @@ export function atlasFixtureFiles(variant: AtlasFixtureVariant = "base"): AtlasF
 }
 
 /**
+ * A timeline's files on top of the base fixture (CORE-176): search's ranking
+ * now reads the ledger (an import into billing), search gains a suggestion
+ * module (a new file in a folder the Atlas places), a new notify folder
+ * appears (a new file with nothing to place it by), and misc's legacy file
+ * goes.
+ */
+export function atlasFixtureTimelineFiles(): AtlasFixtureFile[] {
+  const files = atlasFixtureFiles("base")
+    .filter((f) => f.path !== "misc/legacy.ts")
+    .map((f) => ({ ...f, imports: [...f.imports], concepts: [...f.concepts] }));
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  byPath.get("search/rank.ts")!.imports.push("billing/ledger/ledger.ts");
+  files.push(
+    {
+      path: "search/suggest.ts",
+      imports: ["search/query.ts", "search/index.ts"],
+      concepts: ["search"],
+      symbols: ["suggest"],
+    },
+    { path: "notify/email.ts", imports: [], concepts: [] },
+  );
+  return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/**
  * The source pushed for a fixture file, its imports and functions really
  * there, and the line each function starts on.
  */

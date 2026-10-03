@@ -303,6 +303,8 @@ export interface WikiPageSummary {
   position: number;
   nodeId: string | null;
   updatedAt: string;
+  /** The commit it was written from (the catalog and pages carry it). */
+  generatedIn?: string;
 }
 
 export interface WikiCatalog {

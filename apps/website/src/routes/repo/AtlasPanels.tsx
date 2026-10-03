@@ -35,11 +35,14 @@ export function AtlasGone({
   error,
   base,
   noCurrent,
+  note = null,
 }: {
   error: AtlasError;
   base: string;
   /** Said when there's no current view to offer. */
   noCurrent: string;
+  /** What the link keeps that the current view still shows (a timeline's overlay). */
+  note?: string | null;
 }) {
   const [params] = useSearchParams();
   const current = atlasHref(base, { snapshot: error.current?.id ?? null }, params);
@@ -62,6 +65,7 @@ export function AtlasGone({
         The link showed the Atlas as it was then; the current one may group things differently, so
         it isn't opened in its place without asking.
       </p>
+      {note && <p className="m-0 text-body-sm text-ink-muted">{note}</p>}
       {error.current ? (
         <Link to={current} className="mk-btn self-start">
           Open the current view

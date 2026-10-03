@@ -12,6 +12,8 @@
 //   GET /snapshots[?cursor=]                       published snapshots, newest first
 //   GET /compare?from=&to=[&class=&within=]        what changed between two retained
 //                                                  snapshots (worker/atlas/compare.ts)
+//   GET /timeline?ref=timeline/<slug>[&within=]    what a timeline changes, placed in
+//                                                  capabilities (worker/atlas/timeline.ts)
 //
 // Every route authorizes the repository first (unreadable looks like missing),
 // then reads only the published projection (worker/atlas/projection.ts): no
@@ -57,9 +59,12 @@ import {
   type AtlasComparisonCaveat,
   type AtlasSnapshotList,
   type AtlasSnapshotListing,
+  type AtlasTimeline,
 } from "../../shared/atlas.ts";
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
+import type { RepoRow } from "../db.ts";
+import { overlayRef } from "../knowledge/overlay.ts";
 import {
   cursorSecret,
   signCursor,
@@ -93,6 +98,7 @@ import {
 import { lineageOf } from "./identity.ts";
 import { comparePage, compareSummary, type CompareKey } from "./compare.ts";
 import { capacityFailure, cursorExpiresAt, pinnedSnapshot } from "./retention.ts";
+import { readTimelineState, timelineView } from "./timeline.ts";
 
 export const atlas = new Hono<AppEnv>();
 
@@ -189,6 +195,7 @@ export function region(
 interface Pinned<K> {
   scope: string;
   repoId: string;
+  repo: RepoRow;
   snapshot: AtlasSnapshotRef;
   /** The verified cursor, when the request continues a traversal. */
   cursor: CursorState<K> | null;
@@ -258,7 +265,15 @@ async function pin<K>(
         "This repository has no Atlas yet. It appears after a Knowledge build.",
         null,
       );
-    return { scope, repoId: loaded.row.id, snapshot: refOf(current), cursor, binding, secret };
+    return {
+      scope,
+      repoId: loaded.row.id,
+      repo: loaded.row,
+      snapshot: refOf(current),
+      cursor,
+      binding,
+      secret,
+    };
   }
   const now = Date.now();
   const pinned = await pinnedSnapshot(d1, scope, id, new Date(now));
@@ -278,6 +293,7 @@ async function pin<K>(
   return {
     scope,
     repoId: loaded.row.id,
+    repo: loaded.row,
     snapshot: refOf(pinned.snapshot),
     cursor,
     binding,
@@ -835,6 +851,85 @@ atlas.get("/compare", async (c) => {
     class: filter.class,
     summary,
     caveats: caveatsOf(fromSide, toSide, Number(between?.n ?? 0)),
+  };
+  return c.json(body);
+});
+
+// ---- timelines (CORE-176) -------------------------------------------------------
+
+/**
+ * What a timeline changes, in Atlas terms: its kept overlay placed in this
+ * snapshot's capabilities (worker/atlas/timeline.ts), the capabilities it
+ * touches on the first page, then its files by path, optionally only those in
+ * one capability or area. The cursor is bound to the bookmark and the filter,
+ * and to the overlay it started on: a push that recomputes the overlay stops
+ * the traversal (`timeline_changed`) instead of mixing two. Reading never
+ * computes an overlay, so an ended one stays exactly as it was kept.
+ */
+atlas.get("/timeline", async (c) => {
+  const raw = c.req.query("ref") ?? "";
+  const within = c.req.query("within") || null;
+  const ctx = await pin<[string, string]>(c, "timeline", { ref: raw, within });
+  if (ctx instanceof Response) return ctx;
+  const ref = raw.length <= 512 ? overlayRef(raw) : null;
+  if (!ref) return failWith(c, 400, "bad_request", "Pass ref=timeline/<slug>.");
+  if (within !== null && within.length > 2048)
+    return failWith(c, 400, "bad_request", "That capability id is too long.");
+  const limit = limitOf(c);
+  if (limit instanceof Response) return limit;
+  const d1 = c.env.DB;
+  let withinEntity: ProjectedEntity | null = null;
+  if (within) {
+    withinEntity = await entityAt(d1, ctx.scope, ctx.snapshot.seq, within);
+    if (!withinEntity) return failWith(c, 404, "entity_unknown", "That isn't in this snapshot.");
+    if (withinEntity.kind !== "capability" && withinEntity.kind !== "area")
+      return failWith(c, 400, "bad_request", "within names a capability or an area.");
+  }
+  const state = await readTimelineState(c.env, ctx.repo, ref, c.get("timing"), (work) =>
+    c.executionCtx.waitUntil(work),
+  );
+  if (!state)
+    return failWith(
+      c,
+      404,
+      "timeline_unknown",
+      "This repository has no such timeline bookmark, and keeps no overlay of one.",
+    );
+  const view = await timelineView(d1, ctx.scope, ctx.snapshot, ctx.repo, state, Boolean(c.env.AI));
+  const after = ctx.cursor?.after ?? null;
+  if (after && after[0] !== (view.overlayId ?? ""))
+    return failWith(
+      c,
+      409,
+      "timeline_changed",
+      "The timeline was pushed again since this list started, so its changes were computed again. Start again.",
+    );
+  const matching = within
+    ? view.files.filter(
+        (f) => f.placement.capability?.id === within || f.placement.area?.id === within,
+      )
+    : view.files;
+  const from = after ? matching.findIndex((f) => f.path > after[1]) : 0;
+  const start = from === -1 ? matching.length : from;
+  const items = matching.slice(start, start + limit);
+  const last = items.at(-1);
+  const paged = await page(
+    ctx,
+    items,
+    last && start + limit < matching.length ? [view.overlayId ?? "", last.path] : null,
+    async () => matching.length,
+  );
+  const body: AtlasTimeline = {
+    ...paged,
+    counts: { ...paged.counts, unknownTotal: false },
+    ref: view.repo.ref,
+    timeline: view.repo.ref.replace(/^timeline\//, ""),
+    repos: [view.repo],
+    within: withinEntity ? lean(withinEntity) : null,
+    regions: ctx.cursor ? null : view.regions,
+    regionCount: ctx.cursor ? null : view.regionCount,
+    wiki: view.wiki,
+    caveats: view.caveats,
   };
   return c.json(body);
 });

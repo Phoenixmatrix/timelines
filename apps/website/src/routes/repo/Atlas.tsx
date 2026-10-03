@@ -25,12 +25,7 @@ import {
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
-import type {
-  KnowledgeOverlay,
-  KnowledgeOverlaySummary,
-  KnowledgeStatus,
-  WikiCatalog,
-} from "../../../shared/api.ts";
+import type { KnowledgeOverlaySummary, KnowledgeStatus, WikiCatalog } from "../../../shared/api.ts";
 import type {
   AtlasEntitySummary,
   AtlasError,
@@ -55,6 +50,8 @@ import { usePalette } from "../../palette/Palette.tsx";
 import { useMediaQuery } from "../../lib/useMediaQuery.ts";
 import { AtlasCompare } from "./AtlasCompare.tsx";
 import { AtlasInspector } from "./AtlasInspector.tsx";
+import { AtlasTimeline } from "./AtlasTimeline.tsx";
+import { wikiNote } from "./atlasTimeline.ts";
 import { AtlasOutline } from "./AtlasOutline.tsx";
 import { AtlasContents, AtlasExpired, AtlasGone, AtlasLookup } from "./AtlasPanels.tsx";
 import { FocusResolver, OPENS, type Focus } from "./atlasNavigation.ts";
@@ -70,7 +67,6 @@ import { scopeNotices, type AtlasNotice } from "./atlasStates.ts";
 import { AtlasTerritory } from "./AtlasTerritory.tsx";
 import { KnowledgeBar } from "./KnowledgeBar.tsx";
 import { useRepo } from "./RepoLayout.tsx";
-import { OverlayPanel } from "./TimelineOverlay.tsx";
 import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./territory.ts";
 
 export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
@@ -92,20 +88,15 @@ export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
   // Build state says whether the map is behind, rebuilding or failed; the
   // map still renders without it. The wiki catalog links entities to their
   // pages; timelines' overlays (CORE-83) are what the timeline picker offers.
-  const timeline = scopeOf(url.search);
+  // A selected timeline is read in Atlas terms by its own bounded request
+  // (AtlasTimeline.tsx), not here.
   const around = Promise.all([
     quiet<KnowledgeStatus | null>(`${base}/status`, null),
     quiet<WikiCatalog | null>(`${base}/wiki`, null).then((w) => w?.pages ?? []),
     quiet<{ overlays: KnowledgeOverlaySummary[] }>(`${base}/overlays`, { overlays: [] }).then(
       (r) => r.overlays,
     ),
-    timeline
-      ? quiet<KnowledgeOverlay | null>(
-          `${base}/overlay?ref=${encodeURIComponent(`timeline/${timeline}`)}`,
-          null,
-        )
-      : null,
-  ]).then(([status, wiki, overlays, overlay]) => ({ status, wiki, overlays, overlay }));
+  ]).then(([status, wiki, overlays]) => ({ status, wiki, overlays }));
   try {
     return {
       overview: await atlasApi.overview(repo, { snapshot, signal: request.signal }),
@@ -247,11 +238,18 @@ const TONE: Record<AtlasNotice["tone"], string> = {
 /** A link's snapshot is gone: say why, keep the rest of the link, and let the person choose. */
 function PinnedGone({ error }: { error: AtlasError }) {
   const { base } = useAtlasBase();
+  const [params] = useSearchParams();
+  const timeline = scopeOf(params);
   return (
     <AtlasGone
       error={error}
       base={base}
       noCurrent="This repository has no current Atlas to open instead."
+      note={
+        timeline
+          ? `Timeline ${timeline}'s overlay is kept apart from Atlas snapshots: it opens with the current view, read against it. This snapshot isn't replayed.`
+          : null
+      }
     />
   );
 }
@@ -263,6 +261,7 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
   const snapshot = overview.snapshot;
   const [params, setParams] = useSearchParams();
   const url = readAtlasUrl(params);
+  const timeline = scopeOf(params);
   const navigationType = useNavigationType();
 
   const navigate = (patch: Partial<AtlasUrlState>, replace = false) =>
@@ -489,11 +488,15 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
         selected={selected}
         onPick={select}
       />
-      {data.overlay && (
-        <OverlayPanel
-          overlay={data.overlay}
-          href={(id) => atlasHref(base, { select: id }, params)}
-          inMap={() => true}
+      {timeline && (
+        <AtlasTimeline
+          key={timeline}
+          repo={ref}
+          snapshot={snapshot}
+          timeline={timeline}
+          selected={selected}
+          onSelect={(id) => navigate({ select: id, snapshot: snapshot.id })}
+          onCurrent={() => navigate({ snapshot: null })}
         />
       )}
       {focus.state === "resolving" && (
@@ -512,7 +515,7 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
         <AtlasInspector
           key={selected.id}
           repo={ref}
-          wiki={wikiPageFor(data.wiki, selected)}
+          wiki={wikiPageFor(data.wiki, selected, snapshot)}
           snapshot={snapshot}
           entity={selected}
           lens={url.lens}
@@ -923,10 +926,14 @@ function Legend() {
 }
 
 /** The wiki page written for an entity, if any; the repository's is the wiki's first page. */
-function wikiPageFor(pages: WikiCatalog["pages"], entity: AtlasEntitySummary) {
-  return (
+function wikiPageFor(
+  pages: WikiCatalog["pages"],
+  entity: AtlasEntitySummary,
+  snapshot: AtlasSnapshotRef,
+) {
+  const page =
     pages.find((p) => p.nodeId === entity.id) ??
-    (entity.kind === "repository" ? pages[0] : undefined) ??
-    null
-  );
+    (entity.kind === "repository" ? pages[0] : undefined);
+  // The page has its own commit: say where it sits against this map (CORE-176).
+  return page ? { ...page, note: wikiNote(page, snapshot) } : null;
 }

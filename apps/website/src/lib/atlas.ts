@@ -16,6 +16,7 @@ import type {
   AtlasAncestors,
   AtlasChangeClass,
   AtlasComparison,
+  AtlasTimeline,
   AtlasContribution,
   AtlasCrossLink,
   AtlasDetail,
@@ -185,6 +186,22 @@ export const atlasApi = {
       "compare",
       { from, to, class: request.class, within: request.within, ...paged(request) },
       { signal: request.signal },
+    ),
+  /**
+   * What a timeline (`timeline/<slug>`) changes, placed in the snapshot's
+   * capabilities: the capabilities it touches on the first page, then its
+   * files by path, optionally only those within one capability or area.
+   */
+  timeline: (
+    repo: AtlasRepo,
+    ref: string,
+    request: AtlasPageRequest & { within?: string | null } = {},
+  ) =>
+    get<AtlasTimeline>(
+      repo,
+      "timeline",
+      { ref, within: request.within, ...paged(request) },
+      request,
     ),
 };
 

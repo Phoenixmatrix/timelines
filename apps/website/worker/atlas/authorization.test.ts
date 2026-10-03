@@ -427,6 +427,8 @@ function surfaces(o: Open): string[] {
     `/atlas/catalogue?q=${enc(VAULT)}&${s}`,
     `/atlas/detail?${id("cap:does-not-exist")}`,
     `/atlas/overview?snapshot=made-up`,
+    `/atlas/timeline?ref=${enc("timeline/plan")}`,
+    `/atlas/timeline?ref=${enc("timeline/plan")}&${s}`,
     "/knowledge/status",
     "/knowledge/wiki",
     "/knowledge/overlays",

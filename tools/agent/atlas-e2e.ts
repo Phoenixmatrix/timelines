@@ -7,15 +7,20 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { chromium, expect as playwrightExpect, type Page } from "@playwright/test";
 import type { RepoDetail } from "../../apps/website/shared/api.ts";
-import type { AtlasAncestors, AtlasWorkspaceComposition } from "../../apps/website/shared/atlas.ts";
+import type {
+  AtlasAncestors,
+  AtlasTimeline,
+  AtlasWorkspaceComposition,
+} from "../../apps/website/shared/atlas.ts";
 import {
   ATLAS_FIXTURE_PACKAGE,
   atlasFixtureFiles,
   atlasFixtureSource,
+  atlasFixtureTimelineFiles,
   type AtlasFixtureVariant,
 } from "../../apps/website/shared/atlasFixture.ts";
 import type { HarnessContext, Persona } from "./types.ts";
@@ -1125,6 +1130,213 @@ export async function atlasRevocationScenario(t: AtlasE2E & { readerToken: strin
     throw error;
   } finally {
     await context.close().catch(() => {});
+    await browser.close();
+  }
+}
+
+/**
+ * CORE-176: a timeline in Atlas terms. A pushed `timeline/<slug>` bookmark
+ * whose overlay (stored as the overlay step would, without a build) is read
+ * on the Knowledge tab with `?tl=`: the repository's bookmark, overlay, main
+ * base and merge base; the capabilities it touches; each file placed where
+ * main's map puts it, a new one provisionally; a capability filter in the
+ * address; a source handoff on the timeline's commit that Back returns from.
+ * Then it ends: read-only, nothing asks for a computation. Then the map's
+ * snapshot expires: the link explains and keeps the route to the overlay.
+ */
+export async function atlasTimelineScenario(t: AtlasE2E) {
+  const browserTimeout = 15_000;
+  const expect = playwrightExpect.configure({ timeout: browserTimeout });
+  const { owner, name, api, head, dev, first } = await atlasFixtureRepo(t);
+  const base = `/${owner}/${name}/knowledge`;
+  const slug = `atlas-${randomUUID().slice(0, 8)}`;
+  const bookmark = `timeline/${slug}`;
+
+  // The timeline's work, pushed for real to its bookmark; main stays at `head`.
+  const dir = join(t.work, name);
+  for (const file of atlasFixtureTimelineFiles()) {
+    const path = join(dir, file.path);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, atlasFixtureSource(file).text);
+  }
+  await rm(join(dir, "misc/legacy.ts"));
+  await t.gm(["commit", "-m", `Timeline ${slug}: suggestions, notify, ranking`], "marco", dir);
+  await t.gm(["push", "-b", bookmark], "marco", dir);
+  const detail = await t.json<RepoDetail>(api, t.token);
+  const tip = detail.branches.find((b) => b.shortName === bookmark)?.oid;
+  assert(tip && tip !== head, "The timeline push must land on its own bookmark");
+  assert.equal(
+    detail.branches.find((b) => b.shortName === detail.defaultBranch)?.oid,
+    head,
+    "Main stays where it was",
+  );
+  await dev({ action: "overlay", ref: bookmark, commit: tip, base: head });
+  const expected = await t.json<AtlasTimeline>(
+    `${api}/atlas/timeline?ref=${encodeURIComponent(bookmark)}`,
+    t.token,
+  );
+  const search = expected.regions?.find((r) => r.id !== "group:unclassified");
+  assert(search, "The timeline touches search's capability");
+  const reached = search.imports.added[0]?.name;
+  assert(reached, "Search's new import reaches another capability");
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    baseURL: t.ctx.origin,
+    viewport: { width: 1280, height: 900 },
+  });
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+  const page = await context.newPage();
+  page.setDefaultTimeout(browserTimeout);
+  const seen: { method: string; url: URL }[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/api/")) seen.push({ method: request.method(), url });
+  });
+  const since = (mark: number) => seen.slice(mark);
+  /**
+   * Bounded Atlas reads of this repository only; never the overlay's whole list
+   * or the graph. The source handoff opens the file view, whose knowledge rail
+   * reads that one node (`/graph/node`): bounded, so allowed; the whole-graph
+   * routes (the list, `/graph/map`, `/graph/export`) are not.
+   */
+  const assertBounded = (mark: number, label: string) => {
+    for (const { url } of since(mark)) {
+      if (url.pathname.includes("/graph"))
+        assert(url.pathname.endsWith("/knowledge/graph/node"), `${label}: ${url.pathname}`);
+      assert(!url.pathname.endsWith("/knowledge/overlay"), `${label}: ${url.pathname}`);
+      assert(!url.pathname.includes("/knowledge/search"), `${label}: ${url.pathname}`);
+      if (url.pathname.includes("/atlas/"))
+        assert(url.pathname.startsWith(`${api}/atlas/`), `${label}: ${url.pathname}`);
+    }
+  };
+  const timelineReads = (mark: number) =>
+    since(mark).filter(({ url }) => url.pathname === `${api}/atlas/timeline`);
+
+  try {
+    await page.goto("/signin");
+    await page.getByRole("button", { name: /Continue as marco/i }).click();
+    await page.waitForURL((url) => url.pathname !== "/signin");
+
+    // 1. The timeline in the Selection pane: its repository's facts, each known.
+    let mark = seen.length;
+    await page.goto(`${base}?tl=${slug}`);
+    const panel = page.getByRole("region", { name: `Timeline ${slug}` });
+    await expect(panel.getByRole("heading", { name: bookmark, level: 2 })).toBeVisible();
+    const facts = panel.getByRole("region", { name: `${owner}/${name} on ${bookmark}` });
+    await expect(facts).toContainText("Up to date");
+    await expect(facts).toContainText(`Bookmark${tip.slice(0, 7)}`);
+    await expect(facts).toContainText(`Main base${head.slice(0, 7)} · the same main as this map`);
+    await expect(facts).toContainText(`Merge base${head.slice(0, 7)}`);
+    await expect(facts).toContainText(`This map${head.slice(0, 7)}`);
+
+    // 2. The capabilities it touches, and its files placed in them.
+    const touched = panel.getByRole("region", { name: "Capabilities it touches" });
+    await expect(touched.getByRole("button", { name: search.name, exact: true })).toBeVisible();
+    await expect(touched).toContainText(`1 new, 1 changed files; 1 placed here provisionally`);
+    await expect(touched).toContainText(`New imports reach ${reached}`);
+    await expect(touched.getByRole("button", { name: "Unclassified", exact: true })).toBeVisible();
+    const files = panel.getByRole("region", { name: "Files it changes" });
+    const suggest = files.getByRole("listitem").filter({ hasText: "search/suggest.ts" });
+    await expect(suggest).toContainText(`Provisionally in ${search.name}: 6 files of 6 in search/`);
+    await expect(files.getByRole("listitem").filter({ hasText: "notify/email.ts" })).toContainText(
+      "Unclassified: nothing in the map places its folder yet.",
+    );
+    await expect(files.getByRole("listitem").filter({ hasText: "search/rank.ts" })).toContainText(
+      `Now imports from ${reached}`,
+    );
+    await expect(panel).toContainText("Regrouping isn't computed for timelines");
+    await expect(panel).toContainText("Syntax changes cover all 4 changed files");
+    await page.waitForLoadState("networkidle");
+    assert(timelineReads(mark).length > 0, "The panel read GET /atlas/timeline");
+    assertBounded(mark, "timeline panel");
+    await page.screenshot({ path: join(t.ctx.artifacts, "browser-atlas-timeline.png") });
+
+    // 3. Its capability on the map, then only the timeline's changes there.
+    mark = seen.length;
+    await touched.getByRole("button", { name: search.name, exact: true }).click();
+    await page.waitForURL((url) => url.searchParams.get("select") === search.id);
+    await expect(
+      page.getByRole("heading", { name: search.name, exact: true, level: 2 }),
+    ).toBeVisible();
+    await panel
+      .getByRole("button", { name: `Only this timeline's changes in ${search.name}` })
+      .click();
+    await page.waitForURL((url) => url.searchParams.get("tlwithin") === search.id);
+    assert.equal(new URL(page.url()).searchParams.get("tl"), slug, "The scope stays");
+    await expect(panel).toContainText(`Only in ${search.name}: 2 files`);
+    await expect(files).not.toContainText("notify/email.ts");
+    await expect(suggest).toBeVisible();
+    const filtered = page.url();
+
+    // 4. Source on the timeline's commit, scoped to the timeline; Back returns.
+    await suggest.getByRole("link", { name: `Source at ${tip.slice(0, 7)}` }).click();
+    await page.waitForURL(
+      (url) =>
+        url.pathname === `/${owner}/${name}/blob/${tip}/search/suggest.ts` &&
+        url.searchParams.get("tl") === slug,
+    );
+    await expect(page.getByText("export function suggest() {}")).toBeVisible();
+    await page.goBack();
+    await page.waitForURL((url) => url.href === filtered);
+    await expect(panel).toContainText(`Only in ${search.name}: 2 files`);
+    assertBounded(mark, "filter and handoff");
+
+    // 5. The timeline lands: its overlay is kept read-only, and reading it
+    // asks for nothing (no write, no page writing offered).
+    await dev({ action: "end", ref: bookmark, reason: "landed" });
+    mark = seen.length;
+    await page.goto(`${base}?tl=${slug}`);
+    await expect(panel).toContainText("This timeline landed");
+    await expect(panel).toContainText("kept read-only: nothing here computes it again");
+    await expect(facts).toContainText("Ended");
+    await expect(files.getByRole("listitem")).toHaveCount(4);
+    await expect(panel.getByRole("region", { name: "Timeline wiki pages" })).toContainText(
+      "None were written before this timeline ended.",
+    );
+    await expect(panel.getByRole("button", { name: "Write pages now" })).toHaveCount(0);
+    await page.waitForLoadState("networkidle");
+    const writes = since(mark).filter(({ method }) => method !== "GET");
+    assert.deepEqual(
+      writes.map(({ method, url }) => `${method} ${url.pathname}`),
+      [],
+      "Reading an ended timeline writes nothing",
+    );
+    assertBounded(mark, "ended timeline");
+
+    // 6. The map's snapshot expires: the link explains, keeps the route to
+    // the overlay, and the current view reads it there.
+    await dev({ action: "publish", commit: head });
+    await dev({ action: "expire" });
+    await page.goto(`${base}?snapshot=${first.snapshotId}&tl=${slug}`);
+    await expect(
+      page.getByRole("heading", { name: "This link's Atlas snapshot has expired", level: 2 }),
+    ).toBeFocused();
+    await expect(page.getByText(`Timeline ${slug}'s overlay is kept apart`)).toBeVisible();
+    await page.getByRole("link", { name: "Open the current view" }).click();
+    await page.waitForURL(
+      (url) =>
+        url.searchParams.get("tl") === slug &&
+        url.searchParams.get("snapshot") !== first.snapshotId,
+    );
+    await expect(panel).toContainText("This timeline landed");
+    await expect(files.getByRole("listitem")).toHaveCount(4);
+
+    await context.tracing.stop();
+    t.record({ timeline: { repo: `${owner}/${name}`, bookmark, tip, base: head } });
+  } catch (error) {
+    await page
+      .screenshot({
+        path: join(t.ctx.artifacts, "browser-atlas-timeline-failure.png"),
+        fullPage: true,
+      })
+      .catch(() => {});
+    await context.tracing
+      .stop({ path: join(t.ctx.artifacts, "browser-atlas-timeline-failure.zip") })
+      .catch(() => {});
+    throw error;
+  } finally {
+    await context.close();
     await browser.close();
   }
 }
