@@ -24,6 +24,7 @@ import { db } from "./schema.ts";
 import { Timing } from "./timing.ts";
 import { buildRegistry } from "../registry/app.ts";
 import { tracker } from "./tracker/api.ts";
+import { timelines } from "./timelines/api.ts";
 import { assistant } from "./api/assistant.ts";
 import { search } from "./search/api.ts";
 
@@ -78,6 +79,7 @@ api.use(async (c, next) => {
 });
 api.route("/", accounts);
 api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
+api.route("/tracker/:owner/timelines", timelines);
 api.route("/", tracker);
 api.route("/repos/:owner/:name/knowledge", knowledge);
 api.route("/repos/:owner/:name/release-notes", releaseNotes);

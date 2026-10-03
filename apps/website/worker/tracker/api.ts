@@ -48,7 +48,7 @@ export async function accessible(db: D1Database, actor: Actor): Promise<TrackerO
     canAdmin: row.id === actor.id || row.role === "owner",
   }));
 }
-async function authorize(c: Context<AppEnv>, includeMembers = true): Promise<Access> {
+export async function authorize(c: Context<AppEnv>, includeMembers = true): Promise<Access> {
   const actor = c.get("actor");
   if (!actor) throw new TrackerError(401, "unauthenticated", "Sign in to access trackers.");
   const owner = await findAccountBySlug(c.env.DB, c.req.param("owner")!);

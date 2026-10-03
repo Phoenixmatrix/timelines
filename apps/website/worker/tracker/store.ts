@@ -78,7 +78,7 @@ const tables = {
   request: "requests",
   subscription: "subscriptions",
 } as const;
-function fail(code: string, message: string, status: TrackerError["status"] = 400): never {
+export function fail(code: string, message: string, status: TrackerError["status"] = 400): never {
   throw new TrackerError(status, code, message);
 }
 function object(value: unknown): Record<string, unknown> {
@@ -90,7 +90,7 @@ function keys(value: Record<string, unknown>, allowed: string[]) {
   for (const key of Object.keys(value))
     if (!allowed.includes(key)) fail("invalid_input", `Unknown field: ${key}.`);
 }
-function text(value: unknown, name: string, max = 200, empty = false): string {
+export function text(value: unknown, name: string, max = 200, empty = false): string {
   if (
     typeof value !== "string" ||
     value.length > max ||

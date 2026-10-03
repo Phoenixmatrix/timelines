@@ -617,6 +617,39 @@ own schema. Generate the new binding with `cf workers types`.
 These primitives support durable agent handoffs. An autonomous hours/days-long
 execution loop is not included.
 
+### Timelines
+
+A timeline (`TIMELINES-RESEARCH.md`) is an account-wide line of work with a
+bookmark `timeline/<slug>` in each repository it touches. Records and their
+events live in the tracker's Durable Object, beside the issues and leases that
+landing and abandoning will change with them, but outside the tracker's event
+log, so replicas that don't know them keep syncing. `shared/timelines.ts`
+defines the wire types.
+
+| Route                                                   | Contract                                                                                       |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `GET /api/tracker/:owner/timelines?status=`             | Every timeline, newest first                                                                   |
+| `POST /api/tracker/:owner/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: write each bookmark, then the record |
+| `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                 |
+| `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                     |
+| `POST /api/tracker/:owner/timelines/:slug/abandon`      | Record the abandon event with each bookmark's last commit, then delete the bookmarks           |
+
+- **Forking** needs tracker membership and write access to each repository,
+  which must belong to the tracker's account. Each bookmark starts at the
+  parent's bookmark in that repository, else the default branch's tip, unless
+  `{repo, commit}` names a commit. The Worker writes bookmarks with a
+  receive-pack request to Artifacts (ref commands and an empty pack); if any
+  repository refuses, or the record can't be made, the bookmarks already
+  written are removed.
+- **Merges** are found after each push (`waitUntil`), from the push log: a
+  commit on the pushed line's own first-parent chain whose other parent has
+  been the tip of main or another timeline bookmark. Each is one event,
+  listed in both sides' histories. Pushes also record the agents that worked
+  in a timeline.
+- **Abandoning** is for the timeline's accountable person, acting as
+  themselves, and the agent that started it. Abandoning again retries the
+  bookmarks still there and records nothing new.
+
 ## Release notes
 
 Release notes are code-update history, not deployment records. The default view

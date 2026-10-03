@@ -1,6 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
+import { TimelineStore, type NewTimeline, type PushActivity } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
+import type { TimelineStatus } from "../../shared/timelines.ts";
 
 export type TrackerReply<T> =
   | { ok: true; value: T }
@@ -13,9 +15,12 @@ export type TrackerReply<T> =
     };
 export class Tracker extends DurableObject<Env> {
   private store: TrackerStore;
+  private timelines: TimelineStore;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.store = new TrackerStore(ctx.storage.sql, (fn) => ctx.storage.transactionSync(fn));
+    const transaction = <T>(fn: () => T) => ctx.storage.transactionSync(fn);
+    this.store = new TrackerStore(ctx.storage.sql, transaction);
+    this.timelines = new TimelineStore(ctx.storage.sql, transaction);
   }
   private reply<T>(fn: () => T): TrackerReply<T> {
     try {
@@ -61,5 +66,29 @@ export class Tracker extends DurableObject<Env> {
   }
   mutate(access: Access, input: MutationRequest) {
     return this.reply(() => this.store.mutate(access, input));
+  }
+  listTimelines(status?: TimelineStatus) {
+    return this.reply(() => this.timelines.list(status));
+  }
+  timeline(slug: string, after: number, limit: number) {
+    return this.reply(() => this.timelines.detail(slug, after, limit));
+  }
+  prepareTimeline(slug: string, parent: string | null) {
+    return this.reply(() => this.timelines.prepare(slug, parent));
+  }
+  createTimeline(access: Access, input: NewTimeline) {
+    return this.reply(() => this.timelines.create(access, input));
+  }
+  updateTimeline(slug: string, data: Record<string, unknown>, expectedVersion?: unknown) {
+    return this.reply(() => this.timelines.update(slug, data, expectedVersion));
+  }
+  mayAbandonTimeline(access: Access, slug: string) {
+    return this.reply(() => this.timelines.mayAbandon(access, slug));
+  }
+  abandonTimeline(access: Access, slug: string, lastCommits: Record<string, string | null>) {
+    return this.reply(() => this.timelines.abandon(access, slug, lastCommits));
+  }
+  recordTimelinePush(activity: PushActivity) {
+    return this.reply(() => this.timelines.recordPush(activity));
   }
 }

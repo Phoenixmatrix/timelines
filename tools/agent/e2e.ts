@@ -379,6 +379,58 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ issue: fixtures.tracker.ready, status: completed.issue.status, evidenceSynced: true });
   });
 
+  await scenario("timeline-fork-bookmark-and-abandon-permissions", async () => {
+    // A writer forks a timeline from main: the bookmark exists in Artifacts at
+    // main's tip. Only its accountable person may abandon it, which deletes the
+    // bookmark and keeps the record and its events.
+    const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
+    const slug = `e2e-${randomUUID().slice(0, 8)}`;
+    const bookmark = `timeline/${slug}`;
+    const jun = fixtures.tokens.jun;
+    await request(timelines, fixtures.tokens.sam, "POST", { slug, repos: [fullName] }, [403]);
+    const before = await json<RepoDetail>(api, ownerToken);
+    const created = await json<{
+      timeline: { id: string; slug: string; forkPoint: { commits: Record<string, string> } };
+      bookmarks: { ok: boolean }[];
+    }>(timelines, jun, "POST", { slug, repos: [fullName] }, [201]);
+    assert(
+      created.bookmarks.every((b) => b.ok),
+      "Every bookmark must be created",
+    );
+    const forked = Object.values(created.timeline.forkPoint.commits)[0];
+    const main = before.branches.find((b) => b.shortName === before.defaultBranch)?.oid;
+    assert.equal(forked, main, "A fork from main starts at the default branch's tip");
+    await poll(
+      () => json<RepoDetail>(api, ownerToken),
+      (detail) => detail.branches.some((b) => b.shortName === bookmark && b.oid === forked),
+      "the timeline bookmark",
+    );
+    await request(timelines, jun, "POST", { slug, repos: [fullName] }, [409]);
+    await request(`${timelines}/${slug}/abandon`, ownerToken, "POST", undefined, [403]);
+    const abandoned = await json<{ timeline: { status: string }; bookmarks: { ok: boolean }[] }>(
+      `${timelines}/${slug}/abandon`,
+      jun,
+      "POST",
+    );
+    assert.equal(abandoned.timeline.status, "abandoned");
+    assert(abandoned.bookmarks.length === 1 && abandoned.bookmarks[0]!.ok, "Bookmark deleted");
+    await poll(
+      () => json<RepoDetail>(api, ownerToken),
+      (detail) => !detail.branches.some((b) => b.shortName === bookmark),
+      "the bookmark's deletion",
+    );
+    const detail = await json<{ events: { kind: string; lastCommits?: Record<string, string> }[] }>(
+      `${timelines}/${slug}`,
+      ownerToken,
+    );
+    assert.deepEqual(
+      detail.events.map((e) => e.kind),
+      ["fork", "abandon"],
+    );
+    assert.equal(Object.values(detail.events[1]!.lastCommits ?? {})[0], forked);
+    record({ timeline: slug, forked, abandoned: true });
+  });
+
   await scenario("agent-capabilities-self-reporting-and-claim-identity", async () => {
     const name = `capabilities-${randomUUID().slice(0, 8)}`;
     const skillDir = join(work, "capability-skills");

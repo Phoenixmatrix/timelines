@@ -37,6 +37,8 @@ export interface LoggedUpdate {
   ref: string;
   old: string | null;
   new: string | null;
+  /** The commits it made newly reachable, when they were read. */
+  commits?: PackCommit[];
 }
 
 export interface NewCommits {
@@ -177,6 +179,7 @@ export async function recordRefs(
       });
       continue;
     }
+    update.commits = found.commits;
     if (update.old) {
       // Fast-forward when a new commit has the old tip as a parent; with
       // history cut short, it can't be told.

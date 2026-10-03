@@ -42,6 +42,12 @@ export interface TrackerDatabase {
   events: { cursor: Generated<number>; data: string };
   issue_events: { issue_id: string; cursor: number };
   tracker_migrations: { name: string };
+  /** Timelines (timelines.ts), whole as JSON like the entities above. */
+  timelines: EntityRow;
+  /** Timeline events, kept forever; `seq` orders them across timelines. */
+  timeline_events: { seq: Generated<number>; id: string; data: string };
+  /** The timelines each event belongs to: a merge between two is listed by both. */
+  timeline_event_index: { timeline_id: string; seq: number };
 }
 
 /** The storage surface the store needs: `ctx.storage.sql`, or a test double. */
