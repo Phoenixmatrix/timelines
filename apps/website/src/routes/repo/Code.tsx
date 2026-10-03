@@ -1,17 +1,24 @@
-import { FileIcon, FolderSimpleIcon, LinkSimpleIcon, CubeIcon } from "@phosphor-icons/react";
-import { Suspense } from "react";
+import {
+  CubeIcon,
+  FileIcon,
+  FolderSimpleIcon,
+  LinkSimpleIcon,
+  UsersThreeIcon,
+} from "@phosphor-icons/react";
+import { Suspense, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Await, Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { CommitSummary, RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
 import { CopyField, link } from "../../components/ui.tsx";
+import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
-import { Attribution, CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
+import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
 import { About } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
@@ -46,16 +53,31 @@ const ICONS = {
   gitlink: CubeIcon,
 } as const;
 
+/**
+ * One line per entry, GitHub-style: name, last commit message, and time in a
+ * fixed column so every row lines up. The authors view adds who made that
+ * commit; phones keep the name and time.
+ */
+const ROW = {
+  compact: "grid-cols-[minmax(0,1fr)_auto] sm:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_6.5rem]",
+  authors:
+    "grid-cols-[minmax(0,1fr)_minmax(0,7rem)_auto] sm:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_minmax(0,1.25fr)_6.5rem]",
+} as const;
+
 function EntryRow({
   repo,
   refName,
   entry,
   change,
+  authors,
+  loading,
 }: {
   repo: RepoDetail;
   refName: string;
   entry: TreeEntry;
   change?: { latest: CommitSummary; count: number };
+  authors: boolean;
+  loading: boolean;
 }) {
   const Icon = ICONS[entry.type];
   const to =
@@ -72,61 +94,105 @@ function EntryRow({
       <span className="truncate">{entry.name}</span>
     </>
   );
+  const history = commitsUrl(repo.owner.slug, repo.name, refName, entry.path);
+  const subject = change ? firstLine(change.latest.message) : "";
   return (
-    <li className="grid gap-x-4 px-4 py-2 sm:grid-cols-[minmax(10rem,1fr)_minmax(0,2fr)]">
+    <li
+      className={`grid min-h-10 items-center gap-x-4 px-4 hover:bg-raised max-sm:min-h-11 ${authors ? ROW.authors : ROW.compact}`}
+    >
       {entry.type === "gitlink" ? (
-        <span className="flex min-h-8 min-w-0 items-center gap-3 text-ink-muted" title="Submodule">
+        <span className="flex min-w-0 items-center gap-3 text-ink-muted" title="Submodule">
           {label}
         </span>
       ) : (
         <PrefetchLink
           to={to}
-          className="flex min-h-8 min-w-0 items-center gap-3 text-ink no-underline transition-colors hover:underline"
+          className="flex min-w-0 items-center gap-3 text-ink no-underline hover:underline"
         >
           {label}
         </PrefetchLink>
       )}
-      <div className="grid min-h-11 min-w-0 grid-cols-[minmax(0,1fr)_auto] content-center items-baseline gap-x-3 pl-7 sm:pl-0">
+      <span className="min-w-0 truncate text-body-sm max-sm:hidden">
         {change ? (
-          <>
-            <Link
-              to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
-              className="min-w-0 truncate text-body-sm text-ink-muted no-underline hover:underline sm:text-right"
-              title={firstLine(change.latest.message)}
-            >
-              {firstLine(change.latest.message)}
-            </Link>
-            <Link
-              to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
-              className="text-micro whitespace-nowrap text-ink-faint no-underline hover:underline"
-              title={fullDate(change.latest.authoredAt)}
-            >
-              {timeAgo(change.latest.authoredAt)}
-            </Link>
-            <div
-              className="col-span-2 min-w-0 truncate sm:col-span-1 sm:text-right"
-              title={change.latest.message}
-            >
-              <Attribution commit={change.latest} />
-            </div>
-          </>
-        ) : (
           <Link
-            to={commitsUrl(repo.owner.slug, repo.name, refName, entry.path)}
-            className="col-span-2 text-body-sm text-ink-faint no-underline hover:underline sm:text-right"
+            to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
+            className="text-ink-muted no-underline hover:text-ink hover:underline"
+            title={`${subject} · ${change.latest.authorName}`}
           >
-            View history
+            {subject}
+          </Link>
+        ) : (
+          !loading && (
+            <Link to={history} className="text-ink-faint no-underline hover:underline">
+              View history
+            </Link>
+          )
+        )}
+      </span>
+      {authors && (
+        <span className="min-w-0 truncate text-body-sm text-ink-faint">
+          {change && <AuthorCell commit={change.latest} />}
+        </span>
+      )}
+      <span className="text-right text-body-sm whitespace-nowrap text-ink-faint tabular-nums">
+        {change && (
+          <Link
+            to={history}
+            className="text-ink-faint no-underline hover:text-ink hover:underline"
+            title={`${fullDate(change.latest.authoredAt)} · history of ${entry.name}`}
+          >
+            <time dateTime={new Date(change.latest.authoredAt * 1000).toISOString()}>
+              {timeAgo(change.latest.authoredAt)}
+            </time>
           </Link>
         )}
-      </div>
+      </span>
     </li>
   );
+}
+
+/** The author, then "+2" for co-authors; every name is in the tooltip. */
+function AuthorCell({ commit }: { commit: CommitSummary }) {
+  const others = coAuthors(commit.message).filter(
+    (person) => person.email.toLowerCase() !== commit.authorEmail.toLowerCase(),
+  );
+  const everyone = [commit.authorName, ...others.map((person) => person.name)].join(", ");
+  return (
+    <span title={others.length ? everyone : commit.authorEmail}>
+      <bdi>{commit.authorName}</bdi>
+      {others.length > 0 && <span> +{others.length}</span>}
+    </span>
+  );
+}
+
+const AUTHORS_KEY = "gitmatrix:files:authors";
+
+/** The authors view is a per-browser preference; it works without storage. */
+function useAuthorsView() {
+  const [on, setOn] = useState(() => {
+    try {
+      return localStorage.getItem(AUTHORS_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggle = () => {
+    setOn(!on);
+    try {
+      if (on) localStorage.removeItem(AUTHORS_KEY);
+      else localStorage.setItem(AUTHORS_KEY, "1");
+    } catch {
+      // The view still switches for this page.
+    }
+  };
+  return [on, toggle] as const;
 }
 
 function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
   const state = useHistory(repo, tree.commit.oid, tree.path, true);
   const history = state.history;
   const latest = history?.commits[0] ?? (!tree.path ? tree.commit : null);
+  const [authors, toggleAuthors] = useAuthorsView();
   return (
     <section className="overflow-hidden rounded-pane bg-pane" aria-label="Repository files">
       <div className="flex flex-wrap items-center gap-3 border-b border-line-soft px-4 py-3">
@@ -135,6 +201,16 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
         ) : (
           <span className="mr-auto text-body-sm text-ink-faint">Folder history</span>
         )}
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink max-sm:h-11 max-sm:w-11 max-sm:px-0"
+          aria-pressed={authors}
+          onClick={toggleAuthors}
+          title={authors ? "Hide who last changed each file" : "Show who last changed each file"}
+        >
+          <UsersThreeIcon aria-hidden />
+          <span className="max-sm:sr-only">Authors</span>
+        </button>
         <Link
           className="mk-btn mk-btn--sm no-underline"
           to={commitsUrl(repo.owner.slug, repo.name, tree.commit.oid, tree.path)}
@@ -152,7 +228,7 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
                 tree.ref,
                 tree.path.split("/").slice(0, -1).join("/"),
               )}
-              className="flex h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised"
+              className="flex min-h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised max-sm:min-h-11"
               aria-label="Parent folder"
             >
               <FolderSimpleIcon className="size-4" aria-hidden />
@@ -166,6 +242,8 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
             repo={repo}
             refName={tree.ref}
             entry={entry}
+            authors={authors}
+            loading={state.loading}
             change={
               history && Object.hasOwn(history.entries, entry.path)
                 ? history.entries[entry.path]
