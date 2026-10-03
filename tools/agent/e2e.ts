@@ -24,6 +24,7 @@ import {
   atlasAccessibleScenario,
   atlasBrowserScenario,
   atlasRevocationScenario,
+  atlasWorkspaceScenario,
 } from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
@@ -2049,6 +2050,20 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       work,
       token: ownerToken,
       readerToken: fixtures.tokens.sam,
+      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
+      json,
+      record,
+    });
+  });
+
+  await scenario("browser-atlas-workspace-composites-and-address", async () => {
+    // CORE-184: the workspace Atlas finds a capability spanning two
+    // repositories, cites sources at each one's immutable commit, keeps its
+    // view in the address and never reads a whole graph.
+    await atlasWorkspaceScenario({
+      ctx,
+      work,
+      token: ownerToken,
       gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
       json,
       record,

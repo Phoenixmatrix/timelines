@@ -5,6 +5,7 @@ import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { atlas } from "./api.ts";
+import { workspaceAtlas } from "./workspace.ts";
 import {
   beginRepoProjection,
   groupRepoCapabilities,
@@ -41,10 +42,18 @@ function setup() {
     await next();
   });
   app.route("/api/repos/:owner/:name/atlas", atlas);
+  app.route("/api/accounts/:owner/atlas", workspaceAtlas);
   return {
     sqlite,
     db: env.DB,
     call: (path: string) => app.request(`/api/repos/ann/shop/atlas/${path}`, {}, env),
+    /** The same, across a workspace of this one repository (ids namespaced `r1/`). */
+    across: (path: string) =>
+      app.request(
+        `/api/accounts/ann/atlas/${path}${path.includes("?") ? "&" : "?"}repos=shop`,
+        {},
+        env,
+      ),
   };
 }
 
@@ -97,7 +106,7 @@ async function build(db: D1Database, commit: string) {
 
 describe("the relationship lens", () => {
   test("capabilities relate through the imports that cross them, with the links behind each", async () => {
-    const { sqlite, call } = setup();
+    const { sqlite, call, across } = setup();
     // A published snapshot with two capabilities and one import crossing them.
     const data = (capability: string) => JSON.stringify({ membership: { capability } });
     sqlite.exec(`
@@ -184,6 +193,34 @@ describe("the relationship lens", () => {
     ).json()) as { items: unknown[] };
     expect(back.items).toHaveLength(1);
     expect((await call("contributing?id=cap%3Abilling&direction=out")).status).toBe(400);
+
+    // Across a workspace: the same links, by namespaced id, at the same snapshot.
+    const ws = (await (
+      await across("contributing?id=r1%2Fcap%3Abilling&other=r1%2Fcap%3Adeploy&direction=out")
+    ).json()) as {
+      items: { src: string; dst: string; srcPath: string }[];
+      counts: { knownTotal: number };
+      snapshot: { repos: { id: string; snapshot: { vector: { commit: string }[] } }[] };
+    };
+    expect(ws.items).toEqual([
+      {
+        src: "r1/file:src/charge.ts",
+        dst: "r1/file:ops/deploy.ts",
+        srcPath: "src/charge.ts",
+        dstPath: "ops/deploy.ts",
+      },
+    ]);
+    expect(ws.counts.knownTotal).toBe(1);
+    expect(ws.snapshot.repos.map((r) => [r.id, r.snapshot.vector[0]!.commit])).toEqual([
+      ["r1", "c1"],
+    ]);
+    // The other end must be in the same repository, named the same way.
+    expect(
+      (await across("contributing?id=r1%2Fcap%3Abilling&other=cap%3Adeploy&direction=out")).status,
+    ).toBe(400);
+    expect(
+      (await across("contributing?id=r9%2Fcap%3Abilling&other=r9%2Fcap%3Adeploy")).status,
+    ).toBe(404);
   });
 
   test("capability edges are versioned like graph edges", async () => {

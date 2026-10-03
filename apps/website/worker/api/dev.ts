@@ -6,6 +6,7 @@ import { newArtifactsName } from "../artifacts.ts";
 import {
   expireAtlasPriors,
   publishAtlasFixture,
+  registerFixturePackage,
   writeAtlasFixtureGraph,
 } from "../atlas/fixture.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
@@ -179,15 +180,18 @@ dev.post("/seed", async (c) => {
  * An Atlas for a seeded repository without a Knowledge build or a model
  * (worker/atlas/fixture.ts): `publish` writes the fixture graph at `commit`
  * (the commit its files were pushed at) and publishes a snapshot; `expire`
- * expires every prior snapshot, as retention does.
+ * expires every prior snapshot, as retention does. `publishes` first records
+ * in the registry that the repository publishes that npm package, and the
+ * snapshot records it, so a workspace can resolve imports of it (CORE-167).
  */
 dev.post("/atlas", async (c) => {
   const body = await readJson<{
     repo: string;
     action: "publish" | "expire";
     commit?: string;
-    variant?: "base" | "merged";
+    variant?: "base" | "merged" | "consumer";
     unavailable?: "disabled" | "budget_exhausted" | "provider_error" | "error";
+    publishes?: string;
   }>(c);
   const [owner, name] = (body.repo ?? "").split("/");
   const account = owner ? await findAccountBySlug(c.env.DB, owner) : null;
@@ -203,9 +207,14 @@ dev.post("/atlas", async (c) => {
   if (body.action === "expire") return c.json(await expireAtlasPriors(c.env.DB, repo.id));
   if (body.action !== "publish" || !body.commit || !/^[0-9a-f]{40}$/.test(body.commit))
     return fail(c, 400, "Send {repo, action: publish, commit} or {repo, action: expire}.");
+  if (body.publishes !== undefined && !/^[a-z0-9][a-z0-9._-]{0,100}$/.test(body.publishes))
+    return fail(c, 400, "publishes is an unscoped npm package name.");
+  if (body.publishes)
+    await registerFixturePackage(c.env.REGISTRY_DB, account!, repo.id, body.publishes);
   await writeAtlasFixtureGraph(c.env.DB, repo.id, repo.name, body.commit, body.variant ?? "base");
   const published = await publishAtlasFixture(c.env, repo.id, body.commit, {
     unavailable: body.unavailable ?? "disabled",
+    packages: true,
   });
   return c.json(published, 201);
 });

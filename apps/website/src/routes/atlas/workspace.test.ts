@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vite-plus/test";
 import type {
+  AtlasCompositeCapability,
   AtlasEntitySummary,
   AtlasRegion,
   AtlasWorkspaceComposition,
@@ -11,8 +12,12 @@ import { ApiError } from "../../lib/api.ts";
 import type { AtlasWorkspace } from "../../lib/atlas.ts";
 import {
   buildWorkspaceTerritory,
+  compositeSummary,
   coverageOf,
+  parseLinkState,
   parseSelection,
+  rescopeSearch,
+  tiesOf,
   toggleSelection,
   WorkspaceSession,
   type WorkspaceClient,
@@ -289,6 +294,8 @@ function scriptedClient() {
     workspace: AtlasWorkspace;
     snapshot?: string;
     signal?: AbortSignal;
+    id?: string;
+    cursor?: string | null;
   }[] = [];
   const client: WorkspaceClient = {
     overview(workspace, request) {
@@ -529,6 +536,202 @@ describe("composition coverage", () => {
       coverage: [expect.objectContaining({ repoId: "r2" })],
       composites: null,
       resolved: null,
+      items: [],
+      next: null,
+      more: null,
     });
+  });
+});
+
+// ---- capabilities spanning repositories (CORE-184) ---------------------------------
+
+const composite = (
+  id: string,
+  members: AtlasRegion[],
+  files = members.reduce((n, m) => n + (m.counts.files ?? 0), 0),
+): AtlasCompositeCapability => ({
+  id,
+  kind: "composite-capability",
+  name: `Shared ${id}`,
+  nameSource: "concepts",
+  anchor: members[0]!.id,
+  repos: [...new Set(members.map((m) => m.repoId!))],
+  members,
+  counts: {
+    files,
+    capabilities: members.length,
+    repos: new Set(members.map((m) => m.repoId)).size,
+  },
+  concepts: [{ id: "concept:billing", name: "Billing", members: members.length }],
+  rationale: [],
+  composition: { producer: "atlas/compose", version: 1, evidence: ["resolved-dependencies"] },
+});
+const billing = composite("xcap:1", [cap("r1", "cap:billing", 1), cap("r2", "cap:forms", 1)]);
+const theming = composite("xcap:2", [cap("r2", "cap:theme", 5), cap("r3", "cap:guides", 0)]);
+const compositionPage = (
+  repos: AtlasWorkspaceRepo[],
+  items: AtlasCompositeCapability[],
+  next: string | null = null,
+  knownTotal = items.length,
+): AtlasWorkspaceComposition => ({
+  scope: "ws:o:hash",
+  owner: { id: "o", slug: "acme" },
+  snapshot: { id: "ws1.tag.2.2.2", repos },
+  items,
+  counts: { loaded: items.length, knownTotal, unknownTotal: false },
+  next,
+  coverage: repos.map((r) => ({
+    repoId: r.id,
+    capabilities: { composed: 2, total: 2 },
+    packages: "recorded",
+    imports: { considered: 1, truncated: false },
+  })),
+  resolved: 1,
+  inference: "none",
+});
+
+describe("capabilities spanning repositories", () => {
+  test("a composite counts each file once and is drawn as a tie, never a region", () => {
+    expect(compositeSummary(billing)).toEqual({
+      id: "xcap:1",
+      kind: "composite-capability",
+      parentId: null,
+      name: "Shared xcap:1",
+      path: null,
+      summary: "",
+      counts: { files: 20 },
+      structural: false,
+    });
+    // The map draws the members where they are; the composite adds a line, not a cell.
+    const map = layout(["api", "web", "docs"], [A, B, C]);
+    expect(map.byId.has("xcap:1")).toBe(false);
+    expect(tiesOf([billing, theming], "r2/cap:forms")).toEqual([
+      { id: "xcap:1", cells: ["r1/cap:billing", "r2/cap:forms"], active: true },
+      { id: "xcap:2", cells: ["r2/cap:theme", "r3/cap:guides"], active: false },
+    ]);
+    expect(tiesOf([billing, theming], "xcap:2").map((t) => t.active)).toEqual([false, true]);
+  });
+
+  test("composites are paged at the overview's composite, and revocation drops those it touched", async () => {
+    const { client, overviews, compositions, requests } = scriptedClient();
+    const view = track({ owner: "acme", repos: ["api", "web", "docs"] }, client);
+    void view.session.open();
+    overviews[0]!.resolve(overview([A, B, C], "ws1.tag.2.2.2"));
+    await flush();
+    compositions[0]!.resolve(compositionPage([A, B, C], [billing], "cursor-2", 2));
+    await flush();
+    expect(view.last().composition).toMatchObject({ items: [billing], next: "cursor-2" });
+
+    void view.session.moreComposites();
+    expect(view.last().composition).toMatchObject({ more: "loading" });
+    compositions[1]!.resolve(compositionPage([A, B, C], [theming]));
+    await flush();
+    const asked = requests.filter((r) => r.route === "composition");
+    expect(asked.map((r) => [r.snapshot, (r as { cursor?: string }).cursor ?? null])).toEqual([
+      ["ws1.tag.2.2.2", null],
+      ["ws1.tag.2.2.2", "cursor-2"],
+    ]);
+    expect(view.last().composition).toMatchObject({
+      items: [billing, theming],
+      next: null,
+      more: null,
+    });
+
+    // Losing "api" drops the composite made with it; the other one stays.
+    view.session.revoke(["api"]);
+    expect(view.last().composition).toMatchObject({ items: [theming], composites: null });
+  });
+
+  test("a link to a composite reads just it, once, and an unknown one is missing", async () => {
+    const { client, overviews, compositions, requests } = scriptedClient();
+    const view = track({ owner: "acme", repos: ["api", "web", "docs"] }, client);
+    void view.session.open();
+    overviews[0]!.resolve(overview([A, B, C], "ws1.tag.2.2.2"));
+    await flush();
+    // Before the first page answers, a cold link names the second composite.
+    const found = view.session.composite("xcap:2");
+    await flush();
+    const one = requests.at(-1) as { route: string; id?: string; snapshot?: string };
+    expect(one).toMatchObject({ route: "composition", id: "xcap:2", snapshot: "ws1.tag.2.2.2" });
+    compositions[1]!.resolve(compositionPage([A, B, C], [theming]));
+    expect(await found).toEqual(theming);
+    // Once the page is read, what's on it needs no request.
+    compositions[0]!.resolve(compositionPage([A, B, C], [billing]));
+    await flush();
+    const before = requests.length;
+    expect(await view.session.composite("xcap:1")).toEqual(billing);
+    expect(requests).toHaveLength(before);
+    // An id the scope doesn't compose is missing, not an error.
+    const missing = view.session.composite("xcap:9");
+    await flush();
+    compositions[2]!.reject(
+      new ApiError(404, "That isn't in this Atlas snapshot.", "entity_unknown"),
+    );
+    expect(await missing).toBeNull();
+  });
+});
+
+describe("the workspace address", () => {
+  test("a new selection keeps only the map-or-outline choice", () => {
+    expect(
+      rescopeSearch(
+        "repos=api&select=r1%2Fcap%3Aauth&snapshot=ws1.a.2&lens=in&q=auth&kind=file&view=outline&links=related&tl=main",
+        ["api", "web"],
+      ),
+    ).toBe("repos=api,web&view=outline&tl=main");
+    expect(rescopeSearch("repos=api&select=x", [])).toBe("");
+  });
+
+  test("cross-repository link state defaults to resolved dependencies", () => {
+    expect(parseLinkState(null)).toBe("resolved");
+    expect(parseLinkState("related")).toBe("related");
+    expect(parseLinkState("unresolved")).toBe("unresolved");
+    expect(parseLinkState("everything")).toBe("resolved");
+  });
+
+  test("a link pins the overview's composite; an expired one explains instead of switching", async () => {
+    const { client, overviews, requests } = scriptedClient();
+    const view = track({ owner: "acme", repos: ["api"] }, client);
+    void view.session.open("ws1.tag.1");
+    expect(requests[0]).toMatchObject({ route: "overview", snapshot: "ws1.tag.1" });
+    overviews[0]!.reject(
+      new ApiError(410, "This Atlas snapshot has expired.", "snapshot_expired", {
+        error: "This Atlas snapshot has expired.",
+        code: "snapshot_expired",
+        current: { id: "ws1.tag.4", seq: null },
+        expired: { at: "2026-10-01T00:00:00.000Z", reason: "count" },
+      }),
+    );
+    await flush();
+    expect(view.last()).toMatchObject({
+      status: "gone",
+      overview: null,
+      gone: {
+        code: "snapshot_expired",
+        current: { id: "ws1.tag.4", seq: null },
+        expired: { reason: "count" },
+      },
+    });
+    // Opening the current one is explicit, and reads it unpinned.
+    void view.session.open();
+    expect(requests.at(-1)).toMatchObject({ route: "overview" });
+    expect((requests.at(-1) as { snapshot?: string }).snapshot).toBeUndefined();
+    overviews[1]!.resolve(overview([A], "ws1.tag.4"));
+    await flush();
+    expect(view.last()).toMatchObject({ status: "ready", gone: null });
+  });
+
+  test("a region is opened once however often a link or the outline asks", async () => {
+    const { client, overviews, requests } = scriptedClient();
+    const view = track({ owner: "acme", repos: ["api"] }, client);
+    void view.session.open();
+    overviews[0]!.resolve(overview([A]));
+    await flush();
+    view.session.ensure("r1/cap:auth");
+    view.session.ensure("r1/cap:auth");
+    expect(requests.filter((r) => r.route === "children r1/cap:auth")).toHaveLength(1);
+    // A retry is explicit.
+    view.session.expand("r1/cap:auth");
+    expect(requests.filter((r) => r.route === "children r1/cap:auth")).toHaveLength(2);
   });
 });

@@ -11,8 +11,13 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { chromium, expect as playwrightExpect, type Page } from "@playwright/test";
 import type { RepoDetail } from "../../apps/website/shared/api.ts";
-import type { AtlasAncestors } from "../../apps/website/shared/atlas.ts";
-import { atlasFixtureFiles, atlasFixtureSource } from "../../apps/website/shared/atlasFixture.ts";
+import type { AtlasAncestors, AtlasWorkspaceComposition } from "../../apps/website/shared/atlas.ts";
+import {
+  ATLAS_FIXTURE_PACKAGE,
+  atlasFixtureFiles,
+  atlasFixtureSource,
+  type AtlasFixtureVariant,
+} from "../../apps/website/shared/atlasFixture.ts";
 import type { HarnessContext, Persona } from "./types.ts";
 
 export interface AtlasE2E {
@@ -31,13 +36,21 @@ export interface AtlasE2E {
 }
 
 /** A pushed repository with a published fixture Atlas: what the browser scenarios share. */
-export async function atlasFixtureRepo(t: AtlasE2E) {
+export async function atlasFixtureRepo(
+  t: AtlasE2E,
+  {
+    prefix = "atlas",
+    variant = "base" as AtlasFixtureVariant,
+    /** An npm package the registry should say this repository publishes. */
+    publishes = undefined as string | undefined,
+  } = {},
+) {
   const owner = "orbit";
-  const name = `atlas-${randomUUID().slice(0, 8)}`;
+  const name = `${prefix}-${randomUUID().slice(0, 8)}`;
   await t.gm(["repo", "create", name, "--owner", owner, "--description", "Atlas E2E fixture"]);
   const dir = join(t.work, name);
   await t.gm(["clone", `${owner}/${name}`, dir]);
-  for (const file of atlasFixtureFiles("base")) {
+  for (const file of atlasFixtureFiles(variant)) {
     const path = join(dir, file.path);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, atlasFixtureSource(file).text);
@@ -51,7 +64,12 @@ export async function atlasFixtureRepo(t: AtlasE2E) {
   const secret = t.ctx.env.GITMATRIX_AGENT_SECRET ?? "";
   const dev = <T>(body: Record<string, unknown>) =>
     t.json<T>("/api/dev/atlas", secret, "POST", { repo: `${owner}/${name}`, ...body }, [200, 201]);
-  const first = await dev<{ snapshotId: string; seq: number }>({ action: "publish", commit: head });
+  const first = await dev<{ snapshotId: string; seq: number }>({
+    action: "publish",
+    commit: head,
+    ...(variant === "base" ? {} : { variant }),
+    ...(publishes ? { publishes } : {}),
+  });
   return { owner, name, api, head, dev, first };
 }
 
@@ -721,6 +739,286 @@ export async function atlasAccessibleScenario(t: AtlasE2E) {
     throw error;
   } finally {
     await desk.close().catch(() => {});
+    await browser.close();
+  }
+}
+
+/**
+ * CORE-184: the workspace Atlas (/:owner/-/atlas?repos=) in a real browser.
+ * Two pushed repositories, one publishing the npm package the other's billing
+ * imports, compose into capabilities spanning both. From the workspace page a
+ * person finds one, reads it, drills through each member to a file and cites
+ * the two source locations at each repository's immutable commit; the
+ * selection, lens and snapshot are in the address, so Back/Forward and a
+ * copied link come back to the same place, and an expired link explains
+ * before offering the current view. Every request the page makes is captured:
+ * only bounded /api/accounts/:owner/atlas pages, never a whole graph.
+ */
+export async function atlasWorkspaceScenario(t: AtlasE2E) {
+  const browserTimeout = 15_000;
+  const expect = playwrightExpect.configure({ timeout: browserTimeout });
+  const ledger = await atlasFixtureRepo(t, { prefix: "ledger", publishes: ATLAS_FIXTURE_PACKAGE });
+  const shop = await atlasFixtureRepo(t, { prefix: "shop", variant: "consumer" });
+  const owner = shop.owner;
+  const repos = `${shop.name},${ledger.name}`;
+  const workspaceApi = `/api/accounts/${owner}/atlas`;
+  const composition = await t.json<AtlasWorkspaceComposition>(
+    `${workspaceApi}/composition?repos=${repos}`,
+    t.token,
+  );
+  const repoIds = new Map(composition.snapshot.repos.map((r) => [r.name, r.id]));
+  const composite = composition.items.find(
+    (x) => x.repos.includes(repoIds.get(shop.name)!) && x.repos.includes(repoIds.get(ledger.name)!),
+  );
+  assert(composite, "The fixture must compose a capability spanning both repositories");
+  const member = (name: string) => composite.members.find((m) => m.repoId === repoIds.get(name))!;
+  const shopMember = member(shop.name);
+  const ledgerMember = member(ledger.name);
+  assert.equal(
+    composite.counts.files,
+    (shopMember.counts.files ?? 0) + (ledgerMember.counts.files ?? 0),
+    "A composite counts each file once",
+  );
+  const base = `/${owner}/-/atlas`;
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    baseURL: t.ctx.origin,
+    viewport: { width: 1280, height: 900 },
+  });
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+  const page = await context.newPage();
+  page.setDefaultTimeout(browserTimeout);
+  const seen: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/api/")) seen.push(url);
+  });
+  /** Browsing reads only bounded workspace pages: no graph, search or repository Atlas. */
+  const assertBounded = (mark: number, label: string) => {
+    for (const url of seen.slice(mark)) {
+      assert(!url.pathname.includes("/graph"), `${label}: ${url.pathname}`);
+      assert(!url.pathname.includes("/knowledge/search"), `${label}: ${url.pathname}`);
+      assert(url.pathname !== "/api/search", `${label}: ${url.pathname}`);
+      if (url.pathname.includes("/atlas/"))
+        assert(url.pathname.startsWith(`${workspaceApi}/`), `${label}: ${url.pathname}`);
+      const limit = url.searchParams.get("limit");
+      assert(limit === null || Number(limit) <= 100, `${label}: unbounded ${url.href}`);
+    }
+  };
+  const heading = (p: Page, text: string) =>
+    p.getByRole("heading", { name: text, exact: true, level: 2 });
+  const sourceLink = (p: Page, repo: string, commit: string) =>
+    p.locator(`a[href^="/${owner}/${repo}/blob/${commit}/"]`).first();
+  const citations: string[] = [];
+
+  try {
+    await page.goto("/signin");
+    await page.getByRole("button", { name: /Continue as marco/i }).click();
+    await page.waitForURL((url) => url.pathname !== "/signin");
+
+    // 1. The workspace, chosen explicitly: both repositories, each at its own commit.
+    let mark = seen.length;
+    await page.goto(`${base}?repos=${repos}`);
+    const tree = page.getByRole("tree", { name: `Outline of ${shop.name}, ${ledger.name}` });
+    const compositeRow = tree.getByRole("treeitem", {
+      name: new RegExp(`^${escape(composite.name)}.*Capability across repositories`),
+    });
+    await expect(compositeRow.first()).toBeVisible();
+    // Coverage names each repository's own indexed commit: no common head.
+    const coverage = page.getByRole("region", { name: "Coverage" });
+    await expect(coverage.getByText(shop.head.slice(0, 7), { exact: true })).toBeVisible();
+    await expect(coverage.getByText(ledger.head.slice(0, 7), { exact: true })).toBeVisible();
+
+    // 2. Find the capability spanning both and read it.
+    await compositeRow.first().click();
+    await page.waitForURL((url) => url.searchParams.get("select") === composite.id);
+    const snapshot = new URL(page.url()).searchParams.get("snapshot");
+    assert(snapshot?.startsWith("ws1."), "Selecting pins the composite snapshot");
+    await expect(heading(page, composite.name)).toBeVisible();
+    await expect(page.getByText(/each file counted once/)).toBeVisible();
+    const members = page.getByRole("list", { name: `Members of ${composite.name}` });
+    await expect(members.getByRole("button")).toHaveCount(composite.members.length);
+    // Why it's one: the importing file in shop, at shop's indexed commit.
+    await expect(sourceLink(page, shop.name, shop.head)).toBeVisible();
+
+    // 3. Drill through each member to a file, and cite it at its own commit.
+    for (const [m, repo] of [
+      [shopMember, shop],
+      [ledgerMember, ledger],
+    ] as const) {
+      await members
+        .getByRole("button", { name: new RegExp(`^${escape(m.name)}.*${escape(repo.name)}`) })
+        .click();
+      await page.waitForURL((url) => url.searchParams.get("select") === m.id);
+      await expect(heading(page, m.name)).toBeVisible();
+      const inside = page.getByRole("list", { name: `Inside ${m.name}` });
+      // Areas open a level further; files are the first thing a source lives in.
+      let entry = inside.getByRole("button").first();
+      await expect(entry).toBeVisible();
+      for (let depth = 0; depth < 3; depth++) {
+        const label = ((await entry.locator("span").first().textContent()) ?? "").trim();
+        await entry.click();
+        await expect(heading(page, label)).toBeVisible();
+        if (label.endsWith(".ts")) break;
+        entry = page
+          .getByRole("list", { name: `Inside ${label}` })
+          .getByRole("button")
+          .first();
+        await expect(entry).toBeVisible();
+      }
+      const source = sourceLink(page, repo.name, repo.head);
+      await expect(source).toBeVisible();
+      citations.push((await source.getAttribute("href")) ?? "");
+      if (m === shopMember) {
+        // Back to the composite for the other member.
+        await page.goto(`${base}?repos=${repos}&select=${encodeURIComponent(composite.id)}`);
+        await expect(heading(page, composite.name)).toBeVisible();
+      }
+    }
+    assert.equal(citations.length, 2);
+    assert(citations[0]!.includes(`/${shop.name}/blob/${shop.head}/`), citations[0]);
+    assert(citations[1]!.includes(`/${ledger.name}/blob/${ledger.head}/`), citations[1]);
+    t.record({ workspaceCitations: citations });
+
+    // 4. The member's lens and cross-repository links are in the address too.
+    await page.goto(`${base}?repos=${repos}&select=${encodeURIComponent(composite.id)}`);
+    await expect(heading(page, composite.name)).toBeVisible();
+    await members
+      .getByRole("button", {
+        name: new RegExp(`^${escape(shopMember.name)}.*${escape(shop.name)}`),
+      })
+      .click();
+    await page.waitForURL((url) => url.searchParams.get("select") === shopMember.id);
+    await expect(heading(page, shopMember.name)).toBeVisible();
+    await page.getByRole("button", { name: "Used by", exact: true }).click();
+    await page.waitForURL((url) => url.searchParams.get("lens") === "in");
+    const crossRepo = page.getByRole("region", { name: "Across repositories" });
+    await expect(crossRepo.getByText(/Depends on/).first()).toBeVisible();
+    await crossRepo.getByRole("button", { name: "Related", exact: true }).click();
+    await page.waitForURL((url) => url.searchParams.get("links") === "related");
+
+    // 5. Back and Forward restore each state, and move focus to what they show.
+    await page.goBack();
+    await page.waitForURL((url) => !url.searchParams.has("links"));
+    await page.goBack();
+    await page.waitForURL((url) => !url.searchParams.has("lens"));
+    await page.goBack();
+    await page.waitForURL((url) => url.searchParams.get("select") === composite.id);
+    await expect(heading(page, composite.name)).toBeFocused();
+    await page.goForward();
+    await page.waitForURL((url) => url.searchParams.get("select") === shopMember.id);
+    await expect(heading(page, shopMember.name)).toBeFocused();
+    await page.goForward();
+    await page.waitForURL((url) => url.searchParams.get("lens") === "in");
+    await expect(page.getByRole("button", { name: "Used by", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await page.goForward();
+    await page.waitForURL((url) => url.searchParams.get("links") === "related");
+
+    // 6. A copied link opens the same state in a fresh page.
+    const copied = page.url();
+    const fresh = await context.newPage();
+    fresh.setDefaultTimeout(browserTimeout);
+    await fresh.goto(copied);
+    await expect(heading(fresh, shopMember.name)).toBeFocused();
+    await expect(fresh.getByRole("button", { name: "Used by", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect(
+      fresh.getByRole("region", { name: "Across repositories" }).getByRole("button", {
+        name: "Related",
+        exact: true,
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await fresh.close();
+
+    // 7. The lookup reads the workspace catalogue, labelled by repository.
+    const box = page.getByRole("searchbox", { name: "Find a capability, file or symbol" });
+    await box.fill("ledger.ts");
+    const matches = page.getByRole("list", { name: "Matches" });
+    for (const repo of [shop, ledger])
+      await expect(
+        matches.getByRole("button", {
+          name: new RegExp(`^ledger\\.ts\\s*File.*${escape(repo.name)}`),
+        }),
+      ).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    assertBounded(mark, "workspace browsing");
+    const routes = new Set(
+      seen
+        .slice(mark)
+        .filter((u) => u.pathname.startsWith(`${workspaceApi}/`))
+        .map((u) => u.pathname.slice(workspaceApi.length + 1)),
+    );
+    t.record({ workspaceRoutes: [...routes].sort() });
+
+    // 8. A link to a composite snapshot that has since expired explains, and
+    // only an explicit action opens the current view.
+    const pinned = `${base}?repos=${repos}&select=${encodeURIComponent(composite.id)}&snapshot=${snapshot}`;
+    await shop.dev({ action: "publish", commit: shop.head, variant: "consumer" });
+    await shop.dev({ action: "expire" });
+    mark = seen.length;
+    await page.goto(pinned);
+    await expect(heading(page, "This link's Atlas snapshot has expired")).toBeFocused();
+    await page.getByRole("link", { name: "Open the current view" }).click();
+    await page.waitForURL(
+      (url) =>
+        url.searchParams.get("snapshot") !== snapshot &&
+        url.searchParams.get("select") === composite.id,
+    );
+    await expect(heading(page, composite.name)).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    assertBounded(mark, "an expired link");
+    await page.screenshot({ path: join(t.ctx.artifacts, "browser-atlas-workspace-desktop.png") });
+
+    // 9. A phone: the outline by default, nothing scrolling sideways.
+    const phone = await browser.newContext({
+      baseURL: t.ctx.origin,
+      viewport: { width: 390, height: 844 },
+      isMobile: true,
+      hasTouch: true,
+    });
+    try {
+      const mobile = await phone.newPage();
+      mobile.setDefaultTimeout(browserTimeout);
+      await mobile.goto("/signin");
+      await mobile.getByRole("button", { name: /Continue as marco/i }).tap();
+      await mobile.waitForURL((url) => url.pathname !== "/signin");
+      await mobile.goto(`${base}?repos=${repos}&select=${encodeURIComponent(composite.id)}`);
+      await expect(heading(mobile, composite.name)).toBeFocused();
+      assert.equal(await mobile.locator("canvas").count(), 0, "Phones open on the outline");
+      await expect(mobile.getByRole("tree", { name: /^Outline of / })).toBeVisible();
+      const overflow = await mobile.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      assert(overflow <= 0, `The phone workspace scrolls sideways by ${overflow}px`);
+      await mobile.screenshot({
+        path: join(t.ctx.artifacts, "browser-atlas-workspace-phone.png"),
+        fullPage: true,
+      });
+    } finally {
+      await phone.close();
+    }
+
+    await context.tracing.stop();
+    t.record({ workspace: repos, composite: composite.id, files: composite.counts.files });
+  } catch (error) {
+    await page
+      .screenshot({
+        path: join(t.ctx.artifacts, "browser-atlas-workspace-failure.png"),
+        fullPage: true,
+      })
+      .catch(() => {});
+    await context.tracing
+      .stop({ path: join(t.ctx.artifacts, "browser-atlas-workspace-failure.zip") })
+      .catch(() => {});
+    throw error;
+  } finally {
+    await context.close();
     await browser.close();
   }
 }

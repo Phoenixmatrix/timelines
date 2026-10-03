@@ -48,6 +48,19 @@ export interface MapBand {
 
 const NO_BANDS: readonly MapBand[] = [];
 
+/**
+ * Regions drawn as one thing across bands: in a workspace, the repository
+ * capabilities of a capability spanning repositories (CORE-184), joined by a
+ * line. `active` draws it, and its members, in the selection colour.
+ */
+export interface MapTie {
+  id: string;
+  cells: readonly string[];
+  active: boolean;
+}
+
+const NO_TIES: readonly MapTie[] = [];
+
 const fileLabel = (n: number) => `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
 
 export function AtlasTerritory({
@@ -57,6 +70,7 @@ export function AtlasTerritory({
   onSelect,
   label,
   bands = NO_BANDS,
+  ties = NO_TIES,
   origin,
 }: {
   territory: Territory;
@@ -68,6 +82,8 @@ export function AtlasTerritory({
   label: string;
   /** Frames drawn behind the cells, e.g. one per repository in a workspace. */
   bands?: readonly MapBand[];
+  /** Regions joined across bands, drawn over them. */
+  ties?: readonly MapTie[];
   /** Where a cell comes from, for its hover card (e.g. its repository). */
   origin?: (cell: TerritoryCell) => string | null;
 }) {
@@ -292,7 +308,50 @@ export function AtlasTerritory({
         if (text) ctx.fillText(text, x + 10, y + 10 + size + 6);
       }
     }
-  }, [frame, territory, selected, loading, bands]);
+
+    // Ties over the cells: arcs between the members' centres, left to right,
+    // bowed upward so a tie never runs through a region it doesn't join.
+    for (const tie of [...ties].sort((a, b) => Number(a.active) - Number(b.active))) {
+      const members = tie.cells
+        .map((id) => territory.byId.get(id))
+        .filter((c): c is TerritoryCell => !!c && visibleParent(c))
+        .sort((a, b) => a.x - b.x || a.y - b.y);
+      if (members.length < 2) continue;
+      ctx.lineWidth = tie.active ? 2.5 : 1.5;
+      ctx.strokeStyle = tie.active ? color.signal : color.muted;
+      ctx.setLineDash(tie.active ? [] : [6, 5]);
+      ctx.beginPath();
+      members.forEach((c, i) => {
+        const cx = (c.x + c.w / 2) * k + tx;
+        const cy = (c.y + c.h / 2) * k + ty;
+        if (i === 0) {
+          ctx.moveTo(cx, cy);
+          return;
+        }
+        const p = members[i - 1]!;
+        const px = (p.x + p.w / 2) * k + tx;
+        const py = (p.y + p.h / 2) * k + ty;
+        const lift = Math.min(160, Math.hypot(cx - px, cy - py) * 0.3);
+        ctx.quadraticCurveTo((px + cx) / 2, Math.min(py, cy) - lift, cx, cy);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (const c of members) {
+        const cx = (c.x + c.w / 2) * k + tx;
+        const cy = (c.y + c.h / 2) * k + ty;
+        ctx.beginPath();
+        ctx.arc(cx, cy, tie.active ? 5 : 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = tie.active ? color.signal : color.muted;
+        ctx.fill();
+        if (!tie.active) continue;
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = color.signal;
+        ctx.beginPath();
+        ctx.roundRect(c.x * k + tx - 1, c.y * k + ty - 1, c.w * k + 2, c.h * k + 2, 10);
+        ctx.stroke();
+      }
+    }
+  }, [frame, territory, selected, loading, bands, ties]);
 
   const local = (event: { clientX: number; clientY: number }) => {
     const rect = canvas.current!.getBoundingClientRect();

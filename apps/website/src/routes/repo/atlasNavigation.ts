@@ -8,8 +8,9 @@
 //   whole graph, never unrelated regions.
 // - CatalogueLookup: find-as-you-type over the snapshot's materialized
 //   catalogue (`/atlas/catalogue`, a D1 lookup). It never reaches a model,
-//   an embedding index or AI Search, and only ever this one repository; code
-//   and wiki search is a separate, explicit handoff to the palette.
+//   an embedding index or AI Search, and only ever the scope on screen (a
+//   repository, or a workspace's selected repositories, CORE-184); code and
+//   wiki search is a separate, explicit handoff to the palette.
 //
 // Both drop late answers: only the newest request's answer is ever shown.
 
@@ -47,6 +48,8 @@ export type Focus =
   | { state: "restart"; id: string; error: AtlasError }
   | { state: "error"; id: string; message: string };
 
+type Ancestry = Pick<AtlasAncestors, "entity" | "ancestors">;
+
 /** The ids to open so `entity` is drawn: its ancestors below the root, then itself if it holds others. */
 export function pathToOpen(entity: AtlasEntitySummary, ancestors: AtlasEntitySummary[]): string[] {
   const path = ancestors.filter((a) => a.parentId !== null).map((a) => a.id);
@@ -57,12 +60,12 @@ export function pathToOpen(entity: AtlasEntitySummary, ancestors: AtlasEntitySum
 export class FocusResolver {
   #generation = 0;
   #controller: AbortController | null = null;
-  readonly #fetchAncestors: (id: string, signal: AbortSignal) => Promise<AtlasAncestors>;
+  readonly #fetchAncestors: (id: string, signal: AbortSignal) => Promise<Ancestry>;
   readonly #open: (id: string) => void;
   readonly #onChange: (focus: Focus) => void;
 
   constructor(
-    fetchAncestors: (id: string, signal: AbortSignal) => Promise<AtlasAncestors>,
+    fetchAncestors: (id: string, signal: AbortSignal) => Promise<Ancestry>,
     /** Load a region's children (a no-op when they're loaded or loading). */
     open: (id: string) => void,
     onChange: (focus: Focus) => void,
@@ -149,7 +152,7 @@ export type LookupFetch = (
   kind: string | null,
   cursor: string | null,
   signal: AbortSignal,
-) => Promise<AtlasPage<AtlasEntitySummary>>;
+) => Promise<Pick<AtlasPage<AtlasEntitySummary>, "items" | "counts" | "next">>;
 
 export const LOOKUP_DEBOUNCE_MS = 200;
 export const LOOKUP_PAGE = 20;

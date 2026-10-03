@@ -21,6 +21,7 @@ import {
   repoScope,
   type EdgeCursor,
 } from "./projection.ts";
+import { recordPublishedPackages } from "./publishers.ts";
 import { enforceRetention } from "./retention.ts";
 
 const title = (slug: string) => slug.charAt(0).toUpperCase() + slug.slice(1);
@@ -114,14 +115,20 @@ export async function writeAtlasFixtureGraph(
  * the superseded snapshot's retention.
  */
 export async function publishAtlasFixture(
-  env: Pick<Env, "DB">,
+  env: Pick<Env, "DB"> & Partial<Pick<Env, "REGISTRY_DB">>,
   repoId: string,
   commit: string,
-  { unavailable = "disabled" as AtlasUnavailableReason } = {},
+  {
+    unavailable = "disabled" as AtlasUnavailableReason,
+    /** Record what the registry says the repository publishes, as the build's `atlas-packages` step. */
+    packages = false,
+  } = {},
 ): Promise<{ snapshotId: string; seq: number }> {
   const d1 = env.DB;
   const buildId = `fixture-${commit.slice(0, 12)}`;
   const { snapshotId, seq } = await beginRepoProjection(d1, repoId, [{ repoId, commit, buildId }]);
+  if (packages && env.REGISTRY_DB)
+    await recordPublishedPackages(env as Pick<Env, "DB" | "REGISTRY_DB">, repoId, snapshotId);
   await groupRepoCapabilities(d1, repoId, snapshotId, seq);
   await describeRepoCapabilities(
     env as Env,
@@ -142,4 +149,51 @@ export async function publishAtlasFixture(
 /** Expire every prior snapshot of the repository now, as retention does when over its count. */
 export async function expireAtlasPriors(d1: D1Database, repoId: string) {
   return enforceRetention(d1, [repoScope(repoId)], { policy: { maxPrior: 0 } });
+}
+
+/**
+ * Say in the registry that `repoId` publishes the npm package `name`, as its
+ * first CI publish would: a package in the owner's npm feed (created public
+ * if the owner has none) with the repository as a source. Idempotent.
+ */
+export async function registerFixturePackage(
+  registry: D1Database,
+  owner: { id: string; slug: string },
+  repoId: string,
+  name: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const feedId = `atlas-fixture-npm-${owner.id}`;
+  await registry
+    .prepare(
+      `INSERT INTO repositories (id, key, format, owner_id, kind, visibility, created_at, updated_at)
+       VALUES (?, ?, 'npm', ?, 'local', 'public', ?, ?) ON CONFLICT DO NOTHING`,
+    )
+    .bind(feedId, owner.slug, owner.id, now, now)
+    .run();
+  const feed = await registry
+    .prepare(`SELECT id FROM repositories WHERE format = 'npm' AND key = ?`)
+    .bind(owner.slug)
+    .first<{ id: string }>();
+  if (!feed) throw new Error("The fixture feed couldn't be created.");
+  const normalized = name.toLowerCase();
+  await registry
+    .prepare(
+      `INSERT INTO packages (id, repo_id, name, normalized_name, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    )
+    .bind(`atlas-fixture-${feed.id}-${normalized}`, feed.id, name, normalized, now, now)
+    .run();
+  const pkg = await registry
+    .prepare(`SELECT id FROM packages WHERE repo_id = ? AND normalized_name = ?`)
+    .bind(feed.id, normalized)
+    .first<{ id: string }>();
+  if (!pkg) throw new Error("The fixture package couldn't be created.");
+  await registry
+    .prepare(
+      `INSERT INTO package_sources (package_id, git_repo_id, granted_by, granted_at)
+       VALUES (?, ?, 'atlas-fixture', ?) ON CONFLICT DO NOTHING`,
+    )
+    .bind(pkg.id, repoId, now)
+    .run();
 }

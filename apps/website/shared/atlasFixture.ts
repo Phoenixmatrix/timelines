@@ -8,6 +8,11 @@
 // evidence and stays unclassified. The "merged" variant ties operations into
 // search, so a later build retires operations' capability (merged, with
 // search as its successor).
+//
+// Two repositories make a workspace (CORE-184): one publishes the npm package
+// ATLAS_FIXTURE_PACKAGE (the dev endpoint records that in the registry), and
+// the "consumer" variant's billing imports it, so its billing capabilities
+// compose with the publisher's into capabilities spanning both repositories.
 
 export interface AtlasFixtureFile {
   path: string;
@@ -21,7 +26,10 @@ export interface AtlasFixtureFile {
   packages?: string[];
 }
 
-export type AtlasFixtureVariant = "base" | "merged";
+export type AtlasFixtureVariant = "base" | "merged" | "consumer";
+
+/** The npm package a fixture repository publishes, and the "consumer" variant imports. */
+export const ATLAS_FIXTURE_PACKAGE = "atlas-fixture-ledger";
 
 const all = (paths: string[], concept: string): AtlasFixtureFile[] =>
   paths.map((path) => ({
@@ -71,6 +79,10 @@ export function atlasFixtureFiles(variant: AtlasFixtureVariant = "base"): AtlasF
   byPath.get("billing/ledger/ledger.ts")!.symbols = ["post", "reverse"];
   byPath.get("search/query.ts")!.symbols = ["parseQuery"];
   byPath.get("search/index.ts")!.packages = ["hono"];
+  if (variant === "consumer")
+    // Billing here uses the ledger another repository publishes.
+    for (const path of ["billing/ledger/ledger.ts", "billing/invoices/invoice.ts"])
+      byPath.get(path)!.packages = [ATLAS_FIXTURE_PACKAGE];
   if (variant === "merged")
     // Operations now runs through search everywhere: one capability.
     for (const o of ops) for (const s of search) byPath.get(o)!.imports.push(s);

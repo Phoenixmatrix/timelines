@@ -9,20 +9,34 @@
 // The map is each repository's own territory in its own column (see
 // workspace.ts for why columns). Changing the scope remounts the view, so
 // nothing read for the previous scope stays on screen or arrives late.
+//
+// Since CORE-184 it works like a repository's Knowledge tab (repo/Atlas.tsx),
+// with the same parts over the workspace API: the inspector, relationship lens
+// and evidence (AtlasInspector through an AtlasReader), the outline, the
+// lookup, and the address as its state (select, composite snapshot, lens,
+// lookup, view; copied links and Back/Forward come back to the same place,
+// an expired link explains and offers the current view). Capabilities spanning
+// repositories (CORE-167) are drawn as lines joining their members' regions,
+// listed first in the outline, and inspected with their cross-repository
+// evidence at immutable commits. Every read is a bounded page under
+// /api/accounts/:owner/atlas, re-authorized by the server each time.
 
-import { ArrowClockwiseIcon, CaretRightIcon, XIcon } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState } from "react";
+import { ArrowClockwiseIcon, XIcon } from "@phosphor-icons/react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
   useLoaderData,
   useLocation,
   useNavigate,
+  useNavigationType,
+  useSearchParams,
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
 import type { AccountPage, RepoSummary } from "../../../shared/api.ts";
 import {
   ATLAS_WORKSPACE_MAX_REPOS,
+  type AtlasCompositeCapability,
   type AtlasCompositionCoverage,
   type AtlasEntitySummary,
   type AtlasRegion,
@@ -31,31 +45,50 @@ import type { Snapshot as TrackerSnapshot } from "../../../shared/tracker.ts";
 import { Page } from "../../components/AppShell.tsx";
 import { SelectField, VisibilityChip, link } from "../../components/ui.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
-import { atlasWorkspaceApi } from "../../lib/atlas.ts";
+import { atlasWorkspaceApi, workspaceReader, type AtlasWorkspace } from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
+import { useMediaQuery } from "../../lib/useMediaQuery.ts";
 import { useViewer } from "../../lib/session.ts";
+import { AtlasInspector } from "../repo/AtlasInspector.tsx";
+import { AtlasOutline, KIND_LABEL } from "../repo/AtlasOutline.tsx";
+import { AtlasContents, AtlasGone, AtlasLookup } from "../repo/AtlasPanels.tsx";
+import { FocusResolver, OPENS, type Focus } from "../repo/atlasNavigation.ts";
+import { scopeNotices } from "../repo/atlasStates.ts";
+import {
+  atlasHref,
+  readAtlasUrl,
+  writeAtlasUrl,
+  type AtlasUrlState,
+  type AtlasView,
+} from "../repo/atlasUrl.ts";
 import { AtlasTerritory, type MapBand } from "../repo/AtlasTerritory.tsx";
-import type { Load, TerritoryCell } from "../repo/territory.ts";
+import type { TerritoryCell } from "../repo/territory.ts";
 import {
   BAND_HEADER,
   buildWorkspaceTerritory,
+  compositeSummary,
   coverageOf,
   initialWorkspaceState,
+  isComposite,
+  parseLinkState,
   parseSelection,
   repoOf,
+  rescopeSearch,
   scopeKey,
+  tiesOf,
   toggleSelection,
   WorkspaceSession,
   type CompositionView,
   type Coverage,
   type WorkspaceState,
 } from "./workspace.ts";
+import { CompositeInspector, CrossLinks } from "./WorkspaceInspector.tsx";
 
 export async function workspaceAtlasLoader({ request, params }: LoaderFunctionArgs) {
   return load<AccountPage>(`/accounts/${encodeURIComponent(params.owner ?? "")}`, request);
 }
 
-/** The account's repositories only change with the account: the selection is the view's. */
+/** The account's repositories only change with the account: the selection and view state are the view's. */
 export function workspaceAtlasShouldRevalidate({
   currentParams,
   nextParams,
@@ -65,11 +98,6 @@ export function workspaceAtlasShouldRevalidate({
   return currentParams.owner !== nextParams.owner || formMethod ? defaultShouldRevalidate : false;
 }
 
-/** Regions and entities that hold others, and so can be opened. */
-const OPENS = new Set(["capability", "area", "group", "component", "directory", "repository"]);
-
-const files = (n: number | undefined) =>
-  n === undefined ? "" : `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
 const short = (sha: string) => sha.slice(0, 7);
 
 export function WorkspaceAtlas() {
@@ -80,14 +108,9 @@ export function WorkspaceAtlas() {
     () => parseSelection(new URLSearchParams(location.search).get("repos"), account.slug),
     [location.search, account.slug],
   );
-  const select = (next: string[]) => {
-    const params = new URLSearchParams(location.search);
-    params.delete("repos");
-    const rest = params.toString();
-    // Commas stay readable in the URL: names never contain them.
-    const repos = next.length ? `repos=${next.map(encodeURIComponent).join(",")}` : "";
-    void navigate({ search: [repos, rest].filter(Boolean).join("&") });
-  };
+  // A new selection is a new scope: what was selected, pinned or looked up stays behind.
+  const select = (next: string[]) =>
+    void navigate({ search: rescopeSearch(location.search, next) });
 
   return (
     <Page full>
@@ -335,6 +358,16 @@ function TrackerSeed({
 
 // ---- the view of one scope -----------------------------------------------------------
 
+/** Below this, the outline is the default and the inspector reads in line. */
+const NARROW = "(max-width: 1023.98px)";
+
+type CompositeFocus =
+  | { state: "none" }
+  | { state: "resolving"; id: string }
+  | { state: "ready"; id: string; composite: AtlasCompositeCapability }
+  | { state: "missing"; id: string }
+  | { state: "error"; id: string; message: string };
+
 function WorkspaceView({
   owner,
   selection,
@@ -344,26 +377,73 @@ function WorkspaceView({
   selection: string[];
   accountRepos: RepoSummary[];
 }) {
+  const base = `/${encodeURIComponent(owner)}/-/atlas`;
+  const [params, setParams] = useSearchParams();
+  const url = readAtlasUrl(params);
+  const links = parseLinkState(params.get("links"));
+  const navigationType = useNavigationType();
+  const navigate = (
+    patch: Partial<AtlasUrlState>,
+    replace = false,
+    extra: Record<string, string | null> = {},
+  ) =>
+    setParams(
+      (current) => {
+        const next = writeAtlasUrl(current, patch);
+        for (const [key, value] of Object.entries(extra))
+          if (value === null) next.delete(key);
+          else next.set(key, value);
+        return next;
+      },
+      { replace, preventScrollReset: true },
+    );
+
+  // ---- the session: one per scope, opened at the address's composite ----------------
+  const selectionKey = selection.join(",");
+  const workspace = useMemo<AtlasWorkspace>(
+    () => ({ owner, repos: selectionKey.split(",") }),
+    [owner, selectionKey],
+  );
+  const reader = useMemo(() => workspaceReader(workspace), [workspace]);
   const [state, setState] = useState<WorkspaceState>(initialWorkspaceState);
   const [session, setSession] = useState<WorkspaceSession | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
-  const selectionKey = selection.join(",");
+  /** The composite last asked for: the address's, or null for the current one. */
+  const asked = useRef<string | null>(url.snapshot);
   useEffect(() => {
-    const opened = new WorkspaceSession(
-      { owner, repos: selectionKey.split(",") },
-      atlasWorkspaceApi,
-      setState,
-    );
+    const opened = new WorkspaceSession(workspace, atlasWorkspaceApi, setState);
     setSession(opened);
-    void opened.open();
+    void opened.open(asked.current);
     return () => opened.dispose();
-  }, [owner, selectionKey]);
+  }, [workspace]);
+  // A link to another composite (e.g. "Open the current view") reads it.
+  useEffect(() => {
+    if (!session || !url.snapshot) return;
+    if (url.snapshot === asked.current || url.snapshot === state.overview?.snapshot.id) return;
+    asked.current = url.snapshot;
+    void session.open(url.snapshot);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url.snapshot, session]);
+  const openCurrent = () => {
+    asked.current = null;
+    void session?.open();
+    navigate({ snapshot: null }, true);
+  };
 
   const overview = state.overview;
+  const snapshotId = overview?.snapshot.id ?? "";
   const coverage = useMemo(
     () => coverageOf(selection, overview?.snapshot.repos ?? [], state.revoked),
     [selection, overview, state.revoked],
   );
+  const nameOf = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const r of overview?.snapshot.repos ?? []) names.set(r.id, r.name);
+    return names;
+  }, [overview]);
+  const repoSnapshot = (repoId: string | undefined) =>
+    overview?.snapshot.repos.find((r) => r.id === repoId)?.snapshot ?? null;
+
+  // ---- regions opened, on the map and in the outline ---------------------------------
   const expanded = useMemo(() => {
     const ready = new Map<string, AtlasEntitySummary[]>();
     for (const [id, l] of state.loads) if (l.state === "ready") ready.set(id, l.items);
@@ -373,15 +453,12 @@ function WorkspaceView({
     () => buildWorkspaceTerritory(coverage, overview?.regions ?? [], expanded),
     [coverage, overview, expanded],
   );
+  const territoryRef = useRef(territory);
+  territoryRef.current = territory;
   const loading = useMemo(
     () => new Set([...state.loads].filter(([, l]) => l.state === "loading").map(([id]) => id)),
     [state.loads],
   );
-  const nameOf = useMemo(() => {
-    const names = new Map<string, string>();
-    for (const r of overview?.snapshot.repos ?? []) names.set(r.id, r.name);
-    return names;
-  }, [overview]);
   const bands = useMemo(
     () =>
       territory.bands.map((band): MapBand => ({
@@ -396,6 +473,173 @@ function WorkspaceView({
       })),
     [territory],
   );
+  const composites = state.composition?.status === "ready" ? state.composition.items : NONE;
+
+  // ---- the selection, from the address ---------------------------------------------
+  const [focus, setFocus] = useState<Focus>({ state: "none" });
+  const [compositeFocus, setCompositeFocus] = useState<CompositeFocus>({ state: "none" });
+  const [focusOnShow, setFocusOnShow] = useState<string | null>(null);
+  const resolver = useMemo(
+    () =>
+      session && snapshotId
+        ? new FocusResolver(
+            (id, signal) => reader.ancestors(id, { snapshot: snapshotId, signal }),
+            (id) => session.ensure(id),
+            setFocus,
+          )
+        : null,
+    [session, snapshotId, reader],
+  );
+  useEffect(() => () => resolver?.dispose(), [resolver]);
+  const narrowNow = useRef(false);
+  useEffect(() => {
+    if (!resolver || !session) return;
+    setFocusOnShow(navigationType === "POP" || narrowNow.current ? url.select : null);
+    if (isComposite(url.select)) {
+      void resolver.focus(null);
+      const id = url.select;
+      const controller = new AbortController();
+      setCompositeFocus({ state: "resolving", id });
+      session.composite(id, controller.signal).then(
+        (composite) => {
+          if (controller.signal.aborted) return;
+          setCompositeFocus(
+            composite ? { state: "ready", id, composite } : { state: "missing", id },
+          );
+        },
+        (error: unknown) => {
+          if (controller.signal.aborted) return;
+          setCompositeFocus({
+            state: "error",
+            id,
+            message: error instanceof Error ? error.message : "Couldn't open it.",
+          });
+        },
+      );
+      return () => controller.abort();
+    }
+    setCompositeFocus({ state: "none" });
+    void resolver.focus(
+      url.select,
+      url.select ? territoryRef.current.byId.get(url.select)?.entity : undefined,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url.select, resolver]);
+  // A pinned read that can't continue: the session re-checks access or offers the current view.
+  useEffect(() => {
+    if (focus.state === "restart") session?.failed(focus.error);
+  }, [focus, session]);
+
+  const select = (entity: AtlasEntitySummary) => {
+    if (entity.id === url.select) return;
+    navigate({ select: entity.id, snapshot: snapshotId || null });
+  };
+  const selected = focus.state === "ready" ? focus.entity : null;
+  const mapFocus = useMemo(() => {
+    if (focus.state !== "ready") return null;
+    if (territory.byId.has(focus.id)) return focus.id;
+    for (const a of [...(focus.ancestors ?? [])].reverse())
+      if (territory.byId.has(a.id)) return a.id;
+    return null;
+  }, [focus, territory]);
+  const ties = useMemo(() => tiesOf(composites, url.select), [composites, url.select]);
+
+  // ---- the outline's top level: composites, the overview's regions, then the catalogue -
+  const [catalogue, setCatalogue] = useState<{
+    snapshot: string;
+    items: AtlasRegion[];
+    next: string | null;
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
+  const shownCatalogue =
+    catalogue?.snapshot === snapshotId
+      ? catalogue
+      : {
+          snapshot: snapshotId,
+          items: overview?.catalogue.items ?? [],
+          next: overview?.catalogue.next ?? null,
+          loading: false,
+          error: null,
+        };
+  const moreRegions = () => {
+    const now = shownCatalogue;
+    if (!now.next || now.loading) return;
+    setCatalogue({ ...now, loading: true, error: null });
+    atlasWorkspaceApi
+      .regions(workspace, { snapshot: snapshotId, cursor: now.next, limit: 50 })
+      .then(
+        (page) =>
+          setCatalogue((c) =>
+            c?.snapshot === now.snapshot
+              ? {
+                  ...c,
+                  items: [...c.items, ...page.items],
+                  next: page.next,
+                  loading: false,
+                  error: null,
+                }
+              : c,
+          ),
+        (error: unknown) => {
+          session?.failed(error);
+          setCatalogue((c) =>
+            c?.snapshot === now.snapshot
+              ? {
+                  ...c,
+                  loading: false,
+                  error: error instanceof Error ? error.message : "Couldn't load more regions.",
+                }
+              : c,
+          );
+        },
+      );
+  };
+  const readable = useMemo(
+    () => new Set((overview?.snapshot.repos ?? []).map((r) => r.id)),
+    [overview],
+  );
+  const roots = useMemo(
+    () => [
+      ...composites.map(compositeSummary),
+      ...(overview?.regions ?? []),
+      ...shownCatalogue.items.filter((r) => readable.has(r.repoId ?? "")),
+    ],
+    [composites, overview, shownCatalogue.items, readable],
+  );
+  const path = useMemo(() => {
+    if (focus.state !== "ready") return [];
+    if (focus.ancestors) return focus.ancestors.filter((a) => a.parentId !== null).map((a) => a.id);
+    const up: string[] = [];
+    for (let cell = territory.byId.get(focus.id); cell?.parent;) {
+      up.unshift(cell.parent);
+      cell = territory.byId.get(cell.parent);
+    }
+    return up;
+  }, [focus, territory]);
+  const where = useMemo(() => {
+    if (focus.state !== "ready") return [];
+    const repo = nameOf.get(focus.entity.repoId ?? "");
+    const trail = focus.ancestors
+      ? focus.ancestors.slice(1).map((a) => a.name)
+      : path.flatMap((id) => {
+          const name = territory.byId.get(id)?.entity.name;
+          return name ? [name] : [];
+        });
+    return repo ? [repo, ...trail] : trail;
+  }, [focus, path, territory, nameOf]);
+
+  // ---- the view: the map, or the outline (the default on narrow screens) --------------
+  const narrow = useMediaQuery(NARROW);
+  narrowNow.current = narrow;
+  const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
+  const tree = useRef<HTMLDivElement>(null);
+  const backToOutline = () => {
+    const target =
+      tree.current?.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]') ??
+      tree.current?.querySelector<HTMLElement>('[role="treeitem"]');
+    target?.focus();
+  };
 
   if (state.status === "loading")
     return (
@@ -403,31 +647,216 @@ function WorkspaceView({
         Reading {selection.length} repositor{selection.length === 1 ? "y" : "ies"}…
       </p>
     );
-  if (state.status === "error")
+  if (state.status === "gone" && state.gone)
+    return (
+      <div className="mt-4">
+        <AtlasGone
+          error={state.gone}
+          base={base}
+          noCurrent="None of the selected repositories has a current Atlas to open instead."
+        />
+      </div>
+    );
+  if (state.status === "error" || state.status === "gone")
     return (
       <div className="mt-4 flex items-center gap-2 text-body-sm text-danger-text" role="alert">
         {state.error}
-        <button
-          type="button"
-          className="mk-btn mk-btn--ghost mk-btn--sm"
-          onClick={() => void session?.open()}
-        >
+        <button type="button" className="mk-btn mk-btn--ghost mk-btn--sm" onClick={openCurrent}>
           <ArrowClockwiseIcon weight="bold" aria-hidden /> Retry
         </button>
       </div>
     );
 
-  const choose = (entity: AtlasEntitySummary) => {
-    setSelected(entity.id);
-    if (OPENS.has(entity.kind) && !state.loads.has(entity.id)) session?.expand(entity.id);
-  };
-  const selectedEntity = selected ? territory.byId.get(selected)?.entity : undefined;
   const regions = overview?.regions ?? [];
   const capabilities = regions.filter((r) => !r.structural).length;
   const ready = coverage.filter((c) => c.state === "ready").length;
+  const seqOf = (entity: AtlasEntitySummary) => repoSnapshot(entity.repoId)?.seq ?? 0;
+  const noteOf = (entity: AtlasEntitySummary) => {
+    if (isComposite(entity.id)) {
+      const composite = composites.find((x) => x.id === entity.id);
+      return composite
+        ? `spans ${composite.repos.map((id) => nameOf.get(id) ?? "?").join(", ")}`
+        : null;
+    }
+    const repo = nameOf.get(entity.repoId ?? "");
+    return repo && entity.parentId === `${entity.repoId}/repo` ? `in ${repo}` : null;
+  };
+  const selectedSnapshot = selected ? repoSnapshot(selected.repoId) : null;
+  const selectedRepo = selected ? nameOf.get(selected.repoId ?? "") : undefined;
+  const crossLinks =
+    selected && (selected.kind === "capability" || selected.id.endsWith("/group:unclassified"))
+      ? "out"
+      : selected?.kind === "repository"
+        ? "in"
+        : null;
+
+  const outline = (
+    <AtlasOutline
+      treeRef={tree}
+      label={`Outline of ${selection.join(", ")}`}
+      roots={roots}
+      rootsMore={shownCatalogue.next !== null}
+      rootsCount={(overview?.totalRegions ?? 0) + composites.length}
+      rootsState={shownCatalogue.loading ? "loading" : shownCatalogue.error ? "error" : null}
+      loads={state.loads}
+      selected={url.select}
+      path={path}
+      seq={seqOf}
+      note={noteOf}
+      onOpen={(id) => session?.ensure(id)}
+      onRetry={(id) => session?.expand(id)}
+      onMore={(id) => {
+        const load = state.loads.get(id);
+        if (load?.state === "ready" && load.next) session?.expand(id, load.next, load.items);
+      }}
+      onMoreRoots={moreRegions}
+      onSelect={select}
+    />
+  );
+  const lookup = (
+    <AtlasLookup
+      fetch={(q, kind, cursor, signal) =>
+        reader.catalogue(q, {
+          kind: kind ?? undefined,
+          snapshot: snapshotId,
+          cursor,
+          signal,
+          limit: 20,
+        })
+      }
+      snapshot={snapshotId}
+      base={base}
+      url={url}
+      origin={(item) => nameOf.get(item.repoId ?? "") ?? null}
+      onQuery={(q) => navigate({ q }, true)}
+      onKind={(kind) => navigate({ kind }, true)}
+      onPick={select}
+    >
+      <p className="m-0 border-t border-line-soft pt-2 text-micro text-ink-faint">
+        The lookup reads only the selected repositories' Atlas snapshots. Code and wiki search runs
+        for one repository at a time, from its Knowledge tab, and only when you ask.
+      </p>
+    </AtlasLookup>
+  );
+  const inspector = (
+    <>
+      {(focus.state === "resolving" || compositeFocus.state === "resolving") && (
+        <p className="m-0 text-body-sm text-ink-faint">Opening the selection…</p>
+      )}
+      {(focus.state === "missing" ||
+        focus.state === "error" ||
+        compositeFocus.state === "missing" ||
+        compositeFocus.state === "error") && (
+        <section aria-label="Not in this snapshot" className="flex flex-col gap-2 text-body-sm">
+          <p className="m-0 text-ink-muted">
+            {compositeFocus.state === "error"
+              ? `Couldn't open the selection: ${compositeFocus.message}`
+              : focus.state === "error"
+                ? `Couldn't open the selection: ${focus.message}`
+                : compositeFocus.state === "missing"
+                  ? "No capability spans these repositories under that name in this snapshot. The link may be from another selection or build."
+                  : "That isn't in this Atlas snapshot. The link may be from another selection or build, or what it named was removed."}
+          </p>
+          {url.snapshot && (
+            <Link
+              to={atlasHref(base, { snapshot: null }, params)}
+              className="mk-btn mk-btn--sm self-start"
+            >
+              Open the current view
+            </Link>
+          )}
+        </section>
+      )}
+      {compositeFocus.state === "ready" && (
+        <CompositeInspector
+          key={compositeFocus.id}
+          workspace={workspace}
+          snapshot={snapshotId}
+          composite={compositeFocus.composite}
+          names={nameOf}
+          autoFocus={focusOnShow === compositeFocus.id}
+          onPick={select}
+          onFailed={(error) => session?.failed(error)}
+        />
+      )}
+      {selected && selectedSnapshot && selectedRepo && (
+        <>
+          <AtlasInspector
+            key={selected.id}
+            repo={{ owner, name: selectedRepo }}
+            reader={reader}
+            snapshot={{ ...selectedSnapshot, id: snapshotId }}
+            entity={selected}
+            lens={url.lens}
+            autoFocus={focusOnShow === selected.id}
+            onPick={select}
+            onLens={(lens) => navigate({ lens, snapshot: snapshotId })}
+            onRestart={(error) => session?.failed(error)}
+            contents={
+              OPENS.has(selected.kind) ? (
+                <AtlasContents
+                  entity={selected}
+                  load={state.loads.get(selected.id)}
+                  onPick={select}
+                  onRetry={() => session?.expand(selected.id)}
+                  onMore={(cursor, items) => session?.expand(selected.id, cursor, items)}
+                />
+              ) : null
+            }
+          />
+          {crossLinks && (
+            <CrossLinks
+              key={`${selected.id}|${crossLinks}`}
+              workspace={workspace}
+              snapshot={snapshotId}
+              entity={selected}
+              names={nameOf}
+              state={crossLinks === "in" ? "resolved" : links}
+              direction={crossLinks}
+              heading={crossLinks === "in" ? "Depended on across repositories" : undefined}
+              onState={
+                crossLinks === "out"
+                  ? (next) =>
+                      navigate({ snapshot: snapshotId }, false, {
+                        links: next === "resolved" ? null : next,
+                      })
+                  : undefined
+              }
+              onPick={select}
+              onFailed={(error) => session?.failed(error)}
+            />
+          )}
+        </>
+      )}
+      {(selected || compositeFocus.state === "ready") && view === "outline" && narrow && (
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm self-start pointer-coarse:min-h-11"
+          onClick={backToOutline}
+        >
+          Back to the outline
+        </button>
+      )}
+    </>
+  );
+  const moreComposites =
+    state.composition?.status === "ready" && state.composition.next ? (
+      <button
+        type="button"
+        className="mk-btn mk-btn--ghost mk-btn--sm self-start"
+        disabled={state.composition.more === "loading"}
+        onClick={() => void session?.moreComposites()}
+      >
+        {state.composition.more === "loading"
+          ? "Loading…"
+          : state.composition.more === "error"
+            ? "Couldn't load more capabilities across repositories. Retry"
+            : "More capabilities across repositories"}
+      </button>
+    ) : null;
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
+    <div className="mt-4 flex min-w-0 flex-col gap-4">
       {state.notice && (
         <div
           role="alert"
@@ -440,14 +869,7 @@ function WorkspaceView({
                 } was removed from this view.`
               : state.notice.message}
           </span>
-          <button
-            type="button"
-            className="mk-btn mk-btn--sm"
-            onClick={() => {
-              setSelected(null);
-              void session?.open();
-            }}
-          >
+          <button type="button" className="mk-btn mk-btn--sm" onClick={openCurrent}>
             Open the current view
           </button>
         </div>
@@ -469,54 +891,118 @@ function WorkspaceView({
             : "None of the selected repositories has an Atlas yet, so there's no map to draw."}
         </div>
       ) : (
-        <div className="grid gap-3 lg:h-[max(34rem,calc(100dvh-16rem))] lg:grid-cols-[minmax(0,1fr)_23rem]">
-          <div className="h-[62dvh] min-h-[22rem] lg:h-auto lg:min-h-0">
-            <AtlasTerritory
-              territory={territory}
-              bands={bands}
-              selected={selected}
-              loading={loading}
-              onSelect={(cell: TerritoryCell) => choose(cell.entity)}
-              origin={(cell) => {
-                const name = nameOf.get(repoOf(cell.id));
-                return name ? `in ${name}` : null;
-              }}
-              label={`Capability map of ${territory.bands.length} repositor${
-                territory.bands.length === 1 ? "y" : "ies"
-              }, one column each in selection order: ${capabilities} capabilities${
-                regions.length > capabilities ? " and structural groups" : ""
-              }. The list beside it has the same regions.`}
-            />
+        <>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <span className="text-body-sm text-ink-muted tabular-nums">
+              {(overview?.totalRegions ?? 0).toLocaleString()} regions
+              {composites.length > 0 &&
+                ` · ${composites.length.toLocaleString()} ${
+                  composites.length === 1 ? "capability spans" : "capabilities span"
+                } repositories`}
+              {url.snapshot && " · a linked snapshot"}
+            </span>
+            <div role="group" aria-label="View" className="ml-auto flex gap-1">
+              {(["map", "outline"] as const).map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  aria-pressed={view === v}
+                  className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
+                  onClick={() => navigate({ view: v })}
+                >
+                  {v === "map" ? "Map" : "Outline"}
+                </button>
+              ))}
+            </div>
           </div>
-          <aside
-            aria-label="Regions"
-            className="flex min-h-0 flex-col gap-3 overflow-y-auto rounded-pane bg-pane p-3"
-          >
-            {selectedEntity && (
-              <Selection
-                entity={selectedEntity}
-                repo={nameOf.get(repoOf(selectedEntity.id)) ?? ""}
-                load={state.loads.get(selectedEntity.id)}
-                onPick={choose}
-                onRetry={() => session?.expand(selectedEntity.id)}
-                onMore={(cursor, items) => session?.expand(selectedEntity.id, cursor, items)}
-              />
-            )}
-            <RegionList coverage={coverage} regions={regions} selected={selected} onPick={choose} />
-            {overview && overview.totalRegions > regions.length && (
-              <p className="m-0 text-micro text-ink-faint">
-                The map shows the {regions.length} largest regions across the selection;{" "}
-                {(overview.totalRegions - regions.length).toLocaleString()} smaller ones are in the
-                catalogue.
-              </p>
-            )}
-            <Legend />
-          </aside>
-        </div>
+          <p role="status" className="sr-only">
+            {focus.state === "resolving" || compositeFocus.state === "resolving"
+              ? "Opening the selection…"
+              : compositeFocus.state === "ready"
+                ? `Selected ${compositeFocus.composite.name}, a capability across repositories.`
+                : focus.state === "ready"
+                  ? `Selected ${focus.entity.name}, ${KIND_LABEL[focus.entity.kind] ?? focus.entity.kind}${
+                      where.length ? `, in ${where.join(" › ")}` : ""
+                    }.`
+                  : focus.state === "missing" || focus.state === "error"
+                    ? "The selection couldn't be shown."
+                    : ""}
+          </p>
+          {view === "map" ? (
+            <div className="grid gap-3 lg:h-[max(34rem,calc(100dvh-16rem))] lg:grid-cols-[minmax(0,1fr)_23rem]">
+              <div className="h-[62dvh] min-h-[22rem] lg:h-auto lg:min-h-0">
+                <AtlasTerritory
+                  territory={territory}
+                  bands={bands}
+                  ties={ties}
+                  selected={mapFocus}
+                  loading={loading}
+                  onSelect={(cell: TerritoryCell) => select(cell.entity)}
+                  origin={(cell) => {
+                    const name = nameOf.get(repoOf(cell.id));
+                    return name ? `in ${name}` : null;
+                  }}
+                  label={`Capability map of ${territory.bands.length} repositor${
+                    territory.bands.length === 1 ? "y" : "ies"
+                  }, one column each in selection order: ${capabilities} capabilities${
+                    regions.length > capabilities ? " and structural groups" : ""
+                  }${
+                    composites.length
+                      ? `, with lines joining the ${composites.length} that span repositories`
+                      : ""
+                  }. The outline beside it has the same regions, and more.`}
+                />
+              </div>
+              <aside
+                aria-label="Regions"
+                className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto rounded-pane bg-pane p-3"
+              >
+                {lookup}
+                {inspector}
+                {outline}
+                {moreComposites}
+                <Legend />
+              </aside>
+            </div>
+          ) : narrow ? (
+            <div className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3">
+              {lookup}
+              {inspector}
+              {outline}
+              {moreComposites}
+              <Legend />
+            </div>
+          ) : (
+            <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_23rem]">
+              <section
+                aria-label="Outline"
+                className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3"
+              >
+                {lookup}
+                {outline}
+                {moreComposites}
+                <Legend />
+              </section>
+              <aside
+                aria-label="Selection"
+                className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3 lg:sticky lg:top-3 lg:max-h-[calc(100dvh-1.5rem)] lg:overflow-y-auto"
+              >
+                {inspector}
+                {!selected && compositeFocus.state === "none" && focus.state === "none" && (
+                  <p className="m-0 text-body-sm text-ink-faint">
+                    Choose an entry in the outline to read about it here.
+                  </p>
+                )}
+              </aside>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
 }
+
+const NONE: readonly AtlasCompositeCapability[] = [];
 
 /** The band's second line on the map: its own commit, or why there's nothing. */
 function bandNote(entry: Coverage): string {
@@ -584,7 +1070,7 @@ function CoverageList({
         {coverage.map((entry) => {
           const repo = entry.repo;
           const pushedAt = accountRepos.find((r) => r.name === entry.name)?.pushedAt ?? null;
-          const shown = repo ? regions.filter((r) => r.repoId === repo.id).length : 0;
+          const own = repo ? regions.filter((r) => r.repoId === repo.id) : [];
           return (
             <li
               key={entry.name}
@@ -610,7 +1096,7 @@ function CoverageList({
                 </span>
               </span>
               <span className="min-w-0 text-body-sm text-ink-muted">
-                <CoverageDetail entry={entry} pushedAt={pushedAt} shown={shown} empty={empty} />
+                <CoverageDetail entry={entry} pushedAt={pushedAt} own={own} empty={empty} />
                 {repo && composition?.status === "ready" && (
                   <PackagesLine
                     packages={composition.coverage.find((c) => c.repoId === repo.id)?.packages}
@@ -683,14 +1169,16 @@ function PackagesLine({
 function CoverageDetail({
   entry,
   pushedAt,
-  shown,
+  own,
   empty,
 }: {
   entry: Coverage;
   pushedAt: string | null;
-  shown: number;
+  /** Its regions on the map. */
+  own: readonly AtlasRegion[];
   empty: boolean;
 }) {
+  const shown = own.length;
   switch (entry.state) {
     case "ready": {
       const snapshot = entry.repo.snapshot;
@@ -715,11 +1203,6 @@ function CoverageDetail({
           )}
           {snapshot?.publishedAt && ` · ${timeAgo(snapshot.publishedAt)}`}
           {` · ${shown ? `${shown} region${shown === 1 ? "" : "s"} on the map` : "none of its regions are among the largest here"}`}
-          {snapshot?.partial && (
-            <span className="block">
-              Partial: some files aren't analyzed yet, so counts are a floor.
-            </span>
-          )}
           {entry.repo.building && (
             <span className="block">Lagging: a newer Knowledge build is running.</span>
           )}
@@ -728,11 +1211,19 @@ function CoverageDetail({
               Lagging: pushed {timeAgo(pushedAt)}, after this Atlas was built.
             </span>
           )}
-          {entry.repo.capacityFailure && (
-            <span className="block text-danger-text">
-              The newest build didn't fit the Atlas storage limit; this is the previous one.
-            </span>
-          )}
+          {snapshot &&
+            scopeNotices(null, {
+              snapshot,
+              capacityFailure: entry.repo.capacityFailure ?? null,
+              regions: [...own],
+            }).map((n) => (
+              <span
+                key={n.id}
+                className={`block ${n.tone === "error" || n.id === "capacity" ? "text-danger-text" : ""}`}
+              >
+                {n.text}
+              </span>
+            ))}
         </>
       );
     }
@@ -758,178 +1249,6 @@ function CoverageDetail({
     case "revoked":
       return <>You lost access while viewing; everything from it was removed.</>;
   }
-}
-
-function summaryLine(entity: AtlasEntitySummary): string {
-  if (entity.summary) return entity.summary;
-  switch (entity.summaryState?.status) {
-    case "stale":
-      return "Summary out of date: it describes an earlier build.";
-    case "unavailable":
-      return "Summary unavailable for this build.";
-    default:
-      return "";
-  }
-}
-
-/** The map's regions, grouped by repository in selection order: the accessible path. */
-function RegionList({
-  coverage,
-  regions,
-  selected,
-  onPick,
-}: {
-  coverage: Coverage[];
-  regions: readonly AtlasRegion[];
-  selected: string | null;
-  onPick: (entity: AtlasEntitySummary) => void;
-}) {
-  return (
-    <div className="flex flex-col gap-3">
-      {coverage.map((entry) => {
-        const repo = entry.repo;
-        const own =
-          repo && entry.state === "ready" ? regions.filter((r) => r.repoId === repo.id) : [];
-        const seq = repo?.snapshot?.seq ?? 0;
-        return (
-          <section key={entry.name} aria-label={`Regions in ${entry.name}`}>
-            <h3 className="m-0 mb-1 px-2.5 text-micro font-semibold tracking-wide text-ink-faint uppercase">
-              <bdi>{entry.name}</bdi>
-            </h3>
-            {own.length === 0 ? (
-              <p className="m-0 px-2.5 text-micro text-ink-faint">
-                {entry.state === "ready"
-                  ? "None of its regions are among the largest in this selection."
-                  : bandNote(entry)}
-              </p>
-            ) : (
-              <ul className="m-0 flex list-none flex-col gap-1 p-0">
-                {own.map((region) => (
-                  <li key={region.id}>
-                    <button
-                      type="button"
-                      aria-current={region.id === selected || undefined}
-                      onClick={() => onPick(region)}
-                      className="flex w-full cursor-pointer flex-col gap-0.5 rounded-plate border-0 bg-transparent px-2.5 py-2 text-left hover:bg-raised aria-[current]:bg-signal-wash"
-                    >
-                      <span className="flex w-full items-baseline gap-2">
-                        <span
-                          className={`min-w-0 flex-1 truncate text-body-sm font-semibold ${region.structural ? "text-ink-muted" : "text-ink"}`}
-                        >
-                          {region.name}
-                        </span>
-                        {seq > 1 && region.since === seq && (
-                          <span className="text-micro text-ink-faint" title="Changed in this build">
-                            changed
-                          </span>
-                        )}
-                        <span className="text-micro text-ink-faint tabular-nums">
-                          {region.structural
-                            ? `${region.size.members.toLocaleString()} item${region.size.members === 1 ? "" : "s"}`
-                            : files(region.size.files)}
-                        </span>
-                      </span>
-                      {summaryLine(region) && (
-                        <span className="line-clamp-2 text-micro text-ink-muted">
-                          {summaryLine(region)}
-                        </span>
-                      )}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        );
-      })}
-    </div>
-  );
-}
-
-function Selection({
-  entity,
-  repo,
-  load: state,
-  onPick,
-  onRetry,
-  onMore,
-}: {
-  entity: AtlasEntitySummary;
-  repo: string;
-  load: Load | undefined;
-  onPick: (entity: AtlasEntitySummary) => void;
-  onRetry: () => void;
-  onMore: (cursor: string, items: AtlasEntitySummary[]) => void;
-}) {
-  return (
-    <section
-      aria-label={entity.name}
-      className="flex flex-col gap-2 border-b border-line-soft pb-3"
-    >
-      <h2 className="m-0 text-body font-semibold">{entity.name}</h2>
-      <p className="m-0 text-micro text-ink-faint">
-        In <bdi className="text-ink-muted">{repo}</bdi> ·{" "}
-        {entity.structural
-          ? "Structural group: not a capability."
-          : entity.kind === "capability" || entity.kind === "area"
-            ? "Grouped from imports and shared concepts in the code, never folders alone."
-            : entity.kind}
-      </p>
-      {summaryLine(entity) && (
-        <p className="m-0 text-body-sm text-ink-muted">{summaryLine(entity)}</p>
-      )}
-      {state?.state === "loading" && (
-        <p className="m-0 text-body-sm text-ink-faint" aria-live="polite">
-          Loading what's inside…
-        </p>
-      )}
-      {state?.state === "error" && (
-        <div className="flex items-center gap-2 text-body-sm text-danger-text" role="alert">
-          Couldn't load what's inside.
-          <button type="button" className="mk-btn mk-btn--ghost mk-btn--sm" onClick={onRetry}>
-            <ArrowClockwiseIcon weight="bold" aria-hidden /> Retry
-          </button>
-        </div>
-      )}
-      {state?.state === "ready" && (
-        <>
-          <ul className="m-0 flex list-none flex-col p-0" aria-label={`Inside ${entity.name}`}>
-            {state.items.map((child) => (
-              <li key={child.id}>
-                <button
-                  type="button"
-                  onClick={() => onPick(child)}
-                  className="flex min-h-8 w-full cursor-pointer items-center gap-2 rounded-plate border-0 bg-transparent px-2 text-left text-body-sm hover:bg-raised"
-                >
-                  {OPENS.has(child.kind) && (
-                    <CaretRightIcon className="size-3 shrink-0 text-ink-faint" aria-hidden />
-                  )}
-                  <span className="min-w-0 flex-1 truncate">{child.name}</span>
-                  <span className="text-micro text-ink-faint tabular-nums">
-                    {files(child.counts.files)}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-          <p className="m-0 text-micro text-ink-faint">
-            {state.total !== null
-              ? `${state.items.length.toLocaleString()} of ${state.total.toLocaleString()}`
-              : `${state.items.length.toLocaleString()} loaded`}
-          </p>
-          {state.next && (
-            <button
-              type="button"
-              className="mk-btn mk-btn--sm self-start"
-              onClick={() => onMore(state.next!, state.items)}
-            >
-              Show more
-            </button>
-          )}
-        </>
-      )}
-    </section>
-  );
 }
 
 /** What the map's shapes mean, and what they don't. */
@@ -958,6 +1277,16 @@ function Legend() {
         <li>
           <strong className="text-ink">Dashed regions</strong> are structural groups (unclassified
           files, concepts, dependencies, folders), not capabilities.
+        </li>
+        <li>
+          <strong className="text-ink">Lines between columns</strong> join the capabilities of one
+          capability spanning repositories: one imports a package the other repository publishes,
+          and they share concepts. Its files stay in their own regions and are counted once. The
+          outline lists these first.
+        </li>
+        <li>
+          <strong className="text-ink">The outline</strong> holds everything the map draws, and
+          more: use the arrow keys to move, Right to open, Left to close, Enter to select.
         </li>
         <li>
           <span className="mr-1 inline-block size-2 rounded-full bg-data-berry align-middle" />

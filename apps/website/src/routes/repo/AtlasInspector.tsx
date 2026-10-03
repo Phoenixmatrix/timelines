@@ -3,6 +3,10 @@
 // relationship lens. Everything is a bounded, paged request against the
 // snapshot on screen; a late answer for an earlier selection is dropped.
 //
+// It reads through an AtlasReader (src/lib/atlas.ts), so the workspace Atlas
+// (CORE-184) shows the same inspector over namespaced ids; `repo` is then the
+// entity's own repository, for its source and wiki links.
+//
 // The lens shows static, indexed links: never a complete runtime call graph,
 // a guarantee that something breaks, or proof a change is safe. "No indexed
 // link" is said as such, not as "no dependencies".
@@ -15,7 +19,7 @@ import { repoPath } from "../../lib/refs.ts";
 import type {
   AtlasContribution,
   AtlasCounts,
-  AtlasDetail,
+  AtlasDetail as AtlasDetailResponse,
   AtlasDirection,
   AtlasEntitySummary,
   AtlasError,
@@ -24,7 +28,13 @@ import type {
   AtlasSnapshotRef,
 } from "../../../shared/atlas.ts";
 import { fileNote, summaryNote } from "./atlasStates.ts";
-import { atlasApi, atlasErrorOf, atlasNeedsRestart, type AtlasRepo } from "../../lib/atlas.ts";
+import {
+  atlasErrorOf,
+  atlasNeedsRestart,
+  repoReader,
+  type AtlasReader,
+  type AtlasRepo,
+} from "../../lib/atlas.ts";
 import type { AtlasLens } from "./atlasUrl.ts";
 import { lineAnchor } from "../../lib/lineAnchors.ts";
 import { blobUrl } from "../../lib/refs.ts";
@@ -60,6 +70,8 @@ const VERB: Record<AtlasDirection, Record<string, string>> = {
     part_of: "Includes",
   },
 };
+
+type AtlasDetail = Omit<AtlasDetailResponse, "scope" | "snapshot">;
 
 interface Paged<T> {
   items: T[];
@@ -122,6 +134,7 @@ function countLine(counts: AtlasCounts, noun: string) {
 
 export function AtlasInspector({
   repo,
+  reader,
   snapshot,
   entity,
   contents,
@@ -132,7 +145,10 @@ export function AtlasInspector({
   onRestart,
   wiki = null,
 }: {
+  /** The entity's repository: where its sources and wiki pages are. */
   repo: AtlasRepo;
+  /** What it's read through; the repository's own Atlas when omitted. */
+  reader?: AtlasReader;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
   /** What's inside it, as the map already loads it. */
@@ -148,6 +164,7 @@ export function AtlasInspector({
   /** The wiki page written about it, if any. */
   wiki?: Pick<WikiPageSummary, "slug" | "title"> | null;
 }) {
+  const read = reader ?? repoReader(repo);
   const [detail, setDetail] = useState<AtlasDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
@@ -159,8 +176,8 @@ export function AtlasInspector({
     const controller = new AbortController();
     setDetail(null);
     setDetailError(null);
-    atlasApi
-      .detail(repo, entity.id, { snapshot: snapshot.id, signal: controller.signal })
+    read
+      .detail(entity.id, { snapshot: snapshot.id, signal: controller.signal })
       .then(setDetail)
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
@@ -283,6 +300,7 @@ export function AtlasInspector({
       {detail && (
         <Lens
           repo={repo}
+          reader={read}
           snapshot={snapshot}
           entity={entity}
           detail={detail}
@@ -291,13 +309,14 @@ export function AtlasInspector({
           onPick={onPick}
         />
       )}
-      <Evidence repo={repo} snapshot={snapshot} entity={entity} />
+      <Evidence repo={repo} reader={read} snapshot={snapshot} entity={entity} />
     </section>
   );
 }
 
 function Lens({
   repo,
+  reader,
   snapshot,
   entity,
   detail,
@@ -306,6 +325,7 @@ function Lens({
   onPick,
 }: {
   repo: AtlasRepo;
+  reader: AtlasReader;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
   detail: AtlasDetail;
@@ -324,7 +344,7 @@ function Lens({
   const list = usePaged<AtlasRelation>(
     active ? `${entity.id}|${direction}|${active}|${snapshot.id}` : null,
     (cursor, signal) =>
-      atlasApi.relations(repo, entity.id, direction, {
+      reader.relations(entity.id, direction, {
         kind: active ?? undefined,
         snapshot: snapshot.id,
         cursor,
@@ -399,6 +419,7 @@ function Lens({
                   <RelationRow
                     key={`${r.src}|${r.dst}|${r.kind}`}
                     repo={repo}
+                    reader={reader}
                     snapshot={snapshot}
                     entity={entity}
                     relation={r}
@@ -429,6 +450,7 @@ function Lens({
 
 function RelationRow({
   repo,
+  reader,
   snapshot,
   entity,
   relation,
@@ -436,6 +458,7 @@ function RelationRow({
   onPick,
 }: {
   repo: AtlasRepo;
+  reader: AtlasReader;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
   relation: AtlasRelation;
@@ -444,7 +467,10 @@ function RelationRow({
 }) {
   const [open, setOpen] = useState(false);
   const other = direction === "out" ? relation.dst : relation.src;
-  const capabilityLink = relation.kind === "depends_on" && other.startsWith("cap:");
+  // Between two capabilities (ids are `<repoId>/cap:…` in a workspace).
+  const capabilityLink =
+    relation.kind === "depends_on" &&
+    (relation.neighbor ? relation.neighbor.kind === "capability" : other.startsWith("cap:"));
   return (
     <li className="flex flex-col">
       <div className="flex min-h-8 items-center gap-1 pointer-coarse:min-h-11">
@@ -474,7 +500,10 @@ function RelationRow({
             className="min-w-0 flex-1 truncate px-1 font-mono text-body-sm text-ink-faint"
             title="Not in this snapshot (external or unresolved)"
           >
-            {other.replace(/^(file|pkg|concept):/, "")}
+            {(entity.repoId && other.startsWith(`${entity.repoId}/`)
+              ? other.slice(entity.repoId.length + 1)
+              : other
+            ).replace(/^(file|pkg|concept):/, "")}
           </span>
         )}
         <span className="text-micro text-ink-faint tabular-nums">
@@ -486,6 +515,7 @@ function RelationRow({
       {open && (
         <Contributing
           repo={repo}
+          reader={reader}
           snapshot={snapshot}
           entity={entity}
           other={other}
@@ -498,12 +528,14 @@ function RelationRow({
 
 function Contributing({
   repo,
+  reader,
   snapshot,
   entity,
   other,
   direction,
 }: {
   repo: AtlasRepo;
+  reader: AtlasReader;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
   other: string;
@@ -512,7 +544,7 @@ function Contributing({
   const list = usePaged<AtlasContribution>(
     `${entity.id}|${other}|${direction}|${snapshot.id}`,
     (cursor, signal) =>
-      atlasApi.contributing(repo, entity.id, other, direction, {
+      reader.contributing(entity.id, other, direction, {
         snapshot: snapshot.id,
         cursor,
         signal,
@@ -572,15 +604,17 @@ function Contributing({
 
 function Evidence({
   repo,
+  reader,
   snapshot,
   entity,
 }: {
   repo: AtlasRepo;
+  reader: AtlasReader;
   snapshot: AtlasSnapshotRef;
   entity: AtlasEntitySummary;
 }) {
   const list = usePaged<AtlasEvidence>(`${entity.id}|${snapshot.id}`, (cursor, signal) =>
-    atlasApi.evidence(repo, entity.id, { snapshot: snapshot.id, cursor, signal, limit: 10 }),
+    reader.evidence(entity.id, { snapshot: snapshot.id, cursor, signal, limit: 10 }),
   );
   if (list.status === "loading")
     return (

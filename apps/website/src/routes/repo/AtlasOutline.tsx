@@ -25,6 +25,7 @@ export const KIND_LABEL: Record<string, string> = {
   concept: "Concept",
   package: "Package",
   repository: "Repository",
+  "composite-capability": "Capability across repositories",
 };
 
 /** Whether the outline can open it: regions, and files that define symbols. */
@@ -132,6 +133,7 @@ export function AtlasOutline({
   selected,
   path,
   seq,
+  note,
   onOpen,
   onRetry,
   onMore,
@@ -152,7 +154,10 @@ export function AtlasOutline({
   selected: string | null;
   /** The selection's ancestors (and itself): opened so it's in view. */
   path: readonly string[];
-  seq: number;
+  /** The snapshot sequence an entity was read at (per repository in a workspace). */
+  seq: number | ((entity: AtlasEntitySummary) => number);
+  /** More to say on a row, e.g. which repository it's in. */
+  note?: (entity: AtlasEntitySummary) => string | null;
   onOpen: (id: string) => void;
   onRetry: (id: string) => void;
   onMore: (id: string) => void;
@@ -362,7 +367,11 @@ export function AtlasOutline({
               >
                 {entity.name}
               </span>
-              <span className="text-micro text-ink-faint">{rowDetail(entity, seq)}</span>
+              <span className="text-micro text-ink-faint">
+                {[rowDetail(entity, typeof seq === "number" ? seq : seq(entity)), note?.(entity)]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
               {row.level === 1 && rowSummary(entity) && (
                 <span className="line-clamp-2 text-micro text-ink-muted">{rowSummary(entity)}</span>
               )}

@@ -3,10 +3,14 @@
 // keeps what's on screen inside the scope it was read for.
 //
 // Selection. `?repos=a,b` names repositories under the page's account, in the
-// order they were picked. It is the only state: no subscription is created,
-// and nothing here starts or enables a Knowledge build. The server
-// re-authorizes it on every request (worker/atlas/workspace.ts) and silently
-// keeps only what the viewer can read now.
+// order they were picked: no subscription is created, and nothing here starts
+// or enables a Knowledge build. The server re-authorizes it on every request
+// (worker/atlas/workspace.ts) and silently keeps only what the viewer can read
+// now. Beside it the address holds the repository Atlas's view state
+// (atlasUrl.ts: select, snapshot, lens, q, kind, view, CORE-184), with the
+// composite snapshot id as `snapshot`, plus `links`, the cross-repository
+// link state the inspector shows. A new selection is a new scope: none of
+// that carries over.
 //
 // Layout. Every repository with an Atlas gets its own column ("band"), in
 // selection order, each a fixed TOP_WIDTH cells wide. Inside its band a
@@ -24,16 +28,27 @@
 // others.
 //
 // Session. One per scope (the page remounts it when the selection or account
-// changes, so nothing from the previous scope survives the switch). It drops
-// any answer that arrives after it was disposed, and when a pinned request
-// says the authorized set changed (revocation mid-view), it re-reads the
-// scope and discards everything from repositories the viewer can no longer
-// read before showing anything else.
+// changes, so nothing from the previous scope survives the switch). It reads
+// the overview at the address's pinned composite, or the current one, then
+// everything else pinned to what that overview named. It drops any answer
+// that arrives after it was disposed, and when a pinned request says the
+// authorized set changed (revocation mid-view), it re-reads the scope and
+// discards everything from repositories the viewer can no longer read before
+// showing anything else.
+//
+// Composites. Capabilities spanning repositories (CORE-167) come a bounded
+// page at a time from /composition at the same composite. Each is drawn as a
+// tie between its member capabilities' regions, never as another region: a
+// file has one primary capability in its own repository, so nothing is
+// counted or drawn twice.
 
 import {
   ATLAS_WORKSPACE_MAX_REPOS,
+  type AtlasCompositeCapability,
   type AtlasCompositionCoverage,
   type AtlasEntitySummary,
+  type AtlasError,
+  type AtlasLinkState,
   type AtlasRegion,
   type AtlasWorkspaceComposition,
   type AtlasWorkspaceOverview,
@@ -41,7 +56,14 @@ import {
   type AtlasWorkspaceRepo,
 } from "../../../shared/atlas.ts";
 import { ApiError } from "../../lib/api.ts";
-import type { AtlasPageRequest, AtlasRequest, AtlasWorkspace } from "../../lib/atlas.ts";
+import {
+  atlasErrorOf,
+  atlasNeedsRestart,
+  type AtlasPageRequest,
+  type AtlasRequest,
+  type AtlasWorkspace,
+} from "../../lib/atlas.ts";
+import { writeAtlasUrl } from "../repo/atlasUrl.ts";
 import {
   buildTerritory,
   CELL,
@@ -87,6 +109,31 @@ export function toggleSelection(selection: readonly string[], name: string): str
 /** The search string for a selection: `?repos=a,b`, or "" when empty. */
 export function selectionSearch(selection: readonly string[]): string {
   return selection.length ? `?repos=${selection.map(encodeURIComponent).join(",")}` : "";
+}
+
+/**
+ * The search string for a new selection: the repositories, and of the view
+ * state only the map-or-outline choice. A selection, snapshot, lens or lookup
+ * belongs to the scope it was made in.
+ */
+export function rescopeSearch(search: string, selection: readonly string[]): string {
+  const params = writeAtlasUrl(search, { select: null, snapshot: null, q: "", kind: null });
+  params.delete("repos");
+  params.delete("lens");
+  params.delete("links");
+  const rest = params.toString();
+  // Commas stay readable in the URL: names never contain them.
+  const repos = selection.length ? `repos=${selection.map(encodeURIComponent).join(",")}` : "";
+  return [repos, rest].filter(Boolean).join("&");
+}
+
+const LINK_STATES: readonly AtlasLinkState[] = ["resolved", "unresolved", "related"];
+
+/** Which cross-repository links the inspector lists (`links=`); resolved by default. */
+export function parseLinkState(raw: string | null): AtlasLinkState {
+  return (LINK_STATES as readonly string[]).includes(raw ?? "")
+    ? (raw as AtlasLinkState)
+    : "resolved";
 }
 
 /** What a view is about: another key is another scope, with nothing carried over. */
@@ -193,6 +240,43 @@ export function buildWorkspaceTerritory(
 /** The repository id a namespaced workspace id belongs to. */
 export const repoOf = (id: string) => id.slice(0, Math.max(0, id.indexOf("/")));
 
+// ---- capabilities spanning repositories ----------------------------------------------
+
+export const isComposite = (id: string | null | undefined): id is string =>
+  !!id && id.startsWith("xcap:");
+
+/**
+ * A composite as the outline and lookup list it: its files counted once each
+ * (every file has one primary capability in its own repository), its name
+ * from the concepts its members share, and no prose of its own.
+ */
+export function compositeSummary(composite: AtlasCompositeCapability): AtlasEntitySummary {
+  return {
+    id: composite.id,
+    kind: composite.kind,
+    parentId: null,
+    name: composite.name,
+    path: null,
+    summary: "",
+    counts: { files: composite.counts.files },
+    structural: false,
+  };
+}
+
+/**
+ * The map's ties: each composite through its members' regions. Active when
+ * it, or one of its members, is what's selected.
+ */
+export function tiesOf(
+  composites: readonly AtlasCompositeCapability[],
+  selected: string | null,
+): { id: string; cells: string[]; active: boolean }[] {
+  return composites.map((x) => {
+    const cells = x.members.map((m) => m.id);
+    return { id: x.id, cells, active: selected === x.id || cells.includes(selected ?? "") };
+  });
+}
+
 // ---- the session -------------------------------------------------------------------
 
 export interface WorkspaceClient {
@@ -204,9 +288,12 @@ export interface WorkspaceClient {
   ): Promise<AtlasWorkspacePage<AtlasEntitySummary>>;
   composition(
     workspace: AtlasWorkspace,
-    request: AtlasPageRequest,
+    request: AtlasPageRequest & { id?: string },
   ): Promise<AtlasWorkspaceComposition>;
 }
+
+/** Capabilities spanning repositories per page: one page covers almost every scope. */
+export const COMPOSITES_PAGE = 50;
 
 /**
  * What cross-repository composition (CORE-167) could read from each selected
@@ -222,6 +309,11 @@ export type CompositionView =
       /** Capabilities spanning repositories, and resolved dependencies; null once access changed. */
       composites: number | null;
       resolved: number | null;
+      /** The composites read so far, largest first, and where the next page starts. */
+      items: AtlasCompositeCapability[];
+      next: string | null;
+      /** The next page is loading, or failed. */
+      more: "loading" | "error" | null;
     };
 
 export type Notice =
@@ -231,7 +323,8 @@ export type Notice =
   | { kind: "restart"; message: string };
 
 export interface WorkspaceState {
-  status: "loading" | "ready" | "empty" | "error";
+  /** "gone": the address pins a composite that can't be read (see `gone`). */
+  status: "loading" | "ready" | "empty" | "error" | "gone";
   error: string | null;
   /** What's on screen: never anything from a repository in `revoked`. */
   overview: AtlasWorkspaceOverview | null;
@@ -241,6 +334,8 @@ export interface WorkspaceState {
   notice: Notice | null;
   /** Null until the overview is read. */
   composition: CompositionView | null;
+  /** Why the pinned composite in the address can't be opened. */
+  gone: AtlasError | null;
 }
 
 export const initialWorkspaceState: WorkspaceState = {
@@ -251,6 +346,7 @@ export const initialWorkspaceState: WorkspaceState = {
   revoked: new Set(),
   notice: null,
   composition: null,
+  gone: null,
 };
 
 /** The pinned composite no longer matches what the viewer may read: re-read the scope. */
@@ -275,6 +371,8 @@ export class WorkspaceSession {
   #opening: AbortController | null = null;
   #checking: AbortController | null = null;
   #children: ChildLoader | null = null;
+  #requested = new Set<string>();
+  #composing: AbortController | null = null;
 
   constructor(
     workspace: AtlasWorkspace,
@@ -296,19 +394,27 @@ export class WorkspaceSession {
     this.#onChange(this.#state);
   }
 
-  /** Read the scope's current composite (again, for "open the current view"). */
-  async open() {
+  /**
+   * Read the scope at `snapshot`, a composite id from the address, or at its
+   * current composite (again, for "open the current view").
+   */
+  async open(snapshot: string | null = null) {
     if (this.#disposed) return;
     this.#opening?.abort();
     this.#checking?.abort();
+    this.#composing?.abort();
     this.#checking = null;
     this.#children?.reset("");
     this.#children = null;
+    this.#requested.clear();
     const controller = new AbortController();
     this.#opening = controller;
     this.#set({ ...initialWorkspaceState });
     try {
-      const overview = await this.#client.overview(this.#workspace, { signal: controller.signal });
+      const overview = await this.#client.overview(this.#workspace, {
+        signal: controller.signal,
+        ...(snapshot ? { snapshot } : {}),
+      });
       if (this.#disposed || controller.signal.aborted) return;
       this.#children = new ChildLoader(
         overview.snapshot.id,
@@ -325,6 +431,13 @@ export class WorkspaceSession {
       if (this.#disposed || controller.signal.aborted) return;
       if (error instanceof ApiError && error.code === "scope_empty")
         this.#set({ status: "empty", error: error.message });
+      else if (snapshot && atlasNeedsRestart(error))
+        // A link to a composite that expired, or to a scope that changed since.
+        this.#set({
+          status: "gone",
+          error: error instanceof Error ? error.message : "This snapshot can't be opened.",
+          gone: atlasErrorOf(error),
+        });
       else
         this.#set({
           status: "error",
@@ -333,12 +446,12 @@ export class WorkspaceSession {
     }
   }
 
-  /** Composition coverage, pinned to the overview's composite so both describe the same vector. */
+  /** Composites and coverage, pinned to the overview's composite so both describe the same vector. */
   async #compose(overview: AtlasWorkspaceOverview, signal: AbortSignal) {
     try {
       const page = await this.#client.composition(this.#workspace, {
         snapshot: overview.snapshot.id,
-        limit: 1,
+        limit: COMPOSITES_PAGE,
         signal,
       });
       if (
@@ -355,6 +468,9 @@ export class WorkspaceSession {
           coverage: page.coverage.filter((c) => readable.has(c.repoId)),
           composites: changed ? null : page.counts.knownTotal,
           resolved: changed ? null : page.resolved,
+          items: page.items.filter((x) => x.repos.every((id) => this.#readable(id))),
+          next: changed ? null : page.next,
+          more: null,
         },
       });
     } catch (error) {
@@ -369,6 +485,93 @@ export class WorkspaceSession {
     }
   }
 
+  /** The next page of composites. */
+  async moreComposites() {
+    const overview = this.#state.overview;
+    const view = this.#state.composition;
+    if (this.#disposed || !overview || view?.status !== "ready" || !view.next || view.more) return;
+    const controller = new AbortController();
+    this.#composing = controller;
+    const cursor = view.next;
+    this.#set({ composition: { ...view, more: "loading" } });
+    try {
+      const page = await this.#client.composition(this.#workspace, {
+        snapshot: overview.snapshot.id,
+        cursor,
+        limit: COMPOSITES_PAGE,
+        signal: controller.signal,
+      });
+      const now = this.#state.composition;
+      if (this.#disposed || controller.signal.aborted || now?.status !== "ready") return;
+      this.#set({
+        composition: {
+          ...now,
+          items: [
+            ...now.items,
+            ...page.items.filter((x) => x.repos.every((id) => this.#readable(id))),
+          ],
+          next: page.next,
+          more: null,
+        },
+      });
+    } catch (error) {
+      if (this.#disposed || controller.signal.aborted) return;
+      this.failed(error);
+      const now = this.#state.composition;
+      if (now?.status === "ready") this.#set({ composition: { ...now, more: "error" } });
+    }
+  }
+
+  /**
+   * A composite by id, at the overview's composite: from what's read, else
+   * one bounded read of just it (a link to it). Null when the scope doesn't
+   * compose it; throws what the API said otherwise.
+   */
+  async composite(id: string, signal?: AbortSignal): Promise<AtlasCompositeCapability | null> {
+    const overview = this.#state.overview;
+    if (!overview) return null;
+    const view = this.#state.composition;
+    const known = view?.status === "ready" ? view.items.find((x) => x.id === id) : undefined;
+    if (known) return known;
+    try {
+      const page = await this.#client.composition(this.#workspace, {
+        snapshot: overview.snapshot.id,
+        id,
+        limit: 1,
+        signal,
+      });
+      const found = page.items[0] ?? null;
+      return found && found.repos.every((r) => this.#readable(r)) ? found : null;
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "entity_unknown") return null;
+      this.failed(error);
+      throw error;
+    }
+  }
+
+  /**
+   * A pinned read failed: the scope may have changed under the view (re-read
+   * it), or the composite expired (say so, and offer the current one).
+   */
+  failed(error: unknown) {
+    // An API error, or the AtlasError a shared view already read from one.
+    const code =
+      error instanceof ApiError
+        ? error.code
+        : typeof (error as AtlasError | null)?.code === "string"
+          ? (error as AtlasError).code
+          : undefined;
+    if (!code) return;
+    if (RECHECK.has(code)) void this.recheck();
+    else if (EXPIRED.has(code))
+      this.#set({
+        notice: {
+          kind: "restart",
+          message: "This view's snapshot has expired. Open the current one to continue.",
+        },
+      });
+  }
+
   async #page(snapshot: string, id: string, cursor: string | null, signal: AbortSignal) {
     try {
       const page = await this.#client.children(this.#workspace, id, {
@@ -379,16 +582,7 @@ export class WorkspaceSession {
       });
       return { items: page.items, next: page.next, total: page.counts.knownTotal };
     } catch (error) {
-      if (error instanceof ApiError && error.code) {
-        if (RECHECK.has(error.code)) void this.recheck();
-        else if (EXPIRED.has(error.code))
-          this.#set({
-            notice: {
-              kind: "restart",
-              message: "This view's snapshot has expired. Open the current one to continue.",
-            },
-          });
-      }
+      this.failed(error);
       throw error;
     }
   }
@@ -402,7 +596,14 @@ export class WorkspaceSession {
   /** Load (or continue) the children of something on the map. */
   expand(id: string, cursor: string | null = null, previous: AtlasEntitySummary[] = []) {
     if (this.#disposed || !this.#children || !this.#readable(repoOf(id))) return;
+    if (!cursor) this.#requested.add(id);
     void this.#children.load(id, cursor, previous);
+  }
+
+  /** Open something once: a no-op when its children are loaded or loading (retry with expand). */
+  ensure(id: string) {
+    if (this.#requested.has(id)) return;
+    this.expand(id);
   }
 
   /**
@@ -465,7 +666,8 @@ export class WorkspaceSession {
     const catalogue = overview.catalogue.items.filter(keep);
     const composition = this.#state.composition;
     this.#set({
-      // Totals counted the revoked repositories: keep only per-repository rows.
+      // Totals counted the revoked repositories: keep only per-repository
+      // rows, and only composites made without them.
       composition:
         composition?.status === "ready"
           ? {
@@ -473,6 +675,9 @@ export class WorkspaceSession {
               coverage: composition.coverage.filter((c) => !ids.has(c.repoId)),
               composites: null,
               resolved: null,
+              items: composition.items.filter((x) => !x.repos.some((id) => ids.has(id))),
+              next: null,
+              more: null,
             }
           : composition,
       overview: {
@@ -506,6 +711,7 @@ export class WorkspaceSession {
     this.#disposed = true;
     this.#opening?.abort();
     this.#checking?.abort();
+    this.#composing?.abort();
     this.#children?.reset("");
   }
 }

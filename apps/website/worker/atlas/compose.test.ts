@@ -297,6 +297,17 @@ describe("Atlas cross-repository composition", () => {
       evidence: ["resolved-dependencies", "concepts"],
     });
 
+    // A link to one composite reads just it, at the same composite snapshot;
+    // an id the scope doesn't compose is unknown, not an empty success.
+    const one = await w.get<AtlasWorkspaceComposition>(
+      `composition?repos=app,core,docs&id=${encodeURIComponent(composite.id)}&snapshot=${composition.snapshot.id}`,
+    );
+    expect(one.items).toEqual([composite]);
+    expect(one.counts.knownTotal).toBe(1);
+    expect(one.snapshot.id).toBe(composition.snapshot.id);
+    const unknown = await w.text(`composition?repos=app,core,docs&id=xcap%3A0000000000000000`);
+    expect(unknown).toMatch(/^404 .*"code":"entity_unknown"/);
+
     // The dependency, with inspectable evidence: who imports, the manifest
     // governing them, the package and the repository publishing it.
     const out = await w.get<Links>(`links?repos=app,core,docs&id=${enc(ui)}&state=resolved`);

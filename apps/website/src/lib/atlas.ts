@@ -1,7 +1,10 @@
 // A typed client for the Atlas read API (worker/atlas/api.ts, CORE-160), and
 // for the same pages over an explicit workspace scope (worker/atlas/workspace.ts,
 // CORE-161) as `atlasWorkspaceApi`, with capabilities spanning repositories and
-// their cross-repository links (CORE-167).
+// their cross-repository links (CORE-167). `AtlasReader` is what the shared
+// Atlas views (inspector, lens, evidence, lookup) read through, so the same
+// components serve a repository (`repoReader`) and a workspace
+// (`workspaceReader`, CORE-184).
 //
 // Every call can pin a snapshot; continuing a page passes its `next` cursor,
 // which pins its own. Failures throw an ApiError whose `code` is an
@@ -183,27 +186,6 @@ export const atlasApi = {
       { from, to, class: request.class, within: request.within, ...paged(request) },
       { signal: request.signal },
     ),
-  /** Capabilities spanning the selected repositories, largest first. */
-  composition: (workspace: AtlasWorkspace, request: AtlasPageRequest = {}) =>
-    getIn<AtlasWorkspaceComposition>(workspace, "composition", paged(request), request),
-  /**
-   * A capability's (or a repository's unclassified files') cross-repository
-   * links: `resolved` dependencies with evidence, `unresolved` package
-   * imports, or `related` capabilities (shared concepts, not a dependency).
-   * `direction: "in"` lists resolved dependencies on a repository (`<repoId>/repo`).
-   */
-  links: (
-    workspace: AtlasWorkspace,
-    id: string,
-    state: AtlasLinkState,
-    request: AtlasPageRequest & { direction?: AtlasDirection } = {},
-  ) =>
-    getIn<AtlasWorkspacePage<AtlasCrossLink>>(
-      workspace,
-      "links",
-      { id, state, direction: request.direction, ...paged(request) },
-      request,
-    ),
 };
 
 /**
@@ -259,6 +241,20 @@ export const atlasWorkspaceApi = {
     getIn<AtlasWorkspaceDetail>(workspace, "detail", { id }, request),
   ancestors: (workspace: AtlasWorkspace, id: string, request: AtlasRequest = {}) =>
     getIn<AtlasWorkspaceAncestors>(workspace, "ancestors", { id }, request),
+  /** The file imports behind a capability relation inside one repository (both ids namespaced). */
+  contributing: (
+    workspace: AtlasWorkspace,
+    id: string,
+    other: string,
+    direction: AtlasDirection,
+    request: AtlasPageRequest = {},
+  ) =>
+    getIn<AtlasWorkspacePage<AtlasContribution>>(
+      workspace,
+      "contributing",
+      { id, other, direction, ...paged(request) },
+      request,
+    ),
   relations: (
     workspace: AtlasWorkspace,
     id: string,
@@ -289,9 +285,14 @@ export const atlasWorkspaceApi = {
       { q, kind: request.kind, ...paged(request) },
       request,
     ),
-  /** Capabilities spanning the selected repositories, largest first. */
-  composition: (workspace: AtlasWorkspace, request: AtlasPageRequest = {}) =>
-    getIn<AtlasWorkspaceComposition>(workspace, "composition", paged(request), request),
+  /** Capabilities spanning the selected repositories, largest first; `id` reads just that one. */
+  composition: (workspace: AtlasWorkspace, request: AtlasPageRequest & { id?: string } = {}) =>
+    getIn<AtlasWorkspaceComposition>(
+      workspace,
+      "composition",
+      { id: request.id, ...paged(request) },
+      request,
+    ),
   /**
    * A capability's (or a repository's unclassified files') cross-repository
    * links: `resolved` dependencies with evidence, `unresolved` package
@@ -311,6 +312,64 @@ export const atlasWorkspaceApi = {
       request,
     ),
 };
+
+// ---- one reader for both scopes ---------------------------------------------------
+
+/** A page as the shared views use it, whichever envelope it came in. */
+export type AtlasPageOf<T> = Pick<AtlasPage<T>, "items" | "counts" | "next">;
+
+/**
+ * The entity reads the shared Atlas views make, against a repository or a
+ * workspace. Ids are what the scope's responses give (namespaced
+ * `<repoId>/<id>` in a workspace); `snapshot` pins what the scope's own
+ * overview named.
+ */
+export interface AtlasReader {
+  detail(id: string, request: AtlasRequest): Promise<Omit<AtlasDetail, "scope" | "snapshot">>;
+  ancestors(id: string, request: AtlasRequest): Promise<Omit<AtlasAncestors, "scope" | "snapshot">>;
+  children(id: string, request: AtlasPageRequest): Promise<AtlasPageOf<AtlasEntitySummary>>;
+  relations(
+    id: string,
+    direction: AtlasDirection,
+    request: AtlasPageRequest & { kind?: string },
+  ): Promise<AtlasPageOf<AtlasRelation>>;
+  contributing(
+    id: string,
+    other: string,
+    direction: AtlasDirection,
+    request: AtlasPageRequest,
+  ): Promise<AtlasPageOf<AtlasContribution>>;
+  evidence(id: string, request: AtlasPageRequest): Promise<AtlasPageOf<AtlasEvidence>>;
+  catalogue(
+    q: string,
+    request: AtlasPageRequest & { kind?: string },
+  ): Promise<AtlasPageOf<AtlasEntitySummary>>;
+}
+
+/** The reader for one repository's Atlas. */
+export const repoReader = (repo: AtlasRepo): AtlasReader => ({
+  detail: (id, request) => atlasApi.detail(repo, id, request),
+  ancestors: (id, request) => atlasApi.ancestors(repo, id, request),
+  children: (id, request) => atlasApi.children(repo, id, request),
+  relations: (id, direction, request) => atlasApi.relations(repo, id, direction, request),
+  contributing: (id, other, direction, request) =>
+    atlasApi.contributing(repo, id, other, direction, request),
+  evidence: (id, request) => atlasApi.evidence(repo, id, request),
+  catalogue: (q, request) => atlasApi.catalogue(repo, q, request),
+});
+
+/** The reader for a workspace scope: the same views, over namespaced ids. */
+export const workspaceReader = (workspace: AtlasWorkspace): AtlasReader => ({
+  detail: (id, request) => atlasWorkspaceApi.detail(workspace, id, request),
+  ancestors: (id, request) => atlasWorkspaceApi.ancestors(workspace, id, request),
+  children: (id, request) => atlasWorkspaceApi.children(workspace, id, request),
+  relations: (id, direction, request) =>
+    atlasWorkspaceApi.relations(workspace, id, direction, request),
+  contributing: (id, other, direction, request) =>
+    atlasWorkspaceApi.contributing(workspace, id, other, direction, request),
+  evidence: (id, request) => atlasWorkspaceApi.evidence(workspace, id, request),
+  catalogue: (q, request) => atlasWorkspaceApi.catalogue(workspace, q, request),
+});
 
 const RESTART: ReadonlySet<string> = new Set<AtlasErrorCode>([
   "snapshot_expired",

@@ -5,8 +5,9 @@
 //   GET /regions?repos=…&cursor=                        more of that catalogue
 //   GET /children?repos=…&id=<repoId>/<entity>          one entity's children, as /api/repos/…/atlas
 //   GET /detail | /ancestors | /relations | /evidence   the same, by namespaced id
+//   GET /contributing?id=&other=&direction=             the file imports behind a capability relation
 //   GET /catalogue?repos=…&q=[&kind=]                   lookup across every selected repository
-//   GET /composition?repos=…                            capabilities spanning repositories (CORE-167)
+//   GET /composition?repos=…[&id=xcap:…]                capabilities spanning repositories (CORE-167)
 //   GET /links?repos=…&id=&state=[&direction=]          a capability's cross-repository links (CORE-167)
 //
 // The scope. A workspace scope is the set of repositories the caller selected
@@ -61,6 +62,7 @@ import {
   ATLAS_WORKSPACE_MAX_REPOS,
   type AtlasCompositeCapability,
   type AtlasCompositionCoverage,
+  type AtlasContribution,
   type AtlasCounts,
   type AtlasCrossLink,
   type AtlasEntitySummary,
@@ -94,7 +96,9 @@ import {
   catalogueCountAt,
   childCountAt,
   childrenAt,
+  contributingAt,
   edgeCountsAt,
+  edgesAt,
   entityAt,
   evidenceCountAt,
   evidenceFilesAt,
@@ -736,6 +740,49 @@ workspaceAtlas.get("/relations", async (c) => {
   );
 });
 
+workspaceAtlas.get("/contributing", async (c) => {
+  const direction = c.req.query("direction") ?? "out";
+  const rawOther = c.req.query("other") ?? "";
+  const limit = limitOf(c);
+  const p = await pinEntity<[string, string]>(c, "contributing", { other: rawOther, direction });
+  if (p instanceof Response) return p;
+  if (direction !== "in" && direction !== "out")
+    return failWith(c, 400, "bad_request", "direction is in or out.");
+  if (limit instanceof Response) return limit;
+  const { ctx, target, id } = p;
+  // Both ends are in the entity's own repository: capability relations never
+  // cross repositories (those are /links).
+  const prefix = `${target.id}${SEP}`;
+  if (!rawOther.startsWith(prefix) || rawOther.length === prefix.length)
+    return failWith(c, 400, "bad_request", "other names the capability at the other end.");
+  const other = rawOther.slice(prefix.length);
+  const [from, to] = direction === "out" ? [id, other] : [other, id];
+  const d1 = c.env.DB;
+  const seq = target.snapshot.seq;
+  const result = await contributingAt(
+    d1,
+    target.scope,
+    seq,
+    from,
+    to,
+    ctx.cursor?.after ?? null,
+    limit,
+  );
+  const items: AtlasContribution[] = result.links.map((l) => ({
+    ...l,
+    src: qualify(target.id, l.src),
+    dst: qualify(target.id, l.dst),
+  }));
+  return c.json(
+    await page(c, ctx, [target], items, result.next, async () => {
+      const edge = (await edgesAt(d1, target.scope, seq, from, false)).find(
+        (e) => e.dst === to && e.kind === "depends_on",
+      );
+      return edge?.weight ?? 0;
+    }),
+  );
+});
+
 workspaceAtlas.get("/evidence", async (c) => {
   const limit = limitOf(c);
   const p = await pinEntity<string>(c, "evidence", {});
@@ -902,17 +949,21 @@ type CompositeKey = [number, string];
 
 workspaceAtlas.get("/composition", async (c) => {
   const limit = limitOf(c);
-  const pinned = await pin<CompositeKey>(c, "composition", {});
+  // `id` reads one composite (a link to it), with the same envelope and coverage.
+  const only = c.req.query("id") || null;
+  const pinned = await pin<CompositeKey>(c, "composition", { id: only });
   if (pinned instanceof Response) return pinned;
   if (limit instanceof Response) return limit;
   const { ctx } = pinned;
   const composed = await composition(c, ctx as Scope<unknown>);
+  const all = only ? composed.composites.filter((x) => x.id === only) : composed.composites;
+  if (only && all.length === 0) return failWith(c, 404, "entity_unknown", ENTITY_UNKNOWN);
   const after = ctx.cursor?.after ?? null;
   const rest = after
-    ? composed.composites.filter(
+    ? all.filter(
         (x) => x.counts.files < after[0] || (x.counts.files === after[0] && x.id > after[1]),
       )
-    : composed.composites;
+    : all;
   const items = rest.slice(0, limit);
   const last = items.at(-1);
   const shaped: AtlasCompositeCapability[] = items.map(({ memberIds, ...x }) => ({
@@ -929,7 +980,7 @@ workspaceAtlas.get("/composition", async (c) => {
       ctx.read,
       shaped,
       rest.length > limit && last ? ([last.counts.files, last.id] as CompositeKey) : null,
-      async () => composed.composites.length,
+      async () => all.length,
     )),
     coverage: coverageOf(ctx as Scope<unknown>, composed),
     resolved: composed.resolved.length,
