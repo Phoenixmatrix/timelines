@@ -38,8 +38,8 @@ export class Tracker extends DurableObject<Env> {
       throw error;
     }
   }
-  snapshot(access: Access) {
-    return this.reply(() => this.store.snapshot(access));
+  snapshot(access: Access, timeline?: string) {
+    return this.reply(() => this.store.snapshot(access, timeline));
   }
   changes(after: number, limit: number) {
     return this.reply(() => this.store.changes(after, limit));

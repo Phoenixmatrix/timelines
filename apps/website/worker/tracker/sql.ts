@@ -50,6 +50,15 @@ export interface TrackerDatabase {
   timeline_event_index: { timeline_id: string; seq: number };
 }
 
+/**
+ * The timeline tables (timelines.ts). Both stores create them: the tracker's
+ * views read timelines, and either store may be constructed first.
+ */
+export const TIMELINE_TABLES = `CREATE TABLE IF NOT EXISTS timelines (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS timeline_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS timeline_event_index (timeline_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (timeline_id, seq));
+  CREATE UNIQUE INDEX IF NOT EXISTS timeline_slugs ON timelines(json_extract(data, '$.slug'));`;
+
 /** The storage surface the store needs: `ctx.storage.sql`, or a test double. */
 export interface SqlDatabase {
   exec<T extends Record<string, SqlStorageValue> = Record<string, SqlStorageValue>>(

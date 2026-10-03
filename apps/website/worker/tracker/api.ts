@@ -132,6 +132,14 @@ async function agentsOf(d1: D1Database, members: TrackerIdentity[]): Promise<Tra
     revokedAt: row.revoked_at,
   }));
 }
+/** `?timeline=<slug>`: a timeline's view instead of main's. */
+function timelineParam(c: Context<AppEnv>): string | undefined {
+  const timeline = c.req.query("timeline");
+  if (timeline === undefined || timeline === "" || timeline === "main") return undefined;
+  if (timeline.length > 100)
+    throw new TrackerError(400, "invalid_input", "timeline must be a slug or id.");
+  return timeline;
+}
 function response<T>(c: Context<AppEnv>, result: TrackerReply<T>) {
   return result.ok
     ? Response.json(result.value)
@@ -223,7 +231,7 @@ tracker.get("/tracker/:owner/view", async (c) => {
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
   const [view, trackers] = await Promise.all([
     authorize(c).then(async (access) => ({
-      result: await trackerObject(c.env, access.owner.id).snapshot(access),
+      result: await trackerObject(c.env, access.owner.id).snapshot(access, timelineParam(c)),
       // An agent sees its person's defaults: they're whose work it does.
       preferences: await preferencesFor(c.env.DB, actor.id, access.owner.id),
     })),
@@ -272,7 +280,10 @@ tracker.delete("/tracker/:owner/preferences", async (c) => {
 });
 tracker.get("/tracker/:owner/snapshot", async (c) => {
   const access = await authorize(c);
-  return response(c, await trackerObject(c.env, access.owner.id).snapshot(access));
+  return response(
+    c,
+    await trackerObject(c.env, access.owner.id).snapshot(access, timelineParam(c)),
+  );
 });
 tracker.get("/tracker/:owner/changes", async (c) => {
   // Members and agents aren't events: a replica asks for them (directory=1) to

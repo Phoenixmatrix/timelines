@@ -723,6 +723,24 @@ defines the wire types.
   themselves, and the agent that started it. Abandoning again retries the
   bookmarks still there and records nothing new.
 
+**Views.** Issues have a view per timeline, projected from the one event log
+(`worker/tracker/views.ts`). A mutation request with `timeline: <slug>` is
+made in that timeline: its events carry `timelineId` and `view` (the entity
+as the timeline saw it, before and after), and issues it creates record
+`timelineId`. Main's view is the store's tables, as before: an event's
+`before`/`entity` stay main's, so in a timeline main's copy changes only
+shared fields (version, claim, assignee, waiting), and something only a
+timeline has is absent (`entity: null`). A timeline's view
+(`GET …/snapshot?timeline=<slug>`, `?tl=<slug>` in the web app, `--timeline`
+or `GM_TIMELINE` in gm) is main's with the scoped fields (title, description,
+acceptance, type, status, close reason, priority, parent, workspaces, labels)
+and the links and comments of the timeline, its ancestors and the timelines
+merged into them replayed on top in event order. `issue.next` in a timeline
+picks from its view. Landing folds a timeline into main's tables as
+`timeline.land` events (`TrackerStore.landTimeline`, for CORE-77 to call when it
+marks the timeline landed); views then leave landed timelines out. Ended
+timelines take no changes.
+
 ## Release notes
 
 Release notes are code-update history, not deployment records. The default view

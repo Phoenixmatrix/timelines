@@ -52,7 +52,7 @@ import { ActivityStrip } from "../../components/ActivityStrip.tsx";
 import { FormError, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
-import type { trackerLoader } from "./loaders.ts";
+import { timelineQuery, type trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
 import {
@@ -153,7 +153,12 @@ function scopeLabel(query: string, now: number): string | null {
 export function Tracker() {
   const data = useLoaderData<typeof trackerLoader>();
   const viewer = useViewer();
-  return <Workbench key={`${data.snapshot.owner.id}:${viewer?.id}`} data={data} />;
+  return (
+    <Workbench
+      key={`${data.snapshot.owner.id}:${viewer?.id}:${data.snapshot.timeline?.id ?? "main"}`}
+      data={data}
+    />
+  );
 }
 
 function Workbench({ data }: { data: TrackerView }) {
@@ -217,6 +222,9 @@ function Workbench({ data }: { data: TrackerView }) {
   const queryRef = useRef<HTMLInputElement>(null);
   const owner = data.snapshot.owner.slug;
   const base = `/tracker/${encodeURIComponent(owner)}`;
+  // A timeline's view (?tl=): its issues and statuses, and changes made here are its own.
+  const timeline = data.snapshot.timeline ?? null;
+  const scopeQuery = timelineQuery(timeline ? { tl: timeline.slug } : {});
   const selected =
     snapshot.issues.find((issue) => issue.id === route.issue || issue.key === route.issue) ?? null;
   useEffect(() => {
@@ -287,7 +295,9 @@ function Workbench({ data }: { data: TrackerView }) {
     const sequence = ++refreshSequence.current;
     setRefreshing(true);
     try {
-      const next = await api<Snapshot>(`/tracker/${encodeURIComponent(owner)}/snapshot`);
+      const next = await api<Snapshot>(
+        `/tracker/${encodeURIComponent(owner)}/snapshot${scopeQuery}`,
+      );
       if (sequence === refreshSequence.current) accept(next);
       return true;
     } catch (cause) {
@@ -299,7 +309,7 @@ function Workbench({ data }: { data: TrackerView }) {
     } finally {
       if (sequence === refreshSequence.current) setRefreshing(false);
     }
-  }, [owner, accept]);
+  }, [owner, scopeQuery, accept]);
   useEffect(() => {
     const onFocus = () => {
       if (!busyRef.current) void refresh();
@@ -329,7 +339,11 @@ function Workbench({ data }: { data: TrackerView }) {
     busyRef.current = true;
     setBusy(true);
     setError("");
-    pending.current ??= { operationId: crypto.randomUUID(), mutations };
+    pending.current ??= {
+      operationId: crypto.randomUUID(),
+      mutations,
+      ...(timeline ? { timeline: timeline.slug } : {}),
+    };
     try {
       const result = await api<MutationResult>(`/tracker/${encodeURIComponent(owner)}/mutate`, {
         method: "POST",
@@ -368,6 +382,7 @@ function Workbench({ data }: { data: TrackerView }) {
           "This team or workspace is archived. Choose an active one or ask an administrator to restore it.",
         forbidden:
           "You no longer have permission to make this change. Ask a tracker administrator for access.",
+        timeline_ended: "This timeline has ended. Switch to main to make changes.",
       };
       const message =
         (code && recovery[code]) ||
@@ -703,6 +718,33 @@ function Workbench({ data }: { data: TrackerView }) {
           )}
         </div>
       </header>
+      {timeline && (
+        <div className="mk-strip" role="status">
+          <span className="mk-strip-dot" aria-hidden />
+          <p className="mk-strip-text m-0 text-body-sm">
+            Timeline <strong>{timeline.name}</strong>{" "}
+            <span className="mk-mono text-ink-muted">timeline/{timeline.slug}</span>
+            {timeline.status !== "active" && (
+              <span className="text-ink-muted"> · {timeline.status.replace("_", " ")}</span>
+            )}
+            <span className="text-ink-muted">
+              {" "}
+              · main's issues with this timeline's changes; what you change here stays in it until
+              it lands.
+            </span>
+          </p>
+          <Link
+            className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+            to={(() => {
+              const next = new URLSearchParams(params);
+              next.delete("tl");
+              return `${base}${route.issue ? `/issues/${encodeURIComponent(route.issue)}` : ""}${next.size ? `?${next}` : ""}`;
+            })()}
+          >
+            View main
+          </Link>
+        </div>
+      )}
       {createOpen && (
         <CreateIssue
           snapshot={snapshot}

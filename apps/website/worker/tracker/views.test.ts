@@ -1,0 +1,266 @@
+import { describe, expect, test } from "vite-plus/test";
+import type { Issue, Mutation, Snapshot } from "../../shared/tracker.ts";
+import { durableStorage } from "../testing/durable.ts";
+import { TrackerStore, type Access } from "./store.ts";
+import { TimelineStore } from "./timelines.ts";
+
+const oid = (n: number) => n.toString(16).padStart(40, "0");
+
+function setup() {
+  const { sql, db, transactionSync } = durableStorage();
+  let now = Date.parse("2026-10-03T00:00:00Z");
+  const clock = () => (now += 1000);
+  const store = new TrackerStore(sql, transactionSync, clock);
+  const timelines = new TimelineStore(sql, transactionSync, clock);
+  const access: Access = {
+    actorId: "ann",
+    principalId: "ann",
+    agents: [],
+    owner: { id: "org", slug: "org", displayName: "Org" },
+    canAdmin: true,
+    members: [{ id: "ann", slug: "ann", displayName: "Ann" }],
+    repos: [],
+  };
+  let operation = 0;
+  const mutate = (timeline: string | undefined, ...mutations: Mutation[]) =>
+    store.mutate(access, {
+      operationId: `op-${++operation}`,
+      mutations,
+      ...(timeline ? { timeline } : {}),
+    });
+  const fork = (slug: string, parent: string | null = null) =>
+    timelines.create(access, {
+      slug,
+      parent,
+      repos: [{ id: "app", owner: "org", name: "app" }],
+      commits: { app: oid(1) },
+    });
+  const issue = (snapshot: Snapshot, id: string) => snapshot.issues.find((i) => i.id === id);
+  const view = (timeline?: string) => store.snapshot(access, timeline);
+  const version = (id: string, timeline?: string) => issue(view(timeline), id)!.version;
+  const update = (timeline: string | undefined, id: string, data: Record<string, unknown>) =>
+    mutate(timeline, {
+      kind: "issue.update",
+      id,
+      expectedVersion: version(id, timeline),
+      data,
+    });
+  mutate(undefined, { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } });
+  return { store, timelines, db, access, mutate, fork, issue, view, update };
+}
+
+describe("timeline views of the tracker", () => {
+  test("an issue made in a timeline is the timeline's, and absent from main", () => {
+    const t = setup();
+    const search = t.fork("search");
+    const result = t.mutate("search", {
+      kind: "issue.create",
+      id: "a",
+      data: { teamId: "team", title: "Index the docs" },
+    });
+    expect(result.events).toMatchObject([
+      {
+        entityType: "issue",
+        entityId: "a",
+        timelineId: search.id,
+        before: null,
+        entity: null,
+        view: { before: null, entity: { id: "a", timelineId: search.id, title: "Index the docs" } },
+      },
+    ]);
+    expect(t.issue(t.view(), "a")).toBeUndefined();
+    expect(t.view("search")).toMatchObject({
+      timeline: { id: search.id, slug: "search", status: "active" },
+      issues: [{ id: "a", key: "ENG-1", timelineId: search.id }],
+    });
+    // Its id stays taken in every view, and main can't change it.
+    expect(() =>
+      t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "x" } }),
+    ).toThrow(/already exists/);
+    expect(() =>
+      t.mutate(undefined, {
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: 1,
+        data: { title: "x" },
+      }),
+    ).toThrow(/not found/);
+    // History finds it by key, as the timeline saw it.
+    expect(t.store.history(t.access, "ENG-1", null, 10).events).toMatchObject([
+      {
+        kind: "issue.create",
+        timelineId: search.id,
+        before: null,
+        entity: { title: "Index the docs" },
+      },
+    ]);
+  });
+
+  test("a timeline's changes stay in its view and its descendants'; shared fields are everyone's", () => {
+    const t = setup();
+    t.mutate(undefined, {
+      kind: "issue.create",
+      id: "a",
+      data: { teamId: "team", title: "Ship search" },
+    });
+    t.fork("search");
+    t.fork("ranking", "search");
+    t.fork("other");
+    t.update("search", "a", { status: "in_progress", labels: ["search"] });
+    // Main's view is as before, but the version moved for everyone.
+    expect(t.issue(t.view(), "a")).toMatchObject({ status: "todo", labels: [], version: 2 });
+    expect(t.issue(t.view("search"), "a")).toMatchObject({
+      status: "in_progress",
+      labels: ["search"],
+      version: 2,
+    });
+    expect(t.issue(t.view("ranking"), "a")).toMatchObject({ status: "in_progress" });
+    expect(t.issue(t.view("other"), "a")).toMatchObject({ status: "todo", labels: [] });
+    // Main's later changes show through where the timeline didn't change the field.
+    t.update(undefined, "a", { title: "Ship search v2", status: "backlog" });
+    expect(t.issue(t.view("search"), "a")).toMatchObject({
+      title: "Ship search v2",
+      status: "in_progress",
+      version: 3,
+    });
+    expect(t.issue(t.view(), "a")).toMatchObject({ title: "Ship search v2", status: "backlog" });
+  });
+
+  test("links removed in a timeline stay on main, and readiness follows the view", () => {
+    const t = setup();
+    t.mutate(
+      undefined,
+      {
+        kind: "issue.create",
+        id: "a",
+        data: { teamId: "team", title: "Blocker", status: "backlog" },
+      },
+      { kind: "issue.create", id: "b", data: { teamId: "team", title: "Blocked" } },
+      { kind: "link.add", id: "l", data: { fromId: "a", toId: "b", kind: "blocks" } },
+    );
+    t.fork("search");
+    t.update("search", "a", { status: "done" });
+    // In the timeline the blocker is done, so the blocked issue is next; on main it isn't.
+    const next = (timeline?: string) =>
+      t.mutate(timeline, { kind: "issue.next", id: crypto.randomUUID(), data: { agent: "w" } })
+        .results[0]!;
+    expect(next().issueId).toBeUndefined();
+    const picked = next("search");
+    expect(picked).toMatchObject({ issueId: "b", key: "ENG-2" });
+    // The lease is shared: main sees the claim, though the status change is the timeline's.
+    expect(t.issue(t.view(), "b")).toMatchObject({ status: "todo", claim: { agent: "w" } });
+    expect(t.issue(t.view("search"), "b")).toMatchObject({ status: "in_progress" });
+    t.mutate("search", { kind: "link.remove", id: "l" });
+    expect(t.view().links.map((l) => l.id)).toEqual(["l"]);
+    expect(t.view("search").links).toEqual([]);
+  });
+
+  test("work on a timeline's own issue goes through claim, batch edits and completion", () => {
+    const t = setup();
+    t.fork("search");
+    t.mutate("search", { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
+    const claimed = t.mutate("search", {
+      kind: "issue.next",
+      id: "pick",
+      data: { agent: "w" },
+    }).results[0]!;
+    expect(claimed.issueId).toBe("a");
+    expect(t.issue(t.view("search"), "a")).toMatchObject({ status: "in_progress", version: 2 });
+    t.mutate(
+      "search",
+      { kind: "issue.update", id: "a", expectedVersion: 2, data: { title: "A, renamed" } },
+      { kind: "issue.update", id: "a", expectedVersion: 3, data: { labels: ["x"] } },
+    );
+    t.mutate("search", {
+      kind: "issue.complete",
+      id: "a",
+      data: { leaseToken: claimed.leaseToken!, evidence: "done" },
+    });
+    expect(t.issue(t.view("search"), "a")).toMatchObject({
+      title: "A, renamed",
+      labels: ["x"],
+      status: "done",
+      claim: null,
+    });
+    expect(t.view("search").comments).toMatchObject([{ issueId: "a", kind: "evidence" }]);
+    expect(t.issue(t.view(), "a")).toBeUndefined();
+    expect(t.view().comments).toEqual([]);
+  });
+
+  test("ended and unknown timelines take no changes", () => {
+    const t = setup();
+    t.fork("search");
+    t.timelines.abandon(t.access, "search", {});
+    const create: Mutation = {
+      kind: "issue.create",
+      id: "a",
+      data: { teamId: "team", title: "x" },
+    };
+    expect(() => t.mutate("search", create)).toThrow(/abandoned/);
+    expect(() => t.mutate("missing", create)).toThrow(/No timeline missing/);
+    expect(() => t.view("missing")).toThrow(/No timeline missing/);
+    // Main by name is main.
+    expect(t.mutate("main", create).events[0]).not.toHaveProperty("timelineId");
+  });
+
+  test("a timeline merged into another is part of its view", () => {
+    const t = setup();
+    t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
+    t.fork("search");
+    t.fork("ranking");
+    t.update("ranking", "a", { priority: 0 });
+    expect(t.issue(t.view("search"), "a")!.priority).toBe(2);
+    t.timelines.recordPush({
+      repo: { id: "app", owner: "org", name: "app" },
+      actorId: "ann",
+      accountableId: "ann",
+      pushed: ["search"],
+      merges: [{ into: "search", from: "ranking", commit: oid(5), parent: oid(4), refUpdateId: 1 }],
+    });
+    expect(t.issue(t.view("search"), "a")!.priority).toBe(0);
+    expect(t.issue(t.view(), "a")!.priority).toBe(2);
+  });
+
+  test("landing folds a timeline's changes into main, once", () => {
+    const t = setup();
+    t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
+    const search = t.fork("search");
+    t.fork("ranking", "search");
+    t.update("search", "a", { status: "done" });
+    t.mutate("search", { kind: "issue.create", id: "b", data: { teamId: "team", title: "B" } });
+    t.mutate("search", { kind: "comment.add", id: "c", data: { issueId: "b", body: "note" } });
+    t.update("ranking", "b", { priority: 1 });
+    const events = t.store.landTimeline(t.access, "search");
+    expect(events.map((e) => [e.kind, e.entityId, e.timelineId])).toEqual([
+      ["timeline.land", "a", undefined],
+      ["timeline.land", "b", undefined],
+      ["timeline.land", "c", undefined],
+    ]);
+    t.db
+      .prepare(`UPDATE timelines SET data = json_set(data, '$.status', 'landed') WHERE id = ?`)
+      .run(search.id);
+    const main = t.view();
+    expect(t.issue(main, "a")).toMatchObject({ status: "done" });
+    // A descendant's own changes are still its own.
+    expect(t.issue(main, "b")).toMatchObject({ timelineId: search.id, priority: 2 });
+    expect(main.comments.map((c) => c.id)).toEqual(["c"]);
+    expect(t.issue(t.view("ranking"), "b")).toMatchObject({ status: "todo", priority: 1 });
+    expect(t.issue(t.view("search"), "b")).toMatchObject({ priority: 2 });
+    expect(t.store.landTimeline(t.access, "search")).toEqual([]);
+  });
+
+  test("main's view and its event log are unchanged for work outside timelines", () => {
+    const t = setup();
+    t.fork("search");
+    const result = t.mutate(undefined, {
+      kind: "issue.create",
+      id: "a",
+      data: { teamId: "team", title: "Main work" },
+    });
+    expect(result.events[0]).not.toHaveProperty("timelineId");
+    expect(result.events[0]).not.toHaveProperty("view");
+    expect(result.events[0]!.entity).not.toHaveProperty("timelineId");
+    expect(t.view()).not.toHaveProperty("timeline");
+    expect((t.issue(t.view("search"), "a") as Issue).title).toBe("Main work");
+  });
+});

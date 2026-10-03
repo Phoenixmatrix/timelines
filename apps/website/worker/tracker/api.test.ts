@@ -67,6 +67,17 @@ describe("tracker browser data", () => {
       expect(getByName).not.toHaveBeenCalled();
     }
   });
+  test("?timeline= asks for that timeline's view; main is the default", async () => {
+    const { call, snapshot } = setup();
+    await call("/tracker/orbit/view?timeline=search");
+    await call("/tracker/orbit/snapshot?timeline=search");
+    await call("/tracker/orbit/snapshot?timeline=main");
+    expect(snapshot.mock.calls.map((args) => (args as unknown[])[1])).toEqual([
+      "search",
+      "search",
+      undefined,
+    ]);
+  });
   test("keeps the snapshot API response unchanged for CLI and refresh consumers", async () => {
     const { call } = setup();
     const result = await call("/tracker/ann/snapshot");

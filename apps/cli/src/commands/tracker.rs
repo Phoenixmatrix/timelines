@@ -324,6 +324,8 @@ struct Replica {
     db: Connection,
     config: Config,
     owner: String,
+    /// The timeline whose view this works in (`--timeline`); None for main.
+    timeline: Option<String>,
 }
 impl Replica {
     fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -352,6 +354,46 @@ impl Replica {
     }
     fn path(&self, suffix: &str) -> String {
         format!("/tracker/{}/{}", self.owner, suffix)
+    }
+    /// The base this replica views: main's snapshot, or the timeline's view as last fetched.
+    /// The server projects a timeline's view (main's issues with the timeline's changes);
+    /// offline, the copy fetched by the last online command stands in.
+    fn base(&self) -> Result<Value> {
+        let Some(slug) = &self.timeline else {
+            return self.snapshot();
+        };
+        let raw = self.meta(&format!("view:{slug}"))?.ok_or_else(|| {
+            GmError::new(
+                "replica_uninitialized",
+                format!("No copy of timeline {slug}'s view yet; run a command online first."),
+            )
+        })?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+    /// Fetch the selected timeline's view for offline use.
+    fn refresh_view(&self) -> Result<()> {
+        let Some(slug) = &self.timeline else {
+            return Ok(());
+        };
+        let mut view = remote::api(
+            &self.config,
+            "GET",
+            &self.path(&format!("snapshot?timeline={slug}")),
+            None,
+        )?;
+        redact(&mut view);
+        if !view["issues"].is_array() || !view["timeline"].is_object() {
+            return Err(GmError::new("protocol_error", "Invalid timeline view."));
+        }
+        self.set(&format!("view:{slug}"), &serde_json::to_string(&view)?)
+    }
+    /// A request carries the timeline it was made in.
+    fn request(&self, mutations: Value) -> Value {
+        let mut request = json!({"operationId":uid(),"mutations":mutations});
+        if let Some(slug) = &self.timeline {
+            request["timeline"] = json!(slug);
+        }
+        request
     }
     fn verify(&self) -> Result<()> {
         let session = remote::api(&self.config, "GET", "/session", None)?;
@@ -449,8 +491,12 @@ impl Replica {
         rows.map(|row| { let (operation,body,state,error)=row.map_err(db_err)?; Ok(json!({"operationId":operation,"request":serde_json::from_str::<Value>(&body)?,"state":state,"error":error})) }).collect()
     }
     fn view(&self) -> Result<Value> {
-        let mut snapshot = self.snapshot()?;
+        let mut snapshot = self.base()?;
         for row in self.queued()? {
+            // Queued changes to main show in every view; a timeline's only in its own.
+            if !in_view(&row["request"], self.timeline.as_deref()) {
+                continue;
+            }
             for mutation in row["request"]["mutations"].as_array().into_iter().flatten() {
                 project(&mut snapshot, mutation)?;
             }
@@ -526,7 +572,7 @@ impl Replica {
         }
         self.pull()?;
         self.pull_preferences();
-        Ok(())
+        self.refresh_view()
     }
     /// Your defaults for this tracker, set on the web, kept for offline use.
     /// Best effort: an older server or a failed fetch keeps what gm had.
@@ -556,8 +602,8 @@ impl Replica {
     }
     fn submit(&self, ctx: &Ctx, offline: bool, mutations: Vec<Value>) -> Result<Shown> {
         validate_batch(&mutations)?;
-        let operation = uid();
-        let request = json!({"operationId":operation,"mutations":mutations});
+        let request = self.request(json!(mutations));
+        let operation = request["operationId"].as_str().unwrap().to_string();
         if ctx.dry_run {
             let mut preview = self.view()?;
             for m in request["mutations"].as_array().unwrap() {
@@ -627,11 +673,23 @@ fn with_replica(
     let db = Connection::open(path).map_err(db_err)?;
     db.busy_timeout(Duration::from_secs(30)).map_err(db_err)?;
     db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT UNIQUE NOT NULL,body TEXT NOT NULL,state TEXT NOT NULL,error TEXT);").map_err(db_err)?;
-    let replica = Replica { db, config, owner };
+    let replica = Replica {
+        db,
+        config,
+        owner,
+        timeline: scope.timeline(),
+    };
     if !scope.offline && refresh && !ctx.dry_run {
         replica.sync()?;
     }
     f(&replica)
+}
+/// Whether a queued request shows in a view: main's changes show everywhere.
+fn in_view(request: &Value, timeline: Option<&str>) -> bool {
+    match request["timeline"].as_str() {
+        None | Some("main") => true,
+        made_in => made_in == timeline,
+    }
 }
 fn collection(kind: &str) -> Option<&'static str> {
     match kind {
@@ -892,6 +950,7 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
         let scope = Scope {
             owner: Some(owner.clone()),
             offline: false,
+            timeline: None,
         };
         return with_replica(&scope, ctx, true, |r| {
             let root = root(&r.config)?;
@@ -1414,7 +1473,7 @@ fn listing(
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
     Ok(Shown(
-        json!({"team":choice.describe(owner, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"next":"Acquire an online claim before starting exclusive work."}),
+        json!({"team":choice.describe(owner, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"timeline":snapshot["timeline"],"next":"Acquire an online claim before starting exclusive work."}),
     ))
 }
 fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Result<Shown> {
@@ -1463,7 +1522,7 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         .take(limit)
         .collect();
     Ok(Shown(
-        json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline}),
+        json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline,"timeline":snapshot["timeline"]}),
     ))
 }
 /// Adds a delegation's underToken and forActorId (an agent resolved by name or id).
@@ -1520,6 +1579,7 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
             "expiresAt": result["expiresAt"],
         },
         "context": context,
+        "timeline": snapshot["timeline"],
         "blockerEvidence": blocker_evidence,
         "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete with evidence. gm kept the lease token for this identity, so those commands need no token.",
     });
@@ -1826,7 +1886,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
         };
         if lease_command {
-            let mut request = json!({"operationId":uid(),"mutations":[mutation]});
+            let mut request = r.request(json!([mutation]));
             if ctx.dry_run {
                 redact(&mut request);
                 return Ok(Shown(json!({"dryRun":true,"request":request})));
@@ -2030,6 +2090,24 @@ impl TeamChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timeline_changes_show_in_their_own_view_and_mains_everywhere() {
+        let main = json!({"mutations":[]});
+        let search = json!({"mutations":[],"timeline":"search"});
+        assert!(in_view(&main, None));
+        assert!(in_view(&main, Some("search")));
+        assert!(in_view(&search, Some("search")));
+        assert!(!in_view(&search, None));
+        assert!(!in_view(&search, Some("ranking")));
+        let scope = |timeline: Option<&str>| Scope {
+            owner: None,
+            offline: false,
+            timeline: timeline.map(str::to_string),
+        };
+        assert_eq!(scope(Some("main")).timeline(), None);
+        assert_eq!(scope(Some("")).timeline(), None);
+        assert_eq!(scope(Some("search")).timeline().as_deref(), Some("search"));
+    }
     #[test]
     fn kept_leases_remember_who_took_them_and_expire() {
         let kept = Kept {
@@ -2389,6 +2467,7 @@ mod tests {
             db,
             config: Config::default(),
             owner: "orbit".into(),
+            timeline: None,
         };
         let snapshot =
             json!({"teams":[{"id":"t1","key":"CORE"},{"id":"t2","key":"OLD","archived":true}]});
@@ -2413,6 +2492,7 @@ mod tests {
             db,
             config: Config::default(),
             owner: "orbit".into(),
+            timeline: None,
         };
         r.set("snapshot", &snapshot().to_string()).unwrap();
         let first = json!({"operationId":"one","mutations":[{"kind":"issue.create","id":"stable","data":{"title":"Offline"}}]});
@@ -2434,5 +2514,43 @@ mod tests {
         // Refreshing remote state must never mutate the request awaiting its receipt.
         r.set("snapshot", &snapshot().to_string()).unwrap();
         assert_eq!(r.queued().unwrap()[0]["request"], first);
+    }
+    #[test]
+    fn a_timeline_view_is_the_servers_projection_plus_changes_queued_for_it() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT UNIQUE,body TEXT,state TEXT,error TEXT);").unwrap();
+        let r = Replica {
+            db,
+            config: Config::default(),
+            owner: "orbit".into(),
+            timeline: Some("search".into()),
+        };
+        r.set("snapshot", &snapshot().to_string()).unwrap();
+        assert_eq!(r.view().unwrap_err().code, "replica_uninitialized");
+        let mut view = snapshot();
+        view["timeline"] = json!({"id":"tl_1","slug":"search"});
+        view["issues"] = json!([{"id":"a","key":"ENG-1","title":"Made in search","version":1}]);
+        r.set("view:search", &view.to_string()).unwrap();
+        assert_eq!(
+            r.request(json!([]))["timeline"],
+            "search",
+            "changes are made in the timeline"
+        );
+        let queue = |operation: &str, timeline: Option<&str>, title: &str| {
+            let mut request = json!({"operationId":operation,"mutations":[{"kind":"issue.update","id":"a","expectedVersion":1,"data":{"title":title}}]});
+            if let Some(timeline) = timeline {
+                request["timeline"] = json!(timeline);
+            }
+            r.db.execute(
+                "INSERT INTO outbox(operation,body,state) VALUES (?,?,'queued')",
+                params![operation, request.to_string()],
+            )
+            .unwrap();
+        };
+        queue("one", Some("search"), "Search edit");
+        queue("two", Some("ranking"), "Ranking edit");
+        let shown = r.view().unwrap();
+        assert_eq!(shown["timeline"]["slug"], "search");
+        assert_eq!(shown["issues"][0]["title"], "Search edit");
     }
 }

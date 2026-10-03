@@ -18,7 +18,7 @@ import {
   type TimelineRepo,
   type TimelineStatus,
 } from "../../shared/timelines.ts";
-import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
+import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { fail, text, type Access } from "./store.ts";
 
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -98,10 +98,7 @@ export class TimelineStore {
     this.sql = sql;
     this.transaction = transaction;
     this.clock = clock;
-    sql.exec(`CREATE TABLE IF NOT EXISTS timelines (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS timeline_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS timeline_event_index (timeline_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (timeline_id, seq));
-      CREATE UNIQUE INDEX IF NOT EXISTS timeline_slugs ON timelines(json_extract(data, '$.slug'));`);
+    sql.exec(TIMELINE_TABLES);
   }
   private now() {
     return new Date(this.clock()).toISOString();

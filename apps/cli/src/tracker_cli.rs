@@ -64,6 +64,18 @@ pub struct Scope {
     /// Use only this private SQLite replica. Never automatically falls back offline.
     #[arg(long, global = true)]
     pub offline: bool,
+    /// Work in a timeline (its slug): read its view of the issues, and make changes in it.
+    /// `main` (the default) is main's view.
+    #[arg(long, global = true, env = "GM_TIMELINE")]
+    pub timeline: Option<String>,
+}
+impl Scope {
+    /// The timeline selected, if any: None for main.
+    pub fn timeline(&self) -> Option<String> {
+        self.timeline
+            .clone()
+            .filter(|slug| !slug.is_empty() && slug != "main")
+    }
 }
 #[derive(Subcommand)]
 pub enum TrackerCommand {

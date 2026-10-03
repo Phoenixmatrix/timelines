@@ -73,16 +73,18 @@ export function initializeAudit(sql: SqlDatabase, transaction: <T>(fn: () => T) 
 
 export function indexAuditEvent(sql: SqlDatabase, event: IssueAuditEvent) {
   const ids = new Set<string>();
+  // A change made in a timeline is about what that timeline saw.
+  const { before: seen, entity: made } = event.view ?? event;
   if (event.entityType === "issue") {
     ids.add(event.entityId);
-    const before = event.before as Issue | null;
-    const after = event.entity as Issue | null;
+    const before = seen as Issue | null;
+    const after = made as Issue | null;
     if (before?.parentId !== after?.parentId) {
       if (before?.parentId) ids.add(before.parentId);
       if (after?.parentId) ids.add(after.parentId);
     }
   } else {
-    for (const entity of [event.before, event.entity]) {
+    for (const entity of [seen, made]) {
       if (!entity) continue;
       if ("issueId" in entity) ids.add(entity.issueId);
       if ("fromId" in entity) {
@@ -115,7 +117,11 @@ export function issueHistory(
   if (before !== null) query = query.where("i.cursor", "<", before);
   const rows = all(sql, query.orderBy("i.cursor", "desc").limit(limit + 1));
   const events = rows.slice(0, limit).map((row): IssueAuditEvent => {
-    const event = JSON.parse(row.data) as TrackerEvent;
+    const logged = JSON.parse(row.data) as TrackerEvent;
+    // In a timeline, history shows the change as the timeline saw it.
+    const event = logged.view
+      ? { ...logged, before: logged.view.before, entity: logged.view.entity }
+      : logged;
     let previous = event.before;
     if (previous === undefined) {
       const prior = first(

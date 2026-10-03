@@ -34,6 +34,14 @@ describe("tracker navigation", () => {
       expect.objectContaining({ signal: input.request.signal }),
     );
   });
+  test("?tl= loads a timeline's view", async () => {
+    const view = { snapshot: { owner: owners[1], issues: [] }, trackers: owners };
+    const fetch = reply(view);
+    await trackerLoader(args("/tracker/orbit?q=is%3Aopen&tl=search"));
+    expect(fetch.mock.calls[0]![0]).toBe("/api/tracker/orbit/view?timeline=search");
+    await trackerLoader(args("/tracker/orbit?tl=main"));
+    expect(fetch.mock.calls[1]![0]).toBe("/api/tracker/orbit/view");
+  });
   test("uses the authenticated viewer's saved owner and preserves explicit URL state", async () => {
     const fetch = reply({ viewerId: "ann", trackers: owners });
     const getItem = vi

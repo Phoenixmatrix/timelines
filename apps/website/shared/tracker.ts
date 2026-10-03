@@ -115,6 +115,36 @@ export interface Issue extends TrackerEntity {
   attempts?: number;
   /** A pending handoff of the lease: to whom (anyone with the code when null), and until when. */
   handoff?: { to: string | null; expiresAt: string } | null;
+  /** The timeline it was created in; absent or null for main. */
+  timelineId?: string | null;
+}
+
+/**
+ * Issue fields that differ between timelines' views (TIMELINES-RESEARCH.md,
+ * "Tracker"): what a timeline changes stays in its view until it lands. The
+ * rest (identity, version, claim, assignee, waiting) is shared by every view:
+ * leases stay unique per issue across timelines.
+ */
+export const TIMELINE_SCOPED_ISSUE_FIELDS = [
+  "title",
+  "description",
+  "acceptance",
+  "type",
+  "status",
+  "closeReason",
+  "priority",
+  "parentId",
+  "workspaceIds",
+  "labels",
+] as const satisfies readonly (keyof Issue)[];
+/** Entity types whose existence and contents are per view; the rest are shared by every view. */
+export const TIMELINE_SCOPED_TYPES = ["issue", "link", "comment"] as const;
+/** The timeline a snapshot is a view of. */
+export interface TimelineScope {
+  id: string;
+  slug: string;
+  name: string;
+  status: string;
 }
 
 export type RequestKind = "question" | "approval" | "decision" | "credential";
@@ -181,6 +211,11 @@ export interface Snapshot {
   subscriptions: Subscription[];
   cursor: number;
   serverTime: string;
+  /**
+   * Set when this is a timeline's view: main's issues with the timeline's
+   * (and its ancestors') changes on top. Absent for main's view.
+   */
+  timeline?: TimelineScope;
 }
 /** Initial browser data; repository choices are loaded only in management. */
 export interface TrackerView {
@@ -255,7 +290,18 @@ export interface TrackerEvent {
   source?: AuditSource;
   /** The requested mutation, which may also emit secondary events. */
   mutationKind?: string;
+  /**
+   * `before` and `entity` are always main's view (what a replica of main
+   * applies). An event made in a timeline names it here.
+   */
   before?: TrackerEvent["entity"];
+  timelineId?: string;
+  /**
+   * For an issue, link or comment changed in a timeline: the entity as that
+   * timeline saw it, before and after. Main's `entity` then changes only
+   * shared fields (and is null for something that exists only in timelines).
+   */
+  view?: { before: TrackerEvent["entity"]; entity: TrackerEvent["entity"] };
 }
 export interface IssueAuditEvent extends TrackerEvent {
   actor: AuditActor;
@@ -414,6 +460,11 @@ export type Mutation =
 export interface MutationRequest {
   operationId: string;
   mutations: Mutation[];
+  /**
+   * Make the changes in a timeline (its slug or id): they apply to its view,
+   * and issues created become the timeline's. Absent or `main` for main.
+   */
+  timeline?: string;
 }
 export interface MutationResult {
   cursor: number;

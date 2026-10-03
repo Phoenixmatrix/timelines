@@ -31,6 +31,15 @@ export async function trackerIndexLoader({ request }: LoaderFunctionArgs) {
   return { trackers };
 }
 
+/** `?tl=<slug>` selects a timeline's view; main's is the default. */
+export function timelineQuery(search: ConstructorParameters<typeof URLSearchParams>[0]): string {
+  const tl = new URLSearchParams(search).get("tl");
+  return tl && tl !== "main" ? `?timeline=${encodeURIComponent(tl)}` : "";
+}
+
 export function trackerLoader({ request, params }: LoaderFunctionArgs) {
-  return loadTracker<TrackerView>(`/tracker/${encodeURIComponent(params.owner!)}/view`, request);
+  return loadTracker<TrackerView>(
+    `/tracker/${encodeURIComponent(params.owner!)}/view${timelineQuery(new URL(request.url).search)}`,
+    request,
+  );
 }
