@@ -1148,4 +1148,79 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await browser.close();
     }
   });
+
+  await scenario("browser-global-search-palette", async () => {
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+    const page = await context.newPage();
+    page.setDefaultTimeout(browserTimeout);
+    try {
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as marco/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/${fullName}`);
+      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+      const dialog = page.getByRole("dialog", { name: "Search" });
+      const input = page.getByRole("combobox", { name: "Search or go to" });
+
+      // The visible control opens it with focus in the query; Escape gives focus back.
+      const button = page.getByRole("button", { name: "Search", exact: true });
+      await button.click();
+      await expect(input).toBeFocused();
+      await expect(page.getByRole("group", { name: `In ${fullName}` })).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(dialog).toBeHidden();
+      await expect(button).toBeFocused();
+
+      // Ctrl+K, a real search, exact identifier first, Enter navigates and closes.
+      await page.keyboard.press("Control+k");
+      await input.fill(`${publicRepo.owner}/${publicRepo.name}`);
+      await expect(page.getByRole("option", { selected: true })).toContainText(
+        `${publicRepo.owner}/${publicRepo.name}`,
+      );
+      await page.keyboard.press("Enter");
+      await expect(dialog).toBeHidden();
+      await page.waitForURL((url) => url.pathname === `/${publicRepo.owner}/${publicRepo.name}`);
+
+      // A private repository marco can't read never appears.
+      await page.keyboard.press("Control+k");
+      await input.fill(`${outsiderRepo.owner}/${outsiderRepo.name}`);
+      await expect(
+        dialog.getByText(`Nothing matches “${outsiderRepo.owner}/${outsiderRepo.name}”.`),
+      ).toBeVisible();
+      await page.keyboard.press("Escape");
+
+      // Signed out: navigation only, and no search requests.
+      await context.clearCookies();
+      let searched = 0;
+      page.on("request", (request) => {
+        if (request.url().includes("/api/search")) searched++;
+      });
+      await page.goto("/");
+      await page.waitForLoadState("networkidle");
+      await page.keyboard.press("Control+k");
+      const goTo = page.getByRole("combobox", { name: "Go to" });
+      await expect(goTo).toBeFocused();
+      await goTo.fill("sign");
+      await page.keyboard.press("Enter");
+      await page.waitForURL((url) => url.pathname === "/signin");
+      assert.equal(searched, 0, "Signed-out palette must not search");
+      await context.tracing.stop();
+      record({ persona: "marco", signedOut: true, independentContext: true });
+    } catch (error) {
+      await page
+        .screenshot({ path: join(ctx.artifacts, "browser-palette-failure.png"), fullPage: true })
+        .catch(() => {});
+      await context.tracing
+        .stop({ path: join(ctx.artifacts, "browser-palette-failure.zip") })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  });
 }

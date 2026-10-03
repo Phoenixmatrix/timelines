@@ -259,6 +259,27 @@ never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 
 ## Global search
 
+**The palette** (CORE-94): press **⌘K** (Mac) or **Ctrl+K**, or the magnifying
+glass in the rail (the top bar on phones), from any page but sign-in. Type to
+filter; **↑/↓** choose, **Enter** opens, **Esc** closes and returns focus to where
+you were. It lists, in labelled groups:
+
+- **In owner/name**: the current repository's sections (the same list as its tabs);
+- **Go to**: the app's places (tracker, Needs you, packages, settings…);
+- **Actions**: things to do, such as opening the assistant;
+- **Repositories**, **People and organizations**, **Conversations**: from
+  `/api/search` as you type (debounced; signed-in only). Choosing a
+  conversation reopens it in the assistant.
+
+Local groups answer at once and keep working while remote ones load or fail;
+a category that can't be searched says so instead of looking empty. Selection
+follows the option you picked, so results arriving never move it, and only the
+newest query's answer is ever shown. Signed out, the palette only navigates.
+While it's open, page shortcuts (⌘J, tracker keys) don't fire. Code lives in
+`src/palette/`: `commands.ts` is the typed catalog of pages and actions (a new
+action adds a `CommandSource`), `selection.ts` and `remote.ts` hold the
+selection and race rules, with tests in `palette.test.ts`.
+
 `GET /api/search` (CORE-91) is the lookup behind the global palette: plain,
 permission-aware matching over names and titles, never inference, embeddings or
 AI Search. The contract is `shared/search.ts`; each category is a provider in

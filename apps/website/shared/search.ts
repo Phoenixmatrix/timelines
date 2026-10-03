@@ -96,10 +96,50 @@ export type SearchGroup =
     }
   | { category: SearchCategory; status: "unavailable"; error: string };
 
-/** GET /api/search?q=&categories=&limit=, or ?q=&category=&cursor= for the next page. */
+/** GET /api/search?q=&categories=&limit=; add `cursor` with one category for its next page. */
 export interface SearchResponse {
   /** The query as it was matched: trimmed, with whitespace collapsed. */
   query: string;
   /** In the order requested (by default, SEARCH_CATEGORIES order). */
   groups: SearchGroup[];
 }
+
+/** The text a local result (a command, a page) is matched on, like a provider's columns. */
+export interface MatchFields {
+  /** Equal to the query is `exact`. */
+  identifiers: string[];
+  /** Starting with the query is `prefix`; a word in them starting with it is `word`. */
+  names: string[];
+  /** Everything else searched; every query word must appear in a name or one of these. */
+  searched: string[];
+}
+
+const SEPARATORS = /[-_./]/g;
+
+/**
+ * How `query` matches, or null: the same tiers the server's SQL computes
+ * (worker/search/query.ts), so local and remote results rank alike.
+ */
+export function matchFields(query: string, fields: MatchFields): SearchMatch | null {
+  const lower = query.trim().replace(/\s+/g, " ").toLowerCase();
+  if (!lower) return null;
+  const all = [...fields.identifiers, ...fields.names, ...fields.searched].join(" ").toLowerCase();
+  if (!lower.split(" ").every((word) => all.includes(word))) return null;
+  if (fields.identifiers.some((id) => id.toLowerCase() === lower)) return "exact";
+  if (fields.names.some((name) => name.toLowerCase().startsWith(lower))) return "prefix";
+  if (
+    fields.names.some((name) =>
+      ` ${name.toLowerCase().replace(SEPARATORS, " ")}`.includes(` ${lower}`),
+    )
+  )
+    return "word";
+  return "contains";
+}
+
+/** Strongest first, for sorting. */
+export const MATCH_RANK: Record<SearchMatch, number> = {
+  exact: 0,
+  prefix: 1,
+  word: 2,
+  contains: 3,
+};

@@ -16,7 +16,8 @@ import { Page } from "../../components/AppShell.tsx";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { CopyField, RoleChip, VisibilityChip, link, popMotion } from "../../components/ui.tsx";
 import { forgetRepoData, repoData, routeData } from "../../lib/repoData.ts";
-import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { repoPath } from "../../lib/refs.ts";
+import { repoSections } from "../../lib/repoSections.ts";
 import { useViewer } from "../../lib/session.ts";
 
 export async function repoLoader({ params }: LoaderFunctionArgs) {
@@ -177,43 +178,11 @@ export function RepoLayout() {
             aria-label="Repository"
             className="mt-4 flex gap-5 overflow-x-auto border-b border-line-soft [scrollbar-width:none] max-sm:[mask-image:linear-gradient(to_right,transparent,black_1.25rem,black_calc(100%-1.25rem),transparent)] max-sm:px-3 sm:mt-6"
           >
-            <Tab to={base} sections={["", `${base}/tree/`, `${base}/blob/`]}>
-              Code
-            </Tab>
-            {repo.head && (
-              <Tab
-                to={commitsUrl(repo.owner.slug, repo.name, repo.defaultBranch)}
-                sections={[`${base}/commits/`]}
-              >
-                Commits
+            {repoSections(repo).map((section) => (
+              <Tab key={section.id} to={section.to} sections={section.sections}>
+                {section.label}
               </Tab>
-            )}
-            <Tab to={`${base}/changes`} sections={[`${base}/changes`]}>
-              Changes
-            </Tab>
-            <Tab to={`${base}/ci`} sections={[`${base}/ci`]}>
-              CI
-            </Tab>
-            <Tab to={`${base}/packages`} sections={[`${base}/packages`]}>
-              Packages
-            </Tab>
-            <Tab to={`${base}/tracker`} sections={[`${base}/tracker`]}>
-              Issues
-            </Tab>
-            <Tab to={`${base}/releases`} sections={[`${base}/releases`]}>
-              Releases
-            </Tab>
-            <Tab to={`${base}/wiki`} sections={[`${base}/wiki`]}>
-              Wiki
-            </Tab>
-            <Tab to={`${base}/knowledge`} sections={[`${base}/knowledge`]}>
-              Knowledge
-            </Tab>
-            {repo.viewerRole === "admin" && (
-              <Tab to={`${base}/settings`} sections={[`${base}/settings`]}>
-                Settings
-              </Tab>
-            )}
+            ))}
           </nav>
           <div className="mt-4 sm:mt-6">
             <Outlet />

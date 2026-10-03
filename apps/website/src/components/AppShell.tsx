@@ -22,6 +22,7 @@ import { useState } from "react";
 import { Link, NavLink, Outlet, useFetcher, useLocation, useNavigation } from "react-router";
 import { AssistantDock } from "../assistant/Dock.tsx";
 import { AssistantProvider, useAssistant } from "../assistant/state.tsx";
+import { PaletteProvider, SearchButton } from "../palette/Palette.tsx";
 import { useViewer } from "../lib/session.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
@@ -205,82 +206,85 @@ export function AppShell() {
 
   return (
     <AssistantProvider>
-      <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
-        <nav
-          aria-label="Places"
-          className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2 sm:fixed sm:inset-y-0 sm:left-0"
-        >
-          <Place to="/" label="Home" end>
-            {() => <GitmatrixLogo markOnly className="size-8" />}
-          </Place>
-          {viewer && (
-            <Place to="/tracker" label="Issue tracker">
-              {(active) => (
-                <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
-              )}
+      <PaletteProvider>
+        <div className="flex min-h-dvh max-sm:flex-col sm:pl-[var(--size-rail)]">
+          <nav
+            aria-label="Places"
+            className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:px-3 max-sm:py-2 sm:fixed sm:inset-y-0 sm:left-0"
+          >
+            <Place to="/" label="Home" end>
+              {() => <GitmatrixLogo markOnly className="size-8" />}
             </Place>
-          )}
-          {viewer && (
-            <Place to="/needs-you" label="Needs you">
-              {(active) => (
-                <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
-              )}
-            </Place>
-          )}
-          {viewer && (
-            <Place to="/packages" label="Packages" also={/^\/[^/]+\/-\/(packages|feeds)(\/|$)/}>
-              {(active) => (
-                <PackageIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
-              )}
-            </Place>
-          )}
-          {viewer && (
-            <Place to="/settings/tokens" label="Access tokens">
-              {(active) => <KeyIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
-            </Place>
-          )}
-          {places.length > 0 && <span className="mk-rail-rule max-sm:hidden" />}
-          {places.map((org) => (
-            <Tip key={org.id} label={org.displayName} side="right">
-              <NavLink
-                to={`/${org.slug}`}
-                className="grid size-12 place-items-center rounded-[16px]"
-                aria-label={org.displayName}
-              >
-                <Monogram name={org.displayName} shape="place" size="lg" />
-              </NavLink>
-            </Tip>
-          ))}
-          {viewer && (
-            <Tip label="New repository" side="right">
-              <NavLink
-                to="/new"
-                className="mk-place mk-place--add max-sm:before:hidden"
-                aria-label="New repository"
-              >
-                <PlusIcon size={20} weight="bold" aria-hidden />
-              </NavLink>
-            </Tip>
-          )}
-          <div className="flex-1" />
-          {viewer && <AskButton />}
-          {viewer ? (
-            <AccountMenu />
-          ) : (
-            <Place to={`/signin?next=${encodeURIComponent(location.pathname)}`} label="Sign in">
-              {() => <SignInIcon size={22} aria-hidden />}
-            </Place>
-          )}
-        </nav>
-        <main
-          className="min-w-0 flex-1 transition-opacity"
-          style={{ opacity: navigation.state === "loading" ? 0.7 : 1 }}
-        >
-          <Outlet />
-        </main>
-        {viewer && <AssistantDock />}
-        <Toasts />
-      </div>
+            <SearchButton />
+            {viewer && (
+              <Place to="/tracker" label="Issue tracker">
+                {(active) => (
+                  <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                )}
+              </Place>
+            )}
+            {viewer && (
+              <Place to="/needs-you" label="Needs you">
+                {(active) => (
+                  <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                )}
+              </Place>
+            )}
+            {viewer && (
+              <Place to="/packages" label="Packages" also={/^\/[^/]+\/-\/(packages|feeds)(\/|$)/}>
+                {(active) => (
+                  <PackageIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                )}
+              </Place>
+            )}
+            {viewer && (
+              <Place to="/settings/tokens" label="Access tokens">
+                {(active) => <KeyIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
+              </Place>
+            )}
+            {places.length > 0 && <span className="mk-rail-rule max-sm:hidden" />}
+            {places.map((org) => (
+              <Tip key={org.id} label={org.displayName} side="right">
+                <NavLink
+                  to={`/${org.slug}`}
+                  className="grid size-12 place-items-center rounded-[16px]"
+                  aria-label={org.displayName}
+                >
+                  <Monogram name={org.displayName} shape="place" size="lg" />
+                </NavLink>
+              </Tip>
+            ))}
+            {viewer && (
+              <Tip label="New repository" side="right">
+                <NavLink
+                  to="/new"
+                  className="mk-place mk-place--add max-sm:before:hidden"
+                  aria-label="New repository"
+                >
+                  <PlusIcon size={20} weight="bold" aria-hidden />
+                </NavLink>
+              </Tip>
+            )}
+            <div className="flex-1" />
+            {viewer && <AskButton />}
+            {viewer ? (
+              <AccountMenu />
+            ) : (
+              <Place to={`/signin?next=${encodeURIComponent(location.pathname)}`} label="Sign in">
+                {() => <SignInIcon size={22} aria-hidden />}
+              </Place>
+            )}
+          </nav>
+          <main
+            className="min-w-0 flex-1 transition-opacity"
+            style={{ opacity: navigation.state === "loading" ? 0.7 : 1 }}
+          >
+            <Outlet />
+          </main>
+          {viewer && <AssistantDock />}
+          <Toasts />
+        </div>
+      </PaletteProvider>
     </AssistantProvider>
   );
 }
