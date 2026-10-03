@@ -34,6 +34,7 @@ import {
   type Row,
 } from "./timelineGraph.ts";
 import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./TimelineLanes.tsx";
+import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -501,6 +502,52 @@ function describe(
   }
 }
 
+/**
+ * The issues a timeline worked on or has done (CORE-74), linked into its view,
+ * which stays readable after it ends. An abandoned timeline's show the status
+ * they had in it.
+ */
+function TimelineIssues({ timeline, data }: { timeline: Timeline; data: TimelineGraphData }) {
+  if (!data.issues) return null;
+  const issues = data.issues[timeline.id] ?? [];
+  const base = `/tracker/${encodeURIComponent(data.owner.slug)}/issues/`;
+  const view = `?tl=${encodeURIComponent(timeline.slug)}`;
+  const label = (issue: (typeof issues)[number]) => {
+    if (issue.status === "done_in_timeline" && issue.doneIn?.id === timeline.id)
+      return "Done here, not landed";
+    if (timeline.status === "abandoned" && issue.status === "done") return "Done here, abandoned";
+    return statusLabel(issue);
+  };
+  return (
+    <>
+      <h3 className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">Issues</h3>
+      {issues.length === 0 ? (
+        <p className="m-0 text-body-sm text-ink-faint">None worked on here yet.</p>
+      ) : (
+        <ul className="m-0 max-h-60 list-none overflow-y-auto p-0">
+          {issues.map((issue) => (
+            <li key={issue.id} className="flex items-baseline gap-2 py-0.5 text-body-sm">
+              <Link
+                className={`${link} shrink-0`}
+                to={`${base}${encodeURIComponent(issue.key)}${view}`}
+              >
+                <span className="mk-mono">{issue.key}</span>
+              </Link>
+              <span className="min-w-0 flex-1 truncate" title={issue.title}>
+                {issue.title}
+              </span>
+              <span className="inline-flex shrink-0 items-center gap-1 text-micro text-ink-faint">
+                {issue.status === "done_in_timeline" && <DoneInTimelineIcon />}
+                {label(issue)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
 function TimelineDetails({
   timeline,
   data,
@@ -595,6 +642,8 @@ function TimelineDetails({
           );
         })}
       </ul>
+
+      <TimelineIssues timeline={timeline} data={data} />
 
       <h3 id="events" className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">
         Events

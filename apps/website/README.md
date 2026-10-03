@@ -800,6 +800,33 @@ picks from its view. Landing folds a timeline into main's tables as
 marks the timeline landed); views then leave landed timelines out. Ended
 timelines take no changes.
 
+**Done in a timeline** (CORE-74). An issue whose status becomes `done` in a
+timeline's view is done there, and in the views that include that timeline
+(its descendants, and timelines it merges into). Elsewhere, main included, its
+status is `done_in_timeline` with `doneIn: {id, slug}` (a shared field, like the
+lease): it keeps blocking, isn't ready, and stays in `is:open`. The status is
+locked wherever it shows: updates that change it, claims, completion and
+release fail with `done_in_timeline` ("… is done in timeline `<slug>`; it lands
+with the timeline, or reopen it there with --timeline `<slug>`"), while other
+fields stay editable. Only the tracker moves it: a reopen inside the timeline,
+a merge between timelines (`doneIn` moves to the timeline merged into, as
+`timeline.merge` events), landing (done), and abandoning (`todo` again, leases
+released, a note linking the abandoned timeline on each, unless a live
+timeline that merged into it still has the work done). The web marks it with
+its own icon (a branch ending in a done check, in landing green), disables the
+status picker with a link to the issue in the timeline (`?tl=<slug>`), and
+lists a timeline's issues in the graph's inspector (`issues` in
+`GET …/timelines/:slug` and the graph's data); `gm issue show` and
+`gm timeline show` say the same, and gm refuses the same changes before
+queueing them. Older gm binaries treat the status as data: not ready, still
+blocking.
+
+**Ended timelines stay readable.** A landed or abandoned timeline's view
+(`?tl=<slug>`, `--timeline <slug>`) still loads, read-only, with a banner that
+says how it ended; changes made in it fail with `timeline_ended`. Its own
+issues are left alone when it is abandoned, and its issue list keeps the
+status each had in it, even after main's copies went back to do.
+
 ## Release notes
 
 Release notes are code-update history, not deployment records. The default view

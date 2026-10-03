@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import {
   CLOSE_REASONS,
   DEFAULT_ATTEMPT_LIMIT,
+  SETTABLE_STATUSES,
   TIMELINE_USES,
   hasActiveClaim,
   isOpen,
@@ -9,6 +10,7 @@ import {
   readiness,
   readinessIndex,
   type Changes,
+  type AuditActor,
   type AuditSource,
   type Comment,
   type HumanRequest,
@@ -36,14 +38,21 @@ import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
 import { matchRank, matches, type MatchColumns, type SearchQuery } from "../search/query.ts";
-import { TIMELINE_POLICIES, type Timeline, type TimelineEvent } from "../../shared/timelines.ts";
+import {
+  TIMELINE_POLICIES,
+  type Timeline,
+  type TimelineEvent,
+  type TimelineIssue,
+} from "../../shared/timelines.ts";
 import {
   findTimeline,
   isScoped,
   latestEntity,
   mainAfter,
+  mergedInto,
   overlayOf,
   type Overlay,
+  type ScopedType,
 } from "./views.ts";
 
 export type { SqlDatabase } from "./sql.ts";
@@ -170,6 +179,20 @@ export function validateRequest(value: unknown): MutationRequest {
 
 /** After its last request is answered, a parked lease's holder has this long to resume. */
 export const RESUME_WINDOW_SECONDS = 3600;
+
+/**
+ * Done in a timeline is locked wherever the issue shows it (CORE-74): only the
+ * tracker's own transitions (merge, landing, abandoning, a reopen inside the
+ * timeline) change it.
+ */
+export function lockedStatus(issue: Issue): never {
+  const slug = issue.doneIn?.slug ?? "its timeline";
+  fail(
+    "done_in_timeline",
+    `${issue.key} is done in timeline ${slug}; it lands with the timeline, or reopen it there with --timeline ${slug}.`,
+    409,
+  );
+}
 
 /** All state and event writes run synchronously inside the caller's SQLite transaction. */
 export class TrackerStore {
@@ -557,7 +580,7 @@ export class TrackerStore {
       if (timeline && (timeline.status === "landed" || timeline.status === "abandoned"))
         fail(
           "timeline_ended",
-          `${timeline.slug} is ${timeline.status}; work in main instead.`,
+          `Timeline ${timeline.slug} is ${timeline.status}: its view is read-only. Work in main instead.`,
           409,
         );
       return this.within(timeline, () => this.apply(access, request, encoded, timeline));
@@ -577,13 +600,39 @@ export class TrackerStore {
       if (!timeline) fail("invalid_input", "Main doesn't land.");
       const now = new Date(this.clock()).toISOString();
       const events: TrackerEvent[] = [];
-      for (const [type, entityId, entity] of overlayOf(this.sql, timeline, true).entries()) {
+      const overlay = overlayOf(this.sql, timeline, true);
+      // Done in what lands is done (CORE-74), even where the view didn't change
+      // it; and what lands done is no longer waiting on another timeline.
+      const landed = (issue: Issue): Issue => {
+        if (overlay.includes(issue.doneIn))
+          return {
+            ...issue,
+            status: issue.status === "done_in_timeline" ? "done" : issue.status,
+            doneIn: null,
+          };
+        return issue.status === "done" && issue.doneIn ? { ...issue, doneIn: null } : issue;
+      };
+      const changes: [ScopedType, string, Entity | null][] = overlay.entries();
+      for (const row of all(
+        this.sql,
+        tracker
+          .selectFrom("issues")
+          .select(["id", "data"])
+          .where(json("data", "$.doneIn.id"), "in", [...overlay.timelines, ""]),
+      ))
+        if (!overlay.has("issue", row.id))
+          changes.push(["issue", row.id, JSON.parse(row.data) as Issue]);
+      for (const [type, entityId, viewed] of changes) {
+        let entity = type === "issue" && viewed ? landed(viewed as Issue) : viewed;
         const prior = first(
           this.sql,
           tracker.selectFrom(tables[type]).select("data").where("id", "=", entityId),
         );
         const before = prior ? (JSON.parse(prior.data) as Entity) : null;
         if (JSON.stringify(before) === JSON.stringify(entity)) continue;
+        // An issue main already had changes under readers holding its version.
+        if (type === "issue" && before && entity)
+          entity = { ...entity, version: (before as Issue).version + 1, updatedAt: now } as Issue;
         if (entity)
           run(
             this.sql,
@@ -613,6 +662,206 @@ export class TrackerStore {
       }
       return events;
     });
+  }
+  /** Main's issues done in a timeline (CORE-74). */
+  private doneIn(timelineId: string): Issue[] {
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("issues")
+        .select("data")
+        .where(json("data", "$.doneIn.id"), "=", timelineId)
+        .orderBy("id"),
+    ).map((row) => JSON.parse(row.data) as Issue);
+  }
+  /** Store a change the tracker makes to main's view on its own, and log it. */
+  private write(
+    meta: {
+      operationId: string;
+      kind: string;
+      actorId: string;
+      actor: AuditActor;
+      source: AuditSource;
+    },
+    type: "issue" | "comment",
+    entity: Issue | Comment,
+  ): TrackerEvent {
+    const prior = first(
+      this.sql,
+      tracker.selectFrom(tables[type]).select("data").where("id", "=", entity.id),
+    );
+    run(
+      this.sql,
+      tracker
+        .insertInto(tables[type])
+        .values({ id: entity.id, data: JSON.stringify(entity) })
+        .onConflict((oc) =>
+          oc.column("id").doUpdateSet((eb) => ({ data: eb.ref("excluded.data") })),
+        ),
+    );
+    return this.record({
+      ...meta,
+      mutationKind: meta.kind,
+      before: prior ? (JSON.parse(prior.data) as Entity) : null,
+      entityType: type,
+      entityId: entity.id,
+      entity,
+      createdAt: new Date(this.clock()).toISOString(),
+    });
+  }
+  /**
+   * After timeline `fromId` merged into `intoId` (CORE-74): what was done in
+   * the one is done in the other, whose view now has that work. An ended
+   * timeline takes nothing.
+   */
+  timelineMerged(fromId: string, intoId: string, mergeId: string, actorId: string | null) {
+    return this.transaction(() => {
+      const into = findTimeline(this.sql, intoId);
+      if (!into || into.status === "landed" || into.status === "abandoned") return [];
+      const now = new Date(this.clock()).toISOString();
+      const meta = {
+        operationId: mergeId,
+        kind: "timeline.merge",
+        actorId: actorId ?? "",
+        actor: { id: actorId ?? "", kind: "unknown", name: null, accountable: null } as AuditActor,
+        source: "unknown" as const,
+      };
+      return this.doneIn(fromId).map((issue) =>
+        this.write(meta, "issue", {
+          ...issue,
+          doneIn: { id: into.id, slug: into.slug },
+          version: issue.version + 1,
+          updatedAt: now,
+        }),
+      );
+    });
+  }
+  /**
+   * After a timeline is abandoned (CORE-74): its finished issues are ready on
+   * main again, their leases released, with a note linking the timeline.
+   * Work a timeline merged into it still has stays done in that one.
+   * Running it again changes nothing.
+   */
+  timelineAbandoned(access: Access, timeline: Timeline): TrackerEvent[] {
+    return this.transaction(() => {
+      const issues = this.doneIn(timeline.id);
+      if (!issues.length) return [];
+      const now = new Date(this.clock()).toISOString();
+      const meta = {
+        operationId: `abandon:${timeline.id}`,
+        kind: "timeline.abandon",
+        actorId: access.actorId,
+        actor: auditActor(access),
+        source: access.source ?? "unknown",
+      };
+      // The live timelines that merged into it, nearest first, and their views when needed.
+      const merged = mergedInto(this.sql, timeline.id)
+        .map((id) => findTimeline(this.sql, id))
+        .filter((t): t is Timeline => !!t && t.status !== "landed" && t.status !== "abandoned");
+      const views = new Map<string, Overlay>();
+      const view = (t: Timeline) => {
+        if (!views.has(t.id)) views.set(t.id, overlayOf(this.sql, t));
+        return views.get(t.id)!;
+      };
+      const url = `/tracker/${encodeURIComponent(access.owner.slug)}/timelines?tl=${encodeURIComponent(timeline.slug)}`;
+      const events: TrackerEvent[] = [];
+      for (const issue of issues) {
+        const keeper = merged.find(
+          (t) => (view(t).get("issue", issue.id) as Issue | null | undefined)?.status === "done",
+        );
+        const next: Issue = { ...issue, version: issue.version + 1, updatedAt: now };
+        if (keeper) next.doneIn = { id: keeper.id, slug: keeper.slug };
+        else {
+          next.status = "todo";
+          next.doneIn = null;
+          next.claim = null;
+          next.handoff = null;
+          run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issue.id));
+          run(this.sql, tracker.deleteFrom("offers").where("issue_id", "=", issue.id));
+        }
+        events.push(this.write(meta, "issue", next));
+        const note: Comment = {
+          id: crypto.randomUUID(),
+          issueId: issue.id,
+          body: keeper
+            ? `Timeline [\`${timeline.slug}\`](${url}) was abandoned; this is still done in \`${keeper.slug}\`, which merged it.`
+            : `Timeline [\`${timeline.slug}\`](${url}), where this was done, was abandoned, so it's ready again.`,
+          kind: "comment",
+          actorId: access.actorId,
+          createdAt: now,
+        };
+        events.push(this.write(meta, "comment", note));
+      }
+      return events;
+    });
+  }
+  /**
+   * Each timeline's issues (CORE-74), or one timeline's: those it changed or
+   * made, and those done in it, with main's status (an issue only timelines
+   * have shows its newest). An abandoned timeline's show the status they had
+   * in it, done ones included, though main has them back to do.
+   */
+  timelineIssues(only?: string): Record<string, TimelineIssue[]> {
+    const abandoned = new Set(
+      all(this.sql, tracker.selectFrom("timelines").select("data"))
+        .map((row) => JSON.parse(row.data) as Timeline)
+        .filter((timeline) => timeline.status === "abandoned")
+        .map((timeline) => timeline.id),
+    );
+    /** By timeline, then issue: the status it had there (abandoned timelines only). */
+    const pairs = new Map<string, Map<string, string | null>>();
+    const add = (timelineId: string, issueId: string, status: string | null) => {
+      const issues = pairs.get(timelineId) ?? new Map<string, string | null>();
+      pairs.set(timelineId, issues);
+      if (status !== null || !issues.has(issueId)) issues.set(issueId, status);
+    };
+    // What it changed, oldest first: its own last word on each issue wins.
+    let worked = tracker
+      .selectFrom("events")
+      .select([
+        json<string>("data", "$.timelineId").as("timelineId"),
+        json<string>("data", "$.entityId").as("issueId"),
+        json<string | null>("data", "$.view.entity.status").as("status"),
+      ])
+      .where(json("data", "$.entityType"), "=", "issue")
+      .orderBy("cursor");
+    worked = only
+      ? worked.where(json("data", "$.timelineId"), "=", only)
+      : worked.where(json("data", "$.timelineId"), "is not", null);
+    for (const row of all(this.sql, worked)) add(row.timelineId, row.issueId, row.status);
+    // What is done in it now.
+    let done = tracker
+      .selectFrom("issues")
+      .select([json<string>("data", "$.doneIn.id").as("timelineId"), "id as issueId"]);
+    done = only
+      ? done.where(json("data", "$.doneIn.id"), "=", only)
+      : done.where(json("data", "$.doneIn.id"), "is not", null);
+    for (const row of all(this.sql, done)) add(row.timelineId, row.issueId, null);
+    // What was done in it when it was abandoned, merged-in work included.
+    let returned = tracker
+      .selectFrom("events")
+      .select([
+        json<string>("data", "$.before.doneIn.id").as("timelineId"),
+        json<string>("data", "$.entityId").as("issueId"),
+      ])
+      .where(json("data", "$.kind"), "=", "timeline.abandon")
+      .where(json("data", "$.entityType"), "=", "issue");
+    returned = only
+      ? returned.where(json("data", "$.before.doneIn.id"), "=", only)
+      : returned.where(json("data", "$.before.doneIn.id"), "is not", null);
+    for (const row of all(this.sql, returned)) add(row.timelineId, row.issueId, "done");
+    const out: Record<string, TimelineIssue[]> = {};
+    for (const [timelineId, issues] of pairs) {
+      out[timelineId] = [...issues]
+        .map(([issueId, status]) => {
+          const { id, key, title, ...issue } = this.anyIssue(issueId);
+          return abandoned.has(timelineId) && status
+            ? { id, key, title, status: status as Issue["status"], doneIn: null }
+            : { id, key, title, status: issue.status, doneIn: issue.doneIn ?? null };
+        })
+        .sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }));
+    }
+    return out;
   }
   private apply(
     access: Access,
@@ -655,10 +904,24 @@ export class TrackerStore {
       const overlay = this.overlay && isScoped(type) ? this.overlay : null;
       let view: TrackerEvent["view"];
       let entity = changed;
+      // Whatever the mutation, a status done in another timeline stays as it is.
+      if (type === "issue") {
+        const shown = (overlay?.has(type, entityId) ? overlay.get(type, entityId) : before) as
+          | Issue
+          | null
+          | undefined;
+        if (
+          shown?.status === "done_in_timeline" &&
+          (changed as Issue | null)?.status !== shown.status
+        )
+          lockedStatus(shown);
+      }
       if (overlay && isScoped(type)) {
         const seen = overlay.has(type, entityId) ? overlay.get(type, entityId)! : before;
+        const finish = type === "issue" ? finishing(overlay, seen as Issue | null, changed) : null;
         view = { before: seen, entity: changed };
         entity = mainAfter(type, before, changed);
+        if (finish && entity) finish(entity as Issue);
         overlay.set(type, entityId, changed);
       }
       if (entity)
@@ -689,6 +952,31 @@ export class TrackerStore {
           ...(view ? { view } : {}),
         }),
       );
+    };
+    /**
+     * An issue changing in a timeline's view (CORE-74). Finished there, it is
+     * done in that timeline: main's status says so until the timeline lands.
+     * Reopened in the timeline it was done in, it is main's to do again.
+     * Returns the change to main's copy, if any.
+     */
+    const finishing = (overlay: Overlay, seen: Issue | null, changed: Entity | null) => {
+      const issue = changed as Issue | null;
+      if (!issue) return null;
+      if (issue.status === "done" && seen?.status !== "done") {
+        const { id, slug } = overlay.timeline;
+        issue.doneIn = { id, slug };
+        return (main: Issue) => {
+          if (main.status !== "done" && main.status !== "canceled")
+            main.status = "done_in_timeline";
+        };
+      }
+      if (issue.status !== "done" && seen?.status === "done" && overlay.includes(issue.doneIn)) {
+        issue.doneIn = null;
+        return (main: Issue) => {
+          if (main.status === "done_in_timeline") main.status = "todo";
+        };
+      }
+      return null;
     };
     const admin = () => {
       if (!access.canAdmin)
@@ -1049,12 +1337,9 @@ export class TrackerStore {
           issue[key] = text(data[key], key, key === "title" ? 500 : 131072, key !== "title");
       if ("type" in data)
         issue.type = choice(data.type, ["task", "bug", "prd", "chore", "research"], "issue type");
-      if ("status" in data)
-        issue.status = choice(
-          data.status,
-          ["backlog", "todo", "in_progress", "done", "canceled"],
-          "status",
-        );
+      // Done in a timeline is the tracker's to set; leaving it as it is is fine.
+      if ("status" in data && !(data.status === "done_in_timeline" && issue.status === data.status))
+        issue.status = choice(data.status, SETTABLE_STATUSES, "status");
       if ("closeReason" in data)
         issue.closeReason =
           data.closeReason === null ? null : choice(data.closeReason, closeReasons, "close reason");
@@ -1293,6 +1578,12 @@ export class TrackerStore {
             issue = this.get<Issue>("issue", entityId);
             teamWritable(this.get("team", issue.teamId));
             version(issue, mutation.expectedVersion);
+            if (
+              issue.status === "done_in_timeline" &&
+              "status" in data &&
+              data.status !== issue.status
+            )
+              lockedStatus(issue);
             const covering = coveringLease(issue);
             if (
               covering &&
@@ -1749,6 +2040,8 @@ export class TrackerStore {
           );
           const issue = this.get<Issue>("issue", entityId);
           teamWritable(this.get("team", issue.teamId));
+          // Claiming, completing or releasing would move a status that's locked here.
+          if (issue.status === "done_in_timeline" && kind !== "issue.renew") lockedStatus(issue);
           let delegator: Issue | null = null;
           if (kind === "issue.claim" || kind === "issue.renew") {
             const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;

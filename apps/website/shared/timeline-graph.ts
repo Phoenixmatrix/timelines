@@ -1,7 +1,7 @@
 // What the timeline graph draws (CORE-81), in one request: every timeline,
 // their events across the account, and the names and workspaces it groups by.
 
-import type { Timeline, TimelineEvent } from "./timelines.ts";
+import type { Timeline, TimelineEvent, TimelineIssue } from "./timelines.ts";
 import type { TrackerIdentity, TrackerOwner } from "./tracker.ts";
 
 /** A person or agent a timeline names. */
@@ -25,4 +25,6 @@ export interface TimelineGraphData {
   actors: Record<string, TimelineActor>;
   /** The tracker workspaces subscribed to each repository the timelines touch, by repository id. */
   workspaces: Record<string, { id: string; slug: string; name: string }[]>;
+  /** Each timeline's issues (CORE-74), by timeline id; absent from older servers. */
+  issues?: Record<string, TimelineIssue[]>;
 }

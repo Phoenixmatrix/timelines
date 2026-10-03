@@ -30,7 +30,7 @@ timelineGraph.get("/", async (c) => {
     accessible(c.env.DB, c.get("actor")!),
   ]);
   if (!graph.ok) throw new TrackerError(graph.status, graph.code, graph.error);
-  const { timelines, events, truncated } = graph.value;
+  const { timelines, events, truncated, issues } = graph.value;
 
   const actors: Record<string, TimelineActor> = {};
   for (const member of access.members)
@@ -56,5 +56,6 @@ timelineGraph.get("/", async (c) => {
     truncated,
     actors,
     workspaces,
+    issues,
   });
 });

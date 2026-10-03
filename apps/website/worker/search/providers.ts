@@ -180,6 +180,7 @@ const STATUS_LABEL: Record<Issue["status"], string> = {
   todo: "To do",
   in_progress: "In progress",
   done: "Done",
+  done_in_timeline: "Done in a timeline",
   canceled: "Canceled",
 };
 
@@ -188,7 +189,7 @@ function issueResult(owner: TrackerOwner, issue: Issue, rank: number): IssueResu
     category: "issues",
     id: `issues:${owner.id}:${issue.id}`,
     title: issue.title,
-    subtitle: `${issue.key} · ${STATUS_LABEL[issue.status]}`,
+    subtitle: `${issue.key} · ${issue.status === "done_in_timeline" && issue.doneIn ? `Done in ${issue.doneIn.slug}` : STATUS_LABEL[issue.status]}`,
     breadcrumb: [owner.slug],
     match: matchOf(rank),
     target: {

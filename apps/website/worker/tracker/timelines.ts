@@ -368,9 +368,13 @@ export class TimelineStore {
    * Note a push: who worked in each timeline it moved, and the merges it
    * brought between timelines and main. Bookmarks of unknown slugs are someone's
    * own branches and are ignored. Recording the same push again adds nothing.
-   * Returns the merge events recorded.
+   * Returns the merge events recorded; `onMerge` hears of each new one
+   * between two timelines, inside the same transaction.
    */
-  recordPush(activity: PushActivity): number {
+  recordPush(
+    activity: PushActivity,
+    onMerge?: (merge: { fromId: string; intoId: string; id: string }) => void,
+  ): number {
     return this.transaction(() => {
       const now = this.now();
       const seen = new Map<string, Timeline>();
@@ -403,10 +407,11 @@ export class TimelineStore {
           continue;
         if (into && from && into.id === from.id) continue;
         const ids = [into?.id, from?.id].filter((id): id is string => !!id);
+        const id = `merge:${activity.repo.id}:${merge.commit}:${merge.parent}`;
         if (
           this.append(
             {
-              id: `merge:${activity.repo.id}:${merge.commit}:${merge.parent}`,
+              id,
               timelineId: ids[0]!,
               kind: "merge",
               fromId: from?.id ?? null,
@@ -421,8 +426,10 @@ export class TimelineStore {
             },
             ids,
           )
-        )
+        ) {
           recorded++;
+          if (from && into) onMerge?.({ fromId: from.id, intoId: into.id, id });
+        }
       }
       for (const timeline of pushed) {
         timeline.version++;

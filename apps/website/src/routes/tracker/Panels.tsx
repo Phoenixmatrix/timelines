@@ -5,7 +5,8 @@ import { StarIcon } from "@phosphor-icons/react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
-import { STATE_DOT } from "./Log.tsx";
+import { StateDot } from "./Log.tsx";
+import { DoneInTimelineIcon } from "./ui.tsx";
 import {
   filterToken,
   tokenize,
@@ -160,6 +161,7 @@ const LANES = [
   { value: "backlog", label: "Backlog" },
   { value: "todo", label: "To do" },
   { value: "in_progress", label: "In progress" },
+  { value: "done_in_timeline", label: "Done in a timeline" },
   { value: "done", label: "Done" },
   { value: "canceled", label: "Canceled" },
 ] as const;
@@ -210,7 +212,7 @@ function Lane({
               style={{ top: i * CARD }}
             >
               <span className="flex items-center gap-1.5 text-micro text-ink-faint">
-                <span className={`size-2 rounded-full ${STATE_DOT[state]}`} aria-hidden />
+                <StateDot state={state} />
                 <span className="font-mono">{issue.key}</span>
                 <span className="font-mono">P{issue.priority}</span>
                 {state === "blocked" && (
@@ -472,6 +474,8 @@ export function IssueBoard({
     >
       {LANES.map((lane) => {
         const items = byLane.get(lane.value) ?? [];
+        // Only trackers with work waiting in timelines need that lane.
+        if (lane.value === "done_in_timeline" && items.length === 0) return null;
         if (lane.value === "backlog" && items.length > 0)
           return (
             <BacklogLane
@@ -516,6 +520,7 @@ export function IssueBoard({
             aria-label={lane.label}
           >
             <h2 className="m-0 flex items-center gap-2 px-3 py-2 text-body-sm font-semibold">
+              {lane.value === "done_in_timeline" && <DoneInTimelineIcon />}
               {lane.label}
               <span className="font-mono text-mono font-normal text-ink-faint tabular-nums">
                 {items.length.toLocaleString()}

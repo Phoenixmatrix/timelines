@@ -581,7 +581,7 @@ claiming optimistic and short-lived, and don't add locks on files or areas.
   - delete the bookmark, keeping archived refs and events;
   - tear down previews, keeping the records;
   - deprecate prereleases;
-  - archive the timeline's own issues, or move them to main's backlog;
+  - leave the timeline's own issues alone: its view stays readable, read-only;
   - return its finished issues to ready, and release their leases.
 - **Pruning landed work comes later** (see the deferred research above).
 
@@ -661,7 +661,8 @@ in parallel.
 
 ## Decisions
 
-From the two interviews on 2026-10-02; the last eight rows settled CORE-62:
+From the two interviews on 2026-10-02; the eight rows before the last two
+settled CORE-62, and the last two came with CORE-74:
 
 | Question                                         | Decision                                                                                                                                  |
 | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -691,6 +692,8 @@ From the two interviews on 2026-10-02; the last eight rows settled CORE-62:
 | Release notes                                    | Per-issue entries, each labelled with the timeline it landed with                                                                         |
 | Retention numbers                                | Previews torn down 2 days after landing (and abandoning) and after 7 idle days, configurable per org; reviving a preview must be easy     |
 | Retiring mirrored branches                       | Nothing to retire: the only mirror in production holds just `main` (checked 2026-10-03)                                                   |
+| Changing "done in a timeline" on main?           | Not allowed: locked wherever it shows, for people and agents, linking to the timeline; merge, landing, abandon or a reopen there move it  |
+| Issues of an abandoned timeline                  | Left alone, not archived or moved: its view stays readable, read-only. Finished ones still go back to ready on main                       |
 
 ### Still open
 

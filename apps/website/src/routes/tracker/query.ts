@@ -4,7 +4,7 @@
 // Everything here is pure, so it is tested without a browser.
 //
 //   is:ready is:waiting is:blocked is:claimed is:leased is:open is:closed
-//   status:backlog|todo|in_progress|done|canceled
+//   status:backlog|todo|in_progress|done|done_in_timeline|canceled
 //   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
 //   since:7d until:2026-09-01   (last activity: updatedAt)
 //   parent:CORE-12   words match key, title and labels; - excludes.
@@ -30,6 +30,7 @@ export type IssueState =
   | "todo"
   | "backlog"
   | "done"
+  | "done_in_timeline"
   | "canceled";
 
 export const STATE_LABEL: Record<IssueState, string> = {
@@ -42,6 +43,7 @@ export const STATE_LABEL: Record<IssueState, string> = {
   todo: "To do",
   backlog: "Backlog",
   done: "Done",
+  done_in_timeline: "Done in a timeline",
   canceled: "Canceled",
 };
 
@@ -55,9 +57,11 @@ const STATE_RANK: Record<IssueState, number> = {
   in_progress: 4,
   todo: 5,
   blocked: 6,
-  backlog: 7,
-  done: 8,
-  canceled: 9,
+  // Finished, waiting for its timeline to land (CORE-74).
+  done_in_timeline: 7,
+  backlog: 8,
+  done: 9,
+  canceled: 10,
 };
 
 export interface IssueIndex {
@@ -117,6 +121,8 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     if (why === "leased_above") leasedBy.set(issue.id, leasedAncestor(issue, graph, serverTime)!);
     let value: IssueState;
     if (why === "waiting") value = "waiting";
+    // Done in a timeline whatever its lease: the work is waiting to land, not going on.
+    else if (issue.status === "done_in_timeline") value = "done_in_timeline";
     else if (why === "claimed") value = "claimed";
     else if (issue.status === "done" || issue.status === "canceled") value = issue.status;
     else if (why === "blocked") value = "blocked";
@@ -361,6 +367,7 @@ const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
   todo: { key: "status", value: "todo" },
   backlog: { key: "status", value: "backlog" },
   done: { key: "status", value: "done" },
+  done_in_timeline: { key: "status", value: "done_in_timeline" },
   canceled: { key: "status", value: "canceled" },
 };
 

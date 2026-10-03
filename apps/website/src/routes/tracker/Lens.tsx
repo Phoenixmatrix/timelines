@@ -12,7 +12,7 @@ import { ArrowRightIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Link, useNavigate } from "react-router";
 import type { Issue, Snapshot } from "../../../shared/tracker.ts";
-import { STATE_DOT, StateLegend } from "./Log.tsx";
+import { StateDot, StateLegend } from "./Log.tsx";
 import { STATE_LABEL, type IssueIndex, type IssueState } from "./query.ts";
 import { attribution } from "../../../shared/tracker.ts";
 import { Actor } from "./Actor.tsx";
@@ -101,8 +101,9 @@ const RANK: Record<IssueState, number> = {
   ready: 5,
   todo: 6,
   backlog: 7,
-  done: 8,
-  canceled: 9,
+  done_in_timeline: 8,
+  done: 9,
+  canceled: 10,
 };
 
 function Card({
@@ -139,7 +140,7 @@ function Card({
       style={transition ? { viewTransitionName: `lens-${issue.id}` } : undefined}
     >
       <span className="flex items-center gap-1.5 text-micro text-ink-faint">
-        <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]}`} aria-hidden />
+        <StateDot state={state} />
         <span className="font-mono">{issue.key}</span>
         <span className="sr-only">{STATE_LABEL[state]}</span>
         {meta && <span className="ml-auto truncate">{meta}</span>}
@@ -439,7 +440,7 @@ export function RelationLens({
               style={{ viewTransitionName: `lens-${focus.id}` }}
             >
               <span className="flex items-center gap-2 text-micro text-ink-muted">
-                <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]}`} aria-hidden />
+                <StateDot state={state} />
                 <span className="font-mono text-ink">{focus.key}</span>
                 {STATE_LABEL[state]}
                 {state === "blocked" && ` by ${openBlockers.length}`}
@@ -710,7 +711,7 @@ function StartHere({
           preventScrollReset
           className="grid h-9 grid-cols-[0.5rem_5rem_minmax(0,1fr)_auto] items-center gap-x-3 rounded-plate px-2 text-body-sm text-ink no-underline hover:bg-raised"
         >
-          <span className={`size-2 rounded-full ${STATE_DOT[state]}`} aria-hidden />
+          <StateDot state={state} />
           <span className="font-mono text-mono text-ink-faint">{i.key}</span>
           <span className="truncate">{i.title}</span>
           <span className="text-micro text-ink-faint tabular-nums">{meta}</span>

@@ -319,6 +319,37 @@ fn describe(t: &Value) -> String {
     out
 }
 
+/// A timeline's issues (CORE-74): those it worked on, and whether each is done there.
+fn issues_text(timeline: &Value, issues: &Value) -> String {
+    let Some(issues) = issues.as_array().filter(|i| !i.is_empty()) else {
+        return String::new();
+    };
+    let mut out = String::from("Issues   :\n");
+    for issue in issues {
+        let status = match issue["status"].as_str().unwrap_or("?") {
+            "done_in_timeline" if issue["doneIn"]["id"] == timeline["id"] => {
+                "done here, not landed".to_string()
+            }
+            "done_in_timeline" => format!(
+                "done in {}",
+                issue["doneIn"]["slug"]
+                    .as_str()
+                    .unwrap_or("another timeline")
+            ),
+            // An abandoned timeline's issues keep the status they had in it.
+            "done" if timeline["status"] == "abandoned" => "done here, abandoned".to_string(),
+            status => status.replace('_', " "),
+        };
+        out.push_str(&format!(
+            "  {:<10} {:<24} {}\n",
+            issue["key"].as_str().unwrap_or("?"),
+            status,
+            issue["title"].as_str().unwrap_or("")
+        ));
+    }
+    out
+}
+
 fn event_line(e: &Value) -> String {
     let at = e["createdAt"].as_str().unwrap_or("");
     let what = match e["kind"].as_str().unwrap_or("?") {
@@ -414,6 +445,7 @@ fn show(ctx: &Ctx, args: &ShowArgs) -> Result<Shown> {
         None,
     )?;
     let mut text = describe(&value["timeline"]);
+    text.push_str(&issues_text(&value["timeline"], &value["issues"]));
     let events = value["events"].as_array().cloned().unwrap_or_default();
     if !events.is_empty() {
         text.push_str("Events   :\n");
@@ -964,6 +996,28 @@ mod tests {
         assert!(text.contains("orbit/engine") && text.contains("(Search v2)"));
         assert!(line(&t, None).starts_with("  search-v2"));
         assert!(describe(&t).contains("Repo     : orbit/engine on timeline/search-v2"));
+    }
+
+    #[test]
+    fn issues_say_where_they_are_done() {
+        let t = json!({"id": "tl_1", "slug": "search"});
+        let issues = json!([
+            {"key": "ENG-1", "title": "Index", "status": "done_in_timeline",
+             "doneIn": {"id": "tl_1", "slug": "search"}},
+            {"key": "ENG-2", "title": "Rank", "status": "done_in_timeline",
+             "doneIn": {"id": "tl_2", "slug": "ui"}},
+            {"key": "ENG-3", "title": "Own", "status": "in_progress", "doneIn": null},
+        ]);
+        let text = issues_text(&t, &issues);
+        assert!(text.starts_with("Issues   :\n"), "{text}");
+        assert!(text.contains("ENG-1      done here, not landed"), "{text}");
+        assert!(text.contains("ENG-2      done in ui"), "{text}");
+        assert!(text.contains("ENG-3      in progress"), "{text}");
+        // Older servers send no issues.
+        assert_eq!(issues_text(&t, &Value::Null), "");
+        let abandoned = json!({"id": "tl_1", "slug": "search", "status": "abandoned"});
+        let issues = json!([{"key": "ENG-1", "title": "Index", "status": "done", "doneIn": null}]);
+        assert!(issues_text(&abandoned, &issues).contains("ENG-1      done here, abandoned"));
     }
 
     #[test]

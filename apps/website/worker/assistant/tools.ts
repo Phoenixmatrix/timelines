@@ -98,6 +98,7 @@ function issueRow(issue: Issue, snapshot: Snapshot) {
     key: issue.key,
     title: issue.title,
     status: issue.status,
+    ...(issue.doneIn ? { doneInTimeline: issue.doneIn.slug } : {}),
     type: issue.type,
     priority: `P${issue.priority}`,
     team: team?.key,
@@ -296,7 +297,16 @@ export function buildTools(context: ToolContext) {
         owner: OWNER,
         query: z.string().optional().describe("Words to match in titles, descriptions and keys"),
         status: z
-          .enum(["open", "backlog", "todo", "in_progress", "done", "canceled", "any"])
+          .enum([
+            "open",
+            "backlog",
+            "todo",
+            "in_progress",
+            "done",
+            "done_in_timeline",
+            "canceled",
+            "any",
+          ])
           .optional(),
         team: z.string().optional().describe("Team key, e.g. CORE"),
         label: z.string().optional(),

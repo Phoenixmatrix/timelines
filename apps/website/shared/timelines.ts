@@ -3,6 +3,8 @@
 // repository it touches. The records and their events live in the account's
 // tracker, next to the issues and leases later steps change with them.
 
+import type { DoneIn, Issue } from "./tracker.ts";
+
 export type TimelinePolicy = "auto" | "approval";
 export const TIMELINE_POLICIES: readonly TimelinePolicy[] = ["auto", "approval"];
 
@@ -114,11 +116,22 @@ export interface TimelineList {
   timelines: Timeline[];
 }
 
+/**
+ * An issue a timeline worked on or has done (CORE-74), with main's status:
+ * `done_in_timeline` with `doneIn` while it waits for the timeline to land.
+ * An issue only timelines have shows its newest status in them.
+ */
+export type TimelineIssue = Pick<Issue, "id" | "key" | "title" | "status"> & {
+  doneIn: DoneIn | null;
+};
+
 /** A timeline and its events, oldest first; `after` pages on through `next`. */
 export interface TimelineDetail {
   timeline: Timeline;
   events: TimelineEvent[];
   next: number | null;
+  /** Its issues, by key. */
+  issues?: TimelineIssue[];
 }
 
 /** What happened to each bookmark when a timeline was created or abandoned. */

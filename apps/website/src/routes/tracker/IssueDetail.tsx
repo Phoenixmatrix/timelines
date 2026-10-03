@@ -34,12 +34,14 @@ import {
   MarkdownText,
   MultiCheck,
   statuses,
+  statusLabel,
   TimelineFields,
   typeLabel,
   types,
 } from "./ui.tsx";
 import type { IssueIndex } from "./query.ts";
 import { RequestCard } from "./Requests.tsx";
+import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimeline.tsx";
 import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
@@ -364,10 +366,13 @@ export function IssueDetail({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+  // Done in a timeline (CORE-74): locked here; it lands with the timeline or reopens there.
+  const locked = lockedIn(issue);
   const statusReason =
     [
       unresolvedBlockers.length ? "tracker-completion-blockers" : "",
       activeClaim ? "tracker-claim-reason" : "",
+      issue.status === "done_in_timeline" ? "tracker-done-in-timeline" : "",
     ]
       .filter(Boolean)
       .join(" ") || undefined;
@@ -473,7 +478,7 @@ export function IssueDetail({
           .join(", ") || "None"
       );
     if (key === "labels") return fields.labels.join(", ") || "None";
-    if (key === "status") return statuses.find((status) => status.value === value)?.label;
+    if (key === "status") return statusLabel({ status: fields.status, doneIn: issue.doneIn });
     if (key === "closeReason")
       return fields.closeReason ? CLOSE_REASONS[fields.closeReason] : "No reason recorded";
     if (key === "priority") return `P${fields.priority}`;
@@ -762,9 +767,20 @@ export function IssueDetail({
                 className="mk-input"
                 aria-label="Issue status"
                 aria-describedby={statusReason}
+                disabled={issue.status === "done_in_timeline"}
+                title={
+                  locked
+                    ? `Done in timeline ${locked.slug}: it lands with the timeline, or reopen it there.`
+                    : undefined
+                }
                 value={draft.fields.status}
                 onChange={(event) => change("status", event.target.value as Issue["status"])}
               >
+                {issue.status === "done_in_timeline" && (
+                  <option value="done_in_timeline" disabled>
+                    {statusLabel(issue)}
+                  </option>
+                )}
                 {statuses.map((status) => (
                   <option
                     key={status.value}
@@ -780,6 +796,7 @@ export function IssueDetail({
                   </option>
                 ))}
               </select>
+              <LockedStatusHint issue={issue} owner={snapshot.owner.slug} />
             </Field>
             {draft.fields.status === "canceled" && (
               <CloseReasonField
@@ -935,6 +952,7 @@ export function IssueDetail({
           </h2>
         )}
         {updatedField === "title" && <div className="mt-1 flex justify-end">{updatedNotice}</div>}
+        <DoneInTimelineCallout issue={issue} snapshot={snapshot} />
         <dl className={`${META} mt-3`}>
           <dt className="text-ink-faint">Created by</dt>
           <dd className="m-0 min-w-0">
@@ -1087,35 +1105,41 @@ export function IssueDetail({
               Start work
             </button>
           )}
-          {!editing && issue.status !== "done" && issue.status !== "canceled" && (
-            <button
-              className="mk-btn mk-btn--sm"
-              disabled={busy || activeClaim || unresolvedBlockers.length > 0}
-              aria-describedby={statusReason}
-              onClick={() => void updateStatus("done", "Issue completed.")}
-            >
-              Mark done
-            </button>
-          )}
-          {!editing && issue.status !== "done" && issue.status !== "canceled" && (
-            <button
-              ref={closeButtonRef}
-              className="mk-btn mk-btn--sm"
-              disabled={busy || activeClaim}
-              aria-describedby={activeClaim ? "tracker-claim-reason" : undefined}
-              aria-expanded={closing}
-              aria-controls="tracker-close-form"
-              onClick={() => {
-                if (closing) return;
-                setCloseReason(null);
-                setActionError("");
-                setNotice("");
-                setClosing(true);
-              }}
-            >
-              Close issue
-            </button>
-          )}
+          {!editing &&
+            issue.status !== "done_in_timeline" &&
+            issue.status !== "done" &&
+            issue.status !== "canceled" && (
+              <button
+                className="mk-btn mk-btn--sm"
+                disabled={busy || activeClaim || unresolvedBlockers.length > 0}
+                aria-describedby={statusReason}
+                onClick={() => void updateStatus("done", "Issue completed.")}
+              >
+                Mark done
+              </button>
+            )}
+          {!editing &&
+            issue.status !== "done_in_timeline" &&
+            issue.status !== "done" &&
+            issue.status !== "canceled" && (
+              <button
+                ref={closeButtonRef}
+                className="mk-btn mk-btn--sm"
+                disabled={busy || activeClaim}
+                aria-describedby={activeClaim ? "tracker-claim-reason" : undefined}
+                aria-expanded={closing}
+                aria-controls="tracker-close-form"
+                onClick={() => {
+                  if (closing) return;
+                  setCloseReason(null);
+                  setActionError("");
+                  setNotice("");
+                  setClosing(true);
+                }}
+              >
+                Close issue
+              </button>
+            )}
           {!editing && (issue.status === "done" || issue.status === "canceled") && (
             <button
               className="mk-btn mk-btn--sm"

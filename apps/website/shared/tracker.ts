@@ -57,7 +57,32 @@ export interface Workspace extends TrackerEntity {
   archived: boolean;
 }
 export type IssueType = "task" | "bug" | "prd" | "chore" | "research";
-export type IssueStatus = "backlog" | "todo" | "in_progress" | "done" | "canceled";
+/**
+ * `done_in_timeline` (TIMELINES-RESEARCH.md, "Tracker"; CORE-74): finished
+ * inside a timeline that hasn't landed. It is main's view of that work, and
+ * that of timelines that don't have it: it keeps blocking and isn't ready, so
+ * nobody does the work twice. The tracker sets and clears it; nobody picks it.
+ */
+export type IssueStatus =
+  | "backlog"
+  | "todo"
+  | "in_progress"
+  | "done"
+  | "done_in_timeline"
+  | "canceled";
+/** The statuses a person or agent may set. */
+export const SETTABLE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "done",
+  "canceled",
+] as const satisfies readonly IssueStatus[];
+/** The timeline an issue is done in, while it's `done_in_timeline`. Slugs never change. */
+export interface DoneIn {
+  id: string;
+  slug: string;
+}
 export const CLOSE_REASONS = {
   duplicate: "Duplicate",
   not_planned: "Not planned",
@@ -147,6 +172,12 @@ export interface Issue extends TrackerEntity {
   handoff?: { to: string | null; expiresAt: string } | null;
   /** The timeline it was created in; absent or null for main. */
   timelineId?: string | null;
+  /**
+   * The unlanded timeline it was finished in (CORE-74). Shared by every view,
+   * like the lease: main's status is then `done_in_timeline`, and so is the
+   * status of any timeline whose view doesn't include that one.
+   */
+  doneIn?: DoneIn | null;
 }
 
 /**
@@ -606,7 +637,10 @@ export function claimHolder(
   return attributionText(claimAttribution(snapshot, claim));
 }
 
-/** Done and canceled issues are closed; everything else still has work in it. */
+/**
+ * Done and canceled issues are closed; everything else still has work in it,
+ * including work done in a timeline that hasn't landed.
+ */
 export function isOpen(issue: Pick<Issue, "status">): boolean {
   return issue.status !== "done" && issue.status !== "canceled";
 }
@@ -657,8 +691,10 @@ export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string)
  * - `ready`: todo (or in progress with an expired claim), unblocked, a leaf,
  *   and outside any other active lease's subtree;
  * - `claimed`: it has an active lease;
- * - `unavailable`: backlog, done, canceled, or in progress without a claim;
- * - `blocked`: a `blocks` predecessor isn't done (a missing one still blocks);
+ * - `unavailable`: backlog, done, done in a timeline (not in this view),
+ *   canceled, or in progress without a claim;
+ * - `blocked`: a `blocks` predecessor isn't done in this view (a missing one,
+ *   or one only done in another timeline, still blocks);
  * - `container`: it has open sub-issues, so the work is in those;
  * - `leased_above`: an ancestor's active lease covers it;
  * - `waiting`: it has open requests to a person.

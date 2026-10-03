@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
 import { timeAgo } from "../../lib/format.ts";
-import { typeLabel } from "./ui.tsx";
+import { DoneInTimelineIcon, typeLabel } from "./ui.tsx";
 import {
   claimLabel,
   STATE_LABEL,
@@ -52,8 +52,18 @@ export const STATE_DOT: Record<IssueState, string> = {
   todo: "bg-ink-muted",
   backlog: "bg-ink-faint",
   done: "bg-line",
+  // Drawn as DoneInTimelineIcon by StateDot.
+  done_in_timeline: "",
   canceled: "bg-line",
 };
+
+/** A state's mark: a dot by shape and colour, or done in a timeline's own icon. */
+export function StateDot({ state, className = "" }: { state: IssueState; className?: string }) {
+  if (state === "done_in_timeline") return <DoneInTimelineIcon className={`size-3 ${className}`} />;
+  return (
+    <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]} ${className}`} aria-hidden />
+  );
+}
 
 /** What the state dots mean, wherever dots appear without their words. */
 export function StateLegend({ className = "" }: { className?: string }) {
@@ -66,13 +76,14 @@ export function StateLegend({ className = "" }: { className?: string }) {
     "todo",
     "backlog",
     "blocked",
+    "done_in_timeline",
     "done",
   ];
   return (
     <ul className={`mk-legend gap-x-3 gap-y-1 text-micro ${className}`} aria-label="Issue states">
       {states.map((state) => (
         <li key={state}>
-          <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]}`} aria-hidden />
+          <StateDot state={state} />
           {STATE_LABEL[state]}
         </li>
       ))}
@@ -100,7 +111,9 @@ export function StateLabel({
         ? ` · ${claimLabel(index, holder)}`
         : state === "leased"
           ? ` · ${index.leasedBy.get(issue.id)?.key}`
-          : "";
+          : state === "done_in_timeline" && issue.doneIn
+            ? ` · ${issue.doneIn.slug}`
+            : "";
   return (
     <span
       className="inline-flex max-w-full min-w-0 items-center gap-1.5"
@@ -113,7 +126,7 @@ export function StateLabel({
           : `${STATE_LABEL[state]}${detail}`
       }
     >
-      <span className={`size-2 shrink-0 rounded-full ${STATE_DOT[state]}`} aria-hidden />
+      <StateDot state={state} />
       <span
         className={`truncate ${words ? "@max-lg:sr-only" : "sr-only"} ${state === "done" || state === "canceled" ? "text-ink-faint" : "text-ink-muted"}`}
       >

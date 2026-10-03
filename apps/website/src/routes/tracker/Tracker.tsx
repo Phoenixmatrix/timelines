@@ -409,7 +409,8 @@ function Workbench({ data }: { data: TrackerView }) {
           "This team or workspace is archived. Choose an active one or ask an administrator to restore it.",
         forbidden:
           "You no longer have permission to make this change. Ask a tracker administrator for access.",
-        timeline_ended: "This timeline has ended. Switch to main to make changes.",
+        timeline_ended:
+          "This timeline has ended, so its view is read-only. Switch to main to make changes.",
       };
       const message =
         (code && recovery[code]) ||
@@ -763,8 +764,11 @@ function Workbench({ data }: { data: TrackerView }) {
             )}
             <span className="text-ink-muted">
               {" "}
-              · main's issues with this timeline's changes; what you change here stays in it until
-              it lands.
+              {timeline.status === "abandoned"
+                ? "· abandoned: read-only, its issues as it left them. Main has its finished work back to do."
+                : timeline.status === "landed"
+                  ? "· landed: read-only; its work is on main."
+                  : "· main's issues with this timeline's changes; what you change here stays in it until it lands."}
             </span>
           </p>
           <Link

@@ -136,6 +136,41 @@ describe("buildIndex", () => {
   });
 });
 
+describe("done in a timeline", () => {
+  it("has a state of its own, keeps blocking and stays open until it lands", () => {
+    const doneIn = { id: "tl_1", slug: "search" };
+    const later = new Date(NOW + 3_600_000).toISOString();
+    const snap = snapshot(
+      [
+        issue("CORE-1", { status: "done_in_timeline", doneIn }),
+        issue("CORE-2"),
+        // A lease kept until it lands doesn't make it look like work going on.
+        issue("CORE-3", {
+          status: "done_in_timeline",
+          doneIn,
+          claim: { actorId: "m-jun", agent: "codex", expiresAt: later },
+        }),
+      ],
+      [blocks("core-1", "core-2")],
+    );
+    const index = buildIndex(snap, new Date(NOW).toISOString());
+    expect(["core-1", "core-2", "core-3"].map((id) => index.state.get(id))).toEqual([
+      "done_in_timeline",
+      "blocked",
+      "done_in_timeline",
+    ]);
+    const keys = (query: string) => {
+      const compiled = compile(query, index, "m-priya", NOW);
+      return snap.issues.filter((i) => compiled.matches(i)).map((i) => i.key);
+    };
+    expect(keys("status:done_in_timeline")).toEqual(["CORE-1", "CORE-3"]);
+    expect(keys("is:done_in_timeline")).toEqual(["CORE-1", "CORE-3"]);
+    expect(keys("is:open")).toEqual(["CORE-1", "CORE-2", "CORE-3"]);
+    expect(keys("is:closed")).toEqual([]);
+    expect(keys("is:ready")).toEqual([]);
+  });
+});
+
 describe("graph states", () => {
   it("shows containers by status and issues under another lease as leased", () => {
     const later = new Date(NOW + 3_600_000).toISOString();

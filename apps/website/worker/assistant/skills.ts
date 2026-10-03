@@ -72,7 +72,7 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
     body: `# The tracker
 
 - Trackers belong to an account or organization (the owner), independent of repositories. Issues belong to a team (key like CORE) and get keys CORE-1, CORE-2…
-- Status: backlog, todo, in_progress, done, canceled. Priority 0 (urgent) to 4 (none); 2 is normal. Types: task, bug, prd, chore, research.
+- Status: backlog, todo, in_progress, done, canceled; and done_in_timeline, which the tracker sets: finished in a timeline that hasn't landed (doneIn names it). It still blocks, isn't ready and its status can't be changed (reopen it in the timeline instead); landing makes it done, abandoning the timeline makes it todo again. Priority 0 (urgent) to 4 (none); 2 is normal. Types: task, bug, prd, chore, research.
 - Ready = todo, every blocker done, nobody holding a claim, no open sub-issues. find_issues with ready: true finds them.
 - Links: "A blocks B" (B can't start until A is done), related, duplicates. Parent/sub-issue is structure, not blocking.
 - A claim (lease) means an agent is working on it; only its holder changes its status. Don't change status on claimed issues.

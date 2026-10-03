@@ -22,6 +22,36 @@ import { popMotion, SelectField } from "../../components/ui.tsx";
 import type { IssueIndex } from "./query.ts";
 import { Actor } from "./Actor.tsx";
 
+/**
+ * Done in a timeline (CORE-74): a branch whose tip is a done check, in the
+ * green that marks landing in the timeline graph. Its own shape, not a dot.
+ */
+export function DoneInTimelineIcon({ className = "size-3" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      className={`shrink-0 text-online ${className}`}
+      aria-hidden
+    >
+      <path
+        d="M4 1.5v13M4 11.5c0-3.5 2.2-5.6 4.4-6.3"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+      />
+      <circle cx="11.5" cy="5" r="4.25" fill="currentColor" />
+      <path
+        d="M9.5 5.1l1.4 1.4 2.5-2.7"
+        stroke="var(--pane)"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+/** The statuses a person picks from; the tracker sets done in a timeline itself. */
 export const statuses = [
   { value: "backlog", label: "Backlog" },
   { value: "todo", label: "To do" },
@@ -29,6 +59,12 @@ export const statuses = [
   { value: "done", label: "Done" },
   { value: "canceled", label: "Canceled" },
 ];
+/** A status in words: "Done in search" names the timeline it's done in. */
+export function statusLabel(issue: Pick<Issue, "status" | "doneIn">): string {
+  if (issue.status === "done_in_timeline")
+    return issue.doneIn ? `Done in ${issue.doneIn.slug}` : "Done in a timeline";
+  return statuses.find((status) => status.value === issue.status)?.label ?? issue.status;
+}
 export const types = ["task", "bug", "prd", "chore", "research"];
 /** One casing everywhere: "Task", "Bug", "PRD". */
 export const typeLabel = (type: string) =>
@@ -223,7 +259,7 @@ function StateBadge({
   title,
   children,
 }: {
-  state?: "waiting" | "ready" | "claimed" | "leased" | "blocked";
+  state?: "waiting" | "ready" | "claimed" | "leased" | "blocked" | "done_in_timeline";
   title?: string;
   children: ReactNode;
 }) {
@@ -233,10 +269,14 @@ function StateBadge({
       data-state={state}
       title={title}
     >
-      <span
-        className={`size-2 shrink-0 rounded-full ${(state && STATE_DOT[state]) ?? "bg-ink-faint"}`}
-        aria-hidden
-      />
+      {state === "done_in_timeline" ? (
+        <DoneInTimelineIcon />
+      ) : (
+        <span
+          className={`size-2 shrink-0 rounded-full ${(state && STATE_DOT[state]) ?? "bg-ink-faint"}`}
+          aria-hidden
+        />
+      )}
       {children}
     </span>
   );
@@ -261,6 +301,15 @@ export function IssueState({
       </StateBadge>
     );
   }
+  if (issue.status === "done_in_timeline")
+    return (
+      <StateBadge
+        state="done_in_timeline"
+        title="Done in a timeline: done on main when it lands. Its status is locked here."
+      >
+        {statusLabel(issue)}
+      </StateBadge>
+    );
   if (issue.claim && hasActiveClaim(issue, snapshot.serverTime))
     return (
       <StateBadge
@@ -271,9 +320,7 @@ export function IssueState({
       </StateBadge>
     );
   if (issue.status === "done" || issue.status === "canceled")
-    return (
-      <StateBadge>{statuses.find((status) => status.value === issue.status)?.label}</StateBadge>
-    );
+    return <StateBadge>{statusLabel(issue)}</StateBadge>;
   if (blocked.length)
     return (
       <StateBadge state="blocked" title={blocked.map((item) => item.key).join(", ")}>
@@ -296,7 +343,7 @@ export function IssueState({
   }
   if (why === "ready")
     return <StateBadge state="ready">Ready{issue.claim ? " to reclaim" : ""}</StateBadge>;
-  return <StateBadge>{statuses.find((status) => status.value === issue.status)?.label}</StateBadge>;
+  return <StateBadge>{statusLabel(issue)}</StateBadge>;
 }
 /** Readiness shared with the server and gm, for a page without a list index. */
 function stateOf(issue: Issue, snapshot: Snapshot): "ready" | "leased" | null {

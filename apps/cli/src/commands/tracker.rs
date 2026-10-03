@@ -39,16 +39,69 @@ impl Render for Shown {
                 rule["guidance"].as_str().unwrap_or(""),
             );
         }
+        // An ended timeline's view stays readable, and says so (CORE-74).
+        if let Some(status @ ("abandoned" | "landed")) = self.0["timeline"]["status"].as_str() {
+            body = format!(
+                "Timeline {} is {status}: this view is read-only.\n\n{body}",
+                self.0["timeline"]["slug"].as_str().unwrap_or("?")
+            );
+        }
         if self.0.get("ancestors").is_some() && self.0.get("issue").is_some() {
             return format!(
-                "Created by: {}\n\n{body}",
+                "Created by: {}\n{}\n{body}",
                 self.0["issue"]["creatorDisplay"]
                     .as_str()
-                    .unwrap_or("Unknown")
+                    .unwrap_or("Unknown"),
+                done_in_text(&self.0["issue"])
             );
         }
         body
     }
+}
+
+/// Where an issue is done while its timeline hasn't landed (CORE-74), as lines; else nothing.
+fn done_in_text(issue: &Value) -> String {
+    let Some(slug) = issue["doneIn"]["slug"].as_str() else {
+        return String::new();
+    };
+    let key = issue["key"].as_str().unwrap_or("<issue>");
+    if issue["status"] == "done_in_timeline" {
+        format!(
+            "Done in timeline {slug}: done on main when it lands; its status is locked here.\n\
+             View it there: gm issue show {key} --timeline {slug} (the timeline: gm timeline show {slug}).\n"
+        )
+    } else {
+        format!("Done in timeline {slug}, which hasn't landed yet.\n")
+    }
+}
+
+/// Done in a timeline is locked wherever it shows (CORE-74), as on the server:
+/// only landing, abandoning, merging or a reopen inside the timeline moves it.
+fn locked_status(snapshot: &Value, mutation: &Value) -> Result<()> {
+    let moves_status = match mutation["kind"].as_str().unwrap_or("") {
+        "issue.update" => mutation["data"]
+            .get("status")
+            .is_some_and(|status| status != "done_in_timeline"),
+        "issue.claim" | "issue.complete" | "issue.release" => true,
+        _ => false,
+    };
+    let Some(issue) = find(snapshot, &mutation["id"]).filter(|_| moves_status) else {
+        return Ok(());
+    };
+    if issue["status"] != "done_in_timeline" {
+        return Ok(());
+    }
+    let slug = issue["doneIn"]["slug"].as_str().unwrap_or("its timeline");
+    let key = issue["key"].as_str().unwrap_or("This issue");
+    Err(GmError::new(
+        "done_in_timeline",
+        format!(
+            "{key} is done in timeline {slug}; it lands with the timeline, or reopen it there with --timeline {slug}."
+        ),
+    )
+    .hint(format!(
+        "See it in the timeline: gm issue show {key} --timeline {slug}"
+    )))
 }
 
 fn audit_actor(actor: &Value) -> String {
@@ -1506,6 +1559,8 @@ fn leased_ancestor<'a>(
 }
 /// Mirrors `readiness` in apps/website/shared/tracker.ts: todo (or in progress with an
 /// expired claim), unblocked, a leaf, and outside any other active lease's subtree.
+/// `done_in_timeline` (finished in a timeline that hasn't landed) is neither ready nor
+/// done: it keeps blocking, as on the server.
 fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
     // Waiting on a person is never ready, whatever the status says.
     if issue["waiting"].as_u64().unwrap_or(0) > 0 {
@@ -1891,6 +1946,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             IssueCommand::Batch { data } => {
                 let mutations: Vec<Value> = serde_json::from_str(&input(data)?)?;
+                for mutation in &mutations {
+                    locked_status(&snapshot, mutation)?;
+                }
                 return r.submit(ctx, args.scope.offline, mutations);
             }
             IssueCommand::Claim {
@@ -2060,6 +2118,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 json!({"kind":"issue.complete","id":issue_id,"data":{"leaseToken":token,"evidence":input(evidence)?}})
             }
         };
+        locked_status(&snapshot, &mutation)?;
         if lease_command {
             let mut request = r.request(json!([mutation]));
             if ctx.dry_run {
@@ -2510,6 +2569,64 @@ mod tests {
         assert!(!ready(&s, &s["issues"][1], now));
         s["issues"][1]["claim"]["expiresAt"] = json!("2026-09-30T23:59:00Z");
         assert!(ready(&s, &s["issues"][1], now));
+    }
+    #[test]
+    fn done_in_a_timeline_blocks_is_not_ready_and_says_where() {
+        let now = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"a","status":"todo","claim":null},{"id":"b","status":"todo","claim":null}]);
+        s["links"] = json!([{"fromId":"a","toId":"b","kind":"blocks"}]);
+        // The server's change, as any replica (old or new) applies it: an unknown status is data.
+        let done_in = json!({"id":"tl_1","slug":"search"});
+        apply_event(&mut s, &json!({"entityType":"issue","entityId":"a","entity":{"id":"a","key":"ENG-1","status":"done_in_timeline","doneIn":done_in,"claim":null}})).unwrap();
+        let a = find(&s, &json!("a")).unwrap().clone();
+        let b = find(&s, &json!("b")).unwrap().clone();
+        assert!(!ready(&s, &a, now));
+        assert!(!ready(&s, &b, now));
+        assert!(is_open(&a));
+        let shown = Shown(json!({"issue":a,"ancestors":[]})).text();
+        assert!(
+            shown.contains(
+                "Done in timeline search: done on main when it lands; its status is locked here."
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("View it there: gm issue show ENG-1 --timeline search"),
+            "{shown}"
+        );
+        // Changing its status here is refused before anything is queued, with the way there.
+        for mutation in [
+            json!({"kind":"issue.update","id":"a","data":{"status":"todo"}}),
+            json!({"kind":"issue.update","id":"a","data":{"status":"done"}}),
+            json!({"kind":"issue.claim","id":"a","data":{"agent":"w"}}),
+            json!({"kind":"issue.complete","id":"a","data":{}}),
+        ] {
+            let error = locked_status(&s, &mutation).unwrap_err();
+            assert_eq!(error.code, "done_in_timeline");
+            assert!(error.message.contains("ENG-1 is done in timeline search; it lands with the timeline, or reopen it there with --timeline search."), "{}", error.message);
+            assert_eq!(
+                error.hint.as_deref(),
+                Some("See it in the timeline: gm issue show ENG-1 --timeline search")
+            );
+        }
+        // Other fields stay editable; other issues aren't affected.
+        locked_status(&s, &json!({"kind":"issue.update","id":"a","data":{"title":"x","status":"done_in_timeline"}})).unwrap();
+        locked_status(
+            &s,
+            &json!({"kind":"issue.update","id":"b","data":{"status":"done"}}),
+        )
+        .unwrap();
+        // An ended timeline's view says it's read-only.
+        let ended =
+            Shown(json!({"issues":[],"timeline":{"slug":"search","status":"abandoned"}})).text();
+        assert!(
+            ended.starts_with("Timeline search is abandoned: this view is read-only."),
+            "{ended}"
+        );
+        assert_eq!(done_in_text(&json!({"status":"todo"})), "");
     }
     #[test]
     fn next_reports_the_claim_with_context_and_blocker_evidence_or_nothing_ready() {

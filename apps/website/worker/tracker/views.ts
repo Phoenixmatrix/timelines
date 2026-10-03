@@ -15,6 +15,7 @@ import {
   TIMELINE_SCOPED_ISSUE_FIELDS,
   TIMELINE_SCOPED_TYPES,
   type EntityType,
+  type Issue,
   type TimelineScope,
   type TrackerEvent,
 } from "../../shared/tracker.ts";
@@ -81,9 +82,16 @@ function replay(
 /** A view's entities that differ from main's tables: null where the view has none. */
 export class Overlay {
   readonly timeline: Timeline;
+  /** The timelines whose changes the view shows (`viewTimelines`). */
+  readonly timelines: readonly string[];
   private entities = new Map<string, Entity | null>();
-  constructor(timeline: Timeline) {
+  constructor(timeline: Timeline, timelines: readonly string[] = [timeline.id]) {
     this.timeline = timeline;
+    this.timelines = timelines;
+  }
+  /** Whether an issue done in `doneIn` is done in this view too. */
+  includes(doneIn: Issue["doneIn"]): boolean {
+    return !!doneIn && this.timelines.includes(doneIn.id);
   }
   has(type: ScopedType, id: string): boolean {
     return this.entities.has(`${type}:${id}`);
@@ -142,6 +150,23 @@ export function viewTimelines(sql: SqlDatabase, root: Timeline, landing = false)
       return [timeline.id, timeline];
     }),
   );
+  const mergedInto = mergeSources(sql);
+  const out: string[] = [];
+  const queue = [root.id];
+  while (queue.length) {
+    const id = queue.shift()!;
+    const timeline = timelines.get(id);
+    if (!timeline || out.includes(id)) continue;
+    if (timeline.status === "landed" && !(landing && id === root.id)) continue;
+    out.push(id);
+    if (timeline.parentId) queue.push(timeline.parentId);
+    queue.push(...(mergedInto.get(id) ?? []));
+  }
+  return out;
+}
+
+/** The timelines merged into each timeline, by id. */
+function mergeSources(sql: SqlDatabase): Map<string, string[]> {
   const mergedInto = new Map<string, string[]>();
   for (const row of all(
     sql,
@@ -154,16 +179,19 @@ export function viewTimelines(sql: SqlDatabase, root: Timeline, landing = false)
     if (merge.intoId && merge.fromId)
       mergedInto.set(merge.intoId, [...(mergedInto.get(merge.intoId) ?? []), merge.fromId]);
   }
+  return mergedInto;
+}
+
+/** The timelines merged into `rootId`, directly or through others, nearest first. */
+export function mergedInto(sql: SqlDatabase, rootId: string): string[] {
+  const sources = mergeSources(sql);
   const out: string[] = [];
-  const queue = [root.id];
+  const queue = [...(sources.get(rootId) ?? [])];
   while (queue.length) {
     const id = queue.shift()!;
-    const timeline = timelines.get(id);
-    if (!timeline || out.includes(id)) continue;
-    if (timeline.status === "landed" && !(landing && id === root.id)) continue;
+    if (id === rootId || out.includes(id)) continue;
     out.push(id);
-    if (timeline.parentId) queue.push(timeline.parentId);
-    queue.push(...(mergedInto.get(id) ?? []));
+    queue.push(...(sources.get(id) ?? []));
   }
   return out;
 }
@@ -192,8 +220,8 @@ export function latestEntity(sql: SqlDatabase, type: ScopedType, id: string): En
 
 /** A timeline's view, as differences from main's tables. */
 export function overlayOf(sql: SqlDatabase, timeline: Timeline, landing = false): Overlay {
-  const overlay = new Overlay(timeline);
   const ids = viewTimelines(sql, timeline, landing);
+  const overlay = new Overlay(timeline, ids);
   if (!ids.length) return overlay;
   const rows = all(
     sql,
@@ -220,6 +248,14 @@ export function overlayOf(sql: SqlDatabase, timeline: Timeline, landing = false)
     if (!entity || fromMain.has(`${type}:${id}`)) continue;
     const latest = latestEntity(sql, type, id);
     if (latest) overlay.set(type, id, combine(type, entity, latest));
+  }
+  // Done in a timeline this view doesn't include: done elsewhere, whatever this
+  // view last set (CORE-74). Main's own row already says so.
+  for (const [type, id, entity] of overlay.entries()) {
+    const issue = entity as Issue | null;
+    if (type !== "issue" || !issue?.doneIn || overlay.includes(issue.doneIn)) continue;
+    if (issue.status !== "done" && issue.status !== "canceled")
+      overlay.set(type, id, { ...issue, status: "done_in_timeline" });
   }
   return overlay;
 }

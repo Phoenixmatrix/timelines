@@ -17,9 +17,11 @@ export type TrackerReply<T> =
 export class Tracker extends DurableObject<Env> {
   private store: TrackerStore;
   private timelines: TimelineStore;
+  private transaction: <T>(fn: () => T) => T;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const transaction = <T>(fn: () => T) => ctx.storage.transactionSync(fn);
+    this.transaction = transaction;
     this.store = new TrackerStore(ctx.storage.sql, transaction);
     this.timelines = new TimelineStore(ctx.storage.sql, transaction);
   }
@@ -74,11 +76,20 @@ export class Tracker extends DurableObject<Env> {
   listTimelines(status?: TimelineStatus) {
     return this.reply(() => this.timelines.list(status));
   }
+  /** A timeline, its events, and its issues (CORE-74). */
   timeline(slug: string, after: number, limit: number) {
-    return this.reply(() => this.timelines.detail(slug, after, limit));
+    return this.reply(() => {
+      const detail = this.timelines.detail(slug, after, limit);
+      const issues = this.store.timelineIssues(detail.timeline.id)[detail.timeline.id] ?? [];
+      return { ...detail, issues };
+    });
   }
+  /** The graph's timelines and events, and each timeline's issues. */
   timelineGraph(limit: number) {
-    return this.reply(() => this.timelines.graph(limit));
+    return this.reply(() => ({
+      ...this.timelines.graph(limit),
+      issues: this.store.timelineIssues(),
+    }));
   }
   prepareTimeline(slug: string, parent: string | null) {
     return this.reply(() => this.timelines.prepare(slug, parent));
@@ -97,10 +108,24 @@ export class Tracker extends DurableObject<Env> {
   mayAbandonTimeline(access: Access, slug: string) {
     return this.reply(() => this.timelines.mayAbandon(access, slug));
   }
+  /** Abandon it, and return the issues done in it to ready (CORE-74), together. */
   abandonTimeline(access: Access, slug: string, lastCommits: Record<string, string | null>) {
-    return this.reply(() => this.timelines.abandon(access, slug, lastCommits));
+    return this.reply(() =>
+      this.transaction(() => {
+        const result = this.timelines.abandon(access, slug, lastCommits);
+        this.store.timelineAbandoned(access, result.timeline);
+        return result;
+      }),
+    );
   }
+  /** A push's timeline activity; work done in a merged timeline is then done in the other. */
   recordTimelinePush(activity: PushActivity) {
-    return this.reply(() => this.timelines.recordPush(activity));
+    return this.reply(() =>
+      this.transaction(() =>
+        this.timelines.recordPush(activity, (merge) =>
+          this.store.timelineMerged(merge.fromId, merge.intoId, merge.id, activity.actorId),
+        ),
+      ),
+    );
   }
 }

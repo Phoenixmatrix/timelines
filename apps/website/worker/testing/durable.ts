@@ -25,14 +25,20 @@ export function durableStorage(db = new DatabaseSync(":memory:")) {
       };
     },
   };
+  // Like a Durable Object's, transactions nest: an inner one is a savepoint.
+  let depth = 0;
   const transactionSync = <T>(fn: () => T): T => {
-    db.exec("BEGIN");
+    const savepoint = `nested_${depth}`;
+    db.exec(depth ? `SAVEPOINT ${savepoint}` : "BEGIN");
+    depth++;
     try {
       const result = fn();
-      db.exec("COMMIT");
+      depth--;
+      db.exec(depth ? `RELEASE ${savepoint}` : "COMMIT");
       return result;
     } catch (error) {
-      db.exec("ROLLBACK");
+      depth--;
+      db.exec(depth ? `ROLLBACK TO ${savepoint}; RELEASE ${savepoint}` : "ROLLBACK");
       throw error;
     }
   };
