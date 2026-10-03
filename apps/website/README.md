@@ -276,7 +276,10 @@ you were. It lists, in labelled groups:
 - **Or**: fallbacks that act on what you typed, such as **Create issue “…”**,
   which proposes the text as a title in the current tracker (else the one
   `/tracker` opens, else your own; the hint names it). Fallbacks come last and
-  are never selected by default, so Enter on a search opens a result.
+  are never selected by default, so Enter on a search opens a result. **Ask
+  Gitmatrix “…”** (CORE-96) submits the text to the assistant in a new
+  conversation and opens it; it's the only palette action that reaches a model,
+  and only when chosen: typing, highlighting or closing sends nothing.
 
 Create issue never creates anything itself: it opens the tracker's own
 creator (CORE-95), which keeps its validation, drafts and same-operation
@@ -284,6 +287,16 @@ retries. The handoff is a one-shot intent in router state
 (`src/palette/intents.ts`), so the title never appears in a URL, and the
 tracker clears it as soon as it opens the creator, so back and refresh don't
 reopen it. A title proposed this way leaves the capture box's draft alone.
+
+Ask goes through the assistant's own provider (`ask()` in
+`src/assistant/state.tsx`): one step mints the new chat and queues the prompt
+addressed to it (`src/assistant/queue.ts`), and only that chat takes it, once,
+after its own connection is up, so it can't land in the conversation that was on
+screen, double-send on a re-render, or vanish into a socket a remount closed. The
+earlier conversation keeps its history, pending approvals and unsent draft
+(drafts are kept per conversation for the tab). Choosing a **Conversations**
+search result reopens that chat without sending anything. While the palette
+animates closed it ignores keys, so a quick second Enter can't run an option twice.
 
 Local groups answer at once and keep working while remote ones load or fail;
 a category that can't be searched says so instead of looking empty. Selection

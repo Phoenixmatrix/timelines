@@ -78,7 +78,12 @@ export default function Chat({
   const navigate = useNavigate();
   const revalidator = useRevalidator();
   const [status, setStatus] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
+  // Kept per conversation, so starting or opening another doesn't lose it.
+  const [draft, setDraftState] = useState(() => assistant.draftFor(chatId));
+  const setDraft = (text: string) => {
+    setDraftState(text);
+    assistant.saveDraft(chatId, text);
+  };
   const [withPage, setWithPage] = useState(true);
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -177,12 +182,15 @@ export default function Chat({
     pinned.current = true;
   };
 
-  // A prompt queued from elsewhere (a suggestion, a "ask about this" button).
+  // A prompt queued for this chat from elsewhere (a suggestion, the palette's
+  // Ask), taken only once this chat's own connection is up: a message sent
+  // before that, or into a connection a remount tears down, would be lost.
   useEffect(() => {
-    const queued = assistant.takeQueued();
+    if (!agent.identified) return;
+    const queued = assistant.takeQueued(chatId);
     if (queued) send(queued);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assistant.queued]);
+  }, [assistant.queued, agent.identified]);
 
   useEffect(() => input.current?.focus(), [chatId]);
 

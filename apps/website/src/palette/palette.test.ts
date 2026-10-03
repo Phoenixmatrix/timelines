@@ -169,6 +169,28 @@ describe("create issue", () => {
   });
 });
 
+describe("ask", () => {
+  test("is offered only for typed text, signed in, as a fallback that submits explicitly", () => {
+    const ask = (context: Partial<PaletteContext>) => commands(context).find((c) => c.id === "ask");
+    expect(ask({ query: "" })).toBeUndefined();
+    expect(ask({ query: "   " })).toBeUndefined();
+    expect(ask({ viewer: null, query: "why" })).toBeUndefined();
+    const command = ask({ query: " why is CI slow? " })!;
+    expect(command).toMatchObject({
+      title: "Ask Gitmatrix “why is CI slow?”",
+      always: true,
+      run: { kind: "action" },
+    });
+    const calls: string[] = [];
+    if (command.run.kind === "action")
+      command.run.perform({
+        navigate: () => {},
+        assistant: { show: () => {}, openChat: () => {}, ask: (p) => calls.push(p) },
+      });
+    expect(calls).toEqual(["why is CI slow?"]);
+  });
+});
+
 describe("selection", () => {
   test("defaults to the first option and stays on it as results arrive", () => {
     const first = reconcile(FRESH, ["page:tracker"]);

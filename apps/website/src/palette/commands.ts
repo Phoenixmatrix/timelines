@@ -27,7 +27,7 @@ export interface PaletteContext {
 export interface PaletteEnv {
   /** In-app navigation; `state` carries one-shot intents (palette/intents.ts). */
   navigate(to: string, state?: unknown): void;
-  assistant: { show(): void; openChat(id: string): void };
+  assistant: { show(): void; openChat(id: string): void; ask(prompt: string): void };
 }
 
 export type CommandGroup = "pages" | "repository" | "actions";
@@ -103,19 +103,37 @@ const repository: CommandSource = ({ repo }) =>
       }))
     : [];
 
-const actions: CommandSource = ({ viewer }) =>
-  viewer
-    ? [
-        {
-          id: "action:assistant",
-          group: "actions",
-          title: "Open the assistant",
-          hint: "⌘J",
-          keywords: ["ask", "chat", "help"],
-          run: { kind: "action", perform: (env) => env.assistant.show() },
-        },
-      ]
-    : [];
+const actions: CommandSource = ({ viewer, query }) => {
+  if (!viewer) return [];
+  const prompt = query.trim();
+  return [
+    // Submitting is explicit: typing, highlighting or closing never sends
+    // anything, and this starts a new conversation rather than adding to one.
+    ...(prompt
+      ? [
+          {
+            id: "ask",
+            group: "actions" as const,
+            title: `Ask Gitmatrix “${prompt}”`,
+            hint: "Sends it in a new conversation",
+            always: true,
+            run: {
+              kind: "action" as const,
+              perform: (env: PaletteEnv) => env.assistant.ask(prompt),
+            },
+          },
+        ]
+      : []),
+    {
+      id: "action:assistant",
+      group: "actions",
+      title: "Open the assistant",
+      hint: "⌘J",
+      keywords: ["ask", "chat", "help"],
+      run: { kind: "action", perform: (env) => env.assistant.show() },
+    },
+  ];
+};
 
 /** The tracker the viewer is in: the one being viewed, or the repository owner's. */
 export function contextTracker({ pathname, repo, trackers }: PaletteContext) {

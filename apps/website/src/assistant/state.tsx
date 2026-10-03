@@ -1,22 +1,44 @@
 // Whether the assistant is open, which conversation it shows, and how other
 // parts of the app reach it (open it, start a chat with a prompt).
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { promptQueue, type QueuedPrompt } from "./queue.ts";
 
 interface AssistantState {
   open: boolean;
   chatId: string;
   /** A chat id this tab minted and hasn't sent anything in yet. */
   fresh: boolean;
-  /** A prompt to send as soon as the chat is ready (from a suggestion elsewhere). */
-  queued: string | null;
+  /**
+   * A prompt to send as soon as its chat is ready (from a suggestion elsewhere).
+   * It names its chat, so a conversation still on screen can't take another's.
+   */
+  queued: QueuedPrompt | null;
   toggle(): void;
+  /** Opens the assistant; with a prompt, sends it in the current chat. */
   show(prompt?: string): void;
+  /**
+   * Starts a new conversation with this prompt and opens the assistant, in one
+   * step: the previous chat, its draft and pending approvals stay as they were.
+   */
+  ask(prompt: string): void;
   hide(): void;
   newChat(): void;
   openChat(id: string): void;
   sent(): void;
-  takeQueued(): string | null;
+  /** The prompt queued for this chat, taken at most once. */
+  takeQueued(chatId: string): string | null;
+  /** Unsent text per conversation, kept for this tab while switching between them. */
+  draftFor(chatId: string): string;
+  saveDraft(chatId: string, text: string): void;
 }
 
 const Context = createContext<AssistantState | null>(null);
@@ -57,7 +79,18 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     url.searchParams.delete("chat");
     window.history.replaceState(window.history.state, "", url);
   }, [linked]);
-  const [queued, setQueued] = useState<string | null>(null);
+  // The queue is the source of truth for taking a prompt (effects that run
+  // twice, or two chats rendering at once, must not send it twice); the state
+  // copy only tells chats to look.
+  const queue = useRef(promptQueue()).current;
+  const drafts = useRef(new Map<string, string>()).current;
+  const [queued, setQueued] = useState<QueuedPrompt | null>(null);
+  const enqueue = useCallback(
+    (next: QueuedPrompt) => {
+      if (queue.put(next)) setQueued(next);
+    },
+    [queue],
+  );
 
   useEffect(() => write(OPEN, open ? "1" : null), [open]);
   // Only a chat that has messages is worth coming back to.
@@ -83,20 +116,32 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       queued,
       toggle,
       show(prompt) {
-        if (prompt) setQueued(prompt);
+        if (prompt) enqueue({ chatId: chat.id, prompt });
+        setOpen(true);
+      },
+      ask(prompt) {
+        if (!prompt.trim()) return;
+        const id = crypto.randomUUID();
+        setChat({ id, fresh: true });
+        enqueue({ chatId: id, prompt });
         setOpen(true);
       },
       hide: () => setOpen(false),
       newChat: () => setChat({ id: crypto.randomUUID(), fresh: true }),
       openChat: (id) => setChat({ id, fresh: false }),
       sent: () => setChat((c) => (c.fresh ? { ...c, fresh: false } : c)),
-      takeQueued() {
-        const prompt = queued;
-        if (prompt) setQueued(null);
+      draftFor: (chatId) => drafts.get(chatId) ?? "",
+      saveDraft(chatId, text) {
+        if (text) drafts.set(chatId, text);
+        else drafts.delete(chatId);
+      },
+      takeQueued(chatId) {
+        const prompt = queue.take(chatId);
+        if (prompt !== null) setQueued(null);
         return prompt;
       },
     }),
-    [open, chat, queued, toggle],
+    [open, chat, queued, toggle, enqueue, queue, drafts],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }

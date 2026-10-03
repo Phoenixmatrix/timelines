@@ -136,6 +136,8 @@ function commandOption(command: Command): Option {
     detail: command.hint ?? "",
     icon: command.id.startsWith("create") ? (
       <PlusCircleIcon className={iconClass} aria-hidden />
+    ) : command.id === "ask" ? (
+      <ChatCenteredDotsIcon className={iconClass} aria-hidden />
     ) : command.group === "actions" ? (
       <LightningIcon className={iconClass} aria-hidden />
     ) : command.group === "repository" ? (
@@ -321,7 +323,11 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
 
   const env: PaletteEnv = {
     navigate: (to, state) => void navigate(to, state === undefined ? undefined : { state }),
-    assistant: { show: () => assistant.show(), openChat: (id) => assistant.openChat(id) },
+    assistant: {
+      show: () => assistant.show(),
+      openChat: (id) => assistant.openChat(id),
+      ask: (prompt) => assistant.ask(prompt),
+    },
   };
   const activate = (option: Option) => {
     onOpenChange(false);
@@ -337,6 +343,12 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
       // A toggle: the popup keeps focus while it animates closed, and ⌘K
       // pressed then must reopen it, not close it again.
       onOpenChange(!open);
+      return;
+    }
+    // Still animating closed after an activation: a quick second Enter must
+    // not run the same option again (a second Ask, a second navigation).
+    if (!open) {
+      event.preventDefault();
       return;
     }
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
