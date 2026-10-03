@@ -40,6 +40,8 @@ export interface TrackerDatabase {
   };
   receipts: { id: string; actor_id: string; request: string; result: string };
   events: { cursor: Generated<number>; data: string };
+  issue_events: { issue_id: string; cursor: number };
+  tracker_migrations: { name: string };
 }
 
 /** The storage surface the store needs: `ctx.storage.sql`, or a test double. */

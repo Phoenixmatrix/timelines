@@ -44,6 +44,7 @@ export function apiClient(
         method,
         headers: {
           authorization: `Bearer ${await token()}`,
+          "X-Gitmatrix-Source": "assistant",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),

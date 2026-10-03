@@ -16,6 +16,8 @@ export async function api<T>(path: string, init?: RequestInit & { json?: unknown
   const { json, ...rest } = init ?? {};
   const headers = new Headers(rest.headers);
   if (json !== undefined) headers.set("content-type", "application/json");
+  if (rest.method?.toUpperCase() === "POST" && /^\/tracker\/[^/]+\/mutate$/.test(path))
+    headers.set("X-Gitmatrix-Source", "web");
   const response = await fetch(`/api${path}`, {
     ...rest,
     headers,

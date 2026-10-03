@@ -55,7 +55,8 @@ pub const COMMANDS: &[Meta] = &[
     meta!("issue create", git: "", kw: "ticket task bug prd markdown acceptance offline stable id", mutates: true, out: Out::Other("{operationId,queued,entities:[Issue],cursor}; offline key is null until synchronized"), ex: ["gm issue create 'Ship search' --team ENG --type prd --description-file spec.md"]),
     meta!("issue list", git: "", kw: "tickets issues filter search status team workspace bounded", mutates: false, out: Out::Other("{issues:[Issue],total,truncated,offline,readinessAdvisory,cursor,cachedAt,next}"), ex: ["gm issue list --workspace launch --limit 20"]),
     meta!("issue ready", git: "", kw: "ready frontier agent unblocked available work dependency blockers", mutates: false, out: Out::Other("{issues:[Issue],total,truncated,offline,readinessAdvisory:true,cursor,cachedAt,next}; acquire an online claim before work"), ex: ["gm issue ready --limit 10"]),
-    meta!("issue show", git: "", kw: "bounded context ancestors parent prd blockers dependents checkpoint evidence", mutates: false, out: Out::Other("{issue,ancestors,links,relatedIssues,notes,limitPerSection,truncated,ready,readinessAdvisory,cursor,cachedAt,offline}"), ex: ["gm issue show ENG-1 --limit 20"]),
+    meta!("issue show", git: "", kw: "bounded context creator attribution ancestors parent prd blockers dependents checkpoint evidence", mutates: false, out: Out::Other("{issue:{...,createdBy,creatorDisplay},ancestors,links,relatedIssues,notes,limitPerSection,truncated,ready,readinessAdvisory,cursor,cachedAt,offline}"), ex: ["gm issue show ENG-1 --limit 20"]),
+    meta!("issue history", git: "", kw: "audit history creator attribution actor agent accountable source timestamp mutation before after pagination online", mutates: false, out: Out::Other("{issueId,creator:AuditActor|null,events:[{cursor,operationId,actorId,actor:{id,kind,name,accountable},source,kind,mutationKind,entityType,entityId,before,entity,createdAt}],nextBefore:number|null,hasMore}; newest first; --before is exclusive; online only"), ex: ["gm issue history ENG-1 --owner orbit --limit 50", "gm issue history ENG-1 --owner orbit --before 120 --json"]),
     meta!("issue update", git: "", kw: "edit issue version optimistic status assignment acceptance labels", mutates: true, out: Out::Other("{operationId,queued,entities:[Issue],cursor}"), ex: ["gm issue update ENG-1 --data '{\"priority\":1}' --offline"]),
     meta!("issue link", git: "", kw: "dependency blocker related duplicate directed graph", mutates: true, out: Out::Other("{operationId,queued,entities:[Link],cursor}"), ex: ["gm issue link ENG-1 ENG-2 --kind blocks"]),
     meta!("issue unlink", git: "", kw: "remove dependency blocker relation", mutates: true, out: Out::Other("{operationId,queued,entities:[],cursor}"), ex: ["gm issue unlink LINK_ID"]),
@@ -560,6 +561,7 @@ unsnapshotted edits and ignored files are discarded with --force.
     gm issue create 'Fix search' --team ENG
     gm issue ready --limit 10
     gm issue show ENG-1 --limit 20
+    gm issue history ENG-1 --owner orbit --limit 50
     gm issue claim ENG-1 --agent my-agent
     gm issue checkpoint ENG-1 'Implemented; next: verify'
     gm issue complete ENG-1 --evidence 'Smoke verified'  # GM_LEASE_TOKEN required
@@ -570,6 +572,12 @@ Explicit `--offline` queues durable SQLite edits; online commands never mask err
 Offline readiness is advisory, never a lease. Lease operations require online access.
 Tracker writes are not restored by `gm undo`. `gm schema issue batch` describes atomic
 graph input. `gm tracker status` exposes private replica paths for credential recovery.
+`gm issue show` displays the immutable creator; unavailable legacy/offline attribution
+stays unknown. `gm issue history` reads online audit pages, newest first, including
+actor/agent, accountable person, source, time, operation and full before/after states.
+Repeat with `--before NEXT_BEFORE` until `hasMore` is false; `--limit` is 1..100
+(default 50). `--json` preserves the complete response. The source is a provenance
+hint, not authentication; gm's transport declares `cli`.
 
 ## Working through a graph (agents)
 An agent has its own identity, accountable to a person. `gm agent setup` (run

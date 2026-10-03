@@ -248,8 +248,26 @@ tracker.get("/tracker/:owner/changes", async (c) => {
       : changes,
   );
 });
+tracker.get("/tracker/:owner/issues/:issue/history", async (c) => {
+  const access = await authorize(c);
+  const before = c.req.query("before");
+  const limit = c.req.query("limit") ?? "50";
+  if ((before !== undefined && !/^\d+$/.test(before)) || !/^\d+$/.test(limit))
+    throw new TrackerError(400, "invalid_input", "before and limit must be integers.");
+  return response(
+    c,
+    await trackerObject(c.env, access.owner.id).history(
+      access,
+      c.req.param("issue"),
+      before === undefined ? null : Number(before),
+      Number(limit),
+    ),
+  );
+});
 tracker.post("/tracker/:owner/mutate", async (c) => {
   const access = await authorize(c);
+  const source = c.req.header("X-Gitmatrix-Source");
+  access.source = source === "web" || source === "cli" || source === "assistant" ? source : "api";
   const request = validateRequest(await body(c));
   let removedRepoIds: string[] = [];
   if (

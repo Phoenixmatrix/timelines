@@ -8,6 +8,7 @@ import {
   readiness,
   readinessIndex,
   type Changes,
+  type AuditSource,
   type Comment,
   type HumanRequest,
   type IssueClaim,
@@ -29,6 +30,7 @@ import {
 import type { ShippedIssue } from "../../shared/release-notes.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, tracker, type SqlDatabase } from "./sql.ts";
+import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
 
 export type { SqlDatabase } from "./sql.ts";
 
@@ -53,6 +55,8 @@ export class TrackerError extends Error {
 export interface Access {
   /** Who actions are attributed to: an agent's id, or the person's. */
   actorId: string;
+  /** Client-reported transport, not an authentication or permission input. */
+  source?: AuditSource;
   /** Whose memberships and permissions apply: the person (an agent's accountable human). */
   principalId: string;
   /** Agents accountable to members: they may hold leases and be assigned work. */
@@ -182,6 +186,7 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS comment_issues ON comments(json_extract(data, '$.issueId'));
       CREATE INDEX IF NOT EXISTS event_entities ON events(json_extract(data, '$.entityId'));
       CREATE INDEX IF NOT EXISTS event_times ON events(json_extract(data, '$.createdAt'));`);
+    initializeAudit(sql, transaction);
   }
   private all<T extends Entity>(type: EntityType): T[] {
     return all(this.sql, tracker.selectFrom(tables[type]).select("data").orderBy("id")).map(
@@ -375,6 +380,27 @@ export class TrackerStore {
       serverTime: new Date(this.clock()).toISOString(),
     };
   }
+  history(access: Access, issueId: string, before: number | null, limit: number) {
+    id(issueId);
+    if (
+      (before !== null && (!Number.isSafeInteger(before) || before < 1)) ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    )
+      fail("invalid_input", "before must be a positive integer; limit must be 1–100.");
+    const row =
+      first(this.sql, tracker.selectFrom("issues").select("data").where("id", "=", issueId)) ??
+      first(
+        this.sql,
+        tracker
+          .selectFrom("issues")
+          .select("data")
+          .where(json("data", "$.key"), "=", issueId.toUpperCase()),
+      );
+    if (!row) fail("not_found", `Issue ${issueId} not found.`, 404);
+    return issueHistory(this.sql, access, JSON.parse(row.data) as Issue, before, limit);
+  }
   mutate(access: Access, input: unknown): MutationResult {
     const request = validateRequest(input);
     const encoded = canonical(request);
@@ -401,7 +427,14 @@ export class TrackerStore {
       const events: TrackerEvent[] = [];
       const results: MutationResult["results"] = [];
       const started = new Set<string>();
+      const actor = auditActor(access);
+      let mutationKind = "";
       const emit = (type: EntityType, entityId: string, entity: Entity | null, kind: string) => {
+        const prior = first(
+          this.sql,
+          tracker.selectFrom(tables[type]).select("data").where("id", "=", entityId),
+        );
+        const before = prior ? (JSON.parse(prior.data) as Entity) : null;
         if (entity)
           run(
             this.sql,
@@ -416,6 +449,10 @@ export class TrackerStore {
         const event = {
           operationId: request.operationId,
           actorId: access.actorId,
+          actor,
+          source: access.source ?? "unknown",
+          mutationKind,
+          before,
           kind,
           entityType: type,
           entityId,
@@ -429,6 +466,7 @@ export class TrackerStore {
             .values({ data: JSON.stringify(event) })
             .returning("cursor"),
         ).cursor;
+        indexAuditEvent(this.sql, { ...event, cursor });
         events.push({ ...event, cursor });
       };
       const admin = () => {
@@ -825,6 +863,7 @@ export class TrackerStore {
         if ("labels" in data) issue.labels = strings(data.labels, "labels", 50);
       };
       for (const mutation of request.mutations) {
+        mutationKind = mutation.kind;
         const entityId = mutation.id;
         const data = object("data" in mutation ? mutation.data : {});
         const base = { id: entityId, version: 1, createdAt: now, updatedAt: now };
@@ -982,6 +1021,7 @@ export class TrackerStore {
               ).number;
               issue = {
                 ...base,
+                createdBy: actor,
                 teamId: team.id,
                 key: `${team.key}-${number}`,
                 title: text(data.title, "title", 500),

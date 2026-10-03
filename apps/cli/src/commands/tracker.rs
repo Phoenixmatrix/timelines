@@ -23,8 +23,69 @@ use std::{
 pub struct Shown(pub Value);
 impl Render for Shown {
     fn text(&self) -> String {
-        serde_json::to_string_pretty(&self.0).unwrap_or_default()
+        if self.0.get("issueId").is_some() && self.0.get("events").is_some() {
+            return history_text(&self.0);
+        }
+        let body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
+        if self.0.get("ancestors").is_some() && self.0.get("issue").is_some() {
+            return format!(
+                "Created by: {}\n\n{body}",
+                self.0["issue"]["creatorDisplay"]
+                    .as_str()
+                    .unwrap_or("Unknown")
+            );
+        }
+        body
     }
+}
+
+fn audit_actor(actor: &Value) -> String {
+    let Some(id) = actor["id"].as_str() else {
+        return "Unknown".into();
+    };
+    let name = actor["name"].as_str().unwrap_or(id);
+    let kind = actor["kind"].as_str().unwrap_or("unknown");
+    let mut label = format!("{name} [{kind}; {id}]");
+    if let Some(accountable_id) = actor["accountable"]["id"].as_str() {
+        let person = actor["accountable"]["displayName"]
+            .as_str()
+            .unwrap_or(accountable_id);
+        label.push_str(&format!("; accountable: {person} [{accountable_id}]"));
+    }
+    label
+}
+
+fn history_text(history: &Value) -> String {
+    let mut text = format!(
+        "History: {}\nCreated by: {}\n",
+        history["issueId"].as_str().unwrap_or("Unknown"),
+        audit_actor(&history["creator"]),
+    );
+    for event in history["events"].as_array().into_iter().flatten() {
+        text.push_str(&format!(
+            "\n#{}  {}  {}\nSource: {}  Actor: {}\nMutation: {}  Operation: {}\nEntity: {} {}\nBefore:\n{}\nAfter:\n{}\n",
+            event["cursor"],
+            event["createdAt"].as_str().unwrap_or("Unknown time"),
+            event["kind"].as_str().unwrap_or("Unknown action"),
+            event["source"].as_str().unwrap_or("unknown"),
+            audit_actor(&event["actor"]),
+            event["mutationKind"].as_str().unwrap_or("unknown"),
+            event["operationId"].as_str().unwrap_or("Unknown"),
+            event["entityType"].as_str().unwrap_or("Unknown"),
+            event["entityId"].as_str().unwrap_or("Unknown"),
+            serde_json::to_string_pretty(&event["before"]).unwrap_or_default(),
+            serde_json::to_string_pretty(&event["entity"]).unwrap_or_default(),
+        ));
+    }
+    if history["hasMore"] == true {
+        text.push_str(&format!(
+            "\nMore history: repeat this command with --before {}\n",
+            history["nextBefore"],
+        ));
+    } else {
+        text.push_str("\nEnd of history.\n");
+    }
+    text
 }
 fn db_err(e: rusqlite::Error) -> GmError {
     GmError::new("replica_error", e.to_string())
@@ -584,6 +645,11 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
     let data = mutation["data"]
         .as_object()
         .ok_or_else(|| GmError::usage("Mutation data must be a JSON object."))?;
+    if entity == "issue" && data.contains_key("createdBy") {
+        return Err(GmError::usage(
+            "createdBy is assigned by the server and is immutable.",
+        ));
+    }
     if action == "update" {
         let index = index.ok_or_else(|| {
             GmError::not_found(
@@ -1139,6 +1205,16 @@ fn named(snapshot: &Value, issue: &Value) -> Value {
     if let Some(assignee) = issue["assigneeId"].as_str() {
         out["assignee"] = json!(actor_name(snapshot, assignee));
     }
+    out["creatorDisplay"] = json!(if issue["createdBy"].is_null() {
+        "Unknown".to_string()
+    } else if issue["createdBy"]["name"].is_null() {
+        issue["createdBy"]["id"]
+            .as_str()
+            .map(|id| actor_name(snapshot, id))
+            .unwrap_or_else(|| "Unknown".to_string())
+    } else {
+        audit_actor(&issue["createdBy"])
+    });
     out
 }
 fn listing(snapshot: &Value, args: &ListIssues, only_ready: bool, offline: bool) -> Result<Shown> {
@@ -1296,6 +1372,35 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
     }))
 }
 pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
+    if let IssueCommand::History {
+        issue,
+        before,
+        limit,
+    } = &args.command
+    {
+        if args.scope.offline {
+            return Err(GmError::usage(
+                "Issue history requires online access; the offline replica is not an audit archive.",
+            ));
+        }
+        let config = Config::load();
+        let owner = selected_owner(&config, args.scope.owner.clone())?;
+        use std::fmt::Write as _;
+        let mut encoded = String::with_capacity(issue.len());
+        for b in issue.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    encoded.push(b as char)
+                }
+                _ => write!(&mut encoded, "%{b:02X}").expect("writing to a String"),
+            }
+        }
+        let mut path = format!("/tracker/{owner}/issues/{encoded}/history?limit={limit}");
+        if let Some(before) = before {
+            path.push_str(&format!("&before={before}"));
+        }
+        return Ok(Shown(remote::api(&config, "GET", &path, None)?));
+    }
     let lease_command = matches!(
         args.command,
         IssueCommand::Claim { .. }
@@ -1334,6 +1439,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             IssueCommand::Show { issue, limit } => {
                 return context(&snapshot, issue, *limit as usize, args.scope.offline);
             }
+            IssueCommand::History { .. } => unreachable!("handled before opening the replica"),
             IssueCommand::Create(a) => {
                 if a.description_file.as_deref() == Some(Path::new("-"))
                     && a.acceptance_file.as_deref() == Some(Path::new("-"))
@@ -1579,6 +1685,29 @@ mod tests {
     use super::*;
     fn snapshot() -> Value {
         json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+    }
+    #[test]
+    fn creator_is_unknown_offline_and_immutable_after_confirmation() {
+        let mut s = snapshot();
+        project(
+            &mut s,
+            &json!({"kind":"issue.create","id":"a","data":{"title":"Offline"}}),
+        )
+        .unwrap();
+        assert!(s["issues"][0]["createdBy"].is_null());
+        let creator = json!({"id":"agent-a","kind":"agent","name":"Builder","accountable":{"id":"person-a","displayName":"Ann"}});
+        apply_event(&mut s, &json!({"entityType":"issue","entityId":"a","entity":{"id":"a","key":"ENG-1","title":"Confirmed","version":1,"createdBy":creator}})).unwrap();
+        project(
+            &mut s,
+            &json!({"kind":"issue.update","id":"a","expectedVersion":1,"data":{"title":"Edited"}}),
+        )
+        .unwrap();
+        assert_eq!(s["issues"][0]["createdBy"], creator);
+        let before = s.clone();
+        for (kind, id) in [("issue.update", "a"), ("issue.create", "b")] {
+            assert!(project(&mut s, &json!({"kind":kind,"id":id,"expectedVersion":2,"data":{"createdBy":{"id":"forged"}}})).is_err());
+            assert_eq!(s, before);
+        }
     }
     #[test]
     fn offline_create_and_chained_updates_preserve_stable_id_and_versions() {

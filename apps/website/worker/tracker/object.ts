@@ -38,6 +38,9 @@ export class Tracker extends DurableObject<Env> {
   changes(after: number, limit: number) {
     return this.reply(() => this.store.changes(after, limit));
   }
+  history(access: Access, issueId: string, before: number | null, limit: number) {
+    return this.reply(() => this.store.history(access, issueId, before, limit));
+  }
   openRequests() {
     return this.reply(() => this.store.openRequests());
   }

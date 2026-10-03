@@ -496,6 +496,16 @@ subtasks or satisfy dependent issues' blockers.
   Closed board lanes retain their counts and expand to show closed issues.
   Add subtasks from the parent without leaving it; only active workspaces are
   inherited. Checkpoints, claims, blockers and completion evidence remain distinct.
+- **Creator and audit:** issue details show **Created by** and the creation time
+  without opening history. Expand **Audit history** for newest-first events,
+  including comments, requests, relations and parent changes. Each entry shows
+  the actor (and an agent's accountable person), timestamp, client-reported source,
+  operation ID and field changes; **Full event details** exposes the complete
+  sanitized event. **Load older events** pages through the history. History loads
+  only while expanded, refreshes when the snapshot cursor advances, and resets
+  on issue/account changes. Activity & handoff remains the comments workspace.
+  Legacy attribution/source gaps are labeled unknown; current-directory identity
+  resolution is labeled separately from mutation-time snapshots.
 - **Startup defaults:** in **Tracker settings → Default view and team**, choose
   List/Board/Graph, an issue-view preset, and an active team or all teams. Saving
   also makes this tracker the destination of the global **Issues** link. Defaults
@@ -525,17 +535,22 @@ subtasks or satisfy dependent issues' blockers.
   and `e` edits the selected issue. Shortcuts do not run while typing or interacting
   with form controls. The enabled legend lists the available keys.
 
-| Route                                               | Contract                                                                                                |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `GET /api/tracker`                                  | Trackers accessible to the authenticated account                                                        |
-| `GET /api/tracker/:owner/snapshot`                  | Complete authorized replica snapshot and cursor                                                         |
-| `GET /api/tracker/:owner/changes?after=N&limit=200` | Ordered event page; resume from the returned cursor                                                     |
-| `POST /api/tracker/:owner/mutate`                   | `{operationId, mutations:[{kind,id,expectedVersion?,data?}]}`; 1–100 ordered operations, all or nothing |
-| `GET /api/repos/:owner/:name/tracker`               | Accessible subscribed workspaces for repository navigation                                              |
+| Route                                                             | Contract                                                                                                |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `GET /api/tracker`                                                | Trackers accessible to the authenticated account                                                        |
+| `GET /api/tracker/:owner/snapshot`                                | Complete authorized replica snapshot and cursor                                                         |
+| `GET /api/tracker/:owner/changes?after=N&limit=200`               | Ordered event page; resume from the returned cursor                                                     |
+| `GET /api/tracker/:owner/issues/:issue/history?before=N&limit=50` | Authorized issue audit; ID or key, newest first, exclusive cursor, default 50 / maximum 100 events      |
+| `POST /api/tracker/:owner/mutate`                                 | `{operationId, mutations:[{kind,id,expectedVersion?,data?}]}`; 1–100 ordered operations, all or nothing |
+| `GET /api/repos/:owner/:name/tracker`                             | Accessible subscribed workspaces for repository navigation                                              |
 
 Updates require the version last read; stale writes return `409 version_conflict`
 with current state. Issue IDs are stable client-generated identifiers; the authority
 assigns readable keys such as `ENG-42`. Mutation bodies are limited to 1 MiB.
+Tracker mutation clients declare `X-Gitmatrix-Source: web|cli|api|assistant`;
+the browser sends `web`. This is a provenance hint, never authentication.
+History retains immutable actor snapshots and before/after state, excludes
+lease and credential secrets, and requires the same tracker membership as snapshots.
 `shared/tracker.ts` defines the wire types; `gm schema issue batch` exposes the
 CLI contract. No new D1 migration is needed: the Durable Object initializes its
 own schema. Generate the new binding with `cf workers types`.

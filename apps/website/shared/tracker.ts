@@ -81,8 +81,20 @@ export interface IssueClaim {
    */
   parkedAt?: string;
 }
+
+/** Identity captured at mutation time, independent of later renames or membership changes. */
+export interface AuditActor {
+  id: string;
+  kind: "person" | "agent" | "unknown";
+  name: string | null;
+  accountable: TrackerIdentity | null;
+}
+/** Client-reported transport, not an authorization signal. Old events have no recorded source. */
+export type AuditSource = "web" | "cli" | "api" | "assistant" | "unknown";
 export interface Issue extends TrackerEntity {
   key: string;
+  /** Immutable creator; legacy records without a creation event remain unknown. */
+  createdBy?: AuditActor | null;
   teamId: string;
   title: string;
   description: string;
@@ -196,6 +208,25 @@ export interface TrackerEvent {
   entityId: string;
   entity: Team | Workspace | Issue | Link | Comment | HumanRequest | Subscription | null;
   createdAt: string;
+  actor?: AuditActor;
+  source?: AuditSource;
+  /** The requested mutation, which may also emit secondary events. */
+  mutationKind?: string;
+  before?: TrackerEvent["entity"];
+}
+export interface IssueAuditEvent extends TrackerEvent {
+  actor: AuditActor;
+  source: AuditSource;
+  mutationKind: string;
+  before: TrackerEvent["entity"];
+}
+/** Newest first; before is an exclusive event cursor. */
+export interface IssueHistory {
+  issueId: string;
+  creator: AuditActor | null;
+  events: IssueAuditEvent[];
+  nextBefore: number | null;
+  hasMore: boolean;
 }
 export type IssueFields = Pick<
   Issue,

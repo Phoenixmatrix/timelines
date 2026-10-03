@@ -37,6 +37,7 @@ import type { IssueIndex } from "./query.ts";
 import { RequestCard } from "./Requests.tsx";
 import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
+import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
 
 export type MutationOutcome = { ok: true } | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
@@ -738,6 +739,16 @@ export function IssueDetail({
           </h2>
         )}
         <dl className={`${META} mt-3`}>
+          <dt className="text-ink-faint">Created by</dt>
+          <dd className="m-0 min-w-0">
+            <AuditIdentity actor={issue.createdBy} snapshot={snapshot} />
+          </dd>
+          <dt className="text-ink-faint">Created</dt>
+          <dd className="m-0 min-w-0">
+            <time dateTime={issue.createdAt} title={issue.createdAt}>
+              {new Date(issue.createdAt).toLocaleString()}
+            </time>
+          </dd>
           <dt className="text-ink-faint">Team</dt>
           <dd className="m-0 min-w-0">{team?.name}</dd>
           <dt className="text-ink-faint">Type</dt>
@@ -1282,6 +1293,11 @@ export function IssueDetail({
           </button>
         </form>
       </section>
+      <AuditHistory
+        key={`${snapshot.owner.id}:${issue.id}`}
+        issueId={issue.id}
+        snapshot={snapshot}
+      />
       <section className={SECTION}>
         <h3 className={HEADING}>Activity & handoff</h3>
         <p className="mk-hint mt-0.5 mb-0 max-w-[48ch]">

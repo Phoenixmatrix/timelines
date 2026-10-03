@@ -331,6 +331,7 @@ pub fn artifact(
     let url = format!("{}{}", config.server(), path);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .middleware(cli_source)
         .max_redirects(0)
         .build()
         .into();
@@ -372,9 +373,22 @@ pub fn artifact(
     }
 }
 
+// Provenance hint only: authentication still comes from the credential.
+fn cli_source(
+    mut request: ureq::http::Request<ureq::SendBody>,
+    next: ureq::middleware::MiddlewareNext,
+) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    request.headers_mut().insert(
+        "x-gitmatrix-source",
+        ureq::http::HeaderValue::from_static("cli"),
+    );
+    next.handle(request)
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .middleware(cli_source)
         .build()
         .into()
 }

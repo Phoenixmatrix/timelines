@@ -227,6 +227,16 @@ pub enum IssueCommand {
         #[arg(long, default_value_t=30, value_parser=clap::value_parser!(u16).range(1..=200))]
         limit: u16,
     },
+    /// Read the complete audit trail, newest first (online only).
+    History {
+        /// Canonical issue ID or key.
+        issue: String,
+        /// Exclusive cursor from the previous page's nextBefore.
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long, default_value_t=50, value_parser=clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Apply a JSON patch with optimistic version checking; null clears nullable fields.
     Update(Patch),
     /// Add a directed relation: FROM blocks TO (or related/duplicates).

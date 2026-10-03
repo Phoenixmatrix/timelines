@@ -39,21 +39,18 @@ function fixture() {
     },
   };
   let now = Date.parse("2026-10-01T00:00:00Z");
-  const store = new TrackerStore(
-    sql,
-    (fn) => {
-      db.exec("BEGIN");
-      try {
-        const result = fn();
-        db.exec("COMMIT");
-        return result;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-    },
-    () => now,
-  );
+  const transaction = <T>(fn: () => T): T => {
+    db.exec("BEGIN");
+    try {
+      const result = fn();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  };
+  const store = new TrackerStore(sql, transaction, () => now);
   const access: Access = {
     actorId: "alice",
     principalId: "alice",
@@ -87,6 +84,7 @@ function fixture() {
   return {
     db,
     store,
+    reopen: () => new TrackerStore(sql, transaction, () => now),
     access,
     mutate,
     issue,
@@ -95,6 +93,200 @@ function fixture() {
     },
   };
 }
+
+describe("ticket audit history", () => {
+  test("persists creator and authenticated agent identity, paginates without duplicates, and fences retries", () => {
+    const f = fixture();
+    f.access.actorId = "agt-bot";
+    f.access.source = "cli";
+    f.issue("ticket");
+    const creator = {
+      id: "agt-bot",
+      kind: "agent",
+      name: "bot",
+      accountable: { id: "alice", slug: "alice", displayName: "Alice" },
+    };
+    expect(f.store.snapshot(f.access).issues[0]!.createdBy).toEqual(creator);
+    const input = {
+      operationId: "edit-once",
+      mutations: [
+        { kind: "issue.update", id: "ticket", expectedVersion: 1, data: { title: "Changed" } },
+      ],
+    };
+    f.advance(1000);
+    f.store.mutate(f.access, input);
+    f.access.source = "web";
+    f.store.mutate(f.access, input);
+    f.access.agents[0]!.name = "renamed";
+    f.access.members[0]!.displayName = "Renamed Alice";
+    const first = f.store.history(f.access, "ENG-1", null, 1);
+    expect(first.creator).toEqual(creator);
+    expect(first.hasMore).toBe(true);
+    expect(first.events[0]).toMatchObject({
+      actor: creator,
+      source: "cli",
+      kind: "issue.update",
+      mutationKind: "issue.update",
+      operationId: "edit-once",
+      createdAt: "2026-10-01T00:00:01.000Z",
+      before: { title: "ticket", version: 1 },
+      entity: { title: "Changed", version: 2 },
+    });
+    const second = f.store.history(f.access, "ticket", first.nextBefore, 1);
+    expect(second.hasMore).toBe(false);
+    expect(second.nextBefore).toBeNull();
+    expect(second.events.map((event) => event.kind)).toEqual(["issue.create"]);
+    expect(second.events[0]!.cursor).toBeLessThan(first.events[0]!.cursor);
+    expect(() => f.store.history(f.access, "missing", null, 10)).toThrow(/not found/);
+    expect(() => f.store.history(f.access, "ticket", 0, 10)).toThrow(/before/);
+    expect(() => f.store.history(f.access, "ticket", null, 101)).toThrow(/limit/);
+    expect(() =>
+      f.mutate(
+        {
+          kind: "issue.update",
+          id: "ticket",
+          expectedVersion: 2,
+          data: { title: "Rolled back" },
+        },
+        { kind: "link.remove", id: "missing-link" },
+      ),
+    ).toThrow();
+    expect(
+      f.store.history(f.access, "ticket", null, 100).events.map((event) => event.kind),
+    ).toEqual(["issue.update", "issue.create"]);
+  });
+
+  test("includes both link endpoints, former parents, requests, comments and completion effects without secrets", () => {
+    const f = fixture();
+    for (const id of ["ticket", "other", "parent", "new-parent"]) f.issue(id);
+    f.mutate({
+      kind: "issue.update",
+      id: "ticket",
+      expectedVersion: 1,
+      data: { parentId: "parent" },
+    });
+    f.mutate({
+      kind: "issue.update",
+      id: "ticket",
+      expectedVersion: 2,
+      data: { parentId: "new-parent" },
+    });
+    f.mutate({
+      kind: "link.add",
+      id: "relation",
+      data: { fromId: "ticket", toId: "other", kind: "related" },
+    });
+    f.mutate({ kind: "link.remove", id: "relation" });
+    f.mutate({
+      kind: "comment.add",
+      id: "note",
+      data: { issueId: "ticket", body: "Checkpoint", kind: "checkpoint" },
+    });
+    f.mutate({
+      kind: "request.open",
+      id: "question",
+      data: { issueId: "ticket", kind: "question", prompt: "Proceed?" },
+    });
+    f.mutate({ kind: "request.answer", id: "question", data: { answer: "Yes" } });
+    const claim = f.mutate({ kind: "issue.claim", id: "ticket", data: { agent: "audit-worker" } });
+    const token = String(claim.results[0]!.leaseToken);
+    f.mutate({
+      kind: "issue.complete",
+      id: "ticket",
+      data: { leaseToken: token, evidence: "Verified" },
+    });
+    const history = f.store.history(f.access, "ticket", null, 100);
+    expect(history.events.map((event) => event.kind)).toEqual([
+      "issue.complete",
+      "comment.add",
+      "issue.claim",
+      "issue.update",
+      "request.answer",
+      "issue.update",
+      "request.open",
+      "comment.add",
+      "link.remove",
+      "link.add",
+      "issue.update",
+      "issue.update",
+      "issue.create",
+    ]);
+    expect(history.events.find((event) => event.kind === "link.remove")).toMatchObject({
+      before: { fromId: "ticket", toId: "other", kind: "related" },
+      entity: null,
+    });
+    expect(
+      history.events.find(
+        (event) => event.entityType === "comment" && event.mutationKind === "issue.complete",
+      ),
+    ).toMatchObject({ entity: { kind: "evidence", body: "Verified" } });
+    expect(JSON.stringify(history)).not.toContain(token);
+    expect(JSON.stringify(history)).not.toContain("leaseToken");
+    expect(f.store.history(f.access, "other", null, 100).events.map((event) => event.kind)).toEqual(
+      ["link.remove", "link.add", "issue.create"],
+    );
+    expect(
+      f.store.history(f.access, "parent", null, 100).events.map((event) => event.kind),
+    ).toEqual(["issue.update", "issue.update", "issue.create"]);
+    expect(
+      f.store.history(f.access, "new-parent", null, 100).events.map((event) => event.kind),
+    ).toEqual(["issue.update", "issue.create"]);
+  });
+
+  test("backfills legacy creators and removed relationships without inventing old source metadata", () => {
+    const f = fixture();
+    for (const id of ["ticket", "other", "parent"]) f.issue(id);
+    f.mutate({
+      kind: "issue.update",
+      id: "ticket",
+      expectedVersion: 1,
+      data: { parentId: "parent" },
+    });
+    f.mutate({ kind: "issue.update", id: "ticket", expectedVersion: 2, data: { parentId: null } });
+    f.mutate({
+      kind: "link.add",
+      id: "removed",
+      data: { fromId: "ticket", toId: "other", kind: "related" },
+    });
+    f.mutate({ kind: "link.remove", id: "removed" });
+    f.db
+      .exec(`UPDATE events SET data = json_remove(data, '$.actor', '$.source', '$.before', '$.mutationKind', '$.entity.createdBy');
+      UPDATE issues SET data = json_remove(data, '$.createdBy');
+      DELETE FROM issue_events; DELETE FROM tracker_migrations;`);
+    const migrated = f.reopen();
+    expect(
+      migrated.snapshot(f.access).issues.find((issue) => issue.id === "ticket")!.createdBy,
+    ).toEqual({ id: "alice", kind: "unknown", name: null, accountable: null });
+    const history = migrated.history(f.access, "ticket", null, 100);
+    expect(history.creator).toEqual({
+      id: "alice",
+      kind: "person",
+      name: "Alice",
+      accountable: null,
+    });
+    expect(history.events.every((event) => event.source === "unknown")).toBe(true);
+    expect(history.events[0]).toMatchObject({
+      kind: "link.remove",
+      entity: null,
+      before: { id: "removed", fromId: "ticket", toId: "other" },
+    });
+    expect(
+      migrated.history(f.access, "other", null, 100).events.map((event) => event.kind),
+    ).toEqual(["link.remove", "link.add", "issue.create"]);
+    expect(
+      migrated.history(f.access, "parent", null, 100).events.map((event) => event.kind),
+    ).toEqual(["issue.update", "issue.update", "issue.create"]);
+    expect(f.reopen().history(f.access, "ticket", null, 100)).toEqual(history);
+    f.db.exec(`DELETE FROM events WHERE json_extract(data, '$.kind') = 'issue.create';
+      UPDATE issues SET data = json_remove(data, '$.createdBy'); DELETE FROM tracker_migrations;`);
+    expect(
+      f
+        .reopen()
+        .snapshot(f.access)
+        .issues.every((issue) => issue.createdBy === null),
+    ).toBe(true);
+  });
+});
 
 describe("tracker SQLite authority", () => {
   test("one claimant wins, expiry fences the old token, and completion persists evidence without leaking tokens", () => {

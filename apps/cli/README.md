@@ -120,6 +120,32 @@ accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` 
 an authoritative permission, graph or lease validation. Tracker changes are **not**
 reversed by `gm undo`.
 
+### Creator and audit history
+
+`gm issue show` displays the immutable creator, including an agent's accountable
+person when recorded. Its JSON keeps `createdBy` and a directory-resolved
+`creatorDisplay`. Legacy attribution may be unknown; an optimistic offline create
+does not invent a creator before the server confirms it.
+
+```bash
+gm issue history ENG-1 --owner orbit --limit 50
+gm issue history ENG-1 --owner orbit --before 120 --limit 100 --json
+gm schema issue history
+```
+
+History is authenticated and **online only**; the offline replica is not an audit
+archive. Pages are newest first. `--before` is an exclusive cursor: pass the
+response's `nextBefore` to fetch the next page, until `hasMore` is false. `--limit`
+accepts 1–100 (default 50). Text shows event time, action, source, actor/agent,
+accountable person, operation ID, and complete before/after state (including
+related comments, requests, and links). JSON preserves the entire server response.
+Lease and credential secrets are excluded by the audit API. Unknown legacy
+actors/sources remain unknown rather than being guessed.
+
+gm HTTP calls declare `X-Gitmatrix-Source: cli`. This is a provenance hint, not
+authentication: recorded actor identity still comes from the authenticated server
+session.
+
 Close an issue without completing it by setting `status` to `canceled` and supplying
 `closeReason`; there is no separate close command:
 
