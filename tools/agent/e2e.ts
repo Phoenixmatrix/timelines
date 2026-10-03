@@ -1393,6 +1393,22 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       );
       await expect(page.getByRole("heading", { name: packageName, exact: true })).toBeVisible();
 
+      // Create issue hands a proposed title to the tracker's own creator, once.
+      const proposed = `Palette issue ${randomUUID().slice(0, 8)}`;
+      await page.goto(`/${fullName}`);
+      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+      await page.keyboard.press("Control+k");
+      await input.fill(proposed);
+      await page.getByRole("option", { name: new RegExp(`Create issue “${proposed}”`) }).click();
+      await page.waitForURL((url) => url.pathname === `/tracker/${fixtures.tracker.owner}`);
+      const creator = page.getByRole("dialog", { name: "Create an issue" });
+      await expect(creator.getByRole("textbox", { name: /Title/i })).toHaveValue(proposed);
+      assert(!page.url().includes("Palette"), "The proposed title must not travel in the URL");
+      await creator.getByRole("button", { name: "Create and edit" }).click();
+      await page.waitForURL((url) => url.pathname.includes("/issues/"));
+      await page.reload();
+      await expect(creator).toBeHidden();
+
       // Signed out: navigation only, and no search requests.
       await context.clearCookies();
       let searched = 0;

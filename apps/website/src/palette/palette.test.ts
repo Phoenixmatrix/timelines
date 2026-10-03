@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { RepoDetail, Viewer } from "../../shared/api.ts";
 import { matchFields, type SearchResponse } from "../../shared/search.ts";
-import { COMMAND_SOURCES, matchCommands, type PaletteContext } from "./commands.ts";
+import { COMMAND_SOURCES, contextTracker, matchCommands, type PaletteContext } from "./commands.ts";
+import { CREATE_INTENT, createIntentOf } from "./intents.ts";
 import { remoteSearch, type RemoteState } from "./remote.ts";
 import { edge, FRESH, move, reconcile } from "./selection.ts";
 
@@ -25,7 +26,14 @@ const repo = {
 } as RepoDetail;
 
 function commands(context: Partial<PaletteContext> = {}) {
-  const full: PaletteContext = { viewer, pathname: "/", repo: null, ...context };
+  const full: PaletteContext = {
+    viewer,
+    pathname: "/",
+    repo: null,
+    trackers: null,
+    query: "",
+    ...context,
+  };
   return COMMAND_SOURCES.flatMap((source) => source(full));
 }
 
@@ -91,12 +99,96 @@ describe("commands", () => {
   });
 });
 
+describe("create issue", () => {
+  const trackers = [
+    { id: "ann", slug: "ann", displayName: "Ann Lee", canAdmin: true },
+    { id: "orbit", slug: "orbit", displayName: "Orbit", canAdmin: false },
+  ];
+  const creates = (context: Partial<PaletteContext>) =>
+    commands({ trackers, ...context }).filter((c) => c.id.startsWith("create"));
+
+  test("offers each usable tracker, the current one first, as a form to open", () => {
+    expect(creates({ trackers: null })).toEqual([]);
+    expect(creates({ viewer: null })).toEqual([]);
+    expect(creates({}).map((c) => c.title)).toEqual([
+      "Create issue in Ann Lee",
+      "Create issue in Orbit",
+    ]);
+    const inRepo = creates({ repo, pathname: "/orbit/engine" });
+    expect(inRepo.map((c) => c.title)).toEqual([
+      "Create issue in Orbit",
+      "Create issue in Ann Lee",
+    ]);
+    expect(inRepo[0]!.run).toEqual({
+      kind: "navigate",
+      to: "/tracker/orbit",
+      state: { [CREATE_INTENT]: { title: "" } },
+    });
+    expect(
+      contextTracker({
+        viewer,
+        pathname: "/tracker/orbit/issues/x",
+        repo: null,
+        trackers,
+        query: "",
+      })?.slug,
+    ).toBe("orbit");
+  });
+
+  test("proposes what's typed as a title, in the current tracker or else your own", () => {
+    const titled = creates({ query: "  Fix the login  " })[0]!;
+    expect(titled).toMatchObject({
+      title: "Create issue “Fix the login”",
+      hint: "in ann",
+      run: { to: "/tracker/ann", state: { [CREATE_INTENT]: { title: "Fix the login" } } },
+    });
+    expect(creates({ query: "x", pathname: "/tracker/orbit" })[0]!.hint).toBe("in orbit");
+    // Away from any tracker, the one /tracker opens wins over your own.
+    expect(creates({ query: "x", defaultTrackerId: "orbit" })[0]!.hint).toBe("in orbit");
+    // Typing the command's name finds the commands, not a titled draft.
+    for (const query of [
+      "create issue",
+      "new issue",
+      "Create",
+      "create issue in orbit",
+      "new issue ann",
+    ])
+      expect(creates({ query }).map((c) => c.id)).not.toContain("create-titled:ann");
+    // It's offered for any text, ahead of other actions.
+    const matched = matchCommands(commands({ trackers, query: "qqq zzz" }), "qqq zzz");
+    expect(matched.get("actions")?.[0]?.command.id).toBe("create-titled:ann");
+  });
+
+  test("intents are read defensively and never carry more than a title", () => {
+    expect(createIntentOf(null)).toBeNull();
+    expect(createIntentOf({ other: 1 })).toBeNull();
+    expect(createIntentOf({ [CREATE_INTENT]: { title: 7 } })).toEqual({ title: "" });
+    expect(createIntentOf({ [CREATE_INTENT]: { title: "x".repeat(600) } })?.title).toHaveLength(
+      500,
+    );
+  });
+});
+
 describe("selection", () => {
   test("defaults to the first option and stays on it as results arrive", () => {
     const first = reconcile(FRESH, ["page:tracker"]);
     expect(first).toEqual({ id: "page:tracker", chosen: false });
     // Remote results land above and below: the active option doesn't jump.
     expect(reconcile(first, ["repositories:1", "page:tracker", "accounts:2"])).toBe(first);
+  });
+
+  test("never defaults to a fallback that acts on the query", () => {
+    const ids = ["repositories:1", "create-titled:ann"];
+    expect(reconcile(FRESH, ids, ["repositories:1"])).toEqual({
+      id: "repositories:1",
+      chosen: false,
+    });
+    // With only the fallback, nothing is selected until the person moves to it.
+    expect(reconcile(FRESH, ["create-titled:ann"], [])).toEqual(FRESH);
+    expect(move(FRESH, ["create-titled:ann"], 1)).toEqual({
+      id: "create-titled:ann",
+      chosen: true,
+    });
   });
 
   test("never moves a chosen option to one the person didn't pick", () => {

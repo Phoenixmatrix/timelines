@@ -14,10 +14,15 @@ export const FRESH: Selection = { id: null, chosen: false };
  * first option until there is one; a chosen option that disappears leaves
  * nothing selected rather than something the person didn't pick.
  */
-export function reconcile(selection: Selection, ids: string[]): Selection {
+export function reconcile(
+  selection: Selection,
+  ids: string[],
+  /** The options a default may land on (fallbacks excluded); all of them if omitted. */
+  defaults: string[] = ids,
+): Selection {
   if (selection.id !== null && ids.includes(selection.id)) return selection;
   if (selection.chosen) return selection.id === null ? selection : { id: null, chosen: true };
-  const first = ids[0] ?? null;
+  const first = defaults[0] ?? null;
   return first === selection.id ? selection : { id: first, chosen: false };
 }
 

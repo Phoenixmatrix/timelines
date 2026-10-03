@@ -266,11 +266,24 @@ you were. It lists, in labelled groups:
 
 - **In owner/name**: the current repository's sections (the same list as its tabs);
 - **Go to**: the app's places (tracker, Needs you, packages, settings…);
-- **Actions**: things to do, such as opening the assistant;
+- **Actions**: things to do, such as opening the assistant, and **Create issue
+  in …** for each tracker you can use (the current one first);
 - **Repositories**, **Issues**, **Packages**, **People and organizations**,
   **Conversations**: from `/api/search` as you type (debounced; signed-in
   only). Issues show their key, status and tracker; packages their format and
   owner; choosing a conversation reopens it in the assistant.
+
+- **Or**: fallbacks that act on what you typed, such as **Create issue “…”**,
+  which proposes the text as a title in the current tracker (else the one
+  `/tracker` opens, else your own; the hint names it). Fallbacks come last and
+  are never selected by default, so Enter on a search opens a result.
+
+Create issue never creates anything itself: it opens the tracker's own
+creator (CORE-95), which keeps its validation, drafts and same-operation
+retries. The handoff is a one-shot intent in router state
+(`src/palette/intents.ts`), so the title never appears in a URL, and the
+tracker clears it as soon as it opens the creator, so back and refresh don't
+reopen it. A title proposed this way leaves the capture box's draft alone.
 
 Local groups answer at once and keep working while remote ones load or fail;
 a category that can't be searched says so instead of looking empty. Selection

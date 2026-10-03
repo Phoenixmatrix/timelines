@@ -14,6 +14,7 @@ import {
   LightningIcon,
   MagnifyingGlassIcon,
   PackageIcon,
+  PlusCircleIcon,
   UserCircleIcon,
   XCircleIcon,
 } from "@phosphor-icons/react";
@@ -30,6 +31,7 @@ import {
 import { useLocation, useNavigate, useRouteLoaderData } from "react-router";
 import type { RepoDetail } from "../../shared/api.ts";
 import type { SearchCategory, SearchResponse, SearchResult } from "../../shared/search.ts";
+import type { TrackerList } from "../../shared/tracker.ts";
 import { useAssistant } from "../assistant/state.tsx";
 import { dialogMotion, fadeMotion, Tip } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
@@ -132,15 +134,17 @@ function commandOption(command: Command): Option {
     id: command.id,
     title: command.title,
     detail: command.hint ?? "",
-    icon:
-      command.group === "actions" ? (
-        <LightningIcon className={iconClass} aria-hidden />
-      ) : command.group === "repository" ? (
-        <FolderSimpleIcon className={iconClass} aria-hidden />
-      ) : (
-        <ArrowRightIcon className={iconClass} aria-hidden />
-      ),
-    activate: (env) => (run.kind === "navigate" ? env.navigate(run.to) : run.perform(env)),
+    icon: command.id.startsWith("create") ? (
+      <PlusCircleIcon className={iconClass} aria-hidden />
+    ) : command.group === "actions" ? (
+      <LightningIcon className={iconClass} aria-hidden />
+    ) : command.group === "repository" ? (
+      <FolderSimpleIcon className={iconClass} aria-hidden />
+    ) : (
+      <ArrowRightIcon className={iconClass} aria-hidden />
+    ),
+    activate: (env) =>
+      run.kind === "navigate" ? env.navigate(run.to, run.state) : run.perform(env),
   };
 }
 
@@ -245,13 +249,39 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
     setSelection(FRESH);
   }, [client, open]);
 
-  const context: PaletteContext = { viewer, pathname, repo };
+  // The trackers create-issue can target, fetched once per opening.
+  const [trackers, setTrackers] = useState<TrackerList | null>(null);
+  useEffect(() => {
+    if (!open || !viewer) return;
+    const controller = new AbortController();
+    api<TrackerList>("/tracker", { signal: controller.signal }).then(
+      (list) => setTrackers(list),
+      () => setTrackers(null),
+    );
+    return () => controller.abort();
+  }, [open, viewer]);
+
+  const context: PaletteContext = {
+    viewer,
+    pathname,
+    repo,
+    trackers: trackers?.trackers ?? null,
+    defaultTrackerId: trackers?.defaultOwnerId ?? null,
+    query,
+  };
   const commands = COMMAND_SOURCES.flatMap((source) => source(context));
   const local = matchCommands(commands, query);
   const sections: Section[] = [];
+  // Commands that act on the query itself ("Create issue “…”") are fallbacks:
+  // listed last and never selected by default, so Enter on a search opens a
+  // result rather than a form.
+  const fallbacks: Command[] = [];
   for (const group of ["repository", "pages", "actions"] as const) {
-    const matched = local.get(group);
-    if (matched?.length)
+    const matched = (local.get(group) ?? []).filter(({ command }) => {
+      if (command.always) fallbacks.push(command);
+      return !command.always;
+    });
+    if (matched.length)
       sections.push({
         key: group,
         label: groupLabel(group, context),
@@ -270,9 +300,17 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
           options: group.results.map(resultOption),
         });
 
+  const found = sections.reduce((count, section) => count + section.options.length, 0);
+  if (fallbacks.length)
+    sections.push({ key: "fallback", label: "Or", options: fallbacks.map(commandOption) });
+
   const options = sections.flatMap((section) => section.options);
   const ids = options.map((option) => option.id);
-  const active = reconcile(selection, ids);
+  const active = reconcile(
+    selection,
+    ids,
+    ids.filter((id) => !fallbacks.some((command) => command.id === id)),
+  );
   const activeIndex = active.id === null ? -1 : ids.indexOf(active.id);
   const optionId = (index: number) => `${listId}-${index}`;
 
@@ -282,7 +320,7 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
   }, [activeIndex, listId]);
 
   const env: PaletteEnv = {
-    navigate: (to) => void navigate(to),
+    navigate: (to, state) => void navigate(to, state === undefined ? undefined : { state }),
     assistant: { show: () => assistant.show(), openChat: (id) => assistant.openChat(id) },
   };
   const activate = (option: Option) => {
@@ -414,7 +452,7 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
                   });
                 })()}
               </div>
-              {normalized && !options.length && !loading && (
+              {normalized && !found && !loading && (
                 <p className="m-0 px-2.5 py-6 text-center text-body-sm text-ink-muted">
                   Nothing matches “{normalized}”.
                 </p>
@@ -451,7 +489,7 @@ function Palette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: b
               </span>
             </div>
             <div role="status" className="sr-only">
-              {announce(options.length, normalized, remote)}
+              {announce(found, normalized, remote)}
             </div>
           </Dialog.Popup>
         </Dialog.Viewport>

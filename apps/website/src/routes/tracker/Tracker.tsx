@@ -35,6 +35,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
   useLoaderData,
+  useLocation,
   useNavigate,
   useNavigation,
   useParams,
@@ -55,6 +56,7 @@ import { useViewer } from "../../lib/session.ts";
 import { timelineQuery, type trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
+import { CREATE_INTENT, createIntentOf } from "../../palette/intents.ts";
 import {
   defaultsFromServer,
   forgetLegacyDefaults,
@@ -217,7 +219,29 @@ function Workbench({ data }: { data: TrackerView }) {
     : "";
   const [createError, setCreateError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  // What the expanded creator starts with: the capture box's text, or a title
+  // proposed from the palette (which leaves the capture box's draft alone).
+  const [createTitle, setCreateTitle] = useState("");
   const [editOnCreate, setEditOnCreate] = useState<string | null>(null);
+  // The palette's Create issue hands off once, in router state (never the URL):
+  // open the creator, then drop the intent so back or refresh can't replay it.
+  const location = useLocation();
+  const intent = createIntentOf(location.state);
+  useEffect(() => {
+    if (!intent) return;
+    const rest = { ...(location.state as Record<string, unknown>) };
+    delete rest[CREATE_INTENT];
+    void navigate(`${location.pathname}${location.search}${location.hash}`, {
+      replace: true,
+      state: rest,
+      preventScrollReset: true,
+    });
+    setCreateError("");
+    setCreateTitle(intent.title);
+    setCreateOpen(true);
+    // Once per navigation that carries an intent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key]);
   const titleRef = useRef<HTMLInputElement>(null);
   const queryRef = useRef<HTMLInputElement>(null);
   const owner = data.snapshot.owner.slug;
@@ -579,6 +603,7 @@ function Workbench({ data }: { data: TrackerView }) {
           className="mk-btn h-(--size-field)"
           onClick={() => {
             setCreateError("");
+            setCreateTitle(title);
             setCreateOpen(true);
           }}
         >
@@ -754,7 +779,7 @@ function Workbench({ data }: { data: TrackerView }) {
       {createOpen && (
         <CreateIssue
           snapshot={snapshot}
-          initialTitle={title}
+          initialTitle={createTitle}
           initialTeam={createTeam}
           initialWorkspaces={captureWorkspace ? [captureWorkspace.id] : []}
           busy={busy}
