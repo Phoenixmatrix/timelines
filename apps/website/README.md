@@ -1360,8 +1360,12 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
 - **Skills** (`skills.ts`): SKILL.md-style built-ins (the API catalog, tracker,
   code, CI, packages, knowledge, navigation, repository, gm), a catalog line
   each, bodies preloaded for the turn's groups and otherwise one
-  `activate_skill` away. A repository's own `.agents/skills/*/SKILL.md` join
-  them when the chat is about it.
+  `activate_skill` away. Every tool-using turn preloads both the API catalog and
+  browser navigation routes, including ordinary answers that cite pages without
+  navigating. Release-note browser links use `/:owner/:repo/releases` (or
+  `/tracker/:owner/releases` for the tracker feed); `/release-notes` is a JSON API
+  suffix, not a page. A repository's own `.agents/skills/*/SKILL.md` join them when
+  the chat is about it.
 - **The web** (`src/assistant/`): page context (repository, file and lines,
   issue, run) goes with each message and shows as a removable chip; receipts
   fold finished reads into one line; typing while an approval waits declines it

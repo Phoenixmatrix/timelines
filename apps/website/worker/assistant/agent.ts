@@ -91,6 +91,7 @@ How to work:
 - Use tools to find out; never guess at code, issues, runs or packages. If something isn't reachable, say what you tried.
 - Be brief and concrete. Lead with the answer. Use Markdown; cite code with links to exact lines.
 - Link everything you mention with app paths, e.g. [CORE-25](/tracker/matrixorg/issues/CORE-25), [run #44](/owner/repo/ci/44), [worker/app.ts:12](/owner/repo/blob/main/worker/app.ts#L12).
+- Use the navigation skill's browser routes for links and navigate. API endpoint names are not page URLs; never derive a browser link by dropping /api or /repos from an API path.
 ${
   options.web
     ? `- Writes (creating or changing issues, comments, reruns, settings…) each wait for the person to approve a card that shows exactly what will happen. Call the tool directly: the card is the confirmation, so don't ask in words first, and never claim a change happened before its tool returns.

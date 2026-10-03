@@ -3,7 +3,7 @@ import { describeWrite, toolLabel } from "../../shared/assistant.ts";
 import { allowedPath } from "./internal.ts";
 import { planFrom, questions } from "./plan.ts";
 import { sentenceCase } from "./titles.ts";
-import { parseSkill, preloaded } from "./skills.ts";
+import { parseSkill } from "./skills.ts";
 import { clip, compact } from "./tools.ts";
 
 describe("clef routing", () => {
@@ -128,7 +128,7 @@ test("chat titles in sentence case, acronyms kept", () => {
 });
 
 describe("skills and results", () => {
-  test("SKILL.md frontmatter, and which skills a turn preloads", () => {
+  test("parses SKILL.md frontmatter and body", () => {
     expect(
       parseSkill('---\nname: deploy\ndescription: "Ship it: carefully"\n---\n\n# Deploy\nSteps'),
     ).toEqual({
@@ -137,9 +137,6 @@ describe("skills and results", () => {
       body: "# Deploy\nSteps",
     });
     expect(parseSkill("no frontmatter")).toBeNull();
-    expect(preloaded([], false)).toEqual([]);
-    expect(preloaded(["tracker"], false)).toEqual(["gitmatrix-api", "tracker"]);
-    expect(preloaded([], true)).toEqual(["gitmatrix-api", "navigation"]);
   });
 
   test("tool output is trimmed with a count of what was cut", () => {

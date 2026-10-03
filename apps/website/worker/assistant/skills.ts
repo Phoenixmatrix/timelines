@@ -43,6 +43,8 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
 - GET /repos/:o/:n/release-notes — daily UTC committer-date code updates and optional tag snapshots. GET /repos/:o/:n/release-notes/release?name=day:YYYY-MM-DD (or a tag) — entries and introduction. Commits and tags are not deployment evidence.
 - GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects named snapshots. Filters include kind, team, repo, ws, type, label, release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
 
+These are JSON API endpoints, not browser pages. Link people to the Releases pages in the navigation skill: browser routes use /releases, never /release-notes.
+
 ## CI (/repos/:o/:n/ci)
 - GET /ci — runs. POST /ci/runs {ref?, commit?} — start a run. GET /ci/runs/:number — jobs and steps.
 - POST /ci/runs/:number/cancel, POST /ci/runs/:number/rerun.
@@ -142,6 +144,8 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
 - Home / ; Issue tracker /tracker and /tracker/<owner> ; an issue /tracker/<owner>/issues/<KEY> ; Needs you /needs-you ; Packages /packages
 - Account or organization /<owner> ; its packages /<owner>/-/packages ; a package /<owner>/-/packages/<format>/<name>
 - Repository /<owner>/<repo> ; folder /<owner>/<repo>/tree/<ref>/<path> ; file /<owner>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<owner>/<repo>/commits/<ref> ; changes /<owner>/<repo>/changes ; CI /<owner>/<repo>/ci and /<owner>/<repo>/ci/<number> ; wiki /<owner>/<repo>/wiki/<slug> ; knowledge map /<owner>/<repo>/knowledge ; settings /<owner>/<repo>/settings
+- Repository release notes /<owner>/<repo>/releases ; a daily update or tag /<owner>/<repo>/releases/<name> (URL-encode the exact name returned by the release-notes API, including @day: for a daily update)
+- Tracker-wide release notes /tracker/<owner>/releases ; preserve feed filters with ?q=<URL-encoded query>. Do not use /release-notes in browser links: that suffix belongs to the JSON API.
 - Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites ; new repository /new
 
 Use navigate when the person asks to go somewhere or see something, or to show what you just made or found; it opens beside the chat. Otherwise just link.`,
@@ -254,16 +258,16 @@ export function builtinSkills(): SkillSource {
 }
 
 /**
- * Skills a turn starts with loaded: the API catalog whenever it uses tools (so
- * paths come from it, not guesses), and those for its tool groups.
+ * A tool-using turn needs both the API catalog and browser routes: answers
+ * cite pages too, even when they don't call navigate. Also load its tool groups.
  */
 export function preloaded(groups: readonly string[], navigate: boolean): string[] {
   if (!groups.length && !navigate) return [];
   return BUILTIN.filter(
     (skill) =>
       skill.name === "gitmatrix-api" ||
-      (skill.group !== undefined &&
-        (groups.includes(skill.group) || (navigate && skill.group === "navigation"))),
+      skill.name === "navigation" ||
+      (skill.group !== undefined && groups.includes(skill.group)),
   ).map((skill) => skill.name);
 }
 
