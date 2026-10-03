@@ -39,6 +39,30 @@ pub enum Acting {
     Token(String),
 }
 
+/// Who a request acts as. Recorded with each lease gm keeps, so work started
+/// under one identity is finished under it after gm switches (say, when a
+/// checkout gets its own agent); new work always uses the current one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Identity {
+    /// The signed-in person (a stored token or SSH key).
+    Person,
+    /// One of the person's agents, by name; its token is kept in gm.json.
+    Agent { name: String },
+    /// GM_TOKEN (or GITMATRIX_TOKEN): usable again only while it's set.
+    Env,
+}
+
+impl Identity {
+    pub fn describe(&self) -> String {
+        match self {
+            Identity::Person => "you".into(),
+            Identity::Agent { name } => format!("your agent {name}"),
+            Identity::Env => "GM_TOKEN".into(),
+        }
+    }
+}
+
 /// gm.json. Sign-ins are kept per server, so signing in to one (say,
 /// production with GM_SERVER) never replaces another (the local dev server).
 /// The flat fields are the sign-in of the server in use: `load` fills them
@@ -151,6 +175,9 @@ impl Config {
     }
 
     pub fn token(&self) -> Result<Option<String>> {
+        if let Acting::Token(token) = &self.acting {
+            return Ok(Some(token.clone()));
+        }
         if let Some(token) = env_token() {
             return Ok(Some(token));
         }
@@ -191,6 +218,50 @@ impl Config {
                 },
             },
         }
+    }
+
+    /// The identity requests use now.
+    pub fn identity(&self) -> Result<Identity> {
+        if matches!(self.acting, Acting::Token(_)) || env_token().is_some() {
+            return Ok(Identity::Env);
+        }
+        if matches!(self.acting, Acting::Auto)
+            && let Some(name) = crate::profile::acting_agent()
+            && self.agent_token()?.is_some()
+        {
+            return Ok(Identity::Agent { name });
+        }
+        Ok(Identity::Person)
+    }
+
+    /// This configuration, acting as `identity` instead.
+    pub fn acting_as(&self, identity: &Identity) -> Result<Config> {
+        let mut config = self.clone();
+        match identity {
+            Identity::Person => config.acting = Acting::Person,
+            Identity::Agent { name } => {
+                let token = self.agent_tokens().get(name).cloned().ok_or_else(|| {
+                    GmError::new(
+                        "identity_gone",
+                        format!("This lease was taken as your agent {name}, whose token is no longer on this machine."),
+                    )
+                    .hint("Run `gm agent setup --name NAME` to restore it, or ask a tracker owner to `gm issue claim --force`.")
+                    .exit(exit::AUTH)
+                })?;
+                config.acting = Acting::Token(token);
+            }
+            Identity::Env => {
+                if env_token().is_none() {
+                    return Err(GmError::new(
+                        "identity_gone",
+                        "This lease was taken with GM_TOKEN, which isn't set now.",
+                    )
+                    .hint("Set GM_TOKEN to that token again, or pass --lease-token.")
+                    .exit(exit::AUTH));
+                }
+            }
+        }
+        Ok(config)
     }
 
     pub fn uses_ssh(&self) -> bool {
@@ -265,6 +336,10 @@ fn provision_agent(config: &Config, name: &str) -> Result<Option<String>> {
 /// session (signing in when the cached one is missing or ending), else the
 /// stored token. The flag says whether it came from SSH.
 pub fn credential(config: &Config) -> Result<(Option<String>, bool)> {
+    // An explicit token (a lease's recorded identity, a probe) is exactly who acts.
+    if let Acting::Token(token) = &config.acting {
+        return Ok((Some(token.clone()), false));
+    }
     if let Some(token) = env_token() {
         return Ok((Some(token), false));
     }

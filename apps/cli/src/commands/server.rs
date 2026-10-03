@@ -82,6 +82,11 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
                     session["viewer"]["displayName"].as_str().unwrap_or("")
                 ));
             }
+            // Leases gm took as someone it no longer acts as: finished as them, then forgotten.
+            let previous = super::tracker::previous_identities(&config);
+            if previous.as_array().is_some_and(|p| !p.is_empty()) {
+                out["previousIdentities"] = previous;
+            }
             if config.uses_ssh()
                 && let Ok(ssh) = crate::ssh::session(&config)
             {

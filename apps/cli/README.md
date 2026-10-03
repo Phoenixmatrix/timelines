@@ -255,7 +255,15 @@ the token a claim (or `next`, `renew`, `resume`, `accept`) returns in a private
 file per issue beside the identity's replica, never in the replica or its outbox;
 lease commands use it when no token is given, and `complete`/`release` delete it.
 `--lease-token` or `GM_LEASE_TOKEN` (preferred to a command-line argument that
-shell history/process listings may expose) still override it. Expired or superseded tokens are rejected even for the same human account.
+shell history/process listings may expose) still override it. Each kept lease
+records the identity that took it (you, one of your agents, or `GM_TOKEN`).
+When gm switches identity, say because a checkout now has its own agent
+(`gm agent setup`), new work uses the new identity, but renewing, parking,
+handing off, completing or releasing a lease taken earlier is sent as the
+identity that holds it (the output says `actedAs`). `gm auth status` lists
+previous identities while they still hold leases; a record goes when its lease
+ends, or a day after it expires, so an identity with no work left leaves no
+trace. Expired or superseded tokens are rejected even for the same human account.
 An ambiguous lease response is an error, not ownership: inspect the issue and do
 not start work without a received token.
 

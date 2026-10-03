@@ -121,10 +121,40 @@ fn private_file(path: &Path) -> Result<fs::File> {
     }
     Ok(file)
 }
-/// Lease tokens gm keeps for this identity: one private file per issue beside
-/// its replica (never in the replica or its outbox), so an agent's next command
-/// finds its lease without the token passing through prompts or shell history.
-fn lease_file(config: &Config, issue_id: &str) -> Result<PathBuf> {
+/// Lease tokens gm keeps: one private record per issue and server, with the
+/// identity that took the lease (never in the replica or its outbox), so an
+/// agent's next command finds its lease without the token passing through
+/// prompts or shell history, and a lease taken before gm switched identity is
+/// still finished as the identity that holds it. Records go when the lease
+/// ends, or a day after it expires; an identity with no leases left leaves no
+/// trace.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Kept {
+    token: String,
+    identity: remote::Identity,
+    /// The issue's key, for people reading `gm auth status`.
+    #[serde(default)]
+    issue: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+fn data_dir() -> Result<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .map(|base| base.join("gitmatrix"))
+        .ok_or_else(|| {
+            GmError::new(
+                "replica_path",
+                "Set HOME or XDG_DATA_HOME for private tracker storage.",
+            )
+        })
+}
+fn leases_dir(config: &Config) -> Result<PathBuf> {
+    Ok(data_dir()?.join("leases").join(digest(&config.server())))
+}
+fn checked(issue_id: &str) -> Result<&str> {
     if issue_id.is_empty()
         || !issue_id
             .chars()
@@ -132,43 +162,117 @@ fn lease_file(config: &Config, issue_id: &str) -> Result<PathBuf> {
     {
         return Err(GmError::new("invalid_input", "Unexpected issue id."));
     }
-    Ok(root(config)?.join("leases").join(issue_id))
+    Ok(issue_id)
 }
-fn keep_lease(config: &Config, issue_id: &str, token: &str) -> Result<()> {
-    let path = lease_file(config, issue_id)?;
-    private_dir(path.parent().unwrap())?;
-    let mut file = private_file(&path)?;
+fn keep_lease(config: &Config, issue_id: &str, kept: &Kept) -> Result<()> {
+    let dir = leases_dir(config)?;
+    private_dir(&dir)?;
+    let mut file = private_file(&dir.join(format!("{}.json", checked(issue_id)?)))?;
     file.set_len(0)?;
-    std::io::Write::write_all(&mut file, token.as_bytes())?;
+    std::io::Write::write_all(&mut file, serde_json::to_string(kept)?.as_bytes())?;
+    // The old per-credential file, if any, is superseded.
+    if let Ok(root) = root(config) {
+        let _ = fs::remove_file(root.join("leases").join(issue_id));
+    }
     Ok(())
 }
-fn kept_lease(config: &Config, issue_id: &str) -> Option<String> {
-    fs::read_to_string(lease_file(config, issue_id).ok()?)
+fn kept_lease(config: &Config, issue_id: &str) -> Option<Kept> {
+    let id = checked(issue_id).ok()?;
+    if let Some(kept) = fs::read_to_string(leases_dir(config).ok()?.join(format!("{id}.json")))
         .ok()
-        .filter(|t| !t.is_empty())
+        .and_then(|text| serde_json::from_str::<Kept>(&text).ok())
+    {
+        return Some(kept);
+    }
+    // Kept by an older gm, beside the current identity's replica.
+    let token = fs::read_to_string(root(config).ok()?.join("leases").join(id)).ok()?;
+    (!token.is_empty()).then(|| Kept {
+        token,
+        identity: config.identity().unwrap_or(remote::Identity::Person),
+        issue: String::new(),
+        expires_at: None,
+    })
 }
 fn drop_lease(config: &Config, issue_id: &str) {
-    if let Ok(path) = lease_file(config, issue_id) {
-        let _ = fs::remove_file(path);
+    let Ok(id) = checked(issue_id) else { return };
+    if let Ok(dir) = leases_dir(config) {
+        let _ = fs::remove_file(dir.join(format!("{id}.json")));
+    }
+    if let Ok(root) = root(config) {
+        let _ = fs::remove_file(root.join("leases").join(id));
     }
 }
-/// The lease token to act with: given, else kept.
+/// Past its expiry by more than the grace before `cutoff`. Parked leases (waiting
+/// on a person) have no expiry, so they're kept until the lease ends.
+fn stale(expires_at: Option<&str>, cutoff: DateTime<Utc>) -> bool {
+    expires_at
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at < cutoff)
+}
+
+/// Every kept lease on this server, pruning those a day past expiry.
+pub(crate) fn kept_leases(config: &Config) -> Vec<Kept> {
+    let Ok(dir) = leases_dir(config) else {
+        return Vec::new();
+    };
+    let cutoff = Utc::now() - chrono::Duration::days(1);
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(kept) = fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| serde_json::from_str::<Kept>(&text).ok())
+        else {
+            continue;
+        };
+        let stale = stale(kept.expires_at.as_deref(), cutoff);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        } else {
+            out.push(kept);
+        }
+    }
+    out
+}
+/// Leases held by identities gm no longer acts as: for `gm auth status`.
+pub fn previous_identities(config: &Config) -> Value {
+    let current = config.identity().ok();
+    let mut by: Vec<(remote::Identity, Vec<String>)> = Vec::new();
+    for kept in kept_leases(config) {
+        if Some(&kept.identity) == current.as_ref() {
+            continue;
+        }
+        match by
+            .iter_mut()
+            .find(|(identity, _)| *identity == kept.identity)
+        {
+            Some((_, issues)) => issues.push(kept.issue),
+            None => by.push((kept.identity, vec![kept.issue])),
+        }
+    }
+    json!(
+        by.into_iter()
+            .map(|(identity, issues)| json!({ "identity": identity.describe(), "leases": issues }))
+            .collect::<Vec<_>>()
+    )
+}
+/// The lease token to act with, given or kept, and the identity a kept one
+/// belongs to.
 fn lease_token(
     config: &Config,
     issue_id: &str,
     lease: &crate::tracker_cli::Lease,
-) -> Result<String> {
-    lease
-        .lease_token
-        .clone()
-        .or_else(|| kept_lease(config, issue_id))
-        .ok_or_else(|| {
-            GmError::usage(format!(
-                "No lease token for {}: this identity didn't claim it here.",
-                lease.issue
-            ))
-            .hint("Pass --lease-token or GM_LEASE_TOKEN, or take work with `gm issue next`.")
-        })
+) -> Result<(String, Option<remote::Identity>)> {
+    if let Some(token) = &lease.lease_token {
+        return Ok((token.clone(), None));
+    }
+    let kept = kept_lease(config, issue_id).ok_or_else(|| {
+        GmError::usage(format!(
+            "No lease token for {}: gm didn't claim it on this machine.",
+            lease.issue
+        ))
+        .hint("Pass --lease-token or GM_LEASE_TOKEN, or take work with `gm issue next`. A tracker owner can take a stuck claim over with `gm issue claim --force`.")
+    })?;
+    Ok((kept.token, Some(kept.identity)))
 }
 
 fn root(config: &Config) -> Result<PathBuf> {
@@ -188,17 +292,8 @@ fn root(config: &Config) -> Result<PathBuf> {
             "Sign in before selecting a tracker replica.",
         ));
     };
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok_or_else(|| {
-            GmError::new(
-                "replica_path",
-                "Set HOME or XDG_DATA_HOME for private tracker storage.",
-            )
-        })?;
-    Ok(base
-        .join("gitmatrix/tracker")
+    Ok(data_dir()?
+        .join("tracker")
         .join(digest(&format!("{}\n{auth}", config.server()))))
 }
 /// The tracker account to act on: explicit, else `gm tracker use`, else agents.toml.
@@ -1433,6 +1528,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     };
     with_replica(&args.scope, ctx, true, |r| {
         let snapshot = r.view()?;
+        // The identity holding a kept lease this command uses, if gm has switched since.
+        let mut holder: Option<remote::Identity> = None;
         let mutation = match &args.command {
             IssueCommand::List(a) => return listing(&snapshot, a, false, args.scope.offline),
             IssueCommand::Ready(a) => return listing(&snapshot, a, true, args.scope.offline),
@@ -1512,18 +1609,25 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 // Holding the issue's lease (given, or kept from claiming it) parks it while you wait.
                 let issue_id = id(&snapshot, "issues", issue)?;
+                let kept = if lease_token.is_some() {
+                    None
+                } else {
+                    kept_lease(&r.config, &issue_id)
+                };
                 if let Some(token) = lease_token
                     .clone()
-                    .or_else(|| kept_lease(&r.config, &issue_id))
+                    .or_else(|| kept.as_ref().map(|k| k.token.clone()))
                 {
                     data["leaseToken"] = json!(token);
                 }
+                holder = kept.map(|k| k.identity);
                 json!({"kind":"request.open","id":uid(),"data":data})
             }
             IssueCommand::Handoff { lease, to, ttl } => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
-                let mut data =
-                    json!({"leaseToken":lease_token(&r.config,&issue_id,lease)?,"ttlSeconds":ttl});
+                let (token, kept_by) = lease_token(&r.config, &issue_id, lease)?;
+                holder = kept_by;
+                let mut data = json!({"leaseToken":token,"ttlSeconds":ttl});
                 if let Some(to) = to {
                     let found = ["agents", "members"]
                         .iter()
@@ -1542,7 +1646,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             IssueCommand::Withdraw(lease) => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
-                json!({"kind":"issue.withdraw","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?}})
+                let (token, kept_by) = lease_token(&r.config, &issue_id, lease)?;
+                holder = kept_by;
+                json!({"kind":"issue.withdraw","id":issue_id,"data":{"leaseToken":token}})
             }
             IssueCommand::Accept { code, agent, ttl } => {
                 // A code starts with its issue's key: ENG-12.<secret>.
@@ -1596,19 +1702,25 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             IssueCommand::Renew { lease, ttl } => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
-                json!({"kind":"issue.renew","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)}})
+                let (token, kept_by) = lease_token(&r.config, &issue_id, lease)?;
+                holder = kept_by;
+                json!({"kind":"issue.renew","id":issue_id,"data":{"leaseToken":token,"ttlSeconds":ttl.unwrap_or(defaults.ttl)}})
             }
             IssueCommand::Release { lease, force } => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
                 if *force {
                     json!({"kind":"issue.release","id":issue_id,"data":{"force":true}})
                 } else {
-                    json!({"kind":"issue.release","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?}})
+                    let (token, kept_by) = lease_token(&r.config, &issue_id, lease)?;
+                    holder = kept_by;
+                    json!({"kind":"issue.release","id":issue_id,"data":{"leaseToken":token}})
                 }
             }
             IssueCommand::Complete { lease, evidence } => {
                 let issue_id = id(&snapshot, "issues", &lease.issue)?;
-                json!({"kind":"issue.complete","id":issue_id,"data":{"leaseToken":lease_token(&r.config,&issue_id,lease)?,"evidence":input(evidence)?}})
+                let (token, kept_by) = lease_token(&r.config, &issue_id, lease)?;
+                holder = kept_by;
+                json!({"kind":"issue.complete","id":issue_id,"data":{"leaseToken":token,"evidence":input(evidence)?}})
             }
         };
         if lease_command {
@@ -1620,8 +1732,15 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             // Lease secrets are never persisted, even in a pending outbox. An
             // ambiguous lease response is reported, never represented as success.
             let target = mutation["id"].as_str().unwrap_or_default().to_string();
+            // A lease taken before gm switched identity is finished as the identity holding it.
+            let current = r.config.identity()?;
+            let switched = holder.clone().filter(|identity| *identity != current);
+            let lease_config = match &switched {
+                Some(identity) => r.config.acting_as(identity)?,
+                None => r.config.clone(),
+            };
             let mut response = match remote::api(
-                &r.config,
+                &lease_config,
                 "POST",
                 &r.path("mutate"),
                 Some(&request),
@@ -1658,9 +1777,29 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 _ => {
                     if let Some(token) = result["leaseToken"].as_str() {
                         let issue = result["issueId"].as_str().unwrap_or(&target);
-                        keep_lease(&r.config, issue, token)?;
+                        let key = snapshot["issues"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|i| i["id"] == issue)
+                            .and_then(|i| i["key"].as_str())
+                            .or(result["key"].as_str())
+                            .unwrap_or(issue);
+                        keep_lease(
+                            &r.config,
+                            issue,
+                            &Kept {
+                                token: token.to_string(),
+                                identity: holder.clone().unwrap_or(current.clone()),
+                                issue: key.to_string(),
+                                expires_at: result["expiresAt"].as_str().map(str::to_string),
+                            },
+                        )?;
                     }
                 }
+            }
+            if let Some(identity) = &switched {
+                response["actedAs"] = json!(identity.describe());
             }
             if let IssueCommand::Next { .. } = args.command {
                 return Ok(next_result(&snapshot, &response));
@@ -1683,6 +1822,39 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kept_leases_remember_who_took_them_and_expire() {
+        let kept = Kept {
+            token: "t".into(),
+            identity: remote::Identity::Agent {
+                name: "builder".into(),
+            },
+            issue: "CORE-1".into(),
+            expires_at: Some("2026-10-02T12:00:00Z".into()),
+        };
+        let text = serde_json::to_string(&kept).unwrap();
+        assert!(text.contains(r#""identity":{"kind":"agent","name":"builder"}"#));
+        let back: Kept = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.identity, kept.identity);
+        assert_eq!(back.identity.describe(), "your agent builder");
+        assert_eq!(remote::Identity::Person.describe(), "you");
+        let cutoff = |at: &str| {
+            DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        // A day of grace after expiry, so a renew racing the clock isn't lost.
+        assert!(!stale(
+            kept.expires_at.as_deref(),
+            cutoff("2026-10-02T11:00:00Z")
+        ));
+        assert!(stale(
+            kept.expires_at.as_deref(),
+            cutoff("2026-10-02T13:00:00Z")
+        ));
+        assert!(!stale(None, cutoff("2030-01-01T00:00:00Z")));
+    }
+
     fn snapshot() -> Value {
         json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
     }
