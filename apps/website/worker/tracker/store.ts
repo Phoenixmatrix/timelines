@@ -6,6 +6,7 @@ import {
   TIMELINE_USES,
   hasActiveClaim,
   isOpen,
+  isRetained,
   leasedAncestor,
   readiness,
   readinessIndex,
@@ -178,6 +179,12 @@ export function validateRequest(value: unknown): MutationRequest {
     mutations: body.mutations as Mutation[],
     ...(timeline === undefined ? {} : { timeline }),
   };
+}
+
+/** A finished issue's lease, kept by the timeline it was finished in (CORE-75). */
+function retained(claim: IssueClaim, timeline: Timeline): IssueClaim {
+  const { parkedAt: _parked, ...rest } = claim;
+  return { ...rest, retainedIn: { id: timeline.id, slug: timeline.slug } };
 }
 
 /** After its last request is answered, a parked lease's holder has this long to resume. */
@@ -659,7 +666,13 @@ export class TrackerStore {
       const overlay = overlayOf(this.sql, timeline, true);
       // Done in what lands is done (CORE-74), even where the view didn't change
       // it; and what lands done is no longer waiting on another timeline.
+      // A lease retained by what lands is released as done (CORE-75).
+      const released = new Set<string>();
       const landed = (issue: Issue): Issue => {
+        if (overlay.includes(issue.claim?.retainedIn ?? null)) {
+          released.add(issue.id);
+          issue = { ...issue, claim: null, handoff: null };
+        }
         if (overlay.includes(issue.doneIn))
           return {
             ...issue,
@@ -715,6 +728,10 @@ export class TrackerStore {
             createdAt: now,
           }),
         );
+      }
+      for (const issueId of released) {
+        run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issueId));
+        run(this.sql, tracker.deleteFrom("offers").where("issue_id", "=", issueId));
       }
       return events;
     });
@@ -782,10 +799,15 @@ export class TrackerStore {
         actor: { id: actorId ?? "", kind: "unknown", name: null, accountable: null } as AuditActor,
         source: "unknown" as const,
       };
+      const doneIn = { id: into.id, slug: into.slug };
       return this.doneIn(fromId).map((issue) =>
         this.write(meta, "issue", {
           ...issue,
-          doneIn: { id: into.id, slug: into.slug },
+          doneIn,
+          // Its retained lease moves with the work (CORE-75).
+          ...(issue.claim?.retainedIn?.id === fromId
+            ? { claim: { ...issue.claim, retainedIn: doneIn } }
+            : {}),
           version: issue.version + 1,
           updatedAt: now,
         }),
@@ -826,8 +848,11 @@ export class TrackerStore {
           (t) => (view(t).get("issue", issue.id) as Issue | null | undefined)?.status === "done",
         );
         const next: Issue = { ...issue, version: issue.version + 1, updatedAt: now };
-        if (keeper) next.doneIn = { id: keeper.id, slug: keeper.slug };
-        else {
+        if (keeper) {
+          next.doneIn = { id: keeper.id, slug: keeper.slug };
+          // The timeline that merged the work keeps holding its lease (CORE-75).
+          if (next.claim?.retainedIn) next.claim = { ...next.claim, retainedIn: next.doneIn };
+        } else {
           next.status = "todo";
           next.doneIn = null;
           next.claim = null;
@@ -1176,9 +1201,15 @@ export class TrackerStore {
     };
     // The graph as this transaction sees it so far.
     const graph = () => readinessIndex(this.all<Issue>("issue"), this.all<Link>("link"));
-    /** A lease on an issue covers its subtree: its holder speaks for every descendant. */
+    /**
+     * A lease on an issue covers its subtree: its holder speaks for every
+     * descendant. A retained lease (CORE-75) holds finished work against
+     * claims, not against a reopen in its timeline, which ends it.
+     */
     const coveringLease = (issue: Issue) =>
-      hasActiveClaim(issue, now) ? issue : leasedAncestor(issue, graph(), now);
+      hasActiveClaim(issue, now) && !isRetained(issue)
+        ? issue
+        : leasedAncestor(issue, graph(), now);
     // A parent with open sub-issues is never offered as work, but claiming it
     // explicitly is how an orchestrating agent takes its whole subtree.
     const claimable = (issue: Issue, underToken?: unknown) => {
@@ -1216,14 +1247,18 @@ export class TrackerStore {
       validateAssignee(assigneeId, issue.teamId);
       const leaseToken = token ?? crypto.randomUUID() + crypto.randomUUID();
       const expiresAt = new Date(Date.parse(now) + ttl * 1000).toISOString();
+      // Renewing or handing off a retained lease (CORE-75) keeps it retained,
+      // and the finished issue's status as it is: that status is locked.
+      const retainedIn = issue.claim?.retainedIn;
       issue.claim = {
         ...holder,
         agent,
         expiresAt,
         ...(delegatedFrom ? { delegatedFrom: delegatedFrom.id } : {}),
+        ...(retainedIn ? { retainedIn } : {}),
       };
       issue.assigneeId = assigneeId;
-      issue.status = "in_progress";
+      if (!retainedIn) issue.status = "in_progress";
       run(
         this.sql,
         tracker
@@ -1670,9 +1705,18 @@ export class TrackerStore {
             started.add(entityId);
           }
           if ("status" in data && issue.status !== previous) {
-            issue.claim = null;
-            run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+            // Finished in a timeline, its own working lease is retained (CORE-75).
+            const retain =
+              timeline &&
+              issue.status === "done" &&
+              hasActiveClaim(issue, now) &&
+              !isRetained(issue);
             dropOffer(issue);
+            if (retain) issue.claim = retained(issue.claim!, timeline);
+            else {
+              issue.claim = null;
+              run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+            }
           }
           if (!creating) {
             issue.version++;
@@ -2127,6 +2171,12 @@ export class TrackerStore {
           teamWritable(this.get("team", issue.teamId));
           // Claiming, completing or releasing would move a status that's locked here.
           if (issue.status === "done_in_timeline" && kind !== "issue.renew") lockedStatus(issue);
+          if ((kind === "issue.release" || kind === "issue.complete") && issue.claim?.retainedIn)
+            fail(
+              "lease_retained",
+              `${issue.key} is done in timeline ${issue.claim.retainedIn.slug}, and its lease is held until that timeline lands or is abandoned.`,
+              409,
+            );
           let delegator: Issue | null = null;
           if (kind === "issue.claim" || kind === "issue.renew") {
             const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
@@ -2256,9 +2306,15 @@ export class TrackerStore {
             const released = issue.claim!;
             issue.status = kind === "issue.complete" ? "done" : "todo";
             issue.closeReason = null;
-            issue.claim = null;
-            run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
             dropOffer(issue);
+            // Finished in a timeline, the lease is retained until the timeline
+            // lands or is abandoned (CORE-75); anywhere else it ends here.
+            if (kind === "issue.complete" && timeline && released)
+              issue.claim = retained(released, timeline);
+            else {
+              issue.claim = null;
+              run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", entityId));
+            }
             // Ending a claim by force isn't the holder failing.
             if (kind === "issue.release" && !forced) failedAttempt(issue, released);
           }

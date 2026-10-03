@@ -310,7 +310,8 @@ export function IssueState({
         {statusLabel(issue)}
       </StateBadge>
     );
-  if (issue.claim && hasActiveClaim(issue, snapshot.serverTime))
+  // A lease retained by a timeline (CORE-75) holds finished work: it shows as done.
+  if (issue.claim && !issue.claim.retainedIn && hasActiveClaim(issue, snapshot.serverTime))
     return (
       <StateBadge
         state="claimed"

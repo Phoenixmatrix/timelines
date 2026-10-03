@@ -180,7 +180,8 @@ describe("timeline views of the tracker", () => {
       title: "A, renamed",
       labels: ["x"],
       status: "done",
-      claim: null,
+      // Its lease is retained until the timeline lands or is abandoned (CORE-75).
+      claim: { agent: "w", retainedIn: { slug: "search" } },
     });
     expect(t.view("search").comments).toMatchObject([{ issueId: "a", kind: "evidence" }]);
     expect(t.issue(t.view(), "a")).toBeUndefined();

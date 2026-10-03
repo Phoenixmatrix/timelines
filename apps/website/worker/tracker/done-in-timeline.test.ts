@@ -120,7 +120,7 @@ describe("done in a timeline", () => {
     expect(t.issue("a")).toMatchObject({
       status: "done_in_timeline",
       doneIn: { id: search.id, slug: "search" },
-      claim: null,
+      claim: { agent: "w", retainedIn: { id: search.id, slug: "search" } },
     });
     expect(t.next().issueId).toBeUndefined();
     expect(() =>

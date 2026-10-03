@@ -270,8 +270,9 @@ export function IssueDetail({
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
   // The issue's own lease, or an ancestor's: either way only its holder changes the status.
+  // A lease retained by a timeline (CORE-75) doesn't guard a reopen there.
   const covering =
-    issue.claim && issue.claim.expiresAt > snapshot.serverTime
+    issue.claim && !issue.claim.retainedIn && issue.claim.expiresAt > snapshot.serverTime
       ? issue
       : leasedAncestor(issue, readinessIndex(snapshot.issues, snapshot.links), snapshot.serverTime);
   const activeClaim = covering !== null;

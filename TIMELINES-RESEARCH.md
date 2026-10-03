@@ -463,7 +463,10 @@ returns:
 Leases stay unique per issue across every timeline, and already have TTLs. The
 change is that finishing an issue inside a timeline _keeps_ its lease (the
 "retained" state of Unity's Smart Locks). Landing releases it as done;
-abandoning releases it back to ready. Cursor's finding still applies: keep
+abandoning releases it back to ready. A retained lease doesn't expire while its
+timeline is live, so the agent that finished the work needs no renewal; a merge
+into another timeline carries it along, and reopening the issue in the timeline
+ends it (CORE-75). Cursor's finding still applies: keep
 claiming optimistic and short-lived, and don't add locks on files or areas.
 
 ### Previews: primitives, not hosting

@@ -854,6 +854,24 @@ lists a timeline's issues in the graph's inspector (`issues` in
 queueing them. Older gm binaries treat the status as data: not ready, still
 blocking.
 
+**Retained leases** (CORE-75). Leases stay unique per issue across every
+timeline (`claim` is a shared field). Finishing an issue inside a timeline
+(`issue.complete`, or an `issue.update` to `done` under the holder's own
+lease) doesn't end its lease: the claim keeps its holder and token and gains
+`retainedIn: {id, slug}`, the "retained" state of Unity's Smart Locks. A
+retained lease counts as active whatever its `expiresAt`, so it needs no
+renewal and nobody else can claim the issue in any view while the timeline is
+live. Renewing it (accepted, harmless) and handing it off keep it retained and
+leave the locked status as it is; releasing or completing it again fails with
+`lease_retained`. It ends with the work: landing releases it as done
+(`landTimeline` clears the claim and deletes the token), abandoning releases
+it back to ready (unless a live timeline that merged the work keeps it), a
+merge between timelines moves `retainedIn` with `doneIn`, and a reopen inside
+the timeline (by anyone with write access, no token needed) ends it, leaving
+the issue open to claim. The web shows a retained issue as done in its
+timeline rather than claimed; older gm binaries see an expired claim on a
+`done_in_timeline` issue, which still isn't ready.
+
 **Ended timelines stay readable.** A landed or abandoned timeline's view
 (`?tl=<slug>`, `--timeline <slug>`) still loads, read-only, with a banner that
 says how it ended; changes made in it fail with `timeline_ended`. Its own

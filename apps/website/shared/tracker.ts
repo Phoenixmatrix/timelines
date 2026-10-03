@@ -133,6 +133,14 @@ export interface IssueClaim {
    * may exit. Answering the last request unparks it for the holder to resume.
    */
   parkedAt?: string;
+  /**
+   * Set once the holder finished the issue inside a timeline (CORE-75, the
+   * "retained" state of Unity's Smart Locks): the lease stays the holder's,
+   * with no renewal needed, until that timeline lands (released as done) or is
+   * abandoned (released back to ready). Nobody else can claim the issue
+   * meanwhile. Merging the timeline into another moves the lease with the work.
+   */
+  retainedIn?: DoneIn;
 }
 
 /** Identity captured at mutation time, independent of later renames or membership changes. */
@@ -666,11 +674,22 @@ export function isOpen(issue: Pick<Issue, "status">): boolean {
   return issue.status !== "done" && issue.status !== "canceled";
 }
 
-/** A claim holds while it's unexpired, or parked waiting on a person. */
+/**
+ * A claim holds while it's unexpired, parked waiting on a person, or retained
+ * by a timeline the issue was finished in (CORE-75).
+ */
 export function hasActiveClaim(issue: Issue, now: string): boolean {
   return (
-    issue.claim !== null && (issue.claim.parkedAt !== undefined || issue.claim.expiresAt > now)
+    issue.claim !== null &&
+    (issue.claim.parkedAt !== undefined ||
+      issue.claim.retainedIn !== undefined ||
+      issue.claim.expiresAt > now)
   );
+}
+
+/** A lease kept after finishing in a timeline: held, but no longer working (CORE-75). */
+export function isRetained(issue: Pick<Issue, "claim">): boolean {
+  return !!issue.claim?.retainedIn;
 }
 
 /** Lookups readiness needs, built once per snapshot. */

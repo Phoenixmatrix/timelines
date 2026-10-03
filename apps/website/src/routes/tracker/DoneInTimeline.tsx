@@ -64,6 +64,8 @@ export function DoneInTimelineCallout({
           {issue.status === "done_in_timeline"
             ? ": done on main when it lands. Its status is locked here."
             : ", which hasn't landed yet."}
+          {issue.claim?.retainedIn &&
+            " Its lease stays with whoever finished it until the timeline lands or is abandoned."}
         </span>
       </span>
       {snapshot.timeline?.id !== issue.doneIn.id && (

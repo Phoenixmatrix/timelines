@@ -1539,9 +1539,10 @@ fn markdown(text: &Option<String>, file: &Option<PathBuf>) -> Result<String> {
         Ok(text.clone().unwrap_or_default())
     }
 }
-/// A claim holds while it's unexpired, or parked waiting on a person.
+/// A claim holds while it's unexpired, parked waiting on a person, or retained
+/// by the timeline its issue was finished in (CORE-75).
 fn active_claim(issue: &Value, now: DateTime<Utc>) -> bool {
-    if issue["claim"]["parkedAt"].is_string() {
+    if issue["claim"]["parkedAt"].is_string() || issue["claim"]["retainedIn"].is_object() {
         return true;
     }
     issue["claim"]["expiresAt"]
@@ -2851,6 +2852,9 @@ mod tests {
             .unwrap()
             .remove("parkedAt");
         assert!(ready(&s, &s["issues"][0], now));
+        // So does a lease retained by the timeline the issue was finished in.
+        s["issues"][0]["claim"]["retainedIn"] = json!({"id":"tl","slug":"search"});
+        assert!(!ready(&s, &s["issues"][0], now));
     }
     #[test]
     fn containers_and_issues_under_another_lease_are_not_ready() {
