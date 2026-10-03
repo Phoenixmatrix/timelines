@@ -472,6 +472,9 @@ subtasks or satisfy dependent issues' blockers.
   workspaces and subscriptions. A nonempty team membership list restricts issue
   writes and assignees; an empty list permits all current account members. A site
   administrator is not automatically a member of every tracker.
+  Team membership edits check an assigned agent's accountable person, not the
+  agent ID: retaining that person permits renaming the team, while removing them
+  from a restricted team requires reassigning their agents' issues first.
 - **Graph:** `FROM blocks TO`; only `done` satisfies a blocker. Canceling a
   prerequisite does not silently unblock its dependents. Parent hierarchy is
   separate and does not imply blocking. Both blocker and parent cycles are rejected.

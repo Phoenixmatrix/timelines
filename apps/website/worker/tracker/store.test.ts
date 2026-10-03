@@ -603,6 +603,49 @@ describe("tracker SQLite authority", () => {
       ),
     ).toThrow(/ownership/);
   });
+  test("team edits retain an assigned agent through its accountable member but cannot remove that member", () => {
+    const f = fixture();
+    f.mutate({
+      kind: "team.update",
+      id: "team",
+      expectedVersion: 1,
+      data: { memberIds: ["alice"] },
+    });
+    f.issue("work");
+    f.store.mutate(
+      { ...f.access, actorId: "agt-bot" },
+      {
+        operationId: "agent-claim",
+        mutations: [{ kind: "issue.claim", id: "work", data: { agent: "session" } }],
+      },
+    );
+    // The admin form sends membership even when only the name changed.
+    f.mutate({
+      kind: "team.update",
+      id: "team",
+      expectedVersion: 2,
+      data: { name: "Renamed engineering", memberIds: ["alice"] },
+    });
+    const saved = f.reopen().snapshot(f.access);
+    expect(saved.teams[0]).toMatchObject({
+      name: "Renamed engineering",
+      memberIds: ["alice"],
+      version: 3,
+    });
+    expect(saved.issues[0]).toMatchObject({
+      assigneeId: "agt-bot",
+      claim: { actorId: "agt-bot", accountableId: "alice" },
+    });
+    expect(() =>
+      f.mutate({
+        kind: "team.update",
+        id: "team",
+        expectedVersion: 3,
+        data: { name: "Rejected rename", memberIds: ["bob"] },
+      }),
+    ).toThrow(expect.objectContaining({ code: "invalid_member", status: 409 }));
+    expect(f.reopen().snapshot(f.access)).toEqual(saved);
+  });
   test("repository administration is required for both subscription directions; archive prevents new associations", () => {
     const f = fixture();
     const subscription: Mutation = {

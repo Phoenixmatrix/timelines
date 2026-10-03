@@ -976,7 +976,10 @@ export class TrackerStore {
               if (
                 memberIds.length &&
                 this.all<Issue>("issue").some(
-                  (i) => i.teamId === entityId && i.assigneeId && !memberIds.includes(i.assigneeId),
+                  (i) =>
+                    i.teamId === entityId &&
+                    i.assigneeId &&
+                    !memberIds.includes(answerable(i.assigneeId)),
                 )
               )
                 fail(
