@@ -11,6 +11,7 @@
 
 import type {
   AtlasAncestors,
+  AtlasContribution,
   AtlasCrossLink,
   AtlasDetail,
   AtlasDirection,
@@ -79,6 +80,20 @@ export const atlasApi = {
     get<AtlasPage<AtlasEntitySummary>>(repo, "children", { id, ...paged(request) }, request),
   detail: (repo: AtlasRepo, id: string, request: AtlasRequest = {}) =>
     get<AtlasDetail>(repo, "detail", { id }, request),
+  /** The file imports behind a capability relation, from `id` toward `other` (or back, with "in"). */
+  contributing: (
+    repo: AtlasRepo,
+    id: string,
+    other: string,
+    direction: AtlasDirection,
+    request: AtlasPageRequest = {},
+  ) =>
+    get<AtlasPage<AtlasContribution>>(
+      repo,
+      "contributing",
+      { id, other, direction, ...paged(request) },
+      request,
+    ),
   ancestors: (repo: AtlasRepo, id: string, request: AtlasRequest = {}) =>
     get<AtlasAncestors>(repo, "ancestors", { id }, request),
   relations: (

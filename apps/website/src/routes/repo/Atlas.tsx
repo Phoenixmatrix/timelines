@@ -11,6 +11,7 @@ import type { AtlasEntitySummary, AtlasOverview, AtlasRegion } from "../../../sh
 import { ApiError } from "../../lib/api.ts";
 import { atlasApi } from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
+import { AtlasInspector } from "./AtlasInspector.tsx";
 import { AtlasTerritory } from "./AtlasTerritory.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./territory.ts";
@@ -51,7 +52,10 @@ function Territory({ overview }: { overview: AtlasOverview }) {
   const ref = { owner: repo.owner.slug, name: repo.name };
   const snapshot = overview.snapshot;
   const [loads, setLoads] = useState<ReadonlyMap<string, Load>>(new Map());
-  const [selected, setSelected] = useState<string | null>(null);
+  // The picked entity itself, so one reached from the lens is inspectable even
+  // when it isn't drawn on the map.
+  const [picked, setPicked] = useState<AtlasEntitySummary | null>(null);
+  const selected = picked?.id ?? null;
 
   const loader = useMemo(
     () =>
@@ -89,14 +93,14 @@ function Territory({ overview }: { overview: AtlasOverview }) {
   );
 
   const choose = (entity: AtlasEntitySummary) => {
-    setSelected(entity.id);
+    setPicked(entity);
     if (OPENS.has(entity.kind) && !loads.has(entity.id)) void loader.load(entity.id);
   };
   const pickCell = (cell: TerritoryCell) => choose(cell.entity);
 
   const commit = snapshot.vector[0]?.commit.slice(0, 7);
   const capabilities = overview.regions.filter((r) => !r.structural).length;
-  const selectedEntity = selected ? territory.byId.get(selected)?.entity : undefined;
+  const selectedEntity = picked ?? undefined;
 
   return (
     <div className="flex flex-col gap-3">
@@ -135,13 +139,23 @@ function Territory({ overview }: { overview: AtlasOverview }) {
           className="flex min-h-0 flex-col gap-3 overflow-y-auto rounded-pane bg-pane p-3"
         >
           {selectedEntity && (
-            <Selection
+            <AtlasInspector
+              key={selectedEntity.id}
+              repo={ref}
+              snapshot={snapshot}
               entity={selectedEntity}
-              load={loads.get(selectedEntity.id)}
               onPick={choose}
-              onRetry={() => void loader.load(selectedEntity.id)}
-              onMore={(cursor, items) => void loader.load(selectedEntity.id, cursor, items)}
-              changed={snapshot.seq > 1 && selectedEntity.since === snapshot.seq}
+              contents={
+                OPENS.has(selectedEntity.kind) ? (
+                  <Contents
+                    entity={selectedEntity}
+                    load={loads.get(selectedEntity.id)}
+                    onPick={choose}
+                    onRetry={() => void loader.load(selectedEntity.id)}
+                    onMore={(cursor, items) => void loader.load(selectedEntity.id, cursor, items)}
+                  />
+                ) : null
+              }
             />
           )}
           <RegionList
@@ -223,38 +237,23 @@ function RegionList({
   );
 }
 
-function Selection({
+/** What's inside a region, as the map loads it: a page at a time. */
+function Contents({
   entity,
   load,
-  changed,
   onPick,
   onRetry,
   onMore,
 }: {
   entity: AtlasEntitySummary;
   load: Load | undefined;
-  changed: boolean;
   onPick: (entity: AtlasEntitySummary) => void;
   onRetry: () => void;
   onMore: (cursor: string, items: AtlasEntitySummary[]) => void;
 }) {
   return (
-    <section
-      aria-label={entity.name}
-      className="flex flex-col gap-2 border-b border-line-soft pb-3"
-    >
-      <h2 className="m-0 text-body font-semibold">{entity.name}</h2>
-      <p className="m-0 text-micro text-ink-faint">
-        {entity.structural
-          ? "Structural group: not a capability."
-          : entity.kind === "capability" || entity.kind === "area"
-            ? "Grouped from imports and shared concepts in the code, never folders alone."
-            : entity.kind}
-        {changed && " · changed in this build"}
-      </p>
-      {summaryLine(entity) && (
-        <p className="m-0 text-body-sm text-ink-muted">{summaryLine(entity)}</p>
-      )}
+    <div className="flex flex-col gap-1">
+      <h3 className="m-0 text-label text-ink-muted">Inside</h3>
       {load?.state === "loading" && (
         <p className="m-0 text-body-sm text-ink-faint" aria-live="polite">
           Loading what's inside…
@@ -305,7 +304,7 @@ function Selection({
           )}
         </>
       )}
-    </section>
+    </div>
   );
 }
 

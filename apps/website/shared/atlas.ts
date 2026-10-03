@@ -201,6 +201,14 @@ export interface AtlasRelation {
   neighbor: AtlasEntitySummary | null;
 }
 
+/** One file import behind a capability-to-capability relation (GET /contributing). */
+export interface AtlasContribution {
+  src: string;
+  dst: string;
+  srcPath: string | null;
+  dstPath: string | null;
+}
+
 /** Where a source line range is known; never invented. */
 export interface AtlasRange {
   startLine: number | null;

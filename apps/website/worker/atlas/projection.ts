@@ -797,6 +797,25 @@ export async function groupRepoCapabilities(
       }),
     };
   });
+  // Capability to capability: how many file imports cross each boundary.
+  const capabilityOf = new Map<string, string>();
+  for (const m of grouping.members) if (m.capability) capabilityOf.set(m.file, capId(m.capability));
+  const crossing = new Map<string, number>();
+  for (const { src, dst } of imports.results) {
+    const a = capabilityOf.get(src);
+    const b = capabilityOf.get(dst);
+    if (a && b && a !== b)
+      crossing.set(`${a}\u0000${b}`, (crossing.get(`${a}\u0000${b}`) ?? 0) + 1);
+  }
+  await writeCapabilityEdges(
+    d1,
+    scope,
+    seq,
+    [...crossing].map(([key, weight]) => {
+      const [src, dst] = key.split("\u0000") as [string, string];
+      return { src, dst, kind: "depends_on", weight };
+    }),
+  );
   const statements: Statement[] = [
     raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq = ?", scope, seq),
   ];
@@ -851,6 +870,74 @@ export async function groupRepoCapabilities(
     capabilities: grouping.capabilities.length,
     areas: shownAreas.length,
   };
+}
+
+/**
+ * Write capability-to-capability edges for snapshot `seq`, versioned like
+ * graph edges: unchanged ones stay one row, changed or new ones open at
+ * `seq`, and ones no longer there close at `seq`. Idempotent for retries.
+ */
+export async function writeCapabilityEdges(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  edges: { src: string; dst: string; kind: string; weight: number }[],
+) {
+  const open = await d1
+    .prepare(
+      `SELECT src, dst, kind, from_seq, weight FROM atlas_edges
+       WHERE scope = ? AND to_seq IS NULL AND src >= 'cap:' AND src < 'cap;'`,
+    )
+    .bind(scope)
+    .all<{ src: string; dst: string; kind: string; from_seq: number; weight: number }>();
+  const key = (e: { src: string; dst: string; kind: string }) =>
+    `${e.src}\u0000${e.dst}\u0000${e.kind}`;
+  const existing = new Map(open.results.map((e) => [key(e), e]));
+  const insert: typeof edges = [];
+  const close: { src: string; dst: string; kind: string }[] = [];
+  const wanted = new Set<string>();
+  for (const edge of edges) {
+    const k = key(edge);
+    wanted.add(k);
+    const before = existing.get(k);
+    if (before && Number(before.weight) === edge.weight) continue;
+    if (before && before.from_seq !== seq) close.push(edge);
+    insert.push(edge);
+  }
+  for (const [k, edge] of existing) if (!wanted.has(k)) close.push(edge);
+  const statements: Statement[] = [];
+  const match = `(src, dst, kind) IN (SELECT json_extract(value, '$.src'), json_extract(value, '$.dst'), json_extract(value, '$.kind') FROM json_each(?))`;
+  for (let i = 0; i < close.length; i += ROWS_PER_STATEMENT) {
+    const list = JSON.stringify(close.slice(i, i + ROWS_PER_STATEMENT));
+    statements.push(
+      raw(
+        `DELETE FROM atlas_edges WHERE scope = ? AND from_seq = ? AND ${match}`,
+        scope,
+        seq,
+        list,
+      ),
+      raw(
+        `UPDATE atlas_edges SET to_seq = ? WHERE scope = ? AND to_seq IS NULL AND ${match}`,
+        seq,
+        scope,
+        list,
+      ),
+    );
+  }
+  for (let i = 0; i < insert.length; i += ROWS_PER_STATEMENT)
+    statements.push(
+      raw(
+        `INSERT INTO atlas_edges (scope, src, dst, kind, from_seq, to_seq, weight)
+         SELECT ?, json_extract(value, '$.src'), json_extract(value, '$.dst'), json_extract(value, '$.kind'), ?, NULL,
+                json_extract(value, '$.weight')
+         FROM json_each(?) WHERE true
+         ON CONFLICT (scope, src, dst, kind, from_seq) DO UPDATE SET weight = excluded.weight, to_seq = NULL`,
+        scope,
+        seq,
+        JSON.stringify(insert.slice(i, i + ROWS_PER_STATEMENT)),
+      ),
+    );
+  for (let i = 0; i < statements.length; i += 50) await batch(d1, statements.slice(i, i + 50));
 }
 
 /**
@@ -1061,7 +1148,8 @@ export async function projectEdges(
     if (before && before.from_seq !== seq) close.push(edge);
     insert.push(edge);
   }
-  for (const [k, edge] of existing) if (!wanted.has(k)) close.push(edge);
+  // Capability edges come from the grouping step, not the graph: never close them here.
+  for (const [k, edge] of existing) if (!wanted.has(k) && !isSynthetic(edge.src)) close.push(edge);
 
   const statements: Statement[] = [];
   for (let i = 0; i < close.length; i += ROWS_PER_STATEMENT) {
@@ -1620,4 +1708,40 @@ export async function catalogueCountAt(
     .bind(scope, seq, seq, pattern, pattern, ...(kind === null ? [] : [kind]))
     .first<{ n: number }>();
   return Number(row?.n ?? 0);
+}
+
+/**
+ * The file imports behind one capability-to-capability relation (CORE-169):
+ * edges from files whose primary capability is `from` to files whose primary
+ * capability is `to`, in snapshot `seq`, paged by (src, dst).
+ */
+export async function contributingAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  from: string,
+  to: string,
+  after: [string, string] | null,
+  limit: number,
+): Promise<{
+  links: { src: string; dst: string; srcPath: string | null; dstPath: string | null }[];
+  next: [string, string] | null;
+}> {
+  const rows = await d1
+    .prepare(
+      `SELECT g.src, g.dst, s.path AS src_path, d.path AS dst_path
+       FROM atlas_entities s
+       JOIN atlas_edges g ON g.scope = s.scope AND g.src = s.entity_id AND g.kind = 'imports' AND ${visibleAs("g")}
+       JOIN atlas_entities d ON d.scope = g.scope AND d.entity_id = g.dst AND ${visibleAs("d")} AND d.capability = ?
+       WHERE s.scope = ? AND s.capability = ? AND ${visibleAs("s")} AND (g.src, g.dst) > (?, ?)
+       ORDER BY g.src, g.dst LIMIT ?`,
+    )
+    .bind(seq, seq, seq, seq, to, scope, from, seq, seq, ...(after ?? ["", ""]), limit + 1)
+    .all<{ src: string; dst: string; src_path: string | null; dst_path: string | null }>();
+  const page = rows.results.slice(0, limit);
+  const last = page.at(-1);
+  return {
+    links: page.map((r) => ({ src: r.src, dst: r.dst, srcPath: r.src_path, dstPath: r.dst_path })),
+    next: rows.results.length > limit && last ? [last.src, last.dst] : null,
+  };
 }

@@ -39,6 +39,7 @@ import {
   type AtlasDescription,
   type AtlasEntitySummary,
   type AtlasLayout,
+  type AtlasContribution,
   type AtlasError,
   type AtlasErrorCode,
   type AtlasEvidence,
@@ -76,6 +77,8 @@ import {
   type AtlasSnapshot,
   type RegionKey,
   type RelationKey,
+  contributingAt,
+  edgesAt,
 } from "./projection.ts";
 import { lineageOf } from "./identity.ts";
 import { capacityFailure, cursorExpiresAt, pinnedSnapshot } from "./retention.ts";
@@ -495,6 +498,49 @@ atlas.get("/relations", async (c) => {
         0,
       ),
     ),
+  );
+});
+
+/**
+ * The file imports behind a capability relation (CORE-169): ?id=<capability>
+ * &other=<capability>&direction=out|in, paged by (src, dst). The total is the
+ * relation's weight, counted when the capability edges were built.
+ */
+atlas.get("/contributing", async (c) => {
+  const direction = c.req.query("direction") ?? "out";
+  const other = c.req.query("other") ?? "";
+  const ctx = await pin<[string, string]>(c, "contributing", { id: rawId(c), other, direction });
+  if (ctx instanceof Response) return ctx;
+  const id = idOf(c);
+  if (id instanceof Response) return id;
+  if (direction !== "in" && direction !== "out")
+    return failWith(c, 400, "bad_request", "direction is in or out.");
+  if (!other)
+    return failWith(c, 400, "bad_request", "other names the capability at the other end.");
+  const limit = limitOf(c);
+  if (limit instanceof Response) return limit;
+  const entity = await entityOr404(c, ctx, id);
+  if (entity instanceof Response) return entity;
+  const [from, to] = direction === "out" ? [id, other] : [other, id];
+  const d1 = c.env.DB;
+  const seq = ctx.snapshot.seq;
+  const result = await contributingAt(
+    d1,
+    ctx.scope,
+    seq,
+    from,
+    to,
+    ctx.cursor?.after ?? null,
+    limit,
+  );
+  const items: AtlasContribution[] = result.links;
+  return c.json(
+    await page(ctx, items, result.next, async () => {
+      const edge = (await edgesAt(d1, ctx.scope, seq, from, false)).find(
+        (e) => e.dst === to && e.kind === "depends_on",
+      );
+      return edge?.weight ?? 0;
+    }),
   );
 });
 
