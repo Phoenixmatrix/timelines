@@ -252,6 +252,10 @@ The server automatically assigns an unassigned issue to the identity holding
 its claim, including `next` and delegated claims. For an authenticated agent,
 that is the agent—not its accountable person or the `--agent` session label.
 Existing assignees are preserved; ending a claim does not clear assignment.
+Automatic assignment follows the same membership rules as explicit assignment.
+Even a tracker admin cannot claim unassigned work in a restricted team unless
+the holder (or its accountable person) belongs to that team. Such claims fail
+without changing the issue; claiming work with a valid existing assignee preserves it.
 
 ```bash
 gm issue claim ENG-1 --agent search-agent --ttl 900

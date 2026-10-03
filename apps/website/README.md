@@ -455,6 +455,10 @@ subtasks or satisfy dependent issues' blockers.
   the same transaction and audit event. Delegated claims use the receiving
   agent, not the delegator or session label. Existing assignees are preserved,
   including on renewal, handoff and takeover; ending a lease does not clear assignment.
+  Lease grants use the same assignee validation as issue edits: the assignee
+  (or an agent's accountable person) must be an account member and belong to any
+  restricted owning team. Admin write access does not waive this requirement.
+  Invalid assignments reject the claim atomically without changing the issue or lease.
 - **Graph engineering (CORE-4):** agents work through issue graphs on their own.
   - _Agents_ are identities a person creates (Settings > Agents, `gm agent`); they
     act with their person's access but everything is attributed to the agent, and

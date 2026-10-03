@@ -483,6 +483,15 @@ export class TrackerStore {
         member(agent ? agent.accountable.id : actorId);
         return agent ? agent.accountable.id : actorId;
       };
+      const validateAssignee = (assigneeId: string | null, teamId: string) => {
+        if (!assigneeId) return;
+        // Administration permits writes, not assignment outside team membership.
+        // An agent is eligible when its accountable human is.
+        const human = answerable(assigneeId);
+        const team = this.get<Team>("team", teamId);
+        if (team.memberIds.length && !team.memberIds.includes(human))
+          fail("invalid_member", "Assignee must belong to the owning team.");
+      };
       const unique = (type: EntityType, entityId: string) => {
         if (
           all(this.sql, tracker.selectFrom(tables[type]).select("id").where("id", "=", entityId))
@@ -629,6 +638,8 @@ export class TrackerStore {
         },
         delegatedFrom?: Issue | null,
       ) => {
+        const assigneeId = issue.assigneeId ?? holder.actorId;
+        validateAssignee(assigneeId, issue.teamId);
         const leaseToken = token ?? crypto.randomUUID() + crypto.randomUUID();
         const expiresAt = new Date(Date.parse(now) + ttl * 1000).toISOString();
         issue.claim = {
@@ -637,7 +648,7 @@ export class TrackerStore {
           expiresAt,
           ...(delegatedFrom ? { delegatedFrom: delegatedFrom.id } : {}),
         };
-        issue.assigneeId ??= holder.actorId;
+        issue.assigneeId = assigneeId;
         issue.status = "in_progress";
         run(
           this.sql,
@@ -832,13 +843,7 @@ export class TrackerStore {
         }
         if ("assigneeId" in data)
           issue.assigneeId = data.assigneeId === null ? null : id(data.assigneeId);
-        if (issue.assigneeId) {
-          // An agent can be assigned when its accountable human could be.
-          const human = answerable(issue.assigneeId);
-          const team = this.get<Team>("team", issue.teamId);
-          if (team.memberIds.length && !team.memberIds.includes(human))
-            fail("invalid_member", "Assignee must belong to the owning team.");
-        }
+        validateAssignee(issue.assigneeId, issue.teamId);
         if ("parentId" in data) {
           issue.parentId = data.parentId === null ? null : id(data.parentId);
           if (issue.parentId) {

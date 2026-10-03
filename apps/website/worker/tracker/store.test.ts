@@ -979,6 +979,92 @@ describe("agents", () => {
     expect(f.store.snapshot(f.access).issues[0]!.assigneeId).toBe(assigneeId);
   });
 
+  test.each(["alice", "agt-bot"])(
+    "an admin claim cannot assign %s outside the restricted team",
+    (actorId) => {
+      const f = fixture();
+      f.mutate({
+        kind: "team.update",
+        id: "team",
+        expectedVersion: 1,
+        data: { memberIds: ["bob"] },
+      });
+      f.issue("work");
+      f.access.actorId = actorId;
+      expect(() =>
+        f.mutate({ kind: "issue.claim", id: "work", data: { agent: "outside-team" } }),
+      ).toThrow(expect.objectContaining({ code: "invalid_member", status: 400 }));
+      expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+        assigneeId: null,
+        claim: null,
+        status: "todo",
+        version: 1,
+      });
+      expect(f.db.prepare("SELECT issue_id FROM leases").all()).toEqual([]);
+      expect(f.store.history(f.access, "work", null, 10).events.map((event) => event.kind)).toEqual(
+        ["issue.create"],
+      );
+      f.mutate({
+        kind: "issue.update",
+        id: "work",
+        expectedVersion: 1,
+        data: { title: "Still editable" },
+      });
+      expect(f.store.snapshot(f.access).issues[0]!.title).toBe("Still editable");
+    },
+  );
+
+  test("an out-of-team admin can claim a valid assigned issue without breaking later edits", () => {
+    const f = fixture();
+    f.mutate({
+      kind: "team.update",
+      id: "team",
+      expectedVersion: 1,
+      data: { memberIds: ["bob"] },
+    });
+    f.mutate({
+      kind: "issue.create",
+      id: "work",
+      data: { teamId: "team", title: "Work", assigneeId: "bob" },
+    });
+    f.mutate({ kind: "issue.claim", id: "work", data: { agent: "admin" } });
+    f.mutate({
+      kind: "issue.update",
+      id: "work",
+      expectedVersion: 2,
+      data: { title: "Edited after claim" },
+    });
+    expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+      assigneeId: "bob",
+      claim: { actorId: "alice" },
+      title: "Edited after claim",
+      version: 3,
+    });
+  });
+
+  test("next cannot autoassign an out-of-team admin's delegated agent", () => {
+    const f = fixture();
+    f.mutate({
+      kind: "team.update",
+      id: "team",
+      expectedVersion: 1,
+      data: { memberIds: ["bob"] },
+    });
+    f.issue("work");
+    expect(() =>
+      f.mutate({
+        kind: "issue.next",
+        id: "pick",
+        data: { agent: "delegated", forActorId: "agt-bot" },
+      }),
+    ).toThrow(expect.objectContaining({ code: "invalid_member", status: 400 }));
+    expect(f.store.snapshot(f.access).issues[0]).toMatchObject({
+      assigneeId: null,
+      claim: null,
+      version: 1,
+    });
+  });
+
   test("assignment and claim roll back together when a later mutation fails", () => {
     const f = fixture();
     f.issue("work");
