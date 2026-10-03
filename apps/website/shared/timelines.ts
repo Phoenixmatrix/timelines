@@ -239,6 +239,8 @@ export interface CreateCheckpoint {
 
 export interface TimelineList {
   timelines: Timeline[];
+  /** With `?stalled=true`: the account's idle period the list was cut with. */
+  idleDays?: number;
 }
 
 /**
@@ -300,4 +302,33 @@ export function timelineBookmark(slug: string): string {
 export function timelineSlugOf(ref: string): string | null {
   const match = /^refs\/heads\/timeline\/([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(ref);
   return match ? match[1]! : null;
+}
+
+/** Days without a push before a timeline counts as idle, unless the account says otherwise. */
+export const DEFAULT_IDLE_DAYS = 7;
+const DAY = 24 * 60 * 60 * 1000;
+
+/** The last sign of work in a timeline: its newest push, or its fork. */
+export function lastPush(timeline: Pick<Timeline, "pushedAt" | "createdAt">): string {
+  return timeline.pushedAt && timeline.pushedAt > timeline.createdAt
+    ? timeline.pushedAt
+    : timeline.createdAt;
+}
+
+/**
+ * Whether a timeline has stalled: still being worked (active or idle, not
+ * waiting on a person or landing) with no push for the idle period. An
+ * experimental timeline never counts: it isn't expected to land, so stalling
+ * is expected of it (TIMELINES-RESEARCH.md, Decisions). Views of stalled or
+ * idle work use this.
+ */
+export function isStalled(
+  timeline: Pick<Timeline, "status" | "experimental" | "pushedAt" | "createdAt">,
+  now: number,
+  idleDays = DEFAULT_IDLE_DAYS,
+): boolean {
+  if (timeline.experimental) return false;
+  if (timeline.status === "idle") return true;
+  if (timeline.status !== "active") return false;
+  return now - Date.parse(lastPush(timeline)) >= idleDays * DAY;
 }

@@ -514,7 +514,14 @@ gm timeline use main                            # back to main
   Main is merged in only by a person, or an agent asked to.
 - **`list`**, **`show [<slug>]`** read the records and events (fork, merge,
   checkpoint, approval, landing, abandon); `*` and `current` mark this
-  checkout's timeline.
+  checkout's timeline. `list --stalled` shows open timelines with no push for
+  the account's idle period (7 days unless the account changes it), leaving
+  experimental ones out: stalling is expected of them.
+- **`update [<slug>]`** (or **`flag`**) renames it (`--name`) or sets and clears
+  the experimental flag (`--experimental`, `--no-experimental`). The flag marks
+  a timeline that isn't expected to land; it restricts nothing, so its work
+  still merges into any timeline and it can still land. Any writer may change
+  it.
 - **`abandon [<slug>]`** ends it and deletes its bookmarks; its events stay. The
   server allows only its accountable person or the agent that started it. A
   checkout bound to it goes back to main.

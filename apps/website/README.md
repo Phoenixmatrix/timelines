@@ -749,14 +749,14 @@ don't know (gm now skips them). gm asks for timelines and keeps them in its
 replica; `gm tracker status` lists them offline. `shared/timelines.ts` defines the
 wire types.
 
-| Route                                                   | Contract                                                                                       |
-| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `GET /api/tracker/:owner/timelines?status=`             | Every timeline, newest first                                                                   |
-| `POST /api/tracker/:owner/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: write each bookmark, then the record |
-| `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                 |
-| `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                     |
-| `POST /api/tracker/:owner/timelines/:slug/abandon`      | Record the abandon event with each bookmark's last commit, then delete the bookmarks           |
-| `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data    |
+| Route                                                   | Contract                                                                                          |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `GET /api/tracker/:owner/timelines?status=&stalled=`    | Every timeline, newest first; `stalled=true`: open, no push for the idle period, not experimental |
+| `POST /api/tracker/:owner/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: write each bookmark, then the record    |
+| `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                    |
+| `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                        |
+| `POST /api/tracker/:owner/timelines/:slug/abandon`      | Record the abandon event with each bookmark's last commit, then delete the bookmarks              |
+| `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data       |
 
 - **Forking** needs tracker membership and write access to each repository,
   which must belong to the tracker's account. Each bookmark starts at the
@@ -773,6 +773,15 @@ wire types.
   the ten most recently active timelines; landed timelines fold into one node
   on main, and the rest are listed by status, workspace, agent or person. The
   layout is in `src/routes/tracker/timelineGraph.ts`.
+- **Experimental** (CORE-86) marks a timeline that isn't expected to land. It
+  restricts nothing: any writer sets or clears it (the graph's inspector,
+  `PATCH`, `gm timeline flag <slug> --experimental|--no-experimental`), its
+  work merges like any other's, and it can still land. Views of stalled or
+  idle work leave flagged timelines out, since stalling is expected of them
+  (`isStalled` in `shared/timelines.ts`: active or idle, no push for the
+  account's idle period, 7 days by default): the graph's Stalled filter, its
+  status groups (quiet experiments are grouped apart), `?stalled=true` and
+  `gm timeline list --stalled`.
 - **Merges** are found after each push (`waitUntil`), from the push log: a
   commit on the pushed line's own first-parent chain whose other parent has
   been the tip of main or another timeline bookmark. Each is one event,

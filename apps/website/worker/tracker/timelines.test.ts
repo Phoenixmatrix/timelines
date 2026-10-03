@@ -180,6 +180,36 @@ describe("pushes and merges", () => {
     expect(t.store.detail("ranking", 0, 50).events.map((e) => e.kind)).toEqual(["fork", "merge"]);
   });
 
+  test("an experimental timeline's work merges like any other's, into timelines and main", () => {
+    const t = setup();
+    const ann = t.as("ann");
+    const search = t.fork(ann, "search");
+    const ranking = t.store.create(ann, {
+      slug: "ranking",
+      parent: null,
+      experimental: true,
+      repos: [repo],
+      commits: { app: oid(1) },
+    });
+    const merges = [
+      { into: "search", from: "ranking", commit: oid(20), parent: oid(19), refUpdateId: 1 },
+      { into: null, from: "ranking", commit: oid(21), parent: oid(19), refUpdateId: 2 },
+    ];
+    expect(
+      t.store.recordPush({ repo, actorId: "ann", accountableId: "ann", pushed: [], merges }),
+    ).toBe(2);
+    expect(t.store.detail("ranking", 0, 50).events.map((e) => e.kind)).toEqual([
+      "fork",
+      "merge",
+      "merge",
+    ]);
+    expect(t.store.detail("search", 0, 50).events.filter((e) => e.kind === "merge")).toMatchObject([
+      { fromId: ranking.id, intoId: search.id, commit: oid(20) },
+    ]);
+    // The flag is a marker: merging neither clears it nor ends the timeline.
+    expect(t.store.get("ranking")).toMatchObject({ experimental: true, status: "active" });
+  });
+
   test("events page in order", () => {
     const t = setup();
     t.fork(t.as("ann"), "search");

@@ -52,6 +52,9 @@ pub enum TimelineCommand {
     Checkpoint(CheckpointArgs),
     /// List a timeline's checkpoints, newest first, with CI runs, previews and approvals
     Checkpoints(CheckpointsArgs),
+    /// Rename a timeline (default: this checkout's), or flag it experimental or clear the flag
+    #[command(visible_alias = "flag")]
+    Update(UpdateArgs),
 }
 
 #[derive(Args)]
@@ -120,6 +123,10 @@ pub struct ListArgs {
     /// Only timelines with this status (active, idle, waiting, landing, partly_landed, landed, abandoned).
     #[arg(long)]
     pub status: Option<String>,
+    /// Only open timelines with no push for the account's idle period; experimental ones,
+    /// which aren't expected to land, are left out.
+    #[arg(long)]
+    pub stalled: bool,
     #[command(flatten)]
     pub owner: Owner,
 }
@@ -163,6 +170,24 @@ pub struct AbandonArgs {
     pub owner: Owner,
 }
 
+#[derive(Args)]
+pub struct UpdateArgs {
+    /// The timeline's slug (default: the one this checkout works in).
+    pub slug: Option<String>,
+    /// A new readable name.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Mark it as not expected to land, so stalled views leave it out. A marker, not a
+    /// restriction: its work still merges anywhere, and it can still land.
+    #[arg(long, conflicts_with = "no_experimental")]
+    pub experimental: bool,
+    /// Clear the experimental flag.
+    #[arg(long)]
+    pub no_experimental: bool,
+    #[command(flatten)]
+    pub owner: Owner,
+}
+
 /// JSON for agents, text for people.
 pub struct Shown {
     value: Value,
@@ -191,6 +216,7 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Abandon(a) => abandon(ctx, a),
         TimelineCommand::Checkpoint(a) => checkpoint(ctx, a),
         TimelineCommand::Checkpoints(a) => checkpoints(ctx, a),
+        TimelineCommand::Update(a) => update(ctx, a),
     }
 }
 
@@ -447,14 +473,21 @@ fn with(op: &OpResult, extra: Value) -> Result<Value> {
 fn list(ctx: &Ctx, args: &ListArgs) -> Result<Shown> {
     let config = Config::load();
     let owner = owner(ctx, &config, args.owner.owner.clone())?;
-    let mut path = base(&owner);
+    let mut query = Vec::new();
     if let Some(status) = &args.status {
         if !status.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
             return Err(GmError::usage(format!(
                 "`{status}` isn't a timeline status."
             )));
         }
-        path.push_str(&format!("?status={status}"));
+        query.push(format!("status={status}"));
+    }
+    if args.stalled {
+        query.push("stalled=true".into());
+    }
+    let mut path = base(&owner);
+    if !query.is_empty() {
+        path.push_str(&format!("?{}", query.join("&")));
     }
     let mut value = remote::api(&config, "GET", &path, None)?;
     let bound = current();
@@ -464,6 +497,10 @@ fn list(ctx: &Ctx, args: &ListArgs) -> Result<Shown> {
             .map(|t| line(t, bound.as_deref()))
             .collect::<Vec<_>>()
             .join("\n"),
+        _ if args.stalled => format!(
+            "No timeline in {owner} has stalled (no push for {} days); experimental ones aren't counted.",
+            value["idleDays"].as_u64().unwrap_or(7)
+        ),
         _ => format!("{owner} has no timelines. Start one with `gm timeline start <slug>`."),
     };
     value["owner"] = json!(owner);
@@ -1176,6 +1213,71 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
     Ok(Shown { value, text })
 }
 
+// ---- update ----------------------------------------------------------------------
+
+/// The fields `update` sends: a name, and the experimental flag set or cleared.
+fn update_body(args: &UpdateArgs) -> Result<Map<String, Value>> {
+    let mut body = Map::new();
+    if let Some(name) = &args.name {
+        if name.trim().is_empty() {
+            return Err(GmError::usage("A timeline's name can't be empty."));
+        }
+        body.insert("name".into(), json!(name.trim()));
+    }
+    if args.experimental || args.no_experimental {
+        body.insert("experimental".into(), json!(args.experimental));
+    }
+    if body.is_empty() {
+        return Err(GmError::usage("Nothing to change.")
+            .hint("Pass --name, --experimental or --no-experimental."));
+    }
+    Ok(body)
+}
+
+fn update_text(slug: &str, body: &Map<String, Value>) -> String {
+    let mut lines = Vec::new();
+    if let Some(name) = body.get("name").and_then(Value::as_str) {
+        lines.push(format!("Timeline {slug} is now named {name}."));
+    }
+    match body.get("experimental").and_then(Value::as_bool) {
+        Some(true) => lines.push(format!(
+            "Timeline {slug} is experimental: not expected to land, so stalled views leave it out. Its work still merges anywhere."
+        )),
+        Some(false) => lines.push(format!(
+            "Timeline {slug} is no longer experimental: stalled views count it again."
+        )),
+        None => {}
+    }
+    lines.join("\n")
+}
+
+fn update(ctx: &Ctx, args: &UpdateArgs) -> Result<Shown> {
+    let slug = named_or_current(&args.slug, "update")?;
+    let body = update_body(args)?;
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    if ctx.dry_run {
+        let record = fetch_record(&config, &owner, &slug)?;
+        return Ok(Shown {
+            text: format!(
+                "dry run: nothing was changed\nWould update:\n{}",
+                update_text(&slug, &body)
+            ),
+            value: json!({ "dry_run": true, "owner": owner, "timeline": record, "request": body }),
+        });
+    }
+    let timeline = remote::api(
+        &config,
+        "PATCH",
+        &format!("{}/{slug}", base(&owner)),
+        Some(&Value::Object(body.clone())),
+    )?;
+    Ok(Shown {
+        text: update_text(&slug, &body),
+        value: json!({ "dry_run": false, "owner": owner, "timeline": timeline }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1328,34 @@ mod tests {
         let superseded = json!({"seq": 12, "kind": "approval", "number": 2,
             "outcome": "superseded", "createdAt": "2026-10-03"});
         assert!(event_line(&superseded).contains("checkpoint #2 superseded"));
+    }
+
+    #[test]
+    fn update_sends_only_what_changes() {
+        let args = |name: Option<&str>, on: bool, off: bool| UpdateArgs {
+            slug: None,
+            name: name.map(str::to_string),
+            experimental: on,
+            no_experimental: off,
+            owner: Owner { owner: None },
+        };
+        let flagged = update_body(&args(None, true, false)).unwrap();
+        assert_eq!(
+            Value::Object(flagged.clone()),
+            json!({"experimental": true})
+        );
+        assert!(update_text("probe", &flagged).contains("stalled views leave it out"));
+        let cleared = update_body(&args(Some(" Probe "), false, true)).unwrap();
+        assert_eq!(
+            Value::Object(cleared.clone()),
+            json!({"name": "Probe", "experimental": false})
+        );
+        assert!(update_text("probe", &cleared).contains("no longer experimental"));
+        assert_eq!(
+            update_body(&args(None, false, false)).unwrap_err().code,
+            "invalid_argument"
+        );
+        assert!(update_body(&args(Some("  "), false, false)).is_err());
     }
 
     #[test]

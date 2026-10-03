@@ -16,7 +16,14 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import type { TimelineGraphData } from "../../../shared/timeline-graph.ts";
-import type { Timeline, TimelineEvent, TimelineStatus } from "../../../shared/timelines.ts";
+import {
+  DEFAULT_IDLE_DAYS,
+  isStalled,
+  type Timeline,
+  type TimelineEvent,
+  type TimelineStatus,
+} from "../../../shared/timelines.ts";
+import { refreshTimelines } from "../../components/TimelineScope.tsx";
 import { SelectField, Tip, link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
@@ -99,18 +106,30 @@ export function TrackerTimelines() {
   const selected = slug ? (data.timelines.find((t) => t.slug === slug) ?? null) : null;
   const byId = useMemo(() => new Map(data.timelines.map((t) => [t.id, t])), [data.timelines]);
 
+  // Stalled: open, and no push for the account's idle period. The data's time
+  // stands in for now, so a refresh moves it on.
+  const now = useMemo(() => Date.now(), [data]);
   const graph = useMemo(
-    () => layoutGraph(data, { selected: selected?.id ?? null, filters, expanded, groupBy }),
-    [data, selected, filters, expanded, groupBy],
+    () =>
+      layoutGraph(data, {
+        selected: selected?.id ?? null,
+        filters,
+        expanded,
+        groupBy,
+        now,
+        idleDays: data.idleDays,
+      }),
+    [data, selected, filters, expanded, groupBy, now],
   );
   const counts = useMemo(() => {
-    const c = { open: 0, landed: 0, abandoned: 0, experimental: 0 };
+    const c = { open: 0, landed: 0, abandoned: 0, experimental: 0, stalled: 0 };
     for (const t of data.timelines) {
       c[lineState(t, data.events)]++;
       if (t.experimental) c.experimental++;
+      if (isStalled(t, now, data.idleDays)) c.stalled++;
     }
     return c;
-  }, [data]);
+  }, [data, now]);
 
   /**
    * The page with a timeline selected (null: main), keeping other parameters.
@@ -239,6 +258,16 @@ export function TrackerTimelines() {
                 onChange={(event) => setFilters({ ...filters, search: event.target.value })}
               />
             </label>
+            <button
+              type="button"
+              className="mk-chip"
+              aria-pressed={filters.stalled}
+              aria-describedby="timelines-stalled-help"
+              onClick={() => setFilters({ ...filters, stalled: !filters.stalled })}
+            >
+              Stalled
+              <span className="font-mono text-micro tabular-nums opacity-70">{counts.stalled}</span>
+            </button>
             <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Show">
               {(["open", "landed", "abandoned", "experimental"] as const).map((key) => (
                 <button
@@ -255,8 +284,15 @@ export function TrackerTimelines() {
                 </button>
               ))}
             </div>
-            <p className="m-0 text-micro text-ink-faint" aria-live="polite">
+            <p
+              id="timelines-stalled-help"
+              className="m-0 text-micro text-ink-faint"
+              aria-live="polite"
+            >
               {[
+                filters.stalled
+                  ? `Stalled: no push for ${data.idleDays ?? DEFAULT_IDLE_DAYS} days. Experimental timelines are left out; stalling is expected of them.`
+                  : "",
                 graph.overflow
                   ? `The ${graph.overflow} least recently active are listed under Not drawn.`
                   : "",
@@ -351,6 +387,10 @@ export function TrackerTimelines() {
                     byId={byId}
                     name={name}
                     clear={select(null)}
+                    onChange={() => {
+                      refreshTimelines(owner);
+                      void revalidator.revalidate();
+                    }}
                   />
                 ) : (
                   <MainSummary data={data} counts={counts} />
@@ -438,15 +478,16 @@ function MainSummary({
   counts,
 }: {
   data: TimelineGraphData;
-  counts: Record<LineState | "experimental", number>;
+  counts: Record<LineState | "experimental" | "stalled", number>;
 }) {
   return (
     <>
       <h2 className="m-0 font-mono text-title-lg">main</h2>
       <p className="mt-1 mb-0 text-body-sm text-ink-muted">
         {counts.open} open, {counts.landed} landed and {counts.abandoned} abandoned timelines in{" "}
-        {data.owner.displayName}'s tracker. Select one to draw it with the timelines it came from
-        and everything that depends on it.
+        {data.owner.displayName}'s tracker
+        {counts.stalled ? `, ${counts.stalled} of them stalled` : ""}. Select one to draw it with
+        the timelines it came from and everything that depends on it.
       </p>
       <dl className="mt-3 mb-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-body-sm">
         <Legend shape={<span className="size-2 rounded-full bg-ink" />} label="Active" />
@@ -553,12 +594,15 @@ function TimelineDetails({
   byId,
   name,
   clear,
+  onChange,
 }: {
   timeline: Timeline;
   data: TimelineGraphData;
   byId: Map<string, Timeline>;
   name: (timeline: Timeline | null) => ReactNode;
   clear: string;
+  /** After the timeline itself changed (its experimental flag). */
+  onChange: () => void;
 }) {
   const events = data.events.filter((e) => involves(e, timeline.id)).reverse();
   const abandoned = events.find((e) => e.kind === "abandon");
@@ -608,6 +652,10 @@ function TimelineDetails({
           )}
         </dd>
       </dl>
+
+      {timeline.status !== "landed" && timeline.status !== "abandoned" && (
+        <ExperimentalSwitch owner={data.owner.slug} timeline={timeline} onChange={onChange} />
+      )}
 
       <h3 className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">Code</h3>
       <ul className="m-0 list-none p-0">
@@ -689,5 +737,77 @@ function TimelineDetails({
         </ol>
       )}
     </>
+  );
+}
+
+/**
+ * The experimental flag (CORE-86): a marker for a timeline not expected to
+ * land, which stalled views leave out. It restricts nothing; any writer sets
+ * or clears it, and its work merges anywhere.
+ */
+function ExperimentalSwitch({
+  owner,
+  timeline,
+  onChange,
+}: {
+  owner: string;
+  timeline: Timeline;
+  onChange: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const id = `experimental-${timeline.id}`;
+  const flag = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api<Timeline>(
+        `/tracker/${encodeURIComponent(owner)}/timelines/${encodeURIComponent(timeline.slug)}`,
+        {
+          method: "PATCH",
+          json: { experimental: !timeline.experimental, expectedVersion: timeline.version },
+        },
+      );
+      onChange();
+    } catch (failure) {
+      setError(
+        failure instanceof ApiError && failure.code === "version_conflict"
+          ? "Someone changed this timeline since the page loaded. Refresh and try again."
+          : failure instanceof Error
+            ? failure.message
+            : String(failure),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mt-3 flex items-start gap-3">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={timeline.experimental}
+        aria-labelledby={`${id}-label`}
+        aria-describedby={`${id}-help`}
+        aria-busy={busy || undefined}
+        disabled={busy}
+        className="mk-switch mt-0.5 shrink-0"
+        onClick={() => void flag()}
+      />
+      <div className="min-w-0">
+        <div id={`${id}-label`} className="text-body-sm font-semibold text-ink">
+          Experimental
+        </div>
+        <p id={`${id}-help`} className="m-0 text-body-sm text-ink-faint">
+          Not expected to land, so stalled views leave it out. Its work still merges into any
+          timeline, and it can still land.
+        </p>
+        {error && (
+          <p className="mk-error m-0 mt-1" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
+    </div>
   );
 }

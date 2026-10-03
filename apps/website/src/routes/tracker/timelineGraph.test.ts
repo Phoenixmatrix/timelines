@@ -219,6 +219,32 @@ describe("with main selected", () => {
     });
     expect(searched.lanes.map((l) => l.id)).toEqual(["main", "tl_search"]);
   });
+
+  test("the stalled view leaves experimental timelines out (CORE-86)", () => {
+    const data = history();
+    data.timelines.push(
+      timeline("quiet-spike", { experimental: true, status: "idle" }),
+      timeline("quiet", { status: "idle" }),
+    );
+    const now = Date.parse(at(0)) + 10 * 24 * 60 * 60 * 1000;
+    const stalled = layoutGraph(data, {
+      selected: null,
+      now,
+      filters: { ...DEFAULT_FILTERS, stalled: true },
+    });
+    const drawn = stalled.lanes.map((l) => l.id).filter((id) => id !== "main");
+    // Ten days on, every open timeline that will land has stalled; experiments haven't.
+    expect(drawn).toContain("tl_quiet");
+    expect(drawn).toContain("tl_search");
+    expect(drawn).not.toContain("tl_quiet-spike");
+    expect(drawn).not.toContain("tl_spike");
+    // Grouped by status (ui landed, so it folds onto main), quiet experiments sit apart.
+    const groups = layoutGraph(data, { selected: null, now, laneLimit: 0 }).groups;
+    expect(groups.map((g) => [g.label, g.timelines.map((t) => t.slug).sort()])).toEqual([
+      ["Stalled", ["quiet", "search", "ui-dark"]],
+      ["Experimental, quiet", ["quiet-spike"]],
+    ]);
+  });
 });
 
 describe("with a timeline selected", () => {

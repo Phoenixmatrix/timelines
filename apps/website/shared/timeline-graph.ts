@@ -27,4 +27,6 @@ export interface TimelineGraphData {
   workspaces: Record<string, { id: string; slug: string; name: string }[]>;
   /** Each timeline's issues (CORE-74), by timeline id; absent from older servers. */
   issues?: Record<string, TimelineIssue[]>;
+  /** Days without a push before an open timeline has stalled (the account's idle period). */
+  idleDays?: number;
 }

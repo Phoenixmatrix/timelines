@@ -7,6 +7,7 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
 import type { TimelineActor, TimelineGraphData } from "../../shared/timeline-graph.ts";
+import { previewSettings } from "../deployments/settings.ts";
 import { accessible, authorize } from "../tracker/api.ts";
 import { TrackerError } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
@@ -25,9 +26,10 @@ timelineGraph.onError((error, c) => {
 timelineGraph.get("/", async (c) => {
   const access = await authorize(c);
   const tracker = trackerObject(c.env, access.owner.id);
-  const [graph, trackers] = await Promise.all([
+  const [graph, trackers, settings] = await Promise.all([
     tracker.timelineGraph(EVENT_LIMIT),
     accessible(c.env.DB, c.get("actor")!),
+    previewSettings(c.env.DB, access.owner.id),
   ]);
   if (!graph.ok) throw new TrackerError(graph.status, graph.code, graph.error);
   const { timelines, events, truncated, issues } = graph.value;
@@ -57,5 +59,6 @@ timelineGraph.get("/", async (c) => {
     actors,
     workspaces,
     issues,
+    idleDays: settings.idleDays,
   });
 });

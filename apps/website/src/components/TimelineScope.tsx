@@ -10,7 +10,7 @@ import { CheckIcon, GitForkIcon, MagnifyingGlassIcon } from "@phosphor-icons/rea
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Link, useLocation, useRouteLoaderData } from "react-router";
 import type { RepoDetail } from "../../shared/api.ts";
-import type { Timeline, TimelineList } from "../../shared/timelines.ts";
+import { lastPush, type Timeline, type TimelineList } from "../../shared/timelines.ts";
 import type { TrackerList } from "../../shared/tracker.ts";
 import { api } from "../lib/api.ts";
 import { timeAgo } from "../lib/format.ts";
@@ -147,10 +147,6 @@ function useScope(open = false): Scope {
 
 const ENDED = new Set(["landed", "abandoned"]);
 
-function lastActive(t: Timeline): string {
-  return t.pushedAt && t.pushedAt > t.createdAt ? t.pushedAt : t.createdAt;
-}
-
 // ---- switcher ----------------------------------------------------------------
 
 function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
@@ -167,7 +163,7 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
     const words = search.toLowerCase().split(/\s+/).filter(Boolean);
     const matching = (scope.timelines ?? [])
       .filter((t) => words.every((w) => `${t.name} ${t.slug}`.toLowerCase().includes(w)))
-      .sort((a, b) => lastActive(b).localeCompare(lastActive(a)));
+      .sort((a, b) => lastPush(b).localeCompare(lastPush(a)));
     return {
       words,
       open: matching.filter((t) => !ENDED.has(t.status)),
@@ -243,7 +239,7 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
                 <span className="mk-chip mk-chip--tag shrink-0">Experimental</span>
               )}
             </>,
-            <Meta>{t.status === "active" ? timeAgo(lastActive(t)) : STATUS_LABEL[t.status]}</Meta>,
+            <Meta>{t.status === "active" ? timeAgo(lastPush(t)) : STATUS_LABEL[t.status]}</Meta>,
           ),
         )}
       </ul>

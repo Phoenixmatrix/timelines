@@ -11,7 +11,12 @@
 // else is listed in groups beside the graph.
 
 import type { TimelineActor, TimelineGraphData } from "../../../shared/timeline-graph.ts";
-import type { Timeline, TimelineEvent, TimelineStatus } from "../../../shared/timelines.ts";
+import {
+  isStalled,
+  type Timeline,
+  type TimelineEvent,
+  type TimelineStatus,
+} from "../../../shared/timelines.ts";
 
 /** Where a timeline stands, for drawing: still going, landed on main, or abandoned. */
 export type LineState = "open" | "landed" | "abandoned";
@@ -24,6 +29,11 @@ export interface GraphFilters {
   abandoned: boolean;
   /** Timelines flagged experimental; off hides them unless selected. */
   experimental: boolean;
+  /**
+   * Only timelines that have stalled (open, no push for the idle period).
+   * Experimental ones never have: stalling is expected of them.
+   */
+  stalled: boolean;
   /** Words matched against name and slug. */
   search: string;
 }
@@ -33,6 +43,7 @@ export const DEFAULT_FILTERS: GraphFilters = {
   landed: true,
   abandoned: false,
   experimental: true,
+  stalled: false,
   search: "",
 };
 
@@ -47,6 +58,9 @@ export interface GraphOptions {
   expanded?: ReadonlySet<string>;
   groupBy?: GroupBy;
   laneLimit?: number;
+  /** For stalled timelines: the time, and the account's idle period in days. */
+  now?: number;
+  idleDays?: number;
 }
 
 export interface Lane {
@@ -155,12 +169,14 @@ export function involves(event: TimelineEvent, id: string): boolean {
   return false;
 }
 
-const STATUS_ORDER: TimelineStatus[] = [
+const STATUS_ORDER: (TimelineStatus | "stalled" | "experimental")[] = [
   "waiting",
   "landing",
   "partly_landed",
   "active",
+  "stalled",
   "idle",
+  "experimental",
   "landed",
   "abandoned",
 ];
@@ -180,11 +196,17 @@ function matches(timeline: Timeline, words: string[]): boolean {
   return words.every((word) => hay.includes(word));
 }
 
-/** Group timelines; a timeline in several workspaces is listed under each. */
+/**
+ * Group timelines; a timeline in several workspaces is listed under each. By
+ * status, stalled work gets a group of its own and quiet experimental
+ * timelines one apart from it: stalling is expected of them.
+ */
 export function groupTimelines(
   timelines: Timeline[],
   by: GroupBy,
   data: Pick<TimelineGraphData, "actors" | "workspaces">,
+  /** When given, stalled timelines are grouped apart (by status). */
+  stalled?: { now: number; idleDays?: number },
 ): Group[] {
   const groups = new Map<string, Group>();
   const add = (key: string, label: string, timeline: Timeline) => {
@@ -194,8 +216,13 @@ export function groupTimelines(
   };
   const nameOf = (id: string) => data.actors[id]?.name ?? "Someone outside the tracker";
   for (const timeline of timelines) {
-    if (by === "status") add(timeline.status, STATUS_LABEL[timeline.status], timeline);
-    else if (by === "workspace") {
+    if (by === "status") {
+      const quiet =
+        !!stalled && isStalled({ ...timeline, experimental: false }, stalled.now, stalled.idleDays);
+      if (quiet && timeline.experimental) add("experimental", "Experimental, quiet", timeline);
+      else if (quiet) add("stalled", "Stalled", timeline);
+      else add(timeline.status, STATUS_LABEL[timeline.status], timeline);
+    } else if (by === "workspace") {
       const seen = new Map<string, string>();
       for (const repo of timeline.repos)
         for (const w of data.workspaces[repo.id] ?? []) seen.set(w.id, w.name);
@@ -242,9 +269,13 @@ export function layoutGraph(
   const selected = options.selected ? (byId.get(options.selected) ?? null) : null;
 
   const words = filters.search.toLowerCase().split(/\s+/).filter(Boolean);
+  const now = options.now ?? Date.now();
   const passes = (t: Timeline) =>
     t === selected ||
-    (filters[state.get(t.id)!] && (filters.experimental || !t.experimental) && matches(t, words));
+    (filters[state.get(t.id)!] &&
+      (filters.experimental || !t.experimental) &&
+      (!filters.stalled || isStalled(t, now, options.idleDays)) &&
+      matches(t, words));
   const visible = timelines.filter(passes);
 
   const ancestors = (t: Timeline): Timeline[] => {
@@ -544,7 +575,12 @@ export function layoutGraph(
     rows,
     min: Math.min(...columns),
     max: Math.max(...columns),
-    groups: groupTimelines(grouped, options.groupBy ?? "status", data),
+    groups: groupTimelines(
+      grouped,
+      options.groupBy ?? "status",
+      data,
+      options.now === undefined ? undefined : { now, idleDays: options.idleDays },
+    ),
     filtered: timelines.length - visible.length,
     overflow,
   };

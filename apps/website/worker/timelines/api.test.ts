@@ -246,6 +246,44 @@ describe("changing and abandoning", () => {
     expect(flagged.body).toMatchObject({ experimental: true, version: 2 });
     const bad = await t.call("cat", "PATCH", "/search", { policy: "auto" });
     expect(bad.status).toBe(400);
+    const cleared = await t.call("bot", "PATCH", "/search", {
+      experimental: false,
+      expectedVersion: 2,
+    });
+    expect(cleared.body).toMatchObject({ experimental: false, version: 3 });
+    const stale = await t.call("cat", "PATCH", "/search", {
+      experimental: true,
+      expectedVersion: 2,
+    });
+    expect(stale.status).toBe(409);
+  });
+
+  test("stalled lists leave experimental timelines out", async () => {
+    const t = await setup();
+    await t.call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    await t.call("ben", "POST", "", { slug: "ranking", repos: ["orbit/app"], experimental: true });
+    const now = Date.now();
+    const stalled = async () => (await t.call("cat", "GET", "?stalled=true")).body as TimelineList;
+    // Fresh forks haven't stalled.
+    expect((await stalled()).timelines).toEqual([]);
+    // Eight quiet days later, past the default seven, only the one expected to land has.
+    const later = vi.spyOn(Date, "now").mockReturnValue(now + 8 * 24 * 60 * 60 * 1000);
+    try {
+      const list = await stalled();
+      expect(list.timelines.map((timeline) => timeline.slug)).toEqual(["search"]);
+      expect(list.idleDays).toBe(7);
+      // Every timeline is still listed without the filter, and unflagging brings it in.
+      const all = (await t.call("cat", "GET", "")).body as TimelineList;
+      expect(all.timelines.map((timeline) => timeline.slug).sort()).toEqual(["ranking", "search"]);
+      await t.call("cat", "PATCH", "/ranking", { experimental: false });
+      expect((await stalled()).timelines.map((timeline) => timeline.slug).sort()).toEqual([
+        "ranking",
+        "search",
+      ]);
+    } finally {
+      later.mockRestore();
+    }
+    expect((await t.call("cat", "GET", "?stalled=maybe")).status).toBe(400);
   });
 
   test("only the accountable person or the starting agent abandons; history stays", async () => {

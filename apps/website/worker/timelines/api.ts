@@ -1,5 +1,7 @@
 // Timelines, under a tracker account (/api/tracker/:owner/timelines):
-//   GET    /                  every timeline, newest first (?status= to filter)
+//   GET    /                  every timeline, newest first (?status= to filter;
+//                             ?stalled=true for open ones without a push for the
+//                             account's idle period, experimental ones left out)
 //   POST   /                  fork one from main or another timeline: a bookmark
 //                             `timeline/<slug>` in each repository, then the record
 //   GET    /:slug             the timeline and its events (?after=&limit= to page)
@@ -23,6 +25,7 @@ import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
 import {
   TIMELINE_POLICIES,
+  isStalled,
   timelineBookmark,
   type BookmarkResult,
   type Timeline,
@@ -33,6 +36,7 @@ import {
   type CheckpointList,
   type CheckpointView,
 } from "../../shared/timelines.ts";
+import { previewSettings } from "../deployments/settings.ts";
 import { authorize } from "../tracker/api.ts";
 import type { TrackerReply } from "../tracker/object.ts";
 import { TrackerError, fail, text } from "../tracker/store.ts";
@@ -110,12 +114,22 @@ async function writeEach(
 timelines.get("/", async (c) => {
   const access = await authorize(c, false);
   const status = c.req.query("status");
+  const stalled = c.req.query("stalled");
+  if (stalled !== undefined && stalled !== "true" && stalled !== "false")
+    fail("invalid_input", "stalled must be true or false.");
   const list = unwrap(
     await trackerObject(c.env, access.owner.id).listTimelines(
       status === undefined ? undefined : timelineStatus(status),
     ),
   );
-  return c.json<TimelineList>({ timelines: list });
+  if (stalled !== "true") return c.json<TimelineList>({ timelines: list });
+  // Stalling is expected of experimental timelines: isStalled leaves them out.
+  const { idleDays } = await previewSettings(c.env.DB, access.owner.id);
+  const now = Date.now();
+  return c.json<TimelineList>({
+    timelines: list.filter((timeline) => isStalled(timeline, now, idleDays)),
+    idleDays,
+  });
 });
 
 timelines.post("/", async (c) => {

@@ -489,6 +489,22 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     };
     assert.equal(shown.events[0]?.kind, "fork");
 
+    // CORE-86: any writer flags it experimental and clears the flag; stalled
+    // lists leave experimental timelines out (and a fresh one hasn't stalled).
+    const flagged = JSON.parse(
+      await gm(["timeline", "flag", "--experimental", "--owner", owner], "marco", clone),
+    ) as { timeline: { experimental: boolean } };
+    assert.equal(flagged.timeline.experimental, true);
+    const stalled = JSON.parse(
+      await gm(["timeline", "list", "--stalled", "--owner", owner], "jun", clone),
+    ) as { timelines: { slug: string }[]; idleDays: number };
+    assert(!stalled.timelines.some((t) => t.slug === slug), "Experimental never stalls");
+    assert(stalled.idleDays > 0);
+    const cleared = JSON.parse(
+      await gm(["timeline", "update", "--no-experimental", "--owner", owner], "jun", clone),
+    ) as { timeline: { experimental: boolean } };
+    assert.equal(cleared.timeline.experimental, false);
+
     // Only its accountable person (or the agent that started it) abandons it.
     await gm(["timeline", "abandon", "--owner", owner], "marco", clone, /"forbidden"/);
     const abandoned = JSON.parse(
@@ -1543,12 +1559,28 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       assert.equal(new URL(page.url()).searchParams.get("timeline"), null);
       await expect(banner).toContainText(name);
 
+      // CORE-86: the graph's inspector flags it experimental, which the banner shows,
+      // and the Stalled view leaves it out.
+      await page.goto(`/tracker/${fixtures.tracker.owner}/timelines?tl=${slug}`);
+      const flag = page.getByRole("switch", { name: "Experimental" });
+      await expect(flag).toHaveAttribute("aria-checked", "false");
+      await flag.click();
+      await expect(flag).toHaveAttribute("aria-checked", "true");
+      await expect(banner.getByText("Experimental", { exact: true })).toBeVisible();
+      const listed = await json<{ timelines: { slug: string; experimental: boolean }[] }>(
+        timelines,
+        ownerToken,
+      );
+      assert.equal(listed.timelines.find((t) => t.slug === slug)?.experimental, true);
+      await page.getByRole("button", { name: /^Stalled/ }).click();
+      await expect(page.getByText(/Experimental timelines are left out/)).toBeVisible();
+
       await banner.getByRole("link", { name: "Back to main" }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === "main");
       await expect(banner).toHaveCount(0);
       await page.screenshot({ path: join(ctx.artifacts, "browser-timeline-switcher.png") });
       await context.tracing.stop();
-      record({ timeline: slug, scoped: ["code", "ci", "knowledge"] });
+      record({ timeline: slug, scoped: ["code", "ci", "knowledge", "timelines"], flagged: true });
     } catch (error) {
       await page
         .screenshot({ path: join(ctx.artifacts, "browser-timeline-failure.png"), fullPage: true })
