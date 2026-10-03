@@ -1181,6 +1181,28 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   Once a timeline's overlay has ended its sets are read-only: none is queued,
   and one being written stops as `ended`, keeping what it wrote.
 
+**Atlas projections** (`worker/atlas/projection.ts`, CORE-158). After
+`graph-final`, each Knowledge build materializes the graph as an immutable,
+numbered snapshot: entity and edge rows are valid for a range of snapshots, so
+a snapshot writes only what changed, and `atlas_current` moves to it in one
+statement once it's complete. Interrupted snapshots never become current and
+are rolled back before the next.
+
+**Capability grouping** (`worker/atlas/grouping.ts`, CORE-163,
+`GROUPING_VERSION`). Before the entity batches, the build groups analyzed files
+into capabilities from non-path evidence only: direct imports (either
+direction) and shared canonical concepts weighted by rarity, so a concept
+nearly every file mentions counts for nothing. Each file keeps at most 32
+candidate neighbors, found through import edges and concept postings (common
+concepts link through a bounded ring), never by comparing all pairs. Two
+levels of deterministic Louvain give areas and capabilities, so identical
+inputs give identical groups. Every file has one primary placement with the
+links that justify it (`membership.rationale`) and cross-cutting references
+that never count twice; files without evidence, or not analyzed yet, go to the
+**Unclassified** group. Directory components remain, under their folders, as
+inputs. Interim capability names come from their strongest shared concepts
+(`nameSource: "concepts"`); summaries come later (CORE-164).
+
 **Atlas paid-synthesis budgets** (`worker/knowledge/budget.ts`, CORE-162).
 Model calls the Semantic Code Atlas adds go through this module; upstream
 Knowledge inference, release notes and the assistant don't, so their spend

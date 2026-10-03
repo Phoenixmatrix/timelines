@@ -10,6 +10,7 @@ import {
   ENTITY_BATCH,
   entityAt,
   failProjection,
+  groupRepoCapabilities,
   GROUPS,
   projectEdges,
   projectEntities,
@@ -333,5 +334,121 @@ describe("Atlas projections", () => {
       "atlas_edges",
     ])
       expect(rows(sqlite, table)).toBe(0);
+  });
+
+  test("capabilities group files across directories, with their evidence", async () => {
+    const { sqlite, db } = setup();
+    node(sqlite, "repo", "repository", "shop", null);
+    for (const dir of ["src", "src/billing", "web", "ops", "misc"])
+      node(sqlite, `dir:${dir}`, "directory", dir, dir);
+    node(sqlite, "component:src/billing", "component", "Billing", null, "", { dir: "src/billing" });
+    node(sqlite, "component:web", "component", "Web", null, "", { dir: "web" });
+    node(sqlite, "component:ops", "component", "Ops", null, "", { dir: "ops" });
+    const file = (path: string) =>
+      node(sqlite, `file:${path}`, "file", path.split("/").pop()!, path, "", { blob: path });
+    for (const path of [
+      "src/billing/charge.ts",
+      "src/billing/invoice.ts",
+      "web/checkout.ts",
+      "web/cart.ts",
+      "ops/deploy.ts",
+      "ops/rollback.ts",
+      "misc/notes.ts",
+    ])
+      file(path);
+    node(sqlite, "file:web/pending.ts", "file", "pending.ts", "web/pending.ts", "", {
+      pending: true,
+    });
+    for (const c of ["payments", "cart", "deployment", "code"])
+      node(sqlite, `concept:${c}`, "concept", c[0]!.toUpperCase() + c.slice(1), null);
+    edge(sqlite, "component:src/billing", "file:src/billing/charge.ts", "contains");
+    edge(sqlite, "component:src/billing", "file:src/billing/invoice.ts", "contains");
+    edge(sqlite, "component:web", "file:web/checkout.ts", "contains");
+    edge(sqlite, "component:web", "file:web/cart.ts", "contains");
+    edge(sqlite, "component:ops", "file:ops/deploy.ts", "contains");
+    edge(sqlite, "component:ops", "file:ops/rollback.ts", "contains");
+    edge(sqlite, "file:web/checkout.ts", "file:src/billing/charge.ts", "imports");
+    edge(sqlite, "file:src/billing/invoice.ts", "file:src/billing/charge.ts", "imports");
+    edge(sqlite, "file:web/cart.ts", "file:web/checkout.ts", "imports");
+    edge(sqlite, "file:ops/rollback.ts", "file:ops/deploy.ts", "imports");
+    for (const [path, concepts] of [
+      ["src/billing/charge.ts", ["payments", "code"]],
+      ["src/billing/invoice.ts", ["payments", "code"]],
+      ["web/checkout.ts", ["payments", "cart", "code"]],
+      ["web/cart.ts", ["cart", "code"]],
+      ["ops/deploy.ts", ["deployment", "code"]],
+      ["ops/rollback.ts", ["deployment", "code"]],
+      ["misc/notes.ts", ["code"]],
+    ] as const)
+      for (const c of concepts) edge(sqlite, `file:${path}`, `concept:${c}`, "mentions");
+
+    const build = async (commit: string) => {
+      const { snapshotId, seq } = await beginRepoProjection(db, "r1", [
+        { repoId: "r1", commit, buildId: commit },
+      ]);
+      const stats = await groupRepoCapabilities(db, "r1", snapshotId, seq);
+      let after: string | null = null;
+      do ({ next: after } = await projectEntities(db, "r1", snapshotId, seq, after, 4));
+      while (after);
+      let cursor: EdgeCursor = null;
+      do ({ next: cursor } = await projectEdges(db, "r1", snapshotId, seq, cursor, 5));
+      while (cursor);
+      await publishProjection(db, scope, snapshotId, seq);
+      return { seq, stats };
+    };
+    const { seq, stats } = await build("c1");
+    expect(stats).toMatchObject({ capabilities: 2, unclassified: 1, files: 7 });
+    expect(
+      sqlite.prepare("SELECT grouping_version FROM atlas_snapshots WHERE seq = ?").get(seq),
+    ).toEqual({
+      grouping_version: 1,
+    });
+
+    const top = await childrenAt(db, scope, seq, "repo", null, 100);
+    const caps = top.entities.filter((e) => e.kind === "capability");
+    expect(caps).toHaveLength(2);
+    // Components are directory-shaped inputs, now under their folders.
+    expect(top.entities.some((e) => e.kind === "component")).toBe(false);
+    expect((await entityAt(db, scope, seq, "component:web"))?.parentId).toBe("dir:web");
+
+    const placed = async (path: string) => (await entityAt(db, scope, seq, `file:${path}`))!;
+    const charge = await placed("src/billing/charge.ts");
+    const checkout = await placed("web/checkout.ts");
+    const capOf = async (path: string) =>
+      ((await placed(path)).data.membership as { capability: string | null }).capability;
+    // Billing spans src/billing and web, apart from ops.
+    const billingId = await capOf("src/billing/charge.ts");
+    expect(await capOf("web/checkout.ts")).toBe(billingId);
+    expect(await capOf("web/cart.ts")).toBe(billingId);
+    expect(await capOf("ops/deploy.ts")).not.toBe(billingId);
+    // Files sit under their area (or the capability when it has one area).
+    const area = await entityAt(db, scope, seq, charge.parentId!);
+    expect(area?.kind === "area" ? area.parentId : charge.parentId).toBe(billingId);
+    const billing = caps.find((c) => c.id === billingId)!;
+    expect(billing.name).toMatch(/Payments|Cart/);
+    expect(billing.data).toMatchObject({
+      counts: { files: 4 },
+      nameSource: "concepts",
+      grouping: { version: 1 },
+    });
+    expect((checkout.data.membership as { rationale: unknown[] }).rationale.length).toBeGreaterThan(
+      0,
+    );
+    // No evidence or not analyzed yet: unclassified, never a capability.
+    expect((await placed("misc/notes.ts")).parentId).toBe(GROUPS.unclassified);
+    expect((await placed("misc/notes.ts")).data.membership).toMatchObject({
+      unclassified: "no-evidence",
+    });
+    expect((await placed("web/pending.ts")).parentId).toBe(GROUPS.unclassified);
+    expect((await entityAt(db, scope, seq, GROUPS.unclassified))?.data).toMatchObject({
+      members: 2,
+    });
+    expect(rows(sqlite, "atlas_assignments")).toBe(0);
+
+    // Unchanged inputs: the same capabilities, and nothing rewritten.
+    const before = rows(sqlite, "atlas_entities");
+    const second = await build("c2");
+    expect(rows(sqlite, "atlas_entities")).toBe(before);
+    expect((await entityAt(db, scope, second.seq, billing.id))?.name).toBe(billing.name);
   });
 });

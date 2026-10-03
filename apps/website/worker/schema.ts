@@ -351,6 +351,13 @@ export interface Database {
     published_at: string | null;
     expires_at: string | null;
   };
+  atlas_assignments: {
+    scope: string;
+    seq: number;
+    entity_id: string;
+    parent_id: string;
+    data: string;
+  };
   atlas_current: {
     scope: string;
     snapshot_id: string;

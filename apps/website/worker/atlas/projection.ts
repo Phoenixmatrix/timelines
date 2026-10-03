@@ -17,9 +17,10 @@
 
 import { batch, db, nowIso } from "../schema.ts";
 import { sha256 } from "../knowledge/util.ts";
+import { groupCapabilities, GROUPING_VERSION, type Grouping } from "./grouping.ts";
 
 /** Bump when the projected shape changes: snapshots record which one built them. */
-export const PROJECTION_VERSION = 1;
+export const PROJECTION_VERSION = 2;
 export const ENTITY_BATCH = 10_000;
 export const EDGE_BATCH = 50_000;
 /** Rows per write statement: one JSON parameter each, well inside D1's limits. */
@@ -41,6 +42,13 @@ const GROUP_NAMES: Record<string, string> = {
 };
 
 export const repoScope = (repoId: string) => `repo:${repoId}`;
+
+/**
+ * Entities written by passes other than the graph batches (structural groups,
+ * capabilities, areas). Graph batches never close them; each pass owns its own.
+ */
+const isSynthetic = (id: string) =>
+  id.startsWith("group:") || id.startsWith("cap:") || id.startsWith("area:");
 
 export interface VectorEntry {
   repoId: string;
@@ -102,6 +110,7 @@ async function rollBackUnpublished(d1: D1Database, scope: string) {
     raw("UPDATE atlas_entities SET to_seq = NULL WHERE scope = ? AND to_seq > ?", scope, published),
     raw("DELETE FROM atlas_edges WHERE scope = ? AND from_seq > ?", scope, published),
     raw("UPDATE atlas_edges SET to_seq = NULL WHERE scope = ? AND to_seq > ?", scope, published),
+    raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq > ?", scope, published),
     raw(
       "UPDATE atlas_snapshots SET status = 'failed', error = coalesce(error, 'Superseded before publication.') WHERE scope = ? AND seq > ? AND status = 'building'",
       scope,
@@ -194,9 +203,10 @@ export async function publishProjection(
       summary: "",
       data: { members: byGroup.get(id) ?? 0, structural: true },
     }));
+  const groupIds = new Set<string>(Object.values(GROUPS));
   const groupBytes = await writeEntities(d1, scope, seq, groups, ["group:", "group:~"], {
     final: false,
-    only: new Set(Object.values(GROUPS)),
+    owns: (id) => groupIds.has(id),
   });
 
   const totals = await d1
@@ -218,6 +228,7 @@ export async function publishProjection(
       groupBytes,
       snapshotId,
     ),
+    raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq = ?", scope, seq),
     raw(
       `INSERT INTO atlas_current (scope, snapshot_id, seq, published_at)
        SELECT scope, id, seq, ? FROM atlas_snapshots WHERE id = ? AND status = 'published'
@@ -230,27 +241,39 @@ export async function publishProjection(
 
 // ---- entities ----------------------------------------------------------------
 
+/** What placing an entity needs beyond itself. */
+export interface Placement {
+  componentOf: Map<string, string>;
+  broaderOf: Map<string, string>;
+  /** File placements from capability grouping, when it ran for this snapshot. */
+  assigned: Map<string, string> | null;
+}
+
 /** Where an entity sits in the primary tree. Each source unit has exactly one parent. */
 export function parentOf(
-  id: string,
-  kind: string,
-  path: string | null,
-  componentOf: Map<string, string>,
-  broaderOf: Map<string, string>,
+  node: { id: string; kind: string; path: string | null; data: Record<string, unknown> },
+  placement: Placement,
 ): string | null {
+  const { id, kind, path } = node;
   switch (kind) {
     case "repository":
       return null;
-    case "component":
-      return "repo";
+    case "component": {
+      // With capabilities, components are directory-shaped inputs: they live
+      // with their folder, not at the top.
+      if (!placement.assigned) return "repo";
+      const dir = typeof node.data.dir === "string" ? node.data.dir : "";
+      return dir && dir !== "." ? `dir:${dir}` : GROUPS.folders;
+    }
     case "file":
-      return componentOf.get(id) ?? GROUPS.unclassified;
+      if (placement.assigned) return placement.assigned.get(id) ?? GROUPS.unclassified;
+      return placement.componentOf.get(id) ?? GROUPS.unclassified;
     case "symbol": {
       const hash = id.lastIndexOf("#");
       return hash > 4 ? `file:${id.slice(4, hash)}` : GROUPS.unclassified;
     }
     case "concept":
-      return broaderOf.get(id) ?? GROUPS.concepts;
+      return placement.broaderOf.get(id) ?? GROUPS.concepts;
     case "package":
       return GROUPS.dependencies;
     case "directory": {
@@ -280,7 +303,7 @@ async function writeEntities(
   seq: number,
   entities: AtlasEntity[],
   range: [string | null, string | null],
-  options: { final: boolean; only?: Set<string> },
+  options: { final: boolean; owns?: (id: string) => boolean },
 ): Promise<number> {
   const [after, upTo] = range;
   const open = await d1
@@ -321,7 +344,7 @@ async function writeEntities(
     if (wanted.has(id)) continue;
     // Graph batches never close groups (written at publication), and the
     // group pass touches nothing else.
-    if (options.only ? !options.only.has(id) : id.startsWith("group:")) continue;
+    if (options.owns ? !options.owns(id) : isSynthetic(id)) continue;
     close.push(id);
   }
 
@@ -404,6 +427,26 @@ export async function projectEntities(
   const symbols = new Map<string, number>();
   const componentFiles = new Map<string, number>();
   const mentions = new Map<string, number>();
+  const grouped = await db(d1)
+    .selectFrom("atlas_snapshots")
+    .select("grouping_version")
+    .where("id", "=", snapshotId)
+    .executeTakeFirst();
+  const assigned = grouped?.grouping_version ? new Map<string, string>() : null;
+  const membership = new Map<string, unknown>();
+  if (assigned && first !== null && last !== null) {
+    const rows = await d1
+      .prepare(
+        `SELECT entity_id, parent_id, data FROM atlas_assignments
+         WHERE scope = ? AND seq = ? AND entity_id >= ? AND entity_id <= ?`,
+      )
+      .bind(scope, seq, first, last)
+      .all<{ entity_id: string; parent_id: string; data: string }>();
+    for (const row of rows.results) {
+      assigned.set(row.entity_id, row.parent_id);
+      membership.set(row.entity_id, JSON.parse(row.data));
+    }
+  }
   if (first !== null && last !== null) {
     const [containers, broader, defines, members, mentioned] = await Promise.all([
       d1
@@ -463,18 +506,20 @@ export async function projectEntities(
     return {
       id: node.id,
       kind: node.kind,
-      parentId: parentOf(node.id, node.kind, node.path, componentOf, broaderOf),
+      parentId: parentOf(
+        { id: node.id, kind: node.kind, path: node.path, data },
+        { componentOf, broaderOf, assigned },
+      ),
       name: node.name,
       path: node.path,
       summary: node.summary,
-      data: { ...data, counts },
+      data: membership.has(node.id)
+        ? { ...data, counts, membership: membership.get(node.id) }
+        : { ...data, counts },
     };
   });
 
-  const bytes = await writeEntities(d1, scope, seq, entities, [after, last], {
-    final,
-    only: undefined,
-  });
+  const bytes = await writeEntities(d1, scope, seq, entities, [after, last], { final });
   await db(d1)
     .updateTable("atlas_snapshots")
     .set((eb) => ({
@@ -484,6 +529,140 @@ export async function projectEntities(
     .where("id", "=", snapshotId)
     .execute();
   return { next: final ? null : last, written: entities.length };
+}
+
+// ---- capabilities --------------------------------------------------------------
+
+/**
+ * Group a repository's analyzed files into capabilities (CORE-163) for
+ * snapshot `seq`: write capability and area entities, and record each file's
+ * placement for the entity batches. Deterministic and inference-free.
+ */
+export async function groupRepoCapabilities(
+  d1: D1Database,
+  repoId: string,
+  snapshotId: string,
+  seq: number,
+): Promise<Grouping["stats"] & { capabilities: number; areas: number }> {
+  const scope = repoScope(repoId);
+  const [fileRows, imports, mentions, concepts] = await Promise.all([
+    d1
+      .prepare(`SELECT id, data FROM kg_nodes WHERE repo_id = ? AND kind = 'file'`)
+      .bind(repoId)
+      .all<{ id: string; data: string }>(),
+    d1
+      .prepare(
+        `SELECT src, dst FROM kg_edges WHERE repo_id = ? AND kind = 'imports'
+         AND src LIKE 'file:%' AND dst LIKE 'file:%'`,
+      )
+      .bind(repoId)
+      .all<{ src: string; dst: string }>(),
+    d1
+      .prepare(
+        `SELECT src AS file, dst AS concept FROM kg_edges WHERE repo_id = ? AND kind = 'mentions'`,
+      )
+      .bind(repoId)
+      .all<{ file: string; concept: string }>(),
+    d1
+      .prepare(`SELECT id, name FROM kg_nodes WHERE repo_id = ? AND kind = 'concept'`)
+      .bind(repoId)
+      .all<{ id: string; name: string }>(),
+  ]);
+  // Only analyzed files are units; pending and skipped ones stay unclassified.
+  const files = fileRows.results
+    .filter((row) => {
+      const data = JSON.parse(row.data) as { pending?: boolean; skipped?: unknown };
+      return !data.pending && !data.skipped;
+    })
+    .map((row) => row.id);
+  const grouping = groupCapabilities({
+    files,
+    imports: imports.results,
+    mentions: mentions.results,
+    conceptNames: new Map(concepts.results.map((c) => [c.id, c.name])),
+  });
+
+  // A capability with one area holds its files directly.
+  const areasOf = new Map(grouping.capabilities.map((c) => [c.id, c.areas]));
+  const shownAreas = grouping.areas.filter((a) => (areasOf.get(a.capability)?.length ?? 0) > 1);
+  const shown = new Set(shownAreas.map((a) => a.id));
+  const basis = { version: GROUPING_VERSION, evidence: ["imports", "concepts"] };
+  const entities: AtlasEntity[] = [
+    ...grouping.capabilities.map((c) => ({
+      id: c.id,
+      kind: "capability",
+      parentId: "repo",
+      name: c.name,
+      path: null,
+      summary: "",
+      data: {
+        counts: { files: c.files, areas: c.areas.filter((id) => shown.has(id)).length },
+        concepts: c.concepts,
+        anchor: c.anchor,
+        nameSource: "concepts",
+        grouping: basis,
+      },
+    })),
+    ...shownAreas.map((a) => ({
+      id: a.id,
+      kind: "area",
+      parentId: a.capability,
+      name: a.concepts[0]?.name ?? a.anchor.split("/").pop() ?? a.anchor,
+      path: null,
+      summary: "",
+      data: {
+        counts: { files: a.files.length },
+        concepts: a.concepts,
+        anchor: a.anchor,
+        nameSource: a.concepts.length ? "concepts" : "anchor",
+        grouping: basis,
+      },
+    })),
+  ];
+  const bytes = await writeEntities(d1, scope, seq, entities, ["area:", "cap:~"], {
+    final: false,
+    owns: (id) => id.startsWith("cap:") || id.startsWith("area:"),
+  });
+
+  const placements = grouping.members.map((m) => ({
+    id: m.file,
+    parent: m.area && shown.has(m.area) ? m.area : (m.capability ?? GROUPS.unclassified),
+    data: JSON.stringify({
+      capability: m.capability,
+      area: m.area && shown.has(m.area) ? m.area : null,
+      rationale: m.rationale,
+      crossCutting: m.crossCutting,
+      ...(m.unclassified ? { unclassified: m.unclassified } : {}),
+    }),
+  }));
+  const statements: Statement[] = [
+    raw("DELETE FROM atlas_assignments WHERE scope = ? AND seq = ?", scope, seq),
+  ];
+  for (let i = 0; i < placements.length; i += ROWS_PER_STATEMENT)
+    statements.push(
+      raw(
+        `INSERT INTO atlas_assignments (scope, seq, entity_id, parent_id, data)
+         SELECT ?, ?, json_extract(value, '$.id'), json_extract(value, '$.parent'), json_extract(value, '$.data')
+         FROM json_each(?)`,
+        scope,
+        seq,
+        JSON.stringify(placements.slice(i, i + ROWS_PER_STATEMENT)),
+      ),
+    );
+  statements.push(
+    raw(
+      "UPDATE atlas_snapshots SET grouping_version = ?, bytes = bytes + ? WHERE id = ?",
+      GROUPING_VERSION,
+      bytes,
+      snapshotId,
+    ),
+  );
+  for (let i = 0; i < statements.length; i += 50) await batch(d1, statements.slice(i, i + 50));
+  return {
+    ...grouping.stats,
+    capabilities: grouping.capabilities.length,
+    areas: shownAreas.length,
+  };
 }
 
 // ---- edges -------------------------------------------------------------------

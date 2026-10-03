@@ -34,6 +34,7 @@ import {
   beginRepoProjection,
   currentSnapshot,
   failProjection,
+  groupRepoCapabilities,
   projectEdges,
   projectEntities,
   publishProjection,
@@ -766,6 +767,10 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       beginRepoProjection(env.DB, repoId, [{ repoId, commit: head, buildId }]),
     );
     try {
+      // Capabilities first: the entity batches place files by them.
+      const grouping = await progress("atlas-group", "atlas", () =>
+        groupRepoCapabilities(env.DB, repoId, begun.snapshotId, begun.seq),
+      );
       let after: string | null = null;
       for (let i = 0; ; i++) {
         const cursor: string | null = after;
@@ -792,7 +797,12 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         await publishProjection(env.DB, scope, begun.snapshotId, begun.seq);
         return null;
       });
-      return { atlasSnapshot: begun.snapshotId, atlasSeq: begun.seq };
+      return {
+        atlasSnapshot: begun.snapshotId,
+        atlasSeq: begun.seq,
+        atlasCapabilities: grouping.capabilities,
+        atlasUnclassified: grouping.unclassified,
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await step.do("atlas-fail", STEP, async () => {
