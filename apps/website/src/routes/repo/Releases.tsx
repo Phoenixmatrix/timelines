@@ -9,19 +9,22 @@ import {
 import {
   landedTimelineSlug,
   releaseLabel,
-  timelineLabel,
   type ReleaseCategory,
   type ReleaseNoteEntry,
   type ReleaseNotesIndex,
   type ReleaseNotesRelease,
 } from "../../../shared/release-notes.ts";
 import { RailSection, railClass } from "../../components/Rail.tsx";
+import {
+  RELEASE_NOTE_DETAILS_ID,
+  ReleaseNoteDetails,
+} from "../../components/ReleaseNoteDetails.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 export async function releasesLoader({ request, params }: LoaderFunctionArgs) {
   const base = `/repos/${params.owner}/${params.repo}/release-notes`;
@@ -54,13 +57,13 @@ const HEADINGS: Record<ReleaseCategory, string> = {
 
 function Entry({
   entry,
-  owner,
-  name,
+  expanded,
+  onSelect,
   scope,
 }: {
   entry: ReleaseNoteEntry;
-  owner: string;
-  name: string;
+  expanded: boolean;
+  onSelect: (trigger: HTMLButtonElement) => void;
   /** The app's timeline scope (?tl=): what that timeline landed is marked. */
   scope: string | null;
 }) {
@@ -69,37 +72,20 @@ function Entry({
       <div className="text-body font-semibold text-ink">{entry.title}</div>
       {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
-        {entry.issue && (
-          <Link
-            className="mk-mono text-ink-muted"
-            to={`/tracker/${encodeURIComponent(entry.issue.trackerOwner)}/issues/${encodeURIComponent(entry.issue.id)}`}
-          >
-            {entry.issue.key}
-          </Link>
-        )}
         {scope && landedTimelineSlug(entry.timeline) === scope && (
           <span className="mk-chip mk-chip--tag">This timeline</span>
         )}
-        {entry.timeline && (
-          <span>
-            landed with{" "}
-            <Link
-              className="mk-mono text-ink-muted"
-              to={commitsUrl(owner, name, entry.timeline.landing)}
-            >
-              {timelineLabel(entry.timeline)}
-            </Link>
-          </span>
-        )}
-        {entry.commits.slice(0, 3).map((oid) => (
-          <Link key={oid} className="mk-mono text-ink-faint" to={commitsUrl(owner, name, oid)}>
-            {shortOid(oid)}
-          </Link>
-        ))}
-        {entry.commits.length > 3 && <span>+{entry.commits.length - 3} more</span>}
-        <span title={new Date(entry.lastCommitAt).toUTCString()}>
+        <button
+          type="button"
+          className="cursor-pointer bg-transparent p-0 text-left text-ink-faint underline decoration-dotted underline-offset-4 hover:text-ink"
+          title="Show commits and linked issue"
+          aria-label={`Show release note details for ${entry.title}; last commit ${timeAgo(entry.lastCommitAt)}`}
+          aria-expanded={expanded}
+          aria-controls={RELEASE_NOTE_DETAILS_ID}
+          onClick={(event) => onSelect(event.currentTarget)}
+        >
           last commit {timeAgo(entry.lastCommitAt)}
-        </span>
+        </button>
       </div>
     </li>
   );
@@ -170,7 +156,28 @@ export function Releases() {
   const { index, release, name } = useLoaderData<typeof releasesLoader>();
   const repo = useRepo();
   const owner = repo.owner.slug;
-  const scope = scopeOf(useLocation().search);
+  const location = useLocation();
+  const scope = scopeOf(location.search);
+  const [selected, setSelected] = useState<{
+    id: string;
+    trigger: HTMLButtonElement;
+    pathname: string;
+    search: string;
+  } | null>(null);
+  const selectedEntry =
+    selected?.pathname === location.pathname && selected.search === location.search
+      ? release?.entries.find((entry) => entry.id === selected.id)
+      : undefined;
+  useEffect(() => {
+    if (selected && !selectedEntry) setSelected(null);
+  }, [selected, selectedEntry]);
+  const selectEntry = (id: string, trigger: HTMLButtonElement) => {
+    setSelected(
+      selectedEntry?.id === id
+        ? null
+        : { id, trigger, pathname: location.pathname, search: location.search },
+    );
+  };
   const revalidator = useRevalidator();
   useEffect(() => {
     if (index.status.state !== "generating") return;
@@ -271,8 +278,8 @@ export function Releases() {
                       <Entry
                         key={entry.id}
                         entry={entry}
-                        owner={owner}
-                        name={repo.name}
+                        expanded={selectedEntry?.id === entry.id}
+                        onSelect={(trigger) => selectEntry(entry.id, trigger)}
                         scope={scope}
                       />
                     ))}
@@ -286,8 +293,8 @@ export function Releases() {
                       <Entry
                         key={entry.id}
                         entry={entry}
-                        owner={owner}
-                        name={repo.name}
+                        expanded={selectedEntry?.id === entry.id}
+                        onSelect={(trigger) => selectEntry(entry.id, trigger)}
                         scope={scope}
                       />
                     ))}
@@ -336,6 +343,14 @@ export function Releases() {
           </p>
         </aside>
       )}
+      <ReleaseNoteDetails
+        selection={
+          selectedEntry && selected
+            ? { entry: selectedEntry, repo: { owner, name: repo.name }, trigger: selected.trigger }
+            : null
+        }
+        onClose={() => setSelected(null)}
+      />
     </div>
   );
 }

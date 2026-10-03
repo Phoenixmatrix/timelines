@@ -53,6 +53,16 @@ hover a tile or select it to see the complete name in the tooltip or inspector.
 Hover names wrap within the map, including near its edges. Tiny tiles remain
 unlabeled until there is enough room to read them.
 
+## Release note evidence
+
+On repository and account release-note pages, select an item's **last commit**
+time to open its details sidebar. The sidebar lists every linked commit, the
+linked tracker issue when available, and any landing timeline; commit links open
+the exact source revision. These links stay out of the reading view until opened.
+
+Select another item's time to switch details, or use Close or Escape to dismiss
+the sidebar and return focus to the opener. On phones, details fill the screen.
+
 ## Agent-first development
 
 Use one **source worktree and isolated environment per agent**. Never test product

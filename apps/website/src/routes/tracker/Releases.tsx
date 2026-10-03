@@ -1,5 +1,5 @@
 import { MagnifyingGlassIcon, RocketLaunchIcon } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Form,
   Link,
@@ -13,17 +13,21 @@ import {
   landedTimelineSlug,
   releaseKind,
   releaseLabel,
-  timelineLabel,
   type ReleaseCategory,
   type ReleaseFeed,
   type ReleaseFeedEntry,
   type ReleaseFeedFacet,
 } from "../../../shared/release-notes.ts";
 import type { TrackerOwner } from "../../../shared/tracker.ts";
+import {
+  RELEASE_NOTE_DETAILS_ID,
+  ReleaseNoteDetails,
+  type ReleaseNoteDetailsSelection,
+} from "../../components/ReleaseNoteDetails.tsx";
 import { SelectField } from "../../components/ui.tsx";
 import { api, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
-import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
@@ -105,7 +109,17 @@ function Facets({
   );
 }
 
-function Entry({ entry, scope }: { entry: ReleaseFeedEntry; scope: string | null }) {
+function Entry({
+  entry,
+  scope,
+  expanded,
+  onSelect,
+}: {
+  entry: ReleaseFeedEntry;
+  scope: string | null;
+  expanded: boolean;
+  onSelect: (id: string, trigger: HTMLButtonElement) => void;
+}) {
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -117,28 +131,6 @@ function Entry({ entry, scope }: { entry: ReleaseFeedEntry; scope: string | null
       </div>
       {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
-        {entry.issue && (
-          <>
-            <span className="mk-mono">{entry.issue.team.key}</span>
-            <Link
-              className="mk-mono text-ink-muted"
-              to={`/tracker/${encodeURIComponent(entry.issue.trackerOwner)}/issues/${encodeURIComponent(entry.issue.id)}`}
-            >
-              {entry.issue.key}
-            </Link>
-          </>
-        )}
-        {entry.timeline && entry.repos[0] && (
-          <span>
-            landed with{" "}
-            <Link
-              className="mk-mono text-ink-muted"
-              to={commitsUrl(entry.repos[0].owner, entry.repos[0].name, entry.timeline.landing)}
-            >
-              {timelineLabel(entry.timeline)}
-            </Link>
-          </span>
-        )}
         {entry.repos.map((repo) => (
           <span key={`${repo.owner}/${repo.name}`}>
             <Link
@@ -160,9 +152,17 @@ function Entry({ entry, scope }: { entry: ReleaseFeedEntry; scope: string | null
               .join(", ")}
           </span>
         ))}
-        <span title={new Date(entry.lastCommitAt).toUTCString()}>
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm text-micro text-ink-faint"
+          title={new Date(entry.lastCommitAt).toUTCString()}
+          aria-label={`${expanded ? "Hide" : "Show"} release note details for ${entry.title}; last commit ${timeAgo(entry.lastCommitAt)}`}
+          aria-expanded={expanded}
+          aria-controls={RELEASE_NOTE_DETAILS_ID}
+          onClick={(event) => onSelect(entry.id, event.currentTarget)}
+        >
           last commit {timeAgo(entry.lastCommitAt)}
-        </span>
+        </button>
       </div>
     </li>
   );
@@ -176,7 +176,32 @@ export function TrackerReleases() {
   useEffect(() => setDraft(q), [q]);
   const owner = feed.owner.slug;
   // In a timeline's scope (?tl=) what it landed is marked; the Timelines facet narrows to it.
-  const scope = scopeOf(useLocation().search);
+  const location = useLocation();
+  const scope = scopeOf(location.search);
+  const [selected, setSelected] = useState<{
+    id: string;
+    trigger: HTMLButtonElement;
+    pathname: string;
+    search: string;
+    owner: string;
+    q: string;
+  } | null>(null);
+  const selectedEntry =
+    selected &&
+    selected.pathname === location.pathname &&
+    selected.search === location.search &&
+    selected.owner === owner &&
+    selected.q === q
+      ? feed.entries.find((entry) => entry.id === selected.id)
+      : undefined;
+  const selection: ReleaseNoteDetailsSelection | null =
+    selected && selectedEntry
+      ? { entry: selectedEntry, repo: selectedEntry.repos[0] ?? null, trigger: selected.trigger }
+      : null;
+  const closeDetails = useCallback(() => setSelected(null), []);
+  useEffect(() => {
+    if (selected && !selectedEntry) setSelected(null);
+  }, [selected, selectedEntry]);
   const onQuery = (next: string) =>
     navigate(
       `/tracker/${encodeURIComponent(owner)}/releases${next ? `?q=${encodeURIComponent(next)}` : ""}`,
@@ -335,7 +360,26 @@ export function TrackerReleases() {
               </h2>
               <ul className="m-0 list-none p-0">
                 {entries.map((entry) => (
-                  <Entry key={entry.id} entry={entry} scope={scope} />
+                  <Entry
+                    key={entry.id}
+                    entry={entry}
+                    scope={scope}
+                    expanded={selectedEntry?.id === entry.id}
+                    onSelect={(id, trigger) =>
+                      setSelected(
+                        selectedEntry?.id === id
+                          ? null
+                          : {
+                              id,
+                              trigger,
+                              pathname: location.pathname,
+                              search: location.search,
+                              owner,
+                              q,
+                            },
+                      )
+                    }
+                  />
                 ))}
               </ul>
             </section>
@@ -347,6 +391,7 @@ export function TrackerReleases() {
           )}
         </div>
       )}
+      <ReleaseNoteDetails selection={selection} onClose={closeDetails} />
     </div>
   );
 }
