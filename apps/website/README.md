@@ -666,6 +666,12 @@ read as `agent_decides`.
   edit just that field in place. Each text section also has a keyboard-accessible
   **Edit** button, and empty sections offer an **Add** action. Markdown preview
   remains available; links in rendered Markdown still navigate normally.
+  Leaving an inline title, description, or acceptance editor returns it to read-only
+  display after the save is confirmed, with a nearby **Updated** check for four
+  seconds. Unchanged fields close without claiming an update; failed saves keep
+  their editor and draft. Preview controls remain usable, and refocusing during a
+  pending save keeps editing active without losing newer text. The complete
+  **Edit issue** form stays open while moving between fields.
   Text fields (including labels) save on blur; selects, the parent picker, and
   workspace checkboxes save immediately. Saves are serialized, preserving edits
   made while an earlier request is running. The editor shows Saving, Saved, or

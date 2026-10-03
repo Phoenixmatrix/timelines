@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FocusEvent } from "react";
+import { CheckIcon } from "@phosphor-icons/react";
 import { Link, useBlocker } from "react-router";
 import {
   actorName,
@@ -157,7 +158,8 @@ export function IssueDetail({
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const [saved, setSaved] = useState(false);
-  const [finishRequested, setFinishRequested] = useState(false);
+  const [finishRequested, setFinishRequested] = useState<"explicit" | "blur" | null>(null);
+  const [updatedField, setUpdatedField] = useState<Exclude<EditMode, "all"> | null>(null);
   const discardButtonRef = useRef<HTMLButtonElement>(null);
   const dirty = fieldKeys.some((key) => !same(draft.fields[key], draft.base?.[key]));
   const hasUnsavedChanges = editing && (dirty || saving || pendingFields.length > 0);
@@ -188,13 +190,21 @@ export function IssueDetail({
   const [subtaskNotice, setSubtaskNotice] = useState("");
   const [removeError, setRemoveError] = useState<{ id: string; error: string } | null>(null);
   const detailRef = useRef<HTMLElement>(null);
+  const firstFocus = useRef(true);
   useLayoutEffect(() => {
     if (editing)
       detailRef.current
         ?.querySelector<HTMLElement>("[data-issue-editor] input, [data-issue-editor] textarea")
         ?.focus();
-    else if (window.matchMedia("(max-width: 760px)").matches) detailRef.current?.focus();
+    else if (firstFocus.current && window.matchMedia("(max-width: 760px)").matches)
+      detailRef.current?.focus();
+    firstFocus.current = false;
   }, [editing, mode]);
+  useEffect(() => {
+    if (!updatedField) return;
+    const timeout = setTimeout(() => setUpdatedField(null), 4000);
+    return () => clearTimeout(timeout);
+  }, [updatedField]);
   useEffect(() => {
     if (closing) closeFormRef.current?.querySelector("select")?.focus();
   }, [closing]);
@@ -293,29 +303,42 @@ export function IssueDetail({
     setEditing(true);
     setPendingFields([]);
     setSaved(false);
-    setFinishRequested(false);
+    setFinishRequested(null);
+    setUpdatedField(null);
   };
-  const finishEdit = (message = "") => {
+  const finishEdit = (restoreFocus = true, showUpdated = false) => {
     setEditing(false);
     setDraft(initial);
-    setNotice(message);
+    setNotice("");
+    if (showUpdated && mode !== "all") setUpdatedField(mode);
     setPendingFields([]);
-    setFinishRequested(false);
+    setFinishRequested(null);
     try {
       sessionStorage.removeItem(storageKey);
     } catch {
       /* Storage can be disabled. */
     }
-    requestAnimationFrame(() =>
-      detailRef.current?.querySelector<HTMLElement>(`[data-edit-field="${mode}"]`)?.focus(),
-    );
+    if (restoreFocus)
+      requestAnimationFrame(() =>
+        detailRef.current?.querySelector<HTMLElement>(`[data-edit-field="${mode}"]`)?.focus(),
+      );
   };
   const requestFinish = () => {
     enqueue(fieldKeys);
-    setFinishRequested(true);
+    setFinishRequested("explicit");
+  };
+  const retrySave = () => {
+    enqueue(fieldKeys);
+    if (mode !== "all") setFinishRequested("blur");
   };
   useEffect(() => {
-    if (finishRequested && !hasUnsavedChanges && !localError) finishEdit();
+    if (
+      finishRequested &&
+      !hasUnsavedChanges &&
+      !localError &&
+      (!saved || draft.version === issue.version)
+    )
+      finishEdit(finishRequested === "explicit", saved);
   });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -467,7 +490,7 @@ export function IssueDetail({
       }
       return { ...previous, version: issue.version, base: initial.fields, fields };
     });
-    enqueue(fieldKeys);
+    retrySave();
   };
   useEffect(() => {
     if (!editing || busy || savingRef.current || localError || !pendingFields.length) return;
@@ -541,18 +564,43 @@ export function IssueDetail({
           cause instanceof Error ? cause.message : "Could not save. Your draft is kept.",
         );
         setPendingFields((previous) => [...new Set([...attempted, ...previous])]);
-        setFinishRequested(false);
+        setFinishRequested(null);
       } finally {
         savingRef.current = false;
         setSaving(false);
       }
     })();
   });
+  const updatedNotice = updatedField && (
+    <span
+      className="mk-chip mk-chip--tag gap-1"
+      role="status"
+      aria-label={`${fieldNames[updatedField]} updated`}
+    >
+      <CheckIcon className="size-3 text-online" weight="bold" aria-hidden />
+      Updated
+    </span>
+  );
   const editor = editing && (
     <form
       className="space-y-4"
       data-issue-editor
       aria-label={mode === "all" ? "Edit issue" : `Edit ${fieldNames[mode]}`}
+      onFocusCapture={() => {
+        if (finishRequested === "blur") setFinishRequested(null);
+      }}
+      onBlur={(event) => {
+        // Preview/recovery controls stay usable; leaving the inline editor waits
+        // for its save, then restores read-only content without moving focus.
+        if (
+          mode !== "all" &&
+          !(
+            event.relatedTarget instanceof Element &&
+            event.currentTarget.contains(event.relatedTarget)
+          )
+        )
+          setFinishRequested("blur");
+      }}
       onKeyDown={(event) => {
         if (event.defaultPrevented || event.nativeEvent.isComposing) return;
         if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -602,7 +650,7 @@ export function IssueDetail({
             className="mk-btn mk-btn--sm"
             type="button"
             disabled={busy || saving}
-            onClick={() => enqueue(fieldKeys)}
+            onClick={retrySave}
           >
             Retry saving
           </button>
@@ -886,6 +934,7 @@ export function IssueDetail({
             </button>
           </h2>
         )}
+        {updatedField === "title" && <div className="mt-1 flex justify-end">{updatedNotice}</div>}
         <dl className={`${META} mt-3`}>
           <dt className="text-ink-faint">Created by</dt>
           <dd className="m-0 min-w-0">
@@ -1191,16 +1240,19 @@ export function IssueDetail({
               <>
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <h3 className={HEADING}>{fieldNames[field]}</h3>
-                  <button
-                    type="button"
-                    className="mk-btn mk-btn--ghost mk-btn--sm"
-                    aria-label={`Edit ${field === "description" ? "description" : "acceptance criteria"}`}
-                    data-edit-field={field}
-                    disabled={busy || editing}
-                    onClick={() => beginEdit(field)}
-                  >
-                    Edit
-                  </button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {updatedField === field && updatedNotice}
+                    <button
+                      type="button"
+                      className="mk-btn mk-btn--ghost mk-btn--sm"
+                      aria-label={`Edit ${field === "description" ? "description" : "acceptance criteria"}`}
+                      data-edit-field={field}
+                      disabled={busy || editing}
+                      onClick={() => beginEdit(field)}
+                    >
+                      Edit
+                    </button>
+                  </div>
                 </div>
                 {issue[field] ? (
                   <div
