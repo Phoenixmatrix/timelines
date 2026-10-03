@@ -552,6 +552,9 @@ export async function atlasAccessibleScenario(t: AtlasE2E) {
         await expect(
           tree.locator(`[role="treeitem"][aria-level="${i + 2}"]`).first(),
         ).toBeVisible();
+        // Its children, not the "Loading…" row in their place: Down on that
+        // row moves on past it, as it should, before the children arrive.
+        await expect(tree.locator('[role="treeitem"][aria-busy="true"]')).toHaveCount(0);
       }
     }
     // Enter selects; the address and the live region say where it is.
@@ -606,7 +609,9 @@ export async function atlasAccessibleScenario(t: AtlasE2E) {
     );
     await expect(selection.getByRole("heading", { name: "ledger.ts", level: 2 })).toBeVisible();
     await selection.getByRole("heading", { name: "ledger.ts", level: 2 }).focus();
-    await pressUntil(page, "Tab", (f) => f.name === "Used by", "Used by");
+    // The lens comes right after the heading, whether or not the file's detail
+    // has loaded yet: tabbing in early doesn't leave the inspector (CORE-187).
+    await pressUntil(page, "Tab", (f) => f.name === "Used by", "Used by", 3);
     await page.keyboard.press("Enter");
     await page.waitForURL((url) => url.searchParams.get("lens") === "in");
     const users = selection.getByRole("list", { name: /^Imported by/ });
@@ -642,14 +647,58 @@ export async function atlasAccessibleScenario(t: AtlasE2E) {
     await page.waitForURL((url) => url.pathname === base);
     await expect(selection.getByRole("heading", { name: neighbour, level: 2 })).toBeFocused();
 
-    // What changed: a later build merges operations into search; the outline
-    // and the inspector say it in words.
-    await dev({ action: "publish", commit: head, variant: "merged" });
+    // What changed: a later build merges operations into search, and it lands
+    // while someone reads the outline by keyboard (CORE-187). The view isn't
+    // pinned, so it moves to the new map on its own: no page reload, the
+    // same entries open and focus on the same row. The outline and the
+    // inspector say what changed in words.
     await page.goto(`${base}?view=outline`);
+    const status = (text: RegExp) => page.getByRole("status").filter({ hasText: text }).first();
+    await expect(status(/^Update queued$/)).toBeVisible();
+    const opened = tree
+      .getByRole("treeitem", { name: new RegExp(`^${escape(capability.name)}`) })
+      .first();
+    await opened.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(opened).toHaveAttribute("aria-expanded", "true");
+    await expect(tree.locator('[role="treeitem"][aria-busy="true"]')).toHaveCount(0);
+    const inside = tree.locator('[role="treeitem"][aria-level="2"]').first();
+    await expect(inside).toBeVisible();
+    await page.keyboard.press("ArrowDown");
+    await expect(inside).toBeFocused();
+    const reading = ((await inside.locator("span > span").first().textContent()) ?? "").trim();
+    assert(reading, "The row being read has a name");
+    await page.evaluate(() => Object.assign(window, { atlasStayed: true }));
+    await dev({ action: "publish", commit: head, variant: "merged", land: true });
     const changed = tree.getByRole("treeitem", { name: /changed in this build/ }).first();
     await expect(changed).toBeVisible();
+    await expect(status(/^Up to date with/)).toBeVisible();
+    assert(
+      await page.evaluate(() => "atlasStayed" in window),
+      "A build landing must not reload the page under the reader",
+    );
+    assert.equal(new URL(page.url()).searchParams.get("snapshot"), null);
+    await expect(opened).toHaveAttribute("aria-expanded", "true");
+    await expect(
+      tree.getByRole("treeitem", { name: new RegExp(`^${escape(reading)}`) }).first(),
+    ).toBeFocused();
+
+    // Pinned (anything selected), a landing build leaves the view as it is:
+    // same address and snapshot, focus kept in the inspector.
+    await dev({ action: "queue" });
     await changed.focus();
     await page.keyboard.press("Enter");
+    await expect(selection.getByText(/changed in this build/)).toBeVisible();
+    await expect(status(/^Update queued$/)).toBeVisible();
+    const pinnedAt = page.url();
+    assert(new URL(pinnedAt).searchParams.get("snapshot"), "A selection pins the snapshot");
+    const reader = selection.getByRole("heading", { level: 2 });
+    await reader.focus();
+    await dev({ action: "publish", commit: head, variant: "merged", land: true });
+    await expect(status(/^Up to date with/)).toBeVisible();
+    await expect(reader).toBeFocused();
+    assert.equal(page.url(), pinnedAt, "A landing build must not move a pinned view");
+    assert(await page.evaluate(() => "atlasStayed" in window), "Nor reload it");
     await expect(selection.getByText(/changed in this build/)).toBeVisible();
     await shot(page, "browser-atlas-outline-desktop-dark.png");
 

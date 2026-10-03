@@ -312,3 +312,25 @@ export async function endAtlasFixtureOverlay(
   const full = ref.startsWith("refs/heads/") ? ref : `refs/heads/${ref}`;
   await endOverlays(d1, repoId, new Map([[full, reason]]));
 }
+
+/**
+ * The repository's Knowledge build finished at `commit`: the indexed commit
+ * and the graph version move, as a real build's last write does, so the
+ * status an open page polls says it landed (CORE-187).
+ */
+export async function landAtlasFixtureBuild(d1: D1Database, repoId: string, commit: string) {
+  const now = new Date().toISOString();
+  await d1
+    .prepare(
+      `INSERT INTO kg_state (repo_id, indexed_commit, indexed_at, graph_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (repo_id) DO UPDATE SET indexed_commit = excluded.indexed_commit,
+         indexed_at = excluded.indexed_at, graph_at = excluded.graph_at`,
+    )
+    .bind(repoId, commit, now, now)
+    .run();
+}
+
+/** A build is pending again: nothing indexed at the branch's head. */
+export async function queueAtlasFixtureBuild(d1: D1Database, repoId: string) {
+  await d1.prepare(`DELETE FROM kg_state WHERE repo_id = ?`).bind(repoId).run();
+}

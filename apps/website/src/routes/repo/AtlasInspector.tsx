@@ -298,18 +298,30 @@ export function AtlasInspector({
 
       {contents}
 
-      {detail && (
-        <Lens
-          repo={repo}
-          reader={read}
-          snapshot={snapshot}
-          entity={entity}
-          detail={detail}
-          lens={lens}
-          onLens={onLens}
-          onPick={onPick}
-        />
-      )}
+      {/* The lens's controls are there from the start and stay the same
+          elements when the detail arrives, so focus and the keyboard order
+          don't change under someone tabbing in while it loads (CORE-187). */}
+      <div className="flex flex-col gap-2">
+        <LensHeader lens={lens} onLens={onLens} />
+        {detail ? (
+          <Lens
+            repo={repo}
+            reader={read}
+            snapshot={snapshot}
+            entity={entity}
+            detail={detail}
+            lens={lens}
+            onLens={onLens}
+            onPick={onPick}
+          />
+        ) : (
+          !detailError && (
+            <p role="status" className="m-0 text-body-sm text-ink-faint">
+              Loading links…
+            </p>
+          )
+        )}
+      </div>
       <Evidence repo={repo} reader={read} snapshot={snapshot} entity={entity} />
     </section>
   );
@@ -354,23 +366,7 @@ function Lens({
       }),
   );
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <h3 className="m-0 mr-auto text-label text-ink-muted">Relationships</h3>
-        <div role="group" aria-label="Direction" className="flex gap-1">
-          {(["out", "in"] as const).map((d) => (
-            <button
-              key={d}
-              type="button"
-              aria-pressed={direction === d}
-              className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
-              onClick={() => onLens({ direction: d, kind: null })}
-            >
-              {d === "out" ? "Uses" : "Used by"}
-            </button>
-          ))}
-        </div>
-      </div>
+    <>
       {kinds.length === 0 ? (
         <p className="m-0 text-body-sm text-ink-faint">
           No indexed links {direction === "out" ? "from" : "to"} it. That isn't proof there are
@@ -445,6 +441,28 @@ function Lens({
           </p>
         </>
       )}
+    </>
+  );
+}
+
+/** The lens's heading and direction: the same before and after the detail arrives. */
+function LensHeader({ lens, onLens }: { lens: AtlasLens; onLens: (lens: AtlasLens) => void }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <h3 className="m-0 mr-auto text-label text-ink-muted">Relationships</h3>
+      <div role="group" aria-label="Direction" className="flex gap-1">
+        {(["out", "in"] as const).map((d) => (
+          <button
+            key={d}
+            type="button"
+            aria-pressed={lens.direction === d}
+            className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
+            onClick={() => onLens({ direction: d, kind: null })}
+          >
+            {d === "out" ? "Uses" : "Used by"}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

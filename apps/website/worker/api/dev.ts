@@ -6,7 +6,9 @@ import { newArtifactsName } from "../artifacts.ts";
 import {
   endAtlasFixtureOverlay,
   expireAtlasPriors,
+  landAtlasFixtureBuild,
   publishAtlasFixture,
+  queueAtlasFixtureBuild,
   registerFixturePackage,
   writeAtlasFixtureGraph,
   writeAtlasFixtureOverlay,
@@ -188,11 +190,16 @@ dev.post("/seed", async (c) => {
  * `overlay` stores the fixture timeline's knowledge overlay for bookmark
  * `ref` at `commit`, measured against main's `base`; `end` keeps it
  * read-only with `reason`, as the coordinator does when the bookmark goes.
+ * `land` (with publish) also records the build as finished at `commit`, as
+ * the Knowledge build does last, so an open page's status poll sees a build
+ * land and reads the route again; `queue` makes the repository's build
+ * pending again (CORE-187).
  */
 dev.post("/atlas", async (c) => {
   const body = await readJson<{
     repo: string;
-    action: "publish" | "expire" | "overlay" | "end";
+    action: "publish" | "expire" | "overlay" | "end" | "queue";
+    land?: boolean;
     commit?: string;
     base?: string;
     ref?: string;
@@ -213,6 +220,10 @@ dev.post("/atlas", async (c) => {
     : undefined;
   if (!repo) return fail(c, 404, "No such repository.");
   if (body.action === "expire") return c.json(await expireAtlasPriors(c.env.DB, repo.id));
+  if (body.action === "queue") {
+    await queueAtlasFixtureBuild(c.env.DB, repo.id);
+    return c.json({ queued: true });
+  }
   const oid = /^[0-9a-f]{40}$/;
   if (body.action === "overlay") {
     if (
@@ -243,5 +254,6 @@ dev.post("/atlas", async (c) => {
     unavailable: body.unavailable ?? "disabled",
     packages: true,
   });
+  if (body.land) await landAtlasFixtureBuild(c.env.DB, repo.id, body.commit);
   return c.json(published, 201);
 });

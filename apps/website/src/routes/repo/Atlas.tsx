@@ -13,12 +13,13 @@
 // view; it never switches silently.
 
 import { ArrowClockwiseIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   data as routeResponse,
   Link,
   redirect,
   useLoaderData,
+  useLocation,
   useNavigationType,
   useRevalidator,
   useSearchParams,
@@ -63,6 +64,15 @@ import {
   type AtlasUrlState,
   type AtlasView,
 } from "./atlasUrl.ts";
+import {
+  findMarked,
+  focusLost,
+  landedUnder,
+  markOf,
+  type OutlinePlace,
+  type ReaderPlace,
+  type Shown,
+} from "./atlasPlace.ts";
 import { scopeNotices, type AtlasNotice } from "./atlasStates.ts";
 import { AtlasTerritory } from "./AtlasTerritory.tsx";
 import { KnowledgeBar } from "./KnowledgeBar.tsx";
@@ -167,9 +177,36 @@ export function Atlas() {
   const data = useLoaderData<typeof atlasLoader>();
   useAccessLost();
   const { overview, pinned, status } = data;
+  const { landed, place } = useLanding(overview?.snapshot.id ?? null);
   if (pinned) return <PinnedGone error={pinned} />;
   if (!overview) return <NotBuilt status={status} overlays={data.overlays} />;
-  return <Territory key={overview.snapshot.id} overview={overview} data={data} />;
+  return (
+    <Territory
+      key={overview.snapshot.id}
+      overview={overview}
+      data={data}
+      landed={landed}
+      place={place}
+    />
+  );
+}
+
+/**
+ * Whether the snapshot on screen landed under the reader: a Knowledge build
+ * finished and the route was read again, with no navigation (CORE-187). Then
+ * the view is rebuilt for it, and `place` says where the reader was.
+ */
+function useLanding(snapshot: string | null) {
+  const { key } = useLocation();
+  const { ref } = useAtlasBase();
+  const now: Shown = { key, scope: `${ref.owner}/${ref.name}`, snapshot };
+  const shown = useRef<Shown | null>(null);
+  const place = useRef<ReaderPlace | null>(null);
+  const landed = landedUnder(shown.current, now);
+  useEffect(() => {
+    shown.current = now;
+  });
+  return { landed, place };
 }
 
 /**
@@ -254,11 +291,27 @@ function PinnedGone({ error }: { error: AtlasError }) {
   );
 }
 
-function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoaderData }) {
+function Territory({
+  overview,
+  data,
+  landed,
+  place,
+}: {
+  overview: AtlasOverview;
+  data: AtlasLoaderData;
+  /** A build landed under the reader: come back to `place`. */
+  landed: boolean;
+  /** Where the reader is, kept for the view a landing replaces this one with. */
+  place: RefObject<ReaderPlace | null>;
+}) {
   const status = useBuildStatus(data.status);
   const notices = useMemo(() => scopeNotices(status, overview), [status, overview]);
   const { ref, base } = useAtlasBase();
   const snapshot = overview.snapshot;
+  // Where the reader was when this snapshot landed under them, if it did:
+  // read once mounted, after the view this one replaces has said.
+  const arrival = () =>
+    landed && place.current?.scope === `${ref.owner}/${ref.name}` ? place.current : null;
   const [params, setParams] = useSearchParams();
   const url = readAtlasUrl(params);
   const timeline = scopeOf(params);
@@ -289,7 +342,15 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [snapshot.id],
   );
-  useEffect(() => () => loader.reset(""), [loader]);
+  useEffect(
+    () => () => {
+      loader.reset("");
+      // What was in flight is dropped: opening it again reads it again (as
+      // after development's StrictMode remounts this on mounting).
+      requested.current.clear();
+    },
+    [loader],
+  );
   /** Open a region once; a failed one is retried explicitly. */
   const open = (id: string) => {
     if (requested.current.has(id)) return;
@@ -328,11 +389,28 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
   );
   useEffect(() => () => resolver.dispose(), [resolver]);
   const narrowNow = useRef(false);
+  const arriving = useRef(landed);
+  const shownSelect = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     // A restored link, Back or Forward moves focus to what it shows. A click
     // in the page leaves focus where it is, except on a narrow screen, where
-    // what's selected is read in line, so focus goes to it.
-    setFocusOnShow(navigationType === "POP" || narrowNow.current ? url.select : null);
+    // what's selected is read in line, so focus goes to it. After a landing,
+    // focus goes back to the inspector only if it was there. (Once per
+    // selection: development's StrictMode runs this twice on mounting.)
+    if (shownSelect.current !== url.select) {
+      shownSelect.current = url.select;
+      const back = arriving.current ? arrival() : null;
+      arriving.current = false;
+      setFocusOnShow(
+        back
+          ? back.inspector
+            ? url.select
+            : null
+          : navigationType === "POP" || narrowNow.current
+            ? url.select
+            : null,
+      );
+    }
     void resolver.focus(
       url.select,
       url.select ? territoryRef.current.byId.get(url.select)?.entity : undefined,
@@ -437,6 +515,38 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
   narrowNow.current = narrow;
   const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
   const tree = useRef<HTMLDivElement>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const inspectorBox = useRef<HTMLDivElement>(null);
+  const outlinePlace = useRef<OutlinePlace | null>(null);
+  // Leaving: say where the reader is, for the view a landing puts in this
+  // one's place. Layout cleanup runs before this view's elements go.
+  useLayoutEffect(
+    () => () => {
+      const active = document.activeElement;
+      const inside = (box: RefObject<HTMLElement | null>) =>
+        Boolean(active && box.current?.contains(active));
+      const outline = outlinePlace.current;
+      place.current = {
+        scope: `${ref.owner}/${ref.name}`,
+        outline: outline && { ...outline, focused: inside(tree) },
+        inspector: inside(inspectorBox),
+        other:
+          active && inside(root) && !inside(tree) && !inside(inspectorBox) ? markOf(active) : null,
+      };
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- on leaving only
+    [],
+  );
+  // Arriving: a control outside the outline and inspector gets focus back.
+  const settled = useRef(false);
+  useEffect(() => {
+    if (settled.current) return;
+    settled.current = true;
+    const mark = arrival()?.other;
+    const el = mark && root.current ? findMarked(root.current, mark) : null;
+    if (el && focusLost()) el.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- on arriving only
+  }, []);
   const backToOutline = () => {
     const items = tree.current?.querySelectorAll<HTMLElement>('[role="treeitem"]');
     const target =
@@ -457,6 +567,8 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
       selected={url.select}
       path={path}
       seq={snapshot.seq}
+      arrival={landed ? () => arrival()?.outline ?? null : undefined}
+      placeRef={outlinePlace}
       onOpen={open}
       onRetry={(id) => void loader.load(id)}
       onMore={(id) => {
@@ -511,31 +623,33 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
           onRetry={() => void resolver.focus(focus.id)}
         />
       )}
-      {selected && (
-        <AtlasInspector
-          key={selected.id}
-          repo={ref}
-          wiki={wikiPageFor(data.wiki, selected, snapshot)}
-          snapshot={snapshot}
-          entity={selected}
-          lens={url.lens}
-          autoFocus={focusOnShow === selected.id}
-          onPick={select}
-          onLens={setLens}
-          onRestart={setRestart}
-          contents={
-            OPENS.has(selected.kind) ? (
-              <Contents
-                entity={selected}
-                load={loads.get(selected.id)}
-                onPick={select}
-                onRetry={() => void loader.load(selected.id)}
-                onMore={(cursor, items) => void loader.load(selected.id, cursor, items)}
-              />
-            ) : null
-          }
-        />
-      )}
+      <div ref={inspectorBox} className="contents">
+        {selected && (
+          <AtlasInspector
+            key={selected.id}
+            repo={ref}
+            wiki={wikiPageFor(data.wiki, selected, snapshot)}
+            snapshot={snapshot}
+            entity={selected}
+            lens={url.lens}
+            autoFocus={focusOnShow === selected.id}
+            onPick={select}
+            onLens={setLens}
+            onRestart={setRestart}
+            contents={
+              OPENS.has(selected.kind) ? (
+                <Contents
+                  entity={selected}
+                  load={loads.get(selected.id)}
+                  onPick={select}
+                  onRetry={() => void loader.load(selected.id)}
+                  onMore={(cursor, items) => void loader.load(selected.id, cursor, items)}
+                />
+              ) : null
+            }
+          />
+        )}
+      </div>
       {selected && view === "outline" && narrow && (
         <button
           type="button"
@@ -549,7 +663,7 @@ function Territory({ overview, data }: { overview: AtlasOverview; data: AtlasLoa
   );
 
   return (
-    <div className="flex flex-col gap-3">
+    <div ref={root} className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <SnapshotLine overview={overview} pinned={url.snapshot !== null} />
         <div className="ml-auto flex flex-wrap items-center gap-2">

@@ -8,9 +8,18 @@
 // aren't current are said in words, not only in colour.
 
 import { CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react";
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type RefObject,
+} from "react";
 import type { AtlasEntitySummary, AtlasRegion } from "../../../shared/atlas.ts";
 import { OPENS } from "./atlasNavigation.ts";
+import { focusLost, type OutlinePlace } from "./atlasPlace.ts";
 import { summaryNote } from "./atlasStates.ts";
 import type { Load } from "./territory.ts";
 
@@ -134,6 +143,8 @@ export function AtlasOutline({
   path,
   seq,
   note,
+  arrival,
+  placeRef,
   onOpen,
   onRetry,
   onMore,
@@ -158,6 +169,14 @@ export function AtlasOutline({
   seq: number | ((entity: AtlasEntitySummary) => number);
   /** More to say on a row, e.g. which repository it's in. */
   note?: (entity: AtlasEntitySummary) => string | null;
+  /**
+   * Where the reader was in the outline this one replaces (a build landed
+   * under them, CORE-187): the same entries open, and focus back on the
+   * same row if it had it.
+   */
+  arrival?: () => OutlinePlace | null;
+  /** Kept up to date with what's open and current, for the next arrival. */
+  placeRef?: RefObject<OutlinePlace | null>;
   onOpen: (id: string) => void;
   onRetry: (id: string) => void;
   onMore: (id: string) => void;
@@ -209,6 +228,54 @@ export function AtlasOutline({
     moved.current = true;
     refs.current.get(next.key)?.focus();
   }, [rows]);
+  // Arriving where another outline was: open again what it had open, read
+  // from this snapshot, and come back to the row that had focus once the way
+  // to it has loaded (if it's gone, to the tree's current row, never to the
+  // page).
+  const returning = useRef<OutlinePlace | null>(null);
+  const arrived = useRef<OutlinePlace | null | undefined>(undefined);
+  useLayoutEffect(() => {
+    // Read once (development's StrictMode runs this twice on mounting, and
+    // the place has moved on by the second time); open on every run, since
+    // a remount drops what was in flight.
+    if (arrived.current === undefined) {
+      const back = (arrived.current = arrival?.() ?? null);
+      if (!back) return;
+      setExpanded((now) => new Set([...now, ...back.expanded]));
+      setActive(back.active);
+      if (back.focused && back.active) returning.current = back;
+    }
+    for (const id of arrived.current?.expanded ?? []) onOpen(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- on arriving only
+  }, []);
+  // Meanwhile focus waits on the nearest row on the way there.
+  const waiting = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const back = returning.current;
+    if (!back?.active) return;
+    const ours = () => focusLost() || document.activeElement === waiting.current;
+    const row = refs.current.get(back.active);
+    const opening =
+      !back.expanded.every((id) => expanded.has(id)) || rows.some((r) => r.kind === "loading");
+    if (!row && opening) {
+      const near = [...back.trail].reverse().flatMap((key) => refs.current.get(key) ?? []);
+      if (focusLost() && near[0]) {
+        waiting.current = near[0];
+        near[0].focus();
+      }
+      return;
+    }
+    returning.current = null;
+    if (ours()) (row ?? (current ? refs.current.get(current) : undefined))?.focus();
+    waiting.current = null;
+  }, [rows, current, expanded]);
+  useEffect(() => {
+    if (!placeRef) return;
+    const parents = new Map(rows.map((r) => [r.key, r.parent]));
+    const trail: string[] = [];
+    for (let key = current && parents.get(current); key; key = parents.get(key)) trail.unshift(key);
+    placeRef.current = { expanded: [...expanded], active: current, trail, focused: false };
+  });
   const go = (key: string | undefined) => {
     if (!key) return;
     setActive(key);
