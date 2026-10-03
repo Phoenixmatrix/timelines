@@ -830,13 +830,17 @@ describe("Atlas read API", () => {
       for (const a of ids) for (const b of ids) if (a !== b) edge(sqlite, "r1", a, b, "imports");
       return ids;
     };
-    // Two tight areas lightly linked form one capability; two more stand alone.
+    // Two tight parts woven together form one capability with two areas; a
+    // lightly linked group stays its own capability, related to it (v3).
     const pay = cluster("pay/a", 4);
     const cart = cluster("pay/b", 4);
-    edge(sqlite, "r1", pay[0]!, cart[0]!, "imports");
-    edge(sqlite, "r1", cart[1]!, pay[1]!, "imports");
+    for (let i = 0; i < 4; i++) {
+      edge(sqlite, "r1", pay[i]!, cart[i]!, "imports");
+      edge(sqlite, "r1", cart[i]!, pay[(i + 1) % 4]!, "imports");
+    }
+    const notify = cluster("notify", 3);
+    edge(sqlite, "r1", notify[0]!, pay[0]!, "imports");
     cluster("big", 6);
-    cluster("ops", 3);
     // Ten files with no evidence: an unclassified group bigger than any capability.
     for (let i = 0; i < 10; i++)
       node(sqlite, "r1", `file:misc/n${i}.ts`, "file", `n${i}.ts`, `misc/n${i}.ts`);
@@ -848,6 +852,14 @@ describe("Atlas read API", () => {
       ["capability", 6, 6],
       ["capability", 3, 3],
       ["group", 10, 10],
+    ]);
+    // The lightly linked group is a separate capability that depends on payments.
+    const notifyCap = overview.regions[2]!;
+    const related = await s.get<AtlasPage<{ dst: string; kind: string; weight: number }>>(
+      `relations?id=${encodeURIComponent(notifyCap.id)}&direction=out`,
+    );
+    expect(related.items).toEqual([
+      expect.objectContaining({ dst: overview.regions[0]!.id, kind: "depends_on", weight: 1 }),
     ]);
     expect(overview.regions[3]?.id).toBe("group:unclassified");
     expect(overview.regions.map((r) => r.structural)).toEqual([false, false, false, true]);

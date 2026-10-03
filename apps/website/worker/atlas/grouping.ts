@@ -24,7 +24,7 @@
 // (CORE-164) and identity across snapshots (CORE-165) build on its output.
 
 /** Bump whenever the algorithm or its inputs change: snapshots record it. */
-export const GROUPING_VERSION = 2;
+export const GROUPING_VERSION = 3;
 export const MAX_NEIGHBORS = 32;
 const IMPORT_WEIGHT = 3;
 /** Cross-cutting: support for another capability relative to the primary one. */
@@ -37,6 +37,12 @@ const MAX_RATIONALE = 4;
  */
 export const MIN_CAPABILITY_FILES = 3;
 const LOUVAIN_PASSES = 12;
+/**
+ * Modularity resolutions: capabilities are coarse communities of the files;
+ * areas split a capability more finely.
+ */
+export const CAPABILITY_RESOLUTION = 1;
+export const AREA_RESOLUTION = 1.5;
 
 export interface GroupingInput {
   /** Analyzed source files (file ids), the units being grouped. */
@@ -224,7 +230,7 @@ function candidates(input: GroupingInput, files: string[], index: Map<string, nu
  * One Louvain level: returns a community label per node. Nodes are visited in
  * index order (which follows sorted ids), and ties go to the smallest label.
  */
-function louvain(adj: Map<number, number>[]): number[] {
+function louvain(adj: Map<number, number>[], resolution = 1): number[] {
   const n = adj.length;
   const degree = adj.map((m) => {
     let d = 0;
@@ -245,9 +251,10 @@ function louvain(adj: Map<number, number>[]): number[] {
         if (j !== i) links.set(label[j]!, (links.get(label[j]!) ?? 0) + w);
       communityDegree[own]! -= degree[i]!;
       let best = own;
-      let bestGain = (links.get(own) ?? 0) - (communityDegree[own]! * degree[i]!) / total;
+      let bestGain =
+        (links.get(own) ?? 0) - (resolution * communityDegree[own]! * degree[i]!) / total;
       for (const [c, w] of [...links].sort((a, b) => a[0] - b[0])) {
-        const gain = w - (communityDegree[c]! * degree[i]!) / total;
+        const gain = w - (resolution * communityDegree[c]! * degree[i]!) / total;
         if (gain > bestGain + 1e-12 || (Math.abs(gain - bestGain) <= 1e-12 && c < best)) {
           best = c;
           bestGain = gain;
@@ -264,16 +271,99 @@ function louvain(adj: Map<number, number>[]): number[] {
   return label;
 }
 
-/** The graph of communities: summed weights between labels, self-loops dropped. */
-function aggregate(adj: Map<number, number>[], label: number[], count: number) {
-  const out: Map<number, number>[] = Array.from({ length: count }, () => new Map());
-  for (let i = 0; i < adj.length; i++)
-    for (const [j, w] of adj[i]!) {
-      const a = label[i]!;
-      const b = label[j]!;
-      if (a !== b) out[a]!.set(b, (out[a]!.get(b) ?? 0) + w);
+/**
+ * Areas within each capability: Louvain at `resolution` on the capability's
+ * own files. A capability keeps a single area unless it falls into at least
+ * two parts of two or more files; a lone file joins the part it links to most
+ * (ties: the larger part, then the lower label).
+ */
+function splitAreas(
+  adj: Map<number, number>[],
+  capabilityLabel: number[],
+  resolution: number,
+): { areaLabel: number[]; capabilityOfArea: Map<number, number> } {
+  const members = new Map<number, number[]>();
+  capabilityLabel.forEach((c, i) => {
+    if (adj[i]!.size === 0) return;
+    const list = members.get(c) ?? [];
+    list.push(i);
+    members.set(c, list);
+  });
+  const areaLabel: number[] = Array.from({ length: adj.length }, () => -1);
+  const capabilityOfArea = new Map<number, number>();
+  let next = 0;
+  for (const [capability, nodes] of [...members].sort((a, b) => a[0] - b[0])) {
+    const local = new Map(nodes.map((node, k) => [node, k]));
+    const sub = nodes.map((node) => {
+      const out = new Map<number, number>();
+      for (const [j, w] of adj[node]!) {
+        const k = local.get(j);
+        if (k !== undefined) out.set(k, w);
+      }
+      return out;
+    });
+    const parts = compact(louvainLevels(sub, resolution));
+    const size = new Map<number, number>();
+    for (const p of parts.label) size.set(p, (size.get(p) ?? 0) + 1);
+    const real = [...size]
+      .filter(([, n]) => n >= 2)
+      .map(([p]) => p)
+      .sort((a, b) => a - b);
+    if (real.length < 2) {
+      const whole = next++;
+      capabilityOfArea.set(whole, capability);
+      for (const node of nodes) areaLabel[node] = whole;
+      continue;
     }
-  return out;
+    const area = new Map<number, number>();
+    for (const p of real) {
+      area.set(p, next);
+      capabilityOfArea.set(next++, capability);
+    }
+    nodes.forEach((node, k) => {
+      const p = parts.label[k]!;
+      if (area.has(p)) {
+        areaLabel[node] = area.get(p)!;
+        return;
+      }
+      // A lone file: the real part it links to most.
+      const links = new Map<number, number>();
+      for (const [j, w] of sub[k]!) {
+        const q = parts.label[j]!;
+        if (area.has(q)) links.set(q, (links.get(q) ?? 0) + w);
+      }
+      const ranked = (links.size ? [...links] : real.map((q) => [q, 0] as [number, number])).sort(
+        (a, b) => b[1] - a[1] || (size.get(b[0]) ?? 0) - (size.get(a[0]) ?? 0) || a[0] - b[0],
+      );
+      areaLabel[node] = area.get(ranked[0]![0])!;
+    });
+  }
+  return { areaLabel, capabilityOfArea };
+}
+
+/**
+ * Full multi-level Louvain at `resolution`: move nodes, collapse each
+ * community into one node (keeping its internal weight as a self-loop, so
+ * cohesion still counts), and repeat until nothing moves. Deterministic, as
+ * each level is.
+ */
+function louvainLevels(adj: Map<number, number>[], resolution: number): number[] {
+  let label = Array.from({ length: adj.length }, (_, i) => i);
+  let graph = adj;
+  for (let level = 0; level < 12; level++) {
+    const moved = compact(louvain(graph, resolution));
+    if (moved.count === graph.length) break;
+    label = label.map((l) => moved.label[l]!);
+    const next: Map<number, number>[] = Array.from({ length: moved.count }, () => new Map());
+    for (let i = 0; i < graph.length; i++)
+      for (const [j, w] of graph[i]!) {
+        const a = moved.label[i]!;
+        const b = moved.label[j]!;
+        next[a]!.set(b, (next[a]!.get(b) ?? 0) + w);
+      }
+    graph = next;
+  }
+  return label;
 }
 
 /** Relabel to 0..k-1 in order of first appearance (deterministic). */
@@ -288,22 +378,34 @@ function compact(label: number[]): { label: number[]; count: number } {
 
 // ---- 3. membership -----------------------------------------------------------
 
-export function groupCapabilities(input: GroupingInput): Grouping {
+export function groupCapabilities(
+  input: GroupingInput,
+  options: { capabilityResolution?: number; areaResolution?: number } = {},
+): Grouping {
   const files = [...new Set(input.files)].sort(byId);
   const index = new Map(files.map((f, i) => [f, i]));
   const { adj, conceptsOf, idf, importPairs, maxCandidates } = candidates(input, files, index);
   const n = files.length;
   const pairs = adj.reduce((n, m) => n + m.size, 0) / 2;
 
-  const level1 = compact(louvain(adj));
-  const areaGraph = aggregate(adj, level1.label, level1.count);
-  const level2 = compact(louvain(areaGraph));
+  // Top down: capabilities are communities of the files at a coarse
+  // resolution, so related groups stay apart (their link is a relation
+  // between them) while one capability's parts stay together; areas split a
+  // capability more finely, kept only when it falls into real parts.
+  const capabilityLabel = compact(
+    louvainLevels(adj, options.capabilityResolution ?? CAPABILITY_RESOLUTION),
+  ).label;
+  const { areaLabel, capabilityOfArea: capabilityOfAreaLabel } = splitAreas(
+    adj,
+    capabilityLabel,
+    options.areaResolution ?? AREA_RESOLUTION,
+  );
 
   // Members per area; singletons and evidence-free files are unclassified.
   const areaMembers = new Map<number, number[]>();
   files.forEach((_, i) => {
     if (adj[i]!.size === 0) return;
-    const a = level1.label[i]!;
+    const a = areaLabel[i]!;
     const list = areaMembers.get(a) ?? [];
     list.push(i);
     areaMembers.set(a, list);
@@ -313,7 +415,8 @@ export function groupCapabilities(input: GroupingInput): Grouping {
     const memberSet = new Set(members.map((i) => files[i]!));
     const weights = new Map<string, number>();
     for (const { file, concept } of input.mentions)
-      if (memberSet.has(file)) weights.set(concept, (weights.get(concept) ?? 0) + 1);
+      if (memberSet.has(file) && (idf.get(concept) ?? 0) > 0.05)
+        weights.set(concept, (weights.get(concept) ?? 0) + 1);
     return [...weights]
       .filter(([, w]) => w >= 2 || members.length === 1)
       .sort((a, b) => b[1] - a[1] || byId(a[0], b[0]))
@@ -347,13 +450,13 @@ export function groupCapabilities(input: GroupingInput): Grouping {
     };
     areas.push(area);
     for (const i of members) areaOfFile.set(i, area);
-    capabilityOfArea.set(a, level2.label[a]!);
+    capabilityOfArea.set(a, capabilityOfAreaLabel.get(a)!);
   }
 
   // Capabilities: areas grouped by level two, anchored on their strongest file.
   const capAreas = new Map<number, Area[]>();
   for (const area of areas) {
-    const a = level1.label[index.get(area.anchor)!]!;
+    const a = areaLabel[index.get(area.anchor)!]!;
     const c = capabilityOfArea.get(a)!;
     const list = capAreas.get(c) ?? [];
     list.push(area);
@@ -363,14 +466,11 @@ export function groupCapabilities(input: GroupingInput): Grouping {
   const capabilityOfFile = new Map<number, Capability>();
   const weak = new Set<number>();
   const dropped = new Set<string>();
+  const small: { list: Area[]; members: number[] }[] = [];
   for (const [, list] of [...capAreas].sort((x, y) => x[0] - y[0])) {
     const members = list.flatMap((area) => area.files.map((f) => index.get(f)!));
     if (members.length < MIN_CAPABILITY_FILES) {
-      for (const area of list) dropped.add(area.id);
-      for (const i of members) {
-        weak.add(i);
-        areaOfFile.delete(i);
-      }
+      small.push({ list, members });
       continue;
     }
     const anchor = files[anchorOf(members)]!;
@@ -390,6 +490,83 @@ export function groupCapabilities(input: GroupingInput): Grouping {
     for (const area of list) area.capability = capability.id;
     capabilities.push(capability);
     for (const i of members) capabilityOfFile.set(i, capability);
+  }
+  // Groups too small to be capabilities: those linked to each other combine
+  // first (two linked pairs are one small capability, not two scraps); a
+  // combination that reaches the minimum becomes a capability. What's still
+  // small joins, as areas, the capability its files link to most (ties: the
+  // larger, then the lower id); with no link to any, it's too little evidence
+  // and stays unclassified.
+  const groupOf = new Map<number, number>();
+  small.forEach((g, k) => {
+    for (const i of g.members) groupOf.set(i, k);
+  });
+  const root = small.map((_, k) => k);
+  const find = (k: number): number => (root[k] === k ? k : (root[k] = find(root[k]!)));
+  small.forEach((g, k) => {
+    for (const i of g.members)
+      for (const [j] of adj[i]!) {
+        const other = groupOf.get(j);
+        if (other !== undefined) {
+          const [a, b] = [find(k), find(other)];
+          if (a !== b) root[Math.max(a, b)] = Math.min(a, b);
+        }
+      }
+  });
+  const unions = new Map<number, { list: Area[]; members: number[] }>();
+  small.forEach((g, k) => {
+    const r = find(k);
+    const u = unions.get(r) ?? { list: [], members: [] };
+    u.list.push(...g.list);
+    u.members.push(...g.members);
+    unions.set(r, u);
+  });
+  const leftover: { list: Area[]; members: number[] }[] = [];
+  for (const [, u] of [...unions].sort((x, y) => x[0] - y[0])) {
+    if (u.members.length < MIN_CAPABILITY_FILES) {
+      leftover.push(u);
+      continue;
+    }
+    const anchor = files[anchorOf(u.members)]!;
+    const concepts = conceptWeight(u.members);
+    const capability: Capability = {
+      id: `cap:${hash36(anchor)}`,
+      anchor,
+      areas: u.list.map((area) => area.id).sort(byId),
+      files: u.members.length,
+      concepts,
+      name:
+        concepts
+          .slice(0, 2)
+          .map((c) => c.name)
+          .join(" & ") || (anchor.split("/").pop() ?? anchor).replace(/^file:/, ""),
+    };
+    for (const area of u.list) area.capability = capability.id;
+    capabilities.push(capability);
+    for (const i of u.members) capabilityOfFile.set(i, capability);
+  }
+  for (const { list, members } of leftover) {
+    const links = new Map<Capability, number>();
+    for (const i of members)
+      for (const [j, w] of adj[i]!) {
+        const other = capabilityOfFile.get(j);
+        if (other) links.set(other, (links.get(other) ?? 0) + w);
+      }
+    const best = [...links].sort(
+      (a, b) => b[1] - a[1] || b[0].files - a[0].files || byId(a[0].id, b[0].id),
+    )[0]?.[0];
+    if (!best) {
+      for (const area of list) dropped.add(area.id);
+      for (const i of members) {
+        weak.add(i);
+        areaOfFile.delete(i);
+      }
+      continue;
+    }
+    for (const area of list) area.capability = best.id;
+    best.areas = [...best.areas, ...list.map((area) => area.id)].sort(byId);
+    best.files += members.length;
+    for (const i of members) capabilityOfFile.set(i, best);
   }
   capabilities.sort((a, b) => b.files - a.files || byId(a.id, b.id));
   const keptAreas = areas.filter((area) => !dropped.has(area.id)).sort((a, b) => byId(a.id, b.id));

@@ -198,4 +198,43 @@ describe("capability grouping", () => {
     const areaIds = new Set(grouping.areas.map((a) => a.id));
     for (const m of grouping.members) if (m.area) expect(areaIds.has(m.area)).toBe(true);
   });
+
+  test("v3: lightly linked groups stay apart, their link a relation between them", () => {
+    // Two tight cliques joined by a single import.
+    const clique = (dir: string) => Array.from({ length: 5 }, (_, i) => f(`${dir}/f${i}.ts`));
+    const a = clique("billing");
+    const b = clique("deploy");
+    const imports = [a, b].flatMap((ids) =>
+      ids.flatMap((x) => ids.filter((y) => y !== x).map((y) => ({ src: x, dst: y }))),
+    );
+    imports.push({ src: a[0]!, dst: b[0]! });
+    const g = groupCapabilities({
+      files: [...a, ...b],
+      imports,
+      mentions: [],
+      conceptNames: new Map(),
+    });
+    const capOf = (id: string) => g.members.find((m) => m.file === id)!.capability;
+    expect(new Set(a.map(capOf)).size).toBe(1);
+    expect(new Set(b.map(capOf)).size).toBe(1);
+    expect(capOf(a[0]!)).not.toBe(capOf(b[0]!));
+  });
+
+  test("v3: small groups that link to each other combine before anything is unclassified", () => {
+    // A path of four files: modularity splits it into two pairs, which together
+    // are one small capability, not unclassified scraps.
+    const files = ["a", "b", "c", "d"].map((x) => f(`path/${x}.ts`));
+    const imports = [0, 1, 2].map((i) => ({ src: files[i + 1]!, dst: files[i]! }));
+    const g = groupCapabilities({ files, imports, mentions: [], conceptNames: new Map() });
+    expect(g.stats.unclassified).toBe(0);
+    expect(new Set(g.members.map((m) => m.capability)).size).toBe(1);
+  });
+
+  test("v3: names never use a concept that carries no evidence", () => {
+    const g = groupCapabilities(fixture());
+    for (const c of g.capabilities) {
+      expect(c.name).not.toMatch(/\bCode\b/);
+      expect(c.concepts.map((x) => x.id)).not.toContain("concept:code");
+    }
+  });
 });

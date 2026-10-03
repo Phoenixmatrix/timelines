@@ -1188,41 +1188,27 @@ a snapshot writes only what changed, and `atlas_current` moves to it in one
 statement once it's complete. Interrupted snapshots never become current and
 are rolled back before the next.
 
-**Capability grouping** (`worker/atlas/grouping.ts`, CORE-163,
-`GROUPING_VERSION`). Before the entity batches, the build groups analyzed files
-into capabilities from non-path evidence only: direct imports (either
-direction) and shared canonical concepts weighted by rarity, so a concept
-nearly every file mentions counts for nothing. Each file keeps at most 32
-candidate neighbors, found through import edges and concept postings (common
-concepts link through a bounded ring), never by comparing all pairs. Two
-levels of deterministic Louvain give areas and capabilities, so identical
-inputs give identical groups. Every file has one primary placement with the
-links that justify it (`membership.rationale`) and cross-cutting references
-that never count twice. Files without evidence, not analyzed yet, or in a
-group of fewer than three files (`MIN_CAPABILITY_FILES`: one import between two
-files is too little evidence) go to the **Unclassified** group. Directory components remain, under their folders, as
-inputs. Interim capability names come from their strongest shared concepts
-(`nameSource: "concepts"`, kept as `interimName`).
-
-**Capability names and summaries** (`worker/atlas/describe.ts`, CORE-164,
-`DESCRIBE_VERSION`). The `atlas-describe` step, after grouping and before the
-entity batches, names each capability and writes a 2-3 sentence summary and a
-membership rationale, from source-backed inputs only: member files' cards, the
-directory components' syntheses and the shared concepts, never other
-capabilities' prose. It never moves a member or changes an id, so a change in
-wording can't change membership. Results are cached in `kg_synthesis` under a
-hash of exactly those inputs (and the repository), so identical inputs are
-never inferred twice. A miss is one paid call through the Atlas budget
-(`atlasInfer`), in a step that doesn't retry. Capabilities' `data` keeps three
-kinds apart (types in `shared/atlas.ts`): `description` (`status` current,
-stale or unavailable, with `reason`), `provenance.structural` (grouping),
-`provenance.inferred` (model, versions, inputs hash, the source version it was
-written from, what it was derived from, and the cited files at their commit
-and blob, with ranges or `unavailable`) and `provenance.curated` (none yet).
-With a cap reached, an unpriced model, a provider error or a failed step,
-capabilities keep their interim names and empty `summary`; `description`
-carries the previous snapshot's prose labelled `stale` with its original basis,
-or nothing (`unavailable`). List responses show it as `summaryState`.
+**Capability grouping** (`worker/atlas/grouping.ts`, CORE-163, v3 from
+CORE-183, `GROUPING_VERSION`). Before the entity batches, the build groups
+analyzed files into capabilities from non-path evidence only: direct imports
+(either direction) and shared canonical concepts weighted by rarity, so a
+concept nearly every file mentions counts for nothing (and never names a
+capability). Each file keeps at most 32 candidate neighbors, found through
+import edges and concept postings (common concepts link through a bounded
+ring), never by comparing all pairs. Capabilities are top-down communities of
+those files: multi-level Louvain at modularity resolution 1 (each level keeps a
+community's internal weight, so cohesion counts), so lightly linked groups stay
+apart and their link shows as a capability relation. Areas split a capability
+at resolution 1.5, kept only when it falls into at least two parts of two or
+more files. Groups below three files (`MIN_CAPABILITY_FILES`) that link to each
+other combine; what's still small joins the capability it links to most, and
+only files linked to nothing (or not analyzed yet) go to the **Unclassified**
+group. Identical inputs, in any order, give identical groups. Every file has
+one primary placement with the links that justify it (`membership.rationale`)
+and cross-cutting references that never count twice. Directory components
+remain, under their folders, as inputs. On this repository v3 gives 12
+capabilities and 80 areas with 90 related capability pairs, where v2 merged any
+linked areas (9 capabilities, 31 related pairs).
 
 **Capability identity and layout** (`worker/atlas/identity.ts`, CORE-165).
 Grouping recomputes capabilities every build, so public ids come from
