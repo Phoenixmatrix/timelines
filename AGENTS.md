@@ -127,7 +127,9 @@ Work is tracked in Gitmatrix: matrixorg, team CORE. The loop, in brief (the
    finish: `gm issue release <issue>`.
 
 When an agent harness drives gm here, gm acts as this checkout's agent
-(`gm auth status` shows `actingAs`) and keeps lease tokens for it. To change
+(`gm auth status` shows `actingAs`) and keeps lease tokens for it. If gm says
+the agent's profile has no model, or you run a different model than
+`gm agent show` lists, record yours: `gm agent configure --model <model-id>`. To change
 any of this, edit `.gitmatrix/agents.yml` (shared) or
 `.gitmatrix/agent.local.yml` (this checkout), then rerun `gm agent setup`.
 

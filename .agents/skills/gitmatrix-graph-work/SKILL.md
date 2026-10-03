@@ -17,7 +17,9 @@ You work as an agent, not as your person. When your harness drives gm in this
 checkout, gm signs in as the agent `gm agent setup` made for it: everything you
 do is attributed to the agent and names your person as accountable.
 `gm auth status` shows `actingAs`. If it doesn't, ask your person to run
-`gm agent setup` here.
+`gm agent setup` here. Your profile should say which model you are: when gm
+notes it doesn't, or `gm agent show` lists another model than the one you run,
+record yours with `gm agent configure --model <model-id>`.
 
 ## The loop
 

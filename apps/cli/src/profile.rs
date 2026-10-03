@@ -151,6 +151,51 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
 }
 
+/// The header gm writes above `.gitmatrix/agent.local.yml`.
+pub const LOCAL_HEADER: &str = "\
+# This checkout's agent, written by `gm agent setup`. Not committed.
+# Edit and rerun `gm agent setup` to republish its profile. Its token is kept
+# with gm's credentials, not here.
+\n";
+
+/// Save this checkout's agent profile.
+pub fn write_local(root: &Path, local: &Local) -> Result<()> {
+    let text = serde_yaml_ng::to_string(local)
+        .map_err(|e| GmError::new("invalid_config", e.to_string()))?;
+    std::fs::write(root.join(LOCAL_FILE), format!("{LOCAL_HEADER}{text}"))?;
+    Ok(())
+}
+
+/// The model a harness says it runs, from its own documented setting. Never
+/// inferred from which harness it is: no setting, no model.
+pub fn declared_model(harness: Option<&str>) -> Option<String> {
+    let variable = match harness? {
+        "claude-code" => "ANTHROPIC_MODEL",
+        "gemini-agent" => "GEMINI_MODEL",
+        _ => return None,
+    };
+    std::env::var(variable)
+        .ok()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty() && model.chars().count() <= 120)
+}
+
+/// When an agent drives gm in a checkout whose agent has no model on record:
+/// what to tell it, so it records the model it knows it runs.
+pub fn model_notice() -> Option<String> {
+    let harness = crate::agent::detect()?;
+    let (_, local) = current();
+    let name = local.name.as_ref()?;
+    if local.model.is_some()
+        || declared_model(local.harness.as_deref().or(Some(harness.id))).is_some()
+    {
+        return None;
+    }
+    Some(format!(
+        "Your agent profile ({name}) doesn't say which model you are. Record it once, with your exact model id: gm agent configure --model <model-id>"
+    ))
+}
+
 /// Where a harness reads instructions and skills.
 pub struct Layout {
     /// Instruction files it reads, preferred first.

@@ -82,6 +82,9 @@ pub fn auth(ctx: &Ctx, command: &AuthCommand) -> Result<Json> {
                     session["viewer"]["displayName"].as_str().unwrap_or("")
                 ));
             }
+            if let Some(notice) = crate::profile::model_notice() {
+                out["notice"] = json!(notice);
+            }
             // Leases gm took as someone it no longer acts as: finished as them, then forgotten.
             let previous = super::tracker::previous_identities(&config);
             if previous.as_array().is_some_and(|p| !p.is_empty()) {

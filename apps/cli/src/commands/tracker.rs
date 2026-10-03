@@ -1464,7 +1464,7 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
                 .filter(move |c| c["issueId"] == l["fromId"] && c["kind"] == "evidence")
         })
         .collect();
-    Shown(json!({
+    let mut out = json!({
         "claimed": {
             "issueId": issue_id,
             "key": result["key"],
@@ -1474,7 +1474,11 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
         "context": context,
         "blockerEvidence": blocker_evidence,
         "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete with evidence. gm kept the lease token for this identity, so those commands need no token.",
-    }))
+    });
+    if let Some(notice) = crate::profile::model_notice() {
+        out["notice"] = json!(notice);
+    }
+    Shown(out)
 }
 pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     if let IssueCommand::History {

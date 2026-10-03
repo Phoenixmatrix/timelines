@@ -374,6 +374,15 @@ what it publishes, and rerunning it drops skills no longer allowed; `configure`
 and `detect` follow the same file. `--skill-dir DIR` directories are published
 because you named them.
 
+The model is never inferred from a harness. It comes from `--model`, from the
+harness's own documented setting (`ANTHROPIC_MODEL` for Claude Code,
+`GEMINI_MODEL` for Gemini CLI), or from what was recorded before, in that
+order. When an agent drives gm in a checkout whose agent has no model on
+record, `gm issue next` and `gm auth status` carry a `notice` asking it to run
+`gm agent configure --model <id>`; that also saves the model to
+`.gitmatrix/agent.local.yml`, so later `gm agent setup` runs keep it. The
+managed instructions ask agents to update it when they run a different model.
+
 Every refresh redetects environment, harness and installed skills. Omitted
 `--model`, `--tag` and `--skill` preserve previous declarations. Supplied tags
 replace the tag set; supplied skills replace the declared skill set. A declared

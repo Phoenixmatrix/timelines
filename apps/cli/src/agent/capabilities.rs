@@ -372,11 +372,13 @@ pub fn merge(
     previous: Option<&AgentCapabilities>,
     args: &CapabilityArgs,
 ) -> Result<AgentCapabilities> {
+    // Explicit, then what the harness declares now, then what was recorded.
     report.model = if args.clear_model {
         None
     } else {
         args.model
             .clone()
+            .or(report.model.take())
             .or_else(|| previous.and_then(|p| p.model.clone()))
     };
     if args.clear_harness {
@@ -486,7 +488,10 @@ pub fn detect(
     let report = AgentCapabilities {
         version: 1,
         harness: super::detect().map(|h| h.id.into()),
-        model: None,
+        // What the harness itself declares (ANTHROPIC_MODEL…), never a guess.
+        model: crate::profile::declared_model(
+            args.harness.as_deref().or(super::detect().map(|h| h.id)),
+        ),
         environment: environment(),
         tags: vec![],
         skills: published(&policy(args, cwd), cwd, home.as_deref(), &extra)?,
@@ -497,6 +502,47 @@ pub fn detect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_model_comes_from_a_declaration_never_a_guess() {
+        let with = |model: Option<&str>| AgentCapabilities {
+            model: model.map(str::to_string),
+            ..report()
+        };
+        let recorded = with(Some("model-a"));
+        let none = CapabilityArgs::default();
+        // What the harness declares now beats what was recorded before…
+        assert_eq!(
+            merge(with(Some("model-b")), Some(&recorded), &none)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("model-b")
+        );
+        // …an explicit --model beats both, and nothing declared keeps the record.
+        let explicit = CapabilityArgs {
+            model: Some("model-c".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge(with(Some("model-b")), Some(&recorded), &explicit)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("model-c")
+        );
+        assert_eq!(
+            merge(with(None), Some(&recorded), &none)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("model-a")
+        );
+        assert_eq!(merge(with(None), None, &none).unwrap().model, None);
+        // Harnesses without a documented model setting declare nothing.
+        assert_eq!(crate::profile::declared_model(Some("codex")), None);
+        assert_eq!(crate::profile::declared_model(None), None);
+    }
+
     #[test]
     fn profiles_publish_the_repository_s_skills_unless_you_opt_in() {
         use crate::profile::{Publish, SkillPolicy};

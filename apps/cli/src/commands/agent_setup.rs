@@ -186,12 +186,6 @@ const PROJECT_HEADER: &str = "\
 #                ship: how work ships before an issue is completed
 \n";
 
-const LOCAL_HEADER: &str = "\
-# This checkout's agent, written by `gm agent setup`. Not committed.
-# Edit and rerun `gm agent setup` to republish its profile. Its token is kept
-# with gm's credentials, not here.
-\n";
-
 pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     let root = profile::root_from(&ctx.cwd)
         .ok_or_else(|| GmError::usage("Run `gm agent setup` inside a repository checkout."))?;
@@ -342,7 +336,7 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     files.push(plan(
         &root,
         profile::LOCAL_FILE,
-        format!("{LOCAL_HEADER}{}", yaml(&local)?),
+        format!("{}{}", profile::LOCAL_HEADER, yaml(&local)?),
         true,
     ));
 

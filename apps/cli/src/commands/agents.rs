@@ -269,12 +269,21 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
                     value: json!({ "dry_run": true, "method": method, "path": path, "request": body }),
                 });
             }
-            Ok(shown_agent(remote::api(
-                &config,
-                method,
-                &path,
-                Some(&body),
-            )?))
+            let shown = shown_agent(remote::api(&config, method, &path, Some(&body))?);
+            // This checkout's agent keeps its declared model, so setup reruns keep it too.
+            if (args.model.is_some() || args.clear_model)
+                && let Some(root) = crate::profile::root_from(&ctx.cwd)
+                && let Ok(Some(mut local)) = crate::profile::local_at(&root)
+                && (name.is_none() || name.as_deref() == local.name.as_deref())
+            {
+                local.model = if args.clear_model {
+                    None
+                } else {
+                    args.model.clone()
+                };
+                crate::profile::write_local(&root, &local)?;
+            }
+            Ok(shown)
         }
         AgentCommand::List { owner } => {
             let list = if let Some(owner) = owner {
