@@ -33,6 +33,11 @@ interactive setup remains AI-enabled. Use `vp run agent destroy` when finished.
 Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
 for costs and failure recovery.
 
+The website Vite configuration prebundles the Lezer dependencies used by the
+late-loaded source highlighter. Keep that `optimizeDeps.include` list aligned
+with the runtime imports in `shared/semantic/`: discovering another parser on
+first source navigation can reload the dev page and interrupt browser E2E.
+
 There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
 These bindings use real services; D1, Durable Objects and Workflows run locally
 under the environment's `.gitmatrix-agent` state directory. The pinned Vite

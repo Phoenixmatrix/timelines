@@ -23,6 +23,22 @@ export default defineConfig({
       cloudflare({ persistState: { path: local.stateDir }, inspectorPort: false }),
   ],
   server: { host: local.host, port: local.port, strictPort: true },
+  // Source highlighting loads late; discover its parsers before navigation,
+  // rather than restarting the page when the dependency optimizer finds them.
+  optimizeDeps: {
+    include: [
+      "@lezer/css",
+      "@lezer/go",
+      "@lezer/highlight",
+      "@lezer/html",
+      "@lezer/javascript",
+      "@lezer/json",
+      "@lezer/markdown",
+      "@lezer/python",
+      "@lezer/rust",
+      "@lezer/xml",
+    ],
+  },
   test: {
     maxWorkers: 2,
     include: [
