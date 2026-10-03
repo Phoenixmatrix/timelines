@@ -12,7 +12,18 @@ import { timeAgo } from "../lib/format.ts";
 import { usePageContext } from "./page.ts";
 import { useAssistant } from "./state.tsx";
 
-const Chat = lazy(() => import("./Chat.tsx"));
+let loaded: typeof import("./Chat.tsx") | null = null;
+const loadChat = () => import("./Chat.tsx").then((module) => (loaded = module));
+const LazyChat = lazy(loadChat);
+
+/**
+ * Fetch the chat's code before it's asked for (idle time, or a hover on the
+ * button), so opening the assistant shows the conversation at once instead of
+ * an empty column that fills in a moment later.
+ */
+export function preloadAssistant() {
+  void loadChat().catch(() => {});
+}
 
 function useMedia(query: string) {
   const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
@@ -53,13 +64,26 @@ export function AssistantDock() {
     return () => window.removeEventListener("keydown", onKey);
   }, [assistant, docked]);
 
+  // Load the chat's code while the browser is idle, ready for the first open.
+  useEffect(() => {
+    const idle = window.requestIdleCallback ?? ((run: () => void) => setTimeout(run, 1500));
+    const cancel = window.cancelIdleCallback ?? clearTimeout;
+    const handle = idle(preloadAssistant);
+    return () => cancel(handle as number);
+  }, []);
+
   if (!assistant.open) return null;
+  // Once preloaded, render it directly: even a resolved lazy() waits a frame.
+  const Chat = loaded?.default ?? LazyChat;
   const current = chats?.find((c) => c.id === assistant.chatId);
   const title = assistant.fresh ? "New conversation" : current?.title || "Conversation";
 
   return (
     <aside
       aria-label="Assistant"
+      // Docked, it's part of the layout: it fades in rather than sliding, since
+      // a slide would push it past the window and flash a horizontal scrollbar.
+      data-docked={docked ? "" : undefined}
       className={[
         "gm-dock flex flex-col bg-pane",
         docked
@@ -104,7 +128,15 @@ export function AssistantDock() {
           </button>
         </Tip>
       </header>
-      <Suspense fallback={<div className="flex-1" aria-busy="true" />}>
+      <Suspense
+        fallback={
+          loaded ? (
+            <loaded.ChatPlaceholder page={page} />
+          ) : (
+            <div className="flex-1" aria-busy="true" />
+          )
+        }
+      >
         <Chat
           key={assistant.chatId}
           chatId={assistant.chatId}

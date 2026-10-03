@@ -31,7 +31,7 @@ import {
   useMatch,
   useNavigation,
 } from "react-router";
-import { AssistantDock } from "../assistant/Dock.tsx";
+import { AssistantDock, preloadAssistant } from "../assistant/Dock.tsx";
 import { AssistantProvider, useAssistant } from "../assistant/state.tsx";
 import { PaletteProvider, SearchButton } from "../palette/Palette.tsx";
 import { useViewer } from "../lib/session.ts";
@@ -380,6 +380,8 @@ function AskButton() {
         className="mk-place max-sm:before:hidden"
         aria-label="Assistant"
         aria-pressed={assistant.open}
+        onPointerEnter={preloadAssistant}
+        onFocus={preloadAssistant}
         onClick={() => assistant.toggle()}
       >
         <ChatCenteredDotsIcon size={22} weight={assistant.open ? "fill" : "regular"} aria-hidden />

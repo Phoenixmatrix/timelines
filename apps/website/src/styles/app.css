@@ -250,10 +250,18 @@ body {
 .gm-dock {
   animation: gm-dock-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
 }
+.gm-dock[data-docked] {
+  animation-name: gm-dock-fade;
+}
 @keyframes gm-dock-in {
   from {
     opacity: 0;
     translate: 12px 0;
+  }
+}
+@keyframes gm-dock-fade {
+  from {
+    opacity: 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -263,11 +271,6 @@ body {
   }
   .gm-dock {
     animation-name: gm-dock-fade;
-  }
-  @keyframes gm-dock-fade {
-    from {
-      opacity: 0;
-    }
   }
 }
 

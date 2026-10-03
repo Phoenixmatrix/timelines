@@ -9,7 +9,16 @@ import {
   lastAssistantMessageIsCompleteWithApprovalResponses,
   lastAssistantMessageIsCompleteWithToolCalls,
 } from "ai";
-import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { useNavigate, useRevalidator } from "react-router";
 import { WRITE_TOOLS, type PageContext } from "../../shared/assistant.ts";
 import { contextLabel } from "./page.ts";
@@ -154,8 +163,9 @@ export default function Chat({
     seenWrites.current = settledWrites;
   }, [settledWrites, revalidator]);
 
-  // Stay at the newest message unless the person scrolled up to read.
-  useEffect(() => {
+  // Stay at the newest message unless the person scrolled up to read. Before
+  // paint, so an opened conversation never shows its top for a frame first.
+  useLayoutEffect(() => {
     const el = scroller.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
   }, [messages, status]);
@@ -211,8 +221,6 @@ export default function Chat({
     busy &&
     (last?.role !== "assistant" ||
       !last.parts.some((p) => (p.type === "text" && p.text?.trim()) || isTool(p)));
-  const label = withPage ? contextLabel(page) : null;
-  const pageLabel = contextLabel(page);
   const closeIfCompact = compact ? () => assistant.hide() : undefined;
 
   return (
@@ -226,7 +234,13 @@ export default function Chat({
         }}
       >
         {messages.length === 0 && !busy ? (
-          <Welcome page={page} onPick={send} />
+          // A saved conversation renders empty for a moment while its messages
+          // load: show nothing rather than flash the welcome.
+          fresh ? (
+            <Welcome page={page} onPick={send} />
+          ) : (
+            <div aria-busy="true" />
+          )
         ) : (
           <ol className="m-0 flex list-none flex-col gap-5 p-0" aria-label="Conversation">
             {messages.map((message) =>
@@ -283,35 +297,12 @@ export default function Chat({
         )}
       </div>
 
-      <form onSubmit={submit} className="flex flex-col gap-2 px-3 pt-1 pb-3">
-        {pageLabel && (
-          <div className="flex items-center gap-2 text-micro text-ink-faint">
-            {label ? (
-              <span className="inline-flex h-6 max-w-full items-center gap-1 rounded-full bg-raised pr-1 pl-2.5 text-ink-muted">
-                <span className="truncate" title={page.path}>
-                  {label}
-                </span>
-                <button
-                  type="button"
-                  className="grid size-5 shrink-0 cursor-pointer place-items-center rounded-full border-0 bg-transparent text-ink-faint hover:bg-pressed hover:text-ink"
-                  aria-label={`Don't send ${label} as context`}
-                  onClick={() => setWithPage(false)}
-                >
-                  <XIcon className="size-3" weight="bold" aria-hidden />
-                </button>
-              </span>
-            ) : (
-              <button
-                type="button"
-                className="inline-flex h-6 cursor-pointer items-center rounded-full border-0 bg-transparent px-2 text-ink-faint hover:bg-raised hover:text-ink-muted"
-                onClick={() => setWithPage(true)}
-              >
-                Include {pageLabel}
-              </button>
-            )}
-          </div>
-        )}
-        <div className="flex items-end gap-2 rounded-control bg-sunken p-1.5 shadow-[0_0_0_1px_var(--line-soft)] focus-within:bg-rail focus-within:shadow-[0_0_0_2px_var(--signal-line)]">
+      <Composer
+        page={page}
+        withPage={withPage}
+        onWithPage={setWithPage}
+        onSubmit={submit}
+        field={
           <textarea
             ref={input}
             value={draft}
@@ -320,22 +311,112 @@ export default function Chat({
             rows={1}
             placeholder={pending.length ? "Or say what to do instead…" : placeholder(page)}
             aria-label="Message the assistant"
-            className="max-h-48 min-h-9 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-body text-ink outline-none [field-sizing:content] placeholder:text-ink-faint"
+            className={fieldClass}
           />
-          <button
-            type="submit"
-            className="mk-btn mk-btn--sm size-9 shrink-0 p-0 max-sm:size-11"
-            aria-label={busy && !draft.trim() ? "Stop" : "Send"}
-            disabled={!busy && !draft.trim()}
-          >
-            {busy && !draft.trim() ? (
-              <StopIcon weight="fill" className="size-4" aria-hidden />
-            ) : (
-              <ArrowUpIcon weight="bold" className="size-4" aria-hidden />
-            )}
-          </button>
+        }
+        stop={busy && !draft.trim()}
+        canSend={busy || !!draft.trim()}
+      />
+    </div>
+  );
+}
+
+const fieldClass =
+  "max-h-48 min-h-9 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-body text-ink outline-none [field-sizing:content] placeholder:text-ink-faint";
+
+/** The page-context chip and the message box, shared by the chat and its placeholder. */
+function Composer({
+  page,
+  withPage,
+  onWithPage,
+  onSubmit,
+  field,
+  stop,
+  canSend,
+}: {
+  page: PageContext;
+  withPage: boolean;
+  onWithPage?: (next: boolean) => void;
+  onSubmit?: (event: FormEvent) => void;
+  field: ReactNode;
+  stop: boolean;
+  canSend: boolean;
+}) {
+  const pageLabel = contextLabel(page);
+  const label = withPage ? pageLabel : null;
+  return (
+    <form onSubmit={onSubmit} className="flex flex-col gap-2 px-3 pt-1 pb-3">
+      {pageLabel && (
+        <div className="flex items-center gap-2 text-micro text-ink-faint">
+          {label ? (
+            <span className="inline-flex h-6 max-w-full items-center gap-1 rounded-full bg-raised pr-1 pl-2.5 text-ink-muted">
+              <span className="truncate" title={page.path}>
+                {label}
+              </span>
+              <button
+                type="button"
+                className="grid size-5 shrink-0 cursor-pointer place-items-center rounded-full border-0 bg-transparent text-ink-faint hover:bg-pressed hover:text-ink"
+                aria-label={`Don't send ${label} as context`}
+                disabled={!onWithPage}
+                onClick={() => onWithPage?.(false)}
+              >
+                <XIcon className="size-3" weight="bold" aria-hidden />
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              className="inline-flex h-6 cursor-pointer items-center rounded-full border-0 bg-transparent px-2 text-ink-faint hover:bg-raised hover:text-ink-muted"
+              disabled={!onWithPage}
+              onClick={() => onWithPage?.(true)}
+            >
+              Include {pageLabel}
+            </button>
+          )}
         </div>
-      </form>
+      )}
+      <div className="flex items-end gap-2 rounded-control bg-sunken p-1.5 shadow-[0_0_0_1px_var(--line-soft)] focus-within:bg-rail focus-within:shadow-[0_0_0_2px_var(--signal-line)]">
+        {field}
+        <button
+          type="submit"
+          className="mk-btn mk-btn--sm size-9 shrink-0 p-0 max-sm:size-11"
+          aria-label={stop ? "Stop" : "Send"}
+          disabled={!canSend}
+        >
+          {stop ? (
+            <StopIcon weight="fill" className="size-4" aria-hidden />
+          ) : (
+            <ArrowUpIcon weight="bold" className="size-4" aria-hidden />
+          )}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * What the dock shows while a conversation connects and loads: the same
+ * layout as the chat, so the composer doesn't vanish and come back.
+ */
+export function ChatPlaceholder({ page }: { page: PageContext }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1" aria-busy="true" />
+      <Composer
+        page={page}
+        withPage
+        field={
+          <textarea
+            rows={1}
+            disabled
+            placeholder={placeholder(page)}
+            aria-label="Message the assistant"
+            className={fieldClass}
+          />
+        }
+        stop={false}
+        canSend={false}
+      />
     </div>
   );
 }
