@@ -317,6 +317,9 @@ fn safe_owner(owner: &str) -> Result<()> {
     }
     Ok(())
 }
+// Version 1 includes creator backfill, which did not produce change-feed events.
+const SNAPSHOT_SCHEMA: &str = "1";
+
 struct Replica {
     db: Connection,
     config: Config,
@@ -368,13 +371,20 @@ impl Replica {
         self.set("actor", actor)
     }
     fn pull(&self) -> Result<()> {
-        if self.meta("snapshot")?.is_none() {
+        if self.meta("snapshot")?.is_none()
+            || self.meta("snapshot_schema")?.as_deref() != Some(SNAPSHOT_SCHEMA)
+        {
             let mut snapshot = remote::api(&self.config, "GET", &self.path("snapshot"), None)?;
             redact(&mut snapshot);
             if !snapshot["issues"].is_array() || !snapshot["cursor"].is_u64() {
                 return Err(GmError::new("protocol_error", "Invalid tracker snapshot."));
             }
-            return self.set("snapshot", &serde_json::to_string(&snapshot)?);
+            // Replace only the confirmed base, never queued intent or uncertain
+            // receipts. Commit its schema with it so a failed refresh is retryable.
+            let transaction = self.db.unchecked_transaction().map_err(db_err)?;
+            self.set("snapshot", &serde_json::to_string(&snapshot)?)?;
+            self.set("snapshot_schema", SNAPSHOT_SCHEMA)?;
+            return transaction.commit().map_err(db_err);
         }
         // The first page also brings the current members and agents: they are
         // not events, so the snapshot alone would never learn of new ones.
@@ -943,7 +953,7 @@ pub fn tracker(ctx: &Ctx, args: &TrackerArgs) -> Result<Shown> {
                 r.db.query_row("SELECT COUNT(*) FROM recovery.outbox", [], |row| row.get(0))
                     .map_err(db_err)?;
             if !ctx.dry_run {
-                r.db.execute_batch("BEGIN IMMEDIATE; INSERT INTO main.outbox(operation,body,state,error) SELECT operation,body,state,error FROM recovery.outbox ORDER BY seq; INSERT INTO main.meta(key,value) SELECT key,value FROM recovery.meta WHERE key='snapshot' ON CONFLICT(key) DO UPDATE SET value=excluded.value; DELETE FROM recovery.outbox; COMMIT;").map_err(db_err)?;
+                r.db.execute_batch("BEGIN IMMEDIATE; INSERT INTO main.outbox(operation,body,state,error) SELECT operation,body,state,error FROM recovery.outbox ORDER BY seq; INSERT INTO main.meta(key,value) SELECT key,value FROM recovery.meta WHERE key='snapshot' ON CONFLICT(key) DO UPDATE SET value=excluded.value; DELETE FROM main.meta WHERE key='snapshot_schema'; DELETE FROM recovery.outbox; COMMIT;").map_err(db_err)?;
             }
             Ok(Shown(
                 json!({"dryRun":ctx.dry_run,"recovered":count,"source":source,"replica":destination,"next":"Run gm tracker sync. Original operation IDs and uncertain receipts were preserved."}),

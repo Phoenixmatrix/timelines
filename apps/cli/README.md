@@ -127,6 +127,13 @@ person when recorded. Its JSON keeps `createdBy` and a directory-resolved
 `creatorDisplay`. Legacy attribution may be unknown; an optimistic offline create
 does not invent a creator before the server confirms it.
 
+Existing replicas refresh their confirmed snapshot once on the next online pull
+to pick up server-backfilled creators, even when the event cursor has not changed.
+The refresh preserves pending operations, request bodies, conflict states and
+uncertain receipts; normal sync still replays the outbox first. Offline reads keep
+the cached attribution until that refresh. Recovering an older credential replica
+also schedules a snapshot refresh.
+
 ```bash
 gm issue history ENG-1 --owner orbit --limit 50
 gm issue history ENG-1 --owner orbit --before 120 --limit 100 --json
