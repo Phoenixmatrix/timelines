@@ -116,16 +116,11 @@ pub struct EntityCreate {
 }
 #[derive(Args)]
 pub struct Patch {
-    /// Canonical ID, issue key, team key or workspace slug.
+    /// Canonical ID, team key or workspace slug.
     pub id: String,
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file.
-    /// Issue fields: title, description, acceptance, type, status, closeReason,
-    /// priority (0–4), assigneeId, parentId, workspaceIds and labels. Team fields:
-    /// name, description, memberIds and archived. Workspace fields: name,
-    /// description and archived. Relationships use canonical IDs; null clears
-    /// assigneeId/parentId. Setting status to canceled requires closeReason:
-    /// duplicate, not_planned, obsolete, cannot_reproduce or other.
-    /// Leaving canceled clears closeReason automatically.
+    /// Team fields: name, description, memberIds and archived. Workspace fields:
+    /// name, description and archived. Member IDs are canonical.
     #[arg(long)]
     pub data: String,
 }
@@ -180,6 +175,8 @@ pub struct IssueCreate {
     pub close_reason: Option<String>,
     #[arg(long, default_value_t=2, value_parser=clap::value_parser!(u8).range(0..=4))]
     pub priority: u8,
+    #[command(flatten)]
+    pub timeline: TimelineRule,
     #[arg(long)]
     pub parent: Option<String>,
     #[arg(long)]
@@ -188,6 +185,34 @@ pub struct IssueCreate {
     pub workspace: Vec<String>,
     #[arg(long)]
     pub label: Vec<String>,
+}
+/// Whether an agent works the issue in a timeline (`timelineUse`, `timelinePolicy`).
+#[derive(Args)]
+pub struct TimelineRule {
+    /// Whether agents work this issue in a timeline: agent_decides (the default; the
+    /// agent also reads the description or PRD), required or never.
+    #[arg(long, value_parser=["agent_decides","required","never"])]
+    pub timeline_use: Option<String>,
+    /// With required: the policy the agent's timeline must use (auto or approval);
+    /// none leaves it to the agent.
+    #[arg(long, value_parser=["auto","approval","none"])]
+    pub timeline_policy: Option<String>,
+}
+#[derive(Args)]
+pub struct IssuePatch {
+    /// Canonical ID or issue key.
+    pub id: String,
+    /// JSON object of mutable fields; use '-' for stdin or '@path' for a file:
+    /// title, description, acceptance, type, status, closeReason, timelineUse,
+    /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds and
+    /// labels. Relationships use canonical IDs; null clears assigneeId/parentId.
+    /// Setting status to canceled requires closeReason: duplicate, not_planned,
+    /// obsolete, cannot_reproduce or other. Leaving canceled clears closeReason
+    /// automatically, as leaving required clears timelinePolicy.
+    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy"])]
+    pub data: Option<String>,
+    #[command(flatten)]
+    pub timeline: TimelineRule,
 }
 #[derive(Args)]
 pub struct ListIssues {
@@ -255,7 +280,8 @@ pub enum IssueCommand {
         limit: u16,
     },
     /// Apply a JSON patch with optimistic version checking; null clears nullable fields.
-    Update(Patch),
+    /// --timeline-use and --timeline-policy set the timeline rule without JSON.
+    Update(IssuePatch),
     /// Add a directed relation: FROM blocks TO (or related/duplicates).
     Link {
         from: String,

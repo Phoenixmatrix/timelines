@@ -44,6 +44,8 @@ const labels: Record<string, string> = {
   acceptance: "Acceptance criteria",
   status: "Status",
   closeReason: "Close reason",
+  timelineUse: "Timeline",
+  timelinePolicy: "Timeline policy",
   priority: "Priority",
   type: "Type",
   assigneeId: "Assignee",

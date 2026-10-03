@@ -4,6 +4,7 @@ import {
   actorName,
   type Issue,
   type IssueCloseReason,
+  type IssueTimelineUse,
   type Mutation,
   type Snapshot,
 } from "../../../shared/tracker.ts";
@@ -15,7 +16,16 @@ import {
   TextField,
 } from "../../components/ui.tsx";
 import type { MutationOutcome } from "./IssueDetail.tsx";
-import { CloseReasonField, Field, MultiCheck, statuses, typeLabel, types } from "./ui.tsx";
+import type { TimelinePolicy } from "../../../shared/timelines.ts";
+import {
+  CloseReasonField,
+  Field,
+  MultiCheck,
+  statuses,
+  TimelineFields,
+  typeLabel,
+  types,
+} from "./ui.tsx";
 
 /** Expanded capture stays in the tracker; the existing editor handles the next step. */
 export function CreateIssue({
@@ -46,6 +56,8 @@ export function CreateIssue({
   const [status, setStatus] = useState<Issue["status"]>("todo");
   const [closeReason, setCloseReason] = useState<IssueCloseReason | null>(null);
   const [priority, setPriority] = useState(2);
+  const [timelineUse, setTimelineUse] = useState<IssueTimelineUse>("agent_decides");
+  const [timelinePolicy, setTimelinePolicy] = useState<TimelinePolicy | null>(null);
   const [assigneeId, setAssigneeId] = useState("");
   const [workspaceIds, setWorkspaceIds] = useState(initialWorkspaces);
   const [error, setError] = useState("");
@@ -90,6 +102,8 @@ export function CreateIssue({
                   status,
                   closeReason: status === "canceled" ? closeReason : null,
                   priority: priority as Issue["priority"],
+                  timelineUse,
+                  timelinePolicy,
                   assigneeId: assigneeId || null,
                   workspaceIds,
                 });
@@ -178,6 +192,14 @@ export function CreateIssue({
                       onChange={setAssigneeId}
                     />
                   </Field>
+                  <TimelineFields
+                    use={timelineUse}
+                    policy={timelinePolicy}
+                    onChange={(use, policy) => {
+                      setTimelineUse(use);
+                      setTimelinePolicy(policy);
+                    }}
+                  />
                 </div>
                 <MultiCheck
                   label="Workspaces"

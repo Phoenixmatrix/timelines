@@ -5,6 +5,8 @@ import {
   attribution,
   claimAttribution,
   CLOSE_REASONS,
+  issueTimeline,
+  issueTimelineText,
   leasedAncestor,
   readinessIndex,
   type Comment,
@@ -31,6 +33,7 @@ import {
   MarkdownText,
   MultiCheck,
   statuses,
+  TimelineFields,
   typeLabel,
   types,
 } from "./ui.tsx";
@@ -53,6 +56,8 @@ const fieldNames: Record<keyof IssueFields, string> = {
   type: "Type",
   status: "Status",
   closeReason: "Close reason",
+  timelineUse: "Timeline",
+  timelinePolicy: "Timeline policy",
   priority: "Priority",
   assigneeId: "Assignee",
   parentId: "Parent issue",
@@ -68,6 +73,8 @@ const fieldsOf = (issue: Issue): IssueFields => ({
   type: issue.type,
   status: issue.status,
   closeReason: issue.closeReason ?? null,
+  timelineUse: issueTimeline(issue).use,
+  timelinePolicy: issueTimeline(issue).policy,
   priority: issue.priority,
   assigneeId: issue.assigneeId,
   parentId: issue.parentId,
@@ -232,8 +239,15 @@ export function IssueDetail({
     // Editing a queued/failed text value makes it a draft again until its next blur.
     if (textFields.has(key))
       setPendingFields((previous) => previous.filter((field) => field !== key));
+    // Paired fields save together: the server validates them as one rule.
     if (autosave)
-      enqueue(key === "status" || key === "closeReason" ? ["status", "closeReason"] : [key]);
+      enqueue(
+        key === "status" || key === "closeReason"
+          ? ["status", "closeReason"]
+          : key === "timelineUse" || key === "timelinePolicy"
+            ? ["timelineUse", "timelinePolicy"]
+            : [key],
+      );
   };
   const links = snapshot.links.filter((link) => link.fromId === issue.id || link.toId === issue.id);
   const comments = snapshot.comments.filter((comment) => comment.issueId === issue.id);
@@ -434,6 +448,8 @@ export function IssueDetail({
     if (key === "closeReason")
       return fields.closeReason ? CLOSE_REASONS[fields.closeReason] : "No reason recorded";
     if (key === "priority") return `P${fields.priority}`;
+    if (key === "timelineUse") return issueTimelineText(fields);
+    if (key === "timelinePolicy") return fields.timelinePolicy ?? "Either policy";
     return String(value);
   };
   const rebase = () => {
@@ -744,6 +760,14 @@ export function IssueDetail({
                 onChange={(value) => change("assigneeId", value || null)}
               />
             </Field>
+            <TimelineFields
+              use={draft.fields.timelineUse}
+              policy={draft.fields.timelinePolicy}
+              onChange={(timelineUse, timelinePolicy) => {
+                change("timelineUse", timelineUse);
+                change("timelinePolicy", timelinePolicy);
+              }}
+            />
             <IssuePicker
               label="Parent issue"
               value={draft.fields.parentId ?? ""}
@@ -872,6 +896,8 @@ export function IssueDetail({
           <dd className="m-0 min-w-0">{typeLabel(issue.type)}</dd>
           <dt className="text-ink-faint">Priority</dt>
           <dd className="m-0 min-w-0">P{issue.priority}</dd>
+          <dt className="text-ink-faint">Timeline</dt>
+          <dd className="m-0 min-w-0">{issueTimelineText(issue)}</dd>
           {issue.status === "canceled" && (
             <>
               <dt className="text-ink-faint">Close reason</dt>

@@ -1,5 +1,5 @@
 import type { AgentCapabilities } from "./api.ts";
-import type { Timeline, TimelineEvent } from "./timelines.ts";
+import type { Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
 
 export interface TrackerIdentity {
   id: string;
@@ -66,6 +66,31 @@ export const CLOSE_REASONS = {
   other: "Other",
 } as const;
 export type IssueCloseReason = keyof typeof CLOSE_REASONS;
+/**
+ * Whether an agent works this issue in a timeline (TIMELINES-RESEARCH.md,
+ * "When an agent uses a timeline"): `required`, `never`, or left to the agent,
+ * which also reads the description or PRD. Issues from before the field read
+ * as `agent_decides`.
+ */
+export const TIMELINE_USES = {
+  agent_decides: "Agent decides",
+  required: "Required",
+  never: "Never",
+} as const;
+export type IssueTimelineUse = keyof typeof TIMELINE_USES;
+/** An issue's timeline rule, with the default filled in for issues that predate it. */
+export function issueTimeline(issue: Pick<Issue, "timelineUse" | "timelinePolicy">): {
+  use: IssueTimelineUse;
+  policy: TimelinePolicy | null;
+} {
+  const use = issue.timelineUse ?? "agent_decides";
+  return { use, policy: use === "required" ? (issue.timelinePolicy ?? null) : null };
+}
+/** "Required (approval)", "Agent decides": the rule in words. */
+export function issueTimelineText(issue: Pick<Issue, "timelineUse" | "timelinePolicy">): string {
+  const { use, policy } = issueTimeline(issue);
+  return policy ? `${TIMELINE_USES[use]} (${policy})` : TIMELINE_USES[use];
+}
 export interface IssueClaim {
   /** The holder: an agent's id, or a person's. */
   actorId: string;
@@ -104,6 +129,10 @@ export interface Issue extends TrackerEntity {
   status: IssueStatus;
   /** Why it was canceled. Historical cancellations may have no recorded reason. */
   closeReason?: IssueCloseReason | null;
+  /** Whether to work it in a timeline; absent on older issues (read as `agent_decides`). */
+  timelineUse?: IssueTimelineUse;
+  /** With `required`: the policy the agent's timeline must use, or null for either. */
+  timelinePolicy?: TimelinePolicy | null;
   priority: 0 | 1 | 2 | 3 | 4;
   assigneeId: string | null;
   parentId: string | null;
@@ -329,6 +358,8 @@ export type IssueFields = Pick<
   | "type"
   | "status"
   | "closeReason"
+  | "timelineUse"
+  | "timelinePolicy"
   | "priority"
   | "assigneeId"
   | "parentId"

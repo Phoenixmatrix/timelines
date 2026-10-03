@@ -170,6 +170,20 @@ canceled issues without a reason remain editable, but explicitly clearing a reas
 while canceled is rejected. `issue show`, lists, and mutation output include the
 saved `closeReason`. Cancellation does not satisfy dependent issues' blockers.
 
+Each issue says whether agents work it in a timeline: `timelineUse` is
+`agent_decides` (the default, also for issues from before the field), `required`
+or `never`, and `required` may name the `timelinePolicy` (`auto` or `approval`)
+the timeline must use. Leaving `required` clears the policy.
+
+```bash
+gm issue create 'Migrate billing' --team ENG --timeline-use required --timeline-policy approval
+gm issue update ENG-1 --timeline-use never
+gm issue update ENG-1 --timeline-policy none # Either policy
+```
+
+`gm issue next` and `gm issue claim` return the rule as `timelineRule`
+(`use`, `policy`, `guidance`); the text output leads with it.
+
 ### Offline replicas and explicit conflicts
 
 Initialize a replica online first. Offline mode is explicit: errors never silently

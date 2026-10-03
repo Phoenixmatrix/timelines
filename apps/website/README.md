@@ -500,6 +500,13 @@ The API uses `issue.update` with `status: "canceled"` and `closeReason` set to
 Existing version and lease checks still apply. Closing does not complete
 subtasks or satisfy dependent issues' blockers.
 
+**Timeline** (in the create form and the editor) tells agents whether to work an
+issue in a timeline: Agent decides (the default), Required or Never. Required can
+name the policy the timeline must use, Auto or Approval. The API stores it as
+`timelineUse` (`agent_decides`, `required`, `never`) and `timelinePolicy` (`auto`,
+`approval` or null, allowed only with `required`); issues from before the field
+read as `agent_decides`.
+
 - **Ownership:** a personal account or organization owns each tracker. An issue
   has one team and zero or more cross-team workspaces. Team prefixes and workspace
   slugs are permanent; archival preserves history.

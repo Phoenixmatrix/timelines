@@ -450,6 +450,67 @@ describe("tracker SQLite authority", () => {
     });
     expect(f.store.snapshot(f.access).issues[0]!.closeReason).toBe("cannot_reproduce");
   });
+  test("the timeline rule defaults to agent_decides, keeps a policy only when required, and validates atomically", () => {
+    const f = fixture();
+    f.issue("issue");
+    const read = (id: string) =>
+      f.store.snapshot(f.access).issues.find((issue) => issue.id === id)!;
+    expect(read("issue")).toMatchObject({ timelineUse: "agent_decides", timelinePolicy: null });
+    const before = f.store.snapshot(f.access);
+    for (const data of [
+      { timelineUse: "sometimes" },
+      { timelineUse: null },
+      { timelinePolicy: "approval" },
+      { timelineUse: "never", timelinePolicy: "auto" },
+      { timelineUse: "required", timelinePolicy: "manual" },
+    ]) {
+      expect(() =>
+        f.store.mutate(f.access, {
+          operationId: crypto.randomUUID(),
+          mutations: [{ kind: "issue.update", id: "issue", expectedVersion: 1, data } as Mutation],
+        }),
+      ).toThrow(/timeline/);
+      expect(f.store.snapshot(f.access)).toEqual(before);
+    }
+    f.mutate({
+      kind: "issue.update",
+      id: "issue",
+      expectedVersion: 1,
+      data: { timelineUse: "required", timelinePolicy: "approval" },
+    });
+    expect(read("issue")).toMatchObject({ timelineUse: "required", timelinePolicy: "approval" });
+    // Leaving required drops the policy.
+    f.mutate({
+      kind: "issue.update",
+      id: "issue",
+      expectedVersion: 2,
+      data: { timelineUse: "never" },
+    });
+    expect(read("issue")).toMatchObject({ timelineUse: "never", timelinePolicy: null });
+    f.mutate({
+      kind: "issue.create",
+      id: "auto",
+      data: { teamId: "team", title: "Auto", timelineUse: "required", timelinePolicy: "auto" },
+    });
+    expect(read("auto")).toMatchObject({ timelineUse: "required", timelinePolicy: "auto" });
+    // Issues from before the field keep working and can gain it.
+    f.issue("legacy");
+    f.db
+      .prepare(
+        "UPDATE issues SET data = json_remove(data, '$.timelineUse', '$.timelinePolicy') WHERE id = ?",
+      )
+      .run("legacy");
+    f.mutate({ kind: "issue.update", id: "legacy", expectedVersion: 1, data: { title: "Old" } });
+    expect(read("legacy").timelineUse).toBeUndefined();
+    f.mutate({
+      kind: "issue.update",
+      id: "legacy",
+      expectedVersion: 2,
+      data: { timelineUse: "required" },
+    });
+    expect(read("legacy")).toMatchObject({ timelineUse: "required" });
+    expect(read("legacy").timelinePolicy).toBeUndefined();
+  });
   test("cyclic batches roll back entities, sequence numbers, events and receipts", () => {
     const f = fixture();
     const before = f.store.snapshot(f.access);

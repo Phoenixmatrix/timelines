@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import {
   CLOSE_REASONS,
   DEFAULT_ATTEMPT_LIMIT,
+  TIMELINE_USES,
   hasActiveClaim,
   isOpen,
   leasedAncestor,
@@ -13,6 +14,7 @@ import {
   type HumanRequest,
   type IssueClaim,
   type IssueCloseReason,
+  type IssueTimelineUse,
   type EntityType,
   type Issue,
   type Link,
@@ -34,7 +36,7 @@ import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
 import { matchRank, matches, type MatchColumns, type SearchQuery } from "../search/query.ts";
-import type { Timeline, TimelineEvent } from "../../shared/timelines.ts";
+import { TIMELINE_POLICIES, type Timeline, type TimelineEvent } from "../../shared/timelines.ts";
 import {
   findTimeline,
   isScoped,
@@ -47,6 +49,7 @@ import {
 export type { SqlDatabase } from "./sql.ts";
 
 const closeReasons = Object.keys(CLOSE_REASONS) as IssueCloseReason[];
+const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
 
 export class TrackerError extends Error {
   public status: 400 | 401 | 403 | 404 | 409 | 413;
@@ -1090,6 +1093,20 @@ export class TrackerStore {
         issue.workspaceIds = workspaceIds;
       }
       if ("labels" in data) issue.labels = strings(data.labels, "labels", 50);
+      if ("timelineUse" in data) {
+        issue.timelineUse = choice(data.timelineUse, timelineUses, "timeline use");
+        // A policy belongs to `required` only: leaving it drops the policy.
+        if (issue.timelineUse !== "required" && !("timelinePolicy" in data))
+          issue.timelinePolicy = null;
+      }
+      if ("timelinePolicy" in data) {
+        issue.timelinePolicy =
+          data.timelinePolicy === null
+            ? null
+            : choice(data.timelinePolicy, TIMELINE_POLICIES, "timeline policy");
+        if (issue.timelinePolicy && issue.timelineUse !== "required")
+          fail("invalid_input", "A timeline policy needs timelineUse required.");
+      }
     };
     for (const mutation of request.mutations) {
       mutationKind = mutation.kind;
@@ -1227,6 +1244,8 @@ export class TrackerStore {
             "type",
             "status",
             "closeReason",
+            "timelineUse",
+            "timelinePolicy",
             "priority",
             "assigneeId",
             "parentId",
@@ -1261,6 +1280,8 @@ export class TrackerStore {
               type: "task",
               status: "todo",
               closeReason: null,
+              timelineUse: "agent_decides",
+              timelinePolicy: null,
               priority: 2,
               assigneeId: null,
               parentId: null,

@@ -5,12 +5,16 @@ Work is tracked in Gitmatrix: {{SCOPE}}. The loop, in brief (the
 
 1. `gm issue next` picks and claims the most valuable ready issue in scope.
    Nothing ready means stop, not retry.
-2. Work it: `gm issue checkpoint <issue> '<done; next>'` as you go, and
+2. Choose where it goes before you start: the claim's `timelineRule` says
+   whether the issue requires a timeline, never wants one, or leaves it to
+   you (then read the description or PRD). Record it with a checkpoint:
+   `'Timeline: <slug>'`, or `'Timeline: main, because …'`.
+3. Work it: `gm issue checkpoint <issue> '<done; next>'` as you go, and
    `gm issue renew <issue>` before the lease ({{TTL}}) ends.
-3. Need to find something out (where code lives, why CI failed, what an issue
+4. Need to find something out (where code lives, why CI failed, what an issue
    depends on)? `gm ask "<question>"` asks the Gitmatrix assistant. Blocked on
    a person? `gm issue ask <issue> --kind question|approval|decision|credential --prompt '…'`.
-4. Ship ({{SHIP}}), then `gm issue complete <issue> --evidence '…'`. Can't
+5. Ship ({{SHIP}}), then `gm issue complete <issue> --evidence '…'`. Can't
    finish: `gm issue release <issue>`.
 
 When an agent harness drives gm here, gm acts as this checkout's agent

@@ -11,11 +11,14 @@ import {
   leasedAncestor,
   readiness,
   readinessIndex,
+  TIMELINE_USES,
   type Issue,
   type IssueCloseReason,
+  type IssueTimelineUse,
   type Snapshot,
 } from "../../../shared/tracker.ts";
-import { popMotion } from "../../components/ui.tsx";
+import { TIMELINE_POLICIES, type TimelinePolicy } from "../../../shared/timelines.ts";
+import { popMotion, SelectField } from "../../components/ui.tsx";
 import type { IssueIndex } from "./query.ts";
 import { Actor } from "./Actor.tsx";
 
@@ -72,6 +75,51 @@ export function CloseReasonField({
         ))}
       </select>
     </Field>
+  );
+}
+/**
+ * Whether an agent works the issue in a timeline and, when required, the policy
+ * that timeline must use. Agents also read the description or PRD.
+ */
+export function TimelineFields({
+  use,
+  policy,
+  onChange,
+}: {
+  use: IssueTimelineUse | undefined;
+  policy: TimelinePolicy | null | undefined;
+  onChange: (use: IssueTimelineUse, policy: TimelinePolicy | null) => void;
+}) {
+  const current = use ?? "agent_decides";
+  return (
+    <>
+      <Field label="Timeline">
+        <SelectField
+          ariaLabel="Issue timeline"
+          value={current}
+          options={Object.entries(TIMELINE_USES).map(([value, label]) => ({ value, label }))}
+          onChange={(value) =>
+            onChange(value as IssueTimelineUse, value === "required" ? (policy ?? null) : null)
+          }
+        />
+      </Field>
+      {current === "required" && (
+        <Field label="Timeline policy">
+          <SelectField
+            ariaLabel="Timeline policy"
+            value={policy ?? ""}
+            options={[
+              { value: "", label: "Either policy" },
+              ...TIMELINE_POLICIES.map((value) => ({
+                value,
+                label: value === "auto" ? "Auto: lands when green" : "Approval: a person approves",
+              })),
+            ]}
+            onChange={(value) => onChange("required", (value || null) as TimelinePolicy | null)}
+          />
+        </Field>
+      )}
+    </>
   );
 }
 // Markdown inside the tracker: headings stay at body size so a PRD's "# Title"

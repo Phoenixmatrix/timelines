@@ -26,7 +26,19 @@ impl Render for Shown {
         if self.0.get("issueId").is_some() && self.0.get("events").is_some() {
             return history_text(&self.0);
         }
-        let body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
+        let mut body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
+        // A claim leads with the issue's timeline rule, so the choice comes first.
+        if let Some(rule) = self.0.get("timelineRule").filter(|r| r.is_object()) {
+            body = format!(
+                "Timeline: {}{}. {}\n\n{body}",
+                rule["use"].as_str().unwrap_or("agent_decides"),
+                rule["policy"]
+                    .as_str()
+                    .map(|p| format!(" ({p})"))
+                    .unwrap_or_default(),
+                rule["guidance"].as_str().unwrap_or(""),
+            );
+        }
         if self.0.get("ancestors").is_some() && self.0.get("issue").is_some() {
             return format!(
                 "Created by: {}\n\n{body}",
@@ -862,6 +874,72 @@ fn validate_close_reason(
     Ok(())
 }
 
+/// The timeline rule, as the server checks it: a known use, and a policy only
+/// with `required`. Issues from before the field read as `agent_decides`.
+fn validate_timeline(
+    previous: Option<&Value>,
+    data: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let usage = || {
+        GmError::usage(
+            "timelineUse is agent_decides, required or never; timelinePolicy (auto, approval or null) needs required.",
+        )
+    };
+    let use_ = match data.get("timelineUse") {
+        None => previous
+            .and_then(|issue| issue["timelineUse"].as_str())
+            .unwrap_or("agent_decides"),
+        Some(value) => match value.as_str() {
+            Some(use_ @ ("agent_decides" | "required" | "never")) => use_,
+            _ => return Err(usage()),
+        },
+    };
+    match data.get("timelinePolicy") {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) if matches!(value.as_str(), Some("auto" | "approval")) => {
+            if use_ == "required" {
+                Ok(())
+            } else {
+                Err(usage())
+            }
+        }
+        Some(_) => Err(usage()),
+    }
+}
+/// An issue's timeline rule: `{use, policy}`, defaulted for issues from before it.
+fn timeline_rule(issue: &Value) -> Value {
+    let use_ = issue["timelineUse"].as_str().unwrap_or("agent_decides");
+    let policy = if use_ == "required" {
+        issue["timelinePolicy"].clone()
+    } else {
+        Value::Null
+    };
+    json!({"use": use_, "policy": policy})
+}
+/// What an agent claiming the issue does about timelines (the graph-work skill
+/// explains): the rule, and how to record the choice it makes.
+fn timeline_guidance(issue: &Value) -> Value {
+    let mut rule = timeline_rule(issue);
+    let key = issue["key"].as_str().unwrap_or("<issue>");
+    let policy = rule["policy"].as_str();
+    rule["guidance"] = json!(match rule["use"].as_str() {
+        Some("required") => format!(
+            "Work this issue in a timeline{}, not on main. Record it: gm issue checkpoint {key} 'Timeline: <slug>{}'.",
+            policy
+                .map(|p| format!(" with the {p} policy"))
+                .unwrap_or_default(),
+            policy.map(|p| format!(" ({p})")).unwrap_or_default(),
+        ),
+        Some("never") => format!(
+            "Work this issue on main, not in a timeline. Record it: gm issue checkpoint {key} 'Timeline: main (the issue says never)'."
+        ),
+        _ => format!(
+            "Your choice: read the description or PRD and comments for a request (\"do this in an approval timeline\"); otherwise choose by risk and review needs. Record it: gm issue checkpoint {key} 'Timeline: <slug> (<policy>)' or 'Timeline: main, because <why>'."
+        ),
+    });
+    rule
+}
+
 fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
     let kind = mutation["kind"].as_str().unwrap_or("");
     let (entity, action) = kind
@@ -893,6 +971,7 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         })?;
         if entity == "issue" {
             validate_close_reason(Some(&rows[index]), data)?;
+            validate_timeline(Some(&rows[index]), data)?;
         }
         let row = rows[index].as_object_mut().unwrap();
         for (key, value) in data {
@@ -903,6 +982,13 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         }
         if entity == "issue" && row.get("status").and_then(Value::as_str) != Some("canceled") {
             row.insert("closeReason".into(), Value::Null);
+        }
+        if entity == "issue"
+            && data.contains_key("timelineUse")
+            && !data.contains_key("timelinePolicy")
+            && data["timelineUse"] != "required"
+        {
+            row.insert("timelinePolicy".into(), Value::Null);
         }
         row.insert(
             "version".into(),
@@ -915,10 +1001,11 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         }
         if entity == "issue" {
             validate_close_reason(None, data)?;
+            validate_timeline(None, data)?;
         }
         let mut row = match entity {
             "issue" => {
-                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","closeReason":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
+                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
             }
             "team" => json!({"description":"","memberIds":[],"archived":false}),
             "workspace" => json!({"description":"","archived":false}),
@@ -958,6 +1045,29 @@ fn object(text: &str) -> Result<Value> {
 }
 fn create(entity: &str, data: Value) -> Value {
     json!({"kind":format!("{entity}.create"),"id":uid(),"data":data})
+}
+/// `gm issue update`: the JSON patch, with the timeline flags on top.
+fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
+    let row = resolve(snapshot, "issues", &p.id)?;
+    let mut data = match &p.data {
+        Some(text) => object(text)?,
+        None => json!({}),
+    };
+    timeline_fields(&p.timeline, &mut data);
+    Ok(json!({"kind":"issue.update","id":row["id"],"expectedVersion":row["version"],"data":data}))
+}
+/// `--timeline-use`/`--timeline-policy` as `timelineUse`/`timelinePolicy` (`none` clears).
+fn timeline_fields(rule: &TimelineRule, data: &mut Value) {
+    if let Some(use_) = &rule.timeline_use {
+        data["timelineUse"] = json!(use_);
+    }
+    if let Some(policy) = &rule.timeline_policy {
+        data["timelinePolicy"] = if policy == "none" {
+            Value::Null
+        } else {
+            json!(policy)
+        };
+    }
 }
 fn patch(snapshot: &Value, entity: &str, p: &Patch) -> Result<Value> {
     let row = resolve(snapshot, collection(entity).unwrap(), &p.id)?;
@@ -1447,6 +1557,9 @@ fn actor_name(snapshot: &Value, id: &str) -> String {
 /// The issue as stored, plus who holds its claim and who it's assigned to, by name.
 fn named(snapshot: &Value, issue: &Value) -> Value {
     let mut out = issue.clone();
+    let rule = timeline_rule(issue);
+    out["timelineUse"] = rule["use"].clone();
+    out["timelinePolicy"] = rule["policy"].clone();
     if let Some(holder) = issue["claim"]["actorId"].as_str() {
         out["claimedBy"] = json!(actor_name(snapshot, holder));
     }
@@ -1587,6 +1700,19 @@ fn delegate(snapshot: &Value, delegation: &Delegation, data: &mut Value) -> Resu
     }
     Ok(())
 }
+/// The claimed issue as the server returned it with the claim, else as the replica has it.
+fn claimed_issue(snapshot: &Value, response: &Value, issue_id: &str) -> Option<Value> {
+    response["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|e| {
+            e["entityType"] == "issue" && e["entityId"] == issue_id && e["entity"].is_object()
+        })
+        .map(|e| e["entity"].clone())
+        .or_else(|| resolve(snapshot, "issues", issue_id).ok().cloned())
+}
 /// What `gm issue next` reports: the claim (its token shown once) and the issue's working
 /// context, or that nothing in scope is ready.
 fn next_result(snapshot: &Value, response: &Value) -> Shown {
@@ -1614,7 +1740,11 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
                 .filter(move |c| c["issueId"] == l["fromId"] && c["kind"] == "evidence")
         })
         .collect();
+    let rule = claimed_issue(snapshot, response, issue_id)
+        .map(|issue| timeline_guidance(&issue))
+        .unwrap_or(Value::Null);
     let mut out = json!({
+        "timelineRule": rule,
         "claimed": {
             "issueId": issue_id,
             "key": result["key"],
@@ -1742,12 +1872,14 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 if choice.source != TeamSource::Flag {
                     picked = Some(choice.describe(&r.owner, false));
                 }
-                create(
+                let mut mutation = create(
                     "issue",
                     json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
-                )
+                );
+                timeline_fields(&a.timeline, &mut mutation["data"]);
+                mutation
             }
-            IssueCommand::Update(p) => patch(&snapshot, "issue", p)?,
+            IssueCommand::Update(p) => issue_patch(&snapshot, p)?,
             IssueCommand::Link { from, to, kind } => {
                 json!({"kind":"link.add","id":uid(),"data":{"fromId":id(&snapshot,"issues",from)?,"toId":id(&snapshot,"issues",to)?,"kind":kind}})
             }
@@ -2012,6 +2144,11 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     shown.0["team"] = team;
                 }
                 return Ok(shown);
+            }
+            if let IssueCommand::Claim { .. } = args.command
+                && let Some(issue) = claimed_issue(&snapshot, &response, &target)
+            {
+                response["timelineRule"] = timeline_guidance(&issue);
             }
             if !matches!(
                 args.command,
@@ -2396,8 +2533,118 @@ mod tests {
         assert_eq!(claimed.0["claimed"]["leaseToken"], "secret");
         assert_eq!(claimed.0["context"]["issue"]["key"], "ENG-2");
         assert_eq!(claimed.0["blockerEvidence"].as_array().unwrap().len(), 1);
+        // An issue from before the timeline field leaves the choice to the agent.
+        assert_eq!(claimed.0["timelineRule"]["use"], "agent_decides");
+        assert_eq!(
+            claimed.0["context"]["issue"]["timelineUse"],
+            "agent_decides"
+        );
+        assert!(claimed.0["context"]["issue"]["timelinePolicy"].is_null());
         let none = next_result(&s, &json!({"results":[{"id":"pick"}]}));
         assert!(none.0["claimed"].is_null());
+        assert!(none.0.get("timelineRule").is_none());
+    }
+    #[test]
+    fn claims_lead_with_the_timeline_rule_from_the_server_issue() {
+        let mut s = snapshot();
+        s["members"] = json!([]);
+        s["agents"] = json!([]);
+        s["issues"] =
+            json!([{"id":"b","key":"ENG-2","status":"todo","parentId":null,"claim":null}]);
+        // The claim's event carries the server's issue, newer than the replica's.
+        let response = json!({
+            "events":[{"entityType":"issue","entityId":"b","entity":{"id":"b","key":"ENG-2","timelineUse":"required","timelinePolicy":"approval"}}],
+            "results":[{"issueId":"b","key":"ENG-2","leaseToken":"secret","expiresAt":"later"}],
+        });
+        let claimed = next_result(&s, &response);
+        assert_eq!(
+            claimed.0["timelineRule"],
+            json!({"use":"required","policy":"approval","guidance":"Work this issue in a timeline with the approval policy, not on main. Record it: gm issue checkpoint ENG-2 'Timeline: <slug> (approval)'."})
+        );
+        assert!(
+            claimed
+                .text()
+                .starts_with("Timeline: required (approval). Work this issue")
+        );
+        let never = timeline_guidance(
+            &json!({"key":"ENG-3","timelineUse":"never","timelinePolicy":"auto"}),
+        );
+        assert!(never["policy"].is_null());
+        assert!(never["guidance"].as_str().unwrap().contains("on main"));
+        let open = timeline_guidance(&json!({"key":"ENG-4"}));
+        assert!(
+            open["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("description or PRD")
+        );
+    }
+    #[test]
+    fn offline_timeline_rules_match_the_server() {
+        let mut s = snapshot();
+        project(
+            &mut s,
+            &json!({"kind":"issue.create","id":"a","data":{"title":"T"}}),
+        )
+        .unwrap();
+        assert_eq!(s["issues"][0]["timelineUse"], "agent_decides");
+        assert!(s["issues"][0]["timelinePolicy"].is_null());
+        let before = s.clone();
+        for data in [
+            json!({"timelineUse":"sometimes"}),
+            json!({"timelineUse":null}),
+            json!({"timelinePolicy":"auto"}),
+            json!({"timelineUse":"never","timelinePolicy":"approval"}),
+            json!({"timelineUse":"required","timelinePolicy":"manual"}),
+        ] {
+            assert!(
+                project(
+                    &mut s,
+                    &json!({"kind":"issue.update","id":"a","expectedVersion":1,"data":data})
+                )
+                .is_err(),
+                "{data}"
+            );
+            assert_eq!(s, before);
+        }
+        project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":1,"data":{"timelineUse":"required","timelinePolicy":"auto"}})).unwrap();
+        assert_eq!(s["issues"][0]["timelinePolicy"], "auto");
+        // Leaving required drops the policy, as on the server.
+        project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":2,"data":{"timelineUse":"agent_decides"}})).unwrap();
+        assert!(s["issues"][0]["timelinePolicy"].is_null());
+        assert!(project(&mut s, &json!({"kind":"issue.create","id":"b","data":{"title":"T","timelinePolicy":"auto"}})).is_err());
+    }
+    #[test]
+    fn timeline_flags_build_the_patch() {
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"a","key":"ENG-1","version":4}]);
+        let flags = |use_: Option<&str>, policy: Option<&str>| TimelineRule {
+            timeline_use: use_.map(str::to_string),
+            timeline_policy: policy.map(str::to_string),
+        };
+        let update = issue_patch(
+            &s,
+            &IssuePatch {
+                id: "ENG-1".into(),
+                data: Some(r#"{"priority":1}"#.into()),
+                timeline: flags(Some("required"), Some("approval")),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            update,
+            json!({"kind":"issue.update","id":"a","expectedVersion":4,"data":{"priority":1,"timelineUse":"required","timelinePolicy":"approval"}})
+        );
+        let cleared = issue_patch(
+            &s,
+            &IssuePatch {
+                id: "a".into(),
+                data: None,
+                timeline: flags(None, Some("none")),
+            },
+        )
+        .unwrap();
+        assert_eq!(cleared["data"], json!({"timelinePolicy":null}));
     }
     #[test]
     fn agents_are_named_with_their_accountable_person() {

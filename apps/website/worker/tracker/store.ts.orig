@@ -23,6 +23,8 @@ import {
   type Subscription,
   type Team,
   type TrackerAgent,
+  TIMELINE_FEED_TYPES,
+  type TimelineFeedEvent,
   type TrackerEvent,
   type TrackerIdentity,
   type Workspace,
@@ -32,7 +34,7 @@ import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
 import { matchRank, matches, type MatchColumns, type SearchQuery } from "../search/query.ts";
-import type { Timeline } from "../../shared/timelines.ts";
+import type { Timeline, TimelineEvent } from "../../shared/timelines.ts";
 import {
   findTimeline,
   isScoped,
@@ -276,8 +278,11 @@ export class TrackerStore {
         .select((eb) => eb.fn.coalesce(eb.fn.max("cursor"), eb.lit(0)).as("cursor")),
     ).cursor;
   }
-  /** Main's view, or with `timeline` (slug or id) that timeline's. */
-  snapshot(access: Access, timeline?: string): Snapshot {
+  /**
+   * Main's view, or with `timeline` (slug or id) that timeline's. With
+   * `withTimelines`, the timeline records and their events too.
+   */
+  snapshot(access: Access, timeline?: string, withTimelines = false): Snapshot {
     const scope = this.timeline(timeline);
     return this.within(scope, () => ({
       owner: access.owner,
@@ -294,7 +299,20 @@ export class TrackerStore {
       cursor: this.cursor(),
       serverTime: new Date(this.clock()).toISOString(),
       ...(this.overlay ? { timeline: this.overlay.scope() } : {}),
+      ...(withTimelines ? this.timelineRecords() : {}),
     }));
+  }
+  /** Every timeline and timeline event, for replicas that keep them. */
+  private timelineRecords(): Pick<Snapshot, "timelines" | "timelineEvents"> {
+    return {
+      timelines: all(this.sql, tracker.selectFrom("timelines").select("data").orderBy("id")).map(
+        (row) => JSON.parse(row.data) as Timeline,
+      ),
+      timelineEvents: all(
+        this.sql,
+        tracker.selectFrom("timeline_events").select(["seq", "data"]).orderBy("seq"),
+      ).map((row) => ({ ...JSON.parse(row.data), seq: row.seq }) as TimelineEvent),
+    };
   }
   /** Open requests to people, with the issue each is about. */
   openRequests(): { request: HumanRequest; issue: Pick<Issue, "id" | "key" | "title"> }[] {
@@ -453,7 +471,11 @@ export class TrackerStore {
       evidence,
     };
   }
-  changes(after: number, limit: number): Changes {
+  /**
+   * Events after a cursor. Timeline records and events (`TIMELINE_FEED_TYPES`)
+   * are left out unless the replica asks for them with `withTimelines`.
+   */
+  changes(after: number, limit: number, withTimelines = false): Changes {
     if (
       !Number.isSafeInteger(after) ||
       after < 0 ||
@@ -462,18 +484,21 @@ export class TrackerStore {
       limit > 500
     )
       fail("invalid_input", "after must be a nonnegative integer; limit must be 1–500.");
-    const rows = all(
-      this.sql,
-      tracker
-        .selectFrom("events")
-        .select(["cursor", "data"])
-        .where("cursor", ">", after)
-        .orderBy("cursor")
-        .limit(limit + 1),
-    );
+    let query = tracker
+      .selectFrom("events")
+      .select(["cursor", "data"])
+      .where("cursor", ">", after)
+      .orderBy("cursor")
+      .limit(limit + 1);
+    if (!withTimelines)
+      query = query.where(json("data", "$.entityType"), "not in", [...TIMELINE_FEED_TYPES]);
+    const rows = all(this.sql, query);
     const events = rows
       .slice(0, limit)
-      .map((row) => ({ ...JSON.parse(row.data), cursor: row.cursor }) as TrackerEvent);
+      .map(
+        (row) =>
+          ({ ...JSON.parse(row.data), cursor: row.cursor }) as TrackerEvent | TimelineFeedEvent,
+      );
     return {
       events,
       cursor: events.at(-1)?.cursor ?? after,
