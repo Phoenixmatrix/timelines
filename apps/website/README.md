@@ -67,6 +67,10 @@ CI's test job runs them on every push. E2E runs only in `vp run ready` and
 When a UI behaviour can be checked against a canned or in-memory API, it's a
 browser-mode test, not an E2E step.
 
+The browser test server can choose the next available port, so separate agent
+worktrees do not compete for Vitest's default port. The application dev server
+still requires its configured isolated port.
+
 ### Browser-mode tests
 
 Vitest's browser mode runs these in headless Chromium (Playwright's headless
@@ -751,6 +755,12 @@ The search bar's **Clear search** (×) button clears both typed text and applied
 query filters immediately, shows all issues, and returns focus to the input.
 It preserves the selected layout and sort, and the empty query survives reload.
 The button disappears when both the input and applied query are empty.
+
+Assignee facets select exactly that actor's issues: people use their account
+slug, while agents use their stable ID (`assignee:agt_…`). Agents with the same
+name but different accountable people remain distinct. `assignee:me` selects
+the signed-in identity and `assignee:none` selects unassigned issues; other
+active filters still apply.
 
 Use **Close issue** when work will not be completed. Choose Duplicate, Not planned,
 No longer needed, Cannot reproduce, or Other, then **Confirm close**. This saves

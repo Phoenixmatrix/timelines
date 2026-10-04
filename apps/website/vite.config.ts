@@ -71,6 +71,7 @@ export default defineConfig({
       },
       {
         extends: true,
+        server: { strictPort: false },
         test: {
           name: "browser",
           include: ["src/**/*.browser.test.tsx"],

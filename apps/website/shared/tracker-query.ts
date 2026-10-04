@@ -267,7 +267,8 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
     case "assignee":
       if (v === "none") return (i) => i.assigneeId === null;
       if (v === "me") return (i) => i.assigneeId === viewerId;
-      return (i) => !!i.assigneeId && index.memberSlug.get(i.assigneeId)?.toLowerCase() === v;
+      return (i) =>
+        !!i.assigneeId && (index.memberSlug.get(i.assigneeId) ?? i.assigneeId).toLowerCase() === v;
     case "label":
       return (i) => i.labels.some((l) => l.toLowerCase() === v);
     case "type":

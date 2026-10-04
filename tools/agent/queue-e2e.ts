@@ -477,7 +477,7 @@ async function runActiveQueueDeletion(
   const id = admitted.queue.id;
   const entry = await f.wait(
     id,
-    (value) => value.status === "testing" || value.status === "failed",
+    (value) => (value.status === "testing" && value.gateRun !== null) || value.status === "failed",
   );
   assert.equal(entry.status, "testing");
   assert(entry.gateRun && entry.candidate);

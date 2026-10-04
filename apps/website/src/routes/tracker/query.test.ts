@@ -280,6 +280,43 @@ describe("facets, sorting and activity", () => {
     ]);
   });
 
+  it("selects the issues counted by agent, person and unassigned facets", () => {
+    const assigned = [
+      issue("CORE-1", { assigneeId: "agt-priya" }),
+      issue("CORE-2", { assigneeId: "agt-priya", status: "done" }),
+      issue("CORE-3", { assigneeId: "agt-jun" }),
+      issue("CORE-4", { assigneeId: "m-jun" }),
+      issue("CORE-5"),
+      issue("CORE-6", { assigneeId: "agt-missing" }),
+    ];
+    const snap = snapshot(assigned);
+    snap.agents = snap.members.map((accountable) => ({
+      id: accountable.id.replace("m-", "agt-"),
+      name: "claude-code",
+      accountable,
+      capabilities: null,
+      capabilitiesUpdatedAt: null,
+      revokedAt: null,
+    }));
+    const index = buildIndex(snap, snap.serverTime);
+    const facets = facetsOf(assigned, compile("", index, "m-priya", NOW), index, snap);
+    const cases = [
+      ["agt-priya", ["CORE-1", "CORE-2"]],
+      ["agt-jun", ["CORE-3"]],
+      ["jun", ["CORE-4"]],
+      ["none", ["CORE-5"]],
+      ["agt-missing", ["CORE-6"]],
+    ] as const;
+    for (const [value, expected] of cases) {
+      const facet = facets.assignee.find((entry) => entry.token.value === value)!;
+      const query = toggleToken("", facet.token.key, facet.token.value);
+      const selected = compile(query, index, "m-priya", NOW);
+      expect(assigned.filter((entry) => selected.matches(entry)).map((entry) => entry.key)).toEqual(
+        expected,
+      );
+    }
+  });
+
   it("ranks what can move now first", () => {
     expect(sortIssues(issues, index, "rank").map((i) => i.key)).toEqual([
       "CORE-2",
