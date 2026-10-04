@@ -30,9 +30,10 @@ record yours with `gm agent configure --model <model-id>`.
 2. **Choose: timeline or main.** Before you change anything, decide where the
    work goes, and record it. See "Timeline or main" below.
 3. **Hold the lease.** It lasts 1 hour; `gm issue renew <issue>` before then. gm
-   keeps the lease token for you, so lease commands need no token. Losing it
-   (`Claim expired, was superseded…`) means someone else may own the work now:
-   stop and re-read the issue.
+   keeps a returned lease token for you, so lease commands need no token. A
+   missing/empty token or uncertain claim response grants no ownership; inspect
+   the issue online. Losing it (`Claim expired, was superseded…`) means someone
+   else may own the work now: stop and re-read the issue.
 4. **Ask the assistant** when you need to find something out, e.g.
    `gm ask "Where is the tracker's readiness computed?"`. It reads the code (and
    its knowledge graph), issues, CI runs and packages for you and answers with
@@ -45,11 +46,99 @@ record yours with `gm agent configure --model <model-id>`.
    with `--secret owner/repo:NAME`. Read the responses with
    `gm request list --issue <issue> --status all`; once all are resolved,
    `gm issue resume <issue>` takes the lease back up.
-7. **Finish** with evidence a reviewer can check: ship first (`vp run ready`, then `gm push && gm runs wait`), then
-   `gm issue complete <issue> --evidence 'Shipped in <commit>, CI run #N green; tests: …'`.
+7. **Submit, monitor, then finish.** Ship first (`vp run ready`, then `gm push && gm runs wait`); independent main work
+   uses the explicit queue workflow below. Only after acceptance is shipped and
+   verified, `gm issue complete <issue> --evidence 'Landed <commit>, queue <id>; gate run #N green; deployment/run #M verified; tests: …'`.
+   Cite only evidence actually observed; omit deployment claims when not verified.
    Complete only what is shipped and verified. If abandoning active work,
    `gm issue release <issue>`: after the team's limit of releases, the issue asks
    your person what to try next. Do not release a lease parked on a human request.
+
+### Queued main work and remediation
+
+For independent work targeting main, `gm push --queue --issue <issue>` uploads
+the source and requests admission. Checkpoint the returned queue ID (the full
+source commit), repository, local proof and pending landing/deployment checks:
+`gm issue checkpoint <issue> 'Queue: <id>; source: <commit>; local tests: …; landing/deployment pending'`.
+Admission is not a landing, successful CI, or a deployment. A transport error
+can leave admission uncertain: inspect `gm queue show <id>` before resubmitting;
+do not assume rejection or silently direct-push.
+
+Keep and renew the original issue's lease while its acceptance still needs
+verification. Continue independent, separately claimed work without relying on
+the queued commit being on main. At meaningful work boundaries or the next
+invocation, inspect `gm queue show <id>` and `gm queue list --status failed`.
+Do not busy-poll or repeatedly invoke waits. When deliberately waiting to finish,
+`gm queue wait <id> --deploy --timeout 600` waits for landing and the final main
+pipeline; timeout is not success. Follow the real covering entry when work is
+covered, and read `deployStatus` separately from landing status. `gm sync`
+reconciles local history after landing; admission does not make it immutable.
+
+Failures create unassigned P0 `remediation` issues with server-owned `queueFailure`
+evidence. Discover them with `gm issue ready --type remediation --all-teams`
+(or `gm issue list --type remediation --all-teams` to include held/blocked work).
+These listings are advisory: use `gm issue claim <issue>` or `gm issue next` in
+the proper scope and require the returned fencing token before acting. Remediation
+does not override existing claims, blockers, assignment or timeline rules.
+Read `gm issue show <issue> --json` and `gm queue show <queueFailure.queueId>`;
+inspect `conflictPaths`, `failedJobs`, stage/reason and the referenced run using
+`gm runs show <number>` and `gm runs logs <number>`. Fix the real cause, verify
+locally, and submit a new commit with `gm push --queue --issue <remediation>`.
+`gm queue retry <id>` retries the same admitted source only (for example after an
+infrastructure fix); it cannot upload your changed code. Checkpoint the replacement
+queue ID and complete remediation only after the fix actually lands and the
+required pipeline/deployment evidence is verified. Preserve the original failure
+audit; never forge `queueFailure` in a normal issue patch.
+
+Ordinary `gm push` and native Git push remain available as an explicit recovery
+path if the queue itself needs repair. Investigate first and follow project
+authorization and verification requirements; never automatically fall back to
+direct push after failed/uncertain admission. Queued failures do not imply that
+later independent pushes must stop. Timeline work is different: `--queue` is
+refused while bound to a timeline. Use push/checkpoint/land below, including
+person approval for the exact current checkpoint when policy is `approval`.
+
+## Creating properly tagged issues
+
+When creating an issue, read its scope and acceptance criteria and label the
+expertise needed to implement and verify it, not the agent you hope will take it.
+Use a small, relevant set of work-area labels; do not copy every label from its
+parent onto each child. Reuse the team's established spelling. Where the team
+has no convention, use these lowercase defaults:
+
+- `ux`: user research, interaction design and usability.
+- `frontend`: browser UI, styling and client-side behavior.
+- `backend`: server-side logic, services and background jobs.
+- `data`: schemas, migrations, queries and data pipelines.
+- `architecture`: system boundaries, cross-cutting design and major tradeoffs.
+- `api`: public interfaces, contracts and integrations.
+- `security`: authentication, authorization and threat mitigation.
+- `testing`: test strategy, test infrastructure and regression coverage.
+- `infrastructure`: deployment, CI/CD, networking and runtime operations.
+- `documentation`: user or developer documentation.
+
+These are suggested values for the existing issue `labels` field, not a
+registered catalog or an enforced list. Use an established project-specific
+label when needed; avoid synonyms, case variants and speculative areas. For
+example, a keyboard-navigation fix needs `ux` and `frontend`; a service schema
+migration needs `backend` and `data`. Do not add `architecture` to every code
+change or `testing` merely because every issue should be verified.
+
+Repeat `--label` when creating an issue (it is not `--tag`):
+
+    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --label ux --label frontend
+    gm issue show ENG-1 --json
+
+Replace `ENG` with the actual team, and `ENG-1` with the returned issue key;
+check the returned `labels` before handing off. For existing issues,
+`gm issue update ENG-1 --data '{"labels":["ux","frontend"]}'` replaces the whole
+label list, so preserve unrelated labels you still need.
+
+Issue labels describe work. Agent profile tags and skills describe self-reported
+capabilities: they are separate, advisory hints for delegation, not verified
+expertise or claim restrictions. Compare the required work with the agent's
+profile and available evidence; never infer or publish an agent capability just
+because it created or claimed a labeled issue.
 
 ## Human intervention
 
@@ -144,6 +233,26 @@ another timeline.
   (`gm timeline merge main`), push, and make a new checkpoint.
 - `gm timeline use main` goes back to main. `gm timeline abandon` ends a
   timeline you started, when a person asks or the attempt is dead.
+
+### Steps: commit at meaningful points, with context
+
+In a timeline, record your work as **steps**: commit and push at each
+meaningful point (a working piece, a decision, a fix), not only at the end.
+People and other agents follow them live and read them later.
+
+- `gm step -m '<what this step does>' --context step.md` runs the repository's
+  fast checks (`gm test`), commits with the context and the test results, and
+  pushes. `gm commit --context step.md` plus `gm push` works too.
+- Write the context as Markdown with `## Why` (why this, this way),
+  `## Challenges` (what got in the way), `## Instructions` and `## Steering`
+  (one bullet each). Always include why. Never put secrets in it.
+- With the Claude Code hook installed (`gm agent setup`), the person's own
+  words reach the step by themselves, marked `hook`. Without a hook, record
+  the instructions you're following and every way the person steered you
+  under `## Instructions` and `## Steering` yourself; they're marked `agent`.
+- Resuming work? `gm log --context` and `gm context show <rev>` give earlier
+  steps' why and challenges; `gm steps --follow` shows other agents' steps as
+  they land.
 
 ## Projects and other agents
 
