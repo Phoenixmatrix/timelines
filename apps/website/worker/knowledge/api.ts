@@ -42,6 +42,7 @@ import type { AppEnv } from "../auth.ts";
 import type { RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { db, type Database } from "../schema.ts";
+import { repoAiSnapshot } from "../settings/ai.ts";
 import { coordinator, notifyKnowledge, requestPages } from "./coordinator.ts";
 import { PASSAGE_CANDIDATES, SEARCH_INSTANCE, selectPassages } from "./indexes.ts";
 import { embed } from "./models.ts";
@@ -173,7 +174,10 @@ knowledge.post("/rebuild", async (c) => {
   if (row instanceof Response) return row;
   if (!c.env.AI)
     return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
-  await notifyKnowledge(c.env, row.id, { force: true });
+  if (!(await repoAiSnapshot(c.env.DB, row.id)).features.knowledge)
+    return fail(c, 409, "Knowledge generation is disabled in this account's AI settings.");
+  if (!(await notifyKnowledge(c.env, row.id, { force: true })))
+    return fail(c, 409, "Knowledge generation is disabled for this account or environment.");
   return c.json(await status(c, row), 202);
 });
 
@@ -655,6 +659,9 @@ knowledge.post("/overlay/pages", async (c) => {
   if (row instanceof Response) return row;
   if (!c.env.AI)
     return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
+  const ai = await repoAiSnapshot(c.env.DB, row.id);
+  if (!ai.features.knowledge || !ai.features.wiki)
+    return fail(c, 409, "Wiki generation is disabled in this account's AI settings.");
   const ref = overlayRef(c.req.query("ref") ?? "");
   if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
   if (await overlayEnded(c.env.DB, row.id, ref))
@@ -693,7 +700,9 @@ knowledge.post("/overlay/pages", async (c) => {
       requestedBy: c.get("actor")?.id ?? null,
     };
   }
-  await requestPages(c.env, request);
+  const admitted = await requestPages(c.env, request);
+  if (!admitted)
+    return fail(c, 409, "Wiki generation is disabled for this account or environment.");
   const [set] = await listSets(c.env.DB, row.id, ref, { key: request.key, limit: 1 });
   return c.json(set, 202);
 });

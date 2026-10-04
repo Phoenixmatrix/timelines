@@ -636,7 +636,13 @@ export async function runAtlasProviderE2E(
       assert(index >= 0, `Nothing to open inside ${parent}: ${labels.join(", ")}`);
       const label = labels[index]!;
       path.push(label);
+      // AI-generated parent and child names can match. Wait for the old
+      // inspector to leave before accepting the next heading with that name.
+      const previousHeading = await heading(scope, parent).elementHandle();
+      assert(previousHeading);
       await buttons.nth(index).click();
+      await previousHeading.waitForElementState("hidden");
+      await previousHeading.dispose();
       await expect(heading(scope, label)).toBeVisible();
       if (label.endsWith(".ts")) break;
       parent = label;

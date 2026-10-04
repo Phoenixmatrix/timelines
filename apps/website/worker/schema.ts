@@ -1,5 +1,6 @@
 import { Kysely, type Generated } from "kysely";
 import { D1Dialect } from "kysely-d1";
+import type { ClassificationModel, GenerationModel } from "../shared/ai.ts";
 
 /**
  * Gitmatrix's database (the DB binding) for Kysely. The SQL migrations in
@@ -178,6 +179,7 @@ export interface Database {
     started_at: Generated<string>;
     finished_at: string | null;
     progress_at: string | null;
+    ai_snapshot: Generated<string | null>;
   };
   kg_changes: {
     repo_id: string;
@@ -321,6 +323,7 @@ export interface Database {
     requested_by: string | null;
     requested_at: Generated<string>;
     finished_at: string | null;
+    ai_snapshot: Generated<string | null>;
   };
   kg_page_set_pages: {
     repo_id: string;
@@ -505,6 +508,9 @@ export interface Database {
     status: Generated<string>;
     error: string | null;
     generated_at: string | null;
+    ai_snapshot: Generated<string | null>;
+    lease_id: Generated<string | null>;
+    generation_refs: Generated<string | null>;
   };
   ci_refs: {
     repo_id: string;
@@ -676,7 +682,16 @@ export interface Database {
     preview_ended_days: Generated<number>;
     preview_idle_days: Generated<number>;
     updated_by: string | null;
-    updated_at: Generated<string>;
+    updated_at: Generated<string | null>;
+    ai_knowledge: Generated<number>;
+    ai_wiki: Generated<number>;
+    ai_atlas: Generated<number>;
+    ai_release_notes: Generated<number>;
+    ai_classification_model: Generated<ClassificationModel>;
+    ai_fast_model: Generated<GenerationModel>;
+    ai_task_model: Generated<GenerationModel>;
+    ai_updated_by: Generated<string | null>;
+    ai_updated_at: Generated<string | null>;
   };
 }
 

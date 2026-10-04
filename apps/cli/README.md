@@ -637,6 +637,37 @@ read to know the timeline they act in. Tracker commands (`gm issue …`) default
 `--timeline` to it, so a bound checkout reads the timeline's view and its
 changes are made in the timeline.
 
+## Automatic AI settings
+
+```bash
+gm settings ai show --owner orbit
+gm settings ai set --owner orbit --knowledge off
+gm settings ai set --owner orbit --wiki on --atlas on --release-notes off
+gm settings ai set --owner orbit --classification clef \
+  --fast gemma-4-26b-a4b-it --task glm-5.3-flash
+gm settings ai set --owner orbit --task gemma-4-26b-a4b-it --dry-run
+```
+
+These are account-wide settings, not repository settings. Omit `--owner` to use
+the authenticated person's own account; the current repository's owner is never
+inferred. `show` includes the curated catalog, prices, release dates, permissions
+and save provenance. `set` requires at least one option and changes only supplied
+fields. Feature values are `on|off`; Classification accepts only `clef`; Fast and
+Task allow `glm-5.3-flash|gemma-4-26b-a4b-it`. Defaults are all features on, Clef,
+and GLM 5.3 Flash for both generation roles.
+
+Only human account owners, organization owners and site admins can save; members
+can inspect and agent credentials cannot write. Knowledge off also prevents new
+Wiki and Atlas AI work; Atlas's structural projection is separate from its paid
+descriptions. Agent chat and interactive search are unaffected.
+
+Changes apply to newly admitted jobs. Running jobs and their retries retain their
+policy; old content and cached output remain readable. Saving does not trigger a
+rebuild, and enabling a feature resumes it on normal triggers or explicit requests.
+`--dry-run` with an explicit owner prints the PATCH request without network access.
+Settings mutations are not part of `gm undo`. The equivalent web page is
+`/settings/ai?owner=orbit`.
+
 ## Built for agents, like `cf`
 
 The design follows Cloudflare's agent-first `cf` CLI:

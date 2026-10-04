@@ -1,8 +1,9 @@
 import { describe, expect, test } from "vite-plus/test";
+import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type { RepoReader } from "../objects.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import type { FileAnalysis } from "./analyze.ts";
-import { buildGraph } from "./graph.ts";
+import { applyGraph, buildGraph } from "./graph.ts";
 import { planWiki, updatePages, type WikiSource } from "./wiki.ts";
 
 const analysis = (): FileAnalysis => ({
@@ -17,12 +18,14 @@ const analysis = (): FileAnalysis => ({
 });
 
 interface Call {
-  think: boolean;
   prompt: string;
 }
 
 /** A repository of two components, a fake model, and the database the wiki lives in. */
-function setup(reply: (call: Call) => { content: string | null; finish?: string } | Error) {
+function setup(
+  reply: (call: Call) => { content: string | null; finish?: string } | Error,
+  stale: (state: unknown) => number = () => 0.9,
+) {
   const sqlite = migratedDatabase();
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
@@ -43,13 +46,15 @@ function setup(reply: (call: Call) => { content: string | null; finish?: string 
     async run(
       _model: string,
       inputs: {
-        messages: { content: string }[];
-        chat_template_kwargs: { enable_thinking: boolean };
+        messages?: { content: string }[];
+        questions?: unknown;
+        state?: unknown;
       },
     ) {
+      if (inputs.questions)
+        return { answers: { stale: { type: "noul", noul: stale(inputs.state) } } };
       const call = {
-        think: inputs.chat_template_kwargs.enable_thinking,
-        prompt: inputs.messages[1]?.content ?? "",
+        prompt: inputs.messages?.[1]?.content ?? "",
       };
       calls.push(call);
       const result = reply(call);
@@ -96,7 +101,7 @@ describe("wiki updates", () => {
         ? new Error("upstream reset")
         : { content: "Text." },
     );
-    const first = await updatePages(c.env, c.source, SLUGS, new Set());
+    const first = await updatePages(c.env, LEGACY_AI_SNAPSHOT.models, c.source, SLUGS, new Set());
     expect(first).toMatchObject({ written: 4, failed: 1 });
     expect(first.errors).toEqual(["components/src-web: upstream reset"]);
     expect(c.pages().map(([slug]) => slug)).toEqual(SLUGS.filter((s) => !s.endsWith("web")).sort());
@@ -106,26 +111,91 @@ describe("wiki updates", () => {
     const asked = c.calls.length;
     const plan = await planWiki(c.env, c.source);
     expect(plan.pending).toEqual(["components/src-web"]);
-    expect(await updatePages(c.env, c.source, plan.pending, new Set())).toMatchObject({
+    expect(
+      await updatePages(c.env, LEGACY_AI_SNAPSHOT.models, c.source, plan.pending, new Set()),
+    ).toMatchObject({
       written: 1,
       failed: 0,
     });
     expect(c.calls.length).toBe(asked + 1);
   });
 
-  test("front pages that think themselves out of room are written without thinking", async () => {
-    const c = setup(({ think }) =>
-      think ? { content: null, finish: "length" } : { content: "Plain." },
+  test("front pages recover when the model exhausts its response without content", async () => {
+    let first = true;
+    const c = setup(() => {
+      const result = first ? { content: null, finish: "length" } : { content: "Plain." };
+      first = false;
+      return result;
+    });
+    const stats = await updatePages(
+      c.env,
+      LEGACY_AI_SNAPSHOT.models,
+      c.source,
+      ["overview"],
+      new Set(),
     );
-    const stats = await updatePages(c.env, c.source, ["overview"], new Set());
     expect(stats).toMatchObject({ written: 1, failed: 0 });
-    expect(c.calls.map((call) => call.think)).toEqual([true, false]);
     expect(c.pages()).toEqual([["overview", "Plain."]]);
+  });
+
+  test("resumes missed wiki inputs after a disabled build and an unrelated push", async () => {
+    const decisions: unknown[] = [];
+    let body = "The web component serves requests.";
+    const c = setup(
+      () => ({ content: body }),
+      (state) => {
+        decisions.push(state);
+        return JSON.stringify(state).includes("Refunds require manager approval") ? 0.9 : 0;
+      },
+    );
+    await applyGraph(c.env.DB, "repo", "b1", "c1", c.source.graph);
+    await updatePages(c.env, LEGACY_AI_SNAPSHOT.models, c.source, SLUGS, new Set());
+    const original = c.pages();
+
+    // A wiki-disabled build still publishes the changed graph, but leaves
+    // the last written pages and their input hashes readable.
+    c.source.analyses.set("web0", analysis());
+    c.source.analyses.get("web0")!.summary = "Refunds require manager approval.";
+    c.source.graph = buildGraph("org/app", c.source.files, c.source.analyses, c.source.syntheses);
+    await applyGraph(c.env.DB, "repo", "b2", "c2", c.source.graph);
+    expect(c.pages()).toEqual(original);
+
+    // The next ordinary push after re-enable changes only the CLI. Its
+    // change feed no longer contains the missed web update.
+    c.source.analyses.get("cli0")!.summary = "Prints command usage.";
+    c.source.graph = buildGraph("org/app", c.source.files, c.source.analyses, c.source.syntheses);
+    c.source.commit = "c3";
+    const diff = await applyGraph(c.env.DB, "repo", "b3", "c3", c.source.graph);
+    const changed = new Set([...diff.added, ...diff.changed, ...diff.removed]);
+    expect(changed.has("file:src/web/f0.ts")).toBe(false);
+    body = "Refunds require manager approval.";
+    const plan = await planWiki(c.env, c.source);
+    expect(plan.pending).toContain("components/src-web");
+    const stats = await updatePages(
+      c.env,
+      LEGACY_AI_SNAPSHOT.models,
+      c.source,
+      plan.pending,
+      changed,
+    );
+    expect(stats.failed).toBe(0);
+    expect(c.pages()).toContainEqual(["components/src-web", body]);
+    expect(c.pages()).toContainEqual(["components/src-cli", "The web component serves requests."]);
+
+    // Input hashes still make an unchanged successor entirely free.
+    const calls = c.calls.length;
+    const judgments = decisions.length;
+    expect(await planWiki(c.env, c.source)).toEqual({ pending: [], unchanged: 5, removed: 0 });
+    expect(
+      await updatePages(c.env, LEGACY_AI_SNAPSHOT.models, c.source, SLUGS, new Set()),
+    ).toMatchObject({ unchanged: 5, written: 0, kept: 0 });
+    expect(c.calls.length).toBe(calls);
+    expect(decisions.length).toBe(judgments);
   });
 
   test("pages the graph no longer plans are removed", async () => {
     const c = setup(() => ({ content: "Text." }));
-    await updatePages(c.env, c.source, SLUGS, new Set());
+    await updatePages(c.env, LEGACY_AI_SNAPSHOT.models, c.source, SLUGS, new Set());
     c.sqlite.exec(`
       INSERT INTO wiki_pages (repo_id, slug, title, section, position, body, inputs_hash, generated_in)
         VALUES ('repo', 'components/gone', 'Gone', 'src', 99, 'Old.', 'h', 'c0');

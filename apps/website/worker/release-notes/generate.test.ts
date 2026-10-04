@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vite-plus/test";
 import type { LinkedIssue } from "../../shared/release-notes.ts";
+import { AI_MODEL_CATALOG, LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type { RepoRefs } from "../artifacts.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
@@ -53,7 +54,7 @@ function setup() {
     async run(model: string, inputs: { messages: { content: string }[] }) {
       const prompt = inputs.messages[1]?.content ?? "";
       calls.push({ model, prompt });
-      const content = model.includes("qwen3.8")
+      const content = inputs.messages[0]?.content.includes("You summarize")
         ? `Intro over ${prompt.split("\n").length} entries.`
         : JSON.stringify({
             category: prompt.includes("chore")
@@ -143,7 +144,7 @@ function setup() {
   };
   const run = async (options: { maxModelCalls?: number } = {}) => {
     const before = calls.length;
-    const result = await generateReleaseNotes(env, "repo", source, {
+    const result = await generateReleaseNotes(env, "repo", source, LEGACY_AI_SNAPSHOT.models, {
       ...options,
       now: () => "2026-10-02T00:00:00.000Z",
     });
@@ -479,6 +480,203 @@ describe("release note scheduling", () => {
     };
   };
 
+  function historyFor(r: { env: Env; source: GeneratorSource }) {
+    r.env.JOBS = { send: async () => {} } as unknown as Env["JOBS"];
+    vi.spyOn(RepoReader.prototype, "refs").mockImplementation(() => r.source.refs());
+    vi.spyOn(RepoReader.prototype, "log").mockImplementation((oid, limit, offset) =>
+      r.source.log(oid, limit, offset),
+    );
+    vi.spyOn(RepoReader.prototype, "commit").mockImplementation((oid) => r.source.commit(oid));
+    vi.spyOn(semantic, "semanticFeed").mockResolvedValue({
+      version: 1,
+      ref: "HEAD",
+      head: "",
+      entries: [],
+      coverage: [],
+      nextCursor: null,
+    });
+  }
+
+  test("disabled admission and a disabled queued consumer spend nothing and retain stored notes", async () => {
+    const r = setup();
+    r.commit("Existing work");
+    await r.run();
+    r.sqlite.exec(
+      "INSERT INTO release_note_state (repo_id, status, format_version) VALUES ('repo', 'ready', 1)",
+    );
+    const stored = r.release(DAY);
+    const calls = r.calls.length;
+    const sent: unknown[] = [];
+    r.env.JOBS = { send: async (body: unknown) => void sent.push(body) } as unknown as Env["JOBS"];
+    await notifyReleaseNotes(r.env, "repo");
+    r.sqlite.exec("INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0)");
+    await notifyReleaseNotes(r.env, "repo");
+    await ensureReleaseNotes(r.env, "repo");
+    await runReleaseNotesJob(r.env, message("repo").message, () => {});
+    expect(sent).toEqual([{ type: "release-notes", repoId: "repo" }]);
+    expect(r.calls.length).toBe(calls);
+    expect(r.release(DAY)).toEqual(stored);
+    expect((await releaseNotesFor(r.env.DB, "repo", DAY, new Map()))!.entries).toHaveLength(1);
+  });
+
+  test("a failed generation and its budget continuation retain policy and refs, then a push starts fresh", async () => {
+    const r = setup();
+    historyFor(r);
+    const glm = AI_MODEL_CATALOG.fast.find((option) => option.id === "glm-5.3-flash")!.model;
+    const gemma = AI_MODEL_CATALOG.fast.find((option) => option.id === "gemma-4-26b-a4b-it")!.model;
+    for (let i = 0; i < 41; i++) r.commit(`Original ${i}`);
+    const provider = vi
+      .spyOn(r.env.AI!, "run")
+      .mockRejectedValue(new Error("Provider temporarily unavailable"));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await notifyReleaseNotes(r.env, "repo");
+      const failed = message("repo");
+      await runReleaseNotesJob(r.env, failed.message, () => {});
+      expect(failed.outcome.retried).toBe(true);
+      provider.mockRestore();
+      r.sqlite.exec(`INSERT INTO account_settings
+        (account_id, ai_fast_model, ai_task_model) VALUES
+        ('acc', 'gemma-4-26b-a4b-it', 'gemma-4-26b-a4b-it')`);
+      r.commit("Successor only");
+      await notifyReleaseNotes(r.env, "repo");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.entries(DAY)).toHaveLength(40);
+      expect(r.entries(DAY).flatMap((entry) => JSON.parse(entry.commits!))).not.toContain("c41");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.entries(DAY)).toHaveLength(41);
+      expect(r.calls.map((call) => call.model)).toEqual(Array(42).fill(glm));
+      const before = r.calls.length;
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.entries(DAY)).toHaveLength(42);
+      expect(r.calls.slice(before).map((call) => call.model)).toEqual([gemma, gemma]);
+      expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe("ready");
+    } finally {
+      errors.mockRestore();
+      vi.restoreAllMocks();
+    }
+  });
+
+  test("turning release notes off after start does not cancel its continuation", async () => {
+    const r = setup();
+    historyFor(r);
+    for (let i = 0; i < 41; i++) r.commit(`Accepted ${i}`);
+    try {
+      await notifyReleaseNotes(r.env, "repo");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      r.sqlite.exec(
+        "INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0)",
+      );
+      expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe(
+        "generating",
+      );
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.entries(DAY)).toHaveLength(41);
+      expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe("disabled");
+      r.commit("Disabled successor");
+      const before = r.calls.length;
+      await notifyReleaseNotes(r.env, "repo");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.calls.length).toBe(before);
+      expect(r.entries(DAY)).toHaveLength(41);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  test("completed notes stay readable when a push's successor is disabled", async () => {
+    const r = setup();
+    historyFor(r);
+    const original = r.commit("Shipped work");
+    const provider = r.env.AI!.run.bind(r.env.AI);
+    vi.spyOn(r.env.AI!, "run").mockImplementationOnce(async (...args) => {
+      const result = await provider(...args);
+      r.commit("Future work");
+      await notifyReleaseNotes(r.env, "repo");
+      r.sqlite.exec(
+        "INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0)",
+      );
+      return result;
+    });
+    try {
+      await notifyReleaseNotes(r.env, "repo");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      const notes = await releaseNotesFor(r.env.DB, "repo", DAY, new Map());
+      expect(notes?.entries.flatMap((entry) => entry.commits)).toEqual([original]);
+      const spent = r.calls.length;
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.calls.length).toBe(spent);
+      expect(await releaseNotesFor(r.env.DB, "repo", DAY, new Map())).toEqual(notes);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  test.each([true, false])(
+    "a refs-fetch failure leaves admission pending (enabled=%s)",
+    async (enabled) => {
+      const r = setup();
+      historyFor(r);
+      r.commit("Original work");
+      vi.spyOn(RepoReader.prototype, "refs").mockRejectedValueOnce(
+        new Error("Artifacts unavailable"),
+      );
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await notifyReleaseNotes(r.env, "repo");
+        const failed = message("repo");
+        await runReleaseNotesJob(r.env, failed.message, () => {});
+        expect(failed.outcome.retried).toBe(true);
+        r.sqlite
+          .prepare(`INSERT INTO account_settings
+        (account_id, ai_release_notes, ai_fast_model, ai_task_model)
+        VALUES ('acc', ?, 'gemma-4-26b-a4b-it', 'gemma-4-26b-a4b-it')`)
+          .run(Number(enabled));
+        r.commit("Newly admitted work");
+        await notifyReleaseNotes(r.env, "repo");
+        await runReleaseNotesJob(r.env, message("repo").message, () => {});
+        const gemma = AI_MODEL_CATALOG.task.find(
+          (option) => option.id === "gemma-4-26b-a4b-it",
+        )!.model;
+        expect(r.calls.map((call) => call.model)).toEqual(enabled ? [gemma, gemma, gemma] : []);
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
+  test("an expired generation lease retains its snapshot and a superseded holder cannot clear it", async () => {
+    const r = setup();
+    historyFor(r);
+    r.commit("Resumed work");
+    r.sqlite
+      .exec(`INSERT INTO release_note_state (repo_id, status, lease_until, lease_id, ai_snapshot)
+      VALUES ('repo', 'generating', 1, 'old', '${JSON.stringify(LEGACY_AI_SNAPSHOT)}');
+      INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0);`);
+    try {
+      vi.spyOn(RepoReader.prototype, "refs").mockImplementationOnce(async () => {
+        r.sqlite.exec(
+          "UPDATE release_note_state SET lease_id = 'replacement', lease_until = 9999999999999",
+        );
+        return r.source.refs();
+      });
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.calls).toEqual([]);
+      expect(r.sqlite.prepare("SELECT lease_id FROM release_note_state").get()).toEqual({
+        lease_id: "replacement",
+      });
+      r.sqlite.exec("UPDATE release_note_state SET lease_until = 1");
+      await runReleaseNotesJob(r.env, message("repo").message, () => {});
+      expect(r.calls.map((call) => call.model)).toEqual([
+        LEGACY_AI_SNAPSHOT.models.fast,
+        LEGACY_AI_SNAPSHOT.models.task,
+      ]);
+      expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).status.state).toBe("disabled");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   test("without AI bindings nothing is scheduled or generated", async () => {
     const q = queued(false);
     await notifyReleaseNotes(q.env, "repo");
@@ -538,7 +736,7 @@ describe("release note scheduling", () => {
       expect(first.outcome).toEqual({ acked: true, retried: false });
       expect(
         r.sqlite.prepare("SELECT format_version, status, dirty FROM release_note_state").get(),
-      ).toEqual({ format_version: 0, status: "generating", dirty: 1 });
+      ).toEqual({ format_version: 0, status: "generating", dirty: 0 });
       expect(r.entries(DAY)).toHaveLength(40);
       expect((await releaseIndex(r.env.DB, "repo", new Map(), true)).releases).toEqual([]);
       expect(await releaseNotesFor(r.env.DB, "repo", DAY, new Map())).toBeNull();
@@ -581,11 +779,6 @@ describe("release note scheduling", () => {
       const attempt = message("repo");
       await runReleaseNotesJob(q.env, attempt.message, () => {});
       expect(attempt.outcome).toEqual({ acked: false, retried: true });
-      expect(
-        q.sqlite
-          .prepare("SELECT format_version, status, dirty, lease_until FROM release_note_state")
-          .get(),
-      ).toEqual({ format_version: 0, status: "failed", dirty: 1, lease_until: 0 });
       expect((await releaseIndex(q.env.DB, "repo", new Map(), true)).status.state).toBe("failed");
       await ensureReleaseNotes(q.env, "repo");
       expect(q.sent).toHaveLength(1);

@@ -39,6 +39,13 @@ export function Preferences() {
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Choose how the issue tracker opens and how you move through it.
       </p>
+      <p className="mt-4 mb-0 text-body-sm">
+        Automatic repository work is managed separately in{" "}
+        <Link to="/settings/ai" className="text-signal underline underline-offset-4">
+          account AI settings
+        </Link>
+        .
+      </p>
       <div className="mt-8 flex flex-col gap-8">
         {data ? (
           <div className="flex flex-col gap-4">

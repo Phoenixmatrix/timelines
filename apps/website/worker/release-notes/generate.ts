@@ -13,6 +13,7 @@ import type {
   ReleaseNoteChange,
 } from "../../shared/release-notes.ts";
 import { DAILY_RELEASE_PREFIX } from "../../shared/release-notes.ts";
+import type { AiModels } from "../../shared/ai.ts";
 import type { RepoRefs } from "../artifacts.ts";
 import { chatJson, chatText } from "../knowledge/models.ts";
 import { batch, db } from "../schema.ts";
@@ -129,7 +130,12 @@ function entryPrompt(draft: Draft, changes: ReleaseNoteChange[]): string {
   return parts.join("\n\n");
 }
 
-async function write(env: Env, source: GeneratorSource, draft: Draft): Promise<Written> {
+async function write(
+  env: Env,
+  source: GeneratorSource,
+  draft: Draft,
+  models: AiModels,
+): Promise<Written> {
   const changes: ReleaseNoteChange[] = [];
   // A merge's own diff is everything it landed, other entries' work included.
   for (const commit of draft.commits.filter((c) => !isMerge(c)).slice(0, 10)) {
@@ -143,7 +149,7 @@ async function write(env: Env, source: GeneratorSource, draft: Draft): Promise<W
     entryPrompt(draft, changes),
     // The reply is short, but a tight budget can end the turn before any
     // JSON appears ("no content (length)"); match the knowledge pipeline's.
-    { maxTokens: 1600 },
+    { maxTokens: 1600, model: models.fast },
   );
   const fallback = draft.issue?.title ?? firstLine(draft.commits[0]!.message);
   return {
@@ -227,6 +233,7 @@ export async function generateReleaseNotes(
   env: Env,
   repoId: string,
   source: GeneratorSource,
+  models: AiModels,
   { maxModelCalls = MAX_MODEL_CALLS, now = () => new Date().toISOString() } = {},
 ): Promise<GenerateResult> {
   const d = db(env.DB);
@@ -389,7 +396,7 @@ export async function generateReleaseNotes(
           continue;
         }
         modelCalls++;
-        written = await write(env, source, draft);
+        written = await write(env, source, draft, models);
         reusable.set(draft.inputsHash, written);
       }
       const issue = draft.issue;
@@ -489,6 +496,7 @@ export async function generateReleaseNotes(
       const prompt = shown.map((e) => `- [${e.category}] ${e.title}: ${e.summary}`).join("\n");
       const { text, usage } = await chatText(env, "reason", INTRO_SYSTEM, prompt, {
         maxTokens: 1200,
+        model: models.task,
       });
       intro = text.trim().slice(0, 2000);
       introModel = usage.model;

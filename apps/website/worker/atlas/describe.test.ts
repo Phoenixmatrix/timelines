@@ -18,9 +18,15 @@ import {
   type PriceTable,
 } from "../knowledge/budget.ts";
 import { MODELS } from "../knowledge/models.ts";
+import { sha256 } from "../knowledge/util.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { atlas } from "./api.ts";
-import { describeRepoCapabilities, DESCRIBE_PURPOSE, type DescribeOptions } from "./describe.ts";
+import {
+  describeRepoCapabilities,
+  DESCRIBE_PURPOSE,
+  DESCRIBE_VERSION,
+  type DescribeOptions,
+} from "./describe.ts";
 import {
   beginRepoProjection,
   childrenAt,
@@ -478,20 +484,92 @@ describe("capability names and summaries", () => {
     expect(count(sqlite, "kg_synthesis")).toBe(0);
   });
 
-  test("a configured model writes the prose, prices it and keys its cache apart", async () => {
-    const { DB } = setup();
-    const other = "test/configured-model";
+  test("changing the selected model reuses prose and spends only on changed content", async () => {
+    const { sqlite, DB } = setup();
+    const original = "@cf/zai-org/glm-5.3-flash";
+    const selected = "@cf/google/gemma-4-26b-a4b-it";
     const ai = fakeAi();
-    const prices = { ...PRICES, [other]: { input: 1, output: 1 } };
-    const first = await build(DB, ai, "b1", { model: other, prices });
-    expect(ai.calls.map((c) => c.model)).toEqual([other, other]);
-    expect(first.described).toMatchObject({ current: 2, inferred: 2 });
-    expect(provenanceOf(first.capabilities[0]!).inferred!.model).toBe(other);
-    // The same inputs under the default model are not the configured model's prose.
-    const second = await build(DB, ai, "b2", { prices });
-    expect(second.described).toMatchObject({ cached: 0, inferred: 2 });
-    expect(ai.calls.slice(2).map((c) => c.model)).toEqual([MODELS.reason, MODELS.reason]);
+    const prices = {
+      [original]: { input: 0.15, output: 0.5 },
+      [selected]: { input: 0.1, output: 0.3 },
+    };
+    const first = await build(DB, ai, "b1", { model: original, prices });
+    expect(ai.calls.map((c) => c.model)).toEqual([original, original]);
+    const second = await build(DB, ai, "b2", { model: selected, prices });
+    expect(second.described).toMatchObject({ cached: 2, inferred: 0 });
+    expect(second.capabilities).toEqual(first.capabilities);
+    expect(ai.calls).toHaveLength(2);
+    expect(await atlasRunSpend(DB, "build", "b2")).toMatchObject({ calls: 0, usd: 0 });
+    expect(count(sqlite, "kg_synthesis")).toBe(2);
+
+    setFile(sqlite, "ops/deploy.ts", "ops/deploy.ts@2", "Deploys with blue-green");
+    const third = await build(DB, ai, "b3", { model: selected, prices });
+    expect(third.described).toMatchObject({ current: 2, cached: 1, inferred: 1 });
+    expect(ai.calls.slice(2).map((c) => c.model)).toEqual([selected]);
+    const changed = third.capabilities.find(
+      (c) => provenanceOf(c).inferred?.basis.buildId === "b3",
+    )!;
+    expect(provenanceOf(changed).inferred).toMatchObject({
+      model: selected,
+      basis: { buildId: "b3" },
+    });
+    const unchanged = third.capabilities.find((c) => c.id !== changed.id)!;
+    expect(provenanceOf(unchanged)).toEqual(
+      provenanceOf(first.capabilities.find((c) => c.id === unchanged.id)!),
+    );
+    const spend = await atlasRunSpend(DB, "build", "b3");
+    expect(spend).toMatchObject({ calls: 1, inputTokens: 900, outputTokens: 120 });
+    expect(spend.usd).toBeCloseTo((900 * 0.1 + 120 * 0.3) / 1_000_000, 10);
   });
+
+  test.each([
+    [MODELS.reason, "@cf/zai-org/glm-5.3-flash"],
+    ["@cf/zai-org/glm-5.3-flash", "@cf/google/gemma-4-26b-a4b-it"],
+  ])(
+    "reuses legacy %s cache rows after selecting %s without rewriting provenance",
+    async (original, selected) => {
+      const { sqlite, DB } = setup();
+      const ai = fakeAi();
+      const prices = {
+        [original]: { input: 0.45, output: 3.2 },
+        [selected]: { input: 0.1, output: 0.3 },
+      };
+      await build(DB, ai, "b1", { model: original, prices });
+      // Restore the pre-settings storage shape: the model was part of the
+      // exact input hash, both in the cache key and immutable inference record.
+      for (const call of ai.calls) {
+        const identity = `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:`;
+        const key = await sha256(`${identity}r1:${call.user}`);
+        const legacyKey = await sha256(`${identity}${original}:r1:${call.user}`);
+        sqlite
+          .prepare(
+            `UPDATE kg_synthesis SET key = ?,
+           data = json_set(data, '$.inference.inputsHash', ?) WHERE key = ?`,
+          )
+          .run(legacyKey, legacyKey, key);
+      }
+      const stored = sqlite.prepare("SELECT * FROM kg_synthesis ORDER BY key").all();
+      const cached = sqlite.prepare("SELECT data FROM kg_synthesis").all() as { data: string }[];
+      const originalProvenance = new Map(
+        cached.map(({ data }) => {
+          const value = JSON.parse(data) as { name: string; inference: AtlasInference };
+          return [value.name, value.inference];
+        }),
+      );
+      const second = await build(DB, ai, "b2", { model: selected, prices });
+      expect(second.described).toMatchObject({ current: 2, cached: 2, inferred: 0 });
+      expect(ai.calls).toHaveLength(2);
+      expect(await atlasRunSpend(DB, "build", "b2")).toMatchObject({ calls: 0, usd: 0 });
+      for (const capability of second.capabilities)
+        expect(provenanceOf(capability).inferred).toEqual(originalProvenance.get(capability.name));
+      expect(sqlite.prepare("SELECT * FROM kg_synthesis ORDER BY key").all()).toEqual(stored);
+
+      setFile(sqlite, "ops/deploy.ts", "ops/deploy.ts@2", "Deploys with blue-green");
+      const third = await build(DB, ai, "b3", { model: selected, prices });
+      expect(third.described).toMatchObject({ current: 2, cached: 1, inferred: 1 });
+      expect(ai.calls.slice(2).map((c) => c.model)).toEqual([selected]);
+    },
+  );
 
   test("a model the provider refuses is a provider error, charged once per call", async () => {
     const { sqlite, DB } = setup();

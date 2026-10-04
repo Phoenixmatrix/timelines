@@ -26,6 +26,7 @@
 // merges at level 2 were all correct; see the README.
 
 import type { InferResult } from "kysely";
+import type { AiModels } from "../../shared/ai.ts";
 import { batch, db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import type { BuiltGraph, SnapshotFile } from "./graph.ts";
@@ -415,6 +416,7 @@ export interface AlignStats {
  */
 export async function alignPairs(
   env: Env,
+  models: AiModels,
   repoId: string,
   files: SnapshotFile[],
   analyses: Map<string, FileAnalysis>,
@@ -468,6 +470,7 @@ export async function alignPairs(
       env,
       { repository: context, entity_a: entity(a), entity_b: entity(b) },
       PAIR_QUESTIONS,
+      { model: models.classification },
     );
     const link = answers.link;
     const score = link?.type === "score" ? link.score : 0;
@@ -531,6 +534,7 @@ export interface SettleStats {
  */
 export async function settleConcepts(
   env: Env,
+  models: AiModels,
   repoId: string,
   files: SnapshotFile[],
   analyses: Map<string, FileAnalysis>,
@@ -600,6 +604,7 @@ export async function settleConcepts(
         },
       },
       SALIENCE_QUESTION,
+      { model: models.classification },
     );
     const answer = answers.glossary;
     const recurring = answer?.type === "noul" ? answer.noul : 0;
@@ -673,6 +678,7 @@ export interface ReviewStats {
  */
 export async function reviewConcepts(
   env: Env,
+  models: AiModels,
   repoId: string,
   graph: Pick<BuiltGraph, "nodes" | "conceptFiles">,
 ): Promise<ReviewStats> {
@@ -724,6 +730,7 @@ export async function reviewConcepts(
       env,
       { repository: context, entry_a: entry(a), entry_b: entry(b) },
       REVIEW_QUESTION,
+      { model: models.classification },
     );
     const link = answers.link;
     const score = link?.type === "score" ? link.score : 0;

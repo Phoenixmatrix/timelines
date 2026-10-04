@@ -3,6 +3,7 @@
 // analyzed once per distinct content, ever, across commits and repositories.
 
 import { structuredPatch } from "diff";
+import type { AiModels } from "../../shared/ai.ts";
 import type { RepoReader } from "../objects.ts";
 import { db } from "../schema.ts";
 import { extract, languageOf, skipReason, type Language } from "./extract.ts";
@@ -104,6 +105,7 @@ const MAX_CARD_INPUT = 24_000;
 
 async function card(
   env: Env,
+  models: AiModels,
   path: string,
   role: FileRole,
   content: string,
@@ -131,6 +133,7 @@ async function card(
     `File: ${path}\nRole: ${role}\n${known}${before}\n${body}`,
     {
       maxTokens: 1600,
+      model: models.fast,
     },
   );
 }
@@ -206,6 +209,7 @@ export interface AnalyzeStats {
  */
 export async function analyzeFiles(
   env: Env,
+  models: AiModels,
   reader: RepoReader,
   files: FileToAnalyze[],
 ): Promise<AnalyzeStats> {
@@ -280,6 +284,7 @@ export async function analyzeFiles(
                 "Does this diff change what the code does, its API, or what it means to a reader? Comments, formatting, renames of local variables and typo fixes are not meaningful.",
             },
           },
+          { model: models.classification },
         );
         if (yes(answers.meaningful) < 0.2) {
           stats.reused++;
@@ -330,6 +335,7 @@ export async function analyzeFiles(
       env,
       "Files from one software repository, to be classified by role.",
       questions,
+      { model: models.classification },
     );
     group.forEach((f, i) =>
       roles.set(f.path, (choice(answers[`f${i}`]) as FileRole | null) ?? "source"),
@@ -357,7 +363,15 @@ export async function analyzeFiles(
     let result;
     try {
       const before = file.previousBlob ? previous.get(file.previousBlob) : undefined;
-      result = await card(env, file.path, role, file.content, symbols, before?.concepts ?? []);
+      result = await card(
+        env,
+        models,
+        file.path,
+        role,
+        file.content,
+        symbols,
+        before?.concepts ?? [],
+      );
     } catch (error) {
       // Left without an analysis: the graph shows it as pending and the next
       // build tries again. Only a failure of every file fails the step.

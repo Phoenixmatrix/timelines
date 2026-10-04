@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { releaseIndex, releaseNotesFor } from "./read.ts";
+import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 
 function setup() {
   const sqlite = migratedDatabase();
@@ -64,6 +65,25 @@ describe("reading release notes", () => {
     const anonymous = await releaseIndex(db, "repo", new Map(), false);
     expect(anonymous.status.state).toBe("disabled");
     expect(anonymous.releases[1]!.entries).toBe(2);
+  });
+
+  test("account opt-out reports disabled without hiding stored notes or masking a started generation", async () => {
+    const { db, sqlite } = setup();
+    sqlite.exec(`INSERT INTO account_settings (account_id, ai_release_notes) VALUES ('acc', 0);
+      UPDATE release_note_state SET status = 'generating', dirty = 1;`);
+    const disabled = await releaseIndex(db, "repo", new Map(), true);
+    expect(disabled.status.state).toBe("disabled");
+    expect(disabled.releases.map((release) => release.name)).toEqual([
+      "@day:2026-09-30",
+      "v2",
+      "v1",
+    ]);
+    sqlite
+      .prepare("UPDATE release_note_state SET ai_snapshot = ?")
+      .run(JSON.stringify(LEGACY_AI_SNAPSHOT));
+    expect((await releaseIndex(db, "repo", new Map(), true)).status.state).toBe("generating");
+    sqlite.exec("UPDATE release_note_state SET status = 'failed'");
+    expect((await releaseIndex(db, "repo", new Map(), true)).status.state).toBe("failed");
   });
 
   test("hides entries and introductions shaped by trackers the viewer can't read", async () => {

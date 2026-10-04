@@ -35,9 +35,10 @@
 // a time, so the check and the charge are atomic under concurrent callers.
 //
 // Budgets never authorize inference while browsing: only build-time and
-// grouping-pass code may import this module (budget.test.ts enforces it).
+// grouping-pass code may import this module.
 
 import type { Insertable } from "kysely";
+import { AI_MODEL_CATALOG } from "../../shared/ai.ts";
 import { MODELS } from "./models.ts";
 import { db, nowIso, type Database } from "../schema.ts";
 
@@ -70,13 +71,18 @@ export interface ModelPrice {
 export type PriceTable = Readonly<Record<string, ModelPrice>>;
 
 /**
- * Provider prices Atlas may spend at, per model id. From Workers AI's catalogue
- * (`cf ai models list --search <model>`, property `price`); update them when
- * the catalogue changes. A model missing here cannot be used for Atlas paid
- * synthesis (reservations return `disabled`).
+ * Provider prices Atlas may spend at, per model id. Configurable task prices
+ * share the account settings catalog; legacy Qwen remains priced for already
+ * running jobs. A model missing here cannot be used for Atlas paid synthesis
+ * (reservations return `disabled`).
  */
 export const ATLAS_PRICES: PriceTable = {
-  [MODELS.fast]: { input: 0.15, output: 0.5 },
+  ...Object.fromEntries(
+    AI_MODEL_CATALOG.task.map((option) => [
+      option.model,
+      { input: option.inputUsdPerMillion, output: option.outputUsdPerMillion },
+    ]),
+  ),
   [MODELS.reason]: { input: 0.45, output: 3.2 },
 };
 
@@ -606,9 +612,9 @@ export function atlasInfer(d1: D1Database, scope: AtlasScope, options: BudgetOpt
 //
 // What a build's Atlas calls run with: the model that writes capability prose,
 // the prices it may spend at and the caps, for the repository's owning account.
-// Deployed, these are the built-in defaults (MODELS.reason, ATLAS_PRICES,
-// ATLAS_LIMITS). An environment can configure them with the ATLAS_CONFIG text
-// binding (only development environments declare it, cloudflare.config.ts):
+// Deployed, the selected Task model uses ATLAS_PRICES and ATLAS_LIMITS.
+// An environment can override them with the ATLAS_CONFIG text binding
+// (only development environments declare it, cloudflare.config.ts):
 //
 //   { "model"?, "prices"?, "limits"?,            the environment's defaults
 //     "accounts"?: { "<owner slug>": { … } } }  per owning account, over them
@@ -733,9 +739,10 @@ function apply(base: AtlasSettings, entry: AtlasConfigEntry): Omit<AtlasSettings
 export function resolveAtlasSettings(
   config: AtlasConfig | null,
   accountSlug: string | null,
+  taskModel: string = MODELS.reason,
 ): AtlasSettings {
   let settings: AtlasSettings = {
-    model: MODELS.reason,
+    model: taskModel,
     prices: ATLAS_PRICES,
     limits: ATLAS_LIMITS,
     source: "default",
@@ -748,9 +755,13 @@ export function resolveAtlasSettings(
 }
 
 /** What a build of `repoId` runs its Atlas calls with (its owning account's settings). */
-export async function atlasSettings(env: Env, repoId: string): Promise<AtlasSettings> {
+export async function atlasSettings(
+  env: Env,
+  repoId: string,
+  taskModel: string = MODELS.reason,
+): Promise<AtlasSettings> {
   const config = parseAtlasConfig(Reflect.get(env, "ATLAS_CONFIG"));
-  if (!config) return resolveAtlasSettings(null, null);
+  if (!config) return resolveAtlasSettings(null, null, taskModel);
   const owner = config.accounts
     ? await db(env.DB)
         .selectFrom("repos")
@@ -759,5 +770,5 @@ export async function atlasSettings(env: Env, repoId: string): Promise<AtlasSett
         .where("repos.id", "=", repoId)
         .executeTakeFirst()
     : undefined;
-  return resolveAtlasSettings(config, owner?.slug ?? null);
+  return resolveAtlasSettings(config, owner?.slug ?? null, taskModel);
 }

@@ -15,6 +15,7 @@ import type { Actor } from "../db.ts";
 import { db, type Database } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
 import type { Selectable } from "kysely";
+import { repoAiSnapshot } from "../settings/ai.ts";
 
 /** Tracker accounts the viewer can read, by id, with their slugs. */
 export type ViewerTrackers = Map<string, string>;
@@ -81,7 +82,7 @@ export async function releaseIndex(
   const [state, releases, entries] = await Promise.all([
     d
       .selectFrom("release_note_state")
-      .select(["status", "generated_at", "dirty", "format_version"])
+      .select(["status", "generated_at", "dirty", "format_version", "ai_snapshot"])
       .where("repo_id", "=", repoId)
       .executeTakeFirst(),
     d
@@ -103,7 +104,10 @@ export async function releaseIndex(
     if (entry.kind !== "issue" || trackers.has(entry.tracker_owner_id ?? ""))
       counts.set(entry.release, (counts.get(entry.release) ?? 0) + 1);
   let stateName: ReleaseNotesState = "idle";
-  if (!aiEnabled) stateName = "disabled";
+  const available =
+    aiEnabled &&
+    (Boolean(state?.ai_snapshot) || (await repoAiSnapshot(d1, repoId)).features.releaseNotes);
+  if (!available) stateName = "disabled";
   else if (state?.status === "failed") stateName = "failed";
   else if (state?.status === "generating" || state?.dirty) stateName = "generating";
   else if (state?.status === "ready" && state.format_version === 1) stateName = "ready";

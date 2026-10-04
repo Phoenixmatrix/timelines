@@ -3,6 +3,7 @@
 // cached under a hash of exactly what it was written from, so a push only
 // re-synthesizes the components whose files actually changed meaning.
 
+import type { AiModels } from "../../shared/ai.ts";
 import { db } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import { ANALYZER } from "./analyze.ts";
@@ -94,6 +95,7 @@ export interface SynthesisStats {
 
 export async function synthesize(
   env: Env,
+  models: AiModels,
   repoName: string,
   files: SnapshotFile[],
   analyses: Map<string, FileAnalysis>,
@@ -132,7 +134,10 @@ export async function synthesize(
       summary?: string;
       responsibilities?: string[];
       key_files?: { path?: string; why?: string }[];
-    }>(env, "reason", COMPONENT_SYSTEM, JSON.stringify(input), { maxTokens: 1500 });
+    }>(env, "reason", COMPONENT_SYSTEM, JSON.stringify(input), {
+      maxTokens: 1500,
+      model: models.task,
+    });
     const result: ComponentSynthesis = {
       title: (value.title ?? "").trim() || plan.dir,
       summary: (value.summary ?? "").trim(),
@@ -181,7 +186,7 @@ export async function synthesize(
         repository: repoName,
         concepts: group.map((g) => g.input),
       }),
-      { maxTokens: 2500 },
+      { maxTokens: 2500, model: models.task },
     );
     stats.tokens += usage.tokens;
     const byName = new Map(
@@ -213,7 +218,10 @@ export async function synthesize(
       title?: string;
       summary?: string;
       tech_stack?: string[];
-    }>(env, "reason", REPO_SYSTEM, JSON.stringify(repoInput), { maxTokens: 1200 });
+    }>(env, "reason", REPO_SYSTEM, JSON.stringify(repoInput), {
+      maxTokens: 1200,
+      model: models.task,
+    });
     repo = {
       title: (value.title ?? "").trim() || repoName,
       summary: (value.summary ?? "").trim(),

@@ -9,6 +9,7 @@ pub mod pkg;
 pub mod release;
 pub mod semantic;
 pub mod server;
+pub mod settings;
 pub mod timeline;
 pub mod tracker;
 pub mod why;

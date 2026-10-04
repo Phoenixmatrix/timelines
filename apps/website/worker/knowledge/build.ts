@@ -35,6 +35,8 @@ import {
   type WorkflowStepConfig,
 } from "cloudflare:workers";
 import { sql } from "kysely";
+import type { AiModels } from "../../shared/ai.ts";
+import { LEGACY_KNOWLEDGE_POLICY, type KnowledgePolicy } from "./policy.ts";
 import {
   beginRepoProjection,
   currentSnapshot,
@@ -53,7 +55,7 @@ import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
-import { atlasInfer, atlasRunSpend, atlasSettings } from "./budget.ts";
+import { atlasInfer, atlasRunSpend } from "./budget.ts";
 import {
   applyGraph,
   buildGraph,
@@ -81,10 +83,14 @@ import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.t
 export interface BuildParams {
   repoId: string;
   buildId: string;
+  /** Absent only on Workflows started before account AI settings existed. */
+  policy?: KnowledgePolicy;
+  /** Pin watchdog continuations to their original work, not a newer push. */
+  commit?: string;
   /** Rebuild even when HEAD is already indexed. */
   force?: boolean;
   /** Compute a timeline's overlay instead of building main's graph. */
-  overlay?: { ref: string; commit: string };
+  overlay?: { ref: string; commit: string; base?: string };
   /** Write a timeline's wiki page set (queued in kg_page_sets) instead. */
   pages?: { ref: string; key: string };
 }
@@ -191,6 +197,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     row: RepoRow,
     buildId: string,
     head: string,
+    models: AiModels,
   ): Promise<WikiSource> {
     const env = this.env;
     const files = await loadSnapshot(env.DB, row.id, buildId);
@@ -202,6 +209,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     const readme = await this.#readme(reader, files);
     const { syntheses } = await synthesize(
       env,
+      models,
       row.full_name,
       files,
       analyses,
@@ -223,6 +231,8 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
   }
 
   async run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
+    const policy = event.payload.policy ?? LEGACY_KNOWLEDGE_POLICY;
+    const models = policy.ai.models;
     if (event.payload.overlay) return this.#overlay(event.payload, step);
     if (event.payload.pages)
       return runPageSet(this.env, { ...event.payload, pages: event.payload.pages }, step, {
@@ -256,6 +266,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         if (!row) return null;
         invalidateRefs(row.artifacts_name);
         const refs = await this.#withReader(row, (reader) => reader.refs());
+        const head = event.payload.commit ?? refs.head;
         const state = await db(env.DB)
           .selectFrom("kg_state")
           .select("indexed_commit")
@@ -267,13 +278,15 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             id: buildId,
             repo_id: repoId,
             from_commit: state?.indexed_commit ?? null,
-            to_commit: refs.head ?? "",
+            to_commit: head ?? "",
             status: "running",
             phase: "snapshot",
+            ai_snapshot: JSON.stringify(policy),
+            stats: JSON.stringify({ ai: policy.ai }),
           })
           .onConflict((oc) => oc.column("id").doNothing())
           .execute();
-        return { row, head: refs.head, previous: state?.indexed_commit ?? null };
+        return { row, head, previous: state?.indexed_commit ?? null };
       });
       if (!start?.head) {
         await this.#finish(step, repoId, buildId, null, { empty: true });
@@ -289,7 +302,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           return !current || !(await recordsPackages(env.DB, current.id));
         });
         const atlas = missing
-          ? await this.#project(step, progress, repoId, buildId, head, null)
+          ? await this.#project(step, progress, repoId, buildId, head, null, policy)
           : {};
         await this.#finish(step, repoId, buildId, head, { upToDate: true, ...atlas });
         return { status: "up-to-date" };
@@ -336,7 +349,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       let failed = 0;
       for (const [i, group] of chunk(toAnalyze, ANALYZE_BATCH).entries()) {
         const stats = await progress(`analyze-${i}`, "analyze", () =>
-          this.#withReader(row, (reader) => analyzeFiles(env, reader, group)),
+          this.#withReader(row, (reader) => analyzeFiles(env, models, reader, group)),
         );
         analyzed += stats.analyzed;
         reused += stats.reused;
@@ -375,6 +388,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           );
           const { syntheses } = await synthesize(
             env,
+            models,
             row.full_name,
             files,
             analyses,
@@ -424,7 +438,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             env.DB,
             files.map((f) => f.blob),
           );
-          return alignPairs(env, repoId, files, analyses);
+          return alignPairs(env, models, repoId, files, analyses);
         });
         pairsAsked = Math.max(0, aligned.decided - decidedBefore);
         if (aligned.remaining === 0) break;
@@ -435,7 +449,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           env.DB,
           files.map((f) => f.blob),
         );
-        const stats = await settleConcepts(env, repoId, files, analyses);
+        const stats = await settleConcepts(env, models, repoId, files, analyses);
         await recordStats(env.DB, buildId, {
           conceptPairsAsked: pairsAsked,
           concepts: stats.groups,
@@ -466,6 +480,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           );
           const { stats } = await synthesize(
             env,
+            models,
             row.full_name,
             files,
             analyses,
@@ -496,6 +511,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             );
             const { syntheses } = await synthesize(
               env,
+              models,
               row.full_name,
               files,
               analyses,
@@ -506,11 +522,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             return { draft, graph: buildGraph(row.full_name, files, analyses, syntheses, model) };
           };
           const { graph } = await graphWith(await loadConceptModel(env.DB, repoId));
-          const stats = await reviewConcepts(env, repoId, graph);
+          const stats = await reviewConcepts(env, models, repoId, graph);
           if (stats.newMerges > 0) {
-            await settleConcepts(env, repoId, files, analyses);
+            await settleConcepts(env, models, repoId, files, analyses);
             const { draft } = await graphWith(await loadConceptModel(env.DB, repoId));
-            await synthesize(env, row.full_name, files, analyses, draft, readme);
+            await synthesize(env, models, row.full_name, files, analyses, draft, readme);
           }
           return stats;
         }),
@@ -538,6 +554,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           );
           const { syntheses } = await synthesize(
             env,
+            models,
             row.full_name,
             files,
             analyses,
@@ -555,7 +572,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       );
       // A replay of a step recorded before readiness was returned has none.
       const readyAt = graphFinal?.readyAt ?? null;
-      const atlas = await this.#project(step, progress, repoId, buildId, head, readyAt);
+      const atlas = await this.#project(step, progress, repoId, buildId, head, readyAt, policy);
 
       await progress("index", "index", () =>
         this.#withReader(row, async (reader) => {
@@ -579,6 +596,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           };
           const { syntheses } = await synthesize(
             env,
+            models,
             row.full_name,
             files,
             analyses,
@@ -616,11 +634,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // The wiki, a few pages per step. Each page is saved as soon as it is
       // settled, so a retried step or a restarted build resumes where it stopped.
-      const plan = await progress("wiki-plan", "wiki", () =>
-        this.#withReader(row, async (reader) =>
-          planWiki(env, await this.#wikiSource(reader, row, buildId, head)),
-        ),
-      );
+      const plan = policy.ai.features.wiki
+        ? await progress("wiki-plan", "wiki", () =>
+            this.#withReader(row, async (reader) =>
+              planWiki(env, await this.#wikiSource(reader, row, buildId, head, models)),
+            ),
+          )
+        : { pending: [], unchanged: 0, removed: 0 };
       const wiki: WikiStats = {
         written: 0,
         kept: 0,
@@ -641,7 +661,8 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
               .execute();
             const stats = await updatePages(
               env,
-              await this.#wikiSource(reader, row, buildId, head),
+              models,
+              await this.#wikiSource(reader, row, buildId, head, models),
               slugs,
               new Set(results.map((r) => r.node_id)),
             );
@@ -664,15 +685,16 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       if (wiki.failed > 0 && wiki.written + wiki.kept === 0) {
         throw new Error(`No wiki page could be written: ${wiki.errors[0] ?? "unknown error"}`);
       }
-      await progress("wiki-search", "wiki", async () => {
-        const pages = await db(env.DB)
-          .selectFrom("wiki_pages")
-          .select(["slug", "title", "body", "inputs_hash"])
-          .where("repo_id", "=", repoId)
-          .execute();
-        await syncSearchPages(env, repoId, head, pages);
-        return null;
-      });
+      if (policy.ai.features.wiki)
+        await progress("wiki-search", "wiki", async () => {
+          const pages = await db(env.DB)
+            .selectFrom("wiki_pages")
+            .select(["slug", "title", "body", "inputs_hash"])
+            .where("repo_id", "=", repoId)
+            .execute();
+          await syncSearchPages(env, repoId, head, pages);
+          return null;
+        });
 
       await this.#finish(step, repoId, buildId, head, {
         ...atlas,
@@ -708,6 +730,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
   async #overlay(params: BuildParams, step: WorkflowStep) {
     const { repoId, buildId } = params;
     const { ref, commit } = params.overlay!;
+    const models = (params.policy ?? LEGACY_KNOWLEDGE_POLICY).ai.models;
     const env = this.env;
     try {
       const plan = await step.do("overlay-plan", STEP, async () => {
@@ -718,7 +741,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           .where("repo_id", "=", repoId)
           .executeTakeFirst();
         if (!row || !state?.indexed_commit) return null;
-        const base = state.indexed_commit;
+        const base = params.overlay!.base ?? state.indexed_commit;
         const plan = await this.#withReader(row, (reader) => planOverlay(reader, commit, base));
         const main = await loadSnapshot(env.DB, repoId, "current");
         const known = await loadAnalyses(
@@ -740,7 +763,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       let failed = 0;
       for (const [i, group] of chunk(plan.pending, ANALYZE_BATCH).entries()) {
         const stats = await step.do(`overlay-analyze-${i}`, STEP, () =>
-          this.#withReader(row, (reader) => analyzeFiles(env, reader, group)),
+          this.#withReader(row, (reader) => analyzeFiles(env, models, reader, group)),
         );
         analyzed += stats.analyzed;
         reused += stats.reused;
@@ -789,6 +812,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     buildId: string,
     head: string,
     readyAt: number | null,
+    policy: KnowledgePolicy,
   ): Promise<Record<string, unknown>> {
     const env = this.env;
     const scope = repoScope(repoId);
@@ -835,14 +859,16 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           "atlas",
           () =>
             timed(async () => {
-              const settings = await atlasSettings(env, repoId);
+              const settings = policy.atlas;
               const stats = await describeRepoCapabilities(env, context, {
                 model: settings.model,
-                infer: atlasInfer(
-                  env.DB,
-                  { kind: "build", repoId, buildId },
-                  { prices: settings.prices, limits: settings.limits },
-                ),
+                infer: policy.ai.features.atlas
+                  ? atlasInfer(
+                      env.DB,
+                      { kind: "build", repoId, buildId },
+                      { prices: settings.prices, limits: settings.limits },
+                    )
+                  : null,
               });
               return { ...stats, model: settings.model, settings: settings.source };
             }),

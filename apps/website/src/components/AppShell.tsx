@@ -135,6 +135,14 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
             <Menu.LinkItem
               closeOnClick
               className="mk-menu-item"
+              render={<Link to={`/settings/ai?owner=${encodeURIComponent(viewer.slug)}`} />}
+            >
+              <GearSixIcon className="size-4" aria-hidden />
+              AI settings
+            </Menu.LinkItem>
+            <Menu.LinkItem
+              closeOnClick
+              className="mk-menu-item"
               render={<Link to={`/${viewer.slug}`} />}
             >
               <GitBranchIcon className="size-4" aria-hidden />

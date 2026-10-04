@@ -36,6 +36,8 @@ macro_rules! meta {
 }
 
 pub const COMMANDS: &[Meta] = &[
+    meta!("settings ai show", git: "", kw: "account organization automatic ai settings policy costs pricing models catalog permissions knowledge wiki atlas release notes", mutates: false, out: Out::Other("AiSettingsView {features:{knowledge,wiki,atlas,releaseNotes},models:{classification,fast,task},updatedAt:string|null,updatedBy:string|null,canManage:boolean,catalog:{classification:ModelOption[],fast:ModelOption[],task:ModelOption[]}}; ModelOption {id,name,model,releasedAt,inputUsdPerMillion,outputUsdPerMillion,url}"), ex: ["gm settings ai show", "gm settings ai show --owner orbit"]),
+    meta!("settings ai set", git: "", kw: "account organization automatic ai settings enable disable spending policy model classification fast task knowledge wiki atlas release notes", mutates: true, out: Out::Other("AiSettingsView as returned by settings ai show; --dry-run returns {dry_run:true,owner,method:'PATCH',path,request:{features?:{knowledge?,wiki?,atlas?,releaseNotes?},models?:{classification?,fast?,task?}}} without mutation. Requires at least one change. Backend requires a human account/org owner or site admin."), ex: ["gm settings ai set --owner orbit --knowledge off --dry-run", "gm settings ai set --owner orbit --classification clef --fast glm-5.3-flash --task gemma-4-26b-a4b-it"]),
     meta!("tracker list", git: "", kw: "accounts organizations issue trackers", mutates: false, out: Out::Other("{trackers:[{id,slug,displayName,canAdmin}]}"), ex: ["gm tracker list"]),
     meta!("tracker use", git: "", kw: "select owner initialize offline replica account organization", mutates: true, out: Out::Other("{owner,identity,replica,cursor}"), ex: ["gm tracker use orbit"]),
     meta!("tracker sync", git: "", kw: "offline replica outbox synchronize upload download cursor", mutates: true, out: Out::Other("{dryRun,cursor,pending}; conflicts stop ordered replay without dropping later edits"), ex: ["gm tracker sync"]),
@@ -739,6 +741,23 @@ deploys to `branch/<name>`; `--environment` overrides). Outside CI pass
 Previews: a repository opts in with `on: preview` in ci.yml; Gitmatrix starts a
 preview run per checkpoint (`if: trigger == "preview" && action == "create"`),
 a `teardown` run when it expires, and a `create` again on `gm timeline revive`.
+
+## Account AI settings
+    gm settings ai show --owner orbit
+    gm settings ai set --owner orbit --knowledge off --dry-run
+    gm settings ai set --owner orbit --classification clef --task gemma-4-26b-a4b-it
+
+These settings cover every repository owned by an account. Without --owner,
+gm uses your signed-in personal account, never the current repository owner.
+Show includes management permission and the curated catalog's pricing and dates.
+Set requires at least one option and human account/org owner or site-admin
+authorization; explicit agent credentials cannot change spending policy.
+Feature options --knowledge, --wiki, --atlas and --release-notes accept on|off.
+Knowledge off prevents new wiki and Atlas AI work too; Atlas off preserves its
+deterministic projection. Classification accepts only clef; fast and task accept
+glm-5.3-flash|gemma-4-26b-a4b-it. Changes affect future jobs, not running work,
+existing history or cached output, and saving does not trigger a rebuild.
+--dry-run prints the nested PATCH request without changing account policy.
 
 ## Packages
 CI jobs publish with their own credential: `npm publish`, `docker push

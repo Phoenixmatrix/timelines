@@ -4,8 +4,9 @@
 // named by UTC timestamp, `YYYYMMDDHHMMSS_snake_case.sql`, which sorts after the
 // frozen four-digit files both numerically (cf) and lexically (the test
 // harnesses' readdir().sort()).
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vite-plus/test";
 
 /** Each directory applied with `cf d1 migrations apply`, and its last four-digit file. */
@@ -100,5 +101,72 @@ describe("migration file names", () => {
       "0020_last.sql",
       "20261003021500_ref_updates.sql",
     ]);
+  });
+});
+
+describe("account AI policy migration", () => {
+  test("preserves preview provenance and freezes only started legacy release work", () => {
+    const sqlite = new DatabaseSync(":memory:");
+    const dir = new URL("../migrations/", import.meta.url);
+    const migration = "20261004005309_account_ai_settings.sql";
+    try {
+      for (const file of readdirSync(fileURLToPath(dir.href))
+        .filter((name) => name.endsWith(".sql") && name < migration)
+        .sort())
+        sqlite.exec(readFileSync(fileURLToPath(new URL(file, dir).href), "utf8"));
+      sqlite.exec(`INSERT INTO accounts (id, kind, slug, display_name)
+        VALUES ('a', 'org', 'a', 'A'), ('b', 'org', 'b', 'B');
+        INSERT INTO account_settings (account_id, preview_idle_days, updated_at)
+        VALUES ('a', 14, '2026-01-01T00:00:00.000Z');`);
+      for (const [id, status, lease, generated] of [
+        ["pending", "generating", 0, null],
+        ["active", "generating", 1, null],
+        ["failed", "failed", 0, null],
+        ["continuation", "generating", 0, "2026-01-01T00:00:00.000Z"],
+        ["upgrade", "generating", 0, "2026-01-01T00:00:00.000Z"],
+      ] as const) {
+        sqlite
+          .prepare(`INSERT INTO repos
+          (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+          VALUES (?, 'a', ?, 'private', ?, 'https://a')`)
+          .run(id, id, id);
+        sqlite
+          .prepare(`INSERT INTO release_note_state
+          (repo_id, dirty, status, lease_until, generated_at) VALUES (?, 1, ?, ?, ?)`)
+          .run(id, status, lease, generated);
+      }
+      sqlite.exec(`INSERT INTO release_notes (repo_id, release, to_oid, released_at, updated_at)
+        VALUES
+          ('continuation', '@day:2026-01-02', 'c1', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z'),
+          ('upgrade', '@unreleased', 'c0', '2025-12-31T00:00:00.000Z', '2025-12-31T00:00:00.000Z');`);
+      sqlite.exec(readFileSync(fileURLToPath(new URL(migration, dir).href), "utf8"));
+      expect(
+        sqlite
+          .prepare(`SELECT repo_id, ai_snapshot IS NOT NULL AS frozen
+        FROM release_note_state ORDER BY repo_id`)
+          .all(),
+      ).toEqual([
+        { repo_id: "active", frozen: 1 },
+        { repo_id: "continuation", frozen: 1 },
+        { repo_id: "failed", frozen: 1 },
+        { repo_id: "pending", frozen: 0 },
+        { repo_id: "upgrade", frozen: 0 },
+      ]);
+      expect(
+        sqlite
+          .prepare(`SELECT preview_idle_days, updated_at FROM account_settings
+        WHERE account_id = 'a'`)
+          .get(),
+      ).toEqual({
+        preview_idle_days: 14,
+        updated_at: "2026-01-01T00:00:00.000Z",
+      });
+      sqlite.exec("INSERT INTO account_settings (account_id, ai_wiki) VALUES ('b', 0)");
+      expect(
+        sqlite.prepare("SELECT updated_at FROM account_settings WHERE account_id = 'b'").get(),
+      ).toEqual({ updated_at: null });
+    } finally {
+      sqlite.close();
+    }
   });
 });

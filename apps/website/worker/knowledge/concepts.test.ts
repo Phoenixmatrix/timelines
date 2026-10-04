@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vite-plus/test";
+import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import {
@@ -227,7 +228,7 @@ test("alignPairs counts stored pair decisions only, not reviews", async () => {
   const analyses = new Map([
     ["a1", { concepts: ["Theme", "Theme Switching"], skipped: undefined } as never],
   ]);
-  const stats = await alignPairs(env, "repo", files, analyses);
+  const stats = await alignPairs(env, LEGACY_AI_SNAPSHOT.models, "repo", files, analyses);
   expect(stats.asked).toBe(1);
   // One stored first-pass decision; the review-only pair must not read as asked.
   expect(stats.decided).toBe(1);

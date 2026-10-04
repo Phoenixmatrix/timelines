@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium, expect as playwrightExpect } from "@playwright/test";
 import type { HarnessContext, SeedManifest } from "./types.ts";
+import type { AiSettingsView, AiSnapshot } from "../../apps/website/shared/ai.ts";
 import type {
   ReleaseFeed,
   ReleaseNotesIndex,
@@ -171,6 +172,9 @@ export async function runProviderE2E(
     stageStarted = Date.now();
   };
   let target: MirrorTarget | undefined;
+  // Use the owning organization's member for AI scenarios; site administration
+  // does not grant access to another account's tracker.
+  const persona = mode === "ai" ? "marco" : "priya";
   const env: NodeJS.ProcessEnv = {
     ...ctx.env,
     GIT_CONFIG_NOSYSTEM: "1",
@@ -195,7 +199,7 @@ export async function runProviderE2E(
                 ...env,
                 GIT_CONFIG_COUNT: "1",
                 GIT_CONFIG_KEY_0: `http.${ctx.origin}/.extraHeader`,
-                GIT_CONFIG_VALUE_0: `Authorization: Bearer ${fixtures.tokens.priya}`,
+                GIT_CONFIG_VALUE_0: `Authorization: Bearer ${fixtures.tokens[persona]}`,
               }
             : env,
         },
@@ -217,7 +221,7 @@ export async function runProviderE2E(
     const response = await fetch(`${ctx.origin}/api${path}`, {
       method,
       headers: {
-        authorization: `Bearer ${fixtures.tokens.priya}`,
+        authorization: `Bearer ${fixtures.tokens[persona]}`,
         "content-type": "application/json",
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -266,10 +270,26 @@ export async function runProviderE2E(
       await git(["--git-dir", join(root, "target.git"), "config", "http.receivepack", "true"]);
       target = await targetServer(root, authorization, env);
     }
-    const owner = "priya";
+    // Account policy changes here must not affect the concurrent priya Atlas fixtures.
+    const owner = mode === "ai" ? "orbit" : "priya";
     const name = `provider-${randomBytes(5).toString("hex")}`;
     const base = `/repos/${encodeURIComponent(owner)}/${name}`;
     evidence.repo = `${owner}/${name}`;
+    const settingsPath = `/accounts/${owner}/settings/ai`;
+    const aiSettingsEvidence: Record<string, unknown> = {};
+    let capturedAi: AiSnapshot | undefined;
+    let nextAi: AiSettingsView | undefined;
+    if (mode === "ai") {
+      evidence.aiSettings = aiSettingsEvidence;
+      aiSettingsEvidence.disabled = await api(settingsPath, "PATCH", {
+        features: { knowledge: false, wiki: false, atlas: false, releaseNotes: false },
+        models: {
+          classification: "clef",
+          fast: "gemma-4-26b-a4b-it",
+          task: "gemma-4-26b-a4b-it",
+        },
+      });
+    }
     await api(
       "/repos",
       "POST",
@@ -399,6 +419,46 @@ export async function runProviderE2E(
     } else {
       await git(["push", "origin", "main"], work, true);
       final = await git(["rev-parse", "HEAD"]);
+      enter("ai-settings-disabled");
+      // Both reads ordinarily repair missing generated data. Account policy must
+      // stop that admission as well as the original push-triggered work.
+      await api(`${base}/knowledge/status`);
+      await api(`${base}/release-notes`);
+      await delay(10_000); // Beyond the Knowledge coordinator's maximum debounce.
+      const disabledKnowledge = await api(`${base}/knowledge/status`);
+      const disabledNotes: ReleaseNotesIndex = await api(`${base}/release-notes`);
+      assert.equal(disabledKnowledge.current, null, "Disabled knowledge started a build");
+      assert.deepEqual(disabledKnowledge.recent, [], "Disabled knowledge created build history");
+      assert.equal(disabledKnowledge.indexedCommit, null);
+      assert.equal(disabledNotes.status.state, "disabled");
+      assert.deepEqual(disabledNotes.releases, [], "Disabled release generation wrote notes");
+      aiSettingsEvidence.disabledKnowledge = disabledKnowledge;
+      aiSettingsEvidence.disabledNotes = disabledNotes;
+      await api(settingsPath, "PATCH", {
+        features: { knowledge: true, wiki: true, atlas: true, releaseNotes: true },
+      });
+      await api(`${base}/knowledge/rebuild`, "POST", undefined, 202);
+      enter("ai-settings-running-snapshot");
+      await waitFor(stage, 60_000, async () => {
+        const status = await api(`${base}/knowledge/status`);
+        if (status.state === "failed") throw new Error("Configured provider build failed");
+        if (status.current?.toCommit !== final || !status.current.stats?.ai) return false;
+        capturedAi = status.current.stats.ai as AiSnapshot;
+        aiSettingsEvidence.runningBuild = status.current.id;
+        return true;
+      });
+      assert(capturedAi, "The running build must expose its immutable policy");
+      assert.equal(capturedAi.models.classification, "@cf/cloudflare/clef");
+      assert.equal(capturedAi.models.fast, "@cf/google/gemma-4-26b-a4b-it");
+      assert.equal(capturedAi.models.task, "@cf/google/gemma-4-26b-a4b-it");
+      assert.equal(capturedAi.features.wiki, true);
+      assert.equal(capturedAi.features.atlas, true);
+      aiSettingsEvidence.startedWith = capturedAi;
+      nextAi = await api(settingsPath, "PATCH", {
+        features: { wiki: false, atlas: false },
+        models: { classification: "clef", fast: "glm-5.3-flash", task: "glm-5.3-flash" },
+      });
+      aiSettingsEvidence.futureSettings = nextAi;
       enter("knowledge-build");
       await waitFor(stage, 12 * 60_000, async () => {
         const status = await api(`${base}/knowledge/status`);
@@ -440,6 +500,16 @@ export async function runProviderE2E(
       assert.match(page.body, /65521|checksum/i, "Wiki must describe checksum behavior");
       assert.equal(page.generatedIn, final, "Wiki must describe the indexed fixture commit");
       assert(page.model, "Wiki must record its real generation model");
+      assert.equal(page.model, capturedAi.models.task, "Running wiki work retargeted its model");
+      const completedPolicy = evidence.knowledge as {
+        recent: { id: string; stats: { ai?: AiSnapshot } }[];
+      };
+      assert.deepEqual(
+        completedPolicy.recent.find((build) => build.id === aiSettingsEvidence.runningBuild)?.stats
+          .ai,
+        capturedAi,
+        "A settings edit changed the running build's persisted policy",
+      );
       evidence.wiki = page;
       enter("index-visibility");
       const fixtureRepo = await api(base);
@@ -509,7 +579,9 @@ export async function runProviderE2E(
         });
         try {
           await page.goto("/signin");
-          await page.getByRole("button", { name: /Continue as Priya/i }).click();
+          await page
+            .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
+            .click();
           await page.waitForURL((url) => url.pathname !== "/signin");
           await page.goto(`/${owner}/${name}`);
           await page.waitForLoadState("networkidle");
@@ -553,7 +625,7 @@ export async function runProviderE2E(
       const asked = await fetch(`${ctx.origin}/api/assistant/ask`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${fixtures.tokens.priya}`,
+          authorization: `Bearer ${fixtures.tokens[persona]}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({
@@ -596,7 +668,7 @@ export async function runProviderE2E(
       enter("assistant-approval-continuation");
       {
         const teamKey = `C${randomBytes(2).toString("hex").toUpperCase()}`;
-        await api("/tracker/priya/mutate", "POST", {
+        await api(`/tracker/${persona}/mutate`, "POST", {
           operationId: randomUUID(),
           mutations: [
             {
@@ -635,13 +707,15 @@ export async function runProviderE2E(
         });
         try {
           await page.goto("/signin");
-          await page.getByRole("button", { name: /Continue as Priya/i }).click();
+          await page
+            .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
+            .click();
           await page.waitForURL((url) => url.pathname !== "/signin");
           await page.getByRole("button", { name: "Assistant", exact: true }).click();
           const composer = page.getByRole("textbox", { name: "Message the assistant" });
           const title = `Approval continuity ${randomBytes(4).toString("hex")}`;
           await composer.fill(
-            `Use create_issue to create exactly one task in owner priya, team ${teamKey}, titled "${title}". Request my approval before creating it, then open the new issue.`,
+            `Use create_issue to create exactly one task in owner ${persona}, team ${teamKey}, titled "${title}". Request my approval before creating it, then open the new issue.`,
           );
           await page.getByRole("button", { name: "Send", exact: true }).click();
           await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
@@ -666,7 +740,7 @@ export async function runProviderE2E(
           assert(approval, "The pending tool invocation must already be persisted");
           const call = approval.parts.find((part) => part.state === "approval-requested")!;
           const matchingIssues = async () =>
-            (await api("/tracker/priya/snapshot")).issues.filter(
+            (await api(`/tracker/${persona}/snapshot`)).issues.filter(
               (issue: { title: string }) => issue.title === title,
             );
           assert.equal((await matchingIssues()).length, 0, "No write may precede approval");
@@ -687,7 +761,7 @@ export async function runProviderE2E(
           await expect(
             page
               .locator(
-                `[aria-label="Conversation"] a[href="/tracker/priya/issues/${created[0].key}"]`,
+                `[aria-label="Conversation"] a[href="/tracker/${persona}/issues/${created[0].key}"]`,
               )
               .first(),
           ).toBeVisible();
@@ -741,7 +815,7 @@ export async function runProviderE2E(
           await expect(page.getByRole("list", { name: "Conversation" })).toContainText(retryMarker);
           const declinedTitle = `Declined ${title}`;
           await composer.fill(
-            `Create one task in owner priya, team ${teamKey}, titled "${declinedTitle}". Ask for my approval.`,
+            `Create one task in owner ${persona}, team ${teamKey}, titled "${declinedTitle}". Ask for my approval.`,
           );
           await page.getByRole("button", { name: "Send", exact: true }).click();
           await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
@@ -767,7 +841,7 @@ export async function runProviderE2E(
           await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
           await expect(page.getByRole("alert")).toBeHidden();
           assert.equal(
-            (await api("/tracker/priya/snapshot")).issues.filter(
+            (await api(`/tracker/${persona}/snapshot`)).issues.filter(
               (issue: { title: string }) => issue.title === declinedTitle,
             ).length,
             0,
@@ -842,6 +916,7 @@ export async function runProviderE2E(
       enter("release-daily-initial");
       await waitForNotes(["@day:2026-01-01"]);
       const firstDay = await notesFor("day:2026-01-01");
+      evidence.initialDailyNotes = firstDay;
       assert.equal(firstDay.release.kind, "daily");
       assert.equal(firstDay.release.toOid, final);
       assert.equal(firstDay.release.lastCommitAt, "2026-01-01T00:00:00.000Z");
@@ -849,13 +924,12 @@ export async function runProviderE2E(
         firstDay.entries.map((entry) => entry.commits),
         [[final]],
       );
-      assert(firstDay.entries[0]?.model, "Daily notes must record the real generation model");
+      assert.equal(firstDay.entries[0]?.model, "@cf/zai-org/glm-5.3-flash");
       assert.match(
         `${firstDay.entries[0]?.title} ${firstDay.entries[0]?.summary}`,
         /checksum|65521/i,
         "Daily notes must describe the committed checksum behavior",
       );
-      evidence.initialDailyNotes = firstDay;
       enter("knowledge-edit");
       // A meaningful edit re-analyzes checksum.ts; the concepts it still deals
       // with must keep their names, or every edit becomes new concepts to align.
@@ -881,7 +955,16 @@ export async function runProviderE2E(
       await git(["-c", "core.hooksPath=/dev/null", "commit", "-am", "Verify Copper Finch parcels"]);
       await git(["push", "origin", "main"], work, true);
       const edited = await git(["rev-parse", "HEAD"]);
-      let editBuild: { stats: { analyzed?: number; reused?: number } } | undefined;
+      let editBuild:
+        | {
+            stats: {
+              analyzed?: number;
+              reused?: number;
+              ai?: AiSnapshot;
+              atlasSpend?: { calls: number };
+            };
+          }
+        | undefined;
       await waitFor(stage, 12 * 60_000, async () => {
         const status = await api(`${base}/knowledge/status`);
         if (status.state === "failed")
@@ -902,6 +985,26 @@ export async function runProviderE2E(
         ),
         "Graph lacks the symbol the edit added",
       );
+      assert.equal(editBuild?.stats.ai?.models.task, "@cf/zai-org/glm-5.3-flash");
+      assert.equal(editBuild?.stats.ai?.features.wiki, false);
+      assert.equal(editBuild?.stats.ai?.features.atlas, false);
+      assert.equal(
+        editBuild?.stats.atlasSpend?.calls,
+        0,
+        "Disabled Atlas descriptions spent calls",
+      );
+      const retainedWiki = await api(`${base}/knowledge/wiki/page?slug=overview`);
+      assert.equal(retainedWiki.generatedIn, final, "Disabled wiki generation rewrote an old page");
+      assert.equal(
+        retainedWiki.body,
+        page.body,
+        "Disabling wiki must preserve its readable content",
+      );
+      aiSettingsEvidence.successorPolicy = editBuild?.stats.ai;
+      aiSettingsEvidence.disabledAtlasSpend = editBuild?.stats.atlasSpend;
+      aiSettingsEvidence.retainedWikiCommit = retainedWiki.generatedIn;
+      // Restore generation for the subsequent ordinary push and timeline scenarios.
+      await api(settingsPath, "PATCH", { features: { wiki: true, atlas: true } });
       const conceptsAfter = conceptsOf(editedGraph);
       const kept = conceptsBefore.filter((c) => conceptsAfter.includes(c));
       evidence.conceptRetention = {
@@ -1040,12 +1143,15 @@ export async function runProviderE2E(
       assert.equal(issueEntry.issue!.trackerOwner, owner);
       assert.equal(issueEntry.issue!.team.key, "CF");
       assert.deepEqual(issueEntry.commits, [cited], "The issue entry must cite the commit");
-      assert(issueEntry.model, "The issue entry must record its real generation model");
+      assert.equal(issueEntry.model, "@cf/zai-org/glm-5.3-flash");
       assert.notEqual(
         issueEntry.category,
         "internal",
         "A new verification function is not internal work",
       );
+      // Internal-only seed releases legitimately omit introductions. This
+      // user-facing release must actually exercise the newly selected Task model.
+      assert.equal(thirdDay.release.introModel, "@cf/zai-org/glm-5.3-flash");
       assert.match(
         `${issueEntry.title} ${issueEntry.summary}`,
         /verif|check|match/i,

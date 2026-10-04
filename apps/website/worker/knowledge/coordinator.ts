@@ -51,6 +51,8 @@ import {
 } from "./pages.ts";
 import type { Checkpoint } from "../../shared/timelines.ts";
 import { watchdog } from "./watchdog.ts";
+import { repoAiSnapshot } from "../settings/ai.ts";
+import { knowledgePolicy, LEGACY_KNOWLEDGE_POLICY, type KnowledgePolicy } from "./policy.ts";
 
 /** Quiet period after the last push before building. */
 const DEBOUNCE_MS = 1_500;
@@ -70,6 +72,10 @@ interface Running {
   /** The push sequence number the build covers. */
   seq: number;
   startedAt: number;
+  policy?: KnowledgePolicy;
+  force?: boolean;
+  ai?: KnowledgePolicy["ai"];
+  commit?: string;
 }
 
 export interface CoordinatorStatus {
@@ -92,13 +98,21 @@ interface State {
   builtSeq: number;
   burstStartedAt: number | null;
   running: Running | null;
+  /** A watchdog continuation is separate from newer pending push signals. */
+  retry?: Running;
   force: boolean;
   retries: number;
   lastError: string | null;
   lastFinishedAt: number | null;
   /** Timeline bookmarks need comparing with their overlays. */
   scan: boolean;
-  overlays: Record<string, OverlayState>;
+  overlays: Record<
+    string,
+    OverlayState & {
+      policy?: KnowledgePolicy;
+      retry?: { commit: string; base: string | null; policy: KnowledgePolicy };
+    }
+  >;
   /** Timeline wiki page sets being written, by build id. */
   pages: Record<string, PageRun>;
   /** Queued page sets may be waiting in D1. */
@@ -138,6 +152,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     state.seq += 1;
     state.force ||= Boolean(options.force);
     state.scan = true;
+    state.pagesDue = true;
     state.burstStartedAt ??= now;
     await this.#save(state);
     // Even while a build runs: timeline overlays don't wait for main's build.
@@ -168,7 +183,8 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     if (!state.repoId) return;
     if (state.running) await this.#watchBuild(state);
     await this.#watchOverlays(state);
-    const buildDue = !state.running && (state.seq > state.builtSeq || state.force);
+    const buildDue =
+      !state.running && (Boolean(state.retry) || state.seq > state.builtSeq || state.force);
     let refs: RepoRefs | null = null;
     let indexed: string | null = null;
     let ownerId: string | null = null;
@@ -198,15 +214,36 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     }
     if (buildDue) {
       // Pushes that only moved other branches (timeline bookmarks) leave main as indexed.
-      if (!state.force && refs?.head && refs.head === indexed) state.builtSeq = state.seq;
+      if (!state.retry && !state.force && refs?.head && refs.head === indexed)
+        state.builtSeq = state.seq;
       else {
-        const buildId = crypto.randomUUID();
-        await this.env.KNOWLEDGE_BUILD.create({
-          id: buildId,
-          params: { repoId: state.repoId, buildId, force: state.force },
-        });
-        state.running = { buildId, seq: state.seq, startedAt: Date.now() };
-        state.force = false;
+        const retry = state.retry;
+        const policy =
+          retry?.policy ??
+          (retry ? LEGACY_KNOWLEDGE_POLICY : await knowledgePolicy(this.env, state.repoId));
+        if (!policy.ai.features.knowledge) {
+          state.builtSeq = state.seq;
+          state.force = false;
+        } else {
+          const buildId = crypto.randomUUID();
+          const force = retry ? true : state.force;
+          state.running = {
+            buildId,
+            seq: retry?.seq ?? state.seq,
+            force,
+            policy,
+            commit: retry?.commit ?? refs?.head ?? undefined,
+            startedAt: Date.now(),
+          };
+          if (!retry) state.force = false;
+          state.retry = undefined;
+          await this.#save(state);
+          await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+          await this.env.KNOWLEDGE_BUILD.create({
+            id: buildId,
+            params: { repoId: state.repoId, buildId, force, policy, commit: state.running.commit },
+          });
+        }
       }
     }
     // Main's next build waits for its own run to end (finished() schedules it).
@@ -262,12 +299,17 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     const queued = await queuedSets(this.env.DB, repoId);
     const plan = schedulePages(Object.values(state.pages), queued);
     for (const set of plan.start) {
+      const policy = await knowledgePolicy(this.env, repoId);
+      if (!policy.ai.features.knowledge || !policy.ai.features.wiki) {
+        state.pagesDue = false;
+        return;
+      }
       const buildId = crypto.randomUUID();
-      if (!(await claimSet(this.env.DB, { repoId, ...set }, buildId))) continue;
+      if (!(await claimSet(this.env.DB, { repoId, ...set }, buildId, policy))) continue;
       try {
         await this.env.KNOWLEDGE_BUILD.create({
           id: buildId,
-          params: { repoId, buildId, pages: set },
+          params: { repoId, buildId, pages: set, policy },
         });
       } catch (error) {
         // Left queued for the next wake-up rather than stuck as being written.
@@ -289,7 +331,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     const status = instance ? await instance.status().catch(() => null) : null;
     const build = await db(this.env.DB)
       .selectFrom("kg_builds")
-      .select("progress_at")
+      .select(["progress_at", "to_commit"])
       .where("id", "=", running.buildId)
       .executeTakeFirst();
     const verdict = watchdog(Date.now(), running.startedAt, build?.progress_at ?? null);
@@ -318,7 +360,11 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
       state.lastError = `Build ${reason}${status?.error?.message ? `: ${status.error.message}` : ""}`;
       if (state.retries < MAX_RETRIES) {
         state.retries += 1;
-        state.force = true;
+        state.retry = {
+          ...running,
+          commit: build?.to_commit || running.commit,
+          policy: running.policy ?? LEGACY_KNOWLEDGE_POLICY,
+        };
       } else {
         state.builtSeq = running.seq;
         state.retries = 0;
@@ -350,19 +396,27 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
 
   #overlayEnded(
     state: State,
-    overlay: OverlayState,
+    overlay: State["overlays"][string],
     covered: { commit: string; base: string | null },
     error: string | null,
   ) {
+    const run = overlay.running;
     overlay.running = null;
     overlay.lastError = error;
     // A failure is retried once (a cleared `done`), then left until the bookmark or main moves.
     if (error && overlay.retries < MAX_RETRIES) {
       overlay.retries += 1;
       overlay.done = null;
+      if (run)
+        overlay.retry = {
+          commit: run.commit,
+          base: run.base,
+          policy: overlay.policy ?? LEGACY_KNOWLEDGE_POLICY,
+        };
     } else {
       overlay.retries = 0;
       overlay.done = covered;
+      overlay.retry = undefined;
     }
     state.scan = true;
   }
@@ -403,15 +457,33 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     // Over the limit: picked up when one of those in flight ends.
     state.scan = scan.deferred;
     for (const [ref, commit] of scan.start) {
+      const previous = state.overlays[ref];
+      const retry = previous?.retry;
+      const policy = retry?.policy ?? (await knowledgePolicy(this.env, repoId));
+      if (!policy.ai.features.knowledge) continue;
       const buildId = crypto.randomUUID();
-      await this.env.KNOWLEDGE_BUILD.create({
-        id: buildId,
-        params: { repoId, buildId, overlay: { ref, commit } },
-      });
       state.overlays[ref] = {
         ...(state.overlays[ref] ?? { done: null, retries: 0, lastError: null }),
-        running: { buildId, commit, base: indexed!, startedAt: Date.now() },
+        running: {
+          buildId,
+          commit: retry?.commit ?? commit,
+          base: retry?.base ?? indexed!,
+          startedAt: Date.now(),
+        },
+        policy,
+        retry: undefined,
       };
+      await this.#save(state);
+      await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+      await this.env.KNOWLEDGE_BUILD.create({
+        id: buildId,
+        params: {
+          repoId,
+          buildId,
+          overlay: { ref, commit: retry?.commit ?? commit, base: retry?.base ?? indexed! },
+          policy,
+        },
+      });
     }
   }
 
@@ -466,7 +538,9 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
   async status(): Promise<CoordinatorStatus> {
     const state = await this.#state();
     return {
-      running: state.running,
+      running: state.running
+        ? { ...state.running, ai: state.running.policy?.ai ?? LEGACY_KNOWLEDGE_POLICY.ai }
+        : null,
       pending: state.seq > state.builtSeq && !state.running,
       lastError: state.lastError,
       lastFinishedAt: state.lastFinishedAt,
@@ -491,11 +565,13 @@ export function coordinator(env: Env, repoId: string): DurableObjectStub<Knowled
 }
 
 /** Tell a repository's coordinator that something changed. */
-export function notifyKnowledge(env: Env, repoId: string, options: { force?: boolean } = {}) {
+export async function notifyKnowledge(env: Env, repoId: string, options: { force?: boolean } = {}) {
   // Automatic non-AI agent environments omit provider bindings altogether,
   // and a preview never starts the (production) KnowledgeBuild Workflow.
-  if (!env.AI || !productionOnly(env, "workflow", "a knowledge build")) return Promise.resolve();
-  return coordinator(env, repoId).notify(repoId, options);
+  if (!env.AI || !productionOnly(env, "workflow", "a knowledge build")) return false;
+  if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
+  await coordinator(env, repoId).notify(repoId, options);
+  return true;
 }
 
 /**
@@ -505,8 +581,11 @@ export function notifyKnowledge(env: Env, repoId: string, options: { force?: boo
  */
 export async function requestPages(env: Env, request: PageRequest) {
   if (!env.AI || !productionOnly(env, "workflow", "wiki pages")) return null;
+  const ai = await repoAiSnapshot(env.DB, request.repoId);
+  if (!ai.features.knowledge || !ai.features.wiki) return null;
   const result = await queueSet(env.DB, request);
-  if (result.queued) await coordinator(env, request.repoId).pagesRequested(request.repoId);
+  if (result.status === "queued")
+    await coordinator(env, request.repoId).pagesRequested(request.repoId);
   return result;
 }
 

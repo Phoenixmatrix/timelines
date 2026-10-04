@@ -4,6 +4,9 @@
 // change during a run schedules another.
 
 import type { MutationResult } from "../../shared/tracker.ts";
+import type { AiSnapshot } from "../../shared/ai.ts";
+import type { RepoRefs } from "../artifacts.ts";
+import { repoAiSnapshot } from "../settings/ai.ts";
 import { semanticFeed } from "../semantic/feed.ts";
 import { semanticCache } from "../semantic/api.ts";
 import { RepoReader } from "../objects.ts";
@@ -25,6 +28,7 @@ const LEASE_MS = 14 * 60_000;
 /** Lazily rebuild old derived data; the dirty mark coalesces concurrent reads. */
 export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void> {
   if (!env.AI || !productionOnly(env, "queue", "release notes")) return;
+  if (!(await repoAiSnapshot(env.DB, repoId)).features.releaseNotes) return;
   const claimed = await db(env.DB)
     .insertInto("release_note_state")
     .values({ repo_id: repoId, dirty: 1, status: "generating" })
@@ -35,6 +39,7 @@ export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void
         .where("format_version", "<", 1)
         .where("dirty", "=", 0)
         .where("lease_until", "<", Date.now())
+        .where("ai_snapshot", "is", null)
         .where("status", "!=", "failed"),
     )
     .returning("repo_id")
@@ -57,6 +62,7 @@ export async function ensureReleaseNotes(env: Env, repoId: string): Promise<void
 export async function notifyReleaseNotes(env: Env, repoId: string): Promise<void> {
   // Automatic non-AI agent environments omit provider bindings altogether.
   if (!env.AI || !productionOnly(env, "queue", "release notes")) return;
+  if (!(await repoAiSnapshot(env.DB, repoId)).features.releaseNotes) return;
   await db(env.DB)
     .insertInto("release_note_state")
     .values({ repo_id: repoId, dirty: 1 })
@@ -152,17 +158,52 @@ export async function runReleaseNotesJob(
   waitUntil: (work: Promise<unknown>) => void,
 ): Promise<void> {
   const { repoId } = message.body;
-  if (!env.AI) return message.ack();
+  if (!env.AI || !productionOnly(env, "queue", "release notes")) return message.ack();
   const d = db(env.DB);
   const now = Date.now();
+  const previous = await d
+    .selectFrom("release_note_state")
+    .selectAll()
+    .where("repo_id", "=", repoId)
+    .executeTakeFirst();
+  if (
+    !previous ||
+    previous.lease_until >= now ||
+    (!previous.ai_snapshot && !previous.dirty && previous.format_version >= 1)
+  )
+    return message.ack();
+
+  // A non-null snapshot is the generation, not the delivery. Retries, expired
+  // leases and budget continuations all resume it; dirty only signals a successor.
+  const snapshot: AiSnapshot = previous.ai_snapshot
+    ? JSON.parse(previous.ai_snapshot)
+    : await repoAiSnapshot(env.DB, repoId);
+  if (!snapshot.features.releaseNotes) {
+    await d
+      .updateTable("release_note_state")
+      .set({ dirty: 0, status: previous.format_version >= 1 ? "ready" : "idle" })
+      .where("repo_id", "=", repoId)
+      .where("lease_until", "<", now)
+      .where("ai_snapshot", "is", null)
+      .execute();
+    return message.ack();
+  }
+  const leaseId = crypto.randomUUID();
   const leased = await d
     .updateTable("release_note_state")
-    .set({ lease_until: now + LEASE_MS, dirty: 0, status: "generating" })
+    .set((eb) => ({
+      lease_until: now + LEASE_MS,
+      lease_id: leaseId,
+      dirty: previous.ai_snapshot ? eb.ref("dirty") : 0,
+      status: "generating",
+    }))
     .where("repo_id", "=", repoId)
     .where("lease_until", "<", now)
-    .where((eb) => eb.or([eb("dirty", "=", 1), eb("format_version", "<", 1)]))
+    .where("ai_snapshot", previous.ai_snapshot ? "=" : "is", previous.ai_snapshot)
+    .where((eb) =>
+      eb.or([eb("dirty", "=", 1), eb("ai_snapshot", "is not", null), eb("format_version", "<", 1)]),
+    )
     .executeTakeFirst();
-  // Another run holds it; that run sees the dirty mark and follows up.
   if (!leased.numUpdatedRows) return message.ack();
 
   let again = false;
@@ -170,7 +211,24 @@ export async function runReleaseNotesJob(
     const opened = await source(env, repoId, waitUntil);
     if (opened) {
       try {
-        const result = await generateReleaseNotes(env, repoId, opened.source);
+        // Keep a push during this generation out of its continuation. The next
+        // generation reads new refs together with its freshly selected models.
+        const refs: RepoRefs = previous.generation_refs
+          ? JSON.parse(previous.generation_refs)
+          : await opened.source.refs();
+        const saved = await d
+          .updateTable("release_note_state")
+          .set({ generation_refs: JSON.stringify(refs), ai_snapshot: JSON.stringify(snapshot) })
+          .where("repo_id", "=", repoId)
+          .where("lease_id", "=", leaseId)
+          .executeTakeFirst();
+        if (!saved.numUpdatedRows) return message.ack();
+        const result = await generateReleaseNotes(
+          env,
+          repoId,
+          { ...opened.source, refs: async () => refs },
+          snapshot.models,
+        );
         again = result.more;
       } finally {
         await opened.close();
@@ -180,47 +238,51 @@ export async function runReleaseNotesJob(
       .updateTable("release_note_state")
       .set((eb) => ({
         lease_until: 0,
+        lease_id: null,
+        ai_snapshot: again ? JSON.stringify(snapshot) : null,
+        generation_refs: again ? eb.ref("generation_refs") : null,
         status: eb
           .case()
           .when("dirty", "=", 1)
           .then("generating" as const)
           .else(again ? ("generating" as const) : ("ready" as const))
           .end(),
-        format_version: again
-          ? eb.ref("format_version")
-          : eb.case().when("dirty", "=", 0).then(1).else(eb.ref("format_version")).end(),
-        dirty: eb
-          .case()
-          .when("dirty", "=", 1)
-          .then(1)
-          .else(again ? 1 : 0)
-          .end(),
+        format_version: again ? eb.ref("format_version") : 1,
         error: null,
-        generated_at: again
-          ? eb.ref("generated_at")
-          : eb
-              .case()
-              .when("dirty", "=", 0)
-              .then(new Date().toISOString())
-              .else(eb.ref("generated_at"))
-              .end(),
+        generated_at: again ? eb.ref("generated_at") : new Date().toISOString(),
       }))
       .where("repo_id", "=", repoId)
+      .where("lease_id", "=", leaseId)
       .returning("dirty")
       .executeTakeFirst();
-    again ||= Boolean(state?.dirty);
-    if (again)
+    if (!state) return message.ack();
+    if (again || state.dirty)
       await env.JOBS.send({ type: "release-notes", repoId } satisfies ReleaseNotesJob, {
         delaySeconds: 5,
       });
     message.ack();
   } catch (error) {
     console.error("Release notes: generation failed", repoId, error);
-    await d
+    const failed = await d
       .updateTable("release_note_state")
-      .set({ lease_until: 0, status: "failed", error: String(error).slice(0, 500), dirty: 1 })
+      .set((eb) => ({
+        lease_until: 0,
+        lease_id: null,
+        status: "failed",
+        error: String(error).slice(0, 500),
+        // No frozen refs means no admitted AI work. A retry must reconsider
+        // current policy rather than apply an old policy to a newly fetched HEAD.
+        dirty: eb.case().when("ai_snapshot", "is", null).then(1).else(eb.ref("dirty")).end(),
+      }))
       .where("repo_id", "=", repoId)
-      .execute();
+      .where("lease_id", "=", leaseId)
+      .executeTakeFirst();
+    if (!failed.numUpdatedRows) {
+      // Completion can succeed before the follow-up send fails. Retry delivery
+      // to pick up its persisted successor/continuation, without reviving it.
+      message.retry({ delaySeconds: 5 });
+      return;
+    }
     message.retry({ delaySeconds: Math.min(600, 30 * 2 ** Math.max(0, message.attempts - 1)) });
   }
 }

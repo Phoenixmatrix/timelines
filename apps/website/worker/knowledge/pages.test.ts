@@ -8,6 +8,7 @@
 import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { WorkflowStep } from "cloudflare:workers";
+import { LEGACY_AI_SNAPSHOT } from "../../shared/ai.ts";
 import type {
   KnowledgeOverlay,
   KnowledgeOverlayChange,
@@ -255,6 +256,7 @@ async function setup() {
   };
   await updatePages(
     env,
+    LEGACY_AI_SNAPSHOT.models,
     mainSource,
     ["overview", "architecture", "components/src-cli", "components/src-web", "glossary"],
     new Set(),
@@ -379,6 +381,133 @@ async function makeCheckpoint(t: Setup, summary = "Refunds") {
 }
 
 describe("timeline wiki pages", () => {
+  test("knowledge disabled before admission blocks main, overlays and queued pages", async () => {
+    const t = await setup();
+    const made = await makeCheckpoint(t);
+    t.sqlite
+      .prepare("INSERT INTO account_settings (account_id, ai_knowledge) VALUES (?, ?)")
+      .run("orbit", 0);
+    await t.coordinator.notify("app", { force: true });
+    await t.coordinator.alarm();
+    expect([...t.builds.values()]).toEqual([]);
+    expect(t.ai.calls).toEqual([]);
+    expect(t.sets()).toEqual([
+      { set_key: made.checkpoint.id, status: "queued", commit_oid: TIP, checkpoint_number: 1 },
+    ]);
+    expect((await t.kn("ann", "POST", "/rebuild")).status).toBe(409);
+    expect((await t.kn("ben", "POST", "/overlay/pages?ref=timeline/search")).status).toBe(409);
+  });
+
+  test.each(["knowledge", "wiki"] as const)(
+    "an explicit queued re-request resumes after %s is reenabled, without waking completed sets",
+    async (feature) => {
+      const t = await setup();
+      const made = await makeCheckpoint(t);
+      const path = `/overlay/pages?ref=timeline/search&checkpoint=${made.checkpoint.id}`;
+      t.sqlite
+        .prepare(`INSERT INTO account_settings (account_id, ai_${feature}) VALUES (?, 0)`)
+        .run("orbit");
+      await t.coordinator.alarm();
+      const wake = vi.spyOn(t.coordinator, "pagesRequested");
+      expect((await t.kn("ben", "POST", path)).status).toBe(409);
+      expect(wake).not.toHaveBeenCalled();
+
+      t.sqlite
+        .prepare(`UPDATE account_settings SET ai_${feature} = 1 WHERE account_id = ?`)
+        .run("orbit");
+      await t.coordinator.alarm();
+      expect([...t.builds.values()]).toEqual([]);
+      const requested = await t.kn("ben", "POST", path);
+      expect(requested.status).toBe(202);
+      expect(requested.body.state).toBe("queued");
+      const { results } = await t.drain();
+      expect(results).toEqual([expect.objectContaining({ status: "succeeded", written: 2 })]);
+      wake.mockClear();
+      expect((await t.kn("ben", "POST", path)).body.state).toBe("succeeded");
+      expect(wake).not.toHaveBeenCalled();
+      wake.mockRestore();
+    },
+  );
+
+  test("queued pages use admission policy and running pages retain it after settings change", async () => {
+    const t = await setup();
+    const made = await makeCheckpoint(t);
+    t.sqlite
+      .prepare("INSERT INTO account_settings (account_id, ai_wiki) VALUES (?, ?)")
+      .run("orbit", 0);
+    await t.coordinator.alarm();
+    expect([...t.builds.values()]).toEqual([]);
+    expect(t.ai.calls).toEqual([]);
+    expect((await t.kn("ben", "POST", "/overlay/pages?ref=timeline/search")).status).toBe(409);
+
+    t.sqlite
+      .prepare("UPDATE account_settings SET ai_wiki = 1, ai_task_model = ? WHERE account_id = ?")
+      .run("gemma-4-26b-a4b-it", "orbit");
+    // Saving policy does not wake a stopped queue. Re-requesting the same
+    // checkpoint must wake it even though its set already exists.
+    await t.coordinator.alarm();
+    expect([...t.builds.values()]).toEqual([]);
+    expect(
+      (
+        await t.kn(
+          "ben",
+          "POST",
+          `/overlay/pages?ref=timeline/search&checkpoint=${made.checkpoint.id}`,
+        )
+      ).status,
+    ).toBe(202);
+    await t.coordinator.alarm();
+    const build = [...t.builds.values()][0]!;
+    const params = build.params as Parameters<typeof runPageSet>[1];
+    const snapshot = t.sqlite
+      .prepare("SELECT ai_snapshot FROM kg_page_sets WHERE set_key = ?")
+      .get(made.checkpoint.id) as { ai_snapshot: string };
+    expect(JSON.parse(snapshot.ai_snapshot)).toEqual(params.policy);
+    expect(params.policy!.ai.models.task).toBe("@cf/google/gemma-4-26b-a4b-it");
+
+    t.sqlite
+      .prepare(
+        "UPDATE account_settings SET ai_knowledge = 0, ai_wiki = 0, ai_task_model = ? WHERE account_id = ?",
+      )
+      .run("glm-5.3-flash", "orbit");
+    const { results } = await t.drain();
+    expect(results).toEqual([
+      expect.objectContaining({ status: "succeeded", written: 2, kept: 0, copied: 0 }),
+    ]);
+    expect(t.pages(made.checkpoint.id)).toContainEqual(
+      expect.objectContaining({
+        slug: "components/src-web",
+        model: params.policy!.ai.models.task,
+      }),
+    );
+  });
+
+  test("main watchdog retries retain admission policy while a successor captures changed settings", async () => {
+    const t = await setup();
+    // Keep this scenario on main rather than starting an independent overlay.
+    t.app.refs.delete(REF);
+    await t.coordinator.notify("app", { force: true });
+    await t.coordinator.alarm();
+    const [firstId, first] = [...t.builds.entries()][0]!;
+    const firstParams = first.params as Parameters<typeof runPageSet>[1];
+    t.sqlite
+      .prepare("INSERT INTO account_settings (account_id, ai_task_model, ai_wiki) VALUES (?, ?, ?)")
+      .run("orbit", "gemma-4-26b-a4b-it", 0);
+    first.status = "errored";
+    await t.coordinator.notify("app", { force: true });
+    await t.coordinator.alarm();
+    const [retryId, retry] = [...t.builds.entries()].find(([id]) => id !== firstId)!;
+    expect((retry.params as Parameters<typeof runPageSet>[1]).policy).toEqual(firstParams.policy);
+    retry.status = "complete";
+    await t.coordinator.finished(retryId, true, null);
+    await t.coordinator.alarm();
+    const successor = [...t.builds.entries()].find(([id]) => id !== firstId && id !== retryId)![1];
+    const nextPolicy = (successor.params as Parameters<typeof runPageSet>[1]).policy!;
+    expect(nextPolicy.ai.models.task).toBe("@cf/google/gemma-4-26b-a4b-it");
+    expect(nextPolicy.ai.features.wiki).toBe(false);
+    expect(firstParams.policy!.ai.features.wiki).toBe(true);
+  });
+
   test("a checkpoint queues them; they're written from the timeline's graph, never main's wiki", async () => {
     const t = await setup();
     const wikiBefore = t.mainWiki();
@@ -400,6 +529,7 @@ describe("timeline wiki pages", () => {
       repoId: "app",
       pages: { ref: REF, key: made.checkpoint.id },
     });
+    const policy = (build!.params as Parameters<typeof runPageSet>[1]).policy!;
     const pending = (await t.timeline("cat", "GET", "/search/checkpoints/1"))
       .body as CheckpointView;
     expect(pending.knowledge).toMatchObject([{ repoId: "app", state: "writing", pages: [] }]);
@@ -417,7 +547,7 @@ describe("timeline wiki pages", () => {
         kind: "component",
         change: "changed",
         outcome: "written",
-        model: "@cf/qwen/qwen3.8-27b",
+        model: policy.ai.models.task,
       },
       { slug: "glossary", kind: "glossary", change: "changed", outcome: "written", model: null },
     ]);
@@ -504,7 +634,14 @@ describe("timeline wiki pages", () => {
     // Settling the set's pages again changes nothing and asks no model.
     const set: PageSetRef = { repoId: "app", ref: REF, key: made.checkpoint.id };
     const changes = await timelineChanges(t);
-    const again = await writeSetPages(t.env, set, changes.source, changes.diff, changes.chosen);
+    const again = await writeSetPages(
+      t.env,
+      LEGACY_AI_SNAPSHOT.models,
+      set,
+      changes.source,
+      changes.diff,
+      changes.chosen,
+    );
     expect(again).toMatchObject({ written: 0, unchanged: 2 });
     expect(t.ai.calls.length).toBe(calls);
     expect(t.sqlite.prepare("SELECT * FROM kg_page_set_pages ORDER BY slug").all()).toEqual(first);
@@ -571,6 +708,7 @@ describe("timeline wiki pages", () => {
     const changes = await timelineChanges(t);
     const capped = await writeSetPages(
       t.env,
+      LEGACY_AI_SNAPSHOT.models,
       { repoId: "app", ref: REF, key: "commit:x" },
       changes.source,
       changes.diff,
@@ -583,7 +721,14 @@ describe("timeline wiki pages", () => {
 
     t.ai.stale = 0.1;
     const set: PageSetRef = { repoId: "app", ref: REF, key: "commit:y" };
-    const kept = await writeSetPages(t.env, set, changes.source, changes.diff, changes.chosen);
+    const kept = await writeSetPages(
+      t.env,
+      LEGACY_AI_SNAPSHOT.models,
+      set,
+      changes.source,
+      changes.diff,
+      changes.chosen,
+    );
     expect(kept).toMatchObject({ kept: 1, written: 1, tokens: 0 });
     expect(t.ai.calls.map((c) => c.kind)).toEqual(["clef", "clef"]);
     expect(t.pages("commit:y")).toMatchObject([

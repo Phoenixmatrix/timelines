@@ -113,6 +113,9 @@ pub enum Command {
     /// Sign in to a Gitmatrix server
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Account-wide settings for a person or organization
+    #[command(subcommand)]
+    Settings(crate::commands::settings::SettingsCommand),
     /// Manage repositories on the Gitmatrix server
     #[command(subcommand)]
     Repo(RepoCommand),

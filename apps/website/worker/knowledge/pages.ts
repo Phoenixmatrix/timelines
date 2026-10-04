@@ -26,6 +26,7 @@ import type {
   KnowledgePageSet,
   KnowledgeTimelinePageSummary,
 } from "../../shared/api.ts";
+import { LEGACY_AI_SNAPSHOT, type AiModels } from "../../shared/ai.ts";
 import type { WorkflowStep } from "cloudflare:workers";
 import { sql } from "kysely";
 import { timelineSlugOf } from "../../shared/timelines.ts";
@@ -34,6 +35,7 @@ import { db, nowIso } from "../schema.ts";
 import { analyzeFiles, loadAnalyses } from "./analyze.ts";
 import { loadSnapshot, type BuiltGraph, type Syntheses } from "./graph.ts";
 import { countChanges, diffGraphs, overlayGraphs, planOverlay, toAnalyze } from "./overlay.ts";
+import type { KnowledgePolicy } from "./policy.ts";
 import { chunk, pool, sha256 } from "./util.ts";
 import {
   diagramFor,
@@ -232,6 +234,7 @@ export function addStats(into: PageSetStats, from: PageSetStats) {
  */
 export async function writeSetPages(
   env: Env,
+  models: AiModels,
   set: PageSetRef,
   source: WikiSource,
   diff: KnowledgeOverlayChange[],
@@ -356,14 +359,14 @@ export async function writeSetPages(
     if (
       before &&
       (before.inputs_hash === base.hash ||
-        !(await isStale(env, page, before, changedNodes, source.graph)))
+        !(await isStale(env, models, page, before, changedNodes, source.graph)))
     ) {
       await save(page, change, hash, { outcome: "kept", body: "", model: null, tokens: 0 });
       stats.kept++;
       return;
     }
     if (spent >= budget) return void stats.skipped++;
-    const written = await writePage(env, page, inputs, ALSO);
+    const written = await writePage(env, models, page, inputs, ALSO);
     spent += written.tokens;
     await save(page, change, hash, { outcome: "written", ...written });
     stats.written++;
@@ -498,10 +501,15 @@ export async function queuedSets(d1: D1Database, repoId: string, limit = 20) {
 }
 
 /** Mark a queued set as being written by `buildId`; false if someone else took it. */
-export async function claimSet(d1: D1Database, set: PageSetRef, buildId: string) {
+export async function claimSet(
+  d1: D1Database,
+  set: PageSetRef,
+  buildId: string,
+  policy: KnowledgePolicy,
+) {
   const row = await db(d1)
     .updateTable("kg_page_sets")
-    .set({ status: "writing", build_id: buildId })
+    .set({ status: "writing", build_id: buildId, ai_snapshot: JSON.stringify(policy) })
     .where("repo_id", "=", set.repoId)
     .where("ref", "=", set.ref)
     .where("set_key", "=", set.key)
@@ -515,7 +523,7 @@ export async function claimSet(d1: D1Database, set: PageSetRef, buildId: string)
 export async function releaseSet(d1: D1Database, set: PageSetRef, buildId: string) {
   await db(d1)
     .updateTable("kg_page_sets")
-    .set({ status: "queued", build_id: null })
+    .set({ status: "queued", build_id: null, ai_snapshot: null })
     .where("repo_id", "=", set.repoId)
     .where("ref", "=", set.ref)
     .where("set_key", "=", set.key)
@@ -617,11 +625,18 @@ export interface PageSetDeps<R extends { id: string; full_name: string }> {
  */
 export async function runPageSet<R extends { id: string; full_name: string }>(
   env: Env,
-  params: { repoId: string; buildId: string; pages: { ref: string; key: string } },
+  params: {
+    repoId: string;
+    buildId: string;
+    pages: { ref: string; key: string };
+    policy?: KnowledgePolicy;
+  },
   step: WorkflowStep,
   deps: PageSetDeps<R>,
 ) {
   const { repoId, buildId } = params;
+  // Only payloads admitted before account AI settings lack their frozen policy.
+  const { models } = params.policy?.ai ?? LEGACY_AI_SNAPSHOT;
   const set: PageSetRef = { repoId, ...params.pages };
   const done = (status: "succeeded" | "failed" | "ended", values = {}) =>
     step.do(`pages-${status}`, STEP, async () => {
@@ -671,7 +686,7 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
     const { commit, changes } = plan;
     for (const [i, group] of chunk(plan.pending, ANALYZE_BATCH).entries()) {
       await step.do(`pages-analyze-${i}`, STEP, () =>
-        deps.withReader(repo, (reader) => analyzeFiles(env, reader, group)),
+        deps.withReader(repo, (reader) => analyzeFiles(env, models, reader, group)),
       );
     }
     // Rebuilt in each step from D1, as main's wiki steps do: nothing large crosses steps.
@@ -711,7 +726,7 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
         if (await overlayEnded(env.DB, repoId, set.ref)) return null;
         return deps.withReader(repo, async (reader) => {
           const { diff, source } = await graphsAt(reader);
-          return writeSetPages(env, set, source, diff, batch);
+          return writeSetPages(env, models, set, source, diff, batch);
         });
       });
       if (!stats) {

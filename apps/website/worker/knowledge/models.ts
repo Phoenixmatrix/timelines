@@ -82,6 +82,23 @@ function once(env: Env, model: string, inputs: unknown): Promise<unknown> {
   });
 }
 
+// Provider-specific reasoning controls: GLM and Qwen cannot use the old
+// boolean toggle. `think: false` requests their lowest supported effort.
+function reasoning(model: string, think: boolean) {
+  switch (model) {
+    case MODELS.fast:
+      return { reasoning_effort: think ? "max" : "low" };
+    case MODELS.reason:
+      return { reasoning_effort: think ? "xhigh" : "low" };
+    case "@cf/google/gemma-4-26b-a4b-it":
+      return { chat_template_kwargs: { enable_thinking: think } };
+    default:
+      // Development Atlas overrides may name other models (including deliberate
+      // provider failures); don't invent reasoning parameters for them.
+      return {};
+  }
+}
+
 async function chat(
   env: Env,
   tier: "fast" | "reason",
@@ -93,8 +110,7 @@ async function chat(
     messages,
     max_tokens: options.maxTokens,
     ...(options.json ? { response_format: { type: "json_object" } } : {}),
-    // Thinking costs 3-5x the latency; only the hardest writing turns it on.
-    chat_template_kwargs: { enable_thinking: options.think },
+    ...reasoning(model, options.think),
   })) as ChatResult;
   const choice = result.choices?.[0];
   const text =
@@ -175,7 +191,7 @@ export async function chatText(
   tier: "fast" | "reason",
   system: string,
   user: string,
-  options: { maxTokens?: number; think?: boolean } = {},
+  options: { maxTokens?: number; think?: boolean; model?: string } = {},
 ): Promise<{ text: string; usage: Usage }> {
   return chat(
     env,
@@ -184,11 +200,16 @@ export async function chatText(
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    { json: false, maxTokens: options.maxTokens ?? 4000, think: options.think ?? false },
+    {
+      json: false,
+      maxTokens: options.maxTokens ?? 4000,
+      think: options.think ?? false,
+      model: options.model,
+    },
   );
 }
 
-// ---- clef: decisions with probabilities -----------------------------------
+// ---- typed decisions with probabilities -------------------------------------
 
 export type ClefQuestion =
   | { type: "noul"; instructions: unknown; criteria?: { true?: unknown; false?: unknown } }
@@ -198,21 +219,27 @@ export type ClefQuestion =
 export type ClefAnswer =
   | { type: "noul"; noul: number }
   | { type: "choice"; choice: string; probabilities: Record<string, number>; confidence: number }
-  | { type: "score"; score: number; probabilities: number[]; confidence: number };
+  | {
+      type: "score";
+      score: number;
+      probabilities: number[];
+      confidence: number;
+    };
 
-/** Ask clef up to 64 typed questions about one state (`flash` for the 9B model). */
+/** Ask typed questions; `flash` is reserved for interactive chat routing. */
 export async function decide(
   env: Env,
   state: unknown,
   questions: Record<string, ClefQuestion>,
-  options: { flash?: boolean } = {},
+  options: { flash?: boolean; model?: string } = {},
 ): Promise<Record<string, ClefAnswer>> {
-  const result = (await ai(env).run(options.flash ? MODELS.route : MODELS.classify, {
+  const model = options.flash ? MODELS.route : (options.model ?? MODELS.classify);
+  const result = (await ai(env).run(model, {
     model: options.flash ? "clef-flash" : "clef",
     state,
     questions,
   })) as { answers?: Record<string, ClefAnswer> };
-  if (!result.answers) throw new Error("clef returned no answers");
+  if (!result.answers) throw new Error(`${model} returned no answers`);
   return result.answers;
 }
 

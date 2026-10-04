@@ -10,7 +10,7 @@
 // concepts they share, and the structural evidence that grouped them; never
 // from other capabilities' prose. The result is cached in kg_synthesis under a
 // hash of exactly those inputs (and the repository, so provenance never
-// crosses repositories), so identical inputs are never inferred twice.
+// crosses repositories), independent of the model selected for future work.
 //
 // A cache miss is a paid call, made only through `infer` (the build passes the
 // Atlas budget's runner, CORE-162): once, never retried, and not at all once a
@@ -205,7 +205,7 @@ function parseData(raw: string): Record<string, unknown> {
 }
 
 /** Load every capability of snapshot `seq` with what describing it needs. */
-async function prepare(env: Env, ctx: DescribeContext, model: string): Promise<Prepared[]> {
+async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
   const d1 = env.DB;
   const scope = repoScope(ctx.repoId);
   const [capRows, areaRows, assignments, imports, componentEdges] = await Promise.all([
@@ -460,7 +460,7 @@ async function prepare(env: Env, ctx: DescribeContext, model: string): Promise<P
       membership,
       input,
       inputsHash: await sha256(
-        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${model}:${ctx.repoId}:${JSON.stringify(input)}`,
+        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${ctx.repoId}:${JSON.stringify(input)}`,
       ),
     });
   }
@@ -605,7 +605,7 @@ export async function describeRepoCapabilities(
 ): Promise<DescribeStats> {
   const now = options.now ?? (() => new Date());
   const model = options.model ?? MODELS.reason;
-  const prepared = await prepare(env, ctx, model);
+  const prepared = await prepare(env, ctx);
   const stats: DescribeStats = {
     capabilities: prepared.length,
     current: 0,
@@ -617,12 +617,39 @@ export async function describeRepoCapabilities(
   };
   if (!prepared.length) return stats;
 
+  // Older rows included the selected model in their hash. Discover models
+  // from this repository's actual cached descriptions, then match the exact
+  // old input identity. Never copy those rows or rewrite their provenance.
+  // Load lazily once: builds whose new-format cache is complete need no scan.
+  let previousModels: Promise<D1Result<{ model: string }>> | undefined;
+  const previousDescription = async (p: Prepared): Promise<CachedDescription | null> => {
+    previousModels ??= env.DB.prepare(
+      `SELECT DISTINCT model FROM kg_synthesis
+       WHERE json_extract(data, '$.inference.producer') = 'atlas/describe'
+         AND json_extract(data, '$.inference.version') = ?
+         AND json_extract(data, '$.inference.basis.repoId') = ?
+       ORDER BY model`,
+    )
+      .bind(DESCRIBE_VERSION, ctx.repoId)
+      .all<{ model: string }>();
+    const input = JSON.stringify(p.input);
+    for (const { model: previousModel } of (await previousModels).results) {
+      const key = await sha256(
+        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${previousModel}:${ctx.repoId}:${input}`,
+      );
+      const hit = await cached<CachedDescription>(env.DB, key);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
   // Once paid work stops (a cap, no price, a failing provider), it stays stopped.
   let stopped: Extract<Outcome, { kind: "missing" }> | null = options.infer
     ? null
     : { kind: "missing", reason: options.unavailable ?? "disabled" };
   const outcomes = await pool(prepared, CONCURRENCY, async (p): Promise<Outcome> => {
-    const hit = await cached<CachedDescription>(env.DB, p.inputsHash);
+    const hit =
+      (await cached<CachedDescription>(env.DB, p.inputsHash)) ?? (await previousDescription(p));
     if (hit) return { kind: "current", value: hit, cached: true };
     if (stopped || !options.infer) return stopped ?? { kind: "missing", reason: "disabled" };
     const user = JSON.stringify(p.input);

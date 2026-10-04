@@ -1115,6 +1115,53 @@ For the generator's local regressions, run
 `vp check`. The suite covers large daily-group convergence, retention when the
 model budget is exhausted, and stale-subject pruning within D1 binding limits.
 
+## Automatic AI settings
+
+`/settings/ai?owner=<account>` controls automatic work across repositories owned
+by that personal or organization account. The account menu and Preferences link
+to this page. Account members can read; only the human account owner, organization
+owners, and site admins can save. Agent credentials cannot change spending policy.
+Agent chat and interactive search, including query embeddings and reranking, are
+unchanged.
+
+Four independent preferences default to enabled:
+
+- **Knowledge:** new main builds, timeline overlays, embeddings and indexing.
+  Disabling it also blocks new Wiki and Atlas AI work, without erasing their
+  individual preferences.
+- **Wiki:** repository wiki and timeline checkpoint page generation.
+- **Atlas descriptions:** paid capability descriptions, not deterministic Atlas
+  projection or browsing.
+- **Release notes:** automatic generation, including read-triggered repair.
+
+The curated catalog is `shared/ai.ts`. Prices below are published USD per million
+input/output tokens, not a total bill estimate:
+
+| Role                     | Option ID            | Provider model                  | Released   | Input / output |
+| ------------------------ | -------------------- | ------------------------------- | ---------- | -------------- |
+| Classification (default) | `clef`               | `@cf/cloudflare/clef`           | 2026-10-01 | $0.24 / $0     |
+| Fast / Task (default)    | `glm-5.3-flash`      | `@cf/zai-org/glm-5.3-flash`     | 2026-08-26 | $0.15 / $0.50  |
+| Fast / Task              | `gemma-4-26b-a4b-it` | `@cf/google/gemma-4-26b-a4b-it` | 2026-04-04 | $0.10 / $0.30  |
+
+Classification handles structured decisions; Fast handles file analysis and
+release entries; Task handles synthesis, wiki prose, Atlas descriptions and
+release introductions. Embedding models and dimensions remain fixed.
+
+`GET/PATCH /api/accounts/:slug/settings/ai` returns features, selected option IDs,
+the catalog, save provenance and `canManage`. PATCH accepts partial nested
+`features` and `models` objects; unknown keys and out-of-role model IDs are rejected.
+The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
+
+Policy is frozen when a Workflow is admitted or a release generation captures its
+refs. Retries, watchdog restarts and budget continuations keep that policy,
+including Atlas prices and limits; queued successors read the latest settings.
+Existing in-progress legacy work keeps its former Task model, Qwen 3.8 27B.
+Saving neither cancels running work nor enqueues a rebuild. Re-enabled features
+resume on normal triggers or explicit generation requests. Existing content remains
+readable, and changing models does not invalidate cached output or rewrite its
+original model provenance. Development-only `ATLAS_CONFIG` overrides remain
+available for provider and budget verification.
+
 ## Knowledge graph and wiki
 
 Every repository has a knowledge graph that stays current as it changes; the
@@ -1141,14 +1188,14 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 
 - **Analysis per content, not per commit.** Each file version (blob) is
   analyzed once: exact structure from regex extractors (imports, symbols,
-  resolved file/package edges), its role from `clef`, and a semantic card from
-  `glm-5.3-flash`. An edit `clef` judges cosmetic reuses the previous card.
+  resolved file/package edges), its role from the Classification model, and a
+  semantic card from Fast. An edit classified as cosmetic reuses the previous card.
 - **The graph** (repo, directories, files, symbols, packages, concepts,
   components) is rebuilt from cached analyses on every build and diffed, so
   ids are stable and each build leaves a change feed (`kg_changes`).
   Components are size-bounded directory clusters; their summaries, the
-  repository overview and concept definitions come from `qwen3.8-27b`, cached
-  by a hash of their inputs.
+  repository overview and concept definitions come from Task, cached by a hash
+  of their inputs.
 - **Retrieval:** Vectorize holds one embedding per entity
   (`qwen3-embedding-0.6b`); AI Search holds source files and wiki pages for
   hybrid keyword + semantic passage search with reranking. The reranker scores
@@ -1156,9 +1203,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   passages whenever the wiki or a README covered them; search keeps passages the
   reranker scores at 0.4 or more, then ones with vector similarity of 0.5 or more
   (`selectPassages` in `worker/knowledge/indexes.ts`).
-- **Concepts are aligned and trimmed with `clef`** (`worker/knowledge/concepts.ts`),
+- **Concepts are aligned and trimmed with Classification** (`worker/knowledge/concepts.ts`),
   after the entity-alignment recipe: candidate pairs come from shared uncommon
-  words and mutual nearest neighbours by name embedding; `clef` scores each
+  words and mutual nearest neighbours by name embedding; the classifier scores each
   pair 0 different / 1 related but separate / 2 the same ("should a glossary
   list these as one entry?"), plus which is part of the other. Level-2 pairs
   merge under a stable canonical key (never chaining into a group with a
@@ -1177,11 +1224,11 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   15 part-of links; the glossary went from 60 to 118 entries. First alignment
   ~1,300 `clef` calls (~6 min); a rebuild with nothing new asks none.
 - **The wiki** catalog comes from the graph. A page is rewritten only when its
-  inputs change _and_ `clef` judges the change makes it out of date; diagrams
+  inputs change _and_ Classification judges the page out of date; diagrams
   are drawn from the graph on every build, never by a model.
-- **Latency** on this repo: a 2-file push updates the graph in ~14s, summaries
-  in ~40s, search in ~60s and the affected wiki page in ~90s. A first build of
-  ~100 files takes ~13 minutes (mostly writing every page once).
+- **Historical Clef/Qwen latency** on this repo: a 2-file push updated the graph
+  in ~14s, summaries in ~40s, search in ~60s and the affected wiki page in ~90s.
+  A first build of ~100 files took ~13 minutes (mostly writing every page once).
 - **Robustness:** model calls have deadlines and back off on Workers AI rate
   limits; a failed file is retried next build; the coordinator's watchdog
   stops a hung build and retries it once.
@@ -1214,7 +1261,7 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   first), Architecture when components come or go, and a glossary of its
   concepts (no model), with main's wiki code, into `kg_page_set_pages`, never
   `wiki_pages`. A page is copied from the timeline's earlier set when its
-  material is unchanged, `kept` (no body) when clef finds main's page still
+  material is unchanged, `kept` (no body) when Classification finds main's page still
   holds, and skipped once the set has spent 80k tokens. No indexing runs.
   `GET|POST …/knowledge/overlay/pages?ref=timeline/<slug>` lists sets or asks
   for one at the bookmark's tip (write access; `&checkpoint=` retries a failed
@@ -1279,8 +1326,9 @@ membership rationale, from source-backed inputs only: member files' cards, the
 directory components' syntheses and the shared concepts, never other
 capabilities' prose. It never moves a member or changes an id, so a change in
 wording can't change membership. Results are cached in `kg_synthesis` under a
-hash of exactly those inputs (and the repository), so identical inputs are
-never inferred twice. A miss is one paid call through the Atlas budget
+hash of exactly those inputs (and the repository), independent of the selected
+Task model. Historical model-keyed entries are reused with their original
+provenance, so identical inputs are never inferred twice. A miss is one paid call through the Atlas budget
 (`atlasInfer`), in a step that doesn't retry. Capabilities' `data` keeps three
 kinds apart (types in `shared/atlas.ts`): `description` (`status` current,
 stale or unavailable, with `reason`), `provenance.structural` (grouping),
@@ -1329,7 +1377,7 @@ maxOutputTokens}, call)` (or `reserveAtlasCall` then `settleAtlasCall`,
 `failAtlasCall` or `releaseAtlasCall`), passing `attempts: 1` to `chatJson`;
 on `exhausted` or `disabled`, publish structure and label summaries
 unavailable. Only build-time code may import it: browsing never authorizes
-inference (a test enforces it).
+inference.
 
 **Atlas projection retention** (`worker/atlas/retention.ts`, CORE-159). Atlas
 snapshots (`worker/atlas/projection.ts`) are bounded by `ATLAS_RETENTION`:
@@ -1580,7 +1628,8 @@ policy inside the one 2 GiB account composition pool and need invalidation on
 every visibility change; computing needs neither, so the pool stays unused and
 no account grouping budget is drawn.
 
-Models live in `worker/knowledge/models.ts`. `POST /api/dev/clef` with
+The model catalog lives in `shared/ai.ts`; provider adapters live in
+`worker/knowledge/models.ts`. `POST /api/dev/clef` with
 `{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
 `gitmatrix-knowledge`, AI Search namespace `gitmatrix` / instance `knowledge`.
 

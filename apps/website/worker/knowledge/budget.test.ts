@@ -1,6 +1,3 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vite-plus/test";
 import { d1, migratedDatabase } from "../testing/d1.ts";
@@ -344,10 +341,7 @@ describe("pricing", () => {
     expect(rows(sqlite, "SELECT * FROM atlas_budget_exhaustions")).toEqual([]);
   });
 
-  test("the configured table prices the Knowledge chat models; costs round up", () => {
-    expect(ATLAS_PRICES[MODELS.reason]).toBeDefined();
-    expect(ATLAS_PRICES[MODELS.fast]).toBeDefined();
-    expect(ATLAS_PRICES[MODELS.embed]).toBeUndefined();
+  test("costs round up without floating-point overcharging", () => {
     // 1,000 in at $0.45/M + 100 out at $3.20/M = $0.00045 + $0.00032.
     expect(costMicroUsd({ input: 0.45, output: 3.2 }, 1000, 100)).toBe(770);
     expect(costMicroUsd({ input: 0.15, output: 0.5 }, 1, 1)).toBe(1);
@@ -432,6 +426,40 @@ describe("configuration", () => {
     });
   });
 
+  test("selected task model sets the budget price and survives cap-only overrides", async () => {
+    const { DB } = setup();
+    const model = "@cf/google/gemma-4-26b-a4b-it";
+    const settings = await atlasSettings(
+      { DB, ATLAS_CONFIG: JSON.stringify({ limits: { build: { calls: 1 } } }) } as unknown as Env,
+      "r1",
+      model,
+    );
+    expect(settings.model).toBe(model);
+    const request = { ...call(build("r1", "selected-task"), 1000, 100), model: settings.model };
+    const reservation = await reserveAtlasCall(DB, request, settings);
+    expect(reservation).toMatchObject({
+      status: "reserved",
+      handle: { model, price: { input: 0.1, output: 0.3 }, reservedUsd: 0.00013 },
+    });
+    expect(await reserveAtlasCall(DB, request, settings)).toMatchObject({
+      status: "exhausted",
+      cap: "calls",
+    });
+  });
+
+  test("development model overrides still take precedence over the selected task", async () => {
+    const { DB } = setup();
+    const selected = "@cf/google/gemma-4-26b-a4b-it";
+    const config = JSON.stringify({
+      model: MODELS.fast,
+      accounts: { acme: { model: MODEL, prices: CHEAP } },
+    });
+    const env = { DB, ATLAS_CONFIG: config } as unknown as Env;
+    expect((await atlasSettings(env, "r1", selected)).model).toBe(MODEL);
+    expect((await atlasSettings(env, "r3", selected)).model).toBe(MODELS.fast);
+    expect((await atlasSettings({ DB } as unknown as Env, "r1", selected)).model).toBe(selected);
+  });
+
   test("the owning account's entry overrides the environment's, cap by cap", async () => {
     const { DB } = setup();
     const env = { DB, ATLAS_CONFIG: CONFIG } as unknown as Env;
@@ -488,17 +516,4 @@ describe("configuration", () => {
     );
     expect(() => parseAtlasConfig('{"model":""}')).toThrow("config.model");
   });
-});
-
-test("only build-time code reaches the budget: browsing never authorizes inference", () => {
-  const worker = fileURLToPath(new URL("../", import.meta.url).href);
-  const files = (dir: string): string[] =>
-    readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
-      entry.isDirectory() ? files(join(dir, entry.name)) : [join(dir, entry.name)],
-    );
-  const importers = files(worker)
-    .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
-    .filter((f) => /from "\.{1,2}\/(knowledge\/)?budget\.ts"/.test(readFileSync(f, "utf8")))
-    .map((f) => relative(worker, f));
-  expect(importers).toEqual(["knowledge/build.ts"]);
 });

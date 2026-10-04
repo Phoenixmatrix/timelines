@@ -6,6 +6,7 @@
 // A page is rewritten only when the hash of its inputs changes, and then only
 // if clef agrees the change makes the page out of date.
 
+import type { AiModels } from "../../shared/ai.ts";
 import type { RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import type { FileAnalysis } from "./analyze.ts";
@@ -310,7 +311,13 @@ const THINKING_TOKENS = 8000;
  * reasoning model. `also` adds to the instruction (a timeline's pages say
  * what the timeline changes).
  */
-export async function writePage(env: Env, page: PlannedPage, inputs: PageInputs, also = "") {
+export async function writePage(
+  env: Env,
+  models: AiModels,
+  page: PlannedPage,
+  inputs: PageInputs,
+  also = "",
+) {
   if (page.kind === "glossary") return { body: glossaryBody(inputs), model: null, tokens: 0 };
   const base =
     page.kind === "overview"
@@ -321,6 +328,7 @@ export async function writePage(env: Env, page: PlannedPage, inputs: PageInputs,
   const instruction = also ? `${base} ${also}` : base;
   const draft = (think: boolean) =>
     chatText(env, "reason", PAGE_SYSTEM, `${instruction}\n\nMaterial:\n${JSON.stringify(inputs)}`, {
+      model: models.task,
       maxTokens: think ? THINKING_TOKENS : PAGE_TOKENS,
       think,
     });
@@ -396,16 +404,18 @@ const keep = (d1: D1Database, source: WikiSource, page: PlannedPage, hash: strin
     .where("slug", "=", page.slug);
 
 /**
- * Whether what changed (`changedNodes`, graph node ids) makes a written page
- * wrong or incomplete, as clef judges it. Changes that don't touch the page's
- * subject never ask.
+ * Whether a written page is wrong or incomplete. Timeline comparisons use
+ * their complete graph diff; main pages also supply current inputs because
+ * the latest build's change feed can omit changes made while wiki was paused.
  */
 export async function isStale(
   env: Env,
+  models: AiModels,
   page: PlannedPage,
   before: { title: string; body: string },
   changedNodes: Set<string>,
   graph: BuiltGraph,
+  currentInputs?: PageInputs,
 ): Promise<boolean> {
   const relevant = [...changedNodes]
     .filter((id) =>
@@ -420,17 +430,22 @@ export async function isStale(
       const node = graph.nodes.find((n) => n.id === id);
       return { node: id, now: node?.summary ?? "(removed)" };
     });
-  if (relevant.length === 0) return false;
+  if (relevant.length === 0 && !currentInputs) return false;
   const answers = await decide(
     env,
-    { page: { title: before.title, text: before.body.slice(0, 4000) }, changes: relevant },
+    {
+      page: { title: before.title, text: before.body.slice(0, 4000) },
+      changes: relevant,
+      ...(currentInputs ? { currentInputs } : {}),
+    },
     {
       stale: {
         type: "noul",
         instructions:
-          "Given what changed in the code (each change shows the element's current description), would this wiki page now be wrong, misleading or missing something important?",
+          "Given the current inputs (when provided) and code changes, would this wiki page now be wrong, misleading or missing something important? Current inputs describe the complete present state; changes alone may omit earlier updates.",
       },
     },
+    { model: models.classification },
   );
   return yes(answers.stale) >= 0.3;
 }
@@ -470,12 +485,13 @@ export async function planWiki(env: Env, source: WikiSource): Promise<WikiPlan> 
 
 /**
  * Bring the given pages up to date. A page with new inputs is rewritten only if
- * clef agrees that `changedNodes` (this build's change feed) makes it out of
- * date. Each page is saved as soon as it is settled, so a retried step only
- * redoes the pages it had not finished; a page that fails is left as it was.
+ * clef agrees that the current inputs make it out of date. The latest graph
+ * change feed is context, not a complete record since the last wiki update.
+ * Each page is saved as soon as it is settled; failed pages stay unchanged.
  */
 export async function updatePages(
   env: Env,
+  models: AiModels,
   source: WikiSource,
   slugs: string[],
   changedNodes: Set<string>,
@@ -494,13 +510,13 @@ export async function updatePages(
       return;
     }
     if (before && page.kind !== "glossary") {
-      if (!(await isStale(env, page, before, changedNodes, graph))) {
+      if (!(await isStale(env, models, page, before, changedNodes, graph, inputs))) {
         stats.kept++;
         await keep(env.DB, source, page, hash, before.body).execute();
         return;
       }
     }
-    const written = await writePage(env, page, inputs);
+    const written = await writePage(env, models, page, inputs);
     await db(env.DB)
       .insertInto("wiki_pages")
       .values({

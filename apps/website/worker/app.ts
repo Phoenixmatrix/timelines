@@ -36,6 +36,7 @@ import { avatars } from "./avatars/api.ts";
 import { deployments } from "./deployments/api.ts";
 import { jobRoute } from "./deployments/job.ts";
 import { previewSettingsApi } from "./deployments/settings.ts";
+import { aiSettingsApi } from "./settings/ai.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -89,6 +90,7 @@ api.use(async (c, next) => {
   return next();
 });
 api.route("/accounts/:slug/settings/previews", previewSettingsApi);
+api.route("/accounts/:slug/settings/ai", aiSettingsApi);
 api.route("/accounts/:owner/atlas", workspaceAtlas);
 api.route("/", accounts);
 api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
