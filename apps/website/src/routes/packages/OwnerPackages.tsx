@@ -97,7 +97,12 @@ export function OwnerPackages() {
     <Page wide>
       <header className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-4">
-          <Monogram name={data.owner.displayName} shape={isOrg ? "place" : "person"} size="lg" />
+          <Monogram
+            name={data.owner.displayName}
+            shape={isOrg ? "place" : "person"}
+            size="lg"
+            src={data.owner.avatarUrl}
+          />
           <div className="min-w-0">
             <h1 className="m-0 text-headline">Packages</h1>
             <p className="m-0 text-ink-muted">

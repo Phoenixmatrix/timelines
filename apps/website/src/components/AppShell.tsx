@@ -331,7 +331,7 @@ export function AppShell() {
                   className="grid size-12 place-items-center rounded-[16px]"
                   aria-label={org.displayName}
                 >
-                  <Monogram name={org.displayName} shape="place" size="lg" />
+                  <Monogram name={org.displayName} shape="place" size="lg" src={org.avatarUrl} />
                 </NavLink>
               </Tip>
             ))}

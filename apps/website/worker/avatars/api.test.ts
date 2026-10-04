@@ -4,7 +4,15 @@ import type { AvatarOptions, SessionResponse } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { avatarPrompts, avatars, imageType, MAX_AVATAR_BYTES } from "./api.ts";
+import { accounts } from "../api/accounts.ts";
+import {
+  avatarPrompts,
+  avatars,
+  fallbackPrompt,
+  imageType,
+  MAX_AVATAR_BYTES,
+  MAX_GENERATION_CALLS,
+} from "./api.ts";
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
@@ -47,17 +55,23 @@ function bucket() {
   };
 }
 
-function setup({ ai = "ok" as "ok" | "none" | "fail" | ((n: number) => boolean) } = {}) {
+function setup({
+  ai = "ok" as "ok" | "none" | "fail" | ((n: number, prompt: string) => boolean),
+} = {}) {
   const sqlite = migratedDatabase();
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
-      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
+      ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben'),
+      ('cid', 'user', 'cid', 'Cid'), ('orbit', 'org', 'orbit', 'Orbit');
+    INSERT INTO org_members (org_id, user_id, role) VALUES
+      ('orbit', 'ann', 'owner'), ('orbit', 'ben', 'member');
   `);
   const store = bucket();
   let calls = 0;
-  const run = vi.fn(async () => {
+  const run = vi.fn(async (_model: string, input: { prompt: string }) => {
     const n = calls++;
-    if (ai === "fail" || (typeof ai === "function" && !ai(n))) throw new Error("model down");
+    if (ai === "fail" || (typeof ai === "function" && !ai(n, input.prompt)))
+      throw new Error("8007: Input prompt contains NSFW content.");
     return { image: btoa(String.fromCharCode(...JPEG)) };
   });
   const env = {
@@ -72,6 +86,7 @@ function setup({ ai = "ok" as "ok" | "none" | "fail" | ((n: number) => boolean) 
     await next();
   });
   app.route("/api", avatars);
+  app.route("/api", accounts);
   const waits: Promise<unknown>[] = [];
   const ctx = { waitUntil: (p: Promise<unknown>) => waits.push(p), passThroughOnException() {} };
   const call = (path: string, init: RequestInit = {}) =>
@@ -163,7 +178,7 @@ describe("generated options", () => {
       status: "ready",
       options: [0, 1, 2, 3].map((n) => `/api/account/avatar/options/${n}`),
     });
-    expect(s.run.mock.calls.map((call) => (call as unknown[])[1])).toEqual(
+    expect(s.run.mock.calls.map((call) => call[1])).toEqual(
       avatarPrompts("ann").map((prompt) => ({ prompt, steps: 4 })),
     );
     // No rerolls: asking again changes nothing and runs no model.
@@ -185,20 +200,51 @@ describe("generated options", () => {
     expect(s.run).toHaveBeenCalledTimes(4);
   });
 
-  test("nothing made can be retried; anything made is final", async () => {
+  test("refusals are retried within a hard budget; nothing made can be tried again", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const failed = setup({ ai: "fail" });
     expect((await failed.call("/account/avatar/options", { method: "POST" })).status).toBe(502);
+    expect(failed.run).toHaveBeenCalledTimes(MAX_GENERATION_CALLS);
     expect(await options(await failed.call("/account/avatar/options"))).toEqual({
       status: "failed",
       options: [],
     });
+    expect((await failed.call("/account/avatar/options", { method: "POST" })).status).toBe(502);
 
-    const partial = setup({ ai: (n) => n % 2 === 0 });
-    const made = await partial.call("/account/avatar/options", { method: "POST" });
+    // The provider's filter refuses harmless prompts at random: a retry fills the slot.
+    const flaky = setup({ ai: (n) => n % 2 === 0 });
+    expect(
+      (await options(await flaky.call("/account/avatar/options", { method: "POST" }))).options,
+    ).toHaveLength(4);
+    expect(flaky.run).toHaveBeenCalledTimes(7);
+  });
+
+  test("a preset the provider always refuses falls back to the fixed fallback", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const refused = avatarPrompts("ann")[1]!;
+    const s = setup({ ai: (_, prompt) => prompt !== refused });
+    const made = await options(await s.call("/account/avatar/options", { method: "POST" }));
+    expect(made.options).toHaveLength(4);
+    const prompts = s.run.mock.calls.map((call) => call[1].prompt);
+    expect(prompts).toEqual([
+      avatarPrompts("ann")[0],
+      refused,
+      refused,
+      fallbackPrompt("ann", 1),
+      avatarPrompts("ann")[2],
+      avatarPrompts("ann")[3],
+    ]);
+  });
+
+  test("anything made is final, even a short set", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const s = setup({ ai: (n) => n < 2 });
+    const made = await s.call("/account/avatar/options", { method: "POST" });
+    expect(made.status).toBe(201);
     expect((await options(made)).options).toHaveLength(2);
-    expect((await partial.call("/account/avatar/options", { method: "POST" })).status).toBe(409);
-    expect(partial.run).toHaveBeenCalledTimes(4);
+    expect((await s.call("/account/avatar/options", { method: "POST" })).status).toBe(409);
+    // Two made, then the last two slots' three attempts each: 8 calls, under the cap.
+    expect(s.run).toHaveBeenCalledTimes(8);
   });
 
   test("are their owner's alone, and off without AI", async () => {
@@ -211,5 +257,73 @@ describe("generated options", () => {
     expect(
       (await setup({ ai: "none" }).call("/account/avatar/options", { method: "POST" })).status,
     ).toBe(503);
+  });
+});
+
+describe("organization icons", () => {
+  const cid: Actor = { id: "cid", slug: "cid", displayName: "Cid", isSiteAdmin: false };
+  const admin: Actor = { id: "cid", slug: "cid", displayName: "Cid", isSiteAdmin: true };
+  const put = (s: ReturnType<typeof setup>, slug = "orbit") =>
+    s.call(`/accounts/${slug}/avatar`, { method: "PUT", body: PNG });
+
+  test("owners and site admins set and remove it; it shows on the organization", async () => {
+    const s = setup();
+    const saved = await put(s);
+    expect(saved.status).toBe(200);
+    const { avatarUrl } = (await saved.json()) as { avatarUrl: string };
+    expect(avatarUrl).toMatch(/^\/api\/avatars\/orbit\/[0-9a-f]{32}\.png$/);
+    const page = (await (await s.call("/accounts/orbit")).json()) as {
+      avatarUrl: string;
+      viewerCanManage: boolean;
+    };
+    expect(page).toMatchObject({ avatarUrl, viewerCanManage: true });
+    s.as(admin);
+    expect((await s.call("/accounts/orbit/avatar", { method: "DELETE" })).status).toBe(200);
+    expect(
+      ((await (await s.call("/accounts/orbit")).json()) as { avatarUrl: null }).avatarUrl,
+    ).toBeNull();
+  });
+
+  test("members, outsiders, agents and signed-out people can't, and see no manage control", async () => {
+    const s = setup();
+    for (const [actor, status] of [
+      [ben, 403],
+      [cid, 403],
+      [annsAgent, 403],
+      [null, 401],
+    ] as const) {
+      s.as(actor);
+      expect((await put(s)).status).toBe(status);
+      expect(
+        ((await (await s.call("/accounts/orbit")).json()) as { viewerCanManage: boolean })
+          .viewerCanManage,
+      ).toBe(false);
+    }
+    expect(s.store.objects.size).toBe(0);
+  });
+
+  test("the organization route is for organizations only", async () => {
+    const s = setup();
+    expect((await put(s, "ben")).status).toBe(404);
+    expect((await put(s, "missing")).status).toBe(404);
+  });
+
+  test("organizations get their own once-only set, from logo-style prompts", async () => {
+    const s = setup();
+    const made = await s.call("/accounts/orbit/avatar/options", { method: "POST" });
+    expect(made.status).toBe(201);
+    expect(((await made.json()) as AvatarOptions).options).toEqual(
+      [0, 1, 2, 3].map((n) => `/api/accounts/orbit/avatar/options/${n}`),
+    );
+    expect(s.run.mock.calls.map((call) => call[1].prompt)).toEqual(avatarPrompts("orbit", "org"));
+    expect(avatarPrompts("orbit", "org")).not.toEqual(avatarPrompts("orbit", "user"));
+    expect((await s.call("/accounts/orbit/avatar/options", { method: "POST" })).status).toBe(409);
+    // Ann's own set is separate, and a plain member can't load the org's.
+    expect((await (await s.call("/account/avatar/options")).json()) as AvatarOptions).toEqual({
+      status: "none",
+      options: [],
+    });
+    s.as(ben);
+    expect((await s.call("/accounts/orbit/avatar/options/0")).status).toBe(403);
   });
 });

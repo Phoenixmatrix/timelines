@@ -1,4 +1,7 @@
-import { link } from "../components/ui.tsx";
+import { Card, link } from "../components/ui.tsx";
+import { useState } from "react";
+import { ImageSquareIcon } from "@phosphor-icons/react";
+import { PictureEditor } from "./AvatarEditor.tsx";
 import { Link, useLoaderData, type LoaderFunctionArgs } from "react-router";
 import type { AccountPage } from "../../shared/api.ts";
 import { Page } from "../components/AppShell.tsx";
@@ -14,6 +17,7 @@ export async function accountLoader({ request, params }: LoaderFunctionArgs) {
 export function Account() {
   const account = useLoaderData<typeof accountLoader>();
   const isOrg = account.kind === "org";
+  const [editingIcon, setEditingIcon] = useState(false);
 
   return (
     <Page>
@@ -33,7 +37,32 @@ export function Account() {
             {isOrg && " · Organization"}
           </p>
         </div>
+        {account.viewerCanManage && (
+          <button
+            type="button"
+            className="mk-btn mk-btn--ghost mk-btn--sm ml-auto"
+            aria-expanded={editingIcon}
+            onClick={() => setEditingIcon((open) => !open)}
+          >
+            <ImageSquareIcon className="size-4" aria-hidden />
+            {editingIcon ? "Done" : "Change icon"}
+          </button>
+        )}
       </header>
+      {account.viewerCanManage && editingIcon && (
+        <Card title="Icon" className="mt-6 max-w-xl">
+          <PictureEditor
+            target={{
+              endpoint: `/accounts/${encodeURIComponent(account.slug)}/avatar`,
+              name: account.displayName,
+              avatarUrl: account.avatarUrl,
+              shape: "place",
+              noun: "icon",
+              intro: "Shown wherever the organization appears. Only its owners can change it.",
+            }}
+          />
+        </Card>
+      )}
       {account.bio && (
         <p className="mt-4 mb-0 max-w-[48ch] text-ink-muted" dir="auto">
           {account.bio}

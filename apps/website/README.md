@@ -149,7 +149,7 @@ flight on a branch, a push's run is held; when one finishes, the newest held run
 starts and covers the older ones (`covered_by`), and `gm runs wait` follows the
 covering run.
 
-## Profile pictures
+## Profile pictures and organization icons
 
 People can set a picture (CORE-116) on **Settings → Profile**: upload one or
 drop it on the card, then crop it to a square (drag or arrow keys to move, the
@@ -172,6 +172,20 @@ model call, so a double click or second tab pays once, and once any image is
 made the set is final. A generation that produced nothing can be tried again.
 Options are private to their owner (`/api/account/avatar/options/:n`); picking
 one opens the same cropper. Where AI is off, generation answers 503.
+
+FLUX's input safety filter refuses harmless presets now and then, mostly at
+random (about one in six on a first try; "plum" was dropped from the palette
+for tripping it). Each slot retries its preset once, then a fixed fallback
+prompt; one generation makes at most `MAX_GENERATION_CALLS` (10) model calls,
+so a refused prompt can't leave someone short without spending more than that.
+
+**Organization icons** (CORE-128) work the same way, under
+`/api/accounts/:slug/avatar` (and `/options`): an org's owners and site admins
+(people, not agents) set, crop, generate (once per organization, from
+logo-style presets) and remove it, from **Change icon** on the organization's
+page (`viewerCanManage` on `AccountPage` shows the control). Icons show as
+squircles wherever the organization appears: its page, the rail, repository
+lists and package pages.
 
 ## Personas (dev sign-in)
 

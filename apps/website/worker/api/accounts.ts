@@ -6,6 +6,7 @@ import { accountSummary, findAccountBySlug, findUserById, viewerFor, visibleRepo
 import { db } from "../schema.ts";
 import { createDb } from "../../registry/core/db.ts";
 import { slugProblem } from "../names.ts";
+import { canManageOrg } from "../avatars/api.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
 export const accounts = new Hono<AppEnv>();
@@ -129,11 +130,17 @@ accounts.get("/accounts/:slug", async (c) => {
             .execute()
         ).map((row) => ({ ...accountSummary(row), role: row.role }))
       : [];
+  const actor = c.get("actor");
   const page: AccountPage = {
     ...accountSummary(account),
     bio: account.bio,
-    repos: await visibleRepos(c.env.DB, c.get("actor"), account.id),
+    repos: await visibleRepos(c.env.DB, actor, account.id),
     members,
+    // People manage organizations; agents acting for them don't.
+    viewerCanManage:
+      account.kind === "org" && !!actor && !actor.agent
+        ? await canManageOrg(c.env.DB, actor, account.id)
+        : false,
   };
   return c.json(page);
 });

@@ -22,6 +22,7 @@ import type {
   UpdateFeedRequest,
 } from "../../shared/packages.ts";
 import { issueToken } from "../../worker/api/tokens.ts";
+import { avatarUrl } from "../../worker/avatars/api.ts";
 import { db as gitmatrixDb } from "../../worker/schema.ts";
 import type { AccessControl } from "../core/acl.ts";
 import { loginObject, type Services } from "../core/context.ts";
@@ -51,16 +52,23 @@ interface Owner {
   slug: string;
   displayName: string;
   kind: "user" | "org";
+  avatarUrl: string | null;
 }
 
 async function findOwner(services: Services, slug: string): Promise<Owner> {
   const row = await gitmatrixDb(services.env.DB)
     .selectFrom("accounts")
-    .select(["id", "slug", "display_name", "kind"])
+    .select(["id", "slug", "display_name", "kind", "avatar_key"])
     .where("slug", "=", slug)
     .executeTakeFirst();
   if (!row) throw RegistryError.notFound(`No account ${slug}.`);
-  return { id: row.id, slug: row.slug, displayName: row.display_name, kind: row.kind };
+  return {
+    id: row.id,
+    slug: row.slug,
+    displayName: row.display_name,
+    kind: row.kind,
+    avatarUrl: avatarUrl(row.avatar_key),
+  };
 }
 
 async function ownerAccess(access: AccessControl, ownerId: string): Promise<PackageAccess | null> {

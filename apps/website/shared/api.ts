@@ -10,11 +10,11 @@ export interface AccountSummary {
   kind: "user" | "org";
   slug: string;
   displayName: string;
-  /** A person's profile picture; null shows their initials. Orgs have none. */
+  /** A person's profile picture or an organization's icon; null shows initials. */
   avatarUrl: string | null;
 }
 
-/** A person's generated avatar options (CORE-116): made once, never more. */
+/** An account's generated picture options (CORE-116, CORE-128): made once, never more. */
 export interface AvatarOptions {
   /** "none" until they ask; "failed" (nothing made) may be asked again. */
   status: "none" | "generating" | "ready" | "failed";
@@ -168,6 +168,8 @@ export interface AccountPage extends AccountSummary {
   bio: string;
   repos: RepoSummary[];
   members: (AccountSummary & { role: "owner" | "member" })[];
+  /** An organization the signed-in person can manage (its owners, site admins). */
+  viewerCanManage: boolean;
 }
 
 export interface Collaborator extends AccountSummary {

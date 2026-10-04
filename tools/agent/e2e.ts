@@ -1861,7 +1861,27 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "DELETE",
     );
     assert.equal(removed.viewer.avatarUrl, null);
-    record({ avatar: url, removed: true });
+
+    // CORE-128: an organization's icon, by its owners only.
+    const orgPut = (who: string) =>
+      fetch(`${ctx.origin}/api/accounts/${repo.owner}/avatar`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${who}`, "content-type": "image/png" },
+        body: new Uint8Array(png),
+        signal: AbortSignal.timeout(30_000),
+      });
+    assert.equal((await orgPut(token)).status, 403, "A plain member can't change the org icon");
+    const iconSaved = await orgPut(fixtures.tokens.marco);
+    assert.equal(iconSaved.status, 200, `org icon: HTTP ${iconSaved.status}`);
+    const icon = ((await iconSaved.json()) as { avatarUrl: string | null }).avatarUrl;
+    const org = await json<{ avatarUrl: string | null; viewerCanManage: boolean }>(
+      `/api/accounts/${repo.owner}`,
+      fixtures.tokens.marco,
+    );
+    assert.equal(org.avatarUrl, icon, "The organization shows its icon");
+    assert.equal(org.viewerCanManage, true);
+    await request(`/api/accounts/${repo.owner}/avatar`, fixtures.tokens.marco, "DELETE");
+    record({ avatar: url, removed: true, orgIcon: icon });
   });
 
   await scenario("browser-personas-persisted-product-state", async () => {

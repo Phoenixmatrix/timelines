@@ -1,4 +1,5 @@
-// Your profile picture (CORE-116): upload or drop one, crop it to a square,
+// Account pictures: your profile picture (CORE-116) and an organization's
+// icon (CORE-128). Upload or drop one, crop it to a square,
 // or pick one of four generated options (made once, never more).
 
 import { Dialog } from "@base-ui/react/dialog";
@@ -185,7 +186,41 @@ function Cropper({
   );
 }
 
+/** What the editor changes: your picture, or an organization's icon. */
+export interface PictureTarget {
+  /** The account's API path: "/account/avatar" or "/accounts/<slug>/avatar". */
+  endpoint: string;
+  name: string;
+  avatarUrl: string | null;
+  shape: "person" | "place";
+  /** "picture" for people, "icon" for organizations. */
+  noun: "picture" | "icon";
+  /** One line on where it shows. */
+  intro: string;
+}
+
+/** Your profile picture, on Settings → Profile. */
 export function AvatarCard({ viewer }: { viewer: Viewer }) {
+  return (
+    <Card title="Picture" className="max-w-xl">
+      <PictureEditor
+        target={{
+          endpoint: "/account/avatar",
+          name: viewer.displayName,
+          avatarUrl: viewer.avatarUrl,
+          shape: "person",
+          noun: "picture",
+          intro: "Shown wherever you appear.",
+        }}
+      />
+    </Card>
+  );
+}
+
+export function PictureEditor({ target }: { target: PictureTarget }) {
+  const { endpoint, noun } = target;
+  const article = noun === "icon" ? "an" : "a";
+  const plural = `${noun}s`;
   const revalidator = useRevalidator();
   const fileInput = useRef<HTMLInputElement>(null);
   const [source, setSource] = useState<Source | null>(null);
@@ -199,12 +234,12 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
 
   useEffect(() => {
     const controller = new AbortController();
-    api<AvatarOptions>("/account/avatar/options", { signal: controller.signal }).then(
+    api<AvatarOptions>(`${endpoint}/options`, { signal: controller.signal }).then(
       setOptions,
       () => {},
     );
     return () => controller.abort();
-  }, []);
+  }, [endpoint]);
   // Object URLs for local files are released when replaced or closed.
   useEffect(() => {
     const url = source?.url;
@@ -240,7 +275,7 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
     setCropError("");
     try {
       const blob = await render(source, crop);
-      await api("/account/avatar", {
+      await api(endpoint, {
         method: "PUT",
         body: blob,
         headers: { "content-type": blob.type },
@@ -258,7 +293,7 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
     setBusy(true);
     setError("");
     try {
-      await api("/account/avatar", { method: "DELETE" });
+      await api(endpoint, { method: "DELETE" });
       await revalidator.revalidate();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Couldn't remove the picture.");
@@ -272,14 +307,14 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
     setGenerating(true);
     setError("");
     try {
-      setOptions(await api<AvatarOptions>("/account/avatar/options", { method: "POST" }));
+      setOptions(await api<AvatarOptions>(`${endpoint}/options`, { method: "POST" }));
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 503)
         setError("Generated pictures are off on this server.");
       else {
         setError(cause instanceof Error ? cause.message : "Couldn't generate pictures.");
         // A conflict or a partial failure still leaves options to show.
-        api<AvatarOptions>("/account/avatar/options").then(setOptions, () => {});
+        api<AvatarOptions>(`${endpoint}/options`).then(setOptions, () => {});
       }
     } finally {
       setGenerating(false);
@@ -300,7 +335,7 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
   const canGenerate = options?.status === "none" || options?.status === "failed";
 
   return (
-    <Card title="Picture" className="max-w-xl">
+    <>
       <div
         className={`mk-card-body rounded-pane transition-colors ${dragging ? "bg-raised outline-2 outline-dashed outline-signal-line" : ""}`}
         onDragOver={(event) => {
@@ -317,10 +352,10 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
         }}
       >
         <div className="flex flex-wrap items-center gap-4">
-          <Monogram name={viewer.displayName} src={viewer.avatarUrl} size="lg" />
+          <Monogram name={target.name} src={target.avatarUrl} shape={target.shape} size="lg" />
           <p className="m-0 min-w-0 flex-1 text-body-sm text-ink-muted">
-            Shown wherever you appear. Drop a picture here, upload one, or pick a generated one; you
-            can crop it before saving.
+            {target.intro} Drop {article} {noun} here, upload one, or pick a generated one; you can
+            crop it before saving.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -331,7 +366,7 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
             onClick={() => fileInput.current?.click()}
           >
             <UploadSimpleIcon className="size-4" aria-hidden />
-            Upload a picture
+            Upload {article} {noun}
           </button>
           <input
             ref={fileInput}
@@ -346,26 +381,26 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
               if (file) void open(file);
             }}
           />
-          {viewer.avatarUrl && (
+          {target.avatarUrl && (
             <button type="button" className="mk-btn mk-btn--ghost" disabled={busy} onClick={remove}>
               <TrashIcon className="size-4" aria-hidden />
-              Remove picture
+              Remove {noun}
             </button>
           )}
         </div>
 
         <section
-          aria-label="Generated pictures"
+          aria-label={`Generated ${plural}`}
           className="flex flex-col gap-2 border-t border-line-soft pt-4"
         >
           <h3 className="m-0 flex items-center gap-2 text-body font-semibold">
             <SparkleIcon className="size-4 text-ink-muted" aria-hidden />
-            Generated pictures
+            Generated {plural}
           </h3>
           {options?.status === "ready" && (
             <>
               <p className="m-0 text-body-sm text-ink-muted">
-                Your generated set: pick one to crop and use. There won't be more.
+                The generated set: pick one to crop and use. There won't be more.
               </p>
               <ul className="m-0 grid list-none grid-cols-2 gap-3 p-0 sm:grid-cols-4">
                 {options.options.map((url, index) => (
@@ -373,7 +408,7 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
                     <button
                       type="button"
                       className="block w-full overflow-hidden rounded-pane border border-line-soft p-0 hover:border-signal-line focus-visible:outline-2"
-                      aria-label={`Use generated picture ${index + 1}`}
+                      aria-label={`Use generated ${noun} ${index + 1}`}
                       onClick={() => void pick(url)}
                     >
                       <img src={url} alt="" className="block aspect-square w-full object-cover" />
@@ -386,20 +421,20 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
           {generating && (
             <p role="status" className="m-0 text-body-sm text-ink-muted">
               <ImageIcon className="mr-1 inline size-4 align-[-2px]" aria-hidden />
-              Generating four pictures… this takes a little while.
+              Generating four {plural}… this takes a little while.
             </p>
           )}
           {!generating && canGenerate && !confirming && (
             <>
               <p className="m-0 text-body-sm text-ink-muted">
                 {options?.status === "failed"
-                  ? "The last attempt didn't produce any pictures, so you can try again."
-                  : "Gitmatrix can make four abstract pictures for you to choose from. You get one set, once: no prompts and no redos."}
+                  ? `The last attempt didn't produce any ${plural}, so you can try again.`
+                  : `Gitmatrix can make four abstract ${plural} to choose from. There's one set, once: no prompts and no redos.`}
               </p>
               <div>
                 <button type="button" className="mk-btn" onClick={() => setConfirming(true)}>
                   <SparkleIcon className="size-4" aria-hidden />
-                  {options?.status === "failed" ? "Try again" : "Generate four pictures"}
+                  {options?.status === "failed" ? "Try again" : `Generate four ${plural}`}
                 </button>
               </div>
             </>
@@ -411,7 +446,7 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
               aria-label="Confirm generating pictures"
             >
               <p className="m-0 text-body-sm">
-                You can only do this once. Generate your four pictures now?
+                This can only be done once. Generate the four {plural} now?
               </p>
               <div className="flex gap-2">
                 <button type="button" className="mk-btn mk-btn--primary" onClick={generate}>
@@ -439,6 +474,6 @@ export function AvatarCard({ viewer }: { viewer: Viewer }) {
           onCancel={() => setSource(null)}
         />
       )}
-    </Card>
+    </>
   );
 }

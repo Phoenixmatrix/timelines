@@ -54,7 +54,13 @@ export interface Retention {
 }
 
 export interface OwnerPackages {
-  owner: { id: string; slug: string; displayName: string; kind: "user" | "org" };
+  owner: {
+    id: string;
+    slug: string;
+    displayName: string;
+    kind: "user" | "org";
+    avatarUrl: string | null;
+  };
   access: PackageAccess | null;
   /** Where clients reach the registry (the site's public URL). */
   registryUrl: string;

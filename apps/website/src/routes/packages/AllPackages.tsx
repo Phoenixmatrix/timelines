@@ -47,6 +47,7 @@ export function AllPackages() {
                   <Monogram
                     name={data.owner.displayName}
                     shape={data.owner.kind === "org" ? "place" : "person"}
+                    src={data.owner.avatarUrl}
                   />
                   <bdi>{data.owner.displayName}</bdi>
                   {data.packages.length > 0 && (
