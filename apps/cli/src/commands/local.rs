@@ -399,7 +399,16 @@ pub fn merge(ctx: &Ctx, args: &cli::MergeArgs) -> Result<OpResult> {
 }
 
 pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
-    mutate(ctx, |ws| {
+    // Read and check the step context first: a bad file fails before anything changes.
+    let context = match &args.context {
+        Some(arg) => Some(super::steps::parse_context(
+            &super::steps::read_context_arg(arg)?,
+        )?),
+        None => None,
+    };
+    let mut timeline = None;
+    let mut result = mutate(ctx, |ws| {
+        timeline = ws.timeline.clone();
         let wc = ws.wc();
         let commit = ws.commit(wc)?;
         let full = commit.tree_id();
@@ -421,6 +430,11 @@ pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
             Some(&msg),
         )?;
         drop(commit);
+        if let Some(context) = context.clone()
+            && !ctx.dry_run
+        {
+            super::steps::record(ws, described, context)?;
+        }
         let next = ws.new_commit(&[described], full, "")?;
         // Anything built on the old @ now builds on the full contents in the new @.
         let rebased = ws.rebase_descendants(HashMap::from([(wc, next)]), HashMap::new())?;
@@ -439,7 +453,17 @@ pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
             vec![described],
             rebased,
         ))
-    })
+    })?;
+    // In a timeline, an agent's commit is a step: say when it has no context.
+    if context.is_none()
+        && crate::agent::detect().is_some()
+        && let Some(slug) = timeline
+    {
+        result.warnings.push(format!(
+            "This step in timeline {slug} has no context: pass --context with why, instructions and steering (gm commit --help)."
+        ));
+    }
+    Ok(result)
 }
 
 // ---- moving edits around -----------------------------------------------------

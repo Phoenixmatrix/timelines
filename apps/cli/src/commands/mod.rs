@@ -10,6 +10,7 @@ pub mod release;
 pub mod semantic;
 pub mod server;
 pub mod settings;
+pub mod steps;
 pub mod timeline;
 pub mod tracker;
 pub mod why;
@@ -92,6 +93,7 @@ pub fn report(
                 paths,
             })
             .collect(),
+        warnings: Vec::new(),
     })
 }
 

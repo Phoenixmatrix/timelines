@@ -344,6 +344,11 @@ pub struct Pushed {
     pub message: String,
     pub working_copy: Change,
     pub operation: Option<String>,
+    /// Step context uploaded for the pushed changes (CORE-232), when any was journaled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<super::steps::Uploads>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Render for Pushed {
@@ -356,6 +361,17 @@ impl Render for Pushed {
         out.push('\n');
         for c in &self.pushed {
             out.push_str(&format!("  {}\n", c.line()));
+        }
+        if let Some(steps) = &self.steps
+            && steps.uploaded > 0
+        {
+            out.push_str(&format!(
+                "Uploaded context for {} step(s).\n",
+                steps.uploaded
+            ));
+        }
+        for warning in &self.warnings {
+            out.push_str(&format!("warning: {warning}\n"));
         }
         out.push_str(&format!("Working copy: {}", self.working_copy.line()));
         out
@@ -445,6 +461,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             } else {
                 ws.finish(&ctx.argv)?
             },
+            steps: None,
+            warnings: Vec::new(),
         };
         return Ok(result);
     }
@@ -524,6 +542,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             message: summary.replace("Pushed", "Would push"),
             working_copy,
             operation: None,
+            steps: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -565,6 +585,29 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         .iter()
         .map(|o| Change::load(&ws, *o))
         .collect::<Result<_>>()?;
+    // The pushed changes' step context goes up now; a failure never fails the
+    // push, it waits for `gm context sync`.
+    let mut warnings = Vec::new();
+    let steps = if super::steps::journal_dir(&ws).exists() {
+        match super::steps::repo_slug(ctx) {
+            Ok(repo) => {
+                let uploads = super::steps::upload_commits(&config, &repo, &ws, &outgoing);
+                if !uploads.failed.is_empty() {
+                    warnings.push(format!(
+                        "{} step context(s) weren't uploaded; run `gm context sync` to retry.",
+                        uploads.failed.len()
+                    ));
+                }
+                Some(uploads)
+            }
+            Err(e) => {
+                warnings.push(format!("Step context wasn't uploaded: {}", e.message));
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(Pushed {
         dry_run: false,
         bookmark: bookmark.clone(),
@@ -573,6 +616,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         message: summary,
         working_copy: Change::load(&ws, ws.wc())?,
         operation,
+        steps,
+        warnings,
     })
 }
 
