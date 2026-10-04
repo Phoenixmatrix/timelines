@@ -477,6 +477,11 @@ function Workbench({ data }: { data: TrackerView }) {
         !f.negated &&
         (f.key === "status" || (f.key === "is" && f.value !== "open" && f.value !== "closed")),
     ).length === 1;
+  const releaseTeams = compiled.parsed.filters.filter((f) => f.key === "team" && !f.negated);
+  const releaseTeam = releaseTeams.length === 1 ? releaseTeams[0]!.value : null;
+  const releasesHref = `${base}/releases${
+    releaseTeam ? `?q=${encodeURIComponent(filterToken("team", releaseTeam))}` : ""
+  }`;
   const count = (
     <>
       {issues.length.toLocaleString()}
@@ -752,6 +757,17 @@ function Workbench({ data }: { data: TrackerView }) {
         )}
         {admin && <span className="flex-1" />}
         <div className="ml-auto flex items-center gap-1">
+          {!admin && (
+            <Link
+              className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+              to={releasesHref}
+              aria-label={
+                releaseTeam ? `Release notes for ${releaseTeam.toUpperCase()}` : "All release notes"
+              }
+            >
+              Release notes
+            </Link>
+          )}
           <span className="max-sm:hidden">
             <Freshness receivedAt={clock.current.received} />
           </span>

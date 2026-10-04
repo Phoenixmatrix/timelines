@@ -1421,6 +1421,12 @@ Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
 `gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
 
+The issue tracker's header shortcut carries its current single-team scope,
+including a saved default team; explicit URL filters take precedence. It drops
+issue-only filters so completed work is included. With no single team selected,
+the shortcut opens all account notes. The navigation rail always opens the
+account-wide feed.
+
 Real-provider coverage in `vp run agent test-ai` checks daily generation without
 tags, a second commit on a different UTC committer date despite unchanged
 authorship, retained earlier-day provenance, a named tag containing both changes,

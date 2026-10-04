@@ -28,6 +28,7 @@ import { atlas } from "../atlas/api.ts";
 import { findUserById } from "../db.ts";
 import { knowledge } from "../knowledge/api.ts";
 import { invalidateRefs } from "../objects.ts";
+import { trackerReleaseNotes } from "../release-notes/api.ts";
 import { search } from "../search/api.ts";
 import { steps } from "../steps/api.ts";
 import { timelines } from "../timelines/api.ts";
@@ -181,6 +182,7 @@ app.use(async (c, next) => {
 });
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
 app.route("/api", accounts);
+app.route("/api/tracker/:owner/release-notes", trackerReleaseNotes);
 app.route("/api/tracker/:owner/timelines", timelines);
 app.route("/api/tracker/:owner/timeline-graph", timelineGraph);
 app.route("/api", tracker);
