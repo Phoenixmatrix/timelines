@@ -285,6 +285,50 @@ export const CATEGORIES = [
     // At least a week: a run's own caps read its per-call rows.
     thresholds: [days("days", "Days of per-call detail", 90, 7)],
   },
+  // CORE-225: what metering (CORE-207) and the Durable Object registry (CORE-197) keep.
+  {
+    id: "usage-history",
+    scope: "site",
+    control: "policy",
+    label: "Usage history",
+    description:
+      "Daily usage figures older than the given days, rolled up to monthly figures; monthly figures older than the given months.",
+    never: [
+      "The latest figures of each account and construct (the report's current usage)",
+      "Totals: a month's roll-up keeps the sum of its days",
+    ],
+    thresholds: [
+      // At least the report's 30-day window (worker/usage/report.ts WINDOW_DAYS) and then some.
+      days("days", "Days of daily figures", 90, 32),
+      {
+        key: "months",
+        label: "Months of monthly figures",
+        unit: "months",
+        min: 1,
+        max: 120,
+        default: 24,
+      },
+    ],
+  },
+  {
+    id: "ai-usage",
+    scope: "site",
+    control: "policy",
+    label: "AI usage records",
+    description:
+      "Daily AI call and token records older than the given days, rolled up to monthly totals per account, feature and model.",
+    never: ["Totals: a month's roll-up keeps the sum of its days", "Records of the current period"],
+    thresholds: [days("days", "Days of daily records", 90, 7)],
+  },
+  {
+    id: "durable-registry",
+    scope: "site",
+    control: "policy",
+    label: "Durable Object registry rows",
+    description: "Rows of Durable Object instances purged more than the given days ago.",
+    never: ["Rows of live instances, or of instances used again since their purge"],
+    thresholds: [days("days", "Days after the purge", 30)],
+  },
 ] as const satisfies readonly RetentionCategory[];
 
 export type CategoryId = (typeof CATEGORIES)[number]["id"];

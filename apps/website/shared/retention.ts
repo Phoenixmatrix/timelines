@@ -16,7 +16,7 @@ export type RetentionScope = "account" | "site";
  */
 export type RetentionControl = "policy" | "active" | "fixed";
 
-export type ThresholdUnit = "days" | "count" | "gib";
+export type ThresholdUnit = "days" | "months" | "count" | "gib";
 
 /** One configurable number of a category, always a whole number within bounds. */
 export interface RetentionThreshold {

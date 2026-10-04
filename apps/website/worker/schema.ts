@@ -155,6 +155,33 @@ export interface Database {
     output_tokens: Generated<number>;
     total_tokens: Generated<number>;
   };
+  /** usage_snapshots past their policy, rolled up by month (CORE-225, worker/usage/history.ts). */
+  usage_monthly: {
+    month: string;
+    account_id: string;
+    construct: UsageConstruct;
+    item: string;
+    metric: string;
+    kind: "storage" | "activity";
+    quantity: number;
+    days: number;
+    last_day: string;
+    last_quantity: number;
+    estimated: number;
+    method: string;
+  };
+  /** ai_usage past its policy, rolled up by month (CORE-225). */
+  ai_usage_monthly: {
+    month: string;
+    account_id: string;
+    feature: string;
+    model: string;
+    calls: Generated<number>;
+    input_tokens: Generated<number>;
+    output_tokens: Generated<number>;
+    total_tokens: Generated<number>;
+    days: Generated<number>;
+  };
   /** Where a bounded, resumable cron pass left off. */
   job_cursors: {
     name: string;

@@ -93,6 +93,9 @@ describe("the category registry", () => {
       "registry-audit",
       "auth-hygiene",
       "ai-spend",
+      "usage-history",
+      "ai-usage",
+      "durable-registry",
     ]);
     for (const c of CATEGORIES) {
       expect(c.id).toMatch(/^[a-z]+(-[a-z]+)*$/);
@@ -389,6 +392,9 @@ describe("site retention settings", () => {
       "registry-audit",
       "auth-hygiene",
       "ai-spend",
+      "usage-history",
+      "ai-usage",
+      "durable-registry",
     ]);
     // Only categories that take a policy have site-wide defaults.
     expect(site.categories.some((c) => c.control !== "policy")).toBe(false);

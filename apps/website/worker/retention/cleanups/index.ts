@@ -12,6 +12,7 @@ import { analysisCaches } from "./analysis-caches.ts";
 import { endedTimelineData } from "./ended-timeline-data.ts";
 import { knowledgeBuilds } from "./knowledge-builds.ts";
 import { previewRecords } from "./preview-records.ts";
+import { aiUsage, durableRegistry, usageHistory } from "./usage.ts";
 import { closedIssues, trackerActivity } from "./tracker.ts";
 import { registryAudit, registryProxyCache } from "./registry.ts";
 
@@ -21,6 +22,9 @@ const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "ci-logs": ciLogs,
   "ci-runs": ciRuns,
   "preview-records": previewRecords,
+  "usage-history": usageHistory,
+  "ai-usage": aiUsage,
+  "durable-registry": durableRegistry,
   "closed-issues": closedIssues,
   "tracker-activity": trackerActivity,
   "registry-proxy-cache": registryProxyCache,

@@ -190,7 +190,12 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "account",
     label: "Usage records",
-    tables: { usage_snapshots: "account_id = ?1", ai_usage: "account_id = ?1" },
+    tables: {
+      usage_snapshots: "account_id = ?1",
+      usage_monthly: "account_id = ?1",
+      ai_usage: "account_id = ?1",
+      ai_usage_monthly: "account_id = ?1",
+    },
   },
   {
     id: "retention",
