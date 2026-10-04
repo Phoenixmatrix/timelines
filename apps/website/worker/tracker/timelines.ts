@@ -33,6 +33,7 @@ import {
 } from "../../shared/timelines.ts";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { fail, text, type Access } from "./store.ts";
+import { RETENTION_TABLES, removedMessage, tombstone } from "./retention.ts";
 
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const STATUSES: readonly TimelineStatus[] = [
@@ -146,6 +147,13 @@ export class TimelineStore {
     this.clock = clock;
     this.withdraw = withdraw;
     sql.exec(TIMELINE_TABLES);
+    sql.exec(RETENTION_TABLES);
+  }
+  /** Not found: removed by retention (and why), or never there. */
+  private missing(ref: string): never {
+    const stone = tombstone(this.sql, "timeline", ref);
+    if (stone) fail("removed_by_retention", removedMessage(stone), 404);
+    fail("not_found", `No timeline ${ref}.`, 404);
   }
   private now() {
     return new Date(this.clock()).toISOString();
@@ -218,7 +226,7 @@ export class TimelineStore {
   }
   get(slug: string): Timeline {
     const timeline = this.find(timelineSlug(slug));
-    if (!timeline) fail("not_found", `No timeline ${slug}.`, 404);
+    if (!timeline) this.missing(slug);
     return timeline;
   }
   /** A timeline and its events after `after`, oldest first. */
@@ -271,6 +279,13 @@ export class TimelineStore {
   prepare(slug: string, parent: string | null): Timeline | null {
     if (this.find(timelineSlug(slug)))
       fail("already_exists", `A timeline named ${slug} already exists.`, 409);
+    // Slugs name bookmarks, previews and runs: one retention removed stays taken.
+    if (tombstone(this.sql, "timeline", timelineSlug(slug)))
+      fail(
+        "already_exists",
+        `A timeline named ${slug} existed and was removed by retention; choose another name.`,
+        409,
+      );
     if (parent === null) return null;
     const found = this.get(parent);
     if (ENDED.includes(found.status))
@@ -509,7 +524,7 @@ export class TimelineStore {
       this.sql,
       tracker.selectFrom("timelines").select("data").where("id", "=", timelineId),
     );
-    if (!row) fail("not_found", `No timeline ${timelineId}.`, 404);
+    if (!row) this.missing(timelineId);
     return JSON.parse(row.data) as Timeline;
   }
   private setHead(timelineId: string, repoId: string, oid: string | null) {

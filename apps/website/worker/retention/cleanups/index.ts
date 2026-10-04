@@ -6,11 +6,14 @@
 import type { CategoryId } from "../categories.ts";
 import type { CategoryCleanup } from "../engine.ts";
 import { previewRecords } from "./preview-records.ts";
+import { closedIssues, trackerActivity } from "./tracker.ts";
 
 // Items are opaque to the engine: each cleanup gets back what it selected.
 // oxlint-disable-next-line typescript/no-explicit-any
 const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "preview-records": previewRecords,
+  "closed-issues": closedIssues,
+  "tracker-activity": trackerActivity,
 };
 
 export function cleanupFor(id: string): CategoryCleanup | undefined {

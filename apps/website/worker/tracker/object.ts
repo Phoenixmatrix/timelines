@@ -20,12 +20,21 @@ import {
   type Purgeable,
   type PurgeReport,
 } from "../durable/contract.ts";
+import {
+  removeActivity,
+  removeClosedIssues,
+  selectActivity,
+  selectClosedIssues,
+  type TrackerCategory,
+  type TrackerRemoval,
+  type TrackerSelection,
+} from "./retention.ts";
 
 export type TrackerReply<T> =
   | { ok: true; value: T }
   | {
       ok: false;
-      status: 400 | 401 | 403 | 404 | 409 | 413;
+      status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
       error: string;
       code: string;
       details: TrackerError["details"];
@@ -194,6 +203,31 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
           access.actorId,
         );
       }),
+    );
+  }
+
+  // ---- retention (CORE-203; worker/tracker/retention.ts) ----------------------
+  /** One batch of what a retention category selects at `now`, after `cursor`. */
+  retentionSelect(
+    category: TrackerCategory,
+    thresholds: Record<string, number>,
+    now: string,
+    cursor: string | null,
+    limit: number,
+  ): TrackerSelection {
+    const select = category === "closed-issues" ? selectClosedIssues : selectActivity;
+    return select(this.ctx.storage.sql, thresholds, now, cursor, limit);
+  }
+  /** Remove those items, re-checking each against the policy, in one transaction. */
+  retentionRemove(
+    category: TrackerCategory,
+    thresholds: Record<string, number>,
+    now: string,
+    items: string[],
+  ): TrackerRemoval {
+    const remove = category === "closed-issues" ? removeClosedIssues : removeActivity;
+    return this.transaction(() =>
+      remove(this.ctx.storage.sql, thresholds, now, items, new Date().toISOString()),
     );
   }
 

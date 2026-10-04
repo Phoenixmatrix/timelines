@@ -8,6 +8,7 @@ import { previewSettingsApi } from "../deployments/settings.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { accountRetentionApi, siteRetentionApi } from "./api.ts";
 import { CATEGORIES } from "./categories.ts";
+import { cleanupFor } from "./cleanups/index.ts";
 import { enabledTargets } from "./policies.ts";
 
 async function setup() {
@@ -119,7 +120,7 @@ describe("account retention settings", () => {
       expect(c).toMatchObject({
         enabled: false,
         enabledFrom: "default",
-        runnable: c.id === "preview-records",
+        runnable: cleanupFor(c.id) !== undefined,
         lastRun: null,
       });
     expect(policy(settings, "ci-logs").values).toEqual({ days: 30 });

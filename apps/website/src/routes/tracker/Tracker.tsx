@@ -690,13 +690,7 @@ function Workbench({ data }: { data: TrackerView }) {
       />
     </fieldset>
   ) : route.issue ? (
-    <div className="p-4">
-      <h2 className="m-0 text-title">Issue not found</h2>
-      <p className="mk-card-desc">This issue is unavailable in this tracker.</p>
-      <Link className="gm-link" to={href()}>
-        Back to issues
-      </Link>
-    </div>
+    <MissingIssue owner={owner} issue={route.issue} back={href()} />
   ) : null;
 
   const content = (
@@ -1077,5 +1071,38 @@ function DefaultTeamNote({
         Change
       </button>
     </p>
+  );
+}
+
+/**
+ * An issue the snapshot doesn't have: never there, or removed by retention
+ * (CORE-203), which the tracker's history endpoint says, with when and why.
+ */
+function MissingIssue({ owner, issue, back }: { owner: string; issue: string; back: string }) {
+  const [removed, setRemoved] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    setRemoved(null);
+    api(
+      `/tracker/${encodeURIComponent(owner)}/issues/${encodeURIComponent(issue)}/history?limit=1`,
+      { signal: controller.signal },
+    ).catch((cause: unknown) => {
+      if (
+        !controller.signal.aborted &&
+        cause instanceof ApiError &&
+        cause.code === "removed_by_retention"
+      )
+        setRemoved(cause.message);
+    });
+    return () => controller.abort();
+  }, [owner, issue]);
+  return (
+    <div className="p-4">
+      <h2 className="m-0 text-title">{removed ? "Removed by retention" : "Issue not found"}</h2>
+      <p className="mk-card-desc">{removed ?? "This issue is unavailable in this tracker."}</p>
+      <Link className="gm-link" to={back}>
+        Back to issues
+      </Link>
+    </div>
   );
 }

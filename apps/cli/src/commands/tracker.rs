@@ -479,6 +479,19 @@ impl Replica {
         self.set("actor", actor)
     }
     fn pull(&self) -> Result<()> {
+        match self.pull_once() {
+            // Retention pruned the feed past this replica's cursor (CORE-203):
+            // refetch the base snapshot; queued operations stay as they are.
+            Err(error) if error.code == "cursor_expired" => {
+                self.db
+                    .execute("DELETE FROM meta WHERE key='snapshot_schema'", [])
+                    .map_err(db_err)?;
+                self.pull_once()
+            }
+            other => other,
+        }
+    }
+    fn pull_once(&self) -> Result<()> {
         if self.meta("snapshot")?.is_none()
             || self.meta("snapshot_schema")?.as_deref() != Some(SNAPSHOT_SCHEMA)
         {
@@ -1837,6 +1850,20 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
     }
     Shown(out)
 }
+/// A path segment, percent-encoded but for unreserved characters.
+fn path_segment(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(b as char)
+            }
+            _ => write!(&mut encoded, "%{b:02X}").expect("writing to a String"),
+        }
+    }
+    encoded
+}
 pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
     if let IssueCommand::History {
         issue,
@@ -1851,16 +1878,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
         }
         let config = Config::load();
         let owner = selected_owner(&config, args.scope.owner.clone())?;
-        use std::fmt::Write as _;
-        let mut encoded = String::with_capacity(issue.len());
-        for b in issue.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                    encoded.push(b as char)
-                }
-                _ => write!(&mut encoded, "%{b:02X}").expect("writing to a String"),
-            }
-        }
+        let encoded = path_segment(issue);
         let mut path = format!("/tracker/{owner}/issues/{encoded}/history?limit={limit}");
         if let Some(before) = before {
             path.push_str(&format!("&before={before}"));
@@ -1923,7 +1941,23 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 );
             }
             IssueCommand::Show { issue, limit } => {
-                return context(&snapshot, issue, *limit as usize, args.scope.offline);
+                return context(&snapshot, issue, *limit as usize, args.scope.offline).map_err(
+                    |error| {
+                        if error.code != "tracker_not_found" || args.scope.offline {
+                            return error;
+                        }
+                        // Not in the replica: the server says if retention removed it.
+                        match remote::api(
+                            &r.config,
+                            "GET",
+                            &r.path(&format!("issues/{}/history?limit=1", path_segment(issue))),
+                            None,
+                        ) {
+                            Err(removed) if removed.code == "removed_by_retention" => removed,
+                            _ => error,
+                        }
+                    },
+                );
             }
             IssueCommand::History { .. } => unreachable!("handled before opening the replica"),
             IssueCommand::Create(a) => {

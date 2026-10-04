@@ -2130,6 +2130,156 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("tracker-retention-removes-closed-issues-and-replicas-converge", async () => {
+    // CORE-203, in the real runtime: sam's own tracker gets a closed issue,
+    // an open one and a gm replica; a retention run 400 days ahead (a dry run
+    // first) removes the closed issue and prunes old activity, including an
+    // event after the replica's cursor. The replica converges (the feed
+    // answers 410 below its floor, so gm fetches a fresh snapshot), the open
+    // issue stays, and the removed key answers 404 "removed by retention" in
+    // the API, `gm issue show` and the browser.
+    const owner = "sam";
+    const token = fixtures.tokens.sam;
+    const key = `R${randomUUID().replaceAll("-", "").slice(0, 5).toUpperCase()}`;
+    const team = randomUUID(),
+      closed = randomUUID(),
+      open = randomUUID();
+    await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "team.create", id: team, data: { key, name: "Retention regression" } },
+        { kind: "issue.create", id: closed, data: { teamId: team, title: "Finished long ago" } },
+        { kind: "issue.create", id: open, data: { teamId: team, title: "Still open" } },
+      ],
+    });
+    await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "issue.update", id: closed, expectedVersion: 1, data: { status: "done" } },
+      ],
+    });
+    const keys = await json<Snapshot>(`/api/tracker/${owner}/snapshot`, token);
+    const closedKey = keys.issues.find((issue) => issue.id === closed)?.key;
+    const openKey = keys.issues.find((issue) => issue.id === open)?.key;
+    assert(closedKey && openKey, "Both issues have keys");
+    await gm(["tracker", "sync", "--owner", owner], "sam");
+    await gm(["issue", "show", closedKey, "--owner", owner, "--offline"], "sam");
+    // Two renames after the replica's cursor: retention prunes the first
+    // (the team's newest event stays), which raises the feed's floor past it.
+    for (const [version, name] of [
+      [1, "Retention regression (renamed)"],
+      [2, "Retention regression"],
+    ] as const)
+      await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+        operationId: randomUUID(),
+        mutations: [{ kind: "team.update", id: team, expectedVersion: version, data: { name } }],
+      });
+
+    type Run = { run: { status: string; items: number; bytes: number; dryRun: boolean } };
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    // Each category's dry run, then its run at the same moment: the same items.
+    const removed: Record<string, number> = {};
+    for (const [category, thresholds] of [
+      ["closed-issues", { days: 365 }],
+      ["tracker-activity", { eventDays: 365, endedTimelineDays: 180 }],
+    ] as const) {
+      const runs: Run["run"][] = [];
+      for (const dryRun of [true, false])
+        runs.push(
+          (
+            await json<Run>("/api/dev/retention", secret, "POST", {
+              account: owner,
+              categories: { [category]: thresholds },
+              daysAhead: 400,
+              dryRun,
+            })
+          ).run,
+        );
+      const [dry, real] = runs as [Run["run"], Run["run"]];
+      assert.equal(dry.status, "succeeded", `${category}: dry run`);
+      assert.equal(real.status, "succeeded", `${category}: run`);
+      assert(dry.items > 0, `${category}: the dry run lists what the scenario made old`);
+      assert.equal(real.items, dry.items, `${category}: the run removes what the dry run listed`);
+      assert.equal(real.bytes, dry.bytes, `${category}: the same bytes`);
+      removed[category] = real.items;
+    }
+
+    const after = await json<Snapshot>(`/api/tracker/${owner}/snapshot`, token);
+    assert(!after.issues.some((issue) => issue.id === closed), "The closed issue is gone");
+    assert(
+      after.issues.some((issue) => issue.id === open),
+      "The open issue stays",
+    );
+    const gone = JSON.parse(
+      await request(
+        `/api/tracker/${owner}/issues/${closedKey}/history?limit=1`,
+        token,
+        "GET",
+        undefined,
+        [404],
+      ),
+    ) as { code: string; error: string };
+    assert.equal(gone.code, "removed_by_retention");
+    assert.match(gone.error, /removed by retention/);
+
+    // The replica's cursor is below the feed's new floor: it starts over.
+    const stale = await request(
+      `/api/tracker/${owner}/changes?after=0&limit=1`,
+      token,
+      "GET",
+      undefined,
+      [410],
+    );
+    assert.match(stale, /cursor_expired/);
+    await gm(["tracker", "sync", "--owner", owner], "sam");
+    const kept = JSON.parse(
+      await gm(["issue", "show", openKey, "--owner", owner, "--offline"], "sam"),
+    ) as { issue: { id: string } };
+    assert.equal(kept.issue.id, open);
+    await gm(
+      ["issue", "show", closedKey, "--owner", owner, "--offline"],
+      "sam",
+      work,
+      /tracker_not_found/,
+    );
+    await gm(["issue", "show", closedKey, "--owner", owner], "sam", work, /removed by retention/);
+    // A new issue never takes the removed key, and the replica gets it.
+    const fresh = randomUUID();
+    await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "issue.create", id: fresh, data: { teamId: team, title: "New" } }],
+    });
+    const freshKey = (await json<Snapshot>(`/api/tracker/${owner}/snapshot`, token)).issues.find(
+      (issue) => issue.id === fresh,
+    )?.key;
+    assert(freshKey && freshKey !== closedKey, "The removed key is not reused");
+    await gm(["tracker", "sync", "--owner", owner], "sam");
+    await gm(["issue", "show", freshKey, "--owner", owner, "--offline"], "sam");
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as sam/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/tracker/${owner}/issues/${closedKey}`);
+      await expect(page.getByRole("heading", { name: "Removed by retention" })).toBeVisible();
+      await expect(page.getByText(`Issue ${closedKey} was removed by retention`)).toBeVisible();
+      await page.screenshot({ path: join(ctx.artifacts, "browser-retention-removed-issue.png") });
+    } catch (error) {
+      await page
+        .screenshot({ path: join(ctx.artifacts, "browser-retention-failure.png"), fullPage: true })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+    record({ removed: closedKey, kept: openKey, items: removed });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

@@ -17,6 +17,8 @@ import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
 import { collectUsage } from "../usage/collect.ts";
+import { advanceRun, createRun, getRun } from "../retention/runs.ts";
+import type { RetentionTarget } from "../retention/policies.ts";
 import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
@@ -73,8 +75,8 @@ dev.use("*", async (c, next) => {
   const id = Reflect.get(c.env, "AGENT_ID");
   if (
     id &&
-    ["/tokens", "/seed", "/environment", "/atlas", "/durable", "/usage"].some((path) =>
-      c.req.path.endsWith(path),
+    ["/tokens", "/seed", "/environment", "/atlas", "/durable", "/usage", "/retention"].some(
+      (path) => c.req.path.endsWith(path),
     )
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
@@ -110,6 +112,41 @@ dev.post("/usage", async (c) => {
     .bind(found.id)
     .all();
   return c.json({ runs, figures: results });
+});
+
+// Retention runs in the real runtime with a moment `daysAhead` days from now
+// (CORE-203), so E2E can age what it just made: run to the end, synchronously.
+// With `account`, that account's categories; without, the site's.
+dev.post("/retention", async (c) => {
+  const { account, categories, daysAhead, dryRun } = await readJson<{
+    account?: string;
+    categories?: Record<string, Record<string, number>>;
+    daysAhead?: number;
+    dryRun?: boolean;
+  }>(c);
+  if (typeof daysAhead !== "number" || !Number.isFinite(daysAhead) || !categories)
+    return fail(c, 400, "daysAhead and categories are required.");
+  let target: RetentionTarget = { scope: "site" };
+  if (account) {
+    const found = await findAccountBySlug(c.env.DB, account);
+    if (!found) return fail(c, 404, "No such account.");
+    target = { scope: "account", accountId: found.id };
+  }
+  const now = new Date(Date.now() + daysAhead * 86_400_000);
+  const id = await createRun(c.env.DB, {
+    target,
+    trigger: "manual",
+    actorId: null,
+    dryRun: dryRun === true,
+    categories: Object.entries(categories).map(([category, thresholds]) => ({
+      id: category,
+      thresholds,
+    })),
+    now,
+  });
+  for (let calls = 0; calls < 50; calls++)
+    if ((await advanceRun(c.env, id, { now })) !== "more") break;
+  return c.json({ run: await getRun(c.env.DB, target, id) });
 });
 
 dev.get("/environment", async (c) => {
