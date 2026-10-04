@@ -248,7 +248,11 @@ export const CATEGORIES = [
     label: "Registry proxy cache and derived objects",
     description:
       "Cached upstream package entries and derived files unused for the given days, so garbage collection can reclaim their blobs.",
-    never: ["Blobs any version, tag or kept cache entry refers to", "Published packages"],
+    never: [
+      "Blobs any version, tag or kept cache entry refers to",
+      "Published packages",
+      "Derived files in use, or written within the last day",
+    ],
     thresholds: [days("days", "Days unused", 30)],
   },
   {
@@ -257,7 +261,11 @@ export const CATEGORIES = [
     control: "policy",
     label: "Registry audit log and publish records",
     description: "Registry audit entries and publish records older than the given days.",
-    never: ["Package versions and their contents"],
+    never: [
+      "Package versions and their contents",
+      "The newest publish record of each version still published",
+      "Records of versions published from another branch (they keep them from becoming latest)",
+    ],
     thresholds: [days("days", "Days to keep", 365)],
   },
   {

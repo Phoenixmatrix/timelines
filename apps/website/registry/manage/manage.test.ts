@@ -10,7 +10,7 @@ import type {
   PublishPage,
 } from "../../shared/packages.ts";
 import { publishBody } from "../formats/npm/testing.ts";
-import { basic, makeHarness, type Harness } from "../testing/harness.ts";
+import { basic, makeHarness, purgedRepoObjects, type Harness } from "../testing/harness.ts";
 
 describe("packages API", () => {
   let h: Harness;
@@ -277,6 +277,15 @@ describe("packages API", () => {
 
     expect((await call("/test/feeds/npm/test", admin, { method: "DELETE" })).status).toBe(400);
     expect((await call("/test/feeds/npm/test.all", admin, { method: "DELETE" })).status).toBe(204);
+    // Its Durable Object is purged through the registry, which records it (CORE-205).
+    expect(purgedRepoObjects).toEqual(["registry repository deleted"]);
+    expect(
+      await h.gitmatrix
+        .prepare(
+          "SELECT purge_reason FROM do_instances WHERE class = 'RegistryRepo' AND purged_at IS NOT NULL",
+        )
+        .all(),
+    ).toMatchObject({ results: [{ purge_reason: "registry repository deleted" }] });
   });
 
   it("shows what a commit and a CI run published", async () => {

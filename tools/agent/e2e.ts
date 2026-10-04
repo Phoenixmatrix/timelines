@@ -2379,6 +2379,67 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ removed: closedKey, kept: openKey, items: removed });
   });
 
+  await scenario("registry-retention-keeps-installs-working", async () => {
+    // CORE-205, in the real runtime: the registry's site categories run 400
+    // days ahead (a dry run first, the same items), then garbage collection
+    // at that moment; every version the package scenario published still
+    // downloads and installs, byte for byte.
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    type Run = { run: { status: string; items: number; bytes: number } };
+    const counts: Record<string, number> = {};
+    for (const [category, days] of [
+      ["registry-proxy-cache", 30],
+      ["registry-audit", 365],
+    ] as const) {
+      const runs: Run["run"][] = [];
+      for (const dryRun of [true, false])
+        runs.push(
+          (
+            await json<Run>("/api/dev/retention", secret, "POST", {
+              categories: { [category]: { days } },
+              daysAhead: 400,
+              dryRun,
+              gc: !dryRun,
+            })
+          ).run,
+        );
+      const [dry, real] = runs as [Run["run"], Run["run"]];
+      assert.equal(real.status, "succeeded", `${category}: run`);
+      assert.equal(real.items, dry.items, `${category}: the run removes what the dry run listed`);
+      assert.equal(real.bytes, dry.bytes, `${category}: the same bytes`);
+      counts[category] = real.items;
+    }
+    assert(counts["registry-audit"]! > 0, "Old audit entries are removed");
+    assert.equal(
+      await request(`/generic/${repo.owner}/${packageName}/1.0.0/artifact.txt`, ownerToken),
+      bytes,
+      "A published file still downloads",
+    );
+    const executableName = `${packageName}-executable`;
+    const binDir = join(work, "retention-bin");
+    for (const version of ["1.0.0", "2.0.0"]) {
+      await gm([
+        "pkg",
+        "install",
+        executableName,
+        "--owner",
+        repo.owner,
+        "--bin-dir",
+        binDir,
+        "--version",
+        version,
+        "--force",
+      ]);
+      const { stdout } = await promisify(execFile)(join(binDir, executableName), [], {
+        cwd: work,
+        env: ctx.env,
+        timeout: 10_000,
+      });
+      assert.equal(stdout, `${executableName} ${version}\n`, `${version} still installs`);
+    }
+    record({ removed: counts, installed: ["1.0.0", "2.0.0"] });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

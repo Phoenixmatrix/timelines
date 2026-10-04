@@ -13,6 +13,24 @@ import { unseal } from "./seal.ts";
  * single-flight through the repository's RepoDO.
  */
 
+/** How finely an entry's last use is kept (retention, CORE-205): one write a day at most. */
+const USE_RESOLUTION_MS = 24 * 60 * 60 * 1000;
+
+/** Record that a cached entry was served, unless it was already today. */
+async function touchEntry(
+  db: Services["db"],
+  entry: { repo_id: string; path: string; used_at: string | null },
+): Promise<void> {
+  const now = Date.now();
+  if (entry.used_at && Date.parse(entry.used_at) > now - USE_RESOLUTION_MS) return;
+  await db
+    .updateTable("remote_entries")
+    .set({ used_at: new Date(now).toISOString() })
+    .where("repo_id", "=", entry.repo_id)
+    .where("path", "=", entry.path)
+    .execute();
+}
+
 export const DEFAULT_METADATA_TTL_SECONDS = 600;
 export const DEFAULT_NEGATIVE_TTL_SECONDS = 120;
 const METADATA_MAX_BYTES = 128 * 1024 * 1024;
@@ -211,7 +229,10 @@ export async function cachedMetadata(
           stale,
         }
       : { status: entry!.status, text: "", contentType: "text/plain", stale };
-  if (entry && fresh && (entry.status !== 200 || cached)) return fromCache(false);
+  if (entry && fresh && (entry.status !== 200 || cached)) {
+    await touchEntry(db, entry);
+    return fromCache(false);
+  }
 
   const leaseKey = `meta:${path}`;
   const leased = await waitForLease(services, repo, leaseKey);
@@ -242,7 +263,7 @@ export async function cachedMetadata(
     if (response.status === 304 && entry && cached) {
       await db
         .updateTable("remote_entries")
-        .set({ fetched_at: nowIso(), expires_at: expires })
+        .set({ fetched_at: nowIso(), used_at: nowIso(), expires_at: expires })
         .where("repo_id", "=", repo.id)
         .where("path", "=", cacheKey)
         .execute();
@@ -270,6 +291,7 @@ export async function cachedMetadata(
       last_modified: response.headers.get("last-modified"),
       content_type: contentType,
       fetched_at: nowIso(),
+      used_at: nowIso(),
       expires_at: expires,
     };
     await db
@@ -313,9 +335,9 @@ export async function cachedArtifact(
     if (!entry) return undefined;
     if (entry.status !== 200) return entry.expires_at > nowIso() ? null : undefined;
     const blob = entry.digest ? await getBlob(db, entry.digest) : null;
-    return blob
-      ? { blob, contentType: entry.content_type ?? "application/octet-stream" }
-      : undefined;
+    if (!blob) return undefined;
+    await touchEntry(db, entry);
+    return { blob, contentType: entry.content_type ?? "application/octet-stream" };
   };
   const hit = await lookup();
   if (hit !== undefined) return hit;
@@ -343,6 +365,7 @@ export async function cachedArtifact(
         etag: null,
         last_modified: null,
         fetched_at: nowIso(),
+        used_at: nowIso(),
         expires_at: new Date(
           Date.now() + (repo.config.negativeTtlSeconds ?? DEFAULT_NEGATIVE_TTL_SECONDS) * 1000,
         ).toISOString(),
@@ -371,6 +394,7 @@ export async function cachedArtifact(
       etag: response.headers.get("etag"),
       last_modified: response.headers.get("last-modified"),
       fetched_at: nowIso(),
+      used_at: nowIso(),
       expires_at: "9999-12-31T00:00:00.000Z",
     };
     await db

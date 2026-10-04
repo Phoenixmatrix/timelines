@@ -24,6 +24,7 @@ import type {
 import { issueToken } from "../../worker/api/tokens.ts";
 import { avatarUrl } from "../../worker/avatars/api.ts";
 import { db as gitmatrixDb } from "../../worker/schema.ts";
+import { purgeInstance } from "../../worker/durable/registry.ts";
 import type { AccessControl } from "../core/acl.ts";
 import { loginObject, type Services } from "../core/context.ts";
 import { nowIso } from "../core/db.ts";
@@ -627,6 +628,11 @@ export async function removeFeed(
   }
   await deleteRepo(services.db, feed);
   await audit(services.db, access.actor, "feed.delete", { target: key });
+  // Its Durable Object (indexes, leases) goes with it (CORE-205). The feed is
+  // gone either way; a failure leaves the instance in the registry's list.
+  await purgeInstance(services.env, "RegistryRepo", feed.id, "registry repository deleted").catch(
+    (error: unknown) => console.error("Registry: purging a deleted feed's object failed", error),
+  );
 }
 
 // ── What a commit or a run published ──────────────────────────────────────

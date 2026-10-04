@@ -18,6 +18,9 @@ import { findAccountBySlug } from "../db.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
 import { collectUsage } from "../usage/collect.ts";
 import { advanceRun, createRun, getRun } from "../retention/runs.ts";
+import { SYSTEM_ACTOR } from "../../registry/core/auth/system.ts";
+import { Services } from "../../registry/core/context.ts";
+import { collectGarbage } from "../../registry/jobs/gc.ts";
 import type { RetentionTarget } from "../retention/policies.ts";
 import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
@@ -123,13 +126,15 @@ dev.post("/usage", async (c) => {
 
 // Retention runs in the real runtime with a moment `daysAhead` days from now
 // (CORE-203), so E2E can age what it just made: run to the end, synchronously.
-// With `account`, that account's categories; without, the site's.
+// With `account`, that account's categories; without, the site's. With `gc`,
+// the registry's garbage collection then runs at the same moment (CORE-205).
 dev.post("/retention", async (c) => {
-  const { account, categories, daysAhead, dryRun } = await readJson<{
+  const { account, categories, daysAhead, dryRun, gc } = await readJson<{
     account?: string;
     categories?: Record<string, Record<string, number>>;
     daysAhead?: number;
     dryRun?: boolean;
+    gc?: boolean;
   }>(c);
   if (typeof daysAhead !== "number" || !Number.isFinite(daysAhead) || !categories)
     return fail(c, 400, "daysAhead and categories are required.");
@@ -153,7 +158,17 @@ dev.post("/retention", async (c) => {
   });
   for (let calls = 0; calls < 50; calls++)
     if ((await advanceRun(c.env, id, { now })) !== "more") break;
-  return c.json({ run: await getRun(c.env.DB, target, id) });
+  let collected: number | null = null;
+  if (gc) {
+    const services = new Services(c.env, c.req.raw, () => undefined, "dev", SYSTEM_ACTOR);
+    collected = 0;
+    for (let rounds = 0; rounds < 20; rounds++) {
+      const { blobs } = await collectGarbage(services, now.getTime());
+      collected += blobs;
+      if (!blobs) break;
+    }
+  }
+  return c.json({ run: await getRun(c.env.DB, target, id), collected });
 });
 
 // CI retention in the real runtime (CORE-200): move runs (with their jobs and
