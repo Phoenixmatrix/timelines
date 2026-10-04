@@ -93,6 +93,9 @@ export function gitBackend(root: string, origin = "https://artifacts.test") {
       child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
       child.on("error", reject);
       child.on("close", () => resolve(Buffer.concat(out)));
+      // http-backend may answer and exit before reading the whole body; the
+      // answer is on stdout, so a write to its closed stdin (EPIPE) is no error.
+      child.stdin.on("error", () => {});
       child.stdin.end(Buffer.from(body));
     });
     const split = result.indexOf("\r\n\r\n");
