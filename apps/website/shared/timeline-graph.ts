@@ -9,6 +9,8 @@ export interface TimelineActor {
   name: string;
   /** Agents carry their accountable person's id; people don't. */
   accountableId: string | null;
+  /** A person's account slug, for their profile; agents have none. */
+  slug?: string;
 }
 
 export interface TimelineGraphData {

@@ -120,6 +120,9 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   searchIssues(query: SearchQuery, limit: number) {
     return this.reply(() => this.store.searchIssues(query, limit));
   }
+  issueRefs(refs: string[]) {
+    return this.reply(() => this.store.issueRefs(refs));
+  }
   issuesByKey(keys: string[]) {
     return this.reply(() => this.store.issuesByKey(keys));
   }

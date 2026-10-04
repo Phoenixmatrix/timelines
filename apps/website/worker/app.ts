@@ -31,6 +31,7 @@ import { timelines } from "./timelines/api.ts";
 import { timelineGraph } from "./timelines/graph.ts";
 import { assistant } from "./api/assistant.ts";
 import { search } from "./search/api.ts";
+import { refs } from "./refs/api.ts";
 import { avatars } from "./avatars/api.ts";
 import { steps } from "./steps/api.ts";
 import { deployments } from "./deployments/api.ts";
@@ -130,6 +131,7 @@ api.route("/auth/ssh", sshAuth);
 api.route("/dev", dev);
 api.route("/assistant", assistant);
 api.route("/search", search);
+api.route("/refs", refs);
 api.route("/", avatars);
 api.notFound((c) => c.json({ error: "Not found." }, 404));
 api.onError((error, c) => {

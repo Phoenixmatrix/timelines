@@ -95,7 +95,7 @@ describe("the timeline graph's data", () => {
     expect(body.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
     expect(body.truncated).toBe(false);
     expect(body.actors).toEqual({
-      ann: { name: "Ann", accountableId: null },
+      ann: { name: "Ann", accountableId: null, slug: "ann" },
       agt_bot: { name: "bot", accountableId: "ann" },
     });
     expect(body.workspaces).toEqual({ app: [] });

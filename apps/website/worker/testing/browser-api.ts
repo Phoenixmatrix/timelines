@@ -28,6 +28,7 @@ import { atlas } from "../atlas/api.ts";
 import { findUserById } from "../db.ts";
 import { knowledge } from "../knowledge/api.ts";
 import { invalidateRefs } from "../objects.ts";
+import { refs } from "../refs/api.ts";
 import { trackerReleaseNotes } from "../release-notes/api.ts";
 import { search } from "../search/api.ts";
 import { steps } from "../steps/api.ts";
@@ -194,6 +195,7 @@ app.route("/api/repos/:owner/:name/steps", steps);
 app.route("/api/repos", repos);
 app.route("/api/dev", dev);
 app.route("/api/search", search);
+app.route("/api/refs", refs);
 app.notFound((c) => c.json({ error: "Not found." }, 404));
 app.onError((error, c) => {
   console.error(error);

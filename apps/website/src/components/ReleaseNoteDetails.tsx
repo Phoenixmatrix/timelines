@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router";
 import { timelineLabel, type ReleaseNoteEntry } from "../../shared/release-notes.ts";
 import { commitsUrl } from "../lib/refs.ts";
+import { LinkedText } from "../refs/RefLink.tsx";
 import { link, Tip } from "./ui.tsx";
 
 export type ReleaseNoteDetailsSelection = {
@@ -84,7 +85,9 @@ export function ReleaseNoteDetails({
               key={entry.id}
               className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain p-4 [overflow-wrap:anywhere]"
             >
-              <h3 className="mt-0 mb-6 text-title">{entry.title}</h3>
+              <h3 className="mt-0 mb-6 text-title">
+                <LinkedText text={entry.title} />
+              </h3>
               <section className="mb-6">
                 <h4 className="mt-0 mb-2 text-body-sm font-semibold">Last commit</h4>
                 <time dateTime={entry.lastCommitAt} className="text-body-sm text-ink-muted">

@@ -29,6 +29,8 @@ import { api, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
+import { useRefContext } from "../../refs/context.ts";
+import { LinkedText } from "../../refs/RefLink.tsx";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
   const q = new URL(request.url).searchParams.get("q") ?? "";
@@ -120,6 +122,9 @@ function Entry({
   expanded: boolean;
   onSelect: (id: string, trigger: HTMLButtonElement) => void;
 }) {
+  // Refs resolve in this tracker first, then in the entry's repository (CORE-22).
+  const { tracker } = useRefContext();
+  const context = { tracker, owner: entry.repo.owner, repo: entry.repo.name };
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -127,9 +132,15 @@ function Entry({
         {scope && landedTimelineSlug(entry.timeline) === scope && (
           <span className="mk-chip mk-chip--tag">This timeline</span>
         )}
-        <span className="text-body font-semibold text-ink">{entry.title}</span>
+        <span className="text-body font-semibold text-ink">
+          <LinkedText text={entry.title} context={context} />
+        </span>
       </div>
-      {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
+      {entry.summary && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          <LinkedText text={entry.summary} context={context} />
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         {entry.repos.map((repo) => (
           <span key={`${repo.owner}/${repo.name}`}>
@@ -196,7 +207,12 @@ export function TrackerReleases() {
       : undefined;
   const selection: ReleaseNoteDetailsSelection | null =
     selected && selectedEntry
-      ? { entry: selectedEntry, repo: selectedEntry.repos[0] ?? null, trigger: selected.trigger }
+      ? {
+          entry: selectedEntry,
+          // Commits are the entry's own repository's, whichever groups list it.
+          repo: selectedEntry.repo,
+          trigger: selected.trigger,
+        }
       : null;
   const closeDetails = useCallback(() => setSelected(null), []);
   useEffect(() => {

@@ -98,6 +98,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     // Explicit named snapshots remain distinct; the default feed contains only days.
     shipped.push({
       ...entry,
+      repo: { owner: row.repo_owner, name: row.repo_name },
       repos: [{ owner: row.repo_owner, name: row.repo_name, releases: [entry.release] }],
     });
   }

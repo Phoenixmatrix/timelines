@@ -8,6 +8,7 @@ import {
   redirect,
   data as routeData,
   useLoaderData,
+  useParams,
   type LoaderFunctionArgs,
 } from "react-router";
 import { useLiveSearchParams } from "../../lib/searchParams.ts";
@@ -16,6 +17,7 @@ import type { CommitDiff, DiffFile } from "../../../shared/diff.ts";
 import type { Step, StepPage, StepVersions } from "../../../shared/steps.ts";
 import type { TimelineDetail, TimelineRepo } from "../../../shared/timelines.ts";
 import { SelectField, link } from "../../components/ui.tsx";
+import { PersonLink } from "../../components/PersonLink.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 
@@ -219,14 +221,15 @@ export function Story() {
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
-  const owner = repo?.owner ?? "";
+  // The timeline belongs to the tracker in the address, not to its repositories' owner.
+  const owner = useParams().owner ?? "";
   return (
     <main className="mx-auto max-w-[110rem] px-4 py-4">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <h1 className="m-0 text-title-lg [overflow-wrap:anywhere]">{timeline.name}: story</h1>
         <Link
           className={link}
-          to={`/tracker/${encodeURIComponent(owner)}/timelines?tl=${timeline.slug}`}
+          to={`/tracker/${encodeURIComponent(owner)}/timelines?tl=${encodeURIComponent(timeline.slug)}`}
         >
           Timeline
         </Link>
@@ -437,9 +440,25 @@ function StepDetail({
       </div>
       <p className="mt-1 mb-3 flex flex-wrap gap-x-3 text-body-sm text-ink-muted">
         <span>
-          {step
-            ? `${step.author.name}${step.author.accountable && step.author.kind === "agent" ? ` for ${step.author.accountable.displayName}` : ""}`
-            : row.commit.authorName}
+          {step ? (
+            step.author.kind === "agent" ? (
+              <>
+                {step.author.name}
+                {step.author.accountable && (
+                  <>
+                    {" for "}
+                    <PersonLink slug={step.author.accountable.slug}>
+                      {step.author.accountable.displayName}
+                    </PersonLink>
+                  </>
+                )}
+              </>
+            ) : (
+              <PersonLink slug={step.author.accountable?.slug}>{step.author.name}</PersonLink>
+            )
+          ) : (
+            row.commit.authorName
+          )}
         </span>
         <time dateTime={at} title={fullDate(at)}>
           {timeAgo(at)}

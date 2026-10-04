@@ -1,9 +1,10 @@
 import { link } from "./ui.tsx";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Link } from "react-router";
 import { blobUrl, repoPath } from "../lib/refs.ts";
 import { Mermaid } from "./Mermaid.tsx";
+import type { ReactNode } from "react";
+import { useRefMarkdown } from "../refs/remark.tsx";
 
 function textOf(node: unknown): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -52,6 +53,15 @@ export function outline(text: string): { depth: 2 | 3; text: string; id: string 
   return headings;
 }
 
+/** A bare URL in a generated page: a new tab, like its other outside links. */
+function outsideLink(href: string, children: ReactNode) {
+  return (
+    <a className={link} href={href} target="_blank" rel="noreferrer">
+      {children}
+    </a>
+  );
+}
+
 /**
  * Markdown for generated pages: `wiki:<slug>` links open wiki pages, repo
  * paths open the code browser at `refName`, and ```mermaid blocks render as
@@ -68,11 +78,14 @@ export function Markdown({
   name: string;
   refName: string;
 }) {
+  // Refs in the page link when they resolve, in this repository (CORE-22).
+  const refs = useRefMarkdown(outsideLink, { owner, repo: name });
   return (
     <div className="gm-prose" dir="auto">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={refs.remarkPlugins}
         components={{
+          ...refs.components,
           h2({ children }) {
             return <h2 id={slug(textOf(children))}>{children}</h2>;
           },
@@ -99,7 +112,15 @@ export function Markdown({
                 </a>
               );
             }
-            const path = href.replace(/^\.?\//, "").replace(/#.*$/, "");
+            // App-absolute links (/tracker/…, /owner/repo/…) open in place, as written.
+            if (href.startsWith("/") && !href.startsWith("//")) {
+              return (
+                <Link className={link} to={href}>
+                  {children}
+                </Link>
+              );
+            }
+            const path = href.replace(/^\.\//, "").replace(/#.*$/, "");
             return (
               <Link className={link} to={blobUrl(owner, name, refName, path)}>
                 {children}

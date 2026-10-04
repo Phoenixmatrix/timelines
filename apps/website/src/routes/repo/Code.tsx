@@ -5,9 +5,8 @@ import {
   LinkSimpleIcon,
   UsersThreeIcon,
 } from "@phosphor-icons/react";
-import { Suspense, useState } from "react";
+import { Suspense, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Await, Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { CommitSummary, RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
 import { CopyField, link } from "../../components/ui.tsx";
@@ -19,6 +18,8 @@ import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
+import { LinkedText } from "../../refs/RefLink.tsx";
+import { useRefMarkdown } from "../../refs/remark.tsx";
 import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
 import { About } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
@@ -74,6 +75,21 @@ const ROW = {
     "grid-cols-[minmax(0,1fr)_minmax(0,7rem)_auto] sm:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_minmax(0,1.25fr)_6.5rem]",
 } as const;
 
+/** A bare URL in a README, as react-markdown would link it. */
+function readmeUrl(href: string, children: ReactNode) {
+  return <a href={href}>{children}</a>;
+}
+
+/** A Markdown README; refs in it link when they resolve (CORE-22). */
+function Readme({ text }: { text: string }) {
+  const refs = useRefMarkdown(readmeUrl);
+  return (
+    <ReactMarkdown remarkPlugins={refs.remarkPlugins} components={refs.components}>
+      {text}
+    </ReactMarkdown>
+  );
+}
+
 function EntryRow({
   repo,
   refName,
@@ -124,13 +140,18 @@ function EntryRow({
       )}
       <span className="min-w-0 truncate text-body-sm max-sm:hidden">
         {change ? (
-          <Link
-            to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
-            className="text-ink-muted no-underline hover:text-ink hover:underline"
-            title={`${subject} · ${change.latest.authorName}`}
-          >
-            {subject}
-          </Link>
+          <LinkedText
+            text={subject}
+            plain={(text) => (
+              <Link
+                to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
+                className="text-ink-muted no-underline hover:text-ink hover:underline"
+                title={`${subject} · ${change.latest.authorName}`}
+              >
+                {text}
+              </Link>
+            )}
+          />
         ) : (
           <span className="text-ink-faint">
             {loading ? "Finding last change…" : "Last change unavailable"}
@@ -335,7 +356,7 @@ export function Code() {
               {/\.(md|markdown)$/i.test(tree.readme.name) ? (
                 <div className="gm-prose" dir="auto">
                   {/* react-markdown never renders raw HTML, so READMEs can't inject markup. */}
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{tree.readme.text}</ReactMarkdown>
+                  <Readme text={tree.readme.text} />
                 </div>
               ) : (
                 <pre className="m-0 font-mono text-body-sm whitespace-pre-wrap">

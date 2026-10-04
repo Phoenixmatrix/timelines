@@ -9,6 +9,7 @@ import { Link } from "react-router";
 import type { RepoDetail } from "../../../shared/api.ts";
 import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
 import { link } from "../../components/ui.tsx";
+import { PersonLink } from "../../components/PersonLink.tsx";
 import { api } from "../../lib/api.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl } from "../../lib/refs.ts";
@@ -164,7 +165,19 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
   const tracker = result.tracker.owner;
   const timelineUrl = (slug: string) =>
     `/tracker/${encodeURIComponent(tracker)}/timelines?tl=${encodeURIComponent(slug)}`;
-  const who = (id: string | null) => (id ? (result.people[id]?.name ?? id) : "someone");
+  const who = (id: string | null) => {
+    if (!id) return "someone";
+    const named = result.people[id];
+    if (!named) return id;
+    // People link to their profile; agents stay text.
+    return named.kind === "person" ? (
+      <PersonLink slug={named.slug} prose>
+        {named.name}
+      </PersonLink>
+    ) : (
+      named.name
+    );
+  };
   const refName = (ref: string) => ref.replace(/^refs\/(heads|tags)\//, "");
   const commit = chain.commit;
 
@@ -309,7 +322,7 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
               {chain.approval.state === "pending"
                 ? "Waiting for approval"
                 : `${chain.approval.state[0]!.toUpperCase()}${chain.approval.state.slice(1)}`}
-              {chain.approval.by && ` by ${who(chain.approval.by)}`}
+              {chain.approval.by && <> by {who(chain.approval.by)}</>}
               {chain.approval.at && (
                 <>
                   {" "}

@@ -337,7 +337,7 @@ describe("GET /why", () => {
       },
     });
     expect(body.people).toEqual({
-      ann: { name: "Ann", kind: "person" },
+      ann: { name: "Ann", kind: "person", slug: "ann" },
       agt_bot: { name: "bot", kind: "agent" },
     });
     expect(chain.discussions).toEqual({

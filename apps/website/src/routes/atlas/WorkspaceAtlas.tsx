@@ -118,6 +118,16 @@ export function WorkspaceAtlas() {
   return (
     <Page full>
       <header className="flex flex-col gap-1">
+        <nav aria-label="Breadcrumb" className="text-body-sm text-ink-muted">
+          <Link
+            to={`/${encodeURIComponent(account.slug)}`}
+            className="text-ink-muted no-underline hover:text-ink"
+          >
+            <bdi>{account.slug}</bdi>
+          </Link>
+          <span className="px-1.5 text-ink-faint">/</span>
+          <span aria-current="page">Atlas</span>
+        </nav>
         <h1 className="m-0 text-headline">Atlas</h1>
         <p className="m-0 max-w-[70ch] text-ink-muted">
           Capabilities across the repositories you pick from <bdi>{account.displayName}</bdi>. Each

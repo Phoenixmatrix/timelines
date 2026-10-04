@@ -47,6 +47,7 @@ import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 import { LandingPanel } from "./Landing.tsx";
 import { LiveNow } from "./LiveNow.tsx";
+import { PersonLink } from "../../components/PersonLink.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -601,6 +602,17 @@ function TimelineDetails({
   const lastCommits = abandoned?.kind === "abandon" ? abandoned.lastCommits : {};
   const parent = timeline.parentId ? (byId.get(timeline.parentId) ?? null) : null;
   const actor = (id: string) => data.actors[id]?.name ?? "someone outside the tracker";
+  /** The same, with a person linked to their profile; agents stay text. */
+  const actorLink = (id: string) => {
+    const known = data.actors[id];
+    return known?.slug && known.accountableId === null ? (
+      <PersonLink slug={known.slug} prose>
+        {known.name}
+      </PersonLink>
+    ) : (
+      actor(id)
+    );
+  };
   return (
     <>
       <div className="flex items-start gap-2">
@@ -631,10 +643,10 @@ function TimelineDetails({
         <dd className="m-0 min-w-0 truncate">{name(parent)}</dd>
         <dt className="text-ink-faint">Started</dt>
         <dd className="m-0" title={fullDate(timeline.createdAt)}>
-          {timeAgo(timeline.createdAt)} by {actor(timeline.startedBy)}
+          {timeAgo(timeline.createdAt)} by {actorLink(timeline.startedBy)}
         </dd>
         <dt className="text-ink-faint">Accountable</dt>
-        <dd className="m-0">{actor(timeline.accountableId)}</dd>
+        <dd className="m-0">{actorLink(timeline.accountableId)}</dd>
         {timeline.agentIds.length > 0 && (
           <>
             <dt className="text-ink-faint">Agents</dt>

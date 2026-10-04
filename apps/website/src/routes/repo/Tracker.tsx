@@ -4,6 +4,8 @@ import type { Issue, Snapshot } from "../../../shared/tracker.ts";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { requireViewer } from "../../lib/session.ts";
 import { buildIndex, sortIssues } from "../tracker/query.ts";
+import { useRepo } from "./RepoLayout.tsx";
+import { link } from "../../components/ui.tsx";
 
 interface RepoWorkspace {
   trackerOwner: string;
@@ -84,6 +86,7 @@ const COUNTS = [
 export function RepoTracker() {
   const { workspaces, previews } = useLoaderData<typeof repoTrackerLoader>();
   const revalidator = useRevalidator();
+  const repo = useRepo();
   return (
     <section className="flex flex-col gap-4">
       <header>
@@ -201,7 +204,11 @@ export function RepoTracker() {
       ) : (
         <div className="mk-empty max-w-[44rem]">
           No subscribed workspaces are visible. A repository and tracker administrator can connect a
-          workspace from tracker management.
+          workspace from{" "}
+          <Link className={link} to={`/tracker/${encodeURIComponent(repo.owner.slug)}?manage=true`}>
+            tracker management
+          </Link>
+          .
         </div>
       )}
     </section>

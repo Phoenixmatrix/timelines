@@ -749,6 +749,25 @@ export class TrackerStore {
     ).map((row) => this.shipped(JSON.parse(row.data) as Issue));
   }
   /**
+   * Issues by key or id, as a reference in text names them (CORE-22,
+   * worker/refs): just enough to label a link. Unknown refs are skipped.
+   * Every member may read every issue, so the caller authorizes the tracker.
+   */
+  issueRefs(refs: string[]): Pick<Issue, "id" | "key" | "title" | "status">[] {
+    if (refs.length > 500) fail("invalid_input", "Look up at most 500 issues at once.");
+    if (!refs.length) return [];
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("issues")
+        .select("data")
+        .where((eb) => eb.or([eb(json("data", "$.key"), "in", refs), eb("id", "in", refs)])),
+    ).map((row) => {
+      const { id, key, title, status } = JSON.parse(row.data) as Issue;
+      return { id, key, title, status };
+    });
+  }
+  /**
    * Issues matching a global search (worker/search), open and closed, best
    * first: by match, then priority, most recently updated, ID. Keys are the
    * exact identifiers; titles rank prefixes and words; descriptions only

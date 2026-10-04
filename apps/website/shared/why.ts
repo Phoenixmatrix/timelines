@@ -218,8 +218,11 @@ export interface WhyResponse {
   blame: WhyBlame | null;
   /** One per distinct commit, in the order of the first line each explains. */
   chains: WhyChain[];
-  /** Names for the person and agent ids the chains mention (approvers, checkpoint authors). */
-  people: Record<string, { name: string; kind: "person" | "agent" }>;
+  /**
+   * Names for the person and agent ids the chains mention (approvers, checkpoint
+   * authors); a person also has their account slug, for their profile.
+   */
+  people: Record<string, { name: string; kind: "person" | "agent"; slug?: string }>;
 }
 
 /** The person and agent ids a chain mentions. */

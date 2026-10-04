@@ -30,10 +30,13 @@ import { bytes, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { formatLabel, packagePath } from "../../lib/packages.ts";
 import { STATUS_LABEL } from "../packages/PackageConsole.tsx";
 import type { Published } from "../../../shared/packages.ts";
-import { repoPath, treeUrl } from "../../lib/refs.ts";
+import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
+import { PersonLink } from "../../components/PersonLink.tsx";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
+import type { RefKind } from "../../../shared/refs.ts";
+import { LinkedText } from "../../refs/RefLink.tsx";
 
 const SETUP_STEP = -1;
 const base = (owner?: string, name?: string) => `/repos/${owner}/${name}/ci`;
@@ -217,6 +220,27 @@ const WIDER = "hidden @4xl:block";
 /** Who pushed or started a run: an agent is named with the person it acts for. */
 const runBy = (run: CiRunSummary) =>
   run.agent && run.actor ? `${run.agent} for ${run.actor}` : run.actor;
+
+/** runBy with the person linked to their profile; an agent's name stays text. */
+function RunBy({ run }: { run: CiRunSummary }) {
+  if (!run.actor) return null;
+  const person = (
+    <PersonLink slug={run.actor} className="text-ink-muted">
+      {run.actor}
+    </PersonLink>
+  );
+  return run.agent ? (
+    <>
+      {run.agent} for {person}
+    </>
+  ) : (
+    person
+  );
+}
+
+/** A timeline's page in the tracker that holds the repository's timelines (its owner's). */
+const timelineUrl = (owner: string, slug: string) =>
+  `/tracker/${encodeURIComponent(owner)}/timelines?tl=${encodeURIComponent(slug)}`;
 
 /** A preview run (CORE-79): what it does, and for whom when someone asked. */
 const previewLabel = (preview: NonNullable<CiRunSummary["preview"]>) =>
@@ -535,6 +559,9 @@ function setupStatus(job: CiJob): CiJob["steps"][number]["status"] {
   return started || !isActive(job.status) ? "succeeded" : "running";
 }
 
+/** What a log links: commit hashes alone. */
+const LOG_REFS: RefKind[] = ["commit"];
+
 function StepLog({
   title,
   status,
@@ -573,7 +600,8 @@ function StepLog({
           ref={pre}
           className="mk-mono m-0 max-h-[32rem] overflow-auto bg-sunken px-4 py-3 text-mono leading-relaxed whitespace-pre-wrap break-words"
         >
-          {clean(text)}
+          {/* Hashes in the output open the commit panel; nothing else is linked. */}
+          <LinkedText text={clean(text)} only={LOG_REFS} />
         </pre>
       ) : (
         <p className="m-0 bg-sunken px-4 py-3 text-body-sm text-ink-faint">
@@ -670,7 +698,8 @@ export function CiRun() {
           <h2 className="m-0 mt-1 flex items-center gap-2 text-title-lg">
             <CiStatusIcon status={run.status} className="size-6" />
             <span className="truncate" dir="auto">
-              {run.title || "(no message)"}
+              {/* Issue keys, hashes and owner/repo link when they resolve (CORE-22). */}
+              {run.title ? <LinkedText text={run.title} /> : "(no message)"}
             </span>
             <span className="font-normal text-ink-faint">#{run.number}</span>
           </h2>
@@ -698,18 +727,53 @@ export function CiRun() {
               {run.preview ? (
                 <>
                   {previewLabel(run.preview).replace(/^p/, "P")}
-                  {run.preview.timeline && <> of {run.preview.timeline}</>}
-                  {run.actor ? ` for ${runBy(run)}` : " by Gitmatrix"}{" "}
+                  {run.preview.timeline && (
+                    <>
+                      {" of "}
+                      <Link
+                        to={timelineUrl(repo.owner.slug, run.preview.timeline)}
+                        className="text-ink-muted no-underline hover:text-ink"
+                      >
+                        {run.preview.timeline}
+                      </Link>
+                    </>
+                  )}
+                  {run.actor ? (
+                    <>
+                      {" for "}
+                      <RunBy run={run} />
+                    </>
+                  ) : (
+                    " by Gitmatrix"
+                  )}{" "}
                 </>
               ) : run.landing ? (
                 <>
-                  Landing{run.landing.timeline && <> of {run.landing.timeline}</>}
-                  {run.actor ? ` for ${runBy(run)}` : " by Gitmatrix"}{" "}
+                  Landing
+                  {run.landing.timeline && (
+                    <>
+                      {" of "}
+                      <Link
+                        to={timelineUrl(repo.owner.slug, run.landing.timeline)}
+                        className="text-ink-muted no-underline hover:text-ink"
+                      >
+                        {run.landing.timeline}
+                      </Link>
+                    </>
+                  )}
+                  {run.actor ? (
+                    <>
+                      {" for "}
+                      <RunBy run={run} />
+                    </>
+                  ) : (
+                    " by Gitmatrix"
+                  )}{" "}
                 </>
               ) : (
                 <>
                   {run.trigger === "manual" ? "Started by" : "Pushed by"}{" "}
-                  {runBy(run) ?? "someone"}{" "}
+                  {run.actor ? <RunBy run={run} /> : "someone"}{" "}
                 </>
               )}
               <span title={fullDate(run.createdAt)}>{timeAgo(run.createdAt)}</span>
@@ -721,10 +785,14 @@ export function CiRun() {
               </>
             )}
             <span>·</span>
-            <span className="inline-flex items-center gap-1">
+            <Link
+              to={commitsUrl(repo.owner.slug, repo.name, run.ref)}
+              className="inline-flex items-center gap-1 text-ink-muted no-underline hover:text-ink"
+              title={`Commits on ${run.ref}`}
+            >
               <GitBranchIcon weight="bold" aria-hidden />
               {run.ref}
-            </span>
+            </Link>
             <PrefetchLink
               to={treeUrl(repo.owner.slug, repo.name, run.commit)}
               className="mk-chip mk-chip--tag mk-mono h-6 no-underline"

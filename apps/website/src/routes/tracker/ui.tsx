@@ -2,7 +2,6 @@ import { memo, useId, useMemo, type ReactNode } from "react";
 import { Combobox } from "@base-ui/react/combobox";
 import { FlagIcon } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Link } from "react-router";
 import {
   actorName,
@@ -21,6 +20,7 @@ import {
 } from "../../../shared/tracker.ts";
 import { TIMELINE_POLICIES, type TimelinePolicy } from "../../../shared/timelines.ts";
 import { popMotion, SelectField } from "../../components/ui.tsx";
+import { useRefMarkdown } from "../../refs/remark.tsx";
 import type { IssueIndex } from "./query.ts";
 import { Actor } from "./Actor.tsx";
 
@@ -184,12 +184,19 @@ const MARKDOWN =
   "gm-prose [&_:is(h1,h2,h3,h4,h5,h6)]:text-body! [&_:is(h1,h2,h3,h4,h5,h6)]:leading-normal! " +
   "[&_.contains-task-list]:list-none! [&_.contains-task-list]:ps-0! [&_.task-list-item]:list-none " +
   "[&_.task-list-item_input]:me-2 [&_.task-list-item_input]:accent-signal";
+/** A bare URL as tracker Markdown links it: Link handles same-origin absolute URLs. */
+function trackerUrl(href: string, children: ReactNode) {
+  return <Link to={href}>{children}</Link>;
+}
 export const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
+  // Issue keys, tracker URLs, owner/repo and pkg@version link when they resolve (CORE-22).
+  const refs = useRefMarkdown(trackerUrl);
   return (
     <div className={MARKDOWN}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={refs.remarkPlugins}
         components={{
+          ...refs.components,
           a({ node: _node, href, ...props }) {
             // Link handles same-origin absolute URLs and leaves external URLs
             // and modified clicks to the browser. Keep relative/hash links native.

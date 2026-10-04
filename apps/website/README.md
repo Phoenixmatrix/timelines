@@ -652,6 +652,66 @@ AI Search. The contract is `shared/search.ts`; each category is a provider in
   comes back `{status: "unavailable", error}`, which is not "no matches", and
   the other groups are unaffected.
 
+## References in text
+
+Issue keys (`CORE-12`), this deployment's tracker issue URLs, commit hashes,
+`owner/repo` and `pkg@version` become links wherever people read text
+(CORE-22): commit titles (history, the file list), CI run titles and logs
+(hashes only), release-note titles and summaries, issue and comment
+Markdown, READMEs, wiki pages and assistant answers. Code (inline and
+fenced) is never touched, and nothing inside another address is a ref.
+
+**Only the server decides.** `shared/refs.ts` finds candidates;
+`POST /api/refs/resolve` (`worker/refs/`) answers for the viewer:
+
+```jsonc
+// request: at most 100 refs of at most 300 characters
+{ "refs": ["CORE-12", "3f2a9c1", "orbit/engine"], "context": { "owner": "orbit", "repo": "engine", "tracker": "orbit" } }
+// response: one result per ref, in order
+{ "results": [
+  { "ref": "CORE-12", "status": "resolved", "target": { "kind": "issue", "path": "/tracker/orbit/issues/…", "label": "CORE-12 · Title", "tracker": "orbit", "id": "…", "key": "CORE-12", "title": "…", "status": "todo" } },
+  { "ref": "3f2a9c1", "status": "resolved", "target": { "kind": "commit", "path": "/orbit/engine?commit=<40 hex>", "label": "…", "owner": "orbit", "repo": "engine", "sha": "<40 hex>" } },
+  { "ref": "orbit/engine", "status": "unresolved" } // or "ambiguous", with "candidates"
+] }
+```
+
+- **Issue keys** link only to an issue in a Gitmatrix tracker the viewer
+  belongs to. The page's tracker (`context.tracker`) is asked first, then the
+  trackers subscribed to the page's repository (and its owner's), then the
+  viewer's others (at most 25). The first tier with a match decides; two
+  matches there are `ambiguous` and render as a small chooser. A key nobody's
+  tracker has (`JIRA-9`, `UTF-8`) stays exactly as written: no dead links and
+  no guessing at external trackers.
+- **Tracker URLs** count only on this deployment's origins (`PUBLIC_URL` and
+  the request's), and only in the tracker they name. One of ours the viewer
+  can't open is `unresolved` with `ours: true` and reads as plain text; other
+  domains stay the links they were.
+- **Hashes** need a repository in context the viewer can read. A full hash
+  must name a commit; a short one (7 to 39 hex digits, at least one letter and
+  one digit) must prefix exactly one commit among the branch and tag tips, the
+  repository's CI runs and its latest 200 default-branch commits (Artifacts
+  can't expand an abbreviation). A hash opens the commit panel: inside the
+  repository, the current page with `?commit=<full hash>` (other parameters
+  kept), elsewhere `/<owner>/<repo>?commit=<full hash>`.
+- **`owner/repo`** must be readable; **`pkg@version`** looks in
+  `context.owner`'s feeds the registry lets the viewer read (the same name in
+  two formats is `ambiguous`).
+
+Responses are `private, no-store`; each request reads every tracker,
+repository and feed once. The client (`src/refs/`) takes the context from the
+address, batches every ref a render asks about into one request per context,
+and keeps answers for a minute (failures for ten seconds). Text renders at
+once and only gains link styling when the answer arrives; a failure leaves it
+as text. `LinkedText` is the plain-text linkifier, `useRefMarkdown` the remark
+plugin plus its `gm-ref` component.
+
+`/-/go/<ref>` (with optional `?owner=&repo=&tracker=`) opens whatever a ref
+names, for plain-text contexts and the palette: one match redirects, several
+get a chooser, none says so. `GET /api/refs/go/<ref>` is the same for scripts:
+a 302 to the target (or to `/-/go/` when it's ambiguous or unresolved), or the
+result as JSON with `Accept: application/json` or `?format=json` (404 when
+unresolved). `/go/` itself belongs to the Go module proxy.
+
 ## Semantic changes
 
 The repository **Changes** tab (`/:owner/:repo/changes`) is a functional

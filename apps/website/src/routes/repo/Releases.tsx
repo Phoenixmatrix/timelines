@@ -19,6 +19,7 @@ import {
   RELEASE_NOTE_DETAILS_ID,
   ReleaseNoteDetails,
 } from "../../components/ReleaseNoteDetails.tsx";
+import { LinkedText } from "../../refs/RefLink.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, repoPath } from "../../lib/refs.ts";
@@ -69,8 +70,14 @@ function Entry({
 }) {
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
-      <div className="text-body font-semibold text-ink">{entry.title}</div>
-      {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
+      <div className="text-body font-semibold text-ink">
+        <LinkedText text={entry.title} />
+      </div>
+      {entry.summary && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          <LinkedText text={entry.summary} />
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         {scope && landedTimelineSlug(entry.timeline) === scope && (
           <span className="mk-chip mk-chip--tag">This timeline</span>

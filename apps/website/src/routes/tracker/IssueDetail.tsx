@@ -1037,7 +1037,7 @@ export function IssueDetail({
           <dt className="text-ink-faint">Assignee</dt>
           <dd className="m-0 min-w-0">
             {issue.assigneeId ? (
-              <Actor who={attribution(snapshot, issue.assigneeId)} />
+              <Actor who={attribution(snapshot, issue.assigneeId)} link />
             ) : (
               "Unassigned"
             )}
@@ -1158,6 +1158,7 @@ export function IssueDetail({
             <span>
               <Actor
                 who={claimAttribution(snapshot, covering!.claim!)}
+                link
                 className="font-semibold text-ink"
               />
               {covering!.claim!.delegatedFrom &&
@@ -1667,6 +1668,7 @@ export function IssueDetail({
               <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
                 <Actor
                   who={attribution(snapshot, comment.actorId)}
+                  link
                   className="[&>span:last-child]:font-semibold [&>span:last-child]:text-ink"
                 />
                 <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>

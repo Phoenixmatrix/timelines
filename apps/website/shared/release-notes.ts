@@ -164,6 +164,8 @@ export interface ReleaseNotesRelease {
 
 /** An entry in a tracker's code-update feed, with its repository and grouping. */
 export interface ReleaseFeedEntry extends ReleaseNoteEntry {
+  /** The repository whose commits `commits` (and the landing) are. */
+  repo: { owner: string; name: string };
   /** Repository and release-note groups containing this entry. */
   repos: { owner: string; name: string; releases: string[] }[];
 }

@@ -9,19 +9,42 @@ import {
   ProhibitIcon,
   WarningCircleIcon,
 } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useState, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router";
-import remarkGfm from "remark-gfm";
 import { describeWrite, toolLabel, WRITE_TOOLS } from "../../shared/assistant.ts";
+import { useRefMarkdown } from "../refs/remark.tsx";
+
+/** Following a linked ref in an answer navigates like any app link (it may collapse the dock). */
+function refClick(onNavigate: () => void) {
+  return (event: MouseEvent) => {
+    if ((event.target as HTMLElement).closest("a[data-ref-kind]")) onNavigate();
+  };
+}
+
+/** A bare URL in an answer: a new tab, like any other outside link. */
+function answerUrl(href: string, children: ReactNode) {
+  return (
+    <a href={href} target="_blank" rel="noreferrer">
+      {children}
+    </a>
+  );
+}
 
 /** Assistant prose: app paths open in place, everything else in a new tab. */
 export function ChatMarkdown({ text, onNavigate }: { text: string; onNavigate?: () => void }) {
+  // Refs link when they resolve for the page the dock sits on (CORE-22).
+  const refs = useRefMarkdown(answerUrl);
   return (
-    <div className="gm-prose gm-prose--chat" dir="auto">
+    <div
+      className="gm-prose gm-prose--chat"
+      dir="auto"
+      onClickCapture={onNavigate && refClick(onNavigate)}
+    >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={refs.remarkPlugins}
         components={{
+          ...refs.components,
           a({ href, children }) {
             if (href?.startsWith("/"))
               return (

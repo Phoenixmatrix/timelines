@@ -58,6 +58,7 @@ import {
   trackerLoader,
 } from "./routes/tracker/loaders.ts";
 import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
+import { GoPage, goLoader } from "./refs/GoPage.tsx";
 
 /** The app's routes. */
 export const routes: RouteObject[] = [
@@ -84,6 +85,8 @@ export const routes: RouteObject[] = [
           { path: "release-notes", loader: releaseNotesIndexLoader, Component: TrackerIndex },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
           { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
+          // Whatever a ref names (CORE-22): redirects, or a chooser when it's ambiguous.
+          { path: "-/go/*", loader: goLoader, Component: GoPage },
           {
             path: "tracker/:owner/releases",
             loader: trackerReleasesLoader,

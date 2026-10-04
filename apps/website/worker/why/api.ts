@@ -219,7 +219,8 @@ async function names(d1: D1Database, ids: string[]): Promise<WhyResponse["people
         .execute(),
       kdb.selectFrom("agents").select(["id", "name"]).where("id", "in", slice).execute(),
     ]);
-    for (const a of accounts) people[a.id] = { name: a.display_name || a.slug, kind: "person" };
+    for (const a of accounts)
+      people[a.id] = { name: a.display_name || a.slug, kind: "person", slug: a.slug };
     for (const a of agents) people[a.id] = { name: a.name, kind: "agent" };
   }
   return people;
