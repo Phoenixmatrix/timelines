@@ -24,6 +24,7 @@ import {
   switchScope,
 } from "../lib/timelineScope.ts";
 import { STATUS_LABEL } from "../routes/tracker/timelineGraph.ts";
+import { TimelinesMark } from "./GitmatrixLogo.tsx";
 import { Tip, popMotion } from "./ui.tsx";
 
 // ---- data ------------------------------------------------------------------
@@ -267,26 +268,24 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
       ) : words.length && !shown.length ? (
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">No timeline matches.</p>
       ) : null}
-      {scope.owner ? (
-        <div className="mt-1 flex items-center gap-2 border-t border-line-soft px-1.5 pt-1.5">
-          {ended.length > 0 && !showEnded && !words.length && (
-            <button
-              type="button"
-              className="mk-btn mk-btn--ghost mk-btn--sm"
-              onClick={() => setShowEnded(true)}
-            >
-              Show {ended.length} ended
-            </button>
-          )}
-          <Link
-            to={`/tracker/${encodeURIComponent(scope.owner)}/timelines`}
-            onClick={close}
-            className="mk-btn mk-btn--ghost mk-btn--sm ml-auto no-underline"
+      <div className="sticky bottom-0 mt-1 flex items-center gap-2 border-t border-line-soft bg-rail px-1.5 pt-1.5">
+        {scope.owner && ended.length > 0 && !showEnded && !words.length && (
+          <button
+            type="button"
+            className="mk-btn mk-btn--ghost mk-btn--sm"
+            onClick={() => setShowEnded(true)}
           >
-            Timeline graph
-          </Link>
-        </div>
-      ) : null}
+            Show {ended.length} ended
+          </button>
+        )}
+        <Link
+          to={scope.owner ? `/tracker/${encodeURIComponent(scope.owner)}/timelines` : "/timelines"}
+          onClick={close}
+          className="mk-btn mk-btn--ghost mk-btn--sm ml-auto no-underline"
+        >
+          Timeline graph
+        </Link>
+      </div>
     </>
   );
 }
@@ -296,11 +295,17 @@ function Meta({ children }: { children: React.ReactNode }) {
 }
 
 /** The switcher: a place in the rail, or the banner's Switch button. */
-export function TimelineSwitcher({ variant }: { variant: "rail" | "banner" }) {
+export function TimelineSwitcher({
+  variant,
+  active = false,
+}: {
+  variant: "rail" | "banner";
+  active?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const scope = useScope(open);
   const name = scope.timeline?.name ?? scope.slug;
-  const label = `Timeline: ${name ?? "main"}`;
+  const label = `Timeline: ${name ?? "main"}. Timelines: switch timeline or open graph`;
   const onOpenChange = (next: boolean) => {
     // Fresh each time it opens: timelines start and end while you work.
     if (next && scope.owner) refreshTimelines(scope.owner);
@@ -310,9 +315,10 @@ export function TimelineSwitcher({ variant }: { variant: "rail" | "banner" }) {
     variant === "rail" ? (
       <Popover.Trigger
         className="mk-place relative max-sm:before:hidden"
-        aria-label={`${label}. Switch timeline`}
+        aria-label={label}
+        aria-current={active ? "page" : undefined}
       >
-        <GitForkIcon size={22} weight={scope.slug ? "fill" : "regular"} aria-hidden />
+        <TimelinesMark className="size-7" />
         {scope.slug && (
           <span
             className="absolute top-2 right-2 size-2.5 rounded-full bg-signal ring-2 ring-rail"

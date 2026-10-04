@@ -112,6 +112,8 @@ Timelines are a first-class place, so they get a mark of their own in the rail i
 
 `public/brand/timelines.svg` holds the paths in a `mark` group, with the generation prompt, selection and conversion in its metadata; `TimelinesMark` in `src/components/GitmatrixLogo.tsx` references it at 28px in the 48px rail tile. Its fills read the `--timelines-mint/amber/violet/sky` tokens: the generated pastels on dark, and deeper shades on light (each at least 3:1 against the rail) the way the Pounce cat switches to forest. Like `--brand`, these colors belong to the mark alone and never style interface state. Bump `?v=` on the reference when the artwork changes.
 
+The rail has one Timelines control (CORE-218): its branded mark opens quick scope switching and the timeline graph, instead of separate switcher and graph buttons. The tile marks the graph as the current place; the amber dot still marks a selected timeline on other pages. Search, ended timelines and the scope banner remain available. The graph action stays reachable while the list loads or fails, using the current account or the default-tracker route when no account is resolved.
+
 ## Colors
 
 ### Primary

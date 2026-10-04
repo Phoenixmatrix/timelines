@@ -39,7 +39,7 @@ import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
 import { scopeOf } from "../lib/timelineScope.ts";
 import { Monogram } from "./Monogram.tsx";
-import { GitmatrixLogo, TimelinesMark } from "./GitmatrixLogo.tsx";
+import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
 import { TimelineBanner, TimelineSwitcher } from "./TimelineScope.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
@@ -268,7 +268,6 @@ export function AppShell() {
               {() => <GitmatrixLogo markOnly className="size-8" />}
             </Place>
             <SearchButton />
-            {viewer && <TimelineSwitcher variant="rail" />}
             {viewer && (
               <Place
                 to={owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}
@@ -280,15 +279,7 @@ export function AppShell() {
                 )}
               </Place>
             )}
-            {viewer && (
-              <Place
-                to={owner ? `/tracker/${encodeURIComponent(owner)}/timelines` : "/timelines"}
-                label="Timelines"
-                active={onTimelines}
-              >
-                {() => <TimelinesMark className="size-7" />}
-              </Place>
-            )}
+            {viewer && <TimelineSwitcher variant="rail" active={onTimelines} />}
             {viewer && (
               <Place
                 to={owner ? `/tracker/${encodeURIComponent(owner)}/releases` : "/release-notes"}

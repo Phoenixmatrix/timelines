@@ -11,10 +11,11 @@ import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { CiRunList } from "../../shared/api.ts";
 import type { TimelineList } from "../../shared/timelines.ts";
+import type { TrackerList } from "../../shared/tracker.ts";
 import { commitId } from "../testing/atlas.ts";
 import { cannedFiles } from "../testing/git.ts";
 import { renderApp } from "../testing/render.tsx";
-import { TestServer } from "../testing/server.ts";
+import { reply, TestServer } from "../testing/server.ts";
 
 test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines graph", async () => {
   const server = await TestServer.start({ world: true });
@@ -68,9 +69,17 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
   expect(app.url().searchParams.get("timeline")).toBeNull();
   await expect.element(banner).toMatchTextContent(name);
 
+  // The same rail control opens the graph without dropping the account or scope.
+  const rail = page.getByRole("button", { name: /^Timeline: / });
+  await expect.element(rail).not.toHaveAttribute("aria-current");
+  await userEvent.click(rail);
+  await userEvent.click(page.getByRole("link", { name: "Timeline graph", exact: true }));
+  await app.waitForUrl((url) => url.pathname === "/tracker/orbit/timelines");
+  expect(app.url().searchParams.get("tl"), "The graph keeps the selected timeline").toBe(slug);
+  await expect.element(rail).toHaveAttribute("aria-current", "page");
+
   // CORE-86: the graph's inspector flags it experimental, which the banner
   // shows, and the Stalled view leaves it out.
-  await app.navigate(`/tracker/orbit/timelines?tl=${slug}`);
   const flag = page.getByRole("switch", { name: "Experimental" });
   await expect.element(flag).toHaveAttribute("aria-checked", "false");
   await userEvent.click(flag);
@@ -84,4 +93,60 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
   await userEvent.click(banner.getByRole("link", { name: "Back to main" }));
   await app.waitForUrl((url) => url.searchParams.get("tl") === "main");
   await expect.element(banner).not.toBeInTheDocument();
+});
+
+test.each(["empty", "failed"] as const)(
+  "Home can open the default account's graph when its timeline list is %s",
+  async (state) => {
+    const server = await TestServer.start({ world: true });
+    const trackers = await server.call<TrackerList>("GET", "/api/tracker");
+    const owner = trackers.trackers.find((tracker) => tracker.slug === "orbit")!;
+    server.on("GET", "/api/tracker", { ...trackers, defaultOwnerId: owner.id });
+    server.on("GET", "/api/tracker/orbit/timelines", () =>
+      state === "empty"
+        ? ({ timelines: [] } satisfies TimelineList)
+        : reply({ error: "Timeline list temporarily unavailable" }, 503),
+    );
+
+    const app = renderApp("/");
+    const rail = page.getByRole("button", { name: /^Timeline: main/ });
+    await userEvent.click(rail);
+    await expect
+      .element(
+        page.getByText(
+          state === "empty"
+            ? /orbit has no timelines yet/
+            : /Timeline list temporarily unavailable/,
+        ),
+      )
+      .toBeVisible();
+    const graph = page.getByRole("link", { name: "Timeline graph", exact: true });
+    await expect.element(graph).toHaveAttribute("href", "/tracker/orbit/timelines");
+    await userEvent.click(graph);
+    await app.waitForUrl((url) => url.pathname === "/tracker/orbit/timelines");
+    await expect
+      .element(page.getByRole("heading", { name: "Timelines", exact: true }))
+      .toBeVisible();
+    await expect.element(rail).toHaveAttribute("aria-current", "page");
+  },
+);
+
+test("Home keeps graph navigation available without a resolved account", async () => {
+  const server = await TestServer.start({ world: true });
+  const trackers = await server.call<TrackerList>("GET", "/api/tracker");
+  server.on("GET", "/api/tracker", {
+    ...trackers,
+    trackers: [],
+    defaultOwnerId: null,
+  } satisfies TrackerList);
+
+  const app = renderApp("/");
+  const rail = page.getByRole("button", { name: /^Timeline: main/ });
+  await userEvent.click(rail);
+  const graph = page.getByRole("link", { name: "Timeline graph", exact: true });
+  await expect.element(graph).toHaveAttribute("href", "/timelines");
+  await userEvent.click(graph);
+  await app.waitForUrl((url) => url.pathname === "/timelines");
+  await expect.element(page.getByText(/No trackers are available to this account/)).toBeVisible();
+  await expect.element(rail).toHaveAttribute("aria-current", "page");
 });
