@@ -2,13 +2,17 @@
 
 Date: 2026-10-02.
 
-Status: research and owner decisions for CORE-50 ("Not ready for work yet, need
-to think this through"). The owner answered the open questions in two interviews
-on 2026-10-02, the second for CORE-62. The answers are listed under [Decisions](#decisions) and the
-design below follows them. Nothing is built, and nothing in this document is
-approved for implementation. The work is filed as CORE-62 to CORE-86, under
-CORE-50. CORE-42 (timeline visualization in the tracker) and CORE-51
-(discussions) are blocked on CORE-50.
+Status: built and shipped (2026-10-03). This began as research and owner
+decisions for CORE-50; the owner answered the open questions in two interviews
+on 2026-10-02, the second for CORE-62, and later rows under
+[Decisions](#decisions) came while building. The work was filed as CORE-62 to
+CORE-86 plus CORE-121, CORE-138 and CORE-139, under CORE-50, and every one of
+them is done: timelines fork, merge and land through the landing queue, the
+tracker follows them, previews are a contract with Gitmatrix's own as the
+reference, and knowledge and `gm why` read them. What is left is listed under
+[A path to build it](#a-path-to-build-it) as later work and follow-ups.
+CORE-42 (timeline visualization in the tracker) and CORE-51 (discussions) were
+blocked on CORE-50.
 
 ## Conclusion
 
@@ -668,11 +672,13 @@ in parallel.
 | 5            | Knowledge overlays on every push, wiki pages at checkpoints, `gm why`; discussions on timelines (CORE-51)                                                                                                                  | CORE-83, CORE-84, CORE-85          | The "why" for agents and people                                                                                 |
 | Experimental | The experimental flag: a UX marker for timelines not expected to land, left out of stalled views                                                                                                                           | CORE-86                            | Experiments kept without looking stalled                                                                        |
 | Later        | Pruning landed work; experimental best-of-N; secrets per environment; CORE-42's time axis                                                                                                                                  | Not filed                          |                                                                                                                 |
+| Follow-ups   | `gm why` reads landing events; a landing credential narrowed to the landing ref; discussions on timelines                                                                                                                  | CORE-156, CORE-157, CORE-51        |                                                                                                                 |
 
 ## Decisions
 
-From the two interviews on 2026-10-02; the eight rows before the last two
-settled CORE-62, and the last two came with CORE-74:
+From the two interviews on 2026-10-02 (CORE-62), and while building: the two
+rows on "done in a timeline" and abandoned issues came with CORE-74, and the
+last two with CORE-80:
 
 | Question                                         | Decision                                                                                                                                  |
 | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -704,6 +710,8 @@ settled CORE-62, and the last two came with CORE-74:
 | Retiring mirrored branches                       | Nothing to retire: the only mirror in production holds just `main` (checked 2026-10-03)                                                   |
 | Changing "done in a timeline" on main?           | Not allowed: locked wherever it shows, for people and agents, linking to the timeline; merge, landing, abandon or a reopen there move it  |
 | Issues of an abandoned timeline                  | Left alone, not archived or moved: its view stays readable, read-only. Finished ones still go back to ready on main                       |
+| Who can open a Gitmatrix preview?                | Anyone with its access link, recorded on the deployment; only people who can read the private repository see it                           |
+| Preview URLs on the production Worker            | On (`previewUrls`), with workers.dev itself off; production versions get preview URLs too, an accepted trade-off                          |
 
 ### Still open
 
