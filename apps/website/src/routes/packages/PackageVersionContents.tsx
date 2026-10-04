@@ -25,8 +25,11 @@ export function versionContentsSearch(params: URLSearchParams, version: string |
 
 type Navigate = (values: Record<string, string | null>) => string;
 
-/** Name, size, then actions in fixed columns so every row lines up. */
-const ROW = "grid-cols-[minmax(0,1fr)_auto_6rem] sm:grid-cols-[minmax(0,1fr)_7rem_5rem]";
+/** Name, size, then actions: the same row anatomy as the versions table below it. */
+const ROW =
+  "grid items-center gap-x-2.5 border-b border-line-soft pr-1 pl-2 " +
+  "grid-cols-[minmax(0,1fr)_6.5rem_4.5rem] max-md:grid-cols-[minmax(0,1fr)_5.5rem_6rem]";
+const CELL = "flex min-w-0 items-center gap-1.5";
 
 const KIND_LABEL: Record<PackageContentEntry["kind"], string> = {
   file: "File",
@@ -148,13 +151,10 @@ function EntryRow({ entry, navigate }: { entry: PackageContentEntry; navigate: N
   const download = sameOriginDownload(entry.downloadUrl);
   const Icon = directory ? FolderSimpleIcon : entry.kind === "manifest" ? CubeIcon : FileIcon;
   const label = entry.platform ?? entry.name;
-  const hasDetails = !directory;
   return (
-    <li className="min-w-0">
-      <div
-        className={`grid min-h-10 items-center gap-x-4 px-3 hover:bg-raised max-sm:min-h-11 ${ROW}`}
-      >
-        <span className="flex min-w-0 items-center gap-3">
+    <>
+      <div role="row" className={`${ROW} h-10 text-body-sm hover:bg-surface max-md:h-11`}>
+        <span role="cell" className={CELL}>
           <Icon
             aria-hidden
             weight={directory ? "fill" : "regular"}
@@ -164,28 +164,27 @@ function EntryRow({ entry, navigate }: { entry: PackageContentEntry; navigate: N
             <Link
               to={destination}
               preventScrollReset
-              className="min-w-0 truncate mk-mono text-body-sm text-ink no-underline hover:underline"
+              className="mk-mono truncate py-2 text-signal underline-offset-4 hover:underline"
               title={entry.path}
               aria-label={directory ? `Open directory ${entry.name}` : `View platform ${label}`}
             >
               {label}
             </Link>
           ) : (
-            <span className="min-w-0 truncate mk-mono text-body-sm" title={entry.path}>
+            <span className="mk-mono truncate" title={entry.path}>
               {label}
             </span>
           )}
           {entry.fileCount !== undefined && (
-            <span className="shrink-0 text-body-sm text-ink-faint">
-              {plural(entry.fileCount, "file")}
-            </span>
+            <span className="flex-none text-ink-faint">{plural(entry.fileCount, "file")}</span>
           )}
           {entry.kind !== "file" && !directory && (
-            <span className="mk-chip shrink-0 max-sm:hidden">{KIND_LABEL[entry.kind]}</span>
+            <span className="mk-chip mk-chip--tag flex-none">{KIND_LABEL[entry.kind]}</span>
           )}
         </span>
         <span
-          className="text-right text-body-sm whitespace-nowrap text-ink-muted tabular-nums"
+          role="cell"
+          className={`${CELL} justify-end whitespace-nowrap text-ink-muted tabular-nums`}
           title={entry.size === null ? undefined : plural(entry.size, "byte")}
         >
           {entry.size === null ? (
@@ -196,7 +195,7 @@ function EntryRow({ entry, navigate }: { entry: PackageContentEntry; navigate: N
             bytes(entry.size)
           )}
         </span>
-        <span className="flex items-center justify-end gap-1">
+        <span role="cell" className={`${CELL} justify-end gap-0.5`}>
           {download && (
             <a
               className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm"
@@ -207,7 +206,7 @@ function EntryRow({ entry, navigate }: { entry: PackageContentEntry; navigate: N
               <DownloadSimpleIcon aria-hidden />
             </a>
           )}
-          {hasDetails && (
+          {!directory && (
             <button
               type="button"
               className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm"
@@ -225,8 +224,14 @@ function EntryRow({ entry, navigate }: { entry: PackageContentEntry; navigate: N
           )}
         </span>
       </div>
-      {open && <EntryDetails id={detailsId} entry={entry} />}
-    </li>
+      {open && (
+        <div role="row" className="border-b border-line-soft">
+          <div role="cell">
+            <EntryDetails id={detailsId} entry={entry} />
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -240,7 +245,7 @@ function Breadcrumbs({ root, path, navigate }: { root: string; path: string; nav
       <Link
         to={navigate({ path: null, contentOffset: null })}
         preventScrollReset
-        className="min-h-11 content-center text-signal hover:underline"
+        className="min-h-9 content-center text-signal hover:underline max-md:min-h-11"
         aria-current={!path ? "location" : undefined}
       >
         {root}
@@ -257,7 +262,7 @@ function Breadcrumbs({ root, path, navigate }: { root: string; path: string; nav
             })}
             preventScrollReset
             aria-current={index === directories.length - 1 ? "location" : undefined}
-            className="min-h-11 content-center mk-mono text-signal hover:underline break-all"
+            className="min-h-9 content-center mk-mono text-signal hover:underline break-all max-md:min-h-11"
           >
             {directory}
           </Link>
@@ -378,8 +383,8 @@ export function PackageVersionContents({ base, version }: { base: string; versio
               <p className="mb-0 mt-2 mk-mono text-body-sm text-ink-muted break-all">{manifest}</p>
             </div>
           )}
-          <div className="min-w-0 overflow-hidden rounded-pane border border-line-soft">
-            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-line-soft px-3 py-1">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-x-3">
               {browsable ? (
                 <Breadcrumbs
                   root={data.format === "npm" ? "Archive root" : "All files"}
@@ -387,7 +392,7 @@ export function PackageVersionContents({ base, version }: { base: string; versio
                   navigate={navigate}
                 />
               ) : (
-                <h3 className="m-0 min-h-11 content-center text-body font-semibold">
+                <h3 className="m-0 min-h-9 content-center text-body font-semibold max-md:min-h-11">
                   {data.format === "oci" ? "Manifests and blobs" : "Files"}
                 </h3>
               )}
@@ -395,34 +400,39 @@ export function PackageVersionContents({ base, version }: { base: string; versio
                 {plural(data.total, "entry", "entries")}
               </span>
             </div>
-            <div
-              aria-hidden
-              className={`grid gap-x-4 border-b border-line-soft px-3 py-1.5 text-body-sm text-ink-faint max-sm:hidden ${ROW}`}
-            >
-              <span>Name</span>
-              <span className="text-right">Size</span>
-              <span />
-            </div>
-            <ul className="m-0 list-none divide-y divide-line-soft p-0">
+            <div role="table" aria-label="Files" className="min-w-0">
+              <div role="row" className={`${ROW} h-9 text-label text-ink-faint max-md:hidden`}>
+                <span role="columnheader" className={CELL}>
+                  Name
+                </span>
+                <span role="columnheader" className={`${CELL} justify-end`}>
+                  Size
+                </span>
+                <span role="columnheader" className={CELL}>
+                  <span className="sr-only">Actions</span>
+                </span>
+              </div>
               {path && offset === 0 && (
-                <li>
-                  <Link
-                    to={navigate({ path: parent || null, contentOffset: null })}
-                    preventScrollReset
-                    className="flex min-h-10 items-center gap-3 px-3 text-ink-muted no-underline hover:bg-raised max-sm:min-h-11"
-                    aria-label="Parent directory"
-                  >
-                    <FolderSimpleIcon className="size-4" aria-hidden />
-                    ..
-                  </Link>
-                </li>
+                <div role="row" className={`${ROW} h-10 text-body-sm hover:bg-surface max-md:h-11`}>
+                  <span role="cell" className={CELL}>
+                    <Link
+                      to={navigate({ path: parent || null, contentOffset: null })}
+                      preventScrollReset
+                      className="flex min-w-0 items-center gap-1.5 py-2 text-ink-muted no-underline hover:text-ink"
+                      aria-label="Parent directory"
+                    >
+                      <FolderSimpleIcon className="size-4 shrink-0" aria-hidden />
+                      ..
+                    </Link>
+                  </span>
+                </div>
               )}
               {data.files.map((entry) => (
                 <EntryRow key={entry.id} entry={entry} navigate={navigate} />
               ))}
-            </ul>
+            </div>
             {!data.files.length && (
-              <p className="m-0 px-3 py-3 text-body-sm text-ink-muted">
+              <p className="m-0 py-3 text-body-sm text-ink-muted">
                 {offset > 0
                   ? "No files on this page. Return to the first page to browse this version."
                   : path
@@ -433,7 +443,7 @@ export function PackageVersionContents({ base, version }: { base: string; versio
             {(data.total > data.limit || offset > 0) && (
               <nav
                 aria-label="Contents pagination"
-                className="flex flex-wrap items-center justify-between gap-2 border-t border-line-soft px-3 py-2"
+                className="flex flex-wrap items-center justify-between gap-2 pt-3"
               >
                 <span role="status" className="text-body-sm text-ink-muted tabular-nums">
                   {data.files.length
