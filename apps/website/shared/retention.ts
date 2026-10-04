@@ -53,6 +53,8 @@ export interface RetentionPolicy extends RetentionCategory {
   valuesFrom: Record<string, PolicySource>;
   /** True when a cleanup is implemented and runs can include it (CORE-198). */
   runnable: boolean;
+  /** The latest run that covered it at this level; null if none. */
+  lastRun: RetentionLastRun | null;
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -97,4 +99,74 @@ export interface RetentionPatch {
     string,
     { enabled?: boolean | null; thresholds?: Record<string, number | null> }
   >;
+}
+
+/** The latest run that covered a category at this level (CORE-198). */
+export interface RetentionLastRun {
+  runId: number;
+  dryRun: boolean;
+  trigger: "schedule" | "manual";
+  status: RetentionRunCategory["status"];
+  items: number;
+  bytes: number;
+  error: string | null;
+  at: string;
+}
+
+export type RetentionRunStatus = "queued" | "running" | "succeeded" | "failed";
+
+/** One category of a cleanup run. */
+export interface RetentionRunCategory {
+  category: string;
+  label: string;
+  status: "pending" | "running" | "succeeded" | "failed";
+  /** The thresholds the run used. */
+  thresholds: Record<string, number>;
+  /** Records selected (dry run) or removed (run), so far. */
+  items: number;
+  /** Their estimated bytes. */
+  bytes: number;
+  batches: number;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+/** A cleanup run: scheduled or manual, dry or real, with what each category did. */
+export interface RetentionRun {
+  id: number;
+  level: RetentionScope;
+  /** The account's slug; null for a site run. */
+  account: string | null;
+  trigger: "schedule" | "manual";
+  /** Who started a manual run. */
+  actor: string | null;
+  dryRun: boolean;
+  status: RetentionRunStatus;
+  /** The moment every selection is computed from. */
+  asOf: string;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  items: number;
+  bytes: number;
+  error: string | null;
+  categories: RetentionRunCategory[];
+}
+
+/** GET …/runs: newest first; pass `before` = next for the following page. */
+export interface RetentionRunPage {
+  runs: RetentionRun[];
+  next: number | null;
+}
+
+/**
+ * POST /api/accounts/:slug/retention/runs, POST /api/admin/retention/runs:
+ * any categories of that level that have a cleanup, enabled or not, at their
+ * effective thresholds unless overridden here (same bounds as policies).
+ */
+export interface RetentionRunRequest {
+  dryRun: boolean;
+  categories: string[];
+  thresholds?: Record<string, Record<string, number>>;
 }

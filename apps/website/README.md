@@ -2257,7 +2257,7 @@ deletes nothing it didn't delete before.
   resolves account, then site-wide default, then category default; `enabled`
   ends at false. Enabling a category without values applies its defaults. A
   stored value outside today's bounds is ignored. `enabledTargets(d1)` lists
-  what scheduled cleanup covers (empty with nothing enabled).
+  what scheduled runs cover (empty with nothing enabled).
 - **Audit:** every change records who changed which category from what to
   what in `retention_policy_changes`; the settings responses include the
   latest 20.
@@ -2271,6 +2271,44 @@ deletes nothing it didn't delete before.
 Unknown categories or thresholds, fractional or out-of-bounds values, site
 categories at account level and read-only categories are rejected with 400,
 and a rejected request stores nothing.
+
+### Cleanup runs
+
+The engine (CORE-198) runs categories' cleanups for one target (an account,
+or the site), as a **dry run** (select only) or a **run** (select, then
+remove), and records each run in `cleanup_runs` and `cleanup_run_categories`:
+trigger (`schedule` or `manual` with its actor), target, categories with the
+thresholds used, counts, estimated bytes, batches, errors and timings.
+
+- **The contract** (`worker/retention/engine.ts`): a category implements
+  `CategoryCleanup` with `select(ctx, cursor)` (at most `ctx.limit` items after
+  a keyset cursor, with `next`, `count` and `bytes`) and `remove(ctx, items)`
+  (deletes them, re-checking the policy in the same statement, and returns what
+  it actually removed). `ctx` holds `env`, the `target`, the run's
+  `thresholds` and `now`, fixed when the run is created, so a dry run and a run
+  at the same moment select the same items. Register it in
+  `worker/retention/cleanups/index.ts`; `preview-records.ts` is the reference
+  to copy. A category without a cleanup can be configured but never runs.
+- **Bounded, resumable, idempotent** (`worker/retention/runs.ts`): a worker
+  claims a run with a lease token, does at most 50 batches or 20 seconds, saves
+  each category's cursor and counts after every batch, and queues the rest on
+  `gitmatrix-jobs` (`{type: "retention", runId}`). A batch interrupted before
+  its progress was saved is selected again on resume; what it already removed
+  is gone, so nothing is removed twice or missed (its removals may go
+  uncounted). A failing category fails the run with its error; the others
+  still run.
+- **Scheduled runs:** the hourly cron (`retentionCron`) starts one run a day
+  per target for its _enabled_ categories that have a cleanup, and restarts
+  runs whose lease lapsed. With nothing enabled it writes nothing at all
+  (gate 1, `worker/retention/engine.test.ts`).
+
+| Route                                          | Contract                                                                                                                                                             |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/accounts/:slug/retention/runs`      | `{dryRun, categories: [<id>], thresholds?: {<id>: {key: n}}}`: any account categories with a cleanup, enabled or not; 202 with the run (owners, site admins; people) |
+| `GET /api/accounts/:slug/retention/runs[/:id]` | Runs newest first (`?before=<next>&limit=`), or one run with each category's thresholds, counts, bytes and errors (members)                                          |
+| `POST`, `GET /api/admin/retention/runs[/:id]`  | The same for site categories (site administrators)                                                                                                                   |
+
+The settings responses show each category's `runnable` and `lastRun`.
 
 ## Layout
 

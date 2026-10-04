@@ -741,6 +741,41 @@ export interface Database {
     after: string;
     created_at: Generated<string>;
   };
+  /** Cleanup runs (CORE-198): one per retention run; account_id null for the site. */
+  cleanup_runs: {
+    id: Generated<number>;
+    account_id: string | null;
+    trigger: "schedule" | "manual";
+    actor_id: string | null;
+    dry_run: number;
+    status: "queued" | "running" | "succeeded" | "failed";
+    as_of: string;
+    items: Generated<number>;
+    bytes: Generated<number>;
+    error: Generated<string | null>;
+    lease_token: Generated<string | null>;
+    lease_until: Generated<string | null>;
+    created_at: Generated<string>;
+    started_at: Generated<string | null>;
+    finished_at: Generated<string | null>;
+    updated_at: Generated<string>;
+  };
+  /** A run's categories, with their thresholds, cursor and counts. */
+  cleanup_run_categories: {
+    run_id: number;
+    position: number;
+    category: string;
+    /** JSON {key: number}. */
+    thresholds: string;
+    status: "pending" | "running" | "succeeded" | "failed";
+    cursor: Generated<string | null>;
+    items: Generated<number>;
+    bytes: Generated<number>;
+    batches: Generated<number>;
+    error: Generated<string | null>;
+    started_at: Generated<string | null>;
+    finished_at: Generated<string | null>;
+  };
 }
 
 export type DB = Kysely<Database>;

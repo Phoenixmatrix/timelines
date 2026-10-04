@@ -12,13 +12,15 @@
 // - "fixed" categories (Atlas) always run with their defaults.
 // A stored value that no longer fits its threshold's bounds is ignored.
 //
-// Nothing here deletes anything. The cleanup engine asks `targetPolicies` /
-// `enabledTargets` what to run.
+// Nothing here deletes anything. The cleanup engine (runs.ts) asks
+// `targetPolicies` / `enabledTargets` what to run; `runnable` says whether a
+// category has a cleanup (cleanups/index.ts), `lastRun` what its latest run did.
 
 import type {
   PolicySource,
   RetentionCategory,
   RetentionChange,
+  RetentionLastRun,
   RetentionPolicy,
   RetentionScope,
   StoredPolicy,
@@ -26,6 +28,7 @@ import type {
 import { DEFAULT_PREVIEW_SETTINGS } from "../../shared/deployments.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { CATEGORIES, category, validThreshold } from "./categories.ts";
+import { cleanupFor } from "./cleanups/index.ts";
 
 /** Whose policies: one account's, or the site's. */
 export type RetentionTarget = { scope: "account"; accountId: string } | { scope: "site" };
@@ -65,6 +68,7 @@ function stored(row: StoredRow | undefined): StoredPolicy {
 function resolve(
   c: RetentionCategory,
   levels: { from: PolicySource; row: StoredRow | undefined }[],
+  lastRun?: RetentionLastRun,
 ): RetentionPolicy {
   const values: Record<string, number> = {};
   const valuesFrom: Record<string, PolicySource> = {};
@@ -100,8 +104,8 @@ function resolve(
     enabledFrom,
     values,
     valuesFrom,
-    // No cleanup is implemented yet (the engine is CORE-198).
-    runnable: false,
+    runnable: c.control === "policy" && cleanupFor(c.id) !== undefined,
+    lastRun: lastRun ?? null,
     updatedAt: own?.updated_at ?? null,
     updatedBy: own?.slug ?? null,
   };
@@ -154,18 +158,23 @@ export async function accountPolicies(
   d1: D1Database,
   accountId: string,
 ): Promise<RetentionPolicy[]> {
-  const [site, own, preview] = await Promise.all([
+  const [site, own, preview, runs] = await Promise.all([
     siteRows(d1),
     accountRows(d1, accountId),
     previewRow(d1, accountId),
+    lastRuns(d1, { scope: "account", accountId }),
   ]);
   return CATEGORIES.filter((c) => c.scope === "account").map((c) => {
     if (c.control === "fixed") return resolve(c, []);
     if (c.control === "active") return resolve(c, [{ from: "account", row: preview }]);
-    return resolve(c, [
-      { from: "account", row: own.get(c.id) },
-      { from: "site", row: site.get(c.id) },
-    ]);
+    return resolve(
+      c,
+      [
+        { from: "account", row: own.get(c.id) },
+        { from: "site", row: site.get(c.id) },
+      ],
+      runs.get(c.id),
+    );
   });
 }
 
@@ -174,11 +183,15 @@ export async function accountPolicies(
  * categories that take a policy, with the site-wide defaults.
  */
 export async function sitePolicies(d1: D1Database): Promise<RetentionPolicy[]> {
-  const site = await siteRows(d1);
-  const of = (c: RetentionCategory) => resolve(c, [{ from: "site", row: site.get(c.id) }]);
+  const [site, runs] = await Promise.all([siteRows(d1), lastRuns(d1, { scope: "site" })]);
+  const of = (c: RetentionCategory) =>
+    resolve(c, [{ from: "site", row: site.get(c.id) }], runs.get(c.id));
   return [
     ...CATEGORIES.filter((c) => c.scope === "site").map(of),
-    ...CATEGORIES.filter((c) => c.scope === "account" && c.control === "policy").map(of),
+    // Site-wide defaults: their runs are each account's.
+    ...CATEGORIES.filter((c) => c.scope === "account" && c.control === "policy").map((c) =>
+      resolve(c, [{ from: "site", row: site.get(c.id) }]),
+    ),
   ];
 }
 
@@ -219,6 +232,49 @@ export async function enabledTargets(
     const on = (await accountPolicies(d1, id)).filter((p) => p.control === "policy" && p.enabled);
     if (on.length) out.push({ target: { scope: "account", accountId: id }, policies: on });
   }
+  return out;
+}
+
+/** The latest run of each category at a target, from its recent runs. */
+export async function lastRuns(
+  d1: D1Database,
+  target: RetentionTarget,
+): Promise<Map<string, RetentionLastRun>> {
+  const query = db(d1)
+    .selectFrom("cleanup_run_categories as c")
+    .innerJoin("cleanup_runs as r", "r.id", "c.run_id")
+    .select([
+      "c.category",
+      "r.id",
+      "r.dry_run",
+      "r.trigger",
+      "r.created_at",
+      "c.status",
+      "c.items",
+      "c.bytes",
+      "c.error",
+      "c.finished_at",
+    ])
+    .where("r.id", "in", (eb) => {
+      const recent = eb.selectFrom("cleanup_runs").select("id").orderBy("id", "desc").limit(100);
+      return target.scope === "site"
+        ? recent.where("account_id", "is", null)
+        : recent.where("account_id", "=", target.accountId);
+    })
+    .orderBy("r.id", "desc");
+  const out = new Map<string, RetentionLastRun>();
+  for (const row of await query.execute())
+    if (!out.has(row.category))
+      out.set(row.category, {
+        runId: row.id,
+        dryRun: row.dry_run === 1,
+        trigger: row.trigger,
+        status: row.status,
+        items: row.items,
+        bytes: row.bytes,
+        error: row.error,
+        at: row.finished_at ?? row.created_at,
+      });
   return out;
 }
 

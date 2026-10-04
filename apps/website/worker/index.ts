@@ -6,6 +6,7 @@ import { sweepPreviews } from "./deployments/sweep.ts";
 import { sweepDurableInstances } from "./durable/sweep.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
+import { retentionCron, runRetentionJob, type RetentionJob } from "./retention/runs.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 import { settled, sweepLandings } from "./timelines/landing.ts";
 
@@ -23,8 +24,12 @@ export default {
     // it would be consuming production's messages, so leave them be.
     if (isPreview(env)) return batch.retryAll();
     if (batch.queue === "gitmatrix-jobs") {
-      for (const message of batch.messages as readonly Message<MirrorJob | ReleaseNotesJob>[]) {
-        if (message.body.type === "release-notes")
+      for (const message of batch.messages as readonly Message<
+        MirrorJob | ReleaseNotesJob | RetentionJob
+      >[]) {
+        if (message.body.type === "retention")
+          await runRetentionJob(env, message as Message<RetentionJob>);
+        else if (message.body.type === "release-notes")
           await runReleaseNotesJob(env, message as Message<ReleaseNotesJob>, (work) =>
             ctx.waitUntil(work),
           );
@@ -43,8 +48,8 @@ export default {
     }
   },
   /**
-   * Hourly: package sweeps, tearing down expired timeline previews (CORE-79)
-   * and Atlas projection retention (CORE-159).
+   * Hourly: package sweeps, tearing down expired timeline previews (CORE-79),
+   * Atlas projection retention (CORE-159) and data retention runs (CORE-198).
    */
   async scheduled(_controller, env, ctx) {
     if (isPreview(env)) return;
@@ -66,6 +71,11 @@ export default {
         console.error("Durable: the registry sweep failed", error),
       ),
     );
+    // Data retention (CORE-198): scheduled runs of enabled categories only,
+    // and restarting stalled runs; with nothing enabled it writes nothing.
+    ctx.waitUntil(
+      retentionCron(env).catch((error) => console.error("Retention: the cron failed", error)),
+    );
     // Landings a CI run's end didn't move on (CORE-77).
     ctx.waitUntil(
       settled(env, (deps) => sweepLandings(env, deps)).catch((error) =>
@@ -73,7 +83,7 @@ export default {
       ),
     );
   },
-} satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob>;
+} satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob | RetentionJob>;
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
 export { CiRun } from "./ci/workflow.ts";

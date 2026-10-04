@@ -116,7 +116,12 @@ describe("account retention settings", () => {
       CATEGORIES.filter((c) => c.scope === "account").map((c) => c.id),
     );
     for (const c of settings.categories.filter((c) => c.control === "policy"))
-      expect(c).toMatchObject({ enabled: false, enabledFrom: "default", runnable: false });
+      expect(c).toMatchObject({
+        enabled: false,
+        enabledFrom: "default",
+        runnable: c.id === "preview-records",
+        lastRun: null,
+      });
     expect(policy(settings, "ci-logs").values).toEqual({ days: 30 });
     expect(policy(settings, "ci-runs").values).toEqual({ days: 180, keepLatest: 20 });
     expect(policy(settings, "tracker-activity").values).toEqual({
