@@ -2273,6 +2273,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
           `${label}: CSV has one row per figure`,
         );
         await context.tracing.stop();
+        await context.close();
       }
 
       // A member who isn't an administrator is refused; the site page isn't theirs.
@@ -2288,6 +2289,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await page.goto("/settings/site-usage");
         await page.waitForURL((url) => url.pathname === "/");
         await context.tracing.stop();
+        await context.close();
       }
 
       // The site administrator: every account and the site total, at both widths.
@@ -2312,6 +2314,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         );
         await expect(page.locator('[data-usage-report="account"]')).toBeVisible();
         await context.tracing.stop();
+        await context.close();
       }
       record({ lines: lines.length, accounts: site.accounts!.length, widths: [1280, 390] });
     } catch (error) {
@@ -2547,6 +2550,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await row.getByRole("button", { name: "Save Assistant chats" }).click();
         await expect(row.getByText("Assistant chats: saved.")).toBeVisible();
         await context.tracing.stop();
+        await context.close();
       }
 
       // The schedule never runs a category that's off: a stale chat stays.
@@ -2599,6 +2603,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await expect(page.locator(`[data-cleanup-category="${category}"]`)).toBeChecked();
         await noSideways(page, "account 390px");
         await context.tracing.stop();
+        await context.close();
       }
 
       // A member who isn't an administrator is refused; the site page isn't theirs.
@@ -2614,6 +2619,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await page.goto("/settings/site-retention");
         await page.waitForURL((url) => url.pathname === "/");
         await context.tracing.stop();
+        await context.close();
       }
 
       // The site administrator: site categories and site-wide defaults, a preview.
@@ -2644,6 +2650,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         });
         await noSideways(page, `site ${width}px`);
         await context.tracing.stop();
+        await context.close();
       }
       record({ deleted: idle.length, scheduled: cron.scheduled.length, widths: [1280, 390] });
     } catch (error) {

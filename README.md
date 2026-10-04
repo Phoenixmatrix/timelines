@@ -219,6 +219,10 @@ or an unavailable browser fail the command. The website's `vp test` includes
 browser-mode tests in headless Chromium; UI behaviour belongs there, and E2E
 keeps a few real-stack journeys (apps/website/README.md, "Testing").
 
+The usage and retention browser journeys close each persona/viewport context after
+its assertions and trace finish, before opening the next. Keep that lifetime bounded:
+finished pages still consume renderer memory if left open until scenario teardown.
+
 The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
