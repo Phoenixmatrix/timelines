@@ -427,13 +427,23 @@ export function historyOf(sql: SqlDatabase): ChronicleHistory {
   const floor = feedFloor(sql);
   let pruned: ChronicleHistory["pruned"] = null;
   if (floor > 0) {
-    const row = sql
-      .exec(
-        "SELECT json_extract(data, '$.createdAt') AS t FROM events WHERE cursor > ? ORDER BY cursor LIMIT 1",
-        floor,
-      )
-      .toArray()[0] as { t: string } | undefined;
-    pruned = { before: row?.t ?? new Date().toISOString(), cursor: floor };
+    // The newest event retention removed; older trackers recorded only the
+    // cursor, so then the oldest event kept after it stands in.
+    const at = sql
+      .exec("SELECT value FROM retention_state WHERE key = 'events_floor_at'")
+      .toArray()[0] as { value: number } | undefined;
+    const row = at
+      ? null
+      : (sql
+          .exec(
+            "SELECT json_extract(data, '$.createdAt') AS t FROM events WHERE cursor > ? ORDER BY cursor LIMIT 1",
+            floor,
+          )
+          .toArray()[0] as { t: string } | undefined);
+    pruned = {
+      before: at ? new Date(at.value).toISOString() : (row?.t ?? new Date().toISOString()),
+      cursor: floor,
+    };
   }
   const removed = sql
     .exec("SELECT count(*) AS n FROM retention_removed WHERE kind = 'issue'")

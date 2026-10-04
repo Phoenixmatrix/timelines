@@ -26,6 +26,7 @@ import type { Landing } from "../../apps/website/shared/timelines.ts";
 import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
 import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
+import { chronicleScenario } from "./chronicle-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 import { runQueueE2E } from "./queue-e2e.ts";
 
@@ -4113,6 +4114,18 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       build: build.number,
       pushes: 8,
       chats: { fresh: fresh.length, idleRemoved: idle.length },
+    });
+  });
+
+  await scenario("browser-chronicle-scrub-range-span-and-links", async () => {
+    // CORE-251: a month of real tracker history read on a time axis, at
+    // desktop and phone widths (tools/agent/chronicle-e2e.ts).
+    await chronicleScenario({
+      ctx,
+      token: ownerToken,
+      secret: ctx.env.GITMATRIX_AGENT_SECRET ?? "",
+      json,
+      record,
     });
   });
 }

@@ -306,6 +306,15 @@ export function summarize(
   for (const issue of issues) {
     const start = stateAt(issue, from);
     const end = stateAt(issue, to);
+    // Made after the range, or closed before it and untouched in it: not part of what it holds.
+    if (!start.status && !end.status) continue;
+    if (
+      (start.status === "done" || start.status === "canceled") &&
+      !issue.segments.some((s) => ms(s.at) > from && ms(s.at) <= to) &&
+      !issue.markers.some((m) => ms(m.at) >= from && ms(m.at) <= to) &&
+      !issue.spans.some((s) => workedMs(s, from, to, now) > 0)
+    )
+      continue;
     const a = start.status ?? "none";
     const b = end.status ?? "none";
     summary.startCounts[a] = (summary.startCounts[a] ?? 0) + 1;

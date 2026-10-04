@@ -329,7 +329,7 @@ export interface TrackerList {
   /** The tracker whose defaults the viewer saved most recently: where /tracker opens. */
   defaultOwnerId: string | null;
 }
-export const TRACKER_LAYOUTS = ["list", "board", "graph"] as const;
+export const TRACKER_LAYOUTS = ["list", "board", "graph", "chronicle"] as const;
 /**
  * A person's defaults for one tracker (CORE-119), saved on the server so they
  * follow them everywhere. The team is also gm's default when nothing more

@@ -9,6 +9,7 @@ import {
 } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
 import type { ChronicleOptions } from "./chronicle.ts";
+import { runChronicleFixture, type ChronicleFixtureOptions } from "./chronicle-fixture.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import type { SearchQuery } from "../search/query.ts";
 import type { Landing, TimelineStatus } from "../../shared/timelines.ts";
@@ -84,6 +85,25 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   /** An issue's timelines, checkpoints and landings, for its linked work (CORE-250). */
   issueWork(issue: string) {
     return this.reply(() => this.store.issueWork(issue));
+  }
+  /**
+   * DEVELOPMENT ONLY (POST /api/dev/chronicle, CORE-251): a synthetic history
+   * made of real mutations, applied in time order under a controlled clock.
+   */
+  chronicleFixture(people: Access[], agents: Access[], options: ChronicleFixtureOptions) {
+    if (Reflect.get(this.env, "DEV_MODE") !== "true")
+      throw new Error("The Chronicle fixture is for development only.");
+    let clock = Date.now();
+    const store = new TrackerStore(this.ctx.storage.sql, this.transaction, () => clock);
+    return runChronicleFixture(
+      (access, at, request) => {
+        clock = at;
+        return store.mutate(access, request);
+      },
+      people,
+      agents,
+      options,
+    );
   }
   openRequests() {
     return this.reply(() => this.store.openRequests());

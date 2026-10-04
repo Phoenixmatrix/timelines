@@ -431,9 +431,10 @@ describe("the Chronicle's history by time", () => {
     const h = history();
     const all = h.read(30, 500, { quiet: true });
     const summary = summarize(all.issues, Date.parse(at(30)), Date.parse(at(500)), h.nowIs());
-    expect(summary.startCounts).toEqual({ todo: 6, done: 1 });
+    // q, closed before the range and untouched in it, isn't part of it.
+    expect(summary.startCounts).toEqual({ todo: 6 });
     // p's lapsed lease left it in progress.
-    expect(summary.endCounts).toEqual({ done: 3, todo: 3, in_progress: 1 });
+    expect(summary.endCounts).toEqual({ done: 2, todo: 3, in_progress: 1 });
     expect(summary.completed.sort()).toEqual(["a", "e"]);
     expect(summary.changed.sort()).toEqual(["a", "e", "p"]);
     const minutes = Object.fromEntries(
@@ -496,6 +497,10 @@ describe("the Chronicle's history by time", () => {
     removeActivity(h.sql, thresholds, now, selected.items, now);
     const page = h.read(30, 500, { quiet: true });
     expect(page.history.pruned).toMatchObject({ cursor: expect.any(Number) });
+    // When: the newest event it removed, inside the history, not "now".
+    const before = Date.parse(page.history.pruned!.before);
+    expect(before).toBeGreaterThanOrEqual(Date.parse(at(5)));
+    expect(before).toBeLessThanOrEqual(Date.parse(at(500)));
     // q (closed) lost its early events: its row says where its history begins.
     const q = row(page, "ENG-7");
     expect(q.historyFrom).not.toBeNull();

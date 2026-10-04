@@ -1062,6 +1062,27 @@ linked work in `worker/tracker/work.ts`.
   (`release_note_entries_issue`); runs, deployments and packages by the
   commits found. Each list holds at most 50 items (`truncated`).
 
+**The view** (`/tracker/:owner?view=chronicle`, CORE-251; `src/routes/tracker/Chronicle*.tsx`,
+pure model in `chronicleModel.ts`): presets, zoom, group by and layout over the
+query bar; a brushable density overview; a canvas ruler and lanes (status,
+work spans, markers) with the playhead and a selectable range; the range
+summary or, for a selected issue or span, the inspector with linked work. The
+address holds `from`, `to`, `at` (the playhead), `rs`/`re` (a selected range),
+`span`, `group=team` and `layout=list`. It reads pages of `/chronicle` for a
+range half a window wider on each side, at most 10 pages, and never the
+change feed. Phones get the List layout, the accessible equivalent of the
+canvas. Design: root `DESIGN.md`, "Chronicle (time axis)".
+
+**Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
+(agent secret) makes `issues` issues of a new team worked by the account's
+people and a "builder" agent over `days`, through real tracker mutations
+under a controlled clock (`worker/tracker/chronicle-fixture.ts`). With
+`link: {repo: "owner/name", commit}` the showcase issue (its first) gets a
+step context at that commit and a release-note entry naming it, as the
+generator would store them, so its linked work reaches a real commit and its
+CI runs. E2E `browser-chronicle-scrub-range-span-and-links`
+(`tools/agent/chronicle-e2e.ts`) checks the page against the API's own answer.
+
 ### Timelines
 
 A timeline (`TIMELINES-RESEARCH.md`) is an account-wide line of work with a

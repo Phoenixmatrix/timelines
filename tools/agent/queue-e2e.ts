@@ -475,6 +475,8 @@ async function runActiveQueueDeletion(
     queue: QueueEntry;
   };
   const id = admitted.queue.id;
+  // The scheduler records the candidate as testing, then starts its gates on
+  // its next step: wait for the gate run, not just the status.
   const entry = await f.wait(
     id,
     (value) => (value.status === "testing" && value.gateRun !== null) || value.status === "failed",

@@ -71,6 +71,7 @@ import {
 } from "./preferences.ts";
 import { acknowledge } from "./snapshot.ts";
 import { RelationLens } from "./Lens.tsx";
+import { Chronicle } from "./Chronicle.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
 import { IssueLog } from "./Log.tsx";
 import { FacetColumn, IssueBoard } from "./Panels.tsx";
@@ -457,7 +458,10 @@ function Workbench({ data }: { data: TrackerView }) {
   const scoped = scopeLabel(query, now);
   // The graph view is about relationships: an issue there is the lens's
   // centre, and its details open beside it only when asked for.
-  const showInspector = !!(selected || route.issue) && (view !== "graph" || params.has("details"));
+  const showInspector =
+    !!(selected || route.issue) &&
+    view !== "chronicle" &&
+    (view !== "graph" || params.has("details"));
   const closeHref = (() => {
     if (view !== "graph" || !selected) return href();
     const next = new URLSearchParams(params);
@@ -882,7 +886,13 @@ function Workbench({ data }: { data: TrackerView }) {
                     role="radio"
                     aria-checked={view === v}
                     className="mk-segment"
-                    onClick={() => setParam("view", v)}
+                    onClick={() => {
+                      const next = new URLSearchParams(params);
+                      next.set("view", v);
+                      // The Chronicle is about what happened: closed work belongs in it.
+                      if (v === "chronicle" && query === DEFAULT_QUERY) next.set("q", "");
+                      setParams(next, { replace: true, preventScrollReset: true });
+                    }}
                   >
                     {VIEW_LABEL[v]}
                   </button>
@@ -944,12 +954,26 @@ function Workbench({ data }: { data: TrackerView }) {
                 </span>
               </summary>
               <div className="flex flex-col gap-4 pt-2">
-                {view !== "graph" && strip("h-10")}
+                {view !== "graph" && view !== "chronicle" && strip("h-10")}
                 {facetColumn}
               </div>
             </details>
-            {view !== "graph" && <div className="max-lg:hidden">{strip("h-8")}</div>}
-            {issues.length === 0 ? (
+            {view !== "graph" && view !== "chronicle" && (
+              <div className="max-lg:hidden">{strip("h-8")}</div>
+            )}
+            {view === "chronicle" ? (
+              <Chronicle
+                owner={owner}
+                base={base}
+                query={query}
+                params={params}
+                setParams={(next, options) =>
+                  setParams(next, { ...options, preventScrollReset: true })
+                }
+                selectedIssue={route.issue ?? null}
+                serverNow={now}
+              />
+            ) : issues.length === 0 ? (
               <div className="mk-empty">
                 {snapshot.issues.length ? (
                   <>
@@ -1002,11 +1026,13 @@ function Workbench({ data }: { data: TrackerView }) {
           <aside
             aria-label={selected ? `Issue ${selected.key}` : "Narrow it down"}
             className={
-              showInspector
-                ? "relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-pane bg-pane lg:max-w-[40rem] lg:flex-none lg:basis-[44%]"
-                : selected
-                  ? "hidden"
-                  : "hidden w-64 shrink-0 overflow-y-auto pr-1 lg:block"
+              view === "chronicle"
+                ? "hidden"
+                : showInspector
+                  ? "relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-pane bg-pane lg:max-w-[40rem] lg:flex-none lg:basis-[44%]"
+                  : selected
+                    ? "hidden"
+                    : "hidden w-64 shrink-0 overflow-y-auto pr-1 lg:block"
             }
           >
             {showInspector ? (
