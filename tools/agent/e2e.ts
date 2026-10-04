@@ -2564,6 +2564,8 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       for (const run of cron.scheduled)
         if (run.account === owner)
           assert.deepEqual(run.categories, ["release-notes"], "Only what's on is scheduled");
+        else if (run.account === null)
+          assert.deepEqual(run.categories, ["auth-hygiene"], "The site's only always-on category");
       assert(
         !cron.scheduled.some(
           (r) => r.categories.includes("assistant-chats") && r.account === owner,
@@ -2630,6 +2632,11 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
           page.getByRole("heading", { name: "Defaults for every account" }),
         ).toBeVisible();
         await expect(page.locator('[data-retention-row="usage-history"]')).toContainText("months");
+        // Auth hygiene always runs: no switch, its days shown but not editable.
+        const hygiene = page.locator('[data-retention-row="auth-hygiene"]');
+        await expect(hygiene).toContainText("Always on");
+        await expect(hygiene.getByRole("switch")).toHaveCount(0);
+        await expect(hygiene.getByLabel("Days after expiry")).toBeDisabled();
         await expect(page.locator('[data-cleanup-category="auth-hygiene"]')).toBeChecked();
         await page.getByRole("button", { name: "Preview cleanup" }).click();
         await expect(page.locator("[data-cleanup-status]")).toContainText(/Preview #\d+ finished/, {

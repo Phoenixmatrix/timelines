@@ -11,7 +11,9 @@
 //   here or through /settings/previews is the same change; Atlas snapshots'
 //   in retention_policies (enabled null), which every Atlas retention pass
 //   reads (worker/atlas/retention.ts `scopePolicy`).
-// - "fixed" categories always run with their defaults (none today).
+// - "fixed" categories always run with their defaults, on the schedule like
+//   an enabled policy, and ignore any stored value (auth hygiene stored a site
+//   row while it was a policy; CORE-249).
 // A stored value that no longer fits its threshold's bounds is ignored.
 //
 // Nothing here deletes anything. The cleanup engine (runs.ts) asks
@@ -70,9 +72,10 @@ function stored(row: StoredRow | undefined): StoredPolicy {
 
 function resolve(
   c: RetentionCategory,
-  levels: { from: PolicySource; row: StoredRow | undefined }[],
+  saved: { from: PolicySource; row: StoredRow | undefined }[],
   lastRun?: RetentionLastRun,
 ): RetentionPolicy {
+  const levels = c.control === "fixed" ? [] : saved;
   const values: Record<string, number> = {};
   const valuesFrom: Record<string, PolicySource> = {};
   for (const t of c.thresholds) {
@@ -108,7 +111,7 @@ function resolve(
     enabledFrom,
     values,
     valuesFrom,
-    runnable: c.control === "policy" && cleanupFor(c.id) !== undefined,
+    runnable: c.control !== "active" && cleanupFor(c.id) !== undefined,
     lastRun: lastRun ?? null,
     updatedAt: own?.updated_at ?? null,
     updatedBy: own?.slug ?? null,
@@ -212,15 +215,16 @@ export async function targetPolicies(
 }
 
 /**
- * Every target with at least one enabled "policy" category, with those
- * categories: what scheduled runs cover. With nothing enabled anywhere, empty.
+ * Every target with at least one enabled "policy" or "fixed" category, with
+ * those categories: what scheduled runs cover. With nothing enabled anywhere,
+ * only the site with its fixed categories.
  */
 export async function enabledTargets(
   d1: D1Database,
 ): Promise<{ target: RetentionTarget; policies: RetentionPolicy[] }[]> {
   const site = await sitePolicies(d1);
   const out: { target: RetentionTarget; policies: RetentionPolicy[] }[] = [];
-  const siteOn = site.filter((p) => p.scope === "site" && p.enabled);
+  const siteOn = site.filter((p) => p.scope === "site" && p.control !== "active" && p.enabled);
   if (siteOn.length) out.push({ target: { scope: "site" }, policies: siteOn });
   // Accounts that enabled something, or every account when a site-wide
   // default enables an account category.

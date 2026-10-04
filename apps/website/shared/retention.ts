@@ -14,7 +14,7 @@ export type RetentionScope = "account" | "site";
  * - "active": cleanup that already ran before retention policies existed and
  *   always runs (preview teardown, Atlas snapshots); its thresholds are
  *   editable within their bounds.
- * - "fixed": always runs with thresholds that are shown, not edited (none today).
+ * - "fixed": always runs with thresholds that are shown, not edited (auth hygiene).
  */
 export type RetentionControl = "policy" | "active" | "fixed";
 

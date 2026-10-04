@@ -77,8 +77,8 @@ export default {
         console.error("Durable: the registry sweep failed", error),
       ),
     );
-    // Data retention (CORE-198): scheduled runs of enabled categories only,
-    // and restarting stalled runs; with nothing enabled it writes nothing.
+    // Data retention (CORE-198): scheduled runs of enabled and fixed categories
+    // only, and restarting stalled runs; with nothing enabled, only auth hygiene.
     ctx.waitUntil(
       retentionCron(env).catch((error) => console.error("Retention: the cron failed", error)),
     );

@@ -2720,7 +2720,8 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 Everything Gitmatrix keeps costs storage, so data past its useful life can be
 cleaned up by **retention categories** (PRD CORE-195). Every new category is
 **disabled until an administrator enables it**: a fresh or upgraded deployment
-deletes nothing it didn't delete before.
+deletes nothing it didn't delete before. The one exception is auth hygiene,
+which always runs (CORE-249): expired sign-in state is worth nothing to keep.
 
 - **Categories** are defined once in `worker/retention/categories.ts`: id
   (kebab-case, stored, never renamed), scope (`account` or `site`), label,
@@ -2730,7 +2731,8 @@ deletes nothing it didn't delete before.
   numbers are the `account_settings` preview columns, the same ones
   `/settings/previews` changes, and Atlas snapshot retention, which an account
   can tighten within `ATLAS_RETENTION_BOUNDS` but never loosen) or `fixed`
-  (shown read-only; none today). Shapes for clients are in
+  (always runs with its defaults, shown read-only; stored values are ignored:
+  auth hygiene). Shapes for clients are in
   `shared/retention.ts`.
 - **Policies** (`worker/retention/policies.ts`) store only what was changed:
   `retention_policies` per account, `retention_site_policies` for site
@@ -2738,7 +2740,8 @@ deletes nothing it didn't delete before.
   resolves account, then site-wide default, then category default; `enabled`
   ends at false. Enabling a category without values applies its defaults. A
   stored value outside today's bounds is ignored. `enabledTargets(d1)` lists
-  what scheduled runs cover (empty with nothing enabled).
+  what scheduled runs cover (only the site's fixed categories with nothing
+  enabled).
 - **Audit:** every change records who changed which category from what to
   what in `retention_policy_changes`; the settings responses include the
   latest 20.
@@ -2865,11 +2868,11 @@ bounds shown.
   deletes: package versions and their contents; the newest publish record of
   each version still published; records of versions published from another
   branch (they keep them from becoming latest).
-- **Auth hygiene** (`auth-hygiene`, site scope; off until enabled). Expired
-  sign-in sessions, lockouts, SSH challenges, verification codes and expired or
-  revoked tokens, the given days after they ended. Defaults when enabled: Days
-  after expiry: 7 (`days`, 1–3650). Never deletes: live sessions, valid tokens
-  and active lockouts.
+- **Auth hygiene** (`auth-hygiene`, site scope; always on, read-only). Expired
+  sign-in sessions, sign-in and device codes, lockouts, SSH challenges and
+  expired tokens, the given days after they ended. Defaults: Days after expiry:
+  7 (`days`, 1–3650). Never deletes: live sessions, valid tokens and active
+  lockouts.
 - **AI spend records** (`ai-spend`, site scope; off until enabled). Per-call AI
   spend records older than the given days, rolled up to daily totals. Defaults
   when enabled: Days of per-call detail: 90 (`days`, 7–3650). Never deletes:
@@ -2918,9 +2921,10 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
   uncounted). A failing category fails the run with its error; the others
   still run.
 - **Scheduled runs:** the hourly cron (`retentionCron`) starts one run a day
-  per target for its _enabled_ categories that have a cleanup, and restarts
-  runs whose lease lapsed. With nothing enabled it writes nothing at all
-  (gate 1, `worker/retention/engine.test.ts`).
+  per target for its _enabled_ and fixed categories that have a cleanup, and
+  restarts runs whose lease lapsed. With nothing enabled, its only run is the
+  site's daily auth hygiene, which touches nothing else (gate 1,
+  `worker/retention/engine.test.ts`).
 
 | Route                                          | Contract                                                                                                                                                             |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3027,8 +3031,9 @@ CORE-201, `worker/retention/cleanups/`:
 
 CORE-206, `worker/retention/cleanups/`:
 
-- **`auth-hygiene`** (site) deletes sign-in state that ended more than `days`
-  ago, by each table's own expiry: expired `auth_sessions`,
+- **`auth-hygiene`** (site, `fixed` since CORE-249: it always runs, daily, and
+  its 7 days can't be changed) deletes sign-in state that ended more than
+  `days` ago, by each table's own expiry: expired `auth_sessions`,
   `auth_verifications` (sign-in codes), `auth_device_codes`, `auth_lockouts`
   past their `until`, `ssh_challenges`, expired `access_tokens` (revoking a
   token already deletes it; a token without an expiry never expires) and

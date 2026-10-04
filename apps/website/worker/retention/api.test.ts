@@ -145,7 +145,11 @@ describe("account retention settings", () => {
       values: { maxPrior: 20, priorDays: 7, capGib: 2 },
     });
     expect(settings.changes).toEqual([]);
-    expect(await enabledTargets(t.env.DB)).toEqual([]);
+    // Only the site's always-on auth hygiene is scheduled.
+    const targets = await enabledTargets(t.env.DB);
+    expect(targets.map((x) => [x.target, x.policies.map((p) => p.id)])).toEqual([
+      [{ scope: "site" }, ["auth-hygiene"]],
+    ]);
   });
 
   test("enabling without values applies the defaults; values and resets are recorded", async () => {
@@ -173,7 +177,7 @@ describe("account retention settings", () => {
         ["release-notes", "ann", {}, { thresholds: { days: 400 } }],
       ]),
     );
-    const targets = await enabledTargets(t.env.DB);
+    const targets = (await enabledTargets(t.env.DB)).filter((x) => x.target.scope === "account");
     expect(targets).toHaveLength(1);
     expect(targets[0]!.target).toEqual({ scope: "account", accountId: "acc_org" });
     expect(targets[0]!.policies.map((p) => p.id)).toEqual(["ci-logs"]);
@@ -366,14 +370,14 @@ describe("site retention settings", () => {
     expect(
       (
         await t.call(t.tokens.ann, "PATCH", SITE, {
-          categories: { "auth-hygiene": { enabled: true } },
+          categories: { "registry-audit": { enabled: true } },
         })
       ).status,
     ).toBe(403);
     expect(
       (
         await t.call(t.tokens.sueAgent, "PATCH", SITE, {
-          categories: { "auth-hygiene": { enabled: true } },
+          categories: { "registry-audit": { enabled: true } },
         })
       ).status,
     ).toBe(403);
@@ -396,32 +400,48 @@ describe("site retention settings", () => {
       "ai-usage",
       "durable-registry",
     ]);
-    // Only categories that take a policy have site-wide defaults.
-    expect(site.categories.some((c) => c.control !== "policy")).toBe(false);
-    for (const c of site.categories) expect(c.enabled).toBe(false);
+    // Only categories that take a policy have site-wide defaults; auth
+    // hygiene is the one site category that always runs.
+    expect(site.categories.filter((c) => c.control !== "policy").map((c) => c.id)).toEqual([
+      "auth-hygiene",
+    ]);
+    for (const c of site.categories) expect(c.enabled).toBe(c.id === "auth-hygiene");
+    expect(policy(site, "auth-hygiene")).toMatchObject({
+      control: "fixed",
+      enabled: true,
+      runnable: true,
+      values: { days: 7 },
+    });
 
-    const bad = async (body: unknown) =>
-      expect((await t.call(t.tokens.sue, "PATCH", SITE, body)).status).toBe(400);
+    const bad = async (body: unknown) => {
+      const response = await t.call(t.tokens.sue, "PATCH", SITE, body);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+      return (response.json as { error: string }).error;
+    };
     await bad({ categories: { previews: { thresholds: { idleDays: 3 } } } });
     await bad({ categories: { "atlas-snapshots": { thresholds: { maxPrior: 20 } } } });
-    await bad({ categories: { "auth-hygiene": { thresholds: { days: -1 } } } });
+    await bad({ categories: { "registry-audit": { thresholds: { days: -1 } } } });
+    expect(await bad({ categories: { "auth-hygiene": { enabled: false } } })).toMatch(/read-only/);
+    expect(await bad({ categories: { "auth-hygiene": { thresholds: { days: 14 } } } })).toMatch(
+      /read-only/,
+    );
 
     site = (
       await t.call(t.tokens.sue, "PATCH", SITE, {
         categories: {
-          "auth-hygiene": { enabled: true, thresholds: { days: 14 } },
+          "registry-audit": { enabled: true, thresholds: { days: 14 } },
           "ci-logs": { thresholds: { days: 60 } },
         },
       })
     ).json;
-    expect(policy(site, "auth-hygiene")).toMatchObject({
+    expect(policy(site, "registry-audit")).toMatchObject({
       enabled: true,
       enabledFrom: "site",
       values: { days: 14 },
     });
     expect(site.changes.map((c) => [c.category, c.actor])).toEqual(
       expect.arrayContaining([
-        ["auth-hygiene", "sue"],
+        ["registry-audit", "sue"],
         ["ci-logs", "sue"],
       ]),
     );
@@ -453,5 +473,25 @@ describe("site retention settings", () => {
     expect(accounts).toContain("acc_org");
     expect(accounts).toContain("acc_ann");
     expect(accounts).not.toContain("acc_bob");
+  });
+
+  test("auth hygiene ignores what was stored while it was a policy", async () => {
+    const t = await setup();
+    t.sqlite.exec(`
+      INSERT INTO retention_site_policies (category, enabled, thresholds)
+        VALUES ('auth-hygiene', 0, '{"days": 30}');
+    `);
+    const site = (await t.call(t.tokens.sue, "GET", SITE)).json as RetentionSettings;
+    expect(policy(site, "auth-hygiene")).toMatchObject({
+      enabled: true,
+      enabledFrom: "default",
+      values: { days: 7 },
+      valuesFrom: { days: "default" },
+      updatedAt: null,
+    });
+    const targets = await enabledTargets(t.env.DB);
+    expect(targets.map((x) => [x.target, x.policies.map((p) => [p.id, p.values])])).toEqual([
+      [{ scope: "site" }, [["auth-hygiene", { days: 7 }]]],
+    ]);
   });
 });

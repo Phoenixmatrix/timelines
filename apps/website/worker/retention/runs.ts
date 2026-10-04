@@ -320,7 +320,7 @@ export async function runRetentionJob(env: Env, message: Message<RetentionJob>):
 
 /**
  * Hourly: start scheduled runs that are due, and restart stalled ones. With
- * nothing enabled and no run open, it reads and writes nothing else.
+ * nothing enabled, the only scheduled run is the site's fixed categories.
  */
 export async function retentionCron(
   env: Env,

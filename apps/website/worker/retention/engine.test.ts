@@ -1,7 +1,7 @@
 // The cleanup engine end to end (CORE-198) over D1, with the reference
 // category "preview-records": dry run = run, bounded batches, idempotence,
 // resuming after a crash, the audit record, and gate 1 (nothing enabled, so
-// a cron cycle leaves the database unchanged).
+// a cron cycle changes nothing but expired sign-in state and its run records).
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -293,27 +293,45 @@ describe("the cleanup engine with expired preview records", () => {
 });
 
 describe("scheduled runs", () => {
-  test("gate 1: with nothing enabled, a cron cycle changes nothing at all", async () => {
+  test("gate 1: with nothing enabled, a cron cycle only runs auth hygiene, daily", async () => {
     const t = seeded();
     // Policies stored, none enabled: thresholds changed, a category turned
-    // off explicitly, and site-wide defaults without enabling anything.
+    // off explicitly, site-wide defaults without enabling anything, and auth
+    // hygiene's row from when it was a policy (ignored: it always runs at 7).
     t.sqlite.exec(`
       INSERT INTO retention_policies (account_id, category, enabled, thresholds) VALUES
         ('acc_orbit', 'preview-records', 0, '{"days": 1}'),
         ('acc_orbit', 'ci-logs', NULL, '{"days": 1}');
       INSERT INTO retention_site_policies (category, enabled, thresholds) VALUES
         ('preview-records', 0, '{"days": 1}'),
-        ('auth-hygiene', NULL, '{"days": 1}');
+        ('auth-hygiene', 0, '{"days": 1}');
+      INSERT INTO auth_lockouts (key, until) VALUES
+        ('ip:ended-long-ago', '${ago(30)}'), ('ip:ended-lately', '${ago(2)}');
     `);
     const before = dump(t.sqlite);
+    const scheduled: number[] = [];
     for (const hour of [0, 1, 2, 24, 48]) {
       const at = new Date(NOW.getTime() + hour * 3_600_000);
-      expect(await retentionCron(t.env, { now: at, advance: { now: at } })).toEqual({
-        scheduled: [],
-        restarted: [],
-      });
+      const cycle = await retentionCron(t.env, { now: at, advance: { now: at } });
+      expect(cycle.restarted).toEqual([]);
+      scheduled.push(...cycle.scheduled);
     }
-    expect(dump(t.sqlite)).toEqual(before);
+    expect(scheduled).toHaveLength(3);
+    for (const id of scheduled)
+      expect(await getRun(t.env.DB, { scope: "site" }, id)).toMatchObject({
+        trigger: "schedule",
+        dryRun: false,
+        status: "succeeded",
+        categories: [{ category: "auth-hygiene", thresholds: { days: 7 } }],
+      });
+    const changed = ["cleanup_runs", "cleanup_run_categories", "sqlite_sequence", "auth_lockouts"];
+    const others = (tables: Record<string, unknown[]>) =>
+      Object.fromEntries(Object.entries(tables).filter(([name]) => !changed.includes(name)));
+    const after = dump(t.sqlite);
+    expect(others(after)).toEqual(others(before));
+    expect(after.auth_lockouts).toEqual(
+      before.auth_lockouts!.filter((row) => !String(row).includes("ended-long-ago")),
+    );
     expect(t.sent).toEqual([]);
   });
 
@@ -326,9 +344,13 @@ describe("scheduled runs", () => {
       INSERT INTO retention_policies (account_id, category, enabled) VALUES ('acc_sam', 'atlas-snapshots', 1);
     `);
     const dry = await run(t.env, true);
+    // Each cycle also schedules the site's always-on auth hygiene.
+    const orbitRuns = async (ids: number[]) =>
+      (await Promise.all(ids.map((id) => getRun(t.env.DB, ORBIT, id)))).filter((r) => r !== null);
     const first = await retentionCron(t.env, { now: NOW, advance: { now: NOW } });
-    expect(first.scheduled).toHaveLength(1);
-    const scheduled = (await getRun(t.env.DB, ORBIT, first.scheduled[0]!))!;
+    expect(first.scheduled).toHaveLength(2);
+    const [scheduled] = await orbitRuns(first.scheduled);
+    if (!scheduled) throw new Error("Orbit's run wasn't scheduled.");
     expect(scheduled).toMatchObject({
       trigger: "schedule",
       actor: null,
@@ -354,9 +376,9 @@ describe("scheduled runs", () => {
     expect((await retentionCron(t.env, { now: hourLater })).scheduled).toEqual([]);
     const nextDay = new Date(NOW.getTime() + DAY);
     const second = await retentionCron(t.env, { now: nextDay, advance: { now: nextDay } });
-    expect(second.scheduled).toHaveLength(1);
+    expect(second.scheduled).toHaveLength(2);
     // A day later, record 20 is past 30 days too.
-    expect((await getRun(t.env.DB, ORBIT, second.scheduled[0]!))!.items).toBe(1);
+    expect((await orbitRuns(second.scheduled)).map((r) => r.items)).toEqual([1]);
     expect(t.deployments()).toEqual([21, 22, 23, 24, 25, 26, 27, 28]);
   });
 });

@@ -15,6 +15,9 @@
 // /settings/previews) and Atlas snapshot retention ("active"; ATLAS_RETENTION,
 // which an account can tighten within ATLAS_RETENTION_BOUNDS; CORE-201).
 //
+// "fixed" categories always run with their defaults and can't be changed:
+// auth hygiene (CORE-249).
+//
 // Adding a category: append an entry (a new kebab-case id; ids are stored, so
 // never rename one), then implement its cleanup against the engine contract
 // (worker/retention/engine.ts) in the ticket that owns it.
@@ -284,10 +287,12 @@ export const CATEGORIES = [
   {
     id: "auth-hygiene",
     scope: "site",
-    control: "policy",
+    // Expired sign-in state is worth nothing to keep, so it isn't left to an
+    // administrator to find and enable (CORE-249).
+    control: "fixed",
     label: "Auth hygiene",
     description:
-      "Expired sign-in sessions, lockouts, SSH challenges, verification codes and expired or revoked tokens, the given days after they ended.",
+      "Expired sign-in sessions, sign-in and device codes, lockouts, SSH challenges and expired tokens, the given days after they ended.",
     never: ["Live sessions, valid tokens and active lockouts"],
     thresholds: [days("days", "Days after expiry", 7)],
   },
