@@ -201,6 +201,18 @@ export async function recordRefs(
       first_update_id: update.id,
       last_commit_oid: oid,
     }));
+    // Step context reported before this push (CORE-231) is now verified.
+    const pushed = found.commits.map((commit) => commit.oid);
+    for (let start = 0; start < pushed.length; start += ROWS_PER_INSERT) {
+      writes.push(
+        kdb
+          .updateTable("step_contexts")
+          .set({ verified_at: nowIso() })
+          .where("repo_id", "=", repoId)
+          .where("commit_oid", "in", pushed.slice(start, start + ROWS_PER_INSERT))
+          .where("verified_at", "is", null),
+      );
+    }
     for (let start = 0; start < rows.length; start += ROWS_PER_INSERT) {
       writes.push(
         kdb

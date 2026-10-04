@@ -48,6 +48,14 @@ export const TABLE_GROUPS: TableGroup[] = [
     tables: { ref_updates: REPO, change_refs: REPO },
   },
   {
+    // CORE-231; its retention category arrives with CORE-244.
+    id: "step-context",
+    database: "db",
+    scope: "account",
+    label: "Step context (work context per commit)",
+    tables: { step_contexts: REPO },
+  },
+  {
     id: "ci-logs",
     database: "db",
     scope: "account",

@@ -754,6 +754,24 @@ export interface Database {
     teardown_run_id: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
+  /** The context attached to a step: a commit an agent made in a timeline (CORE-231). */
+  step_contexts: {
+    repo_id: string;
+    change_id: string;
+    commit_oid: string;
+    author_id: string;
+    accountable_id: string;
+    timeline: string | null;
+    issue_key: string | null;
+    summary: Generated<string>;
+    /** JSON StepContextBody. */
+    context: Generated<string>;
+    committed_at: string;
+    verified_at: string | null;
+    deleted_at: string | null;
+    deleted_by: string | null;
+    created_at: Generated<string>;
+  };
   /** A person's one set of generated avatar options (CORE-116). */
   avatar_generations: {
     user_id: string;

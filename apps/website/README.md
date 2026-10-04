@@ -149,6 +149,29 @@ flight on a branch, a push's run is held; when one finishes, the newest held run
 starts and covers the older ones (`covered_by`), and `gm runs wait` follows the
 covering run.
 
+## Steps: work context per commit
+
+Agents working in a timeline commit at each meaningful step and attach the
+context that produced it (CORE-226). A step's context is stored per change and
+commit in `step_contexts` (`worker/steps/api.ts`, contract `shared/steps.ts`):
+instructions and human steering (each entry marked `hook`, `agent` or
+`person`), why, challenges, test results (`local` from `gm test`, or
+`reported`), coverage (how each part was captured) and harness/model. It's
+keyed by gm's change ID, so amend and rebase add versions instead of
+overwriting, and capped at 256 KiB per step.
+
+| Route                                                        | Does                                                                                    |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `POST /api/repos/:o/:n/steps`                                | Upload one step (write access); retries replace the author's own record, others get 409 |
+| `GET /api/repos/:o/:n/steps?timeline=&issue=&cursor=&limit=` | Newest first, paged (1–100, default 50)                                                 |
+| `GET /api/repos/:o/:n/steps/:changeId`                       | Every version of a change, newest first                                                 |
+| `DELETE /api/repos/:o/:n/steps/:changeId/:commitOid`         | Delete or redact (admins): the text goes, a tombstone stays                             |
+
+Anyone who can read the repository reads its steps. A step is **verified** once
+a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a
+later push (`worker/ref-log/record.ts`); until then it's "local, unverified".
+Context is the agent's account, shown as such next to what Gitmatrix verifies.
+
 ## Profile pictures and organization icons
 
 People can set a picture (CORE-116) on **Settings → Profile**: upload one or
