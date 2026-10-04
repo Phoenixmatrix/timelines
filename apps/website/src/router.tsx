@@ -36,6 +36,7 @@ import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { Preferences, preferencesLoader } from "./routes/Preferences.tsx";
 import { AiSettings, aiSettingsLoader } from "./routes/AiSettings.tsx";
+import { SiteUsage, siteUsageLoader, UsageCosts, usageLoader } from "./routes/UsageCosts.tsx";
 import { SshKeys, sshKeysAction, sshKeysLoader } from "./routes/SshKeys.tsx";
 import { Agents, agentsAction, agentsLoader } from "./routes/Agents.tsx";
 import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
@@ -129,6 +130,8 @@ export const router = createBrowserRouter([
             loader: aiSettingsLoader,
             Component: AiSettings,
           },
+          { path: "settings/usage", loader: usageLoader, Component: UsageCosts },
+          { path: "settings/site-usage", loader: siteUsageLoader, Component: SiteUsage },
           {
             path: "settings/invites",
             loader: invitesLoader,

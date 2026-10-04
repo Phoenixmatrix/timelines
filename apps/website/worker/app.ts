@@ -38,6 +38,7 @@ import { previewSettingsApi } from "./deployments/settings.ts";
 import { aiSettingsApi } from "./settings/ai.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./retention/api.ts";
 import { pricesApi } from "./usage/prices-api.ts";
+import { accountUsageApi, siteUsageApi } from "./usage/report-api.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -96,6 +97,8 @@ api.route("/accounts/:slug/settings/retention", accountRetentionApi);
 api.route("/accounts/:slug/retention/runs", accountRunsApi);
 api.route("/admin/retention", siteRetentionApi);
 api.route("/admin/prices", pricesApi);
+api.route("/accounts/:slug/usage", accountUsageApi);
+api.route("/admin/usage", siteUsageApi);
 api.route("/accounts/:owner/atlas", workspaceAtlas);
 api.route("/", accounts);
 api.route("/tracker/:owner/release-notes", trackerReleaseNotes);

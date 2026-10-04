@@ -21,6 +21,7 @@ import type { Deployment, DeploymentList } from "../../apps/website/shared/deplo
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { Landing } from "../../apps/website/shared/timelines.ts";
+import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
 import {
   atlasAccessibleScenario,
@@ -1970,6 +1971,163 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     for (const figure of figures)
       assert(figure.method.length > 0, `${figure.construct}/${figure.item} says how it was made`);
     record({ usage: figures.map((f) => `${f.construct}/${f.item}/${f.metric}=${f.quantity}`) });
+  });
+
+  await scenario("browser-usage-and-costs-account-and-site", async () => {
+    // CORE-209: the account's Usage & costs page (its administrators) and the
+    // site's (site administrators), from the collection the scenario above ran,
+    // at desktop and phone widths; members and non-admins are refused.
+    const owner = repo.owner;
+    const report = await json<UsageReport>(`/api/accounts/${owner}/usage`, fixtures.tokens.marco);
+    assert(report.asOf, "The collection above produced a report day");
+    const lines = report.constructs.flatMap((c) => c.lines);
+    assert(lines.length > 0, "The report has priced lines");
+    assert(
+      lines.some((l) => l.estimated),
+      "Estimated figures (sampled D1 bytes, Artifacts) are labelled",
+    );
+    for (const line of lines)
+      for (const cost of line.costs)
+        assert(
+          Math.abs(cost.monthlyUsd - (cost.quantity * cost.unitPriceUsd) / cost.unitQuantity) <
+            1e-12,
+          `${line.construct}/${line.item}: cost = quantity × price`,
+        );
+    await request(`/api/accounts/${owner}/usage`, fixtures.tokens.jun, "GET", undefined, [403]);
+    await request(`/api/accounts/${owner}/usage`, fixtures.tokens.sam, "GET", undefined, [404]);
+    await request("/api/admin/usage", fixtures.tokens.marco, "GET", undefined, [403]);
+    const site = await json<UsageReport>("/api/admin/usage", fixtures.tokens.priya);
+    assert(
+      site.accounts?.some((a) => a.slug === owner),
+      "The site report totals the fixture's owner",
+    );
+
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const signIn = async (persona: Persona, viewport: { width: number; height: number }) => {
+      const context = await browser.newContext({ baseURL: ctx.origin, viewport });
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+      const page = await context.newPage();
+      page.setDefaultTimeout(browserTimeout);
+      await page.goto("/signin");
+      await page.getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      return { context, page };
+    };
+    const noSideways = async (page: import("@playwright/test").Page, label: string) => {
+      const width = await page.evaluate(() => document.documentElement.scrollWidth);
+      assert(width <= page.viewportSize()!.width, `${label}: no horizontal scrolling (${width})`);
+    };
+    const contexts: BrowserContext[] = [];
+    let current: import("@playwright/test").Page | null = null;
+    try {
+      for (const [width, height] of [
+        [1280, 900],
+        [390, 844],
+      ] as const) {
+        const label = `${width}px`;
+        const { context, page } = await signIn("marco", { width, height });
+        contexts.push(context);
+        current = page;
+        // Reached from the settings navigation's account group.
+        await page.goto(`/settings/ai?owner=${owner}`);
+        if (width < 768) await page.getByText("Settings /").click();
+        await page.getByRole("link", { name: "Usage & costs", exact: true }).click();
+        await page.waitForURL((url) => url.pathname === "/settings/usage");
+        await expect(page.getByRole("heading", { name: "Usage & costs", level: 1 })).toBeVisible();
+        await expect(page.getByText(`Usage for @${owner}`, { exact: true })).toBeVisible();
+        await expect(page.locator("[data-usage-total]")).toBeVisible();
+        await expect(page.getByText("Daily cost, last 30 days")).toBeVisible();
+        for (const construct of report.constructs)
+          await expect(
+            page.getByRole("heading", { name: construct.label, level: 2, exact: true }),
+          ).toBeVisible();
+        await expect(page.locator("[data-usage-line]")).toHaveCount(lines.length);
+        // Drill down: figures with how they were measured, the price, the category.
+        const d1 = lines.find((l) => l.construct === "d1" && l.categories.length > 0);
+        assert(d1, "A D1 group maps to a retention category");
+        const detail = page.locator(`[data-usage-line="d1/${d1.item}"]`);
+        await detail.locator("summary").click();
+        await expect(detail.getByText("Estimated").first()).toBeVisible();
+        await expect(detail.getByText(/per GB-month/).first()).toBeVisible();
+        await expect(
+          detail.locator(`[data-retention-category="${d1.categories[0]!.id}"]`),
+        ).toContainText(d1.categories[0]!.label);
+        await expect(page.getByRole("link", { name: "D1", exact: true })).toHaveAttribute(
+          "href",
+          /developers\.cloudflare\.com\/d1\//,
+        );
+        await noSideways(page, label);
+        // CSV export: one row per figure.
+        const [download] = await Promise.all([
+          page.waitForEvent("download"),
+          page.getByRole("link", { name: "Download CSV" }).click(),
+        ]);
+        assert.equal(download.suggestedFilename(), `${owner}-usage-${report.asOf}.csv`);
+        const csv = await readFile((await download.path())!, "utf8");
+        const rows = csv.trim().split("\n");
+        assert.match(rows[0]!, /^construct,item,label,kind,metric,quantity,estimated,/);
+        assert.equal(
+          rows.length - 1,
+          lines.reduce((sum, l) => sum + l.figures.length, 0),
+          `${label}: CSV has one row per figure`,
+        );
+        await context.tracing.stop();
+      }
+
+      // A member who isn't an administrator is refused; the site page isn't theirs.
+      {
+        const { context, page } = await signIn("jun", { width: 390, height: 844 });
+        contexts.push(context);
+        current = page;
+        await page.goto(`/settings/usage?owner=${owner}`);
+        await expect(
+          page.getByText("Only the account's administrators see its usage and costs."),
+        ).toBeVisible();
+        await expect(page.locator("[data-usage-report]")).toHaveCount(0);
+        await page.goto("/settings/site-usage");
+        await page.waitForURL((url) => url.pathname === "/");
+        await context.tracing.stop();
+      }
+
+      // The site administrator: every account and the site total, at both widths.
+      for (const [width, height] of [
+        [1280, 900],
+        [390, 844],
+      ] as const) {
+        const { context, page } = await signIn("priya", { width, height });
+        contexts.push(context);
+        current = page;
+        await page.goto("/settings/site-usage");
+        await expect(
+          page.getByRole("heading", { name: "Site usage & costs", level: 1 }),
+        ).toBeVisible();
+        await expect(page.locator('[data-usage-report="site"]')).toBeVisible();
+        const accounts = page.getByRole("region", { name: "By account" });
+        await expect(accounts.getByRole("listitem")).toHaveCount(site.accounts!.length);
+        await noSideways(page, `site ${width}px`);
+        await accounts.getByRole("link", { name: new RegExp(`@${owner}\\b`) }).click();
+        await page.waitForURL(
+          (url) => url.pathname === "/settings/usage" && url.searchParams.get("owner") === owner,
+        );
+        await expect(page.locator('[data-usage-report="account"]')).toBeVisible();
+        await context.tracing.stop();
+      }
+      record({ lines: lines.length, accounts: site.accounts!.length, widths: [1280, 390] });
+    } catch (error) {
+      await current
+        ?.screenshot({ path: join(ctx.artifacts, "browser-usage-failure.png"), fullPage: true })
+        .catch(() => {});
+      await contexts
+        .at(-1)
+        ?.tracing.stop({ path: join(ctx.artifacts, "browser-usage-failure.zip") })
+        .catch(() => {});
+      throw error;
+    } finally {
+      for (const context of contexts) await context.close().catch(() => {});
+      await browser.close();
+    }
   });
 
   await scenario("browser-personas-persisted-product-state", async () => {

@@ -2357,6 +2357,45 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
 
 The settings responses show each category's `runnable` and `lastRun`.
 
+### Usage and costs
+
+**Settings → Usage & costs** (`/settings/usage?owner=<slug>`, an account's
+administrators: org owners, the user themselves, site administrators) and
+**Settings → Site usage & costs** (`/settings/site-usage`, site
+administrators) price the daily `usage_snapshots` (CORE-207, `worker/usage/`)
+with the price catalog (CORE-208, `cloudflare_prices`). The report
+(`worker/usage/report.ts`, shapes in `shared/usage.ts`):
+
+- **Storage** is the latest day whose collection finished for the account (or
+  the whole site; the `usage:collect` cursor says which), priced as if it
+  stayed that size for a month. **Activity** (Workers AI tokens) is the 30 days
+  before that day; with fewer days measured it's extrapolated to 30 and marked
+  estimated.
+- **Cost = quantity in the price's unit × unit price ÷ unit quantity**, with
+  the catalog version in effect that day: bytes ÷ 10^9 → GB-months (D1,
+  Durable Objects SQLite, R2 Standard, Artifacts, AI Search), stored vector
+  dimensions, model input/output tokens (a model that reports only totals is
+  priced as input and marked estimated). Included allowances are account-wide
+  on the Cloudflare account, so nothing is subtracted (gross list price). A
+  price whose billing hasn't started (Artifacts before 2026-10-14, AI Search
+  before 2026-11-01) is shown with its start date and left out of totals. CI
+  sandbox minutes are shown unpriced.
+- Every line carries its figures with `estimated` and `method`, its costs
+  with the price and source page, and the retention categories that clean it
+  up (account pages list account categories only). `RETENTION_PAGES` in
+  `src/lib/retention-links.ts` turns those into links once the Data retention
+  pages exist (CORE-210).
+- The site report sums every account and the site's own figures (account
+  `''`), counting registry blobs once (`registry_blobs_all`), and totals each
+  account (at most 200, highest first).
+- The trend is each of the last 30 days: that day's storage at a thirtieth of
+  its monthly cost plus that day's activity.
+
+| Route                           | Contract                                                                                                                      |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/accounts/:slug/usage` | `UsageReport`; `?format=csv` for one row per figure with its price and monthly cost (administrators; members 403, others 404) |
+| `GET /api/admin/usage`          | The site's `UsageReport` with `accounts`; `?format=csv` (site administrators)                                                 |
+
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack);

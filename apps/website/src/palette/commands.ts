@@ -89,8 +89,16 @@ const pages: CommandSource = ({ viewer, pathname }) => {
     page("tokens", "Access tokens", "/settings/tokens", ["pat", "api"]),
     page("agents", "Agents", "/settings/agents", ["bots"]),
     page("ssh-keys", "SSH keys", "/settings/ssh-keys"),
+    page("usage", "Usage & costs", "/settings/usage", ["billing", "storage", "spend", "cost"]),
     ...(viewer.isSiteAdmin
-      ? [page("invites", "Invitations", "/settings/invites", ["invite", "admin"])]
+      ? [
+          page("invites", "Invitations", "/settings/invites", ["invite", "admin"]),
+          page("site-usage", "Site usage & costs", "/settings/site-usage", [
+            "billing",
+            "storage",
+            "admin",
+          ]),
+        ]
       : []),
   ];
 };
