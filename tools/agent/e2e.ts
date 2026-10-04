@@ -23,13 +23,7 @@ import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { Landing } from "../../apps/website/shared/timelines.ts";
 import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
-import {
-  atlasAccessibleScenario,
-  atlasBrowserScenario,
-  atlasTimelineScenario,
-  atlasRevocationScenario,
-  atlasWorkspaceScenario,
-} from "./atlas-e2e.ts";
+import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 type Evidence = {
@@ -2669,125 +2663,13 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
-  await scenario("browser-global-search-palette", async () => {
-    const browserTimeout = 15_000;
-    const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ baseURL: ctx.origin });
-    await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
-    const page = await context.newPage();
-    page.setDefaultTimeout(browserTimeout);
-    try {
-      await page.goto("/signin");
-      await page.getByRole("button", { name: /Continue as marco/i }).click();
-      await page.waitForURL((url) => url.pathname !== "/signin");
-      await page.goto(`/${fullName}`);
-      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-      const dialog = page.getByRole("dialog", { name: "Search" });
-      const input = page.getByRole("combobox", { name: "Search or go to" });
-
-      // The visible control opens it with focus in the query; Escape gives focus back.
-      const button = page.getByRole("button", { name: "Search", exact: true });
-      await button.click();
-      await expect(input).toBeFocused();
-      await expect(page.getByRole("group", { name: `In ${fullName}` })).toBeVisible();
-      await page.keyboard.press("Escape");
-      await expect(dialog).toBeHidden();
-      await expect(button).toBeFocused();
-
-      // Ctrl+K, a real search, exact identifier first, Enter navigates and closes.
-      await page.keyboard.press("Control+k");
-      await input.fill(`${publicRepo.owner}/${publicRepo.name}`);
-      await expect(page.getByRole("option", { selected: true })).toContainText(
-        `${publicRepo.owner}/${publicRepo.name}`,
-      );
-      await page.keyboard.press("Enter");
-      await expect(dialog).toBeHidden();
-      await page.waitForURL((url) => url.pathname === `/${publicRepo.owner}/${publicRepo.name}`);
-
-      // A private repository marco can't read never appears.
-      await page.keyboard.press("Control+k");
-      await input.fill(`${outsiderRepo.owner}/${outsiderRepo.name}`);
-      await expect(
-        dialog.getByText(`Nothing matches “${outsiderRepo.owner}/${outsiderRepo.name}”.`),
-      ).toBeVisible();
-      await page.keyboard.press("Escape");
-
-      // Issues from the trackers marco belongs to, closed ones included, open their page.
-      await page.keyboard.press("Control+k");
-      await input.fill("Agent ready fixture");
-      const issues = page.getByRole("group", { name: "Issues" });
-      await expect(issues.getByRole("option").first()).toContainText("Agent ready fixture");
-      await expect(issues.getByRole("option").first()).toContainText(fixtures.tracker.owner);
-      await page.keyboard.press("Enter");
-      await page.waitForURL(
-        (url) =>
-          url.pathname === `/tracker/${fixtures.tracker.owner}/issues/${fixtures.tracker.ready}`,
-      );
-      await expect(page.getByText("Agent ready fixture", { exact: true }).first()).toBeVisible();
-
-      // The package published earlier, by its qualified name, opens its console page.
-      await page.keyboard.press("Control+k");
-      await input.fill(`${repo.owner}/${packageName}`);
-      const packages = page.getByRole("group", { name: "Packages" });
-      await expect(packages.getByRole("option").first()).toContainText(packageName);
-      await page.keyboard.press("Enter");
-      await page.waitForURL(
-        (url) => url.pathname === `/${repo.owner}/-/packages/generic/${packageName}`,
-      );
-      await expect(page.getByRole("heading", { name: packageName, exact: true })).toBeVisible();
-
-      // Create issue hands a proposed title to the tracker's own creator, once.
-      const proposed = `Palette issue ${randomUUID().slice(0, 8)}`;
-      await page.goto(`/${fullName}`);
-      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-      await page.keyboard.press("Control+k");
-      await input.fill(proposed);
-      await page.getByRole("option", { name: new RegExp(`Create issue “${proposed}”`) }).click();
-      await page.waitForURL((url) => url.pathname === `/tracker/${fixtures.tracker.owner}`);
-      const creator = page.getByRole("dialog", { name: "Create an issue" });
-      await expect(creator.getByRole("textbox", { name: /Title/i })).toHaveValue(proposed);
-      assert(!page.url().includes("Palette"), "The proposed title must not travel in the URL");
-      await creator.getByRole("button", { name: "Create and edit" }).click();
-      await page.waitForURL((url) => url.pathname.includes("/issues/"));
-      await page.reload();
-      await expect(creator).toBeHidden();
-
-      // Signed out: navigation only, and no search requests.
-      await context.clearCookies();
-      let searched = 0;
-      page.on("request", (request) => {
-        if (request.url().includes("/api/search")) searched++;
-      });
-      await page.goto("/");
-      await page.waitForLoadState("networkidle");
-      await page.keyboard.press("Control+k");
-      const goTo = page.getByRole("combobox", { name: "Go to" });
-      await expect(goTo).toBeFocused();
-      await goTo.fill("sign");
-      await page.keyboard.press("Enter");
-      await page.waitForURL((url) => url.pathname === "/signin");
-      assert.equal(searched, 0, "Signed-out palette must not search");
-      await context.tracing.stop();
-      record({ persona: "marco", signedOut: true, independentContext: true });
-    } catch (error) {
-      await page
-        .screenshot({ path: join(ctx.artifacts, "browser-palette-failure.png"), fullPage: true })
-        .catch(() => {});
-      await context.tracing
-        .stop({ path: join(ctx.artifacts, "browser-palette-failure.zip") })
-        .catch(() => {});
-      throw error;
-    } finally {
-      await context.close();
-      await browser.close();
-    }
-  });
-
-  await scenario("browser-atlas-deep-links-lookup-and-expiry", async () => {
-    // CORE-171: the repository Atlas's address restores its state; cold links
-    // read only the path; lookup and browsing never fan out paid search.
-    await atlasBrowserScenario({
+  // The browser scenarios are a few journeys across the real stack. What a
+  // page does with what it reads (the palette, the Atlas, the switcher's
+  // scoping) is in apps/website's browser-mode tests: README "Testing".
+  await scenario("browser-atlas-smoke", async () => {
+    // CORE-171: a pushed repository's Atlas, projected by the Worker, read in
+    // a real session down to the cited source in git.
+    await atlasSmokeScenario({
       ctx,
       work,
       token: ownerToken,
@@ -2797,36 +2679,9 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
-  await scenario("browser-atlas-keyboard-touch-themes-and-motion", async () => {
-    // CORE-170: every Atlas journey by keyboard alone and by touch at 320px,
-    // never through the canvas; light and dark; reduced motion.
-    await atlasAccessibleScenario({
-      ctx,
-      work,
-      token: ownerToken,
-      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
-      json,
-      record,
-    });
-  });
-
-  await scenario("browser-atlas-timeline-in-capabilities-ended-and-expired", async () => {
-    // CORE-176: a timeline read in Atlas terms with its per-repo facts, a
-    // capability filter and source handoff; ended read-only; the overlay's
-    // route kept when the map's snapshot expires.
-    await atlasTimelineScenario({
-      ctx,
-      work,
-      token: ownerToken,
-      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
-      json,
-      record,
-    });
-  });
-
-  await scenario("browser-atlas-revocation-clears-the-open-view", async () => {
-    // CORE-178: removing a collaborator reaches their open Knowledge tab; the
-    // view, a reload, their cursor and pinned snapshot all disclose nothing.
+  await scenario("atlas-revocation-reads-like-a-missing-repository", async () => {
+    // CORE-178: a removed collaborator's still-valid Atlas links answer as a
+    // repository that never existed.
     await atlasRevocationScenario({
       ctx,
       work,
@@ -2838,30 +2693,23 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
-  await scenario("browser-atlas-workspace-composites-and-address", async () => {
-    // CORE-184: the workspace Atlas finds a capability spanning two
-    // repositories, cites sources at each one's immutable commit, keeps its
-    // view in the address and never reads a whole graph.
-    await atlasWorkspaceScenario({
-      ctx,
-      work,
-      token: ownerToken,
-      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
-      json,
-      record,
-    });
-  });
-
-  await scenario("browser-timeline-switcher-scopes-the-app", async () => {
-    // CORE-82: choosing a timeline in the rail scopes every page to it. The
-    // banner names it, links and navigation carry ?tl=, the code browser and
-    // CI follow its bookmark, the Knowledge tab's old ?timeline= becomes
-    // ?tl=, and Back to main leaves it.
+  await scenario("browser-timeline-scope-round-trip", async () => {
+    // CORE-82 and CORE-86 across the real stack: a timeline forked through the
+    // API (its bookmark written in git), chosen in the rail of a real session,
+    // opens the code at that bookmark; its Experimental flag set in the page
+    // persists; Back to main leaves it. (Scoping links, CI, Knowledge and the
+    // Stalled view are browser-mode tests: TimelineScope.browser.test.tsx.)
     const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
     const slug = `e2e-switch-${randomUUID().slice(0, 8)}`;
     const name = `Switcher ${slug.slice(-8)}`;
     const bookmark = `timeline/${slug}`;
     await json(timelines, fixtures.tokens.jun, "POST", { slug, name, repos: [fullName] }, [201]);
+    const detail = await json<RepoDetail>(`/api/repos/${fullName}`, ownerToken);
+    assert.equal(
+      detail.branches.find((b) => b.shortName === bookmark)?.oid,
+      detail.branches.find((b) => b.shortName === detail.defaultBranch)?.oid,
+      "Forking writes the bookmark at main's tip",
+    );
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
     const browser = await chromium.launch({ headless: true });
@@ -2878,49 +2726,37 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await page.waitForURL((url) => url.pathname !== "/signin");
       await page.goto(`/${fullName}`);
       const banner = page.getByRole("region", { name: "Timeline scope" });
+      await expect(page.getByRole("link", { name: "README.md" }).first()).toBeVisible();
       await expect(banner).toHaveCount(0);
 
       await page.getByRole("button", { name: /^Timeline: main/ }).click();
       await page.getByRole("link", { name: new RegExp(name) }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === slug);
-      await expect(banner).toContainText(name);
       await expect(banner).toContainText(`Code on ${bookmark}`);
       await expect(page.getByLabel("Branch or tag")).toContainText(bookmark);
+      // The listing is git's, at the bookmark.
+      await expect(page.getByRole("link", { name: "README.md" }).first()).toBeVisible();
 
-      const ci = page.getByRole("link", { name: "CI", exact: true });
-      await expect(ci).toHaveAttribute("href", new RegExp(`[?&]tl=${slug}`));
-      await ci.click();
-      await page.waitForURL((url) => url.pathname.endsWith("/ci"));
-      assert.equal(new URL(page.url()).searchParams.get("tl"), slug, "Navigation keeps the scope");
-      await expect(banner).toContainText(`Runs on ${bookmark}`);
-
-      await page.goto(`/${fullName}/knowledge?timeline=${slug}`);
-      await page.waitForURL((url) => url.searchParams.get("tl") === slug);
-      assert.equal(new URL(page.url()).searchParams.get("timeline"), null);
-      await expect(banner).toContainText(name);
-
-      // CORE-86: the graph's inspector flags it experimental, which the banner shows,
-      // and the Stalled view leaves it out.
       await page.goto(`/tracker/${fixtures.tracker.owner}/timelines?tl=${slug}`);
       const flag = page.getByRole("switch", { name: "Experimental" });
       await expect(flag).toHaveAttribute("aria-checked", "false");
       await flag.click();
       await expect(flag).toHaveAttribute("aria-checked", "true");
-      await expect(banner.getByText("Experimental", { exact: true })).toBeVisible();
-      const listed = await json<{ timelines: { slug: string; experimental: boolean }[] }>(
-        timelines,
-        ownerToken,
-      );
-      assert.equal(listed.timelines.find((t) => t.slug === slug)?.experimental, true);
-      await page.getByRole("button", { name: /^Stalled/ }).click();
-      await expect(page.getByText(/Experimental timelines are left out/)).toBeVisible();
+      await expect
+        .poll(async () => {
+          const listed = await json<{ timelines: { slug: string; experimental: boolean }[] }>(
+            timelines,
+            ownerToken,
+          );
+          return listed.timelines.find((t) => t.slug === slug)?.experimental;
+        })
+        .toBe(true);
 
       await banner.getByRole("link", { name: "Back to main" }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === "main");
       await expect(banner).toHaveCount(0);
-      await page.screenshot({ path: join(ctx.artifacts, "browser-timeline-switcher.png") });
       await context.tracing.stop();
-      record({ timeline: slug, scoped: ["code", "ci", "knowledge", "timelines"], flagged: true });
+      record({ timeline: slug, bookmark, flagged: true });
     } catch (error) {
       await page
         .screenshot({ path: join(ctx.artifacts, "browser-timeline-failure.png"), fullPage: true })

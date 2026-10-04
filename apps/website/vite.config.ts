@@ -2,12 +2,15 @@ import { cloudflare } from "@cloudflare/vite-plugin";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite-plus";
-import { playwright } from "vite-plus/test/browser-playwright";
 import { browserCommands } from "./vite/browser-commands.ts";
 import { ciRunners } from "./vite/ci-runners.ts";
 import { developmentEnvironment } from "./vite/environment.ts";
 
 const local = developmentEnvironment(process.env);
+// Only Vitest needs the browser provider: dev and build don't load Playwright.
+const browserProvider = process.env.VITEST
+  ? (await import("vite-plus/test/browser-playwright")).playwright
+  : undefined;
 
 // Remote bindings authenticate through the plugin's bundled wrangler unless this
 // is set; with it, they reuse the `cf auth login` session instead.
@@ -75,7 +78,7 @@ export default defineConfig({
             // Chromium's headless shell, which `vp run agent setup` and CI install.
             headless: true,
             // Touch on, so tests can tap as well as click.
-            provider: playwright({ contextOptions: { hasTouch: true } }),
+            provider: browserProvider?.({ contextOptions: { hasTouch: true } }),
             instances: [{ browser: "chromium" }],
             viewport: { width: 1280, height: 900 },
             screenshotFailures: false,

@@ -1583,9 +1583,11 @@ that a workspace never shows a lost repository through composition, related
 links, lineage, lookup or totals; that a deleted repository leaves no Atlas
 rows and nothing for a namesake; that building and failed projections are never
 readable while pinned pages keep their snapshot; and that no browse path
-touches a model, Vectorize or AI Search (those bindings throw). The browser
-E2E `browser-atlas-revocation-clears-the-open-view` removes a collaborator
-while their Knowledge tab is open.
+touches a model, Vectorize or AI Search (those bindings throw). The
+browser-mode test `src/routes/repo/Atlas.browser.test.tsx` removes a
+collaborator while their Knowledge tab is open and checks the view clears; the
+E2E `atlas-revocation-reads-like-a-missing-repository` checks the same through
+real tokens against the dev server.
 
 **Atlas scale gates and benchmark** (CORE-177, PRD gate 18). Two layers.
 `worker/atlas/scale.test.ts` runs in every `vp test` and holds what is

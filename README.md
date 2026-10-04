@@ -189,21 +189,23 @@ vp run agent test-ai         # explicit paid knowledge/wiki/search verification
 TypeScript projects, recursive unit/integration tests, recursive builds, then the
 non-AI real-service end-to-end suite. Test commands always execute; Cargo may reuse
 compiled outputs, not test results. Missing credentials, required provider outages
-or an unavailable browser fail the command.
+or an unavailable browser fail the command. The website's `vp test` includes
+browser-mode tests in headless Chromium; UI behaviour belongs there, and E2E
+keeps a few real-stack journeys (apps/website/README.md, "Testing").
 
 The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
 
-| Boundary                       | Observable behavior                                                                                                                                |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                    |
-| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                   |
-| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                       |
-| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance |
-| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                               |
-| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries                                         |
-| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target        |
+| Boundary                       | Observable behavior                                                                                                                                                               |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                   |
+| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                  |
+| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                      |
+| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                |
+| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                              |
+| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source |
+| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                       |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation
