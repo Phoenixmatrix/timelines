@@ -793,14 +793,28 @@ quality and real-service E2E gate in addition to this semantic-specific smoke.
 ## Distributed issue tracker
 
 Open `/tracker` from the global navigation. Select an account, create a team,
-and capture a title-only issue with the default **Create** action. The adjacent
-arrow opens **Add details**: the dialog carries over the title draft, selected
-team and current workspace scope, and lets you set a Markdown description, type,
-status, priority, assignee and workspaces. **Create and edit** saves the issue and immediately
-opens the existing editor for acceptance criteria, labels and relationships,
+and capture an issue with the default **Create** action. The compact type selector
+supports Bug, Research / investigation, and the other existing issue types.
+Prefix a title with `(tag)`, or several `(tag) (another tag)` groups, to apply
+catalog tags without retaining the prefixes in the title. Matching ignores case
+and reuses the catalog spelling. Unknown tags offer **Define tag**; creation
+waits until those definitions are accepted. Definitions remain drafts until the
+issue saves successfully. Parentheses elsewhere remain ordinary title text.
+The adjacent arrow opens **Add details**: the dialog carries the parsed title,
+tags, type, selected team and workspace scope, and adds a Markdown description,
+status, priority and assignee. **Create and edit** saves the issue and immediately
+opens the existing editor for acceptance criteria, tags and relationships,
 including from the blocker graph. Rejected submissions keep the draft; an
 unconfirmed submission stays open with an idempotent retry rather than creating
 another issue.
+
+The **Tags** picker searches the tracker's shared catalog and offers **Create tag**
+for a new name. Selecting or removing a tag in the issue editor saves immediately;
+in the creation dialog it remains part of the unsaved draft. Names are 1–100
+characters without NUL. Definitions persist after their last issue assignment is
+removed, and include tags used in timelines. Existing issue labels are migrated
+into this catalog. The API and CLI continue to call issue tags `labels`; CLI
+replicas refresh their snapshot once to pick up the backfilled catalog.
 
 The workbench keeps the list, board or blocker graph beside the selected issue;
 phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
@@ -1011,7 +1025,7 @@ read as `agent_decides`.
   even after the editor closes. Preview controls remain usable, and typing during
   a pending save keeps newer text until its own versioned save completes.
   The complete **Edit issue** form stays open while moving between fields.
-  Text fields (including labels) save on blur; selects, the parent picker, and
+  Text fields save on blur; tag selection/removal, selects, the parent picker, and
   workspace checkboxes save immediately. Saves are serialized, preserving edits
   made while an earlier request is running, including when **Done** closes the
   form before either request finishes. The editor shows Updating, Updated, or

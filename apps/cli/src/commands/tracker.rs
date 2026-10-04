@@ -384,7 +384,8 @@ fn safe_owner(owner: &str) -> Result<()> {
 }
 // Version 1 includes creator backfill, which did not produce change-feed events.
 // Version 2 includes timelines and their events (asked for with `timelines=1`).
-const SNAPSHOT_SCHEMA: &str = "2";
+// Version 3 includes the durable tag catalog, backfilled without feed events.
+const SNAPSHOT_SCHEMA: &str = "3";
 
 struct Replica {
     db: Connection,
@@ -815,6 +816,23 @@ fn timeline_collection(kind: &str) -> Option<&'static str> {
 }
 fn apply_event(snapshot: &mut Value, event: &Value) -> Result<()> {
     let kind = event["entityType"].as_str().unwrap_or("");
+    if kind == "issue" {
+        let labels = snapshot["labels"]
+            .as_array_mut()
+            .ok_or_else(|| GmError::new("protocol_error", "Missing tracker label catalog."))?;
+        let mut added = false;
+        for entity in [&event["entity"], &event["view"]["entity"]] {
+            for label in entity["labels"].as_array().into_iter().flatten() {
+                if label.is_string() && !labels.contains(label) {
+                    labels.push(label.clone());
+                    added = true;
+                }
+            }
+        }
+        if added {
+            labels.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+    }
     let table = if let Some(table) = collection(kind) {
         table
     } else if let Some(table) = timeline_collection(kind) {
@@ -2548,7 +2566,46 @@ mod tests {
     }
 
     fn snapshot() -> Value {
-        json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+        json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"labels":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+    }
+    #[test]
+    fn tag_catalog_retains_removed_and_timeline_only_definitions() {
+        let mut s = snapshot();
+        s["labels"] = json!(["existing"]);
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"a", "entity":null,
+                "view":{"entity":{"id":"a","labels":["new"]}}
+            }),
+        )
+        .unwrap();
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"a", "entity":null,
+                "view":{"entity":{"id":"a","labels":[]}}
+            }),
+        )
+        .unwrap();
+        assert_eq!(s["labels"], json!(["existing", "new"]));
+        assert_eq!(s["issues"], json!([]));
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"b", "entity":{"id":"b","labels":["main"]}
+            }),
+        )
+        .unwrap();
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"b", "entity":null
+            }),
+        )
+        .unwrap();
+        assert_eq!(s["labels"], json!(["existing", "main", "new"]));
+        assert_eq!(s["issues"], json!([]));
     }
     #[test]
     fn creator_is_unknown_offline_and_immutable_after_confirmation() {

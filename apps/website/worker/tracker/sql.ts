@@ -24,6 +24,7 @@ export interface TrackerDatabase {
   teams: EntityRow;
   workspaces: EntityRow;
   issues: EntityRow;
+  tracker_labels: { name: string };
   links: EntityRow;
   comments: EntityRow;
   requests: EntityRow;

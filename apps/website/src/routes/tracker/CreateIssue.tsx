@@ -16,6 +16,7 @@ import {
   TextField,
 } from "../../components/ui.tsx";
 import type { MutationOutcome } from "./IssueDetail.tsx";
+import { LabelPicker } from "./Labels.tsx";
 import type { TimelinePolicy } from "../../../shared/timelines.ts";
 import {
   CloseReasonField,
@@ -31,6 +32,8 @@ import {
 export function CreateIssue({
   snapshot,
   initialTitle,
+  initialType,
+  initialLabels,
   initialTeam,
   initialWorkspaces,
   busy,
@@ -41,6 +44,8 @@ export function CreateIssue({
 }: {
   snapshot: Snapshot;
   initialTitle: string;
+  initialType: Issue["type"];
+  initialLabels: string[];
   initialTeam: string;
   initialWorkspaces: string[];
   busy: boolean;
@@ -52,7 +57,8 @@ export function CreateIssue({
   const [title, setTitle] = useState(initialTitle);
   const [teamId, setTeamId] = useState(initialTeam);
   const [description, setDescription] = useState("");
-  const [type, setType] = useState<Issue["type"]>("task");
+  const [type, setType] = useState<Issue["type"]>(initialType);
+  const [labels, setLabels] = useState(initialLabels);
   const [status, setStatus] = useState<Issue["status"]>("todo");
   const [closeReason, setCloseReason] = useState<IssueCloseReason | null>(null);
   const [priority, setPriority] = useState(2);
@@ -81,8 +87,8 @@ export function CreateIssue({
           >
             <Dialog.Title className="mk-dialog-title">Create an issue</Dialog.Title>
             <Dialog.Description className="mk-dialog-desc text-body-sm">
-              Add context now. After creation, continue in the editor for acceptance criteria,
-              labels, and relationships.
+              Add context now. After creation, continue in the editor for acceptance criteria and
+              relationships.
             </Dialog.Description>
             <form
               className="mt-5"
@@ -106,6 +112,7 @@ export function CreateIssue({
                   timelinePolicy,
                   assigneeId: assigneeId || null,
                   workspaceIds,
+                  labels,
                 });
                 if (!result.ok) setError(result.error);
               }}
@@ -201,6 +208,11 @@ export function CreateIssue({
                     }}
                   />
                 </div>
+                <LabelPicker
+                  options={[...snapshot.labels, ...initialLabels]}
+                  values={labels}
+                  onChange={setLabels}
+                />
                 <MultiCheck
                   label="Workspaces"
                   options={snapshot.workspaces.filter((workspace) => !workspace.archived)}

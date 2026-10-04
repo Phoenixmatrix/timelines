@@ -50,6 +50,25 @@ function setup() {
 }
 
 describe("timeline views of the tracker", () => {
+  test("shares timeline-only tag definitions with main and backfills timeline history", () => {
+    const t = setup();
+    t.fork("tags");
+    t.fork("other");
+    t.mutate("tags", {
+      kind: "issue.create",
+      id: "tagged",
+      data: { teamId: "team", title: "Only here", labels: ["timeline-only"] },
+    });
+    t.update("tags", "tagged", { labels: [] });
+    expect(t.view().issues).toEqual([]);
+    expect(t.view().labels).toEqual(["timeline-only"]);
+    expect(t.view("other").labels).toEqual(["timeline-only"]);
+    t.db.exec("DROP TABLE tracker_labels; DELETE FROM tracker_migrations WHERE name = 'labels-v1'");
+    const storage = durableStorage(t.db);
+    const reopened = new TrackerStore(storage.sql, storage.transactionSync);
+    expect(reopened.snapshot(t.access).labels).toEqual(["timeline-only"]);
+    expect(reopened.snapshot(t.access, "tags").issues[0]!.labels).toEqual([]);
+  });
   test("an issue made in a timeline is the timeline's, and absent from main", () => {
     const t = setup();
     const search = t.fork("search");

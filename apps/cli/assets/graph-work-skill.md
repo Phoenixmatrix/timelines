@@ -117,9 +117,10 @@ has no convention, use these lowercase defaults:
 - `infrastructure`: deployment, CI/CD, networking and runtime operations.
 - `documentation`: user or developer documentation.
 
-These are suggested values for the existing issue `labels` field, not a
-registered catalog or an enforced list. Use an established project-specific
-label when needed; avoid synonyms, case variants and speculative areas. For
+These are suggested values for the existing issue `labels` field, not an
+enforced list. Successful assignments register names in the tracker's shared
+tag catalog. Reuse an established project-specific label when needed; avoid
+synonyms, case variants and speculative areas. For
 example, a keyboard-navigation fix needs `ux` and `frontend`; a service schema
 migration needs `backend` and `data`. Do not add `architecture` to every code
 change or `testing` merely because every issue should be verified.

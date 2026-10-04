@@ -300,6 +300,8 @@ export interface Snapshot {
   agents: TrackerAgent[];
   teams: Team[];
   workspaces: Workspace[];
+  /** Defined tags, shared across timelines and retained after their last use. */
+  labels: string[];
   issues: Issue[];
   links: Link[];
   comments: Comment[];

@@ -1,5 +1,6 @@
 import type {
   EntityType,
+  Issue,
   MutationResult,
   Snapshot,
   TrackerEvent,
@@ -44,8 +45,15 @@ export function acknowledge(snapshot: Snapshot, result: MutationResult): Snapsho
   if (result.cursor <= snapshot.cursor) return snapshot;
   const apply = <T extends NonNullable<TrackerEvent["entity"]>>(current: T[], type: EntityType) =>
     updated(current, type, result.events, snapshot.cursor, !!snapshot.timeline);
+  const labels = new Set(snapshot.labels);
+  for (const event of result.events) {
+    if (event.entityType !== "issue" || event.cursor <= snapshot.cursor) continue;
+    for (const entity of [event.entity, event.view?.entity])
+      for (const label of (entity as Issue | null | undefined)?.labels ?? []) labels.add(label);
+  }
   return {
     ...snapshot,
+    labels: [...labels].sort(),
     teams: apply(snapshot.teams, "team"),
     workspaces: apply(snapshot.workspaces, "workspace"),
     issues: apply(snapshot.issues, "issue"),

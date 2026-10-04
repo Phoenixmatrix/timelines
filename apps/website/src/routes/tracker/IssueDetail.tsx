@@ -47,6 +47,7 @@ import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
+import { LabelPicker } from "./Labels.tsx";
 
 export type MutationOutcome =
   | { ok: true; events: TrackerEvent[] }
@@ -67,10 +68,10 @@ const fieldNames: Record<keyof IssueFields, string> = {
   assigneeId: "Assignee",
   parentId: "Parent issue",
   workspaceIds: "Workspaces",
-  labels: "Labels",
+  labels: "Tags",
 };
 const fieldKeys = Object.keys(fieldNames) as (keyof IssueFields)[];
-const textFields = new Set<keyof IssueFields>(["title", "description", "acceptance", "labels"]);
+const textFields = new Set<keyof IssueFields>(["title", "description", "acceptance"]);
 const fieldsOf = (issue: Issue): IssueFields => ({
   title: issue.title,
   description: issue.description,
@@ -890,11 +891,10 @@ export function IssueDetail({
               allowNone
               onChange={(value) => change("parentId", value || null)}
             />
-            <TextField
-              label="Labels (comma separated)"
-              value={draft.fields.labels.join(",")}
-              onChange={(event) => change("labels", event.target.value.split(","))}
-              onBlur={(event) => saveOnBlur(event, "labels")}
+            <LabelPicker
+              options={snapshot.labels}
+              values={draft.fields.labels}
+              onChange={(values) => change("labels", values)}
             />
           </div>
           <MultiCheck
@@ -1060,7 +1060,7 @@ export function IssueDetail({
           )}
           {issue.labels.length > 0 && (
             <>
-              <dt className="text-ink-faint">Labels</dt>
+              <dt className="text-ink-faint">Tags</dt>
               <dd className="m-0 flex min-w-0 flex-wrap items-center gap-1">
                 {issue.labels.map((label) => (
                   <span className="mk-chip mk-chip--tag" key={label}>

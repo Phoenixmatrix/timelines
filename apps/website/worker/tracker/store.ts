@@ -249,6 +249,7 @@ export class TrackerStore {
     sql.exec(`CREATE TABLE IF NOT EXISTS teams (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS tracker_labels (name TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS links (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -271,6 +272,27 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS event_timelines ON events(json_extract(data, '$.timelineId'));`);
     sql.exec(RETENTION_TABLES);
     initializeAudit(sql, transaction);
+    if (
+      !first(
+        this.sql,
+        tracker.selectFrom("tracker_migrations").select("name").where("name", "=", "labels-v1"),
+      )
+    ) {
+      transaction(() => {
+        // Timeline-only issues live in the event log. Include both views and
+        // history so an already-used definition does not disappear on upgrade.
+        sql.exec(`INSERT OR IGNORE INTO tracker_labels (name)
+          SELECT label.value FROM issues, json_each(issues.data, '$.labels') AS label
+          WHERE label.type = 'text'`);
+        sql.exec(`INSERT OR IGNORE INTO tracker_labels (name)
+          SELECT label.value FROM events, json_each(events.data, '$.entity.labels') AS label
+          WHERE json_extract(events.data, '$.entityType') = 'issue' AND label.type = 'text'`);
+        sql.exec(`INSERT OR IGNORE INTO tracker_labels (name)
+          SELECT label.value FROM events, json_each(events.data, '$.view.entity.labels') AS label
+          WHERE json_extract(events.data, '$.entityType') = 'issue' AND label.type = 'text';`);
+        run(sql, tracker.insertInto("tracker_migrations").values({ name: "labels-v1" }));
+      });
+    }
     this.timelines = new TimelineStore(sql, transaction, clock, (ids, reason, actorId) =>
       this.withdrawSuperseded(ids, reason, actorId),
     );
@@ -575,6 +597,18 @@ export class TrackerStore {
   }
   /** Append an event to the log, indexed for issue history. */
   private record(event: Omit<TrackerEvent, "cursor">): TrackerEvent {
+    if (event.entityType === "issue") {
+      for (const entity of [event.entity, event.view?.entity]) {
+        for (const name of (entity as Issue | null | undefined)?.labels ?? [])
+          run(
+            this.sql,
+            tracker
+              .insertInto("tracker_labels")
+              .values({ name })
+              .onConflict((oc) => oc.doNothing()),
+          );
+      }
+    }
     const cursor = one(
       this.sql,
       tracker
@@ -622,6 +656,9 @@ export class TrackerStore {
       agents: access.agents,
       teams: this.all("team"),
       workspaces: this.all("workspace"),
+      labels: all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
+        .map((row) => row.name)
+        .sort(),
       issues: this.all("issue"),
       links: this.all("link"),
       comments: this.all("comment"),
@@ -915,6 +952,9 @@ export class TrackerStore {
       agents: access.agents,
       teams: this.all<Team>("team"),
       workspaces: this.all<Workspace>("workspace"),
+      labels: all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
+        .map((row) => row.name)
+        .sort(),
       issues: this.all<Issue>("issue"),
       links: this.all<Link>("link"),
       comments: [],

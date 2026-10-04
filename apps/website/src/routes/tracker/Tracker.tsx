@@ -45,6 +45,7 @@ import {
 } from "react-router";
 import {
   fallbackTeam,
+  type IssueType,
   type Mutation,
   type MutationRequest,
   type MutationResult,
@@ -59,6 +60,8 @@ import { useViewer } from "../../lib/session.ts";
 import { timelineQuery, type trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
+import { parseCaptureTitle } from "./capture.ts";
+import { types, typeLabel } from "./ui.tsx";
 import { CREATE_INTENT, createIntentOf } from "../../palette/intents.ts";
 import {
   defaultsFromServer,
@@ -211,6 +214,12 @@ function Workbench({ data }: { data: TrackerView }) {
     [urlParams, defaults, snapshot],
   );
   const [title, setTitle] = useState("");
+  const [captureType, setCaptureType] = useState<IssueType>("task");
+  const [draftLabels, setDraftLabels] = useState<string[]>([]);
+  const captured = useMemo(
+    () => parseCaptureTitle(title, [...snapshot.labels, ...draftLabels]),
+    [title, snapshot.labels, draftLabels],
+  );
   const defaultTeam =
     (viewer ? fallbackTeam(snapshot, viewer.id) : null) ??
     snapshot.teams.find((team) => !team.archived)?.id ??
@@ -227,6 +236,8 @@ function Workbench({ data }: { data: TrackerView }) {
   // What the expanded creator starts with: the capture box's text, or a title
   // proposed from the palette (which leaves the capture box's draft alone).
   const [createTitle, setCreateTitle] = useState("");
+  const [createType, setCreateType] = useState<IssueType>("task");
+  const [createLabels, setCreateLabels] = useState<string[]>([]);
   const [editOnCreate, setEditOnCreate] = useState<string | null>(null);
   // The palette's Create issue hands off once, in router state (never the URL):
   // open the creator, then drop the intent so back or refresh can't replay it.
@@ -243,6 +254,8 @@ function Workbench({ data }: { data: TrackerView }) {
     });
     setCreateError("");
     setCreateTitle(intent.title);
+    setCreateType("task");
+    setCreateLabels([]);
     setCreateOpen(true);
     // Once per navigation that carries an intent.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -552,6 +565,7 @@ function Workbench({ data }: { data: TrackerView }) {
     const result = await mutate([{ kind: "issue.create", id, data: fields }]);
     if (result.ok) {
       setTitle("");
+      setDraftLabels([]);
       if (edit) {
         setCreateOpen(false);
         setEditOnCreate(id);
@@ -577,10 +591,21 @@ function Workbench({ data }: { data: TrackerView }) {
           event.preventDefault();
           if (busy || uncertain || !createTeam || !title.trim()) return;
           setCreateError("");
+          if (captured.error || captured.unknown.length || !captured.title) {
+            setCreateError(
+              captured.error ??
+                (captured.unknown.length
+                  ? "Define the new tags below before creating."
+                  : "Add an issue title after the tags."),
+            );
+            return;
+          }
           const result = await createIssue(
             {
               teamId: createTeam,
-              title: title.trim(),
+              title: captured.title,
+              type: captureType,
+              labels: captured.labels,
               workspaceIds: captureWorkspace ? [captureWorkspace.id] : [],
             },
             false,
@@ -600,12 +625,23 @@ function Workbench({ data }: { data: TrackerView }) {
           ]}
           onChange={(value) => setParam("captureTeam", value || null)}
         />
+        <SelectField
+          ariaLabel="Type for the new issue"
+          value={captureType}
+          className="w-28 shrink-0"
+          options={types.map((value) => ({
+            value,
+            label: value === "research" ? "Research / investigation" : typeLabel(value),
+          }))}
+          onChange={(value) => setCaptureType(value as IssueType)}
+        />
         <input
           ref={titleRef}
           aria-label="New issue title"
           aria-keyshortcuts={shortcuts ? "c n" : undefined}
+          aria-describedby="capture-tag-help"
           className="mk-input min-w-0 flex-1 basis-40"
-          placeholder="Capture an issue"
+          placeholder="(tag) Capture an issue"
           required
           maxLength={500}
           value={title}
@@ -640,7 +676,15 @@ function Workbench({ data }: { data: TrackerView }) {
                     onClick={() => {
                       if (busy || uncertain) return;
                       setCreateError("");
-                      setCreateTitle(title);
+                      if (captured.error || captured.unknown.length) {
+                        setCreateError(
+                          captured.error ?? "Define the new tags below before adding details.",
+                        );
+                        return;
+                      }
+                      setCreateTitle(captured.title);
+                      setCreateType(captureType);
+                      setCreateLabels(captured.labels);
                       setCreateOpen(true);
                     }}
                   >
@@ -651,6 +695,40 @@ function Workbench({ data }: { data: TrackerView }) {
             </Menu.Portal>
           </Menu.Root>
         </div>
+        <span id="capture-tag-help" className="sr-only">
+          Prefix the title with (tag) to apply a tag. Multiple prefixes are allowed. Define an
+          unknown tag below; new definitions are saved with the issue.
+        </span>
+        {(captured.labels.length > 0 || captured.unknown.length > 0) && (
+          <div
+            className="flex basis-full flex-wrap items-center gap-1.5"
+            aria-label="Capture tags"
+            aria-live="polite"
+          >
+            <span className="text-micro text-ink-muted">Tags</span>
+            {captured.labels.map((label) => (
+              <span
+                key={label}
+                className="mk-chip mk-chip--tag max-w-full whitespace-normal [overflow-wrap:anywhere]"
+              >
+                {label}
+              </span>
+            ))}
+            {captured.unknown.map((label) => (
+              <button
+                key={label}
+                type="button"
+                className="mk-btn mk-btn--ghost mk-btn--sm max-w-full whitespace-normal [overflow-wrap:anywhere]"
+                onClick={() => {
+                  setDraftLabels((labels) => [...labels, label]);
+                  setCreateError("");
+                }}
+              >
+                Define tag “{label}”
+              </button>
+            ))}
+          </div>
+        )}
       </form>
     </fieldset>
   );
@@ -796,6 +874,8 @@ function Workbench({ data }: { data: TrackerView }) {
         <CreateIssue
           snapshot={snapshot}
           initialTitle={createTitle}
+          initialType={createType}
+          initialLabels={createLabels}
           initialTeam={createTeam}
           initialWorkspaces={captureWorkspace ? [captureWorkspace.id] : []}
           busy={busy}

@@ -30,6 +30,7 @@ const snapshot = (issues: Issue[]): Snapshot => ({
   agents: [],
   teams: [],
   workspaces: [],
+  labels: [],
   issues,
   links: [],
   comments: [],
@@ -62,6 +63,20 @@ const result = (events: TrackerEvent[]): MutationResult => ({
 });
 
 describe("committed mutation acknowledgements", () => {
+  it("keeps definitions after removal and learns tags from timeline-only events on main", () => {
+    const before = snapshot([]);
+    before.labels = ["existing"];
+    const next = acknowledge(
+      before,
+      result([
+        event(11, "1", null, { view: { before: null, entity: issue("1", { labels: ["new"] }) } }),
+        event(12, "1", null, { view: { before: null, entity: issue("1", { labels: [] }) } }),
+      ]),
+    );
+    expect(next.labels).toEqual(["existing", "new"]);
+    expect(next.issues).toEqual([]);
+    expect(before.labels).toEqual(["existing"]);
+  });
   it("applies a batch's final issue state without losing unrelated issues or mutating the prior view", () => {
     const before = snapshot([issue("1"), issue("2")]);
     const saved = issue("1", { version: 2, description: "Server-confirmed description" });
