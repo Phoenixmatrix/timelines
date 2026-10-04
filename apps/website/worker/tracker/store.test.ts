@@ -9,6 +9,7 @@ import {
 } from "../../shared/tracker.ts";
 import { RESUME_WINDOW_SECONDS, TrackerStore, type Access, type SqlDatabase } from "./store.ts";
 import { trackerSql, transactional } from "../testing/tracker.ts";
+import type { QueueFailure } from "../../shared/merge-queue.ts";
 
 const databases: DatabaseSync[] = [];
 afterEach(() => {
@@ -64,6 +65,288 @@ function fixture() {
     },
   };
 }
+
+describe("trusted queue remediation", () => {
+  const failure: QueueFailure = {
+    queueId: "a".repeat(40),
+    commit: "a".repeat(40),
+    repo: "org/private",
+    attempt: 1,
+    stage: "gates",
+    kind: "build_failed",
+    reason: "Required build failed.",
+    runNumber: 42,
+    failedJobs: ["build"],
+    conflictPaths: [],
+    classificationModel: null,
+    repairModel: null,
+    occurredAt: "2026-10-01T00:00:00.000Z",
+  };
+  test("atomic evidence survives ambiguous replay without changing original ownership", () => {
+    const f = fixture();
+    f.issue("original");
+    const held = f.mutate({ kind: "issue.claim", id: "original", data: { agent: "worker" } })
+      .results[0]!;
+    const before = f.store.snapshot(f.access).issues[0]!;
+    const input = { repoId: "repo", issueIds: ["original"], failure };
+    const remediation = f.store.recordQueueFailure(f.access, input);
+    const saved = f.store.snapshot(f.access);
+    expect(f.reopen().recordQueueFailure(f.access, input)).toEqual(remediation);
+    expect(f.store.snapshot(f.access)).toEqual(saved);
+    expect(saved.issues.find((i) => i.id === "original")).toMatchObject({
+      status: before.status,
+      claim: before.claim,
+      assigneeId: before.assigneeId,
+      queueFailure: failure,
+    });
+    expect(saved.issues.find((i) => i.id === remediation.id)).toMatchObject({
+      type: "remediation",
+      priority: 0,
+      status: "todo",
+      parentId: null,
+      assigneeId: null,
+      queueFailure: failure,
+    });
+    expect(saved.links).toMatchObject([
+      { fromId: remediation.id, toId: "original", kind: "related" },
+    ]);
+    expect(
+      saved.comments.map((c) => [c.issueId, c.kind]).sort((a, b) => a[0]!.localeCompare(b[0]!)),
+    ).toEqual(
+      [
+        ["original", "evidence"],
+        [remediation.id, "evidence"],
+      ].sort((a, b) => a[0]!.localeCompare(b[0]!)),
+    );
+    expect(() =>
+      f.store.recordQueueFailure(f.access, {
+        ...input,
+        failure: { ...failure, reason: "Changed" },
+      }),
+    ).toThrow(/different evidence/);
+    f.mutate({
+      kind: "issue.complete",
+      id: "original",
+      data: { leaseToken: held.leaseToken!, evidence: "Original work verified independently" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((i) => i.id === "original")!.status).toBe("done");
+  });
+
+  test("a failed write rolls back originals, issue numbers, links, evidence and receipts", () => {
+    const f = fixture();
+    f.issue("original");
+    const before = f.store.snapshot(f.access);
+    f.db.exec(
+      "CREATE TRIGGER reject_evidence BEFORE INSERT ON comments BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END",
+    );
+    const input = { repoId: "repo", issueIds: ["original"], failure };
+    expect(() => f.store.recordQueueFailure(f.access, input)).toThrow(/storage unavailable/);
+    expect(f.store.snapshot(f.access)).toEqual(before);
+    f.db.exec("DROP TRIGGER reject_evidence");
+    expect(f.store.recordQueueFailure(f.access, input).key).toBe("ENG-2");
+  });
+
+  test("invalid failure evidence and missing originals leave no partial remediation", () => {
+    const f = fixture();
+    f.issue("original");
+    const before = f.store.snapshot(f.access);
+    for (const invalid of [
+      { ...failure, attempt: 0 },
+      { ...failure, runNumber: -1 },
+      { ...failure, occurredAt: "not-a-date" },
+      { ...failure, commit: "../main" },
+      { ...failure, failedJobs: Array.from({ length: 101 }, () => "build") },
+    ])
+      expect(() =>
+        f.store.recordQueueFailure(f.access, {
+          repoId: "repo",
+          issueIds: ["original"],
+          failure: invalid,
+        }),
+      ).toThrow();
+    expect(() =>
+      f.store.recordQueueFailure(f.access, {
+        repoId: "repo",
+        issueIds: ["original", "missing"],
+        failure,
+      }),
+    ).toThrow(/not found/);
+    expect(f.store.snapshot(f.access)).toEqual(before);
+  });
+
+  test("distinct attempts retain history and delayed callbacks cannot erase newer failure", () => {
+    const f = fixture();
+    f.issue("original");
+    const input = { repoId: "repo", issueIds: ["original"], failure };
+    const first = f.store.recordQueueFailure(f.access, input);
+    const later = { ...failure, attempt: 2, runNumber: 43, occurredAt: "2026-10-01T01:00:00Z" };
+    const second = f.store.recordQueueFailure(f.access, { ...input, failure: later });
+    expect(second.id).not.toBe(first.id);
+    expect(f.store.recordQueueFailure(f.access, input)).toEqual(first);
+    f.store.recordQueueFailure(f.access, { ...input, failure: { ...failure, stage: "merge" } });
+    const snapshot = f.store.snapshot(f.access);
+    expect(snapshot.issues.find((i) => i.id === "original")!.queueFailure).toEqual(later);
+    expect(
+      snapshot.comments
+        .filter((c) => c.issueId === "original")
+        .map((c) => JSON.parse(c.body.split("\n\n")[1]!).runNumber)
+        .sort((a, b) => a - b),
+    ).toEqual([42, 42, 43]);
+    const history = f.store.history(f.access, "original", null, 100);
+    expect(history.events.filter((e) => e.entityType === "comment")).toHaveLength(3);
+  });
+
+  test("unlinked failures reuse MERGE and P0 next grants a fenced normal lease", () => {
+    const f = fixture();
+    f.issue("normal");
+    const remediation = f.store.recordQueueFailure(f.access, {
+      repoId: "repo",
+      issueIds: [],
+      failure,
+    });
+    const second = f.store.recordQueueFailure(f.access, {
+      repoId: "repo",
+      issueIds: [],
+      failure: { ...failure, attempt: 2 },
+    });
+    expect([remediation.key, second.key]).toEqual(["MERGE-1", "MERGE-2"]);
+    expect(f.store.snapshot(f.access).teams.filter((team) => team.key === "MERGE")).toHaveLength(1);
+    const next = f.mutate({ kind: "issue.next", id: "pick", data: { agent: "fixer" } }).results[0]!;
+    expect([remediation.id, second.id]).toContain(next.issueId);
+    expect(typeof next.leaseToken).toBe("string");
+    expect(() =>
+      f.mutate({
+        kind: "issue.complete",
+        id: next.issueId!,
+        data: { leaseToken: "forged", evidence: "Pretend" },
+      }),
+    ).toThrow();
+    f.mutate({
+      kind: "issue.complete",
+      id: next.issueId!,
+      data: { leaseToken: next.leaseToken!, evidence: "Build rerun succeeded" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((i) => i.id === next.issueId)!.status).toBe(
+      "done",
+    );
+  });
+
+  test("read-only metadata cannot be forged and admission enforces main visibility and team scope", () => {
+    const f = fixture();
+    f.issue("original");
+    expect(f.store.snapshot(f.access).issues[0]!.queueFailure).toBeUndefined();
+    for (const mutation of [
+      {
+        kind: "issue.create",
+        id: "forged",
+        data: { teamId: "team", title: "Fake", queueFailure: failure },
+      },
+      { kind: "issue.update", id: "original", expectedVersion: 1, data: { queueFailure: failure } },
+    ])
+      expect(() => f.mutate(mutation as Mutation)).toThrow(/Unknown field: queueFailure/);
+    expect(f.store.validateQueueIssues(f.access, ["ENG-1", "original"])).toEqual(["original"]);
+    expect(() => f.store.validateQueueIssues(f.access, ["missing"])).toThrow(/not found/);
+    f.mutate({ kind: "team.update", id: "team", expectedVersion: 1, data: { memberIds: ["bob"] } });
+    expect(() =>
+      f.store.validateQueueIssues({ ...f.access, canAdmin: false }, ["original"]),
+    ).toThrow(/Only team members/);
+  });
+
+  test("remediation obeys assignment, ancestor leases and active claim boundaries", () => {
+    const f = fixture();
+    const remediation = f.store.recordQueueFailure(f.access, {
+      repoId: "repo",
+      issueIds: [],
+      failure,
+    });
+    f.mutate({
+      kind: "issue.update",
+      id: remediation.id,
+      expectedVersion: 1,
+      data: { assigneeId: "bob" },
+    });
+    expect(
+      f.mutate({ kind: "issue.next", id: "assigned", data: { agent: "fixer" } }).results[0]!
+        .issueId,
+    ).toBeUndefined();
+    f.issue("parent");
+    f.mutate({
+      kind: "issue.update",
+      id: remediation.id,
+      expectedVersion: 2,
+      data: { assigneeId: null, parentId: "parent" },
+    });
+    const parent = f.mutate({ kind: "issue.claim", id: "parent", data: { agent: "lead" } })
+      .results[0]!;
+    expect(() =>
+      f.mutate({ kind: "issue.claim", id: remediation.id, data: { agent: "unfenced" } }),
+    ).toThrow();
+    expect(
+      f.mutate({ kind: "issue.next", id: "under-lease", data: { agent: "fixer" } }).results[0]!
+        .issueId,
+    ).toBeUndefined();
+    const delegated = f.mutate({
+      kind: "issue.claim",
+      id: remediation.id,
+      data: { agent: "fixer", underToken: parent.leaseToken! },
+    }).results[0]!;
+    expect(typeof delegated.leaseToken).toBe("string");
+    expect(() =>
+      f.mutate({
+        kind: "issue.claim",
+        id: remediation.id,
+        data: { agent: "other", underToken: parent.leaseToken! },
+      }),
+    ).toThrow();
+    f.mutate({
+      kind: "issue.complete",
+      id: remediation.id,
+      data: { leaseToken: delegated.leaseToken!, evidence: "Verified repaired deployment" },
+    });
+    expect(f.store.snapshot(f.access).issues.find((i) => i.id === remediation.id)!.status).toBe(
+      "done",
+    );
+  });
+
+  test("failure metadata stays global through timeline edits and landing", () => {
+    const f = fixture();
+    f.issue("original");
+    f.store.timelines.create(f.access, {
+      slug: "work",
+      parent: null,
+      repos: [{ id: "repo", owner: "org", name: "private" }],
+      commits: { repo: "b".repeat(40) },
+    });
+    f.store.mutate(f.access, {
+      operationId: "timeline-edit",
+      timeline: "work",
+      mutations: [
+        {
+          kind: "issue.update",
+          id: "original",
+          expectedVersion: 1,
+          data: { title: "Timeline title" },
+        },
+      ],
+    });
+    const remediation = f.store.recordQueueFailure(f.access, {
+      repoId: "repo",
+      issueIds: ["original"],
+      failure,
+    });
+    expect(
+      f.store.snapshot(f.access, "work").issues.find((i) => i.id === "original"),
+    ).toMatchObject({ title: "Timeline title", queueFailure: failure });
+    expect(
+      f.store.snapshot(f.access, "work").issues.find((i) => i.id === remediation.id)!.queueFailure,
+    ).toEqual(failure);
+    f.store.landTimeline(f.access, "work");
+    expect(f.store.snapshot(f.access).issues.find((i) => i.id === "original")).toMatchObject({
+      title: "Timeline title",
+      queueFailure: failure,
+    });
+  });
+});
 
 describe("ticket audit history", () => {
   test("persists creator and authenticated agent identity, paginates without duplicates, and fences retries", () => {

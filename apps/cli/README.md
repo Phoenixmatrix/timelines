@@ -11,11 +11,89 @@ gm auth login --persona jun     # dev sign-in; or --token gmx_…
 gm clone orbit/engine && cd engine
 # edit files…
 gm commit -m "Add retry to fetch"
-gm push --sync                  # rebase onto the latest trunk, then land on main
+gm push --queue                 # explicitly submit for merge/gates; not landed yet
 ```
 
 `gm cli guide` prints the whole workflow in one page; it is written to be pasted
 into an AGENTS.md.
+
+## Queued pushes
+
+`gm push --queue [--issue KEY_OR_ID ...]` stages the selected commit and admits
+it to the repository's default-branch merge queue. It returns a queue ID, not a
+claim that main advanced, CI passed or deployment succeeded. Queue submission
+is explicit: ordinary `gm push`, `gm push --sync` and native Git pushes remain
+available for authorized queue recovery, subject to the pending-rewrite safety
+rule below for `gm push`.
+There is no automatic direct-push fallback after an admission error. A staging
+upload alone does not advance main. `--dry-run` does not upload or admit.
+
+```sh
+gm push --queue --issue ENG-1
+gm issue checkpoint ENG-1 'Queue: <returned-id>; source: <commit>; local tests: …; landing/deployment pending'
+gm queue show <returned-id>
+gm queue list --status failed
+gm queue wait <returned-id> --deploy --timeout 600
+```
+
+Queue IDs are the full 40-hex source commit IDs. After an uncertain network
+outcome, inspect that deterministic ID before retrying; preserve local work and
+do not assume the source landed. `gm queue` commands accept `-R owner/name`.
+`wait` fails on failure, cancellation or timeout; `--deploy` additionally waits
+for the final main pipeline, including coverage by a later run. A landed entry
+alone is not deployment proof. `gm queue cancel <id>` cancels pending work
+without rewinding main; `gm queue retry <id>` retries the same failed/cancelled
+source. Changed code needs a new `gm push --queue`. Mutating commands accept
+`--dry-run`.
+
+Queued changes remain editable. If you rewrite their **content** while an older
+revision is still queued, both `gm push --queue` and ordinary `gm push` refuse
+to race that older admission. Either wait for the original to land and run
+`gm sync`, or explicitly `gm queue cancel <old-id>` before pushing the rewrite.
+Nothing is cancelled automatically. A confirmed failed/cancelled admission no
+longer guards the rewrite; do not later retry that obsolete source. Metadata-only
+rewrites, unchanged queued revisions and independent descendants remain pushable.
+Sync preserves edits made after admission—including removals—while retaining
+unrelated newer main work and reporting real conflicts. If rewritten parents
+make the admitted revision ambiguous, sync stops without replacing local content;
+inspect the reported local/landed revisions and explicitly reconcile the parent
+changes before pushing. Admission receipts survive local undo and are scoped to
+the normalized API server, repository and source commit, including when origin
+switches to a fork or the same repository slug on another server.
+A definitive first-request authentication/permission/not-found
+rejection releases its receipt; transport and server uncertainty stay guarded.
+If the server cannot confirm cancellation, the error identifies the guarded
+change and queue ID; an unavailable API does not block unrelated pushes.
+Native Git cannot enforce this local guard: cancel or reconcile the older
+admission before using native Git to publish a rewrite too.
+
+Checkpoint the queue ID and outstanding verification, keep/renew the issue's
+lease, and work on independent, separately claimed work while it runs. Inspect
+queue state at work boundaries or the next invocation; do not busy-poll. Use a
+bounded wait when deliberately waiting to finish. `gm sync` later reconciles
+landed history; queue admission does not mark local commits immutable.
+Complete with honest commit, queue, CI and required deployment evidence only
+when the issue's actual acceptance is verified:
+`gm issue complete ENG-1 --evidence '…'`.
+
+Automatic failures create unassigned, top-level P0 `remediation` issues.
+Discover them with `gm issue ready --type remediation --all-teams`; use
+`gm issue list --type remediation --all-teams` to include held/blocked issues.
+Claim with normal `gm issue claim <issue>` or `gm issue next` in scope; a
+listing, missing token or uncertain response never grants ownership. Inspect
+`queueFailure` from `gm issue show <issue> --json`, the queue entry, and
+`gm runs show <number>` / `gm runs logs <number>` for the reported run. Fix,
+verify, queue the new commit with `--issue <remediation>`, checkpoint its ID,
+and resolve only after actual landing and required pipeline verification.
+Server-owned failure metadata survives tracker snapshots, replication and JSON
+output, including additional evidence fields; normal create/update/batch
+patches cannot write it. Old issues without this optional metadata still work.
+Failures do not block later independent submissions.
+
+Queued push is refused in a timeline or with a bookmark/non-main target. Keep
+the timeline push/checkpoint/land workflow: an `approval` timeline requires a
+person's approval of its exact current checkpoint. Generic queue admission and
+direct-push recovery are not permission to bypass timeline approvals.
 
 ## Semantic changes
 
@@ -146,6 +224,7 @@ gm workspace create launch --name Launch
 gm issue create 'Search redesign' --team ENG --type prd \
   --description-file design.md --acceptance-file acceptance.md --workspace launch --label ux --label frontend
 gm issue ready --limit 10
+gm issue ready --type remediation --all-teams
 gm issue show ENG-1 --limit 20
 gm issue update ENG-1 --data '{"priority":1,"labels":["search"]}'
 gm issue link ENG-1 ENG-2 --kind blocks  # FROM blocks TO
@@ -659,9 +738,12 @@ gm context sync                                     # retries uploads a push cou
   known token shapes, private keys, `Bearer` values and `*_TOKEN=`/`*_SECRET=`
   style assignments are redacted. Rewriting the commit (`describe`, `squash`,
   rebases) carries the context to the new commit through its change ID.
-- **`gm push` uploads** the context of the commits it pushed, once each. A
-  failed upload never fails the push: it warns, and `gm context sync` sends
-  what's still pending.
+- **`gm push` uploads** the context of the commits it pushed, once each.
+  `gm push --queue` also uploads the selected source commits' context after
+  admission succeeds; neither admission nor a context upload means they landed.
+  A failed context upload never fails the push or admission: it warns, and
+  `gm context sync` sends what's still pending. Failed or uncertain admission
+  leaves context pending locally for an admission retry or `gm context sync`.
 - **Missing context warns, never blocks.** An agent's commit in a timeline
   without `--context` succeeds with a warning saying what to add.
 

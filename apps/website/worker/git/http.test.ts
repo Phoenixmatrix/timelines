@@ -10,14 +10,19 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import type { AppEnv } from "../auth.ts";
+import { hashToken, type AppEnv } from "../auth.ts";
 import { mintJobToken } from "../ci/registry.ts";
+import { queueMergeJob } from "../ci/queue-auth.ts";
+import { queueCandidateBranch } from "../../shared/merge-queue.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { gitBackend, run, serve } from "../testing/git-http.ts";
-import { gitHttp, landingPushRefusal } from "./http.ts";
+import { gitHttp, landingPushRefusal, queuePushRefusal } from "./http.ts";
 import { FLUSH, pkt } from "./pktline.ts";
+import { afterPush } from "./effects.ts";
+import { steps } from "../steps/api.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("./effects.ts", () => ({ afterPush: vi.fn() }));
 
 const ZERO = "0".repeat(40);
 const LANDING = "refs/heads/gitmatrix/landing/search";
@@ -48,13 +53,14 @@ function git(cwd: string, ...args: string[]) {
   }).trim();
 }
 
-async function setup() {
+async function setup(queue = false, changeId?: string) {
   const root = mkdtempSync(join(tmpdir(), "git-proxy-"));
   dirs.push(root);
   // Artifacts: a bare repository with main, the landing branch and a tag.
   const remote = join(root, "app.git");
   const work = join(root, "work");
   git(root, "init", "--quiet", "--bare", "-b", "main", remote);
+  git(root, "--git-dir", remote, "config", "uploadpack.allowFilter", "true");
   git(root, "init", "--quiet", "-b", "main", work);
   git(work, "remote", "add", "origin", remote);
   writeFileSync(join(work, "file"), "one\n");
@@ -65,6 +71,19 @@ async function setup() {
   const main = git(work, "rev-parse", "HEAD");
   writeFileSync(join(work, "file"), "merged\n");
   git(work, "commit", "--quiet", "-am", "the merge");
+  if (changeId) {
+    const body = git(work, "cat-file", "commit", "HEAD").replace(
+      "\n\n",
+      `\nchange-id ${changeId}\n\n`,
+    );
+    const commit = execFileSync("git", ["hash-object", "-t", "commit", "-w", "--stdin"], {
+      cwd: work,
+      encoding: "utf8",
+      input: `${body}\n`,
+      env: { ...process.env, ...GIT_ENV },
+    }).trim();
+    git(work, "update-ref", "HEAD", commit);
+  }
   const merge = git(work, "rev-parse", "HEAD");
 
   const sqlite = migratedDatabase();
@@ -84,6 +103,21 @@ async function setup() {
       ('build', 'push', 'app', 'build', '${landing}', 'running', 'sandbox'),
       ('done', 'old', 'app', 'land', '${landing}', 'succeeded', 'sandbox');
   `);
+  const candidate = queueCandidateBranch(main, 1);
+  if (queue) {
+    git(remote, "update-ref", `refs/heads/${candidate}`, main);
+    sqlite
+      .prepare(`INSERT INTO merge_queue
+      (repo_id,id,status,attempts,merge_run_id,base,data,created_at,updated_at)
+      VALUES ('app',?,'merging',1,'merge',?,'{}',datetime('now'),datetime('now'))`)
+      .run(main, main);
+    sqlite
+      .prepare(`UPDATE ci_runs SET queue_id=?, ref=?, trigger='manual' WHERE id='merge'`)
+      .run(main, candidate);
+    sqlite
+      .prepare(`UPDATE ci_jobs SET spec=? WHERE id='land'`)
+      .run(JSON.stringify({ steps: [], queue: { id: main, attempt: 1 } }));
+  }
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: {
@@ -163,6 +197,7 @@ async function setup() {
     sqlite,
     backend,
     main,
+    candidate,
     merge,
     token,
     ref,
@@ -330,5 +365,183 @@ describe("landingPushRefusal", () => {
         landingPushRefusal({ commands: [command(ref)], pushCert: false }, "search"),
         ref,
       ).toMatch(/only to/);
+  });
+});
+
+describe("a queue merge job's credential", () => {
+  test("fetches and publishes only its own candidate with real git", async () => {
+    const t = await setup(true);
+    const secret = await t.token();
+    const fetched = await t.gitWith(secret, "fetch", t.proxyUrl, "main");
+    expect(fetched.status, fetched.stderr).toBe(0);
+    const pushed = await t.gitWith(secret, "push", t.proxyUrl, `HEAD:refs/heads/${t.candidate}`);
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect(t.ref(`refs/heads/${t.candidate}`)).toBe(t.merge);
+    expect(t.ref("refs/heads/main")).toBe(t.main);
+    expect(await queueMergeJob(t.env.DB, secret, "orbit", "app", t.main)).toMatchObject({
+      ok: true,
+      queueId: t.main,
+      attempt: 1,
+      runId: "merge",
+      jobId: "land",
+      branch: t.candidate,
+    });
+  });
+
+  test("refuses other refs, deletion, mixed updates and other repositories before forwarding", async () => {
+    const t = await setup(true);
+    const secret = await t.token();
+    const own = `${t.main} ${t.merge} refs/heads/${t.candidate}`;
+    for (const commands of [
+      [`${t.main} ${t.merge} refs/heads/main`],
+      [`${t.main} ${t.merge} ${LANDING}`],
+      [`${t.main} ${ZERO} refs/heads/${t.candidate}`],
+      [own, `${t.main} ${t.merge} refs/heads/main`],
+    ]) {
+      const result = await t.receivePack(secret, commands);
+      expect(result.status).toBe(403);
+      expect(result.forwarded).toEqual([]);
+    }
+    expect((await t.infoRefs(secret, "git-upload-pack", "lib")).status).toBe(403);
+    expect((await t.receivePack(secret, [own], { repo: "lib" })).forwarded).toEqual([]);
+    expect(queuePushRefusal({ commands: [], pushCert: true }, t.candidate)).toMatch(/signed/);
+    expect(t.ref("refs/heads/main")).toBe(t.main);
+    expect(t.ref(`refs/heads/${t.candidate}`)).toBe(t.main);
+  });
+
+  test.each([
+    "UPDATE repos SET deleted_at=CURRENT_TIMESTAMP",
+    "UPDATE merge_queue SET status='cancelled'",
+    "UPDATE merge_queue SET attempts=2",
+    "UPDATE merge_queue SET merge_run_id='replacement'",
+    "UPDATE ci_runs SET status='cancelled' WHERE id='merge'",
+    "UPDATE ci_jobs SET status='queued' WHERE id='land'",
+    "UPDATE ci_runs SET commit_oid='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id='merge'",
+    "UPDATE ci_runs SET ref='main' WHERE id='merge'",
+    'UPDATE ci_jobs SET spec=\'{"steps":[],"queue":{"id":"wrong","attempt":1}}\' WHERE id=\'land\'',
+  ])("revokes reads, writes and resolution for stale authority: %s", async (mutation) => {
+    const t = await setup(true);
+    const secret = await t.token();
+    t.sqlite.exec(mutation);
+    expect((await t.infoRefs(secret, "git-upload-pack")).status).toBe(403);
+    const push = await t.receivePack(secret, [`${t.main} ${t.merge} refs/heads/${t.candidate}`]);
+    expect(push.status).toBe(403);
+    expect(await queueMergeJob(t.env.DB, secret, "orbit", "app", t.main)).toMatchObject({
+      ok: false,
+      status: 403,
+    });
+    expect(t.backend.requests).toEqual([]);
+  });
+
+  test("pins a combined source and keeps replacement attempts on separate refs", async () => {
+    const t = await setup(true);
+    const oldSecret = await t.token();
+    t.sqlite.prepare("UPDATE merge_queue SET data=?").run(JSON.stringify({ mergeSource: t.merge }));
+    expect(await queueMergeJob(t.env.DB, oldSecret, "orbit", "app")).toMatchObject({ ok: false });
+    t.sqlite.prepare("UPDATE ci_runs SET commit_oid=? WHERE id='merge'").run(t.merge);
+    expect(await queueMergeJob(t.env.DB, oldSecret, "orbit", "app")).toMatchObject({ ok: true });
+    const nextBranch = queueCandidateBranch(t.main, 2);
+    t.sqlite
+      .prepare(`INSERT INTO ci_runs
+      (id,repo_id,number,commit_oid,ref,trigger,status,queue_id)
+      VALUES ('replacement','app',4,?,?,'manual','running',?)`)
+      .run(t.merge, nextBranch, t.main);
+    t.sqlite
+      .prepare(`INSERT INTO ci_jobs
+      (id,run_id,repo_id,name,spec,status,runner)
+      VALUES ('replacement-job','replacement','app','land',?,'running','sandbox')`)
+      .run(JSON.stringify({ steps: [], queue: { id: t.main, attempt: 2 } }));
+    t.sqlite.exec("UPDATE merge_queue SET attempts=2,merge_run_id='replacement'");
+    const nextSecret = await t.token("replacement-job");
+    expect(await queueMergeJob(t.env.DB, oldSecret, "orbit", "app")).toMatchObject({ ok: false });
+    expect(await queueMergeJob(t.env.DB, nextSecret, "orbit", "app")).toMatchObject({
+      ok: true,
+      attempt: 2,
+      branch: nextBranch,
+    });
+    const oldBranch = await t.receivePack(nextSecret, [
+      `${t.main} ${t.merge} refs/heads/${t.candidate}`,
+    ]);
+    expect(oldBranch.status).toBe(403);
+    expect(oldBranch.forwarded).toEqual([]);
+    const pushed = await t.gitWith(nextSecret, "push", t.proxyUrl, `HEAD:refs/heads/${nextBranch}`);
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect(t.ref(`refs/heads/${nextBranch}`)).toBe(t.merge);
+    expect(t.ref(`refs/heads/${t.candidate}`)).toBe(t.main);
+  });
+
+  test("denies a different queue's resolve request", async () => {
+    const t = await setup(true);
+    expect(
+      await queueMergeJob(t.env.DB, await t.token(), "orbit", "app", "a".repeat(40)),
+    ).toMatchObject({ ok: false, status: 403 });
+  });
+});
+
+describe("ordinary queue source staging", () => {
+  test("records source provenance before context upload without starting ordinary effects", async () => {
+    const changeId = "queuestep01";
+    const t = await setup(false, changeId);
+    const secret = "gmx_proxy_staging_test";
+    t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
+    t.sqlite
+      .prepare(`INSERT INTO access_tokens
+      (id,user_id,name,scope,token_hash,last_four) VALUES ('pat','orbit','test','write',?,'test')`)
+      .run(await hashToken(secret));
+    vi.mocked(afterPush).mockClear();
+    const source = `refs/heads/gitmatrix/queue/${t.merge}`;
+    const staged = await t.gitWith(secret, "push", t.proxyUrl, `HEAD:${source}`);
+    expect(staged.status, staged.stderr).toBe(0);
+    expect(t.ref(source)).toBe(t.merge);
+    expect(t.ref("refs/heads/main")).toBe(t.main);
+    expect(afterPush).not.toHaveBeenCalled();
+    expect(
+      t.sqlite
+        .prepare(
+          "SELECT change_id, first_commit_oid, last_commit_oid FROM change_refs WHERE repo_id = 'app' AND ref = ?",
+        )
+        .all(source),
+    ).toEqual([{ change_id: changeId, first_commit_oid: t.merge, last_commit_oid: t.merge }]);
+    const context = new Hono<AppEnv>();
+    context.use("*", async (c, next) => {
+      c.set("actor", { id: "orbit", slug: "orbit", displayName: "Orbit", isSiteAdmin: false });
+      await next();
+    });
+    context.route("/api/repos/:owner/:name/steps", steps);
+    const uploaded = await context.request(
+      "/api/repos/orbit/app/steps",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          changeId,
+          commitOid: t.merge,
+          summary: "Queued source context",
+          committedAt: "2026-10-04T00:00:00.000Z",
+          why: "Keep provenance while expensive staging effects remain disabled.",
+        }),
+      },
+      t.env,
+    );
+    expect(uploaded.status).toBe(201);
+    expect(await uploaded.json()).toMatchObject({
+      commitOid: t.merge,
+      verified: true,
+      context: { why: "Keep provenance while expensive staging effects remain disabled." },
+    });
+    const direct = await t.gitWith(secret, "push", t.proxyUrl, "HEAD:refs/heads/main");
+    expect(direct.status, direct.stderr).toBe(0);
+    expect(t.ref("refs/heads/main")).toBe(t.merge);
+    expect(afterPush).toHaveBeenCalledTimes(1);
+    vi.mocked(afterPush).mockClear();
+    const mixed = await t.gitWith(
+      secret,
+      "push",
+      t.proxyUrl,
+      `HEAD:refs/heads/gitmatrix/queue/${t.main}`,
+      "HEAD:refs/heads/feature",
+    );
+    expect(mixed.status, mixed.stderr).toBe(0);
+    expect(t.ref("refs/heads/feature")).toBe(t.merge);
+    expect(afterPush).toHaveBeenCalledTimes(1);
   });
 });

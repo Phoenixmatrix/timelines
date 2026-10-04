@@ -17,6 +17,7 @@ import { waitForIndexVisibility, type VisibilityReport } from "./index-visibilit
 import { searchItemStatus } from "./search-item-status.ts";
 import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
+import { runQueueAiE2E } from "./queue-ai-e2e.ts";
 
 interface GatewayLog {
   id: string;
@@ -810,7 +811,7 @@ export async function runProviderE2E(
           const composer = page.getByRole("textbox", { name: "Message the assistant" });
           const title = `Approval continuity ${randomBytes(4).toString("hex")}`;
           await composer.fill(
-            `Use create_issue to create exactly one task in owner ${persona}, team ${teamKey}, titled "${title}". Request my approval before creating it, then open the new issue.`,
+            `Call create_issue now to propose exactly one task in owner ${persona}, team ${teamKey}, titled "${title}". The tool's built-in approval card must obtain my approval before the write executes; do not ask for a separate conversational confirmation. After I approve that card, open the new issue.`,
           );
           await page.getByRole("button", { name: "Send", exact: true }).click();
           await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
@@ -1697,9 +1698,9 @@ export async function runProviderE2E(
       let after: Inventory | undefined;
       await waitFor("repository-deletion-done", 15 * 60_000, async () => {
         after = await inventoryOf(fixture);
+        deletionEvidence.after = after;
         return after.deletion?.phase === "done" && after.vectors === 0 && after.searchItems === 0;
       });
-      deletionEvidence.after = after;
       assert.equal(after!.repo, null);
       assert.deepEqual(after!.d1, {}, "No D1 row names the deleted repository");
       assert.deepEqual(after!.registry, { packageSources: 0, publishes: 0 });
@@ -1719,13 +1720,15 @@ export async function runProviderE2E(
       }
 
       enter("repository-orphan-sweep");
-      await atlas;
+      const atlasError = await atlas;
+      if (atlasError) throw atlasError;
       const planted = await dev<{
         repoId: string;
         artifactsName: string;
         itemId: string | null;
         vectorId: string | null;
       }>("/repo-orphans", "POST", { action: "plant" });
+      deletionEvidence.planted = planted;
       assert(planted.itemId && planted.vectorId, "An orphan was planted in each provider");
       // Vectorize applies upserts asynchronously: the orphan must be findable first.
       await waitFor("repository-orphan-planted", 300_000, async () => {
@@ -1755,7 +1758,32 @@ export async function runProviderE2E(
           orphan.deletion?.phase === "done" && orphan.vectors === 0 && orphan.searchItems === 0
         );
       });
-      deletionEvidence.orphan = orphan;
+      enter("queue-real-conflict-repair");
+      // Run last: Atlas and the orphan sweep's real embedding have finished
+      // before the queue usage window begins. Keep the prior AI policy intact
+      // through deletion; only these queue fixtures disable background inference.
+      await api(settingsPath, "PATCH", {
+        features: { knowledge: false, wiki: false, atlas: false, releaseNotes: false },
+        models: { classification: "clef", task: "gemma-4-26b-a4b-it" },
+      });
+      const queueEvidence: Record<string, unknown> = { outcome: "running" };
+      evidence.queue = queueEvidence;
+      await runQueueAiE2E(ctx, fixtures, queueEvidence);
+      await waitFor("queue-gateway-evidence", 120_000, async () => {
+        const logs = await gatewayLogs(owned, String(queueEvidence.startedAt), "knowledge");
+        queueEvidence.usage = logs;
+        const successful = logs.filter((log) => log.success && !log.cached);
+        const repair = successful.filter((log) => log.model.includes("gemma-4-26b"));
+        const classifier = successful.filter((log) => log.model.toLowerCase().includes("clef"));
+        assert(logs.length <= 8, "Queue submissions must not create an inference retry loop");
+        if (!repair.length || !classifier.length) return false;
+        assert.equal(repair.length, 1, "Only the safe documentation conflict may invoke repair");
+        assert(
+          repair[0]!.tokensIn > 0 && repair[0]!.tokensOut > 0,
+          "Real repair must record token usage",
+        );
+        return true;
+      });
     }
     evidence.outcome = "passed";
   } catch (error) {

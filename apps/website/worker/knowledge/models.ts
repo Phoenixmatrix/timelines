@@ -61,13 +61,13 @@ function rateLimited(error: unknown): boolean {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Call a model with a deadline, waiting out Workers AI rate limits with backoff. */
-const ai = (env: Env): LooseAi => ({
+const ai = (env: Env, rateLimitRetries = RATE_LIMIT_RETRIES): LooseAi => ({
   async run(model, inputs) {
     for (let attempt = 0; ; attempt++) {
       try {
         return await once(env, model, inputs);
       } catch (error) {
-        if (!rateLimited(error) || attempt >= RATE_LIMIT_RETRIES) throw error;
+        if (!rateLimited(error) || attempt >= rateLimitRetries) throw error;
         // Per-minute limits: back off for most of a window, with jitter so
         // parallel callers don't all come back at once.
         await sleep(Math.min(60_000, 5_000 * 2 ** attempt) * (0.5 + Math.random()));
@@ -114,10 +114,16 @@ async function chat(
   env: Env,
   tier: "fast" | "reason",
   messages: { role: "system" | "user"; content: string }[],
-  options: { json: boolean; maxTokens: number; think: boolean; model?: string | undefined },
+  options: {
+    json: boolean;
+    maxTokens: number;
+    think: boolean;
+    model?: string | undefined;
+    rateLimitRetries?: number | undefined;
+  },
 ): Promise<{ text: string; usage: Usage }> {
   const model = options.model ?? MODELS[tier];
-  const result = (await ai(env).run(model, {
+  const result = (await ai(env, options.rateLimitRetries).run(model, {
     messages,
     max_tokens: options.maxTokens,
     ...(options.json ? { response_format: { type: "json_object" } } : {}),
@@ -157,7 +163,13 @@ export async function chatJson<T>(
   tier: "fast" | "reason",
   system: string,
   user: string,
-  options: { maxTokens?: number; think?: boolean; attempts?: number; model?: string } = {},
+  options: {
+    maxTokens?: number;
+    think?: boolean;
+    attempts?: number;
+    model?: string;
+    rateLimitRetries?: number;
+  } = {},
 ): Promise<{ value: T; usage: Usage }> {
   const messages = [
     { role: "system" as const, content: system },
@@ -175,6 +187,7 @@ export async function chatJson<T>(
         maxTokens: options.maxTokens ?? 2000,
         think: options.think ?? false,
         model: options.model,
+        rateLimitRetries: options.rateLimitRetries,
       });
       tokens += usage.tokens;
       inputTokens =
@@ -242,10 +255,10 @@ export async function decide(
   env: Env,
   state: unknown,
   questions: Record<string, ClefQuestion>,
-  options: { flash?: boolean; model?: string } = {},
+  options: { flash?: boolean; model?: string; rateLimitRetries?: number } = {},
 ): Promise<Record<string, ClefAnswer>> {
   const model = options.flash ? MODELS.route : (options.model ?? MODELS.classify);
-  const result = (await ai(env).run(model, {
+  const result = (await ai(env, options.rateLimitRetries).run(model, {
     model: options.flash ? "clef-flash" : "clef",
     state,
     questions,

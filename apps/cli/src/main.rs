@@ -169,6 +169,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Fetch => out(f, network::fetch(ctx)),
         Command::Sync => out(f, network::sync(ctx)),
         Command::Push(a) => out(f, network::push(ctx, &a)),
+        Command::Queue(c) => out(f, commands::queue::run(ctx, &c)),
         Command::Timeline(c) => out(f, commands::timeline::run(ctx, &c)),
         Command::Context(commands::steps::ContextCommand::Sync) => {
             out(f, commands::steps::sync(ctx))

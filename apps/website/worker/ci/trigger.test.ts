@@ -4,7 +4,7 @@
 import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { jobPayload, loadJob } from "./jobs.ts";
-import { startRun } from "./trigger.ts";
+import { startRun, startWorkflow } from "./trigger.ts";
 
 const files = vi.hoisted(() => ({ ciYml: "" }));
 vi.mock("../objects.ts", () => ({
@@ -75,6 +75,33 @@ beforeEach(() => {
 });
 
 describe("preview runs", () => {
+  test("deletion fences new CI and workflow recovery but permits purge teardown", async () => {
+    const t = setup();
+    try {
+      const original = await t.start();
+      if (!("runId" in original)) throw new Error(original.skipped);
+      t.created.length = 0;
+      t.sqlite.exec("UPDATE repos SET deleted_at = CURRENT_TIMESTAMP WHERE id = 'repo'");
+      await startWorkflow(t.env, original.runId);
+      expect(t.created).toEqual([]);
+      await expect(
+        t.start({ commit: oid(10), trigger: "push", preview: undefined }),
+      ).rejects.toThrow();
+      expect(t.sqlite.prepare("SELECT commit_oid FROM ci_runs ORDER BY number").all()).toEqual([
+        { commit_oid: oid(9) },
+      ]);
+      const teardown = await t.start({
+        preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
+      });
+      if (!("runId" in teardown)) throw new Error(teardown.skipped);
+      expect(t.created).toEqual([teardown.runId]);
+      expect(t.jobs(teardown.runId).find((job) => job.status === "pending")?.name).toBe(
+        "preview-teardown",
+      );
+    } finally {
+      t.sqlite.close();
+    }
+  });
   test("a create run records its action, timeline and checkpoint, and runs only its job", async () => {
     const t = setup();
     const started = await t.start();
@@ -211,5 +238,61 @@ jobs:
     const job = await loadJob(t.env.DB, t.jobs(started.runId).find((j) => j.name === "gate")!.id);
     const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
     expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
+  });
+});
+
+describe("queue gates", () => {
+  test("a source staging ref never starts a pipeline, including a manual request", async () => {
+    const t = setup();
+    for (const trigger of ["push", "manual"] as const) {
+      expect(
+        await t.start({
+          branch: `gitmatrix/queue/${oid(9)}`,
+          trigger,
+          preview: undefined,
+        }),
+      ).toEqual({ skipped: expect.stringContaining("staging only") });
+    }
+    expect(t.created).toEqual([]);
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM ci_runs").get()).toEqual({ n: 0 });
+  });
+
+  test("a queue with no runnable landing gate is not an all-skipped success", async () => {
+    const t = setup();
+    files.ciYml = "jobs:\n  deploy:\n    if: trigger == 'push'\n    steps: [deploy]\n";
+    expect(
+      await t.start({
+        branch: `gitmatrix/landing/queue-${oid(9)}-1`,
+        trigger: "landing",
+        preview: undefined,
+        queueId: oid(9),
+        runId: "queue-gates",
+      }),
+    ).toEqual({ skipped: expect.stringContaining("No job") });
+    expect(t.created).toEqual([]);
+  });
+
+  test("the current queue gate cannot adopt an unrelated manual run of the same object", async () => {
+    const t = setup();
+    files.ciYml = "jobs:\n  gate:\n    steps: [check]\n";
+    const branch = `gitmatrix/landing/queue-${oid(9)}-1`;
+    const manual = await t.start({ branch, trigger: "manual", preview: undefined });
+    if (!("runId" in manual)) throw new Error(manual.skipped);
+    const gates = await t.start({
+      branch,
+      trigger: "landing",
+      preview: undefined,
+      queueId: oid(9),
+      runId: "queue-gates",
+    });
+    expect(gates).toEqual({ runId: "queue-gates", number: 2 });
+    expect(t.jobs("queue-gates")).toEqual([
+      { id: expect.any(String), name: "gate", status: "pending" },
+    ]);
+    const job = await loadJob(t.env.DB, t.jobs("queue-gates")[0]!.id);
+    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
+    expect(payload.env.GITMATRIX_QUEUE_ID).toBe(oid(9));
+    expect(payload.env.GITMATRIX_TIMELINE).toBeUndefined();
   });
 });

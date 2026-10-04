@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod local;
 pub mod network;
 pub mod pkg;
+pub mod queue;
 pub mod release;
 pub mod retention;
 pub mod semantic;

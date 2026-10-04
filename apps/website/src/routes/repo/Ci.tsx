@@ -734,7 +734,7 @@ export function CiRun() {
             </PrefetchLink>
           </div>
         </div>
-        {canRun && (
+        {canRun && (active || !run.queueId) && (
           <Form
             method="post"
             action={repoPath(repo.owner.slug, repo.name, "ci")}
@@ -767,6 +767,19 @@ export function CiRun() {
           </Form>
         )}
       </div>
+      {canRun && !active && run.queueId && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          Queue-owned runs cannot be re-run here. Inspect{" "}
+          <code className="mk-mono break-all">
+            gm queue show {run.queueId} -R {repo.owner.slug}/{repo.name}
+          </code>
+          ; for a failed or cancelled queue entry, use{" "}
+          <code className="mk-mono break-all">
+            gm queue retry {run.queueId} -R {repo.owner.slug}/{repo.name}
+          </code>
+          .
+        </p>
+      )}
       <FormError message={error && "error" in error ? error.error : null} />
 
       {run.configError ? (

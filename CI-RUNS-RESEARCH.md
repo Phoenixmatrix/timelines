@@ -16,13 +16,13 @@ without making any agent wait longer for its verdict.
 
 ## Options
 
-| Option                                           | Fewer runs or less work             | Slower for anyone?                |
-| ------------------------------------------------ | ----------------------------------- | --------------------------------- |
-| Dedupe runs of a commit in flight                | Removes duplicate runs              | No                                |
-| Skip jobs whose inputs didn't change (`paths:`)  | Removes most Rust work today        | No                                |
-| Coalesce pushes under load                       | Fewer runs when busy                | Only when busy, bounded           |
-| Merge queue (test before landing, batch, bisect) | Fewer runs, and `main` never breaks | Changes `gm push`: lands after CI |
-| Path filters for whole runs                      | Docs-only pushes skip CI            | No, but rare here                 |
+| Option                                                                 | Fewer runs or less work                                        | Slower for anyone?               |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------- | -------------------------------- |
+| Dedupe runs of a commit in flight                                      | Removes duplicate runs                                         | No                               |
+| Skip jobs whose inputs didn't change (`paths:`)                        | Removes most Rust work today                                   | No                               |
+| Coalesce pushes under load                                             | Fewer runs when busy                                           | Only when busy, bounded          |
+| Explicit merge queue (test before landing, proven descendant coverage) | Can reduce duplicate work; gates queued candidates before main | `gm push --queue` lands after CI |
+| Path filters for whole runs                                            | Docs-only pushes skip CI                                       | No, but rare here                |
 
 Reducing the _number_ of runs without delaying anyone isn't possible in
 general: a run that covers several pushes starts later than the earliest of
@@ -62,10 +62,47 @@ Together with deploy concurrency (`concurrency: production`, newest deploy wins)
 a burst of pushes now runs at most four pipelines at a time per branch, deploys
 once, and builds gm only when it changed.
 
-## Not done: a merge queue
+## Explicit merge queue (CORE-136)
 
-A merge queue would test pushes before they land on `main`, batch them, and
-bisect a failing batch. It's the only option that keeps `main` green rather
-than reporting after the fact, but it changes `gm push` (it would land once CI
-passes) and every agent's loop. Worth it if `main` starts breaking often;
-coalescing and `paths:` are the cheaper first step.
+The additive `gm push --queue` path tests the merged candidate before advancing
+the default branch. Ordinary `gm push` and native pushes remain unchanged as
+self-hosting recovery paths; this is not universal main protection and passing
+gates cannot prove that main will never break. Timeline landing remains separate.
+
+Source staging refs skip ordinary CI, knowledge and preview work. Queue gates
+run in full without new path-based reuse. Ordinary exact-run dedupe, push
+coalescing/coverage, complete declared `paths` inputs with identical job-spec/object
+proof, and deployment concurrency retain their existing roles.
+Clef can recommend combining queued descendants, but only deterministic Git
+ancestry proves coverage. Unrelated work is not covered merely because a model
+says so; unavailable scheduling AI leaves separate/FIFO work safe. This does not
+promise arbitrary batch bisection or a measured reduction for every workload.
+
+Each candidate pins its base and source, passes configured required merge gates,
+and advances via compare-and-swap. A moving main forces remerge/retest; missing
+gates fail closed for queued work. Cancellation/retry fence stale attempts, and
+failed entries release capacity so the next push can proceed. Post-main CI and
+deployment remain separate verdicts, followed through existing coverage chains.
+
+Bounded repair requires all three Clef `noul` semantic checks (ordinary
+documentation, compatible additions, explicit concatenation approval) to return
+yes-probability at least 0.95; persisted repair confidence is their minimum.
+This differs from scheduling's advisory choice-confidence metric, despite the same numeric threshold.
+At most three ordinary additive documentation files are eligible (4,096 UTF-8
+bytes per version, 16,384 aggregate), with one classification call and at most
+one content-only generation.
+Unicode prose is supported; the exact base and both appended suffixes must be
+preserved without invented edits. Classification and generation have 65-second
+and 125-second deadlines respectively.
+Unsafe paths/content, ambiguous output and model outages do not authorize
+edits. The runner checks the result and runs full gates; AI cannot skip checks
+or update refs. See the [website operational guide](apps/website/README.md) for
+the exclusions, failure metadata and recovery protocol.
+
+Admission means accepted, not landed or deployed. Agents checkpoint the queue
+ID and monitor `gm queue show`/`wait --deploy` at work boundaries, not by busy
+polling. Failures record dedicated read-only `queueFailure` evidence and create
+P0 remediation issues related to original work without changing its lease.
+Claim remediation through normal fenced commands, inspect actual CI/conflict
+evidence, fix forward, and complete only with real recovery evidence. Inspect an
+uncertain admission by ID; never silently fall back to a direct push.

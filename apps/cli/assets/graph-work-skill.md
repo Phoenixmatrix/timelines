@@ -30,9 +30,10 @@ record yours with `gm agent configure --model <model-id>`.
 2. **Choose: timeline or main.** Before you change anything, decide where the
    work goes, and record it. See "Timeline or main" below.
 3. **Hold the lease.** It lasts {{TTL}}; `gm issue renew <issue>` before then. gm
-   keeps the lease token for you, so lease commands need no token. Losing it
-   (`Claim expired, was superseded…`) means someone else may own the work now:
-   stop and re-read the issue.
+   keeps a returned lease token for you, so lease commands need no token. A
+   missing/empty token or uncertain claim response grants no ownership; inspect
+   the issue online. Losing it (`Claim expired, was superseded…`) means someone
+   else may own the work now: stop and re-read the issue.
 4. **Ask the assistant** when you need to find something out, e.g.
    `gm ask "Where is the tracker's readiness computed?"`. It reads the code (and
    its knowledge graph), issues, CI runs and packages for you and answers with
@@ -45,11 +46,57 @@ record yours with `gm agent configure --model <model-id>`.
    with `--secret owner/repo:NAME`. Read the responses with
    `gm request list --issue <issue> --status all`; once all are resolved,
    `gm issue resume <issue>` takes the lease back up.
-7. **Finish** with evidence a reviewer can check: ship first ({{SHIP}}), then
-   `gm issue complete <issue> --evidence 'Shipped in <commit>, CI run #N green; tests: …'`.
+7. **Submit, monitor, then finish.** Ship first ({{SHIP}}); independent main work
+   uses the explicit queue workflow below. Only after acceptance is shipped and
+   verified, `gm issue complete <issue> --evidence 'Landed <commit>, queue <id>; gate run #N green; deployment/run #M verified; tests: …'`.
+   Cite only evidence actually observed; omit deployment claims when not verified.
    Complete only what is shipped and verified. If abandoning active work,
    `gm issue release <issue>`: after the team's limit of releases, the issue asks
    your person what to try next. Do not release a lease parked on a human request.
+
+### Queued main work and remediation
+
+For independent work targeting main, `gm push --queue --issue <issue>` uploads
+the source and requests admission. Checkpoint the returned queue ID (the full
+source commit), repository, local proof and pending landing/deployment checks:
+`gm issue checkpoint <issue> 'Queue: <id>; source: <commit>; local tests: …; landing/deployment pending'`.
+Admission is not a landing, successful CI, or a deployment. A transport error
+can leave admission uncertain: inspect `gm queue show <id>` before resubmitting;
+do not assume rejection or silently direct-push.
+
+Keep and renew the original issue's lease while its acceptance still needs
+verification. Continue independent, separately claimed work without relying on
+the queued commit being on main. At meaningful work boundaries or the next
+invocation, inspect `gm queue show <id>` and `gm queue list --status failed`.
+Do not busy-poll or repeatedly invoke waits. When deliberately waiting to finish,
+`gm queue wait <id> --deploy --timeout 600` waits for landing and the final main
+pipeline; timeout is not success. Follow the real covering entry when work is
+covered, and read `deployStatus` separately from landing status. `gm sync`
+reconciles local history after landing; admission does not make it immutable.
+
+Failures create unassigned P0 `remediation` issues with server-owned `queueFailure`
+evidence. Discover them with `gm issue ready --type remediation --all-teams`
+(or `gm issue list --type remediation --all-teams` to include held/blocked work).
+These listings are advisory: use `gm issue claim <issue>` or `gm issue next` in
+the proper scope and require the returned fencing token before acting. Remediation
+does not override existing claims, blockers, assignment or timeline rules.
+Read `gm issue show <issue> --json` and `gm queue show <queueFailure.queueId>`;
+inspect `conflictPaths`, `failedJobs`, stage/reason and the referenced run using
+`gm runs show <number>` and `gm runs logs <number>`. Fix the real cause, verify
+locally, and submit a new commit with `gm push --queue --issue <remediation>`.
+`gm queue retry <id>` retries the same admitted source only (for example after an
+infrastructure fix); it cannot upload your changed code. Checkpoint the replacement
+queue ID and complete remediation only after the fix actually lands and the
+required pipeline/deployment evidence is verified. Preserve the original failure
+audit; never forge `queueFailure` in a normal issue patch.
+
+Ordinary `gm push` and native Git push remain available as an explicit recovery
+path if the queue itself needs repair. Investigate first and follow project
+authorization and verification requirements; never automatically fall back to
+direct push after failed/uncertain admission. Queued failures do not imply that
+later independent pushes must stop. Timeline work is different: `--queue` is
+refused while bound to a timeline. Use push/checkpoint/land below, including
+person approval for the exact current checkpoint when policy is `approval`.
 
 ## Creating properly tagged issues
 

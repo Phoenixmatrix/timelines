@@ -795,13 +795,54 @@ impl Workspace {
         Ok((tree, conflicts))
     }
 
+    /// The unchanged admitted revision reconstructed on this local revision's
+    /// parents. Measuring edits here retains changes that undo parent rewrites.
+    pub fn landed_tree_on_local_parents(&self, commit: &Commit, landed: Oid) -> Result<Oid> {
+        let landed = self.commit(landed)?;
+        let local_parents: Vec<Oid> = commit.parent_ids().collect();
+        let (expected_tree, parent_conflicts) = self.rebased_tree(&landed, &local_parents)?;
+        if !parent_conflicts.is_empty() {
+            return Err(GmError::new(
+                "ambiguous_landed_rewrite",
+                format!("Cannot safely replay local revision {} against landed revision {}: rewritten parents conflict at {}. Local work is retained.", commit.id(), landed.id(), parent_conflicts.join(", ")),
+            ).hint(format!("Inspect `gm show {}` and `gm show {}`. Explicitly reconcile the parent changes with `gm merge trunk`, inspect/resolve `gm status`, and verify the intended content before pushing; sync has not chosen a replacement tree.", commit.id(), landed.id()))
+                .exit(exit::CONFLICT));
+        }
+        Ok(expected_tree)
+    }
+
+    /// Replay only post-admission edits, not unchanged work already landed.
+    pub fn rebased_tree_after_landing(
+        &self,
+        commit: &Commit,
+        parents: &[Oid],
+        expected_tree: Oid,
+    ) -> Result<(Oid, Vec<String>)> {
+        let (new_base, base_conflicts) = self.merged_parent_tree(parents)?;
+        let (tree, mut conflicts) =
+            trees::merge(&self.repo, expected_tree, new_base, commit.tree_id())?;
+        conflicts.extend(self.still_conflicted(tree, base_conflicts)?);
+        conflicts.sort();
+        conflicts.dedup();
+        Ok((tree, conflicts))
+    }
+
     /// After some changes were rewritten (`rewritten`: old -> new) or dropped
     /// (`abandoned`: old -> the parents its children should move to), rebase
     /// every descendant and move `@`, bookmarks and heads along.
     pub fn rebase_descendants(
         &mut self,
+        rewritten: HashMap<Oid, Oid>,
+        abandoned: HashMap<Oid, Vec<Oid>>,
+    ) -> Result<Rebased> {
+        self.rebase_descendants_after_landing(rewritten, abandoned, &HashMap::new())
+    }
+
+    pub fn rebase_descendants_after_landing(
+        &mut self,
         mut rewritten: HashMap<Oid, Oid>,
         abandoned: HashMap<Oid, Vec<Oid>>,
+        landed_bases: &HashMap<Oid, Oid>,
     ) -> Result<Rebased> {
         let graph = self.graph()?;
         let mut outcome = Rebased::default();
@@ -847,7 +888,13 @@ impl Workspace {
             if new_parents == old_parents {
                 continue;
             }
-            let (tree, mut conflicts) = self.rebased_tree(&commit, &new_parents)?;
+            let (tree, mut conflicts) =
+                match landed_bases.get(oid).filter(|_| !explicit.contains(oid)) {
+                    Some(expected_tree) => {
+                        self.rebased_tree_after_landing(&commit, &new_parents, *expected_tree)?
+                    }
+                    None => self.rebased_tree(&commit, &new_parents)?,
+                };
             let change_id = self.change_id(&commit);
             // A merge left with one parent and nothing of its own only recorded
             // bringing in what that parent now has (a `gm merge trunk` that

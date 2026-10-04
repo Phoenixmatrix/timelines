@@ -510,6 +510,8 @@ export interface CiRunSummary {
   preview: CiRunPreview | null;
   /** A landing run's landing and timeline (CORE-77): its merge, or the gates on it; else null. */
   landing: { id: string; timeline: string | null } | null;
+  /** Independent merge queue submission, when this is its merge or gate run. */
+  queueId?: string | null;
   title: string;
   status: CiRunStatus;
   actor: string | null;

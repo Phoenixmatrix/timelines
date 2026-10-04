@@ -423,9 +423,9 @@ async function stopPhase(env: Env, repoId: string, step: PurgeStep, limits: Limi
   await step.do("stop:record", STEP, () =>
     saveProgress(env, repoId, { stop: { ...knowledge, cancelled } }),
   );
-  // A terminated build's step in flight may still write an upsert: let it land
-  // before the vectors and items are deleted (the sweeps catch any after).
-  if (knowledge.terminated > 0) await step.sleep("stop:settle", "1 minute");
+  // A terminated build or queue CI callback may already have an effect in
+  // flight. Let it settle before purging stores; tombstones fence new work.
+  if (knowledge.terminated > 0 || cancelled > 0) await step.sleep("stop:settle", "1 minute");
 }
 
 /** Purge the coordinator first (it starts builds), then terminate its builds. */
@@ -975,6 +975,7 @@ async function artifactsPhase(env: Env, repoId: string, step: PurgeStep) {
 
 /** Large child tables, children before parents, with how a row finds the repository (?1). */
 export const CHILD_ROWS: [table: string, where: string][] = [
+  ["merge_queue", "repo_id = ?1"],
   ["ci_logs", "job_id IN (SELECT id FROM ci_jobs WHERE repo_id = ?1)"],
   ["ci_steps", "job_id IN (SELECT id FROM ci_jobs WHERE repo_id = ?1)"],
   ["ci_jobs", "repo_id = ?1"],

@@ -39,6 +39,7 @@ export const REPO_TABLES = [
   "kg_page_sets",
   "kg_search_items",
   "kg_state",
+  "merge_queue",
   "ref_updates",
   "release_note_entries",
   "release_note_mentions",

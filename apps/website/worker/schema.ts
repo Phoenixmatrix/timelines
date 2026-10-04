@@ -1,6 +1,7 @@
 import { Kysely, type Generated } from "kysely";
 import { D1Dialect } from "kysely-d1";
 import type { ClassificationModel, GenerationModel } from "../shared/ai.ts";
+import type { QueueStatus } from "../shared/merge-queue.ts";
 
 /**
  * Gitmatrix's database (the DB binding) for Kysely. The SQL migrations in
@@ -10,6 +11,23 @@ import type { ClassificationModel, GenerationModel } from "../shared/ai.ts";
  * (The package registry keeps its own database: registry/core/db.ts.)
  */
 export interface Database {
+  merge_queue: {
+    repo_id: string;
+    id: string;
+    status: QueueStatus;
+    version: Generated<number>;
+    attempts: Generated<number>;
+    merge_run_id: string | null;
+    gate_run_id: string | null;
+    base: string | null;
+    candidate: string | null;
+    covered_by: string | null;
+    data: string;
+    created_at: string;
+    updated_at: string;
+    swept_at: Generated<string>;
+    recovered_at: Generated<string>;
+  };
   accounts: {
     id: string;
     kind: "user" | "org";
@@ -730,6 +748,8 @@ export interface Database {
      * with trigger 'manual' like a preview run and reported as 'landing'.
      */
     landing_id: Generated<string | null>;
+    /** Independent default-branch merge queue identity, not a timeline landing. */
+    queue_id: Generated<string | null>;
   };
   ci_jobs: {
     id: string;

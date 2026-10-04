@@ -1,5 +1,6 @@
 import type { AgentCapabilities } from "./api.ts";
 import type { CheckpointView, Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
+import type { QueueFailure } from "./merge-queue.ts";
 
 export interface TrackerIdentity {
   id: string;
@@ -63,7 +64,7 @@ export interface Workspace extends TrackerEntity {
   description: string;
   archived: boolean;
 }
-export type IssueType = "task" | "bug" | "prd" | "chore" | "research";
+export type IssueType = "task" | "bug" | "prd" | "chore" | "research" | "remediation";
 /**
  * `done_in_timeline` (TIMELINES-RESEARCH.md, "Tracker"; CORE-74): finished
  * inside a timeline that hasn't landed. It is main's view of that work, and
@@ -193,6 +194,8 @@ export interface Issue extends TrackerEntity {
    * status of any timeline whose view doesn't include that one.
    */
   doneIn?: DoneIn | null;
+  /** Latest trusted queue failure; global across timeline views and never client-writable. */
+  queueFailure?: QueueFailure | null;
 }
 
 /**

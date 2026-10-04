@@ -45,6 +45,7 @@ import { RequestCard } from "./Requests.tsx";
 import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimeline.tsx";
 import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
+import { repoPath } from "../../lib/refs.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
 
 export type MutationOutcome =
@@ -1070,6 +1071,81 @@ export function IssueDetail({
             </>
           )}
         </dl>
+        {issue.queueFailure && (
+          <section className={`${SECTION} mt-4`} aria-label="Queue failure">
+            <h3 className={HEADING}>Queue failure</h3>
+            <p className="mt-1 mb-3 text-body-sm text-ink-muted">
+              System-recorded evidence, not editable issue fields. Admission does not mean landed or
+              deployed. Inspect the run before claiming recovery.
+            </p>
+            <dl className={META}>
+              <dt className="text-ink-faint">Kind</dt>
+              <dd className="m-0 min-w-0">{issue.queueFailure.kind.replaceAll("_", " ")}</dd>
+              <dt className="text-ink-faint">Stage</dt>
+              <dd className="m-0 min-w-0">{issue.queueFailure.stage}</dd>
+              <dt className="text-ink-faint">Reason</dt>
+              <dd className="m-0 min-w-0 break-words">{issue.queueFailure.reason}</dd>
+              <dt className="text-ink-faint">Repository</dt>
+              <dd className="m-0 min-w-0 break-all">{issue.queueFailure.repo}</dd>
+              <dt className="text-ink-faint">Commit</dt>
+              <dd className="mk-mono m-0 min-w-0 break-all">{issue.queueFailure.commit}</dd>
+              <dt className="text-ink-faint">Queue ID</dt>
+              <dd className="mk-mono m-0 min-w-0 break-all">{issue.queueFailure.queueId}</dd>
+              <dt className="text-ink-faint">CI run</dt>
+              <dd className="m-0 min-w-0">
+                {issue.queueFailure.runNumber === null ? (
+                  "No run recorded"
+                ) : (
+                  <Link
+                    className={`${LINK} inline-flex min-h-11 items-center`}
+                    to={repoPath(
+                      issue.queueFailure.repo.split("/")[0]!,
+                      issue.queueFailure.repo.split("/")[1]!,
+                      "ci",
+                      String(issue.queueFailure.runNumber),
+                    )}
+                  >
+                    Run #{issue.queueFailure.runNumber}
+                  </Link>
+                )}
+              </dd>
+              <dt className="text-ink-faint">Failed jobs</dt>
+              <dd className="m-0 min-w-0 break-words">
+                {issue.queueFailure.failedJobs.length
+                  ? issue.queueFailure.failedJobs.join(", ")
+                  : "None recorded"}
+              </dd>
+              <dt className="text-ink-faint">Conflict paths</dt>
+              <dd className="m-0 min-w-0">
+                {issue.queueFailure.conflictPaths.length ? (
+                  <ul className={`${LIST} space-y-1`}>
+                    {issue.queueFailure.conflictPaths.map((path) => (
+                      <li className="mk-mono break-all" key={path}>
+                        {path}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  "None recorded"
+                )}
+              </dd>
+              <dt className="text-ink-faint">Classifier</dt>
+              <dd className="m-0 min-w-0 break-words">
+                {issue.queueFailure.classificationModel ?? "No model recorded"}
+              </dd>
+              <dt className="text-ink-faint">Repair model</dt>
+              <dd className="m-0 min-w-0 break-words">
+                {issue.queueFailure.repairModel ?? "No model recorded"}
+              </dd>
+              <dt className="text-ink-faint">Occurred</dt>
+              <dd className="m-0 min-w-0">
+                <time dateTime={issue.queueFailure.occurredAt}>
+                  {new Date(issue.queueFailure.occurredAt).toLocaleString()}
+                </time>
+              </dd>
+            </dl>
+          </section>
+        )}
         {activeClaim && (
           <p
             className="mt-3 mb-0 flex gap-2 rounded-control bg-sunken px-3 py-2 text-body-sm text-ink-muted"

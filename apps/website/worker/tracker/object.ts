@@ -8,6 +8,7 @@ import {
   type PushActivity,
 } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
+import type { QueueFailure } from "../../shared/merge-queue.ts";
 import type { SearchQuery } from "../search/query.ts";
 import type { Landing, TimelineStatus } from "../../shared/timelines.ts";
 import {
@@ -98,6 +99,16 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   }
   mutate(access: Access, input: MutationRequest) {
     return this.reply(() => this.store.mutate(access, input));
+  }
+  /** Internal Worker RPCs; never routed through client Mutation payloads. */
+  validateQueueIssues(access: Access, issueIds: string[]) {
+    return this.reply(() => this.store.validateQueueIssues(access, issueIds));
+  }
+  recordQueueFailure(
+    access: Access,
+    input: { repoId: string; issueIds: string[]; failure: QueueFailure },
+  ) {
+    return this.reply(() => this.store.recordQueueFailure(access, input));
   }
   listTimelines(status?: TimelineStatus) {
     return this.reply(() => this.timelines.list(status));

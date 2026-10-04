@@ -36,6 +36,7 @@ export async function loadJob(d1: D1Database, jobId: string) {
       "r.checkpoint_id",
       "r.preview_action",
       "r.landing_id",
+      "r.queue_id",
       sql<string>`o.slug || '/' || p.name`.as("full_name"),
       "p.artifacts_name",
       "p.artifacts_remote",
@@ -88,7 +89,12 @@ export async function jobPayload(
       GITMATRIX_COMMIT: job.commit_oid,
       GITMATRIX_RUN_NUMBER: String(job.number),
       GITMATRIX_JOB: job.name,
-      GITMATRIX_TRIGGER: job.preview_action ? "preview" : job.landing_id ? "landing" : job.trigger,
+      GITMATRIX_TRIGGER: job.preview_action
+        ? "preview"
+        : job.landing_id || job.queue_id
+          ? "landing"
+          : job.trigger,
+      ...(job.queue_id ? { GITMATRIX_QUEUE_ID: job.queue_id } : {}),
       ...(timeline ? { GITMATRIX_TIMELINE: timeline } : {}),
       ...(job.checkpoint_id ? { GITMATRIX_CHECKPOINT: job.checkpoint_id } : {}),
       ...(job.preview_action ? { GITMATRIX_PREVIEW_ACTION: job.preview_action } : {}),

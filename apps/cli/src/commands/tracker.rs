@@ -898,10 +898,45 @@ fn validate_batch(mutations: &[Value]) -> Result<()> {
         if kind.ends_with(".update") && !m["expectedVersion"].is_u64() {
             return Err(GmError::usage("Updates require expectedVersion."));
         }
+        if kind == "issue.create" || kind == "issue.update" {
+            let data = m["data"]
+                .as_object()
+                .ok_or_else(|| GmError::usage("Mutation data must be a JSON object."))?;
+            validate_issue_fields(data, kind == "issue.create")?;
+        }
         if m.to_string().contains("\"leaseToken\"") {
             return Err(GmError::usage(
                 "Lease tokens cannot enter the durable outbox. Use claim/renew/release/complete online.",
             ));
+        }
+    }
+    Ok(())
+}
+/// Only client-owned issue fields enter an offline patch. Server evidence remains
+/// opaque on reads, so newer queue metadata survives without becoming writable.
+fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) -> Result<()> {
+    for key in data.keys() {
+        if !(creating && key == "teamId")
+            && ![
+                "title",
+                "description",
+                "acceptance",
+                "type",
+                "status",
+                "closeReason",
+                "timelineUse",
+                "timelinePolicy",
+                "priority",
+                "assigneeId",
+                "parentId",
+                "workspaceIds",
+                "labels",
+            ]
+            .contains(&key.as_str())
+        {
+            return Err(GmError::usage(format!(
+                "Server-owned or unknown issue field '{key}'."
+            )));
         }
     }
     Ok(())
@@ -1023,10 +1058,8 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
     let data = mutation["data"]
         .as_object()
         .ok_or_else(|| GmError::usage("Mutation data must be a JSON object."))?;
-    if entity == "issue" && data.contains_key("createdBy") {
-        return Err(GmError::usage(
-            "createdBy is assigned by the server and is immutable.",
-        ));
+    if entity == "issue" {
+        validate_issue_fields(data, action == "create")?;
     }
     if action == "update" {
         let index = index.ok_or_else(|| {
@@ -1699,6 +1732,7 @@ fn listing(
                         .is_some_and(|a| a.iter().any(|v| v == w))
                 })
                 && args.status.as_ref().is_none_or(|s| i["status"] == *s)
+                && args.r#type.as_ref().is_none_or(|t| i["type"] == *t)
                 && search.as_ref().is_none_or(|s| {
                     i["title"].as_str().unwrap_or("").to_lowercase().contains(s)
                         || i["description"]
@@ -1806,6 +1840,12 @@ fn claimed_issue(snapshot: &Value, response: &Value, issue_id: &str) -> Option<V
 /// context, or that nothing in scope is ready.
 fn next_result(snapshot: &Value, response: &Value) -> Shown {
     let result = &response["results"][0];
+    if result["issueId"].is_string() && result["leaseToken"].as_str().is_none_or(str::is_empty) {
+        return Shown(json!({
+            "claimed": null,
+            "message": "The claim response lacked a fencing token. Inspect the issue online; do not assume ownership.",
+        }));
+    }
     let Some(issue_id) = result["issueId"].as_str() else {
         return Shown(json!({
             "claimed": null,
@@ -2218,8 +2258,19 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 || !response["events"].is_array()
                 || (matches!(
                     args.command,
-                    IssueCommand::Claim { .. } | IssueCommand::Renew { .. }
-                ) && response["results"][0]["leaseToken"].as_str().is_none())
+                    IssueCommand::Claim { .. }
+                        | IssueCommand::Renew { .. }
+                        | IssueCommand::Accept { .. }
+                ) && response["results"][0]["leaseToken"]
+                    .as_str()
+                    .is_none_or(str::is_empty))
+                || (matches!(
+                    args.command,
+                    IssueCommand::Next { .. } | IssueCommand::Resume { .. }
+                ) && response["results"][0]["issueId"].is_string()
+                    && response["results"][0]["leaseToken"]
+                        .as_str()
+                        .is_none_or(str::is_empty))
                 || (matches!(args.command, IssueCommand::Ask { .. })
                     && response["results"][0]["id"].as_str() != Some(target.as_str()))
             {
@@ -2523,6 +2574,100 @@ mod tests {
         }
     }
     #[test]
+    fn queue_failure_survives_replication_and_local_edits_but_cannot_be_forged() {
+        let mut s = snapshot();
+        let failure = json!({
+            "queueId":"0123456789012345678901234567890123456789", "repo":"orbit/engine",
+            "commit":"0123456789012345678901234567890123456789", "stage":"gates",
+            "kind":"build_failed", "reason":"Compiler rejected candidate", "runNumber":42,
+            "failedJobs":["build"], "conflictPaths":[], "classificationModel":null,
+            "repairModel":null, "occurredAt":"2026-10-04T00:00:00Z",
+            "futureEvidence":{"attempt":2}
+        });
+        apply_event(
+            &mut s,
+            &json!({"entityType":"issue","entityId":"repair","entity":{
+                "id":"repair","key":"ENG-2","version":1,"type":"remediation","priority":0,
+                "status":"todo","title":"Repair queue failure","queueFailure":failure
+            }}),
+        )
+        .unwrap();
+        project(&mut s, &json!({"kind":"issue.update","id":"repair","expectedVersion":1,"data":{"title":"Investigating compiler failure"}})).unwrap();
+        let restored: Value = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(
+            named(&restored, &restored["issues"][0])["queueFailure"],
+            failure
+        );
+        let before = s.clone();
+        for kind in ["issue.create", "issue.update"] {
+            for field in ["queueFailure", "queueFailureHistory", "claim", "waiting"] {
+                let mut data = json!({"title":"Forged"});
+                data[field] = json!({});
+                let mutation = json!({"kind":kind,"id":"repair","expectedVersion":2,"data":data});
+                assert!(validate_batch(std::slice::from_ref(&mutation)).is_err());
+                assert!(project(&mut s, &mutation).is_err());
+                assert_eq!(s, before);
+            }
+        }
+    }
+
+    #[test]
+    fn remediation_filters_and_priority_respect_existing_readiness_fences() {
+        let mut s = snapshot();
+        for (id, priority, kind) in [
+            ("ordinary", 2, "task"),
+            ("repair", 0, "remediation"),
+            ("held", 0, "remediation"),
+        ] {
+            project(&mut s, &json!({"kind":"issue.create","id":id,"data":{"title":id,"type":kind,"priority":priority}})).unwrap();
+        }
+        s["issues"][2]["claim"] = json!({"actorId":"other","parkedAt":"2026-10-04T00:00:00Z"});
+        use clap::Parser;
+        let parsed = crate::cli::Cli::try_parse_from([
+            "gm",
+            "issue",
+            "ready",
+            "--all-teams",
+            "--type",
+            "remediation",
+        ])
+        .unwrap();
+        let Some(crate::cli::Command::Issue(IssueArgs {
+            command: IssueCommand::Ready(mut args),
+            ..
+        })) = parsed.command
+        else {
+            panic!("expected issue ready");
+        };
+        let choice = choose_team(None, true, None, false, None);
+        let filter = args.r#type.take();
+        let all = listing(&s, &args, &choice, "orbit", true, false).unwrap().0;
+        assert_eq!(
+            all["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["repair", "ordinary"]
+        );
+        args.r#type = filter;
+        let ready = listing(&s, &args, &choice, "orbit", true, false).unwrap().0;
+        assert_eq!(ready["total"], 1);
+        assert_eq!(ready["issues"][0]["id"], "repair");
+        let listed = listing(&s, &args, &choice, "orbit", false, false)
+            .unwrap()
+            .0;
+        assert_eq!(listed["total"], 2);
+        args.status = Some("done".into());
+        assert_eq!(
+            listing(&s, &args, &choice, "orbit", false, false)
+                .unwrap()
+                .0["total"],
+            0
+        );
+    }
+    #[test]
     fn offline_create_and_chained_updates_preserve_stable_id_and_versions() {
         let mut s = snapshot();
         project(
@@ -2753,6 +2898,12 @@ mod tests {
         let none = next_result(&s, &json!({"results":[{"id":"pick"}]}));
         assert!(none.0["claimed"].is_null());
         assert!(none.0.get("timelineRule").is_none());
+        for token in [Value::Null, json!("")] {
+            let incomplete =
+                next_result(&s, &json!({"results":[{"issueId":"b","leaseToken":token}]}));
+            assert!(incomplete.0["claimed"].is_null());
+            assert!(incomplete.0.get("timelineRule").is_none());
+        }
     }
     #[test]
     fn claims_lead_with_the_timeline_rule_from_the_server_issue() {

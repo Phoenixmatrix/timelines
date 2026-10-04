@@ -158,7 +158,7 @@ pub fn fetch(ctx: &Ctx) -> Result<Json> {
 /// Fetch, then move every stack of changes that was built on trunk onto the
 /// new trunk. Changes that landed in trunk meanwhile are dropped, including
 /// the ones a landing merge brought in through its other parents.
-fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Rebased)> {
+fn sync_in(ws: &mut Workspace, config: &Config, ctx: &Ctx) -> Result<(String, Vec<Oid>, Rebased)> {
     let old_trunk = ws.trunk.as_ref().map(|t| t.oid);
     let old_graph = ws.graph()?;
     let roots: Vec<Oid> = old_graph
@@ -183,27 +183,75 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
     };
     let (new_trunk, trunk_name) = trunk;
 
-    // Change ids that arrived in trunk: our copies of them are now duplicates.
-    let mut landed = HashSet::new();
+    // A matching change id identifies a possible duplicate, not identical work:
+    // queued revisions remain mutable and may have acquired unlanded edits.
+    let mut landed = HashMap::new();
     if let Some(old) = old_trunk
         && old != new_trunk
     {
         let mut walk = ws.repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
         walk.push(new_trunk)?;
         walk.hide(old)?;
         for oid in walk.take(5000) {
-            landed.insert(ws.change_id(&ws.commit(oid?)?));
+            let commit = ws.commit(oid?)?;
+            landed.entry(ws.change_id(&commit)).or_insert(commit.id());
         }
     }
 
+    // A prior fetch may already have moved the remote bookmark. Durable
+    // receipts still identify revisions that sync has not reconciled locally.
+    let submissions = ws.store().queue_submissions()?;
+    let receipts = if submissions.is_empty() {
+        None
+    } else {
+        submissions.get(&queue_repository(
+            config,
+            &super::server::current_repo(ctx)?,
+        )?)
+    };
+    for submission in receipts.into_iter().flat_map(|entries| entries.values()) {
+        for (change, revision) in &submission.revisions {
+            let original = Oid::from_str(revision)?;
+            if original == new_trunk || ws.repo.graph_descendant_of(new_trunk, original)? {
+                match landed.get(change).copied() {
+                    Some(previous) if ws.repo.graph_descendant_of(previous, original)? => {}
+                    _ => {
+                        landed.insert(change.clone(), original);
+                    }
+                }
+            }
+        }
+    }
     let mut abandoned = HashMap::new();
     let mut roots = roots;
     let graph = ws.graph()?;
+    let mut landed_bases = HashMap::new();
     for oid in &graph.topo {
         let commit = ws.commit(*oid)?;
         let parents: Vec<Oid> = commit.parent_ids().collect();
         let root = parents.iter().all(|p| !graph.topo.contains(p));
-        if landed.contains(&ws.change_id(&commit)) && *oid != ws.wc() {
+        let original = landed
+            .get(&ws.change_id(&commit))
+            .copied()
+            .filter(|original| {
+                *original != *oid
+                    && !ws
+                        .repo
+                        .graph_descendant_of(*oid, *original)
+                        .unwrap_or(false)
+            });
+        let expected_tree = original
+            .map(|original| ws.landed_tree_on_local_parents(&commit, original))
+            .transpose()?;
+        if let Some(tree) = expected_tree {
+            landed_bases.insert(*oid, tree);
+        }
+        // Never dedup against bare trunk: a parent's later rebase may add
+        // content this child intentionally removes. Only an unchanged
+        // admitted revision on the actual local parents is a duplicate.
+        let already_landed = *oid != ws.wc() && expected_tree == Some(commit.tree_id());
+        if already_landed {
             // What was built on a landed root of trunk's history follows trunk
             // to where the change landed, not back to the base it started from.
             let on_trunk = parents
@@ -243,7 +291,10 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
         if !on_trunk || merged_trunk(ws, &graph, root, new_trunk)? {
             continue;
         }
-        let (tree, conflicts) = ws.rebased_tree(&commit, &onto)?;
+        let (tree, conflicts) = match landed_bases.get(&root) {
+            Some(expected_tree) => ws.rebased_tree_after_landing(&commit, &onto, *expected_tree)?,
+            None => ws.rebased_tree(&commit, &onto)?,
+        };
         let new = ws.rewrite_commit(&commit, &onto, tree, None)?;
         let change_id = ws.change_id(&commit);
         drop(commit);
@@ -257,7 +308,7 @@ fn sync_in(ws: &mut Workspace, config: &Config) -> Result<(String, Vec<Oid>, Reb
         moved.push(new);
     }
     let dropped = abandoned.len();
-    let mut rebased = ws.rebase_descendants(rewritten, abandoned)?;
+    let mut rebased = ws.rebase_descendants_after_landing(rewritten, abandoned, &landed_bases)?;
     rebased.conflicts.extend(root_conflicts);
 
     // A local trunk bookmark follows the remote one when it can fast-forward.
@@ -326,17 +377,112 @@ fn merged_trunk(ws: &Workspace, graph: &Graph, root: Oid, trunk: Oid) -> Result<
 pub fn sync(ctx: &Ctx) -> Result<OpResult> {
     let config = Config::load();
     mutate(ctx, |ws| {
-        let (message, moved, rebased) = sync_in(ws, &config)?;
+        let (message, moved, rebased) = sync_in(ws, &config, ctx)?;
         Ok(Outcome::new(message, moved, rebased))
     })
 }
 
 // ---- push ------------------------------------------------------------------------
 
+/// Queue authority is the configured API server, not just an owner/name slug.
+/// Canonical host/default-port spelling prevents aliases of that authority
+/// from escaping a receipt; the path retains any configured API mount prefix.
+fn queue_repository(config: &Config, repo: &str) -> Result<String> {
+    let server = config.server();
+    let uri: ureq::http::Uri = server
+        .parse()
+        .map_err(|_| GmError::usage("Queue receipts require a valid server URL."))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| GmError::usage("Queue server URL needs a scheme."))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| GmError::usage("Queue server URL needs a host."))?
+        .to_ascii_lowercase();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Ok(format!(
+        "{scheme}://{host}:{port}{}/{repo}",
+        uri.path().trim_end_matches('/')
+    ))
+}
+
+/// A pending admission can still publish its pinned tree. A rewritten copy
+/// must not race it, even through the ordinary direct-push recovery path.
+fn protect_pending_rewrites(
+    ws: &mut Workspace,
+    config: &Config,
+    outgoing: &[Oid],
+    ctx: &Ctx,
+) -> Result<()> {
+    let submissions = ws.store().queue_submissions()?;
+    if submissions.is_empty() {
+        return Ok(());
+    }
+    let repo = super::server::current_repo(ctx)?;
+    let Some(submissions) = submissions.get(&queue_repository(config, &repo)?) else {
+        return Ok(());
+    };
+    for (source, submission) in submissions {
+        let source_oid = Oid::from_str(source)?;
+        let mut changed = None;
+        for oid in outgoing {
+            let change = ws.change_id(&ws.commit(*oid)?);
+            if let Some(original) = submission.revisions.get(&change)
+                && original != &oid.to_string()
+                && !ws.repo.graph_descendant_of(*oid, source_oid)?
+            {
+                let original = ws.commit(Oid::from_str(original)?)?;
+                let parents: Vec<Oid> = original.parent_ids().collect();
+                let (tree, conflicts) = ws.rebased_tree(&ws.commit(*oid)?, &parents)?;
+                if tree != original.tree_id() || !conflicts.is_empty() {
+                    changed = Some(change);
+                    break;
+                }
+            }
+        }
+        let Some(change) = changed else {
+            continue;
+        };
+        // Do not discard a just-snapshotted rewrite when the safety check fails.
+        ws.finish(&ctx.argv)?;
+        let hint = format!(
+            "Change {change} rewrites queue admission {source}. Wait for it to land, then `gm sync`; or explicitly `gm queue cancel {source} -R {repo}` before pushing the rewrite. If admission is uncertain/absent, inspect `gm queue show {source} -R {repo}`, retry that exact source if necessary, then cancel it. Unchanged revisions and independent descendants remain pushable."
+        );
+        let response = remote::api(
+            config,
+            "GET",
+            &format!("/repos/{repo}/queue/{source}"),
+            None,
+        )
+        .map_err(|error| error.hint(hint.clone()))?;
+        let entry = super::queue::entry(&response).map_err(|error| error.hint(hint.clone()))?;
+        if entry["id"].as_str() != Some(source.as_str()) {
+            return Err(GmError::new(
+                "invalid_response",
+                "Queue lookup returned a different entry.",
+            )
+            .hint(hint));
+        }
+        if !matches!(entry["status"].as_str(), Some("failed" | "cancelled")) {
+            return Err(GmError::new(
+                "queued_revision_rewritten",
+                format!(
+                    "Change {change} differs from still-unreconciled queue admission {source}."
+                ),
+            )
+            .hint(hint)
+            .exit(exit::CONFLICT));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct Pushed {
     pub dry_run: bool,
-    /// Bookmark that was updated on the server.
+    /// Target bookmark; queue admission does not update it.
     pub bookmark: String,
     pub remote_ref: String,
     /// Changes the push sent, newest first.
@@ -344,6 +490,9 @@ pub struct Pushed {
     pub message: String,
     pub working_copy: Change,
     pub operation: Option<String>,
+    /// Accepted asynchronous admission, not proof of landing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<serde_json::Value>,
     /// Step context uploaded for the pushed changes (CORE-232), when any was journaled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps: Option<super::steps::Uploads>,
@@ -382,9 +531,30 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
     let config = Config::load();
     let mut ws = Workspace::open(&ctx.cwd)?;
     require_origin(&ws)?;
+    if args.queue {
+        if ws.on_timeline() {
+            return Err(GmError::new(
+                "timeline_bound",
+                "Queued main pushes are not allowed in a timeline.",
+            )
+            .hint("Use `gm push` and timeline checkpoint/land so approval remains enforced.")
+            .exit(exit::CONFLICT));
+        }
+        let main = ws.main().map(|m| m.name.as_str()).unwrap_or("main");
+        if args.bookmark.as_deref().is_some_and(|name| name != main) {
+            return Err(GmError::usage(
+                "`gm push --queue` targets only the repository's default branch; omit --bookmark.",
+            ));
+        }
+    }
     let mut sync_note = String::new();
     if args.sync {
-        let (msg, _, rebased) = sync_in(&mut ws, &config)?;
+        let (msg, _, rebased) = sync_in(&mut ws, &config, ctx)?;
+        // Sync can rewrite local commits. Preserve that completed operation even
+        // when subsequent validation, upload or admission fails.
+        if args.queue && !ctx.dry_run {
+            ws.finish(&format!("{} (sync)", ctx.argv))?;
+        }
         if !rebased.conflicts.is_empty() {
             if !ctx.dry_run {
                 ws.finish(&format!("{} (sync)", ctx.argv))?;
@@ -448,9 +618,10 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
     for oid in walk.take(1000) {
         outgoing.push(oid?);
     }
-    if outgoing.is_empty() && to_trunk {
+    if outgoing.is_empty() && to_trunk && !args.queue {
         let result = Pushed {
             dry_run: ctx.dry_run,
+            queue: None,
             bookmark: bookmark.clone(),
             remote_ref: format!("refs/heads/{bookmark}"),
             pushed: Vec::new(),
@@ -507,6 +678,135 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         .exit(exit::CONFLICT));
     }
 
+    if !ctx.dry_run && to_trunk && !ws.on_timeline() {
+        protect_pending_rewrites(&mut ws, &config, &outgoing, ctx)?;
+    }
+
+    if args.queue {
+        let commit = rev.to_string();
+        let source = format!("gitmatrix/queue/{commit}");
+        let remote_ref = format!("refs/heads/{source}");
+        let pushed = outgoing
+            .iter()
+            .map(|o| Change::load(&ws, *o))
+            .collect::<Result<Vec<_>>>()?;
+        let working_copy = Change::load(&ws, ws.wc())?;
+        if ctx.dry_run {
+            ws.discard();
+            return Ok(Pushed {
+                dry_run: true,
+                bookmark,
+                remote_ref,
+                pushed,
+                working_copy,
+                operation: None,
+                queue: None,
+                steps: None,
+                warnings: Vec::new(),
+                message: format!(
+                    "{sync_note}Would upload {commit} and request queue admission; main would not advance."
+                ),
+            });
+        }
+        let repo = super::server::current_repo(ctx)?;
+        // Snapshot before any network operation: a lost response must not lose
+        // either the admitted commit or the user's unsubmitted working copy.
+        let operation = ws.finish(&ctx.argv)?;
+        let mut submissions = ws.store().queue_submissions()?;
+        let repository = queue_repository(&config, &repo)?;
+        let recorded = submissions
+            .get(&repository)
+            .is_some_and(|entries| entries.contains_key(&commit));
+        let repository_hash = Oid::hash_object(git2::ObjectType::Blob, repository.as_bytes())?;
+        let receipt_ref = format!("refs/gm/queue/{repository_hash}/{commit}");
+        let revisions = outgoing
+            .iter()
+            .map(|oid| Ok((ws.change_id(&ws.commit(*oid)?), oid.to_string())))
+            .collect::<Result<_>>()?;
+        // Persist before upload/admission: an uncertain reply remains guarded,
+        // and undo cannot erase an already-sent request.
+        ws.repo
+            .reference(&receipt_ref, rev, true, "retain queue admission")?;
+        submissions
+            .entry(repository.clone())
+            .or_default()
+            .entry(commit.clone())
+            .or_insert(crate::repo::view::QueueSubmission { revisions });
+        ws.store().save_queue_submissions(&submissions)?;
+        let mut forget_rejected_submission = || -> Result<()> {
+            if !recorded {
+                if let Some(entries) = submissions.get_mut(&repository) {
+                    entries.remove(&commit);
+                    if entries.is_empty() {
+                        submissions.remove(&repository);
+                    }
+                }
+                ws.store().save_queue_submissions(&submissions)?;
+                ws.repo.find_reference(&receipt_ref)?.delete()?;
+            }
+            Ok(())
+        };
+        let hint = format!(
+            "Local work is preserved. Admission is not proof of landing. Inspect `gm queue show {commit}`; if absent, retry `gm push --queue -r {commit}` with the same --issue values. Pending step context can be retried with `gm context sync`. Never assume a failed response advanced main."
+        );
+        let refspec = format!("{commit}:{remote_ref}");
+        let output = match remote::git(
+            &config,
+            workdir(&ws),
+            &["push", "--quiet", "origin", &refspec],
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                forget_rejected_submission()?;
+                return Err(error.hint(hint));
+            }
+        };
+        if !output.status.success() {
+            forget_rejected_submission()?;
+            return Err(remote::git_failure("Queue source upload", &output).hint(hint));
+        }
+        let response = match remote::api(
+            &config,
+            "POST",
+            &format!("/repos/{repo}/queue"),
+            Some(&serde_json::json!({"commit": commit, "issues": args.issues})),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                // These responses reject admission before it can occur. Never
+                // erase an earlier uncertain request, nor a 5xx/transport error.
+                if matches!(error.code, "not_found" | "unauthenticated" | "forbidden") {
+                    forget_rejected_submission()?;
+                }
+                return Err(error.hint(hint));
+            }
+        };
+        let entry = super::queue::entry(&response).map_err(|error| error.hint(hint.clone()))?;
+        if entry["id"].as_str() != Some(commit.as_str()) {
+            return Err(GmError::new(
+                "invalid_response",
+                "Queue admission returned a different commit identity.",
+            )
+            .hint(hint));
+        }
+        let (steps, warnings) = upload_push_context(ctx, &config, &ws, &outgoing);
+        return Ok(Pushed {
+            dry_run: false,
+            bookmark,
+            remote_ref,
+            pushed,
+            working_copy,
+            operation,
+            queue: Some(entry.clone()),
+            steps,
+            warnings,
+            message: format!(
+                "{sync_note}Queue admission accepted: {commit} ({}). Acceptance is not proof of landing; `gm queue wait {commit} --deploy` observes the final verdict.",
+                entry["status"].as_str().unwrap_or("unknown")
+            ),
+        });
+    }
+
     let remote_tracking = format!("refs/remotes/origin/{bookmark}");
     let remote_oid = ws
         .repo
@@ -536,6 +836,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         ws.discard();
         return Ok(Pushed {
             dry_run: true,
+            queue: None,
             bookmark: bookmark.clone(),
             remote_ref: format!("refs/heads/{bookmark}"),
             pushed,
@@ -585,13 +886,34 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         .iter()
         .map(|o| Change::load(&ws, *o))
         .collect::<Result<_>>()?;
-    // The pushed changes' step context goes up now; a failure never fails the
-    // push, it waits for `gm context sync`.
+    let (steps, warnings) = upload_push_context(ctx, &config, &ws, &outgoing);
+    Ok(Pushed {
+        dry_run: false,
+        queue: None,
+        bookmark: bookmark.clone(),
+        remote_ref: format!("refs/heads/{bookmark}"),
+        pushed,
+        message: summary,
+        working_copy: Change::load(&ws, ws.wc())?,
+        operation,
+        steps,
+        warnings,
+    })
+}
+
+// Context follows a successful push/admission, without changing its verdict or
+// making staged queue commits immutable. Failed uploads remain in the journal.
+fn upload_push_context(
+    ctx: &Ctx,
+    config: &Config,
+    ws: &Workspace,
+    outgoing: &[Oid],
+) -> (Option<super::steps::Uploads>, Vec<String>) {
     let mut warnings = Vec::new();
-    let steps = if super::steps::journal_dir(&ws).exists() {
+    let steps = if super::steps::journal_dir(ws).exists() {
         match super::steps::repo_slug(ctx) {
             Ok(repo) => {
-                let uploads = super::steps::upload_commits(&config, &repo, &ws, &outgoing);
+                let uploads = super::steps::upload_commits(config, &repo, ws, outgoing);
                 if !uploads.failed.is_empty() {
                     warnings.push(format!(
                         "{} step context(s) weren't uploaded; run `gm context sync` to retry.",
@@ -608,17 +930,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
     } else {
         None
     };
-    Ok(Pushed {
-        dry_run: false,
-        bookmark: bookmark.clone(),
-        remote_ref: format!("refs/heads/{bookmark}"),
-        pushed,
-        message: summary,
-        working_copy: Change::load(&ws, ws.wc())?,
-        operation,
-        steps,
-        warnings,
-    })
+    (steps, warnings)
 }
 
 pub fn bookmark_delete(ctx: &Ctx, name: &str, remote: bool) -> Result<OpResult> {

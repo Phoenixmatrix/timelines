@@ -247,7 +247,11 @@ async function setup() {
       INSERT INTO kg_edges (repo_id, src, dst, kind) VALUES ('${id}', 'repo', 'file:a.ts', 'contains');
       INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
         ('${id}-run1', '${id}', 1, 'c1', 'main', 'push', 'succeeded'),
-        ('${id}-run2', '${id}', 2, 'c2', 'main', 'push', 'queued');
+        ('${id}-run2', '${id}', 2, 'c2', 'gitmatrix/landing/queue-c2', 'manual', 'queued');
+      UPDATE ci_runs SET queue_id = 'c2' WHERE id = '${id}-run2';
+      INSERT INTO merge_queue (repo_id, id, status, merge_run_id, data, created_at, updated_at) VALUES
+        ('${id}', 'c2', 'merging', '${id}-run2', '{"effectsPending":false,"remediationPending":false}', 'now', 'now'),
+        ('${id}', 'old', 'failed', NULL, '{"remediationPending":true,"history":[{"status":"failed"}]}', 'now', 'now');
       INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
         ('${id}-job1', '${id}-run1', '${id}', 'test', '{}', 'succeeded', 'sandbox');
       INSERT INTO ci_steps (job_id, position, name, status) VALUES ('${id}-job1', 0, 'run', 'succeeded');
@@ -291,6 +295,7 @@ async function setup() {
       INSERT INTO do_instances (class, name, repo_id) VALUES ('KnowledgeCoordinator', '${id}', '${id}');
     `);
     await builds.create({ id: `${id}-b2`, params: {} });
+    await ciRuns.create({ id: `${id}-run2`, params: {} });
     registry.exec(`
       INSERT INTO package_sources (package_id, git_repo_id, granted_at) VALUES ('pkg-${id}', '${id}', 'now');
       INSERT INTO publishes (id, feed_id, format, package_id, version, action, git_repo_id, commit_oid, ref,
@@ -421,6 +426,7 @@ describe("repository deletion", () => {
       ci_logs: 2,
       deployments: 4,
       atlas_spend: 2,
+      merge_queue: 2,
     });
     expect(before).toMatchObject({
       vectors: 4,
@@ -463,6 +469,8 @@ describe("repository deletion", () => {
     expect(left(await repoInventory(w.env, "r_keep"))).toEqual(keepBefore);
     expect(w.builds.instances.get("r_doomed-b2")?.status).toBe("terminated");
     expect(w.builds.instances.get("r_keep-b2")?.status).toBe("running");
+    expect(w.ciRuns.instances.get("r_doomed-run2")?.status).toBe("terminated");
+    expect(w.ciRuns.instances.get("r_keep-run2")?.status).toBe("running");
 
     // Each timeline's previews were torn down by one run at its newest commit.
     expect(
@@ -495,7 +503,7 @@ describe("repository deletion", () => {
       search: { deleted: 2, swept: 1, remaining: 0 },
       links: { spendDeleted: 1, spendDetached: 1, sources: 1, publishes: 1 },
       artifacts: { deleted: true },
-      rows: { repos: 1, ci_logs: 2, kg_nodes: 3 },
+      rows: { repos: 1, ci_logs: 2, kg_nodes: 3, merge_queue: 2 },
     });
 
     // The name is free again.
@@ -554,7 +562,6 @@ describe("repository deletion", () => {
     expect(await runPurge(w.env, "r_doomed", step, { waitUntil: () => {} })).toBe("done");
     expect(sleeps).toBe(3);
     expect((await deletionStatus(w.env, "r_doomed"))!.progress.previews?.timedOut).toBe(2);
-    expect(w.ciRuns.instances.size).toBe(0);
     expect(left(await repoInventory(w.env, "r_doomed"))).toEqual(NOTHING_LEFT);
   });
 

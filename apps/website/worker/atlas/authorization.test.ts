@@ -632,7 +632,9 @@ describe("Atlas authorization, revocation and privacy", () => {
       // Tampered.
       const [payload, mac] = cursor.split(".");
       await invalid("ann", "vault", path(`${payload}x.${mac}`));
-      await invalid("ann", "vault", path(`${payload}.${mac?.slice(0, -2)}AA`));
+      // Change significant MAC bits; replacing a suffix can leave it unchanged.
+      const tamperedMac = `${mac![0] === "A" ? "B" : "A"}${mac!.slice(1)}`;
+      await invalid("ann", "vault", path(`${payload}.${tamperedMac}`));
     }
     // Other filters on the same route.
     await invalid(

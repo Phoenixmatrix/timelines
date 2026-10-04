@@ -22,6 +22,7 @@ import { batch, db } from "../schema.ts";
 import type { StoredJob } from "./jobs.ts";
 import { startWorkflow } from "./trigger.ts";
 import { landingBranch, landingSlugOf } from "../../shared/timelines.ts";
+import { QUEUE_MERGE_SCRIPT } from "./queue-script.ts";
 
 /** The exit code the merge step ends with when the merge conflicts. */
 export const CONFLICT_EXIT = 42;
@@ -31,6 +32,10 @@ export const LANDING_JOB = "land";
 /** What marks a job as a landing merge: only the Worker writes it into a spec. */
 export interface LandingJobSpec extends StoredJob {
   landing: { slug: string };
+}
+
+export interface QueueMergeJobSpec extends StoredJob {
+  queue: { id: string; attempt: number };
 }
 
 /** The merge step: POSIX shell under `bash -eo pipefail`, like every step. */
@@ -69,9 +74,7 @@ export async function startMergeRun(
   repo: { id: string },
   options: {
     runId: string;
-    /** The landing it merges for: the run reports trigger "landing". */
-    landingId: string;
-    slug: string;
+    /** Exactly one authority: a timeline landing or the current queue attempt. */
     branch: string;
     commit: string;
     base: string;
@@ -80,13 +83,16 @@ export async function startMergeRun(
     title: string;
     author: { name: string; email: string };
     actor: { id: string; agentId: string | null } | null;
-  },
+  } & (
+    | { landingId: string; slug: string; queueId?: never; attempt?: never }
+    | { queueId: string; attempt: number; landingId?: never; slug?: never }
+  ),
 ): Promise<{ number: number }> {
   // CI_RUN is production's Workflow: a preview can't run the merge, so it can't land.
-  if (!productionOnly(env, "workflow", `the merge run of landing ${options.landingId}`))
+  if (!productionOnly(env, "workflow", `the merge run of ${options.queueId ?? options.landingId}`))
     throw new PreviewModeError("workflow", "Previews don't run CI, so nothing lands in one.");
   const kdb = db(env.DB);
-  const spec: LandingJobSpec = {
+  const spec: LandingJobSpec | QueueMergeJobSpec = {
     needs: [],
     if: null,
     image: "default",
@@ -98,13 +104,18 @@ export async function startMergeRun(
       GITMATRIX_LANDING_MESSAGE: options.message,
       GITMATRIX_LANDING_NAME: options.author.name,
       GITMATRIX_LANDING_EMAIL: options.author.email,
+      ...(options.queueId
+        ? { GITMATRIX_QUEUE_ID: options.queueId, GITMATRIX_QUEUE_ATTEMPT: String(options.attempt) }
+        : {}),
     },
     secrets: [],
     timeoutMinutes: 20,
-    steps: [{ name: "Merge into main", run: MERGE_SCRIPT }],
+    steps: [{ name: "Merge into main", run: options.queueId ? QUEUE_MERGE_SCRIPT : MERGE_SCRIPT }],
     concurrency: null,
     paths: [],
-    landing: { slug: options.slug },
+    ...(options.queueId
+      ? { queue: { id: options.queueId, attempt: options.attempt } }
+      : { landing: { slug: options.slug! } }),
   };
   // Named after the run, so recording it twice records it once.
   const jobId = `${options.runId}m`;
@@ -123,6 +134,7 @@ export async function startMergeRun(
         "title",
         "status",
         "landing_id",
+        "queue_id",
       ])
       .expression((eb) =>
         eb
@@ -138,9 +150,19 @@ export async function startMergeRun(
             eb.val(options.actor?.agentId ?? null).as("agent_id"),
             eb.val(options.title.slice(0, 200)).as("title"),
             eb.val("queued" as const).as("status"),
-            eb.val(options.landingId).as("landing_id"),
+            eb.val(options.landingId ?? null).as("landing_id"),
+            eb.val(options.queueId ?? null).as("queue_id"),
           ])
-          .where("repo_id", "=", repo.id),
+          .where("repo_id", "=", repo.id)
+          .having((eb) =>
+            eb.exists(
+              eb
+                .selectFrom("repos")
+                .select("id")
+                .where("id", "=", repo.id)
+                .where("deleted_at", "is", null),
+            ),
+          ),
       )
       .onConflict((oc) => oc.doNothing()),
     kdb

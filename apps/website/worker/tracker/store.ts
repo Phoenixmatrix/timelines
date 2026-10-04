@@ -35,6 +35,7 @@ import {
   type Workspace,
 } from "../../shared/tracker.ts";
 import type { ShippedIssue } from "../../shared/release-notes.ts";
+import type { QueueFailure } from "../../shared/merge-queue.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
@@ -256,6 +257,220 @@ export class TrackerStore {
     this.timelines = new TimelineStore(sql, transaction, clock, (ids, reason, actorId) =>
       this.withdrawSuperseded(ids, reason, actorId),
     );
+  }
+  /** Admission only: resolve main-view issues and enforce the submitter's team write scope. */
+  validateQueueIssues(access: Access, references: string[]): string[] {
+    const refs = strings(references, "issues", 20);
+    const issues = this.all<Issue>("issue");
+    return [
+      ...new Set(
+        refs.map((ref) => {
+          const issue = issues.find((entry) => entry.id === ref || entry.key === ref);
+          if (!issue) fail("not_found", `Issue ${ref} not found in main.`, 404);
+          const team = this.get<Team>("team", issue.teamId);
+          if (team.archived) fail("archived", "Team is archived.", 409);
+          if (
+            !access.canAdmin &&
+            team.memberIds.length &&
+            !team.memberIds.includes(access.principalId)
+          )
+            fail("forbidden", "Only team members may queue this team's work.", 403);
+          return issue.id;
+        }),
+      ),
+    ].sort();
+  }
+
+  /**
+   * Worker-only transition, deliberately absent from Mutation. Admission checked
+   * authority; this durable effect still runs if membership or leases change later.
+   * A receipt and all issue/link/evidence writes commit together.
+   */
+  recordQueueFailure(
+    access: Access,
+    input: { repoId: string; issueIds: string[]; failure: QueueFailure },
+  ): { id: string; key: string } {
+    const failure = input.failure;
+    text(input.repoId, "repoId", 100);
+    for (const field of ["queueId", "commit"] as const)
+      if (!/^[0-9a-f]{40}$/.test(failure[field])) fail("invalid_input", `Invalid ${field}.`);
+    if (!/^[^/\s]+\/[^/\s]+$/.test(text(failure.repo, "repo", 200)))
+      fail("invalid_input", "repo must be owner/name.");
+    choice(failure.stage, ["merge", "gates", "deployment"], "failure stage");
+    choice(
+      failure.kind,
+      [
+        "build_failed",
+        "conflict",
+        "unsafe_conflict",
+        "repair_failed",
+        "infrastructure",
+        "configuration",
+      ],
+      "failure kind",
+    );
+    text(failure.reason, "reason", 4000);
+    if (
+      failure.runNumber !== null &&
+      (!Number.isSafeInteger(failure.runNumber) || failure.runNumber < 1)
+    )
+      fail("invalid_input", "runNumber must be positive or null.");
+    if (
+      failure.attempt !== undefined &&
+      (!Number.isSafeInteger(failure.attempt) || failure.attempt < 1)
+    )
+      fail("invalid_input", "attempt must be positive.");
+    if (!Number.isFinite(Date.parse(failure.occurredAt)))
+      fail("invalid_input", "Invalid failure time.");
+    for (const field of ["failedJobs", "conflictPaths"] as const) {
+      if (!Array.isArray(failure[field]) || failure[field].length > 100)
+        fail("invalid_input", `Invalid ${field}.`);
+      failure[field].forEach((value) => text(value, field, 1024));
+    }
+    for (const field of ["classificationModel", "repairModel"] as const)
+      if (failure[field] !== null) text(failure[field], field, 200);
+    const issueIds = strings(input.issueIds, "issues", 20).sort();
+    const operationId = `queue-failure:${input.repoId}:${failure.queueId}:${failure.attempt ?? 0}:${failure.stage}:${failure.runNumber ?? 0}`;
+    const encoded = canonical({ repoId: input.repoId, issueIds, failure });
+    return this.transaction(() => {
+      const receipt = first(
+        this.sql,
+        tracker.selectFrom("receipts").selectAll().where("id", "=", operationId),
+      );
+      if (receipt) {
+        if (receipt.request !== encoded)
+          fail("operation_conflict", "Queue failure identity already has different evidence.", 409);
+        return JSON.parse(receipt.result) as { id: string; key: string };
+      }
+      // Resolve everything before writes; missing originals must never become a partial effect.
+      const originals = issueIds.map((issueId) => this.get<Issue>("issue", issueId));
+      const now = new Date(this.clock()).toISOString();
+      const actor = auditActor(access);
+      const emit = (type: EntityType, entity: Entity, kind: string) => {
+        const prior = first(
+          this.sql,
+          tracker.selectFrom(tables[type]).select("data").where("id", "=", entity.id),
+        );
+        const before = prior ? (JSON.parse(prior.data) as Entity) : null;
+        run(
+          this.sql,
+          tracker
+            .insertInto(tables[type])
+            .values({ id: entity.id, data: JSON.stringify(entity) })
+            .onConflict((oc) => oc.column("id").doUpdateSet({ data: JSON.stringify(entity) })),
+        );
+        this.record({
+          operationId,
+          actorId: access.actorId,
+          actor,
+          source: "unknown",
+          mutationKind: "queue.failure",
+          kind,
+          entityType: type,
+          entityId: entity.id,
+          entity,
+          before,
+          createdAt: now,
+        });
+      };
+      let team = originals.length ? this.get<Team>("team", originals[0]!.teamId) : undefined;
+      if (!team || team.archived) {
+        team = this.all<Team>("team").find((entry) => entry.key === "MERGE");
+        if (!team) {
+          team = {
+            id: crypto.randomUUID(),
+            key: "MERGE",
+            name: "Merge remediation",
+            description: "Failures reported by the repository merge queue.",
+            memberIds: [],
+            archived: false,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          };
+          emit("team", team, "team.create");
+        } else if (team.archived) {
+          // The dedicated system team must remain available for new failures.
+          team = { ...team, archived: false, version: team.version + 1, updatedAt: now };
+          emit("team", team, "team.update");
+        }
+      }
+      const number = one(
+        this.sql,
+        tracker
+          .insertInto("team_numbers")
+          .values({ id: team.id, number: raw.lit(1) })
+          .onConflict((oc) =>
+            oc.column("id").doUpdateSet((eb) => ({ number: eb("number", "+", raw.lit(1)) })),
+          )
+          .returning("number"),
+      ).number;
+      const remediation: Issue = {
+        id: crypto.randomUUID(),
+        key: `${team.key}-${number}`,
+        teamId: team.id,
+        title: `Repair ${failure.repo} queue ${failure.stage} failure`,
+        description: failure.reason,
+        acceptance: "Push a fix and verify the failed queue stage with real run evidence.",
+        type: "remediation",
+        status: "todo",
+        priority: 0,
+        assigneeId: null,
+        parentId: null,
+        workspaceIds: [],
+        labels: [],
+        claim: null,
+        createdBy: actor,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+        queueFailure: failure,
+      };
+      emit("issue", remediation, "issue.create");
+      const evidence = `Merge queue failure\n\n${JSON.stringify(failure, null, 2)}`;
+      for (const issue of [...originals, remediation]) {
+        if (issue.id !== remediation.id) {
+          // A delayed earlier callback must not replace a newer failure's summary.
+          if (
+            !issue.queueFailure ||
+            Date.parse(issue.queueFailure.occurredAt) <= Date.parse(failure.occurredAt)
+          )
+            emit(
+              "issue",
+              { ...issue, queueFailure: failure, version: issue.version + 1, updatedAt: now },
+              "issue.update",
+            );
+          emit(
+            "link",
+            { id: crypto.randomUUID(), fromId: remediation.id, toId: issue.id, kind: "related" },
+            "link.create",
+          );
+        }
+        emit(
+          "comment",
+          {
+            id: crypto.randomUUID(),
+            issueId: issue.id,
+            body: evidence,
+            kind: "evidence",
+            actorId: access.actorId,
+            createdAt: now,
+          },
+          "comment.add",
+        );
+      }
+      const result = { id: remediation.id, key: remediation.key };
+      run(
+        this.sql,
+        tracker.insertInto("receipts").values({
+          id: operationId,
+          actor_id: access.actorId,
+          request: encoded,
+          result: JSON.stringify(result),
+        }),
+      );
+      return result;
+    });
   }
   /**
    * Withdraw approval requests whose checkpoint the timeline moved past, inside
@@ -1450,7 +1665,11 @@ export class TrackerStore {
         if (key in data)
           issue[key] = text(data[key], key, key === "title" ? 500 : 131072, key !== "title");
       if ("type" in data)
-        issue.type = choice(data.type, ["task", "bug", "prd", "chore", "research"], "issue type");
+        issue.type = choice(
+          data.type,
+          ["task", "bug", "prd", "chore", "research", "remediation"],
+          "issue type",
+        );
       // Done in a timeline is the tracker's to set; leaving it as it is is fine.
       if ("status" in data && !(data.status === "done_in_timeline" && issue.status === data.status))
         issue.status = choice(data.status, SETTABLE_STATUSES, "status");

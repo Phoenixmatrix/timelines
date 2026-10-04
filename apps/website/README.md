@@ -205,6 +205,86 @@ flight on a branch, a push's run is held; when one finishes, the newest held run
 starts and covers the older ones (`covered_by`), and `gm runs wait` follows the
 covering run.
 
+**Explicit merge queue (CORE-136).** `gm push --queue --issue CORE-123` submits
+independent default-branch work without immediately advancing main. It uploads a
+source staging ref, then admits a durable per-repository entry whose ID is the
+full source commit. Admission is not landing or deployment. Save that ID in a
+tracker checkpoint; use `gm queue show ID` or `gm queue wait ID --deploy` at work
+boundaries, and continue unrelated work only under its own valid claim.
+
+The queue pins the base and source, prepares an exact two-parent candidate, runs
+the configured required merge gates on that candidate, then advances main with
+compare-and-swap. Missing/invalid configuration, no runnable gates or skipped
+required jobs fail closed. If main moves, the candidate must be merged and tested
+again. Failed/cancelled entries release scheduling capacity; retry fences off old
+attempts. Post-landing main CI/deployment is tracked separately: failure creates
+remediation without changing the landed status or rewinding main.
+Notification retries do not block deployment startup or failure remediation.
+If deployment recovery finds main has already advanced and the original pipeline
+is missing, it never starts a new production deployment of the old candidate.
+It follows the current main's real push pipeline only with Git ancestry proof;
+missing newer-main CI stays pending for bounded recovery before an honest
+infrastructure failure, and unrelated main history fails without inventing coverage.
+Source staging refs do not start ordinary CI, knowledge or preview work. They do
+record push provenance before returning, so subsequently uploaded step context is
+verified against the staged commit without waiting for landing. Queue
+gates run in full; no new path-based gate reuse is introduced. Ordinary exact-run
+dedupe, push coalescing/coverage, declared complete `paths` input reuse and deploy
+concurrency remain in place. AI never authorizes skipped checks: combining queued
+descendants requires deterministic Git ancestry proof. Queue CI summaries have
+`trigger: landing` and a nullable `queueId`, not a fabricated timeline link.
+Candidate refs include the attempt: `gitmatrix/landing/queue-ID-ATTEMPT`.
+
+Explicit submission opts into bounded queue inference through the repository's
+captured AI settings. Scheduling remains a separate advisory `choice` decision;
+both its reported confidence and combination probability must reach 0.95.
+Repair requires all three Clef `noul` semantic checks—ordinary documentation,
+compatible additions, and explicit approval of exact concatenation—to have
+yes-probability at least 0.95. Repair `decision.confidence` records the minimum
+of those three yes-probabilities, not the scheduling choice-confidence metric.
+The classifier receives the unchanged base and each exact addition as separate
+fields. Repair permits one classification call and at most one content-only generation, with 65-second and
+125-second deadlines respectively. At most three ordinary documentation files
+are eligible, bounded to 4,096 UTF-8 bytes per version and 16,384 aggregate bytes.
+Unicode prose is supported. The exact base and both appended suffixes must be
+preserved; invented edits are rejected. Executable, CI, auth/security, dependency, migration,
+configuration, generated and agent-instruction files, deletion, binary content,
+symlinks, traversal and ambiguous/model-invalid output are excluded. The model
+proposes content, never commands. Runner checks and the full required gates still
+apply; model outages or missing approval cannot authorize repair.
+
+Failures create top-level, unassigned P0 `remediation` issues without taking over
+the original work. Both remediation and linked originals expose read-only
+`queueFailure`: `queueId`, `repo`, `commit`, `stage` (`merge`, `gates`, `deployment`),
+`kind`, `reason`, `runNumber`, `failedJobs`, `conflictPaths`,
+`classificationModel`, `repairModel`, and `occurredAt` (with attempt attribution
+when available). Kinds distinguish build failures, conflicts, unsafe conflicts,
+repair failures, infrastructure and configuration. These are trusted system
+fields, not editable `IssueFields`; model identifiers are evidence, not approval.
+The tracker's **Remediation** view selects open remediation, and issue detail
+links to the actual CI run. Inspect logs/paths, claim with the normal online
+fenced protocol, keep/renew any original lease as needed, and record genuine
+recovery evidence before completing. No result or lost token grants ownership.
+
+Use `gm queue list`, `show`, `cancel`, and `retry` to inspect and recover; retry
+is only for failed/cancelled entries. Cancellation is refused while advancing or
+after landing. Cancelling a combined member cancels only that member and
+atomically invalidates/requeues the leader's original work rather than silently
+cancelling the whole group. Queue-owned CI runs reject ordinary CI reruns: use
+queue retry to create a new fenced attempt. An uncertain admission is
+investigated by the deterministic queue ID, never silently retried as a direct
+push. Ordinary
+`gm push` and native Git pushes intentionally remain available for recovery:
+they are **not universally protected by this queue**. A broken queue must not
+prevent fixing Gitmatrix itself. Timeline-bound work instead uses its existing
+checkpoint/land queue: `--queue` is rejected there, and pinned human approvals
+are never automatically weakened or replaced.
+
+Repository deletion also fences queue admission, candidate publication and recovery
+effects at the tombstone boundary. Purging cancels queue CI alongside other runs
+and removes queue entries and their attempt history in the bounded row sweep;
+deleted repositories cannot restart queue remediation or post-land work.
+
 ## Steps: work context per commit
 
 Agents working in a timeline commit at each meaningful step and attach the

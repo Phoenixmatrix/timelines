@@ -1,6 +1,7 @@
 // A person's defaults for each tracker they use (CORE-119): team, layout and
 // issue view, on the server so they follow them across browsers and devices.
 
+import { sql } from "kysely";
 import { TRACKER_LAYOUTS, type TrackerPreferences } from "../../shared/tracker.ts";
 import { db, nowIso } from "../schema.ts";
 
@@ -58,8 +59,16 @@ export async function savePreferences(
   ownerId: string,
   preferences: Omit<TrackerPreferences, "updatedAt">,
 ): Promise<TrackerPreferences> {
-  const updatedAt = nowIso();
-  await db(d1)
+  const now = nowIso();
+  // Allocate chronology inside the write, not in a separate read: simultaneous
+  // saves (or a clock moving backwards) must still select the last saved tracker.
+  const updatedAt = sql<string>`(
+    select max(${now}, coalesce(
+      strftime('%Y-%m-%dT%H:%M:%fZ', max(updated_at), '+0.001 seconds'), ${now}
+    ))
+    from tracker_preferences where user_id = ${userId}
+  )`;
+  const row = await db(d1)
     .insertInto("tracker_preferences")
     .values({
       user_id: userId,
@@ -70,15 +79,16 @@ export async function savePreferences(
       updated_at: updatedAt,
     })
     .onConflict((oc) =>
-      oc.columns(["user_id", "owner_id"]).doUpdateSet({
+      oc.columns(["user_id", "owner_id"]).doUpdateSet((eb) => ({
         team_id: preferences.teamId,
         view: preferences.view,
         query: preferences.query,
-        updated_at: updatedAt,
-      }),
+        updated_at: eb.ref("excluded.updated_at"),
+      })),
     )
-    .execute();
-  return { ...preferences, updatedAt };
+    .returning("updated_at")
+    .executeTakeFirstOrThrow();
+  return { ...preferences, updatedAt: row.updated_at };
 }
 
 export async function clearPreferences(d1: D1Database, userId: string, ownerId: string) {

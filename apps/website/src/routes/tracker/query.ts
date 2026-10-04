@@ -479,6 +479,7 @@ export const DEFAULT_QUERY = "is:open";
 export const VIEWS: { label: string; query: string }[] = [
   { label: "Open", query: DEFAULT_QUERY },
   { label: "Ready", query: "is:ready" },
+  { label: "Remediation", query: "type:remediation is:open" },
   { label: "Mine", query: "assignee:me is:open" },
   { label: "In progress", query: "status:in_progress" },
   { label: "Claimed", query: "is:claimed" },
