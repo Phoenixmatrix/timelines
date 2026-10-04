@@ -60,6 +60,16 @@ function world() {
       ('run8', 'r-engine', 8, '${oid(4)}', 'refs/heads/gitmatrix/landing/search', 'manual', 'Gates', 'succeeded', '2026-09-01T12:05:00.000Z', 'land1'),
       ('run9', 'r-secret', 9, '${oid(5)}', 'refs/heads/gitmatrix/landing/search', 'manual', 'Merge', 'succeeded', '2026-09-01T12:00:00.000Z', 'land1'),
       ('run10', 'r-secret', 10, '${oid(7)}', 'refs/heads/timeline/search', 'push', 'Hidden', 'failed', '2026-09-01T10:06:00.000Z', NULL);
+    -- Commit messages naming CORE-1 (CORE-22): in engine, in secret, one that
+    -- named another tracker's CORE-1, and one left ambiguous; a run of the first.
+    INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, change_id, resolution, tracker_owner_id, issue_id, title, committed_at, first_ref, pushed_at) VALUES
+      ('r-engine', '${oid(20)}', 'CORE-1', 'chgmention', 'linked', 'orbit', 'work', 'CORE-1: Tune ranking weights', '2026-09-03T09:00:00.000Z', 'refs/heads/main', '2026-09-03T09:01:00.000Z'),
+      ('r-engine', '${oid(19)}', 'CORE-1', NULL, 'linked', 'orbit', 'work', 'Prepare for CORE-1', NULL, NULL, '2026-09-02T09:01:00.000Z'),
+      ('r-secret', '${oid(21)}', 'CORE-1', NULL, 'linked', 'orbit', 'work', 'CORE-1 hidden mention', '2026-09-03T10:00:00.000Z', 'refs/heads/main', '2026-09-03T10:01:00.000Z'),
+      ('r-engine', '${oid(22)}', 'CORE-1', NULL, 'linked', 'other', 'x', 'Other tracker work', '2026-09-03T11:00:00.000Z', 'refs/heads/main', '2026-09-03T11:01:00.000Z'),
+      ('r-engine', '${oid(23)}', 'CORE-1', NULL, 'ambiguous', NULL, NULL, 'Ambiguous CORE-1', '2026-09-03T12:00:00.000Z', 'refs/heads/main', '2026-09-03T12:01:00.000Z');
+    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, title, status, created_at, landing_id) VALUES
+      ('run20', 'r-engine', 20, '${oid(20)}', 'refs/heads/main', 'push', 'CORE-1: Tune ranking weights', 'succeeded', '2026-09-03T09:02:00.000Z', NULL);
     INSERT INTO deployments (repo_id, environment, timeline_slug, timeline_id, checkpoint_id, commit_oid, url, status, run_id, created_at) VALUES
       ('r-engine', 'timeline-search', 'search', NULL, NULL, '${oid(2)}', 'https://search.preview.test', 'active', NULL, '2026-09-01T11:00:00.000Z'),
       ('r-secret', 'timeline-search', 'search', NULL, NULL, '${oid(3)}', 'https://hidden.preview.test', 'active', NULL, '2026-09-01T11:00:00.000Z');
@@ -72,7 +82,8 @@ function world() {
       ('hid', 'feed', '@orbit/hidden', '@orbit/hidden', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');
     INSERT INTO publishes (id, feed_id, format, package_id, version, action, status, git_repo_id, commit_oid, actor, actor_label, via, at) VALUES
       ('u1', 'feed', 'npm', 'pkg', '1.2.0', 'publish', 'active', 'r-engine', '${oid(6)}', 'job:j', 'ci', 'ci', '2026-09-01T10:10:00Z'),
-      ('u2', 'feed', 'npm', 'hid', '0.1.0', 'publish', 'active', 'r-secret', '${oid(7)}', 'job:k', 'ci', 'ci', '2026-09-01T10:10:00Z');
+      ('u2', 'feed', 'npm', 'hid', '0.1.0', 'publish', 'active', 'r-secret', '${oid(7)}', 'job:k', 'ci', 'ci', '2026-09-01T10:10:00Z'),
+      ('u3', 'feed', 'npm', 'pkg', '1.3.0', 'publish', 'active', 'r-engine', '${oid(20)}', 'job:m', 'ci', 'ci', '2026-09-03T09:05:00Z');
   `);
 
   // The tracker: CORE-1 worked in timeline "search", which touches both repositories.
@@ -228,7 +239,7 @@ describe("an issue's linked work", () => {
         verified: true,
         why: "Results were unordered.",
         model: "claude-opus",
-        href: `/orbit/engine/commits/${oid(6)}`,
+        href: `/orbit/engine?commit=${oid(6)}`,
       },
     ]);
     expect(work.commits.map((c) => [c.oid, c.sources.sort()])).toEqual(
@@ -304,6 +315,59 @@ describe("an issue's linked work", () => {
     expect(work.steps.map((s) => s.repo.name)).toEqual(["secret"]);
     expect(work.packages.map((p) => p.name)).toEqual(["@orbit/hidden"]);
     expect(JSON.stringify(work)).not.toContain("engine");
+  });
+
+  test("lists the commits that mention it apart, with their runs and packages, as the viewer may read them", async () => {
+    const { call } = world();
+    const work = (await (
+      await call(ann, "/tracker/orbit/issues/CORE-1/work")
+    ).json()) as LinkedWork;
+    expect(work.mentions).toEqual([
+      {
+        repo: { id: "r-engine", owner: "orbit", name: "engine" },
+        oid: oid(20),
+        changeId: "chgmention",
+        title: "CORE-1: Tune ranking weights",
+        committedAt: "2026-09-03T09:00:00.000Z",
+        ref: "refs/heads/main",
+        pushedAt: "2026-09-03T09:01:00.000Z",
+        href: `/orbit/engine?commit=${oid(20)}`,
+        runs: [
+          expect.objectContaining({
+            number: 20,
+            status: "succeeded",
+            commit: oid(20),
+            href: "/orbit/engine/ci/20",
+          }),
+        ],
+        packages: [
+          expect.objectContaining({
+            name: "@orbit/ranker",
+            version: "1.3.0",
+            commit: oid(20),
+            href: "/orbit/-/packages/npm/%40orbit/ranker",
+          }),
+        ],
+      },
+      // Found in history: no committer time recorded, ordered by when it was seen.
+      expect.objectContaining({
+        oid: oid(19),
+        committedAt: null,
+        ref: null,
+        runs: [],
+        packages: [],
+      }),
+    ]);
+    // Mentions aren't evidence: their commit, run and package stay out of the explicit lists.
+    for (const list of [work.commits, work.runs, work.packages])
+      expect(JSON.stringify(list)).not.toContain(oid(20));
+    // Another tracker's issue, an ambiguous key and an unreadable repository don't show.
+    const text = JSON.stringify(work);
+    for (const hidden of [oid(21), oid(22), oid(23)]) expect(text).not.toContain(hidden);
+    // Ben reads secret, not engine: he sees only its mention.
+    const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
+    const his = (await (await call(ben, "/tracker/orbit/issues/CORE-1/work")).json()) as LinkedWork;
+    expect(his.mentions.map((m) => [m.repo.name, m.oid])).toEqual([["secret", oid(21)]]);
   });
 
   test("needs tracker membership, and names a missing issue", async () => {

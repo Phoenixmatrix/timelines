@@ -297,10 +297,17 @@ export async function world(action: string, input: unknown): Promise<unknown> {
     }
     case "sql": {
       // Rows only machinery the world lacks would write (CI runs,
-      // deployments, wiki page sets), as that machinery would leave them.
-      const { statement, params = [] } = input as { statement: string; params?: unknown[] };
+      // deployments, wiki page sets, packages published from CI), as that
+      // machinery would leave them; `database: "registry"` for the registry's.
+      const {
+        statement,
+        params = [],
+        database,
+      } = input as { statement: string; params?: unknown[]; database?: "registry" };
       const world = worldOf(args.world ?? "");
-      const { results } = await world.env.DB.prepare(statement)
+      const target = database === "registry" ? world.env.REGISTRY_DB : world.env.DB;
+      const { results } = await target
+        .prepare(statement)
         .bind(...params)
         .all();
       return results;

@@ -15,7 +15,7 @@ import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
 import { landedTimelines, ownerTimelines } from "./timelines.ts";
-import { affectedRepos, issuesFrom, subscribedOwners } from "./trackers.ts";
+import { affectedRepos, repoIssues } from "./trackers.ts";
 import { aiWork } from "../usage/ai.ts";
 
 export interface ReleaseNotesJob {
@@ -124,7 +124,7 @@ async function source(
           merges,
           ownerTimelines(env, row.owner_id),
         ),
-      issues: async (keys) => issuesFrom(env, await subscribedOwners(env, row), row.id, keys),
+      issues: (keys) => repoIssues(env, row, keys),
       async changes(oid) {
         try {
           const feed = await semanticFeed(reader, cache, row.id, base, {

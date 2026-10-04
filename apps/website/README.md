@@ -102,7 +102,9 @@ pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
   there; the Knowledge coordinator is idle. `atlasFixtureRepo()` (`atlas.ts`)
   publishes the Atlas fixture the way the non-AI E2E does.
 - `server.sql()` writes the rows only machinery the world lacks would write
-  (CI runs and jobs, deployments, wiki page sets, the push log), as it would.
+  (CI runs and jobs, deployments, wiki page sets, the push log), as it would;
+  `server.registrySql()` does the same in the registry's database (feeds,
+  packages, publishes).
   `timelines.ts` builds on it: a timeline across repositories with work on
   its bookmarks, checkpoints, approval requests, those rows, and a merge
   run's end that moves a real landing on (`mergeRunEnded`).
@@ -1204,6 +1206,23 @@ linked work in `worker/tracker/work.ts`.
   `step_contexts_issue`), release-note entries by tracker and key
   (`release_note_entries_issue`); runs, deployments and packages by the
   commits found. Each list holds at most 50 items (`truncated`).
+- **Mentions** (CORE-22, `mentions` in the response) are commits whose
+  message names the issue's key, kept apart from that evidence: the issue
+  page and the inspector label them "Mentioned in". After each push the push
+  log's commit read (`worker/ref-log/record.ts`) feeds `worker/mentions`,
+  which resolves each key (`issueKeys()`) to a Gitmatrix tracker issue: first
+  trackers whose workspaces subscribe to the repository, then the owner's,
+  then (for a person's repository) their organizations'. Within a tier the
+  owner's tracker breaks a tie; otherwise the key is recorded `ambiguous` and
+  links nothing, and keys no tracker knows aren't recorded. Rows
+  (`commit_issue_mentions`) are one per repository, commit and key, keep
+  their first ref and time, and are listed by issue id in any repository the
+  viewer can read, with their own CI runs and packages; each SHA opens the
+  commit panel (`/<owner>/<repo>?commit=<sha>`). History pushed before the
+  index is read by the hourly cron: 20 repositories a run, the latest 200
+  first-parent commits of each default branch, once per repository
+  (`commit_mention_backfills`). Release notes resolve keys no subscribed
+  workspace covers through the same tiers (`repoIssues()`).
 
 **The view** (`/tracker/:owner?view=chronicle`, CORE-251; `src/routes/tracker/Chronicle*.tsx`,
 pure model in `chronicleModel.ts`): presets, zoom, group by and layout over the

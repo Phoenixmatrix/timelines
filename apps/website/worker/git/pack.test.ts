@@ -9,7 +9,7 @@ const noise = (bytes: number) =>
   Buffer.from(crypto.getRandomValues(new Uint8Array(bytes / 2))).toString("hex");
 
 describe("packCommits", () => {
-  test("reads each commit's id, parents and change id, skipping other objects", async () => {
+  test("reads each commit's id, parents, change id, time and message, skipping other objects", async () => {
     const root = commitBody({ changeId: "zzzzkkkk", message: "Root" });
     const rootId = objectId("commit", root);
     const child = commitBody({ parents: [rootId], changeId: "yyyykkkk", message: "Child" });
@@ -21,10 +21,23 @@ describe("packCommits", () => {
       { type: "commit", body: root },
       { type: "commit", body: plain },
     ]);
+    const at = 1790000000;
     expect(await packCommits(pack)).toEqual([
-      { oid: objectId("commit", child), parents: [rootId], changeId: "yyyykkkk" },
-      { oid: rootId, parents: [], changeId: "zzzzkkkk" },
-      { oid: objectId("commit", plain), parents: [rootId], changeId: null },
+      {
+        oid: objectId("commit", child),
+        parents: [rootId],
+        changeId: "yyyykkkk",
+        message: "Child\n",
+        committedAt: at,
+      },
+      { oid: rootId, parents: [], changeId: "zzzzkkkk", message: "Root\n", committedAt: at },
+      {
+        oid: objectId("commit", plain),
+        parents: [rootId],
+        changeId: null,
+        message: "Plain git\n",
+        committedAt: at,
+      },
     ]);
   });
 
@@ -64,7 +77,12 @@ describe("packCommits", () => {
 
 test("commit headers stop at the message", () => {
   const body = encoder.encode(
-    "tree t\nparent a\nparent b\nchange-id kkkk\n\nchange-id in the message\n",
+    "tree t\nparent a\nparent b\ncommitter A <a@b> 1790000000 -0700\nchange-id kkkk\n\nchange-id in the message\n",
   );
-  expect(parseCommitHeaders(body)).toEqual({ parents: ["a", "b"], changeId: "kkkk" });
+  expect(parseCommitHeaders(body)).toEqual({
+    parents: ["a", "b"],
+    changeId: "kkkk",
+    committedAt: 1790000000,
+    message: "change-id in the message\n",
+  });
 });

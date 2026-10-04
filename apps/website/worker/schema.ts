@@ -846,6 +846,27 @@ export interface Database {
     teardown_run_id: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
+  /** Issue keys commit messages name, resolved to tracker issues on push (CORE-22). */
+  commit_issue_mentions: {
+    repo_id: string;
+    commit_oid: string;
+    issue_key: string;
+    change_id: string | null;
+    resolution: "linked" | "ambiguous";
+    tracker_owner_id: string | null;
+    issue_id: string | null;
+    title: Generated<string>;
+    committed_at: string | null;
+    first_ref: string | null;
+    pushed_at: Generated<string>;
+  };
+  /** Repositories whose recent history was read for mentions (CORE-22). */
+  commit_mention_backfills: {
+    repo_id: string;
+    commits: Generated<number>;
+    note: string | null;
+    done_at: Generated<string>;
+  };
   /** The context attached to a step: a commit an agent made in a timeline (CORE-231). */
   step_contexts: {
     repo_id: string;

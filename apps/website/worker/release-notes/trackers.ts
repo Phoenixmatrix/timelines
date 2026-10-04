@@ -1,5 +1,6 @@
 import type { LinkedIssue } from "../../shared/release-notes.ts";
 import type { MutationResult } from "../../shared/tracker.ts";
+import { resolveRepoKeys, trackerLookup, type IssueLookup } from "../mentions/index.ts";
 import { db } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
 
@@ -32,10 +33,41 @@ export async function issuesFrom(
         issues.push({ ...issue, trackerOwner: owner.slug, trackerOwnerId: owner.id });
     }
   }
+  return byKeyOrder(issues, keys);
+}
+
+function byKeyOrder(issues: LinkedIssue[], keys: string[]): LinkedIssue[] {
   return issues.sort(
     (a, b) =>
       keys.indexOf(a.key) - keys.indexOf(b.key) || a.trackerOwner.localeCompare(b.trackerOwner),
   );
+}
+
+/**
+ * A repository's keys for its release notes: through the trackers that
+ * subscribe a workspace to it (issuesFrom), then, for keys none of them
+ * knows, as the commit-mention index resolves them (CORE-22: the repository
+ * owner's tracker, then its organizations'), so an issue needn't be in a
+ * subscribed workspace to be named.
+ */
+export async function repoIssues(
+  env: Env,
+  repo: { id: string; owner_id: string },
+  keys: string[],
+  lookup: IssueLookup = trackerLookup(env),
+): Promise<LinkedIssue[]> {
+  const issues = await issuesFrom(env, await subscribedOwners(env, repo), repo.id, keys);
+  const known = new Set(issues.map((issue) => issue.key));
+  const missing = keys.filter((key) => !known.has(key));
+  if (!missing.length) return issues;
+  for (const found of (await resolveRepoKeys(env.DB, repo, missing, lookup)).values())
+    if (found.kind === "linked")
+      issues.push({
+        ...found.issue,
+        trackerOwner: found.owner.slug,
+        trackerOwnerId: found.owner.id,
+      });
+  return byKeyOrder(issues, keys);
 }
 
 /**

@@ -162,6 +162,19 @@ export class TestServer {
     })) as T[];
   }
 
+  /** server.sql() against the registry's database (REGISTRY_DB): feeds, packages, publishes. */
+  async registrySql<T = Record<string, unknown>>(
+    statement: string,
+    ...params: unknown[]
+  ): Promise<T[]> {
+    return (await browserCommands.gmWorld("sql", {
+      world: this.#world(),
+      statement,
+      params,
+      database: "registry",
+    })) as T[];
+  }
+
   #world(): string {
     if (!this.world)
       throw new Error("This test server has no world: start it with { world: true }");

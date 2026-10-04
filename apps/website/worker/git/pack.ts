@@ -16,6 +16,10 @@ export interface PackCommit {
   parents: string[];
   /** gm's (and jj's) `change-id` header, when the commit has one. */
   changeId: string | null;
+  /** The message, after the headers (packs always have it; test graphs may not). */
+  message?: string;
+  /** The committer's timestamp, in Unix seconds, when the header parses. */
+  committedAt?: number | null;
 }
 
 /**
@@ -77,20 +81,28 @@ export async function packCommits(pack: Uint8Array): Promise<PackCommit[]> {
   return commits;
 }
 
-/** A commit's parents and change id, from its header lines. */
+/** A commit's parents, change id, committer time and message, from its body. */
 export function parseCommitHeaders(body: Uint8Array): {
   parents: string[];
   changeId: string | null;
+  message: string;
+  committedAt: number | null;
 } {
   const text = decoder.decode(body);
   const end = text.indexOf("\n\n");
   const parents: string[] = [];
   let changeId: string | null = null;
+  let committedAt: number | null = null;
   for (const line of (end === -1 ? text : text.slice(0, end)).split("\n")) {
     if (line.startsWith("parent ")) parents.push(line.slice(7));
     else if (line.startsWith("change-id ")) changeId = line.slice(10).trim() || null;
+    else if (line.startsWith("committer ")) {
+      // `committer Name <email> 1700000000 +0000`
+      const seconds = /> (\d+) [+-]\d{4}$/.exec(line)?.[1];
+      committedAt = seconds ? Number(seconds) : null;
+    }
   }
-  return { parents, changeId };
+  return { parents, changeId, message: end === -1 ? "" : text.slice(end + 2), committedAt };
 }
 
 /** Git's object id: SHA-1 over `<type> <size>\0<body>`. */

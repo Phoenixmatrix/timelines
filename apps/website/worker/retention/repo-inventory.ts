@@ -22,6 +22,8 @@ export const REPO_TABLES = [
   "ci_refs",
   "ci_runs",
   "ci_secrets",
+  "commit_issue_mentions",
+  "commit_mention_backfills",
   "deployments",
   "do_instances",
   "kg_builds",

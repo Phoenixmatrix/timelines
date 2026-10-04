@@ -13,6 +13,7 @@ import { sweepRepoOrphans, sweepsOrphans } from "./retention/repo-orphans.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 import { settled, sweepLandings } from "./timelines/landing.ts";
 import { sweepQueue } from "./merge-queue/index.ts";
+import { artifactsHistory, backfillMentions } from "./mentions/backfill.ts";
 import { checkCatalogDaily } from "./usage/prices.ts";
 
 export default {
@@ -55,7 +56,8 @@ export default {
   /**
    * Hourly: package sweeps, tearing down expired timeline previews (CORE-79),
    * Atlas projection retention (CORE-159), data retention runs (CORE-198),
-   * usage snapshots (CORE-207) and the daily price check (CORE-208).
+   * usage snapshots (CORE-207), the daily price check (CORE-208) and the
+   * commit-mention backfill (CORE-22).
    */
   async scheduled(_controller, env, ctx) {
     if (isPreview(env)) return;
@@ -115,6 +117,13 @@ export default {
       sweepQueue(env, (work) => ctx.waitUntil(work)).catch((error) =>
         console.error("Merge queue: sweep failed", error),
       ),
+    );
+    // Issue mentions in history pushed before the index existed, a few repositories a run.
+    ctx.waitUntil(
+      backfillMentions(
+        env,
+        artifactsHistory(env, (work) => ctx.waitUntil(work)),
+      ).catch((error) => console.error("Mentions: the backfill failed", error)),
     );
   },
 } satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob | RetentionJob>;

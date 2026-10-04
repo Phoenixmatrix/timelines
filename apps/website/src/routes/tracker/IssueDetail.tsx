@@ -48,6 +48,7 @@ import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
 import { LabelPicker } from "./Labels.tsx";
+import { LinkedWorkPanel } from "./LinkedWork.tsx";
 import { Requirements } from "./Requirements.tsx";
 
 export type MutationOutcome =
@@ -1644,6 +1645,15 @@ export function IssueDetail({
             Add relation
           </button>
         </form>
+      </section>
+      <section className={SECTION} aria-label="Linked work" data-issue-linked-work>
+        <LinkedWorkPanel
+          key={`${snapshot.owner.id}:${issue.id}`}
+          owner={snapshot.owner.slug}
+          issueId={issue.id}
+          issueKey={issue.key}
+          headingClassName={HEADING}
+        />
       </section>
       <AuditHistory
         key={`${snapshot.owner.id}:${issue.id}`}

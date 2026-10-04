@@ -4,8 +4,8 @@
 // its state as of the playhead, its changes, spans and markers in the
 // range, and its linked work, each item opening its existing page.
 
-import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState } from "react";
+import { XIcon } from "@phosphor-icons/react";
+import { useMemo } from "react";
 import { Link } from "react-router";
 import {
   actorText,
@@ -14,13 +14,12 @@ import {
   summarize,
   workedMs,
   type ChronicleIssue,
-  type LinkedWork,
   type WorkSpan,
 } from "../../../shared/chronicle.ts";
 import type { AuditActor, IssueStatus } from "../../../shared/tracker.ts";
 import { Tip } from "../../components/ui.tsx";
-import { api, ApiError } from "../../lib/api.ts";
 import { Actor } from "./Actor.tsx";
+import { LinkedWorkPanel } from "./LinkedWork.tsx";
 import type { Loaded } from "./chronicleData.ts";
 import {
   duration,
@@ -338,7 +337,13 @@ export function Inspector({
           </ol>
         </div>
       )}
-      <LinkedWorkPanel owner={owner} issue={issue} span={span} now={now} />
+      <LinkedWorkPanel
+        owner={owner}
+        issueId={issue.id}
+        issueKey={issue.key}
+        span={span}
+        now={now}
+      />
     </section>
   );
 }
@@ -405,245 +410,5 @@ function SpanFacts({ span, data, now }: { span: WorkSpan; data: Loaded; now: num
         </>
       )}
     </dl>
-  );
-}
-
-type WorkState =
-  | { state: "loading" }
-  | { state: "error"; message: string }
-  | { state: "ready"; work: LinkedWork };
-
-/** Linked work, loaded when an issue opens; with a span, what falls inside it first. */
-function LinkedWorkPanel({
-  owner,
-  issue,
-  span,
-  now,
-}: {
-  owner: string;
-  issue: ChronicleIssue;
-  span: WorkSpan | null;
-  now: number;
-}) {
-  const [work, setWork] = useState<WorkState>({ state: "loading" });
-  useEffect(() => {
-    const controller = new AbortController();
-    setWork({ state: "loading" });
-    api<LinkedWork>(
-      `/tracker/${encodeURIComponent(owner)}/issues/${encodeURIComponent(issue.id)}/work`,
-      { signal: controller.signal },
-    )
-      .then((value) => setWork({ state: "ready", work: value }))
-      .catch((cause: unknown) => {
-        if (controller.signal.aborted) return;
-        setWork({
-          state: "error",
-          message:
-            cause instanceof ApiError ? cause.message : "Couldn't load this issue's linked work.",
-        });
-      });
-    return () => controller.abort();
-  }, [owner, issue.id]);
-
-  if (work.state === "loading")
-    return (
-      <div aria-busy="true" className="flex flex-col gap-2">
-        <h3 className="m-0 text-label text-ink-muted">Linked work</h3>
-        <div className="h-16 animate-pulse rounded-plate bg-surface motion-reduce:animate-none" />
-      </div>
-    );
-  if (work.state === "error")
-    return (
-      <div>
-        <h3 className="m-0 mb-1 text-label text-ink-muted">Linked work</h3>
-        <p className="m-0 text-body-sm text-danger-text">{work.message}</p>
-      </div>
-    );
-  const w = work.work;
-  // With a span: what was made while it held (and shortly after), first.
-  const during = (at: string | null) => {
-    if (!span || !at) return true;
-    const t = time(at);
-    const end = span.end ? time(span.end) : now;
-    return t >= time(span.start) - 5 * 60_000 && t <= end + 60 * 60_000;
-  };
-  const items: {
-    group: string;
-    key: string;
-    label: string;
-    meta: string;
-    href: string;
-    at: string | null;
-    external?: boolean;
-  }[] = [
-    ...w.steps.map((s) => ({
-      group: "Agent work",
-      key: `step:${s.repo.id}:${s.commitOid}`,
-      label: s.summary || s.commitOid.slice(0, 10),
-      meta: `${s.repo.owner}/${s.repo.name} · ${s.commitOid.slice(0, 7)} · ${s.author.name ?? s.author.id}${s.verified ? "" : " · unverified"}`,
-      href: s.href,
-      at: s.committedAt,
-    })),
-    ...w.commits.map((c) => ({
-      group: "Commits",
-      key: `commit:${c.repo.id}:${c.oid}`,
-      label: c.summary ?? `Commit ${c.oid.slice(0, 7)}`,
-      meta: `${c.repo.owner}/${c.repo.name} · ${c.oid.slice(0, 7)} · ${c.sources.join(", ")}`,
-      href: c.href,
-      at: c.at,
-    })),
-    ...w.runs.map((r) => ({
-      group: "CI runs",
-      key: `run:${r.repo.id}:${r.number}`,
-      label: `Run #${r.number} ${r.title ? `· ${r.title}` : ""}`,
-      meta: `${r.repo.owner}/${r.repo.name} · ${r.status} · ${r.kind}`,
-      href: r.href,
-      at: r.createdAt,
-    })),
-    ...w.deployments.map((d) => ({
-      group: "Deployments",
-      key: `deploy:${d.id}`,
-      label: d.environment,
-      meta: `${d.repo.owner}/${d.repo.name} · ${d.status} · ${d.commit.slice(0, 7)}`,
-      href: d.href,
-      at: d.createdAt,
-      external: /^https?:/.test(d.href),
-    })),
-    ...w.packages.map((p) => ({
-      group: "Packages",
-      key: `package:${p.format}:${p.name}:${p.version}`,
-      label: `${p.name}@${p.version}`,
-      meta: `${p.format} · from ${p.commit.slice(0, 7)}`,
-      href: p.href,
-      at: p.at,
-    })),
-    ...w.timelines.flatMap((t) => [
-      ...t.checkpoints.map((cp) => ({
-        group: "Timelines",
-        key: `cp:${cp.id}`,
-        label: `${t.slug} · checkpoint #${cp.number}`,
-        meta: `${cp.approval ?? "no approval"}${cp.summary ? ` · ${cp.summary}` : ""}`,
-        href: cp.href,
-        at: cp.createdAt,
-      })),
-      ...t.landings.map((l) => ({
-        group: "Timelines",
-        key: `landing:${l.id}`,
-        label: `${t.slug} · landing of #${l.checkpointNumber}`,
-        meta: l.state,
-        href: l.href,
-        at: l.updatedAt,
-      })),
-      ...(t.checkpoints.length || t.landings.length
-        ? []
-        : [
-            {
-              group: "Timelines",
-              key: `timeline:${t.id}`,
-              label: t.name || t.slug,
-              meta: t.status,
-              href: t.href,
-              at: null,
-            },
-          ]),
-    ]),
-    ...w.releaseNotes.map((n) => ({
-      group: "Release notes",
-      key: `note:${n.repo.id}:${n.release}:${n.title}`,
-      label: n.title,
-      meta: `${n.repo.owner}/${n.repo.name} · ${n.label} · ${n.category}`,
-      href: n.href,
-      at: n.shippedAt,
-    })),
-  ];
-  const groups = [
-    "Agent work",
-    "Commits",
-    "CI runs",
-    "Deployments",
-    "Packages",
-    "Timelines",
-    "Release notes",
-  ];
-  const list = (subset: typeof items) =>
-    groups
-      .map((group) => ({ group, entries: subset.filter((item) => item.group === group) }))
-      .filter((g) => g.entries.length);
-  const inSpan = span ? items.filter((item) => during(item.at)) : items;
-  const rest = span ? items.filter((item) => !during(item.at)) : [];
-  const render = (subset: typeof items, heading: string) => (
-    <div className="flex flex-col gap-3">
-      <h3 className="m-0 text-label text-ink-muted">{heading}</h3>
-      {list(subset).map(({ group, entries }) => (
-        <div key={group}>
-          <h4 className="m-0 mb-0.5 px-2 text-micro font-semibold text-ink-faint">{group}</h4>
-          <ul className="m-0 flex list-none flex-col p-0">
-            {entries.map((item) => {
-              const body = (
-                <>
-                  <span className="flex items-center gap-1 truncate text-ink">
-                    {item.label}
-                    {item.external && (
-                      <ArrowSquareOutIcon
-                        className="size-3.5 shrink-0 text-ink-faint"
-                        aria-hidden
-                      />
-                    )}
-                  </span>
-                  <span className="block truncate text-micro text-ink-faint">{item.meta}</span>
-                </>
-              );
-              const cls =
-                "block rounded-plate px-2 py-1 text-body-sm no-underline hover:bg-raised max-sm:py-2";
-              return (
-                <li key={item.key} data-linked-work={item.group}>
-                  {item.external ? (
-                    <a href={item.href} target="_blank" rel="noreferrer" className={cls}>
-                      {body}
-                    </a>
-                  ) : (
-                    <Link to={item.href} className={cls}>
-                      {body}
-                    </Link>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      ))}
-    </div>
-  );
-  if (!items.length)
-    return (
-      <div>
-        <h3 className="m-0 mb-1 text-label text-ink-muted">Linked work</h3>
-        <p className="m-0 max-w-[44ch] px-2 text-body-sm text-ink-faint">
-          Nothing names {issue.key} yet: no step context, release-note entry or timeline that worked
-          it. Steps link to an issue when <code className="mk-mono">gm</code> records the commit's
-          context with the issue it was for.
-        </p>
-      </div>
-    );
-  return (
-    <div className="flex flex-col gap-4" data-chronicle-linked-work>
-      {span ? (
-        <>
-          {inSpan.length > 0 ? (
-            render(inSpan, "Linked work during this span")
-          ) : (
-            <p className="m-0 px-2 text-body-sm text-ink-faint">
-              Nothing linked was made during this span.
-            </p>
-          )}
-          {rest.length > 0 && render(rest, "Other linked work")}
-        </>
-      ) : (
-        render(items, "Linked work")
-      )}
-      {w.truncated && (
-        <p className="m-0 px-2 text-micro text-ink-faint">Showing the newest of each kind.</p>
-      )}
-    </div>
   );
 }

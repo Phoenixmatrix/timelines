@@ -992,6 +992,7 @@ export const CHILD_ROWS: [table: string, where: string][] = [
   ["atlas_edges", "scope IN (SELECT scope FROM atlas_scopes WHERE repo_id = ?1)"],
   ["atlas_entities", "scope IN (SELECT scope FROM atlas_scopes WHERE repo_id = ?1)"],
   ["change_refs", "repo_id = ?1"],
+  ["commit_issue_mentions", "repo_id = ?1"],
   ["ref_updates", "repo_id = ?1"],
   ["release_note_entries", "repo_id = ?1"],
 ];

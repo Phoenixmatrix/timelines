@@ -49,6 +49,14 @@ export const TABLE_GROUPS: TableGroup[] = [
     tables: { ref_updates: REPO, change_refs: REPO },
   },
   {
+    // CORE-22; no retention category: one small row per mention.
+    id: "issue-mentions",
+    database: "db",
+    scope: "account",
+    label: "Issue mentions in commit messages",
+    tables: { commit_issue_mentions: REPO, commit_mention_backfills: REPO },
+  },
+  {
     // CORE-231; its retention category arrives with CORE-244.
     id: "step-context",
     database: "db",

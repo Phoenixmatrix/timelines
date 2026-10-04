@@ -483,6 +483,27 @@ export interface WorkReleaseNote {
   href: string;
 }
 
+/**
+ * A commit whose message names the issue (CORE-22): a mention, not evidence
+ * the work was done, so it's kept apart from the explicit lists above. Its
+ * own CI runs and packages ride along.
+ */
+export interface WorkMention {
+  repo: WorkRepo;
+  oid: string;
+  changeId: string | null;
+  /** The message's first line. */
+  title: string;
+  committedAt: string | null;
+  /** The branch or tag whose push first made it reachable; null when found in history. */
+  ref: string | null;
+  pushedAt: string;
+  /** Opens the commit panel: `/<owner>/<repo>?commit=<oid>`. */
+  href: string;
+  runs: WorkRun[];
+  packages: WorkPackage[];
+}
+
 /** GET /api/tracker/:owner/issues/:issue/work: what the issue's work produced, newest first. */
 export interface LinkedWork {
   issue: { id: string; key: string; title: string; status: IssueStatus };
@@ -493,6 +514,8 @@ export interface LinkedWork {
   packages: WorkPackage[];
   timelines: WorkTimeline[];
   releaseNotes: WorkReleaseNote[];
+  /** Commits that mention the issue by key, newest first. */
+  mentions: WorkMention[];
   /** A list stopped at its limit. */
   truncated: boolean;
 }

@@ -24,6 +24,7 @@ import type { Issue, TrackerOwner } from "../../shared/tracker.ts";
 import { readableRepo, roleFor, selectRepos, type Actor, type RepoRow } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
+import { repoTrackers } from "../mentions/index.ts";
 import { db } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { accessible } from "../tracker/api.ts";
@@ -187,17 +188,14 @@ async function resolveIssues(
   const keyWork = (async () => {
     if (!keys.length || !trackers.length) return;
     const first = context.tracker ? bySlug.get(context.tracker) : undefined;
-    const subscribed = contextRepo
-      ? new Set(
-          (
-            await db(scope.env.DB)
-              .selectFrom("tracker_repo_subscriptions")
-              .select("tracker_owner_id")
-              .where("repo_id", "=", contextRepo.id)
-              .execute()
-          ).map((row) => row.tracker_owner_id),
-        ).add(contextRepo.owner_id)
-      : new Set<string>();
+    // The repository's subscribing trackers and its owner's: one tier here
+    // (the push-time mention index splits them, worker/mentions).
+    const related = contextRepo
+      ? await repoTrackers(scope.env.DB, contextRepo.id, { orgs: false })
+      : null;
+    const subscribed = new Set(
+      related ? [...related.subscribed.map((t) => t.id), related.owner.id] : [],
+    );
     const rest = trackers
       .filter((t) => t !== first && !subscribed.has(t.id))
       // Your own tracker first, then organizations by slug.
