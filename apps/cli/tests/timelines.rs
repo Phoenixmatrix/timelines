@@ -663,3 +663,185 @@ fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
         "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch"
     );
 }
+
+/// The change `@` sits on (`@-`), and whether `@` is an empty change on it.
+fn parent_of_working_copy(s: &Sandbox) -> (String, bool) {
+    let log = s.ok(&["log"]);
+    let changes = log["changes"].as_array().unwrap();
+    let wc = changes
+        .iter()
+        .find(|c| c["working_copy"] == true)
+        .expect("a working copy");
+    let parent = wc["parents"][0].as_str().unwrap().to_string();
+    let description = changes
+        .iter()
+        .find(|c| c["change_id"] == parent.as_str())
+        .map(|c| c["description"].as_str().unwrap().trim().to_string())
+        .unwrap_or_default();
+    (description, wc["empty"] == true)
+}
+
+/// CORE-224: a change built on an older main than the timeline's fork point
+/// is this checkout's work, so starting the timeline keeps `@` on it and a
+/// push sends it to the timeline, rebased onto the bookmark first.
+#[test]
+fn work_on_an_older_main_goes_to_a_newly_started_timeline() {
+    let s = Sandbox::new();
+    s.commit("stale.txt", "Stale-base work");
+    // Main moves on before the timeline forks from it.
+    let teammate = s.teammate("main", "main.txt");
+    let started = s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    assert_eq!(s.remote(&["rev-parse", "timeline/search"]), teammate);
+    let said = started["use"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("stays on your change"), "{started}");
+    assert!(said.contains("gm push --sync"), "{started}");
+    // @ is still the empty change on the work, not a fresh one on the bookmark.
+    assert_eq!(
+        parent_of_working_copy(&s),
+        ("Stale-base work".to_string(), true)
+    );
+
+    // Like a push to main that moved: refused, with --sync as the way on.
+    assert_eq!(s.err(&["push"]), "remote_moved");
+    assert_eq!(s.remote(&["rev-parse", "timeline/search"]), teammate);
+
+    // --sync rebases the stack onto the bookmark, @ along with it, and pushes.
+    let pushed = s.ok(&["push", "--sync"]);
+    assert_eq!(pushed["bookmark"], "timeline/search");
+    let sent = pushed["pushed"].as_array().unwrap();
+    assert_eq!(sent.len(), 1, "{pushed}");
+    assert_eq!(
+        sent[0]["description"].as_str().unwrap().trim(),
+        "Stale-base work"
+    );
+    assert_eq!(
+        s.remote(&["rev-parse", "timeline/search^"]),
+        teammate,
+        "pushed on top of the bookmark"
+    );
+    assert_eq!(
+        s.remote(&["log", "-1", "--format=%s", "timeline/search"]),
+        "Stale-base work"
+    );
+    assert_eq!(
+        parent_of_working_copy(&s),
+        ("Stale-base work".to_string(), true),
+        "@ stays on top of the pushed stack"
+    );
+    assert!(s.work().join("stale.txt").exists());
+    assert!(s.work().join("main.txt").exists());
+    assert_eq!(s.remote(&["rev-parse", "main"]), teammate);
+
+    // Now it really is there.
+    let again = s.ok(&["push"]);
+    assert!(again["pushed"].as_array().unwrap().is_empty(), "{again}");
+    assert!(
+        again["message"]
+            .as_str()
+            .unwrap()
+            .contains("Nothing to push: timeline/search already has everything."),
+        "{again}"
+    );
+}
+
+/// CORE-224: `gm push --sync` keeps `@` on top of the rebased stack when the
+/// checkout was already bound and the bookmark then moved.
+#[test]
+fn push_sync_in_a_timeline_keeps_the_working_copy_on_the_stack() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    s.commit("one.txt", "First");
+    s.commit("two.txt", "Second");
+    fs::write(s.work().join("draft.txt"), "draft\n").unwrap();
+    let theirs = s.teammate("timeline/search", "theirs.txt");
+    assert_eq!(s.err(&["push", "-r", "@-"]), "remote_moved");
+
+    let pushed = s.ok(&["push", "--sync", "-r", "@-"]);
+    assert_eq!(pushed["pushed"].as_array().unwrap().len(), 2, "{pushed}");
+    assert_eq!(s.remote(&["rev-parse", "timeline/search~2"]), theirs);
+    // @ still holds the draft, on top of what was pushed.
+    let (parent, empty) = parent_of_working_copy(&s);
+    assert_eq!(parent, "Second");
+    assert!(!empty);
+    assert_eq!(
+        fs::read_to_string(s.work().join("draft.txt")).unwrap(),
+        "draft\n"
+    );
+    assert!(s.work().join("theirs.txt").exists());
+}
+
+/// Outside timelines nothing changes: a stale trunk is refused, and --sync
+/// rebases and pushes to main with `@` on top.
+#[test]
+fn trunk_pushes_on_an_older_main_are_unchanged() {
+    let s = Sandbox::new();
+    s.commit("stale.txt", "Stale-base work");
+    let teammate = s.teammate("main", "main.txt");
+    s.ok(&["fetch"]);
+    assert_eq!(s.err(&["push"]), "remote_moved");
+    let pushed = s.ok(&["push", "--sync"]);
+    assert_eq!(pushed["bookmark"], "main");
+    assert_eq!(pushed["pushed"].as_array().unwrap().len(), 1, "{pushed}");
+    assert_eq!(s.remote(&["rev-parse", "main^"]), teammate);
+    assert_eq!(
+        parent_of_working_copy(&s),
+        ("Stale-base work".to_string(), true)
+    );
+    let again = s.ok(&["push"]);
+    assert!(
+        again["message"]
+            .as_str()
+            .unwrap()
+            .contains("Nothing to push: main already has everything."),
+        "{again}"
+    );
+}
+
+/// Work that origin already has on another bookmark isn't this checkout's to
+/// bring along: starting a timeline still begins a fresh `@` on its bookmark.
+#[test]
+fn work_on_another_remote_bookmark_stays_behind_when_a_timeline_starts() {
+    let s = Sandbox::new();
+    let seed = s.root.join("seed");
+    git(&seed, &["checkout", "-q", "-b", "other"]);
+    fs::write(seed.join("other.txt"), "other\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-qm", "Other line"]);
+    git(&seed, &["push", "-q", "origin", "other"]);
+    git(&seed, &["checkout", "-q", "main"]);
+    s.ok(&["fetch"]);
+    s.ok(&["new", "origin/other"]);
+    s.commit("mine.txt", "Built on other");
+    let teammate = s.teammate("main", "main.txt");
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    assert_eq!(
+        parent_of_working_copy(&s),
+        ("Teammate on main".to_string(), true)
+    );
+    assert_eq!(s.remote(&["rev-parse", "timeline/search"]), teammate);
+    assert!(!s.work().join("other.txt").exists());
+}

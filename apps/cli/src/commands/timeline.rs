@@ -1416,7 +1416,7 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
 
     // Fetch, so the bookmark (and main) are current, then find where @ goes.
     network::fetch(ctx)?;
-    let (target, target_name, old_wc) = {
+    let (target, target_name, old_wc, stale) = {
         let ws = Workspace::open(&ctx.cwd)?;
         let (target, name) = match &slug {
             Some(slug) => {
@@ -1450,15 +1450,22 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
         let untouched = ws.is_untouched(&commit)?;
         // Already there. Work built on a timeline's head stays where it is and
         // goes to the timeline with the next push (a timeline just forked
-        // from main's tip takes the work started on it). Going back to main,
-        // only a fresh @ on main's head stays: anything else may hold the
-        // timeline's work, which must not reach main by a plain push.
-        let here = match &slug {
-            Some(_) => wc == target || ws.repo.graph_descendant_of(wc, target)?,
-            None => untouched && commit.parent_ids().eq([target]),
+        // from main's tip takes the work started on it). So does this
+        // checkout's own work built on main (CORE-224), even an older main:
+        // `gm push --sync` rebases it onto the bookmark, as it would onto a
+        // main that moved. Going back to main, only a fresh @ on main's head
+        // stays: anything else may hold the timeline's work, which must not
+        // reach main by a plain push.
+        let (here, stale) = match &slug {
+            Some(_) if wc == target || ws.repo.graph_descendant_of(wc, target)? => (true, None),
+            Some(_) => match local_work_on_main(&ws, wc, untouched)? {
+                Some(work) => (true, Some(super::short(&ws, work))),
+                None => (false, None),
+            },
+            None => (untouched && commit.parent_ids().eq([target]), None),
         };
         let kept = (!here && !untouched).then(|| super::short(&ws, wc));
-        (if here { None } else { Some(target) }, name, kept)
+        (if here { None } else { Some(target) }, name, kept, stale)
     };
 
     if !ctx.dry_run {
@@ -1502,9 +1509,12 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
         (None, None) => "This checkout works on main.".to_string(),
     };
     message.push(' ');
-    message.push_str(&match target {
-        Some(_) => format!("Started a new working copy on {target_name}."),
-        None => format!("The working copy is already on {target_name}."),
+    message.push_str(&match (target, &stale) {
+        (Some(_), _) => format!("Started a new working copy on {target_name}."),
+        (None, Some(work)) => format!(
+            "The working copy stays on your change {work}, built on main and not on {target_name} yet: `gm push --sync` rebases it onto the timeline and pushes it."
+        ),
+        (None, None) => format!("The working copy is already on {target_name}."),
     });
     if let Some(kept) = &old_wc {
         message.push_str(&match &slug {
@@ -1541,6 +1551,40 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
         text: op.text(),
         value,
     })
+}
+
+/// The change `@` stands for (`@-` when `@` is untouched) when it heads a stack
+/// of this checkout's own work built on main's history: none of it is on main
+/// or on any other bookmark origin has (another timeline's work, or work
+/// already pushed somewhere). That work belongs wherever this checkout pushes.
+fn local_work_on_main(ws: &Workspace, wc: git2::Oid, untouched: bool) -> Result<Option<git2::Oid>> {
+    let Some(main) = ws.main().map(|m| m.oid) else {
+        return Ok(None);
+    };
+    let work = if untouched {
+        match ws.commit(wc)?.parent_id(0) {
+            Ok(parent) => parent,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        wc
+    };
+    let count = |hide_remote: bool| -> Result<usize> {
+        let mut walk = ws.repo.revwalk()?;
+        walk.push(work)?;
+        walk.hide(main)?;
+        if hide_remote {
+            walk.hide_glob("refs/remotes/origin/*")?;
+        }
+        let mut n = 0;
+        for oid in walk.take(1001) {
+            oid?;
+            n += 1;
+        }
+        Ok(n)
+    };
+    let stack = count(false)?;
+    Ok((stack > 0 && stack <= 1000 && count(true)? == stack).then_some(work))
 }
 
 /// After leaving a timeline, what was pushed to it (up to `tip`) stays on its
