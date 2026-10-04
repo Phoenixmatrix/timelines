@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import { sql } from "kysely";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { landingJob } from "../ci/landing.ts";
@@ -11,6 +12,7 @@ import { db } from "../schema.ts";
 import { landingBranch } from "../../shared/timelines.ts";
 import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 import { afterPush } from "./effects.ts";
+import { recordPush } from "../ref-log/record.ts";
 import { readReceivePackCommands, type ReceiveCommand } from "./receive-pack.ts";
 
 // Git smart HTTP: https://git-scm.com/docs/http-protocol
@@ -67,7 +69,11 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     return challenge("Invalid credentials. Use a personal access token as the password.\n");
   }
   const actor = credential.kind === "token" ? credential.actor : null;
-  const repo = await findRepo(c.env.DB, actor, owner, name);
+  const repo =
+    (await findRepo(c.env.DB, actor, owner, name)) ??
+    (service === "git-upload-pack" && actor
+      ? await teardownCheckout(c.env.DB, actor, owner, name)
+      : null);
   const role = repo ? roleFor(repo, actor) : "none";
 
   if (!repo || !atLeast(role, "read")) {
@@ -113,7 +119,14 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
       if (!(await sourceOnly))
         afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
-      else invalidateRefs(repo.artifacts_name);
+      else {
+        invalidateRefs(repo.artifacts_name);
+        // Staging skips CI/AI/preview work, not provenance. Finish this bounded
+        // metadata read before the CLI uploads context for the staged commits.
+        await recordPush(c.env, repo, actor).catch((error) =>
+          console.error("Queue source push log: recording failed", error),
+        );
+      }
       if (pack) c.executionCtx.waitUntil(recordPushedBytes(c.env, repo.id, pack.done));
     }
   }
@@ -141,6 +154,33 @@ async function queueSourceOnly(body: ReadableStream<Uint8Array>, gzip: boolean):
   } catch {
     return false;
   }
+}
+
+/**
+ * A repository being deleted is missing to everyone (CORE-199) except a local
+ * runner checking out its preview teardown: the purge waits for that run
+ * before the repository goes. Only the runner's person, holding write access,
+ * while one of their runners has such a job running, and only to read.
+ */
+async function teardownCheckout(
+  d1: D1Database,
+  actor: NonNullable<Parameters<typeof findRepo>[1]>,
+  owner: string,
+  name: string,
+) {
+  const repo = await findRepo(d1, actor, owner, name, { deleting: true });
+  if (!repo?.deleted_at || !atLeast(roleFor(repo, actor), "write")) return null;
+  const running = await db(d1)
+    .selectFrom("ci_jobs as j")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
+    .select("j.id")
+    .where("j.repo_id", "=", repo.id)
+    .where("j.runner", "=", "local")
+    .where("j.status", "=", "running")
+    .where(sql<string>`substr(j.claimed_by, 1, ${actor.slug.length + 1})`, "=", `${actor.slug}/`)
+    .where("r.preview_action", "=", "teardown")
+    .executeTakeFirst();
+  return running ? repo : null;
 }
 
 /**

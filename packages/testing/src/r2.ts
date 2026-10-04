@@ -236,13 +236,16 @@ export class FakeR2Bucket {
     for (const key of Array.isArray(keys) ? keys : [keys]) this.objects.delete(key);
   }
 
-  async list(options: { prefix?: string; limit?: number; cursor?: string } = {}): Promise<{
+  async list(
+    options: { prefix?: string; limit?: number; cursor?: string; startAfter?: string } = {},
+  ): Promise<{
     objects: FakeR2Object[];
     truncated: boolean;
     cursor?: string;
   }> {
     const keys = [...this.objects.keys()]
       .filter((k) => !options.prefix || k.startsWith(options.prefix))
+      .filter((k) => options.startAfter === undefined || k > options.startAfter)
       .sort();
     const start = options.cursor ? Number(options.cursor) : 0;
     const limit = options.limit ?? 1000;

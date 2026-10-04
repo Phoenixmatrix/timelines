@@ -105,7 +105,22 @@ class FakeRepoObject {
   release(key: string) {
     this.logic.release(key);
   }
+  /** The purge contract (CORE-197): tests read what was purged from `purgedRepoObjects`. */
+  async purge(reason: string) {
+    purgedRepoObjects.push(reason);
+    return {
+      reason,
+      purgedAt: new Date().toISOString(),
+      bytes: 0,
+      tables: [],
+      keys: 0,
+      alarm: null,
+    };
+  }
 }
+
+/** Reasons the fake repository objects were purged with, in order (reset per harness). */
+export const purgedRepoObjects: string[] = [];
 
 class FakeStateObject {
   private state: unknown = null;
@@ -211,6 +226,7 @@ export async function makeHarness(
 ): Promise<Harness> {
   resetRegistryTokenKeys();
   resetDerivedKeys();
+  purgedRepoObjects.length = 0;
   invalidateRepoCache();
 
   const db = new FakeD1();

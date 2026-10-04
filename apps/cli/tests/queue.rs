@@ -56,6 +56,9 @@ struct State {
     writes: usize,
     runs: BTreeMap<i64, Value>,
     reads: usize,
+    steps: BTreeMap<String, Value>,
+    fail_steps: bool,
+    step_writes: usize,
 }
 
 fn entry(id: &str, status: &str) -> Value {
@@ -157,6 +160,19 @@ impl Api {
                             continue;
                         }
                         (201, json!({"entry": e}))
+                    }
+                } else if method == "POST" && path == format!("/api/repos/{owner}/{name}/steps") {
+                    state.step_writes += 1;
+                    let oid = body["commitOid"].as_str().unwrap();
+                    assert_eq!(
+                        git(&remote, &["rev-parse", &format!("{oid}^{{commit}}")]),
+                        oid
+                    );
+                    if state.fail_steps {
+                        (503, json!({"error": "unavailable"}))
+                    } else {
+                        state.steps.insert(oid.to_owned(), body.clone());
+                        (200, json!({"ok": true}))
                     }
                 } else if method == "POST"
                     && path.starts_with(&format!("{prefix}/"))
@@ -348,6 +364,114 @@ impl Sandbox {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+}
+
+#[test]
+fn queued_context_upload_is_idempotent_without_landing_or_uploading_unselected_work() {
+    let s = Sandbox::new();
+    let main = s.remote(&["rev-parse", "main"]);
+    fs::write(
+        s.work().join("context.json"),
+        r#"{"why":"Preserve queue intent"}"#,
+    )
+    .unwrap();
+    s.ok(&[
+        "commit",
+        "-m",
+        "Context source",
+        "--context",
+        "context.json",
+    ]);
+    let short_source = s.change("Context source")["commit_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = git(&s.work(), &["rev-parse", &short_source]);
+    fs::write(s.work().join("next.txt"), "unselected\n").unwrap();
+    s.ok(&["commit", "-m", "Unselected", "--context", "context.json"]);
+    let dry = s.ok(&["push", "--queue", "-r", &source, "--dry-run"]);
+    assert!(dry.get("steps").is_none());
+    assert_eq!(s.api.state.lock().step_writes, 0);
+    let admitted = s.ok(&["push", "--queue", "-r", &source]);
+    assert_eq!(admitted["queue"]["id"], source);
+    assert_eq!(admitted["steps"]["uploaded"], 1);
+    assert_eq!(
+        s.api.state.lock().steps[&source]["why"],
+        "Preserve queue intent"
+    );
+    assert_eq!(s.api.state.lock().steps.len(), 1);
+    let repeated = s.ok(&["push", "--queue", "-r", &source]);
+    assert_eq!(repeated["steps"]["uploaded"], 0);
+    assert_eq!(s.api.state.lock().step_writes, 1);
+    assert_eq!(s.remote(&["rev-parse", "main"]), main);
+    assert_eq!(
+        git(&s.work(), &["rev-parse", "refs/remotes/origin/main"]),
+        main
+    );
+    assert_eq!(s.change("Context source")["immutable"], false);
+}
+
+#[test]
+fn queued_context_failure_warns_and_context_sync_retries_without_readmitting() {
+    let s = Sandbox::new();
+    fs::write(
+        s.work().join("context.json"),
+        r#"{"why":"Retry context only"}"#,
+    )
+    .unwrap();
+    s.ok(&["commit", "-m", "Context retry", "--context", "context.json"]);
+    s.api.state.lock().fail_steps = true;
+    let admitted = s.ok(&["push", "--queue"]);
+    let source = admitted["queue"]["id"].as_str().unwrap();
+    assert_eq!(admitted["queue"]["status"], "queued");
+    assert_eq!(admitted["steps"]["uploaded"], 0);
+    assert_eq!(admitted["steps"]["failed"].as_array().unwrap().len(), 1);
+    assert!(
+        admitted["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("gm context sync")
+    );
+    s.api.state.lock().fail_steps = false;
+    assert_eq!(s.ok(&["context", "sync"])["uploaded"], 1);
+    assert_eq!(
+        s.api.state.lock().steps[source]["why"],
+        "Retry context only"
+    );
+    assert_eq!(s.api.state.lock().writes, 1);
+    assert_eq!(s.change("Context retry")["immutable"], false);
+}
+
+#[test]
+fn failed_admission_keeps_context_pending_for_an_idempotent_retry() {
+    for admission in [Admission::Reject, Admission::LoseReply] {
+        let s = Sandbox::new();
+        fs::write(
+            s.work().join("context.json"),
+            r#"{"why":"Survive admission failure"}"#,
+        )
+        .unwrap();
+        s.ok(&[
+            "commit",
+            "-m",
+            "Pending context",
+            "--context",
+            "context.json",
+        ]);
+        s.api.state.lock().admission = admission;
+        s.fails(&["push", "--queue"]);
+        assert_eq!(s.api.state.lock().step_writes, 0);
+        s.api.state.lock().admission = Admission::Accept;
+        let admitted = s.ok(&["push", "--queue"]);
+        let source = admitted["queue"]["id"].as_str().unwrap();
+        assert_eq!(admitted["steps"]["uploaded"], 1);
+        assert_eq!(
+            s.api.state.lock().steps[source]["why"],
+            "Survive admission failure"
+        );
+        assert_eq!(s.api.state.lock().entries.len(), 1);
+        assert_eq!(s.change("Pending context")["immutable"], false);
     }
 }
 

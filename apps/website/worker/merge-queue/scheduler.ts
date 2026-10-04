@@ -29,6 +29,7 @@ async function repoFor(env: Env, id: string): Promise<PushedRepo | undefined> {
       "r.artifacts_remote",
     ])
     .where("r.id", "=", id)
+    .where("r.deleted_at", "is", null)
     .executeTakeFirst();
 }
 /** Bounded proof only: an exhausted graph walk never authorizes coverage. */
@@ -199,6 +200,7 @@ async function releaseCombined(env: Env, s: StoredQueue) {
   return true;
 }
 async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps) {
+  if (!(await repoFor(env, repo.id))) return;
   await db(env.DB)
     .updateTable("merge_queue")
     .set({ recovered_at: new Date().toISOString() })
@@ -216,6 +218,7 @@ async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps:
   };
   await releaseCombined(env, s);
   if (s.remediationPending && s.entry.failure) {
+    if (!(await repoFor(env, repo.id))) return;
     try {
       const issue = await deps.remediate(repo, s, s.entry.failure);
       const saved = await saveQueue(env.DB, s, {
@@ -230,6 +233,7 @@ async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps:
   }
   if (s.entry.status !== "landed") return;
   if (s.effectsPending) {
+    if (!(await repoFor(env, repo.id))) return;
     try {
       await deps.effects(repo, s);
       const saved = await saveQueue(env.DB, s, { ...s, effectsPending: false });
@@ -360,6 +364,7 @@ async function terminalEffects(env: Env, repo: PushedRepo, s: StoredQueue, deps:
 }
 
 async function step(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps): Promise<boolean> {
+  if (!(await repoFor(env, repo.id))) return false;
   const e = s.entry;
   if (e.status === "queued") {
     if (e.coveredBy) return false;
@@ -702,6 +707,8 @@ async function step(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps)
     // this candidate ref, and only this exact already-tested OID may reach main.
     let main = (await deps.refs(repo)).get(`refs/heads/${e.branch}`);
     if (main === e.base) {
+      // The ref read can overlap repository deletion. Never publish its stale snapshot.
+      if (!(await repoFor(env, repo.id))) return false;
       try {
         await deps.write(repo, [
           { ref: `refs/heads/${e.branch}`, old: e.base!, new: e.candidate! },
@@ -762,6 +769,7 @@ export async function progressQueue(
   }
   for (let count = 0; count < 32; count++) {
     const rows = await listQueue(env.DB, repoId);
+    if (!(await repoFor(env, repoId))) return;
     const state =
       rows.find((x) => ACTIVE.some((status) => status === x.entry.status)) ??
       rows.find((x) => x.entry.status === "queued" && !x.entry.coveredBy);
@@ -822,6 +830,15 @@ export async function sweepQueue(env: Env, waitUntil: Waiter): Promise<void> {
     .selectFrom("merge_queue")
     .select("repo_id")
     .select(sql<string>`min(swept_at)`.as("last_swept"))
+    .where((eb) =>
+      eb.exists(
+        eb
+          .selectFrom("repos")
+          .select("id")
+          .whereRef("repos.id", "=", "merge_queue.repo_id")
+          .where("deleted_at", "is", null),
+      ),
+    )
     .where(
       sql<boolean>`status IN ('queued','merging','testing','advancing') OR json_extract(data, '$.effectsPending') = 1 OR json_extract(data, '$.remediationPending') = 1 OR (status = 'landed' AND json_extract(data, '$.entry.deployStatus') NOT IN ('succeeded','failed','cancelled'))`,
     )

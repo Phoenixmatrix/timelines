@@ -1,5 +1,6 @@
 import {
   CaretDownIcon,
+  ChartBarIcon,
   EnvelopeSimpleIcon,
   FingerprintIcon,
   GearSixIcon,
@@ -49,6 +50,7 @@ export function SettingsPage({
           active: tracker,
         },
         { label: "AI settings", to: `/settings/ai${accountQuery}`, icon: GearSixIcon },
+        { label: "Usage & costs", to: `/settings/usage${accountQuery}`, icon: ChartBarIcon },
       ],
     },
     {
@@ -76,6 +78,11 @@ export function SettingsPage({
                 label: "Invitations",
                 to: `/settings/invites${accountQuery}`,
                 icon: EnvelopeSimpleIcon,
+              },
+              {
+                label: "Site usage & costs",
+                to: `/settings/site-usage${accountQuery}`,
+                icon: ChartBarIcon,
               },
             ],
           },

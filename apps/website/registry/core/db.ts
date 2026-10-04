@@ -196,6 +196,8 @@ export interface Database {
     last_modified: string | null;
     fetched_at: string;
     expires_at: string;
+    /** Last served (at most daily); null only for rows from before it existed. */
+    used_at: string | null;
   };
   signing_keys: {
     repo_id: string;

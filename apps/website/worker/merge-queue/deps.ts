@@ -46,6 +46,16 @@ export interface QueueDeps {
   ) => Promise<{ id: string }>;
 }
 export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
+  const live = async <T>(repo: PushedRepo, work: () => Promise<T>): Promise<T> => {
+    const row = await db(env.DB)
+      .selectFrom("repos")
+      .select("id")
+      .where("id", "=", repo.id)
+      .where("deleted_at", "is", null)
+      .executeTakeFirst();
+    if (!row) throw new Error("Repository is being deleted or no longer exists.");
+    return work();
+  };
   return {
     refs: async (repo) =>
       new Map(
@@ -57,40 +67,46 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       using artifacts = await env.ARTIFACTS.get(repo.artifacts_name);
       return (await artifacts.readCommit(commit))?.parents ?? null;
     },
-    write: (repo, writes) => writeRefs(env, repo, writes),
+    write: (repo, writes) => live(repo, () => writeRefs(env, repo, writes)),
     merge: (repo, s) =>
-      startMergeRun(env, repo, {
-        runId: s.mergeRunId!,
-        queueId: s.entry.id,
-        attempt: s.entry.attempts,
-        branch: s.entry.candidateBranch,
-        commit: s.mergeSource,
-        base: s.entry.base!,
-        mainBranch: s.entry.branch,
-        message: `Merge queued ${s.entry.id}`,
-        title: `Queue ${s.entry.id.slice(0, 12)}`,
-        author: { name: "Gitmatrix merge queue", email: "queue@gitmatrix.dev" },
-        actor: { id: s.actor.id, agentId: s.actor.agent?.id ?? null },
-      }),
+      live(repo, () =>
+        startMergeRun(env, repo, {
+          runId: s.mergeRunId!,
+          queueId: s.entry.id,
+          attempt: s.entry.attempts,
+          branch: s.entry.candidateBranch,
+          commit: s.mergeSource,
+          base: s.entry.base!,
+          mainBranch: s.entry.branch,
+          message: `Merge queued ${s.entry.id}`,
+          title: `Queue ${s.entry.id.slice(0, 12)}`,
+          author: { name: "Gitmatrix merge queue", email: "queue@gitmatrix.dev" },
+          actor: { id: s.actor.id, agentId: s.actor.agent?.id ?? null },
+        }),
+      ),
     gates: (repo, s) =>
-      startRun(env, repo, {
-        runId: s.gateRunId!,
-        queueId: s.entry.id,
-        branch: s.entry.candidateBranch,
-        commit: s.entry.candidate!,
-        trigger: "landing",
-        actor: s.actor,
-        waitUntil,
-      }),
+      live(repo, () =>
+        startRun(env, repo, {
+          runId: s.gateRunId!,
+          queueId: s.entry.id,
+          branch: s.entry.candidateBranch,
+          commit: s.entry.candidate!,
+          trigger: "landing",
+          actor: s.actor,
+          waitUntil,
+        }),
+      ),
     deploy: (repo, s) =>
-      startRun(env, repo, {
-        runId: s.deployRunId!,
-        branch: s.entry.branch,
-        commit: s.entry.candidate!,
-        trigger: "push",
-        actor: s.actor,
-        waitUntil,
-      }),
+      live(repo, () =>
+        startRun(env, repo, {
+          runId: s.deployRunId!,
+          branch: s.entry.branch,
+          commit: s.entry.candidate!,
+          trigger: "push",
+          actor: s.actor,
+          waitUntil,
+        }),
+      ),
     outcome: (id) => runOutcome(env.DB, id),
     recover: async (id) => {
       const run = await db(env.DB)
@@ -125,7 +141,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       const instance = await env.CI_RUN.get(id).catch(() => null);
       await instance?.terminate();
     },
-    effects: (repo, s) => afterQueuedPush(env, repo, s.actor),
+    effects: (repo, s) => live(repo, () => afterQueuedPush(env, repo, s.actor)),
     classify: async (repo, s, entries) => {
       if (entries.length < 2)
         return {
@@ -158,13 +174,15 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       return classifyQueue(env, s.snapshot, { repoId: repo.id, entries: inputs });
     },
     remediate: (repo, s, failure) =>
-      recordQueueFailure(env, {
-        ownerId: repo.owner_id,
-        repoId: repo.id,
-        actorId: s.actor.id,
-        agentId: s.actor.agent?.id ?? null,
-        issueIds: s.entry.issueIds,
-        failure,
-      }),
+      live(repo, () =>
+        recordQueueFailure(env, {
+          ownerId: repo.owner_id,
+          repoId: repo.id,
+          actorId: s.actor.id,
+          agentId: s.actor.agent?.id ?? null,
+          issueIds: s.entry.issueIds,
+          failure,
+        }),
+      ),
   };
 }

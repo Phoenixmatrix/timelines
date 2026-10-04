@@ -393,6 +393,10 @@ pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
         401 => GmError::new("unauthenticated", message).exit(exit::AUTH),
         403 => GmError::new("forbidden", message).exit(exit::AUTH),
         409 => GmError::new("conflict", message).exit(exit::CONFLICT),
+        // A tracker change feed pruned past the replica's cursor: start over.
+        410 if value.get("code").and_then(Value::as_str) == Some("cursor_expired") => {
+            GmError::new("cursor_expired", message)
+        }
         _ => GmError::new("server_error", format!("HTTP {status}: {message}")),
     })
 }
@@ -710,8 +714,16 @@ fn status_error(status: u16, value: &Value) -> GmError {
             .hint("Sign in: `gm auth login` (in the browser), or `--persona <name>` in dev.")
             .exit(exit::AUTH),
         403 => GmError::new("forbidden", message).exit(exit::AUTH),
+        // Retention (CORE-203) says when and why it removed an issue or timeline.
+        404 if value.get("code").and_then(Value::as_str) == Some("removed_by_retention") => {
+            GmError::not_found("removed_by_retention", message)
+        }
         404 => GmError::not_found("not_found", message),
         409 => GmError::new("conflict", message).exit(exit::CONFLICT),
+        // A tracker change feed pruned past the replica's cursor: start over.
+        410 if value.get("code").and_then(Value::as_str) == Some("cursor_expired") => {
+            GmError::new("cursor_expired", message)
+        }
         _ => GmError::new("server_error", format!("HTTP {status}: {message}")),
     }
 }

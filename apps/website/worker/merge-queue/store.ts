@@ -96,7 +96,40 @@ export async function admitQueue(d1: D1Database, state: QueueState): Promise<boo
   const e = state.entry;
   const result = await db(d1)
     .insertInto("merge_queue")
-    .values({ repo_id: e.repo.id, id: e.id, created_at: e.createdAt, ...columns(state) })
+    .columns([
+      "repo_id",
+      "id",
+      "created_at",
+      "status",
+      "attempts",
+      "merge_run_id",
+      "gate_run_id",
+      "base",
+      "candidate",
+      "covered_by",
+      "data",
+      "updated_at",
+    ])
+    .expression((eb) =>
+      eb
+        .selectFrom("repos")
+        .select([
+          "id as repo_id",
+          eb.val(e.id).as("id"),
+          eb.val(e.createdAt).as("created_at"),
+          eb.val(e.status).as("status"),
+          eb.val(e.attempts).as("attempts"),
+          eb.val(state.mergeRunId).as("merge_run_id"),
+          eb.val(state.gateRunId).as("gate_run_id"),
+          eb.val(e.base).as("base"),
+          eb.val(e.candidate).as("candidate"),
+          eb.val(e.coveredBy).as("covered_by"),
+          eb.val(JSON.stringify(state)).as("data"),
+          eb.val(e.updatedAt).as("updated_at"),
+        ])
+        .where("id", "=", e.repo.id)
+        .where("deleted_at", "is", null),
+    )
     .onConflict((oc) => oc.doNothing())
     .executeTakeFirst();
   return Number(result.numInsertedOrUpdatedRows) === 1;
@@ -121,6 +154,15 @@ export async function saveQueue(
       .where("repo_id", "=", before.entry.repo.id)
       .where("id", "=", before.entry.id)
       .where("version", "=", before.version)
+      .where((eb) =>
+        eb.exists(
+          eb
+            .selectFrom("repos")
+            .select("id")
+            .where("id", "=", before.entry.repo.id)
+            .where("deleted_at", "is", null),
+        ),
+      )
       .$if(!!leader, (query) =>
         query.where((eb) => {
           const owner = eb
@@ -168,6 +210,15 @@ export async function cancelCombined(
       .where("id", "=", member.entry.id)
       .where("version", "=", member.version)
       .where("status", "=", "queued")
+      .where((eb) =>
+        eb.exists(
+          eb
+            .selectFrom("repos")
+            .select("id")
+            .where("id", "=", repo)
+            .where("deleted_at", "is", null),
+        ),
+      )
       .where((eb) =>
         eb.exists(
           eb

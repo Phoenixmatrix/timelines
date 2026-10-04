@@ -597,7 +597,8 @@ export interface TimelineFeedEvent {
   kind: string;
   entityType: "timeline" | "timelineEvent";
   entityId: string;
-  entity: Timeline | TimelineEvent;
+  /** Null when it was removed (by retention: kind `retention.remove`). */
+  entity: Timeline | TimelineEvent | null;
   createdAt: string;
 }
 export const TIMELINE_FEED_TYPES = ["timeline", "timelineEvent"] as const;

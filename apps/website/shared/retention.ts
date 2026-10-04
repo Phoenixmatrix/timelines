@@ -10,12 +10,13 @@ export type RetentionScope = "account" | "site";
  * How a category is controlled:
  * - "policy": off until an administrator enables it (every new category).
  * - "active": cleanup that already ran before retention policies existed and
- *   always runs (preview teardown); its thresholds are editable.
- * - "fixed": always runs with thresholds that are shown, not edited (Atlas).
+ *   always runs (preview teardown, Atlas snapshots); its thresholds are
+ *   editable within their bounds.
+ * - "fixed": always runs with thresholds that are shown, not edited (none today).
  */
 export type RetentionControl = "policy" | "active" | "fixed";
 
-export type ThresholdUnit = "days" | "count" | "gib";
+export type ThresholdUnit = "days" | "months" | "count" | "gib";
 
 /** One configurable number of a category, always a whole number within bounds. */
 export interface RetentionThreshold {

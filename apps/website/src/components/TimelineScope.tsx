@@ -32,9 +32,15 @@ const lists = new Map<string, Promise<Timeline[]>>();
 let generation = 0;
 const listeners = new Set<() => void>();
 
-/** Drop an account's cached timelines (after a change), so the switcher and banner refetch. */
-export function refreshTimelines(owner: string): void {
-  lists.delete(owner);
+/**
+ * Drop an account's cached timelines (after a change), so the switcher and
+ * banner refetch; with no account, every account's and the default tracker.
+ */
+export function refreshTimelines(owner?: string): void {
+  if (owner === undefined) {
+    lists.clear();
+    defaultTracker = null;
+  } else lists.delete(owner);
   generation++;
   for (const listener of listeners) listener();
 }

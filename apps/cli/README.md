@@ -716,6 +716,37 @@ read to know the timeline they act in. Tracker commands (`gm issue …`) default
 `--timeline` to it, so a bound checkout reads the timeline's view and its
 changes are made in the timeline.
 
+## Steps: context for every commit
+
+An agent commits at meaningful steps and says what drove each one: the
+instructions it followed, how a person steered it, why it did the work this
+way and what got in the way (CORE-226). Everyone who can read the repository
+sees it beside the commit.
+
+```bash
+gm commit -m "Rank by recency" --context step.md   # or --context - for stdin
+gm push                                             # uploads it for the pushed commits
+gm context sync                                     # retries uploads a push couldn't make
+```
+
+- **`--context <file|->`** takes Markdown with `## Instructions`, `## Steering`,
+  `## Why` and `## Challenges` sections (bullets become entries), or a JSON
+  object with those fields (`instructions`, `steering`, `why`, `challenges`,
+  `tests`, `coverage`, `harness`, `model`; others are dropped). Context that
+  has none of them fails before anything is committed.
+- **It's journaled locally first**, in `.git/gm/steps/<commit>.json`, after
+  known token shapes, private keys, `Bearer` values and `*_TOKEN=`/`*_SECRET=`
+  style assignments are redacted. Rewriting the commit (`describe`, `squash`,
+  rebases) carries the context to the new commit through its change ID.
+- **`gm push` uploads** the context of the commits it pushed, once each.
+  `gm push --queue` also uploads the selected source commits' context after
+  admission succeeds; neither admission nor a context upload means they landed.
+  A failed context upload never fails the push or admission: it warns, and
+  `gm context sync` sends what's still pending. Failed or uncertain admission
+  leaves context pending locally for an admission retry or `gm context sync`.
+- **Missing context warns, never blocks.** An agent's commit in a timeline
+  without `--context` succeeds with a warning saying what to add.
+
 ## Automatic AI settings
 
 ```bash

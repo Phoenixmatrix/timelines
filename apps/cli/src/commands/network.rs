@@ -482,7 +482,7 @@ fn protect_pending_rewrites(
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct Pushed {
     pub dry_run: bool,
-    /// Bookmark that was updated on the server.
+    /// Target bookmark; queue admission does not update it.
     pub bookmark: String,
     pub remote_ref: String,
     /// Changes the push sent, newest first.
@@ -493,6 +493,11 @@ pub struct Pushed {
     /// Accepted asynchronous admission, not proof of landing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<serde_json::Value>,
+    /// Step context uploaded for the pushed changes (CORE-232), when any was journaled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<super::steps::Uploads>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Render for Pushed {
@@ -505,6 +510,17 @@ impl Render for Pushed {
         out.push('\n');
         for c in &self.pushed {
             out.push_str(&format!("  {}\n", c.line()));
+        }
+        if let Some(steps) = &self.steps
+            && steps.uploaded > 0
+        {
+            out.push_str(&format!(
+                "Uploaded context for {} step(s).\n",
+                steps.uploaded
+            ));
+        }
+        for warning in &self.warnings {
+            out.push_str(&format!("warning: {warning}\n"));
         }
         out.push_str(&format!("Working copy: {}", self.working_copy.line()));
         out
@@ -616,6 +632,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             } else {
                 ws.finish(&ctx.argv)?
             },
+            steps: None,
+            warnings: Vec::new(),
         };
         return Ok(result);
     }
@@ -683,6 +701,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
                 working_copy,
                 operation: None,
                 queue: None,
+                steps: None,
+                warnings: Vec::new(),
                 message: format!(
                     "{sync_note}Would upload {commit} and request queue admission; main would not advance."
                 ),
@@ -727,7 +747,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             Ok(())
         };
         let hint = format!(
-            "Local work is preserved. Admission is not proof of landing. Inspect `gm queue show {commit}`; if absent, retry `gm push --queue -r {commit}` with the same --issue values. Never assume a failed response advanced main."
+            "Local work is preserved. Admission is not proof of landing. Inspect `gm queue show {commit}`; if absent, retry `gm push --queue -r {commit}` with the same --issue values. Pending step context can be retried with `gm context sync`. Never assume a failed response advanced main."
         );
         let refspec = format!("{commit}:{remote_ref}");
         let output = match remote::git(
@@ -769,6 +789,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             )
             .hint(hint));
         }
+        let (steps, warnings) = upload_push_context(ctx, &config, &ws, &outgoing);
         return Ok(Pushed {
             dry_run: false,
             bookmark,
@@ -777,6 +798,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             working_copy,
             operation,
             queue: Some(entry.clone()),
+            steps,
+            warnings,
             message: format!(
                 "{sync_note}Queue admission accepted: {commit} ({}). Acceptance is not proof of landing; `gm queue wait {commit} --deploy` observes the final verdict.",
                 entry["status"].as_str().unwrap_or("unknown")
@@ -820,6 +843,8 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             message: summary.replace("Pushed", "Would push"),
             working_copy,
             operation: None,
+            steps: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -861,6 +886,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         .iter()
         .map(|o| Change::load(&ws, *o))
         .collect::<Result<_>>()?;
+    let (steps, warnings) = upload_push_context(ctx, &config, &ws, &outgoing);
     Ok(Pushed {
         dry_run: false,
         queue: None,
@@ -870,7 +896,41 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         message: summary,
         working_copy: Change::load(&ws, ws.wc())?,
         operation,
+        steps,
+        warnings,
     })
+}
+
+// Context follows a successful push/admission, without changing its verdict or
+// making staged queue commits immutable. Failed uploads remain in the journal.
+fn upload_push_context(
+    ctx: &Ctx,
+    config: &Config,
+    ws: &Workspace,
+    outgoing: &[Oid],
+) -> (Option<super::steps::Uploads>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let steps = if super::steps::journal_dir(ws).exists() {
+        match super::steps::repo_slug(ctx) {
+            Ok(repo) => {
+                let uploads = super::steps::upload_commits(config, &repo, ws, outgoing);
+                if !uploads.failed.is_empty() {
+                    warnings.push(format!(
+                        "{} step context(s) weren't uploaded; run `gm context sync` to retry.",
+                        uploads.failed.len()
+                    ));
+                }
+                Some(uploads)
+            }
+            Err(e) => {
+                warnings.push(format!("Step context wasn't uploaded: {}", e.message));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    (steps, warnings)
 }
 
 pub fn bookmark_delete(ctx: &Ctx, name: &str, remote: bool) -> Result<OpResult> {

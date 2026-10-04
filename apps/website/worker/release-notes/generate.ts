@@ -238,12 +238,29 @@ export async function generateReleaseNotes(
 ): Promise<GenerateResult> {
   const d = db(env.DB);
   const refs = await source.refs();
-  const stored = await d
-    .selectFrom("release_notes")
-    .select(["release", "format_version", "to_oid"])
-    .where("repo_id", "=", repoId)
-    .execute();
-  const { result: releases, tagged, upgrading } = await ranges(source, refs, stored);
+  const [stored, state] = await Promise.all([
+    d
+      .selectFrom("release_notes")
+      .select(["release", "format_version", "to_oid"])
+      .where("repo_id", "=", repoId)
+      .execute(),
+    d
+      .selectFrom("release_note_state")
+      .select("retained_from")
+      .where("repo_id", "=", repoId)
+      .executeTakeFirst(),
+  ]);
+  const { result: all, tagged, upgrading } = await ranges(source, refs, stored);
+  // Retention removed releases before `retained_from` (CORE-206): never write
+  // one again. Releases still stored are kept current as before.
+  const horizon = state?.retained_from ?? null;
+  const kept = new Set(stored.map((row) => row.release));
+  const releases = horizon
+    ? all.filter(
+        (r) =>
+          kept.has(r.release) || iso(Math.max(...r.commits.map((c) => c.committedAt))) >= horizon,
+      )
+    : all;
 
   // Every key any release cites, resolved once.
   const keys = [
@@ -520,10 +537,7 @@ export async function generateReleaseNotes(
   }
 
   // Tags that no longer exist lose their notes; older tags beyond the window keep theirs.
-  const live = new Set([
-    ...releases.map((r) => r.release),
-    ...refs.tags.map((tag) => tag.shortName),
-  ]);
+  const live = new Set([...all.map((r) => r.release), ...refs.tags.map((tag) => tag.shortName)]);
   const existing = await d
     .selectFrom("release_notes")
     .select("release")

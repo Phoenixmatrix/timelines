@@ -153,7 +153,16 @@ export async function startMergeRun(
             eb.val(options.landingId ?? null).as("landing_id"),
             eb.val(options.queueId ?? null).as("queue_id"),
           ])
-          .where("repo_id", "=", repo.id),
+          .where("repo_id", "=", repo.id)
+          .having((eb) =>
+            eb.exists(
+              eb
+                .selectFrom("repos")
+                .select("id")
+                .where("id", "=", repo.id)
+                .where("deleted_at", "is", null),
+            ),
+          ),
       )
       .onConflict((oc) => oc.doNothing()),
     kdb

@@ -396,7 +396,15 @@ export interface KnowledgeOverlaySummary {
    * Set once the timeline's bookmark is gone (CORE-139): the last overlay is
    * kept read-only and never computed again. Null while the bookmark exists.
    */
-  ended: { reason: KnowledgeOverlayEndReason; at: string } | null;
+  ended: {
+    reason: KnowledgeOverlayEndReason;
+    at: string;
+    /**
+     * When retention removed the ended overlay's changes, regrouping and page
+     * sets (CORE-201, "ended-timeline-data"); null while they're kept.
+     */
+    removedAt: string | null;
+  } | null;
 }
 
 export interface KnowledgeOverlay extends KnowledgeOverlaySummary {
@@ -593,6 +601,8 @@ export interface CiJob {
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  /** When retention removed this job's log text; null while it's kept. */
+  logsRemovedAt: string | null;
   steps: CiStep[];
 }
 
@@ -612,6 +622,8 @@ export interface CiLogs {
   /** Pass back as `after` to fetch only newer output. */
   next: number;
   done: boolean;
+  /** When retention removed the log text (no chunks follow); null while it's kept. */
+  removedAt: string | null;
 }
 
 /** Latest run per commit, for status dots in history. */

@@ -10,6 +10,7 @@ import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { fakeRemotes } from "../testing/remote.ts";
+import { endedTimelineData } from "../retention/cleanups/ended-timeline-data.ts";
 import { Timing } from "../timing.ts";
 import { knowledge } from "./api.ts";
 import { KnowledgeCoordinator } from "./coordinator.ts";
@@ -225,5 +226,49 @@ describe("ended overlays", () => {
     const fast = await t.get<KnowledgeOverlay>("/overlay?ref=timeline/fast");
     expect(fast.ended?.reason).toBe("landed");
     expect(t.overlays()[0]).toMatchObject({ ref: FAST, ended_reason: "landed" });
+  });
+
+  test("say when retention removed an ended overlay; a returning bookmark computes it afresh", async () => {
+    const t = await setup();
+    await t.push();
+    const first = t.started();
+    await t.finish(FAST, first.get(FAST)!, oid(2));
+    await t.finish(SIDE, first.get(SIDE)!, oid(3));
+    t.remote.refs.delete(SIDE);
+    await t.push();
+    const before = await t.get<KnowledgeOverlay>("/overlay?ref=timeline/side");
+    expect(before.ended).toEqual({ reason: "ended", at: expect.any(String), removedAt: null });
+
+    // 100 days later, "ended-timeline-data" (90 days) empties it.
+    const now = new Date(Date.parse(before.ended!.at) + 100 * 86_400_000);
+    const ctx = {
+      env: { DB: d1(t.sqlite) } as unknown as Env,
+      target: { scope: "account", accountId: "ann" } as const,
+      thresholds: { days: 90 },
+      now,
+      limit: 10,
+    };
+    const { items } = await endedTimelineData.select(ctx, null);
+    expect(items.map((i) => i.ref)).toEqual([SIDE]);
+    expect(await endedTimelineData.remove(ctx, items)).toMatchObject({ count: 1 });
+
+    const side = await t.get<KnowledgeOverlay>("/overlay?ref=timeline/side");
+    expect(side).toMatchObject({
+      state: "ended",
+      ended: { reason: "ended", removedAt: now.toISOString() },
+      counts: {},
+      changes: [],
+    });
+    const { overlays } = await t.get<{ overlays: KnowledgeOverlaySummary[] }>("/overlays");
+    expect(overlays.map((o) => [o.ref, o.ended?.removedAt ?? null])).toEqual([
+      ["timeline/fast", null],
+      ["timeline/side", now.toISOString()],
+    ]);
+
+    // The bookmark comes back: the overlay is computed again from scratch.
+    t.remote.refs.set(SIDE, oid(3));
+    await t.push();
+    expect([...t.started().keys()]).toEqual([SIDE]);
+    expect(t.overlays()[1]).toEqual({ ref: SIDE, head_commit: null, ended_reason: null, ended: 0 });
   });
 });

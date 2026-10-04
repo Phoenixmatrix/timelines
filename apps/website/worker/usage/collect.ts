@@ -11,6 +11,7 @@
 import { db, nowIso, type UsageConstruct } from "../schema.ts";
 import { DURABLE_CLASS_NAMES } from "../durable/classes.ts";
 import { EMBEDDING_DIMENSIONS } from "../knowledge/models.ts";
+import { measureUnreachable, type Unreachable, type UnreachableRepo } from "../git/unreachable.ts";
 import { MEASURED_TEXT, TABLE_GROUPS, type Database, type TableGroup } from "./tables.ts";
 
 export const USAGE_LIMITS = {
@@ -340,6 +341,67 @@ const artifacts: Step = {
   },
 };
 
+/**
+ * Artifacts' unreachable data (CORE-202): per repository whose push log saw a
+ * ref leave a commit, one fetch of what only those commits reach
+ * (worker/git/unreachable.ts). A page per repository; Artifacts can't prune it.
+ */
+const artifactsUnreachable: Step = {
+  id: "artifacts:unreachable",
+  async run(ctx, page) {
+    const repo = await ctx.env.DB.prepare(
+      `SELECT r.id, r.artifacts_name, r.artifacts_remote FROM repos r
+        WHERE r.owner_id = ?1 AND r.id > ?2 AND r.deleted_at IS NULL
+          AND EXISTS (SELECT 1 FROM ref_updates u WHERE u.repo_id = r.id AND u.old_oid IS NOT NULL
+                        AND (u.new_oid IS NULL OR u.forced = 1))
+        ORDER BY r.id LIMIT 1`,
+    )
+      .bind(ctx.account, page ?? "")
+      .first<UnreachableRepo>();
+    if (!repo && page !== null) return { rows: [], next: null };
+    // The first page writes the day's figure, zero when nothing left a ref
+    // (and nothing when the account has no repositories).
+    if (!repo) {
+      const any = await ctx.env.DB.prepare("SELECT 1 AS n FROM repos WHERE owner_id = ?1 LIMIT 1")
+        .bind(ctx.account)
+        .first();
+      if (!any) return { rows: [], next: null };
+    }
+    let found: Unreachable = { commits: 0, objects: 0, bytes: 0, truncated: false };
+    if (repo)
+      try {
+        found = await measureUnreachable(ctx.env, repo);
+      } catch (error) {
+        // One repository's failure leaves it out of the figure, not the rest.
+        console.error("Usage: measuring unreachable git data failed", repo.id, error);
+      }
+    const method = `packed bytes of the objects only commits that left a ref reach (deleted branches and bookmarks, force pushes), fetched from Artifacts with every ref as a have: Artifacts keeps them and can't prune them. Commits that left a ref before the push log began (2026-10-03) or whose push log entries were cleaned up aren't seen${found.truncated ? "; a lower bound (a pack was cut at 512 MiB or 15 s)" : ""}`;
+    return {
+      rows: [
+        {
+          construct: "artifacts",
+          item: "repositories",
+          metric: "unreachable_bytes",
+          kind: "storage",
+          quantity: found.bytes,
+          estimated: true,
+          method,
+        },
+        {
+          construct: "artifacts",
+          item: "repositories",
+          metric: "unreachable_objects",
+          kind: "storage",
+          quantity: found.objects,
+          estimated: true,
+          method,
+        },
+      ],
+      next: repo ? repo.id : null,
+    };
+  },
+};
+
 const OWNED_REPOS = "repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)";
 
 /** Vectorize: one vector per embedded graph node. */
@@ -511,7 +573,17 @@ export function stepsFor(account: string): Step[] {
   );
   return account === SITE
     ? [...groups, durableObjects, r2, workersAi]
-    : [...groups, durableObjects, r2, artifacts, vectorize, aiSearch, workersAi, ci];
+    : [
+        ...groups,
+        durableObjects,
+        r2,
+        artifacts,
+        artifactsUnreachable,
+        vectorize,
+        aiSearch,
+        workersAi,
+        ci,
+      ];
 }
 
 async function loadCursor(env: Env): Promise<Cursor | null> {

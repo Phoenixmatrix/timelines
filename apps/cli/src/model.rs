@@ -171,6 +171,10 @@ pub struct OpResult {
     /// Changes left with conflict markers by the rebase.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<ConflictReport>,
+    /// Things worth knowing that didn't stop the command (e.g. a step committed
+    /// in a timeline without context).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Render for OpResult {
@@ -181,6 +185,9 @@ impl Render for OpResult {
         }
         out.push_str(&self.message);
         out.push('\n');
+        for warning in &self.warnings {
+            out.push_str(&format!("warning: {warning}\n"));
+        }
         for change in &self.changes {
             out.push_str(&format!("  {}\n", change.line()));
         }

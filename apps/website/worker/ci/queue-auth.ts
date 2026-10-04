@@ -58,6 +58,7 @@ export async function queueMergeJob(
       "q.data",
     ])
     .where("j.id", "=", job.jobId)
+    .where("p.deleted_at", "is", null)
     .executeTakeFirst();
   let spec: { queue?: { id?: unknown; attempt?: unknown }; landing?: unknown } | null = null;
   let source: unknown = null;

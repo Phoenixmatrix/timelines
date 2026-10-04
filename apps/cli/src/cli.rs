@@ -113,6 +113,9 @@ pub enum Command {
     /// Timelines: parallel lines of work on `timeline/<slug>` that land on main later
     #[command(subcommand, visible_alias = "tl")]
     Timeline(crate::commands::timeline::TimelineCommand),
+    /// Step context: the why, instructions and steering attached to commits
+    #[command(subcommand)]
+    Context(crate::commands::steps::ContextCommand),
     /// Sign in to a Gitmatrix server
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -259,6 +262,11 @@ pub struct CommitArgs {
     pub message: Vec<String>,
     /// Commit only these paths; the rest stays in the new working copy.
     pub paths: Vec<String>,
+    /// Step context for this commit (CORE-226): a JSON or Markdown file, or `-`
+    /// for stdin, with instructions, steering, why, challenges (and tests).
+    /// Journaled locally and uploaded by `gm push`.
+    #[arg(long, value_name = "FILE|-")]
+    pub context: Option<String>,
 }
 
 #[derive(Args)]

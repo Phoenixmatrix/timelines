@@ -42,6 +42,8 @@ const livePreviews = (kdb: DB) =>
     ])
     .where("d.status", "in", ["active", "sleeping"])
     .where("d.timeline_slug", "is not", null)
+    // A repository's deletion tears down its own previews (CORE-199).
+    .where("p.deleted_at", "is", null)
     .orderBy("d.id")
     .limit(MAX_PREVIEWS);
 

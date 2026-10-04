@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { describe, expect, test, vi } from "vite-plus/test";
-import type { CiRunList } from "../../shared/api.ts";
+import type { CiLogs, CiRunDetail, CiRunList } from "../../shared/api.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
@@ -36,7 +36,7 @@ async function setup() {
   });
   app.route("/api/repos/:owner/:name/ci", ci);
   const { secret } = await issueToken(env.DB, "acc_ann", "t", "read");
-  return async (path: string) => {
+  const get = async (path: string) => {
     const response = await app.request(
       path,
       { headers: { authorization: `Bearer ${secret}` } },
@@ -44,6 +44,7 @@ async function setup() {
     );
     return { status: response.status, json: (await response.json()) as CiRunList };
   };
+  return Object.assign(get, { sqlite });
 }
 
 describe("CI runs list", () => {
@@ -72,5 +73,40 @@ describe("CI runs list", () => {
     expect(scoped.json.runs.map((run) => run.number)).toEqual([4, 2]);
     const full = await get("/api/repos/ann/app/ci?ref=refs/heads/timeline/fast-search&before=4");
     expect(full.json.runs.map((run) => run.number)).toEqual([2]);
+  });
+});
+
+describe("after retention (CORE-200)", () => {
+  test("a job's removed log says when, and a removed run says it was removed", async () => {
+    const get = await setup();
+    get.sqlite.exec(`
+      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, finished_at, logs_removed_at)
+        VALUES ('j1', 'run3', 'repo', 'build', '{"needs":[]}', 'succeeded', 'sandbox',
+                '2026-01-01T00:00:00.000Z', '2026-10-01T12:00:00.000Z');
+      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, finished_at)
+        VALUES ('j2', 'run3', 'repo', 'test', '{"needs":[]}', 'succeeded', 'sandbox',
+                '2026-01-01T00:00:00.000Z');
+      INSERT INTO ci_logs (job_id, seq, step, text) VALUES ('j2', 1, 0, 'kept');
+      DELETE FROM ci_runs WHERE id = 'run2';
+    `);
+    const run = (await get("/api/repos/ann/app/ci/runs/3")).json as unknown as CiRunDetail;
+    expect(run.jobs.map((j) => [j.name, j.logsRemovedAt])).toEqual([
+      ["build", "2026-10-01T12:00:00.000Z"],
+      ["test", null],
+    ]);
+    const removed = (await get("/api/repos/ann/app/ci/jobs/j1/logs")).json as unknown as CiLogs;
+    expect(removed).toEqual({
+      chunks: [],
+      next: 0,
+      done: true,
+      removedAt: "2026-10-01T12:00:00.000Z",
+    });
+    const kept = (await get("/api/repos/ann/app/ci/jobs/j2/logs")).json as unknown as CiLogs;
+    expect(kept).toMatchObject({ chunks: [{ text: "kept" }], removedAt: null });
+
+    const gone = await get("/api/repos/ann/app/ci/runs/2");
+    expect(gone).toEqual({ status: 404, json: { error: "Run #2 was removed by retention." } });
+    const never = await get("/api/repos/ann/app/ci/runs/9");
+    expect(never).toEqual({ status: 404, json: { error: "No such run." } });
   });
 });

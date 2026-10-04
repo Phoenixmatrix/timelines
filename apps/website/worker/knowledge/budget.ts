@@ -34,6 +34,11 @@
 // Each reservation is one guarded INSERT … SELECT: D1 runs statements one at
 // a time, so the check and the charge are atomic under concurrent callers.
 //
+// Retention may roll calls older than its policy up into atlas_spend_daily
+// (CORE-201, category "ai-spend"): every daily total adds that table's row for
+// the day, so a roll-up changes no answer. Per-run caps read atlas_spend only:
+// a run ends long before its calls are old enough to roll up.
+//
 // Budgets never authorize inference while browsing: only build-time and
 // grouping-pass code may import this module.
 
@@ -255,6 +260,8 @@ export async function reserveAtlasCall(
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reserved', ?9, ?10, ?11, ?9, ?10, ?11, ?12
          WHERE NOT EXISTS (SELECT 1 FROM atlas_budget_exhaustions WHERE key IN (?13, ?14))
            AND (SELECT COALESCE(SUM(cost_micro_usd), 0) FROM atlas_spend
+                 WHERE account_id = ?2 AND day = ?3)
+             + (SELECT COALESCE(SUM(cost_micro_usd), 0) FROM atlas_spend_daily
                  WHERE account_id = ?2 AND day = ?3) + ?11 <= ?15
            AND (SELECT COUNT(*) FROM atlas_spend
                  WHERE scope = ?4 AND run_id = ?5 AND account_id = ?2 AND status <> 'released') < ?16
@@ -342,7 +349,7 @@ async function recordExhaustion(
     return asExhausted(ceiling);
   }
 
-  const [runTotals, dayTotals] = await Promise.all([
+  const [runTotals, dayTotals, rolledUp] = await Promise.all([
     k
       .selectFrom("atlas_spend")
       .select((eb) => [
@@ -361,6 +368,7 @@ async function recordExhaustion(
       .where("account_id", "=", run.accountId)
       .where("day", "=", day)
       .executeTakeFirstOrThrow(),
+    rolledUpCost(d1, run.accountId, day),
   ]);
   const limits = caps[run.scope];
   // A run's own caps first: they stop only that run.
@@ -371,7 +379,7 @@ async function recordExhaustion(
         ? "input_tokens"
         : Number(runTotals.output) + wanted.outputTokens > limits.outputTokens
           ? "output_tokens"
-          : Number(dayTotals.cost) + wanted.cost > caps.dailyUsdPerAccount * MICRO
+          : Number(dayTotals.cost) + rolledUp + wanted.cost > caps.dailyUsdPerAccount * MICRO
             ? "daily_usd"
             : null;
   if (!cap) return null;
@@ -387,6 +395,21 @@ async function recordExhaustion(
   ]);
   const stored = (await recorded()).find((e) => e.key === runKey(run));
   return stored ? asExhausted(stored) : null;
+}
+
+/**
+ * An account's spend on a day that the "ai-spend" retention category rolled
+ * up into atlas_spend_daily (CORE-201); 0 for a day with every call still
+ * recorded on its own. Daily totals add it, so a roll-up changes no answer.
+ */
+async function rolledUpCost(d1: D1Database, accountId: string, day: string): Promise<number> {
+  const row = await db(d1)
+    .selectFrom("atlas_spend_daily")
+    .select("cost_micro_usd")
+    .where("account_id", "=", accountId)
+    .where("day", "=", day)
+    .executeTakeFirst();
+  return Number(row?.cost_micro_usd ?? 0);
 }
 
 /** Record exhaustions; the first record for a key wins. */
@@ -574,13 +597,14 @@ export async function atlasDailySpend(
   const now = options.now ?? new Date();
   const day = utcDay(now);
   const k = db(d1);
-  const [spent, exhaustion] = await Promise.all([
+  const [spent, rolledUp, exhaustion] = await Promise.all([
     k
       .selectFrom("atlas_spend")
       .select((eb) => eb.fn.coalesce(eb.fn.sum<number>("cost_micro_usd"), eb.lit(0)).as("cost"))
       .where("account_id", "=", accountId)
       .where("day", "=", day)
       .executeTakeFirstOrThrow(),
+    rolledUpCost(d1, accountId, day),
     k
       .selectFrom("atlas_budget_exhaustions")
       .select("key")
@@ -589,7 +613,7 @@ export async function atlasDailySpend(
   ]);
   return {
     day,
-    usd: Number(spent.cost) / MICRO,
+    usd: (Number(spent.cost) + rolledUp) / MICRO,
     limitUsd: (options.limits ?? ATLAS_LIMITS).dailyUsdPerAccount,
     resetsAt: nextUtcMidnight(now),
     exhausted: Boolean(exhaustion),

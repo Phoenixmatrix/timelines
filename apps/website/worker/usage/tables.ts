@@ -35,6 +35,7 @@ export const TABLE_GROUPS: TableGroup[] = [
     label: "Repositories, collaborators, mirrors and refs",
     tables: {
       repos: "owner_id = ?1",
+      repo_deletions: "owner_id = ?1",
       repo_collaborators: REPO,
       repo_mirrors: REPO,
       repo_refs: REPO,
@@ -46,6 +47,14 @@ export const TABLE_GROUPS: TableGroup[] = [
     scope: "account",
     label: "Push log and change refs",
     tables: { ref_updates: REPO, change_refs: REPO },
+  },
+  {
+    // CORE-231; its retention category arrives with CORE-244.
+    id: "step-context",
+    database: "db",
+    scope: "account",
+    label: "Step context (work context per commit)",
+    tables: { step_contexts: REPO },
   },
   {
     id: "ci-logs",
@@ -135,7 +144,11 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "account",
     label: "Atlas model spend records",
-    tables: { atlas_spend: "account_id = ?1", atlas_budget_exhaustions: "account_id = ?1" },
+    tables: {
+      atlas_spend: "account_id = ?1",
+      atlas_spend_daily: "account_id = ?1",
+      atlas_budget_exhaustions: "account_id = ?1",
+    },
   },
   {
     id: "release-notes",
@@ -179,7 +192,12 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "account",
     label: "Usage records",
-    tables: { usage_snapshots: "account_id = ?1", ai_usage: "account_id = ?1" },
+    tables: {
+      usage_snapshots: "account_id = ?1",
+      usage_monthly: "account_id = ?1",
+      ai_usage: "account_id = ?1",
+      ai_usage_monthly: "account_id = ?1",
+    },
   },
   {
     id: "retention",

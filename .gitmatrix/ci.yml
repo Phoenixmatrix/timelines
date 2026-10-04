@@ -56,6 +56,13 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Generate Worker types
         run: vp run website#cf-typegen
+      # apps/website's browser-mode tests (*.browser.test.tsx) run in Chromium's
+      # headless shell: fetch it, and its system libraries where the job may
+      # install them (the Sandbox runs as root; a local runner has them). ~20s.
+      - name: Chromium for browser-mode tests
+        run: |
+          if [ "$(id -u)" = 0 ]; then pnpm --filter website exec playwright install-deps chromium; fi
+          pnpm --filter website exec playwright install --only-shell chromium
       - name: Tests (everything but gm, which the cli job tests)
         run: vp run --filter '!cli' --concurrency-limit 1 --no-cache test
 

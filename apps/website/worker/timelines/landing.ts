@@ -138,6 +138,7 @@ async function repoRows(d1: D1Database, ids: string[]): Promise<Map<string, Push
       "r.artifacts_remote",
     ])
     .where("r.id", "in", ids)
+    .where("r.deleted_at", "is", null)
     .execute();
   return new Map(rows.map((row) => [row.id, row]));
 }

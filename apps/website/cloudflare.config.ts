@@ -186,6 +186,12 @@ export default defineConfig(({ mode, isPreview }) => {
                 worker: "gitmatrix",
                 exportName: "KnowledgeBuild",
               }),
+              // Repository deletion's purge (CORE-199, worker/retention/repo-purge.ts).
+              REPO_PURGE: bindings.workflow({
+                name: "repo-purge",
+                worker: "gitmatrix",
+                exportName: "RepoPurge",
+              }),
             }),
         // CI/CD.
         CI_RUNNER: bindings.text<Runner>(runner),
@@ -336,6 +342,7 @@ export default defineConfig(({ mode, isPreview }) => {
           : {
               KnowledgeBuild: exports.workflow({ name: "knowledge-build" }),
               CiRun: exports.workflow({ name: "ci-run" }),
+              RepoPurge: exports.workflow({ name: "repo-purge" }),
             }),
         RegistryRepo: exports.durableObject({ storage: "sqlite" }),
         RegistryUpload: exports.durableObject({ storage: "sqlite" }),

@@ -37,6 +37,7 @@ import { findRepo, roleFor } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { batch, db, nowIso, type DB } from "../schema.ts";
+import { cancelRun } from "./cancel.ts";
 import { claim, jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { startRun } from "./trigger.ts";
@@ -166,6 +167,7 @@ async function runDetail(
       error: job.error,
       startedAt: job.started_at,
       finishedAt: job.finished_at,
+      logsRemovedAt: job.logs_removed_at,
       steps: stepRows
         .filter((s) => s.job_id === job.id)
         .map((s) => ({
@@ -183,16 +185,32 @@ async function runDetail(
 ci.get("/runs/:number{[0-9]+}", async (c) => {
   const repo = await loadRepo(c);
   if (repo instanceof Response) return repo;
-  const run = await runDetail(c.env.DB, repo.row.id, Number(c.req.param("number")));
-  return run ? c.json<CiRunDetail>(run) : fail(c, 404, "No such run.");
+  const number = Number(c.req.param("number"));
+  const run = await runDetail(c.env.DB, repo.row.id, number);
+  if (run) return c.json<CiRunDetail>(run);
+  return fail(c, 404, await missingRun(c.env.DB, repo.row.id, number));
 });
+
+/**
+ * Why a run number has no run. Numbers are handed out in sequence and only
+ * retention deletes runs ("ci-runs", CORE-200), so a number below a run that
+ * exists was removed by retention.
+ */
+async function missingRun(d1: D1Database, repoId: string, number: number): Promise<string> {
+  const later = await db(d1)
+    .selectFrom("ci_runs")
+    .select("number")
+    .where("repo_id", "=", repoId)
+    .where("number", ">", number)
+    .limit(1)
+    .executeTakeFirst();
+  return later ? `Run #${number} was removed by retention.` : "No such run.";
+}
 
 ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   const repo = await loadRepo(c, "write");
   if (repo instanceof Response) return repo;
-  const d1 = c.env.DB;
-  const kdb = db(d1);
-  const run = await kdb
+  const run = await db(c.env.DB)
     .selectFrom("ci_runs")
     .select(["id", "status"])
     .where("repo_id", "=", repo.row.id)
@@ -202,26 +220,7 @@ ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   if (run.status !== "queued" && run.status !== "running") {
     return fail(c, 409, `The run already ${run.status}.`);
   }
-  // Runners notice on their next report and stop; the Workflow stops now.
-  const now = nowIso();
-  await batch(d1, [
-    kdb
-      .updateTable("ci_runs")
-      .set({ status: "cancelled", finished_at: now })
-      .where("id", "=", run.id),
-    kdb
-      .updateTable("ci_jobs")
-      .set({ status: "cancelled", finished_at: now })
-      .where("run_id", "=", run.id)
-      .where("status", "in", ["pending", "queued", "running"]),
-    kdb
-      .updateTable("ci_steps")
-      .set({ status: "cancelled", finished_at: now })
-      .where("job_id", "in", kdb.selectFrom("ci_jobs").select("id").where("run_id", "=", run.id))
-      .where("status", "in", ["pending", "running"]),
-  ]);
-  const instance = await c.env.CI_RUN.get(run.id).catch(() => null);
-  await instance?.terminate().catch(() => {});
+  await cancelRun(c.env, run.id);
   return c.json({ ok: true });
 });
 
@@ -290,12 +289,13 @@ ci.get("/jobs/:job/logs", async (c) => {
     .limit(500);
   const jobQuery = kdb
     .selectFrom("ci_jobs")
-    .select("status")
+    .select(["status", "logs_removed_at"])
     .where("id", "=", c.req.param("job"))
     .where("repo_id", "=", repo.row.id);
   const [chunks, job] = await batch(d1, [chunksQuery, jobQuery]);
-  const status = (job!.results as InferResult<typeof jobQuery>)[0]?.status;
-  if (!status) return fail(c, 404, "No such job.");
+  const found = (job!.results as InferResult<typeof jobQuery>)[0];
+  if (!found) return fail(c, 404, "No such job.");
+  const status = found.status;
   const rows: CiLogs["chunks"] = chunks!.results as InferResult<typeof chunksQuery>;
   const done = !["pending", "queued", "running"].includes(status);
   return c.json<CiLogs>({
@@ -303,6 +303,7 @@ ci.get("/jobs/:job/logs", async (c) => {
     next: rows.at(-1)?.seq ?? after,
     // Done only once the job ended and every chunk has been read.
     done: done && rows.length < 500,
+    removedAt: found.logs_removed_at,
   });
 });
 
@@ -375,14 +376,18 @@ ci.delete("/secrets/:secret", async (c) => {
 
 export const runner = new Hono<AppEnv>();
 
-/** Whether the actor may run (and see the secrets of) jobs for a repo. */
+/**
+ * Whether the actor may run (and see the secrets of) jobs for a repo. A
+ * repository being deleted still runs its previews' teardown (CORE-199); its
+ * other runs were cancelled when the deletion started.
+ */
 async function mayRun(
   d1: D1Database,
   actor: NonNullable<AppEnv["Variables"]["actor"]>,
   repo: string,
 ) {
   const [owner, name] = repo.split("/");
-  const row = await findRepo(d1, actor, owner ?? "", name ?? "");
+  const row = await findRepo(d1, actor, owner ?? "", name ?? "", { deleting: true });
   return row !== null && atLeast(roleFor(row, actor), "write");
 }
 

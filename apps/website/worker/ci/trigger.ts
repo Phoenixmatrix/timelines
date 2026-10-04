@@ -73,6 +73,15 @@ async function pipelineAt(
 export async function startWorkflow(env: Env, runId: string) {
   if (!productionOnly(env, "workflow", `CI run ${runId}`))
     throw new PreviewModeError("workflow", "Previews don't run CI.");
+  const run = await db(env.DB)
+    .selectFrom("ci_runs as r")
+    .innerJoin("repos as p", "p.id", "r.repo_id")
+    .select("r.id")
+    .where("r.id", "=", runId)
+    .where("r.status", "in", ["queued", "running"])
+    .where((eb) => eb.or([eb("p.deleted_at", "is", null), eb("r.preview_action", "=", "teardown")]))
+    .executeTakeFirst();
+  if (!run) return;
   await env.CI_RUN.create({ id: runId, params: { runId } satisfies RunParams });
 }
 
@@ -236,7 +245,18 @@ export async function startRun(
                 .as("landing_id"),
               eb.val(options.queueId ?? null).as("queue_id"),
             ])
-            .where("repo_id", "=", repo.id),
+            .where("repo_id", "=", repo.id)
+            .having((eb) =>
+              eb.exists(
+                eb
+                  .selectFrom("repos")
+                  .select("id")
+                  .where("id", "=", repo.id)
+                  .$if(preview?.action !== "teardown", (query) =>
+                    query.where("deleted_at", "is", null),
+                  ),
+              ),
+            ),
         ),
     ];
     const tree = (await reader.commit(options.commit))?.treeHash;

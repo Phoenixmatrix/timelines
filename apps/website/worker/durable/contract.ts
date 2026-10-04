@@ -52,10 +52,11 @@ export interface Retirement {
 
 /** What `storage` holds right now. */
 export async function storageReport(storage: DurableObjectStorage): Promise<StorageReport> {
-  // substr, not LIKE: `_` is LIKE's single-character wildcard.
+  // substr, not LIKE: `_` is LIKE's single-character wildcard. The local
+  // runtime keeps an instance's name in `__miniflare_do_name` (development only).
   const tables = storage.sql
     .exec<{ name: string }>(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND substr(name, 1, 7) != 'sqlite_' AND substr(name, 1, 4) != '_cf_' ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND substr(name, 1, 7) != 'sqlite_' AND substr(name, 1, 4) != '_cf_' AND substr(name, 1, 12) != '__miniflare_' ORDER BY name",
     )
     .toArray()
     .map((row) => row.name);

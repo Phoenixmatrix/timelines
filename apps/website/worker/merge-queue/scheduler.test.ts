@@ -741,6 +741,59 @@ describe("durable independent merge queue", () => {
     expect(await getQueue(t.env.DB, "repo", oid(2))).toBeNull();
     await t.progress();
   });
+  test.each(["queued", "merging", "testing", "advancing", "landed", "failed"] as const)(
+    "a tombstone fences %s work, pending effects, retries and admission",
+    async (status) => {
+      const t = setup();
+      const admission = await t.admit(2);
+      const before = await t.state(2);
+      const saved = (await saveQueue(t.env.DB, before, {
+        ...before,
+        effectsPending: true,
+        remediationPending: true,
+        entry: { ...before.entry, status, base: oid(1), candidate: oid(3) },
+      }))!;
+      t.sqlite.exec("UPDATE repos SET deleted_at = CURRENT_TIMESTAMP WHERE id = 'repo'");
+      const other = { ...admission, entry: { ...admission.entry, id: oid(4), commit: oid(4) } };
+      expect(await admitQueue(t.env.DB, other)).toBe(false);
+      expect(
+        await saveQueue(t.env.DB, saved, {
+          ...saved,
+          entry: { ...saved.entry, status: "queued" },
+        }),
+      ).toBeNull();
+      await t.progress();
+      expect(t.refs.get("refs/heads/main")).toBe(oid(1));
+      for (const operation of [
+        "write",
+        "merge",
+        "gates",
+        "deploy",
+        "effects",
+        "remediate",
+        "recover",
+      ] as const)
+        expect(t.deps[operation]).not.toHaveBeenCalled();
+      expect((await t.state(2)).version).toBe(saved.version);
+    },
+  );
+  test("deletion during the advancing ref read prevents publishing the tested candidate", async () => {
+    const t = setup();
+    await t.admit(2);
+    const before = await t.state(2);
+    await saveQueue(t.env.DB, before, {
+      ...before,
+      entry: { ...before.entry, status: "advancing", base: oid(1), candidate: oid(3) },
+    });
+    t.deps.refs = async () => {
+      t.sqlite.exec("UPDATE repos SET deleted_at = CURRENT_TIMESTAMP WHERE id = 'repo'");
+      return new Map(t.refs);
+    };
+    await t.progress();
+    expect(t.deps.write).not.toHaveBeenCalled();
+    expect(t.deps.effects).not.toHaveBeenCalled();
+    expect(t.refs.get("refs/heads/main")).toBe(oid(1));
+  });
   test("an expired uncertain scheduling answer falls back to FIFO without provider replay", async () => {
     const t = setup();
     await t.admit(2);

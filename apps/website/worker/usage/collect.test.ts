@@ -5,11 +5,22 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { beforeEach, describe, expect, test } from "vite-plus/test";
+import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { FakeR2Bucket } from "@gitmatrix/testing";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { collectUsage, SITE, USAGE_LIMITS } from "./collect.ts";
 import { TABLE_GROUPS } from "./tables.ts";
+
+// Unreachable git data takes a fetch from Artifacts (worker/git/unreachable.test.ts).
+vi.mock(import("../git/unreachable.ts"), async (original) => ({
+  ...(await original()),
+  measureUnreachable: async (_env: Env, repo: { id: string }) => ({
+    commits: 1,
+    objects: 3,
+    bytes: repo.id === "repo_1" ? 100 : 250,
+    truncated: false,
+  }),
+}));
 
 function migrated(dir: string): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -51,6 +62,10 @@ beforeEach(async () => {
       ('repo_p', 'acc_p', 'notes', 'private', 'n3', 'https://x', 0);
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
       ('run_1', 'repo_1', 1, 'c', 'refs/heads/main', 'push', 'succeeded');
+    -- Branches deleted in Orbit's two repositories, none in Pat's.
+    INSERT INTO ref_updates (repo_id, ref, old_oid, new_oid) VALUES
+      ('repo_1', 'refs/heads/gone', 'a1', NULL), ('repo_2', 'refs/heads/gone', 'b1', NULL),
+      ('repo_p', 'refs/heads/main', NULL, 'c1');
     INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, started_at, finished_at) VALUES
       ('job_1', 'run_1', 'repo_1', 'a', '{}', 'succeeded', 'sandbox', '${YESTERDAY}T10:00:00.000Z', '${YESTERDAY}T10:30:00.000Z'),
       ('job_2', 'run_1', 'repo_1', 'b', '{}', 'succeeded', 'sandbox', '${YESTERDAY}T23:50:00.000Z', '${TODAY}T00:10:00.000Z'),
@@ -171,6 +186,14 @@ describe("collectUsage", () => {
       quantity: 12000,
       estimated: 1,
     });
+
+    // Unreachable git data: one measurement per repository a ref left a commit in, summed.
+    expect(o[`${TODAY} artifacts/repositories/unreachable_bytes`]).toMatchObject({
+      quantity: 350,
+      estimated: 1,
+      method: expect.stringMatching(/can't prune/),
+    });
+    expect(q(`${TODAY} artifacts/repositories/unreachable_objects`)).toBe(6);
 
     // Vectorize: embedded kinds with a summary only; × 1024.
     expect(o[`${TODAY} vectorize/knowledge/vectors`]).toMatchObject({ quantity: 2, estimated: 1 });

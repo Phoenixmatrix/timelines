@@ -4,7 +4,7 @@
 
 /** Top-level paths an account must never shadow: app routes and registry prefixes. */
 export const RESERVED_SLUGS = new Set([
-  // App routes (src/router.tsx) and the Worker's own prefixes.
+  // App routes (src/appRoutes.tsx) and the Worker's own prefixes.
   "api",
   "assets",
   "ci",

@@ -19,6 +19,7 @@ import { gitBackend, run, serve } from "../testing/git-http.ts";
 import { gitHttp, landingPushRefusal, queuePushRefusal } from "./http.ts";
 import { FLUSH, pkt } from "./pktline.ts";
 import { afterPush } from "./effects.ts";
+import { steps } from "../steps/api.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 vi.mock("./effects.ts", () => ({ afterPush: vi.fn() }));
@@ -52,13 +53,14 @@ function git(cwd: string, ...args: string[]) {
   }).trim();
 }
 
-async function setup(queue = false) {
+async function setup(queue = false, changeId?: string) {
   const root = mkdtempSync(join(tmpdir(), "git-proxy-"));
   dirs.push(root);
   // Artifacts: a bare repository with main, the landing branch and a tag.
   const remote = join(root, "app.git");
   const work = join(root, "work");
   git(root, "init", "--quiet", "--bare", "-b", "main", remote);
+  git(root, "--git-dir", remote, "config", "uploadpack.allowFilter", "true");
   git(root, "init", "--quiet", "-b", "main", work);
   git(work, "remote", "add", "origin", remote);
   writeFileSync(join(work, "file"), "one\n");
@@ -69,6 +71,19 @@ async function setup(queue = false) {
   const main = git(work, "rev-parse", "HEAD");
   writeFileSync(join(work, "file"), "merged\n");
   git(work, "commit", "--quiet", "-am", "the merge");
+  if (changeId) {
+    const body = git(work, "cat-file", "commit", "HEAD").replace(
+      "\n\n",
+      `\nchange-id ${changeId}\n\n`,
+    );
+    const commit = execFileSync("git", ["hash-object", "-t", "commit", "-w", "--stdin"], {
+      cwd: work,
+      encoding: "utf8",
+      input: `${body}\n`,
+      env: { ...process.env, ...GIT_ENV },
+    }).trim();
+    git(work, "update-ref", "HEAD", commit);
+  }
   const merge = git(work, "rev-parse", "HEAD");
 
   const sqlite = migratedDatabase();
@@ -395,6 +410,7 @@ describe("a queue merge job's credential", () => {
   });
 
   test.each([
+    "UPDATE repos SET deleted_at=CURRENT_TIMESTAMP",
     "UPDATE merge_queue SET status='cancelled'",
     "UPDATE merge_queue SET attempts=2",
     "UPDATE merge_queue SET merge_run_id='replacement'",
@@ -463,8 +479,9 @@ describe("a queue merge job's credential", () => {
 });
 
 describe("ordinary queue source staging", () => {
-  test("suppresses source-only effects but keeps direct and mixed pushes", async () => {
-    const t = await setup();
+  test("records source provenance before context upload without starting ordinary effects", async () => {
+    const changeId = "queuestep01";
+    const t = await setup(false, changeId);
     const secret = "gmx_proxy_staging_test";
     t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
     t.sqlite
@@ -478,6 +495,39 @@ describe("ordinary queue source staging", () => {
     expect(t.ref(source)).toBe(t.merge);
     expect(t.ref("refs/heads/main")).toBe(t.main);
     expect(afterPush).not.toHaveBeenCalled();
+    expect(
+      t.sqlite
+        .prepare(
+          "SELECT change_id, first_commit_oid, last_commit_oid FROM change_refs WHERE repo_id = 'app' AND ref = ?",
+        )
+        .all(source),
+    ).toEqual([{ change_id: changeId, first_commit_oid: t.merge, last_commit_oid: t.merge }]);
+    const context = new Hono<AppEnv>();
+    context.use("*", async (c, next) => {
+      c.set("actor", { id: "orbit", slug: "orbit", displayName: "Orbit", isSiteAdmin: false });
+      await next();
+    });
+    context.route("/api/repos/:owner/:name/steps", steps);
+    const uploaded = await context.request(
+      "/api/repos/orbit/app/steps",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          changeId,
+          commitOid: t.merge,
+          summary: "Queued source context",
+          committedAt: "2026-10-04T00:00:00.000Z",
+          why: "Keep provenance while expensive staging effects remain disabled.",
+        }),
+      },
+      t.env,
+    );
+    expect(uploaded.status).toBe(201);
+    expect(await uploaded.json()).toMatchObject({
+      commitOid: t.merge,
+      verified: true,
+      context: { why: "Keep provenance while expensive staging effects remain disabled." },
+    });
     const direct = await t.gitWith(secret, "push", t.proxyUrl, "HEAD:refs/heads/main");
     expect(direct.status, direct.stderr).toBe(0);
     expect(t.ref("refs/heads/main")).toBe(t.merge);

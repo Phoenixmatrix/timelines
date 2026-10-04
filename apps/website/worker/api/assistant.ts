@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import type { AskRequest, AssistantChat } from "../../shared/assistant.ts";
 import type { AppEnv } from "../auth.ts";
 import { durableAgent, purgeInstance } from "../durable/registry.ts";
+import { accountPolicies } from "../retention/policies.ts";
 import { db } from "../schema.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
@@ -34,13 +35,24 @@ assistant.get("/chats", async (c) => {
     .orderBy("updated_at", "desc")
     .limit(200)
     .execute();
+  const policy = (await accountPolicies(c.env.DB, actor.id)).find(
+    (p) => p.id === "assistant-chats",
+  );
+  const now = new Date().toISOString();
+  const expires = (updatedAt: string, index: number) => {
+    if (!policy?.enabled) return null;
+    const { days = 0, maxPerUser = 0 } = policy.values;
+    if (maxPerUser > 0 && index >= maxPerUser) return now;
+    return new Date(Date.parse(updatedAt) + days * 86_400_000).toISOString();
+  };
   return c.json({
-    chats: rows.map((row): AssistantChat => ({
+    chats: rows.map((row, index): AssistantChat => ({
       id: row.id,
       title: row.title,
       source: row.source,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      expiresAt: expires(row.updated_at, index),
     })),
   });
 });

@@ -99,6 +99,9 @@ fn detail_text(run: &Value) -> String {
         if let Some(error) = job["error"].as_str() {
             out.push_str(&format!("    {error}\n"));
         }
+        if let Some(at) = job["logsRemovedAt"].as_str() {
+            out.push_str(&format!("    {}\n", removed_note(at)));
+        }
         for step in job["steps"].as_array().into_iter().flatten() {
             out.push_str(&format!(
                 "    {} {}{}\n",
@@ -113,6 +116,14 @@ fn detail_text(run: &Value) -> String {
         }
     }
     out
+}
+
+/// What a job whose log text retention removed says instead of its log.
+fn removed_note(at: &str) -> String {
+    format!(
+        "Logs removed by retention on {}.",
+        at.get(..10).unwrap_or(at)
+    )
 }
 
 fn latest_run(config: &Config, repo: &str) -> Result<Value> {
@@ -388,6 +399,22 @@ fn logs(
     let mut text = String::new();
     for job in &jobs {
         let id = s(job, "id").to_string();
+        if let Some(at) = job["logsRemovedAt"].as_str() {
+            let note = format!("── {}: {}\n", s(job, "name"), removed_note(at));
+            if streaming {
+                print!("{note}");
+            } else {
+                text.push_str(&note);
+            }
+            value.push(json!({
+                "job": s(job, "name"),
+                "status": s(job, "status"),
+                "done": true,
+                "log": "",
+                "logsRemovedAt": at,
+            }));
+            continue;
+        }
         let mut last_step = None;
         let (mut chunks, mut next, mut done) = job_logs(config, repo, &id, 0)?;
         if streaming {
@@ -1214,7 +1241,8 @@ pub fn runner(ctx: &Ctx, args: &RunnerArgs) -> Result<Shown> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Ended, Reporter, execute, strip_ansi};
+    use super::{Config, Ended, Reporter, detail_text, execute, strip_ansi};
+    use serde_json::json;
     use std::io::{BufRead, Read, Write};
     use std::net::TcpListener;
     use std::process::Command;
@@ -1452,5 +1480,20 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[38;2;225;80;80;1m×\x1b[0m x"), "× x");
         assert_eq!(strip_ansi("\x1b]0;title\x07plain"), "plain");
         assert_eq!(strip_ansi("no escapes"), "no escapes");
+    }
+
+    #[test]
+    fn run_detail_says_when_retention_removed_a_log() {
+        let run = json!({
+            "number": 7, "status": "succeeded", "trigger": "push", "ref": "main",
+            "commit": "0123456789abcdef", "title": "Old run",
+            "jobs": [
+                {"name": "build", "status": "succeeded", "logsRemovedAt": "2026-10-01T12:00:00.000Z", "steps": []},
+                {"name": "test", "status": "succeeded", "logsRemovedAt": null, "steps": []}
+            ]
+        });
+        let text = detail_text(&run);
+        assert!(text.contains("build (succeeded)\n    Logs removed by retention on 2026-10-01.\n"));
+        assert_eq!(text.matches("removed by retention").count(), 1);
     }
 }

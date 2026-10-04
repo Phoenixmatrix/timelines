@@ -5,7 +5,8 @@
 import { structuredPatch } from "diff";
 import type { AiModels } from "../../shared/ai.ts";
 import type { RepoReader } from "../objects.ts";
-import { db } from "../schema.ts";
+import { db, nowIso } from "../schema.ts";
+import { useIsStale } from "./cache-use.ts";
 import { extract, languageOf, skipReason, type Language } from "./extract.ts";
 import { chatJson, choice, decide, yes, type ClefQuestion } from "./models.ts";
 import { chunk, pool } from "./util.ts";
@@ -154,15 +155,29 @@ export async function loadAnalyses(
   blobs: string[],
 ): Promise<Map<string, FileAnalysis>> {
   const out = new Map<string, FileAnalysis>();
+  const now = new Date();
+  const stale: string[] = [];
   for (const group of chunk([...new Set(blobs)], 90)) {
     const results = await db(d1)
       .selectFrom("kg_blob_analysis")
-      .select(["blob_oid", "data"])
+      .select(["blob_oid", "data", "used_at"])
       .where("analyzer", "=", ANALYZER)
       .where("blob_oid", "in", group)
       .execute();
-    for (const row of results) out.set(row.blob_oid, JSON.parse(row.data) as FileAnalysis);
+    for (const row of results) {
+      out.set(row.blob_oid, JSON.parse(row.data) as FileAnalysis);
+      if (useIsStale(row.used_at, now)) stale.push(row.blob_oid);
+    }
   }
+  // Record the use for retention (cache-use.ts): at most daily per entry.
+  if (stale.length)
+    await d1
+      .prepare(
+        `UPDATE kg_blob_analysis SET used_at = ?
+         WHERE analyzer = ? AND blob_oid IN (SELECT value FROM json_each(?))`,
+      )
+      .bind(now.toISOString(), ANALYZER, JSON.stringify(stale))
+      .run();
   return out;
 }
 
@@ -182,12 +197,14 @@ async function store(
       data: JSON.stringify(analysis),
       model,
       tokens,
+      used_at: nowIso(),
     })
     .onConflict((oc) =>
       oc.columns(["blob_oid", "analyzer"]).doUpdateSet((eb) => ({
         data: eb.ref("excluded.data"),
         model: eb.ref("excluded.model"),
         tokens: eb.ref("excluded.tokens"),
+        used_at: eb.ref("excluded.used_at"),
       })),
     )
     .execute();

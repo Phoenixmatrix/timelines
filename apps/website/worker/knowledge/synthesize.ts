@@ -4,7 +4,8 @@
 // re-synthesizes the components whose files actually changed meaning.
 
 import type { AiModels } from "../../shared/ai.ts";
-import { db } from "../schema.ts";
+import { db, nowIso } from "../schema.ts";
+import { useIsStale } from "./cache-use.ts";
 import type { FileAnalysis } from "./analyze.ts";
 import { ANALYZER } from "./analyze.ts";
 import type {
@@ -21,10 +22,19 @@ import { chunk, pool, sha256 } from "./util.ts";
 export async function cached<T>(d1: D1Database, key: string): Promise<T | null> {
   const row = await db(d1)
     .selectFrom("kg_synthesis")
-    .select("data")
+    .select(["data", "used_at"])
     .where("key", "=", key)
     .executeTakeFirst();
-  return row ? (JSON.parse(row.data) as T) : null;
+  if (!row) return null;
+  // Record the use for retention (cache-use.ts): at most daily per entry.
+  const now = new Date();
+  if (useIsStale(row.used_at, now))
+    await db(d1)
+      .updateTable("kg_synthesis")
+      .set({ used_at: now.toISOString() })
+      .where("key", "=", key)
+      .execute();
+  return JSON.parse(row.data) as T;
 }
 
 /** Cache a synthesis under the hash of its inputs, with the model that wrote it. */
@@ -37,12 +47,13 @@ export async function remember(
 ) {
   await db(d1)
     .insertInto("kg_synthesis")
-    .values({ key, data: JSON.stringify(value), model, tokens })
+    .values({ key, data: JSON.stringify(value), model, tokens, used_at: nowIso() })
     .onConflict((oc) =>
       oc.column("key").doUpdateSet((eb) => ({
         data: eb.ref("excluded.data"),
         model: eb.ref("excluded.model"),
         tokens: eb.ref("excluded.tokens"),
+        used_at: eb.ref("excluded.used_at"),
       })),
     )
     .execute();

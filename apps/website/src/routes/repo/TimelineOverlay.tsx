@@ -11,7 +11,7 @@ import type {
 } from "../../../shared/api.ts";
 import { PageSetSummary, pagesPending, setLabel } from "../../components/TimelinePages.tsx";
 import { api, ApiError } from "../../lib/api.ts";
-import { timeAgo } from "../../lib/format.ts";
+import { fullDate, timeAgo } from "../../lib/format.ts";
 
 /** Main, or one of the repository's timelines. */
 export function TimelinePicker({
@@ -65,6 +65,7 @@ export function TimelineWikiPages({
   ref,
   canAsk,
   ended,
+  removedAt = null,
   note,
 }: {
   repo: { owner: string; name: string };
@@ -73,6 +74,8 @@ export function TimelineWikiPages({
   /** The bookmark is there and its overlay has a main to compare with. */
   canAsk: boolean;
   ended: boolean;
+  /** When retention removed the ended timeline's pages (CORE-201). */
+  removedAt?: string | null;
   /** The newest set's main against the map on screen, in words. */
   note: string | null;
 }) {
@@ -137,9 +140,11 @@ export function TimelineWikiPages({
       ) : (
         sets !== null && (
           <p className="m-0 text-body-sm text-ink-muted">
-            {ended
-              ? "None were written before this timeline ended."
-              : "Written at each checkpoint, or when asked."}
+            {removedAt
+              ? `Removed by retention on ${fullDate(removedAt)}.`
+              : ended
+                ? "None were written before this timeline ended."
+                : "Written at each checkpoint, or when asked."}
           </p>
         )
       )}

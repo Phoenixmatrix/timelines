@@ -23,6 +23,12 @@ export interface AssistantChat {
   source: "web" | "cli";
   createdAt: string;
   updatedAt: string;
+  /**
+   * When retention deletes it unless it's used again (CORE-204): null while
+   * the account's "assistant-chats" policy is off. A chat over the policy's
+   * per-person cap expires at the next cleanup (now).
+   */
+  expiresAt: string | null;
 }
 
 /** POST /api/assistant/ask: one turn from the CLI. */

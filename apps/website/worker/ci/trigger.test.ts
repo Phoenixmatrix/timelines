@@ -4,7 +4,7 @@
 import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { jobPayload, loadJob } from "./jobs.ts";
-import { startRun } from "./trigger.ts";
+import { startRun, startWorkflow } from "./trigger.ts";
 
 const files = vi.hoisted(() => ({ ciYml: "" }));
 vi.mock("../objects.ts", () => ({
@@ -75,6 +75,33 @@ beforeEach(() => {
 });
 
 describe("preview runs", () => {
+  test("deletion fences new CI and workflow recovery but permits purge teardown", async () => {
+    const t = setup();
+    try {
+      const original = await t.start();
+      if (!("runId" in original)) throw new Error(original.skipped);
+      t.created.length = 0;
+      t.sqlite.exec("UPDATE repos SET deleted_at = CURRENT_TIMESTAMP WHERE id = 'repo'");
+      await startWorkflow(t.env, original.runId);
+      expect(t.created).toEqual([]);
+      await expect(
+        t.start({ commit: oid(10), trigger: "push", preview: undefined }),
+      ).rejects.toThrow();
+      expect(t.sqlite.prepare("SELECT commit_oid FROM ci_runs ORDER BY number").all()).toEqual([
+        { commit_oid: oid(9) },
+      ]);
+      const teardown = await t.start({
+        preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
+      });
+      if (!("runId" in teardown)) throw new Error(teardown.skipped);
+      expect(t.created).toEqual([teardown.runId]);
+      expect(t.jobs(teardown.runId).find((job) => job.status === "pending")?.name).toBe(
+        "preview-teardown",
+      );
+    } finally {
+      t.sqlite.close();
+    }
+  });
   test("a create run records its action, timeline and checkpoint, and runs only its job", async () => {
     const t = setup();
     const started = await t.start();

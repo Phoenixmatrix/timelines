@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -15,20 +15,16 @@ import type {
   CiRunList,
   CreatedAccessToken,
   HistoryPage,
+  RefUpdateList,
   RepoDetail,
 } from "../../apps/website/shared/api.ts";
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { Landing } from "../../apps/website/shared/timelines.ts";
+import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
-import {
-  atlasAccessibleScenario,
-  atlasBrowserScenario,
-  atlasTimelineScenario,
-  atlasRevocationScenario,
-  atlasWorkspaceScenario,
-} from "./atlas-e2e.ts";
+import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 import { runQueueE2E } from "./queue-e2e.ts";
 
@@ -1418,6 +1414,111 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("ci-retention-removes-logs-and-runs", async () => {
+    // CORE-200, in the real runtime: two finished runs on one branch, moved
+    // 40 days back; a manual dry run then run of "ci-logs" removes their log
+    // text (the run page, the logs API and `gm runs` say so), then "ci-runs"
+    // keeping one run per ref removes the older run (its page says it was
+    // removed by retention) and keeps the latest.
+    const branch = `agent-ci-retention-${randomUUID().slice(0, 6)}`;
+    const jobs = { say: { steps: [{ run: "printf 'retention marker\\n'" }] } };
+    const older = await pushPipeline(jobs, branch);
+    await poll(() => runDetail(older), terminal, "older retention run");
+    const newer = (
+      await json<{ number: number }>(`${api}/ci/runs`, ownerToken, "POST", { ref: branch }, [201])
+    ).number;
+    const latest = await poll(() => runDetail(newer), terminal, "newer retention run");
+    assert.equal(latest.status, "succeeded");
+    await json("/api/dev/ci-age", ctx.env.GITMATRIX_AGENT_SECRET ?? "", "POST", {
+      owner: repo.owner,
+      name: repo.name,
+      numbers: [older, newer],
+      days: 40,
+    });
+    const runs = `/api/accounts/${repo.owner}/retention/runs`;
+    interface Run {
+      id: number;
+      status: string;
+      dryRun: boolean;
+      items: number;
+      bytes: number;
+      categories: { category: string; status: string; items: number; error: string | null }[];
+    }
+    const retention = async (dryRun: boolean, category: string, thresholds: object) => {
+      const started = await json<Run>(
+        runs,
+        ownerToken,
+        "POST",
+        { dryRun, categories: [category], thresholds: { [category]: thresholds } },
+        [202],
+      );
+      const done = await poll(
+        () => json<Run>(`${runs}/${started.id}`, ownerToken),
+        (r) => r.status !== "queued" && r.status !== "running",
+        `retention run ${started.id}`,
+      );
+      assert.equal(done.status, "succeeded", JSON.stringify(done));
+      return done;
+    };
+    const dry = await retention(true, "ci-logs", { days: 30 });
+    assert(dry.items >= 2 && dry.bytes > 0, `the dry run lists both jobs' logs: ${dry.items}`);
+    const removed = await retention(false, "ci-logs", { days: 30 });
+    assert.equal(removed.items, dry.items, "the run removes what the dry run listed");
+    assert.equal(removed.bytes, dry.bytes);
+    for (const number of [older, newer]) {
+      const run = await json<CiRunDetail>(`${api}/ci/runs/${number}`, ownerToken);
+      const job = run.jobs[0]!;
+      assert(job.logsRemovedAt, `run #${number}: the job records the removal`);
+      const logs = await json<CiLogs>(`${api}/ci/jobs/${job.id}/logs`, ownerToken);
+      assert.deepEqual([logs.chunks, logs.done, logs.removedAt], [[], true, job.logsRemovedAt]);
+    }
+    const cliLogs = JSON.parse(await gm(["runs", "logs", String(newer), "-R", fullName])) as {
+      jobs: { log: string; logsRemovedAt?: string }[];
+    };
+    assert(cliLogs.jobs[0]?.logsRemovedAt, "gm runs logs reports the removal");
+    assert.equal((await retention(false, "ci-logs", { days: 30 })).items, 0, "idempotent");
+
+    const pruned = await retention(false, "ci-runs", { days: 30, keepLatest: 1 });
+    assert(pruned.items >= 1, "the older run goes");
+    const gone = await request(`${api}/ci/runs/${older}`, ownerToken, "GET", undefined, [404]);
+    assert.match(gone, new RegExp(`Run #${older} was removed by retention`));
+    await gm(
+      ["runs", "show", String(older), "-R", fullName],
+      "marco",
+      work,
+      /removed by retention/,
+    );
+    assert.equal((await json<CiRunDetail>(`${api}/ci/runs/${newer}`, ownerToken)).number, newer);
+    record({ older, newer, dry, removed, pruned });
+
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    page.setDefaultTimeout(browserTimeout);
+    try {
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as marco/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/${fullName}/ci/${newer}`);
+      await expect(page.getByText(/Logs removed by retention on /)).toBeVisible();
+      await expect(page.getByText("Output removed by retention.").first()).toBeAttached();
+      await page.screenshot({ path: join(ctx.artifacts, "ci-retention-run.png"), fullPage: true });
+      await page.goto(`/${fullName}/ci/${older}`);
+      await expect(page.getByText(`Run #${older} was removed by retention.`)).toBeVisible();
+      record({ browser: { logsRemovedShown: true, removedRunShown: true } });
+    } catch (error) {
+      await page
+        .screenshot({ path: join(ctx.artifacts, "ci-retention-failure.png"), fullPage: true })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  });
+
   // CORE-77: a timeline lands through the queue. The merge job and the gates
   // run on the local runner `vp dev` starts per job: the merge job fetches
   // its landing credential with its job token, merges the checkpoint into
@@ -1977,6 +2078,923 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ usage: figures.map((f) => `${f.construct}/${f.item}/${f.metric}=${f.quantity}`) });
   });
 
+  await scenario("browser-usage-and-costs-account-and-site", async () => {
+    // CORE-209: the account's Usage & costs page (its administrators) and the
+    // site's (site administrators), from the collection the scenario above ran,
+    // at desktop and phone widths; members and non-admins are refused.
+    const owner = repo.owner;
+    const report = await json<UsageReport>(`/api/accounts/${owner}/usage`, fixtures.tokens.marco);
+    assert(report.asOf, "The collection above produced a report day");
+    const lines = report.constructs.flatMap((c) => c.lines);
+    assert(lines.length > 0, "The report has priced lines");
+    assert(
+      lines.some((l) => l.estimated),
+      "Estimated figures (sampled D1 bytes, Artifacts) are labelled",
+    );
+    for (const line of lines)
+      for (const cost of line.costs)
+        assert(
+          Math.abs(cost.monthlyUsd - (cost.quantity * cost.unitPriceUsd) / cost.unitQuantity) <
+            1e-12,
+          `${line.construct}/${line.item}: cost = quantity × price`,
+        );
+    await request(`/api/accounts/${owner}/usage`, fixtures.tokens.jun, "GET", undefined, [403]);
+    await request(`/api/accounts/${owner}/usage`, fixtures.tokens.sam, "GET", undefined, [404]);
+    await request("/api/admin/usage", fixtures.tokens.marco, "GET", undefined, [403]);
+    const site = await json<UsageReport>("/api/admin/usage", fixtures.tokens.priya);
+    assert(
+      site.accounts?.some((a) => a.slug === owner),
+      "The site report totals the fixture's owner",
+    );
+
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const signIn = async (persona: Persona, viewport: { width: number; height: number }) => {
+      const context = await browser.newContext({ baseURL: ctx.origin, viewport });
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+      const page = await context.newPage();
+      page.setDefaultTimeout(browserTimeout);
+      await page.goto("/signin");
+      await page.getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      return { context, page };
+    };
+    const noSideways = async (page: import("@playwright/test").Page, label: string) => {
+      const width = await page.evaluate(() => document.documentElement.scrollWidth);
+      assert(width <= page.viewportSize()!.width, `${label}: no horizontal scrolling (${width})`);
+    };
+    const contexts: BrowserContext[] = [];
+    let current: import("@playwright/test").Page | null = null;
+    try {
+      for (const [width, height] of [
+        [1280, 900],
+        [390, 844],
+      ] as const) {
+        const label = `${width}px`;
+        const { context, page } = await signIn("marco", { width, height });
+        contexts.push(context);
+        current = page;
+        // Reached from the settings navigation's account group.
+        await page.goto(`/settings/ai?owner=${owner}`);
+        if (width < 768) await page.getByText("Settings /").click();
+        await page.getByRole("link", { name: "Usage & costs", exact: true }).click();
+        await page.waitForURL((url) => url.pathname === "/settings/usage");
+        await expect(page.getByRole("heading", { name: "Usage & costs", level: 1 })).toBeVisible();
+        await expect(page.getByText(`Usage for @${owner}`, { exact: true })).toBeVisible();
+        await expect(page.locator("[data-usage-total]")).toBeVisible();
+        await expect(page.getByText("Daily cost, last 30 days")).toBeVisible();
+        for (const construct of report.constructs)
+          await expect(
+            page.getByRole("heading", { name: construct.label, level: 2, exact: true }),
+          ).toBeVisible();
+        await expect(page.locator("[data-usage-line]")).toHaveCount(lines.length);
+        // Drill down: figures with how they were measured, the price, the category.
+        const d1 = lines.find((l) => l.construct === "d1" && l.categories.length > 0);
+        assert(d1, "A D1 group maps to a retention category");
+        const detail = page.locator(`[data-usage-line="d1/${d1.item}"]`);
+        await detail.locator("summary").click();
+        await expect(detail.getByText("Estimated").first()).toBeVisible();
+        await expect(detail.getByText(/per GB-month/).first()).toBeVisible();
+        await expect(
+          detail.locator(`[data-retention-category="${d1.categories[0]!.id}"]`),
+        ).toContainText(d1.categories[0]!.label);
+        await expect(page.getByRole("link", { name: "D1", exact: true })).toHaveAttribute(
+          "href",
+          /developers\.cloudflare\.com\/d1\//,
+        );
+        await noSideways(page, label);
+        // CSV export: one row per figure.
+        const [download] = await Promise.all([
+          page.waitForEvent("download"),
+          page.getByRole("link", { name: "Download CSV" }).click(),
+        ]);
+        assert.equal(download.suggestedFilename(), `${owner}-usage-${report.asOf}.csv`);
+        const csv = await readFile((await download.path())!, "utf8");
+        const rows = csv.trim().split("\n");
+        assert.match(rows[0]!, /^construct,item,label,kind,metric,quantity,estimated,/);
+        assert.equal(
+          rows.length - 1,
+          lines.reduce((sum, l) => sum + l.figures.length, 0),
+          `${label}: CSV has one row per figure`,
+        );
+        await context.tracing.stop();
+      }
+
+      // A member who isn't an administrator is refused; the site page isn't theirs.
+      {
+        const { context, page } = await signIn("jun", { width: 390, height: 844 });
+        contexts.push(context);
+        current = page;
+        await page.goto(`/settings/usage?owner=${owner}`);
+        await expect(
+          page.getByText("Only the account's administrators see its usage and costs."),
+        ).toBeVisible();
+        await expect(page.locator("[data-usage-report]")).toHaveCount(0);
+        await page.goto("/settings/site-usage");
+        await page.waitForURL((url) => url.pathname === "/");
+        await context.tracing.stop();
+      }
+
+      // The site administrator: every account and the site total, at both widths.
+      for (const [width, height] of [
+        [1280, 900],
+        [390, 844],
+      ] as const) {
+        const { context, page } = await signIn("priya", { width, height });
+        contexts.push(context);
+        current = page;
+        await page.goto("/settings/site-usage");
+        await expect(
+          page.getByRole("heading", { name: "Site usage & costs", level: 1 }),
+        ).toBeVisible();
+        await expect(page.locator('[data-usage-report="site"]')).toBeVisible();
+        const accounts = page.getByRole("region", { name: "By account" });
+        await expect(accounts.getByRole("listitem")).toHaveCount(site.accounts!.length);
+        await noSideways(page, `site ${width}px`);
+        await accounts.getByRole("link", { name: new RegExp(`@${owner}\\b`) }).click();
+        await page.waitForURL(
+          (url) => url.pathname === "/settings/usage" && url.searchParams.get("owner") === owner,
+        );
+        await expect(page.locator('[data-usage-report="account"]')).toBeVisible();
+        await context.tracing.stop();
+      }
+      record({ lines: lines.length, accounts: site.accounts!.length, widths: [1280, 390] });
+    } catch (error) {
+      await current
+        ?.screenshot({ path: join(ctx.artifacts, "browser-usage-failure.png"), fullPage: true })
+        .catch(() => {});
+      await contexts
+        .at(-1)
+        ?.tracing.stop({ path: join(ctx.artifacts, "browser-usage-failure.zip") })
+        .catch(() => {});
+      throw error;
+    } finally {
+      for (const context of contexts) await context.close().catch(() => {});
+      await browser.close();
+    }
+  });
+
+  await scenario("tracker-retention-removes-closed-issues-and-replicas-converge", async () => {
+    // CORE-203, in the real runtime: sam's own tracker gets a closed issue,
+    // an open one and a gm replica; a retention run 400 days ahead (a dry run
+    // first) removes the closed issue and prunes old activity, including an
+    // event after the replica's cursor. The replica converges (the feed
+    // answers 410 below its floor, so gm fetches a fresh snapshot), the open
+    // issue stays, and the removed key answers 404 "removed by retention" in
+    // the API, `gm issue show` and the browser.
+    const owner = "sam";
+    const token = fixtures.tokens.sam;
+    const key = `R${randomUUID().replaceAll("-", "").slice(0, 5).toUpperCase()}`;
+    const team = randomUUID(),
+      closed = randomUUID(),
+      open = randomUUID();
+    await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "team.create", id: team, data: { key, name: "Retention regression" } },
+        { kind: "issue.create", id: closed, data: { teamId: team, title: "Finished long ago" } },
+        { kind: "issue.create", id: open, data: { teamId: team, title: "Still open" } },
+      ],
+    });
+    await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "issue.update", id: closed, expectedVersion: 1, data: { status: "done" } },
+      ],
+    });
+    const keys = await json<Snapshot>(`/api/tracker/${owner}/snapshot`, token);
+    const closedKey = keys.issues.find((issue) => issue.id === closed)?.key;
+    const openKey = keys.issues.find((issue) => issue.id === open)?.key;
+    assert(closedKey && openKey, "Both issues have keys");
+    await gm(["tracker", "sync", "--owner", owner], "sam");
+    await gm(["issue", "show", closedKey, "--owner", owner, "--offline"], "sam");
+    // Two renames after the replica's cursor: retention prunes the first
+    // (the team's newest event stays), which raises the feed's floor past it.
+    for (const [version, name] of [
+      [1, "Retention regression (renamed)"],
+      [2, "Retention regression"],
+    ] as const)
+      await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+        operationId: randomUUID(),
+        mutations: [{ kind: "team.update", id: team, expectedVersion: version, data: { name } }],
+      });
+
+    type Run = { run: { status: string; items: number; bytes: number; dryRun: boolean } };
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    // Each category's dry run, then its run at the same moment: the same items.
+    const removed: Record<string, number> = {};
+    for (const [category, thresholds] of [
+      ["closed-issues", { days: 365 }],
+      ["tracker-activity", { eventDays: 365, endedTimelineDays: 180 }],
+    ] as const) {
+      const runs: Run["run"][] = [];
+      for (const dryRun of [true, false])
+        runs.push(
+          (
+            await json<Run>("/api/dev/retention", secret, "POST", {
+              account: owner,
+              categories: { [category]: thresholds },
+              daysAhead: 400,
+              dryRun,
+            })
+          ).run,
+        );
+      const [dry, real] = runs as [Run["run"], Run["run"]];
+      assert.equal(dry.status, "succeeded", `${category}: dry run`);
+      assert.equal(real.status, "succeeded", `${category}: run`);
+      assert(dry.items > 0, `${category}: the dry run lists what the scenario made old`);
+      assert.equal(real.items, dry.items, `${category}: the run removes what the dry run listed`);
+      assert.equal(real.bytes, dry.bytes, `${category}: the same bytes`);
+      removed[category] = real.items;
+    }
+
+    const after = await json<Snapshot>(`/api/tracker/${owner}/snapshot`, token);
+    assert(!after.issues.some((issue) => issue.id === closed), "The closed issue is gone");
+    assert(
+      after.issues.some((issue) => issue.id === open),
+      "The open issue stays",
+    );
+    const gone = JSON.parse(
+      await request(
+        `/api/tracker/${owner}/issues/${closedKey}/history?limit=1`,
+        token,
+        "GET",
+        undefined,
+        [404],
+      ),
+    ) as { code: string; error: string };
+    assert.equal(gone.code, "removed_by_retention");
+    assert.match(gone.error, /removed by retention/);
+
+    // The replica's cursor is below the feed's new floor: it starts over.
+    const stale = await request(
+      `/api/tracker/${owner}/changes?after=0&limit=1`,
+      token,
+      "GET",
+      undefined,
+      [410],
+    );
+    assert.match(stale, /cursor_expired/);
+    await gm(["tracker", "sync", "--owner", owner], "sam");
+    const kept = JSON.parse(
+      await gm(["issue", "show", openKey, "--owner", owner, "--offline"], "sam"),
+    ) as { issue: { id: string } };
+    assert.equal(kept.issue.id, open);
+    await gm(
+      ["issue", "show", closedKey, "--owner", owner, "--offline"],
+      "sam",
+      work,
+      /tracker_not_found/,
+    );
+    await gm(["issue", "show", closedKey, "--owner", owner], "sam", work, /removed by retention/);
+    // A new issue never takes the removed key, and the replica gets it.
+    const fresh = randomUUID();
+    await json(`/api/tracker/${owner}/mutate`, token, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "issue.create", id: fresh, data: { teamId: team, title: "New" } }],
+    });
+    const freshKey = (await json<Snapshot>(`/api/tracker/${owner}/snapshot`, token)).issues.find(
+      (issue) => issue.id === fresh,
+    )?.key;
+    assert(freshKey && freshKey !== closedKey, "The removed key is not reused");
+    await gm(["tracker", "sync", "--owner", owner], "sam");
+    await gm(["issue", "show", freshKey, "--owner", owner, "--offline"], "sam");
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as sam/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/tracker/${owner}/issues/${closedKey}`);
+      await expect(page.getByRole("heading", { name: "Removed by retention" })).toBeVisible();
+      await expect(page.getByText(`Issue ${closedKey} was removed by retention`)).toBeVisible();
+      await page.screenshot({ path: join(ctx.artifacts, "browser-retention-removed-issue.png") });
+    } catch (error) {
+      await page
+        .screenshot({ path: join(ctx.artifacts, "browser-retention-failure.png"), fullPage: true })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+    record({ removed: closedKey, kept: openKey, items: removed });
+  });
+
+  await scenario("registry-retention-keeps-installs-working", async () => {
+    // CORE-205, in the real runtime: the registry's site categories run 400
+    // days ahead (a dry run first, the same items), then garbage collection
+    // at that moment; every version the package scenario published still
+    // downloads and installs, byte for byte.
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    type Run = { run: { status: string; items: number; bytes: number } };
+    const counts: Record<string, number> = {};
+    for (const [category, days] of [
+      ["registry-proxy-cache", 30],
+      ["registry-audit", 365],
+    ] as const) {
+      const runs: Run["run"][] = [];
+      for (const dryRun of [true, false])
+        runs.push(
+          (
+            await json<Run>("/api/dev/retention", secret, "POST", {
+              categories: { [category]: { days } },
+              daysAhead: 400,
+              dryRun,
+              gc: !dryRun,
+            })
+          ).run,
+        );
+      const [dry, real] = runs as [Run["run"], Run["run"]];
+      assert.equal(real.status, "succeeded", `${category}: run`);
+      assert.equal(real.items, dry.items, `${category}: the run removes what the dry run listed`);
+      assert.equal(real.bytes, dry.bytes, `${category}: the same bytes`);
+      counts[category] = real.items;
+    }
+    assert(counts["registry-audit"]! > 0, "Old audit entries are removed");
+    assert.equal(
+      await request(`/generic/${repo.owner}/${packageName}/1.0.0/artifact.txt`, ownerToken),
+      bytes,
+      "A published file still downloads",
+    );
+    const executableName = `${packageName}-executable`;
+    const binDir = join(work, "retention-bin");
+    for (const version of ["1.0.0", "2.0.0"]) {
+      await gm([
+        "pkg",
+        "install",
+        executableName,
+        "--owner",
+        repo.owner,
+        "--bin-dir",
+        binDir,
+        "--version",
+        version,
+        "--force",
+      ]);
+      const { stdout } = await promisify(execFile)(join(binDir, executableName), [], {
+        cwd: work,
+        env: ctx.env,
+        timeout: 10_000,
+      });
+      assert.equal(stdout, `${executableName} ${version}\n`, `${version} still installs`);
+    }
+    record({ removed: counts, installed: ["1.0.0", "2.0.0"] });
+  });
+
+  await scenario("repository-deletion-purges-everything-and-resumes", async () => {
+    // CORE-199, in the real runtime with real Artifacts: a repository with a
+    // live timeline preview, a registry grant and pushed history is deleted.
+    // It's missing at once; the purge Workflow tears the preview down with the
+    // project's own teardown job (which still checks the repository out), is
+    // killed mid-purge and resumed, and leaves nothing behind; then the name
+    // is free again.
+    interface Inventory {
+      repo: { name: string; deletedAt: string | null } | null;
+      d1: Record<string, number>;
+      registry: { packageSources: number; publishes: number };
+      durable: { class: string; name: string; purgedAt: string | null }[];
+      artifacts: { name: string | null; exists: boolean | null };
+      vectors: number | null;
+      searchItems: number | null;
+      previews: { live: number; teardownsOpen: number };
+      deletion: {
+        phase: string;
+        workflowId: string | null;
+        attempts: number;
+        finishedAt: string | null;
+        progress: {
+          previews?: {
+            groups: { timeline: string; run: { number: number } | null }[];
+            timedOut?: number;
+          };
+          artifacts?: { deleted: boolean };
+          links?: { sources: number };
+          rows?: Record<string, number>;
+        };
+      } | null;
+    }
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const name = `agent-delete-${randomUUID().slice(0, 8)}`;
+    const doomed = `${repo.owner}/${name}`;
+    const timeline = `delete-${randomUUID().slice(0, 8)}`;
+    // The local runtime's D1 sometimes fails a query under load: retry a read.
+    const inventory = async (): Promise<Inventory> => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await json<Inventory>(
+            `/api/dev/repo-inventory?repo=${encodeURIComponent(doomed)}`,
+            secret,
+          );
+        } catch (error) {
+          if (attempt === 3) throw error;
+          await delay(1000);
+        }
+      }
+    };
+    const capability = randomUUID();
+    let tornDown: string | undefined;
+    let gate: ServerResponse | undefined;
+    const collector = createServer((req, res) => {
+      if (req.method === "GET" && req.url === `/${capability}/wait`) {
+        gate = res;
+        res.setTimeout(170_000, () => res.writeHead(504).end());
+        return;
+      }
+      if (req.method !== "POST" || req.url !== `/${capability}`) {
+        res.writeHead(404).end();
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+        if (body.length > 256) req.destroy();
+      });
+      req.on("end", () => {
+        tornDown = body;
+        res.writeHead(204).end();
+      });
+    });
+    const listening = Promise.withResolvers<void>();
+    collector.once("error", listening.reject);
+    collector.listen(0, "127.0.0.1", listening.resolve);
+    await listening.promise;
+    try {
+      const address = collector.address();
+      assert(address && typeof address !== "string");
+      await gm(["repo", "create", name, "--owner", repo.owner]);
+      const clone = join(work, name);
+      await gm(["clone", doomed, clone]);
+      await writeFile(join(clone, "marker.txt"), "checked out by the teardown\n");
+      await mkdir(join(clone, ".gitmatrix"), { recursive: true });
+      // The teardown proves its checkout, reports, then holds until released.
+      const teardown = [
+        "test -f marker.txt",
+        `curl --fail --silent --show-error --max-time 20 --data "$GITMATRIX_TIMELINE" http://127.0.0.1:${address.port}/${capability}`,
+        `curl --fail --silent --show-error --max-time 180 http://127.0.0.1:${address.port}/${capability}/wait`,
+      ].join("\n");
+      await writeFile(
+        join(clone, ".gitmatrix", "ci.yml"),
+        JSON.stringify({
+          on: { push: { branches: ["never-agent-auto"] }, preview: {} },
+          jobs: {
+            teardown: {
+              if: 'trigger == "preview" && action == "teardown"',
+              steps: [{ run: teardown }],
+            },
+          },
+        }),
+      );
+      await gm(["commit", "-m", "Agent deletion fixture"], "marco", clone);
+      await gm(["push", "--bookmark", "main"], "marco", clone);
+      const detail = await json<RepoDetail>(`/api/repos/${doomed}`, ownerToken);
+      const commit = detail.branches.find((b) => b.shortName === "main")?.oid;
+      assert(commit, "The fixture's main was pushed");
+      await gm([
+        "deploy",
+        "record",
+        "--url",
+        "https://agent-e2e.example.com/deleted-preview",
+        "--timeline",
+        timeline,
+        "--commit",
+        commit,
+        "-R",
+        doomed,
+      ]);
+      // A package the repository may publish: a registry grant that names it.
+      const granted = `${name}-pkg`;
+      const artifact = join(work, `${name}.txt`);
+      await writeFile(artifact, "published before the repository was deleted\n");
+      await gm(["pkg", "upload", artifact, `${granted}/1.0.0/artifact.txt`, "--owner", repo.owner]);
+      await gm(["pkg", "grant", `generic/${granted}`, doomed, "--owner", repo.owner]);
+
+      const before = await inventory();
+      assert.equal(before.repo?.deletedAt, null);
+      assert.equal(before.artifacts.exists, true, "Its Artifacts repository exists");
+      assert.deepEqual(before.previews, { live: 1, teardownsOpen: 0 });
+      assert.equal(before.registry.packageSources, 1, "The registry grant names it");
+      assert((before.d1.ref_updates ?? 0) >= 1, "The push log names it");
+      record({ before });
+
+      await request(`/api/repos/${doomed}`, ownerToken, "DELETE", undefined, [204]);
+      // Missing to every reader at once; the name stays taken until the purge ends.
+      await request(`/api/repos/${doomed}`, ownerToken, "GET", undefined, [404]);
+      await gm(["clone", doomed, join(work, `${name}-again`)], "marco", work, /not found|404/i);
+      const taken = await request(
+        "/api/repos",
+        ownerToken,
+        "POST",
+        { owner: repo.owner, name, visibility: "private" },
+        [409],
+      );
+      assert.match(taken, /being deleted/);
+
+      // The teardown run checked the deleted repository out and is held: the
+      // purge waits in its previews phase. Kill it there, then resume it.
+      await poll(async () => tornDown, Boolean, "the preview's teardown job");
+      assert.equal(tornDown, timeline, "The teardown ran for the preview's timeline");
+      await poll(async () => gate, Boolean, "the teardown's hold");
+      const waiting = await poll(
+        inventory,
+        (value) => value.deletion?.phase === "previews" && Boolean(value.deletion.workflowId),
+        "the purge waiting for its teardown",
+      );
+      assert.equal(waiting.deletion?.attempts, 1);
+      assert.equal(waiting.previews.teardownsOpen, 1);
+      const killed = await json<{ terminated: string; status: { status: string } }>(
+        "/api/dev/repo-purge",
+        secret,
+        "POST",
+        { repo: doomed, action: "terminate" },
+      );
+      assert.equal(killed.terminated, waiting.deletion?.workflowId);
+      const resumed = await json<{ started: string[]; deletion: Inventory["deletion"] }>(
+        "/api/dev/repo-purge",
+        secret,
+        "POST",
+        { repo: doomed, action: "resume" },
+      );
+      assert.equal(resumed.started.length, 1, "The resume started a new purge");
+      assert.equal(resumed.deletion?.attempts, 2);
+      assert.notEqual(resumed.deletion?.workflowId, waiting.deletion?.workflowId);
+      gate!.writeHead(204).end();
+
+      const after = await poll(
+        inventory,
+        (value) => value.deletion?.phase === "done",
+        "the resumed purge to finish",
+        300_000,
+      );
+      assert.equal(after.repo, null, "The repository row is gone");
+      assert.deepEqual(after.d1, {}, "No D1 row names it");
+      assert.deepEqual(after.registry, { packageSources: 0, publishes: 0 });
+      assert.equal(after.artifacts.exists, false, "Its Artifacts repository is deleted");
+      assert.deepEqual(after.previews, { live: 0, teardownsOpen: 0 });
+      for (const instance of after.durable)
+        assert(instance.purgedAt, `${instance.class} ${instance.name} was purged`);
+      assert(!after.vectors && !after.searchItems, "No vector or search item is left");
+      const progress = after.deletion!.progress;
+      assert.equal(progress.previews?.groups.length, 1);
+      assert.equal(progress.previews?.groups[0]?.timeline, timeline);
+      assert(progress.previews?.groups[0]?.run, "One teardown run was started");
+      assert.equal(progress.previews?.timedOut, undefined, "The teardown finished in time");
+      assert.equal(progress.artifacts?.deleted, true);
+      assert.equal(progress.links?.sources, 1);
+      record({ after });
+
+      // Purged, the name is free again.
+      await gm(["repo", "create", name, "--owner", repo.owner]);
+      await request(`/api/repos/${doomed}`, ownerToken, "DELETE", undefined, [204]);
+      await poll(
+        inventory,
+        (value) => value.deletion?.phase === "done" && value.repo === null,
+        "the reused name's purge",
+      );
+    } finally {
+      if (gate && !gate.writableEnded) gate.writeHead(204).end();
+      collector.close();
+    }
+  });
+
+  await scenario("assistant-chats-expire", async () => {
+    // CORE-204, in the real runtime: jun turns on assistant chat expiration;
+    // the chat list says when each chat expires; a run 100 days ahead (a dry
+    // run first) purges the chat nobody used (its Durable Object through the
+    // registry, which records it) and keeps the one used since. The browser's
+    // list shows the expiry, then no longer shows the purged chat.
+    const owner = "jun";
+    const token = fixtures.tokens.jun;
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const tag = randomUUID().replaceAll("-", "").slice(0, 10);
+    const stale = { id: `e2e-stale-${tag}`, title: `Stale chat ${tag}` };
+    const used = { id: `e2e-used-${tag}`, title: `Used chat ${tag}` };
+    const settings = `/api/accounts/${owner}/settings/retention`;
+    type Chat = { id: string; title: string; expiresAt: string | null };
+    const list = async () =>
+      (await json<{ chats: Chat[] }>("/api/assistant/chats", token)).chats.filter((chat) =>
+        chat.id.endsWith(tag),
+      );
+    await json("/api/dev/assistant-chat", secret, "POST", { account: owner, ...stale });
+    // Used again "later": still active when the run's moment comes.
+    await json("/api/dev/assistant-chat", secret, "POST", {
+      account: owner,
+      ...used,
+      updatedAt: new Date(Date.now() + 95 * 86_400_000).toISOString(),
+    });
+    assert.deepEqual(
+      (await list()).map((chat) => chat.expiresAt),
+      [null, null],
+      "No expiry while the policy is off",
+    );
+    await json(settings, token, "PATCH", { categories: { "assistant-chats": { enabled: true } } });
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expiring = await list();
+      const staleExpiry = expiring.find((chat) => chat.id === stale.id)?.expiresAt;
+      assert(staleExpiry, "The chat list says when the stale chat expires");
+      const days = Math.round((Date.parse(staleExpiry) - Date.now()) / 86_400_000);
+      assert.equal(days, 90, "Ninety days after its last use (the default)");
+
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      // The dock remembers being open across page loads: open it only if it's closed.
+      const conversations = async () => {
+        await page.goto("/");
+        const toggle = page.getByRole("button", { name: "Assistant", exact: true });
+        await expect(toggle).toBeVisible();
+        if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();
+        const dock = page.getByRole("complementary", { name: "Assistant" });
+        await dock.getByRole("button", { name: "Conversations", exact: true }).click();
+      };
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as jun/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await conversations();
+      const row = page.getByRole("button", { name: new RegExp(`^${stale.title}`) });
+      await expect(row).toBeVisible();
+      await expect(row).toContainText(/expires in (89|90) days/);
+      await page.screenshot({ path: join(ctx.artifacts, "browser-assistant-chat-expiry.png") });
+
+      type Run = { run: { status: string; items: number; bytes: number } };
+      const runs: Run["run"][] = [];
+      for (const dryRun of [true, false])
+        runs.push(
+          (
+            await json<Run>("/api/dev/retention", secret, "POST", {
+              account: owner,
+              categories: { "assistant-chats": { days: 90, maxPerUser: 0 } },
+              daysAhead: 100,
+              dryRun,
+            })
+          ).run,
+        );
+      const [dry, real] = runs as [Run["run"], Run["run"]];
+      assert.equal(real.status, "succeeded");
+      assert(dry.items >= 1, "The dry run lists the stale chat");
+      assert.equal(real.items, dry.items, "The run purges what the dry run listed");
+      assert.equal(real.bytes, dry.bytes);
+
+      assert.deepEqual(
+        (await list()).map((chat) => chat.id),
+        [used.id],
+        "The stale chat is gone, the used one stays",
+      );
+      const purged = await json<{
+        instance: { purged_at: string | null; purge_reason: string | null } | null;
+        listed: boolean;
+      }>("/api/dev/assistant-chat", secret, "POST", { account: owner, id: stale.id });
+      assert.equal(purged.listed, false);
+      assert(purged.instance?.purged_at, "The registry records the purge");
+      assert.match(purged.instance?.purge_reason ?? "", /^retention: /);
+      const kept = await json<{ instance: { purged_at: string | null } | null }>(
+        "/api/dev/assistant-chat",
+        secret,
+        "POST",
+        { account: owner, id: used.id },
+      );
+      assert.equal(kept.instance?.purged_at, null, "The used chat's object stays");
+
+      await conversations();
+      await expect(page.getByRole("button", { name: new RegExp(`^${used.title}`) })).toBeVisible();
+      await expect(page.getByRole("button", { name: new RegExp(`^${stale.title}`) })).toHaveCount(
+        0,
+      );
+      record({ purged: stale.id, kept: used.id, items: real.items, bytes: real.bytes });
+    } catch (error) {
+      await page
+        .screenshot({
+          path: join(ctx.artifacts, "browser-assistant-chat-failure.png"),
+          fullPage: true,
+        })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+      await request(settings, token, "PATCH", {
+        categories: { "assistant-chats": { enabled: null } },
+      }).catch(() => {});
+      await request(`/api/assistant/chats/${used.id}`, token, "DELETE", undefined, [204]).catch(
+        () => {},
+      );
+    }
+  });
+
+  await scenario("auth-hygiene-keeps-sign-in-and-tokens-working", async () => {
+    // CORE-206, in the real runtime: a site administrator's dry run then run
+    // of "auth-hygiene" removes sign-in state that ended a month ago; every
+    // live token still authenticates, gm still works, and a browser sign-in
+    // still lands.
+    const written = await json<Record<string, string>>(
+      "/api/dev/auth-expired",
+      ctx.env.GITMATRIX_AGENT_SECRET ?? "",
+      "POST",
+      { account: "jun" },
+    );
+    const runs = "/api/admin/retention/runs";
+    const admin = fixtures.tokens.priya;
+    const hygiene = async (dryRun: boolean) => {
+      const started = await json<{ id: number }>(
+        runs,
+        admin,
+        "POST",
+        { dryRun, categories: ["auth-hygiene"] },
+        [202],
+      );
+      const done = await poll(
+        () =>
+          json<{ status: string; items: number; bytes: number }>(`${runs}/${started.id}`, admin),
+        (r) => r.status !== "queued" && r.status !== "running",
+        `auth hygiene run ${started.id}`,
+      );
+      assert.equal(done.status, "succeeded", JSON.stringify(done));
+      return done;
+    };
+    // Marco can't run site categories.
+    await request(runs, ownerToken, "POST", { dryRun: true, categories: ["auth-hygiene"] }, [403]);
+    const dry = await hygiene(true);
+    assert(dry.items >= Object.keys(written).length, `The dry run lists them: ${dry.items}`);
+    const removed = await hygiene(false);
+    assert.equal(removed.items, dry.items, "The run removes what the dry run listed");
+    assert.equal(removed.bytes, dry.bytes);
+    assert.equal((await hygiene(true)).items, 0, "Nothing is left to remove");
+
+    for (const persona of ["priya", "marco", "jun", "sam"] as const)
+      await request(api, fixtures.tokens[persona]);
+    await request(api, fixtures.readToken);
+    await gm(["auth", "status"], "jun");
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as jun/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/${fullName}`);
+      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+    record({ written: Object.keys(written), dry: dry.items, removed: removed.items });
+  });
+
+  await scenario("push-log-retention-and-unreachable-git", async () => {
+    // CORE-202 with real Artifacts, in jun's own account (the cleanup is
+    // per account): a deleted branch leaves a commit no ref reaches.
+    // Artifacts keeps it (it still serves it by id) and can't prune it, so
+    // it's measured, not deleted: the usage figure counts its incompressible
+    // blob. Push log retention, a year on, removes exactly the entries its dry
+    // run listed, keeps main's latest, and every reachable ref, commit and
+    // object is identical before and after.
+    const owner = "jun";
+    const token = fixtures.tokens.jun;
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const name = `agent-unreachable-${randomUUID().slice(0, 8)}`;
+    const remote = `${ctx.origin}/${owner}/${name}.git`;
+    const dir = join(work, name);
+    const run = promisify(execFile);
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: `http.${ctx.origin}/.extraHeader`,
+      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+    };
+    for (const key of Object.keys(gitEnv))
+      if (/^GIT_CONFIG_(?:KEY|VALUE)_[1-9]/.test(key)) delete gitEnv[key];
+    const git = async (args: string[], cwd = dir) =>
+      (
+        await run("git", args, { cwd, env: gitEnv, timeout: 90_000, maxBuffer: 16 << 20 })
+      ).stdout.trim();
+    await json(`/api/repos`, token, "POST", { owner, name, visibility: "private" }, [201]);
+    await mkdir(dir);
+    await git(["init", "--initial-branch=main"]);
+    await git(["config", "user.name", "Agent Fixture"]);
+    await git(["config", "user.email", "agent@gitmatrix.invalid"]);
+    await writeFile(join(dir, "README.md"), "Reachable history.\n");
+    await git(["add", "."]);
+    await git(["commit", "-m", "Reachable"]);
+    await git(["push", remote, "main"]);
+    await git(["checkout", "-b", "doomed"]);
+    const blobBytes = 96 * 1024;
+    await writeFile(join(dir, "noise.bin"), randomBytes(blobBytes));
+    await git(["add", "."]);
+    await git(["commit", "-m", "Only the deleted branch reaches this"]);
+    const doomed = await git(["rev-parse", "HEAD"]);
+    // The push log records a push after answering it, by comparing the refs
+    // with the last it saw: let it see the branch before it goes.
+    const updates = async () =>
+      (await json<RefUpdateList>(`/api/repos/${owner}/${name}/ref-updates`, token)).updates;
+    await git(["push", remote, "doomed"]);
+    await poll(updates, (list) => list.length === 2, "the push log's branch entry");
+    await git(["push", remote, ":doomed"]);
+
+    /** Every ref, every reachable object, and a full fsck, from a fresh mirror clone. */
+    const reachable = async (label: string) => {
+      const mirror = join(work, `${name}-${label}.git`);
+      await git(["clone", "--mirror", remote, mirror], work);
+      await git(["fsck", "--full", "--strict"], mirror);
+      const refs = await git(["for-each-ref", "--format=%(refname) %(objectname)"], mirror);
+      const objects = (await git(["rev-list", "--all", "--objects"], mirror)).split("\n").sort();
+      const log = await git(["log", "--all", "--format=%H %T %P %an %ae %at %s"], mirror);
+      return {
+        refs,
+        objects: createHash("sha256").update(objects.join("\n")).digest("hex"),
+        count: objects.length,
+        log,
+      };
+    };
+    const before = await reachable("before");
+    assert(!before.refs.includes("doomed"), "The branch is deleted");
+    assert(!before.log.includes(doomed), "Its commit is unreachable");
+
+    // Artifacts still serves the unreachable commit by id: it keeps it.
+    const probe = join(work, `${name}-probe`);
+    await mkdir(probe);
+    await git(["init", "--bare"], probe);
+    await git(["fetch", remote, doomed], probe);
+    assert.equal(await git(["cat-file", "-t", doomed], probe), "commit");
+
+    const logged = await poll(updates, (list) => list.length === 3, "the push log's entries");
+    assert.deepEqual(
+      logged
+        .map((u) => [u.ref, Boolean(u.old), Boolean(u.new)] as const)
+        .toSorted((a, b) => `${a[0]}${a[1]}`.localeCompare(`${b[0]}${b[1]}`)),
+      [
+        ["refs/heads/doomed", false, true],
+        ["refs/heads/doomed", true, false],
+        ["refs/heads/main", false, true],
+      ],
+    );
+    interface Figure {
+      construct: string;
+      item: string;
+      metric: string;
+      quantity: number;
+      estimated: number;
+      method: string;
+    }
+    const unreachable = async () => {
+      const { figures } = await json<{ figures: Figure[] }>("/api/dev/usage", secret, "POST", {
+        account: owner,
+      });
+      const figure = (metric: string) =>
+        figures.find(
+          (f) => f.construct === "artifacts" && f.item === "repositories" && f.metric === metric,
+        );
+      return { bytes: figure("unreachable_bytes"), objects: figure("unreachable_objects") };
+    };
+    const measured = await unreachable();
+    assert(
+      measured.bytes &&
+        measured.bytes.quantity >= blobBytes &&
+        measured.bytes.quantity < blobBytes + 8192,
+      `The incompressible blob only the deleted branch reached is measured: ${JSON.stringify(measured.bytes)}`,
+    );
+    assert.equal(measured.bytes.estimated, 1, "Unreachable bytes are labelled estimated");
+    assert.match(measured.bytes.method, /can't prune/);
+    assert.equal(measured.objects?.quantity, 3, "Its commit, tree and blob");
+
+    const cleanup = async (dryRun: boolean) =>
+      (
+        await json<{ run: { status: string; items: number; bytes: number } }>(
+          "/api/dev/retention",
+          secret,
+          "POST",
+          { account: owner, categories: { "push-log": { days: 365 } }, daysAhead: 400, dryRun },
+        )
+      ).run;
+    const dry = await cleanup(true);
+    assert.equal(dry.status, "succeeded");
+    assert.equal((await updates()).length, 3, "A dry run removes nothing");
+    const real = await cleanup(false);
+    assert.equal(real.status, "succeeded");
+    assert.deepEqual([real.items, real.bytes], [dry.items, dry.bytes], "The run is its dry run");
+    const kept = await updates();
+    assert.deepEqual(
+      kept.map((u) => u.ref),
+      ["refs/heads/main"],
+      "Only main's latest entry, which explains its commit, stays",
+    );
+
+    const after = await reachable("after");
+    assert.deepEqual(after, before, "Reachable history is identical before and after");
+    // What nothing names any more isn't seen: the limitation the figure states.
+    assert.equal((await unreachable()).bytes?.quantity, 0);
+    record({ unreachable: measured, objects: before.count, cleanup: { dry, real } });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;
@@ -2366,125 +3384,13 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
-  await scenario("browser-global-search-palette", async () => {
-    const browserTimeout = 15_000;
-    const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ baseURL: ctx.origin });
-    await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
-    const page = await context.newPage();
-    page.setDefaultTimeout(browserTimeout);
-    try {
-      await page.goto("/signin");
-      await page.getByRole("button", { name: /Continue as marco/i }).click();
-      await page.waitForURL((url) => url.pathname !== "/signin");
-      await page.goto(`/${fullName}`);
-      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-      const dialog = page.getByRole("dialog", { name: "Search" });
-      const input = page.getByRole("combobox", { name: "Search or go to" });
-
-      // The visible control opens it with focus in the query; Escape gives focus back.
-      const button = page.getByRole("button", { name: "Search", exact: true });
-      await button.click();
-      await expect(input).toBeFocused();
-      await expect(page.getByRole("group", { name: `In ${fullName}` })).toBeVisible();
-      await page.keyboard.press("Escape");
-      await expect(dialog).toBeHidden();
-      await expect(button).toBeFocused();
-
-      // Ctrl+K, a real search, exact identifier first, Enter navigates and closes.
-      await page.keyboard.press("Control+k");
-      await input.fill(`${publicRepo.owner}/${publicRepo.name}`);
-      await expect(page.getByRole("option", { selected: true })).toContainText(
-        `${publicRepo.owner}/${publicRepo.name}`,
-      );
-      await page.keyboard.press("Enter");
-      await expect(dialog).toBeHidden();
-      await page.waitForURL((url) => url.pathname === `/${publicRepo.owner}/${publicRepo.name}`);
-
-      // A private repository marco can't read never appears.
-      await page.keyboard.press("Control+k");
-      await input.fill(`${outsiderRepo.owner}/${outsiderRepo.name}`);
-      await expect(
-        dialog.getByText(`Nothing matches “${outsiderRepo.owner}/${outsiderRepo.name}”.`),
-      ).toBeVisible();
-      await page.keyboard.press("Escape");
-
-      // Issues from the trackers marco belongs to, closed ones included, open their page.
-      await page.keyboard.press("Control+k");
-      await input.fill("Agent ready fixture");
-      const issues = page.getByRole("group", { name: "Issues" });
-      await expect(issues.getByRole("option").first()).toContainText("Agent ready fixture");
-      await expect(issues.getByRole("option").first()).toContainText(fixtures.tracker.owner);
-      await page.keyboard.press("Enter");
-      await page.waitForURL(
-        (url) =>
-          url.pathname === `/tracker/${fixtures.tracker.owner}/issues/${fixtures.tracker.ready}`,
-      );
-      await expect(page.getByText("Agent ready fixture", { exact: true }).first()).toBeVisible();
-
-      // The package published earlier, by its qualified name, opens its console page.
-      await page.keyboard.press("Control+k");
-      await input.fill(`${repo.owner}/${packageName}`);
-      const packages = page.getByRole("group", { name: "Packages" });
-      await expect(packages.getByRole("option").first()).toContainText(packageName);
-      await page.keyboard.press("Enter");
-      await page.waitForURL(
-        (url) => url.pathname === `/${repo.owner}/-/packages/generic/${packageName}`,
-      );
-      await expect(page.getByRole("heading", { name: packageName, exact: true })).toBeVisible();
-
-      // Create issue hands a proposed title to the tracker's own creator, once.
-      const proposed = `Palette issue ${randomUUID().slice(0, 8)}`;
-      await page.goto(`/${fullName}`);
-      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-      await page.keyboard.press("Control+k");
-      await input.fill(proposed);
-      await page.getByRole("option", { name: new RegExp(`Create issue “${proposed}”`) }).click();
-      await page.waitForURL((url) => url.pathname === `/tracker/${fixtures.tracker.owner}`);
-      const creator = page.getByRole("dialog", { name: "Create an issue" });
-      await expect(creator.getByRole("textbox", { name: /Title/i })).toHaveValue(proposed);
-      assert(!page.url().includes("Palette"), "The proposed title must not travel in the URL");
-      await creator.getByRole("button", { name: "Create and edit" }).click();
-      await page.waitForURL((url) => url.pathname.includes("/issues/"));
-      await page.reload();
-      await expect(creator).toBeHidden();
-
-      // Signed out: navigation only, and no search requests.
-      await context.clearCookies();
-      let searched = 0;
-      page.on("request", (request) => {
-        if (request.url().includes("/api/search")) searched++;
-      });
-      await page.goto("/");
-      await page.waitForLoadState("networkidle");
-      await page.keyboard.press("Control+k");
-      const goTo = page.getByRole("combobox", { name: "Go to" });
-      await expect(goTo).toBeFocused();
-      await goTo.fill("sign");
-      await page.keyboard.press("Enter");
-      await page.waitForURL((url) => url.pathname === "/signin");
-      assert.equal(searched, 0, "Signed-out palette must not search");
-      await context.tracing.stop();
-      record({ persona: "marco", signedOut: true, independentContext: true });
-    } catch (error) {
-      await page
-        .screenshot({ path: join(ctx.artifacts, "browser-palette-failure.png"), fullPage: true })
-        .catch(() => {});
-      await context.tracing
-        .stop({ path: join(ctx.artifacts, "browser-palette-failure.zip") })
-        .catch(() => {});
-      throw error;
-    } finally {
-      await context.close();
-      await browser.close();
-    }
-  });
-
-  await scenario("browser-atlas-deep-links-lookup-and-expiry", async () => {
-    // CORE-171: the repository Atlas's address restores its state; cold links
-    // read only the path; lookup and browsing never fan out paid search.
-    await atlasBrowserScenario({
+  // The browser scenarios are a few journeys across the real stack. What a
+  // page does with what it reads (the palette, the Atlas, the switcher's
+  // scoping) is in apps/website's browser-mode tests: README "Testing".
+  await scenario("browser-atlas-smoke", async () => {
+    // CORE-171: a pushed repository's Atlas, projected by the Worker, read in
+    // a real session down to the cited source in git.
+    await atlasSmokeScenario({
       ctx,
       work,
       token: ownerToken,
@@ -2494,36 +3400,9 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
-  await scenario("browser-atlas-keyboard-touch-themes-and-motion", async () => {
-    // CORE-170: every Atlas journey by keyboard alone and by touch at 320px,
-    // never through the canvas; light and dark; reduced motion.
-    await atlasAccessibleScenario({
-      ctx,
-      work,
-      token: ownerToken,
-      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
-      json,
-      record,
-    });
-  });
-
-  await scenario("browser-atlas-timeline-in-capabilities-ended-and-expired", async () => {
-    // CORE-176: a timeline read in Atlas terms with its per-repo facts, a
-    // capability filter and source handoff; ended read-only; the overlay's
-    // route kept when the map's snapshot expires.
-    await atlasTimelineScenario({
-      ctx,
-      work,
-      token: ownerToken,
-      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
-      json,
-      record,
-    });
-  });
-
-  await scenario("browser-atlas-revocation-clears-the-open-view", async () => {
-    // CORE-178: removing a collaborator reaches their open Knowledge tab; the
-    // view, a reload, their cursor and pinned snapshot all disclose nothing.
+  await scenario("atlas-revocation-reads-like-a-missing-repository", async () => {
+    // CORE-178: a removed collaborator's still-valid Atlas links answer as a
+    // repository that never existed.
     await atlasRevocationScenario({
       ctx,
       work,
@@ -2535,30 +3414,23 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
-  await scenario("browser-atlas-workspace-composites-and-address", async () => {
-    // CORE-184: the workspace Atlas finds a capability spanning two
-    // repositories, cites sources at each one's immutable commit, keeps its
-    // view in the address and never reads a whole graph.
-    await atlasWorkspaceScenario({
-      ctx,
-      work,
-      token: ownerToken,
-      gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
-      json,
-      record,
-    });
-  });
-
-  await scenario("browser-timeline-switcher-scopes-the-app", async () => {
-    // CORE-82: choosing a timeline in the rail scopes every page to it. The
-    // banner names it, links and navigation carry ?tl=, the code browser and
-    // CI follow its bookmark, the Knowledge tab's old ?timeline= becomes
-    // ?tl=, and Back to main leaves it.
+  await scenario("browser-timeline-scope-round-trip", async () => {
+    // CORE-82 and CORE-86 across the real stack: a timeline forked through the
+    // API (its bookmark written in git), chosen in the rail of a real session,
+    // opens the code at that bookmark; its Experimental flag set in the page
+    // persists; Back to main leaves it. (Scoping links, CI, Knowledge and the
+    // Stalled view are browser-mode tests: TimelineScope.browser.test.tsx.)
     const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
     const slug = `e2e-switch-${randomUUID().slice(0, 8)}`;
     const name = `Switcher ${slug.slice(-8)}`;
     const bookmark = `timeline/${slug}`;
     await json(timelines, fixtures.tokens.jun, "POST", { slug, name, repos: [fullName] }, [201]);
+    const detail = await json<RepoDetail>(`/api/repos/${fullName}`, ownerToken);
+    assert.equal(
+      detail.branches.find((b) => b.shortName === bookmark)?.oid,
+      detail.branches.find((b) => b.shortName === detail.defaultBranch)?.oid,
+      "Forking writes the bookmark at main's tip",
+    );
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
     const browser = await chromium.launch({ headless: true });
@@ -2575,49 +3447,37 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await page.waitForURL((url) => url.pathname !== "/signin");
       await page.goto(`/${fullName}`);
       const banner = page.getByRole("region", { name: "Timeline scope" });
+      await expect(page.getByRole("link", { name: "README.md" }).first()).toBeVisible();
       await expect(banner).toHaveCount(0);
 
       await page.getByRole("button", { name: /^Timeline: main/ }).click();
       await page.getByRole("link", { name: new RegExp(name) }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === slug);
-      await expect(banner).toContainText(name);
       await expect(banner).toContainText(`Code on ${bookmark}`);
       await expect(page.getByLabel("Branch or tag")).toContainText(bookmark);
+      // The listing is git's, at the bookmark.
+      await expect(page.getByRole("link", { name: "README.md" }).first()).toBeVisible();
 
-      const ci = page.getByRole("link", { name: "CI", exact: true });
-      await expect(ci).toHaveAttribute("href", new RegExp(`[?&]tl=${slug}`));
-      await ci.click();
-      await page.waitForURL((url) => url.pathname.endsWith("/ci"));
-      assert.equal(new URL(page.url()).searchParams.get("tl"), slug, "Navigation keeps the scope");
-      await expect(banner).toContainText(`Runs on ${bookmark}`);
-
-      await page.goto(`/${fullName}/knowledge?timeline=${slug}`);
-      await page.waitForURL((url) => url.searchParams.get("tl") === slug);
-      assert.equal(new URL(page.url()).searchParams.get("timeline"), null);
-      await expect(banner).toContainText(name);
-
-      // CORE-86: the graph's inspector flags it experimental, which the banner shows,
-      // and the Stalled view leaves it out.
       await page.goto(`/tracker/${fixtures.tracker.owner}/timelines?tl=${slug}`);
       const flag = page.getByRole("switch", { name: "Experimental" });
       await expect(flag).toHaveAttribute("aria-checked", "false");
       await flag.click();
       await expect(flag).toHaveAttribute("aria-checked", "true");
-      await expect(banner.getByText("Experimental", { exact: true })).toBeVisible();
-      const listed = await json<{ timelines: { slug: string; experimental: boolean }[] }>(
-        timelines,
-        ownerToken,
-      );
-      assert.equal(listed.timelines.find((t) => t.slug === slug)?.experimental, true);
-      await page.getByRole("button", { name: /^Stalled/ }).click();
-      await expect(page.getByText(/Experimental timelines are left out/)).toBeVisible();
+      await expect
+        .poll(async () => {
+          const listed = await json<{ timelines: { slug: string; experimental: boolean }[] }>(
+            timelines,
+            ownerToken,
+          );
+          return listed.timelines.find((t) => t.slug === slug)?.experimental;
+        })
+        .toBe(true);
 
       await banner.getByRole("link", { name: "Back to main" }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === "main");
       await expect(banner).toHaveCount(0);
-      await page.screenshot({ path: join(ctx.artifacts, "browser-timeline-switcher.png") });
       await context.tracing.stop();
-      record({ timeline: slug, scoped: ["code", "ci", "knowledge", "timelines"], flagged: true });
+      record({ timeline: slug, bookmark, flagged: true });
     } catch (error) {
       await page
         .screenshot({ path: join(ctx.artifacts, "browser-timeline-failure.png"), fullPage: true })

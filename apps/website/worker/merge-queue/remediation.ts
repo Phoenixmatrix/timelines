@@ -71,6 +71,14 @@ export async function recordQueueFailure(
       access.agents.push(...identity.agents.filter((agent) => agent.id === input.agentId));
     }
   }
+  // Access resolution can overlap deletion: don't recreate its queue evidence.
+  const repo = await db(env.DB)
+    .selectFrom("repos")
+    .select("id")
+    .where("id", "=", input.repoId)
+    .where("deleted_at", "is", null)
+    .executeTakeFirst();
+  if (!repo) throw new TrackerError(404, "not_found", "Repository not found.");
   const result = await trackerObject(env, owner.id).recordQueueFailure(access, {
     repoId: input.repoId,
     issueIds: input.issueIds,

@@ -47,6 +47,7 @@ import {
   type TimelineIssue,
 } from "../../shared/timelines.ts";
 import { TimelineStore } from "./timelines.ts";
+import { feedFloor, RETENTION_TABLES, removedMessage, tombstone } from "./retention.ts";
 import {
   findTimeline,
   isScoped,
@@ -64,7 +65,7 @@ const closeReasons = Object.keys(CLOSE_REASONS) as IssueCloseReason[];
 const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
 
 export class TrackerError extends Error {
-  public status: 400 | 401 | 403 | 404 | 409 | 413;
+  public status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
   public code: string;
   public details: { currentVersion?: number; current?: Team | Workspace | Issue };
   constructor(
@@ -251,6 +252,7 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS event_entities ON events(json_extract(data, '$.entityId'));
       CREATE INDEX IF NOT EXISTS event_times ON events(json_extract(data, '$.createdAt'));
       CREATE INDEX IF NOT EXISTS event_timelines ON events(json_extract(data, '$.timelineId'));`);
+    sql.exec(RETENTION_TABLES);
     initializeAudit(sql, transaction);
     this.timelines = new TimelineStore(sql, transaction, clock, (ids, reason, actorId) =>
       this.withdrawSuperseded(ids, reason, actorId),
@@ -529,7 +531,11 @@ export class TrackerStore {
       this.sql,
       tracker.selectFrom(tables[type]).select("data").where("id", "=", entityId),
     );
-    if (!row) fail("not_found", `${type} ${entityId} not found.`, 404);
+    if (!row) {
+      const stone = type === "issue" ? tombstone(this.sql, "issue", entityId) : null;
+      if (stone) fail("removed_by_retention", removedMessage(stone), 404);
+      fail("not_found", `${type} ${entityId} not found.`, 404);
+    }
     return JSON.parse(row.data) as T;
   }
   /** The timeline a request names (slug or id); null for main. */
@@ -571,7 +577,11 @@ export class TrackerStore {
     );
     if (row) return JSON.parse(row.data) as Issue;
     const latest = latestEntity(this.sql, "issue", issueId);
-    if (!latest) fail("not_found", `issue ${issueId} not found.`, 404);
+    if (!latest) {
+      const stone = tombstone(this.sql, "issue", issueId);
+      if (stone) fail("removed_by_retention", removedMessage(stone), 404);
+      fail("not_found", `issue ${issueId} not found.`, 404);
+    }
     return latest as Issue;
   }
   private cursor(): number {
@@ -788,6 +798,13 @@ export class TrackerStore {
       limit > 500
     )
       fail("invalid_input", "after must be a nonnegative integer; limit must be 1–500.");
+    // Retention pruned events after this cursor: the replica must start over.
+    if (after < feedFloor(this.sql))
+      fail(
+        "cursor_expired",
+        "This replica is older than the tracker's retained activity; fetch a fresh snapshot.",
+        410,
+      );
     let query = tracker
       .selectFrom("events")
       .select(["cursor", "data"])
@@ -845,7 +862,11 @@ export class TrackerStore {
         )
         .limit(1),
     );
-    if (!made) fail("not_found", `Issue ${issueId} not found.`, 404);
+    if (!made) {
+      const stone = tombstone(this.sql, "issue", issueId);
+      if (stone) fail("removed_by_retention", removedMessage(stone), 404);
+      fail("not_found", `Issue ${issueId} not found.`, 404);
+    }
     return issueHistory(this.sql, access, this.anyIssue(made.id), before, limit);
   }
   mutate(access: Access, input: unknown): MutationResult {
@@ -1312,7 +1333,9 @@ export class TrackerStore {
               .where(json("data", "$.entityType"), "=", type)
               .where(json("data", "$.timelineId"), "is not", null)
               .limit(1),
-          ))
+          )) ||
+        // An issue retention removed keeps its id (and key) forever.
+        (type === "issue" && tombstone(this.sql, "issue", entityId)?.id === entityId)
       )
         fail("already_exists", `${type} ID already exists.`, 409);
     };

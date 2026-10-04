@@ -51,6 +51,62 @@ from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 
+## Testing
+
+Three kinds of test, each where it's cheapest to say what it checks. `vp test`
+here runs the first two (projects `unit` and `browser` in `vite.config.ts`);
+CI's test job runs them on every push. E2E runs only in `vp run ready` and
+`vp run agent test`.
+
+| Kind                       | Files                               | What belongs there                                                                                                                                                                                           |
+| -------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Node unit tests            | `**/*.test.ts`                      | Pure logic: parsers, reducers, URL and state helpers, and Worker routes over `worker/testing/` fakes (D1 over node:sqlite, Durable Object storage, git remotes).                                             |
+| Browser-mode tests         | `src/**/*.browser.test.tsx`         | What a person sees and does: rendering, interaction, keyboard and focus, touch, reduced motion, themes and responsive layout, the address and Back/Forward, against mocked or in-memory APIs.                |
+| End-to-end (`tools/agent`) | `e2e.ts`, `atlas-e2e.ts`, providers | Only what needs the real stack: sign-in and sessions, the Worker under `vp dev`, D1, git over HTTP and `gm`, CI runners, mirrors, deployments. A few journeys, asserting integration rather than UI details. |
+
+When a UI behaviour can be checked against a canned or in-memory API, it's a
+browser-mode test, not an E2E step.
+
+### Browser-mode tests
+
+Vitest's browser mode runs these in headless Chromium (Playwright's headless
+shell, which `vp run agent setup` installs; elsewhere run
+`vp exec playwright install --only-shell chromium` in this package). Run one file with
+`vp test --project browser src/palette/Palette.browser.test.tsx`; add
+`--project unit` for the Node tests alone. The helpers are in `src/testing/`:
+
+- `renderApp(path)` (`render.tsx`) mounts the whole app, as `main.tsx` does,
+  at an address: the real routes, loaders, shell and styles, with a browser
+  router (the timeline scope's middleware reads `window.location`). It returns
+  the router, `url()`, `waitForUrl()`, `navigate()`, `back()` and `forward()`;
+  `unmount()` and a fresh `renderApp(url)` is a cold load of a copied link.
+- `TestServer.start()` (`server.ts`) replaces `fetch` for the test. Each /api
+  request goes to the newest matching canned handler (`server.on(method,
+pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
+  the **in-memory API**: the Worker's own routes (accounts, repositories,
+  tracker and timelines, Knowledge, Atlas, search, `/api/dev/atlas`) over the
+  migrated schema and development seed, in Vitest's Node process
+  (`worker/testing/browser-api.ts`, reached through the commands in
+  `vite/browser-commands.ts`). Requests act as the world's persona (marco by
+  default; `server.as()` switches, and `server.call(..., as)` acts as someone
+  else once). `server.requests` records every request, for "it read only
+  this" assertions.
+- A world's repositories (`server.repo()`) have refs (`server.push()`) and
+  accept ref-only pushes, but no git objects: file listings and history are
+  canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
+  there; the Knowledge coordinator is idle. `atlasFixtureRepo()` (`atlas.ts`)
+  publishes the Atlas fixture the way the non-AI E2E does.
+- `press()`, `pressUntil()` and `tap()` (`focus.ts`) drive the keyboard and
+  touch; `browserCommands.emulateMedia()` sets reduced motion or a colour
+  scheme; `page.viewport(w, h)` resizes.
+
+Write assertions with `expect.element(locator)`. `toHaveTextContent` and
+`toHaveAttribute` compare exactly; use `toMatchTextContent` for "contains"
+and `expect.poll(() => el.getAttribute(...)).toMatch(...)` for patterns.
+Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
+Locator text with an apostrophe is safer as a RegExp. Restore what a test
+changes in the page (viewport, theme, emulated media) in a `finally`.
+
 ## File history
 
 The repository file list shows each entry's most recent change, author,
@@ -169,7 +225,9 @@ is missing, it never starts a new production deployment of the old candidate.
 It follows the current main's real push pipeline only with Git ancestry proof;
 missing newer-main CI stays pending for bounded recovery before an honest
 infrastructure failure, and unrelated main history fails without inventing coverage.
-Source staging refs do not start ordinary CI, knowledge or preview work. Queue
+Source staging refs do not start ordinary CI, knowledge or preview work. They do
+record push provenance before returning, so subsequently uploaded step context is
+verified against the staged commit without waiting for landing. Queue
 gates run in full; no new path-based gate reuse is introduced. Ordinary exact-run
 dedupe, push coalescing/coverage, declared complete `paths` input reuse and deploy
 concurrency remain in place. AI never authorizes skipped checks: combining queued
@@ -221,6 +279,34 @@ they are **not universally protected by this queue**. A broken queue must not
 prevent fixing Gitmatrix itself. Timeline-bound work instead uses its existing
 checkpoint/land queue: `--queue` is rejected there, and pinned human approvals
 are never automatically weakened or replaced.
+
+Repository deletion also fences queue admission, candidate publication and recovery
+effects at the tombstone boundary. Purging cancels queue CI alongside other runs
+and removes queue entries and their attempt history in the bounded row sweep;
+deleted repositories cannot restart queue remediation or post-land work.
+
+## Steps: work context per commit
+
+Agents working in a timeline commit at each meaningful step and attach the
+context that produced it (CORE-226). A step's context is stored per change and
+commit in `step_contexts` (`worker/steps/api.ts`, contract `shared/steps.ts`):
+instructions and human steering (each entry marked `hook`, `agent` or
+`person`), why, challenges, test results (`local` from `gm test`, or
+`reported`), coverage (how each part was captured) and harness/model. It's
+keyed by gm's change ID, so amend and rebase add versions instead of
+overwriting, and capped at 256 KiB per step.
+
+| Route                                                        | Does                                                                                    |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `POST /api/repos/:o/:n/steps`                                | Upload one step (write access); retries replace the author's own record, others get 409 |
+| `GET /api/repos/:o/:n/steps?timeline=&issue=&cursor=&limit=` | Newest first, paged (1–100, default 50)                                                 |
+| `GET /api/repos/:o/:n/steps/:changeId`                       | Every version of a change, newest first                                                 |
+| `DELETE /api/repos/:o/:n/steps/:changeId/:commitOid`         | Delete or redact (admins): the text goes, a tombstone stays                             |
+
+Anyone who can read the repository reads its steps. A step is **verified** once
+a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a
+later push (`worker/ref-log/record.ts`); until then it's "local, unverified".
+Context is the agent's account, shown as such next to what Gitmatrix verifies.
 
 ## Profile pictures and organization icons
 
@@ -1577,9 +1663,11 @@ that a workspace never shows a lost repository through composition, related
 links, lineage, lookup or totals; that a deleted repository leaves no Atlas
 rows and nothing for a namesake; that building and failed projections are never
 readable while pinned pages keep their snapshot; and that no browse path
-touches a model, Vectorize or AI Search (those bindings throw). The browser
-E2E `browser-atlas-revocation-clears-the-open-view` removes a collaborator
-while their Knowledge tab is open.
+touches a model, Vectorize or AI Search (those bindings throw). The
+browser-mode test `src/routes/repo/Atlas.browser.test.tsx` removes a
+collaborator while their Knowledge tab is open and checks the view clears; the
+E2E `atlas-revocation-reads-like-a-missing-repository` checks the same through
+real tokens against the dev server.
 
 **Atlas scale gates and benchmark** (CORE-177, PRD gate 18). Two layers.
 `worker/atlas/scale.test.ts` runs in every `vp test` and holds what is
@@ -2366,10 +2454,11 @@ deletes nothing it didn't delete before.
   (kebab-case, stored, never renamed), scope (`account` or `site`), label,
   description, `never` (what it never deletes, in plain words) and thresholds
   (whole numbers with `min`, `max` and the PRD `default`). `control` is
-  `policy` (off until enabled), `active` (preview teardown: always runs, its
+  `policy` (off until enabled), `active` (always runs: preview teardown, whose
   numbers are the `account_settings` preview columns, the same ones
-  `/settings/previews` changes) or `fixed` (Atlas snapshot retention,
-  `ATLAS_RETENTION`, shown read-only). Shapes for clients are in
+  `/settings/previews` changes, and Atlas snapshot retention, which an account
+  can tighten within `ATLAS_RETENTION_BOUNDS` but never loosen) or `fixed`
+  (shown read-only; none today). Shapes for clients are in
   `shared/retention.ts`.
 - **Policies** (`worker/retention/policies.ts`) store only what was changed:
   `retention_policies` per account, `retention_site_policies` for site
@@ -2429,6 +2518,186 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
 | `POST`, `GET /api/admin/retention/runs[/:id]`  | The same for site categories (site administrators)                                                                                                                   |
 
 The settings responses show each category's `runnable` and `lastRun`.
+
+### CI retention
+
+`ci-logs` and `ci-runs` (CORE-200, `worker/retention/cleanups/ci-*.ts`):
+
+- **`ci-logs`** deletes the `ci_logs` chunks of jobs that finished more than
+  `days` ago (any end state; never pending, queued or running jobs) and stamps
+  `ci_jobs.logs_removed_at`. Items are jobs; counts are chunks; bytes are the
+  log text. The run API returns `logsRemovedAt` per job and the logs API
+  `removedAt`; the run page and `gm runs show`/`gm runs logs` say "Logs
+  removed by retention on <date>" instead of an empty log.
+- **`ci-runs`** deletes runs older than `days` (finished, else created) with
+  their jobs, steps and logs, always keeping the latest `keepLatest` runs of
+  each ref, runs that are queued or running or have a job still running,
+  landing runs, runs a deployment records or tore down, and runs a registry
+  publish names as provenance. A removed run's number answers 404 "Run #n was
+  removed by retention." when a later run exists.
+
+### Knowledge retention
+
+CORE-201, `worker/retention/cleanups/`:
+
+- **`knowledge-builds`** deletes `kg_builds` older than `days` (finished, else
+  started) with their `kg_changes`, keeping the latest `keepLatest` builds of
+  each repository, running builds, the build behind the current graph and
+  wiki (`kg_state.last_build_id`) and any build a kept Atlas snapshot's vector
+  names. Graph, wiki and Atlas rows are never touched.
+- **`ended-timeline-data`** empties overlays whose timeline ended more than
+  `days` ago: their `kg_overlay_changes`, `atlas_timeline_regroupings`,
+  `kg_page_sets` and `kg_page_set_pages`. The `kg_overlays` row stays with
+  `removed_at`, which the overlay APIs return as `ended.removedAt`; the
+  Knowledge tab's timeline panel says the overlay and wiki pages were removed
+  by retention. A bookmark that comes back reopens the overlay and computes it
+  afresh.
+- **`analysis-caches`** (site) deletes `kg_blob_analysis` and `kg_synthesis`
+  entries no build has used for `days`. Builds record use cheaply in
+  `used_at` (`worker/knowledge/cache-use.ts`: at most once a day per entry;
+  null counts as 2026-10-04, when the column came). Never: an analysis of a
+  file in any current or running build (`kg_files`, current analyzer), or a
+  synthesis used since the oldest current or running build started (less a
+  day); with a graph whose build record is gone, no synthesis goes. A later
+  build re-analyzes only what was removed.
+- **`ai-spend`** (site; at least 7 days) rolls `atlas_spend` rows of whole
+  UTC days older than `days` (not in-flight reservations) into
+  `atlas_spend_daily` per account and day, deleting them in the same
+  transaction. Daily budget checks add that table, so they answer exactly as
+  before; a rolled-up run no longer shows its per-call detail.
+- **`atlas-snapshots`** is `active`: `PATCH …/settings/retention` stores an
+  account's `maxPrior` (0–20), `priorDays` (1–7) and `capGib` (1–2) in
+  `retention_policies`, every Atlas retention pass reads them
+  (`scopePolicy`), a shorter period brings stamped priors' expiry forward, and
+  a change flags the account's scopes so the hourly sweep applies it.
+
+### Auth hygiene and release notes
+
+CORE-206, `worker/retention/cleanups/`:
+
+- **`auth-hygiene`** (site) deletes sign-in state that ended more than `days`
+  ago, by each table's own expiry: expired `auth_sessions`,
+  `auth_verifications` (sign-in codes), `auth_device_codes`, `auth_lockouts`
+  past their `until`, `ssh_challenges`, expired `access_tokens` (revoking a
+  token already deletes it; a token without an expiry never expires) and
+  `ci_job_tokens`. The cutoff is at least a day in the past, so live
+  sessions, valid tokens and active lockouts never match.
+- **`release-notes`** deletes release notes released more than `days` ago
+  with their entries, and mentions of issues only they cited, never each
+  repository's latest daily or latest tagged release. It records the cutoff
+  in `release_note_state.retained_from`; the generator then never writes
+  notes for an older release again (it would pay a model to rebuild them),
+  while releases still stored stay current.
+
+### Push log and unreachable git data
+
+- **Push log** (`push-log`, CORE-202, `worker/retention/cleanups/push-log.ts`):
+  `ref_updates` entries older than the policy's days (365 by default), and
+  `change_refs` rows on refs that no longer exist (deleted branches, landed or
+  abandoned timeline bookmarks) last seen before then. It never removes the
+  latest entry of a branch or tag that exists, a change's record on one, or
+  the entry such a record points to (`first_update_id`, which would cascade).
+  Git itself is never touched.
+- **Unreachable git data** (`unreachable-git`): a deleted branch, a force
+  push or an ended timeline's bookmark leaves commits no ref reaches.
+  Artifacts keeps them (it still serves an unreachable commit by id) and has
+  no gc, prune, repack or size API, so this category has no cleanup: it can
+  be configured but never deletes anything. The usage collection measures it
+  instead (`worker/git/unreachable.ts`): per repository whose push log saw a
+  ref leave a commit, one protocol v2 fetch wanting those commits (at most 256,
+  newest first) with every ref tip as a `have` returns exactly the objects only
+  they reach; the pack is counted as it streams (at most 512 MiB or 15 s, else
+  a lower bound) into `artifacts/repositories` `unreachable_bytes` and
+  `unreachable_objects`, both estimated. Commits that left a ref before the
+  push log began (2026-10-03), or whose entries the push log cleanup removed,
+  aren't seen.
+
+### Usage and costs
+
+**Settings → Usage & costs** (`/settings/usage?owner=<slug>`, an account's
+administrators: org owners, the user themselves, site administrators) and
+**Settings → Site usage & costs** (`/settings/site-usage`, site
+administrators) price the daily `usage_snapshots` (CORE-207, `worker/usage/`)
+with the price catalog (CORE-208, `cloudflare_prices`). The report
+(`worker/usage/report.ts`, shapes in `shared/usage.ts`):
+
+- **Storage** is the latest day whose collection finished for the account (or
+  the whole site; the `usage:collect` cursor says which), priced as if it
+  stayed that size for a month. **Activity** (Workers AI tokens) is the 30 days
+  before that day; with fewer days measured it's extrapolated to 30 and marked
+  estimated.
+- **Cost = quantity in the price's unit × unit price ÷ unit quantity**, with
+  the catalog version in effect that day: bytes ÷ 10^9 → GB-months (D1,
+  Durable Objects SQLite, R2 Standard, Artifacts, AI Search), stored vector
+  dimensions, model input/output tokens (a model that reports only totals is
+  priced as input and marked estimated). Included allowances are account-wide
+  on the Cloudflare account, so nothing is subtracted (gross list price). A
+  price whose billing hasn't started (Artifacts before 2026-10-14, AI Search
+  before 2026-11-01) is shown with its start date and left out of totals. CI
+  sandbox minutes are shown unpriced.
+- Every line carries its figures with `estimated` and `method`, its costs
+  with the price and source page, and the retention categories that clean it
+  up (account pages list account categories only). `RETENTION_PAGES` in
+  `src/lib/retention-links.ts` turns those into links once the Data retention
+  pages exist (CORE-210).
+- The site report sums every account and the site's own figures (account
+  `''`), counting registry blobs once (`registry_blobs_all`), and totals each
+  account (at most 200, highest first).
+- The trend is each of the last 30 days: that day's storage at a thirtieth of
+  its monthly cost plus that day's activity.
+
+| Route                           | Contract                                                                                                                      |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/accounts/:slug/usage` | `UsageReport`; `?format=csv` for one row per figure with its price and monthly cost (administrators; members 403, others 404) |
+| `GET /api/admin/usage`          | The site's `UsageReport` with `accounts`; `?format=csv` (site administrators)                                                 |
+
+### Repository deletion
+
+Deleting a repository (CORE-199, `worker/retention/repo-deletion.ts`) removes
+everything it owned, everywhere, in two steps:
+
+- **Tombstone.** `DELETE /api/repos/:owner/:name` sets `repos.deleted_at` and
+  records the deletion in `repo_deletions`, in one transaction. From then on
+  the repository is missing to every reader (`selectRepos`/`findRepo` and the
+  other repository lookups skip it; pass `{deleting: true}` only where a
+  deletion's own preview teardown needs it: the local runner claiming,
+  checking out and reporting its job). The name stays taken (409 "being
+  deleted") until the purge ends.
+- **Purge.** The `RepoPurge` Workflow (`repo-purge.ts`) runs the phases in
+  order, each step bounded and idempotent, recording the phase and its counts
+  in `repo_deletions.progress`: `stop` (purge the KnowledgeCoordinator,
+  terminate its builds, cancel CI runs), `previews` (expire live timeline
+  previews and start the project's own teardown run per timeline, as the
+  preview sweep does, then wait for them up to 2 hours), `vectors` (Vectorize
+  ids from `kg_nodes`, then the `repo` metadata filter until nothing is
+  found), `search` (AI Search items from `kg_search_items`, then by metadata and
+  key prefix), `durable` (every registered instance it owns), `links`
+  (earlier days' `atlas_spend` go, today's stay detached for the account's
+  ceiling; registry `package_sources` go, `publishes` keep the package history
+  without the repository), `artifacts`, and `rows` (large children in batches,
+  then the repository row and its cascade). The hourly cron
+  (`resumeDeletions`) starts a new instance for a deletion whose Workflow
+  died; it resumes from the recorded phase. A timeline preview has no
+  Workflow: the purge runs on the request's `waitUntil`.
+- **Orphans** (`repo-orphans.ts`): what deletions before this left behind is
+  swept once by production's cron: AI Search items and `atlas_spend`,
+  `do_instances` and registry links naming unknown repository ids become
+  `repo_deletions` rows (`source = 'orphan-sweep'`) purged through the phases
+  that need no row; Artifacts repositories no row names and older than a day
+  are deleted. Vectorize can't be listed from a Worker, so vectors only a
+  deleted repository's id names are found through the metadata filter of ids
+  found elsewhere; the sweep records the index's vector count beside the
+  count live graphs account for.
+
+`GET /api/dev/repo-inventory?repo=<id|owner/name>` lists what a repository
+holds in every store (D1 tables, registry, Durable Objects, Artifacts,
+Vectorize, AI Search, previews) and its deletion's progress;
+`POST /api/dev/repo-purge {repo, action: "terminate"|"resume"}` kills or
+restarts a purge and `POST /api/dev/repo-orphans {action: "plant"|"sweep"}`
+plants and sweeps orphans (isolated agent environments only). E2E:
+`repository-deletion-purges-everything-and-resumes` (ready: Artifacts, a live
+preview's teardown, a killed purge resumed, the name reused) and the
+`repository-deletion` stage of `agent test-ai` (Vectorize, AI Search).
 
 ## Layout
 

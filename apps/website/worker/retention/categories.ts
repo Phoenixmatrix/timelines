@@ -12,15 +12,15 @@
 // Two categories describe cleanup that already ran before policies existed and
 // keeps running exactly as before: preview teardown ("active"; its two numbers
 // are the account_settings preview columns, also served by
-// /settings/previews) and Atlas snapshot retention ("fixed"; ATLAS_RETENTION,
-// shown read-only).
+// /settings/previews) and Atlas snapshot retention ("active"; ATLAS_RETENTION,
+// which an account can tighten within ATLAS_RETENTION_BOUNDS; CORE-201).
 //
 // Adding a category: append an entry (a new kebab-case id; ids are stored, so
 // never rename one), then implement its cleanup against the engine contract
 // (worker/retention/engine.ts) in the ticket that owns it.
 
 import type { RetentionCategory, RetentionThreshold } from "../../shared/retention.ts";
-import { ATLAS_RETENTION } from "../atlas/retention.ts";
+import { ATLAS_RETENTION, ATLAS_RETENTION_BOUNDS } from "../atlas/retention.ts";
 import { DEFAULT_PREVIEW_SETTINGS } from "../../shared/deployments.ts";
 
 const TEN_YEARS = 3650;
@@ -51,7 +51,7 @@ export const CATEGORIES = [
     control: "policy",
     label: "CI logs",
     description: "Log text of CI jobs that finished more than the given days ago.",
-    never: ["Logs of running or queued jobs", "The run, job and step records themselves"],
+    never: ["Logs of pending, queued or running jobs", "The run, job and step records themselves"],
     thresholds: [days("days", "Days after the job finished", 30)],
   },
   {
@@ -62,8 +62,8 @@ export const CATEGORIES = [
     description: "CI runs older than the given days, with their jobs, steps and logs.",
     never: [
       "The latest runs of each ref (the count below)",
-      "Running or queued runs",
-      "Runs a deployment or a landing refers to",
+      "Running or queued runs, and runs with a job still running",
+      "Runs a deployment, a landing or a package publish refers to",
     ],
     thresholds: [days("days", "Days after the run", 180), keepLatest("Runs kept per ref", 20)],
   },
@@ -103,8 +103,13 @@ export const CATEGORIES = [
     scope: "account",
     control: "policy",
     label: "Push log",
-    description: "Ref update records older than the given days, and change refs nothing uses.",
-    never: ["Commits, refs or any reachable git history"],
+    description:
+      "Push log entries older than the given days, and records of changes on branches or bookmarks that no longer exist, last seen before then.",
+    never: [
+      "Commits, refs or any git history",
+      "The latest push log entry of each branch or tag that exists",
+      "A change's record on a branch or tag that exists, or the push log entry it points to",
+    ],
     thresholds: [days("days", "Days after the push", 365)],
   },
   {
@@ -113,8 +118,11 @@ export const CATEGORIES = [
     control: "policy",
     label: "Unreachable git data",
     description:
-      "Git objects no ref reaches any more (deleted branches, landed or abandoned timeline bookmarks), as far as Artifacts allows.",
-    never: ["Reachable history of any branch, tag or bookmark"],
+      "Git objects no ref reaches any more (deleted branches, landed or abandoned timeline bookmarks). Artifacts can't prune them yet: they are measured in the usage report, never deleted.",
+    never: [
+      "Reachable history of any branch, tag or bookmark",
+      "Anything, until Artifacts can prune",
+    ],
     thresholds: [days("days", "Days after becoming unreachable", 30)],
   },
   {
@@ -145,7 +153,11 @@ export const CATEGORIES = [
     control: "policy",
     label: "Assistant chats",
     description: "Assistant chats nobody has used for the given days.",
-    never: ["Chats used within the period"],
+    never: [
+      "Chats used within the period (unless over the per-person limit)",
+      "A chat with a turn in progress",
+      "The newest chats up to the per-person limit",
+    ],
     thresholds: [
       days("days", "Days without activity", 90),
       {
@@ -164,7 +176,7 @@ export const CATEGORIES = [
     control: "policy",
     label: "Release notes",
     description: "Release notes older than the given days, with their entries and mentions.",
-    never: ["The latest release's notes"],
+    never: ["Each repository's latest daily and latest tagged release notes"],
     thresholds: [days("days", "Days after publishing", 730)],
   },
   {
@@ -197,34 +209,31 @@ export const CATEGORIES = [
   {
     id: "atlas-snapshots",
     scope: "account",
-    control: "fixed",
+    control: "active",
     label: "Atlas snapshots",
     description:
-      "Each repository keeps its current Atlas snapshot and recent prior ones; older priors expire and their rows are reclaimed.",
+      "Each repository keeps its current Atlas snapshot and recent prior ones; older priors expire and their rows are reclaimed. An account can keep fewer, never more.",
     never: ["The current snapshot"],
     thresholds: [
       {
         key: "maxPrior",
         label: "Prior snapshots kept",
         unit: "count",
-        min: ATLAS_RETENTION.maxPrior,
-        max: ATLAS_RETENTION.maxPrior,
+        ...ATLAS_RETENTION_BOUNDS.maxPrior,
         default: ATLAS_RETENTION.maxPrior,
       },
       {
         key: "priorDays",
         label: "Days a prior snapshot is kept",
         unit: "days",
-        min: ATLAS_RETENTION.priorTtlMs / 86_400_000,
-        max: ATLAS_RETENTION.priorTtlMs / 86_400_000,
+        ...ATLAS_RETENTION_BOUNDS.priorDays,
         default: ATLAS_RETENTION.priorTtlMs / 86_400_000,
       },
       {
         key: "capGib",
         label: "Storage per repository",
         unit: "gib",
-        min: ATLAS_RETENTION.repoCapBytes / 1024 ** 3,
-        max: ATLAS_RETENTION.repoCapBytes / 1024 ** 3,
+        ...ATLAS_RETENTION_BOUNDS.capGib,
         default: ATLAS_RETENTION.repoCapBytes / 1024 ** 3,
       },
     ],
@@ -248,7 +257,11 @@ export const CATEGORIES = [
     label: "Registry proxy cache and derived objects",
     description:
       "Cached upstream package entries and derived files unused for the given days, so garbage collection can reclaim their blobs.",
-    never: ["Blobs any version, tag or kept cache entry refers to", "Published packages"],
+    never: [
+      "Blobs any version, tag or kept cache entry refers to",
+      "Published packages",
+      "Derived files in use, or written within the last day",
+    ],
     thresholds: [days("days", "Days unused", 30)],
   },
   {
@@ -257,7 +270,11 @@ export const CATEGORIES = [
     control: "policy",
     label: "Registry audit log and publish records",
     description: "Registry audit entries and publish records older than the given days.",
-    never: ["Package versions and their contents"],
+    never: [
+      "Package versions and their contents",
+      "The newest publish record of each version still published",
+      "Records of versions published from another branch (they keep them from becoming latest)",
+    ],
     thresholds: [days("days", "Days to keep", 365)],
   },
   {
@@ -267,7 +284,7 @@ export const CATEGORIES = [
     label: "Auth hygiene",
     description:
       "Expired sign-in sessions, lockouts, SSH challenges, verification codes and expired or revoked tokens, the given days after they ended.",
-    never: ["Live sessions and valid tokens"],
+    never: ["Live sessions, valid tokens and active lockouts"],
     thresholds: [days("days", "Days after expiry", 7)],
   },
   {
@@ -276,8 +293,53 @@ export const CATEGORIES = [
     control: "policy",
     label: "AI spend records",
     description: "Per-call AI spend records older than the given days, rolled up to daily totals.",
-    never: ["Totals budgets are enforced against"],
-    thresholds: [days("days", "Days of per-call detail", 90)],
+    never: ["Totals budgets are enforced against", "Reservations still in flight"],
+    // At least a week: a run's own caps read its per-call rows.
+    thresholds: [days("days", "Days of per-call detail", 90, 7)],
+  },
+  // CORE-225: what metering (CORE-207) and the Durable Object registry (CORE-197) keep.
+  {
+    id: "usage-history",
+    scope: "site",
+    control: "policy",
+    label: "Usage history",
+    description:
+      "Daily usage figures older than the given days, rolled up to monthly figures; monthly figures older than the given months.",
+    never: [
+      "The latest figures of each account and construct (the report's current usage)",
+      "Totals: a month's roll-up keeps the sum of its days",
+    ],
+    thresholds: [
+      // At least the report's 30-day window (worker/usage/report.ts WINDOW_DAYS) and then some.
+      days("days", "Days of daily figures", 90, 32),
+      {
+        key: "months",
+        label: "Months of monthly figures",
+        unit: "months",
+        min: 1,
+        max: 120,
+        default: 24,
+      },
+    ],
+  },
+  {
+    id: "ai-usage",
+    scope: "site",
+    control: "policy",
+    label: "AI usage records",
+    description:
+      "Daily AI call and token records older than the given days, rolled up to monthly totals per account, feature and model.",
+    never: ["Totals: a month's roll-up keeps the sum of its days", "Records of the current period"],
+    thresholds: [days("days", "Days of daily records", 90, 7)],
+  },
+  {
+    id: "durable-registry",
+    scope: "site",
+    control: "policy",
+    label: "Durable Object registry rows",
+    description: "Rows of Durable Object instances purged more than the given days ago.",
+    never: ["Rows of live instances, or of instances used again since their purge"],
+    thresholds: [days("days", "Days after the purge", 30)],
   },
 ] as const satisfies readonly RetentionCategory[];
 

@@ -16,7 +16,16 @@ import {
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
+import { durableAgent, instanceStorage } from "../durable/registry.ts";
 import { collectUsage } from "../usage/collect.ts";
+import { advanceRun, createRun, getRun } from "../retention/runs.ts";
+import { SYSTEM_ACTOR } from "../../registry/core/auth/system.ts";
+import { Services } from "../../registry/core/context.ts";
+import { collectGarbage } from "../../registry/jobs/gc.ts";
+import type { RetentionTarget } from "../retention/policies.ts";
+import { deletionStatus, resumeDeletions } from "../retention/repo-deletion.ts";
+import { repoInventory } from "../retention/repo-inventory.ts";
+import { plantOrphans, resetOrphanSweep, sweepRepoOrphans } from "../retention/repo-orphans.ts";
 import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
@@ -73,9 +82,21 @@ dev.use("*", async (c, next) => {
   const id = Reflect.get(c.env, "AGENT_ID");
   if (
     id &&
-    ["/tokens", "/seed", "/environment", "/atlas", "/durable", "/usage"].some((path) =>
-      c.req.path.endsWith(path),
-    )
+    [
+      "/tokens",
+      "/seed",
+      "/environment",
+      "/atlas",
+      "/durable",
+      "/usage",
+      "/retention",
+      "/ci-age",
+      "/repo-inventory",
+      "/repo-purge",
+      "/repo-orphans",
+      "/auth-expired",
+      "/assistant-chat",
+    ].some((path) => c.req.path.endsWith(path))
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
     const supplied = c.req.header("Authorization")?.replace(/^Bearer /, "");
@@ -110,6 +131,236 @@ dev.post("/usage", async (c) => {
     .bind(found.id)
     .all();
   return c.json({ runs, figures: results });
+});
+
+// Retention runs in the real runtime with a moment `daysAhead` days from now
+// (CORE-203), so E2E can age what it just made: run to the end, synchronously.
+// With `account`, that account's categories; without, the site's. With `gc`,
+// the registry's garbage collection then runs at the same moment (CORE-205).
+dev.post("/retention", async (c) => {
+  const { account, categories, daysAhead, dryRun, gc } = await readJson<{
+    account?: string;
+    categories?: Record<string, Record<string, number>>;
+    daysAhead?: number;
+    dryRun?: boolean;
+    gc?: boolean;
+  }>(c);
+  if (typeof daysAhead !== "number" || !Number.isFinite(daysAhead) || !categories)
+    return fail(c, 400, "daysAhead and categories are required.");
+  let target: RetentionTarget = { scope: "site" };
+  if (account) {
+    const found = await findAccountBySlug(c.env.DB, account);
+    if (!found) return fail(c, 404, "No such account.");
+    target = { scope: "account", accountId: found.id };
+  }
+  const now = new Date(Date.now() + daysAhead * 86_400_000);
+  const id = await createRun(c.env.DB, {
+    target,
+    trigger: "manual",
+    actorId: null,
+    dryRun: dryRun === true,
+    categories: Object.entries(categories).map(([category, thresholds]) => ({
+      id: category,
+      thresholds,
+    })),
+    now,
+  });
+  for (let calls = 0; calls < 50; calls++)
+    if ((await advanceRun(c.env, id, { now })) !== "more") break;
+  let collected: number | null = null;
+  if (gc) {
+    const services = new Services(c.env, c.req.raw, () => undefined, "dev", SYSTEM_ACTOR);
+    collected = 0;
+    for (let rounds = 0; rounds < 20; rounds++) {
+      const { blobs } = await collectGarbage(services, now.getTime());
+      collected += blobs;
+      if (!blobs) break;
+    }
+  }
+  return c.json({ run: await getRun(c.env.DB, target, id), collected });
+});
+
+// CI retention in the real runtime (CORE-200): move runs (with their jobs and
+// steps) back in time so the retention categories see them as old.
+dev.post("/ci-age", async (c) => {
+  const { owner, name, numbers, days } = await readJson<{
+    owner: string;
+    name: string;
+    numbers: number[];
+    days: number;
+  }>(c);
+  const account = owner ? await findAccountBySlug(c.env.DB, owner) : null;
+  const repo = account
+    ? await db(c.env.DB)
+        .selectFrom("repos")
+        .select("id")
+        .where("owner_id", "=", account.id)
+        .where("name", "=", name ?? "")
+        .executeTakeFirst()
+    : undefined;
+  if (!repo) return fail(c, 404, "No such repository.");
+  if (!Array.isArray(numbers) || !Number.isInteger(days))
+    return fail(c, 400, "Send {numbers, days}.");
+  const shift = `-${days} days`;
+  const at = (column: string) =>
+    `${column} = CASE WHEN ${column} IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ', ${column}, '${shift}') END`;
+  const runs = `SELECT id FROM ci_runs WHERE repo_id = ? AND number IN (SELECT value FROM json_each(?))`;
+  const jobs = `SELECT id FROM ci_jobs WHERE run_id IN (${runs})`;
+  const ids = JSON.stringify(numbers);
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE ci_steps SET ${at("started_at")}, ${at("finished_at")} WHERE job_id IN (${jobs})`,
+    ).bind(repo.id, ids),
+    c.env.DB.prepare(
+      `UPDATE ci_jobs SET ${at("started_at")}, ${at("finished_at")} WHERE id IN (${jobs})`,
+    ).bind(repo.id, ids),
+    c.env.DB.prepare(
+      `UPDATE ci_runs SET ${at("created_at")}, ${at("started_at")}, ${at("finished_at")}
+       WHERE id IN (${runs})`,
+    ).bind(repo.id, ids),
+  ]);
+  return c.json({ ok: true });
+});
+
+// Repository deletion in the real runtime (CORE-199). The inventory of what
+// a repository (by id, or owner/name while it exists or its deletion is
+// recorded) holds in every store; nothing is changed.
+dev.get("/repo-inventory", async (c) => {
+  const id = await devRepoId(c.env, c.req.query("repo") ?? "");
+  if (!id) return fail(c, 404, "No such repository or deletion.");
+  return c.json(await repoInventory(c.env, id));
+});
+
+// `terminate` stands for a crash: the purge's Workflow instance dies where it
+// is. `resume` is the cron's restart, without waiting for staleness.
+dev.post("/repo-purge", async (c) => {
+  const body = await readJson<{ repo: string; action: "terminate" | "resume" }>(c);
+  const id = await devRepoId(c.env, body.repo ?? "");
+  const deletion = id ? await deletionStatus(c.env, id) : null;
+  if (!id || !deletion) return fail(c, 404, "No such deletion.");
+  if (body.action === "terminate") {
+    if (!deletion.workflowId) return fail(c, 409, "The purge has no Workflow instance.");
+    const instance = await c.env.REPO_PURGE.get(deletion.workflowId);
+    await instance.terminate();
+    return c.json({ terminated: deletion.workflowId, status: await instance.status() });
+  }
+  if (body.action === "resume") {
+    const started = await resumeDeletions(c.env, {
+      staleMs: 0,
+      waitUntil: (work) => c.executionCtx.waitUntil(work),
+    });
+    return c.json({ started, deletion: await deletionStatus(c.env, id) });
+  }
+  return fail(c, 400, "action is terminate or resume.");
+});
+
+// The orphan sweep, only in an isolated agent environment (its provider
+// namespaces are its own). `plant` makes an orphan in each store as a
+// repository deleted before the purge existed would have left it: an AI
+// Search item and a vector naming an unknown repository id, and an Artifacts
+// repository no row names. `sweep` runs the sweep from the start to the end,
+// treating every Artifacts repository as old enough.
+dev.post("/repo-orphans", async (c) => {
+  if (!Reflect.get(c.env, "AGENT_ID"))
+    return fail(c, 403, "Only an isolated agent environment sweeps orphans.");
+  const body = await readJson<{ action: "plant" | "sweep" }>(c);
+  if (body.action === "plant") return c.json(await plantOrphans(c.env));
+  if (body.action === "sweep") {
+    await resetOrphanSweep(c.env);
+    let state = await sweepRepoOrphans(c.env, {
+      waitUntil: (work) => c.executionCtx.waitUntil(work),
+      limits: { minAgeMs: 0 },
+    });
+    for (let calls = 1; state.stage !== "done" && calls < 50; calls++)
+      state = await sweepRepoOrphans(c.env, {
+        waitUntil: (work) => c.executionCtx.waitUntil(work),
+        limits: { minAgeMs: 0 },
+      });
+    return c.json(state);
+  }
+  return fail(c, 400, "action is plant or sweep.");
+});
+
+// An assistant chat without a model call (CORE-204): its directory row (last
+// used `updatedAt`) and its Durable Object, woken through the registry so it
+// holds storage and is recorded. Without `title`, only reports on it.
+dev.post("/assistant-chat", async (c) => {
+  const { account, id, title, updatedAt } = await readJson<{
+    account?: string;
+    id?: string;
+    title?: string;
+    updatedAt?: string;
+  }>(c);
+  const found = account ? await findAccountBySlug(c.env.DB, account) : null;
+  if (!found || !id || !/^[A-Za-z0-9_-]{8,64}$/.test(id))
+    return fail(c, 400, "account and a chat id are required.");
+  const name = `${found.id}:${id}`;
+  const instance = () =>
+    c.env.DB.prepare(
+      "SELECT purged_at, purge_reason FROM do_instances WHERE class = 'Assistant' AND name = ?",
+    )
+      .bind(name)
+      .first<{ purged_at: string | null; purge_reason: string | null }>();
+  if (title) {
+    const at = updatedAt ?? new Date().toISOString();
+    await c.env.DB.prepare(
+      `INSERT INTO assistant_chats (id, user_id, title, source, updated_at) VALUES (?, ?, ?, 'web', ?)
+       ON CONFLICT (id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at`,
+    )
+      .bind(id, found.id, title, at)
+      .run();
+    await (await durableAgent(c.env, "Assistant", name)).transcript();
+    for (let i = 0; i < 40 && !(await instance()); i++)
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    return c.json({
+      instance: await instance(),
+      storage: await instanceStorage(c.env, "Assistant", name),
+    });
+  }
+  const row = await c.env.DB.prepare("SELECT id FROM assistant_chats WHERE id = ?")
+    .bind(id)
+    .first();
+  return c.json({ instance: await instance(), listed: row !== null });
+});
+
+// Auth hygiene in the real runtime (CORE-206): sign-in state that ended a
+// month ago for a persona, for the "auth-hygiene" category to remove. Returns
+// what it wrote, by table.
+dev.post("/auth-expired", async (c) => {
+  const { account } = await readJson<{ account: string }>(c);
+  const found = account ? await findAccountBySlug(c.env.DB, account) : null;
+  if (!found) return fail(c, 404, "No such account.");
+  const ended = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const id = crypto.randomUUID();
+  await c.env.DB.batch([
+    // A Better Auth user's id is the account id (worker/better-auth.ts).
+    c.env.DB.prepare(
+      `INSERT OR IGNORE INTO auth_users (id, name, email, createdAt, updatedAt)
+       VALUES (?1, ?2, ?3, ?4, ?4)`,
+    ).bind(found.id, found.display_name, `${found.slug}@personas.invalid`, ended),
+    c.env.DB.prepare(
+      `INSERT INTO auth_sessions (id, expiresAt, token, createdAt, updatedAt, userId)
+       VALUES (?1, ?2, ?1, ?2, ?2, ?3)`,
+    ).bind(`ses_${id}`, ended, found.id),
+    c.env.DB.prepare(
+      `INSERT INTO auth_verifications (id, identifier, value, expiresAt, createdAt, updatedAt)
+       VALUES (?1, ?2, '000000', ?3, ?3, ?3)`,
+    ).bind(`ver_${id}`, `sign-in-otp-${found.slug}`, ended),
+    c.env.DB.prepare(`INSERT INTO auth_lockouts (key, until) VALUES (?, ?)`).bind(
+      `ip:e2e-${id}`,
+      ended,
+    ),
+    c.env.DB.prepare(
+      `INSERT INTO access_tokens (id, user_id, name, scope, token_hash, last_four, expires_at)
+       VALUES (?1, ?2, 'expired', 'read', ?1, 'xxxx', ?3)`,
+    ).bind(`tok_${id}`, found.id, ended),
+  ]);
+  return c.json({
+    auth_sessions: `ses_${id}`,
+    auth_verifications: `ver_${id}`,
+    auth_lockouts: `ip:e2e-${id}`,
+    access_tokens: `tok_${id}`,
+  });
 });
 
 dev.get("/environment", async (c) => {
@@ -286,3 +537,23 @@ dev.post("/atlas", async (c) => {
   if (body.land) await landAtlasFixtureBuild(c.env.DB, repo.id, body.commit);
   return c.json(published, 201);
 });
+
+/** A repository's id from its id or owner/name, live, being deleted or deleted. */
+async function devRepoId(env: Env, repo: string): Promise<string | null> {
+  if (!repo) return null;
+  if (!repo.includes("/")) return repo;
+  const [owner, name] = repo.split("/");
+  const live = await env.DB.prepare(
+    "SELECT r.id FROM repos r JOIN accounts o ON o.id = r.owner_id WHERE o.slug = ? AND r.name = ?",
+  )
+    .bind(owner, name)
+    .first<string>("id");
+  if (live) return live;
+  return (
+    (await env.DB.prepare(
+      "SELECT repo_id FROM repo_deletions WHERE full_name = ? ORDER BY requested_at DESC LIMIT 1",
+    )
+      .bind(repo)
+      .first<string>("repo_id")) ?? null
+  );
+}

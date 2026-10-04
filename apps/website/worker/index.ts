@@ -8,6 +8,8 @@ import { collectUsage } from "./usage/collect.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { retentionCron, runRetentionJob, type RetentionJob } from "./retention/runs.ts";
+import { resumeDeletions } from "./retention/repo-deletion.ts";
+import { sweepRepoOrphans, sweepsOrphans } from "./retention/repo-orphans.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 import { settled, sweepLandings } from "./timelines/landing.ts";
 import { sweepQueue } from "./merge-queue/index.ts";
@@ -80,6 +82,19 @@ export default {
     ctx.waitUntil(
       retentionCron(env).catch((error) => console.error("Retention: the cron failed", error)),
     );
+    // Repository deletions whose purge Workflow died: a new one resumes (CORE-199).
+    ctx.waitUntil(
+      resumeDeletions(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>
+        console.error("Repository deletion: resuming purges failed", error),
+      ),
+    );
+    // What repositories deleted before that left behind, once (production only).
+    if (sweepsOrphans(env))
+      ctx.waitUntil(
+        sweepRepoOrphans(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>
+          console.error("Repository deletion: the orphan sweep failed", error),
+        ),
+      );
     // Per-account usage snapshots, a bounded slice per run (CORE-207).
     ctx.waitUntil(
       collectUsage(env).catch((error) => console.error("Usage: the collection failed", error)),
@@ -106,6 +121,7 @@ export default {
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
 export { CiRun } from "./ci/workflow.ts";
+export { RepoPurge } from "./retention/repo-purge.ts";
 export { CiSandbox } from "./ci/sandbox.ts";
 export { RepoDO as RegistryRepo } from "../registry/do/repo-do.ts";
 export { UploadDO as RegistryUpload } from "../registry/do/upload-do.ts";

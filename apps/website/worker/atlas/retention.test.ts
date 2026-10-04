@@ -220,6 +220,47 @@ describe("Atlas retention", () => {
     expect((await pinnedSnapshot(db, scope, first!.snapshotId)).state).toBe("expired");
   });
 
+  test("an account's tighter policy (CORE-201): fewer priors, a shorter period", async () => {
+    const { sqlite, db } = setup();
+    await pushes(sqlite, db, 6, { retain: {} });
+    expect(snapshots(sqlite).filter((s) => s.status === "published")).toHaveLength(6);
+    // Another account's choice changes nothing here.
+    sqlite.exec(`
+      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('bob', 'user', 'bob', 'Bob');
+      INSERT INTO retention_policies (account_id, category, thresholds)
+        VALUES ('bob', 'atlas-snapshots', '{"maxPrior": 0}');
+    `);
+    expect((await enforceRetention(db, [scope])).expired).toEqual([]);
+
+    // Ann keeps 3 priors for 2 days, and a value over the bounds is ignored.
+    sqlite.exec(`
+      INSERT INTO retention_policies (account_id, category, thresholds)
+        VALUES ('ann', 'atlas-snapshots', '{"maxPrior": 3, "priorDays": 2, "capGib": 9}');
+    `);
+    const result = await enforceRetention(db, [scope]);
+    expect(result.expired.map((e) => e.seq).sort((a, b) => a - b)).toEqual([1, 2]);
+    expect(new Set(result.expired.map((e) => e.reason))).toEqual(new Set(["count"]));
+    expect(result.capBytes).toBe(ATLAS_RETENTION.repoCapBytes);
+    // Priors stamped with 7 days are brought forward to 2.
+    const due = sqlite
+      .prepare(
+        `SELECT s.seq, s.expires_at, n.published_at FROM atlas_snapshots s
+         JOIN atlas_snapshots n ON n.scope = s.scope AND n.seq = s.seq + 1
+         WHERE s.scope = ? AND s.status = 'published' ORDER BY s.seq`,
+      )
+      .all(scope) as { seq: number; expires_at: string; published_at: string }[];
+    expect(due.map((d) => d.seq)).toEqual([3, 4, 5]);
+    for (const d of due)
+      expect(Date.parse(d.expires_at)).toBe(Date.parse(d.published_at) + 2 * DAY);
+    // The hourly sweep expires them after 2 days, not 7; current stays.
+    expect(await sweepAtlasRetention(db, { now: later(3 * DAY) })).toMatchObject({ expired: 3 });
+    expect(snapshots(sqlite).map((s) => s.status)).toEqual([
+      ...Array(5).fill("expired"),
+      "published",
+    ]);
+    expectAccounted(sqlite);
+  });
+
   test("storage pressure evicts the oldest priors first and never current", async () => {
     const { sqlite, db } = setup();
     await pushes(sqlite, db, 6, { size: 10_000 });

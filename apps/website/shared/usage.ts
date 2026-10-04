@@ -213,3 +213,125 @@ export function priceCost(
 
 /** Bytes in a GB, as Cloudflare bills storage. */
 export const GB = 1e9;
+
+// ---- the usage and cost report (CORE-209) ---------------------------------------
+
+export type UsageConstruct =
+  | "d1"
+  | "durable_objects"
+  | "r2"
+  | "artifacts"
+  | "vectorize"
+  | "ai_search"
+  | "workers_ai"
+  | "ci";
+
+export const USAGE_CONSTRUCTS: Readonly<Record<UsageConstruct, string>> = {
+  d1: "D1",
+  durable_objects: "Durable Objects",
+  r2: "R2",
+  artifacts: "Artifacts",
+  vectorize: "Vectorize",
+  ai_search: "AI Search",
+  workers_ai: "Workers AI",
+  ci: "CI sandboxes",
+};
+
+/** One measured or estimated figure: storage as of the report's day, or activity over its window. */
+export interface UsageFigure {
+  /** rows, bytes, instances, objects, repositories, vectors, dimensions, items, calls, input_tokens… */
+  metric: string;
+  quantity: number;
+  estimated: boolean;
+  /** How it was measured or estimated, in plain words. */
+  method: string;
+}
+
+/** What one priced figure costs per month at the catalog's list price. */
+export interface UsageCost {
+  /** The catalog price used. */
+  product: PriceProduct;
+  metric: string;
+  label: string;
+  /** The figure it prices. */
+  figure: string;
+  /** How much of the price's unit: GB-months, tokens over the window, stored dimensions… */
+  quantity: number;
+  unit: PriceUnit;
+  unitPriceUsd: number;
+  unitQuantity: number;
+  /** The account-wide allowance (not subtracted: these are gross list-price figures). */
+  includedQuantity: number | null;
+  includedPeriod: "month" | "day" | null;
+  effectiveFrom: string;
+  sourceUrl: string;
+  monthlyUsd: number;
+  /** The price isn't billed yet: billing starts this day, and monthlyUsd is what it will be. */
+  startsOn: string | null;
+  estimated: boolean;
+}
+
+export interface UsageCategoryLink {
+  id: string;
+  label: string;
+  /** What the category removes, in plain words. */
+  description: string;
+  scope: "account" | "site";
+}
+
+/** One thing an account keeps or does: a D1 table group, a Durable Object class, a model… */
+export interface UsageLine {
+  construct: UsageConstruct;
+  item: string;
+  label: string;
+  kind: "storage" | "activity";
+  figures: UsageFigure[];
+  costs: UsageCost[];
+  /** The sum of its costs already billed. */
+  monthlyUsd: number;
+  estimated: boolean;
+  /** The retention categories that clean this up. */
+  categories: UsageCategoryLink[];
+  /** E.g. why it has no price. */
+  note: string | null;
+}
+
+export interface UsageConstructReport {
+  construct: UsageConstruct;
+  label: string;
+  monthlyUsd: number;
+  estimated: boolean;
+  lines: UsageLine[];
+}
+
+export interface UsageTrendDay {
+  day: string;
+  /** That day's storage at a thirtieth of its monthly price, plus that day's activity. */
+  costUsd: number;
+  byConstruct: Partial<Record<UsageConstruct, number>>;
+  /** Whether a snapshot exists for the day. */
+  measured: boolean;
+}
+
+export interface UsageReport {
+  scope: "account" | "site";
+  /** The account, for an account's report. */
+  account: { slug: string; displayName: string } | null;
+  /** The day the storage figures describe; null before the first collection. */
+  asOf: string | null;
+  /** The activity window: the last 30 days up to asOf. */
+  window: { from: string; to: string; daysMeasured: number };
+  collectedAt: string | null;
+  monthlyUsd: number;
+  constructs: UsageConstructReport[];
+  trend: UsageTrendDay[];
+  /** Where the prices came from. */
+  catalog: {
+    version: number;
+    sources: { product: PriceProduct; label: string; url: string; sourceUpdated: string | null }[];
+  };
+  /** Site reports: each account's monthly estimate, highest first (at most 200). */
+  accounts: { slug: string; displayName: string; monthlyUsd: number }[] | null;
+  /** Caveats every reader should see. */
+  notes: string[];
+}

@@ -122,11 +122,16 @@ function usageTokens(
   return { input: usage?.inputTokens, output: usage?.outputTokens, total: usage?.totalTokens };
 }
 
+/** A turn this recent counts as in progress even before it streams (purgeIfIdle). */
+export const TURN_GRACE_MS = 10 * 60_000;
+
 export class Assistant extends AIChatAgent<Env> implements Purgeable {
   maxPersistedMessages = 500;
   private credential: AssistantCredential | null = null;
   /** Set while a `gm ask` turn runs (programmatic turns carry no request body). */
   private cli: CliTurn | null = null;
+  /** When the latest turn started (ms), for purgeIfIdle. */
+  #turnAt = 0;
 
   /** Whose model calls these are (CORE-207 metering). */
   #aiWork(): AiWork {
@@ -192,6 +197,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const repo = cli?.repo ?? page?.repo ?? null;
     const lastUser = [...this.messages].reverse().find((m) => m.role === "user");
     const lastReply = [...this.messages].reverse().find((m) => m.role === "assistant");
+    this.#turnAt = Date.now();
     await this.touch(web ? "web" : "cli");
 
     const history = this.messages.slice(-60);
@@ -420,6 +426,17 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
   async purge(reason: string): Promise<PurgeReport> {
     await this.destroy();
     return confirmPurged(this.ctx.storage, reason);
+  }
+
+  /**
+   * Purge unless the chat is being written to (retention, CORE-204): a turn
+   * streaming, a `gm ask` turn, or one started in the last TURN_GRACE_MS (it
+   * may not stream yet). Null when it's busy, and nothing changes.
+   */
+  async purgeIfIdle(reason: string): Promise<PurgeReport | null> {
+    if (this.cli || this._activeStreamId !== null || Date.now() - this.#turnAt < TURN_GRACE_MS)
+      return null;
+    return this.purge(reason);
   }
 
   /** Purge from the agent's own scheduler (its alarm), after the turn in progress. */

@@ -8,6 +8,7 @@ import type { QueueEntry } from "../../apps/website/shared/merge-queue.ts";
 import type { CiRunDetail, RepoDetail } from "../../apps/website/shared/api.ts";
 import type { DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
+import type { StepPage, StepVersions } from "../../apps/website/shared/steps.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 export type QueueGm = (
@@ -23,6 +24,7 @@ export async function queueFixture(
   ctx: HarnessContext,
   fixtures: SeedManifest,
   record: (value: unknown) => void,
+  holdSeconds = 12,
 ) {
   const name = `queue-${randomUUID().slice(0, 8)}`;
   const repo = `orbit/${name}`;
@@ -100,7 +102,7 @@ export async function queueFixture(
           if: 'trigger == "landing"',
           steps: [
             {
-              run: 'test "$(git log -1 --format=%P | wc -w)" = 2 && test ! -f queue-fail.txt && if test -f queue-hold.txt; then sleep 12; fi && echo QUEUE_GATE_OK',
+              run: `test "$(git log -1 --format=%P | wc -w)" = 2 && test ! -f queue-fail.txt && if test -f queue-hold.txt; then sleep ${holdSeconds}; fi && echo QUEUE_GATE_OK`,
             },
           ],
         },
@@ -193,11 +195,41 @@ export async function runQueueE2E(
   };
   const left = await clone("left"),
     right = await clone("right");
-  await commit(left, "left.txt", "left contribution\n");
+  const contextFile = join(f.root, "queued-context.md");
+  await writeFile(
+    contextFile,
+    "## Instructions\n- Preserve the left contribution\n\n## Steering\n- Keep admission separate from landing\n\n## Why\nQueued source context must survive candidate merging.\n\n## Challenges\nThe candidate has a different revision from the source.\n",
+  );
+  await writeFile(join(left, "left.txt"), "left contribution\n");
+  await gm(["commit", "-m", "Queue left.txt", "--context", contextFile], "marco", left);
+  assert.deepEqual((await f.json<StepPage>(`${f.api}/steps`)).steps, []);
   await commit(right, "right.txt", "right contribution\n");
   const [a, b] = await Promise.all([submit(left), submit(right)]);
+  const sourceSteps = (await f.json<StepPage>(`${f.api}/steps`)).steps;
+  assert.equal(sourceSteps.length, 1, "Queued push uploads its journaled context");
+  const step = sourceSteps[0]!;
+  assert.equal(step.commitOid, a, "Context belongs to the admitted source, not the candidate");
+  assert.equal(step.verified, true, "The server verifies the staged source revision");
+  assert.equal(step.summary, "Queue left.txt");
+  assert.deepEqual(step.context.instructions, [
+    { text: "Preserve the left contribution", source: "agent" },
+  ]);
+  assert.deepEqual(step.context.steering, [
+    { text: "Keep admission separate from landing", source: "agent" },
+  ]);
+  assert.equal(step.context.why, "Queued source context must survive candidate merging.");
+  assert.equal(step.context.challenges, "The candidate has a different revision from the source.");
+  assert.deepEqual((await f.json<StepVersions>(`${f.api}/steps/${step.changeId}`)).versions, [
+    step,
+  ]);
   await commit(left, "next.txt", "unsubmitted independent work\n");
-  await f.landed(a);
+  const leftLanded = await f.landed(a);
+  assert.notEqual(
+    leftLanded.candidate,
+    step.commitOid,
+    "Verified source context is not proof of landing",
+  );
+  assert.deepEqual((await f.json<StepPage>(`${f.api}/steps`)).steps, [step]);
   await f.landed(b);
   for (const [file, text] of [
     ["left.txt", "left contribution\n"],
@@ -373,4 +405,188 @@ export async function runQueueE2E(
     retried: heldId,
     directMain: await f.tip(),
   });
+  // A separate repository keeps lifecycle CI out of the original fixture's assertions.
+  await runActiveQueueDeletion(ctx, fixtures, gm, record);
+}
+
+// Node-side wire shape, kept separate from Worker-only runtime types.
+interface RepoInventory {
+  repoId: string;
+  repo: { name: string; deletedAt: string | null } | null;
+  d1: Record<string, number>;
+  registry: { packageSources: number; publishes: number };
+  durable: { purgedAt: string | null }[];
+  artifacts: { name: string | null; exists: boolean | null };
+  vectors: number | null;
+  searchItems: number | null;
+  previews: { live: number; teardownsOpen: number };
+  deletion: {
+    phase: string;
+    progress: {
+      stop?: { cancelled?: number };
+      rows?: Record<string, number>;
+      artifacts?: { deleted?: boolean };
+    };
+  } | null;
+}
+
+async function runActiveQueueDeletion(
+  ctx: HarnessContext,
+  fixtures: SeedManifest,
+  gm: QueueGm,
+  record: (value: unknown) => void,
+) {
+  const holdSeconds = 60;
+  const f = await queueFixture(ctx, fixtures, record, holdSeconds);
+  const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+  async function poll<T>(read: () => Promise<T>, done: (value: T) => boolean, label: string) {
+    const deadline = Date.now() + 300_000;
+    while (true) {
+      const value = await read();
+      if (done(value)) return value;
+      assert(Date.now() < deadline, `Timed out waiting for ${label}`);
+      await delay(1_000);
+    }
+  }
+  const inventory = async (repo = f.repo): Promise<RepoInventory> => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await f.json<RepoInventory>(
+          `/api/dev/repo-inventory?repo=${encodeURIComponent(repo)}`,
+          "GET",
+          undefined,
+          [200],
+          secret,
+        );
+      } catch (error) {
+        if (attempt === 3) throw error;
+        await delay(1_000);
+      }
+    }
+  };
+  const directory = join(f.root, "doomed");
+  await gm(["clone", f.repo, directory]);
+  await writeFile(
+    join(directory, "queue-hold.txt"),
+    "Delete while this candidate's real gate runs.\n",
+  );
+  await gm(["commit", "-m", "Queue deletion while gates run"], "marco", directory);
+  const admitted = JSON.parse(await gm(["push", "--queue"], "marco", directory)) as {
+    queue: QueueEntry;
+  };
+  const id = admitted.queue.id;
+  const entry = await f.wait(
+    id,
+    (value) => value.status === "testing" || value.status === "failed",
+  );
+  assert.equal(entry.status, "testing");
+  assert(entry.gateRun && entry.candidate);
+  const run = await poll(
+    () => f.json<CiRunDetail>(`${f.api}/ci/runs/${entry.gateRun}`),
+    (value) =>
+      value.status === "running" &&
+      value.jobs.some(
+        (job) =>
+          job.name === "gate" &&
+          job.status === "running" &&
+          job.steps.some((step) => step.status === "running"),
+      ),
+    "the actual candidate gate job and step to run",
+  );
+  const holdObservedAt = Date.now();
+  assert.equal(run.commit, entry.candidate);
+  assert.equal(run.trigger, "landing");
+  const before = await inventory();
+  assert.equal(before.repo?.deletedAt, null);
+  assert.equal(before.d1.merge_queue, 1);
+  assert((before.d1.ci_jobs ?? 0) > 0);
+  assert.equal(before.artifacts.exists, true);
+  // Inventory can be slow: do not accept deleting an already-finished gate.
+  const active = await f.json<CiRunDetail>(`${f.api}/ci/runs/${entry.gateRun}`);
+  assert.equal(active.status, "running");
+  assert.equal(active.jobs.find((job) => job.name === "gate")?.status, "running");
+  assert.equal((await f.show(id)).status, "testing");
+  record({ deletingQueue: { repo: f.repo, entry, run: active, before } });
+
+  await f.json(f.api, "DELETE", undefined, [204]);
+  for (const path of [
+    f.api,
+    `${f.api}/queue`,
+    `${f.api}/queue/${id}`,
+    `${f.api}/ci/runs/${entry.gateRun}`,
+  ])
+    await f.json(path, "GET", undefined, [404]);
+  await f.json(`${f.api}/queue/${id}/retry`, "POST", {}, [404]);
+  await f.json(`${f.api}/queue`, "POST", { commit: id }, [404]);
+  await gm(["clone", f.repo, join(f.root, "deleted-clone")], "marco", f.root, /not found|404/i);
+
+  const purged = await poll(
+    () => inventory(before.repoId),
+    (value) => value.deletion?.phase === "done",
+    "the active queue repository purge",
+  );
+  const assertPurged = (value: RepoInventory) => {
+    assert.equal(value.repo, null);
+    assert.deepEqual(value.d1, {}, "No old rows, including merge_queue, CI or refs, survive");
+    assert.equal(value.artifacts.exists, false);
+    assert.deepEqual(value.registry, { packageSources: 0, publishes: 0 });
+    assert.deepEqual(value.previews, { live: 0, teardownsOpen: 0 });
+    for (const instance of value.durable) assert(instance.purgedAt);
+    assert(!value.vectors && !value.searchItems);
+    assert.equal(value.deletion?.phase, "done");
+  };
+  assertPurged(purged);
+  assert((purged.deletion?.progress.stop?.cancelled ?? 0) >= 1, "Purge cancelled active old CI");
+  assert.equal(purged.deletion?.progress.rows?.merge_queue, 1, "Purge removed the queued work");
+  assert.equal(purged.deletion?.progress.artifacts?.deleted, true);
+
+  const name = f.repo.split("/")[1]!;
+  await f.json("/api/repos", "POST", { owner: "orbit", name, visibility: "private" }, [201]);
+  const fresh = await inventory();
+  assert.notEqual(fresh.repoId, before.repoId, "Same name is a new repository identity");
+  const freshDetail = await f.json<RepoDetail>(f.api);
+  assert.deepEqual(freshDetail.branches, []);
+  await f.json(`${f.api}/queue/${id}`, "GET", undefined, [404]);
+  await f.json(`${f.api}/queue/${id}/retry`, "POST", {}, [404]);
+  await f.json(`${f.api}/queue/${id}/cancel`, "POST", {}, [404]);
+  await f.json(`${f.api}/ci/runs/${entry.gateRun}`, "GET", undefined, [404]);
+  await f.json(`${f.api}/queue`, "POST", { commit: id }, [409]);
+  const tracker = `/api/tracker/${fixtures.tracker.owner}/snapshot`;
+  // Observe through the original hold's completion window, not just a clean
+  // instant after deletion: late callbacks must not publish or recreate work.
+  const settleUntil = Math.max(Date.now() + 5_000, holdObservedAt + (holdSeconds + 5) * 1_000);
+  for (;;) {
+    assertPurged(await inventory(before.repoId));
+    assert.deepEqual((await f.json<RepoDetail>(f.api)).branches, []);
+    assert.deepEqual((await f.json<{ entries: QueueEntry[] }>(`${f.api}/queue`)).entries, []);
+    const current = await inventory(fresh.repoId);
+    for (const table of [
+      "merge_queue",
+      "ci_runs",
+      "ci_jobs",
+      "ci_steps",
+      "ci_logs",
+      "repo_refs",
+      "ref_updates",
+      "deployments",
+    ])
+      assert.equal(current.d1[table] ?? 0, 0, `Old work must not populate fresh ${table}`);
+    const snapshot = await f.json<Snapshot>(tracker);
+    assert.equal(
+      snapshot.issues.filter((issue) => issue.queueFailure?.queueId === id).length,
+      0,
+      "Deletion must not generate a stale queue-failure remediation",
+    );
+    if (Date.now() >= settleUntil) break;
+    await delay(1_000);
+  }
+  record({ deletedQueue: { id, oldRepoId: before.repoId, freshRepoId: fresh.repoId, purged } });
+  await f.json(f.api, "DELETE", undefined, [204]);
+  assertPurged(
+    await poll(
+      () => inventory(fresh.repoId),
+      (value) => value.deletion?.phase === "done",
+      "the fresh empty repository cleanup",
+    ),
+  );
 }

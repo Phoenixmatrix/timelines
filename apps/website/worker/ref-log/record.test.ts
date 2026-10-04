@@ -92,6 +92,27 @@ describe("recordRefs", () => {
     expect(t.membership()).toHaveLength(3);
   });
 
+  test("a push verifies step context reported for its commits (CORE-231)", async () => {
+    const t = setup();
+    const a = t.commit("aaaa");
+    const other = "f".repeat(40);
+    t.sqlite.exec(`
+      INSERT INTO step_contexts (repo_id, change_id, commit_oid, author_id, accountable_id, committed_at)
+      VALUES ('repo', 'aaaa', '${a}', 'agt_builder', 'acc_ann', '2026-10-04T00:00:00Z'),
+             ('repo', 'zzzz', '${other}', 'agt_builder', 'acc_ann', '2026-10-04T00:00:00Z');
+    `);
+    await t.push({ "refs/heads/timeline/search": a });
+    const verified = t.sqlite
+      .prepare(
+        "SELECT commit_oid, verified_at IS NOT NULL AS verified FROM step_contexts ORDER BY commit_oid",
+      )
+      .all();
+    expect(verified).toEqual([
+      { commit_oid: a, verified: 1 },
+      { commit_oid: other, verified: 0 },
+    ]);
+  });
+
   test("fast-forwards, force pushes and deletions are all logged", async () => {
     const t = setup();
     const a = t.commit("aaaa");

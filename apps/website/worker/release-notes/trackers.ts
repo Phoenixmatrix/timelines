@@ -95,6 +95,7 @@ export async function affectedRepos(
       .selectFrom("repos")
       .select("id")
       .where("id", "=", repoId)
+      .where("deleted_at", "is", null)
       .executeTakeFirst();
     if (!exists) continue;
     if (subscribed.value.length)

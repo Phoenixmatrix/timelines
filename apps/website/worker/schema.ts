@@ -88,6 +88,25 @@ export interface Database {
     pushed_at: string | null;
     /** Pack bytes pushed through the proxy since CORE-207 (Artifacts' size estimate). */
     pushed_bytes: Generated<number>;
+    /** Set when deletion starts (CORE-199): missing to readers until the purge removes the row. */
+    deleted_at: Generated<string | null>;
+  };
+  /** Repository deletions and what their purge did (CORE-199, worker/retention/repo-purge.ts). */
+  repo_deletions: {
+    repo_id: string;
+    owner_id: string;
+    full_name: string;
+    artifacts_name: string | null;
+    source: Generated<"delete" | "orphan-sweep">;
+    requested_by: string | null;
+    requested_at: string;
+    phase: string;
+    progress: Generated<string>;
+    workflow_id: string | null;
+    attempts: Generated<number>;
+    updated_at: string;
+    finished_at: string | null;
+    error: string | null;
   };
   repo_collaborators: {
     repo_id: string;
@@ -173,6 +192,33 @@ export interface Database {
     output_tokens: Generated<number>;
     total_tokens: Generated<number>;
   };
+  /** usage_snapshots past their policy, rolled up by month (CORE-225, worker/usage/history.ts). */
+  usage_monthly: {
+    month: string;
+    account_id: string;
+    construct: UsageConstruct;
+    item: string;
+    metric: string;
+    kind: "storage" | "activity";
+    quantity: number;
+    days: number;
+    last_day: string;
+    last_quantity: number;
+    estimated: number;
+    method: string;
+  };
+  /** ai_usage past its policy, rolled up by month (CORE-225). */
+  ai_usage_monthly: {
+    month: string;
+    account_id: string;
+    feature: string;
+    model: string;
+    calls: Generated<number>;
+    input_tokens: Generated<number>;
+    output_tokens: Generated<number>;
+    total_tokens: Generated<number>;
+    days: Generated<number>;
+  };
   /** Where a bounded, resumable cron pass left off. */
   job_cursors: {
     name: string;
@@ -204,6 +250,8 @@ export interface Database {
     model: string | null;
     tokens: Generated<number>;
     created_at: Generated<string>;
+    /** When a build last used it (at most daily; CORE-201). */
+    used_at: Generated<string | null>;
   };
   kg_synthesis: {
     key: string;
@@ -211,6 +259,8 @@ export interface Database {
     model: string | null;
     tokens: Generated<number>;
     created_at: Generated<string>;
+    /** When a build last used it (at most daily; CORE-201). */
+    used_at: Generated<string | null>;
   };
   kg_nodes: {
     repo_id: string;
@@ -318,6 +368,18 @@ export interface Database {
     /** Set when the bookmark disappeared (CORE-139): the overlay is kept read-only. */
     ended_at: string | null;
     ended_reason: "landed" | "abandoned" | "ended" | null;
+    /** Set when retention removed an ended overlay's changes and pages (CORE-201). */
+    removed_at: Generated<string | null>;
+  };
+  /** Atlas spend rolled up per account and day (CORE-201, "ai-spend"). */
+  atlas_spend_daily: {
+    account_id: string;
+    day: string;
+    calls: number;
+    input_tokens: number;
+    output_tokens: number;
+    cost_micro_usd: number;
+    rolled_up_at: string;
   };
   /** Atlas paid-synthesis calls, reserved then reconciled (worker/knowledge/budget.ts). */
   atlas_spend: {
@@ -615,6 +677,8 @@ export interface Database {
     ai_snapshot: Generated<string | null>;
     lease_id: Generated<string | null>;
     generation_refs: Generated<string | null>;
+    /** Releases before it were removed by retention: never regenerated (CORE-206). */
+    retained_from: Generated<string | null>;
   };
   ci_refs: {
     repo_id: string;
@@ -702,6 +766,8 @@ export interface Database {
     finished_at: string | null;
     /** Set when a job in a concurrency group took the group's slot. */
     concurrency_claimed_at: Generated<string | null>;
+    /** When retention removed its log text (CORE-200). */
+    logs_removed_at: Generated<string | null>;
   };
   ci_steps: {
     job_id: string;
@@ -774,6 +840,24 @@ export interface Database {
     teardown_run_id: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
+  /** The context attached to a step: a commit an agent made in a timeline (CORE-231). */
+  step_contexts: {
+    repo_id: string;
+    change_id: string;
+    commit_oid: string;
+    author_id: string;
+    accountable_id: string;
+    timeline: string | null;
+    issue_key: string | null;
+    summary: Generated<string>;
+    /** JSON StepContextBody. */
+    context: Generated<string>;
+    committed_at: string;
+    verified_at: string | null;
+    deleted_at: string | null;
+    deleted_by: string | null;
+    created_at: Generated<string>;
+  };
   /** A person's one set of generated avatar options (CORE-116). */
   avatar_generations: {
     user_id: string;
