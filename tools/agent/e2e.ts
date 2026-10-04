@@ -791,9 +791,74 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       undefined,
       { ...agentEnv, GM_LEASE_TOKEN: lease },
     );
+
+    // Requirements (CORE-32): next passes over what the agent doesn't meet and
+    // says so, a claim names what's missing, and people can lift them.
+    const owner = fixtures.tracker.owner;
+    const key = `R${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "team.create", id: randomUUID(), data: { key, name: "Requirements" } }],
+    });
+    const create = async (title: string, priority: string, requires: string) =>
+      (
+        JSON.parse(
+          await gm([
+            "issue",
+            "create",
+            title,
+            "--team",
+            key,
+            "--priority",
+            priority,
+            "--requires",
+            requires,
+            "--owner",
+            owner,
+          ]),
+        ) as { entities: { id: string; key: string | null; requires?: unknown }[] }
+      ).entities[0]!;
+    const gpu = await create("Needs a GPU", "0", "tag:gpu memory>=1TiB");
+    const native = await create("Native work", "1", "tag:NATIVE-E2E model:fixture-*");
+    assert.deepEqual(native.requires, { tags: ["native-e2e"], models: ["fixture-*"] });
+    const asAgent = (args: string[], failure?: RegExp) =>
+      gm([...args, "--owner", owner], "marco", work, failure, agentEnv);
+    const picked = JSON.parse(await asAgent(["issue", "next", "--team", key, "--agent", name])) as {
+      claimed: { issueId: string; leaseToken: string } | null;
+      skipped: { requirements: number; keys: string[]; message: string };
+    };
+    assert.equal(picked.claimed?.issueId, native.id, "next takes the issue it meets");
+    secrets.add(picked.claimed!.leaseToken);
+    assert.equal(picked.skipped.requirements, 1);
+    assert.deepEqual(picked.skipped.keys, [`${key}-1`]);
+    await asAgent(["issue", "release", native.id]);
+    // Refused, naming each requirement it misses.
+    await asAgent(
+      ["issue", "claim", gpu.id, "--agent", name],
+      /requirements_unmet[\s\S]*needs tag gpu[\s\S]*needs at least 1TiB of memory/,
+    );
+    const eligibility = JSON.parse(await asAgent(["issue", "show", gpu.id])) as {
+      issue: { requiresText: string };
+      eligibility: { eligible: boolean; unmet: { wanted: string }[] };
+    };
+    assert.equal(eligibility.issue.requiresText, "tag:gpu memory>=1TiB");
+    assert.equal(eligibility.eligibility.eligible, false);
+    assert.deepEqual(
+      eligibility.eligibility.unmet.map((u) => u.wanted),
+      ["tag:gpu", "memory>=1TiB"],
+    );
+    await gm(["issue", "update", gpu.id, "--clear-requires", "--owner", owner]);
+    const lifted = JSON.parse(await asAgent(["issue", "claim", gpu.id, "--agent", name])) as {
+      results: { leaseToken: string }[];
+    };
+    secrets.add(lifted.results[0]!.leaseToken);
+    await asAgent(["issue", "release", gpu.id]);
+
     await gm(["agent", "revoke", other.agent.id]);
     await gm(["agent", "revoke", agent.id]);
     record({
+      requirementsSkipped: picked.skipped.requirements,
+      requirementsRefused: true,
       agent: name,
       model: capabilities.model,
       tags: capabilities.tags,

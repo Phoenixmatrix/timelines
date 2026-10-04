@@ -392,6 +392,9 @@ pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
     Err(match status {
         401 => GmError::new("unauthenticated", message).exit(exit::AUTH),
         403 => GmError::new("forbidden", message).exit(exit::AUTH),
+        409 if value.get("code").and_then(Value::as_str) == Some("requirements_unmet") => {
+            requirements_unmet(message)
+        }
         409 => GmError::new("conflict", message).exit(exit::CONFLICT),
         // A tracker change feed pruned past the replica's cursor: start over.
         410 if value.get("code").and_then(Value::as_str) == Some("cursor_expired") => {
@@ -399,6 +402,14 @@ pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
         }
         _ => GmError::new("server_error", format!("HTTP {status}: {message}")),
     })
+}
+
+/// An agent refused an issue it doesn't meet the requirements of (CORE-32); the
+/// message lists each unmet requirement.
+fn requirements_unmet(message: String) -> GmError {
+    GmError::new("requirements_unmet", message)
+        .exit(exit::CONFLICT)
+        .hint("See what it needs with `gm issue show <key>`; publish this agent's capabilities with `gm agent setup` (e.g. --tag ux); or a person can claim it, or assign it to this agent.")
 }
 
 /// Fetch a registry artifact without following redirects or forwarding credentials.
@@ -758,6 +769,9 @@ fn status_error(status: u16, value: &Value) -> GmError {
             GmError::not_found("removed_by_retention", message)
         }
         404 => GmError::not_found("not_found", message),
+        409 if value.get("code").and_then(Value::as_str) == Some("requirements_unmet") => {
+            requirements_unmet(message)
+        }
         409 => GmError::new("conflict", message).exit(exit::CONFLICT),
         // A tracker change feed pruned past the replica's cursor: start over.
         410 if value.get("code").and_then(Value::as_str) == Some("cursor_expired") => {

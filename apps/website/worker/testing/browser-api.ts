@@ -35,6 +35,7 @@ import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
 import { Timing } from "../timing.ts";
 import { tracker } from "../tracker/api.ts";
+import { agents } from "../api/agents.ts";
 import { Tracker } from "../tracker/object.ts";
 import { d1, migratedDatabase } from "./d1.ts";
 import { durableStorage } from "./durable.ts";
@@ -181,6 +182,7 @@ app.use(async (c, next) => {
   await next();
 });
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
+app.route("/api/agents", agents);
 app.route("/api", accounts);
 app.route("/api/tracker/:owner/release-notes", trackerReleaseNotes);
 app.route("/api/tracker/:owner/timelines", timelines);

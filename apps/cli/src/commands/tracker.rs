@@ -1,6 +1,6 @@
 //! Private offline tracker replicas. The outbox is durable before HTTP and immutable
 //! after its first send; an ambiguous acknowledgement is replayed with the same ID.
-use super::Ctx;
+use super::{Ctx, requirements};
 use crate::{
     output::{GmError, Render, Result},
     remote::{self, Config},
@@ -48,17 +48,43 @@ impl Render for Shown {
         }
         if self.0.get("ancestors").is_some() && self.0.get("issue").is_some() {
             return format!(
-                "Created by: {}\n{}\n{body}",
+                "Created by: {}\n{}{}\n{body}",
                 self.0["issue"]["creatorDisplay"]
                     .as_str()
                     .unwrap_or("Unknown"),
-                done_in_text(&self.0["issue"])
+                done_in_text(&self.0["issue"]),
+                requirements_text(&self.0),
             );
         }
         body
     }
 }
 
+/// An issue's requirements and the acting identity's eligibility (CORE-32), as lines.
+fn requirements_text(shown: &Value) -> String {
+    let mut out = String::new();
+    if let Some(text) = shown["issue"]["requiresText"].as_str() {
+        out.push_str(&format!("Requires: {text}\n"));
+    }
+    if let Some(why) = shown["eligibility"]["why"].as_str()
+        && requirements::has_requirements(&shown["issue"]["requires"])
+    {
+        out.push_str(&format!("Eligibility: {why}\n"));
+    }
+    if let Some(assignee) = shown["assigneeMismatch"]["assignee"].as_str() {
+        out.push_str(&format!(
+            "Assigned to {assignee}, which doesn't meet: {}\n",
+            shown["assigneeMismatch"]["unmet"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    out
+}
 /// Where an issue is done while its timeline hasn't landed (CORE-74), as lines; else nothing.
 fn done_in_text(issue: &Value) -> String {
     let Some(slug) = issue["doneIn"]["slug"].as_str() else {
@@ -638,6 +664,7 @@ impl Replica {
                 }
                 Err(error) => {
                     if error.code == "conflict"
+                        || error.code == "requirements_unmet"
                         || error.code == "not_found"
                         || error.code == "forbidden"
                         || (error.code == "server_error" && error.message.starts_with("HTTP 4"))
@@ -949,6 +976,7 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "parentId",
                 "workspaceIds",
                 "labels",
+                "requires",
             ]
             .contains(&key.as_str())
         {
@@ -956,6 +984,9 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "Server-owned or unknown issue field '{key}'."
             )));
         }
+    }
+    if let Some(requires) = data.get("requires") {
+        requirements::normalize(requires)?;
     }
     Ok(())
 }
@@ -1107,6 +1138,11 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         {
             row.insert("timelinePolicy".into(), Value::Null);
         }
+        if entity == "issue"
+            && let Some(requires) = data.get("requires")
+        {
+            row.insert("requires".into(), requirements::normalize(requires)?);
+        }
         row.insert(
             "version".into(),
             json!(mutation["expectedVersion"].as_u64().unwrap_or(0) + 1),
@@ -1130,6 +1166,11 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         };
         for (key, value) in data {
             row[key] = value.clone();
+        }
+        if entity == "issue"
+            && let Some(requires) = data.get("requires")
+        {
+            row["requires"] = requirements::normalize(requires)?;
         }
         row["id"] = mutation["id"].clone();
         row["version"] = json!(1);
@@ -1171,7 +1212,17 @@ fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
         None => json!({}),
     };
     timeline_fields(&p.timeline, &mut data);
+    requires_field(&p.requires, p.clear_requires, &mut data)?;
     Ok(json!({"kind":"issue.update","id":row["id"],"expectedVersion":row["version"],"data":data}))
+}
+/// `--requires TERMS` as the stored `requires` object; `--clear-requires` as null.
+fn requires_field(args: &RequiresArgs, clear: bool, data: &mut Value) -> Result<()> {
+    if clear {
+        data["requires"] = Value::Null;
+    } else if let Some(text) = &args.requires {
+        data["requires"] = requirements::parse(text)?;
+    }
+    Ok(())
 }
 /// `--timeline-use`/`--timeline-policy` as `timelineUse`/`timelinePolicy` (`none` clears).
 fn timeline_fields(rule: &TimelineRule, data: &mut Value) {
@@ -1706,6 +1757,9 @@ fn named(snapshot: &Value, issue: &Value) -> Value {
     if let Some(assignee) = issue["assigneeId"].as_str() {
         out["assignee"] = json!(actor_name(snapshot, assignee));
     }
+    if requirements::has_requirements(&issue["requires"]) {
+        out["requiresText"] = json!(requirements::text(&issue["requires"]));
+    }
     out["creatorDisplay"] = json!(if issue["createdBy"].is_null() {
         "Unknown".to_string()
     } else if issue["createdBy"]["name"].is_null() {
@@ -1822,6 +1876,110 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline,"timeline":snapshot["timeline"]}),
     ))
 }
+/// Who gm acts as here, for eligibility (CORE-32): a person, an agent (with its
+/// directory entry when the replica knows it), or unknown.
+enum Acting {
+    Person,
+    Agent { name: String, entry: Option<Value> },
+    Unknown,
+}
+fn acting(r: &Replica, snapshot: &Value, offline: bool) -> Acting {
+    let agents = snapshot["agents"].as_array().cloned().unwrap_or_default();
+    match r.config.identity() {
+        Ok(remote::Identity::Person) => Acting::Person,
+        Ok(remote::Identity::Agent { name }) => {
+            // Names are unique per person: prefer the agent of the person this replica belongs to.
+            let person = r.meta("actor").ok().flatten();
+            let named: Vec<&Value> = agents
+                .iter()
+                .filter(|a| a["name"] == name.as_str())
+                .collect();
+            let entry = named
+                .iter()
+                .find(|a| {
+                    person
+                        .as_deref()
+                        .is_some_and(|p| a["accountable"]["id"] == p)
+                })
+                .or(named.first())
+                .map(|a| (*a).clone());
+            Acting::Agent { name, entry }
+        }
+        // GM_TOKEN: ask the server who it is, when online.
+        _ if offline => Acting::Unknown,
+        _ => match remote::api(&r.config, "GET", "/session", None) {
+            Ok(session) if session["viewer"]["agent"].is_object() => {
+                let id = &session["viewer"]["agent"]["id"];
+                Acting::Agent {
+                    name: session["viewer"]["agent"]["name"]
+                        .as_str()
+                        .unwrap_or("this agent")
+                        .to_string(),
+                    entry: agents.iter().find(|a| a["id"] == *id).cloned(),
+                }
+            }
+            Ok(session) if session["viewer"]["id"].is_string() => Acting::Person,
+            _ => Acting::Unknown,
+        },
+    }
+}
+/// Whether `acting` may claim `issue` by its requirements: people always may;
+/// an agent when it meets every one, or when the issue is assigned to it.
+fn eligibility(issue: &Value, acting: &Acting) -> Value {
+    let requires = &issue["requires"];
+    match acting {
+        Acting::Unknown => Value::Null,
+        Acting::Person => {
+            json!({"kind":"person","eligible":true,"why":"People can always claim; requirements apply to agents."})
+        }
+        Acting::Agent { name, entry: None } => json!({
+            "kind":"agent","agent":name,"eligible":Value::Null,
+            "why":"This agent isn't in the tracker's directory yet; run `gm tracker sync`, or `gm agent setup` to publish it.",
+        }),
+        Acting::Agent {
+            name,
+            entry: Some(agent),
+        } => {
+            let unmet = requirements::unmet(requires, &agent["capabilities"]);
+            let assigned = issue["assigneeId"] == agent["id"];
+            let why = if !requirements::has_requirements(requires) {
+                "No requirements: any agent may claim it.".to_string()
+            } else if unmet.is_empty() {
+                "It meets every requirement.".to_string()
+            } else if assigned {
+                "It doesn't meet every requirement, but the issue is assigned to it, so it may still claim it.".to_string()
+            } else {
+                format!(
+                    "It can't claim it: {}. Publish its capabilities with `gm agent setup` (e.g. --tag), or ask a person to claim it or assign it to this agent.",
+                    unmet
+                        .iter()
+                        .filter_map(|u| u["message"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            };
+            json!({
+                "kind":"agent","agent":name,"eligible":unmet.is_empty() || assigned,
+                "unmet":unmet,"why":why,
+            })
+        }
+    }
+}
+/// The assignee, when it's an agent that doesn't meet the issue's requirements:
+/// explicit assignment lets it claim anyway, and shows the mismatch.
+fn assignee_mismatch(snapshot: &Value, issue: &Value) -> Option<Value> {
+    let agent = snapshot["agents"]
+        .as_array()?
+        .iter()
+        .find(|a| a["id"] == issue["assigneeId"] && !a["id"].is_null())?;
+    let unmet = requirements::unmet(&issue["requires"], &agent["capabilities"]);
+    (!unmet.is_empty()).then(|| {
+        json!({
+            "assignee": actor_name(snapshot, agent["id"].as_str().unwrap_or("")),
+            "unmet": unmet,
+        })
+    })
+}
 /// Adds a delegation's underToken and forActorId (an agent resolved by name or id).
 fn delegate(snapshot: &Value, delegation: &Delegation, data: &mut Value) -> Result<()> {
     if let Some(token) = &delegation.under_token {
@@ -1864,11 +2022,29 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
             "message": "The claim response lacked a fencing token. Inspect the issue online; do not assume ownership.",
         }));
     }
+    // Ready issues passed over because this agent doesn't meet their requirements (CORE-32).
+    let skipped = result["skipped"].clone();
+    let skipped_count = skipped["requirements"].as_u64().unwrap_or(0);
     let Some(issue_id) = result["issueId"].as_str() else {
-        return Shown(json!({
+        let mut out = json!({
             "claimed": null,
             "message": "Nothing in scope is ready: everything is claimed, blocked, waiting, or done.",
-        }));
+        });
+        if skipped_count > 0 {
+            out["message"] = json!(format!(
+                "Nothing in scope is ready for this agent: it skipped {skipped_count} ready issue{} whose requirements it doesn't meet ({}). See what one needs with `gm issue show <key>`; `gm agent setup` (e.g. --tag ux) updates what this agent reports, or a person can claim or assign them.",
+                if skipped_count == 1 { "" } else { "s" },
+                skipped["keys"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+            out["skipped"] = skipped;
+        }
+        return Shown(out);
     };
     let context = context(snapshot, issue_id, 30, false)
         .map(|shown| shown.0)
@@ -1903,6 +2079,9 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
         "blockerEvidence": blocker_evidence,
         "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete with evidence. gm kept the lease token for this identity, so those commands need no token.",
     });
+    if skipped_count > 0 {
+        out["skipped"] = skipped;
+    }
     if let Some(notice) = crate::profile::model_notice() {
         out["notice"] = json!(notice);
     }
@@ -1999,8 +2178,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 );
             }
             IssueCommand::Show { issue, limit } => {
-                return context(&snapshot, issue, *limit as usize, args.scope.offline).map_err(
-                    |error| {
+                let mut shown = context(&snapshot, issue, *limit as usize, args.scope.offline)
+                    .map_err(|error| {
                         if error.code != "tracker_not_found" || args.scope.offline {
                             return error;
                         }
@@ -2014,8 +2193,14 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                             Err(removed) if removed.code == "removed_by_retention" => removed,
                             _ => error,
                         }
-                    },
-                );
+                    })?;
+                // Whether the acting identity may claim it, and whether its assignee could (CORE-32).
+                let acting = acting(r, &snapshot, args.scope.offline);
+                shown.0["eligibility"] = eligibility(&shown.0["issue"], &acting);
+                if let Some(mismatch) = assignee_mismatch(&snapshot, &shown.0["issue"]) {
+                    shown.0["assigneeMismatch"] = mismatch;
+                }
+                return Ok(shown);
             }
             IssueCommand::History { .. } => unreachable!("handled before opening the replica"),
             IssueCommand::Create(a) => {
@@ -2045,6 +2230,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
                 );
                 timeline_fields(&a.timeline, &mut mutation["data"]);
+                requires_field(&a.requires, false, &mut mutation["data"])?;
                 mutation
             }
             IssueCommand::Update(p) => issue_patch(&snapshot, p)?,
@@ -2268,6 +2454,10 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                         && e.message.starts_with("Claim expired, was superseded")
                     {
                         drop_lease(&r.config, &target);
+                    }
+                    // A definite refusal: the agent doesn't meet the issue's requirements.
+                    if e.code == "requirements_unmet" {
+                        return Err(e);
                     }
                     return Err(e.hint("Lease outcome may be uncertain after transport failure. Inspect the issue online; do not assume ownership without the returned fencing token."));
                 }
@@ -3046,6 +3236,8 @@ mod tests {
                 id: "ENG-1".into(),
                 data: Some(r#"{"priority":1}"#.into()),
                 timeline: flags(Some("required"), Some("approval")),
+                requires: RequiresArgs { requires: None },
+                clear_requires: false,
             },
         )
         .unwrap();
@@ -3059,10 +3251,49 @@ mod tests {
                 id: "a".into(),
                 data: None,
                 timeline: flags(None, Some("none")),
+                requires: RequiresArgs { requires: None },
+                clear_requires: false,
             },
         )
         .unwrap();
         assert_eq!(cleared["data"], json!({"timelinePolicy":null}));
+    }
+    #[test]
+    fn requirements_patch_and_project_offline_in_their_stored_form() {
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"a","key":"ENG-1","version":4,"status":"todo"}]);
+        let patch = |requires: Option<&str>, clear: bool| {
+            issue_patch(
+                &s,
+                &IssuePatch {
+                    id: "ENG-1".into(),
+                    data: None,
+                    timeline: TimelineRule {
+                        timeline_use: None,
+                        timeline_policy: None,
+                    },
+                    requires: RequiresArgs {
+                        requires: requires.map(str::to_string),
+                    },
+                    clear_requires: clear,
+                },
+            )
+        };
+        let set = patch(Some("tag:UX memory>=8G"), false).unwrap();
+        assert_eq!(
+            set["data"],
+            json!({"requires":{"tags":["ux"],"minMemory":8u64<<30}})
+        );
+        assert_eq!(patch(None, true).unwrap()["data"], json!({"requires":null}));
+        assert!(patch(Some("gpu"), false).is_err());
+
+        // The replica keeps what the server will: normalized, and rejects bad values.
+        project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":4,"data":{"requires":{"tags":[" GPU ","gpu"],"os":[]}}})).unwrap();
+        assert_eq!(s["issues"][0]["requires"], json!({"tags":["gpu"]}));
+        project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":5,"data":{"requires":{"os":[]}}})).unwrap();
+        assert!(s["issues"][0]["requires"].is_null());
+        assert!(project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":6,"data":{"requires":{"disk":1}}})).is_err());
+        assert!(validate_batch(&[json!({"kind":"issue.create","id":"n","data":{"teamId":"t","title":"x","requires":{"minCpus":0}}})]).is_err());
     }
     #[test]
     fn agents_are_named_with_their_accountable_person() {

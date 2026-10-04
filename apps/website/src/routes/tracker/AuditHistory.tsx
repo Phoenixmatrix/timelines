@@ -6,6 +6,7 @@ import type {
   Snapshot,
 } from "../../../shared/tracker.ts";
 import { api } from "../../lib/api.ts";
+import { requirementsText, type IssueRequirements } from "../../../shared/requirements.ts";
 import { FormError } from "../../components/ui.tsx";
 
 /** Prefer the immutable snapshot; the directory only fills gaps in legacy attribution. */
@@ -52,6 +53,7 @@ const labels: Record<string, string> = {
   parentId: "Parent issue",
   workspaceIds: "Workspaces",
   labels: "Labels",
+  requires: "Agent requirements",
   body: "Body",
   fromId: "From issue",
   toId: "To issue",
@@ -67,7 +69,8 @@ const bookkeeping: Record<string, true> = {
   updatedAt: true,
   createdBy: true,
 };
-function valueText(value: unknown): string {
+function valueText(value: unknown, key?: string): string {
+  if (key === "requires") return value ? requirementsText(value as IssueRequirements) : "Any agent";
   if (value === undefined) return "Not present";
   if (value === null) return "None";
   if (value === "") return "Empty text";
@@ -128,11 +131,11 @@ function AuditEntry({ event, snapshot }: { event: IssueAuditEvent; snapshot: Sna
               <dd className="m-0 grid min-w-0 grid-cols-[3rem_minmax(0,1fr)] gap-x-2 gap-y-0.5">
                 <span className="text-ink-muted">Before</span>
                 <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">
-                  {beforeUnknown ? "Not recorded" : valueText(field.before)}
+                  {beforeUnknown ? "Not recorded" : valueText(field.before, field.key)}
                 </span>
                 <span className="text-ink-muted">After</span>
                 <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">
-                  {valueText(field.after)}
+                  {valueText(field.after, field.key)}
                 </span>
               </dd>
             </div>

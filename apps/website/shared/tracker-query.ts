@@ -8,8 +8,11 @@
 //   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
 //   since:7d until:2026-09-01   (last activity: updatedAt)
 //   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
+//   requires:ux|tag:ux|memory>=16GiB|none   eligible:builder|me (CORE-32: which
+//   agents meet an issue's requirements; people always can);
 //   other words match key, title and labels; - excludes.
 
+import { hasRequirements, requirementTerms, unmetRequirements } from "./requirements.ts";
 import {
   actorName,
   claimHolder,
@@ -168,6 +171,8 @@ export const QUERY_KEYS = [
   "since",
   "until",
   "parent",
+  "requires",
+  "eligible",
 ] as const;
 export type QueryKey = (typeof QUERY_KEYS)[number];
 const ALIASES: Record<string, QueryKey> = {
@@ -288,7 +293,80 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
       const parent = index.byKey.get(v) ?? index.byId.get(v);
       return (i) => !!parent && i.parentId === parent.id;
     }
+    case "requires":
+      if (v === "none") return (i) => !hasRequirements(i.requires);
+      // A whole term ("tag:ux", "memory>=16gib"), else any listed value ("ux").
+      return (i) =>
+        requirementTerms(i.requires).some((term) => {
+          const t = term.toLowerCase();
+          return t === v || t.slice(t.indexOf(":") + 1) === v;
+        });
+    case "eligible": {
+      const id = v === "me" ? viewerId : null;
+      const agents = index.people.agents.filter((a) =>
+        id ? a.id === id : a.id.toLowerCase() === v || a.name.toLowerCase() === v,
+      );
+      // People can always claim: `eligible:me` for a person matches everything.
+      if (v === "me" && !agents.length) return () => true;
+      return (i) => agents.some((agent) => agentEligible(i, agent));
+    }
   }
+}
+
+/** Which open work an agent can take in one tracker (CORE-32), for the Agents page. */
+export interface AgentWork {
+  agentId: string;
+  /** Open issues other than PRDs. */
+  open: number;
+  /** Of those, the ones with requirements. */
+  requiring: number;
+  /** Of those, the ones it meets (or is assigned). */
+  eligible: number;
+  /** A few it doesn't meet, highest priority first, and why. */
+  missing: { key: string; title: string; unmet: string[] }[];
+}
+export interface AgentEligibility {
+  trackers: { tracker: { slug: string; displayName: string }; agents: AgentWork[] }[];
+}
+
+/** An agent's open work in a snapshot: how much of it asks for what it doesn't report. */
+export function agentWork(
+  snapshot: Pick<Snapshot, "issues" | "agents">,
+  agentId: string,
+  limit = 5,
+): AgentWork {
+  const agent = snapshot.agents.find((a) => a.id === agentId);
+  const open = snapshot.issues.filter(
+    (i) => i.status !== "done" && i.status !== "canceled" && i.type !== "prd",
+  );
+  const requiring = open.filter((i) => hasRequirements(i.requires));
+  const missing = requiring
+    .filter((i) => !agent || !agentEligible(i, agent))
+    .sort((a, b) => a.priority - b.priority || a.key.localeCompare(b.key));
+  return {
+    agentId,
+    open: open.length,
+    requiring: requiring.length,
+    eligible: requiring.length - missing.length,
+    missing: missing.slice(0, limit).map((i) => ({
+      key: i.key,
+      title: i.title,
+      unmet: unmetRequirements(i.requires, agent?.capabilities ?? null).map((u) => u.message),
+    })),
+  };
+}
+
+/**
+ * Whether an agent may claim an issue (CORE-32), as the tracker decides it:
+ * it meets the requirements, or the issue is assigned to it.
+ */
+export function agentEligible(
+  issue: Issue,
+  agent: Pick<Snapshot["agents"][number], "id" | "capabilities">,
+): boolean {
+  return (
+    issue.assigneeId === agent.id || !unmetRequirements(issue.requires, agent.capabilities).length
+  );
 }
 
 export interface Compiled {

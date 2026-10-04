@@ -7,6 +7,13 @@
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Issue, Snapshot } from "../../shared/tracker.ts";
+import {
+  hasRequirements,
+  parseRequirements,
+  RequirementError,
+  requirementsText,
+  type IssueRequirements,
+} from "../../shared/requirements.ts";
 import type { CallApi } from "./internal.ts";
 import type { Group } from "./plan.ts";
 
@@ -77,6 +84,17 @@ function numbered(text: string, lines?: string): { text: string; total: number }
   };
 }
 
+/** Requirements in their text form: the stored object, null for none, or what's wrong. */
+function requirementsInput(text: string | undefined): IssueRequirements | null | string {
+  if (text === undefined) return null;
+  try {
+    return parseRequirements(text);
+  } catch (error) {
+    if (error instanceof RequirementError) return error.message;
+    throw error;
+  }
+}
+
 /** A tracker snapshot, loaded once per turn and reused by every tracker tool. */
 function snapshots(api: CallApi) {
   const cache = new Map<string, Promise<Snapshot | { error: string }>>();
@@ -103,6 +121,7 @@ function issueRow(issue: Issue, snapshot: Snapshot) {
     priority: `P${issue.priority}`,
     team: team?.key,
     labels: issue.labels,
+    ...(hasRequirements(issue.requires) ? { requires: requirementsText(issue.requires) } : {}),
     ...(issue.claim ? { claimedBy: issue.claim.agent } : {}),
     ...(issue.assigneeId ? { assignee: issue.assigneeId } : {}),
     updatedAt: issue.updatedAt,
@@ -292,7 +311,7 @@ export function buildTools(context: ToolContext) {
   const tracker = {
     find_issues: tool({
       description:
-        'Find issues in a tracker (owner = the account or organization, e.g. "priya" for "priya\'s tracker"). Filters combine; with none, open issues by priority. Returns {total, issues: [{key, title, status, type, priority: "P2", team, labels, blocked, claimedBy?, assignee?, updatedAt}], teams: [key], url}, at most `limit` issues (default 25). Use this for any question about issues or teams.',
+        'Find issues in a tracker (owner = the account or organization, e.g. "priya" for "priya\'s tracker"). Filters combine; with none, open issues by priority. Returns {total, issues: [{key, title, status, type, priority: "P2", team, labels, requires? (what an agent must report to claim it), blocked, claimedBy?, assignee?, updatedAt}], teams: [key], url}, at most `limit` issues (default 25). Use this for any question about issues or teams.',
       inputSchema: z.object({
         owner: OWNER,
         query: z.string().optional().describe("Words to match in titles, descriptions and keys"),
@@ -527,6 +546,13 @@ export function buildTools(context: ToolContext) {
         priority: z.number().int().min(0).max(4).optional().describe("0 is most urgent"),
         parent: KEY.optional(),
         labels: z.array(z.string()).optional(),
+        requires: z
+          .string()
+          .max(1000)
+          .optional()
+          .describe(
+            'What an agent must report to claim it (people always can), e.g. "tag:ux model:claude-opus-* memory>=16GiB": tag:/skill: (all of), model:/harness:/os:/arch:/runtime: (any of, * wildcards), memory>=, cpus>=. Empty for any agent.',
+          ),
       }),
       needsApproval,
       execute: async ({
@@ -539,7 +565,10 @@ export function buildTools(context: ToolContext) {
         priority,
         parent,
         labels,
+        requires,
       }) => {
+        const required = requirementsInput(requires);
+        if (typeof required === "string") return { error: required };
         const snap = await snapshot(owner);
         if ("error" in snap) return snap;
         const teamId = snap.teams.find((t) => t.key.toLowerCase() === team.toLowerCase())?.id;
@@ -565,6 +594,7 @@ export function buildTools(context: ToolContext) {
                 ...(priority === undefined ? {} : { priority }),
                 ...(parentId ? { parentId } : {}),
                 ...(labels ? { labels } : {}),
+                ...(required ? { requires: required } : {}),
               },
             },
           ],
@@ -594,6 +624,13 @@ export function buildTools(context: ToolContext) {
             priority: z.number().int().min(0).max(4).optional(),
             type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
             labels: z.array(z.string()).optional(),
+            requires: z
+              .string()
+              .max(1000)
+              .optional()
+              .describe(
+                'What an agent must report to claim it (people always can), e.g. "tag:ux model:claude-opus-* memory>=16GiB": tag:/skill: (all of), model:/harness:/os:/arch:/runtime: (any of, * wildcards), memory>=, cpus>=. An empty string removes them.',
+              ),
           })
           .refine((c) => Object.keys(c).length > 0, "Change at least one field."),
       }),
@@ -603,11 +640,13 @@ export function buildTools(context: ToolContext) {
         if ("error" in snap) return snap;
         const issue = snap.issues.find((i) => i.key.toLowerCase() === key.toLowerCase());
         if (!issue) return { error: `No issue ${key}.` };
+        const { requires, ...fields } = changes;
+        const required = requirementsInput(requires);
+        if (typeof required === "string") return { error: required };
+        const data = requires === undefined ? fields : { ...fields, requires: required ?? null };
         const r = await api("POST", `/tracker/${enc(owner)}/mutate`, {
           operationId: crypto.randomUUID(),
-          mutations: [
-            { kind: "issue.update", id: issue.id, expectedVersion: issue.version, data: changes },
-          ],
+          mutations: [{ kind: "issue.update", id: issue.id, expectedVersion: issue.version, data }],
         });
         return r.ok
           ? { updated: issue.key, url: `/tracker/${owner}/issues/${issue.key}` }

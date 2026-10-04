@@ -1022,8 +1022,8 @@ function Workbench({ data }: { data: TrackerView }) {
               className={`m-0 text-micro ${parsedUnknown.length ? "text-danger-text" : queryFocused ? "text-ink-faint" : "sr-only"}`}
             >
               {parsedUnknown.length
-                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, label:, type:, p:, since:, until:, parent:.`
-                : "is:ready is:blocked · status: · team: · ws: · assignee:me · label: · type: · p:1 · since:7d · parent:KEY · words match key and title; - excludes"}
+                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, label:, type:, p:, since:, until:, parent:, requires:, eligible:.`
+                : "is:ready is:blocked · status: · team: · ws: · assignee:me · label: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · words match key and title; - excludes"}
             </p>
             {defaultTeamEntry && (
               <DefaultTeamNote

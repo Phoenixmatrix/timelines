@@ -5,7 +5,7 @@ import { planFrom, questions } from "./plan.ts";
 import { cleanStatus, progressPrompt, stepFromMessage } from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
 import { parseSkill } from "./skills.ts";
-import { clip, compact } from "./tools.ts";
+import { buildTools, clip, compact } from "./tools.ts";
 
 describe("clef routing", () => {
   test("one call asks every question, within clef's limit", () => {
@@ -209,5 +209,72 @@ describe("skills and results", () => {
         text: "xxxx\n… (6 more characters)",
       },
     );
+  });
+});
+
+describe("issue requirements in the assistant's tools (CORE-32)", () => {
+  test("create and update take the text form; bad terms come back as errors", async () => {
+    const sent: unknown[] = [];
+    const issue = {
+      id: "i1",
+      key: "CORE-1",
+      version: 3,
+      teamId: "t",
+      title: "x",
+      labels: [],
+      requires: { tags: ["ux"] },
+    };
+    const api = async (method: string, _path: string, body?: unknown) => {
+      if (method === "GET")
+        return {
+          status: 200,
+          ok: true,
+          body: { teams: [{ id: "t", key: "CORE" }], issues: [issue] },
+        };
+      sent.push(body);
+      return {
+        status: 200,
+        ok: true,
+        body: {
+          events: [
+            {
+              entity: {
+                id: (body as { mutations: { id: string }[] }).mutations[0]!.id,
+                key: "CORE-2",
+              },
+            },
+          ],
+        },
+      };
+    };
+    const { writes } = buildTools({
+      api: api as never,
+      writes: true,
+      approve: false,
+      navigate: false,
+    });
+    const run = (name: string, input: unknown) =>
+      (writes[name]!.execute as (i: unknown, o: unknown) => Promise<unknown>)(input, {
+        toolCallId: "t",
+        messages: [],
+      });
+    await run("create_issue", {
+      owner: "o",
+      team: "CORE",
+      title: "Design",
+      requires: "tag:UX memory>=16GiB",
+    });
+    await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "" } });
+    await run("update_issue", { owner: "o", key: "CORE-1", changes: { title: "y" } });
+    expect(
+      sent.map((b) => (b as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data),
+    ).toEqual([
+      expect.objectContaining({ requires: { tags: ["ux"], minMemory: 16 * 2 ** 30 } }),
+      { requires: null },
+      { title: "y" },
+    ]);
+    expect(
+      await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "gpu" } }),
+    ).toEqual({ error: expect.stringContaining('Unknown requirement "gpu"') });
   });
 });

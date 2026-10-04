@@ -17,6 +17,7 @@ import {
 } from "./query.ts";
 import { claimAttribution } from "../../../shared/tracker.ts";
 import { Actor } from "./Actor.tsx";
+import { RequiresMark } from "./Requirements.tsx";
 
 const FACET_GROUPS: { key: keyof Facets; title: string }[] = [
   { key: "state", title: "State" },
@@ -228,7 +229,10 @@ function Lane({
                 )}
                 {state === "ready" && <span>Ready</span>}
               </span>
-              <span className="truncate text-body-sm font-semibold">{issue.title}</span>
+              <span className="truncate text-body-sm font-semibold">
+                <RequiresMark requires={issue.requires} />
+                {issue.title}
+              </span>
             </Link>
           );
         })}

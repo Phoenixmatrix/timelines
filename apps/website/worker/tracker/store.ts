@@ -35,6 +35,14 @@ import {
   type Workspace,
 } from "../../shared/tracker.ts";
 import type { ShippedIssue } from "../../shared/release-notes.ts";
+import {
+  hasRequirements,
+  normalizeRequirements,
+  RequirementError,
+  unmetRequirements,
+  unmetText,
+  type UnmetRequirement,
+} from "../../shared/requirements.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
@@ -75,7 +83,12 @@ const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
 export class TrackerError extends Error {
   public status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
   public code: string;
-  public details: { currentVersion?: number; current?: Team | Workspace | Issue };
+  public details: {
+    currentVersion?: number;
+    current?: Team | Workspace | Issue;
+    /** For requirements_unmet (CORE-32): each requirement the agent doesn't meet. */
+    unmet?: UnmetRequirement[];
+  };
   constructor(
     status: TrackerError["status"],
     code: string,
@@ -1583,6 +1596,70 @@ export class TrackerStore {
         fail("forbidden", "Claims can only be delegated to yourself or your own agents.", 403);
       return { actorId: agent.id, accountableId: agent.accountable.id };
     };
+    /**
+     * What `holder` misses of `issue`'s requirements (CORE-32): nothing for a
+     * person (people can always claim), nor for the agent it's assigned to (an
+     * explicit assignment stands, and shows the mismatch). An agent that never
+     * reported capabilities meets no requirement.
+     */
+    const unmetFor = (issue: Issue, holder: { actorId: string; accountableId: string }) => {
+      if (holder.actorId === holder.accountableId || !hasRequirements(issue.requires)) return [];
+      if (issue.assigneeId === holder.actorId) return [];
+      const agent = access.agents.find((a) => a.id === holder.actorId);
+      return unmetRequirements(issue.requires, agent?.capabilities ?? null);
+    };
+    const agentName = (actorId: string) =>
+      access.agents.find((a) => a.id === actorId)?.name ?? actorId;
+    /** Refuse an agent that doesn't meet `issue`'s requirements, saying which. */
+    const eligible = (issue: Issue, holder: { actorId: string; accountableId: string }) => {
+      const unmet = unmetFor(issue, holder);
+      if (unmet.length)
+        throw new TrackerError(
+          409,
+          "requirements_unmet",
+          unmetText(agentName(holder.actorId), issue.key, unmet),
+          { unmet },
+        );
+    };
+    /**
+     * Assigning work to an agent that doesn't meet its requirements is a
+     * person's explicit call: a tracker owner's, or the agent's accountable
+     * person's. The issue then shows the mismatch.
+     */
+    const assignedAnyway = (issue: Issue) => {
+      const agent = access.agents.find((a) => a.id === issue.assigneeId);
+      if (!agent) return;
+      const unmet = unmetRequirements(issue.requires, agent.capabilities);
+      if (!unmet.length) return;
+      const person = access.actorId === access.principalId;
+      if (person && (access.canAdmin || agent.accountable.id === access.principalId)) return;
+      throw new TrackerError(
+        409,
+        "requirements_unmet",
+        `${unmetText(agent.name, issue.key, unmet)} ${
+          person
+            ? `Only a tracker owner or ${agent.accountable.displayName} can assign it anyway.`
+            : "An agent can't assign it to an agent that doesn't meet them; a person can."
+        }`,
+        { unmet },
+      );
+    };
+    /** What `issue.next` says about ready work it passed over for requirements. */
+    const skippedFor = (actorId: string, skipped: Issue[]) => {
+      const name = agentName(actorId);
+      const keys = skipped.slice(0, 10).map((issue) => issue.key);
+      const more = skipped.length > keys.length ? ` and ${skipped.length - keys.length} more` : "";
+      const reported = access.agents.find((a) => a.id === actorId)?.capabilities;
+      return {
+        requirements: skipped.length,
+        keys,
+        message:
+          `Skipped ${skipped.length} ready issue${skipped.length === 1 ? "" : "s"} whose requirements ${name} doesn't meet: ${keys.join(", ")}${more}. ` +
+          (reported
+            ? "See what each needs with `gm issue show <key>`; `gm agent setup` (with --tag, --model…) updates what it reports."
+            : `${name} hasn't reported its capabilities: run \`gm agent setup\` in its checkout to publish them.`),
+      };
+    };
     /** `issue`'s lease must match `token`; `covered` is the descendant being changed, if any. */
     const lease = (issue: Issue, token: unknown, covered?: Issue) => {
       if (covered && covered.id !== issue.id && typeof token !== "string")
@@ -1683,13 +1760,16 @@ export class TrackerStore {
      * the caller; first by priority, then by how much open work it unblocks
      * (critical path first), then by age.
      */
-    const pick = (scope: {
-      teamId?: string;
-      workspaceId?: string;
-      underId?: string;
-      /** The caller holds underId's lease: its own subtree is open to it. */
-      own?: Issue;
-    }) => {
+    const pick = (
+      scope: {
+        teamId?: string;
+        workspaceId?: string;
+        underId?: string;
+        /** The caller holds underId's lease: its own subtree is open to it. */
+        own?: Issue;
+      },
+      holder: { actorId: string; accountableId: string },
+    ) => {
       const index = graph();
       const takeable = (issue: Issue) => {
         const why = readiness(issue, index, now);
@@ -1732,7 +1812,7 @@ export class TrackerStore {
             }
         return reached.size;
       };
-      const candidates = [...index.byId.values()].filter(
+      const ready = [...index.byId.values()].filter(
         (issue) =>
           takeable(issue) &&
           issue.type !== "prd" &&
@@ -1742,16 +1822,18 @@ export class TrackerStore {
           (!scope.underId || under(issue)) &&
           writable(issue),
       );
-      const weight = new Map(candidates.map((issue) => [issue.id, unblocks(issue)]));
-      return (
-        candidates.sort(
-          (a, b) =>
-            a.priority - b.priority ||
-            weight.get(b.id)! - weight.get(a.id)! ||
-            a.createdAt.localeCompare(b.createdAt) ||
-            a.id.localeCompare(b.id),
-        )[0] ?? null
-      );
+      // Ready work the agent doesn't meet the requirements of is passed over, and counted.
+      const candidates = ready.filter((issue) => !unmetFor(issue, holder).length);
+      const weight = new Map(ready.map((issue) => [issue.id, unblocks(issue)]));
+      const order = (a: Issue, b: Issue) =>
+        a.priority - b.priority ||
+        weight.get(b.id)! - weight.get(a.id)! ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id);
+      return {
+        issue: candidates.sort(order)[0] ?? null,
+        skipped: ready.filter((issue) => !candidates.includes(issue)).sort(order),
+      };
     };
     /**
      * Recount an issue's open requests. When none are left, a parked lease unparks
@@ -1831,6 +1913,18 @@ export class TrackerStore {
         );
     };
     const fields = (data: Record<string, unknown>, issue: Issue, creating: boolean) => {
+      const assignedBefore = issue.assigneeId;
+      if ("requires" in data) {
+        try {
+          const requires = normalizeRequirements(data.requires);
+          // No requirements leaves the field off, as on issues from before it.
+          if (requires) issue.requires = requires;
+          else delete issue.requires;
+        } catch (error) {
+          if (error instanceof RequirementError) fail("invalid_input", error.message);
+          throw error;
+        }
+      }
       for (const key of ["title", "description", "acceptance"] as const)
         if (key in data)
           issue[key] = text(data[key], key, key === "title" ? 500 : 131072, key !== "title");
@@ -1858,6 +1952,7 @@ export class TrackerStore {
       if ("assigneeId" in data)
         issue.assigneeId = data.assigneeId === null ? null : id(data.assigneeId);
       validateAssignee(issue.assigneeId, issue.teamId);
+      if (issue.assigneeId && issue.assigneeId !== assignedBefore) assignedAnyway(issue);
       if ("parentId" in data) {
         issue.parentId = data.parentId === null ? null : id(data.parentId);
         if (issue.parentId) {
@@ -2039,6 +2134,7 @@ export class TrackerStore {
             "parentId",
             "workspaceIds",
             "labels",
+            "requires",
             ...(creating ? ["teamId"] : ["leaseToken"]),
           ]);
           let issue: Issue;
@@ -2270,14 +2366,19 @@ export class TrackerStore {
           } else if (data.underToken !== undefined)
             fail("invalid_input", "underToken needs underId: the issue whose lease it is.");
           const holder = holderFor(data.forActorId);
-          const issue = pick({ ...scope, ...(own ? { own } : {}) });
+          const { issue, skipped } = pick({ ...scope, ...(own ? { own } : {}) }, holder);
+          const passed = skipped.length ? { skipped: skippedFor(holder.actorId, skipped) } : {};
           // Nothing ready is an answer, not an error: the agent can stop or wait.
-          if (!issue) break;
+          if (!issue) {
+            result = { id: entityId, ...passed };
+            break;
+          }
           result = {
             id: entityId,
             issueId: issue.id,
             key: issue.key,
             ...grant(issue, agent, Number(ttl), undefined, holder, own),
+            ...passed,
           };
           issue.version++;
           issue.updatedAt = now;
@@ -2437,7 +2538,7 @@ export class TrackerStore {
               fail("invalid_input", "An offer lasts 30 to 3600 seconds.");
             // To a member or a member's agent; anyone with the code when unset.
             const to = data.toActorId === undefined ? null : id(data.toActorId);
-            if (to) answerable(to);
+            if (to) eligible(issue, { actorId: to, accountableId: answerable(to) });
             const random = () => crypto.randomUUID().replaceAll("-", "");
             const code = `${issue.key}.${random()}${random()}`;
             const expiresAt = new Date(Date.parse(now) + Number(ttl) * 1000).toISOString();
@@ -2494,6 +2595,7 @@ export class TrackerStore {
               "That handoff code is expired, used, withdrawn, or for someone else.",
               409,
             );
+          eligible(issue, { actorId: access.actorId, accountableId: access.principalId });
           const previous = issue.claim!;
           result = {
             id: entityId,
@@ -2650,6 +2752,7 @@ export class TrackerStore {
                   "invalid_input",
                   "forActorId delegates inside your leased subtree; pass that lease's underToken.",
                 );
+              eligible(issue, holderFor(data.forActorId));
             } else lease(issue, data.leaseToken);
             result = {
               id: entityId,

@@ -48,6 +48,7 @@ import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
 import { LabelPicker } from "./Labels.tsx";
+import { Requirements } from "./Requirements.tsx";
 
 export type MutationOutcome =
   | { ok: true; events: TrackerEvent[] }
@@ -1071,6 +1072,7 @@ export function IssueDetail({
             </>
           )}
         </dl>
+        <Requirements issue={issue} snapshot={snapshot} mutate={mutate} busy={busy} />
         {issue.queueFailure && (
           <section className={`${SECTION} mt-4`} aria-label="Queue failure">
             <h3 className={HEADING}>Queue failure</h3>

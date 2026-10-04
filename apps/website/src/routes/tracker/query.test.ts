@@ -281,6 +281,68 @@ describe("query language", () => {
     expect(keys(`until:${ago(7).slice(0, 10)}`)).toEqual(["CORE-2"]);
   });
 
+  it("filters by requirements and by which agents meet them (CORE-32)", () => {
+    const issues = [
+      issue("CORE-1", { requires: { tags: ["ux"], minMemory: 16 * 2 ** 30 } }),
+      issue("CORE-2", { requires: { models: ["gpt-5*"] } }),
+      issue("CORE-3"),
+      issue("CORE-4", { requires: { tags: ["gpu"] }, assigneeId: "agt-blank" }),
+    ];
+    const snap = snapshot(issues);
+    const accountable = { id: "m-priya", slug: "priya", displayName: "Priya Raman" };
+    snap.agents = [
+      {
+        id: "agt-ux",
+        name: "designer",
+        accountable,
+        capabilities: {
+          version: 1,
+          harness: "claude-code",
+          model: "claude-opus-4-5",
+          environment: {
+            os: "linux",
+            arch: "x86_64",
+            runtime: "host",
+            cpuCount: 8,
+            memoryBytes: 32 * 2 ** 30,
+          },
+          tags: ["ux"],
+          skills: [],
+        },
+        capabilitiesUpdatedAt: ago(1),
+        revokedAt: null,
+      },
+      {
+        id: "agt-blank",
+        name: "blank",
+        accountable,
+        capabilities: null,
+        capabilitiesUpdatedAt: null,
+        revokedAt: null,
+      },
+    ];
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (q: string, viewer = "m-priya") => {
+      const c = compile(q, index, viewer, NOW);
+      return issues.filter((i) => c.matches(i)).map((i) => i.key);
+    };
+    expect(keys("requires:ux")).toEqual(["CORE-1"]);
+    expect(keys("requires:tag:ux")).toEqual(["CORE-1"]);
+    expect(keys("requires:memory>=16GiB")).toEqual(["CORE-1"]);
+    expect(keys("requires:gpt-5*")).toEqual(["CORE-2"]);
+    expect(keys("requires:none")).toEqual(["CORE-3"]);
+    expect(keys("-requires:none")).toEqual(["CORE-1", "CORE-2", "CORE-4"]);
+    expect(keys("eligible:designer")).toEqual(["CORE-1", "CORE-3"]);
+    expect(keys("eligible:agt-ux")).toEqual(["CORE-1", "CORE-3"]);
+    // Without capabilities only open-to-all work, and what's assigned to it.
+    expect(keys("eligible:blank")).toEqual(["CORE-3", "CORE-4"]);
+    expect(keys("-eligible:designer")).toEqual(["CORE-2", "CORE-4"]);
+    expect(keys("eligible:nobody")).toEqual([]);
+    // People can always claim; an agent viewer is checked itself.
+    expect(keys("eligible:me")).toEqual(["CORE-1", "CORE-2", "CORE-3", "CORE-4"]);
+    expect(keys("eligible:me", "agt-ux")).toEqual(["CORE-1", "CORE-3"]);
+  });
+
   it("toggles tokens and strips keys", () => {
     expect(toggleToken("is:open", "team", "core")).toBe("is:open team:core");
     expect(toggleToken("is:open TEAM:core", "team", "core")).toBe("is:open");

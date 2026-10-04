@@ -248,8 +248,43 @@ flags. Follow the team's vocabulary; otherwise use the defaults explained by
 `data`, `architecture`, `api`, `security`, `testing`, `infrastructure` and
 `documentation`. Pick only relevant areas, not every area touched by routine
 verification. These are suggested free-form issue labels, not a registered
-catalog or claim restrictions. Agent profile tags and skills remain separate,
-self-reported capability hints. Updating `labels` replaces the whole list.
+catalog or claim restrictions. Updating `labels` replaces the whole list. To
+restrict which agents may claim an issue, use requirements (below).
+
+### Requirements: which agents may claim an issue
+
+An issue can require capabilities of the agent that claims it (`requires`),
+matched against the profile each agent publishes with `gm agent setup` (harness,
+model, OS, architecture, runtime, CPUs, memory, tags and skills):
+
+```bash
+gm issue create 'Polish onboarding' --team ENG --requires 'tag:ux skill:playwright'
+gm issue update ENG-1 --requires 'model:claude-opus-*,gpt-5* os:linux memory>=16GiB cpus>=8'
+gm issue update ENG-1 --clear-requires          # any agent again
+```
+
+Terms are `tag:`, `skill:`, `model:`, `harness:`, `os:`, `arch:`, `runtime:`
+(comma-separated or repeated values), `memory>=` (B, KiB/MiB/GiB/TiB, the same
+as K/M/G/T, or KB/MB/GB/TB) and `cpus>=`. Tags and skills need every value; the
+other lists any one; values match case-insensitively and `*` is a wildcard. The
+issue stores them as `requires: {tags, skills, models, harnesses, os, arch,
+runtime, minMemory, minCpus}` (or null), recorded in its history like any field;
+`--data '{"requires":…}'` works too.
+
+- An agent that doesn't meet them can't `claim` or `accept` the issue, can't be
+  offered it, and `gm issue next` skips it, reporting how many ready issues it
+  skipped (`skipped: {requirements, keys, message}`). A refusal has code
+  `requirements_unmet` and names each unmet requirement.
+- An agent that never published capabilities meets no requirement: run
+  `gm agent setup` (with `--tag`, `--model`) in its checkout.
+- People can always claim. A person who owns the tracker, or the agent's
+  accountable human, can assign the issue to an agent that doesn't meet them;
+  it may then claim it, and the issue shows the mismatch (`assigneeMismatch`).
+- `gm issue show` prints the requirements (`requiresText`) and whether the
+  acting identity is eligible (`eligibility`).
+- This is eligibility, not authorization: capabilities are self-reported, and
+  repository and tracker permissions are enforced as before. Issues without
+  requirements behave as they always did.
 
 ### Creator and audit history
 
@@ -486,6 +521,8 @@ gm agent setup --check                           # exit 4 if instructions or ski
   `--no-identity` writes only the files.
 - **Defaults.** `gm issue next` and `claim` take the session label, scope and
   lease length from these files, and the tracker owner when none is selected.
+  `next` only picks issues whose requirements the agent's published profile
+  meets (see "Requirements").
 - **Your default team.** When neither a flag nor these files name a team,
   `gm issue next`, `create`, `list` and `ready` use the default team you set in
   the web tracker (the star beside a team), synced with the replica and cached

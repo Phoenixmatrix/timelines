@@ -39,7 +39,13 @@ export interface AgentRef {
   name: string;
 }
 
-/** Self-reported advisory metadata, never an authorization or scheduling policy. */
+/**
+ * What an agent reports about itself (`gm agent setup`). Issues can require
+ * some of it (`Issue.requires`, CORE-32): that decides which agents are
+ * eligible to claim them, and `gm issue next` skips the rest. It is
+ * self-reported eligibility, never authorization: repository and tracker
+ * permissions are enforced as before, and people can always claim.
+ */
 export interface AgentCapabilities {
   version: 1;
   harness: string | null;

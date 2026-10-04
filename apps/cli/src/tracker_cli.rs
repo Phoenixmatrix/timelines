@@ -195,9 +195,23 @@ pub struct IssueCreate {
     pub workspace: Vec<String>,
     /// Work-area label; repeat for each area (e.g. --label ux --label frontend).
     /// Reuse team spelling; `gm cli guide` lists suggested defaults. Labels describe
-    /// the issue, not agent capabilities, and do not restrict claims.
+    /// the issue and do not restrict claims; --requires says which agents may claim it.
     #[arg(long)]
     pub label: Vec<String>,
+    #[command(flatten)]
+    pub requires: RequiresArgs,
+}
+/// What an agent must report (`gm agent setup`) to claim the issue (`requires`).
+#[derive(Args)]
+pub struct RequiresArgs {
+    /// Which agents may claim it, from what they report (`gm agent setup`):
+    /// space-separated terms like 'tag:ux skill:playwright model:claude-opus-*,gpt-5*
+    /// harness:claude-code os:linux arch:x86_64 runtime:host memory>=16GiB cpus>=8'.
+    /// Tags and skills: every one; the rest: any one; `*` is a wildcard. Agents that
+    /// don't meet them can't claim it and `gm issue next` skips it; people can always
+    /// claim. Eligibility, not authorization: capabilities are self-reported.
+    #[arg(long, value_name = "TERMS")]
+    pub requires: Option<String>,
 }
 /// Whether an agent works the issue in a timeline (`timelineUse`, `timelinePolicy`).
 #[derive(Args)]
@@ -217,15 +231,21 @@ pub struct IssuePatch {
     pub id: String,
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file:
     /// title, description, acceptance, type, status, closeReason, timelineUse,
-    /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds and
-    /// labels. Relationships use canonical IDs; null clears assigneeId/parentId.
+    /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds, labels
+    /// and requires (an object, or null; --requires writes it from terms).
+    /// Relationships use canonical IDs; null clears assigneeId/parentId.
     /// Setting status to canceled requires closeReason: duplicate, not_planned,
     /// obsolete, cannot_reproduce or other. Leaving canceled clears closeReason
     /// automatically, as leaving required clears timelinePolicy.
-    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy"])]
+    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy","requires","clear_requires"])]
     pub data: Option<String>,
     #[command(flatten)]
     pub timeline: TimelineRule,
+    #[command(flatten)]
+    pub requires: RequiresArgs,
+    /// Let any agent claim it again (requires: null).
+    #[arg(long, conflicts_with = "requires")]
+    pub clear_requires: bool,
 }
 #[derive(Args)]
 pub struct ListIssues {
@@ -279,7 +299,7 @@ pub enum IssueCommand {
     List(ListIssues),
     /// Find unblocked, unclaimed work; offline readiness is advisory only.
     Ready(ListIssues),
-    /// Inspect an issue and bounded ancestors, blockers, dependents and notes.
+    /// Inspect an issue and bounded ancestors, blockers, dependents and notes, with its requirements and whether the acting agent meets them.
     Show {
         issue: String,
         #[arg(long, default_value_t=30, value_parser=clap::value_parser!(u16).range(1..=200))]
@@ -296,7 +316,8 @@ pub enum IssueCommand {
         limit: u16,
     },
     /// Apply a JSON patch with optimistic version checking; null clears nullable fields.
-    /// --timeline-use and --timeline-policy set the timeline rule without JSON.
+    /// --timeline-use and --timeline-policy set the timeline rule without JSON;
+    /// --requires and --clear-requires set which agents may claim it.
     Update(IssuePatch),
     /// Add a directed relation: FROM blocks TO (or related/duplicates).
     Link {
@@ -389,7 +410,7 @@ pub enum IssueCommand {
         #[arg(long, env = "GM_UNDER_TOKEN", hide_env_values = true)]
         under_token: String,
     },
-    /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context.
+    /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context. An agent only gets issues whose requirements it meets; the result says how many it skipped.
     Next {
         /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
         #[arg(long)]

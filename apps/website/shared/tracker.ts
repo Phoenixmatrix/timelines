@@ -1,6 +1,7 @@
 import type { AgentCapabilities } from "./api.ts";
 import type { CheckpointView, Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
 import type { QueueFailure } from "./merge-queue.ts";
+import type { IssueRequirements } from "./requirements.ts";
 
 export interface TrackerIdentity {
   id: string;
@@ -174,6 +175,11 @@ export interface Issue extends TrackerEntity {
   timelineUse?: IssueTimelineUse;
   /** With `required`: the policy the agent's timeline must use, or null for either. */
   timelinePolicy?: TimelinePolicy | null;
+  /**
+   * What an agent must report to claim it (CORE-32, shared/requirements.ts);
+   * absent or null on issues any agent may take. People can always claim.
+   */
+  requires?: IssueRequirements | null;
   priority: 0 | 1 | 2 | 3 | 4;
   assigneeId: string | null;
   parentId: string | null;
@@ -434,6 +440,8 @@ export type IssueFields = Pick<
   | "workspaceIds"
   | "labels"
 >;
+/** Fields a create or update may set beyond the inspector's draft fields. */
+export type IssueData = Partial<IssueFields> & { requires?: IssueRequirements | null };
 export type Mutation =
   | {
       kind: "team.create";
@@ -460,13 +468,13 @@ export type Mutation =
   | {
       kind: "issue.create";
       id: string;
-      data: { teamId: string; title: string } & Partial<Omit<IssueFields, "title">>;
+      data: { teamId: string; title: string } & Omit<IssueData, "title">;
     }
   | {
       kind: "issue.update";
       id: string;
       expectedVersion: number;
-      data: Partial<IssueFields> & { leaseToken?: string };
+      data: IssueData & { leaseToken?: string };
     }
   | { kind: "link.add"; id: string; data: Omit<Link, "id"> }
   | { kind: "link.remove"; id: string }
@@ -583,6 +591,11 @@ export interface MutationResult {
     key?: string;
     /** For issue.offer: the single-use code to hand over, shown once. */
     offerCode?: string;
+    /**
+     * For issue.next: ready issues it passed over because the agent doesn't
+     * meet their requirements (CORE-32), so it isn't silently starved.
+     */
+    skipped?: { requirements: number; keys: string[]; message: string };
   }[];
   serverTime: string;
 }

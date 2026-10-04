@@ -16,6 +16,7 @@ import {
 } from "./query.ts";
 import { attribution, claimAttribution } from "../../../shared/tracker.ts";
 import { Actor } from "./Actor.tsx";
+import { RequiresMark } from "./Requirements.tsx";
 
 const ROW = 32;
 const OVERSCAN = 12;
@@ -264,6 +265,7 @@ export function IssueLog({
                 {issue.type === "prd" && (
                   <span className="mk-chip mk-chip--tag mr-1.5 align-[1px]">PRD</span>
                 )}
+                <RequiresMark requires={issue.requires} />
                 {issue.title}
               </span>
               <span role="cell" className={`truncate text-ink-faint ${TYPE}`}>

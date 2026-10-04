@@ -910,7 +910,8 @@ read as `agent_decides`.
     `show [NAME]` and `list --owner OWNER` expose profiles for human/agent choice.
     Tracker snapshots include member-accountable agents' capabilities, report
     timestamps and revocation state, but never their tokens. Capabilities do not
-    alter membership, assignment or lease authorization.
+    alter membership or permissions; they only decide eligibility for issues
+    with requirements (below).
     `GET /api/agents/:id` (`self` for an agent token) reads an owned profile;
     `PUT /api/agents/:id/capabilities` replaces its version-1 report. An agent's
     write token may update only itself; read tokens cannot update profiles.
@@ -920,8 +921,30 @@ read as `agent_decides`.
     See the [CLI profile workflow](../cli/README.md#agent-capability-profiles)
     for detection limits, declaration replacement and privacy.
   - `issue.next` (`gm issue next`) picks and claims in one step: priority, then
-    the most open work transitively unblocked, then age; it skips PRDs and other
-    people's assignments.
+    the most open work transitively unblocked, then age; it skips PRDs, other
+    people's assignments and issues whose requirements the agent doesn't meet.
+  - _Requirements (CORE-32)_ say which agents may claim an issue: `requires`
+    on `issue.create`/`issue.update` (null clears; recorded in history like any
+    field) holds `tags` and `skills` (every one), `models`, `harnesses`, `os`,
+    `arch` and `runtime` (any one; `*` wildcards; all case-insensitive),
+    `minMemory` (bytes) and `minCpus`. `shared/requirements.ts` parses the text
+    form (`tag:ux model:claude-opus-* memory>=16GiB cpus>=8`, used by gm, the
+    inspector and the assistant) and matches it against the agent's reported
+    capabilities; issues without the field behave as before, and old replicas
+    ignore it. An agent that doesn't meet them can't `issue.claim` the issue,
+    isn't offered it (`issue.offer` to it, `issue.accept` by it) and `issue.next`
+    passes it over, reporting `skipped: {requirements, keys, message}`. Refusals
+    are 409 `requirements_unmet` with one `unmet` entry per requirement; an
+    agent with no reported capabilities is told to run `gm agent setup`.
+    People can always claim. Assigning an agent that doesn't meet them takes a
+    person, the tracker owner or the agent's accountable person; the assigned
+    agent may then claim it, and the inspector shows the mismatch. This is
+    eligibility, not authorization: capabilities are self-reported, and
+    permissions apply as before. The inspector edits requirements as chips and
+    lists each agent's eligibility; list and board rows mark them; the query
+    terms are `requires:ux` (`requires:tag:ux`, `requires:none`) and
+    `eligible:<agent>` (`eligible:me` for the acting agent). Settings > Agents
+    shows each agent's eligible open work per tracker (`GET /api/agent-eligibility`).
   - _A lease covers its subtree._ Claiming a parent (allowed even with open
     sub-issues, which are never offered as work themselves) excludes everyone else
     below it; status and parent changes there need the covering token. The holder
