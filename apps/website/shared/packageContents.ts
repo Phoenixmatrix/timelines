@@ -13,6 +13,8 @@ export interface PackageContentEntry {
   contentType?: string;
   checksums?: Record<string, string>;
   metadata?: Record<string, unknown>;
+  /** Directories of distribution files: how many files sit anywhere below. */
+  fileCount?: number;
   /** OCI child manifest selection; scoped to this version's manifest graph. */
   manifestDigest?: string;
   platform?: string;
@@ -21,7 +23,7 @@ export interface PackageContentEntry {
 export interface PackageContents {
   format: FormatId;
   version: string;
-  /** Current archive directory, empty at the root. */
+  /** Current directory (npm archive or distribution files), empty at the root. */
   path: string;
   files: PackageContentEntry[];
   total: number;

@@ -144,6 +144,51 @@ describe("package version contents API", () => {
     ).toBe(404);
   });
 
+  it("browses generic files by directory, with sizes and file counts", async () => {
+    await feed("generic");
+    for (const [name, body] of [
+      ["README.md", "readme"],
+      ["bin/tool", "binary"],
+      ["lib/a.js", "a"],
+      ["lib/nested/b.js", "bb"],
+      ["lib/nested/c.js", "ccc"],
+    ]) {
+      expect((await send(`/generic/test/tool/1.0/${name}`, body!)).status).toBe(201);
+    }
+    const root = await contents("generic", "tool", "1.0");
+    expect(root.total).toBe(3);
+    expect(root.files.map((e) => [e.kind, e.name, e.path, e.size, e.fileCount])).toEqual([
+      ["directory", "bin", "bin", 6, 1],
+      ["directory", "lib", "lib", 6, 3],
+      ["file", "README.md", "tool/1.0/README.md", 6, undefined],
+    ]);
+    expect(root.files[0]!.downloadUrl).toBeNull();
+
+    const lib = await contents("generic", "tool", "1.0", { path: "lib" });
+    expect(lib.path).toBe("lib");
+    expect(lib.files.map((e) => [e.kind, e.name, e.path])).toEqual([
+      ["directory", "nested", "lib/nested"],
+      ["file", "a.js", "tool/1.0/lib/a.js"],
+    ]);
+    const nested = await contents("generic", "tool", "1.0", { path: "lib/nested" });
+    await downloaded(nested.files[1]!, "ccc");
+
+    // Pages run through directories, then files.
+    const first = await contents("generic", "tool", "1.0", { limit: "2" });
+    expect(first.files.map((e) => e.name)).toEqual(["bin", "lib"]);
+    const second = await contents("generic", "tool", "1.0", { limit: "2", offset: "2" });
+    expect(second.files.map((e) => e.name)).toEqual(["README.md"]);
+
+    const missing = await h.request(url("generic", "tool", "1.0", { path: "nope" }), {
+      headers: headers(reader),
+    });
+    expect(missing.status).toBe(404);
+    const escape = await h.request(url("generic", "tool", "1.0", { path: "../2.0" }), {
+      headers: headers(reader),
+    });
+    expect(escape.status).toBeGreaterThanOrEqual(400);
+  });
+
   it("allows public contents and public downloads without a token", async () => {
     await feed("generic", "public");
     expect((await send("/generic/test/public/1/readme.txt", "public bytes")).status).toBe(201);

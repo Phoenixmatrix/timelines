@@ -2045,8 +2045,9 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
   - bulk delete, yank, deprecate and tag, for a selection or everything a
     query matches.
   - version links open paginated contents without losing the history query:
-    generic files and release assets show sizes, checksums and downloads; npm
-    shows the archive's directory tree and actual `package.json`; OCI shows
+    a file browser with each entry's size and download, and per-file details
+    (type, digest, checksums, metadata) on demand; generic files and npm
+    archives browse by directory, and npm shows its actual `package.json`; OCI shows
     manifests, platform choices, config and layers. Other formats expose their
     recorded distribution files and package/version metadata.
 
@@ -2070,8 +2071,13 @@ the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
 
 `GET /api/packages/:owner/:format/:name/contents?version=…` returns a
 `PackageContents` page. Encode the package name as one API path segment.
-`offset` and `limit` paginate entries; `path` selects an npm archive directory,
-and `manifest` selects a manifest reachable from the selected OCI version.
+`offset` and `limit` paginate entries; `path` selects an npm archive directory
+or a directory of distribution files, and `manifest` selects a manifest
+reachable from the selected OCI version. Distribution file paths are browsed
+relative to the directory every file in the version shares (a generic
+version's own directory); directory entries come first, carry the total
+`size` and `fileCount` of the files below them, and their `path` is the value
+to pass back as `path`.
 The web console keeps that selection in `version`, `path`, `contentOffset` and
 `manifest` URL parameters.
 

@@ -131,7 +131,7 @@ async function distribution(svc: Services, at: Located, version: string) {
           ...(version === at.pkg.name ? [eb("path", "=", at.pkg.name)] : []),
         ]),
       );
-    return { query, metadata: at.pkg.metadata, versionRow: null };
+    return { query, metadata: at.pkg.metadata, versionRow: null, root: prefix };
   }
   const row = await getVersion(svc.db, at.pkg.id, version);
   if (!row) throw missing();
@@ -142,6 +142,96 @@ async function distribution(svc: Services, at: Located, version: string) {
       .where("version_id", "=", row.id),
     metadata: { package: at.pkg.metadata, version: row.metadata },
     versionRow: row,
+    root: null,
+  };
+}
+type Distribution = Awaited<ReturnType<typeof distribution>>;
+
+/**
+ * The deepest directory shared by every path, from the smallest and largest:
+ * any prefix those two share, every path between them shares too.
+ */
+function sharedDirectory(first: string, last: string): string {
+  let i = 0;
+  while (i < first.length && first[i] === last[i]) i++;
+  return first.slice(0, first.lastIndexOf("/", i - 1) + 1);
+}
+
+/**
+ * One directory of a version's distribution files, directories first. Paths
+ * are relative to the directory every file shares (for generic packages, the
+ * version's own), so a version doesn't open several empty levels deep.
+ */
+async function distributionPage(
+  svc: Services,
+  dist: Distribution,
+  path: string,
+  offset: number,
+  limit: number,
+) {
+  const bounds = await dist.query
+    .select((eb) => [eb.fn.min("path").as("first"), eb.fn.max("path").as("last")])
+    .executeTakeFirst();
+  if (!bounds?.first || !bounds.last) {
+    if (path) throw missing();
+    return { total: 0, directories: [], files: [] };
+  }
+  const shared = sharedDirectory(bounds.first, bounds.last);
+  const root = dist.root && shared.startsWith(dist.root) ? dist.root : shared;
+  const prefix = path ? `${root}${path}/` : root;
+  // length() and substr() both count characters, so non-ASCII prefixes line up.
+  const rest = sql<string>`substr(path, length(${prefix}) + 1)`;
+  const below = dist.query.where(sql<boolean>`substr(path, 1, length(${prefix})) = ${prefix}`);
+  const nested = svc.db
+    .selectFrom(
+      below
+        .where(sql<boolean>`instr(${rest}, '/') > 0`)
+        .select([sql<string>`substr(${rest}, 1, instr(${rest}, '/') - 1)`.as("name"), "size"])
+        .as("nested"),
+    )
+    .groupBy("name");
+  const files = below.where(sql<boolean>`instr(${rest}, '/') = 0`);
+  const [directoryCount, fileCount] = await Promise.all([
+    svc.db
+      .selectFrom(nested.select("name").as("directories"))
+      .select((eb) => eb.fn.countAll<number>().as("n"))
+      .executeTakeFirst(),
+    files.select((eb) => eb.fn.countAll<number>().as("n")).executeTakeFirst(),
+  ]).then((counts) => counts.map((count) => Number(count?.n ?? 0)));
+  const total = directoryCount! + fileCount!;
+  if (path && !total) throw missing();
+  const directories =
+    offset < directoryCount!
+      ? await nested
+          .select((eb) => [
+            "name",
+            eb.fn.countAll<number>().as("files"),
+            eb.fn.sum<number>("size").as("size"),
+          ])
+          .orderBy("name")
+          .offset(offset)
+          .limit(limit)
+          .execute()
+      : [];
+  const remaining = limit - directories.length;
+  const rows =
+    remaining > 0
+      ? await files
+          .selectAll()
+          .orderBy("path")
+          .offset(Math.max(0, offset - directoryCount!))
+          .limit(remaining)
+          .execute()
+      : [];
+  return {
+    total,
+    directories: directories.map((d) => ({
+      name: d.name,
+      path: path ? `${path}/${d.name}` : d.name,
+      files: Number(d.files),
+      size: Number(d.size ?? 0),
+    })),
+    files: rows,
   };
 }
 async function npmCache(svc: Services, at: Located, version: string) {
@@ -319,24 +409,32 @@ export async function packageContents(
           },
         ];
     } else {
-      result.total = Number(
-        (await dist.query.select((eb) => eb.fn.countAll<number>().as("n")).executeTakeFirst())?.n ??
-          0,
-      );
+      const page = await distributionPage(svc, dist, path, offset, limit);
+      result.total = page.total;
       if (format === "generic" && !result.total) throw missing();
-      result.files = (
-        await dist.query.selectAll().orderBy("path").offset(offset).limit(limit).execute()
-      ).map((f) => ({
-        id: f.id,
-        name: f.path.split("/").pop()!,
-        path: f.path,
-        kind: "file",
-        size: f.size,
-        digest: f.digest,
-        contentType: f.content_type,
-        metadata: parseJson(f.metadata, {}),
-        downloadUrl: downloadUrl(owner, format, name, options.version, f.id),
-      }));
+      result.files = [
+        ...page.directories.map((d): PackageContentEntry => ({
+          id: `directory:${d.path}`,
+          name: d.name,
+          path: d.path,
+          kind: "directory",
+          size: d.size,
+          fileCount: d.files,
+          digest: null,
+          downloadUrl: null,
+        })),
+        ...page.files.map((f): PackageContentEntry => ({
+          id: f.id,
+          name: f.path.split("/").pop()!,
+          path: f.path,
+          kind: "file",
+          size: f.size,
+          digest: f.digest,
+          contentType: f.content_type,
+          metadata: parseJson(f.metadata, {}),
+          downloadUrl: downloadUrl(owner, format, name, options.version, f.id),
+        })),
+      ];
     }
   }
   for (const file of result.files) {
