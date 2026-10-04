@@ -26,8 +26,10 @@ import type {
 } from "../../shared/retention.ts";
 import { productionOnly } from "../preview.ts";
 import { batch, db } from "../schema.ts";
-import { category } from "./categories.ts";
+import { priceTimeline } from "../usage/prices.ts";
+import { category, overlappingPairs } from "./categories.ts";
 import { cleanupFor } from "./cleanups/index.ts";
+import { categoryCost } from "./costs.ts";
 import type { CleanupContext } from "./engine.ts";
 import { enabledTargets, type RetentionTarget } from "./policies.ts";
 
@@ -421,8 +423,18 @@ export async function getRun(
   return row ? (await toRuns(d1, [row]))[0]! : null;
 }
 
+/** What a dry run's figures can't say on their own. */
+export function runNotes(dryRun: boolean, categories: readonly string[]): string[] {
+  if (!dryRun) return [];
+  return overlappingPairs(categories).map(
+    ([a, b]) =>
+      `${a.label} and ${b.label} can select the same records. This preview counts those under both, so its total is higher than what a run removes; a run removes each record once. Preview them separately for exact figures.`,
+  );
+}
+
 async function toRuns(d1: D1Database, rows: RunRow[]): Promise<RetentionRun[]> {
   if (!rows.length) return [];
+  const timeline = await priceTimeline(d1);
   const categories = await db(d1)
     .selectFrom("cleanup_run_categories")
     .selectAll()
@@ -434,24 +446,28 @@ async function toRuns(d1: D1Database, rows: RunRow[]): Promise<RetentionRun[]> {
     .orderBy("run_id")
     .orderBy("position")
     .execute();
-  return rows.map((r) => ({
-    id: r.id,
-    level: r.account_id === null ? "site" : "account",
-    account: r.account,
-    trigger: r.trigger,
-    actor: r.actor,
-    dryRun: r.dry_run === 1,
-    status: r.status,
-    asOf: r.as_of,
-    createdAt: r.created_at,
-    startedAt: r.started_at,
-    finishedAt: r.finished_at,
-    items: r.items,
-    bytes: r.bytes,
-    error: r.error,
-    categories: categories
-      .filter((c) => c.run_id === r.id)
-      .map((c): RetentionRunCategory => ({
+  return rows.map((r) => {
+    const own = categories.filter((c) => c.run_id === r.id);
+    return {
+      id: r.id,
+      level: r.account_id === null ? "site" : "account",
+      account: r.account,
+      trigger: r.trigger,
+      actor: r.actor,
+      dryRun: r.dry_run === 1,
+      status: r.status,
+      asOf: r.as_of,
+      createdAt: r.created_at,
+      startedAt: r.started_at,
+      finishedAt: r.finished_at,
+      items: r.items,
+      bytes: r.bytes,
+      error: r.error,
+      notes: runNotes(
+        r.dry_run === 1,
+        own.map((c) => c.category),
+      ),
+      categories: own.map((c): RetentionRunCategory => ({
         category: c.category,
         label: category(c.category)?.label ?? c.category,
         status: c.status,
@@ -462,6 +478,8 @@ async function toRuns(d1: D1Database, rows: RunRow[]): Promise<RetentionRun[]> {
         error: c.error,
         startedAt: c.started_at,
         finishedAt: c.finished_at,
+        cost: categoryCost(timeline, c.category, c.bytes, r.as_of.slice(0, 10)),
       })),
-  }));
+    };
+  });
 }

@@ -2,7 +2,9 @@
 // worker/retention/categories.ts and policies.ts; shapes: shared/retention.ts.
 //
 // /api/accounts/:slug/settings/retention (accountRetentionApi)
-//   GET    the account's categories with effective policies (members; others 404)
+//   GET    the account's categories with effective policies (the account's
+//          administrators: org owners or the user, agents acting for them
+//          read-only; other members 403, others 404)
 //   PATCH  RetentionPatch for account categories (org owners or the user
 //          themselves, and site administrators; people, not agents)
 // /api/admin/retention (siteRetentionApi; site administrators only, others 403)
@@ -20,7 +22,8 @@
 //             of the level that have a cleanup, enabled or not.
 //   GET       the level's runs, newest first (?before=<next>&limit=)
 //   GET /:id  one run with each category's thresholds, counts, bytes, errors
-//   Account runs: members read; site runs: site administrators.
+//   Account runs: the account's administrators read (other members 403);
+//   site runs: site administrators.
 
 import { Hono, type Context } from "hono";
 import type {
@@ -69,6 +72,8 @@ async function siteSettings(d1: D1Database, canEdit: boolean): Promise<Retention
   return { level: "site", account: null, canEdit, categories, changes };
 }
 
+const READ_ONLY_ADMINS = "Only the organization's owners can see its data retention.";
+
 export const accountRetentionApi = new Hono<AppEnv>();
 
 accountRetentionApi.get("/", async (c) => {
@@ -76,9 +81,8 @@ accountRetentionApi.get("/", async (c) => {
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
   if (!found) return fail(c, 404, "No such account, or you aren't a member.");
-  return c.json<RetentionSettings>(
-    await accountSettings(c.env.DB, found.account, found.role === "admin" && !actor.agent),
-  );
+  if (found.role !== "admin") return fail(c, 403, READ_ONLY_ADMINS);
+  return c.json<RetentionSettings>(await accountSettings(c.env.DB, found.account, !actor.agent));
 });
 
 accountRetentionApi.patch("/", async (c) => {
@@ -215,6 +219,7 @@ accountRunsApi.get("/", async (c) => {
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
   if (!found) return fail(c, 404, "No such account, or you aren't a member.");
+  if (found.role !== "admin") return fail(c, 403, READ_ONLY_ADMINS);
   return c.json<RetentionRunPage>(
     await listRuns(c.env.DB, { scope: "account", accountId: found.account.id }, page(c)),
   );
@@ -225,6 +230,7 @@ accountRunsApi.get("/:id", async (c) => {
   if (actor instanceof Response) return actor;
   const found = await load(c, actor);
   if (!found) return fail(c, 404, "No such account, or you aren't a member.");
+  if (found.role !== "admin") return fail(c, 403, READ_ONLY_ADMINS);
   const id = runId(c);
   const run =
     id === null

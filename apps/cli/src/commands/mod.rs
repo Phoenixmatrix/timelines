@@ -7,6 +7,7 @@ pub mod local;
 pub mod network;
 pub mod pkg;
 pub mod release;
+pub mod retention;
 pub mod semantic;
 pub mod server;
 pub mod settings;

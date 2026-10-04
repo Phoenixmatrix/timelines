@@ -14,7 +14,8 @@ export type PriceProduct =
   | "ai_search"
   | "workflows"
   | "queues"
-  | "workers_ai";
+  | "workers_ai"
+  | "containers";
 
 export const PRICE_PRODUCTS: Readonly<Record<PriceProduct, string>> = {
   d1: "D1",
@@ -26,6 +27,7 @@ export const PRICE_PRODUCTS: Readonly<Record<PriceProduct, string>> = {
   workflows: "Workflows",
   queues: "Queues",
   workers_ai: "Workers AI",
+  containers: "Containers",
 };
 
 export type PriceUnit =
@@ -33,6 +35,8 @@ export type PriceUnit =
   | "GB-month"
   | "request"
   | "GB-second"
+  | "GiB-second"
+  | "vCPU-second"
   | "operation"
   | "vector dimension"
   | "token"
@@ -183,6 +187,9 @@ const METRIC_LABELS: Readonly<Record<string, string>> = {
   "workflows/steps": "Steps",
   "queues/operations": "Operations",
   "workers_ai/neurons": "Neurons",
+  "containers/vcpu": "vCPU time",
+  "containers/memory": "Memory",
+  "containers/disk": "Disk",
 };
 
 const MODEL_METRIC_LABELS: Readonly<Record<string, string>> = {

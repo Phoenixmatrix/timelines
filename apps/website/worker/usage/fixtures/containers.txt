@@ -1,0 +1,77 @@
+---
+description: Billing rates for Containers vCPU, memory, disk, and network egress, including included usage on the Workers Paid plan.
+title: Pricing
+image: https://developers.cloudflare.com/containers/platform/pricing/og.png?v=6cefb4d67718aa46
+---
+
+[Skip to content](#main-content)
+
+> Documentation Index  
+> Fetch the complete documentation index at: https://developers.cloudflare.com/containers/llms.txt  
+> Use this file to discover all available pages before exploring further.
+
+# Pricing
+
+Last updated Aug 28, 2026|Copy as Markdown| [View as Markdown](https://developers.cloudflare.com/containers/platform/pricing/index.md)| [Agent setup](https://developers.cloudflare.com/agent-setup/)
+
+## vCPU, Memory and Disk
+
+Containers are billed for every 10ms that they are actively running at the following rates, with included monthly usage as part of the $5 USD per month [Workers Paid plan](https://developers.cloudflare.com/workers/platform/pricing/):
+
+|  | Memory | CPU | Disk |
+| --- | --- | --- | --- |
+| **Free** | N/A | N/A | |
+| **Workers Paid** | 25 GiB-hours/month included <br> +$0.0000025 per additional GiB-second | 375 vCPU-minutes/month <br>+ $0.000020 per additional vCPU-second | 200 GB-hours/month <br> +$0.00000007 per additional GB-second |
+
+You only pay for what you use — charges start when a request is sent to the container or when it is manually started. Charges stop after the container instance goes to sleep, which can happen automatically after a timeout. This makes it easy to scale to zero, and allows you to get high utilization even with bursty traffic.
+
+Memory and disk usage are based on the *provisioned resources* for the instance type you select, while CPU usage is based on *active usage* only.
+
+#### Instance Types
+
+When you deploy a container, you specify an [instance type](https://developers.cloudflare.com/containers/platform/limits/#instance-types).
+
+The instance type you select will impact your bill — larger instances include more memory and disk, incurring additional costs, and higher CPU capacity, which allows you to incur higher CPU costs based on active usage.
+
+The following instance types are currently available:
+
+| Instance Type | vCPU | Memory | Disk |
+| --- | --- | --- | --- |
+| lite | 1/16 | 256 MiB | 2 GB |
+| basic | 1/4 | 1 GiB | 4 GB |
+| standard-1 | 1/2 | 4 GiB | 8 GB |
+| standard-2 | 1 | 6 GiB | 12 GB |
+| standard-3 | 2 | 8 GiB | 16 GB |
+| standard-4 | 4 | 12 GiB | 20 GB |
+
+## Network Egress
+
+Egress from Containers is priced at the following rates:
+
+| Region | Price per GB | Included Allotment per month |
+| --- | --- | --- |
+| North America & Europe | $0.025 | 1 TB |
+| Oceania, Korea, Taiwan | $0.05 | 500 GB |
+| Everywhere Else | $0.04 | 500 GB |
+
+## Workers and Durable Objects Pricing
+
+When you use Containers, incoming requests to your containers are handled by your [Worker](https://developers.cloudflare.com/workers/platform/pricing/), and each container has its own [Durable Object](https://developers.cloudflare.com/durable-objects/platform/pricing/). You are billed for your usage of both Workers and Durable Objects.
+
+## Logs and Observability
+
+Containers are integrated with the [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) platform, and billed at the same rate. Refer to [Workers Logs pricing](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#pricing) for details.
+
+When you [enable observability for your Worker](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs) with a binding to a container, logs from your container will show in both the Containers and Observability sections of the Cloudflare dashboard.
+
+Was this helpful?
+
+YesNo
+
+## On this page
+
+[![](https://developers.cloudflare.com/_astro/logo.te5VL_aD.svg)Docs](https://developers.cloudflare.com/)
+
+```json
+{"@context":"https://schema.org","@type":"TechArticle","@id":"https://developers.cloudflare.com/containers/platform/pricing/#page","headline":"Pricing","description":"Billing rates for Containers vCPU, memory, disk, and network egress, including included usage on the Workers Paid plan.","url":"https://developers.cloudflare.com/containers/platform/pricing/","inLanguage":"en","image":"https://developers.cloudflare.com/containers/platform/pricing/og.png?v=6cefb4d67718aa46","dateModified":"2026-08-28","publisher":{"@type":"Organization","name":"Cloudflare","description":"One platform for your apps, agents, and workforce. Build, secure, and scale without managing infrastructure","url":"https://www.cloudflare.com/","sameAs":["https://github.com/cloudflare","https://www.linkedin.com/company/cloudflare","https://x.com/cloudflare"],"logo":{"@type":"ImageObject","url":"https://developers.cloudflare.com/logo.svg"},"address":{"@type":"PostalAddress","streetAddress":"101 Townsend St","addressLocality":"San Francisco","addressRegion":"CA","postalCode":"94107","addressCountry":"US"},"contactPoint":[{"@type":"ContactPoint","contactType":"Customer Support","url":"https://support.cloudflare.com/","availableLanguage":["English"]},{"@type":"ContactPoint","contactType":"Sales","url":"https://www.cloudflare.com/contact/","availableLanguage":["English"]}]},"isPartOf":{"@type":"WebSite","@id":"https://developers.cloudflare.com/#website","name":"Cloudflare Docs","url":"https://developers.cloudflare.com/"}}
+```

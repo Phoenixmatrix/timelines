@@ -2393,7 +2393,7 @@ deletes nothing it didn't delete before.
 
 | Route                                          | Contract                                                                                                                          |
 | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/accounts/:slug/settings/retention`   | The account's categories with effective `enabled`, `values` and where each comes from (members; others 404)                       |
+| `GET /api/accounts/:slug/settings/retention`   | The account's categories with effective `enabled`, `values` and where each comes from (administrators; members 403, others 404)   |
 | `PATCH /api/accounts/:slug/settings/retention` | `{categories: {<id>: {enabled?, thresholds?}}}`; `null` resets to inherit (org owners, the user, site admins; people, not agents) |
 | `GET`, `PATCH /api/admin/retention`            | Site categories and site-wide defaults for account `policy` categories (site administrators; others 403)                          |
 
@@ -2434,10 +2434,51 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
 | Route                                          | Contract                                                                                                                                                             |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /api/accounts/:slug/retention/runs`      | `{dryRun, categories: [<id>], thresholds?: {<id>: {key: n}}}`: any account categories with a cleanup, enabled or not; 202 with the run (owners, site admins; people) |
-| `GET /api/accounts/:slug/retention/runs[/:id]` | Runs newest first (`?before=<next>&limit=`), or one run with each category's thresholds, counts, bytes and errors (members)                                          |
+| `GET /api/accounts/:slug/retention/runs[/:id]` | Runs newest first (`?before=<next>&limit=`), or one run with each category's thresholds, counts, bytes, estimated cost and errors (administrators)                   |
 | `POST`, `GET /api/admin/retention/runs[/:id]`  | The same for site categories (site administrators)                                                                                                                   |
 
 The settings responses show each category's `runnable` and `lastRun`.
+
+Each run category carries `cost`: its bytes priced at the storage list price
+of where that category's data lives (`CATEGORY_STORAGE` in
+`worker/retention/costs.ts`: D1, Durable Object SQLite or R2), from the price
+catalog in effect on the run's day. An estimate of the monthly storage a
+cleanup frees, never a bill. Categories whose selections can hold the same
+records declare `overlaps` (CI logs with CI run history, closed issues with
+tracker activity): a dry run of both counts those records under each, so the
+run's `notes` say so plainly and the UI shows its total as "up to"; a run
+removes each record once. Preview them one at a time for exact figures.
+
+### Data retention pages and `gm retention`
+
+CORE-210. **Settings → Data retention** (`/settings/retention?owner=`, the
+account's administrators) and **Settings → Site data retention**
+(`/settings/site-retention`, site administrators; site categories and the
+site-wide defaults for every account), in `src/routes/DataRetention.tsx` and
+`src/components/RetentionView.tsx`:
+
+- Every category with its scope, an on/off switch (off by default; `active`
+  ones say "Always on"), its thresholds with their defaults and units (days,
+  months, counts, GiB), what it never deletes and its last run. Timeline
+  previews is the existing preview settings (`/settings/previews`), the same
+  columns. Each category saves on its own; "Reset" removes the stored values.
+- **Clean up now:** choose any categories that have a cleanup (on or off),
+  **Preview cleanup** (a dry run: records, bytes and estimated monthly cost
+  per category, plus the overlap note), then **Delete**, confirmed in a dialog;
+  the cleanup uses exactly the preview's categories and thresholds. Both show
+  live progress (the run is polled every second) and land in the **run
+  history** (paged, newest first).
+- The usage report's category links (`src/lib/retention-links.ts`) open a
+  category's row with it chosen in "Clean up now"
+  (`?cleanup=<id>#category-<id>`).
+
+`gm retention show|set|run|runs` (apps/cli) is the same from the command line:
+`gm retention set assistant-chats --enable --threshold days=60`, `gm
+--dry-run retention run ci-logs ci-runs` (a preview), `gm retention run
+ci-logs --yes` (deleting needs `--yes`), `--owner <slug>` or `--site`.
+E2E `browser-data-retention-account-and-site`; dev `POST
+/api/dev/retention-cron` runs the hourly cron and lists the scheduled runs'
+categories.
 
 ### CI retention
 
@@ -2553,8 +2594,21 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
   priced as input and marked estimated). Included allowances are account-wide
   on the Cloudflare account, so nothing is subtracted (gross list price). A
   price whose billing hasn't started (Artifacts before 2026-10-14, AI Search
-  before 2026-11-01) is shown with its start date and left out of totals. CI
-  sandbox minutes are shown unpriced.
+  before 2026-11-01) is shown with its start date and left out of totals.
+- **CI sandboxes** are priced at Cloudflare's Containers rates (catalog
+  product `containers`: `vcpu` per vCPU-second, `memory` per GiB-second,
+  `disk` per GB-second, from
+  `https://developers.cloudflare.com/containers/platform/pricing/`, page dated
+  2026-08-28, seeded 2026-10-04 by migration
+  `20261004071417_containers_prices.sql` and refreshed like every other page).
+  The collection turns each sandbox job's wall time (start to finish) into
+  `vcpu_seconds`, `memory_gib_seconds` and `disk_gb_seconds` by its instance
+  type (`worker/usage/containers.ts`, the sizes Cloudflare publishes; a job
+  without one is `standard-1`), alongside `jobs` and `minutes`. All three are
+  estimated: the container runs slightly longer than the job's steps, and
+  Cloudflare bills memory and disk on the provisioned size but vCPU only on
+  active use, so the vCPU cost is an upper bound. Days collected before this
+  (only `minutes`) stay unpriced.
 - Every line carries its figures with `estimated` and `method`, its costs
   with the price and source page, and the retention categories that clean it
   up (account pages list account categories only). `RETENTION_PAGES` in

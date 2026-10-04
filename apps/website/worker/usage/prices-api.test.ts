@@ -76,7 +76,8 @@ describe("authorization", () => {
     expect((await t.call(null, "GET", "")).status).toBe(401);
     const { status, json } = await t.call(t.tokens.ann, "GET", "");
     expect(status).toBe(200);
-    expect((json as PriceCatalog).version).toBe(1);
+    // The seed, then Containers' prices (CORE-210).
+    expect((json as PriceCatalog).version).toBe(2);
     expect((json as PriceCatalog).prices.length).toBeGreaterThan(40);
   });
 
@@ -100,8 +101,9 @@ describe("authorization", () => {
       expect((await t.call(null, method, path, {})).status).toBe(401);
     }
     // Nothing was fetched or recorded on their behalf.
+    // (The two seed changes: the catalog's, then Containers'.)
     expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM cloudflare_price_changes").get()).toEqual({
-      n: 1,
+      n: 2,
     });
   });
 });
@@ -169,6 +171,7 @@ describe("the flow", () => {
     expect(changes.changes.map((c) => [c.kind, c.status])).toEqual([
       ["manual", "applied"],
       ["refresh", "applied"],
+      ["seed", "applied"],
       ["seed", "applied"],
     ]);
     const one = await t.call(root, "GET", `/changes/${change.id}`);

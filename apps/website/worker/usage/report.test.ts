@@ -76,7 +76,13 @@ const ACTIVITY = (day: string) => [
   activity(addDays(day, -1), "workers_ai", FLASH, "output_tokens", 1e6 / 30),
   activity(addDays(day, -1), "workers_ai", EMBED, "total_tokens", 10e6 / 30),
   activity(addDays(day, -1), "ci", "sandbox", "minutes", 12),
+  // 12 minutes on standard-4 (4 vCPU, 12 GiB, 20 GB): 720 s × each.
+  activity(addDays(day, -1), "ci", "sandbox", "vcpu_seconds", 2880),
+  activity(addDays(day, -1), "ci", "sandbox", "memory_gib_seconds", 8640),
+  activity(addDays(day, -1), "ci", "sandbox", "disk_gb_seconds", 14400),
 ];
+/** A month of that CI at Containers' prices: vCPU-s, GiB-s and GB-s × their per-second prices. */
+const CI_USD = 30 * (2880 * 0.00002 + 8640 * 0.0000025 + 14400 * 0.00000007);
 
 async function timeline() {
   return priceTimeline(d1(migratedDatabase()));
@@ -136,12 +142,28 @@ describe("costs", () => {
     expect(embed.monthlyUsd).toBeCloseTo(0.12, 10);
     expect(embed.estimated).toBe(true);
     expect(embed.note).toContain("priced as input tokens");
-    // CI minutes have no price: shown, with why.
+    // CI sandboxes at Containers' per-second prices, over 30 days: 86,400 vCPU-s ×
+    // $0.00002 + 259,200 GiB-s × $0.0000025 + 432,000 GB-s × $0.00000007.
     const ci = lineOf(report, "ci", "sandbox");
-    expect(ci.costs).toEqual([]);
-    expect(ci.figures[0]).toMatchObject({ metric: "minutes", quantity: 360 });
-    expect(ci.note).toContain("isn't in the price catalog");
-    expect(report.monthlyUsd).toBeCloseTo(1.875 + 0.75 + 0.2 + 0.3 + 0.1 + 2 + 0.8 + 0.12, 10);
+    expect(ci.figures.find((f) => f.metric === "minutes")).toMatchObject({ quantity: 360 });
+    expect(ci.costs.map((c) => [c.product, c.metric, c.unit, c.quantity])).toEqual([
+      ["containers", "vcpu", "vCPU-second", 86_400],
+      ["containers", "memory", "GiB-second", 259_200],
+      ["containers", "disk", "GB-second", 432_000],
+    ]);
+    expect(ci.monthlyUsd).toBeCloseTo(
+      86_400 * 0.00002 + 259_200 * 0.0000025 + 432_000 * 0.00000007,
+      10,
+    );
+    expect(ci.monthlyUsd).toBeCloseTo(CI_USD, 10);
+    // vCPU is provisioned, not active, time: an upper bound, labelled.
+    expect(ci.costs[0]!.estimated).toBe(true);
+    expect(ci.estimated).toBe(true);
+    expect(ci.note).toContain("upper bound");
+    expect(report.monthlyUsd).toBeCloseTo(
+      1.875 + 0.75 + 0.2 + 0.3 + 0.1 + 2 + 0.8 + 0.12 + CI_USD,
+      10,
+    );
   });
 
   test("estimated figures are labelled; measured ones aren't", async () => {
@@ -451,7 +473,7 @@ describe("reports from the database", () => {
       {
         slug: "orbit",
         displayName: "Orbit",
-        monthlyUsd: expect.closeTo(1.875 + 0.75 + 0.2 + 0.3 + 0.1 + 2 + 0.8 + 0.12, 8),
+        monthlyUsd: expect.closeTo(1.875 + 0.75 + 0.2 + 0.3 + 0.1 + 2 + 0.8 + 0.12 + CI_USD, 8),
       },
       { slug: "bob", displayName: "Bob", monthlyUsd: expect.closeTo(0.3, 10) },
     ]);

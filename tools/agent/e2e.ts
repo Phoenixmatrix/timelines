@@ -2230,6 +2230,331 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("browser-data-retention-account-and-site", async () => {
+    // CORE-210: the account's Data retention page (its administrators) and
+    // the site's (site administrators), at desktop and phone widths, driven
+    // from the keyboard. marco turns assistant chat expiration on, previews it
+    // (exactly the stale chats seeded here), deletes them, and the history
+    // records both runs; the cron never schedules a category that's off;
+    // the usage report links each category to its row and "Clean up now";
+    // `gm retention` matches; members and non-admins are refused.
+    const owner = "marco";
+    const token = fixtures.tokens.marco;
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const settings = `/api/accounts/${owner}/settings/retention`;
+    const runs = `/api/accounts/${owner}/retention/runs`;
+    type Run = {
+      id: number;
+      dryRun: boolean;
+      status: string;
+      items: number;
+      bytes: number;
+      categories: { category: string; items: number; cost: { monthlyUsd: number } | null }[];
+    };
+    type Chat = { id: string; updatedAt: string };
+
+    // Authorization, API: a member of orbit and an outsider see nothing; only
+    // site administrators reach the site level.
+    const orbit = `/api/accounts/${repo.owner}`;
+    await request(`${orbit}/settings/retention`, fixtures.tokens.jun, "GET", undefined, [403]);
+    await request(`${orbit}/retention/runs`, fixtures.tokens.jun, "GET", undefined, [403]);
+    await request(
+      `${orbit}/retention/runs`,
+      fixtures.tokens.jun,
+      "POST",
+      {
+        dryRun: true,
+        categories: ["ci-logs"],
+      },
+      [403],
+    );
+    await request(
+      `${orbit}/settings/retention`,
+      fixtures.tokens.jun,
+      "PATCH",
+      {
+        categories: { "ci-logs": { enabled: true } },
+      },
+      [403],
+    );
+    await request(`${orbit}/settings/retention`, fixtures.tokens.sam, "GET", undefined, [404]);
+    await request("/api/admin/retention", token, "GET", undefined, [403]);
+    await request(
+      "/api/admin/retention/runs",
+      token,
+      "POST",
+      {
+        dryRun: true,
+        categories: ["auth-hygiene"],
+      },
+      [403],
+    );
+    await gm(["retention", "show", "--owner", repo.owner], "jun", work, /owners|forbidden|403/i);
+
+    // Seed: stale chats (last used 120 days ago) and one used today.
+    const tag = randomUUID().replaceAll("-", "").slice(0, 10);
+    const staleIds = [`ret-stale-a-${tag}`, `ret-stale-b-${tag}`];
+    const freshId = `ret-fresh-${tag}`;
+    for (const id of staleIds)
+      await json("/api/dev/assistant-chat", secret, "POST", {
+        account: owner,
+        id,
+        title: `Stale ${id}`,
+        updatedAt: new Date(Date.now() - 120 * 86_400_000).toISOString(),
+      });
+    await json("/api/dev/assistant-chat", secret, "POST", {
+      account: owner,
+      id: freshId,
+      title: `Fresh ${tag}`,
+    });
+    const chats = async () => (await json<{ chats: Chat[] }>("/api/assistant/chats", token)).chats;
+    // Everything of marco's the default (90 days unused) selects: the seeded
+    // stale chats, plus any older ones another scenario left.
+    const idle = (await chats()).filter(
+      (c) => Date.parse(c.updatedAt) < Date.now() - 90 * 86_400_000,
+    );
+    for (const id of staleIds)
+      assert(
+        idle.some((c) => c.id === id),
+        `${id} is idle for the policy`,
+      );
+
+    // gm parity: show, set, and a dry run that deletes nothing.
+    const shown = JSON.parse(await gm(["retention", "show", "--owner", owner])) as {
+      categories: { id: string; enabled: boolean }[];
+    };
+    assert.equal(shown.categories.find((c) => c.id === "assistant-chats")?.enabled, false);
+    const gmDry = JSON.parse(
+      await gm(["retention", "run", "assistant-chats", "--owner", owner, "--dry-run"]),
+    ) as Run;
+    assert.equal(gmDry.dryRun, true);
+    assert.equal(gmDry.items, idle.length, "gm's dry run lists exactly the idle chats");
+    await gm(
+      ["retention", "run", "assistant-chats", "--owner", owner],
+      "marco",
+      work,
+      /--yes|confirm/i,
+    );
+
+    const browserTimeout = 20_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const signIn = async (persona: Persona, viewport: { width: number; height: number }) => {
+      const context = await browser.newContext({ baseURL: ctx.origin, viewport });
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+      const page = await context.newPage();
+      page.setDefaultTimeout(browserTimeout);
+      await page.goto("/signin");
+      await page.getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      return { context, page };
+    };
+    const noSideways = async (page: import("@playwright/test").Page, label: string) => {
+      const width = await page.evaluate(() => document.documentElement.scrollWidth);
+      assert(width <= page.viewportSize()!.width, `${label}: no horizontal scrolling (${width})`);
+    };
+    const contexts: BrowserContext[] = [];
+    let current: import("@playwright/test").Page | null = null;
+    try {
+      // Desktop, from the settings navigation; everything by keyboard.
+      {
+        const { context, page } = await signIn("marco", { width: 1280, height: 900 });
+        contexts.push(context);
+        current = page;
+        await page.goto(`/settings/usage?owner=${owner}`);
+        await page.getByRole("link", { name: "Data retention", exact: true }).click();
+        await page.waitForURL((url) => url.pathname === "/settings/retention");
+        await expect(page.getByRole("heading", { name: "Data retention", level: 1 })).toBeVisible();
+        const all = (await json<{ categories: { id: string; scope: string }[] }>(settings, token))
+          .categories;
+        await expect(page.locator("[data-retention-row]")).toHaveCount(all.length);
+        await noSideways(page, "account 1280px");
+
+        // Turn assistant chat expiration on: Space on the switch, Enter to save.
+        const row = page.locator('[data-retention-row="assistant-chats"]');
+        const toggle = row.getByRole("switch", { name: "Enable: Assistant chats" });
+        await expect(toggle).toHaveAttribute("aria-checked", "false");
+        await toggle.focus();
+        await page.keyboard.press("Space");
+        await expect(toggle).toHaveAttribute("aria-checked", "true");
+        await row.getByRole("button", { name: "Save Assistant chats" }).focus();
+        await page.keyboard.press("Enter");
+        await expect(row.getByText("Assistant chats: saved.")).toBeVisible();
+        const after = await json<{ categories: { id: string; enabled: boolean }[] }>(
+          settings,
+          token,
+        );
+        assert.equal(after.categories.find((c) => c.id === "assistant-chats")?.enabled, true);
+
+        // Clean up now: choose it, preview, confirm, watch it finish.
+        await row.getByRole("button", { name: "Clean up now: Assistant chats" }).focus();
+        await page.keyboard.press("Enter");
+        const cleanup = page.locator("#clean-up-now");
+        await expect(cleanup.locator('[data-cleanup-category="assistant-chats"]')).toBeChecked();
+        await cleanup.getByRole("button", { name: "Preview cleanup" }).focus();
+        await page.keyboard.press("Enter");
+        const status = cleanup.locator("[data-cleanup-status]");
+        await expect(status).toContainText(`would be deleted`, { timeout: 60_000 });
+        const previewRow = cleanup.locator(
+          "[data-cleanup-preview] [data-run-category='assistant-chats'] [data-items]",
+        );
+        await expect(previewRow).toHaveAttribute("data-items", String(idle.length));
+        // Nothing is deleted by a preview.
+        for (const id of staleIds)
+          assert(
+            (await chats()).some((c) => c.id === id),
+            `${id} survives the preview`,
+          );
+        const deleteButton = cleanup.getByRole("button", { name: /^Delete / });
+        await deleteButton.focus();
+        await page.keyboard.press("Enter");
+        const dialog = page.getByRole("dialog");
+        await expect(dialog).toContainText(`Delete ${idle.length} record`);
+        await dialog.getByRole("button", { name: "Delete", exact: true }).focus();
+        await page.keyboard.press("Enter");
+        await expect(status).toContainText(`removed ${idle.length} record`, { timeout: 60_000 });
+        const left = await chats();
+        for (const id of staleIds)
+          assert(!left.some((c) => c.id === id), `${id} was deleted by the cleanup`);
+        assert(
+          left.some((c) => c.id === freshId),
+          "The chat used today is kept",
+        );
+
+        // The history records both, newest first, and the row its last run.
+        const history = await json<{ runs: Run[] }>(runs, token);
+        const [real, dry] = history.runs;
+        assert(real && dry && !real.dryRun && dry.dryRun, "History: the run, then its preview");
+        assert.equal(real.items, dry.items, "The run removed exactly what the preview listed");
+        assert.equal(real.categories[0]!.cost !== null, true, "Its estimated cost is priced");
+        await expect(page.locator(`[data-run="${real.id}"]`)).toContainText(`Cleanup #${real.id}`);
+        await expect(page.locator(`[data-run="${dry.id}"]`)).toContainText(`Preview #${dry.id}`);
+        await expect(row.locator("[data-last-run]")).toContainText(`#${real.id}`);
+
+        // Previews: the existing preview settings, as a category.
+        const previews = page.locator('[data-retention-row="previews"]');
+        await previews.getByLabel("Days without pushes").fill("9");
+        await previews.getByRole("button", { name: "Save Timeline previews" }).click();
+        await expect(previews.getByText("Timeline previews: saved.")).toBeVisible();
+        const previewSettings = await json<{ idleDays: number }>(
+          `/api/accounts/${owner}/settings/previews`,
+          token,
+        );
+        assert.equal(previewSettings.idleDays, 9, "The preview sweep reads what the page saved");
+
+        // Turn it off again, with a harmless category on so the cron has a run to make.
+        await toggle.focus();
+        await page.keyboard.press("Space");
+        await row.getByRole("button", { name: "Save Assistant chats" }).click();
+        await expect(row.getByText("Assistant chats: saved.")).toBeVisible();
+        await context.tracing.stop();
+      }
+
+      // The schedule never runs a category that's off: a stale chat stays.
+      const stale = `ret-stale-c-${tag}`;
+      await json("/api/dev/assistant-chat", secret, "POST", {
+        account: owner,
+        id: stale,
+        title: `Stale ${stale}`,
+        updatedAt: new Date(Date.now() - 120 * 86_400_000).toISOString(),
+      });
+      await gm(["retention", "set", "release-notes", "--enable", "--owner", owner]);
+      const cron = await json<{
+        scheduled: { id: number; account: string | null; categories: string[] }[];
+      }>("/api/dev/retention-cron", secret, "POST", {});
+      for (const run of cron.scheduled)
+        if (run.account === owner)
+          assert.deepEqual(run.categories, ["release-notes"], "Only what's on is scheduled");
+      assert(
+        !cron.scheduled.some(
+          (r) => r.categories.includes("assistant-chats") && r.account === owner,
+        ),
+        "A disabled category is never scheduled",
+      );
+      await gm(["retention", "set", "release-notes", "--inherit", "--owner", owner]);
+      await json(`/api/accounts/${owner}/settings/previews`, token, "PATCH", { idleDays: 7 });
+      assert(
+        (await chats()).some((c) => c.id === stale),
+        "The schedule left the stale chat",
+      );
+
+      // Phone: the usage report's category link lands on its row with it chosen.
+      {
+        const { context, page } = await signIn("marco", { width: 390, height: 844 });
+        contexts.push(context);
+        current = page;
+        await page.goto(`/settings/usage?owner=${repo.owner}`);
+        const linked = page.locator("[data-retention-category] a").first();
+        const category = await linked.locator("xpath=..").getAttribute("data-retention-category");
+        await linked.locator("xpath=ancestor::details/summary").click();
+        await linked.click();
+        await page.waitForURL(
+          (url) =>
+            url.pathname === "/settings/retention" &&
+            url.searchParams.get("owner") === repo.owner &&
+            url.searchParams.get("cleanup") === category,
+        );
+        await expect(page.locator(`[data-retention-row="${category}"]`)).toBeVisible();
+        await expect(page.locator(`[data-cleanup-category="${category}"]`)).toBeChecked();
+        await noSideways(page, "account 390px");
+        await context.tracing.stop();
+      }
+
+      // A member who isn't an administrator is refused; the site page isn't theirs.
+      {
+        const { context, page } = await signIn("jun", { width: 390, height: 844 });
+        contexts.push(context);
+        current = page;
+        await page.goto(`/settings/retention?owner=${repo.owner}`);
+        await expect(
+          page.getByText("Only the organization's owners can see its data retention."),
+        ).toBeVisible();
+        await expect(page.locator("[data-retention-row]")).toHaveCount(0);
+        await page.goto("/settings/site-retention");
+        await page.waitForURL((url) => url.pathname === "/");
+        await context.tracing.stop();
+      }
+
+      // The site administrator: site categories and site-wide defaults, a preview.
+      for (const [width, height] of [
+        [1280, 900],
+        [390, 844],
+      ] as const) {
+        const { context, page } = await signIn("priya", { width, height });
+        contexts.push(context);
+        current = page;
+        await page.goto("/settings/site-retention?cleanup=auth-hygiene");
+        await expect(
+          page.getByRole("heading", { name: "Site data retention", level: 1 }),
+        ).toBeVisible();
+        await expect(
+          page.getByRole("heading", { name: "Defaults for every account" }),
+        ).toBeVisible();
+        await expect(page.locator('[data-retention-row="usage-history"]')).toContainText("months");
+        await expect(page.locator('[data-cleanup-category="auth-hygiene"]')).toBeChecked();
+        await page.getByRole("button", { name: "Preview cleanup" }).click();
+        await expect(page.locator("[data-cleanup-status]")).toContainText(/Preview #\d+ finished/, {
+          timeout: 60_000,
+        });
+        await noSideways(page, `site ${width}px`);
+        await context.tracing.stop();
+      }
+      record({ deleted: idle.length, scheduled: cron.scheduled.length, widths: [1280, 390] });
+    } catch (error) {
+      await current
+        ?.screenshot({ path: join(ctx.artifacts, "browser-retention-failure.png"), fullPage: true })
+        .catch(() => {});
+      await contexts
+        .at(-1)
+        ?.tracing.stop({ path: join(ctx.artifacts, "browser-retention-failure.zip") })
+        .catch(() => {});
+      throw error;
+    } finally {
+      for (const context of contexts) await context.close().catch(() => {});
+      await browser.close();
+    }
+  });
+
   await scenario("tracker-retention-removes-closed-issues-and-replicas-converge", async () => {
     // CORE-203, in the real runtime: sam's own tracker gets a closed issue,
     // an open one and a gm replica; a retention run 400 days ahead (a dry run

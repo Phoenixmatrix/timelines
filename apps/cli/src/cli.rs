@@ -119,6 +119,9 @@ pub enum Command {
     /// Account-wide settings for a person or organization
     #[command(subcommand)]
     Settings(crate::commands::settings::SettingsCommand),
+    /// Data retention: policies per category, clean up now (with --dry-run previews) and run history
+    #[command(subcommand)]
+    Retention(crate::commands::retention::RetentionCommand),
     /// Manage repositories on the Gitmatrix server
     #[command(subcommand)]
     Repo(RepoCommand),

@@ -696,6 +696,30 @@ rebuild, and enabling a feature resumes it on normal triggers or explicit reques
 Settings mutations are not part of `gm undo`. The equivalent web page is
 `/settings/ai?owner=orbit`.
 
+## Data retention
+
+```bash
+gm retention show --owner orbit                  # categories, switches, thresholds, last run
+gm retention set ci-logs --enable --threshold days=14
+gm retention set ci-runs --reset keepLatest      # inherit the site-wide default again
+gm retention run ci-logs ci-runs --dry-run       # preview what a cleanup would delete
+gm retention run ci-logs --yes                   # clean up now and wait for the result
+gm retention runs                                # history; `gm retention runs 12` for one run
+gm retention show --site                         # site categories and site-wide defaults
+```
+
+The same policies, cleanup runs and history as the Data retention settings
+pages. Every category is off until enabled; then scheduled cleanups delete what
+its policy selects. Omit `--owner` for the signed-in person's own account;
+`--site` covers site categories and site-wide defaults (site administrators).
+`--inherit` and `--reset <key>` remove this level's value so it inherits again.
+`run` takes any categories with a cleanup, enabled or not, and per-run overrides
+(`--threshold category.key=value`). With `--dry-run` the server previews the run
+without deleting; a real run requires `--yes`. `run` waits for the result unless
+`--no-wait` (exit 4 when it fails). Only account owners (people, not agents) and
+site administrators change settings or start runs; nothing here is part of
+`gm undo`.
+
 ## Built for agents, like `cf`
 
 The design follows Cloudflare's agent-first `cf` CLI:
@@ -772,6 +796,7 @@ not numbers in progress counters or repository URLs. An interrupted pack transfe
 | Server      | `auth login [--ssh]/status/logout`, `repo list/create/view/delete`, `repo mirror show/set/sync/remove`, `api`                             |
 | SSH keys    | `auth ssh-key add/list/remove`, `auth git-credential` (git helper)                                                                        |
 | CI          | `runs list/show/logs/wait/start/cancel/rerun`, `runner`, `secret`                                                                         |
+| Retention   | `retention show/set/run/runs` (`run --dry-run` previews a cleanup)                                                                        |
 | Packages    | `pkg list/show/versions`, `pkg delete/yank/restore/deprecate/tag`, `pkg sources/grant/revoke`, `pkg published`, `pkg upload`, `pkg setup` |
 | Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                                                                                       |
 

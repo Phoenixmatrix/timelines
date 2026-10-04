@@ -7,7 +7,12 @@ import type { RetentionRun, RetentionRunPage, RetentionSettings } from "../../sh
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
+import { seedPrice } from "../usage/seed.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./api.ts";
+import { CATEGORIES } from "./categories.ts";
+import { cleanupFor } from "./cleanups/index.ts";
+import { CATEGORY_STORAGE } from "./costs.ts";
+import { runNotes } from "./runs.ts";
 
 const DAY = 86_400_000;
 const ago = (days: number) => new Date(Date.now() - days * DAY).toISOString();
@@ -93,13 +98,25 @@ describe("manual cleanup runs", () => {
     expect(started.status).toBe(202);
     const dry = started.json as RetentionRun;
     expect(dry).toMatchObject({ level: "account", account: "orbit", actor: "ann", dryRun: true });
-    const finished = (await t.call(t.tokens.cat, "GET", `${RUNS}/${dry.id}`)).json as RetentionRun;
+    const finished = (await t.call(t.tokens.ann, "GET", `${RUNS}/${dry.id}`)).json as RetentionRun;
     expect(finished).toMatchObject({
       status: "succeeded",
       items: 7,
       categories: [{ category: "preview-records", thresholds: { days: 30 }, items: 7 }],
     });
     expect(t.deployments()).toBe(10);
+    // Its estimated cost: the bytes at D1's storage list price (the seeded catalog).
+    const d1Storage = seedPrice("d1", "storage");
+    expect(finished.categories[0]!.cost).toMatchObject({
+      product: "d1",
+      metric: "storage",
+      unit: d1Storage.unit,
+      quantity: finished.bytes / 1e9,
+      monthlyUsd: (finished.bytes / 1e9) * (d1Storage.unitPriceUsd / d1Storage.unitQuantity),
+      startsOn: null,
+      estimated: true,
+    });
+    expect(finished.notes).toEqual([]);
 
     // Thresholds can be overridden for one run, within bounds.
     const narrower = await t.call(t.tokens.ann, "POST", RUNS, {
@@ -128,7 +145,7 @@ describe("manual cleanup runs", () => {
     });
     expect(t.deployments()).toBe(3);
 
-    const history = (await t.call(t.tokens.cat, "GET", RUNS)).json as RetentionRunPage;
+    const history = (await t.call(t.tokens.ann, "GET", RUNS)).json as RetentionRunPage;
     expect(history.runs.map((r) => [r.dryRun, r.items])).toEqual([
       [false, 7],
       [true, 3],
@@ -181,7 +198,7 @@ describe("manual cleanup runs", () => {
     ).toBe(0);
   });
 
-  test("owners run, members read, others see nothing; site runs are site admins'", async () => {
+  test("owners run and read, members are refused, others see nothing; site runs are site admins'", async () => {
     const t = await setup();
     const body = { dryRun: true, categories: ["preview-records"] };
     expect((await t.call(t.tokens.cat, "POST", RUNS, body)).status).toBe(403);
@@ -190,7 +207,11 @@ describe("manual cleanup runs", () => {
     expect((await t.call(t.tokens.bob, "GET", RUNS)).status).toBe(404);
     const run = (await t.call(t.tokens.sue, "POST", RUNS, body)).json as RetentionRun;
     expect(run.actor).toBe("sue");
-    expect((await t.call(t.tokens.cat, "GET", `${RUNS}/${run.id}`)).status).toBe(200);
+    expect((await t.call(t.tokens.ann, "GET", `${RUNS}/${run.id}`)).status).toBe(200);
+    expect((await t.call(t.tokens.agent, "GET", `${RUNS}/${run.id}`)).status).toBe(200);
+    // Members see neither the history nor a run.
+    expect((await t.call(t.tokens.cat, "GET", RUNS)).status).toBe(403);
+    expect((await t.call(t.tokens.cat, "GET", `${RUNS}/${run.id}`)).status).toBe(403);
     // Another account's run isn't found through this one.
     expect(
       (await t.call(t.tokens.bob, "GET", `/api/accounts/bob/retention/runs/${run.id}`)).status,
@@ -216,5 +237,27 @@ describe("manual cleanup runs", () => {
     expect((await t.call(t.tokens.sue, "GET", `/api/admin/retention/runs/${run.id}`)).status).toBe(
       404,
     );
+  });
+});
+
+describe("preview figures", () => {
+  test("every category with a cleanup has a store to price its bytes", () => {
+    const runnable = CATEGORIES.filter((c) => cleanupFor(c.id)).map((c) => c.id);
+    expect(runnable.filter((id) => !(id in CATEGORY_STORAGE))).toEqual([]);
+  });
+
+  test("a dry run of overlapping categories says it counts some records twice", () => {
+    expect(runNotes(true, ["ci-logs", "preview-records"])).toEqual([]);
+    expect(runNotes(false, ["ci-logs", "ci-runs"])).toEqual([]);
+    const notes = runNotes(true, ["tracker-activity", "ci-runs", "closed-issues", "ci-logs"]);
+    expect(notes).toHaveLength(2);
+    expect(notes[0]).toMatch(/^CI logs and CI run history can select the same records/);
+    expect(notes[1]).toMatch(/^Closed and canceled issues and Tracker activity/);
+    // The overlap is symmetric in the registry.
+    for (const c of CATEGORIES)
+      for (const other of ("overlaps" in c ? c.overlaps : []) as readonly string[])
+        expect(
+          (CATEGORIES.find((x) => x.id === other) as { overlaps?: readonly string[] }).overlaps,
+        ).toContain(c.id);
   });
 });
