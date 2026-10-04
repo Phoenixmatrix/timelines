@@ -29,6 +29,7 @@ import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageC
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { Releases, releasesLoader } from "./routes/repo/Releases.tsx";
 import { TrackerReleases, trackerReleasesLoader } from "./routes/tracker/Releases.tsx";
+import { Story, storyLoader } from "./routes/tracker/Story.tsx";
 import { TrackerTimelines, trackerTimelinesLoader } from "./routes/tracker/Timelines.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
@@ -92,6 +93,11 @@ export const routes: RouteObject[] = [
             path: "tracker/:owner/timelines",
             loader: trackerTimelinesLoader,
             Component: TrackerTimelines,
+          },
+          {
+            path: "tracker/:owner/timelines/:slug/story",
+            loader: storyLoader,
+            Component: Story,
           },
           {
             path: "tracker/:owner",

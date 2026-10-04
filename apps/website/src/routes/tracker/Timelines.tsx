@@ -606,6 +606,12 @@ function TimelineDetails({
         <h2 className="m-0 min-w-0 flex-1 text-title-lg [overflow-wrap:anywhere]">
           {timeline.name}
         </h2>
+        <Link
+          className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 no-underline"
+          to={`/tracker/${encodeURIComponent(data.owner.slug)}/timelines/${encodeURIComponent(timeline.slug)}/story`}
+        >
+          Story
+        </Link>
         <Link className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 no-underline" to={clear}>
           Back to main
         </Link>

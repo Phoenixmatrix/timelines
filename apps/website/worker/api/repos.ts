@@ -26,6 +26,9 @@ import {
   type RepoRow,
 } from "../db.ts";
 import { notifyKnowledge } from "../knowledge/coordinator.ts";
+import { structuredPatch } from "diff";
+import { DIFF_LIMITS, type CommitDiff, type DiffFile } from "../../shared/diff.ts";
+import { diffTrees, type FileChange } from "../knowledge/overlay.ts";
 import { isCommitId, RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
@@ -398,6 +401,95 @@ repos.get("/:owner/:name/history", async (c) => {
     await objects.close();
   }
 });
+
+// One commit's diff against its first parent (CORE-234: a step's work).
+// Bounded: DIFF_LIMITS caps files listed, files patched, blob size and tree reads.
+repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
+  const loaded = await loadRepo(c);
+  if (loaded instanceof Response) return loaded;
+  const oid = c.req.param("oid");
+  if (!isCommitId(oid) || oid.length !== 40)
+    return fail(c, 400, "Give the full 40-character commit hash.");
+  const objects = reader(c, loaded.row);
+  try {
+    const commit = await objects.commit(oid);
+    if (!commit) return fail(c, 404, `No commit ${oid}.`);
+    const parent = commit.parents[0] ? await objects.commit(commit.parents[0]) : null;
+    let reads = 0;
+    const trees = {
+      tree: (tree: string) => {
+        if (++reads > DIFF_LIMITS.trees) throw new DiffBudget();
+        return objects.tree(tree);
+      },
+    };
+    let changes: FileChange[];
+    try {
+      changes = await diffTrees(trees, parent?.treeHash ?? null, commit.treeHash);
+    } catch (error) {
+      if (!(error instanceof DiffBudget)) throw error;
+      return fail(c, 413, "This commit changes too much to show here.");
+    }
+    const listed = changes.slice(0, DIFF_LIMITS.files);
+    const text = async (blob: string | null) => {
+      if (!blob) return { text: "", binary: false, omitted: false };
+      const data = await objects.blobLimited(blob, DIFF_LIMITS.blobBytes);
+      if (!data || data.bytes.length < data.size) return { text: "", binary: false, omitted: true };
+      if (data.bytes.subarray(0, 8000).includes(0))
+        return { text: "", binary: true, omitted: false };
+      return { text: new TextDecoder().decode(data.bytes), binary: false, omitted: false };
+    };
+    const files: DiffFile[] = [];
+    for (const [index, change] of listed.entries()) {
+      const status = !change.before ? "added" : !change.blob ? "deleted" : "modified";
+      const file: DiffFile = {
+        path: change.path,
+        status,
+        additions: 0,
+        deletions: 0,
+        binary: false,
+        omitted: index >= DIFF_LIMITS.patched,
+        hunks: [],
+      };
+      if (!file.omitted) {
+        const [before, after] = await Promise.all([text(change.before), text(change.blob)]);
+        file.binary = before.binary || after.binary;
+        file.omitted = before.omitted || after.omitted;
+        if (!file.binary && !file.omitted) {
+          const patch = structuredPatch(change.path, change.path, before.text, after.text, "", "", {
+            context: 3,
+          });
+          file.hunks = patch.hunks.map((h) => ({
+            oldStart: h.oldStart,
+            oldLines: h.oldLines,
+            newStart: h.newStart,
+            newLines: h.newLines,
+            lines: h.lines,
+          }));
+          for (const line of patch.hunks.flatMap((h) => h.lines)) {
+            if (line.startsWith("+")) file.additions++;
+            else if (line.startsWith("-")) file.deletions++;
+          }
+        }
+      }
+      files.push(file);
+    }
+    const body: CommitDiff = {
+      oid,
+      parents: commit.parents,
+      message: commit.message,
+      authorName: commit.author.name,
+      authoredAt: commit.authoredAt,
+      files,
+      truncated: changes.length > listed.length,
+    };
+    cacheIfImmutable(c, oid);
+    return c.json(body);
+  } finally {
+    await objects.close();
+  }
+});
+
+class DiffBudget extends Error {}
 
 repos.get("/:owner/:name/commits", async (c) => {
   const loaded = await loadRepo(c);

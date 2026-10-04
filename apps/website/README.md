@@ -319,6 +319,27 @@ a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a
 later push (`worker/ref-log/record.ts`); until then it's "local, unverified".
 Context is the agent's account, shown as such next to what Gitmatrix verifies.
 
+### The story view
+
+A timeline's **Story** (`/tracker/:owner/timelines/:slug/story`, linked from
+the timeline page; `src/routes/tracker/Story.tsx`) lists its commits newest
+first along the first-parent line of `timeline/<slug>` (the last commits once
+abandoned, the landed head once landed) down to the fork point, merges marked.
+Each row shows the step's summary, agent, time, test result and how complete
+its context is. Opening one shows the commit's diff beside its why,
+instructions, steering, challenges and tests, with the missing-hook note when
+a harness hook didn't record them. `j`/`k` (or ←/→) step through, Escape
+closes; filters by agent and issue and the step itself live in the URL; an
+amended change offers its earlier versions. On a phone the list and the step
+take the screen in turn.
+
+It reads `history` for the line, `steps?commits=` for the context in batches
+of 100, and the diff from `GET /api/repos/:o/:n/commits/:oid/diff`: the
+commit against its first parent as hunks, bounded by `DIFF_LIMITS`
+(`shared/diff.ts`: 300 files listed, 60 patched, 256 KiB per side, 400 tree
+reads; binary and oversized files are counted without hunks). Diffs are
+addressed by commit, so they're cached as immutable.
+
 ## Profile pictures and organization icons
 
 People can set a picture (CORE-116) on **Settings → Profile**: upload one or
