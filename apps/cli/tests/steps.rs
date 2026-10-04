@@ -439,3 +439,119 @@ fn reads_show_local_steps_as_unverified_and_pushed_ones_from_the_server() {
         "{shown}"
     );
 }
+
+const CI_YML: &str = "on:\n  push: {}\n  step: {}\njobs:\n  lint:\n    on: step\n    local: true\n    steps: [\"echo checked 3 files\"]\n  unit:\n    on: [push, step]\n    local: true\n    needs: [lint]\n    env: { CODE: \"3\" }\n    steps: [\"echo 2 failed\", \"exit $CODE\"]\n  docs:\n    on: step\n    local: true\n    needs: [unit]\n    steps: [\"echo never\"]\n  deploy:\n    steps: [\"echo not local\"]\n";
+
+#[test]
+fn gm_test_runs_local_step_jobs_and_the_next_commit_carries_them() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.work().join(".gitmatrix")).unwrap();
+    s.edit(".gitmatrix/ci.yml", CI_YML);
+    let (code, tested, stderr) = s.run(&["test"], &[]);
+    assert_eq!(code, 1, "a failed job fails gm test: {stderr}");
+    assert!(
+        stderr.contains("checked 3 files"),
+        "output streams to stderr: {stderr}"
+    );
+    let jobs: Vec<(String, String, Value)> = tested["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| {
+            (
+                j["name"].as_str().unwrap().into(),
+                j["status"].as_str().unwrap().into(),
+                j["exit"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![
+            ("lint".into(), "passed".into(), json!(0)),
+            ("unit".into(), "failed".into(), json!(3)),
+            ("docs".into(), "skipped".into(), Value::Null),
+        ]
+    );
+    assert_eq!(tested["jobs"][1]["summary"], json!("2 failed"));
+    assert_eq!(
+        tested["jobs"][2]["summary"],
+        json!("needs unit, which failed")
+    );
+
+    // A commit of exactly the tested tree carries the results as its tests.
+    let file = s.context_file("## Why\nAdd CI.\n");
+    s.ok(&["commit", "-m", "Add CI", "--context", &file], &[]);
+    s.ok(&["push"], &[]);
+    let tests = s.api.uploads()[0]["tests"].clone();
+    assert_eq!(tests.as_array().unwrap().len(), 3, "{tests}");
+    assert_eq!(
+        tests[1],
+        json!({"command": "gm test: unit", "exit": 3, "summary": "2 failed", "durationMs": tests[1]["durationMs"], "origin": "local"})
+    );
+
+    // A different tree doesn't get stale results.
+    s.edit("other.txt", "x\n");
+    s.ok(&["commit", "-m", "Other", "--context", &file], &[]);
+    s.ok(&["push"], &[]);
+    assert!(
+        s.api.uploads()[1].get("tests").is_none(),
+        "{}",
+        s.api.uploads()[1]
+    );
+}
+
+#[test]
+fn gm_step_works_only_in_a_timeline_and_tests_commits_and_pushes() {
+    let s = Sandbox::new();
+    let (code, value, _) = s.run(&["step", "-m", "Outside"], &[]);
+    assert_ne!(code, 0);
+    assert_eq!(value["error"]["code"], json!("not_in_timeline"), "{value}");
+
+    // A timeline's bookmark on origin, and a passing local job.
+    git(
+        &s.root.join("seed"),
+        &["push", "-q", "origin", "main:timeline/search"],
+    );
+    fs::create_dir_all(s.work().join(".gitmatrix")).unwrap();
+    s.edit(
+        ".gitmatrix/ci.yml",
+        "on: [push, step]\njobs:\n  lint:\n    on: step\n    local: true\n    steps: [\"echo lint ok\"]\n",
+    );
+    s.edit("rank.rs", "fn rank() {}\n");
+    let file = s.context_file(CONTEXT);
+    let timeline = [("GM_TIMELINE", "search")];
+    s.ok(&["sync"], &timeline);
+    let stepped = s.ok(
+        &["step", "-m", "Rank by recency", "--context", &file],
+        &timeline,
+    );
+    assert_eq!(stepped["tests"]["passed"], json!(1), "{stepped}");
+    assert_eq!(
+        stepped["push"]["bookmark"],
+        json!("timeline/search"),
+        "{stepped}"
+    );
+    assert_eq!(stepped["push"]["steps"]["uploaded"], json!(1), "{stepped}");
+    let up = &s.api.uploads()[0];
+    assert_eq!(up["why"], json!("Recency matters more than score."));
+    assert_eq!(up["tests"][0]["command"], json!("gm test: lint"));
+    assert_eq!(up["timeline"], json!("search"));
+    let tip = git(
+        &s.root.join("remote.git"),
+        &["rev-parse", "timeline/search"],
+    );
+    assert_eq!(up["commitOid"], json!(tip));
+
+    // --no-test, and no context: still a step, with the warning.
+    s.edit("rank.rs", "fn rank() { 1 }\n");
+    let quiet = s.ok(&["step", "-m", "Tweak", "--no-test"], &timeline);
+    assert_eq!(quiet["tests"], Value::Null);
+    assert!(
+        quiet["commit"]["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("has no context"),
+        "{quiet}"
+    );
+}

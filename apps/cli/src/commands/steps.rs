@@ -294,6 +294,32 @@ fn summary_of(ws: &Workspace, oid: Oid) -> Result<String> {
         .collect())
 }
 
+/// Where `gm test` keeps its latest results, for the tree they ran on.
+fn tests_path(ws: &Workspace) -> PathBuf {
+    journal_dir(ws).join("tests.json")
+}
+
+/// Keeps `gm test`'s results for `tree`: a commit of exactly that tree carries
+/// them as its step's tests (CORE-236).
+pub fn record_tests(ws: &Workspace, tree: &str, tests: &[Value]) -> Result<()> {
+    let dir = journal_dir(ws);
+    fs::create_dir_all(&dir)
+        .map_err(|e| GmError::new("io", format!("Couldn't create {}: {e}", dir.display())))?;
+    let path = tests_path(ws);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({"tree": tree, "tests": tests})).unwrap_or_default(),
+    )
+    .map_err(|e| GmError::new("io", format!("Couldn't write {}: {e}", path.display())))
+}
+
+/// `gm test`'s results, if they ran on this commit's tree.
+fn tests_for(ws: &Workspace, oid: Oid) -> Option<Value> {
+    let saved = read_entry(&tests_path(ws))?;
+    let tree = ws.commit(oid).ok()?.tree_id().to_string();
+    (saved["tree"].as_str() == Some(tree.as_str())).then(|| saved["tests"].clone())
+}
+
 /// Journals `context` for the commit `oid`: redacted, with the change ID,
 /// summary, time, timeline and harness filled in. Coverage defaults to what
 /// the context itself contains (`agent`) or `none`.
@@ -304,6 +330,12 @@ pub fn record(ws: &Workspace, oid: Oid, context: Value) -> Result<()> {
         Value::Object(map) => map,
         _ => Map::new(),
     };
+    // Tests `gm test` ran on exactly this commit's tree, unless the context has its own.
+    if !upload.contains_key("tests")
+        && let Some(tests) = tests_for(ws, oid)
+    {
+        upload.insert("tests".into(), tests);
+    }
     let has = |key: &str| {
         upload
             .get(key)
@@ -353,6 +385,7 @@ fn entries_all(ws: &Workspace) -> Vec<(PathBuf, Value)> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| p.file_name().is_some_and(|n| n != "tests.json"))
         .filter_map(|p| read_entry(&p).map(|v| (p, v)))
         .collect();
     all.sort_by(|a, b| {

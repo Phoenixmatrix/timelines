@@ -116,6 +116,10 @@ pub enum Command {
     /// Step context: the why, instructions and steering attached to commits
     #[command(subcommand)]
     Context(crate::commands::steps::ContextCommand),
+    /// Run this repository's fast checks: the step jobs in .gitmatrix/ci.yml marked local: true
+    Test,
+    /// Record a step of a timeline: gm test, commit with context, push
+    Step(StepArgs),
     /// Sign in to a Gitmatrix server
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -276,6 +280,20 @@ pub struct CommitArgs {
     /// Journaled locally and uploaded by `gm push`.
     #[arg(long, value_name = "FILE|-")]
     pub context: Option<String>,
+}
+
+#[derive(Args)]
+pub struct StepArgs {
+    /// Summary of the step: the commit's description.
+    #[arg(short, long, required = true)]
+    pub message: Vec<String>,
+    /// The step's context: a JSON or Markdown file, or `-` for stdin, with
+    /// instructions, steering, why and challenges (see `gm commit --context`).
+    #[arg(long, value_name = "FILE|-")]
+    pub context: Option<String>,
+    /// Don't run `gm test` first.
+    #[arg(long)]
+    pub no_test: bool,
 }
 
 #[derive(Args)]

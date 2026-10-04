@@ -171,6 +171,15 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Push(a) => out(f, network::push(ctx, &a)),
         Command::Queue(c) => out(f, commands::queue::run(ctx, &c)),
         Command::Timeline(c) => out(f, commands::timeline::run(ctx, &c)),
+        Command::Test => {
+            let tested = commands::test::test(ctx)?;
+            emit(f, &tested);
+            if tested.failed > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::Step(a) => out(f, commands::test::step(ctx, &a)),
         Command::Context(commands::steps::ContextCommand::Sync) => {
             out(f, commands::steps::sync(ctx))
         }

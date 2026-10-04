@@ -13,6 +13,7 @@ pub mod semantic;
 pub mod server;
 pub mod settings;
 pub mod steps;
+pub mod test;
 pub mod timeline;
 pub mod tracker;
 pub mod why;

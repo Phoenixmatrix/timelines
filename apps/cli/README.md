@@ -724,10 +724,27 @@ way and what got in the way (CORE-226). Everyone who can read the repository
 sees it beside the commit.
 
 ```bash
-gm commit -m "Rank by recency" --context step.md   # or --context - for stdin
+gm step -m "Rank by recency" --context step.md     # in a timeline: gm test, commit, push
+gm commit -m "Rank by recency" --context step.md   # or by hand; --context - reads stdin
 gm push                                             # uploads it for the pushed commits
 gm context sync                                     # retries uploads a push couldn't make
 ```
+
+- **`gm test`** runs the repository's fast checks: the jobs in
+  `.gitmatrix/ci.yml` that join step runs (`on: step`) and are marked
+  `local: true` (CORE-235). They run with bash in this checkout, in `needs`
+  order, with the pipeline's and job's `env:` plus `GITMATRIX_TRIGGER=step` and
+  `GITMATRIX_LOCAL=1`. Output streams to stderr; the result (each job's status,
+  exit code, duration and last line of output) goes to stdout, and the command
+  exits 1 when a job fails. A job that needs a failed job, or one that doesn't
+  run locally, is skipped. The results are kept for the working copy's tree, so
+  the next `gm commit --context` of exactly that tree carries them as the
+  step's tests.
+- **`gm step -m <summary> [--context <file|->] [--no-test]`** records a step of
+  a timeline in one command: `gm test`, then commit with the context and the
+  test results, then push to `timeline/<slug>`. Failing tests don't stop it:
+  the step records them, with a warning. Outside a timeline it refuses
+  (`not_in_timeline`); use `gm commit` and `gm push` there.
 
 - **`--context <file|->`** takes Markdown with `## Instructions`, `## Steering`,
   `## Why` and `## Challenges` sections (bullets become entries), or a JSON
