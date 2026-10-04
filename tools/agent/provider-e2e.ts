@@ -1749,6 +1749,8 @@ export async function runProviderE2E(
       let orphan: Inventory | undefined;
       await waitFor("repository-orphan-purged", 15 * 60_000, async () => {
         orphan = await inventoryOf(planted.repoId);
+        // The latest observation is evidence even when the deadline passes.
+        deletionEvidence.orphan = orphan;
         return (
           orphan.deletion?.phase === "done" && orphan.vectors === 0 && orphan.searchItems === 0
         );

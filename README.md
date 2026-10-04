@@ -97,6 +97,27 @@ the exact source revision. These links stay out of the reading view until opened
 Select another item's time to switch details, or use Close or Escape to dismiss
 the sidebar and return focus to the opener. On phones, details fill the screen.
 
+## Data retention
+
+Gitmatrix deletes nothing new until someone turns a retention category on.
+Account administrators choose per account in **Settings → Data retention**;
+site administrators set site categories (shared caches, the registry,
+sign-in state, usage records) and defaults for every account in
+**Settings → Site data retention**. Each category says what it never
+deletes. **Clean up now** previews any categories (a dry run with counts,
+bytes and estimated storage cost) before deleting, and every run, scheduled
+or manual, is kept in the run history with who started it. The same from a
+terminal: `gm retention show`, `gm retention set <category> --enable`,
+`gm --dry-run retention run <category>…`, `gm retention run <category> --yes`,
+`gm retention runs` (`--owner <slug>` or `--site`).
+
+**Settings → Usage & costs** shows what each account stores and runs, priced
+from Cloudflare's published list prices, with links to the categories that
+clean each line up. Deleting a repository removes everything it owned.
+
+Categories, defaults, the engine, the safety suite and what is verified
+where: [`apps/website/README.md`](apps/website/README.md#data-retention).
+
 ## Agent-first development
 
 Use one **source worktree and isolated environment per agent**. Never test product

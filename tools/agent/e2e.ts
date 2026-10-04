@@ -3812,4 +3812,213 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await request(`${timelines}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
     }
   });
+  await scenario("retention-concurrent-with-pushes-builds-and-chats", async () => {
+    // CORE-211, in the real runtime: real cleanups (dated a year ahead, so
+    // nearly everything is old enough) run again and again in jun's account
+    // while jun pushes to two branches, a CI build runs, and new chats are
+    // made. Afterwards every push landed (refs, objects, fsck), the build
+    // finished and is kept as its ref's latest, every new chat is there and
+    // only the long-idle ones are gone, each ref keeps its latest push log
+    // entry, every run succeeded, and a final run then dry run find nothing
+    // left. Last in the suite: it ages jun's account a year.
+    const owner = "jun";
+    const token = fixtures.tokens.jun;
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const name = `agent-concurrency-${randomUUID().slice(0, 8)}`;
+    const remote = `${ctx.origin}/${owner}/${name}.git`;
+    const repoApi = `/api/repos/${owner}/${name}`;
+    const dir = join(work, name);
+    const run = promisify(execFile);
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: `http.${ctx.origin}/.extraHeader`,
+      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+    };
+    for (const key of Object.keys(gitEnv))
+      if (/^GIT_CONFIG_(?:KEY|VALUE)_[1-9]/.test(key)) delete gitEnv[key];
+    const git = async (args: string[], cwd = dir) =>
+      (
+        await run("git", args, { cwd, env: gitEnv, timeout: 90_000, maxBuffer: 16 << 20 })
+      ).stdout.trim();
+    await json(`/api/repos`, token, "POST", { owner, name, visibility: "private" }, [201]);
+    await mkdir(join(dir, ".gitmatrix"), { recursive: true });
+    await git(["init", "--initial-branch=main"]);
+    await git(["config", "user.name", "Agent Fixture"]);
+    await git(["config", "user.email", "agent@gitmatrix.invalid"]);
+    // JSON is a YAML subset; manual runs only.
+    await writeFile(
+      join(dir, ".gitmatrix", "ci.yml"),
+      JSON.stringify({
+        on: { push: { branches: ["never-agent-auto"] } },
+        jobs: { build: { steps: [{ run: "sleep 2; printf 'concurrent build\\n'" }] } },
+      }),
+    );
+    await writeFile(join(dir, "README.md"), "Concurrency.\n");
+    await git(["add", "."]);
+    await git(["commit", "-m", "Start"]);
+    await git(["push", remote, "main"]);
+    await git(["push", remote, "main:work"]);
+    await git(["branch", "work"]);
+
+    // Long-idle chats the cleanup may take, and the thresholds it runs with.
+    const tag = randomUUID().replaceAll("-", "").slice(0, 8);
+    const idle = [`conc-idle-a-${tag}`, `conc-idle-b-${tag}`];
+    for (const id of idle)
+      await json("/api/dev/assistant-chat", secret, "POST", {
+        account: owner,
+        id,
+        title: `Idle ${id}`,
+        updatedAt: new Date(Date.now() - 12 * 365 * 86_400_000).toISOString(),
+      });
+    const categories = {
+      "push-log": { days: 365 },
+      "ci-logs": { days: 30 },
+      "ci-runs": { days: 180, keepLatest: 1 },
+      "preview-records": { days: 30 },
+      "assistant-chats": { days: 3650, maxPerUser: 0 },
+    };
+    type DevRun = {
+      run: {
+        status: string;
+        items: number;
+        categories: { category: string; items: number; error: string | null }[];
+      };
+    };
+    const cleanup = (dryRun: boolean) =>
+      json<DevRun>("/api/dev/retention", secret, "POST", {
+        account: owner,
+        categories,
+        daysAhead: 400,
+        dryRun,
+      });
+
+    const fresh: string[] = [];
+    const pushed: Record<"main" | "work", string> = { main: "", work: "" };
+    let settled = false;
+    const concurrent = Promise.all([
+      // A CI build of main.
+      (async () => {
+        const number = (
+          await json<{ number: number }>(
+            `${repoApi}/ci/runs`,
+            token,
+            "POST",
+            { ref: "main" },
+            [201],
+          )
+        ).number;
+        return poll(
+          () => json<CiRunDetail>(`${repoApi}/ci/runs/${number}`, token),
+          (r) => !["queued", "running"].includes(r.status),
+          "the concurrent build",
+        );
+      })(),
+      // Pushes to both branches.
+      (async () => {
+        for (let i = 0; i < 4; i++)
+          for (const branch of ["main", "work"] as const) {
+            await git(["checkout", "-q", branch]);
+            await writeFile(join(dir, `${branch}.txt`), `${branch} ${i} ${randomUUID()}\n`);
+            await git(["add", "."]);
+            await git(["commit", "-q", "-m", `${branch} ${i}`]);
+            await git(["push", remote, `HEAD:${branch}`]);
+            pushed[branch] = await git(["rev-parse", "HEAD"]);
+          }
+      })(),
+      // New chats.
+      (async () => {
+        for (let i = 0; i < 4; i++) {
+          const id = `conc-fresh-${i}-${tag}`;
+          await json("/api/dev/assistant-chat", secret, "POST", {
+            account: owner,
+            id,
+            title: `Fresh ${id}`,
+          });
+          fresh.push(id);
+        }
+      })(),
+    ]).finally(() => {
+      settled = true;
+    });
+    const [runs, [build]] = await Promise.all([
+      // Cleanups, back to back, for as long as the rest is going (at least 4).
+      (async () => {
+        const done: DevRun["run"][] = [];
+        while (!settled || done.length < 4) done.push((await cleanup(false)).run);
+        return done;
+      })(),
+      concurrent,
+    ]);
+    for (const r of runs)
+      assert.equal(
+        r.status,
+        "succeeded",
+        `Every concurrent cleanup succeeded: ${JSON.stringify(r)}`,
+      );
+    assert.equal(build.status, "succeeded", "The build finished");
+    const kept = await json<CiRunDetail>(`${repoApi}/ci/runs/${build.number}`, token);
+    assert.equal(kept.number, build.number, "The build is its ref's latest run, kept");
+
+    // Every push landed: refs at the last pushed commits, history whole, fsck clean.
+    const mirror = join(work, `${name}-after.git`);
+    await git(["clone", "--mirror", remote, mirror], work);
+    await git(["fsck", "--full", "--strict"], mirror);
+    const refs = await git(["for-each-ref", "--format=%(refname) %(objectname)"], mirror);
+    for (const branch of ["main", "work"] as const)
+      assert(
+        refs.includes(`refs/heads/${branch} ${pushed[branch]}`),
+        `${branch} is at its last push`,
+      );
+    const subjects = (await git(["log", "--all", "--format=%s"], mirror)).split("\n");
+    for (let i = 0; i < 4; i++)
+      for (const branch of ["main", "work"])
+        assert(subjects.includes(`${branch} ${i}`), `${branch} ${i} is in the history`);
+
+    // Chats: every new one is there; only the long-idle ones are gone.
+    const chats = (await json<{ chats: { id: string }[] }>("/api/assistant/chats", token)).chats;
+    for (const id of fresh)
+      assert(
+        chats.some((c) => c.id === id),
+        `${id} survives`,
+      );
+    for (const id of idle) assert(!chats.some((c) => c.id === id), `${id} was cleaned up`);
+
+    // The push log keeps each live ref's latest entry (recorded after each push).
+    const latest = await poll(
+      async () => (await json<RefUpdateList>(`${repoApi}/ref-updates`, token)).updates,
+      (updates) =>
+        (["main", "work"] as const).every((b) =>
+          updates.some((u) => u.ref === `refs/heads/${b}` && u.new === pushed[b]),
+        ),
+      "each ref's latest push log entry",
+    );
+    record({ refUpdates: latest.length });
+
+    // Then nothing is left for the same cleanup: a run, and a dry run after it, at that moment.
+    const last = (await cleanup(false)).run;
+    const after = (await cleanup(true)).run;
+    assert.equal(after.status, "succeeded");
+    assert.equal(after.items, 0, `Nothing left: ${JSON.stringify(after.categories)}`);
+    const remaining = (await json<RefUpdateList>(`${repoApi}/ref-updates`, token)).updates;
+    for (const branch of ["main", "work"] as const)
+      assert(
+        remaining.some((u) => u.ref === `refs/heads/${branch}` && u.new === pushed[branch]),
+        `${branch} keeps its latest push log entry after the cleanups`,
+      );
+    assert(
+      runs.reduce((sum, r) => sum + r.items, 0) + last.items > idle.length,
+      "The cleanups removed push log entries and run records, not only the idle chats",
+    );
+    record({
+      cleanups: [...runs.map((r) => r.items), last.items],
+      refUpdatesAfter: remaining.length,
+      build: build.number,
+      pushes: 8,
+      chats: { fresh: fresh.length, idleRemoved: idle.length },
+    });
+  });
 }
